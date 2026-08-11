@@ -197,6 +197,12 @@ struct DCam {
     float  tanHalfX, tanHalfY;
     int    projection;     // CAM_RECTILINEAR (0) or a fisheye/panoramic lens map
     float  rEdge;          // image radius at the vertical film edge (angular projections)
+    // O8 stage 2: Camera::footprintPerDist(1) — the world-space diameter of the surface
+    // patch ONE PIXEL stands for at unit distance, head-on. kShade turns it into the
+    // per-pixel `fw` a pattern sees, so fnoise() band-limits itself in the preview too.
+    // The preview is 1 sample per pixel with no jitter at all, so it is the single most
+    // alias-prone view in the renderer and wants this most.
+    float  fwPerDist;
 };
 
 // A projected screen sub-triangle, SPLIT into what each pass actually reads:
@@ -813,6 +819,21 @@ __device__ inline float3 dTriTangent(float3 p0, float3 p1, float3 p2,
     return (l > 1e-12f) ? T * (1.0f / l) : mk(0.0f, 0.0f, 0.0f);
 }
 
+// O8 stage 2: the `fw` a pattern sees at this preview pixel — the world-space diameter of
+// the patch one pixel covers on this surface. cam.fwPerDist carries the per-unit-distance
+// part (Camera::footprintPerDist at the window's resolution); patShadingFootprint adds the
+// distance and the obliquity, so this shares its geometric-mean/cos-floor convention with
+// the CPU tracer and the mode-W kernel bit for bit. Called only when a pattern is actually
+// bound, so a pattern-free preview pays nothing.
+__device__ inline double dRasterFw(const DCam& cam, float3 wpos, float3 wn) {
+    float3 dv = wpos - cam.eye;
+    double d2 = (double)dot3(dv, dv);
+    if (!(d2 > 0.0)) return 0.0;
+    double dist = sqrt(d2);
+    float3 nn = normalize3(wn);
+    return patShadingFootprint((double)cam.fwPerDist, dist, (double)dot3(dv, nn) / dist);
+}
+
 // ---------------------------------------------------------------------------
 // Pass C: resolve + shade each pixel once. Decode the winning slot, recompute barycentrics
 // at the pixel centre (same float math as kRaster, so the winner's 1/depth reproduces),
@@ -901,9 +922,11 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             // none either, so the two previews agree; `curv` is a tracer-only input.
             // cavity = 0 for a stronger reason: the probe needs whole-scene ray
             // traversal, and the raster preview has no BVH at all — it exists precisely
-            // to avoid one. Both are logged in known-issues.md.
+            // to avoid one. Both are logged in known-issues.md. `fw` (O8 stage 2), by
+            // contrast, IS filled: a rasterizer knows its own pixel footprint exactly.
             wt = dPatternEval(patNodes + wp.off, wp.n, qx, qy, qz, 0.0,
-                              pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, 0.0, 0.0, patEnv);
+                              pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, 0.0, 0.0,
+                              dRasterFw(cam, wpos, wn), patEnv);
         } else if (mx.weightTex >= 0 && mx.weightTex < nTex) {
             wt = texMeta[mx.weightTex].patScalarAt((double)uu, (double)vv);
         }
@@ -936,7 +959,8 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         // approximates, matching both the CPU preview and the tracer's own hit context.
         // curv/cavity = 0 here for the same reason as the mix-weight site above.
         double s = dPatternEval(patNodes + pp.off, pp.n, px, py, pz, 0.0,
-                                pn.x, pn.y, pn.z, r, (double)uu, (double)vv, 0.0, 0.0, patEnv);
+                                pn.x, pn.y, pn.z, r, (double)uu, (double)vv, 0.0, 0.0,
+                                dRasterFw(cam, wpos, wn), patEnv);
         col = col * (float)fmin(1.0, fmax(0.0, s));
     }
     if (emissive) { accum[i] = col * emisBoost; return; }   // raw emitter radiance
@@ -1601,6 +1625,10 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
     dc.tanHalfX = (float)cam.tanHalfX; dc.tanHalfY = (float)cam.tanHalfY;
     dc.projection = cam.projection;
     dc.rEdge = (float)cam.rEdge;
+    // O8 stage 2. The preview draws this camera at W*H, which need not be the camera's own
+    // film resolution, so pass W/H as the pixel-count override. spp = 1: the rasterizer
+    // takes exactly one un-jittered sample per pixel.
+    dc.fwPerDist = (float)cam.footprintPerDist(1, W, H);
 
     const float3 bg = make_float3(0.06f, 0.07f, 0.09f);
     const float  EMIS_BOOST = 4.0f;

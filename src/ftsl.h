@@ -1101,8 +1101,15 @@ public:
             if (e.emitPat < 0) continue;
             if (e.emitPat < (int)L.scene.patterns.size()) {
                 for (const PatNode& n : L.scene.patterns[e.emitPat].nodes) {
-                    if (n.op != PatOp::VarCurv && n.op != PatOp::VarCavity) continue;
-                    const char* which = (n.op == PatOp::VarCurv) ? "curv" : "cavity";
+                    // `fw` (O8 s2) is refused here for a strictly stronger version of the
+                    // same reason: not only does a sampled emitter point carry no shading
+                    // footprint, the footprint is a property of the VIEW rather than of the
+                    // surface, so an emitted profile driven by it would depend on where the
+                    // camera happens to be — which no emission profile may.
+                    if (n.op != PatOp::VarCurv && n.op != PatOp::VarCavity &&
+                        n.op != PatOp::VarFootprint) continue;
+                    const char* which = (n.op == PatOp::VarCurv)   ? "curv"
+                                      : (n.op == PatOp::VarCavity) ? "cavity" : "fw";
                     fail(std::string("an emit pattern cannot read `") + which +
                          "` — an emitter's sampled point carries no such value, so the "
                          "emitted profile would disagree with the one emission-on-hit "

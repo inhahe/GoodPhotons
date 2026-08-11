@@ -1376,6 +1376,11 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
 
     const double zn = 1e-3;   // near plane (camera-forward) for rectilinear clipping
     const bool rect = (cam.projection == CAM_RECTILINEAR);
+    // O8 stage 2: the shading-footprint coefficient for `fw`. W/H override the camera's own
+    // film resolution because the preview draws into a window of its own size, and spp is 1
+    // (one un-jittered sample per pixel — which is exactly why the preview needs `fw` most).
+    // Kept bit-identical to the CUDA preview, which computes the same number in kShade.
+    const double fwPerDist = cam.footprintPerDist(1, W, H);
 
     if (nThreads < 1) nThreads = 1;
 
@@ -1605,7 +1610,14 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
             bool   pcReady = false;
             auto   ctx = [&]() -> const PatCtx& {
                 if (!pcReady) {
-                    pc = makePatCtx(g.wpos[i], 0.0, N0, g.uv[i].x, g.uv[i].y);
+                    // curv/cavity stay 0 (see the CUDA twin: no per-face curvature and no
+                    // BVH to probe), but `fw` IS known here — a rasterizer knows its own
+                    // pixel footprint exactly.
+                    const Vec3 dv = g.wpos[i] - cam.eye;
+                    const double dist = length(dv);
+                    const double cs = dist > 0.0 ? dot(dv, N0) / dist : 0.0;
+                    pc = makePatCtx(g.wpos[i], 0.0, N0, g.uv[i].x, g.uv[i].y, 0.0, 0.0,
+                                    patShadingFootprint(fwPerDist, dist, cs));
                     bindPatScene(pc, *scenePtr);
                     pcReady = true;
                 }

@@ -189,6 +189,42 @@ struct Camera {
         return aNorm * std::sin(th) * rEdge * rEdge / denom;
     }
 
+    // ---- shading footprint (O8 stage 2) -------------------------------------------
+    // The coefficient half of `fw`: the world-space width one camera sample covers PER
+    // UNIT of distance, at normal incidence. A renderer computes this once per frame and
+    // hands it to patShadingFootprint() at each primary hit, which adds the distance and
+    // the obliquity; see that function for what the combination means and Hit::fw for who
+    // fills it. Two decisions are baked in here:
+    //
+    //  * THE PIXEL'S ANGULAR SIZE comes from pixelSolidAngle(), not from fov_y/res_y, so
+    //    fisheye and panoramic lenses — whose pixels are neither square nor uniform over
+    //    the film — need no separate case. The solid angle is turned into the diameter of
+    //    the disc SUBTENDING it, `2*sqrt(Om/pi)`, which is the right conversion precisely
+    //    because `fw` is defined as a disc diameter. It is evaluated ON AXIS: the
+    //    off-axis variation is a cos^3 effect (rectilinear), an order of magnitude below
+    //    the obliquity term, and taking the on-axis value keeps `fw` from depending on
+    //    which pixel a surface happens to land in.
+    //  * SUPERSAMPLING. At `spp` jittered samples per pixel the reconstruction already
+    //    averages over the footprint stochastically and the residual falls about as
+    //    1/sqrt(spp), so the width one sample should band-limit to shrinks by the same
+    //    factor. That is what makes `fw` degrade gracefully rather than lock in a blur:
+    //    raise -spp and the filtering backs off on its own, converging to the unfiltered
+    //    ground truth, which is exactly the behaviour that lets one scene serve both a
+    //    1-spp preview and a converged render.
+    //  * A RESOLUTION OVERRIDE (rx, ry). pixelSolidAngle() normalises by this camera's
+    //    OWN film.resX/resY, but the preview rasterizer draws the same camera into a
+    //    window of its own size. Passing that size rescales the pixel count — exact in
+    //    both branches, since pixelSolidAngle is proportional to 1/(resX*resY) in each
+    //    (pixelPlaneArea for rectilinear, aNorm for the angular maps). 0 = use the film.
+    double footprintPerDist(int spp = 1, int rx = 0, int ry = 0) const {
+        double om = pixelSolidAngle(1.0);
+        if (rx > 0 && ry > 0 && film.resX > 0 && film.resY > 0)
+            om *= ((double)film.resX * (double)film.resY) / ((double)rx * (double)ry);
+        double d = 2.0 * std::sqrt((om > 0.0 ? om : 0.0) / 3.141592653589793);
+        if (spp > 1) d /= std::sqrt((double)spp);
+        return d;
+    }
+
     // Camera importance normaliser: image-plane area at unit distance.
     double imagePlaneArea() const { return 4.0 * tanHalfX * tanHalfY; }
 

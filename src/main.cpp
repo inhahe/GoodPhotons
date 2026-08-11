@@ -4020,6 +4020,82 @@ static int checkFNoise() {
         ok &= chk("S9 CSE'd programs evaluate right (max err)", wv, 0.0, 0.0);
     }
 
+    // ---- §10: the `fw` shading footprint (O8 stage 2) ------------------------
+    // patShadingFootprint() is the ONE place the renderer turns a camera coefficient +
+    // hit geometry into the `w` an fnoise() sees, and it is compiled into the CPU tracer,
+    // the mode-W megakernel and both preview rasterizers. If its convention drifts, the
+    // same scene filters differently on CPU and GPU — a deterministic difference, not
+    // noise — so pin the convention here rather than in a render comparison.
+    {
+        // Head-on, the footprint is just the coefficient times the distance.
+        ok &= chk("S10 head-on is perDist*dist", patShadingFootprint(0.004, 25.0, -1.0),
+                  0.1, 1e-15);
+        // The sign of cos is the ray-vs-normal orientation, which says nothing about how
+        // stretched the footprint is; only its magnitude may matter.
+        ok &= chk("S10 cos sign is ignored", patShadingFootprint(0.004, 25.0, 0.37),
+                  patShadingFootprint(0.004, 25.0, -0.37), 0.0);
+        // Obliquity: the pixel's footprint is an ellipse with minor axis d and major axis
+        // d/|cos|; `fw` is their geometric mean, i.e. d/sqrt(|cos|) — the diameter of the
+        // disc of EQUAL AREA. (Not the major axis: over-filtering is the worse mismatch.)
+        ok &= chk("S10 obliquity is the geometric mean of the ellipse axes",
+                  patShadingFootprint(0.004, 25.0, 0.25), 0.1 / std::sqrt(0.25), 1e-15);
+        // Grazing hits would otherwise send `fw` to infinity and grey out a whole silhouette.
+        ok &= chk("S10 cos floor caps the grazing blowup",
+                  patShadingFootprint(0.004, 25.0, 1e-9),
+                  0.1 / std::sqrt(PAT_FW_COS_MIN), 1e-15);
+        ok &= chk("S10 cos NaN takes the floor too",
+                  patShadingFootprint(0.004, 25.0, std::numeric_limits<double>::quiet_NaN()),
+                  0.1 / std::sqrt(PAT_FW_COS_MIN), 1e-15);
+        // 0 means UNKNOWN at both ends (no camera coefficient / no hit), and unknown must
+        // mean UNFILTERED — never a tiny-but-nonzero width, which would be a silent blur.
+        ok &= chk("S10 zero coefficient => unfiltered", patShadingFootprint(0.0, 25.0, 1.0), 0.0, 0.0);
+        ok &= chk("S10 zero distance => unfiltered",    patShadingFootprint(0.004, 0.0, 1.0), 0.0, 0.0);
+        ok &= chk("S10 negative distance => unfiltered", patShadingFootprint(0.004, -3.0, 1.0), 0.0, 0.0);
+        // Supersampling backs the filter off as 1/sqrt(spp) — the property that lets one
+        // scene serve both a 1-spp preview and a converged render (Camera::footprintPerDist).
+        Camera fc;
+        fc.lookAt(Vec3{0, 0, 0}, Vec3{0, 0, 1}, Vec3{0, 1, 0}, 40.0, 800, 600);
+        const double p1 = fc.footprintPerDist(1), p16 = fc.footprintPerDist(16);
+        ok &= chk("S10 footprintPerDist falls as 1/sqrt(spp)", p16 * 4.0, p1, 1e-12);
+        // A pixel's footprint IS the disc subtending the pixel's solid angle.
+        ok &= chk("S10 footprintPerDist subtends the pixel solid angle",
+                  PI * (p1 * 0.5) * (p1 * 0.5), fc.pixelSolidAngle(1.0), 1e-15);
+        // Halving the raster the camera is drawn into doubles the per-pixel footprint.
+        ok &= chk("S10 resolution override rescales the footprint",
+                  fc.footprintPerDist(1, 400, 300), 2.0 * p1, 1e-12);
+        ok &= chk("S10 resolution override at the film res is a no-op",
+                  fc.footprintPerDist(1, 800, 600), p1, 0.0);
+        // The variable itself: parse, print, stack effect, and the free-variable test that
+        // decides whether a pattern may be baked to a constant.
+        {
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr("fnoise(20*x, 20*y, 20*z, 20*fw, 4)", prog, perr)) {
+                std::printf("[checkfnoise] S10 compile of an `fw` expression FAILED: %s\n",
+                            perr.c_str());
+                ok = false;
+            } else {
+                if (!patternHasFreeVars(prog)) {
+                    std::printf("[checkfnoise] S10 `fw` did not register as a free var  BAD\n");
+                    ok = false;
+                }
+                double wv2 = 0.0;
+                for (int i = 0; i < 128; ++i) {
+                    const double x = (frand() - 0.5) * 8.0, y = (frand() - 0.5) * 8.0,
+                                 z = (frand() - 0.5) * 8.0, f = frand() * 0.05;
+                    PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1}, 0.0, 0.0, 0.0, 0.0, f);
+                    wv2 = std::fmax(wv2, std::fabs(patternEval(prog.data(), (int)prog.size(), c)
+                                                   - patFilteredNoise(20*x, 20*y, 20*z, 20*f, 4)));
+                }
+                ok &= chk("S10 the VM reads `fw` from the PatCtx", wv2, 0.0, 0.0);
+                // A hit with no footprint must give the unfiltered field, not a blurred one.
+                PatCtx c0 = makePatCtx(Vec3{1.5, -0.5, 2.0}, 0.0, Vec3{0, 0, 1});
+                ok &= chk("S10 default PatCtx leaves fnoise unfiltered",
+                          patternEval(prog.data(), (int)prog.size(), c0),
+                          patFilteredNoise(30.0, -10.0, 40.0, 0.0, 4), 0.0);
+            }
+        }
+    }
+
     std::printf("[checkfnoise] worst absolute error (exact checks) = %.3g\n", worst);
     std::printf("[checkfnoise] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
@@ -7891,6 +7967,15 @@ static bool g_whitted = false;
 static int  g_whittedGrid = 4;
 static double g_ambient = 0.0;
 
+// The samples-per-pixel figure the shading footprint `fw` (O8 stage 2) is computed
+// against — the run's REQUESTED -spp, latched once during argument parsing. It is not
+// read from the per-call chunk size on purpose: a progressive or resumed render hands
+// renderBackward a few spp at a time, and if each chunk sized its own filter the chunks
+// would be renders of DIFFERENT images and averaging them would be meaningless. One
+// number for the whole run keeps every chunk consistent, so the only thing accumulating
+// samples changes is the noise. See Camera::footprintPerDist for what spp does to it.
+static long long g_fwSpp = 1;
+
 // -gi: mode W's deterministic ONE-BOUNCE GATHER, the real thing g_ambient only stands in
 // for. A flat constant cannot reproduce contact darkening (it lights a crevice exactly as
 // much as an exposed face) or colour bleeding (it is grey, where light that has bounced
@@ -8377,6 +8462,11 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         br.ambient = g_ambient * scene.ambientRef();
         br.giDirs = g_gi; br.giGrid = g_giGrid; br.giBounce = g_giBounce;
         br.giClamp = g_giClamp * scene.ambientRef();   // same scaling as -ambient above
+        // Shading footprint for `fw` (O8 stage 2). Mode W only — see fwPerDist for why a
+        // stochastic sampler wants none — and derived from the run's REQUESTED spp rather
+        // than this call's chunk, so every chunk of a progressive or resumed render filters
+        // identically and their average stays a render of one image.
+        br.fwPerDist = br.whitted ? cam.footprintPerDist((int)g_fwSpp) : 0.0;
         int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
         br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
     };
@@ -9907,6 +9997,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     whittedOpts.heroSplit = hero::gSplit || g_whitted;
     whittedOpts.ambient   = g_ambient * scene.ambientRef();
     whittedOpts.giClamp   = g_giClamp * scene.ambientRef();   // same scaling as ambient
+    // O8 stage 2: same footprint coefficient the CPU worker gives BackwardRenderer, from the
+    // run's requested spp (not a chunk's), so CPU and GPU mode W filter fnoise() identically.
+    whittedOpts.fwPerDist = cam.footprintPerDist((int)g_fwSpp);
 #endif
     bool useGpu = false;
     if (!wantGpu && !wantAuto && std::strcmp(device, "cpu"))
@@ -12051,6 +12144,7 @@ static int run(int argc, char** argv) {
     // scene would silently still render the biased preview.
     if (ftslScene.whitted && !modeFromCli) g_whitted = true;
     g_directOnly = directOnly || g_whitted;   // -mode W implies it
+    g_fwSpp = spp > 0 ? spp : 1;              // latch the footprint's spp (see g_fwSpp)
     if (maxBounceOverride >= 1) std::printf("[ignore] max bounce = %d\n", maxBounceOverride);
     // The interactive viewer renders its live preview in mode W whatever the run's mode is
     // (press T), so mode W's settings have to be honoured in an -explore run too -- else

@@ -1956,7 +1956,7 @@ inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
         h.cavity = cavityAt(scene, h);
         h.cavityDone = true;
     }
-    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v, h.curv, h.cavity);
+    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v, h.curv, h.cavity, h.fw);
     bindPatScene(c, scene);
     return c;
 }

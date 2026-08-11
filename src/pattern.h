@@ -38,12 +38,14 @@
   #endif
   #define PAT_FLOOR(x) ::floor(x)
   #define PAT_POW(x, y) ::pow(x, y)
+  #define PAT_SQRT(x) ::sqrt(x)
 #else
   #ifndef PATTERN_HD
   #define PATTERN_HD
   #endif
   #define PAT_FLOOR(x) std::floor(x)
   #define PAT_POW(x, y) std::pow(x, y)
+  #define PAT_SQRT(x) std::sqrt(x)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -268,6 +270,33 @@ enum class PatOp : int {
     // every backend. Appended at the END of the enum so the VarX..VarV scans and
     // varName() are unperturbed.
     FNoise,
+    // SHADING FOOTPRINT at the hit, spelled `fw` (O8 stage 2): the world-space DIAMETER
+    // of the surface patch that this one shading sample stands for — precisely the `w`
+    // that `fnoise` wants, so the whole point of the variable is that
+    // `fnoise(k*x, k*y, k*z, k*fw, n)` is the complete, camera-independent spelling of
+    // "band-limit this texture" at any scale `k`.
+    //
+    // It is 0 wherever the footprint is genuinely unknown or meaningless, and 0 means
+    // "unfiltered", which is the right default in every one of those places:
+    //
+    //   * the FORWARD photon modes (A/B/C). Each pixel there accumulates millions of
+    //     photons whose hit points are scattered all over its footprint, so the texture
+    //     is already area-averaged — stochastically, for free — and filtering it again
+    //     would only throw away detail that survived honestly.
+    //   * SECONDARY hits. Only the camera's own cone is tracked, not ray differentials
+    //     through a bounce, so a texture seen in a mirror reads unfiltered. That is the
+    //     safe direction to be wrong in (see patOctaveFade) and it is a real limitation,
+    //     not a definition — ray cones through specular bounces are the obvious
+    //     extension, and `curv` is already sitting at every hit waiting to drive them.
+    //   * FIELD and MEDIUM formulas (isosurface leaves, density/ior programs), which
+    //     have no shading sample and no surface at all.
+    //
+    // Computed as the diameter of the disc of equal solid angle to one pixel, carried to
+    // the hit distance and stretched by the surface's obliquity — see cameraFootprint.
+    // Appended at the END of the enum, and named explicitly in patternHasFreeVars and
+    // patOpStackEffect, exactly like VarCurv and VarCavity, because it is a per-hit
+    // quantity living outside the contiguous VarX..VarV range.
+    VarFootprint,
 };
 
 // Register-file size available to a CSE-optimized program (per evaluator invocation).
@@ -477,6 +506,7 @@ struct PatCtx {
     double u = 0, v = 0;          // surface UV (mesh interpolated or native-primitive wrap)
     double curv = 0;              // mean curvature, 1/length, signed toward the shaded side (O3)
     double cavity = 0;            // blocked fraction of a short hemispherical probe, [0,1] (O3 s2)
+    double fw = 0;                // shading footprint: world-space patch diameter, 0 = unknown (O8 s2)
     double t = 0;                 // flyby timeline in [0,1] (camera_curve record tracks only)
     // PatOp::Tex sampler hook. pattern.h deliberately knows nothing about Texture
     // (texture.h drags in the spectral/upsampling machinery and is not something we
@@ -575,7 +605,7 @@ struct PatTableScope {
 };
 
 inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, double v = 0,
-                         double curv = 0, double cavity = 0) {
+                         double curv = 0, double cavity = 0, double fw = 0) {
     PatCtx c;
     c.x = p.x; c.y = p.y; c.z = p.z;
     c.f = f;
@@ -584,6 +614,7 @@ inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, d
     c.u = u; c.v = v;
     c.curv = curv;
     c.cavity = cavity;
+    c.fw = fw;
     return c;
 }
 
@@ -744,6 +775,31 @@ PATTERN_HD inline double patFilteredNoise(double x, double y, double z,
     return 0.5 + sum / norm;
 }
 
+// ---- the shading footprint `fw` (O8 stage 2) --------------------------------
+// Combine a camera's per-unit-distance sample width (Camera::footprintPerDist) with the
+// geometry of one hit into the value stored in Hit::fw and read by patterns as `fw`.
+// SINGLE POINT OF TRUTH, and it lives here — beside the primitive that consumes it,
+// rather than in camera.h — for the same reason patValueNoise does: the CPU tracer, the
+// mode-R CUDA kernel and the raster preview all fill `fw`, and three hand-kept copies of
+// a formula is three chances for the backends to disagree about how blurry a surface is.
+//
+// The obliquity term is the part worth explaining. A pixel cone of diameter `perDist*d`
+// landing on a surface at cosine `cosSurf` covers an ELLIPSE: minor axis the cone's own
+// diameter, major axis that divided by |cosSurf|. One scalar has to choose between them,
+// and this takes their GEOMETRIC MEAN (hence the sqrt) — the standard compromise, because
+// the minor axis alone leaves the long direction aliased while the major axis alone
+// smears the short one to mush. |cosSurf| is floored so a grazing sliver cannot demand an
+// unbounded width; the floor is deliberately low (0.02, a 7x stretch) but it exists,
+// because a too-small `w` merely under-filters while a too-large one destroys detail the
+// sample genuinely resolved — see patOctaveFade on why that asymmetry decides ties.
+#define PAT_FW_COS_MIN 0.02
+PATTERN_HD inline double patShadingFootprint(double perDist, double dist, double cosSurf) {
+    if (!(dist > 0.0) || !(perDist > 0.0)) return 0.0;   // unknown => unfiltered
+    double c = cosSurf < 0.0 ? -cosSurf : cosSurf;
+    if (!(c > PAT_FW_COS_MIN)) c = PAT_FW_COS_MIN;       // also catches NaN
+    return perDist * dist / PAT_SQRT(c);
+}
+
 // ---- postfix evaluator ------------------------------------------------------
 inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
     double st[64];
@@ -765,6 +821,7 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
             case PatOp::VarV:     st[sp++] = c.v;  break;
             case PatOp::VarCurv:  st[sp++] = c.curv; break;
             case PatOp::VarCavity: st[sp++] = c.cavity; break;
+            case PatOp::VarFootprint: st[sp++] = c.fw; break;
             case PatOp::VarT:     st[sp++] = c.t;  break;
             // `a` is resolved at load time (bound at the use site, or to the material's
             // albedo_default) and so is unreachable here; 0 keeps the switch total.
@@ -938,6 +995,7 @@ inline bool varOp(const std::string& s, PatOp& out) {
     if (s == "v")  { out = PatOp::VarV;  return true; }
     if (s == "curv") { out = PatOp::VarCurv; return true; } // mean curvature, 1/length (O3)
     if (s == "cavity") { out = PatOp::VarCavity; return true; } // enclosure in [0,1] (O3 s2)
+    if (s == "fw") { out = PatOp::VarFootprint; return true; } // shading footprint diameter (O8 s2)
     if (s == "a")  { out = PatOp::VarA;  return true; }   // albedo — resolved at load time
     return false;
 }
@@ -1248,6 +1306,7 @@ inline const char* varName(PatOp op) {
         case PatOp::VarU:  return "u";   case PatOp::VarV:  return "v";
         case PatOp::VarCurv: return "curv";
         case PatOp::VarCavity: return "cavity";
+        case PatOp::VarFootprint: return "fw";
         case PatOp::VarA:  return "a";   default: return nullptr;
     }
 }
@@ -1414,6 +1473,7 @@ inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
         if ((nd.op >= PatOp::VarX && nd.op <= PatOp::VarV) ||
             nd.op == PatOp::VarCurv ||   // a surface intrinsic living outside the range (O3)
             nd.op == PatOp::VarCavity || // ditto (O3 stage 2)
+            nd.op == PatOp::VarFootprint || // ditto (O8 stage 2)
             nd.op == PatOp::Tex || nd.op == PatOp::Grid ||
             nd.op == PatOp::Scatter) return true;
     return false;
@@ -1478,6 +1538,7 @@ inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes,
     // `curv` anywhere would silently switch off CSE for the entire expression around it.
     if (op == PatOp::VarCurv)                     { pops = 0; return true; }
     if (op == PatOp::VarCavity)                   { pops = 0; return true; }
+    if (op == PatOp::VarFootprint)                { pops = 0; return true; }
     if (op >= PatOp::Neg && op <= PatOp::Saturate){ pops = 1; return true; }
     if (op >= PatOp::Add && op <= PatOp::Step)    { pops = 2; return true; }
     if (op >= PatOp::Clamp && op <= PatOp::Noise) { pops = 3; return true; }

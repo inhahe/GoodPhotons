@@ -253,6 +253,11 @@ struct WhittedOpts {
                              // returned radiance, 0 = off. Also pre-scaled by ambientRef().
                              // Caps the caustic-through-the-gather contour aliasing; the
                              // rationale is on BackwardRenderer::giClamp (src/backward.h).
+    double fwPerDist = 0.0;  // O8 stage 2: Camera::footprintPerDist(spp) — the world-space
+                             // shading-footprint diameter at unit distance, head-on. The
+                             // kernel scales it by the hit distance and the grazing factor
+                             // to fill `fw` at the camera segment. 0 = leave `fw` unknown,
+                             // i.e. fnoise() unfiltered. Twin of BackwardRenderer::fwPerDist.
 };
 
 // True if this scene + camera can be rendered by the GPU mode-W megakernel with the given

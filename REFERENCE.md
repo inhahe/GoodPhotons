@@ -2401,8 +2401,9 @@ world-space position `x y z`, the implicit field value `f` (the SDF value at the
 `~0` on an isosurface; `0` for explicit geometry), the surface normal `nx ny nz`, the
 radius `r = √(x²+y²+z²)`, the **surface UV coordinates `u v`** (mesh-interpolated,
 or a native-primitive wrap — see below), the **mean curvature `curv`** (see
-*Curvature-driven, non-stationary patterns* below), and the **enclosure `cavity`**
-(see *Enclosure-driven patterns* below). Two authoring forms:
+*Curvature-driven, non-stationary patterns* below), the **enclosure `cavity`**
+(see *Enclosure-driven patterns* below), and the **shading footprint `fw`** (see
+`fnoise` below). Two authoring forms:
 
 - **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
   a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
@@ -2491,7 +2492,28 @@ or a native-primitive wrap — see below), the **mean curvature `curv`** (see
   backward renders; the forward photon modes already integrate each pixel's footprint
   stochastically, so there `w` buys nothing and costs detail. Deterministic self-test
   `ftrace -checkfnoise`, which measures the result against a brute-force footprint
-  average rather than merely asserting that it blurs.
+  average rather than merely asserting that it blurs. Worked example
+  `scenes/pattern_fnoise.ftsl`.
+  You do not have to derive `w` yourself: the variable **`fw`** *is* it — the
+  world-space diameter of the surface patch one shading sample stands for, computed by
+  the renderer at the hit, so `fnoise(90*x, 90*y, 90*z, 90*fw, 3)` is the whole idiom
+  (scale the width exactly as you scaled the coordinates; `fw` is always in world
+  units). It is built from the solid angle one pixel subtends — via
+  `Camera::pixelSolidAngle`, so fisheye and panoramic lenses need no special case —
+  the hit distance, and the obliquity: the footprint on a slanted surface is an
+  *ellipse* with minor axis `d` and major axis `d/|cos|`, and `fw` reports the
+  geometric mean, i.e. the disc of equal area (clamped at `|cos| = 0.02`, or every
+  silhouette would filter to a flat grey band). Supersampling divides it by `√spp`,
+  since jittered samples already average over the footprint — so the filtering backs
+  off on its own as a render converges and one scene serves both a 1-spp preview and a
+  ground-truth render. **`fw` is 0 — meaning *unfiltered*, never a small blur —
+  wherever the renderer cannot honestly answer**: the forward photon modes and
+  stochastic mode `R` (both already area-average), secondary bounces (which would need
+  ray differentials to know how far their footprint had spread), and implicit-field /
+  medium formulas (evaluated at march samples, not at a surface). It is filled at
+  primary hits in mode `W` and at every pixel of the raster preview, and — like `curv`
+  and `cavity` — is rejected in an `emit` pattern, where it is doubly wrong because an
+  emitter's radiance cannot depend on who is looking at it.
   It can also **sample a declared image
   as a term**: `tex:<name>(u, v)` returns the mean of the texel's three linear RGB
   channels (the same `Texture::scalarAt` sampler a `texture:<name>` slot binding uses,

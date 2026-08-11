@@ -2194,14 +2194,50 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   to the horizon while filtered falls 9.3 → 0.0. The flat line is the point.
 
   Wiring is the O2 checklist (enum at the end, one case in each of the three VMs,
-  `patOpStackEffect` arity 5, no payload). **Stage 2 is not done**: `w` is currently written
-  out by hand in the scene (the demo derives the floor's footprint from `fov_y/res_y`, the
-  grazing-angle stretch and the geometric mean of the two axes, which is instructive but is
-  not something an author should have to do). The renderer should hand it over as a pattern
-  variable `fw`, filled per-hit by mode W / the raster preview / backward primary hits and
-  0 in the forward modes — needing the same plumbing as `VarCurv`/`VarCavity` (a `PatCtx`
-  field, an opcode, `patternHasFreeVars`, `patOpStackEffect`, and the `dPatternEval` /
-  `dPatternEvalF` signatures).
+  `patOpStackEffect` arity 5, no payload).
+
+  **Stage 2 — the `fw` variable** (v0.169.0). The author should not have to derive `w`;
+  the renderer knows it. `fw` is the world-space **diameter of the surface patch one
+  shading sample stands for**, and it is split in two so that no two backends can disagree
+  about it: `Camera::footprintPerDist(spp, rx, ry)` returns the distance-independent
+  coefficient, and `patShadingFootprint(perDist, dist, cosSurf)` in `pattern.h` (shared
+  `__host__ __device__`) combines it with one hit. Three decisions are load-bearing:
+
+  - **The pixel's angular size comes from `pixelSolidAngle()`**, converted to the diameter
+    of the disc subtending it (`2·√(Ω/π)`), not from `fov_y/res_y`. That makes fisheye and
+    panoramic lenses fall out for free, and it is ~18% wider than the naive number for a
+    square pixel (the tan expansion plus the equal-area conversion). Evaluated **on axis**:
+    the off-axis variation is a cos³ effect, an order of magnitude below the obliquity
+    term, and taking it on-axis keeps `fw` from depending on which pixel a surface lands in.
+  - **Obliquity uses the geometric mean of the ellipse axes** (`d/√|cos|` — the disc of
+    equal area), floored at `|cos| = 0.02`. Not the major axis: stage 1 measured that
+    over-filtering is the worse mismatch, so ties break toward the minor. Without the floor
+    every silhouette would filter to a flat grey band.
+  - **0 means unknown means UNFILTERED**, never a small blur. `fw` is filled only where the
+    renderer can answer honestly: primary hits in mode W (`BackwardRenderer::fwPerDist` /
+    `DScene::bkFwPerDist`, stamped at `b == 0 && gi.depth == 0` in both the scalar and hero
+    path loops — `b == 0`, *not* `b == bounce0`, since a heroSplit re-entry resumes deeper)
+    and every pixel of both raster previews (`dRasterFw` / `raster.h`'s shade pass, which
+    pass `W`/`H` as the resolution override because the preview window is not the camera's
+    film). It stays 0 in the forward modes and stochastic mode R — a sampler that jitters
+    over its own footprint is already area-averaging, and filtering on top would only cost
+    detail — at secondary bounces (ray cones through specular bounces are the obvious
+    extension, and `curv` is already sitting at every hit waiting to drive them), and in
+    implicit-field/medium formulas, where a filtered SDF would round off the very detail
+    the sphere-trace is looking for and make its distance bound non-conservative at grazing
+    angles. Like `curv`/`cavity` it is rejected in an `emit` pattern, for the strictly
+    stronger reason that it is view-dependent.
+
+  `spp` divides it by `√spp`, and mode W latches ONE `g_fwSpp` for the whole run (the run's
+  requested `-spp`, not a chunk's) so every chunk of a progressive or resumed render filters
+  identically and their average stays a render of one image. `-checkfnoise` §10 pins the
+  geometric-mean / cos-floor / zero-is-unfiltered conventions, the `1/√spp` and
+  resolution-override scalings, and the variable's parse / free-var / VM wiring. CPU and GPU
+  mode W were measured to differ no more with `fw` than without it (max 8/255 of one channel
+  on 0.9% of the demo's pixels, against 9/255 on 1.1% for the same scene with `fw` removed —
+  i.e. entirely the pre-existing float/double divergence). The demo scene now reads
+  `fnoise(90*x, 90*y + 0.5, 90*z, 90*fw, 3)`, and its hand derivation is kept in the
+  comment as the explanation of what `fw` contains.
 
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as

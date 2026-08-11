@@ -77,7 +77,7 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
                                       double u, double v, double curv, double cavity,
-                                      const DPatEnvT<TexT>& env) {
+                                      double fw, const DPatEnvT<TexT>& env) {
     double st[64]; int sp = 0;
     double reg[PAT_CSE_REGS];   // CSE registers; StReg always precedes LdReg, so no init
     for (int i = 0; i < n; ++i) {
@@ -96,6 +96,7 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
             case PatOp::VarV:     st[sp++] = v;  break;
             case PatOp::VarCurv:  st[sp++] = curv; break; // mean curvature at the hit (O3); 0 wherever there is no surface (field/medium sites)
             case PatOp::VarCavity: st[sp++] = cavity; break; // hemispherical enclosure at the hit (O3 s2); 0 at field/medium sites, which have no surface
+            case PatOp::VarFootprint: st[sp++] = fw; break;  // shading footprint diameter (O8 s2); 0 = unknown = unfiltered, which is every site but a mode-W/raster primary hit
             case PatOp::VarT:     st[sp++] = 0.0; break;  // flyby timeline: never in scope on-device (camera_curve exprs are consumed at load)
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = fabs(st[sp-1]); break;

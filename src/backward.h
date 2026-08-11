@@ -72,6 +72,20 @@ struct BackwardRenderer {
     // dimensionless -ambient is multiplied by Scene::ambientRef() before it lands here.
     double ambient = 0.0;
 
+    // ---- shading footprint for `fw` / `fnoise` (O8 stage 2) -------------------------
+    // Camera::footprintPerDist(spp) — the world-space width one camera sample covers per
+    // unit of distance — or 0 to leave Hit::fw unfilled. Only the CAMERA segment of the
+    // path is stamped (the first hit of a depth-0 trace); a gather ray and every bounce
+    // after the first leave `fw` at 0, since no ray differentials are propagated through
+    // a scatter and 0 correctly means "do not filter".
+    //
+    // Deliberately set ONLY for mode W by the driver, and this is the interesting part of
+    // the design rather than an oversight: `fw` exists for a sampler that cannot average
+    // over the pixel, and stochastic mode R at N jittered samples per pixel IS averaging
+    // over it — for exactly the reason the forward photon modes need no help. Filtering a
+    // sampler that already integrates its own footprint only deletes detail it earned.
+    double fwPerDist = 0.0;
+
     // ---- deterministic one-bounce gather ("radiosity" for mode W) -------------------
     // `ambient` alone cannot reproduce two things real bounce light does, and both are
     // measurable on the gold-gyroid scene:
@@ -1204,6 +1218,8 @@ struct BackwardRenderer {
             if (grinAny) grin::march(scene, ray);
 
             Hit h = scene.closestHit(ray);
+            if (b == 0 && gi.depth == 0 && h.valid)         // camera segment only — see fwPerDist
+                h.fw = patShadingFootprint(fwPerDist, h.t, dot(ray.d, h.n));
             double dSurf = h.valid ? h.t : 1e30;
 
             // Homogeneous fog: sample a free-flight collision that competes with
@@ -1404,6 +1420,11 @@ struct BackwardRenderer {
             int nUp = secAlive ? C : 1;   // wavelengths still being propagated
             gi.bounce = b;                // see the scalar twin: mode W's per-vertex lattice
             Hit h = scene.closestHit(ray);
+            // Camera segment only — see fwPerDist. `b == 0` and not `b == bounce0`: a
+            // heroSplit re-entry resumes this loop at a DEEPER bounce, and that segment
+            // has already been through an interface, so its footprint is not the camera's.
+            if (b == 0 && gi.depth == 0 && h.valid)
+                h.fw = patShadingFootprint(fwPerDist, h.t, dot(ray.d, h.n));
             double dSurf = h.valid ? h.t : 1e30;
 
             // Beer-Lambert over the in-glass segment. A non-empty stack implies we've

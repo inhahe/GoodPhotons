@@ -1012,6 +1012,14 @@ struct DScene {
     int    bkHeroSplit;
     double bkAmbient;
     double bkGiClamp;
+    // O8 stage 2: the camera's footprint coefficient — the world-space patch diameter one
+    // shading sample stands for AT UNIT DISTANCE, head-on (Camera::footprintPerDist(spp)).
+    // The kernel turns it into a per-hit `fw` at the camera segment via
+    // patShadingFootprint(). Device twin of BackwardRenderer::fwPerDist, and set for the
+    // same narrow case: mode W only. 0 = unknown, so `fw` stays 0 and fnoise() runs
+    // unfiltered — which is what stochastic mode R wants, since jittering over the pixel
+    // already averages the footprint.
+    double bkFwPerDist;
 };
 
 // Everything the pattern VM (dPatternEval) needs beyond the scalar variables: the
@@ -1683,7 +1691,7 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p, const D
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, env);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, 0.0, env);
     return d > 0.0 ? d : 0.0;
 }
 
@@ -1787,7 +1795,7 @@ __device__ static double dMedNAt(const DMedium& m, const DVec3& p, const DPatEnv
     if (m.iorN <= 0 || !m.ior) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double n = dPatternEval(m.ior, m.iorN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, env);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, 0.0, env);
     return n > 1e-3 ? n : 1e-3;
 }
 
@@ -2036,6 +2044,12 @@ struct DHit {
     // start with cavityDone = garbage and could return an uninitialised cavity.
     mutable Real cavity = (Real)0;
     mutable bool cavityDone = false;
+    // O8 stage 2 shading footprint (device twin of Hit::fw): the world-space diameter of
+    // the surface patch this shading sample stands for. Like cavity it is NOT written by
+    // any intersector — it is a property of the ARRIVING RAY, not of the geometry — so it
+    // is stamped by the kernel at the camera segment and left 0 (= unknown = unfiltered)
+    // everywhere else. Default-initialised for the same reason cavity is.
+    Real fw = (Real)0;
 };
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
@@ -2076,7 +2090,7 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
             if (!exprPool) return BIG;
             double r = sqrt(px*px + py*py + pz*pz);
             return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
-                                0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, env);
+                                0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, 0.0, env);
         }
         case DF_BOX: {
             double r = nd.p[3];
@@ -4436,6 +4450,13 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
             // field path builds its PatCtx with curv = 0 too).
             case PatOp::VarCurv:  st[sp++] = 0.0f; break;
             case PatOp::VarCavity: st[sp++] = 0.0f; break;
+            // `fw` (O8 stage 2) is 0 here for a second, stronger reason: a field formula
+            // is evaluated at march samples along a ray, not at a shading point, so there
+            // is no footprint to speak of — and 0 means "unknown", i.e. fnoise() runs
+            // unfiltered, which is what the sphere-tracer needs (a filtered SDF would
+            // round off the very detail the march is trying to find, and would make the
+            // distance bound non-conservative at grazing angles).
+            case PatOp::VarFootprint: st[sp++] = 0.0f; break;
             case PatOp::VarT:     st[sp++] = 0.0f; break;
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = fabsf(st[sp-1]); break;
@@ -4572,7 +4593,7 @@ __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit&
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), dPatEnvOf(sc));
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
 }
 
 // Fritsch-Carlson monotone-cubic tangent at node k (device twin of recFCTangent).
@@ -4592,7 +4613,7 @@ __device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, 
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), dPatEnvOf(sc));
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
 }
 // Sample a scalar record channel at driver position `d` (device twin of recSampleScalar):
 // evaluate each stop's per-hit expression, then interpolate by the record's interp mode.
@@ -4639,14 +4660,14 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
     if (m.recRoughMode == 0) {                             // direct scalar expression
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h),
+                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
                          dPatEnvOf(sc));
     } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
         v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
     } else {                                               // per-hit driven
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h),
+                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
                                 dPatEnvOf(sc));
         v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
                              m.recRoughInterp, h, d);
@@ -4748,7 +4769,7 @@ __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
-                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h),
+                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
                             dPatEnvOf(sc));
     out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
                      (double)m.recReflLo, (double)m.recReflHi, d, lambda);
@@ -4828,7 +4849,7 @@ __device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
     double px = y.x, py = y.y, pz = y.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return clamp01(dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                                nOut.x, nOut.y, nOut.z, r, uu, vv, 0.0, 0.0, dPatEnvOf(sc)));
+                                nOut.x, nOut.y, nOut.z, r, uu, vv, 0.0, 0.0, 0.0, dPatEnvOf(sc)));
 }
 
 // Draw a point on `em` and return the emission-pattern multiplier there, so a caller can
@@ -7182,6 +7203,12 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // below then samples along the post-bend straight segment, matching the CPU order.
         if (sc.hasGrin) dGrinMarch(sc, ro, rd);
         DHit h = closestHit(sc, ro, rd);
+        // O8 stage 2: stamp the shading footprint on the CAMERA SEGMENT only (host twin:
+        // backward.h radiance()). A secondary bounce would need ray differentials /
+        // cones to know how much its own footprint spread, so it keeps fw = 0
+        // (= unknown = unfiltered) rather than reusing the primary's number.
+        if (b == 0 && gi.depth == 0 && h.valid)
+            h.fw = (Real)patShadingFootprint(sc.bkFwPerDist, (double)h.t, (double)dot(rd, h.n));
         Real dSurf = h.valid ? h.t : (Real)1e30;
         // Participating media: sample a free-flight collision (superposition over all
         // media — homogeneous = exact free-flight, heterogeneous = Woodcock/delta
@@ -7354,6 +7381,11 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         int nUp = secAlive ? C : 1;                    // wavelengths still being propagated
         gi.bounce = b;                                 // see the scalar twin: mode W's per-vertex lattice
         DHit h = closestHit(sc, ro, rd);
+        // O8 stage 2 footprint, camera segment only — see the scalar twin. The test is
+        // `b == 0`, NOT `b == bounce0`: a heroSplit re-entry resumes at a DEEPER bounce,
+        // and that sub-path's first vertex is not a camera vertex.
+        if (b == 0 && gi.depth == 0 && h.valid)
+            h.fw = (Real)patShadingFootprint(sc.bkFwPerDist, (double)h.t, (double)dot(rd, h.n));
 
         // Beer-Lambert over the in-glass segment. A non-empty stack implies the bundle already
         // collapsed to one λ here (a dielectric entry either de-heros or splits, and the split
@@ -12074,6 +12106,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.bkGiGrid    = 1;
     sc.bkGiBounce  = 4;
     sc.bkGiClamp   = 0.0;
+    sc.bkFwPerDist = 0.0;   // O8 stage 2: unknown footprint => fnoise() unfiltered
     // Split-at-dispersion is NOT a mode-W-only knob: `-herosplit` applies to plain mode R too
     // (see BackwardRenderer::heroSplit, which takes the same default), so default it from the
     // global rather than to 0. Before v0.111.0 the device could not split at all and GPU mode
@@ -12824,6 +12857,7 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
         up.sc.bkGiClamp   = whitted->giClamp;
         up.sc.bkHeroSplit = whitted->heroSplit ? 1 : 0;
         up.sc.bkAmbient   = whitted->ambient;
+        up.sc.bkFwPerDist = whitted->fwPerDist;   // O8 stage 2 (mode W only — see DScene)
     }
     // Hero-wavelength bundle (`-heroc N`). bkRadianceHero covers the plain surface walk
     // only, so fall back to the single-λ estimator when the scene needs a branch it does

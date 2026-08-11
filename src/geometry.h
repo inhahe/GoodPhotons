@@ -140,6 +140,20 @@ struct Hit {
     // takes. Only ever written by cavityAt(); nothing else may touch it.
     mutable double cavity = 0.0;
     mutable bool   cavityDone = false;
+    // Shading footprint (O8 stage 2) — the world-space DIAMETER of the surface patch this
+    // one shading sample stands for, exposed to patterns as `fw` and meant to be handed
+    // straight to `fnoise`. 0 means "unknown", which patterns must read as "do not filter".
+    //
+    // Filled by the RENDERER, not the intersector, and that is the whole reason it lives
+    // here rather than being derived at shading time: it is not a property of the surface
+    // at all but of the ray that arrived — of the camera's pixel cone, the distance it
+    // travelled and the obliquity it landed at (cameraFootprint in camera.h). The
+    // intersector has no idea which of those it is serving. So the deterministic samplers
+    // set it on their PRIMARY hits and leave it 0 everywhere else: 0 on every secondary
+    // bounce (no ray differentials are propagated through a scatter), and 0 throughout the
+    // forward photon modes, whose pixels already area-average over the footprint by
+    // scattering millions of hit points across it.
+    double fw = 0.0;
 };
 
 // Geometric surface normal oriented onto the SAME side as the (ray-oriented) shading

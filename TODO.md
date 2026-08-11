@@ -4856,7 +4856,7 @@ the *randomness vocabulary* is thin. Nothing below is started.
       `wang tile`, `histogram-preserving`, `by-example`. Heitz–Neyret histogram-preserving blending is
       the standard way to tile one photo infinitely without visible repetition, and it composes with
       `PatOp::Tex` rather than replacing it.
-- [ ] **O8 — antialiasing the noise.** *Stage 1 done, v0.168.0; stage 2 (`fw`) open.* None of the above
+- [x] **O8 — antialiasing the noise.** ✅ **DONE — stage 1 v0.168.0, stage 2 v0.169.0.** None of the above
       currently band-limits. Under minification a lattice noise aliases badly; a
       filtered/analytically-band-limited variant (or an explicit octave-cutoff driven by the screen-space
       footprint) is what makes procedural texture usable at distance. This is a *quality* prerequisite
@@ -4885,13 +4885,24 @@ the *randomness vocabulary* is thin. Nothing below is started.
         `scenes/pattern_fnoise.ftsl`, whose own lesson is that a classic wide fBm barely aliases (the
         fine octaves carry 1/64 the amplitude and are exactly the unresolvable ones), so it is 3 octaves
         at base 90/m — energy at the resolution limit, like grain/weave/gravel/stucco.
-  - [ ] **Stage 2 — the `fw` pattern variable.** `w` is still written out by hand in the scene (the demo
-        derives it from `fov_y/res_y`, the grazing-angle stretch and the geometric mean of the two axes
-        — instructive, but not something an author should have to do). The renderer should hand the
-        per-hit world-space shading footprint over as `fw`, filled by mode W / the raster preview /
-        backward primary hits and 0 in the forward modes (which already area-average stochastically).
-        Same plumbing as `VarCurv`/`VarCavity`: a `PatCtx` field, an opcode, `patternHasFreeVars`,
-        `patOpStackEffect`, and the `dPatternEval`/`dPatternEvalF` signatures.
+  - [x] **Stage 2 — the `fw` pattern variable.** ✅ **DONE v0.169.0** — the renderer now hands the
+        per-hit world-space shading footprint to the pattern VM, so the demo reads
+        `fnoise(90*x, 90*y + 0.5, 90*z, 90*fw, 3)` instead of a hand-derived expression that silently
+        stopped being true the moment the camera moved. Split so no backend can drift:
+        `Camera::footprintPerDist(spp, rx, ry)` is the distance-independent coefficient (taken from
+        `pixelSolidAngle()` as the diameter of the equal-solid-angle disc, so fisheye/panoramic need no
+        case, evaluated on axis, divided by `√spp`), and `patShadingFootprint()` in `pattern.h` — shared
+        `__host__ __device__` — adds the distance and the obliquity as the **geometric mean of the
+        footprint ellipse's axes** (`d/√|cos|`, floored at `|cos| = 0.02` so a silhouette does not
+        filter to a grey band; the minor-axis lean is stage 1's over-filtering finding). The
+        load-bearing rule is that **0 means unknown means unfiltered**, never a small blur: filled at
+        primary hits in mode W (`b == 0 && gi.depth == 0`, *not* `b == bounce0` — a heroSplit re-entry
+        resumes deeper) and at every pixel of both raster previews (which pass the window's `W`/`H` as
+        a resolution override), and left 0 in the forward modes and stochastic mode R (already
+        area-averaging), at secondary bounces (want ray cones), in field/medium formulas (a filtered SDF
+        breaks the march's distance bound), and in `emit` patterns (view-dependent). Mode W latches one
+        `g_fwSpp` per run so chunked/resumed renders filter identically. `-checkfnoise` §10 pins all of
+        it; CPU/GPU mode W diverge no more with `fw` than without.
 
 **Ordering note.** O2 then O1 buys the most look per line of code (domain warping + cellular covers a
 huge fraction of natural texture); O8 is the one that decides whether any of it survives a real render

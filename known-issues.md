@@ -60,7 +60,7 @@ rather than obviously absent, and the fix is mechanical.
 ### OPEN (2026-08-10, v0.162.0): `cavity` reads 0 in BOTH preview rasterizers, and unlike `curv` this one is not mechanical
 
 Same symptom as the entry above and a strictly harder cause. `raster.h` and
-`raster_cuda.cu:~902/~935` both pass `0.0` for the cavity argument of `dPatternEval` /
+`raster_cuda.cu:~927/~961` both pass `0.0` for the cavity argument of `dPatternEval` /
 `makePatCtx`, so a `mix` gated on `cavity` previews as one layer everywhere — `-explore`
 on `scenes/pattern_cavity.ftsl` shows a spotlessly clean room.
 
@@ -79,6 +79,29 @@ Currently (c), and that is defensible: `cavity`'s whole point is contact grime, 
 a look-development concern, not a composition/motion one, and the preview already ignores
 roughness and film-thickness maps by design. Logged so that a future "make the preview
 show patterns properly" pass doesn't assume this one falls out with `curv`.
+
+### TECH DEBT (2026-08-10, v0.169.0): `fw` is 0 at every secondary bounce, so `fnoise` does not band-limit in a reflection
+
+O8 stage 2 fills the shading footprint `fw` at **primary** hits only — mode W's camera
+segment (`bkRadiance` / `bkRadianceHeroLoop` at `b == 0 && gi.depth == 0`, and the CPU
+twin in `backward.h`) and every pixel of the two raster previews. A surface seen *through*
+a mirror, a lens or a glossy bounce gets `fw = 0`, i.e. unfiltered, so an `fnoise` floor
+that band-limits correctly when looked at directly still aliases in its own reflection.
+
+This is the honest behaviour rather than a bug — 0 is defined as "unknown", and the
+alternative of reusing the primary vertex's footprint would be *wrong* in a way that shows
+(a convex mirror spreads the footprint by its curvature, a concave one focuses it, and a
+refraction rescales it by the index ratio). But it is a real gap, and the fix is known:
+carry a **ray cone** (Akenine-Möller et al., "Texture Level of Detail Strategies for
+Real-Time Ray Tracing") — one width + one spread angle per ray, widened at each bounce by
+the surface's curvature and the BSDF lobe. The renderer is unusually well set up for it:
+`Hit::curv` is already the mean curvature at every hit (O3 stage 1), which is exactly the
+term the cone's spread update needs, so the work is the plumbing (two floats on the ray,
+an update at each `refractOrReflect` / glossy scatter) rather than any new geometry query.
+
+Cost of leaving it: reflections of high-frequency procedural texture shimmer in mode W and
+in low-spp mode R. Mitigated in practice because stochastic mode R jitters and averages,
+and because most reflective surfaces in a scene are not also the aliasing-prone ones.
 
 ### OPEN (2026-08-10, v0.163.0): an `sdf` over a self-overlapping mesh is exact outside but not inside
 

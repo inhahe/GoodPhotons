@@ -413,7 +413,8 @@ film thickness, mix weight). Patterns are evaluated per hit.
 **Variables:** `x y z` (world position), `f` (field value, for isosurfaces),
 `nx ny nz` (surface normal), `r` (`|p|`), `u v` (surface texture coordinates — on
 meshes and on native primitives that declare a `uv` wrap, see §9), `curv` (mean
-curvature — see below), `cavity` (enclosure — see below). Constant `pi`.
+curvature — see below), `cavity` (enclosure — see below), `fw` (shading footprint —
+see `fnoise` below). Constant `pi`.
 
 **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
 `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args).
@@ -660,12 +661,40 @@ nothing when it is off. `octaves` is truncated and clamped to `[1, 10]`, like `d
 
 ```
 # a floor that stays crisp underfoot and goes smooth in the distance instead of
-# turning into a shimmering mess: ~0.02 world units of footprint per unit of depth
-pattern "floorgrain" { expr "fnoise(6*x, 6*y, 6*z, 6*0.02*r, 7)" }
+# turning into a shimmering mess -- `fw` is the renderer's own footprint at this hit
+pattern "floorgrain" { expr "fnoise(6*x, 6*y, 6*z, 6*fw, 7)" }
 ```
 
 Note the idiom there: the coordinates are scaled by 6, so **the width is scaled by 6
-too**. `w` lives in the same space as the point.
+too**. `w` lives in the same space as the point, and `fw` is always in **world units**,
+so scaling it is your job. Getting that wrong is the easiest mistake to make with
+`fnoise` — the filter is then off by that factor and either does nothing or erases the
+texture.
+
+**The footprint variable — `fw`:** the world-space **diameter of the surface patch one
+shading sample stands for**, computed by the renderer at the hit and handed to the
+pattern. It is exactly what `fnoise`'s `w` wants (scaled to your coordinates), and it
+follows the camera: move it, change `fov_y`, change the film resolution, raise `-spp`,
+and the filtering adjusts itself. A hand-written expression in terms of `r` cannot do
+that.
+
+`fw` is derived from three things: the solid angle one pixel subtends (so fisheye and
+panoramic lenses need no special case), the hit distance, and the obliquity. A pixel's
+footprint on a slanted surface is an **ellipse** with minor axis `d` and major axis
+`d/|cos|`; `fw` reports their geometric mean, the diameter of the disc of equal area.
+At `|cos| < 0.02` the stretch is clamped, or every silhouette would filter to a flat
+grey band. Supersampling divides it by `sqrt(spp)`: jittered samples already average
+over the footprint, so the filter backs off on its own as a render converges, and one
+scene can serve both a 1-spp preview and a ground-truth render.
+
+**`fw` is 0 wherever the renderer cannot honestly answer**, and 0 means *unfiltered* —
+never a small blur. It is 0 in the forward photon modes and in stochastic mode `R`
+(which already area-average, see below), at **secondary bounces** (a reflection would
+need ray differentials to know how much its footprint spread), and inside implicit
+field / medium formulas (which are evaluated at march samples, not at a surface). It
+is filled at primary hits in mode `W` and at every pixel of the raster preview. For
+the same reason it is **rejected in `emit` patterns**: an emitter's radiance is a
+property of the surface, not of who is looking at it.
 
 The reason this exists is what a texture does when it is *not* resolved. Every other
 noise here is evaluated at a point, which is a lie as soon as the sample stands for an
@@ -688,7 +717,12 @@ a volume over-blurs it past the point of being worth doing.
 Where this bites is the **deterministic** samplers — mode `W`, the raster preview, and
 low-sample-count backward renders. The forward photon modes already integrate the
 footprint stochastically (millions of photons land all over each pixel, so the texture
-is area-averaged for free), and there `w` only costs detail; leave it at 0 for those.
+is area-averaged for free), and there `w` only costs detail; that is why `fw` reads 0
+there and the expression filters nothing without you having to write a special case.
+
+Validated by `-checkfnoise`. Worked example: `scenes/pattern_fnoise.ftsl` (a floor
+running to the horizon, split down the frame: plain fBm on one side, the identical
+field through `fnoise(…, 90*fw, 3)` on the other).
 
 **Image samples — `tex:<name>(u, v)`:** samples a declared `texture` as a *scalar term
 inside the formula*, so a photograph can be one operand of an expression rather than
