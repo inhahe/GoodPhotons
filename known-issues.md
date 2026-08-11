@@ -10710,13 +10710,22 @@ implausibly high, the per-collision work is where to look — `odfAt` currently 
 Bingham normalisation per collision and could be cached into the cell's side table at build
 time, and the DDA re-walks from the ray origin rather than resuming a cursor.
 
-**Repro.**
+**Repro** (outputs and logs from the original run are kept in `png/furlod/`).
 ```
-ftrace -in scenes/_dual_pale_sky.ftsl -mode R -r 200 150 -max-bounce 200 \
-    -o png/fv_ref2.png -time 150 -window -keepwindow
-ftrace -in scenes/_dual_pale_sky.ftsl -mode R -r 200 150 -max-bounce 200 -fur-volume \
-    -o png/fv_agg2.png -time 150 -window -keepwindow
-ftrace -topng png/fv_ref2.png.ftbuf png/fv_ref2_a.png -exposure-anchor 2e-14
-ftrace -topng png/fv_agg2.png.ftbuf png/fv_agg2_a.png -exposure-anchor 2e-14
-python scraps/_coatcmp.py png/fv_ref2_a.png png/fv_agg2_a.png
+ftrace -in scenes/_dual_pale_sky.ftsl -mode R -r 200 150 -max-bounce 200 -checkpoint \
+    -o png/furlod/fv_ref2.png -time 150 -window -keepwindow
+ftrace -in scenes/_dual_pale_sky.ftsl -mode R -r 200 150 -max-bounce 200 -fur-volume -checkpoint \
+    -o png/furlod/fv_agg2.png -time 150 -window -keepwindow
+ftrace -topng png/furlod/fv_ref2.png.ftbuf png/furlod/fv_ref2_a.png -exposure-anchor 2e-14
+ftrace -topng png/furlod/fv_agg2.png.ftbuf png/furlod/fv_agg2_a.png -exposure-anchor 2e-14
+python scraps/_coatcmp.py png/furlod/fv_ref2_a.png png/furlod/fv_agg2_a.png
 ```
+(`-checkpoint` is what writes the `.ftbuf` sidecars the two `-topng` lines re-develop; without
+it the renders finish but there is nothing to re-expose against a shared anchor.)
+
+**Update (2026-08-11, v0.178.0):** `-fur-lod` (P2 stage 2c) now keeps this cost off the near
+field entirely — below `d0` fiber diameters of pixel footprint a render is byte-identical to the
+strand render, so the 3.8× only applies where the aggregate is actually wanted. That makes the
+cost problem much less pressing, but it does not answer the crossover question, which is still
+the thing to measure: render the same coat at 90 k / 900 k / 9 M strands and find where the two
+curves cross.
