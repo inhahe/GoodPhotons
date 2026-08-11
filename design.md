@@ -653,7 +653,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     built *outside* the lock so racing threads each build one and the loser's copy is
     dropped; `hairDualResponse()` walks the shadow ray with `Scene::walkFibers` and
     accumulates `T_f = Π ā_f(θ)` and `σ̄_f² = Σ β̄_f(θ)²` over the strands it crosses, using
-    each crossed fiber's OWN table (a two-toned coat attenuates correctly); and
+    each crossed fiber's OWN table (a two-toned coat attenuates correctly) — or, under
+    `-dual-grid`, gets the same two quantities from one DDA march of the fiber-density grid
+    via `hairShadowGrid()` (see `fur_grid.h` below); and
     `hairDualFCos()` evaluates Zinke's Figure-5 combination. `n = 0` crossings means directly
     lit, and the shading point gets `f_s + d_b f_back`; otherwise it gets
     `T_f d_f (f_s + d_b f_back)` evaluated at a direction drawn from the forward spread.
@@ -730,6 +732,66 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     is still treated as reaching the light with what it has. A dense coat can exceed any
     bound, and stopping *dark* there would paint a hard black silhouette exactly where the
     coat is thickest — the most visible possible failure.
+- **`fur_grid.h`** (0.175.0) — the **fiber-density + orientation grid**, Zinke's §4.1.2
+  aggregate, behind `-dual-grid`. It replaces `walkFibers` as the *counting* half of the
+  global term, and it exists because that walk is the one thing in dual scattering that
+  cannot early-out (see the `known-issues.md` entry it closes: `fur_species` 84.8 s → 57.4 s,
+  from *slower* than its own path-traced reference to 1.06× faster).
+  - *The two aggregates.* A fiber of radius `r`, length `ℓ`, unit tangent `t̂` presents
+    cross-section `2rℓ√(1 − (d·t̂)²)` to a ray along `d`. Exact directional extinction would
+    need every strand; pulling the root outside the sum (Jensen) collapses the whole cell onto
+    two quantities that *aggregate*: a scalar `c = (2/V)Σ rᵢℓᵢ` and a normalised symmetric
+    `T = Σ rᵢℓᵢ t̂ᵢt̂ᵢᵀ / Σ rᵢℓᵢ`, giving `σ_t(d) ≈ c√(1 − dᵀTd)`. `FurCell` is exactly 32 B
+    (7 floats + a material id), so 128³ is 64 MB.
+  - *The load-bearing identity: `∫σ_t dt` **is** the expected number of fiber crossings.* A ray
+    of length `L` through volume `V` (cross-section `A = V/L`) hits fiber *i* with probability
+    `2rᵢℓᵢ sinθᵢ / A`, so the expected count over `L` is `L·σ_t(d)` — exactly the walk's `n`,
+    with no primitive tests. And `dᵀTd` is `⟨cos²θ⟩` **in Marschner's frame directly** (that
+    frame's longitudinal axis *is* the tangent, which is why `hairShadowCross` computes
+    `sinθ = dot(w, t)`), so one quadratic form yields both the extinction and the inclination
+    the dual tables are indexed by. One DDA march, two answers.
+  - *The count is SAMPLED, not rounded — this is the whole correctness argument.* `τ` is a
+    *mean*; the walk returns a random *draw*, and `hairDualFCos` is not linear in it.
+    Substituting the mean breaks three things at once: `a_f^τ` instead of
+    `E[a_f^N] = e^{τ(a_f−1)}` (0.107 vs 0.135 at `a_f = 0.8`, `τ = 10` — 26% too dark); the
+    spread becomes one fixed width instead of a distribution of widths; and the `n == 0`
+    *directly lit* branch could never fire, so a rim strand at `τ = 0.3` would always be dimmed
+    by a density factor applied to light that never met a fiber. `hairShadowGrid` therefore
+    draws `N ~ Poisson(τ)` by CDF inversion from a single extra uniform (`HairDualCtx::u3`),
+    which makes the grid an **exact drop-in** for the walk rather than merely a fast
+    approximation of it. *A draft that rounded came out closer to the path-traced reference
+    than the walk did — and that was a symptom, not a success.*
+  - *Visibility is a separate query, and that is the other half of why it pays.*
+    `Scene::occludedSkipHair()` (`scene.h`) is an ordinary occlusion test that treats `Hair`
+    curve segments as invisible but still lets grass/wire curves and all opaque geometry block.
+    Unlike `walkFibers` it **can** stop at the first blocker.
+  - *Build (3 passes).* Radius-inflated AABB over fiber segments only, degenerate axes padded;
+    roughly-cubic axes derived from a cell **budget** rather than a resolution, so one number
+    bounds memory whatever the coat's aspect ratio. Then each round cone is sub-sampled at
+    0.5 × the smallest cell edge and whole `r·dl` pieces are deposited into the midpoint's cell
+    — which conserves `Σ rℓ` *exactly*, asserted by `-checkfurgrid` §1. Material id is
+    winner-take-all by mass margin, and the side table for that is only allocated when the scene
+    actually mixes fiber materials. 187 ms over 900k segments, 423 ms over 2.48M.
+  - *What it deliberately loses.* (a) The Jensen step is biased **high by at most +3.98%** —
+    one-signed, so a grid never *under*-attenuates — and is *exactly zero* where a cell's fibers
+    are locally parallel (`T` rank-1, the root factors out), worst at full isotropy
+    (`√(2/3) = 0.8165` vs the true `⟨sinθ⟩ = π/4 = 0.7854`). (b) The tangent's **sign** is
+    unrecoverable, since `t̂t̂ᵀ == (−t̂)(−t̂)ᵀ`; the right response is to marginalise over both
+    signs (`furAvgSigned` evaluates the table at ±θ and averages), not to pick one — and the
+    dual tables are near-even in θ anyway, only the ~3° cuticle tilt `α` breaks the symmetry.
+    (c) The crossed material's tables are evaluated at the **shading point's** texture
+    coordinates, where the walk had each crossed fiber's own. All three are approximations on
+    top of an approximation, which is why `-dual-grid` is opt-in and the walk stays the default.
+  - *The walk path is byte-for-byte unchanged.* `u3` is drawn only when `dc.grid` is set, so an
+    existing `-dual-scatter` render is bit-identical rather than merely equal in expectation
+    (verified with `cmp`).
+  - *`-checkfurgrid`* validates the model against the **shipping curve intersector**, not
+    against another closed form — see `REFERENCE.md`. Two of its five sections exist because
+    earlier drafts got a wrong answer that *looked* right: capsule end caps are `πr²` of a
+    stadium of area `2rℓ sinθ + πr²`, i.e. 5% for an isolated test segment (and correctly zero
+    for a chained strand, where every cap but the two ends is interior to the chain); and a
+    coarse grid straddling a density taper dilutes `σ_t` along exactly the rays being measured,
+    by almost precisely enough to cancel the Jensen bias and certify a broken model.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds

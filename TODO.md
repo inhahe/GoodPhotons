@@ -5050,6 +5050,33 @@ that item mostly a binding exercise there.
       scene (a small diffuse room, two big area lights, no caustics), not of fur, and it is the
       same ranking a fur-free version would give. (2) 30 s is short; the ratios are what the
       experiment measures well, the absolutes less so.
+  - [x] **P2 stage 1 — the fiber density + orientation grid. ✅ DONE v0.175.0.**
+        `src/fur_grid.h` (new): a voxel grid whose every cell holds a scalar density
+        `c = (2/V)Σ rℓ` and a normalised orientation tensor `T = Σ rℓ t̂t̂ᵀ / Σ rℓ`, so that
+        `σ_t(d) ≈ c√(1 − dᵀTd)` — Zinke et al. 2008 §4.1.2. This is the substrate the far tier
+        needs (a directional extinction for the aggregate medium), and it **also pays for itself
+        immediately** as the fix for the `known-issues.md` entry "`-dual-scatter` costs more than
+        it saves on a dense coat": the load-bearing identity is that `∫σ_t dt` along a ray **is
+        the expected number of fiber crossings**, i.e. exactly what the §4.1.1 shadow walk was
+        paying full BVH traversal to count, and `dᵀTd` is simultaneously `⟨cos²θ⟩` in Marschner's
+        frame, so one DDA march answers both questions the dual tables ask. Exposed as
+        `-dual-grid [cells]` (opt-in, a cell **budget** not a resolution, ~64 MB at the 128³
+        default). Measured, mode `R`, `-max-bounce 200`, fur crop vs each scene's own reference:
+        `fur_species` **84.8 s → 57.4 s** (1.48× faster than the walk; from *slower* than its own
+        path-traced reference to 1.06× faster) at unchanged accuracy 0.672× → 0.678×; pale-coat
+        fixtures 18.2 → 14.1 s and 15.5 → 14.0 s. The one non-obvious design point: **the crossing
+        count is sampled, not rounded** — `τ` is a mean and `hairDualFCos` is not linear in it, so
+        `hairShadowGrid` draws `N ~ Poisson(τ)` by CDF inversion, which is what keeps
+        `E[a_f^N] = e^{τ(a_f−1)}` (not `a_f^τ`, 26% too dark at `a_f = 0.8, τ = 10`), keeps the
+        spread a *distribution* of widths, and keeps the `n == 0` directly-lit branch reachable.
+        Jensen's inequality biases `σ_t` high by at most **+3.98%**, one-signed, and exactly zero
+        where a cell's fibers are parallel. New self-test `-checkfurgrid` (five sections) validates
+        the model against the **shipping curve intersector** rather than another closed form. The
+        walk stays the default and is byte-for-byte unchanged. See `design.md` → `fur_grid.h`.
+  - [ ] **P2 stage 2 — the aggregate volumetric far tier.** Turn the grid into a real
+        participating medium (`MediumBound`, per-λ free flight) carrying an aggregate fiber BSDF,
+        and build the footprint-based near/far transition that decides per ray whether to trace
+        strands or march the medium. Making that transition not pop is the actual work.
 - [x] **P3 — fiber BCSDF. ✅ DONE v0.174.0** (all four stages).  Marschner R/TT/TRT is the baseline, but it was derived for *human hair*;
       **animal fur has a medulla** (hollow scattering core), which is why Yan et al. 2015/2017 add
       the TT^s/TRT^s lobes of the double-cylinder model. Plain Marschner on fur reads as plastic.
@@ -5244,6 +5271,27 @@ that item mostly a binding exercise there.
 ---
 
 ## Progress log
+- 2026-08-10: **P2 stage 1 — the fiber density + orientation grid (v0.175.0).** `src/fur_grid.h`:
+  per-cell `c = (2/V)Σ rℓ` plus a normalised orientation tensor `T`, giving
+  `σ_t(d) ≈ c√(1 − dᵀTd)` (Zinke §4.1.2). Built for P2's far tier, but it lands first as the fix
+  for the one thing `-dual-scatter` was bad at, because `∫σ_t dt` along a ray **is** the expected
+  number of fiber crossings — precisely what the §4.1.1 walk paid full BVH traversal to count, and
+  the walk is the one query in the renderer that cannot early-out at the first blocker. `-dual-grid`
+  takes `fur_species` from 84.8 s (slower than its own 60.6 s path-traced reference) to **57.4 s**,
+  at accuracy 0.672× → 0.678×. Three things worth remembering. **The count is sampled, not
+  rounded**: `τ` is a mean, the shader is not linear in it, and rounding silently kills the `n == 0`
+  directly-lit branch, turns `E[a_f^N] = e^{τ(a_f−1)}` into `a_f^τ` (26% too dark at `a_f = 0.8`,
+  `τ = 10`) and collapses the spread distribution to one width; a Poisson draw from one extra
+  uniform fixes all three and makes the grid a **drop-in** rather than a lookalike. **A draft that
+  rounded scored *closer* to the reference than the walk did** — which was a symptom, not a success,
+  and is the trap this entry exists to record: matching the reference more closely is not the goal
+  when the thing you are replacing is itself an approximation you must reproduce. And **the
+  self-test found two ways to be wrong that looked right**: an isolated segment really does have
+  capsule end caps worth 5% of its cross-section (a *chained* strand correctly does not, which is
+  why the model omits them), and a coarse grid straddling a density taper dilutes `σ_t` along
+  exactly the rays being measured by almost precisely enough to cancel the +3.98% Jensen bias and
+  certify a broken model. `-checkfurgrid` now measures the bias where the fibers are locally
+  parallel (+0.81% ± 0.65%) and marches against a 400k-step Riemann sum through the same field.
 - 2026-08-10: **P3 stage 4 — dual scattering (v0.174.0).** Zinke et al. (2008) behind
   `-dual-scatter`: the coat's multiple scattering as two analytic terms instead of 100+ bounces.
   Global = light arriving *through* the coat, measured along the NEE shadow ray itself

@@ -1770,6 +1770,45 @@ struct Scene {
         });
     }
 
+    // Like occluded(), but fibers are INVISIBLE to it: only non-hair geometry blocks.
+    //
+    // This is the visibility half of the density-grid path (`-dual-grid`). When a coat's
+    // attenuation is read off a `FurGrid` instead of by walking strands, something still has
+    // to answer "is there a wall between this fiber and the light?", and `occluded` cannot:
+    // it stops at the first strand and reports the coat itself as a blocker. Splitting the
+    // question this way is also what makes the grid pay — unlike `walkFibers`, this one CAN
+    // early-out on the first opaque hit, and in a coat's own shadow it almost always does.
+    bool occludedSkipHair(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
+        Ray r{o, dir};
+        const size_t nT = tris.size();
+        const size_t nS = spheres.size();
+        const size_t nI = implicits.size();
+        const size_t nC = curveSegs.size();
+        const double seg = maxDist - tmin;
+        if (!(seg > 0.0)) return false;
+        const TriShear sh = makeTriShear(r.d);
+        const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};
+        const PatTables tabs = patTables();
+        return bvh.traverseAny(r, tmin, seg, [&](int prim) {
+            Hit h; h.t = seg;
+            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
+            if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
+            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
+            if (prim < (int)(nT + nS + nI + nC)) {
+                // A curve, but not necessarily a FIBER: grass and wire are curves too, and a
+                // curve whose material is not Hair is ordinary opaque geometry that must
+                // still block. Only the ones the grid summarises are skipped.
+                const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
+                if (cs.matId >= 0 && cs.matId < (int)mats.size() && mats[cs.matId].type == MatType::Hair)
+                    return false;
+                return intersectCurveSeg(cray, r, cs, tmin, h, /*anyHit=*/true);
+            }
+            const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
+            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
+            return blasList[inst.blasId].occludedLocal(lr, tmin, seg);
+        });
+    }
+
     // Like occluded(), but a shadow ray through a COAT does not stop at the first strand:
     // it reports every fiber it crosses and keeps going. This is the "ray shooting"
     // implementation of Zinke et al. 2008 §4.1.1 — the accurate one, as opposed to their

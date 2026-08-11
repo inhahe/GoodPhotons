@@ -5,32 +5,22 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-08-10, v0.174.0): `-dual-scatter` is *slower* than the reference on an absorbing coat, and drops the coat's indirect illumination
+### OPEN (2026-08-10, v0.174.0): `-dual-scatter` drops the coat's indirect illumination
 
-Two separate limitations of the stage-4 dual-scattering implementation, both measured
-against each scene's own 200-bounce path-traced reference on the fur alone (a centred crop,
-scene-linear mean luminance):
+*(This entry originally logged two limitations. **Part 1 — "slower than the reference on an
+absorbing coat" — was FIXED in v0.175.0 by `-dual-grid`**; see the FIXED entry immediately
+below. Part 2 remains open.)*
 
-| Scene | single scattering | `-dual-scatter` | time vs reference |
+Measured against each scene's own 200-bounce path-traced reference on the fur alone (a
+centred crop, scene-linear mean luminance):
+
+| Scene | single scattering | `-dual-scatter` | `+ -dual-grid` |
 |---|---|---|---|
-| `scenes/_dual_pale_lamp.ftsl` — pale coat, one area light, black room | 0.17× | 0.77× (0.99× at `-dual-density 0.9`) | **2.1× faster** |
-| `scenes/_dual_pale_sky.ftsl` — the same coat under a constant sky | 0.80× | 0.92× | **2.4× faster** |
-| `scenes/fur_species.ftsl` — medullated, absorbing, white room | 0.37× | 0.57× | **1.6× SLOWER** |
+| `scenes/_dual_pale_lamp.ftsl` — pale coat, one area light, black room | 0.17× | 0.77× (0.99× at `-dual-density 0.9`) | 0.81× |
+| `scenes/_dual_pale_sky.ftsl` — the same coat under a constant sky | 0.80× | 0.89× | 0.89× |
+| `scenes/fur_species.ftsl` — medullated, absorbing, white room | 0.37× | 0.67× | 0.68× |
 
-**1. It can cost more than it saves on a dark coat.** `Scene::walkFibers` must traverse the
-*whole* shadow segment: it needs every crossing, so unlike an ordinary occlusion query it
-cannot stop at the first blocker. On a pale coat that is a bargain (the brute-force
-alternative is 100+ bounces). On an absorbing coat the reference's paths die in two or three
-bounces, there is little multiple scattering to approximate, and the full-segment walk is
-pure overhead. There is no automatic guard: the flag is opt-in and the user picks.
-
-*Proper fix:* Zinke's §4.1.2 — a voxelised fiber-density grid marched by DDA instead of BVH
-ray shooting. `T_f` and `σ̄_f²` only need the *number* of crossings and their inclinations,
-not their identities, so a density grid gives both in O(cells) with no primitive tests. That
-also removes `-dual-max-cross` and its bright-failure mode. Not done because it is a second
-acceleration structure with its own build cost and resolution parameter.
-
-**2. The coat loses indirect illumination.** `-dual-scatter` terminates the path at a fiber
+**The coat loses indirect illumination.** `-dual-scatter` terminates the path at a fiber
 vertex (necessarily — continuing would double-count the multiple scattering the analytic
 terms already carry). Direct lights and the environment both go through the model, but light
 that bounced off the room *first* never reaches the fur. That is most of the `fur_species`
@@ -40,6 +30,50 @@ coat lands at 0.77× / 0.99×.
 *Proper fix:* treat the coat as an aggregate and gather the incident field from all
 directions through `Ψ`, rather than only along NEE connections — i.e. the same aggregate-BSDF
 LOD that P2 wants. Until then this is a documented bias, and `REFERENCE.md` says so.
+
+### FIXED (2026-08-10, v0.175.0): `-dual-scatter` cost more than it saved on a dense/absorbing coat — the fiber walk could not early-out
+
+`Scene::walkFibers` has to traverse the *whole* shadow segment: it needs every crossing, so
+unlike an ordinary occlusion query it cannot stop at the first blocker. On a pale coat that
+is still a bargain (the brute-force alternative is 100+ bounces). On `scenes/fur_species.ftsl`
+— medullated, absorbing, 2.48M segments — the reference's paths die in two or three bounces,
+there is little multiple scattering to approximate, and the full-segment walk was **pure
+overhead**: 84.8 s against the reference's own 60.6 s, i.e. the flag made the render *slower*.
+
+**Fixed by `-dual-grid`** (`src/fur_grid.h`, new), which is the proper fix this entry already
+named: Zinke's §4.1.2 aggregate instead of §4.1.1 ray shooting. Each cell of a voxel grid
+stores `c = (2/V)Σrℓ` and the normalised orientation tensor `T = Σrℓ t̂t̂ᵀ / Σrℓ`; then
+`σ_t(d) ≈ c√(1 − dᵀTd)`, and the load-bearing identity is that **`∫σ_t dt` along a ray *is*
+the expected number of fiber crossings** — exactly the walk's `n`, with no primitive tests.
+The same quadratic form `dᵀTd` is `⟨cos²θ⟩` in Marschner's frame, so one DDA march yields both
+the count and the inclination the averaged tables need. Visibility is a separate, *early-outing*
+`Scene::occludedSkipHair()` query that ignores hair fibers but still lets opaque geometry block.
+
+Measured, mode `R`, `-max-bounce 200`, fur crop: `fur_species` **84.8 s → 57.4 s** (1.48× faster
+than the walk, and now 1.06× faster than the reference it used to lose to), at unchanged
+accuracy (0.672× → 0.678×). Pale-coat fixtures 18.2 → 14.1 s and 15.5 → 14.0 s.
+
+Two things this cost, both deliberate and both why the flag is opt-in:
+
+- **The crossing count must be *sampled*, not rounded.** `τ` is a mean and the shader is not
+  linear in it. Rounding breaks three things at once: `a_f^τ` instead of `E[a_f^N] = e^{τ(a_f−1)}`
+  (26% too dark at `a_f = 0.8`, `τ = 10`), a spread that is one fixed width instead of a
+  distribution, and — the visible one — `hairDualFCos`'s `n == 0` *directly lit* branch could
+  never fire, so a rim strand at `τ = 0.3` would always be dimmed instead of being fully lit 70%
+  of the time. Drawing `N ~ Poisson(τ)` by CDF inversion from one extra uniform makes the grid an
+  exact drop-in. (An early draft that rounded landed *closer* to the reference than the walk did —
+  for the wrong reason. Being closer to the reference is not the goal; being a drop-in is.)
+- **Jensen's inequality biases `σ_t` high by at most +3.98%**, one-signed (grids never
+  under-attenuate), and *exactly zero* wherever a cell's fibers are locally parallel. Plus two
+  smaller losses: the shading point's own texture coordinates are used for the crossed material's
+  tables, and the tangent's sign is unrecoverable from `t̂t̂ᵀ` so the tables are evaluated at ±θ
+  and averaged.
+
+`-dual-max-cross` is still honoured (it clamps `τ` and the Poisson draw), so its bright-failure
+mode is unchanged rather than removed. The walk remains the default and is **byte-for-byte
+identical** to before — the fourth uniform is only drawn when the grid is active, verified with
+`cmp`. New self-test `-checkfurgrid` (five sections) validates the model against the real curve
+intersector.
 
 ### OPEN (2026-08-10, v0.172.0): `type hair` cannot be gathered on in modes M / S — the photon record has no incident direction
 

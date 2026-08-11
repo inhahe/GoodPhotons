@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include "hair.h"
 #include "scene.h"
+#include "fur_grid.h"   // -dual-grid: Zinke's §4.1.2 voxel density field
 
 // Everything needed to evaluate or sample the fiber BCSDF at one hit, for one wavelength.
 struct HairShade {
@@ -280,7 +281,85 @@ struct HairDualCtx {
     double db = 0.7, df = 0.7;          // Zinke's backward / forward density factors
     int    maxCross = 64;               // cap on strands counted along one shadow ray
     double u0 = 0.0, u1 = 0.0, u2 = 0.0;// uniforms for the one spread draw
+    double u3 = 0.0;                    // and one more, for the grid's Poisson crossing count
+    // Non-null selects Zinke's §4.1.2 density grid over his §4.1.1 ray shooting: the coat's
+    // attenuation is integrated out of a voxel field instead of by crossing every strand.
+    const FurGrid* grid = nullptr;
 };
+
+// Measure the coat along a shadow ray by MARCHING A DENSITY FIELD rather than crossing
+// strands — Zinke et al. 2008 §4.1.2, the alternative to the §4.1.1 walk below.
+//
+// The whole substitution rests on one identity, which `-checkfurgrid` §4 verifies against
+// the shipping curve intersector: the grid's optical depth IS the expected number of fiber
+// crossings, because a fiber of radius r and length l presents `2 r l sin(theta)` of
+// cross-section and `sigma_t` is exactly that summed per unit volume. So `tau` is the same
+// `n` the walk counts, and `<sin^2 theta>` — which the orientation tensor gives for free,
+// since `d^T T d` is the mean of `(d.tangent)^2` and that is `sin^2(theta_i)` in Marschner's
+// frame — is the inclination to look `a_f` and `beta_f` up at.
+//
+// THE COUNT IS SAMPLED, NOT ROUNDED, and that is the whole design of this function. `tau` is
+// a MEAN; the walk it replaces returns a random draw, and the shader downstream is not
+// linear in the draw. Substituting the mean gets three things wrong at once:
+//
+//  * `T_f` would become `a_f^tau` when the quantity wanted is `E[a_f^N]`. For Poisson N that
+//    is `exp(lambda(a-1))`, larger by Jensen — at a_f = 0.8, lambda = 10 it is 0.135 against
+//    0.107, a 26% error, all of it darkening.
+//  * The "directly lit" branch would never fire. `hairDualFCos` treats `n == 0` specially
+//    (no `d_f`, no spread), and it should: a strand on the lit side of the coat really is
+//    unshadowed. Rounding `tau = 0.3` to `n = 1` replaces `P(N=0) = 74%` with 0% and puts a
+//    0.7 density factor on light that never met a fiber, so the coat's rim goes dull.
+//  * The spread variance `n * beta^2` would be a fixed width instead of a distribution of
+//    widths, which is visible as a missing soft-to-sharp gradient across the coat.
+//
+// Drawing `N ~ Poisson(tau)` from one uniform (CDF inversion — one `exp` and `tau` or so
+// multiplies) fixes all three at once and makes this an exact drop-in for the walk: same
+// estimator, same variance, same distribution of `n`, only the SOURCE of the count differs.
+// Everything after the draw is byte-for-byte the shader the walk feeds.
+//
+// The remaining approximations are the two the grid genuinely cannot avoid: the inclination
+// is a single tau-weighted mean rather than a per-crossing angle, and the table read is
+// SIGN-MARGINALISED (`furAvgSigned`) because a second moment cannot tell a tangent from its
+// reverse.
+//
+// Visibility is a separate query here, which is the other half of why this is faster:
+// `walkFibers` must visit every primitive overlapping the segment because a fiber does not
+// stop it, while `occludedSkipHair` early-outs on the first wall.
+// `shadingHit` is the fiber being shaded, not a crossed one — the grid does not know which
+// strands it summarised, so a material whose absorption comes from a TEXTURE (`hairSigmaA
+// FromReflect`) has to be sampled somewhere, and the nearest fiber whose surface parameters
+// are actually known is the shading vertex itself. For a coat that is one texture varying
+// slowly across the body this is right to within the texture's own gradient over a shadow
+// ray; for a coat with high-frequency per-strand colour it is a genuine loss the walk does
+// not have, and is the reason `-dual-grid` is opt-in rather than the default.
+inline bool hairShadowGrid(HairShadow& sh, const HairDualCtx& ctx, const Scene& sc,
+                           const Hit& shadingHit, const Vec3& o, const Vec3& wi, double len) {
+    if (sc.occludedSkipHair(o, wi, len)) { sh.blocked = true; return false; }
+    const FurMarch fm = ctx.grid->march(o, wi, len);
+    if (!(fm.tau > 0.0) || fm.matId < 0 || fm.matId >= (int)sc.mats.size()) return true;
+    // `maxCross` keeps its meaning: past this many crossings there is nothing left to carry,
+    // and capping the mean also bounds the inversion loop below.
+    const double tau = std::min(fm.tau, (double)ctx.maxCross);
+    // N ~ Poisson(tau) by CDF inversion. `p` is the pmf, stepped by the `tau/n` recurrence;
+    // `u < cdf` terminates in `tau + O(sqrt(tau))` iterations on average. The `n` cap is the
+    // same safety net as the walk's, and doubles as the guard against a `u` that rounds to 1.
+    int n = 0;
+    {
+        double p = std::exp(-tau), cdf = p;
+        const double u = ctx.u3;
+        while (u > cdf && n < ctx.maxCross) { ++n; p *= tau / n; cdf += p; }
+    }
+    sh.n = n;
+    if (!n) return true;                                  // directly lit: T_f = 1, no spread
+    const hair::Dual* d = hairDualFor(sc, sc.mats[fm.matId], fm.matId, shadingHit, ctx.lambda);
+    if (!d) { sh.n = 0; return true; }
+    const double th = std::asin(hair::clampd(std::sqrt(fm.sin2), -1.0, 1.0));
+    const double af = furAvgSigned([&](double t) { return hair::dualLookup(d->af, t); }, th);
+    const double bf = furAvgSigned([&](double t) { return hair::sqr(hair::dualLookup(d->betaF, t)); }, th);
+    sh.Tf   = std::pow(hair::clampd(af, 0.0, 1.0), (double)n);
+    sh.varF = n * bf;
+    return true;
+}
 
 // The dual-scattering surface response toward `wi`, INCLUDING visibility: the shadow ray
 // is the thing that measures T_f, so unlike the single-scattering path the connection
@@ -294,10 +373,16 @@ inline double hairDualResponse(const HairDualCtx& ctx, const HairShade& s, const
     const double len = dist - off - 1e-6;
     if (!(len > 0.0)) return 0.0;
     HairShadow sh;
-    const bool reached = sc.walkFibers(h.p + wi * off, wi, len, [&](const Hit& fh) {
-        const hair::Dual* d = hairDualFor(sc, sc.mats[fh.matId], fh.matId, fh, ctx.lambda);
-        hairShadowCross(sh, *d, fh, wi);
-    }, ctx.maxCross);
+    const Vec3 o = h.p + wi * off;
+    bool reached;
+    if (ctx.grid && ctx.grid->valid) {
+        reached = hairShadowGrid(sh, ctx, sc, h, o, wi, len);
+    } else {
+        reached = sc.walkFibers(o, wi, len, [&](const Hit& fh) {
+            const hair::Dual* d = hairDualFor(sc, sc.mats[fh.matId], fh.matId, fh, ctx.lambda);
+            hairShadowCross(sh, *d, fh, wi);
+        }, ctx.maxCross);
+    }
     if (!reached) return 0.0;
     blockedOut = false;
     const Vec3 ws = (sh.n > 0) ? hairSpreadDir(s, sh, wi, ctx.u0, ctx.u1, ctx.u2) : wi;

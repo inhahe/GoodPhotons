@@ -27,6 +27,7 @@ Three neighbouring documents cover what this one only summarises:
     - [The medulla — what makes fur not hair](#the-medulla--what-makes-fur-not-hair)
     - [`preset` — measured species](#preset--measured-species)
     - [Dual scattering (`-dual-scatter`)](#dual-scattering--dual-scatter)
+      - [The fiber-density grid (`-dual-grid`)](#the-fiber-density-grid--dual-grid)
 - [Spectra (SPDs, reflectances, indices)](#spectra-spds-reflectances-indices)
   - [Spectral representation vs. other renderers](#spectral-representation-vs-other-renderers)
 - [Lights](#lights)
@@ -1310,6 +1311,7 @@ multiply-scattered radiance in two:
 | `-dual-density <d>` | `0.7` | Zinke's `d_f` = `d_b`: "how enclosed is a strand", i.e. how much of the coat's own scattering the analytic terms should account for. The paper uses 0.7 throughout and suggests 0.6–0.8. Lower = a more open, darker coat. This is the knob to reach for if the coat reads dark — see the table below. |
 | `-dual-db <d>` / `-dual-df <d>` | follow `-dual-density` | Override one density factor on its own — `d_b` weights the local backscatter lobe, `d_f` the light let through the coat. Mostly a diagnostic: `-dual-df 0` leaves only the directly-lit term. |
 | `-dual-max-cross <n>` | `64` | How many strands one shadow ray counts before giving up. A dense coat can exceed this; the ray is then treated as reaching the light with whatever it accumulated. |
+| `-dual-grid [cells]` | off (`2097152` = 128³ when given) | Count the crossings from a **fiber-density grid** instead of walking the strands — Zinke's §4.1.2 instead of §4.1.1. Much faster on a dense coat; see below. The optional argument is a cell *budget*, split into roughly cubic cells over the fur's bounding box. |
 
 Two things here are deliberately *not* what the paper does:
 
@@ -1333,25 +1335,80 @@ full path tracing — only fur becomes one-bounce. Direct lights and the environ
 through the approximation; what the coat loses is *indirect* illumination, i.e. light that
 reached it by bouncing off the rest of the scene first.
 
+##### The fiber-density grid (`-dual-grid`)
+
+The global term only needs to know **how many** fibers a shadow ray crossed and at what
+inclinations — never *which* ones. The default walk (§4.1.1) nevertheless pays for the
+identities: it must find every strand along the ray in order, which means it cannot stop at
+the first blocker the way an ordinary shadow ray can, and on a dense coat that is thousands
+of curve intersections per shadow ray.
+
+`-dual-grid` builds Zinke's §4.1.2 aggregate instead. Each cell stores two things summed
+over the fiber pieces inside it:
+
+- a scalar density `c = (2/V)·Σ rᵢℓᵢ`, and
+- a normalised orientation tensor `T = Σ rᵢℓᵢ t̂ᵢt̂ᵢᵀ / Σ rᵢℓᵢ`.
+
+A fiber of radius `r`, length `ℓ` and tangent `t̂` presents cross-section `2rℓ·sinθ` to a ray
+travelling along `d`, with `sin²θ = 1 − (d·t̂)²`. Pulling the square root outside the sum
+(Jensen) turns the per-strand sum into those two aggregates:
+
+> `σ_t(d) ≈ c·√(1 − dᵀTd)`
+
+and the same quadratic form `dᵀTd` **is** `⟨cos²θ⟩` in Marschner's longitudinal frame, so one
+DDA march yields both the optical depth and the inclination the averaged tables want. The
+key identity is that `∫σ_t dt` along a ray *is the expected number of fiber crossings* — the
+walk's `n` — obtained with no primitive tests at all.
+
+Two consequences worth knowing:
+
+- **The count is sampled, not rounded.** `τ = ∫σ_t dt` is a *mean*; the walk returns a random
+  draw, and the shader is not linear in it. So the grid draws `N ~ Poisson(τ)` from one extra
+  uniform. That keeps `E[a_f^N] = e^{τ(a_f−1)}` correct rather than `a_f^τ` (a 26% error at
+  `a_f = 0.8`, `τ = 10`), keeps the spread a distribution of widths, and — most visibly — keeps
+  the `N = 0` *directly lit* case reachable, so a rim strand at `τ = 0.3` is still fully lit
+  70% of the time instead of always being dimmed.
+- **The Jensen step is biased high by at most +3.98%**, and one-signed, so the grid never
+  under-attenuates. It is *exact* wherever the fibers in a cell are locally parallel (`T` is
+  then rank-1 and the root factors out) and worst at full isotropy. `-checkfurgrid` measures
+  this directly against the real curve intersector.
+
+Since the grid only replaces the *counting*, an ordinary early-outing occlusion query
+(`occludedSkipHair`) still runs first for everything that is not a hair fiber, so opaque
+blockers shadow the coat exactly as before.
+
+The grid is opt-in because it does lose two things: the shading point's own texture
+coordinates are used for the crossed material's tables (the walk samples each crossed fiber),
+and the tangent's *sign* is unrecoverable from `t̂t̂ᵀ`, so the tables are evaluated at ±θ and
+averaged. Both are small — the dual tables are near-even in θ apart from the ~3° cuticle
+tilt — but they are approximations on top of an approximation.
+
 **What it actually costs and buys.** Measured against each scene's own 200-bounce path-traced
 reference, on the fur alone (a centred crop, scene-linear mean luminance — the whole frame
 would be diluted by the room):
 
-| Scene | single scattering only | `-dual-scatter` | speed vs reference |
+| Scene | `-dual-scatter` (walk) | `+ -dual-grid` | speed vs reference |
 |---|---|---|---|
-| Pale coat, lit only by an area light (`scenes/_dual_pale_lamp.ftsl`) | 0.17× | **0.77×** (0.99× at `-dual-density 0.9`) | **2.1× faster** |
-| The same coat lit only by a constant sky (`scenes/_dual_pale_sky.ftsl`) | 0.80× | **0.92×** | **2.4× faster** |
-| `scenes/fur_species.ftsl` — medullated, absorbing, in a white room | 0.37× | **0.57×** | **0.6× — slower** |
+| Pale coat, lit only by an area light (`scenes/_dual_pale_lamp.ftsl`) | **0.77×** in 18.2 s (0.99× at `-dual-density 0.9`) | **0.81×** in 14.1 s | **2.2× → 2.9× faster** |
+| The same coat lit only by a constant sky (`scenes/_dual_pale_sky.ftsl`) | **0.89×** in 15.5 s | **0.89×** in 14.0 s | **2.4× → 2.6× faster** |
+| `scenes/fur_species.ftsl` — medullated, absorbing, in a white room | **0.67×** in 84.8 s | **0.68×** in 57.4 s | **0.7× (slower) → 1.06× faster** |
+
+Single scattering alone — no multiple-scattering term at all — reads 0.17×, 0.80× and 0.37×
+on those three, which is what the approximation is being asked to close.
 
 Read that as: on the case it exists for — a pale coat where the brute-force walk is long —
-it recovers most of the multiple scattering at half the cost, and `-dual-density` closes
-the rest (0.7 is the paper's conservative default, not a fit to your coat). On a *dark*
-coat it is a bad trade twice over: there was little multiple scattering to approximate, and
-the fiber walk still cannot early-out at the first blocker the way an ordinary shadow ray
-can, so it costs more than it saves. And in a bright room the dropped indirect bounce is
-the dominant error, not the approximation itself. Render the reference when the coat *is*
-the picture; use `-dual-scatter` for look-development, for pale fur that is scenery rather
-than subject, and for flyby frames.
+it recovers most of the multiple scattering at a third to a half of the cost, and
+`-dual-density` closes the rest (0.7 is the paper's conservative default, not a fit to your
+coat). On a *dark* coat there was little multiple scattering to approximate in the first
+place, and the walk was slow enough to be a net loss; the grid is what makes that case pay
+(1.5× faster than the walk on `fur_species`, at essentially unchanged accuracy). And in a
+bright room the dropped indirect bounce is the dominant error, not the approximation itself.
+Render the reference when the coat *is* the picture; use `-dual-scatter` for
+look-development, for pale fur that is scenery rather than subject, and for flyby frames —
+and add `-dual-grid` whenever the coat is dense.
+
+Grid build cost is small and one-off: 187 ms / 64 MB at 128³ over the pale coat's 900k
+segments, 423 ms / 64 MB over `fur_species`'s 2.48M.
 
 The tables are cached per (material, wavelength bin, absorption bin) and built lazily on
 first use, so the cost is paid once per render regardless of how many strands there are.
@@ -3880,6 +3937,7 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-dual-density <d>` | Zinke's density factor `d_f` = `d_b`, "how enclosed is a strand" (default `0.7`, sensible range 0.6–0.8). Lower reads as a more open, darker coat; raising it toward `0.9` is what brings a dense pale coat up to its own reference. |
 | `-dual-db <d>` / `-dual-df <d>` | Override `d_b` (the local backscatter lobe) or `d_f` (the light let through the coat) on its own; either unset follows `-dual-density`. `-dual-df 0` leaves only the directly-lit term, which is how a brightness error gets attributed to one branch. |
 | `-dual-max-cross <n>` | Strands one dual-scattering shadow ray counts before it stops (default `64`). |
+| `-dual-grid [cells]` | Count dual-scattering crossings by marching a **fiber-density grid** (Zinke §4.1.2) instead of walking the strands one by one — the crossing count comes from `∫σ_t dt` with no curve intersections, and is drawn as a Poisson variate so it stays a drop-in for the walk. 1.5× faster than the walk on a dense coat, which is what turns `-dual-scatter` from a net loss into a win there. Optional argument is a cell **budget** (default `2097152` = 128³), split into roughly cubic cells over the fur's bounds; ~64 MB at the default. Needs `-dual-scatter`. See [The fiber-density grid](#the-fiber-density-grid--dual-grid). |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
@@ -3927,7 +3985,7 @@ alone can't restore, so they are not disk-resumable.
 | `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checkimplicit`,
-`-checkcurve`, `-checkfur`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
+`-checkcurve`, `-checkfur`, `-checkfurgrid`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
@@ -3946,6 +4004,18 @@ in seven sections: roots on the surface, area-uniform root distribution, determi
 across seeds, growth never pointing into the skin, clumping that collapses tips without
 moving roots, a well-formed segment chain, and a regression on the loader-ordering trap
 that once made a whole groom generate zero strands silently — see **Grooms** above.
+`-checkfurgrid` guards the **fiber-density grid** behind `-dual-grid`, in five sections, and
+is unusual in that it validates a mean-field model against the *shipping* curve intersector
+rather than against another closed form: mass conservation (`Σ rℓ` deposited equals `Σ rℓ`
+built, exactly), the orientation tensor's rank-1 and isotropic limits, `σ_t` against a brute
+force sum over every segment, the **expected crossing count** `∫σ_t dt` against the number of
+strands 200k real rays actually hit (which is where the +3.98% Jensen bias is measured — it
+comes out at +0.81% ± 0.65% where the fibers are locally parallel), and the DDA march against
+a 400k-step Riemann sum through the same field. Two of its sections exist because earlier
+drafts got a *wrong* answer that looked right: capsule end caps are 5% of an isolated
+segment's cross-section (and correctly zero for a chained strand), and a coarse grid straddling
+a density taper dilutes σ_t along exactly the rays being measured, by almost exactly enough
+to cancel the Jensen bias.
 `-checkhair` guards the **fiber BCSDF** (Marschner's R / TT / TRT lobes in Chiang's
 energy-conserving form, plus Yan's medulla and Zinke's dual scattering) in eleven sections. A hair BCSDF that is subtly wrong still looks
 like hair, so every claim is a number rather than a picture — and wherever the physics

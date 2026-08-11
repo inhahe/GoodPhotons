@@ -175,6 +175,10 @@ struct BackwardRenderer {
     double dualDb = -1.0;
     double dualDf = -1.0;
     int    dualMaxCross = 64;   // strands counted along one shadow ray before giving up
+    // Non-null swaps Zinke's §4.1.1 ray shooting for his §4.1.2 density grid: the coat is
+    // measured by marching a voxel field instead of by crossing every strand (`-dual-grid`,
+    // built in main.cpp from the scene's own fibers). See hairShadowGrid.
+    const FurGrid* furGrid = nullptr;
 
     // Where a path sits relative to the gather. `depth == 0` is a camera path (it does
     // the gather); `depth == 1` is a gather ray (it does NOT recurse, uses `giGrid`, and
@@ -647,6 +651,10 @@ struct BackwardRenderer {
                 if (dctx) {
                     dc = *dctx;
                     dc.u0 = rng.uniform(); dc.u1 = rng.uniform(); dc.u2 = rng.uniform();
+                    // Only the grid path needs a fourth (its Poisson crossing count),
+                    // and drawing it only there keeps every existing -dual-scatter walk
+                    // render bit-identical rather than merely equal in expectation.
+                    if (dc.grid) dc.u3 = rng.uniform();
                 }
                 if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, hs,
                                  dctx ? &dc : nullptr)) continue;
@@ -942,6 +950,10 @@ struct BackwardRenderer {
         if (dctx) {
             dc = *dctx;
             dc.u0 = rng.uniform(); dc.u1 = rng.uniform(); dc.u2 = rng.uniform();
+            // Only the grid path needs a fourth (its Poisson crossing count),
+            // and drawing it only there keeps every existing -dual-scatter walk
+            // render bit-identical rather than merely equal in expectation.
+            if (dc.grid) dc.u3 = rng.uniform();
         }
         if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist, hs,
                      dctx ? &dc : nullptr)) return 0.0;
@@ -1248,6 +1260,7 @@ struct BackwardRenderer {
                     dc.db = dualDb >= 0.0 ? dualDb : dualDensity;
                     dc.df = dualDf >= 0.0 ? dualDf : dualDensity;
                     dc.maxCross = dualMaxCross;
+                    dc.grid = furGrid;
                 }
                 // rho == 1: the strand's colour lives in sigma_a inside the BCSDF, not in a
                 // separate Lambertian albedo (see neeLight).

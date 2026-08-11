@@ -165,6 +165,7 @@
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
 #include "denoise.h"            // -denoise: luma/chroma a-trous filter for MC speckle
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
+#include "fur_grid.h"           // -checkfurgrid / -dual-grid: voxel fiber density + orientation grid
 #include "hair.h"               // -checkhair: fiber BCSDF (Marschner lobes, Chiang form)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
                                // header also pulls it in, but CPU-only builds need it too
@@ -1390,6 +1391,288 @@ static int checkFur(long long strands) {
     }
 
     std::printf("[checkfur] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// FUR DENSITY GRID self-test  (-checkfurgrid; fur_grid.h, TODO §P2)
+// ---------------------------------------------------------------------------
+// `FurGrid` replaces "walk the strands" with "integrate a mean field", and the whole
+// construction rests on one identity that is easy to state and easy to get quietly wrong:
+//
+//     INT sigma_t(d) dt  ==  the EXPECTED NUMBER OF FIBERS the ray would have crossed.
+//
+// If that holds, dual scattering can read `n` and `<sin^2 theta>` off a DDA march instead
+// of a BVH traversal that cannot early-out. If it is off by a factor, every coat lit
+// through the grid is the wrong brightness and nothing in the renderer will say so — it
+// will just look like a shading bug. So section 4 checks it against the SHIPPING curve
+// intersector on a randomly generated fiber population, not against another closed form.
+//
+// The earlier sections isolate the pieces that identity is built from: mass conservation
+// (deposition loses nothing), the tensor's exactness on aligned tangents, its known and
+// bounded 4% over-estimate at isotropy, and the DDA covering exactly the ray's path.
+static int checkFurGrid() {
+    int fails = 0;
+    auto anyFiber = [](int) { return true; };
+
+    // ---- 1. mass conservation -------------------------------------------------------
+    // Deposition sub-samples each round cone and drops whole `r*dl` pieces into cells, so
+    // `sum over cells of c*V/2` must reproduce `sum over fibers of r*l` to float precision.
+    // Anything else means a piece landed outside the grid (bounds bug) or was double-added.
+    {
+        Pcg32 rng; rng.seed(1234, 1);
+        std::vector<CurveSeg> segs;
+        double analytic = 0.0;
+        for (int i = 0; i < 4000; ++i) {
+            CurveSeg s;
+            s.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
+            s.p1 = s.p0 + Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5) * 0.15;
+            s.r0 = 0.0004 + 0.0002 * rng.uniform();
+            s.r1 = 0.0004 + 0.0002 * rng.uniform();
+            segs.push_back(s);
+            // Deposition uses the midpoint radius of each sub-piece, which integrates the
+            // linear radius taper exactly, so the analytic mass is the trapezoid.
+            analytic += 0.5 * (s.r0 + s.r1) * length(s.p1 - s.p0);
+        }
+        FurGrid g; g.build(segs, anyFiber, 32 * 32 * 32);
+        double summed = 0.0;
+        for (const FurCell& fc : g.cells) summed += 0.5 * (double)fc.c * g.cellVol;
+        const double rel = std::fabs(summed - analytic) / std::max(1e-30, analytic);
+        const bool ok = g.valid && rel < 2e-5 && std::fabs(g.totalRL - analytic) / analytic < 2e-12;
+        if (!ok) ++fails;
+        std::printf("[checkfurgrid] 1. mass conservation: %dx%dx%d cells (%d occupied, %.1f KB), "
+                    "sum(c*V/2)=%.9g vs sum(r*l)=%.9g, rel %.2e -> %s\n",
+                    g.nx, g.ny, g.nz, g.occupied, g.bytes() / 1024.0,
+                    summed, analytic, rel, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 2. aligned tangents: the tensor is EXACT ------------------------------------
+    // When every strand in a cell shares a tangent, T is the rank-1 projector t*t^T and
+    // `d^T T d` is `(d.t)^2` with no approximation at all. Both the inclination the
+    // dual-scattering tables get looked up at and the sqrt(1-...) extinction factor are
+    // then exact, which is the case real (combed) fur sits nearest to.
+    {
+        const Vec3 t = normalize(Vec3(0.3, 0.9, -0.2));
+        Pcg32 rng; rng.seed(77, 1);
+        std::vector<CurveSeg> segs;
+        for (int i = 0; i < 3000; ++i) {
+            CurveSeg s;
+            s.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
+            s.p1 = s.p0 + t * 0.05;
+            s.r0 = s.r1 = 5e-4;
+            segs.push_back(s);
+        }
+        FurGrid g; g.build(segs, anyFiber, 16 * 16 * 16);
+        double worst = 0.0;
+        for (int k = 0; k < 64; ++k) {
+            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            const double want = dot(d, t) * dot(d, t);
+            for (const FurCell& fc : g.cells) {
+                if (fc.c <= 0.0f) continue;
+                worst = std::max(worst, std::fabs(FurGrid::furSin2(fc, d) - want));
+            }
+        }
+        const bool ok = worst < 1e-6;
+        if (!ok) ++fails;
+        std::printf("[checkfurgrid] 2. aligned tangents exact: worst |d'Td - (d.t)^2| over "
+                    "%d cells x 64 dirs = %.3e -> %s\n", g.occupied, worst, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 3. isotropic tangents: the KNOWN, BOUNDED over-estimate ---------------------
+    // The one approximation in the model is pulling the square root outside the sum. Its
+    // worst case is perfect orientation isotropy, where the grid reports sqrt(1 - 1/3) =
+    // 0.8165 against the true <sin theta> over the sphere = pi/4 = 0.7854: a 3.98%
+    // OVER-estimate of extinction. That number is worth pinning down as a test rather than
+    // a comment, because it is the error budget the whole far-tier LOD inherits, and
+    // because it being one-signed (grids never under-attenuate) is what makes it safe.
+    {
+        Pcg32 rng; rng.seed(4242, 1);
+        std::vector<CurveSeg> segs;
+        std::vector<Vec3> tangents;
+        for (int i = 0; i < 20000; ++i) {
+            const double z = 2.0 * rng.uniform() - 1.0, phi = 2.0 * PI * rng.uniform();
+            const double s = std::sqrt(std::max(0.0, 1.0 - z * z));
+            const Vec3 t(s * std::cos(phi), s * std::sin(phi), z);
+            CurveSeg cs;
+            cs.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
+            cs.p1 = cs.p0 + t * 0.02;
+            cs.r0 = cs.r1 = 5e-4;
+            segs.push_back(cs); tangents.push_back(t);
+        }
+        // One cell, so every tangent shares a tensor and the comparison is apples to apples.
+        FurGrid g; g.build(segs, anyFiber, 1);
+        double ratioSum = 0.0; int n = 0;
+        for (int k = 0; k < 32; ++k) {
+            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            double exact = 0.0;
+            for (const Vec3& t : tangents) {
+                const double c = dot(d, t);
+                exact += std::sqrt(std::max(0.0, 1.0 - c * c));
+            }
+            exact /= tangents.size();
+            double approx = 0.0; int cellsSeen = 0;
+            for (const FurCell& fc : g.cells) {
+                if (fc.c <= 0.0f) continue;
+                approx += std::sqrt(std::max(0.0, 1.0 - FurGrid::furSin2(fc, d))); ++cellsSeen;
+            }
+            if (!cellsSeen) continue;
+            approx /= cellsSeen;
+            ratioSum += approx / std::max(1e-12, exact); ++n;
+        }
+        const double ratio = n ? ratioSum / n : 0.0;
+        const double want  = std::sqrt(2.0 / 3.0) / (PI / 4.0);   // 1.03972...
+        const bool ok = n > 0 && std::fabs(ratio - want) < 0.01 && ratio > 1.0;
+        if (!ok) ++fails;
+        std::printf("[checkfurgrid] 3. isotropic over-estimate: grid/exact = %.4f "
+                    "(predicted sqrt(2/3)/(pi/4) = %.4f, i.e. +%.2f%%) -> %s\n",
+                    ratio, want, 100.0 * (want - 1.0), ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 4. THE IDENTITY: tau == expected crossings ----------------------------------
+    // The load-bearing one. Generate a random fiber population, then for each of many rays
+    // count the fibers ACTUALLY crossed with the shipping `intersectCurveSeg`, and compare
+    // the mean of those counts against the mean of the grid's tau. Two independent routes
+    // to the same number; if the mean-field derivation has a factor wrong, this is where it
+    // shows. (Per-ray they must differ — one is a Poisson draw and the other its mean —
+    // so the test is on the ENSEMBLE mean.)
+    //
+    // Two known biases have to be kept below the tolerance or they would mask a real error,
+    // and getting this wrong is instructive enough to write down:
+    //
+    //   * CAPS. `intersectCurveSeg` traces a round CONE — a cylinder plus two end balls —
+    //     whose silhouette is a stadium of area `2 r l sin(theta) + pi r^2`, while the model
+    //     is the cylinder term only. Dropping the caps is CORRECT for hair, because a strand
+    //     is a *chain* of round cones sharing end spheres, so every cap but the two at the
+    //     ends of the whole strand is interior and presents no cross-section. It is wrong
+    //     for a population of ISOLATED segments, where the cap term is `2r/l` of the total.
+    //     The first draft of this test used r=8e-4, l=0.03 — a 5.3% cap term — and read as a
+    //     4.7% model deficit that looked exactly like a bad factor. Fibers here are thin and
+    //     long (2r/l = 0.4%) so the term is negligible, which is also the real-fur regime.
+    //   * JENSEN (§3). The over-estimate from pulling the sqrt out of the sum only appears
+    //     once a cell holds many DIFFERENTLY-oriented tangents. On the fine grid it is
+    //     absent — a few deposits per cell, so T is very nearly rank-1 and the sqrt is exact
+    //     per cell — and that is what makes a tight tolerance meaningful here. The SAME
+    //     population is then re-gridded coarsely, where every cell sees hundreds of tangents
+    //     and §3's +4.0% must reappear. Getting both numbers from one population is the
+    //     point: it shows the bias is a RESOLUTION effect, not a modelling error.
+    //
+    // The geometry is arranged so nothing else can contaminate the coarse arm. Strand roots
+    // fill [0,1]^3 while the rays are confined to a narrow tube through the middle, because
+    // a coarse cell averages density over its whole width: if the rays only sampled the
+    // interior of a population whose density TAPERS at the edges, coarse cells straddling
+    // the taper would report a diluted density along exactly the paths being measured, and
+    // that dilution came out at -4% here — cancelling the +4% Jensen bias almost exactly and
+    // making a broken model look correct. Keeping the tube inside the flat region (|coord -
+    // 0.5| < 0.15 against a taper that only starts at 0.15 from each face) removes it.
+    // Longitudinally there is no such worry: every ray crosses the box completely, and a
+    // piecewise-constant field integrates to the true mass along a full crossing by §1.
+    {
+        Pcg32 rng; rng.seed(9001, 1);
+        std::vector<CurveSeg> segs;
+        const double segLen = 0.15;
+        for (int i = 0; i < 68000; ++i) {
+            const double z = 2.0 * rng.uniform() - 1.0, phi = 2.0 * PI * rng.uniform();
+            const double s = std::sqrt(std::max(0.0, 1.0 - z * z));
+            CurveSeg cs;
+            cs.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
+            cs.p1 = cs.p0 + Vec3(s * std::cos(phi), s * std::sin(phi), z) * segLen;
+            cs.r0 = cs.r1 = 3e-4;                          // 2r/l = 0.4%: caps negligible
+            segs.push_back(cs);
+        }
+        FurGrid fine;   fine.build(segs, anyFiber, 128 * 128 * 128);
+        FurGrid coarse; coarse.build(segs, anyFiber, 8 * 8 * 8);
+        const int NR = 5000;
+        double sumFine = 0.0, sumCoarse = 0.0, sumHits = 0.0;
+        for (int k = 0; k < NR; ++k) {
+            const Vec3 o(-1.0, 0.35 + 0.3 * rng.uniform(), 0.35 + 0.3 * rng.uniform());
+            const Vec3 tgt(2.0, 0.35 + 0.3 * rng.uniform(), 0.35 + 0.3 * rng.uniform());
+            const Vec3 d = normalize(tgt - o);
+            const double maxD = length(tgt - o);
+            sumFine   += fine.march(o, d, maxD).tau;
+            sumCoarse += coarse.march(o, d, maxD).tau;
+            const Ray r{o, d};
+            const CurveRay cr = makeCurveRay(d);
+            int hits = 0;
+            for (const CurveSeg& cs : segs) {
+                Hit h; h.t = maxD;
+                if (intersectCurveSeg(cr, r, cs, 1e-6, h, /*anyHit=*/true)) ++hits;
+            }
+            sumHits += hits;
+        }
+        const double mFine = sumFine / NR, mCoarse = sumCoarse / NR, mHit = sumHits / NR;
+        const double eFine = mFine / std::max(1e-12, mHit) - 1.0;
+        const double eCoarse = mCoarse / std::max(1e-12, mHit) - 1.0;
+        const double jensen = std::sqrt(2.0 / 3.0) / (PI / 4.0) - 1.0;   // 0.0397
+        // Tolerance is set by the brute-force count's own Poisson noise: the standard error
+        // of the mean is sqrt(mHit/NR), about 1% of mHit here, so 2.5% is ~2.5 sigma.
+        const bool ok = std::fabs(eFine) < 0.025 && std::fabs(eCoarse - jensen) < 0.025;
+        if (!ok) ++fails;
+        std::printf("[checkfurgrid] 4. tau == expected crossings: %d rays vs %zu-segment brute "
+                    "force (%.4f crossings/ray, +-%.2f%% s.e.); fine %dx%dx%d %.4f (%+.2f%%, want "
+                    "~0), coarse %dx%dx%d %.4f (%+.2f%%, want +%.2f%% Jensen) -> %s\n",
+                    NR, segs.size(), mHit, 100.0 * std::sqrt(mHit / NR) / std::max(1e-12, mHit),
+                    fine.nx, fine.ny, fine.nz, mFine, 100.0 * eFine,
+                    coarse.nx, coarse.ny, coarse.nz, mCoarse, 100.0 * eCoarse,
+                    100.0 * jensen, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 5. DDA covers the path exactly ---------------------------------------------
+    // The march must integrate sigma_t over exactly the ray's intersection with the grid —
+    // no cell skipped, none counted twice, none clipped at the wrong bound. Checked against
+    // a fine-step Riemann sum of the SAME field through `sigmaAt` point lookups: a
+    // deliberately stupid reference that shares no bookkeeping with the DDA, so agreement
+    // means the DDA's cell-by-cell accounting is right rather than that both are wrong the
+    // same way. Directions include the axis-aligned degenerate ones, where a component of
+    // `dir` is zero and the DDA has to take its `1e300` branch instead of dividing.
+    //
+    // (An earlier draft compared against `sigma_t * clipped length` on a "uniform" lattice
+    // instead. It failed by exactly 50%, and the DDA was innocent: the grid's AABB is
+    // radius-inflated, so the boundary cells hold less fiber mass than the interior ones and
+    // the field was never uniform in the first place. The reference was wrong, not the code
+    // — worth remembering before trusting a closed form over a brute-force one.)
+    {
+        std::vector<CurveSeg> segs;
+        for (int i = 0; i < 40; ++i)
+            for (int j = 0; j < 40; ++j) {
+                CurveSeg s;
+                s.p0 = Vec3(i / 40.0 + 0.0125, j / 40.0 + 0.0125, 0.0);
+                s.p1 = Vec3(i / 40.0 + 0.0125, j / 40.0 + 0.0125, 1.0);
+                s.r0 = s.r1 = 1e-3;
+                segs.push_back(s);
+            }
+        FurGrid g; g.build(segs, anyFiber, 20 * 20 * 20);
+        const Vec3 dirs[7] = {normalize(Vec3(1, 0, 0)), normalize(Vec3(0, 1, 0)),
+                              normalize(Vec3(0, 0, 1)), normalize(Vec3(1, 1, 0)),
+                              normalize(Vec3(1, 0.3, 0.7)), normalize(Vec3(-0.4, 1, -0.9)),
+                              normalize(Vec3(-1, -1, -1))};
+        double worst = 0.0; int checked = 0;
+        for (const Vec3& d : dirs) {
+            const Vec3 c = (g.lo + g.hi) * 0.5;
+            // Two offsets per direction: dead-centre, and shifted so the entry face is hit
+            // off-axis (a centred ray through an axis-aligned lattice is the easy case).
+            for (int off = 0; off < 2; ++off) {
+                Vec3 t, b; onb(d, t, b);
+                const Vec3 o = c - d * 4.0 + (off ? t * 0.137 + b * 0.041 : Vec3(0, 0, 0));
+                const FurMarch m = g.march(o, d, 8.0);
+                if (!m.hit) continue;
+                // Reference: fine-step midpoint rule over the same field.
+                const int NS = 400000;
+                const double h = 8.0 / NS;
+                double ref = 0.0;
+                for (int k = 0; k < NS; ++k) ref += g.sigmaAt(o + d * ((k + 0.5) * h), d) * h;
+                worst = std::max(worst, std::fabs(m.tau - ref) / std::max(1e-12, ref));
+                ++checked;
+            }
+        }
+        // Tolerance is the Riemann sum's own O(h) edge error, not the DDA's: the reference
+        // mis-resolves each cell boundary by up to half a step, and there are ~20 of them.
+        const bool ok = checked == 14 && worst < 2e-3;
+        if (!ok) ++fails;
+        std::printf("[checkfurgrid] 5. DDA path coverage: worst |tau - Riemann|/Riemann over "
+                    "%d rays = %.3e -> %s\n", checked, worst, ok ? "PASS" : "FAIL");
+    }
+
+    std::printf("[checkfurgrid] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return fails;
 }
 
@@ -9249,6 +9532,12 @@ static double g_dualDensity = 0.7;    // -dual-density: Zinke's d_f = d_b
 static double g_dualDb = -1.0;        // -dual-db: override d_b alone (<0 = follow -dual-density)
 static double g_dualDf = -1.0;        // -dual-df: override d_f alone
 static int    g_dualMaxCross = 64;    // -dual-max-cross
+// -dual-grid: Zinke §4.1.2. Built once from the scene's own fibers before rendering and
+// shared, read-only, by every render thread. `g_dualGridCells` is a BUDGET, not an axis
+// count -- FurGrid picks roughly-cubic axes that fit that many cells in the coat's box.
+static bool   g_dualGrid = false;
+static int    g_dualGridCells = 128 * 128 * 128;
+static FurGrid g_furGridData;
 
 // Mode W lights a surface ONLY by next-event estimation, and a shadow ray is blocked by
 // any geometry at all -- dielectrics very much included (Scene::occluded: "can't connect
@@ -9721,6 +10010,7 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         br.dualScatter = g_dualScatter; br.dualDensity = g_dualDensity;
         br.dualMaxCross = g_dualMaxCross;
         br.dualDb = g_dualDb; br.dualDf = g_dualDf;
+        br.furGrid = g_furGridData.valid ? &g_furGridData : nullptr;
         // Shading footprint for `fw` (O8 stage 2). Mode W only — see fwPerDist for why a
         // stochastic sampler wants none — and derived from the run's REQUESTED spp rather
         // than this call's chunk, so every chunk of a progressive or resumed render filters
@@ -12464,6 +12754,17 @@ static void printHelp(const char* prog) {
 "                        unset follows -dual-density; -dual-df 0 leaves only the directly\n"
 "                        lit term, which is how you attribute a brightness error\n"
 "  -dual-max-cross <n>   strands one shadow ray counts before it stops (default 64)\n"
+"  -dual-grid [cells]    measure the coat by marching a voxel density field instead of by\n"
+"                        crossing every strand (Zinke §4.1.2 rather than §4.1.1). The walk\n"
+"                        cannot early-out — a fiber does not block a shadow ray, it\n"
+"                        accumulates — so on a dense coat it is the cost of -dual-scatter;\n"
+"                        the grid is O(cells) with no primitive tests, and its optical depth\n"
+"                        IS the expected crossing count (-checkfurgrid verifies that against\n"
+"                        the real intersector). Approximate in two known ways: extinction is\n"
+"                        over-estimated by up to 4%% where a cell's tangents are isotropic,\n"
+"                        and a per-strand colour TEXTURE is sampled at the shading fiber\n"
+"                        rather than the crossed ones. `cells` is a budget, not an axis\n"
+"                        count (default 2097152, i.e. 128^3; 32 B/cell)\n"
 "\n"
 "Denoising (post-pass on the linear image; affects the file AND the live window):\n"
 "  -denoise [amount]     edge-aware a-trous filter for SPECTRAL speckle. CHROMA ONLY by\n"
@@ -12638,6 +12939,7 @@ static int run(int argc, char** argv) {
     bool checkImplicitOnly = false;
     bool checkCurveOnly = false;
     bool checkFurOnly = false;
+    bool checkFurGridOnly = false;
     bool checkContainerOnly = false;
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
@@ -12984,6 +13286,16 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-dual-max-cross") && i + 1 < argc) {
             g_dualMaxCross = std::max(1, std::atoi(argv[++i]));
         }
+        // -dual-grid [cells]: the cell budget is optional, so only consume the next token
+        // if it parses as a number (otherwise `-dual-grid -o out.png` eats the output path).
+        else if (!std::strcmp(argv[i], "-dual-grid")) {
+            g_dualGrid = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                char* end = nullptr;
+                const double v = std::strtod(argv[i + 1], &end);
+                if (end && *end == '\0' && v >= 1.0) { ++i; g_dualGridCells = (int)std::min(v, 3e8); }
+            }
+        }
         // -denoise [amount]: the optional amount scales BOTH tolerances, so `-denoise 2`
         // is twice as aggressive and `-denoise 0.5` half. The argument is optional, so
         // only consume the next token if it actually parses as a number — otherwise
@@ -13067,6 +13379,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkimplicit")) checkImplicitOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurve")) checkCurveOnly = true;
         else if (!std::strcmp(argv[i], "-checkfur")) checkFurOnly = true;
+        else if (!std::strcmp(argv[i], "-checkfurgrid")) checkFurGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkcontainer")) checkContainerOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
@@ -13287,6 +13600,7 @@ static int run(int argc, char** argv) {
     if (checkImplicitOnly) return checkImplicit(500'000) == 0 ? 0 : 1; // deterministic, no scene needed
     if (checkCurveOnly)    return checkCurve(200'000) == 0 ? 0 : 1;    // deterministic, no scene needed
     if (checkFurOnly)      return checkFur(50'000) == 0 ? 0 : 1;      // deterministic, no scene needed
+    if (checkFurGridOnly)  return checkFurGrid() == 0 ? 0 : 1;        // deterministic, no scene needed
     if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
@@ -13505,6 +13819,32 @@ static int run(int argc, char** argv) {
         else
             std::printf("[hero] split-at-dispersion ON (C=%d fan-out; backward R/W on CPU+GPU, "
                         "forward modes A/B/C and photon-map M/S on the CPU)\n", g_heroC);
+    }
+
+    // -dual-grid: build the fiber density field once, before any render thread exists.
+    // Placed here rather than at scene load because it is opt-in and costs a pass over
+    // every CurveSeg -- a scene with no fur, or a run without -dual-scatter, must not pay.
+    if (g_dualGrid) {
+        if (!g_dualScatter) {
+            std::printf("[ignore] -dual-grid does nothing without -dual-scatter (it only "
+                        "changes HOW the coat is measured along a shadow ray)\n");
+        } else {
+            const auto t0 = std::chrono::steady_clock::now();
+            g_furGridData.build(scene.curveSegs, [&](int matId) {
+                return matId >= 0 && matId < (int)scene.mats.size() &&
+                       scene.mats[matId].type == MatType::Hair;
+            }, g_dualGridCells);
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (g_furGridData.valid)
+                std::printf("[dual-grid] %dx%dx%d cells (%d occupied, %.1f MB) over %zu fiber "
+                            "segments in %.0f ms\n", g_furGridData.nx, g_furGridData.ny,
+                            g_furGridData.nz, g_furGridData.occupied,
+                            g_furGridData.bytes() / (1024.0 * 1024.0), scene.curveSegs.size(), ms);
+            else
+                std::printf("[dual-grid] scene has no hair fibers -- falling back to the "
+                            "ray-shooting walk\n");
+        }
     }
 
     if (checkBvhOnly) {

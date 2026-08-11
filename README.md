@@ -148,7 +148,9 @@ argument for standing a groom in a hall of polished objects.*
   `preset <bobcat|cat|deer|dog|mouse|rabbit|raccoon|redfox|springbok|human>`. A pale coat
   is *mostly* multiple scattering, and brute-forcing it costs 100+ bounces per path, so
   `-dual-scatter` will instead approximate it analytically (Zinke et al. 2008) — about
-  twice the speed of the reference on the case it exists for, biased on purpose. The
+  twice the speed of the reference on the case it exists for, biased on purpose, and
+  `-dual-grid` adds another 1.5× on a dense coat by counting the strands a shadow ray
+  crosses from a fiber-density grid instead of intersecting each one. The
   physics is guarded by `-checkhair`, which asserts the white furnace as *algebra* at
   1e-12 rather than as a picture, and catches a sign typo in Zinke's own eq. 16 by
   measuring its order of convergence.
