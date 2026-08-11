@@ -5050,7 +5050,7 @@ that item mostly a binding exercise there.
       scene (a small diffuse room, two big area lights, no caustics), not of fur, and it is the
       same ranking a fur-free version would give. (2) 30 s is short; the ratios are what the
       experiment measures well, the absolutes less so.
-- [ ] **P3 — fiber BCSDF.** Marschner R/TT/TRT is the baseline, but it was derived for *human hair*;
+- [x] **P3 — fiber BCSDF. ✅ DONE v0.174.0** (all four stages).  Marschner R/TT/TRT is the baseline, but it was derived for *human hair*;
       **animal fur has a medulla** (hollow scattering core), which is why Yan et al. 2015/2017 add
       the TT^s/TRT^s lobes of the double-cylinder model. Plain Marschner on fur reads as plastic.
       Then **dual scattering** (Zinke 2008) for inter-fiber multiple scattering — not optional, since
