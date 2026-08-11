@@ -1450,25 +1450,33 @@ continuous factor instead. Direct lights and the environment both go through it.
 |---|---|---|
 | `-fur-volume [cells]` | off (`2097152` = 128³ when given) | Render every `type hair` coat as a participating medium. Backward modes (`R`, `W`) only. Shares the density field with `-dual-grid` — given both, it is built once at the larger budget — and adds 16 B/cell for the orientation table (32 MB at 128³). |
 
-**What it costs and buys.** On a modest coat it is not a speed win but a **loss**. Measured on
-a 90 k-strand coat filling the frame (mode `R`, 200×150, `-max-bounce 200`, equal 150 s):
+**What it costs and buys.** It is faster than the strands it replaces, and — the point of the
+whole tier — its cost barely moves with fiber count. Measured on the same coat at three fiber
+counts at **fixed optical density** (strand count ×k with radius ÷k, so the picture and the
+number of scattering events are unchanged and only geometric complexity grows), mode `R`,
+200×150, 200 spp, `-max-bounce 32`, every run landing on the same 7.07 % noise:
 
-| | samples | noise |
-|---|---|---|
-| strands (reference) | 2223 spp | 2.12 % |
-| `-fur-volume` | 583 spp | 4.14 % |
+| strands | curve segments | strands | `-fur-volume` | speed-up |
+|---|---|---|---|---|
+| 90 k | 900 k | 15.1 s | **9.1 s** | 1.7× |
+| 300 k | 3.0 M | 31.3 s | **10.3 s** | 3.0× |
+| 900 k | 9.0 M | 67.8 s | **11.7 s** | 5.8× |
 
-It is, however, **accurate**: developed through one shared `-exposure-anchor`, the aggregate's
+Across that 100× range in fiber count the aggregate grows **1.29×** and the strand tier
+**4.49×** — which is the property the tier exists for. (Before v0.179.0 it was a 3.8× *loss*
+and scaled just like the strands, because making fibers invisible was done at the BVH leaf
+rather than by removing them from the tree; see `known-issues.md`.)
+
+It is also **accurate**: developed through one shared `-exposure-anchor`, the aggregate's
 scene-linear mean luminance over the coat lands **0.9 %** below the strand reference (0.9989 of
-it over the whole frame). The reason it loses is that the number of collisions along a path is
-the number of fiber crossings, which is the same either way — so all it saves is BVH traversal,
-and 900 k curve segments is a cheap BVH. What it buys is that the cost stops
-scaling with **fiber count** — a coat of 90 k strands and one of 9 M strands march the same
-grid — and that the coat now has a genuine aggregate representation to hand a footprint-based
-LOD decision. It composes with fog correctly (the first collision in a union of independent
-media is the minimum of their independent free flights, which is exactly how the two are
-sampled), and it deliberately does **not** combine with `-dual-scatter`: dual scattering is
+it over the whole frame). It composes with fog correctly (the first collision in a union of
+independent media is the minimum of their independent free flights, which is exactly how the two
+are sampled), and it deliberately does **not** combine with `-dual-scatter`: dual scattering is
 an analytic stand-in for the very multiple scattering this path now simulates directly.
+
+What it does **not** save is memory: the strands and their BVH stay loaded, so the tier stops
+traversing a coat it does not stop storing (~2.2 GB at 900 k strands / 9 M segments here). A
+coat too large to load is still too large to render.
 
 Two things are genuinely lost, both from the same cause — a collision knows its cell, not a
 strand. There is no `u`/`v`, so a hair material whose colour comes from a texture or pattern
@@ -4149,7 +4157,7 @@ segment's cross-section (and correctly zero for a chained strand), and a coarse 
 a density taper dilutes σ_t along exactly the rays being measured, by almost exactly enough
 to cancel the Jensen bias.
 `-checkfurvol` guards the **aggregate scattering model** that turns those grid cells into a
-participating medium, in eight sections: the symmetric eigensolver; the startup table that
+participating medium, in ten sections: the symmetric eigensolver; the startup table that
 inverts the **Bingham** distribution's second moment (worst error 1.2e-3 over the whole space
 of eigenvalue triples); the reconstructed orientation distribution's own second moment against
 the cell's `T`, plus its *first* moment where the sign rule is exact; the round trip from an
@@ -4167,7 +4175,15 @@ rather than by delta tracking (`σ_t` is piecewise constant along a fixed ray, s
 is needed — and a coat, a thin skin of dense cells in a mostly empty box, is the case delta
 tracking handles worst). That one is falsifiable and so worth having: the survival probability
 over a segment must be exactly `exp(−τ)` for the same `τ` `-checkfurgrid` §4 already tied to
-the number of strands real rays hit.
+the number of strands real rays hit. The last two sections guard the machinery *around* the
+medium rather than the medium itself: §9 the near/far transition (`-fur-lod`), and §10 the
+**hair-free BVH** — the second acceleration structure a skip-hair query traverses. §10 is a
+pure-optimisation check, and the two ways such a thing can go wrong are the two it tests: the
+filtered tree numbers its primitives differently, so a bad remap would decode a leaf as the
+wrong primitive and silently lose a wall; and it must agree with `isHairCurve` about what a
+fiber *is*, since grass and wire are curves too and have to keep blocking. Both queries are
+run over 20 000 rays on a scene mixing all four populations, once on the filtered tree and once
+with the remap swapped out so the old leaf-rejection path runs, and any disagreement fails.
 `-checkhair` guards the **fiber BCSDF** (Marschner's R / TT / TRT lobes in Chiang's
 energy-conserving form, plus Yan's medulla and Zinke's dual scattering) in eleven sections. A hair BCSDF that is subtly wrong still looks
 like hair, so every claim is a number rather than a picture — and wherever the physics

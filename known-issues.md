@@ -10677,7 +10677,42 @@ validation — it is that the fixtures now spell lights that exist:
 `test_material_bundle.py` and `test_viewer.py`, and `Light("collimated", origin=…, dir=…)`
 in `test_grammar_scene.py` (which deliberately round-trips a *non-default* subtype).
 
-## OPEN (tech debt, 2026-08-11, v0.177.0): `-fur-volume`'s far tier is *slower* than the strands it replaces at modest fiber counts
+## DONE (2026-08-11, v0.179.0): `-fur-volume`'s far tier is *slower* than the strands it replaces at modest fiber counts
+
+**Resolved.** The cause was not the per-collision work this entry blamed below — it was that
+`skipHair` rejected fibers at the BVH *leaf*, which never skipped the traversal and, because no
+fiber survived to shorten `tMax`, could not prune either: the far tier walked the whole coat's
+BVH on every ray, where the strand tier stopped at the first fiber. `Scene::buildNoHairBvh()`
+now builds a second tree with the fibers absent, and `closestHit(skipHair)` /
+`occludedSkipHair` traverse that. Same scene, 200×150, 200 spp, `-max-bounce 32`, at fixed
+optical density (count ×k, radius ÷k, so the picture and the collision count are unchanged and
+only geometric complexity grows):
+
+| strands | segments | strand tier | far tier before | far tier after | speed-up |
+|---|---|---|---|---|---|
+| 90 k | 900 k | 15.1 s | 44.2 s | **9.1 s** | 4.9× |
+| 300 k | 3.0 M | 31.3 s | 82.1 s | **10.3 s** | 8.0× |
+| 900 k | 9.0 M | 67.8 s | 195.2 s | **11.7 s** | 16.7× |
+
+So the crossover this entry asked for turns out to be **below 90 k strands** — the far tier is
+now faster than the strands everywhere measured (1.7× / 3.0× / 5.8×). More to the point, the
+"cost is independent of fiber count" claim below is finally *true*: over a 100× range in fiber
+count the far tier grows 1.29×, the strand tier 4.49×. All six renders are **bit-identical** to
+the pre-fix binary (md5), as is a `-dual-scatter` render, so this was a pure optimisation;
+`-checkfurvol` §10 is the standing proof, cross-checking both queries against the old
+leaf-rejection path over 20 000 rays on a scene mixing hair curves, non-hair curves, triangles
+and a sphere.
+
+Two limits remain, neither pressing enough for its own entry: the far tier still holds the
+strands and their BVH in memory (it only stops *traversing* them), so a coat that does not fit
+still does not fit — on this machine ~900 k strands / 9 M segments needs 2.2 GB and 3 M strands
+`bad allocation`s; and `MatType::Hair` is CPU-only on the GPU (`cudaForwardSupported`), so if
+P3 ever lands the fiber BCSDF on the device, `-fur-volume` will need a GPU gate or it will be
+silently ignored there.
+
+The original entry follows.
+
+## ~~OPEN~~ (tech debt, 2026-08-11, v0.177.0): `-fur-volume`'s far tier is *slower* than the strands it replaces at modest fiber counts
 
 `-fur-volume` (P2 stage 2b, `src/fur_volume.h` + `BackwardRenderer::furInteract` in
 `src/backward.h`) is correct but not yet a win. Measured on `scenes/_dual_pale_sky.ftsl`

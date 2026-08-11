@@ -5120,6 +5120,26 @@ that item mostly a binding exercise there.
           scaling with fiber count at all (the same grid, the same march, whether the cell holds
           10³ or 10⁷ fibers), and that the coat finally has an aggregate representation —
           which is what stage 2c exists to cash in.
+          **↑ finding (4) was WRONG about the cause, and is fixed as of v0.179.0.** The loss was
+          not the per-collision work: `skipHair` rejected fibers at the BVH *leaf*, which never
+          skipped the traversal and — because no fiber survived to shorten `tMax` — could not
+          prune either, so the far tier walked the whole coat's BVH on every ray where the strand
+          tier stopped at the first fiber. `Scene::buildNoHairBvh()` (`scene.h`) now builds a
+          second tree with the fibers absent and `closestHit(skipHair)` / `occludedSkipHair`
+          traverse it. At fixed optical density (count ×k, radius ÷k), 200×150, 200 spp,
+          `-max-bounce 32`, all runs at 7.07 % noise:
+          | strands | segs | strand tier | far tier before | far tier after |
+          |---|---|---|---|---|
+          | 90 k | 900 k | 15.1 s | 44.2 s | **9.1 s** (1.7× faster than strands) |
+          | 300 k | 3.0 M | 31.3 s | 82.1 s | **10.3 s** (3.0×) |
+          | 900 k | 9.0 M | 67.8 s | 195.2 s | **11.7 s** (5.8×) |
+          So the crossover is *below* 90 k strands, and "cost independent of fiber count" is now
+          true: 1.29× growth over a 100× fiber range vs the strand tier's 4.49×. All six renders
+          plus a `-dual-scatter` render are **bit-identical** to the pre-fix binary (md5) — a pure
+          optimisation — and `-checkfurvol` **§10** is the standing proof, cross-checking both
+          skip-hair queries against the old leaf-rejection path over 20 000 rays on a scene mixing
+          hair curves, non-hair curves, triangles and a sphere (0 mismatches). Still unsolved: the
+          tier does not save **memory** (strands + BVH stay resident, ~2.2 GB at 9 M segments).
     - [x] **stage 2c — the near/far transition. ✅ DONE v0.178.0** (`-fur-lod [d0[:d1]]`,
           implies `-fur-volume`; `BackwardRenderer::pickFurTier` + `GiCtx::furTier` +
           `FurVolume::entryDist` + `FurGrid::meanRadius`). The ruler is the width of one pixel

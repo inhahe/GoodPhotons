@@ -883,16 +883,42 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   - *No dual-scattering branch, on purpose.* Dual scattering is an **analytic stand-in** for
     exactly the multiple scattering this path now simulates directly; running both double-counts
     it. `-fur-volume` therefore does not end the path at a fiber the way `-dual-scatter` does.
-  - *What it is and is not for.* It is **not** faster at equal quality on a coat that fills the
-    frame — the collision count *is* the crossing count, so the only saving is BVH traversal.
-    What it buys is that cost stops scaling with **fiber count**, and that the coat finally has
-    an aggregate representation a footprint-based LOD decision can switch to (stage 2c). What it
-    loses is everything that lived on an individual strand: no silhouette, and no `u`/`v` at a
-    collision, so a textured hair `reflect` reads at the default `Hit`'s coordinates — the same
-    class of approximation as `-dual-grid`'s textured `σ_a`. Measured on a 90 k-strand coat
-    filling the frame (mode R, 200×150, `-max-bounce 200`, equal 150 s): strands 2223 spp at
-    2.12 % noise, aggregate 583 spp at 4.14 % — a 3.8× *loss* at this fiber count, at 0.9 %
-    agreement in coat luminance. See `known-issues.md` for the unmeasured crossover.
+  - *What it is and is not for.* What it buys is that cost stops scaling with **fiber count**,
+    and that the coat finally has an aggregate representation a footprint-based LOD decision can
+    switch to (stage 2c). What it loses is everything that lived on an individual strand: no
+    silhouette, and no `u`/`v` at a collision, so a textured hair `reflect` reads at the default
+    `Hit`'s coordinates — the same class of approximation as `-dual-grid`'s textured `σ_a`.
+  - *It needed the hair-free BVH (below) to be a win at all.* As first written the tier was a
+    3.8× *loss* at 90 k strands and its cost still scaled with fiber count, because `skipHair`
+    rejected fibers at the BVH leaf rather than removing them from the tree. With
+    `Scene::buildNoHairBvh` it is 1.7×/3.0×/5.8× **faster** than the strands at 90 k/300 k/900 k,
+    and grows only 1.29× across that whole 100× range where the strand tier grows 4.49×.
+  - *What it still does not save is **memory***: the strands and their BVH stay resident, so the
+    tier stops traversing a coat it cannot stop storing. A coat too big to load is still too big.
+- **The hair-free BVH** (`Scene::buildNoHairBvh` / `bvhNoHair` / `noHairPrim`, `scene.h`). A
+  second acceleration structure over every primitive *except* `MatType::Hair` curve segments,
+  built opt-in by `main.cpp` when `-fur-volume` or `-dual-scatter` is on, and traversed by
+  `closestHit(skipHair=true)` and `occludedSkipHair`.
+  - *Why a whole second tree rather than the leaf test it replaces.* Rejecting a fiber when the
+    traversal reaches its leaf does not skip the traversal, and — the part that actually hurt —
+    because no fiber ever survives to shorten `tMax`, the descent cannot **prune**. A coat the
+    strand tier exits at the first fiber was walked end to end by the aggregate tier, which is
+    why the far tier was slower than the strands *and* why its cost kept scaling with fiber
+    count. The any-hit case is worse still: a shadow ray that rejects every fiber it reaches can
+    never early-out inside a coat.
+  - *One box list, two trees.* `collectPrimBoxes(boxes, dropHair, remap)` is the single
+    definition of primitive order; the filtered tree records a `noHairPrim` map from its own leaf
+    index back to the **global** prim index, so both trees decode with the same arithmetic. Two
+    copies of that loop would be two chances for the trees to disagree about what prim 7 is.
+  - *`isHairCurve` is the one predicate.* The tree, `closestHit`'s fallback and
+    `occludedSkipHair` must agree exactly on what a fiber is — grass and wire are curves too and
+    must keep blocking — so all three call it. The leaf-level test survives as the fallback for
+    when no filtered tree was built.
+  - *Pure optimisation, verified as one.* All six benchmark renders and a `-dual-scatter` render
+    are bit-identical to the pre-change binary; `-checkfurvol` §10 runs both queries over 20 000
+    rays on a scene mixing hair curves, non-hair curves, triangles and a sphere, once on the
+    filtered tree and once with `noHairPrim` swapped out so the old path runs, and requires zero
+    mismatches.
 - **`-fur-lod` — choosing a tier** (P2 stage 2c, `backward.h`). Turns the above from a mode
   into a decision. The ruler is the width of one pixel where the coat starts, in fiber
   diameters: `Camera::footprintPerDist(1)` × `FurVolume::entryDist` ÷ `FurGrid::meanRadius()×2`.

@@ -2338,6 +2338,100 @@ static int checkFurVol() {
                     endFar < 0.0 ? 1.0 : endFar, ok ? "PASS" : "FAIL");
     }
 
+    // ---- 10. the hair-free BVH answers exactly what the leaf test answered ------------
+    // `buildNoHairBvh` is a pure OPTIMISATION: it removes the fibers from the tree instead of
+    // rejecting them at its leaves. So the only thing that can go wrong is that it changes an
+    // ANSWER, and there are two distinct ways it could. It could drop too much -- the two
+    // trees number their primitives differently, so a mis-built `noHairPrim` remap would
+    // decode a leaf as the wrong primitive and quietly lose a wall. Or it could drop too
+    // little, i.e. disagree with `isHairCurve` about what a fiber is: grass and wire are
+    // curves too, and a non-Hair curve must still block a skip-hair ray. The scene below has
+    // all four populations on purpose -- hair curves, NON-hair curves, triangles and a sphere,
+    // interleaved in space -- and both queries are run twice over the same rays, once on the
+    // filtered tree and once with the remap swapped out so the old leaf-rejection path runs.
+    // Identical answers are the whole claim.
+    {
+        Scene sc;
+        Material hair;  hair.type = MatType::Hair;    sc.mats.push_back(hair);   // 0
+        Material dif;   dif.type  = MatType::Diffuse; sc.mats.push_back(dif);    // 1
+        Pcg32 rng; rng.seed(4242, 11);
+
+        // The coat: hair curves that must become invisible.
+        for (int c = 0; c < 700; ++c) {
+            Vec3 p(rng.uniform(), 0.02 * rng.uniform(), rng.uniform());
+            const Vec3 comb = normalize(Vec3(0.25, 1.0, 0.1));
+            for (int k = 0; k < 8; ++k) {
+                CurveSeg s; s.p0 = p;
+                const Vec3 jit(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5);
+                p = p + (comb + jit * 0.35) * 0.03;
+                s.p1 = p; s.r0 = 0.0006; s.r1 = 0.0005; s.matId = 0;
+                sc.curveSegs.push_back(s);
+            }
+        }
+        // Wire: curves that are NOT hair and must keep blocking, threaded through the same
+        // space so a remap error cannot hide behind them being somewhere else.
+        for (int c = 0; c < 40; ++c) {
+            Vec3 p(rng.uniform(), 0.4 * rng.uniform(), rng.uniform());
+            for (int k = 0; k < 6; ++k) {
+                CurveSeg s; s.p0 = p;
+                p = p + normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                       rng.uniform() - 0.5)) * 0.05;
+                s.p1 = p; s.r0 = s.r1 = 0.004; s.matId = 1;
+                sc.curveSegs.push_back(s);
+            }
+        }
+        // A floor (two triangles) under the coat and a ball above it: the solid geometry a
+        // skip-hair ray is supposed to find, on both sides of the fibers.
+        const Vec3 a(-1, -0.05, -1), b(2, -0.05, -1), cc(2, -0.05, 2), d(-1, -0.05, 2);
+        for (auto tri : {std::array<Vec3,3>{a, b, cc}, std::array<Vec3,3>{a, cc, d}}) {
+            Tri t; t.v0 = tri[0]; t.v1 = tri[1]; t.v2 = tri[2]; t.matId = 1;
+            t.finalize(); sc.tris.push_back(t);
+        }
+        Sphere sp; sp.c = Vec3(0.5, 0.75, 0.5); sp.r = 0.12; sp.matId = 1;
+        sc.spheres.push_back(sp);
+
+        sc.build();
+        sc.buildNoHairBvh();
+
+        int diffs = 0, occDiffs = 0, solidHits = 0, wireHits = 0, blocked = 0;
+        const bool built = sc.hasNoHairBvh();
+        for (int s = 0; s < 20000 && built; ++s) {
+            const Vec3 o(rng.uniform() * 2.0 - 0.5, rng.uniform() * 1.2 - 0.1,
+                         rng.uniform() * 2.0 - 0.5);
+            const Vec3 dir = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                            rng.uniform() - 0.5));
+            const Ray r{o, dir};
+            const Hit got = sc.closestHit(r, 1e-6, nullptr, /*skipHair=*/true);
+            const bool occGot = sc.occludedSkipHair(o, dir, 2.0);
+            // Swap the remap out: `hasNoHairBvh()` goes false and both queries fall back to
+            // the full tree plus the leaf-level rejection, which is the reference answer.
+            std::vector<int> saved; saved.swap(sc.noHairPrim);
+            const Hit ref = sc.closestHit(r, 1e-6, nullptr, /*skipHair=*/true);
+            const bool occRef = sc.occludedSkipHair(o, dir, 2.0);
+            saved.swap(sc.noHairPrim);
+
+            if (got.valid != ref.valid || got.matId != ref.matId ||
+                (ref.valid && (std::fabs(got.t - ref.t) > 1e-12 ||
+                               length(got.n - ref.n) > 1e-12))) ++diffs;
+            if (occGot != occRef) ++occDiffs;
+            if (ref.valid) { ++solidHits; if (ref.fiberRadius > 0.0) ++wireHits; }
+            if (occRef) ++blocked;
+        }
+        // A skip-hair hit on a fiber radius means a NON-hair curve was hit, which is the
+        // population a too-eager filter would have deleted; if none were hit the test proves
+        // nothing about them.
+        const bool ok = built && diffs == 0 && occDiffs == 0 &&
+                        solidHits > 1000 && wireHits > 0 && blocked > 1000;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 10. hair-free BVH (%zu of %zu prims) agrees with the leaf "
+                    "test on %d closest-hits (%d solid, %d non-hair curve) and %d occlusions "
+                    "(%d blocked): %d + %d mismatches -> %s\n",
+                    sc.noHairPrim.size(),
+                    sc.tris.size() + sc.spheres.size() + sc.curveSegs.size(),
+                    20000, solidHits, wireHits, 20000, blocked, diffs, occDiffs,
+                    ok ? "PASS" : "FAIL");
+    }
+
     std::printf("[checkfurvol] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return fails;
 }
@@ -14623,6 +14717,26 @@ static int run(int argc, char** argv) {
         else if (g_furLod)
             std::printf("[ignore] -fur-lod does nothing: the scene has no hair fibers to "
                         "build a far tier from\n");
+
+        // The second BVH, the one every `skipHair` query traverses. Needed by anything that
+        // makes fibers invisible to a ray: the -fur-volume / -fur-lod far tier (closestHit)
+        // and -dual-scatter's shadow ray (occludedSkipHair). Without it those queries reject
+        // fibers at the LEAF, which does not skip the traversal and, because no fiber ever
+        // shortens tMax, cannot prune either -- see Scene::buildNoHairBvh for the measurement
+        // that made this necessary. Opt-in because it is a second BVH build over ~the whole
+        // scene, and a render that never sets skipHair would pay it for nothing.
+        if (g_furVolume || g_dualScatter) {
+            const auto t0 = std::chrono::steady_clock::now();
+            scene.buildNoHairBvh();
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (scene.hasNoHairBvh())
+                std::printf("[fur] hair-free BVH over %zu of %zu prims in %.0f ms -- the coat is "
+                            "not in the tree a skip-hair ray walks\n",
+                            scene.noHairPrim.size(),
+                            scene.tris.size() + scene.spheres.size() + scene.implicits.size() +
+                            scene.curveSegs.size() + scene.instances.size(), ms);
+        }
     }
 
     if (checkBvhOnly) {

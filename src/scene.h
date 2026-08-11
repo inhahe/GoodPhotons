@@ -1541,6 +1541,14 @@ struct Scene {
 
     Bvh bvh;   // acceleration structure over tris (0..nTris) then spheres.
 
+    // The same acceleration structure MINUS the hair fibers — the tree a `skipHair` query
+    // traverses when a coat is being rendered as a medium (`-fur-volume` / the far `-fur-lod`
+    // tier). Empty unless buildNoHairBvh() was called; `skipHair` then falls back to the leaf
+    // test on `bvh`, which is correct but does not skip the traversal. `noHairPrim` maps a
+    // leaf of this tree back to a GLOBAL prim index so both trees decode identically.
+    Bvh bvhNoHair;
+    std::vector<int> noHairPrim;
+
     // Finalize triangle normals and build the BVH. Call after all geometry is
     // added. Primitive index i: i < tris.size() -> tris[i]; else spheres[i-nTris].
     void build() {
@@ -1617,25 +1625,49 @@ struct Scene {
         return summary;
     }
 
-    void buildBvh() {
+    // Is this curve segment one of the fibers a fur grid summarises? Grass and wire are
+    // curves too, and only `MatType::Hair` is ever replaced by a medium — so this one
+    // predicate defines "hair" for the no-hair BVH, for `closestHit(skipHair)` and for
+    // `occludedSkipHair` alike, and they must agree or a ray would find geometry the tree
+    // it traversed does not contain.
+    bool isHairCurve(const CurveSeg& cs) const {
+        return cs.matId >= 0 && cs.matId < (int)mats.size() &&
+               mats[cs.matId].type == MatType::Hair;
+    }
+
+    // Primitive bounds in THE canonical order — tris, spheres, implicits, curve segments,
+    // instances — which is the order every `prim` index in this file decodes against.
+    // Factored out because the no-hair BVH must lay its boxes out against exactly the same
+    // numbering; two copies of this loop would be two chances for the trees to disagree.
+    //
+    // With `dropHair`, hair curve segments are omitted and `remap` (required) receives, for
+    // each box kept, the GLOBAL prim index it came from — so the caller can decode a leaf
+    // from the filtered tree with the unfiltered arithmetic.
+    void collectPrimBoxes(std::vector<Aabb>& boxes, bool dropHair, std::vector<int>* remap) const {
         const double pad = 1e-6;       // avoid zero-thickness slabs on flat prims
-        std::vector<Aabb> boxes;
-        boxes.reserve(tris.size() + spheres.size());
+        boxes.clear();
+        boxes.reserve(tris.size() + spheres.size() + implicits.size() +
+                      curveSegs.size() + instances.size());
+        if (remap) { remap->clear(); remap->reserve(boxes.capacity()); }
+        int g = 0;                     // running GLOBAL prim index
+        const auto keep = [&](const Aabb& b) { boxes.push_back(b); if (remap) remap->push_back(g); };
         for (const auto& t : tris) {
             Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
             b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
-            boxes.push_back(b);
+            keep(b); ++g;
         }
         for (const auto& s : spheres) {
             Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
-            boxes.push_back(b);
+            keep(b); ++g;
         }
-        boxes.reserve(boxes.size() + implicits.size() + curveSegs.size() + instances.size());
-        for (const auto& im : implicits) boxes.push_back(im.bounds);
+        for (const auto& im : implicits) { keep(im.bounds); ++g; }
         // One leaf per round cone, NOT per strand: a whole hair's box is mostly empty,
         // and a BVH over long thin near-collinear boxes is exactly the degeneracy
         // TODO §P1 warned about. Per-segment bounds are also exact for what is tested.
-        for (const auto& cs : curveSegs) boxes.push_back(curveSegBounds(cs));
+        for (const auto& cs : curveSegs) {
+            if (!(dropHair && isHairCurve(cs))) keep(curveSegBounds(cs));
+            ++g;
+        }
         // One TLAS leaf per instance: the BLAS's local bounding box transformed into
         // world space (union of its 8 transformed corners — the tightest world AABB
         // of a rotated box short of re-bounding the actual triangles).
@@ -1648,10 +1680,46 @@ struct Scene {
                              (c & 4) ? lb.hi.z : lb.lo.z };
                 wb.expand(inst.toWorld.apply(corner));
             }
-            boxes.push_back(wb);
+            keep(wb); ++g;
         }
+    }
+
+    void buildBvh() {
+        std::vector<Aabb> boxes;
+        collectPrimBoxes(boxes, /*dropHair=*/false, nullptr);
         bvh.build(boxes);
     }
+
+    // Build the second tree, the one `skipHair` queries traverse. Opt-in (main.cpp calls it
+    // only when a coat is actually going to be rendered as a medium) because it costs a
+    // second BVH build over nearly the whole scene.
+    //
+    // WHY A SECOND TREE AND NOT JUST THE LEAF TEST. Rejecting hair at the leaf — which is
+    // what `skipHair` did before v0.179.0 — does not skip the *traversal*. The ray still
+    // descends into every hair leaf its box overlaps, and, far worse, because no fiber ever
+    // survives to shorten tMax the descent cannot PRUNE: a coat that the strand tier exits
+    // at the first fiber is walked end to end by the aggregate tier. Measured on a 200x150
+    // 200-spp render of the same coat at fixed optical density, that made the aggregate tier
+    // ~3x SLOWER than the strands it replaced *and* left its cost scaling linearly with
+    // fiber count — the exact property the aggregate representation exists to break:
+    //
+    //     strands   90k -> 300k -> 900k :  13.1s   30.5s   66.2s
+    //     aggregate 90k -> 300k -> 900k :  44.2s   82.1s  195.2s   (3.4x, 2.7x, 3.0x)
+    //
+    // With the fibers absent from the tree instead of rejected in it, the far tier's
+    // traversal is over the coat's SUPPORT (the ball, the room) and no longer sees the
+    // fibers at all.
+    void buildNoHairBvh() {
+        bvhNoHair = Bvh{};
+        noHairPrim.clear();
+        size_t nHair = 0;
+        for (const auto& cs : curveSegs) if (isHairCurve(cs)) ++nHair;
+        if (!nHair) return;      // nothing to exclude: `bvh` already IS the no-hair tree
+        std::vector<Aabb> boxes;
+        collectPrimBoxes(boxes, /*dropHair=*/true, &noHairPrim);
+        bvhNoHair.build(boxes);
+    }
+    bool hasNoHairBvh() const { return !noHairPrim.empty() && !bvhNoHair.nodes.empty(); }
 
     // Transform a BLAS-local hit (from Blas::intersectLocal) back into world space for
     // instance `inst` under the world ray `r`. Positions map by toWorld; shading and
@@ -1730,14 +1798,16 @@ struct Scene {
         // Built once per ray, not per implicit hit: three pointer copies either way, and
         // the lambda is called many times.
         const PatTables tabs = patTables();
-        bvh.traverseClosest(r, tmin, tMax, [&](int prim, double& tm) {
+        // One leaf body, indexed by GLOBAL prim, so both trees decode the same way. The
+        // leaf-level hair rejection stays as the fallback for when no no-hair tree was
+        // built; when there is one, the fibers are simply not in it and the test never fires.
+        const auto leaf = [&](int prim, double& tm) {
             if (prim < (int)nT)            { if (intersectTri(sh, r, tris[prim], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
-                if (skipHair && cs.matId >= 0 && cs.matId < (int)mats.size() &&
-                    mats[cs.matId].type == MatType::Hair) return;
+                if (skipHair && isHairCurve(cs)) return;
                 if (intersectCurveSeg(cray, r, cs, tmin, h)) tm = h.t;
             }
             else {
@@ -1749,7 +1819,12 @@ struct Scene {
                     h = lh; tm = h.t;
                 }
             }
-        }, stats);
+        };
+        if (skipHair && hasNoHairBvh())
+            bvhNoHair.traverseClosest(r, tmin, tMax,
+                [&](int lp, double& tm) { leaf(noHairPrim[lp], tm); }, stats);
+        else
+            bvh.traverseClosest(r, tmin, tMax, leaf, stats);
         applyNormalMap(h);
         return h;
     }
@@ -1801,7 +1876,7 @@ struct Scene {
         const TriShear sh = makeTriShear(r.d);
         const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};
         const PatTables tabs = patTables();
-        return bvh.traverseAny(r, tmin, seg, [&](int prim) {
+        const auto leaf = [&](int prim) {
             Hit h; h.t = seg;
             if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
@@ -1811,14 +1886,20 @@ struct Scene {
                 // curve whose material is not Hair is ordinary opaque geometry that must
                 // still block. Only the ones the grid summarises are skipped.
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
-                if (cs.matId >= 0 && cs.matId < (int)mats.size() && mats[cs.matId].type == MatType::Hair)
-                    return false;
+                if (isHairCurve(cs)) return false;
                 return intersectCurveSeg(cray, r, cs, tmin, h, /*anyHit=*/true);
             }
             const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             return blasList[inst.blasId].occludedLocal(lr, tmin, seg);
-        });
+        };
+        // The no-hair tree matters MORE here than in closestHit: an any-hit query that
+        // rejects every fiber it reaches can never early-out inside a coat, so on `bvh` this
+        // walks the whole coat before concluding "not blocked". On the filtered tree it walks
+        // only the geometry that can actually block.
+        if (hasNoHairBvh())
+            return bvhNoHair.traverseAny(r, tmin, seg, [&](int lp) { return leaf(noHairPrim[lp]); });
+        return bvh.traverseAny(r, tmin, seg, leaf);
     }
 
     // Like occluded(), but a shadow ray through a COAT does not stop at the first strand:
