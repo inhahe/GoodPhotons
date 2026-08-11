@@ -5,6 +5,42 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-10, v0.174.0): `-dual-scatter` is *slower* than the reference on an absorbing coat, and drops the coat's indirect illumination
+
+Two separate limitations of the stage-4 dual-scattering implementation, both measured
+against each scene's own 200-bounce path-traced reference on the fur alone (a centred crop,
+scene-linear mean luminance):
+
+| Scene | single scattering | `-dual-scatter` | time vs reference |
+|---|---|---|---|
+| `scenes/_dual_pale_lamp.ftsl` — pale coat, one area light, black room | 0.17× | 0.77× (0.99× at `-dual-density 0.9`) | **2.1× faster** |
+| `scenes/_dual_pale_sky.ftsl` — the same coat under a constant sky | 0.80× | 0.92× | **2.4× faster** |
+| `scenes/fur_species.ftsl` — medullated, absorbing, white room | 0.37× | 0.57× | **1.6× SLOWER** |
+
+**1. It can cost more than it saves on a dark coat.** `Scene::walkFibers` must traverse the
+*whole* shadow segment: it needs every crossing, so unlike an ordinary occlusion query it
+cannot stop at the first blocker. On a pale coat that is a bargain (the brute-force
+alternative is 100+ bounces). On an absorbing coat the reference's paths die in two or three
+bounces, there is little multiple scattering to approximate, and the full-segment walk is
+pure overhead. There is no automatic guard: the flag is opt-in and the user picks.
+
+*Proper fix:* Zinke's §4.1.2 — a voxelised fiber-density grid marched by DDA instead of BVH
+ray shooting. `T_f` and `σ̄_f²` only need the *number* of crossings and their inclinations,
+not their identities, so a density grid gives both in O(cells) with no primitive tests. That
+also removes `-dual-max-cross` and its bright-failure mode. Not done because it is a second
+acceleration structure with its own build cost and resolution parameter.
+
+**2. The coat loses indirect illumination.** `-dual-scatter` terminates the path at a fiber
+vertex (necessarily — continuing would double-count the multiple scattering the analytic
+terms already carry). Direct lights and the environment both go through the model, but light
+that bounced off the room *first* never reaches the fur. That is most of the `fur_species`
+deficit: in the black-room fixture, where there is no indirect illumination to lose, the same
+coat lands at 0.77× / 0.99×.
+
+*Proper fix:* treat the coat as an aggregate and gather the incident field from all
+directions through `Ψ`, rather than only along NEE connections — i.e. the same aggregate-BSDF
+LOD that P2 wants. Until then this is a documented bias, and `REFERENCE.md` says so.
+
 ### OPEN (2026-08-10, v0.172.0): `type hair` cannot be gathered on in modes M / S — the photon record has no incident direction
 
 `struct Photon { Vec3 n; float power; float lambda; }` (`src/photonmap.h`) stores where a

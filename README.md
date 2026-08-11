@@ -145,9 +145,13 @@ argument for standing a groom in a hall of polished objects.*
   offset secondary highlight that a coloured `diffuse` cylinder can never produce. On
   top of that, Yan's **medulla** — the scattering core that is the actual difference
   between hair and fur — with the ten species he fitted available as
-  `preset <bobcat|cat|deer|dog|mouse|rabbit|raccoon|redfox|springbok|human>`. The
+  `preset <bobcat|cat|deer|dog|mouse|rabbit|raccoon|redfox|springbok|human>`. A pale coat
+  is *mostly* multiple scattering, and brute-forcing it costs 100+ bounces per path, so
+  `-dual-scatter` will instead approximate it analytically (Zinke et al. 2008) — about
+  twice the speed of the reference on the case it exists for, biased on purpose. The
   physics is guarded by `-checkhair`, which asserts the white furnace as *algebra* at
-  1e-12 rather than as a picture.
+  1e-12 rather than as a picture, and catches a sign typo in Zinke's own eq. 16 by
+  measuring its order of convergence.
 - **Participating media** — one or many coexisting (superposed) fog regions with
   Henyey–Greenstein or Rayleigh scattering; box / sphere / **named-object** bounds
   (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous

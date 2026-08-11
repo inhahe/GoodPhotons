@@ -26,6 +26,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Hair and fur fibers (`hair`)](#hair-and-fur-fibers-hair)
     - [The medulla — what makes fur not hair](#the-medulla--what-makes-fur-not-hair)
     - [`preset` — measured species](#preset--measured-species)
+    - [Dual scattering (`-dual-scatter`)](#dual-scattering--dual-scatter)
 - [Spectra (SPDs, reflectances, indices)](#spectra-spds-reflectances-indices)
   - [Spectral representation vs. other renderers](#spectral-representation-vs-other-renderers)
 - [Lights](#lights)
@@ -1281,6 +1282,79 @@ Two practical notes:
   fall back to the CPU tracer for any scene containing a `hair` material.
 
 See `scenes/hair_basics.ftsl`.
+
+#### Dual scattering (`-dual-scatter`)
+
+A pale coat is *dominated* by multiple scattering. A single blonde fiber is nearly
+transparent; a head of blonde hair is bright and soft, and essentially all of that
+brightness is light that has crossed dozens of strands. A path tracer gets this right by
+brute force, which means a hundred-plus bounces per path, and that is what makes white fur
+the slowest thing in this renderer.
+
+`-dual-scatter` replaces those bounces with the analytic approximation of Zinke et al. 2008
+("Dual Scattering Approximation for Fast Multiple Scattering in Hair"). It splits the
+multiply-scattered radiance in two:
+
+- **Global** — light reaching the shading fiber *through* the coat. A shadow ray is walked
+  strand by strand (Zinke's §4.1.1 "ray shooting"), and each crossing multiplies in that
+  fiber's average forward attenuation `ā_f(θ)` and adds its forward spread `β̄_f(θ)²`. The
+  light then arrives attenuated **and** blurred, not from a point.
+- **Local** — light that scattered *backward* out of the strands behind the shading point
+  and came back. That is a closed form in `ā_b`, an infinite sum over how many times the
+  light bounced back and forth, which Zinke collapses into `Ā_b`, a mean shift `Δ̄_b` and a
+  width `σ̄_b`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-dual-scatter` | off | Enable the approximation. Backward modes (`R`, `W`) only. |
+| `-dual-density <d>` | `0.7` | Zinke's `d_f` = `d_b`: "how enclosed is a strand", i.e. how much of the coat's own scattering the analytic terms should account for. The paper uses 0.7 throughout and suggests 0.6–0.8. Lower = a more open, darker coat. This is the knob to reach for if the coat reads dark — see the table below. |
+| `-dual-db <d>` / `-dual-df <d>` | follow `-dual-density` | Override one density factor on its own — `d_b` weights the local backscatter lobe, `d_f` the light let through the coat. Mostly a diagnostic: `-dual-df 0` leaves only the directly-lit term. |
+| `-dual-max-cross <n>` | `64` | How many strands one shadow ray counts before giving up. A dense coat can exceed this; the ray is then treated as reaching the light with whatever it accumulated. |
+
+Two things here are deliberately *not* what the paper does:
+
+- **The six averaged curves are measured from this renderer's own BCSDF**, not from
+  Marschner's three lobes. `ā_f`, `ā_b`, `ᾱ_f`, `ᾱ_b`, `β̄_f`, `β̄_b` are built per material,
+  per wavelength, by importance-sampling `hair::sample()` and splitting the result by
+  azimuthal half. So the table inherits the model's energy conservation exactly (`ā_f + ā_b`
+  is the furnace total, asserted to 1e-4 by `-checkhair` §S11) and picks up the medulla's
+  TT<sup>s</sup> / TRT<sup>s</sup> lobes for free.
+- **The exact series are summed, not Zinke's eq. 16/17 fits.** Those are expansions in
+  `a_b²/(1−a_f²)²`, which is not small for any plausible coat, and eq. 16 also carries a
+  sign error (it prints `1 − 2u` where the sum gives `1 + 2u`; `-checkhair` §S11 demonstrates
+  this by showing the printed form is first-order wrong in `u` while the corrected one is
+  second-order accurate). The sums have closed forms and cost nothing at table-build time,
+  so they are used directly.
+
+**This is biased, on purpose.** The analytic terms already carry the coat's multiple
+scattering, so continuing the path from a fiber would double-count it: `-dual-scatter`
+therefore **terminates the path at a fiber vertex**. Everything else in the scene keeps
+full path tracing — only fur becomes one-bounce. Direct lights and the environment both go
+through the approximation; what the coat loses is *indirect* illumination, i.e. light that
+reached it by bouncing off the rest of the scene first.
+
+**What it actually costs and buys.** Measured against each scene's own 200-bounce path-traced
+reference, on the fur alone (a centred crop, scene-linear mean luminance — the whole frame
+would be diluted by the room):
+
+| Scene | single scattering only | `-dual-scatter` | speed vs reference |
+|---|---|---|---|
+| Pale coat, lit only by an area light (`scenes/_dual_pale_lamp.ftsl`) | 0.17× | **0.77×** (0.99× at `-dual-density 0.9`) | **2.1× faster** |
+| The same coat lit only by a constant sky (`scenes/_dual_pale_sky.ftsl`) | 0.80× | **0.92×** | **2.4× faster** |
+| `scenes/fur_species.ftsl` — medullated, absorbing, in a white room | 0.37× | **0.57×** | **0.6× — slower** |
+
+Read that as: on the case it exists for — a pale coat where the brute-force walk is long —
+it recovers most of the multiple scattering at half the cost, and `-dual-density` closes
+the rest (0.7 is the paper's conservative default, not a fit to your coat). On a *dark*
+coat it is a bad trade twice over: there was little multiple scattering to approximate, and
+the fiber walk still cannot early-out at the first blocker the way an ordinary shadow ray
+can, so it costs more than it saves. And in a bright room the dropped indirect bounce is
+the dominant error, not the approximation itself. Render the reference when the coat *is*
+the picture; use `-dual-scatter` for look-development, for pale fur that is scenery rather
+than subject, and for flyby frames.
+
+The tables are cached per (material, wavelength bin, absorption bin) and built lazily on
+first use, so the cost is paid once per render regardless of how many strands there are.
 
 **Parametric records.** A **record** is a named bank of per-channel look-up tables over
 a shared scalar domain `[lo,hi]`. A single per-hit **driver** scalar samples every
@@ -3802,6 +3876,10 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-gi-grid <n>` | **Mode `W` only.** `n`×`n` shadow rays at a *gather* vertex (default `1`). Separate from `-whitted-grid` because a gather vertex's soft-shadow detail is averaged over `-gi` directions anyway, so paying the full grid there multiplies the gather's cost for almost no visible return. |
 | `-gi-bounce <n>` | **Mode `W` only.** Max bounces along one gather ray (default `4`). Bounds the cost of a specular chain: gold is ~0.9 reflective, so the `adc_bailout` cutoff alone would let a single gather direction ricochet ~60 times inside a gold lattice. |
 | `-gi-clamp <x>` | **Mode `W` only.** Firefly ceiling on the radiance **one** gather ray may return, as a multiple of one light's own radiance — same dimensionless units as `-ambient`, so the same number works at any scene scale. `0` (default) is off and bit-for-bit inert. Fixes the thin bright dashed curves a glass ball or mirror casts onto nearby diffuse surfaces at low `-spp`: those are gather rays reaching the lamp *through* the specular surface, carrying its full radiance, and the shared direction lattice turns the on/off boundary into an image-space contour instead of noise (see "Honest limits"). Try `0.05`–`0.2`; keep it above `-ambient`, which the clamp also caps. Clamped per wavelength, not per bundle, so the hero and single-λ paths cannot drift apart; the weight of a clamped direction is left alone, so the gather still normalises by the realised sum of cosines. |
+| `-dual-scatter` | Backward modes only. Approximate a **coat's multiple scattering** analytically (Zinke et al. 2008) instead of path-tracing it. Terminates the path at a `hair` vertex, so it is biased by construction — fast look-development for fur, not a reference. Full description under [Dual scattering](#dual-scattering--dual-scatter). |
+| `-dual-density <d>` | Zinke's density factor `d_f` = `d_b`, "how enclosed is a strand" (default `0.7`, sensible range 0.6–0.8). Lower reads as a more open, darker coat; raising it toward `0.9` is what brings a dense pale coat up to its own reference. |
+| `-dual-db <d>` / `-dual-df <d>` | Override `d_b` (the local backscatter lobe) or `d_f` (the light let through the coat) on its own; either unset follows `-dual-density`. `-dual-df 0` leaves only the directly-lit term, which is how a brightness error gets attributed to one branch. |
+| `-dual-max-cross <n>` | Strands one dual-scattering shadow ray counts before it stops (default `64`). |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
@@ -3869,7 +3947,7 @@ across seeds, growth never pointing into the skin, clumping that collapses tips 
 moving roots, a well-formed segment chain, and a regression on the loader-ordering trap
 that once made a whole groom generate zero strands silently — see **Grooms** above.
 `-checkhair` guards the **fiber BCSDF** (Marschner's R / TT / TRT lobes in Chiang's
-energy-conserving form, plus Yan's medulla) in ten sections. A hair BCSDF that is subtly wrong still looks
+energy-conserving form, plus Yan's medulla and Zinke's dual scattering) in eleven sections. A hair BCSDF that is subtly wrong still looks
 like hair, so every claim is a number rather than a picture — and wherever the physics
 allows it, an *exact* number rather than a Monte-Carlo estimate. Because the lobes
 separate into a longitudinal `M_p`, an azimuthal `N_p` and an attenuation `A_p`, and each
@@ -3887,6 +3965,14 @@ The medulla adds two of its own: the six-lobe furnace still closes to `2e-16` ov
 (κ, σ_s, g, h, θ) combinations, and the one piece of the model that is *not* Yan's — the
 analytic stand-in for their unpublished `C^M` / `C^N` tables — is pinned against a
 brute-force Henyey-Greenstein random walk through the core, which it tracks to 0.003.
+[Dual scattering](#dual-scattering--dual-scatter) adds a section of pure algebra: the
+forward/backward split reproduces the furnace total exactly (`ā_f + ā_b = 1` to four
+decimals at every inclination, medullated or not) and falls with absorption; Zinke's
+triple sum over `(i, j, k)` collapses to a single sum weighted by `n(n+1)/2`, which
+reproduces his own closed form to `6e-16`; and `Δ̄_b`'s two coefficients, summed in closed
+form, show that eq. 16 as printed is *first-order* wrong in `u = a_b²/(1−a_f²)²` while the
+same expression with one sign flipped is second-order accurate — a sign typo in the paper,
+demonstrated rather than asserted.
 `-checkcontainer` guards the isosurface container clip: rotating an
 isosurface must not change what a ray sees, so it builds the same solid twice
 (axis-aligned and rigidly rotated) and checks that correspondingly rotated rays

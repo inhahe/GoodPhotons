@@ -153,6 +153,29 @@ struct BackwardRenderer {
     // `-gi 0 -ambient min(ambient, c)` on both the CPU and the GPU.
     double giClamp = 0.0;
 
+    // ---- dual scattering for fur (P3 stage 4; Zinke et al. 2008) --------------------
+    // A pale coat is the worst case this renderer has: almost nothing is absorbed, so the
+    // light that reaches the eye has crossed dozens of strands, and an unbiased path
+    // tracer has to walk every one of them. `dualScatter` replaces that walk with Zinke's
+    // two closed-form terms — global forward scattering measured along the shadow ray,
+    // local backscattering folded into one extra BCSDF lobe (see hair.h's `Dual`).
+    //
+    // It is BIASED, and deliberately so: the point is that a fur render that needs
+    // -max-bounce 200 and thousands of samples becomes a direct-lighting render. Because
+    // the multiple scattering is now analytic, a fiber vertex must NOT also continue the
+    // path — that would count the same light twice — so this implies a one-bounce fur.
+    // Everything else in the scene keeps full path tracing.
+    bool   dualScatter = false;
+    double dualDensity = 0.7;   // Zinke's d_f = d_b, "how enclosed is a strand": 0.6-0.8
+    // The paper sets d_f = d_b, and so does `dualDensity`; these override one of them on
+    // its own. Negative means "follow dualDensity". They exist because the two terms are
+    // physically different (d_b weights the local backscatter lobe, d_f the light let
+    // through the coat) and being able to switch one off is the only way to attribute a
+    // brightness error to one of them.
+    double dualDb = -1.0;
+    double dualDf = -1.0;
+    int    dualMaxCross = 64;   // strands counted along one shadow ray before giving up
+
     // Where a path sits relative to the gather. `depth == 0` is a camera path (it does
     // the gather); `depth == 1` is a gather ray (it does NOT recurse, uses `giGrid`, and
     // terminates its own diffuse vertices on the flat `ambient` tail). `sIdx` is the
@@ -266,13 +289,25 @@ struct BackwardRenderer {
     //     own transmitted lobe (hair_shade.h).
     bool emitterGeom(const Scene& scene, const Hit& h, const Vec3& ngo,
                      const Emitter& em, double u1, double u2, double& dist, double& w,
-                     const HairShade* hs = nullptr) const {
+                     const HairShade* hs = nullptr,
+                     const HairDualCtx* dctx = nullptr) const {
+        // Dual scattering (P3 stage 4) makes the shadow ray part of the SHADING: what it
+        // counts on the way to the light is the forward-scattering transmittance, so the
+        // response and the visibility test stop being separable. `response` therefore
+        // does both and `blocked` only reports what it found. Everything else — emitter
+        // sampling, pdfs, weights — is untouched, which is the whole reason this is one
+        // substitution rather than a fourth copy of the emitter loop.
+        bool dualBlocked = false;
         // The surface response that multiplies the geometry weight, and the shadow ray.
         // Both are exactly the pre-hair code when `hs` is null, so every non-fiber scene
         // stays bit-identical (same rejections, same offset, same float ordering).
         // (Two outputs rather than their product so the weight expressions below keep
         // their original float ordering to the last bit; a fiber's `stG` is exactly 1.)
         auto response = [&](const Vec3& wi, double& cosSurf, double& stG) -> bool {
+            if (hs && dctx) {
+                cosSurf = PI * hairDualResponse(*dctx, *hs, h, wi, dist, dualBlocked);
+                stG = 1.0; return !dualBlocked && cosSurf > 0.0;
+            }
             if (hs) { cosSurf = PI * hairFCos(*hs, wi); stG = 1.0; return cosSurf > 0.0; }
             cosSurf = dot(h.n, wi);
             if (cosSurf <= 0) return false;
@@ -281,6 +316,7 @@ struct BackwardRenderer {
             return true;
         };
         auto blocked = [&](const Vec3& wi, double d, double shorten) -> bool {
+            if (hs && dctx) return dualBlocked;     // already walked, inside response()
             if (!hs) return scene.occluded(h.p + ngo * 1e-6, wi, d - shorten);
             const double off = hairExitOffset(*hs, h.n, wi);
             const double len = d - off - 1e-6;
@@ -312,9 +348,11 @@ struct BackwardRenderer {
             // Two rng draws, matching the area-light path below, so adding a sun does
             // not reshuffle any other emitter's stream.
             Vec3 wi = em.sampleCone(-em.beamDir, u1, u2);
+            // `dist` before `response`, not after: a dual-scattering response walks the
+            // shadow segment itself and so needs its length. Nothing else reads it here.
+            dist = length(scene.sceneCenter - h.p) + scene.sceneRadius;   // to the scene exit
             double cosSurf, stG;
             if (!response(wi, cosSurf, stG)) return false;
-            dist = length(scene.sceneCenter - h.p) + scene.sceneRadius;   // to the scene exit
             if (blocked(wi, dist, 0.0)) return false;
             w = cosSurf * em.spotOmega * stG;
             return true;
@@ -355,10 +393,10 @@ struct BackwardRenderer {
         double dist2 = dot(toL, toL);
         dist = std::sqrt(dist2);
         wi = toL / dist;
-        double cosSurf, stG;
-        if (!response(wi, cosSurf, stG)) return false;
         double cosLight = dot(nLight, -wi);              // light is one-sided
-        if (cosLight <= 0) return false;
+        if (cosLight <= 0) return false;                 // tested first: a dual-scattering
+        double cosSurf, stG;                             // response is a shadow WALK, and
+        if (!response(wi, cosSurf, stG)) return false;    // a back-facing sample is free to skip
         if (blocked(wi, dist, 2e-6)) return false;
         double G = cosSurf * cosLight / dist2;           // geometry term
         w = G * effArea * stG;                           // pdf_area = 1/effArea (visible area for cylinder)
@@ -570,7 +608,8 @@ struct BackwardRenderer {
     // (its sigma_a) and the PI in emitterGeom's response cancels the rho/PI below.
     double neeLight(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
                     double lambda, Pcg32& rng, const SpdCache* spdCache = nullptr,
-                    GiCtx gi = GiCtx{}, const HairShade* hs = nullptr) const {
+                    GiCtx gi = GiCtx{}, const HairShade* hs = nullptr,
+                    const HairDualCtx* dctx = nullptr) const {
         double total = 0.0;
         // Geometric normal on the shading-normal side: every light connection must lie
         // in this hemisphere too, else a smoothed shading normal would leak light in
@@ -601,7 +640,16 @@ struct BackwardRenderer {
                 if (whitted) { if (uv) gridUV(s, G, u1, u2); }
                 else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
                 double dist = 0.0, w = 0.0;
-                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, hs)) continue;
+                // Dual scattering draws its one forward-spread sample here, per emitter
+                // sample, unconditionally — so the rng stream depends on the scene's
+                // lights and not on how many strands a shadow ray happened to cross.
+                HairDualCtx dc;
+                if (dctx) {
+                    dc = *dctx;
+                    dc.u0 = rng.uniform(); dc.u1 = rng.uniform(); dc.u2 = rng.uniform();
+                }
+                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, hs,
+                                 dctx ? &dc : nullptr)) continue;
                 if (!haveSpd) {   // evaluated at most once per emitter, as before
                     spdV = cached ? spdCache->spd[(size_t)e * (size_t)spdCache->C]
                                   : em.spdFn(lambda);
@@ -841,9 +889,23 @@ struct BackwardRenderer {
     // skip; on success fills `wi`, `cosSurf`, `stG`, `pdfW`, `wMis`, `farDist`.
     bool envGeom(const Scene& scene, const Hit& h, Pcg32& rng, Vec3& wi,
                  double& cosSurf, double& stG, double& pdfW, double& wMis,
-                 double& farDist, const HairShade* hs = nullptr) const {
+                 double& farDist, const HairShade* hs = nullptr,
+                 const HairDualCtx* dctx = nullptr) const {
         wi = scene.sampleEnvDir(rng, pdfW);
         if (pdfW <= 0.0) return false;
+        if (hs && dctx) {
+            // Same substitution as emitterGeom: under dual scattering the shadow ray IS
+            // part of the shading, so response and visibility come back together. The sky
+            // has to go through it too — leaving the env connection on single scattering
+            // would light a coat's sunlit side by the full model and its sky-lit side by a
+            // bare fiber. And there is no MIS partner here (`dualScatter` ends the path, so
+            // nothing samples the BCSDF), which is exactly why wMis is 1.
+            farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
+            bool dualBlocked = false;
+            cosSurf = PI * hairDualResponse(*dctx, *hs, h, wi, farDist, dualBlocked);
+            stG = 1.0; wMis = 1.0;
+            return !dualBlocked && cosSurf > 0.0;
+        }
         if (hs) {
             // Fiber: `cosSurf` carries PI*hairFCos so the caller's rho/PI (rho == 1) leaves
             // the BCSDF-times-projection, and the MIS partner is the BCSDF's own pdf rather
@@ -871,9 +933,18 @@ struct BackwardRenderer {
     }
 
     double neeEnv(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
-                  double lambda, Pcg32& rng, const HairShade* hs = nullptr) const {
+                  double lambda, Pcg32& rng, const HairShade* hs = nullptr,
+                  const HairDualCtx* dctx = nullptr) const {
         Vec3 wi; double cosSurf, stG, pdfW, wMis, farDist;
-        if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist, hs)) return 0.0;
+        // As in neeLight: the one forward-spread draw is taken unconditionally, so the rng
+        // stream does not depend on how many strands this particular shadow ray crossed.
+        HairDualCtx dc;
+        if (dctx) {
+            dc = *dctx;
+            dc.u0 = rng.uniform(); dc.u1 = rng.uniform(); dc.u2 = rng.uniform();
+        }
+        if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist, hs,
+                     dctx ? &dc : nullptr)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
         double contrib = (rho / PI) * Lenv * cosSurf * invPdfLambda / pdfW * wMis * stG;
@@ -1165,12 +1236,27 @@ struct BackwardRenderer {
                 // vectors and still describe the same fiber: the BCSDF is reciprocal.
                 const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
                 const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
+                // Dual scattering (stage 4): the connection carries the coat's whole
+                // multiple-scattering response, so this vertex both gets a different
+                // response function and ENDS the path — continuing it would count the
+                // light the analytic terms already account for a second time.
+                HairDualCtx dc;
+                if (dualScatter) {
+                    dc.scene = &scene;
+                    dc.dual = hairDualFor(scene, m, h.matId, h, lambda);
+                    dc.lambda = lambda;
+                    dc.db = dualDb >= 0.0 ? dualDb : dualDensity;
+                    dc.df = dualDf >= 0.0 ? dualDf : dualDensity;
+                    dc.maxCross = dualMaxCross;
+                }
                 // rho == 1: the strand's colour lives in sigma_a inside the BCSDF, not in a
                 // separate Lambertian albedo (see neeLight).
-                L += thr * neeLight(scene, h, 1.0, invPdfLambda, lambda, rng, spdCache, gi, &hs);
+                L += thr * neeLight(scene, h, 1.0, invPdfLambda, lambda, rng, spdCache, gi, &hs,
+                                    dualScatter ? &dc : nullptr);
                 if (scene.envIndex >= 0)
-                    L += thr * neeEnv(scene, h, 1.0, invPdfLambda, lambda, rng, &hs);
-                if (directOnly) return false;
+                    L += thr * neeEnv(scene, h, 1.0, invPdfLambda, lambda, rng, &hs,
+                                      dualScatter ? &dc : nullptr);
+                if (directOnly || dualScatter) return false;
                 double pdfH = 0.0, fv = 0.0;
                 const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
                                              rng.uniform(), rng.uniform(), pdfH, fv);

@@ -457,10 +457,12 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     mutation run will tell you which fixture that is.
 - **`hair.h`** — the **fiber BCSDF**: Marschner's (2003) R / TT / TRT lobes in Chiang et
   al.'s (2016) energy-conserving form. Header-only, `<cmath>` + `linalg.h`, no renderer
-  dependencies, so it can be unit-tested with no scene (`-checkhair`, ten sections). 0.171.0
+  dependencies, so it can be unit-tested with no scene (`-checkhair`, eleven sections). 0.171.0
   added the core; **0.172.0 wired it up** as `material { type hair }` — see the
   `hair_shade.h` entry below for the Scene↔BCSDF bridge and how each renderer consumes it;
-  **0.173.0 added the medulla**, the scattering core that separates fur from hair.
+  **0.173.0 added the medulla**, the scattering core that separates fur from hair; **0.174.0
+  added dual scattering** (`hair::Dual`, `-dual-scatter`), which is about a *coat* rather
+  than a fiber.
   - *Why Chiang's form and not Marschner's directly.* Marschner's `M_p` is a flat Gaussian
     in θ, which integrates to **more** than 1 as roughness grows — that is exactly where the
     2003 model's famous energy gain comes from, and why practical implementations bolt on an
@@ -552,6 +554,45 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     re-typed. Note what the table says: every animal Yan measured has κ ∈ [0.65, 0.91] and
     human hair 0.36, i.e. the medulla is not a refinement of the hair model, it is the
     difference between hair and fur.
+  - *Dual scattering (0.174.0) — the coat, not the fiber.* A pale coat's appearance is
+    **mostly** multiple scattering: a single blonde fiber is nearly transparent, and a head
+    of blonde hair is bright because light has crossed dozens of strands. Brute force means
+    100+ bounces per path, which is why white fur is the slowest thing here. Zinke et al.
+    (2008) split that radiance in two — a **global** term (light arriving *through* the coat,
+    attenuated by `Π ā_f` and blurred by `Σ β̄_f²` along the shadow path) and a **local** term
+    (light that scattered backward out of the strands behind and came back, a closed form
+    `Ā_b` with mean shift `Δ̄_b` and width `σ̄_b`). `hair::Dual` is six curves over 48
+    inclination bins plus those three derived ones, built once per material/λ/σ_a.
+  - *The curves are MEASURED from our own BCSDF, not from Marschner's three lobes.*
+    `makeDual` importance-samples `hair::sample()` on a Halton lattice and splits the samples
+    by azimuthal half (`wi.y < 0` ⇒ forward). The sampler's weight `f·cosθ/pdf` has
+    expectation `Σ_p A_p` — the §S1 furnace total — so `ā_f + ā_b` **is** that total, split
+    two ways. The table therefore inherits energy conservation exactly rather than
+    approximating it (§S11 asserts `ā_f + ā_b = 1` to four decimals at every inclination),
+    and it picks up the medulla's TT^s / TRT^s lobes for free, which a Marschner-lobe
+    derivation would have had to be re-done for. `ᾱ` and `β̄` fall out of the same pass as the
+    first two moments of the deviation `θ_i + θ_o`.
+  - *The exact series are summed; eq. 16/17 are checked, not used — and eq. 16 has a sign
+    typo.* Zinke states `Δ̄_b` and `σ̄_b` as power-series fits, because the exact forms are a
+    sum over `i ≥ 1` and a triple sum over `i, j, k`. But substituting `k = j+1+q` makes the
+    exponent `m = 2(i+q)` independent of `j`, so `j` is just a multiplicity of `i`, and with
+    `n = i+q` the triple sum collapses to `Σ_n x^n · n(n+1)/2 · X(2n)` — one loop, converging
+    geometrically. `dualSeries` computes it, so there is no reason to inherit a fit's error:
+    `u = a_b²/(1−a_f²)²` is *not* small for any plausible coat (`a_f = a_b = 0.5` already
+    gives 0.44). Summing the coefficients closed-form also settles a discrepancy: `Δ̄_b`'s
+    coefficient of `ᾱ_b` is exactly `(1+3u)/(1+u) = 1 + 2u + O(u²)`, where eq. 16 prints
+    `1 − 2u`. §S11 demonstrates it rather than asserting it — it shrinks `a_b` and shows the
+    printed form's error is O(u¹·⁰⁰) while the sign-corrected one is O(u¹·⁹⁸). `dualDeltaFit`
+    keeps both behind a `signFix` flag purely so the test can compare them; the renderer
+    itself never calls either.
+  - *`fBack`'s prefactor is derived, not copied — because the normalisations differ.* The
+    paper writes `2 Ā_b g / (π cos²θ_d)`, which is Marschner's convention (`S = M N / cos²θ_d`).
+    `hair.h` is Chiang's (`f = Σ_p A_p M_p N_p / |cos θ_i|`, so `∫ f cos θ_i dω = Σ_p A_p`).
+    Requiring the same of the backscatter lobe — unit-area Gaussian in `dev`, density `1/π`
+    over the π-wide backward azimuths, total albedo `Ā_b` — gives `Ā_b g / (π cos²θ_i)`: the
+    `2` goes and the cosine is the sample's. Worth well under a percent on a real coat (the
+    lobe is a few per cent of the radiance), but it removes a guarded `cos²θ_d` denominator
+    that was a 10⁴ firefly multiplier waiting to happen.
 - **`hair_shade.h`** — the **Scene ↔ `hair.h` bridge** (0.172.0). `hairShadeAt(scene, mat,
   hit, λ, wo)` builds a `HairShade { hair::Bcsdf b; hair::Frame fr; Vec3 woLocal; double
   radius; }` from a `Material` + `Hit`: it resolves σa (either authored directly, or inverted
@@ -606,12 +647,89 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     `default:`, which treats an unknown material as a **mirror**, and would be silently wrong.
     A strand is not a visible point and not a deposit site, the same treatment those modes
     already give glossy/specular surfaces. Logged in `known-issues.md`.
+  - *Dual scattering rides the NEE connection, and terminates the path (0.174.0).* The
+    coat-level half of Zinke lives here: `hairDualFor()` caches a `hair::Dual` per
+    `(material, λ bin, σ_a bin)` (λ to 10 nm, σ_a sqrt-spaced over 64 levels) behind a mutex,
+    built *outside* the lock so racing threads each build one and the loser's copy is
+    dropped; `hairDualResponse()` walks the shadow ray with `Scene::walkFibers` and
+    accumulates `T_f = Π ā_f(θ)` and `σ̄_f² = Σ β̄_f(θ)²` over the strands it crosses, using
+    each crossed fiber's OWN table (a two-toned coat attenuates correctly); and
+    `hairDualFCos()` evaluates Zinke's Figure-5 combination. `n = 0` crossings means directly
+    lit, and the shading point gets `f_s + d_b f_back`; otherwise it gets
+    `T_f d_f (f_s + d_b f_back)` evaluated at a direction drawn from the forward spread.
+    Four things are worth naming:
+    - *It replaces the estimator inside `emitterGeom` and `envGeom`, not the emitter loop.*
+      `neeLight`'s four emitter branches (sun / cone-sampled / spot / area) all funnel through
+      one `response` lambda, so dual scattering is one extra first branch there plus a
+      `blocked` override — every non-dual path stays bit-identical, and there is no fourth
+      copy of the emitter-sampling code to drift. `envGeom` gets the same substitution, with
+      `wMis = 1`: the path ends here, so there is no BCSDF-sampled partner to weight against.
+      Leaving the sky on single scattering would have lit a coat's sunlit side with the full
+      model and its sky-lit side with a bare fiber.
+    - *`hair::f` must be paired with ITS OWN cosine — this was a 13.4× error.* The shading
+      integral is `∫ f(ω_o,ω_i) L_in(ω_i) cos θ_i dω_i`, so the projection belongs to the
+      direction the light actually arrives from, which under `n > 0` is the spread draw and
+      not the light. And `hair::f` is in Chiang's normalisation, ending in `/= |cos θ_i|`, so
+      pairing it with its own cosine cancels exactly. The first version took `cos θ` from the
+      light direction; after a dozen crossings `σ̄_f` exceeds a radian, so the Gaussian draw
+      lands near the fiber axis constantly, `|cos θ_i|` hits its clamp, and `f` comes back
+      amplified with no cosine to undo it. Measured on `scenes/fur_species.ftsl`: 13.4× too
+      bright overall, 67× at the 99th percentile. Fixed, the same scene lands at 0.82× of its
+      reference with the firefly tail gone (max 3.5 vs the reference's 10.1).
+    - *The N^G table is replaced by a Monte-Carlo draw.* The paper precomputes a 2-D
+      azimuthally-convolved `N^G` and widens each lobe's variance to account for light
+      arriving *spread* rather than from a point. A path tracer does not need that: draw ONE
+      direction from the spread distribution per connection (`hairSpreadDir` — a Gaussian of
+      width `σ̄_f` in θ about the light, uniform over the forward azimuthal half) and let the
+      pixel average do the integral. Unbiased with respect to the approximation, and no
+      second table. It also means the spread is *spent*: `f_back`'s Gaussian is NOT widened
+      by `σ̄_f²` the way eq. 10 does, because `dev` already carries that blur — Zinke widens
+      analytically only because his incident direction is still the light's.
+    - *It TERMINATES the path at a fiber vertex, deliberately.* The analytic terms already
+      carry the coat's multiple scattering; continuing the path would double-count it. So
+      `-dual-scatter` makes fur one-bounce while everything else in the scene keeps full path
+      tracing. This is the one place in the renderer where a flag buys speed with bias, and
+      it is documented as such — the reference is `-mode R` without it. What the coat gives
+      up is *indirect* illumination: lights and the environment both go through the model,
+      but light that bounced off the room first never reaches the fur. Measured on the fur
+      alone against each scene's own 200-bounce reference: a pale coat lit only by an area
+      light lands at 0.77× at the paper's `d = 0.7` and 0.99× at `d = 0.9` (single scattering
+      alone: 0.17×) for 2.1× the speed; the same coat under a constant sky 0.92× for 2.4×;
+      but `scenes/fur_species.ftsl` — an absorbing medullated coat in a white room — only
+      0.57×, *and* 1.6× slower than its reference, because a dark coat's brute-force paths
+      die in a couple of bounces while the fiber walk still cannot early-out. That case is
+      logged in `known-issues.md`; the fix Zinke gives for it is §4.1.2's voxel density grid
+      instead of BVH ray shooting.
   - *CUDA falls back.* `cudaForwardSupported()` rejects any scene containing a `Hair`
     material (directly or as a `mix` child): the device `shadeStep` has no Hair branch, and the
     model needs the strand tangent and impact parameter, which the device `Hit` does not carry.
     Like `Layered`, one hair material sends the whole scene to the CPU tracer rather than
     letting the device silently shade strands as something they are not. `MatType::Hair` is
     appended at the **end** of the enum because `render_cuda.cu`'s `D_*` tags are `(int)m.type`.
+    This is also why `-dual-scatter` can never be silently ignored on the GPU: a scene with
+    no `hair` material has nothing for it to do, and a scene with one is already on the CPU.
+- **`Scene::walkFibers`** (`scene.h`, 0.174.0) — the shadow-ray traversal dual scattering
+  needs and nothing else has: call back for every `Hair` strand crossed, and report `false`
+  if anything opaque is in the way.
+  - *One traversal, not one per strand — and this is the difference between the feature
+    being worth having and not.* The obvious implementation is `closestHit`, step past the
+    strand by `2.5 × fiberRadius` (the `hairExitOffset` clearance, so a micron-radius tube
+    cannot re-report itself), repeat. That was the first version, and it made `-dual-scatter`
+    **2.8× slower** than the brute-force path tracing it exists to replace: a coat crosses
+    dozens of strands and each crossing paid a full root-down BVH descent. Riding
+    `bvh.traverseAny` instead visits every primitive overlapping the segment exactly once
+    (`primIdx` is a permutation, so nothing is reported twice) for one descent total.
+  - *Why unordered traversal is legal here.* `T_f` is a product and `σ̄_f²` a sum — both
+    commutative — and an opaque blocker anywhere along the segment kills the connection
+    regardless of where it sits relative to the strands. So the any-hit callback returns
+    "stop" only for a blocker, and the fiber crossings accumulate as a side effect. The cost
+    of that trade is that nothing excludes a self-hit any more, so the caller must start the
+    ray already clear of its own strand (which `hairDualResponse` does anyway).
+  - *The crossing count is bounded, and overflow fails BRIGHT.* `maxCrossings`
+    (`-dual-max-cross`, default 64) caps how many strands are accumulated; past it the ray
+    is still treated as reaching the light with what it has. A dense coat can exceed any
+    bound, and stopping *dark* there would paint a hard black silhouette exactly where the
+    coat is thickest — the most visible possible failure.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds

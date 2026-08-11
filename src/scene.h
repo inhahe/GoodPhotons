@@ -1770,6 +1770,70 @@ struct Scene {
         });
     }
 
+    // Like occluded(), but a shadow ray through a COAT does not stop at the first strand:
+    // it reports every fiber it crosses and keeps going. This is the "ray shooting"
+    // implementation of Zinke et al. 2008 §4.1.1 — the accurate one, as opposed to their
+    // voxelised forward-scattering maps or deep-opacity-map GPU variant, both of which
+    // exist to avoid retracing and neither of which a ray tracer needs.
+    //
+    // Returns false the moment anything that is not a fiber blocks the segment; otherwise
+    // true, having called `onFiber(hit)` once per strand crossed.
+    //
+    // THIS IS ONE TRAVERSAL, NOT ONE PER STRAND. The obvious implementation — closestHit,
+    // step past the strand, repeat — costs a full root-down BVH descent per crossing, and a
+    // coat crosses dozens, so it made `-dual-scatter` about 3x SLOWER than the brute-force
+    // path tracing it was meant to replace. Riding `traverseAny` instead visits every
+    // primitive overlapping the segment exactly once (`primIdx` is a permutation, so no
+    // primitive is reported twice) and costs one descent total.
+    //
+    // Order does not matter, which is what makes that legal: T_f is a product and sigma_f^2
+    // a sum, both commutative, and if anything opaque overlaps the segment at all the whole
+    // connection is dark no matter where along it the blocker sits. So the callback returns
+    // "true = stop" only for a blocker, and fiber crossings accumulate as a side effect.
+    //
+    // The caller is expected to start the ray already clear of the strand it is standing on
+    // (hairExitOffset), since nothing here excludes a self-hit.
+    //
+    // `maxCrossings` bounds the cost: a dense coat's transmittance is a product of numbers
+    // below 1, so by the time this many strands have been crossed there is nothing left to
+    // carry and stopping early is a rounding error, not a cutoff artefact.
+    template <class F>
+    bool walkFibers(const Vec3& o, const Vec3& dir, double maxDist, F&& onFiber,
+                    int maxCrossings = 64) const {
+        const Ray r{o, dir};
+        const double tmin = 1e-6;
+        const double seg  = maxDist - tmin;
+        if (!(seg > 0.0)) return true;
+        const size_t nT = tris.size();
+        const size_t nS = spheres.size();
+        const size_t nI = implicits.size();
+        const size_t nC = curveSegs.size();
+        const TriShear sh = makeTriShear(r.d);
+        const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};
+        const PatTables tabs = patTables();
+        int crossed = 0;
+        const bool blocked = bvh.traverseAny(r, tmin, seg, [&](int prim) {
+            Hit h; h.t = seg;
+            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
+            if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
+            if (prim < (int)(nT + nS + nI))
+                return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
+            if (prim < (int)(nT + nS + nI + nC)) {
+                // A fiber: full hit data, since the model needs the axis and the impact
+                // parameter, not just "something is there".
+                if (!intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], tmin, h)) return false;
+                if (h.matId < 0 || h.matId >= (int)mats.size()) return true;
+                if (mats[h.matId].type != MatType::Hair || h.fiberRadius <= 0.0) return true;
+                if (crossed < maxCrossings) { ++crossed; onFiber(h); }
+                return false;                                  // keep going through the coat
+            }
+            const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
+            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
+            return blasList[inst.blasId].occludedLocal(lr, tmin, seg);
+        });
+        return !blocked;
+    }
+
     // --- deterministic sampling helpers for emitterSeal ---------------------------
     // Van der Corput radical inverse in base `b`: a low-discrepancy 1D sequence.
     static double vdc(int i, int b) {

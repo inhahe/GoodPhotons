@@ -5223,11 +5223,51 @@ that item mostly a binding exercise there.
         refinement of the hair model, it is the difference between hair and fur.
         `scenes/fur_species.ftsl` shows four species plus the A/B that makes the case: the same cat
         fiber twice, same groom seed, core on and core off.
-  - [ ] **P3 stage 4** — dual scattering (Zinke 2008).
+  - [x] **P3 stage 4 — dual scattering. ✅ DONE v0.174.0.** Zinke et al. (2008) behind
+        `-dual-scatter` (+ `-dual-density`, `-dual-db`/`-dual-df`, `-dual-max-cross`), backward
+        modes only. `hair::Dual` is six averaged curves over 48 inclination bins — **measured from
+        our own `hair::sample()`**, not from Marschner's three lobes, so `ā_f + ā_b` *is* the §S1
+        furnace total and the medulla's TT^s/TRT^s lobes come along free. The global term rides the
+        NEE shadow ray (`Scene::walkFibers`, one `traverseAny` descent for the whole segment, not
+        one per strand — the per-strand version was 2.8× slower than the brute force it replaces);
+        the local term is one extra BCSDF lobe. Zinke's `N^G` table is replaced by a single
+        Monte-Carlo draw from the forward spread per connection. Eq. 16/17's fits are **checked and
+        not used**: the exact series collapse to one geometrically-converging loop, and eq. 16 has a
+        sign typo (`1 − 2u` where the sum gives `1 + 2u`) that new `-checkhair` §S11 *demonstrates*
+        by order-of-convergence rather than asserting. Measured on the fur against each scene's own
+        200-bounce reference: a pale coat lit by an area light 0.77× at the paper's `d = 0.7` and
+        0.99× at `d = 0.9` (single scattering alone: 0.17×) at 2.1× the speed; under a sky 0.92× at
+        2.4×. Two limitations logged in `known-issues.md`: it is *slower* on an absorbing coat (the
+        fiber walk cannot early-out, and there was little multiple scattering to save), and the
+        terminated path drops the coat's indirect illumination.
 
 ---
 
 ## Progress log
+- 2026-08-10: **P3 stage 4 — dual scattering (v0.174.0).** Zinke et al. (2008) behind
+  `-dual-scatter`: the coat's multiple scattering as two analytic terms instead of 100+ bounces.
+  Global = light arriving *through* the coat, measured along the NEE shadow ray itself
+  (`Scene::walkFibers` accumulates `T_f = Π ā_f` and `σ̄_f² = Σ β̄_f²` over the strands crossed);
+  local = light that scattered backward off the strands behind and came back, one extra BCSDF lobe.
+  Three things are ours rather than the paper's. **The six averaged curves are measured from our own
+  BCSDF** by importance-sampling `hair::sample()` and splitting by azimuthal half, so the table
+  inherits energy conservation exactly (`ā_f + ā_b` = the §S1 furnace total, asserted at every
+  inclination) and picks up the medulla lobes for free. **The exact series are summed and eq. 16/17
+  are only checked** — substituting `k = j+1+q` collapses the triple sum to `Σ_n x^n n(n+1)/2 X(2n)`,
+  and the closed-form coefficients show eq. 16 prints `1 − 2u` where the sum gives `1 + 2u`; §S11
+  demonstrates the typo by shrinking `a_b` and measuring the order (printed form O(u¹·⁰⁰),
+  sign-corrected O(u¹·⁹⁸)) rather than asserting a tolerance, because `u = a_b²/(1−a_f²)²` is *not*
+  small for any plausible coat. **`N^G` becomes one Monte-Carlo draw** from the forward spread per
+  connection, which is why `f_back`'s Gaussian is not widened by `σ̄_f²` here — `dev` already carries
+  the blur. The bug worth remembering: pairing `hair::f` with the *light's* cosine instead of the
+  spread draw's left Chiang's `1/|cos θ_i|` uncancelled, and with `σ̄_f` over a radian after a dozen
+  crossings the draw lands near the fiber axis constantly — 13.4× too bright, 67× at the 99th
+  percentile, and completely hidden by sRGB clipping until the comparison moved to `-hdr` .pfm.
+  Measured on the fur alone vs. each scene's own 200-bounce reference: pale coat + area light 0.77×
+  at `d = 0.7`, 0.99× at `d = 0.9` (single scattering: 0.17×), 2.1× faster; under a sky 0.92×, 2.4×
+  faster. `-dual-db`/`-dual-df` split the two density factors so a brightness error can be
+  attributed to one branch. Docs in REFERENCE.md § Dual scattering; the two honest limitations
+  (slower on an absorbing coat, no indirect illumination on the coat) in `known-issues.md`.
 - 2026-08-10: **P3 stage 3 — the medulla (v0.173.0).** Yan et al. (2017)'s double cylinder on top of
   stage 1: two scattered lobes TT^s / TRT^s, four new `material { type hair }` keys (`medulla` = κ,
   `medulla_sigma_s`, `medulla_sigma_a`, `medulla_g`), and `preset <species>` for the ten fibers Yan

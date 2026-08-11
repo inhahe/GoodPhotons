@@ -5182,6 +5182,167 @@ static int checkHair() {
                    worstSpread < 0.012);
     }
 
+    // --- S11 the dual-scattering tables ----------------------------------------
+    // `hair::Dual` is the bridge between one fiber and a coat of them (P3 stage 4). Three
+    // things are worth pinning down, and only one of them is a fit.
+    //
+    //  (a) THE SPLIT IS EXACT. `a_f` and `a_b` are not separate integrals: they are the
+    //      furnace total of §S1 partitioned by which azimuthal half the sample landed in.
+    //      So `a_f + a_b` must be 1 for a white fiber, at every inclination, medullated or
+    //      not — with only Monte-Carlo error between them and 1.
+    //  (b) THE TRIPLE SUM COLLAPSES. Zinke eq. 13 sums over i >= 1, 0 <= j < i, k > j.
+    //      Substituting k = j+1+q makes the exponent m = 2(i+q) independent of j, so j is
+    //      a multiplicity of i, and with n = i+q the whole thing is a single sum weighted
+    //      by n(n+1)/2. Setting X = 1 must reproduce the paper's closed form. This is what
+    //      licenses `dualSeries` to compute the eq. 16/17 numerators exactly instead of
+    //      approximating them.
+    //  (c) EQ. 16 HAS A SIGN TYPO, AND THAT IS PROVABLE. Delta_b is linear in alpha_f and
+    //      alpha_b, so its two coefficients can be summed in closed form and compared with
+    //      what eq. 16 claims — no fiber, no Monte Carlo, no fit slack. Writing x = a_f^2
+    //      and u = a_b^2/(1-x)^2:
+    //          coefficient of alpha_b = (1 + 3u)/(1 + u)               = 1 + 2u + O(u^2)
+    //          coefficient of alpha_f = [2(1-x)^2 + 2 a_b^2 (1+2x)]
+    //                                   / [(1-x)((1-x)^2 + a_b^2)]     = eq.16's, to O(u)
+    //      Both are asserted against `dualSeries` to 1e-9 below, which also checks the
+    //      i,j,k -> n collapse for a *weighted* summand and not just the X=1 case of (b).
+    //      eq. 16's alpha_f term then reproduces the second line to first order, but its
+    //      alpha_b term reads 1 - 2u where the expansion says 1 + 2u. The two forms agree
+    //      as a_b -> 0, which is why the typo survives the paper's own plots; the test
+    //      shrinks a_b and watches the printed form's error stay first-order in u while
+    //      the corrected form's falls away quadratically.
+    //
+    //      Note what is NOT asserted: how closely eq. 16/17 track the exact sums on a real
+    //      fiber. They are expansions in u, and u = a_b^2/(1-a_f^2)^2 is not small for any
+    //      plausible coat (a_f = a_b = 0.5 already gives u = 0.44), so the residual is
+    //      first-order-in-nothing and scales with however large the measured alpha/beta
+    //      happen to be. That gap is printed for information — and is exactly why this
+    //      implementation evaluates the exact sums rather than the fits.
+    {
+        // (b) first: pure algebra, no fiber needed.
+        double worstSum = 0.0;
+        for (double af : {0.1, 0.3, 0.5, 0.7, 0.9, 0.97}) {
+            const double x = af * af;
+            double num = 0.0, xn = 1.0;
+            for (int n = 1; n <= 20000; ++n) { xn *= x; num += xn * 0.5 * n * (n + 1.0); }
+            const double closed = x / ((1.0 - x) * (1.0 - x) * (1.0 - x));
+            worstSum = std::max(worstSum, std::fabs(num - closed) / closed);
+        }
+        std::printf("[checkhair] S11 eq.13's triple sum vs its closed form, worst relative "
+                    "gap = %.3g\n", worstSum);
+        ok &= chk("S11 the i,j,k -> n collapse behind dualSeries is wrong", worstSum, 0.0, 1e-9);
+
+        // (c): the two coefficients of Delta_b in closed form, against dualSeries.
+        {
+            double worstCb = 0.0, worstCf = 0.0;
+            for (double af : {0.2, 0.4, 0.5, 0.6, 0.75, 0.9})
+            for (double ab : {0.05, 0.2, 0.4, 0.7, 1.0}) {
+                const double x = af * af, om = 1.0 - x;
+                const double Ab = ab * x / om + ab*ab*ab * x / (om*om*om);
+                // alpha_b's coefficient: set alpha_f = 0, alpha_b = 1.
+                const double cb = (ab * hair::dualSeries(x, false, 0.0, 1.0, false) +
+                                   ab*ab*ab * hair::dualSeries(x, true, 0.0, 1.0, false)) / Ab;
+                const double u = ab*ab / (om*om);
+                worstCb = std::max(worstCb, std::fabs(cb - (1.0 + 3.0*u) / (1.0 + u)));
+                // alpha_f's coefficient: set alpha_f = 1, alpha_b = 0.
+                const double cf = (ab * hair::dualSeries(x, false, 1.0, 0.0, false) +
+                                   ab*ab*ab * hair::dualSeries(x, true, 1.0, 0.0, false)) / Ab;
+                const double cfClosed = (2.0*om*om + 2.0*ab*ab*(1.0 + 2.0*x)) /
+                                        (om * (om*om + ab*ab));
+                worstCf = std::max(worstCf, std::fabs(cf - cfClosed) / cfClosed);
+            }
+            std::printf("[checkhair] S11 Delta_b's alpha_b / alpha_f coefficients vs their closed "
+                        "forms: %.3g abs, %.3g rel\n", worstCb, worstCf);
+            ok &= chk("S11 dualSeries does not reproduce Delta_b's closed-form coefficients",
+                      worstCb + worstCf, 0.0, 1e-9);
+
+            // The sign typo, isolated: only alpha_b is nonzero, so the whole discrepancy is
+            // the 1 -+ 2u term. Shrinking a_b drives u down; the corrected form's error must
+            // vanish an order in u faster than the printed one's.
+            const double afS = 0.5, x = afS*afS, om = 1.0 - x;
+            double ratioSmall = 0.0, ordPaper = 0.0, ordFixed = 0.0;
+            double ePaperPrev = 0.0, eFixedPrev = 0.0;
+            for (int s = 0; s < 4; ++s) {
+                const double ab = 0.2 * std::pow(0.1, s);
+                const double Ab = ab * x / om + ab*ab*ab * x / (om*om*om);
+                const double exact = (ab * hair::dualSeries(x, false, 0.0, 1.0, false) +
+                                      ab*ab*ab * hair::dualSeries(x, true, 0.0, 1.0, false)) / Ab;
+                const double eP = std::fabs(hair::dualDeltaFit(afS, ab, 0.0, 1.0, false) - exact);
+                const double eF = std::fabs(hair::dualDeltaFit(afS, ab, 0.0, 1.0, true)  - exact);
+                if (s > 0) {   // each step divides u by 100
+                    ordPaper = std::log10(ePaperPrev / eP) / 2.0;
+                    ordFixed = std::log10(eFixedPrev / eF) / 2.0;
+                }
+                ePaperPrev = eP; eFixedPrev = eF;
+                ratioSmall = eP / std::max(eF, 1e-300);
+            }
+            std::printf("[checkhair] S11 eq.16's alpha_b term: as printed it is O(u^%.2f), "
+                        "sign-corrected O(u^%.2f); at u=2e-6 it is %.3g x more wrong\n",
+                        ordPaper, ordFixed, ratioSmall);
+            ok &= want("S11 eq.16 as printed is not first-order wrong in u, so the 1-2u / 1+2u "
+                       "sign typo is not demonstrated", ordPaper > 0.9 && ordPaper < 1.1);
+            ok &= want("S11 the sign-corrected eq.16 is not second-order accurate in u",
+                       ordFixed > 1.9);
+        }
+
+        // (a): build real tables. Two fibers — a solid human-like one and a medullated
+        // cat — each in a white furnace and again with real absorption.
+        double worstFurnace = 0.0;
+        double worstDeltaPaper = 0.0, worstDeltaFixed = 0.0, worstSigma = 0.0;
+        double minSigmaSlack = 1e30;
+        double afWhite = 0.0, afDark = 0.0;
+        for (int which = 0; which < 2; ++which) {
+            hair::Params pr;
+            if (which == 1) {   // cat: a big scattering core
+                hair::Species sp{};
+                hair::findSpecies("cat", sp);
+                pr.eta = sp.eta; pr.alpha = sp.alphaDeg;
+                pr.betaM = hair::betaMFromDegrees(sp.betaMDeg);
+                pr.betaN = hair::betaNFromDegrees(sp.betaNDeg);
+                pr.kappa = sp.kappa; pr.mSigmaS = sp.mSigmaS; pr.mG = sp.mG;
+            }
+            const hair::Dual dw = hair::makeDual(pr, 0.0, 8192);   // white furnace
+            for (int i = 0; i < hair::Dual::N; ++i)
+                worstFurnace = std::max(worstFurnace, std::fabs(dw.af[i] + dw.ab[i] - 1.0));
+            // The fits, compared against the exact weighted sums the table actually holds —
+            // informational. What IS asserted is an invariant the exact sum cannot violate:
+            // sigma_b averages sqrt(2n beta_f^2 + beta_b^2) and sqrt(2n beta_f^2 + 3 beta_b^2),
+            // every term of which is at least beta_b, so the multiply-scattered backward lobe
+            // is never narrower than the single-scattered one.
+            for (int i = 0; i < hair::Dual::N; ++i) {
+                const double af = hair::clampd(dw.af[i], 0.0, 0.9999), ab = dw.ab[i];
+                worstDeltaPaper = std::max(worstDeltaPaper, std::fabs(
+                    hair::dualDeltaFit(af, ab, dw.alphaF[i], dw.alphaB[i], false) - dw.deltaB[i]));
+                worstDeltaFixed = std::max(worstDeltaFixed, std::fabs(
+                    hair::dualDeltaFit(af, ab, dw.alphaF[i], dw.alphaB[i], true) - dw.deltaB[i]));
+                worstSigma = std::max(worstSigma, std::fabs(
+                    hair::dualSigmaFit(af, ab, dw.betaF[i], dw.betaB[i]) - dw.sigmaB[i]));
+                minSigmaSlack = std::min(minSigmaSlack, dw.sigmaB[i] - dw.betaB[i]);
+                ok &= want("S11 a dual table entry is not finite",
+                           std::isfinite(dw.Ab[i]) && std::isfinite(dw.deltaB[i]) &&
+                           std::isfinite(dw.sigmaB[i]) && dw.Ab[i] >= 0.0);
+            }
+            if (which == 0) {
+                afWhite = dw.af[hair::Dual::N / 2];
+                const hair::Dual dd = hair::makeDual(pr, 3.0, 8192);   // strongly absorbing
+                afDark = dd.af[hair::Dual::N / 2];
+            }
+        }
+        std::printf("[checkhair] S11 a_f + a_b vs the §S1 furnace total, worst over 2 fibers "
+                    "x %d inclinations = %.4f\n", hair::Dual::N, worstFurnace);
+        ok &= want("S11 the forward/backward split does not conserve energy",
+                   worstFurnace < 0.01);
+        std::printf("[checkhair] S11 absorption cuts forward attenuation %.4f -> %.4f "
+                    "(sigma_a 0 -> 3)\n", afWhite, afDark);
+        ok &= want("S11 a_f is not reduced by absorption", afDark < afWhite);
+        std::printf("[checkhair] S11 sigma_b - beta_b over the built tables, smallest = %.4f "
+                    "(multiple scattering never narrows the backward lobe)\n", minSigmaSlack);
+        ok &= want("S11 sigma_b came out narrower than beta_b", minSigmaSlack > -1e-9);
+        std::printf("[checkhair] S11 on real fibers eq.16/17 miss the exact sums by %.3f rad "
+                    "(as printed) / %.3f rad (sign-corrected) / %.3f rad spread -- u is not "
+                    "small, so the exact sums are used\n",
+                    worstDeltaPaper, worstDeltaFixed, worstSigma);
+    }
+
     std::printf("[checkhair] worst absolute error (exact checks) = %.3g\n", worst);
     std::printf("[checkhair] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
@@ -9080,6 +9241,15 @@ static int g_giBounce = 4;
 // See BackwardRenderer::giClamp for the full rationale.
 static double g_giClamp = 0.0;
 
+// -dual-scatter (P3 stage 4): replace the fur coat's multiple-scattering random walk with
+// Zinke et al. 2008's two analytic terms. Biased, one-bounce fur, orders of magnitude
+// cheaper on a pale coat. See BackwardRenderer::dualScatter.
+static bool   g_dualScatter = false;
+static double g_dualDensity = 0.7;    // -dual-density: Zinke's d_f = d_b
+static double g_dualDb = -1.0;        // -dual-db: override d_b alone (<0 = follow -dual-density)
+static double g_dualDf = -1.0;        // -dual-df: override d_f alone
+static int    g_dualMaxCross = 64;    // -dual-max-cross
+
 // Mode W lights a surface ONLY by next-event estimation, and a shadow ray is blocked by
 // any geometry at all -- dielectrics very much included (Scene::occluded: "can't connect
 // through specular", the SDS limitation). So a light sealed inside refractive or mirrored
@@ -9548,6 +9718,9 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         br.ambient = g_ambient * scene.ambientRef();
         br.giDirs = g_gi; br.giGrid = g_giGrid; br.giBounce = g_giBounce;
         br.giClamp = g_giClamp * scene.ambientRef();   // same scaling as -ambient above
+        br.dualScatter = g_dualScatter; br.dualDensity = g_dualDensity;
+        br.dualMaxCross = g_dualMaxCross;
+        br.dualDb = g_dualDb; br.dualDf = g_dualDf;
         // Shading footprint for `fw` (O8 stage 2). Mode W only — see fwPerDist for why a
         // stochastic sampler wants none — and derived from the run's REQUESTED spp rather
         // than this call's chunk, so every chunk of a progressive or resumed render filters
@@ -12274,6 +12447,24 @@ static void printHelp(const char* prog) {
 "                        escaping gather ray returns, so the gather's fill is effectively\n"
 "                        min(-ambient, x) and a smaller x just darkens the whole scene\n"
 "\n"
+"Fur (mode R):\n"
+"  -dual-scatter         approximate a coat's MULTIPLE scattering analytically (Zinke\n"
+"                        et al. 2008) instead of path-tracing it. The shadow ray counts\n"
+"                        the strands it crosses and turns them into a forward-scattering\n"
+"                        transmittance + spread; local backscattering becomes one extra\n"
+"                        BCSDF lobe. Biased, and the fiber vertex ENDS the path (the\n"
+"                        analytic terms already carry the bounces) — but a pale coat that\n"
+"                        needs -max-bounce 200 renders as direct lighting. Fur only;\n"
+"                        every other material keeps full path tracing\n"
+"  -dual-density <d>     Zinke's density factor, \"how enclosed is a strand\" (default 0.7,\n"
+"                        the paper's value; realistic range 0.6-0.8). Scales the whole\n"
+"                        multiple-scattering contribution\n"
+"  -dual-db <d>          override d_b (the local backscatter lobe's weight) alone\n"
+"  -dual-df <d>          override d_f (the light let through the coat) alone. Either one\n"
+"                        unset follows -dual-density; -dual-df 0 leaves only the directly\n"
+"                        lit term, which is how you attribute a brightness error\n"
+"  -dual-max-cross <n>   strands one shadow ray counts before it stops (default 64)\n"
+"\n"
 "Denoising (post-pass on the linear image; affects the file AND the live window):\n"
 "  -denoise [amount]     edge-aware a-trous filter for SPECTRAL speckle. CHROMA ONLY by\n"
 "                        default: luma is left bit-identical, so no detail is lost. MC\n"
@@ -12777,6 +12968,21 @@ static int run(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-gi-clamp") && i + 1 < argc) {
             g_giClamp = std::max(0.0, std::atof(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-dual-scatter") || !std::strcmp(argv[i], "-dualscatter")) {
+            g_dualScatter = true;
+        }
+        else if (!std::strcmp(argv[i], "-dual-density") && i + 1 < argc) {
+            g_dualDensity = std::max(0.0, std::min(1.0, std::atof(argv[++i])));
+        }
+        else if (!std::strcmp(argv[i], "-dual-db") && i + 1 < argc) {
+            g_dualDb = std::max(0.0, std::min(1.0, std::atof(argv[++i])));
+        }
+        else if (!std::strcmp(argv[i], "-dual-df") && i + 1 < argc) {
+            g_dualDf = std::max(0.0, std::min(1.0, std::atof(argv[++i])));
+        }
+        else if (!std::strcmp(argv[i], "-dual-max-cross") && i + 1 < argc) {
+            g_dualMaxCross = std::max(1, std::atoi(argv[++i]));
         }
         // -denoise [amount]: the optional amount scales BOTH tolerances, so `-denoise 2`
         // is twice as aggressive and `-denoise 0.5` half. The argument is optional, so

@@ -751,6 +751,234 @@ inline double sigmaAFromReflectance(double c, double betaN) {
     return sqr(std::log(c) / d);
 }
 
+// --- Dual scattering (Zinke et al. 2008) --------------------------------------
+// P3 stage 4. Everything above describes ONE fiber. A coat is tens of thousands of them,
+// and in a light-coloured one most of what you see has crossed dozens before it reaches
+// the eye — which a path tracer can do, but only by paying for a hundred-bounce random
+// walk per sample. Dual scattering replaces that walk with two closed-form terms:
+//
+//   GLOBAL  — light that reached the shading point by scattering FORWARD through the
+//             strands between it and the light. Modelled as an attenuation `T_f` (the
+//             product of a per-fiber average forward attenuation `a_f`) times an angular
+//             SPREAD that has gone azimuthally isotropic and stays a narrow Gaussian
+//             longitudinally, with variance the SUM of the per-fiber variances.
+//   LOCAL   — light that turned around in the immediate neighbourhood. Folded into a
+//             single extra BCSDF lobe `f_back`, a material property, summed over all
+//             paths with one or three backward scattering events.
+//
+// The whole method rests on six averaged quantities per fiber, each a function of one
+// angle: the forward/backward average attenuation `a_f`/`a_b` (Zinke eq. 6 / 12) and the
+// mean and standard deviation of the longitudinal deviation each of those imposes. This
+// struct is that table.
+//
+// TWO THINGS ARE DONE DIFFERENTLY HERE, both deliberately.
+//
+// 1. The six curves are MEASURED FROM OUR OWN BCSDF by importance sampling it, not
+//    integrated from a lobe decomposition. `sample()` already returns a weight whose
+//    expectation is exactly `sum_p A_p`, the same quantity `-checkhair` §S1 asserts is 1
+//    in a white furnace — so `a_f + a_b` is that same total, split by which azimuthal
+//    half the sample landed in, and the table inherits the energy identity instead of
+//    re-deriving it. It also means the medulla (stage 3) is picked up for free: TT^s and
+//    TRT^s are just more lobes to the sampler, and a fur fiber's much larger forward
+//    attenuation appears in `a_f` with no extra code.
+//
+// 2. The average backscattering shift and spread are the EXACT weighted sums, not
+//    Zinke eq. 16/17. Those are stated in the paper as numerical fits "based on a power
+//    series expansion with respect to a_b up to an order of three", which is a sensible
+//    thing to do inside a real-time shader and a silly thing to do inside a table that is
+//    built once per material. The triple sum of eq. 13 collapses: substituting
+//    `k = j+1+q` makes the exponent `m = 2(i+q)` independent of `j`, so `j` contributes a
+//    multiplicity of `i` and, with `n = i+q`, the whole thing becomes a single sum
+//    `sum_n a_f^2n X(2n) * n(n+1)/2`. (Setting X = 1 reproduces eq. 13's closed form
+//    `a_f^2/(1-a_f^2)^3` — `-checkhair` §S11 checks that, and checks the eq. 16/17 fits
+//    against these sums.)
+//
+// Angles: every curve is indexed by an inclination in [-pi/2, pi/2]. Zinke overloads the
+// symbol theta_d for both "the inclination of the illumination at a scattering event"
+// (eq. 5/6) and "the difference angle (theta_o - theta_i)/2" (eq. 11-17); they are the
+// same table read at two different arguments, as in the paper's own implementation.
+struct Dual {
+    static const int N = 48;          // inclination bins, uniform over [-pi/2, pi/2]
+    double af[N], ab[N];              // average forward / backward attenuation
+    double alphaF[N], alphaB[N];      // mean longitudinal deviation of each
+    double betaF[N], betaB[N];        // and its standard deviation
+    // Derived, so the shader does no series summation: Zinke eq. 14, and the exact
+    // weighted sums the paper approximates with eq. 16 / 17.
+    double Ab[N], deltaB[N], sigmaB[N];
+};
+
+// Bin centre / lookup. Linear interpolation with clamped ends — the curves are smooth and
+// 48 bins over 180 degrees is finer than the angular structure they carry.
+inline double dualTheta(int i) { return -0.5 * kPi + (i + 0.5) * (kPi / Dual::N); }
+inline double dualLookup(const double t[Dual::N], double theta) {
+    const double x = clampd((theta + 0.5 * kPi) * (Dual::N / kPi) - 0.5, 0.0, Dual::N - 1.0);
+    const int i = int(x);
+    const int j = (i + 1 < Dual::N) ? i + 1 : i;
+    const double u = x - i;
+    return t[i] * (1.0 - u) + t[j] * u;
+}
+
+// A Gaussian of the given variance, normalised in the angle. This is Zinke's `g`.
+inline double dualG(double x, double var) {
+    const double v = std::max(var, 1e-8);
+    return std::exp(-0.5 * x * x / v) / std::sqrt(2.0 * kPi * v);
+}
+
+// The exact `sum_{n>=1} x^n w(n) X(n)` sums behind eq. 16/17, run to convergence.
+// `w(n) = 1` for the single-backscatter family and `n(n+1)/2` for the triple.
+inline double dualSeries(double x, bool triple, double a, double b, bool wantSigma) {
+    if (!(x > 0.0) || x >= 1.0) return 0.0;
+    double sum = 0.0, xn = 1.0;
+    for (int n = 1; n <= 4096; ++n) {
+        xn *= x;
+        const double w = triple ? (0.5 * n * (n + 1.0)) : 1.0;
+        // Single-backscatter path: 2n forward events plus one backward one.
+        // Triple: 2n forward events plus three backward ones.
+        const double val = wantSigma
+            ? std::sqrt((triple ? 3.0 * b * b : b * b) + 2.0 * n * a * a)
+            : ((triple ? 3.0 * b : b) + 2.0 * n * a);
+        const double term = xn * w * val;
+        sum += term;
+        if (term < 1e-14 * (sum + 1e-30) && n > 8) break;
+    }
+    return sum;
+}
+
+// Zinke eq. 16 and 17 verbatim, for §S11 to compare against the exact sums above.
+//
+// `signFix` flips the sign of eq. 16's `a_b^2` term. The exact coefficient of `alpha_b`
+// in the sum above is `(1 + 3u)/(1 + u)` with `u = a_b^2/(1 - a_f^2)^2`, whose expansion
+// is `1 + 2u`; the paper prints `1 - 2u`. §S11 measures both, and the fixed one tracks the
+// exact sum by two orders of magnitude better — so this is a sign typo in the paper, not a
+// disagreement about the model.
+inline double dualDeltaFit(double af, double ab, double alphaF, double alphaB,
+                           bool signFix = false) {
+    const double d = 1.0 - af * af;
+    if (!(d > 1e-6)) return alphaB;
+    const double u = ab * ab / (d * d);
+    return alphaB * (1.0 + (signFix ? 2.0 : -2.0) * u) +
+           alphaF * ((2.0 * d * d + 4.0 * af * af * ab * ab) / (d * d * d));
+}
+inline double dualSigmaFit(double af, double ab, double betaF, double betaB) {
+    const double den = ab + ab * ab * ab * (2.0 * betaF + 3.0 * betaB);
+    if (!(den > 1e-12)) return betaB;
+    return (1.0 + 0.7 * af * af) *
+           (ab * std::sqrt(2.0 * betaF * betaF + betaB * betaB) +
+            ab * ab * ab * std::sqrt(2.0 * betaF * betaF + 3.0 * betaB * betaB)) / den;
+}
+
+// Radical inverse in base `b` — the low-discrepancy sequence the table build uses in
+// place of an rng, so a material's table is identical run to run and thread to thread.
+inline double dualRadical(unsigned i, unsigned b) {
+    double f = 1.0 / b, r = 0.0;
+    for (unsigned n = i; n > 0; n /= b) { r += f * (n % b); f /= b; }
+    return r;
+}
+
+// Build the table for one fiber (one wavelength's worth of absorption). `nSamples` fiber
+// samples per inclination bin; 4096 is plenty for curves this smooth (the sampler is
+// importance-sampling the BCSDF, so the weights are near-constant).
+inline Dual makeDual(const Params& pr, double sigmaA, int nSamples = 4096) {
+    Dual d{};
+    for (int i = 0; i < Dual::N; ++i) {
+        const double th = dualTheta(i);
+        const double sinThetaO = std::sin(th), cosThetaO = std::cos(th);
+        const Vec3 wo{sinThetaO, cosThetaO, 0.0};      // phi_o = 0: the fiber is azimuthally
+                                                       // symmetric, so this loses nothing
+        double sF = 0.0, sB = 0.0;                     // sum of weights, forward / backward
+        double m1F = 0.0, m2F = 0.0, m1B = 0.0, m2B = 0.0;   // weighted moments of the deviation
+        for (int k = 0; k < nSamples; ++k) {
+            // h uniform over the fiber's cross-section is exactly the near-field ->
+            // far-field average the averaged attenuations are defined against.
+            const double h  = 2.0 * dualRadical(k + 1, 2) - 1.0;
+            const Bcsdf b = make(pr, h, sigmaA);
+            double pdf = 0.0, fv = 0.0;
+            const Vec3 wi = sample(b, wo, dualRadical(k + 1, 3), dualRadical(k + 1, 5),
+                                   dualRadical(k + 1, 7), dualRadical(k + 1, 11), pdf, fv);
+            if (!(pdf > 0.0) || !(fv > 0.0)) continue;
+            const double sinThetaI = clampd(wi.x, -1.0, 1.0);
+            const double cosLong = safeSqrt(1.0 - sqr(sinThetaI));
+            const double w = fv * cosLong / pdf;       // E[w] = sum_p A_p
+            if (!(w > 0.0) || !std::isfinite(w)) continue;
+            // The deviation from the specular cone. Both directions point AWAY from the
+            // fiber, and in that convention every lobe — reflected or transmitted — peaks
+            // at theta_i = -theta_o, so this is zero on the cone and the cuticle tilt is
+            // what makes its mean nonzero. It is the variable Marschner's M is a Gaussian
+            // in, which is why variances add along a path.
+            const double dev = std::asin(sinThetaI) + th;
+            // Forward vs backward is azimuthal: phi = 0 is retro-reflection (the R lobe)
+            // and phi = pi is straight through (TT). Zinke's front hemisphere is |phi| >
+            // pi/2, i.e. wi on the far side of the fiber from wo.
+            if (wi.y < 0.0) { sF += w; m1F += w * dev; m2F += w * dev * dev; }
+            else            { sB += w; m1B += w * dev; m2B += w * dev * dev; }
+        }
+        const double inv = 1.0 / double(nSamples);
+        d.af[i] = sF * inv;
+        d.ab[i] = sB * inv;
+        d.alphaF[i] = (sF > 0.0) ? m1F / sF : 0.0;
+        d.alphaB[i] = (sB > 0.0) ? m1B / sB : 0.0;
+        d.betaF[i]  = (sF > 0.0) ? safeSqrt(m2F / sF - sqr(d.alphaF[i])) : 0.0;
+        d.betaB[i]  = (sB > 0.0) ? safeSqrt(m2B / sB - sqr(d.alphaB[i])) : 0.0;
+    }
+    // Eq. 11 / 13 / 14 and the exact forms of 16 / 17.
+    for (int i = 0; i < Dual::N; ++i) {
+        const double af = clampd(d.af[i], 0.0, 0.9999), ab = clampd(d.ab[i], 0.0, 1.0);
+        const double x = af * af, om = 1.0 - x;
+        const double A1 = ab * x / om;                       // eq. 11
+        const double A3 = ab * ab * ab * x / (om * om * om); // eq. 13
+        d.Ab[i] = A1 + A3;
+        if (d.Ab[i] > 1e-12) {
+            const double sD = ab       * dualSeries(x, false, d.alphaF[i], d.alphaB[i], false) +
+                              ab*ab*ab * dualSeries(x, true,  d.alphaF[i], d.alphaB[i], false);
+            const double sS = ab       * dualSeries(x, false, d.betaF[i],  d.betaB[i],  true) +
+                              ab*ab*ab * dualSeries(x, true,  d.betaF[i],  d.betaB[i],  true);
+            d.deltaB[i] = sD / d.Ab[i];
+            d.sigmaB[i] = sS / d.Ab[i];
+        } else {
+            d.deltaB[i] = d.alphaB[i];
+            d.sigmaB[i] = d.betaB[i];
+        }
+    }
+    return d;
+}
+
+// The local-multiple-scattering lobe, Zinke eq. 10 + 15, in THIS renderer's normalisation.
+// `thetaD` is the difference angle (theta_o - theta_i)/2, which indexes the tables; `dev`
+// the deviation from the specular cone (theta_o + theta_i), which the Gaussian is in; and
+// `cosThetaI` the incident longitudinal cosine. The azimuthal restriction to the backward
+// half is applied by the caller, which knows phi.
+//
+// Zinke widens the Gaussian by the accumulated forward spread, `sigma_b^2 + sigma_f^2`,
+// because in the paper the incident direction is still the light's and the spread has to be
+// reintroduced analytically. Here it is not: the caller draws the arriving direction FROM
+// that spread (hairSpreadDir) and evaluates this lobe at the draw, so the blur is already
+// in `dev`. Adding sigma_f^2 on top would apply it twice, which is why there is no such
+// argument.
+//
+// THE PREFACTOR IS DERIVED, NOT COPIED. The paper writes `2 A_b g / (pi cos^2 theta_d)`,
+// which is in MARSCHNER's normalisation (S = M N / cos^2 theta_d). `hair.h` is CHIANG's:
+// `f = sum_p A_p M_p N_p / |cos theta_i|`, with `M` a density in theta against
+// `cos theta_i d theta_i` and `N` a density in phi, so that `INT f cos theta_i domega` is
+// `sum_p A_p`, the albedo. Requiring the same of the backscatter lobe — a Gaussian of unit
+// area in `dev`, uniform density `1/pi` over the pi-wide backward azimuths, total albedo
+// `A_b` — pins the prefactor:
+//     INT f_back cos theta_i domega = INT INT f_back cos^2 theta_i d theta_i d phi = A_b
+//     =>  f_back = A_b g(dev - delta_b) / (pi cos^2 theta_i).
+// So the `2` goes, and the cosine is the SAMPLE's rather than the difference angle's. On
+// `scenes/fur_species.ftsl` that correction is worth well under a percent — this lobe is a
+// few per cent of the coat's radiance, so its prefactor was never going to be visible. It
+// is here because it is the normalisation this file actually uses, and because leaving a
+// `cos^2 theta_d` in a denominator that is guarded at 1e-6 leaves a 1e4 firefly multiplier
+// lying around on a quantity that does not need one. (The bug that DID cost 13.4x on that
+// scene was the caller pairing `hair::f` with the wrong cosine — see hairDualFCos.)
+inline double fBack(const Dual& d, double thetaD, double dev, double cosThetaI) {
+    const double cc = std::max(cosThetaI * cosThetaI, 1e-6);
+    const double Ab = dualLookup(d.Ab, thetaD);
+    if (!(Ab > 0.0)) return 0.0;
+    const double sb = dualLookup(d.sigmaB, thetaD);
+    return Ab * dualG(dev - dualLookup(d.deltaB, thetaD), sb * sb) / (kPi * cc);
+}
+
 // --- Hooking the model to a hit ----------------------------------------------
 // Recover the impact parameter from geometry the intersector already produced. `n` is the
 // outward GEOMETRIC normal at the hit and `tangent` the fiber axis; both are what
