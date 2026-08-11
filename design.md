@@ -2291,6 +2291,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   worst 0.016 — it stops improving because the residual is no longer the table but the
   sigmoid-of-a-quadratic model's own 0.019 error at pure white, so `STOCH_JH_N = 64`,
   `STOCH_JH_PMAX = 60`.
+  • *Validated in the render, not only in the unit test.* `scenes/stochtile.ftsl` rendered on
+  all three backends and compared statistically: the lattice autocorrelation at exactly one
+  repeat (64 px) is +0.998/+1.000/+1.000 on the plain half and **+0.017 on the stochastic
+  half — the same value to three decimals on all three renderers**, which is the real
+  evidence they run one operator rather than three similar ones. And the operator's own claim
+  holds end to end: the stochastic half's mean and sd (0.2690 / 0.1485) match the plain half's
+  (0.2679 / 0.1492), i.e. the histogram survived the blend rather than regressing to the mean.
+  CPU vs CUDA spectral differ by mean |Δ| 0.0058 with means agreeing to 0.0005, so the
+  difference is Monte Carlo noise between two independent runs, not a systematic split.
   • *A latent `fitSigmoid` divergence was found on the way and fixed.* Undamped Gauss-Newton
   diverged for dark saturated colours (red at Y=0.001 gave `|XYZ − target| = 1.41`, blue at
   Y=0.01 gave 1.40); the backtracking line search brought those to 0.0008 / 0.0001, and §8
