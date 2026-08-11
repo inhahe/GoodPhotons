@@ -139,6 +139,15 @@ argument for standing a groom in a hall of polished objects.*
   records, so a groom needs no new code anywhere downstream and inherits the GPU path
   for free; the build is a deterministic, lock-free pure function of
   `(surface, parameters, seed)`.
+- **Fiber BCSDF (`material { type hair }`)** — a strand shaded as what it is, a
+  translucent dielectric *cylinder*, not a surface: Marschner's R / TT / TRT lobes in
+  Chiang's energy-conserving form, so a backlit coat has the forward glow and the
+  offset secondary highlight that a coloured `diffuse` cylinder can never produce. On
+  top of that, Yan's **medulla** — the scattering core that is the actual difference
+  between hair and fur — with the ten species he fitted available as
+  `preset <bobcat|cat|deer|dog|mouse|rabbit|raccoon|redfox|springbok|human>`. The
+  physics is guarded by `-checkhair`, which asserts the white furnace as *algebra* at
+  1e-12 rather than as a picture.
 - **Participating media** — one or many coexisting (superposed) fog regions with
   Henyey–Greenstein or Rayleigh scattering; box / sphere / **named-object** bounds
   (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous
@@ -311,6 +320,7 @@ stays something you can actually read end to end.
 | Area / sphere / cylinder / spot / sun / environment emitters and how they're sampled | [Lights](REFERENCE.md#lights) |
 | Primitives, transforms, meshes (`.obj` / `.gltf` / `.glb` / `.fbx` / `.stl` / `.ply` / `.ftmesh`), CSG, isosurfaces | [Geometry](REFERENCE.md#geometry) |
 | Hair / fur / grass / wire strands — the `curve` primitive and its four bases | [Curves and fibers](REFERENCE.md#curves-and-fibers-curve) |
+| Shading a strand as a fiber rather than a surface — R / TT / TRT, the scattering medulla, measured species | [Hair and fur fibers](REFERENCE.md#hair-and-fur-fibers-hair) |
 | Image textures, UV handling, and the math-driven procedural patterns | [Textures](REFERENCE.md#textures) · [Patterns](REFERENCE.md#procedural-patterns-math-driven-materials) |
 | Fog and volumes: homogeneous, bounded, heterogeneous density fields, OpenVDB / NanoVDB import | [Participating media](REFERENCE.md#participating-media--fog) |
 | A tour of the scene language, and stereoscopic / animation workflows | [Scene language](REFERENCE.md#scene-language-ftsl) |

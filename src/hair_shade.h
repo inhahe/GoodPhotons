@@ -49,6 +49,12 @@ inline HairShade hairShadeAt(const Scene& scene, const Material& m, const Hit& h
     pr.betaM = m.hairBetaM;
     pr.betaN = m.hairBetaN;
     pr.alpha = m.hairAlpha;
+    // Medulla (stage 3). kappa = 0 is the default, which makes every one of these inert
+    // and leaves the fiber a solid stage-1 cylinder.
+    pr.kappa   = m.hairKappa;
+    pr.mG      = m.hairMedullaG;
+    pr.mSigmaS = std::max(0.0, m.hairMedullaSigmaS(lambda));
+    pr.mSigmaA = std::max(0.0, m.hairMedullaSigmaA(lambda));
 
     double sigmaA;
     if (m.hairSigmaAFromReflect) {

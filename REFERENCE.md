@@ -24,6 +24,8 @@ Three neighbouring documents cover what this one only summarises:
 - [Cameras](#cameras)
 - [Materials](#materials)
   - [Hair and fur fibers (`hair`)](#hair-and-fur-fibers-hair)
+    - [The medulla — what makes fur not hair](#the-medulla--what-makes-fur-not-hair)
+    - [`preset` — measured species](#preset--measured-species)
 - [Spectra (SPDs, reflectances, indices)](#spectra-spds-reflectances-indices)
   - [Spectral representation vs. other renderers](#spectral-representation-vs-other-renderers)
 - [Lights](#lights)
@@ -1095,7 +1097,7 @@ Declared with `material "name" { type <type> … }`.
 | `multilayer` | N-layer Abelès transfer-matrix stack | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>` |
 | `grating` | Reflective diffraction grating | `reflect`, `groove_spacing` (nm), `groove_dir`, `max_order` |
 | `fluorescent` | Stokes-shifted fluorescence. **Note `emit` means something different here:** on a fluorescent it is the *reradiation* spectrum — the SHAPE of the Stokes-shifted emission band, normalised by its own integral — **not** self-emission, so a fluorescent surface is never a light. (`emit_map` is therefore rejected on a fluorescent: a reradiation profile isn't a surface pattern.) For a surface that both fluoresces and glows on its own, use a `mix` of a `fluorescent` and an emissive `diffuse` | `reflect` (elastic base lobe), `absorb` (excitation band), `emit` (reradiation band), `yield` (quantum yield ≤ 1) |
-| `hair` | **Fiber BCSDF** for hair / fur strands (Marschner R + TT + TRT, Chiang importance-sampled form) — a scattering model for a translucent dielectric *cylinder*, not a surface. Meant for `curve` / `fur` geometry. See [Hair and fur fibers](#hair-and-fur-fibers-hair) below | `reflect` (the colour you want the coat to be — inverted into an absorption, **not** a Lambertian albedo), or `sigma_a` (the absorption directly, which wins if present); `eta`, `beta_m`, `beta_n` (longitudinal / azimuthal roughness), `alpha` (cuticle tilt, degrees) |
+| `hair` | **Fiber BCSDF** for hair / fur strands (Marschner R + TT + TRT, Chiang importance-sampled form, plus Yan's scattering medulla) — a scattering model for a translucent dielectric *cylinder*, not a surface. Meant for `curve` / `fur` geometry. See [Hair and fur fibers](#hair-and-fur-fibers-hair) below | `preset <species>` (a measured fur — everything below defaults from it); `reflect` (the colour you want the coat to be — inverted into an absorption, **not** a Lambertian albedo), or `sigma_a` (the absorption directly, which wins if present); `eta`, `beta_m`, `beta_n` (longitudinal / azimuthal roughness), `alpha` (cuticle tilt, degrees); `medulla` (κ), `medulla_sigma_s`, `medulla_sigma_a`, `medulla_g` |
 | `mix` | Stochastic blend of materials | repeated `layer <material> <weight>`; optional `weight_map texture:<name>` **or `weight_map pattern:<name>`** (2-child spatial blend mask — with a pattern this becomes a math-driven *per-point material selection*, see Procedural patterns) |
 | `layered` | Physical coat over a weighted body: reflect off the coat with prob R, else enter and pick one body lobe (energy-consistent). CPU only | `coat { reflectance fresnel\|thinfilm\|manual, ior, roughness[/roughness_map], film_ior, film_thickness[/film_thickness_map], specular }` + repeated body `layer <material> <weight>` |
 
@@ -1197,6 +1199,70 @@ material "sleek"  { type hair  sigma_a rgb 0.42 0.63 1.19  beta_m 0.10  beta_n 0
                     alpha 3.0 }
 fur "coat" { on "head"  material blonde  count 70000  length 0.055  radius 0.00005 }
 ```
+
+#### The medulla — what makes fur not hair
+
+A human hair is close to a solid rod. **Animal** fur is not: it has a **medulla**, a wide
+scattering core running down the middle, and that core is most of the difference between
+the two. Light that enters an animal fiber usually does not cross it cleanly — it hits the
+core, bounces around inside, and leaves in a direction that has partly forgotten where it
+came in. So a real coat's forward glow is soft and broad where a hair's TT lobe is a sharp
+blade, and its secondary highlight is a wash rather than a glint.
+
+`type hair` models this after Yan et al. 2017 ("A BSSRDF Model for Efficient Rendering of
+Fur with Global Illumination"), which adds two **scattered** lobes, TT<sup>s</sup> and
+TRT<sup>s</sup>, alongside the three specular ones. Its key simplification is to give the
+cortex and the medulla the *same* index of refraction, so the interior ray does not bend at
+the core boundary — the path topology stays exactly R / TT / TRT, and the medulla only
+changes what happens *along* a chord.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `medulla` | `0` | **κ**, the medulla's radius as a fraction of the fiber's. `0` leaves a solid Marschner cylinder and makes the three keys below inert, so nothing changes for an existing `hair` material. Human hair is ≈ 0.36; every animal Yan measured is 0.65–0.91. |
+| `medulla_sigma_s` | `0` | Scattering coefficient of the core, in 1/(fiber radius). This is the knob that turns a glint into a wash. |
+| `medulla_sigma_a` | `0` | Absorption coefficient of the core. Usually small — the core mostly scatters. |
+| `medulla_g` | `0` | Henyey–Greenstein anisotropy of the core, −1…1. Forward-peaked (positive) cores randomise the direction more slowly. |
+
+Energy is still exact: the scattered lobes are built as the *difference* between the
+specular chain with the medulla and the same chain with the core replaced by cortex, so all
+six lobes sum to 1 in a white furnace as an algebraic identity, not a near-miss
+(`-checkhair` §S1 asserts it at 1e-12, medullated and not).
+
+> **Where the colour has to go.** `reflect` and `sigma_a` tint the **cortex** — and on a fur
+> fiber there is barely any cortex left. κ = 0.87 means the core is 87 % of the radius, so a
+> ray crosses a thin pigmented shell and then meets a strongly scattering, colourless core
+> that sends it back out almost untinted. Tinting the cortex of a big-core species gives you
+> a *pale* coat, not a coloured one. Use `medulla_sigma_a` — which is a spectrum, like every
+> absorption here — to colour the core, and use `reflect` for the shell on top of it. On a
+> small-κ fiber (human hair) the old intuition still holds and `reflect` is all you need.
+>
+> The same effect makes a medullated coat much **brighter** than the solid fiber with
+> identical parameters: measured on one ball under one key light, a `preset cat` coat reads
+> 82 against 34 for the same fiber with `medulla 0`. A solid cat fiber has `beta_n` 1.3°, so
+> its TT lobe is a razor-thin forward spike that fires light straight through the coat into
+> whatever is underneath; the core intercepts it a fraction of a radius in and scatters it
+> broadly back out. `scenes/fur_species.ftsl` renders that A/B side by side.
+
+#### `preset` — measured species
+
+Yan et al. fitted their model to goniophotometer measurements of ten real fibers. Those
+fits are shipped as named presets:
+
+```
+material "fox" { type hair  preset redfox }
+```
+
+`bobcat`, `cat`, `deer`, `dog`, `mouse`, `rabbit`, `raccoon`, `redfox`, `springbok`,
+`human`. Spelling is forgiving — `red fox`, `red_fox`, `RedFox` all work.
+
+A preset supplies **defaults only**, so any key you also write wins:
+`preset redfox  beta_n 0.05` is a red fox with the glint sharpened, and
+`preset rabbit  reflect rgb 0.9 0.9 0.9` is a white rabbit (an explicit `reflect` overrides
+the preset's measured cortex absorption; without one, the measured value is used). A preset
+sets `eta`, `alpha`, `beta_m`, `beta_n`, `sigma_a` and all four medulla keys at once — the
+paper reports the roughnesses as Gaussian widths in degrees, and they are converted into
+the perceptual 0–1 knobs on the way in, so the table in the source can be diffed against
+the paper line by line.
 
 Put it on [`curve`](#curves-and-fibers-curve) or [`fur`](#grooms-fur) geometry: those
 intersectors report the fiber axis and the impact parameter, which is what the model needs.
@@ -3803,7 +3869,7 @@ across seeds, growth never pointing into the skin, clumping that collapses tips 
 moving roots, a well-formed segment chain, and a regression on the loader-ordering trap
 that once made a whole groom generate zero strands silently — see **Grooms** above.
 `-checkhair` guards the **fiber BCSDF** (Marschner's R / TT / TRT lobes in Chiang's
-energy-conserving form) in nine sections. A hair BCSDF that is subtly wrong still looks
+energy-conserving form, plus Yan's medulla) in ten sections. A hair BCSDF that is subtly wrong still looks
 like hair, so every claim is a number rather than a picture — and wherever the physics
 allows it, an *exact* number rather than a Monte-Carlo estimate. Because the lobes
 separate into a longitudinal `M_p`, an azimuthal `N_p` and an attenuation `A_p`, and each
@@ -3817,6 +3883,10 @@ report, and its empirical density matches; absorption darkens monotonically whil
 lobe — which never enters the fiber — survives an opaque one; the three lobes peak within
 0.02° of the azimuths Snell predicts at impact parameter `h = 0.6`, and a 3° cuticle tilt
 moves the R highlight by 2.97°; and `h` is recovered from the hit geometry to 5e-14.
+The medulla adds two of its own: the six-lobe furnace still closes to `2e-16` over 405
+(κ, σ_s, g, h, θ) combinations, and the one piece of the model that is *not* Yan's — the
+analytic stand-in for their unpublished `C^M` / `C^N` tables — is pinned against a
+brute-force Henyey-Greenstein random walk through the core, which it tracks to 0.003.
 `-checkcontainer` guards the isosurface container clip: rotating an
 isosurface must not change what a ray sees, so it builds the same solid twice
 (axis-aligned and rigidly rotated) and checks that correspondingly rotated rays

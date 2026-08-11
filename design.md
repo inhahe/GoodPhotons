@@ -457,9 +457,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     mutation run will tell you which fixture that is.
 - **`hair.h`** — the **fiber BCSDF**: Marschner's (2003) R / TT / TRT lobes in Chiang et
   al.'s (2016) energy-conserving form. Header-only, `<cmath>` + `linalg.h`, no renderer
-  dependencies, so it can be unit-tested with no scene (`-checkhair`, nine sections). 0.171.0
+  dependencies, so it can be unit-tested with no scene (`-checkhair`, ten sections). 0.171.0
   added the core; **0.172.0 wired it up** as `material { type hair }` — see the
-  `hair_shade.h` entry below for the Scene↔BCSDF bridge and how each renderer consumes it.
+  `hair_shade.h` entry below for the Scene↔BCSDF bridge and how each renderer consumes it;
+  **0.173.0 added the medulla**, the scattering core that separates fur from hair.
   - *Why Chiang's form and not Marschner's directly.* Marschner's `M_p` is a flat Gaussian
     in θ, which integrates to **more** than 1 as roughness grows — that is exactly where the
     2003 model's famous energy gain comes from, and why practical implementations bolt on an
@@ -505,6 +506,52 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     weight is just `fOut·|cos θ_i|/pdfOut` — and §5 asserts those agree with independent
     `f()` / `pdf()` calls to *zero* relative error, which is the cheapest possible guard
     against the classic sample/evaluate drift.
+  - *The medulla (0.173.0), and why it grafts on instead of replacing anything.* A fur fiber
+    is a hair with a wide scattering core; Yan et al. (2017) model it as a **double
+    cylinder** and add two scattered lobes TT^s / TRT^s to Marschner's three. Their decisive
+    simplification is to give cortex and medulla the **same IOR**, so the interior ray does
+    not refract at the core boundary: the path topology stays exactly R/TT/TRT and the
+    medulla only changes what happens *along* a chord. That is why the whole feature is one
+    `Chord` struct out of `refractGeom` plus two extra lobes, rather than a second model.
+    With `kappa = 0` every added term is provably inert and `refractGeom` takes a branch that
+    reproduces the stage-1 expression to the last bit.
+  - *The scattered lobes are a DIFFERENCE, which is what keeps the furnace exact.* Yan's
+    eq. 20 leaves the scattered *fraction* implicit in the normalisation of their measured
+    `C^N` table. Supplying it the obvious way — `1 − exp(−σ_s·chord)` times a Fresnel guess —
+    does not conserve energy, because the scattered light then pays a different toll leaving
+    the fiber than the specular light it was taken from. So `ApScattered` runs the stage-1
+    chain **twice**: once with the real medulla, once with the core replaced by cortex. The
+    gap between the two totals *is* the energy the medulla removed, by construction. Multiply
+    by the core's single-scattering albedo (keep what scattered, not what was absorbed) and
+    Yan's `Tb` (the trip out), and at zero absorption the six lobes sum to
+    `Σ_medullated + (1 − Σ_medullated) = 1` — an algebraic identity, asserted at 1e-12 over
+    405 (κ, σ_s, g, h, θ) combinations exactly as the solid fiber is.
+  - *Similarity theory stands in for `C^M` / `C^N`, and is checked against a random walk.*
+    Yan's angular profiles are 24×16×16×720 Monte-Carlo tables, rank-16 tensor-decomposed to
+    150 KB — and never published. Re-deriving them would mean shipping either a 600 MB
+    simulation or a blob nobody can check. Instead one number does the work: after reduced
+    optical depth `τ' = (1−g)σ_s·chord`, the transmitted mean cosine decays as `exp(−τ')`,
+    which drives both the longitudinal variance and the azimuthal logistic width, with the
+    right limits at both ends (thin core → the specular lobe; thick core → azimuthally
+    uniform, which is what a diffusive core should look like). Because that is a claim about
+    an actual walk rather than a fit, §S10 checks it against one: free flights along the
+    chord, Henyey–Greenstein deflections composed as real 3-D rotations, mean cosine measured
+    over 120 000 walks. It tracks the analytic value to 0.003 — and the same section
+    re-derives the medulla half-chord by **bisection** rather than
+    `sqrt(κ² − sin²γ_t)`, so a swapped radius would surface as a geometry error instead of
+    hiding inside a plausible-looking spread.
+  - *Measured species are data, not presets-as-code.* `hair::speciesTable()` is Yan Table 4
+    verbatim — ten fitted fibers, angles left in **degrees** and σ's in 1/radius exactly as
+    printed, so the table can be diffed against the paper line by line. The degree→perceptual
+    conversion happens on the way out through `betaMFromDegrees` / `betaNFromDegrees`, which
+    invert Chiang's fitted polynomials by their leading quadratic (the β²⁰/β²² terms exist
+    only to blow up in the last few percent before β = 1 and are numerically absent below
+    that; the largest measurement in the table is 18.94°, where the cubic-and-up terms
+    contribute < 1e-9). The FTSL `preset` keyword feeds the row in as *defaults only*, so
+    every key an author also writes still wins — `preset redfox  beta_n 0.05` needs nothing
+    re-typed. Note what the table says: every animal Yan measured has κ ∈ [0.65, 0.91] and
+    human hair 0.36, i.e. the medulla is not a refinement of the hair model, it is the
+    difference between hair and fur.
 - **`hair_shade.h`** — the **Scene ↔ `hair.h` bridge** (0.172.0). `hairShadeAt(scene, mat,
   hit, λ, wo)` builds a `HairShade { hair::Bcsdf b; hair::Frame fr; Vec3 woLocal; double
   radius; }` from a `Material` + `Hit`: it resolves σa (either authored directly, or inverted

@@ -1,0 +1,172 @@
+# THE MEDULLA — what actually separates fur from hair.
+#
+# `scenes/hair_basics.ftsl` is the fiber model itself: R, TT, TRT, a cuticle tilt, an
+# interior absorption. All of that describes a solid rod, which is a fair description of a
+# HUMAN hair. It is not a description of an animal's.
+#
+# An animal fiber has a MEDULLA: a wide, air-and-protein core running down the middle that
+# SCATTERS. Light that enters it does not cross cleanly and leave in the direction Snell
+# predicts — it rattles around in the core and comes out having partly forgotten where it
+# went in. So:
+#
+#   * the forward (TT) glow of a real coat is a broad soft wash, where a human hair's is a
+#     narrow blade;
+#   * the secondary (TRT) highlight is a sheen instead of a glint;
+#   * and the coat as a whole is brighter than its absorption alone would suggest, because
+#     light that would have been swallowed on a long chord instead scatters back out.
+#
+# Yan et al. 2017 ("A BSSRDF Model for Efficient Rendering of Fur with Global
+# Illumination") model this as a DOUBLE CYLINDER and add two scattered lobes, TT^s and
+# TRT^s, to Marschner's three. Their key move is to give the cortex and the medulla the
+# SAME index of refraction, so the interior ray does not bend at the core boundary: the
+# path topology stays exactly R / TT / TRT, and the medulla only changes what happens
+# ALONG a chord. That is why it is four extra keywords here and not a second material.
+#
+#   medulla <0..1>        kappa — the core's radius as a fraction of the fiber's. 0 (the
+#                         default) leaves a solid Marschner cylinder and makes the three
+#                         keys below inert, so nothing changes for an existing `hair`.
+#   medulla_sigma_s <s>   how strongly the core scatters, in 1/(fiber radius). THIS is the
+#                         knob that turns a glint into a wash.
+#   medulla_sigma_a <s>   how strongly the core absorbs. Usually small — a medulla mostly
+#                         scatters.
+#   medulla_g <-1..1>     Henyey-Greenstein anisotropy of the core. Forward-peaked cores
+#                         (positive g) randomise the direction more slowly.
+#
+#   preset <species>      loads one of the ten fibers Yan et al. actually fitted against
+#                         goniophotometer measurements: bobcat, cat, deer, dog, mouse,
+#                         rabbit, raccoon, redfox, springbok, human. It supplies DEFAULTS
+#                         only, so any key you write alongside it still wins.
+#
+# Read the numbers in that table and the headline is unmistakable: kappa is 0.65..0.91 for
+# every animal measured, and 0.36 for human hair. The medulla is not a refinement of the
+# hair model. It is the difference between hair and fur.
+#
+# The back row of this scene is the A/B that makes the point: the same cat fiber, twice,
+# with the core switched off on the right. Same colour, same roughness, same tilt — and a
+# completely different material.
+#
+#   ftrace -in scenes/fur_species.ftsl -mode R -spp 512 -max-bounce 200 \
+#          -o png/fur_species.png -window -keepwindow -checkpoint
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse  reflect whitewall 0.32 }
+material "grey"  { type diffuse  reflect 0.18 }
+material "skin"  { type diffuse  reflect rgb 0.35 0.26 0.22 }
+
+# --- four measured species ------------------------------------------------------------
+# A preset gives you the fiber's STRUCTURE — medulla, roughnesses, cuticle tilt, IOR — which
+# is the part nobody can guess and Yan measured. It does not give you a colour: a
+# goniophotometer measures a BRDF, so his fits are monochrome, and a bare `preset deer` is a
+# neutral fiber whose measured cortex absorption (1.39, the darkest in the table) leaves it
+# nearly black in bulk. That last ball is left as measured, for comparison; the other three
+# are coloured.
+#
+# WHERE THE COLOUR HAS TO GO, and this is the part that surprises. `reflect` (and `sigma_a`)
+# tint the CORTEX — and on a fur fiber there is barely any cortex left. kappa 0.87 means the
+# core is 87 % of the radius, so a ray crosses only a thin shell of pigmented cortex before
+# it meets a strongly scattering, nearly colourless medulla and comes back out. Tint the
+# cortex of a cat fiber and you get a coat that is *pale*, not coloured. Real animal colour
+# lives in the whole fiber, so on a big-core species it is `medulla_sigma_a` — a SPECTRUM,
+# like every absorption here — that actually does the work. Both are used below: `reflect`
+# sets the shell, `medulla_sigma_a` sets the core, and the core wins.
+material "fox"   { preset redfox                                    # kappa 0.86, the broadest beta_n in the table
+                   reflect rgb 0.52 0.30 0.14
+                   medulla_sigma_a rgb 0.04 0.24 0.60 }             # absorbs blue -> rufous
+material "kitty" { preset cat                                       # kappa 0.87, beta_n 1.3 deg — a glint, softened
+                   reflect rgb 0.55 0.50 0.44
+                   medulla_sigma_a rgb 0.16 0.18 0.24 }             # near-neutral -> grey tabby
+material "bunny" { preset rabbit                                    # kappa 0.79, a weakly scattering core
+                   reflect rgb 0.82 0.78 0.72
+                   medulla_sigma_a rgb 0.02 0.03 0.05 }             # almost none -> pale
+material "doe"   { preset deer                                }     # kappa 0.91, the largest core — exactly as measured
+
+# --- the A/B --------------------------------------------------------------------------
+# Identical apart from the core, same groom seed, strand for strand. `medulla 0` is not
+# "cat with a different setting" — it is the fiber the classical model would have given you
+# for exactly the same measurements.
+#
+# What to look for. The medullated coat is much BRIGHTER (measured on an isolated ball under
+# this key light: 82 against 34, i.e. 2.4x) and much less SATURATED. Both come from the same
+# cause: a solid cat fiber has beta_n 1.3 deg, so its TT lobe is a razor-thin forward spike
+# that fires light straight on through the coat and into the dark skin underneath, and
+# whatever does come back has crossed a lot of pigmented cortex. The core intercepts that
+# light a fraction of a radius in, scatters it broadly, and sends most of it back out of the
+# coat having barely been coloured. That is the whole difference between fur and hair, and
+# it is why plain Marschner on an animal reads as dark plastic.
+material "cat_med"   { preset cat  reflect rgb 0.55 0.45 0.33 }
+material "cat_solid" { preset cat  reflect rgb 0.55 0.45 0.33  medulla 0 }
+
+# --- an open box ---
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material grey  }   # back wall
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material white }   # left wall
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material white }   # right wall
+
+# Key: a broad ceiling panel. A fiber is thin, so a point-like source leaves most of each
+# strand's circumference unlit and the whole coat reads as black felt.
+light area {
+    origin 0.10 0.985 0.10   u 0.80 0 0   v 0 0 0.80   normal 0 -1 0
+    power 850   spd preset:d65
+}
+
+# Back light, low and behind the row. This is what the scattered TT^s lobe eats, and it is
+# where the medulla is most obvious: a solid fiber gives a thin bright rim exactly on the
+# silhouette, a medullated one gives a glow that reaches inward. It is kept BELOW the balls'
+# equator and dim enough that the strips of it visible between them do not blow out — there
+# is no ball at x = 0.26 / 0.50 / 0.74 to hide behind.
+light area {
+    origin 0.06 0.005 0.30   u 0.88 0 0   v 0 0.11 0   normal 0 0 1
+    power 230   spd preset:d65
+}
+
+# --- front row: the species -----------------------------------------------------------
+sphere "s1" { center 0.14 0.19 0.52  radius 0.10  material skin }
+fur "s1_coat" {
+    on "s1"   material fox
+    count 55000   length 0.055  length_jitter 0.35   radius 0.0005
+    droop 0.50   jitter 0.30   seed 11
+}
+
+sphere "s2" { center 0.38 0.19 0.52  radius 0.10  material skin }
+fur "s2_coat" {
+    on "s2"   material kitty
+    count 55000   length 0.050  length_jitter 0.30   radius 0.0005
+    droop 0.45   jitter 0.25   seed 12
+}
+
+sphere "s3" { center 0.62 0.19 0.52  radius 0.10  material skin }
+fur "s3_coat" {
+    on "s3"   material bunny
+    count 55000   length 0.060  length_jitter 0.40   radius 0.0005
+    droop 0.55   jitter 0.35   seed 13
+}
+
+sphere "s4" { center 0.86 0.19 0.52  radius 0.10  material skin }
+fur "s4_coat" {
+    on "s4"   material doe
+    count 55000   length 0.048  length_jitter 0.30   radius 0.0005
+    droop 0.40   jitter 0.20   seed 14
+}
+
+# --- back row: medulla on / medulla off ------------------------------------------------
+sphere "ab1" { center 0.34 0.13 0.92  radius 0.085  material skin }
+fur "ab1_coat" {
+    on "ab1"   material cat_med
+    count 45000   length 0.050  length_jitter 0.30   radius 0.0005
+    droop 0.45   jitter 0.25   seed 21
+}
+
+sphere "ab2" { center 0.66 0.13 0.92  radius 0.085  material skin }
+fur "ab2_coat" {
+    on "ab2"   material cat_solid
+    count 45000   length 0.050  length_jitter 0.30   radius 0.0005
+    droop 0.45   jitter 0.25   seed 21     # same seed: the two grooms are strand-for-strand identical
+}
+
+camera "cam" {
+    eye 0.50 0.46 1.98   look_at 0.50 0.19 0.62   up 0 1 0   fov_y 42
+    mode R
+    film { res 640 480 }
+}

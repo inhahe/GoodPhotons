@@ -236,6 +236,20 @@ struct Material {
     // depends on hairBetaN, so it must run after the whole block is parsed.
     Spectrum hairSigmaA = constantSpectrum(0.0);
     bool     hairSigmaAFromReflect = true;
+    // --- The MEDULLA (Yan et al. 2015/2017) ---------------------------------
+    // The scattering core that makes fur fur. `hairKappa` (the medullary index: medulla
+    // radius / fiber radius) is the master switch — at its 0 default the fiber is a solid
+    // cylinder and the model is exactly stage 1, so no existing scene moves. Real fitted
+    // values run 0.36 (human) to 0.91 (deer); fur is mostly medulla.
+    //
+    // Both coefficients are spectra, in 1/(fiber radius) like `hairSigmaA`, because a
+    // medulla is genuinely wavelength-selective when it is pigmented (Carrlee & Horelick
+    // found pigment filling brown bear medullas) — and because keeping them spectral costs
+    // nothing here and would be a breaking change to add later.
+    double   hairKappa       = 0.0;   // medullary index [0, 1)
+    Spectrum hairMedullaSigmaS = constantSpectrum(0.0);   // scattering in the medulla
+    Spectrum hairMedullaSigmaA = constantSpectrum(0.0);   // absorption in the medulla
+    double   hairMedullaG    = 0.0;   // Henyey-Greenstein anisotropy of that scattering
 
     // --- Fluorescence (MatType::Fluorescent) --------------------------------
     // A photon at lambda excites the dye with probability fluoAbsorb(lambda); the

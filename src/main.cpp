@@ -4653,11 +4653,46 @@ static int checkHair() {
         // cannot: that f() really combines the terms that way, and that sample() covers
         // the whole support — a sampler blind to one lobe comes out short here while
         // passing every self-consistency check in S5.
+        // The MEDULLA has to pass the same furnace, and this is the test that matters for
+        // stage 3: a scattering core removes energy from the specular chain, and unless the
+        // TT^s / TRT^s lobes carry back exactly what it removed, a white fur fiber loses
+        // light. ApScattered is built as a DIFFERENCE of two chains precisely so that this
+        // closes as algebra rather than as a fit — with sigma_a = 0 everywhere the six
+        // lobes sum to 1 identically, for any kappa, sigma_s or g.
+        {
+            double worstMed = 0.0;
+            for (double kap : {0.2, 0.6, 0.95})
+                for (double ss : {0.1, 2.5, 40.0})
+                    for (double g : {-0.5, 0.0, 0.8})
+                        for (double hh : {-0.97, -0.3, 0.0, 0.55, 0.99})
+                            for (double thO : {-1.1, 0.0, 0.7}) {
+                                hair::Params pr;
+                                pr.betaM = 0.3; pr.betaN = 0.3; pr.alpha = 2.0;
+                                pr.kappa = kap; pr.mSigmaS = ss; pr.mSigmaA = 0.0; pr.mG = g;
+                                const hair::Bcsdf b = hair::make(pr, hh, 0.0);
+                                double w[hair::kNLobes];
+                                const double sTh = std::sin(thO), cTh = std::cos(thO);
+                                const hair::Chord ch = hair::refractGeom(b, sTh, cTh);
+                                double ap[hair::kPMax + 1], aps[2];
+                                hair::Ap(cTh, b.eta, b.h, ch.T, ap);
+                                hair::ApScattered(ch, cTh, b.eta, b.h, aps);
+                                (void)w;
+                                double sum = aps[0] + aps[1];
+                                for (int p = 0; p <= hair::kPMax; ++p) sum += ap[p];
+                                worstMed = std::max(worstMed, std::fabs(sum - 1.0));
+                            }
+            std::printf("[checkhair] S1 medulla: worst |sum of all 6 A_p - 1| over 405 "
+                        "(kappa, sigma_s, g, h, theta) combos = %.3g\n", worstMed);
+            ok &= chk("S1 a scattering medulla loses or invents energy",
+                      worstMed, 0.0, 1e-12);
+        }
         double worstMC = 0.0;
         for (double beta : {0.1, 0.4, 0.8})
             for (double hh : {-0.8, 0.0, 0.6})
-                for (double thetaO : {0.0, 0.9}) {
+                for (double thetaO : {0.0, 0.9})
+                for (int med = 0; med < 2; ++med) {
                     hair::Params pr; pr.betaM = beta; pr.betaN = beta; pr.alpha = 0.0;
+                    if (med) { pr.kappa = 0.85; pr.mSigmaS = 3.0; pr.mSigmaA = 0.0; pr.mG = 0.3; }
                     const hair::Bcsdf b = hair::make(pr, hh, 0.0);
                     const Vec3 wo{std::sin(thetaO), std::cos(thetaO), 0.0};
                     const int N = 60000;
@@ -4672,7 +4707,7 @@ static int checkHair() {
                     worstMC = std::max(worstMC, std::fabs(sum / N - 1.0));
                 }
         std::printf("[checkhair] S1 furnace by the model's own sampler: worst "
-                    "|estimate - 1| over 18 combos = %.4f\n", worstMC);
+                    "|estimate - 1| over 36 combos (half medullated) = %.4f\n", worstMC);
         ok &= want("S1 f and its sampler do not integrate to unit albedo", worstMC < 0.01);
     }
 
@@ -4852,20 +4887,24 @@ static int checkHair() {
         for (double beta : {0.15, 0.5, 0.85})
             for (double hh : {-0.9, -0.7, 0.1, 0.85, 0.99})
                 for (double sa : {0.0, 0.35, 4.0})
-                    for (double thO : {-1.2, -0.3, 0.0, 0.55, 1.3}) {
+                    for (double thO : {-1.2, -0.3, 0.0, 0.55, 1.3})
+                    for (int med = 0; med < 2; ++med) {
                         hair::Params pr; pr.betaM = beta; pr.betaN = beta; pr.alpha = 2.0;
+                        if (med) {   // a medullated fur fiber must be a pmf too
+                            pr.kappa = 0.8; pr.mSigmaS = 2.4; pr.mSigmaA = 0.1; pr.mG = 0.4;
+                        }
                         const hair::Bcsdf b = hair::make(pr, hh, sa);
-                        double w[hair::kPMax + 1];
+                        double w[hair::kNLobes];
                         hair::apPdf(b, std::sin(thO), std::cos(thO), w);
                         double s = 0.0;
-                        for (int p = 0; p <= hair::kPMax; ++p) {
+                        for (int p = 0; p < hair::kNLobes; ++p) {
                             if (!(w[p] >= 0.0)) nonNeg = false;
                             s += w[p];
                         }
                         worstW = std::max(worstW, std::fabs(s - 1.0));
                     }
-        std::printf("[checkhair] S6 lobe-selection weights: worst |sum - 1| over 225 combos "
-                    "= %.3g\n", worstW);
+        std::printf("[checkhair] S6 lobe-selection weights: worst |sum - 1| over 450 combos "
+                    "(half of them medullated) = %.3g\n", worstW);
         ok &= chk("S6 the lobe weights are not a probability mass function", worstW, 0.0, 1e-12);
         ok &= want("S6 a lobe-selection weight is negative or not finite", nonNeg);
 
@@ -5055,6 +5094,92 @@ static int checkHair() {
         }
         std::printf("[checkhair] S9 worst frame round-trip error = %.3g\n", worstF);
         ok &= chk("S9 the fiber frame does not round-trip", worstF, 0.0, 1e-12);
+    }
+
+    // --- S10 the medulla's directional memory ---------------------------------
+    // scatteredSpread() is the one part of the medulla that is NOT taken from Yan et al.
+    // (2017) directly: their C^M / C^N are 24x16x16x720 Monte-Carlo tables that were never
+    // published, so in their place stands one number from similarity theory — after reduced
+    // optical depth tau' = (1-g) sigma_s L, the exit direction has forgotten the entry
+    // direction as exp(-tau').
+    //
+    // That is a claim about an actual random walk, so it is checked against one, with no
+    // closed form anywhere on the right-hand side: sample free flights along the chord,
+    // deflect by a Henyey-Greenstein angle at each, compose the deflections as real 3-D
+    // rotations, and average the cosine between the direction that went in and the one that
+    // came out. The composition is where this could go wrong and the algebra could not
+    // notice — g multiplies per event only because the first Legendre moment of a
+    // composition of independent rotations is the product of the moments, and that is a
+    // property of the rotations, not of the exponent.
+    //
+    // The medulla half-chord is re-derived here too, by bisecting the distance-to-axis
+    // function rather than evaluating sqrt(kappa^2 - sin^2 gammaT), so a sign or a swapped
+    // radius in refractGeom's geometry would show up as a chord error rather than hiding
+    // inside a spread that happens to look plausible.
+    {
+        auto sampleHG = [](double g, double u) {
+            if (std::fabs(g) < 1e-4) return 2.0 * u - 1.0;
+            const double s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u);
+            return hair::clampd((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+        };
+        double worstChord = 0.0, worstSpread = 0.0;
+        int combos = 0;
+        const int kWalks = 120000;
+        const double thetaO = 0.3;
+        for (double kappa : {0.35, 0.95})
+        for (double sigS  : {0.3, 1.5, 5.0})
+        for (double gAn   : {-0.4, 0.0, 0.5, 0.85})
+        for (double h     : {0.0, 0.4}) {
+            hair::Params pr;
+            pr.kappa = kappa; pr.mSigmaS = sigS; pr.mSigmaA = 0.0; pr.mG = gAn;
+            const hair::Bcsdf b = hair::make(pr, h, 0.0);
+            const hair::Chord ch = hair::refractGeom(b, std::sin(thetaO), std::cos(thetaO));
+            const double d = std::fabs(std::sin(ch.gammaT));   // chord's distance from axis
+            if (d >= kappa - 1e-3) continue;                   // grazes / misses the core
+            ++combos;
+
+            // (a) half-chord by bisection on |(d, t)| - kappa, which is a root-find rather
+            // than the algebraic sqrt refractGeom uses.
+            double lo = 0.0, hi = 1.0;
+            for (int it = 0; it < 200; ++it) {
+                const double mid = 0.5 * (lo + hi);
+                (std::sqrt(d * d + mid * mid) < kappa ? lo : hi) = mid;
+            }
+            const double smNum = 0.5 * (lo + hi);
+            const double cosThetaT = std::sqrt(1.0 - hair::sqr(std::sin(thetaO) / pr.eta));
+            const double L = 2.0 * smNum / cosThetaT;          // path travelled in the core
+            worstChord = std::max(worstChord,
+                                  std::fabs((1.0 - gAn) * sigS * L - ch.tauP));
+
+            // (b) the walk. Free flights are drawn along the path parameter, so the number
+            // of events is Poisson(sigma_s L) as it must be, but the DIRECTIONS are built
+            // by actually rotating.
+            double sumCos = 0.0;
+            for (int k = 0; k < kWalks; ++k) {
+                Vec3 w{0, 0, 1};
+                double s = 0.0;
+                for (;;) {
+                    s += -std::log(std::max(1e-12, 1.0 - frand())) / sigS;
+                    if (s >= L) break;
+                    const double ct = sampleHG(gAn, frand());
+                    const double st = std::sqrt(std::max(0.0, 1.0 - ct * ct));
+                    const double ph = 2.0 * hair::kPi * frand();
+                    Vec3 e1, e2; onb(w, e1, e2);
+                    w = normalize(w * ct + (e1 * std::cos(ph) + e2 * std::sin(ph)) * st);
+                }
+                sumCos += w.z;
+            }
+            const double spreadMC = 1.0 - sumCos / double(kWalks);
+            worstSpread = std::max(worstSpread,
+                                   std::fabs(spreadMC - hair::scatteredSpread(ch)));
+        }
+        std::printf("[checkhair] S10 medulla half-chord, worst |tau' bisected - tau' "
+                    "analytic| over %d combos = %.3g\n", combos, worstChord);
+        ok &= chk("S10 the medulla chord geometry is wrong", worstChord, 0.0, 1e-9);
+        std::printf("[checkhair] S10 scatteredSpread vs a %d-walk HG random walk: worst "
+                    "absolute gap = %.4f\n", kWalks, worstSpread);
+        ok &= want("S10 scatteredSpread does not match an actual random walk",
+                   worstSpread < 0.012);
     }
 
     std::printf("[checkhair] worst absolute error (exact checks) = %.3g\n", worst);

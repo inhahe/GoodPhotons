@@ -72,6 +72,7 @@
 #include "fbx.h"
 #include "upsample.h"
 #include "fur.h"         // `fur { }` groom generator — scatters `curve` strands (TODO §P1)
+#include "hair.h"        // hair::Species — the measured fur presets `material { type hair }` names
 #include "parallel.h"    // ft::stopRequested — cooperative `-stop` during a long load
 #include "reaction.h"    // `texture { reaction { } }` — Gray-Scott bake (TODO §O6)
 #include "color.h"
@@ -4299,11 +4300,31 @@ private:
     Material buildMaterial(const Block& b, Loaded& L) {
         if (isRecordOverrideBlock(b)) return buildRecordOverrideMaterial(b, L);
         Material m;
-        // Built-in whole-material recipe: `preset <name>` fills a complete material
-        // (metal / glass / iridescent film). A few common knobs may still be
-        // overridden afterwards so a preset can be lightly retuned.
-        if (find(b, "preset")) {
+        // `preset <name>` is one keyword with two populations behind it. Most names are a
+        // whole-material recipe (metal / glass / iridescent film) handled right here; the
+        // ten names in Yan et al. (2017) Table 4 are measured FUR FIBERS, which are a
+        // parameter set for `type hair` rather than a material of their own. Those are
+        // recognised first and routed to the hair branch below, where every hair key can
+        // still override them — and naming a species implies `type hair`, so
+        // `material "fox" { preset redfox }` is enough on its own.
+        hair::Species furSp{};
+        bool furPreset = false;
+        if (const Stmt* prs = find(b, "preset"); prs && !prs->val.words.empty())
+            furPreset = hair::findSpecies(prs->val.words[0].c_str(), furSp);
+        if (find(b, "preset") && !furPreset) {
             std::string pname = strOf(b, "preset", "");
+            if (strOf(b, "type", "") == "hair") {
+                // `type hair` narrows the namespace to the species table, so say so rather
+                // than reporting the generic miss — the recipe presets are all surfaces and
+                // none of them would have meant anything here.
+                std::string known;
+                int nsp = 0;
+                const hair::Species* tab = hair::speciesTable(nsp);
+                for (int i = 0; i < nsp; ++i) { if (i) known += ", "; known += tab[i].name; }
+                fail("material '" + b.name + "': unknown hair preset '" + pname +
+                     "' — the measured species are " + known);
+                return m;
+            }
             if (!resolveMaterialPreset(pname, m)) { fail("unknown material preset '" + pname + "'"); return m; }
             if (find(b, "roughness")) {
                 if (!bindScalarPattern(b, "roughness", m.roughnessPat) &&
@@ -4320,7 +4341,7 @@ private:
             checkSlotPatsSupported(b, m);
             return m;
         }
-        std::string type = strOf(b, "type", "diffuse");
+        std::string type = strOf(b, "type", furPreset ? "hair" : "diffuse");
         if (type == "diffuse") {
             m.type = MatType::Diffuse;
             // `reflect texture:<name>` binds a spatially-varying albedo; otherwise a
@@ -4402,20 +4423,55 @@ private:
             // sit on `curve` / `fur` geometry, whose intersector already reports the fiber
             // axis as `hit.tangent`.
             m.type = MatType::Hair;
+            auto clamp01d = [](double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); };
+
+            // `preset <species>` loads one row of Yan et al. (2017) Table 4 — a real fitted
+            // fur fiber, medulla and all. It only supplies DEFAULTS: every slot below still
+            // reads its own key first, so `preset redfox  beta_n 0.1` is a red fox with the
+            // glint sharpened, and nothing has to be re-typed to change one thing. The
+            // table's angles are in degrees (that is how goniophotometry reports them), so
+            // they go through hair::betaMFromDegrees / betaNFromDegrees on the way into
+            // Chiang's perceptual [0,1] knobs.
+            // (The name was resolved at the top of buildMaterial, which is also where a
+            // miss is reported — a species name implies `type hair`, so the lookup has to
+            // happen before the type dispatch, not inside it.)
+            const bool havePreset = furPreset;
+            const hair::Species& sp = furSp;
+
             // `reflect` is the colour you WANT the fiber to end up, not a Lambertian
             // albedo: it is inverted through Chiang eq. 9 into an interior sigma_a. That
             // inversion needs the final hairBetaN, so it happens at shading time, not here.
             m.reflect   = reflectParam(b, m, constantSpectrum(0.3));
-            m.hairEta   = dblParam(b, "eta", 1.55);
-            auto clamp01d = [](double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); };
-            m.hairBetaM = clamp01d(dblParam(b, "beta_m", 0.3));
-            m.hairBetaN = clamp01d(dblParam(b, "beta_n", 0.3));
-            m.hairAlpha = dblParam(b, "alpha", 2.0);
+            m.hairEta   = dblParam(b, "eta",    havePreset ? sp.eta      : 1.55);
+            m.hairAlpha = dblParam(b, "alpha",  havePreset ? sp.alphaDeg : 2.0);
+            m.hairBetaM = clamp01d(dblParam(b, "beta_m",
+                                   havePreset ? hair::betaMFromDegrees(sp.betaMDeg) : 0.3));
+            m.hairBetaN = clamp01d(dblParam(b, "beta_n",
+                                   havePreset ? hair::betaNFromDegrees(sp.betaNDeg) : 0.3));
+
+            // The medulla (Yan et al. 2017). `medulla` is kappa, the scattering core's
+            // radius as a fraction of the fiber's; 0 leaves a solid Marschner cylinder and
+            // makes the other three inert, so an existing `hair` material is untouched.
+            m.hairKappa      = clamp01d(dblParam(b, "medulla",
+                                                 havePreset ? sp.kappa : 0.0));
+            m.hairMedullaG   = std::max(-0.999, std::min(0.999,
+                                        dblParam(b, "medulla_g", havePreset ? sp.mG : 0.0)));
+            m.hairMedullaSigmaS = spectrumParam(b, "medulla_sigma_s",
+                                    constantSpectrum(havePreset ? sp.mSigmaS : 0.0));
+            m.hairMedullaSigmaA = spectrumParam(b, "medulla_sigma_a",
+                                    constantSpectrum(havePreset ? sp.mSigmaA : 0.0));
+
             // Physical spelling: sigma_a directly, in units of 1/(fiber radius) — which is
             // what the Beer-Lambert term inside the unit cylinder is expressed in. When
-            // present it wins, and `reflect` is not consulted at all.
+            // present it wins, and `reflect` is not consulted at all. A preset carries a
+            // measured cortex absorption, so it selects this branch too — but an explicit
+            // `reflect` on the same block still wins over the preset, because a colour is
+            // the thing an author is most likely to actually want to change.
             if (find(b, "sigma_a")) {
                 m.hairSigmaA = spectrumParam(b, "sigma_a", constantSpectrum(0.0));
+                m.hairSigmaAFromReflect = false;
+            } else if (havePreset && !find(b, "reflect")) {
+                m.hairSigmaA = constantSpectrum(sp.sigmaCA);
                 m.hairSigmaAFromReflect = false;
             } else {
                 m.hairSigmaAFromReflect = true;

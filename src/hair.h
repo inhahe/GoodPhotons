@@ -44,6 +44,7 @@
 #pragma once
 #include <cmath>
 #include <algorithm>
+#include <string>
 #include "linalg.h"
 
 namespace hair {
@@ -55,6 +56,20 @@ inline constexpr double kPi = 3.14159265358979323846;
 // residual is what makes the model energy-conserving on a light fiber (see the furnace
 // test in -checkhair §1), because for a weakly absorbing hair those tails are not small.
 inline constexpr int kPMax = 3;
+
+// With a medulla (stage 3) two more lobes join them, so the sampler's discrete choice and
+// every per-lobe array runs over kNLobes rather than kPMax + 1:
+//
+//   4  TT^s    entered, was SCATTERED by the medulla on the first crossing, left
+//   5  TRT^s   entered, crossed the medulla clean, bounced off the far wall, and was
+//              scattered on the second crossing before leaving
+//
+// Yan et al. (2017) call these the scattered lobes and show they carry most of a fur
+// fiber's light: the medulla blocks the specular TT almost entirely, so a fur strand's
+// forward glow is TT^s, not TT. Both are identically zero when kappa = 0.
+inline constexpr int kSTT   = kPMax + 1;   // 4
+inline constexpr int kSTRT  = kPMax + 2;   // 5
+inline constexpr int kNLobes = kPMax + 3;  // 6
 
 inline double sqr(double x) { return x * x; }
 inline double safeSqrt(double x) { return std::sqrt(std::max(0.0, x)); }
@@ -205,6 +220,25 @@ struct Params {
     double betaM = 0.3;    // longitudinal roughness [0, 1]
     double betaN = 0.3;    // azimuthal roughness   [0, 1]
     double alpha = 2.0;    // cuticle scale tilt, degrees
+
+    // --- the MEDULLA (P3 stage 3; Yan et al. 2015/2017) ----------------------
+    // Animal fur is not a solid rod. It has a hollow, structured core — the medulla —
+    // which SCATTERS rather than merely absorbing, and it is why plain Marschner on fur
+    // reads as coloured plastic: without it, everything that enters the fiber must leave
+    // along one of three specular azimuths, so a coat has no soft interior glow at all.
+    //
+    // `kappa` is the medullary index: medulla radius / fiber radius. It is the master
+    // switch — at 0 every expression below collapses to the stage-1 solid-cylinder model
+    // *bit for bit*, which is what keeps every existing hair scene unregressed.
+    //
+    // Real fitted values (Yan et al. 2017, Table 4): human 0.36, dog 0.68, raccoon 0.65,
+    // mouse 0.66, rabbit 0.79, springbok 0.82, red fox 0.86, cat 0.87, bobcat 0.88,
+    // deer 0.91. Fur is mostly medulla; human hair is mostly cortex. That single number
+    // is most of the difference between "hair" and "fur".
+    double kappa   = 0.0;   // medullary index, [0, 1)
+    double mSigmaS = 0.0;   // medulla SCATTERING coefficient, per fiber radius
+    double mSigmaA = 0.0;   // medulla ABSORPTION coefficient, per fiber radius
+    double mG      = 0.0;   // Henyey-Greenstein anisotropy of medulla scattering, (-1, 1)
 };
 
 // Everything that depends only on the hit and the parameters — hoisted out of f()/
@@ -216,6 +250,25 @@ struct Bcsdf {
     double v[kPMax + 1] = {0, 0, 0, 0};   // longitudinal variances per lobe
     double s = 0.0;                       // azimuthal logistic scale
     double sin2kAlpha[3] = {0, 0, 0}, cos2kAlpha[3] = {1, 1, 1};
+
+    // Medulla. `hasMedulla` is false whenever kappa or sigma_s is zero, and every code
+    // path below tests it before doing anything, so a solid fiber costs one predictable
+    // branch and executes the exact stage-1 arithmetic.
+    bool   hasMedulla = false;
+    double kappa = 0.0, mSigmaS = 0.0, mSigmaA = 0.0, mG = 0.0;
+};
+
+// Everything a single interior traversal of the fiber does to a ray: where it comes out
+// azimuthally, and how much of it survives. Split out (rather than returned as two loose
+// doubles, as in stage 1) because the double cylinder needs five related quantities and
+// they are all computed from the same two chord lengths.
+struct Chord {
+    double gammaT   = 0.0;   // refracted azimuth inside the fiber
+    double T        = 1.0;   // survival of the UNSCATTERED path across one traversal
+    double Tsolid   = 1.0;   // the same with the medulla's extinction removed (cortex only)
+    double albedoM  = 0.0;   // medulla single-scattering albedo, sigma_s / (sigma_s + sigma_a)
+    double Tb       = 1.0;   // Yan eq. 20's post-scatter escape: kappa of medulla, 1-kappa of cortex
+    double tauP     = 0.0;   // REDUCED optical depth (1-g)*sigma_s*chord — see scatteredSpread
 };
 
 // `sigmaA` is per-unit-radius absorption at the wavelength being traced (the chord
@@ -248,6 +301,15 @@ inline Bcsdf make(const Params& pr, double h, double sigmaA) {
         b.sin2kAlpha[i] = 2.0 * b.cos2kAlpha[i - 1] * b.sin2kAlpha[i - 1];
         b.cos2kAlpha[i] = sqr(b.cos2kAlpha[i - 1]) - sqr(b.sin2kAlpha[i - 1]);
     }
+
+    // A medulla that is infinitely thin, or that does not scatter, is not a medulla — in
+    // either case the extra lobes carry exactly zero and the flag stays false, so the
+    // whole of stage 3 costs nothing and changes nothing on a human-hair fiber.
+    b.kappa   = clampd(pr.kappa, 0.0, 0.999);
+    b.mSigmaS = std::max(0.0, pr.mSigmaS);
+    b.mSigmaA = std::max(0.0, pr.mSigmaA);
+    b.mG      = clampd(pr.mG, -0.999, 0.999);
+    b.hasMedulla = (b.kappa > 0.0) && (b.mSigmaS + b.mSigmaA > 0.0);
     return b;
 }
 
@@ -272,20 +334,138 @@ inline void tiltO(const Bcsdf& b, int p, double sinThetaO, double cosThetaO,
 
 // Shared geometry: the refracted azimuth and the interior chord, both of which depend
 // only on wo. Factored out because f(), pdf() and sample() all need exactly this.
-inline void refractGeom(const Bcsdf& b, double sinThetaO, double cosThetaO,
-                        double& gammaT, double& T) {
+//
+// THE DOUBLE CYLINDER. Yan et al. (2017)'s central simplification is to give the cortex
+// and the medulla the SAME index of refraction. Yan et al. (2015) let them differ, which
+// is more faithful but spawns a combinatorial zoo of T-r-T / T-trt-T paths — and Yan's
+// own Fig. 6 shows the two-IOR model still misses the measured profile, while producing a
+// spurious dark ring at the cortex/medulla interface. With one IOR the interior ray does
+// not bend at that interface at all, so the path TOPOLOGY stays exactly Marschner's
+// R / TT / TRT and the medulla only changes what happens ALONG a chord. That is why this
+// grafts cleanly onto the stage-1 core instead of replacing it.
+//
+// In the normal plane the interior ray is a chord of the unit circle whose perpendicular
+// distance from the axis is |sin gammaT|. The medulla is the concentric circle of radius
+// kappa, so the ray crosses it exactly when |sin gammaT| < kappa, and the two half-chords
+// are sm = sqrt(kappa^2 - sin^2 gammaT) and sc = cos gammaT - sm.
+inline Chord refractGeom(const Bcsdf& b, double sinThetaO, double cosThetaO) {
+    Chord ch;
     // Bravais' "virtual index": a ray at longitudinal angle theta refracts in the normal
     // plane as if the index were this, which is what reduces the 3-D cylinder problem to
     // the familiar 2-D circle one.
     const double etap      = safeSqrt(sqr(b.eta) - sqr(sinThetaO)) / std::max(cosThetaO, 1e-9);
     const double sinGammaT = clampd(b.h / etap, -1.0, 1.0);
     const double cosGammaT = safeSqrt(1.0 - sqr(sinGammaT));
-    gammaT = std::asin(sinGammaT);
+    ch.gammaT = std::asin(sinGammaT);
     const double sinThetaT = sinThetaO / b.eta;
     const double cosThetaT = safeSqrt(1.0 - sqr(sinThetaT));
-    // Chord across the circle, lengthened by the longitudinal obliquity. This is the only
-    // place the fiber's thickness enters: sigmaA is per radius, the chord is in radii.
-    T = std::exp(-b.sigmaA * (2.0 * cosGammaT / std::max(cosThetaT, 1e-9)));
+    // Obliquity: the chord is measured in the normal plane, the ray travels it at the
+    // refracted longitudinal angle. This is the only place the fiber's thickness enters —
+    // sigmaA is per radius, the chord is in radii.
+    const double invCosT = 1.0 / std::max(cosThetaT, 1e-9);
+
+    if (!b.hasMedulla) {
+        // Exactly the stage-1 expression, to the last bit.
+        ch.T = std::exp(-b.sigmaA * (2.0 * cosGammaT * invCosT));
+        ch.Tsolid = ch.T;
+        return ch;
+    }
+
+    const double sm = safeSqrt(sqr(b.kappa) - sqr(sinGammaT));   // half-chord in medulla
+    const double sc = std::max(0.0, cosGammaT - sm);             // half-chord in cortex
+    const double mExt = b.mSigmaS + b.mSigmaA;                   // medulla extinction
+    // An unscattered path crosses 2*sc of absorbing cortex and 2*sm of the medulla, where
+    // BOTH absorption and scattering remove it from the specular chain (Yan Table 3).
+    ch.T      = std::exp(-(2.0 * sc * b.sigmaA + 2.0 * sm * mExt) * invCosT);
+    // The same fiber with the medulla replaced by cortex. Not a physical configuration —
+    // it is the REFERENCE against which the medulla's removed energy is measured, which
+    // is what makes the scattered lobes conserve exactly (see ApScattered).
+    ch.Tsolid = std::exp(-(2.0 * cosGammaT * b.sigmaA) * invCosT);
+    ch.albedoM = (mExt > 1e-12) ? b.mSigmaS / mExt : 0.0;
+    // Yan eq. 20's Tb: having scattered, the light is treated as leaving from the axis,
+    // so it crosses kappa of medulla and (1 - kappa) of cortex on the way out.
+    ch.Tb = std::exp(-(b.kappa * b.mSigmaA + (1.0 - b.kappa) * b.sigmaA) * invCosT);
+    // Similarity theory: n forward-peaked scattering events of anisotropy g randomise a
+    // direction as well as n(1-g) isotropic ones, so the REDUCED depth is what sets how
+    // far the exit direction has forgotten the entry direction.
+    ch.tauP = (1.0 - clampd(b.mG, -0.999, 0.999)) * b.mSigmaS * (2.0 * sm) * invCosT;
+    return ch;
+}
+
+// How much the medulla has smeared the exit direction, as a number in [0, 1): 0 = the
+// scattered lobe still points where the specular one did, 1 = it has forgotten entirely.
+//
+// This is the one place where an ANALYTIC profile stands in for Yan's C^M / C^N, the pair
+// of 24x16x16x720 tables they precompute by Monte-Carlo-ing the medulla and then compress
+// by rank-16 tensor decomposition. Those tables are not published, and re-deriving them
+// would mean shipping a 600 MB simulation or a 150 KB blob nobody can check. Instead:
+// after reduced optical depth tau', the mean cosine of the transmitted-direction
+// distribution decays as exp(-tau'), which is the standard similarity result. So one
+// number drives both the longitudinal variance and the azimuthal logistic width, with the
+// right limits at both ends and a physical parameter in between. `-checkhair` section S10
+// pins it against a brute-force volumetric random walk in the medulla cylinder.
+inline double scatteredSpread(const Chord& ch) {
+    return 1.0 - std::exp(-std::max(0.0, ch.tauP));
+}
+
+// --- Attenuation of the SCATTERED lobes A^s_p ---------------------------------
+// Yan et al. (2017) eq. 20 writes A^s_p = (1 - F) F^(p-1) Ta Tb and leaves the actual
+// SCATTERED FRACTION implicit in the normalisation of their measured C^N table. With an
+// analytic profile that fraction has to be supplied explicitly — and supplying it the
+// obvious way (1 - exp(-sigma_s * chord), times a Fresnel guess for the exit) does not
+// conserve energy, because the scattered light then pays a different toll on the way out
+// than the specular light it was taken from.
+//
+// So compute it as a DIFFERENCE instead. Run the stage-1 chain twice: once with the real
+// medulla (T), once with the medulla replaced by cortex (Tsolid). The gap between the two
+// totals is, by construction, exactly the energy the medulla removed from the specular
+// lobes. Multiply by the medulla's single-scattering albedo to keep only the part that was
+// scattered rather than absorbed, and by Yan's Tb for the trip out.
+//
+// The payoff is that the white furnace still closes EXACTLY: with no absorption anywhere,
+// the solid chain sums to 1 (Chiang's residual telescopes), albedoM = 1 and Tb = 1, so the
+// six lobes sum to (sum of medullated chain) + (1 - sum of medullated chain) = 1. That is
+// an algebraic identity, not a numerical near-miss — `-checkhair` S1 asserts it at 1e-12
+// with a medulla exactly as it does without one.
+//
+// The split between TT^s and TRT^s follows Yan's F^(p-1): the second crossing has already
+// paid one internal Fresnel reflection, so it is dimmer by F. Only two lobes are tracked,
+// so the p >= 3 tail is folded into TRT^s rather than dropped.
+inline void ApScattered(const Chord& ch, double cosThetaO, double eta, double h,
+                        double aps[2]) {
+    aps[0] = aps[1] = 0.0;
+    if (ch.albedoM <= 0.0) return;
+    double apMed[kPMax + 1], apSolid[kPMax + 1];
+    Ap(cosThetaO, eta, h, ch.T, apMed);
+    Ap(cosThetaO, eta, h, ch.Tsolid, apSolid);
+    double missing = 0.0;
+    for (int p = 0; p <= kPMax; ++p) missing += apSolid[p] - apMed[p];
+    if (!(missing > 0.0)) return;                 // Tsolid >= T always, but be defensive
+    const double total = missing * ch.albedoM * ch.Tb;
+    const double cosGammaO = safeSqrt(1.0 - h * h);
+    const double F = frDielectric(cosThetaO * cosGammaO, 1.0, eta);
+    const double norm = 1.0 + F;
+    aps[0] = total * (1.0 / norm);
+    aps[1] = total * (F / norm);
+}
+
+// Exit azimuth of a scattered lobe: Yan eq. 21. One refraction into the cylinder for
+// TT^s, plus one internal reflection for TRT^s — i.e. where the ray was POINTING when it
+// entered the medulla, since after scattering it has no specular direction of its own.
+inline double PhiS(int p, double gammaO, double gammaT) {
+    return (gammaT - gammaO) + double(p - 1) * (kPi + 2.0 * gammaT);
+}
+
+// The scattered lobes reuse M_p and N_p, widened by the medulla. Variances add, so the
+// longitudinal one is the cuticle's plus the medulla's; the azimuthal logistic scale grows
+// toward a value at which the trimmed logistic on [-pi, pi] is flat to within a percent,
+// so a thick medulla is azimuthally uniform — which is exactly what a diffusive core
+// should look like.
+inline double scatteredV(const Bcsdf& b, int p, double spread) {
+    return b.v[p] + spread;
+}
+inline double scatteredS(const Bcsdf& b, double spread) {
+    return b.s + 2.0 * spread;
 }
 
 // The BCSDF value for wo -> wi, both in the local fiber frame.
@@ -302,11 +482,11 @@ inline double f(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
     const double phiI = std::atan2(wi.z, wi.y);
     const double phi  = phiI - phiO;
 
-    double gammaT, T;
-    refractGeom(b, sinThetaO, cosThetaO, gammaT, T);
+    const Chord ch = refractGeom(b, sinThetaO, cosThetaO);
+    const double gammaT = ch.gammaT;
 
     double ap[kPMax + 1];
-    Ap(cosThetaO, b.eta, b.h, T, ap);
+    Ap(cosThetaO, b.eta, b.h, ch.T, ap);
 
     double sum = 0.0;
     for (int p = 0; p < kPMax; ++p) {
@@ -320,6 +500,22 @@ inline double f(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
     sum += Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, b.v[kPMax]) * ap[kPMax] *
            (0.5 / kPi);
 
+    if (b.hasMedulla) {
+        double aps[2];
+        ApScattered(ch, cosThetaO, b.eta, b.h, aps);
+        const double spread = scatteredSpread(ch);
+        const double ss = scatteredS(b, spread);
+        for (int k = 0; k < 2; ++k) {
+            if (aps[k] <= 0.0) continue;
+            const int p = k + 1;                       // TT^s -> 1, TRT^s -> 2
+            double sinThetaOp, cosThetaOp;
+            tiltO(b, p, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp);
+            sum += Mp(cosThetaI, cosThetaOp, sinThetaI, sinThetaOp,
+                      scatteredV(b, p, spread)) * aps[k] *
+                   trimmedLogistic(wrapAngle(phi - PhiS(p, b.gammaO, gammaT)), ss, -kPi, kPi);
+        }
+    }
+
     const double absCosI = std::fabs(cosThetaI);
     if (absCosI > 1e-9) sum /= absCosI;
     return std::isfinite(sum) ? std::max(0.0, sum) : 0.0;
@@ -328,18 +524,23 @@ inline double f(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
 // Discrete probability of picking each lobe, proportional to the energy it carries. Using
 // the true A_p rather than a fixed split is what keeps the sampler efficient on a dark
 // fiber, where TT and TRT are nearly extinct and sampling them would waste most rays.
-inline void apPdf(const Bcsdf& b, double sinThetaO, double cosThetaO, double pdf[kPMax + 1]) {
-    double gammaT, T;
-    refractGeom(b, sinThetaO, cosThetaO, gammaT, T);
+inline void apPdf(const Bcsdf& b, double sinThetaO, double cosThetaO, double pdf[kNLobes]) {
+    const Chord ch = refractGeom(b, sinThetaO, cosThetaO);
     double ap[kPMax + 1];
-    Ap(cosThetaO, b.eta, b.h, T, ap);
+    Ap(cosThetaO, b.eta, b.h, ch.T, ap);
+    double aps[2] = {0.0, 0.0};
+    if (b.hasMedulla) ApScattered(ch, cosThetaO, b.eta, b.h, aps);
     double total = 0.0;
     for (int p = 0; p <= kPMax; ++p) total += ap[p];
+    total += aps[0] + aps[1];
     if (total <= 1e-12) {                     // degenerate: fall back to uniform
-        for (int p = 0; p <= kPMax; ++p) pdf[p] = 1.0 / (kPMax + 1);
+        const int n = b.hasMedulla ? kNLobes : (kPMax + 1);
+        for (int p = 0; p < kNLobes; ++p) pdf[p] = (p < n) ? 1.0 / double(n) : 0.0;
         return;
     }
     for (int p = 0; p <= kPMax; ++p) pdf[p] = ap[p] / total;
+    pdf[kSTT]  = aps[0] / total;
+    pdf[kSTRT] = aps[1] / total;
 }
 
 inline double pdf(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
@@ -347,9 +548,9 @@ inline double pdf(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
     const double sinThetaI = clampd(wi.x, -1.0, 1.0), cosThetaI = safeSqrt(1.0 - sqr(sinThetaI));
     const double phi = std::atan2(wi.z, wi.y) - std::atan2(wo.z, wo.y);
 
-    double gammaT, Tr;
-    refractGeom(b, sinThetaO, cosThetaO, gammaT, Tr);
-    double ap[kPMax + 1];
+    const Chord ch = refractGeom(b, sinThetaO, cosThetaO);
+    const double gammaT = ch.gammaT;
+    double ap[kNLobes];
     apPdf(b, sinThetaO, cosThetaO, ap);
 
     double sum = 0.0;
@@ -361,6 +562,20 @@ inline double pdf(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
     }
     sum += Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, b.v[kPMax]) * ap[kPMax] *
            (0.5 / kPi);
+    if (b.hasMedulla) {
+        const double spread = scatteredSpread(ch);
+        const double ss = scatteredS(b, spread);
+        for (int k = 0; k < 2; ++k) {
+            const double w = ap[kSTT + k];
+            if (w <= 0.0) continue;
+            const int p = k + 1;
+            double sinThetaOp, cosThetaOp;
+            tiltO(b, p, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp);
+            sum += Mp(cosThetaI, cosThetaOp, sinThetaI, sinThetaOp,
+                      scatteredV(b, p, spread)) * w *
+                   trimmedLogistic(wrapAngle(phi - PhiS(p, b.gammaO, gammaT)), ss, -kPi, kPi);
+        }
+    }
     return std::isfinite(sum) ? std::max(0.0, sum) : 0.0;
 }
 
@@ -375,14 +590,22 @@ inline Vec3 sample(const Bcsdf& b, const Vec3& wo, double u0, double u1, double 
     const double sinThetaO = clampd(wo.x, -1.0, 1.0), cosThetaO = safeSqrt(1.0 - sqr(sinThetaO));
     const double phiO = std::atan2(wo.z, wo.y);
 
-    double gammaT, T;
-    refractGeom(b, sinThetaO, cosThetaO, gammaT, T);
-    double ap[kPMax + 1];
+    const Chord ch = refractGeom(b, sinThetaO, cosThetaO);
+    const double gammaT = ch.gammaT;
+    double ap[kNLobes];
     apPdf(b, sinThetaO, cosThetaO, ap);
 
-    int p = 0;
+    const int nLobes = b.hasMedulla ? kNLobes : (kPMax + 1);
+    int lobe = 0;
     { double c = 0.0;
-      for (; p < kPMax; ++p) { c += ap[p]; if (u0 < c) break; } }
+      for (; lobe < nLobes - 1; ++lobe) { c += ap[lobe]; if (u0 < c) break; } }
+
+    // A scattered lobe rides on its parent's cuticle tilt (TT^s on TT, TRT^s on TRT) and
+    // uses the widened variance / logistic scale; an unscattered one is stage 1 unchanged.
+    const bool  scattered = (lobe >= kSTT);
+    const int   p  = scattered ? (lobe - kSTT + 1) : lobe;
+    const double spread = scattered ? scatteredSpread(ch) : 0.0;
+    const double vUse = scattered ? scatteredV(b, p, spread) : b.v[p];
 
     double sinThetaOp, cosThetaOp;
     tiltO(b, p, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp);
@@ -391,24 +614,127 @@ inline Vec3 sample(const Bcsdf& b, const Vec3& wo, double u0, double u1, double 
     // cosmetic — log(0) here would produce a NaN direction that then poisons the film.
     u1 = std::max(u1, 1e-5);
     const double cosTheta =
-        1.0 + b.v[p] * std::log(u1 + (1.0 - u1) * std::exp(-2.0 / b.v[p]));
+        1.0 + vUse * std::log(u1 + (1.0 - u1) * std::exp(-2.0 / vUse));
     const double sinTheta = safeSqrt(1.0 - sqr(cosTheta));
     const double cosPhi   = std::cos(2.0 * kPi * u2);
     const double sinThetaI = clampd(-cosTheta * sinThetaOp + sinTheta * cosPhi * cosThetaOp,
                                     -1.0, 1.0);
     const double cosThetaI = safeSqrt(1.0 - sqr(sinThetaI));
 
-    // Azimuthal: the specular exit angle plus a trimmed-logistic offset, or uniform for
-    // the residual lobe (which has no exit angle to be specular about).
-    const double dphi = (p < kPMax)
-        ? Phi(p, b.gammaO, gammaT) + sampleTrimmedLogistic(u3, b.s, -kPi, kPi)
-        : 2.0 * kPi * u3;
+    // Azimuthal: the exit angle plus a trimmed-logistic offset — the specular one for an
+    // unscattered lobe, Yan's entering-segment direction for a scattered one — or uniform
+    // for the residual, which has no exit angle to be specular about.
+    double dphi;
+    if (scattered)
+        dphi = PhiS(p, b.gammaO, gammaT) +
+               sampleTrimmedLogistic(u3, scatteredS(b, spread), -kPi, kPi);
+    else if (p < kPMax)
+        dphi = Phi(p, b.gammaO, gammaT) + sampleTrimmedLogistic(u3, b.s, -kPi, kPi);
+    else
+        dphi = 2.0 * kPi * u3;
     const double phiI = phiO + dphi;
 
     const Vec3 wi{sinThetaI, cosThetaI * std::cos(phiI), cosThetaI * std::sin(phiI)};
     pdfOut = pdf(b, wo, wi);
     fOut   = f(b, wo, wi);
     return wi;
+}
+
+// --- Roughness from a measured angle ------------------------------------------
+// `betaM` / `betaN` are Chiang's PERCEPTUAL [0, 1] knobs, chosen so equal steps look like
+// equal steps. Every measurement in the fur literature — Yan et al. (2017) Table 4, and
+// every goniophotometer paper before it — instead reports roughness as a Gaussian standard
+// deviation IN DEGREES. These invert Chiang's fitted polynomials so a measured number can
+// be typed in as itself.
+//
+// The polynomials' top terms (beta^20, beta^22) exist only to blow up in the last few
+// percent before beta = 1, i.e. the "and now it is diffuse fuzz" end. Below that they are
+// numerically absent, so the inversion is the quadratic root of the leading two terms,
+// which is exact everywhere a real measurement lands (the largest in Yan's table is 18.94
+// degrees, where the cubic-and-up terms contribute < 1e-9).
+inline double invQuadFit(double target, double c1, double c2) {
+    if (!(target > 0.0)) return 0.0;
+    const double disc = sqr(c1) + 4.0 * c2 * target;
+    return clampd((-c1 + safeSqrt(disc)) / (2.0 * c2), 0.0, 1.0);
+}
+
+// M_p's variance parameter v behaves as the square of the angular width, and make() sets
+// sqrt(v) = 0.726 b + 0.812 b^2 + ...
+inline double betaMFromDegrees(double deg) {
+    return invQuadFit(std::fabs(deg) * kPi / 180.0, 0.726, 0.812);
+}
+
+// The azimuthal smear is a logistic of scale s, whose standard deviation is pi*s/sqrt(3);
+// make() sets s = sqrt(pi/8) * (0.265 b + 1.194 b^2 + ...).
+inline double betaNFromDegrees(double deg) {
+    const double sTarget = std::fabs(deg) * kPi / 180.0 * 1.7320508075688772 / kPi;
+    return invQuadFit(sTarget / 0.626657069, 0.265, 1.194);
+}
+
+// --- Measured species ---------------------------------------------------------
+// Yan et al. (2017), "A BSSRDF Model for Efficient Rendering of Fur with Global
+// Illumination", Table 4: the ten fibers they actually fit against measured
+// goniophotometry. These are the whole reason the medulla exists as a feature — a fur
+// fiber is not a human hair with a different colour, it is a hair with a large scattering
+// core (kappa 0.65-0.91 for every animal in the table, against 0.36 for human), and that
+// core is what turns a hard TRT glint into the soft forward wash a real coat has.
+//
+// Stored EXACTLY as the paper prints them: alpha/betaM/betaN in degrees, sigmas in
+// 1/(fiber radius). The degree->perceptual conversion happens on the way out, through the
+// inversions above, so a reader can diff this table against the paper line by line.
+//
+// The paper's tenth column `l` (the layer/lobe-count fit for their BSSRDF stage) has no
+// analogue in a pure BCSDF and is deliberately not carried here.
+struct Species {
+    const char* name;
+    double kappa;     // medullary index
+    double eta;
+    double alphaDeg;  // cuticle tilt
+    double betaMDeg;  // longitudinal roughness, Gaussian sigma
+    double betaNDeg;  // azimuthal roughness, Gaussian sigma
+    double sigmaCA;   // cortex absorption
+    double mSigmaS;   // medulla scattering
+    double mSigmaA;   // medulla absorption
+    double mG;        // medulla Henyey-Greenstein g
+};
+
+inline const Species* speciesTable(int& n) {
+    static const Species kTab[] = {
+        // name         kappa  eta   alpha  betaM  betaN  sig_c  sig_ms sig_ma  g
+        {"bobcat",      0.88, 1.69,  5.48, 11.64,  7.49,  0.64,  1.69,  0.17,  0.44},
+        {"cat",         0.87, 1.36,  3.65,  5.66,  1.34,  0.06,  2.47,  0.12,  0.60},
+        {"deer",        0.91, 1.60,  3.52,  7.00,  4.53,  1.39,  2.51,  0.09,  0.46},
+        {"dog",         0.68, 1.58,  2.94,  5.77, 18.94,  0.01,  2.44,  0.00,  0.26},
+        {"mouse",       0.66, 1.35,  0.55,  8.39,  2.80,  0.04,  1.34,  0.06,  0.36},
+        {"rabbit",      0.79, 1.47,  3.14, 11.91, 10.52,  0.24,  0.78,  0.10,  0.12},
+        {"raccoon",     0.65, 1.19,  1.81,  7.44,  6.88,  0.25,  2.30,  0.14,  0.08},
+        {"redfox",      0.86, 1.49,  2.64,  9.45, 17.63,  0.39,  3.15,  0.21,  0.79},
+        {"springbok",   0.82, 1.48,  4.61,  8.02, 11.46,  0.32,  2.45,  0.31,  0.19},
+        {"human",       0.36, 1.20,  0.70,  2.05,  3.75,  0.41,  3.49,  0.00,  0.28},
+    };
+    n = int(sizeof(kTab) / sizeof(kTab[0]));
+    return kTab;
+}
+
+// Case-insensitive, and tolerant of the separator: "red fox", "red_fox", "redfox" and
+// "RedFox" all land on the same row, because an author writing a scene should not have to
+// guess which spelling the table happens to use.
+inline bool findSpecies(const char* want, Species& out) {
+    auto norm = [](const char* s) {
+        std::string r;
+        for (const char* p = s; *p; ++p) {
+            const char c = *p;
+            if (c == ' ' || c == '_' || c == '-') continue;
+            r += (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c;
+        }
+        return r;
+    };
+    const std::string key = norm(want);
+    int n = 0;
+    const Species* t = speciesTable(n);
+    for (int i = 0; i < n; ++i)
+        if (norm(t[i].name) == key) { out = t[i]; return true; }
+    return false;
 }
 
 // --- Absorption from a colour ------------------------------------------------
