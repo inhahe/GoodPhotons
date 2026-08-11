@@ -154,7 +154,11 @@ argument for standing a groom in a hall of polished objects.*
   the way and `-fur-volume` deletes the strands entirely: the coat becomes a
   **participating medium**, and each free-flight collision invents one virtual fiber from
   the cell's reconstructed orientation distribution — the far LOD tier, for fur small
-  enough on screen to have no silhouette left to lose. The
+  enough on screen to have no silhouette left to lose. `-fur-lod` then picks between the
+  two by asking how many fiber diameters wide one *pixel* is where the coat starts (the
+  pixel, not the sample — no amount of `-spp` puts a sub-pixel silhouette into the final
+  image), and cross-fades stochastically across the band so the switch dissolves into the
+  sampling instead of drawing a line across the picture. The
   physics is guarded by `-checkhair`, which asserts the white furnace as *algebra* at
   1e-12 rather than as a picture, and catches a sign typo in Zinke's own eq. 16 by
   measuring its order of convergence.

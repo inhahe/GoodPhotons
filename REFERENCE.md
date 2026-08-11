@@ -29,6 +29,7 @@ Three neighbouring documents cover what this one only summarises:
     - [Dual scattering (`-dual-scatter`)](#dual-scattering--dual-scatter)
       - [The fiber-density grid (`-dual-grid`)](#the-fiber-density-grid--dual-grid)
       - [The coat as a medium (`-fur-volume`)](#the-coat-as-a-medium--fur-volume)
+      - [Choosing a tier (`-fur-lod`)](#choosing-a-tier--fur-lod)
 - [Spectra (SPDs, reflectances, indices)](#spectra-spds-reflectances-indices)
   - [Spectral representation vs. other renderers](#spectral-representation-vs-other-renderers)
 - [Lights](#lights)
@@ -1474,6 +1475,73 @@ strand. There is no `u`/`v`, so a hair material whose colour comes from a textur
 reads at the default hit's coordinates (the same class of approximation as `-dual-grid`'s
 textured `σ_a`); and per-strand silhouette detail is gone by construction, which is the
 point of a far tier and the reason it is opt-in rather than automatic.
+
+##### Choosing a tier (`-fur-lod`)
+
+`-fur-volume` on its own is a *mode*: every path goes through the medium, however close the
+camera is. `-fur-lod` makes it a *decision*, and the decision is about what a pixel can see.
+
+The ruler is the width of one pixel where the coat starts, measured in fiber diameters —
+`Camera::footprintPerDist(1)` times the distance at which the camera ray enters the coat's
+bounding box, over the grid's length-weighted mean fiber diameter. Below `d0` diameters a
+strand still has a silhouette worth tracing and the path uses the strands; above `d1` it does
+not and the path uses the medium.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-fur-lod [d0[:d1]]` | off; `1:4` when given | Trace strands while a pixel is narrower than `d0` fiber diameters at the coat, the aggregate once it is wider than `d1`, stochastic crossfade between. Implies `-fur-volume`. One number sets `d0` and puts `d1` two octaves up. |
+
+Three things about it are deliberate.
+
+**The ruler is the pixel, not the sample.** `footprintPerDist(1)`, never
+`footprintPerDist(spp)` — which is the opposite of what the `fw` shading footprint does, and
+the one part of this that is easy to get backwards. `fw` band-limits a sampler that cannot
+average over its own pixel, so more samples must relax it. LOD is not that: if a fiber is
+thinner than a pixel, *no* number of samples will put its silhouette into the final image —
+the reconstruction filter averages it away, and the aggregate is precisely that average. A
+ruler that shrank with `-spp` would make a converged render pick a different tier from its own
+preview, which is exactly the pop the flag exists to prevent.
+
+**The crossfade is stochastic, and per path.** Inside the band each path flips one coin
+against a smoothstep of the footprint. Not a weighted sum of two renders, because a blend
+needs *both* estimators evaluated — in the band that costs more than either tier alone, and it
+would still have to reconcile two incompatible visibility conventions inside one path. A coin
+costs nothing, is unbiased for the same blend, and mode `R` already averages hundreds of paths
+per pixel, so what the image shows is the blend and not the coin. Smoothstep rather than a
+linear ramp so that the derivative vanishes at both ends and neither edge of the band is
+itself an edge.
+
+**The choice is sticky.** A path decides once, on its first segment, and a gather ray or a
+`-herosplit` re-entry inherits it rather than re-rolling. A path that half-believed in the
+strands would test visibility against geometry its own vertices were not built from — the
+aggregate vertex skips fibers and multiplies in `exp(−τ)`, the strand vertex tests them
+directly, and mixing the two inside one path double-counts the coat.
+
+**Outside the band it costs nothing, exactly.** No coin is flipped unless the footprint is
+*inside* [`d0`, `d1`], so the random stream is untouched and a render below `d0` comes out
+**byte-identical** to one with no `-fur-lod` at all, while one above `d1` is byte-identical to
+plain `-fur-volume`. Measured on a 90 k-strand coat at 200×150, 400 spp, sweeping the
+threshold so the same geometry walks the whole band (coat-only scene-linear mean luminance;
+all seven renders landed on the same auto-exposure):
+
+| threshold | coat mean Y | vs. strands | time |
+|---|---|---|---|
+| *(strands, no flag)* | 0.67641 | — | 28.5 s |
+| `-fur-lod 100:200` | 0.67641 | byte-identical | 33.3 s |
+| `-fur-lod 40:80` | 0.67641 | byte-identical | 32.0 s |
+| `-fur-lod 24:48` | 0.67641 | byte-identical | 29.4 s |
+| `-fur-lod 12:24` | 0.67620 | ×0.9997 — in the band | 36.5 s |
+| `-fur-lod 4:8` | 0.67353 | ×0.9957 | 90.6 s |
+| *(`-fur-volume`)* | 0.67353 | ×0.9957, byte-identical to `4:8` | 90.8 s |
+
+The two endpoints are 0.43 % apart, which is the real reason the transition does not pop: the
+tiers already agree on brightness, so the fade only has to hide a change in *noise character*.
+
+`-checkfurvol` §9 covers both halves: that the entry distance leaves exactly zero optical
+depth behind it (checked against the grid march, not against itself), and that the realised
+aggregate fraction tracks the smoothstep it claims — monotonically, and *exactly* 0 and 1 at
+the two ends, since a coat that is one-in-a-thousand aggregate at point-blank range is a coat
+with sparkling holes in it.
 
 **Parametric records.** A **record** is a named bank of per-channel look-up tables over
 a shared scalar domain `[lo,hi]`. A single per-hit **driver** scalar samples every
@@ -4001,6 +4069,7 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-dual-max-cross <n>` | Strands one dual-scattering shadow ray counts before it stops (default `64`). |
 | `-dual-grid [cells]` | Count dual-scattering crossings by marching a **fiber-density grid** (Zinke §4.1.2) instead of walking the strands one by one — the crossing count comes from `∫σ_t dt` with no curve intersections, and is drawn as a Poisson variate so it stays a drop-in for the walk. 1.5× faster than the walk on a dense coat, which is what turns `-dual-scatter` from a net loss into a win there. Optional argument is a cell **budget** (default `2097152` = 128³), split into roughly cubic cells over the fur's bounds; ~64 MB at the default. Needs `-dual-scatter`. See [The fiber-density grid](#the-fiber-density-grid--dual-grid). |
 | `-fur-volume [cells]` | Render `type hair` coats as a **participating medium** instead of as strands — the coat's far LOD tier. Fibers leave the BVH entirely; a ray free-flights against the same grid's `σ_t(d)` (exact inverse-CDF, not delta tracking) and each collision invents one virtual fiber, drawing its tangent from the cell's reconstructed Bingham orientation distribution and shading it with the ordinary BCSDF. Cost stops scaling with fiber count; per-strand silhouette and texture coordinates are lost, so this is for fur that is small on screen. Backward modes only. Shares the field (and the `cells` budget) with `-dual-grid`, plus 16 B/cell. See [The coat as a medium](#the-coat-as-a-medium--fur-volume). |
+| `-fur-lod [d0[:d1]]` | Turn that far tier from a mode into a **LOD decision**: trace strands while one pixel is narrower than `d0` fiber diameters where the coat begins, the aggregate once it is wider than `d1`, and cross-fade stochastically between (one coin per path against a smoothstep, so the switch dissolves into the sampling instead of drawing a line across the image). Implies `-fur-volume`. One number sets `d0` and puts `d1` two octaves up; default `1:4`. The ruler is the **pixel** footprint and does not shrink with `-spp`. See [Choosing a tier](#choosing-a-tier--fur-lod). |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,

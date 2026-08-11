@@ -889,7 +889,44 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     an aggregate representation a footprint-based LOD decision can switch to (stage 2c). What it
     loses is everything that lived on an individual strand: no silhouette, and no `u`/`v` at a
     collision, so a textured hair `reflect` reads at the default `Hit`'s coordinates — the same
-    class of approximation as `-dual-grid`'s textured `σ_a`.
+    class of approximation as `-dual-grid`'s textured `σ_a`. Measured on a 90 k-strand coat
+    filling the frame (mode R, 200×150, `-max-bounce 200`, equal 150 s): strands 2223 spp at
+    2.12 % noise, aggregate 583 spp at 4.14 % — a 3.8× *loss* at this fiber count, at 0.9 %
+    agreement in coat luminance. See `known-issues.md` for the unmeasured crossover.
+- **`-fur-lod` — choosing a tier** (P2 stage 2c, `backward.h`). Turns the above from a mode
+  into a decision. The ruler is the width of one pixel where the coat starts, in fiber
+  diameters: `Camera::footprintPerDist(1)` × `FurVolume::entryDist` ÷ `FurGrid::meanRadius()×2`.
+  Strands below `d0`, medium above `d1`, stochastic smoothstep crossfade between.
+  - *The ruler is the **pixel**, not the sample* — `footprintPerDist(1)`, never
+    `footprintPerDist(spp)`, which is the exact opposite of what `fwPerDist` does two fields
+    above it in the same struct. `fw` band-limits a sampler that cannot average over its own
+    pixel, so more samples must relax it. LOD is not that: a sub-pixel silhouette cannot reach
+    the final image at *any* sample count, because the reconstruction filter averages it away
+    and the aggregate is precisely that average. A ruler that shrank with `-spp` would make a
+    converged render switch tiers relative to its own preview — the pop the flag exists to
+    prevent.
+  - *The crossfade is stochastic and per path*, one coin against a smoothstep, not a weighted
+    sum. A blend needs both estimators evaluated (in the band, dearer than either tier alone)
+    and would still have to reconcile two incompatible visibility conventions inside one path.
+    The coin is unbiased for the same blend and mode R already averages hundreds of paths per
+    pixel. Smoothstep, not a ramp, so neither edge of the band is itself an edge.
+  - *The choice is sticky*, carried in `GiCtx::furTier` so a gather ray and a `-herosplit`
+    re-entry inherit rather than re-roll. A path that half-believed in the strands would test
+    visibility against geometry its own vertices were not built from, double-counting the coat.
+  - *`entryDist` uses the grid's AABB, not the first fiber* — finding the first fiber means the
+    BVH traversal the far tier exists to avoid, and the two differ by at most the coat's own
+    depth, far inside an octave-wide transition band.
+  - *Outside the band it costs nothing, exactly.* No coin is drawn unless the footprint lies
+    inside [`d0`, `d1`], so the rng stream is untouched and the endpoints are **byte-identical**
+    rather than merely close. Confirmed by sweeping the threshold over one fixed coat
+    (200×150, 400 spp): `-fur-lod 100:200`, `40:80` and `24:48` all md5 the same as the no-flag
+    strand render, `4:8` md5s the same as plain `-fur-volume`, and only `12:24` lands in the
+    band (coat mean Y 0.67620 vs 0.67641 strands / 0.67353 aggregate). The endpoints are 0.43 %
+    apart, which is why it does not pop — the fade only has to hide a change in noise character.
+  - `-checkfurvol` §9 checks `entryDist` **against the march** (zero optical depth may lie
+    behind it) and the realised aggregate fraction against the smoothstep: monotone, and
+    exactly 0 and 1 at the ends — a coat one-in-a-thousand aggregate at point-blank range is a
+    coat with sparkling holes in it.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds

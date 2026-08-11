@@ -605,6 +605,29 @@ struct FurVolume {
         return ok;
     }
 
+    // Distance along `o + t*d` at which the ray first reaches the coat's AABB: 0 if it starts
+    // inside, -1 if it misses the box entirely.  This is the LOD ruler (`-fur-lod`): the
+    // camera's per-unit-distance PIXEL width times this distance is how wide one pixel is
+    // where the fur begins, which is what decides whether a strand still has a silhouette
+    // worth tracing.  The box and not the first fiber, deliberately -- finding the first
+    // fiber means the BVH traversal the far tier exists to avoid, and the difference between
+    // the two is at most the coat's own depth, far below the octave-wide transition band.
+    double entryDist(const Vec3& o, const Vec3& d) const {
+        if (!valid()) return -1.0;
+        double t0 = 0.0, t1 = 1e300;
+        for (int a = 0; a < 3; ++a) {
+            const double od = (&d.x)[a], oo = (&o.x)[a];
+            const double bl = (&grid->lo.x)[a], bh = (&grid->hi.x)[a];
+            if (std::fabs(od) < 1e-15) { if (oo < bl || oo > bh) return -1.0; continue; }
+            const double inv = 1.0 / od;
+            double na = (bl - oo) * inv, fa = (bh - oo) * inv;
+            if (na > fa) std::swap(na, fa);
+            t0 = std::max(t0, na); t1 = std::min(t1, fa);
+            if (t0 > t1) return -1.0;
+        }
+        return t1 < 0.0 ? -1.0 : t0;
+    }
+
     // What a free-flight draw found.
     struct Flight {
         bool   hit   = false;   // did a collision happen before `maxDist`

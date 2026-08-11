@@ -5120,9 +5120,44 @@ that item mostly a binding exercise there.
           scaling with fiber count at all (the same grid, the same march, whether the cell holds
           10³ or 10⁷ fibers), and that the coat finally has an aggregate representation —
           which is what stage 2c exists to cash in.
-    - [ ] **stage 2c — the near/far transition**, from `Camera::footprintPerDist(spp, rx, ry)`
-          (`camera.h:219`) and `Hit::fw` / `patShadingFootprint` (`backward.h:1396`,
-          `pattern.h:299`), plus the user-facing flag. Making it not pop is the actual work.
+    - [x] **stage 2c — the near/far transition. ✅ DONE v0.178.0** (`-fur-lod [d0[:d1]]`,
+          implies `-fur-volume`; `BackwardRenderer::pickFurTier` + `GiCtx::furTier` +
+          `FurVolume::entryDist` + `FurGrid::meanRadius`). The ruler is the width of one pixel
+          where the coat starts, in fiber diameters: `Camera::footprintPerDist(1)` ×
+          `entryDist` ÷ mean fiber diameter. Strands below `d0` (default 1), medium above `d1`
+          (default 4), stochastic smoothstep crossfade between. Four things worth keeping:
+          (1) the ruler is the **pixel**, `footprintPerDist(1)` and never `(spp)` — the exact
+          opposite of `fwPerDist` two fields above it in the same struct. `fw` band-limits a
+          sampler that cannot average over its own pixel, so more samples must relax it; LOD is
+          not that, because a sub-pixel silhouette cannot reach the final image at *any* sample
+          count — the reconstruction filter averages it away and the aggregate IS that average.
+          A ruler that shrank with `-spp` would make a converged render switch tiers relative to
+          its own preview, i.e. exactly the pop the flag exists to prevent;
+          (2) the crossfade is **stochastic and per path** — one coin against a smoothstep, not
+          a weighted sum. A blend needs both estimators evaluated (in the band, dearer than
+          either tier alone) and would still have to reconcile two incompatible visibility
+          conventions inside one path; the coin is unbiased for the same blend and mode R
+          already averages hundreds of paths per pixel. Smoothstep and not a ramp, so the
+          derivative vanishes at both ends and neither edge of the band is itself an edge;
+          (3) the choice is **sticky** (`GiCtx::furTier`): a gather ray and a `-herosplit`
+          re-entry inherit it. A path that half-believed in the strands would test visibility
+          against geometry its own vertices were not built from, double-counting the coat;
+          (4) `entryDist` deliberately uses the grid's AABB and not the first fiber — finding
+          the first fiber means the BVH traversal the far tier exists to avoid, and the two
+          differ by at most the coat's depth, far inside an octave-wide band.
+          `-checkfurvol` §9 covers both halves (entry distance checked against the grid march;
+          the realised aggregate fraction against the smoothstep, monotone and exactly 0/1 at
+          the ends).
+          Validated in a real render by sweeping the threshold so one fixed 90 k-strand coat
+          walks the whole band (200×150, 400 spp, all seven landing on the same auto-exposure).
+          No coin is drawn outside the band, so the rng stream is untouched and the endpoints
+          are **byte-identical**, not merely close: `100:200`, `40:80` and `24:48` all md5 the
+          same as the no-flag strand render, `4:8` md5s the same as plain `-fur-volume`, and
+          only `12:24` sits in the band (coat mean Y 0.67620 against 0.67641 strands / 0.67353
+          aggregate — 7 % of the way across, matching its 36.5 s between 28.5 s and 90.8 s).
+          The endpoints are 0.43 % apart in coat luminance, which is the real reason it does
+          not pop: the tiers already agree on brightness, so the fade only has to hide a change
+          in noise character.
 - [x] **P3 — fiber BCSDF. ✅ DONE v0.174.0** (all four stages).  Marschner R/TT/TRT is the baseline, but it was derived for *human hair*;
       **animal fur has a medulla** (hollow scattering core), which is why Yan et al. 2015/2017 add
       the TT^s/TRT^s lobes of the double-cylinder model. Plain Marschner on fur reads as plastic.

@@ -2256,6 +2256,88 @@ static int checkFurVol() {
                     ok ? "PASS" : "FAIL");
     }
 
+    // ---- 9. the near/far transition (-fur-lod, P2 stage 2c) --------------------------
+    // Two independent things, because they fail in different ways. `entryDist` is the LOD's
+    // ruler and is checked AGAINST THE MARCH rather than against itself: if it were short,
+    // the segment before it would contain fiber mass; if it were long, a collision could
+    // happen before it. `pickFurTier` is a stochastic crossfade, so what has to hold is that
+    // its realised aggregate fraction tracks the smoothstep it claims -- and, at the two
+    // ends, that it is not merely close to 0 and 1 but EXACTLY so, since a coat that is
+    // one-in-a-thousand aggregate at point-blank range is a coat with sparkling holes in it.
+    {
+        BackwardRenderer br;
+        br.furVol = &vol;
+        Pcg32 rng; rng.seed(90210, 3);
+
+        double worstGap = 0.0;         // fiber mass found strictly before entryDist
+        int    misses = 0, inside = 0, hits = 0;
+        for (int s = 0; s < 20000; ++s) {
+            const Vec3 o(rng.uniform() * 3.0 - 1.0, rng.uniform() * 3.0 - 1.0,
+                         rng.uniform() * 3.0 - 1.0);
+            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                          rng.uniform() - 0.5));
+            const double te = vol.entryDist(o, d);
+            if (te < 0.0) {   // claimed miss: the whole ray must be empty
+                ++misses;
+                worstGap = std::max(worstGap, coat.march(o, d, 1e3).tau);
+                continue;
+            }
+            if (te == 0.0) { ++inside; continue; }
+            ++hits;
+            worstGap = std::max(worstGap, coat.march(o, d, te * (1.0 - 1e-9)).tau);
+        }
+
+        // The crossfade. One fiber diameter is the unit; put the band at [1, 4] diameters and
+        // walk a camera in along the +y axis so the footprint at the coat sweeps through it.
+        const double dia = 2.0 * coat.meanRadius();
+        br.furLodW0 = 1.0 * dia;
+        br.furLodW1 = 4.0 * dia;
+        const double perDist = 1.0;              // 1 world unit of pixel per unit of distance
+        br.furLodPerDist = perDist;
+        const Vec3 look(0.0, -1.0, 0.0);         // straight down at the slab from above, so
+                                                 // entryDist is just the drop to coat.hi.y
+        const int NW = 13, NP = 20000;
+        double worstBlend = 0.0, prevFrac = -1.0; bool monotone = true;
+        double endNear = -1.0, endFar = -1.0;
+        for (int k = 0; k < NW; ++k) {
+            // Footprint wanted where the coat starts, swept from below the band to above it.
+            const double want = dia * (0.5 + 4.0 * k / (NW - 1.0));
+            const Vec3 o(0.5 * (coat.lo.x + coat.hi.x), coat.hi.y + want,
+                         0.5 * (coat.lo.z + coat.hi.z));
+            const Ray r{o, look};
+            const double te = vol.entryDist(o, look);
+            if (te < 0.0) continue;
+            const double w = perDist * te;
+            const double x = (w - br.furLodW0) / (br.furLodW1 - br.furLodW0);
+            const double xc = x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x);
+            const double expect = xc * xc * (3.0 - 2.0 * xc);
+            int agg = 0;
+            for (int i = 0; i < NP; ++i) agg += (br.pickFurTier(r, rng) == 2) ? 1 : 0;
+            const double frac = (double)agg / NP;
+            worstBlend = std::max(worstBlend, std::fabs(frac - expect));
+            if (frac < prevFrac - 1e-9) monotone = false;
+            prevFrac = frac;
+            if (w <= br.furLodW0) endNear = std::max(endNear, frac);      // must be exactly 0
+            if (w >= br.furLodW1) endFar = std::min(endFar < 0.0 ? 1.0 : endFar, frac);
+        }
+        // A tier roll must cost nothing when the transition is not configured.
+        BackwardRenderer off; off.furVol = &vol;
+        const bool uncond = off.pickFurTier(Ray{Vec3(0.5, 2.0, 0.5), Vec3(0, -1, 0)}, rng) == 2;
+        BackwardRenderer none;
+        const bool noVol = none.pickFurTier(Ray{Vec3(0.5, 2.0, 0.5), Vec3(0, -1, 0)}, rng) == 1;
+
+        const bool ok = worstGap < 1e-12 && hits > 500 && misses > 100 &&
+                        worstBlend < 0.02 && monotone && endNear == 0.0 &&
+                        (endFar < 0.0 || endFar == 1.0) && uncond && noVol;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 9. LOD: entryDist leaves %.1e optical depth behind it over "
+                    "%d entering + %d missing rays; crossfade tracks smoothstep to %.4f over "
+                    "%d widths (%s, ends %g/%g) -> %s\n",
+                    worstGap, hits, misses, worstBlend, NW,
+                    monotone ? "monotone" : "NOT MONOTONE", endNear,
+                    endFar < 0.0 ? 1.0 : endFar, ok ? "PASS" : "FAIL");
+    }
+
     std::printf("[checkfurvol] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return fails;
 }
@@ -10130,6 +10212,15 @@ static FurGrid g_furGridData;
 static bool   g_furVolume = false;
 static int    g_furVolumeCells = 128 * 128 * 128;
 static furvol::FurVolume g_furVolData;
+// -fur-lod: P2 stage 2c, the near/far transition. Turns the tier above from unconditional
+// into a decision made per camera path, measured in FIBER DIAMETERS of pixel footprint --
+// strands while a pixel is narrower than `g_furLodD0` diameters, the aggregate once it is
+// wider than `g_furLodD1`, and a stochastic smoothstep crossfade between the two so the
+// switch cannot draw a line across the image. Implies -fur-volume (there is nothing to
+// transition TO otherwise). Off => the stage-2b behaviour, whichever tier was asked for.
+static bool   g_furLod = false;
+static double g_furLodD0 = 1.0;
+static double g_furLodD1 = 4.0;
 
 // Mode W lights a surface ONLY by next-event estimation, and a shadow ray is blocked by
 // any geometry at all -- dielectrics very much included (Scene::occluded: "can't connect
@@ -10609,6 +10700,15 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         // than this call's chunk, so every chunk of a progressive or resumed render filters
         // identically and their average stays a render of one image.
         br.fwPerDist = br.whitted ? cam.footprintPerDist((int)g_fwSpp) : 0.0;
+        // -fur-lod (P2 stage 2c): the fur LOD ruler. footprintPerDist(1) and NOT (g_fwSpp) --
+        // this is the PIXEL's width, and it must not shrink with -spp; see the long note at
+        // BackwardRenderer::furLodPerDist for why LOD is the opposite case from `fw`.
+        if (g_furLod && g_furVolData.valid()) {
+            const double dia = 2.0 * g_furGridData.meanRadius();
+            br.furLodPerDist = cam.footprintPerDist(1);
+            br.furLodW0 = g_furLodD0 * dia;
+            br.furLodW1 = g_furLodD1 * dia;
+        }
         int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
         br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
     };
@@ -13369,6 +13469,16 @@ static void printHelp(const char* prog) {
 "                        strand is under a pixel and there is no silhouette left to lose.\n"
 "                        Shares the density field with -dual-grid (same `cells` budget\n"
 "                        meaning) and adds 16 B/cell for the orientation table\n"
+"  -fur-lod [d0[:d1]]    make that tier a DECISION instead of a mode: trace strands while\n"
+"                        one pixel is narrower than d0 fiber diameters where the coat\n"
+"                        begins, the aggregate once it is wider than d1, and cross-fade\n"
+"                        stochastically in between (a per-path coin against a smoothstep,\n"
+"                        so the switch dissolves into the sampling instead of drawing a\n"
+"                        line across the image). Implies -fur-volume. One number sets d0\n"
+"                        and puts d1 two octaves up. Defaults 1:4. The ruler is the PIXEL\n"
+"                        footprint and does not shrink with -spp — no number of samples\n"
+"                        can put a sub-pixel silhouette into the final image, so a\n"
+"                        converged render must pick the same tier as its own preview\n"
 "\n"
 "Denoising (post-pass on the linear image; affects the file AND the live window):\n"
 "  -denoise [amount]     edge-aware a-trous filter for SPECTRAL speckle. CHROMA ONLY by\n"
@@ -13908,6 +14018,25 @@ static int run(int argc, char** argv) {
                 char* end = nullptr;
                 const double v = std::strtod(argv[i + 1], &end);
                 if (end && *end == '\0' && v >= 1.0) { ++i; g_furVolumeCells = (int)std::min(v, 3e8); }
+            }
+        }
+        // -fur-lod [d0[:d1]]: the near/far transition, in fiber diameters of pixel footprint.
+        // Implies -fur-volume, since without the far tier there is nothing to fade to. One
+        // number sets the START of the band and puts the end two octaves up, which keeps the
+        // common case ("switch over at about a fiber per pixel") to a single token.
+        else if (!std::strcmp(argv[i], "-fur-lod")) {
+            g_furLod = true; g_furVolume = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                char* end = nullptr;
+                const double a = std::strtod(argv[i + 1], &end);
+                if (end && a > 0.0) {
+                    if (*end == '\0') { ++i; g_furLodD0 = a; g_furLodD1 = a * 4.0; }
+                    else if (*end == ':') {
+                        char* e2 = nullptr;
+                        const double b = std::strtod(end + 1, &e2);
+                        if (e2 && *e2 == '\0' && b > a) { ++i; g_furLodD0 = a; g_furLodD1 = b; }
+                    }
+                }
             }
         }
         // -denoise [amount]: the optional amount scales BOTH tolerances, so `-denoise 2`
@@ -14482,7 +14611,18 @@ static int run(int argc, char** argv) {
                 std::printf("[fur-volume] far-tier ODF table %.1f MB in %.0f ms -- strands are "
                             "now a MEDIUM (no fiber geometry in the backward tracer)\n",
                             g_furVolData.bytes() / (1024.0 * 1024.0), ms);
+            // The LOD ruler, reported in world units so a "why is my close-up still
+            // aggregate?" is one line of arithmetic rather than a guess.
+            if (g_furLod && g_furVolData.valid()) {
+                const double dia = 2.0 * g_furGridData.meanRadius();
+                std::printf("[fur-lod] mean fiber diameter %.4g -- strands while a pixel is "
+                            "under %.4g wide at the coat, aggregate over %.4g, cross-faded "
+                            "between\n", dia, g_furLodD0 * dia, g_furLodD1 * dia);
+            }
         }
+        else if (g_furLod)
+            std::printf("[ignore] -fur-lod does nothing: the scene has no hair fibers to "
+                        "build a far tier from\n");
     }
 
     if (checkBvhOnly) {

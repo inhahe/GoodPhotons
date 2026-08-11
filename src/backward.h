@@ -196,6 +196,48 @@ struct BackwardRenderer {
     // Hit's coordinates (the same class of approximation as -dual-grid's textured sigma_a).
     const furvol::FurVolume* furVol = nullptr;
 
+    // ---- the near/far transition (`-fur-lod`, P2 stage 2c) --------------------------
+    // `furVol` alone is unconditional: every path goes through the medium, however close
+    // the coat is. These three turn it into a LOD DECISION — strands while a fiber still
+    // has a silhouette a pixel can see, the aggregate once it does not, and a stochastic
+    // crossfade in between so the switch dissolves instead of drawing a line across the
+    // image. `furLodW1 <= 0` disables the transition and restores the unconditional tier.
+    //
+    // The footprint here is the PIXEL's, `Camera::footprintPerDist(1)`, and NOT the
+    // sample's — which is the one thing about this that is easy to get backwards, and the
+    // opposite of what `fwPerDist` above does. `fw` band-limits a sampler that cannot
+    // average over its own pixel, so more samples must relax it (see fwPerDist). LOD is
+    // not that: if a fiber is thinner than a pixel, no number of samples will put its
+    // silhouette in the final image — the reconstruction filter averages it away — and
+    // the aggregate is precisely that average. So the ruler must not shrink with -spp,
+    // or a converged render would silently switch tiers relative to its own preview.
+    double furLodPerDist = 0.0;  // Camera::footprintPerDist(1) — 0 also disables
+    double furLodW0 = 0.0;       // pixel width (world units) at which the fade STARTS
+    double furLodW1 = 0.0;       // ...and at which it is fully aggregate
+
+    // Choose this path's fur tier. Returns 1 (strands) or 2 (aggregate); see GiCtx::furTier
+    // for why it is per-path and sticky.
+    //
+    // The crossfade is STOCHASTIC — a per-path coin against a smoothstep of the footprint —
+    // rather than a weighted sum of two renders, for the reason stochastic LOD usually wins:
+    // a blend of two estimators needs both of them evaluated, which in the band would cost
+    // more than either tier alone and would still have to reconcile two incompatible
+    // visibility conventions inside one path. A coin costs nothing, is unbiased for the same
+    // blend, and mode R is already averaging hundreds of paths per pixel, so what the image
+    // shows is the blend and not the coin. Smoothstep (not a linear ramp) because the
+    // derivative at both ends is zero, so neither edge of the band is itself an edge.
+    unsigned char pickFurTier(const Ray& r, Pcg32& rng) const {
+        if (!furVol || !furVol->valid()) return 1;
+        if (!(furLodW1 > furLodW0) || !(furLodPerDist > 0.0)) return 2;  // no LOD configured
+        const double te = furVol->entryDist(r.o, r.d);
+        if (te < 0.0) return 2;              // misses the coat's box: it holds no fiber to lose
+        const double w = furLodPerDist * te;
+        if (w <= furLodW0) return 1;
+        if (w >= furLodW1) return 2;
+        const double x = (w - furLodW0) / (furLodW1 - furLodW0);
+        return rng.uniform() < x * x * (3.0 - 2.0 * x) ? 2 : 1;
+    }
+
     // Where a path sits relative to the gather. `depth == 0` is a camera path (it does
     // the gather); `depth == 1` is a gather ray (it does NOT recurse, uses `giGrid`, and
     // terminates its own diffuse vertices on the flat `ambient` tail). `sIdx` is the
@@ -208,6 +250,12 @@ struct BackwardRenderer {
         int depth = 0;
         unsigned long long sIdx = 0;
         int bounce = 0;
+        // -fur-lod: which fur tier THIS PATH chose (0 = not yet decided, 1 = strands,
+        // 2 = aggregate). Decided once, on the path's first segment, and then carried --
+        // a gather ray and a heroSplit re-entry inherit it rather than re-rolling, because
+        // a path that half-believed in the strands would test visibility against geometry
+        // its own vertices were not built from. See pickFurTier().
+        unsigned char furTier = 0;
     };
 
     // One direction of the fixed gather lattice: point `j` of an `n`-point Fibonacci
@@ -771,7 +819,7 @@ struct BackwardRenderer {
         double acc[hero::kHeroMax];
         for (int i = 0; i < nUp; ++i) acc[i] = 0.0;
         double wSum = 0.0;
-        const GiCtx sub{gi.depth + 1, gi.sIdx};
+        const GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
         for (int j = 0; j < n; ++j) {
             const Vec3 d = giDir(j, n, p1, p2);
             const double c = dot(h.n, d);
@@ -805,7 +853,7 @@ struct BackwardRenderer {
         double p1, p2;
         giPhases(gi.sIdx, p1, p2);
         double acc = 0.0, wSum = 0.0;
-        const GiCtx sub{gi.depth + 1, gi.sIdx};
+        const GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
         for (int j = 0; j < n; ++j) {
             const Vec3 d = giDir(j, n, p1, p2);
             const double c = dot(h.n, d);
@@ -1487,10 +1535,16 @@ struct BackwardRenderer {
             // it stops and we fall through to the straight-ray body.
             if (grinAny) grin::march(scene, ray);
 
+            // Which fur tier this path believes in — rolled once, on its first segment, and
+            // then fixed for the rest of the path (GiCtx::furTier). Without -fur-lod this is
+            // simply "aggregate whenever furVol is set", i.e. the unconditional stage-2b tier.
+            if (!gi.furTier) gi.furTier = pickFurTier(ray, rng);
+            const bool useVol = furVol && gi.furTier == 2;
+
             // With the coat rendered as a medium the strands are NOT geometry any more: they
             // are the extinction the free flight below samples, so intersecting them too
             // would count every fiber twice.
-            Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/furVol != nullptr);
+            Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/useVol);
             if (b == 0 && gi.depth == 0 && h.valid)         // camera segment only — see fwPerDist
                 h.fw = patShadingFootprint(fwPerDist, h.t, dot(ray.d, h.n));
             double dSurf = h.valid ? h.t : 1e30;
@@ -1503,7 +1557,7 @@ struct BackwardRenderer {
             // (`sampleFlight` is an exact inverse-CDF draw, not delta tracking — see
             // fur_volume.h for why a fixed ray makes sigma_t piecewise constant.)
             furvol::FurVolume::Flight fl;
-            if (furVol && furVol->valid()) {
+            if (useVol && furVol->valid()) {
                 fl = furVol->sampleFlight(ray.o, ray.d, dSurf, rng.uniform());
                 if (fl.hit) dSurf = fl.t;
             }
@@ -1714,7 +1768,11 @@ struct BackwardRenderer {
         for (int b = bounce0; b < maxB; ++b) {
             int nUp = secAlive ? C : 1;   // wavelengths still being propagated
             gi.bounce = b;                // see the scalar twin: mode W's per-vertex lattice
-            Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/furVol != nullptr);
+            // The scalar twin's tier roll. Sticky through GiCtx, which is what makes a
+            // heroSplit re-entry (which resumes this loop mid-path) keep the parent's tier.
+            if (!gi.furTier) gi.furTier = pickFurTier(ray, rng);
+            const bool useVol = furVol && gi.furTier == 2;
+            Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/useVol);
             // Camera segment only — see fwPerDist. `b == 0` and not `b == bounce0`: a
             // heroSplit re-entry resumes this loop at a DEEPER bounce, and that segment
             // has already been through an interface, so its footprint is not the camera's.
@@ -1725,7 +1783,7 @@ struct BackwardRenderer {
             // Aggregate fur: the same free flight the scalar twin samples, shortening `dSurf`
             // so the in-glass absorption below is integrated to the collision and not past it.
             furvol::FurVolume::Flight fl;
-            if (furVol && furVol->valid()) {
+            if (useVol && furVol->valid()) {
                 fl = furVol->sampleFlight(ray.o, ray.d, dSurf, rng.uniform());
                 if (fl.hit) dSurf = fl.t;
             }

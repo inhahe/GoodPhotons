@@ -144,10 +144,19 @@ struct FurGrid {
     std::vector<FurCell> cells;
     // Diagnostics / self-test hooks.
     double totalRL   = 0.0;             // sum over all fibers of r*l, as deposited
+    double totalL    = 0.0;             // sum over all fibers of l, as deposited
     int    occupied  = 0;               // cells with any fiber mass
     bool   valid     = false;
 
     int index(int ix, int iy, int iz) const { return (iz * ny + iy) * nx + ix; }
+
+    // Length-weighted mean fiber RADIUS, world units.  `totalRL/totalL`, not a plain average
+    // over segments, because a coat's strands are tessellated into wildly different segment
+    // counts -- a curly guard hair into many short pieces, a straight undercoat fiber into a
+    // few long ones -- so an unweighted mean would be a mean over TESSELLATION rather than
+    // over fur.  This is the scale `-fur-lod` measures the pixel footprint against: it is the
+    // width of the silhouette detail the aggregate tier is throwing away.
+    double meanRadius() const { return totalL > 0.0 ? totalRL / totalL : 0.0; }
 
     // Directional extinction in a cell, 1/length.  `d` must be unit.
     static double sigmaT(const FurCell& fc, const Vec3& d) {
@@ -250,6 +259,7 @@ struct FurGrid {
                 const double r = s.r0 + (s.r1 - s.r0) * u;
                 const double w = r * dl;
                 totalRL += w;
+                totalL  += dl;
                 int ix = (int)((p.x - lo.x) * invCell.x);
                 int iy = (int)((p.y - lo.y) * invCell.y);
                 int iz = (int)((p.z - lo.z) * invCell.z);
