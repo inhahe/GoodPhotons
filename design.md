@@ -2066,6 +2066,66 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   spheres at assorted depths and sees discs of radius `sqrt(R²−h²)` — a uniform `R` already
   gives a spread of spot sizes, with near-tangential ones very small.
 
+  **Reaction–diffusion textures (`src/reaction.h`, O6, v0.167.0).** `texture "n" { reaction
+  { … } }` solves Gray–Scott — `du/dt = Du∇²u − uv² + F(1−u)`, `dv/dt = Dv∇²v + uv² −
+  (F+k)v` — once at load and stores V as a grey image. Turing's result is that the uniform
+  solution of such a system can be unstable to spatial perturbation while stable in time, so
+  the features are the **outcome of a process** rather than placed by fiat as `noise` /
+  `worley` / `gabor` / `bnoise` all do; their spacing, branch points and defects are
+  correlated the way a real coat pattern's are. It is a bake and not a `PatOp` because the
+  value at a point is the endpoint of a trajectory of the whole field — no local closed form
+  exists — and `texture` is exactly the shape of "an offline solve producing an image". That
+  choice is what makes it free: UV wrap, Jakob–Hanika upsampling, triplanar, `reflect
+  texture:`, `tex:<name>(u,v)` as a pattern term, GPU upload and the raster preview all work
+  with **zero renderer changes**, and the demo exercises each. Design points, all of them
+  measured rather than assumed:
+  • *Periodic by construction.* The Laplacian wraps, so the solve is on a torus. Not
+  retrofittable — blending the edges of a finished field destroys the long-range correlations
+  that make it not-noise — so the topology, and the seed's exact `x·nb/N` block partition,
+  are periodic up front.
+  • *The 9-point stencil* (0.2 ortho / 0.05 diag / −1) is Pearson's, so published (F,k) maps
+  transfer directly, and it is far more isotropic than the 5-point one, whose axis bias shows
+  as square grain in the labyrinth regimes.
+  • *The default diffusion is the classic 0.16/0.08 rescaled by s² = 2.5².* This was a real
+  bug found by looking at renders, not by reasoning: a feature is a fixed number of grid
+  *cells* wide (~2π√(D/F)), so at the textbook Du a spot is ~4 cells and comes out visibly
+  **square**, pixel-locked to the lattice. Scaling both coefficients by s² is a pure spatial
+  rescale — identical (F,k) physics, features s× wider — and s ≤ 2.79 by stability, so 2.5
+  leaves 20% margin.
+  • *Stability is a load error.* Explicit Euler needs `dt·max(Du,Dv)·1.6 ≤ 2` (the stencil's
+  Fourier symbol bottoms out at −1.6 at a=b=π); past it the field NaNs within a few dozen
+  steps, which is not a graceful degradation, so `rdStable` rejects at load with the
+  arithmetic printed.
+  • *The seed is the subtle part.* (u,v)=(1,0) is a fixed point **and linearly stable for
+  every F,k>0** — Gray–Scott is subcritical — so infinitesimal noise gives a blank sheet; the
+  perturbation must be finite-amplitude and domain-wide. Both its parameters were forced by
+  measurement: a per-cell seed is smoothed away before it nucleates (five of six presets
+  decayed), so blocks are ~one feature wide; and at 50% fill the ON blocks *percolate* into
+  one domain-spanning region, after which patterning hinges on whether that one region
+  survives — at sim=128 `spots` lost it and left a single nucleus creeping across a blank
+  texture. 25% fill keeps the blocks isolated, and then every preset patterns at every `sim`
+  and `seed`.
+  • *Threading.* `ft::parallelFor` spawns a pool per call, so paying it 6000 times costs more
+  than the arithmetic; threads start once and rendezvous at a sense-reversing `RDBarrier`,
+  with double buffers indexed by step parity. Every cell reads only the previous buffer and
+  there is no reduction, so the result is bit-identical for any band count (`-checkreaction`
+  §5b pins it against a serial `rdLaplacian` reference at tolerance 0). Thread 0 alone polls
+  `-stop`, *before* its compute phase, so the barrier publishes one shared answer.
+  • *Presets are load-bearing, not a convenience*: the pattern-forming crescent is ~0.01 wide
+  in k, so hand-picked numbers usually bake nothing. The six shipped were chosen by scanning
+  the plane and **looking** at every tile — which is how the lattice-locking bug surfaced —
+  and a seventh (`waves`) was dropped because it washed out at the rescaled diffusion.
+  `-checkreaction` §7 re-derives contrast (as the *standard deviation* of the normalised
+  field; its range is 1.0 by construction, so asserting on range would be vacuous) and the
+  dominant wavelength from a radially averaged separable DFT, at the shipped defaults, so a
+  preset name cannot rot silently. Its other sections pin the stencil against its Fourier
+  symbol at every representable wavenumber, the optimised loop against the reference
+  Laplacian, the uniform fixed point, torus translation invariance, seam vs interior
+  gradients, `rdStable` against actual divergence, and determinism/resampler identities.
+  • *Not everything converges*: spot regimes settle to ~4e-5 relative change per step by
+  24000 steps, but `maze` never does (~3e-3 even then) — the labyrinth keeps reconnecting —
+  so there `steps` is an aesthetic choice, and the docs say so rather than implying otherwise.
+
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
   **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the

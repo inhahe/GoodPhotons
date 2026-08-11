@@ -4063,6 +4063,392 @@ static int checkBlueNoise() {
     return ok ? 0 : 1;
 }
 
+// Deterministic Gray-Scott self-test (`-checkreaction`): the reaction-diffusion bake
+// behind `texture { reaction { } }` (O6). Runs with no scene and no renderer.
+//
+// A reaction-diffusion solve has no closed form to compare against, so the checks are
+// built around the things that ARE exactly knowable about it:
+//
+//   §1  The discrete Laplacian's Fourier symbol. cos(a x + b y) on the torus is an
+//       exact eigenvector of the 9-point stencil, so the stencil must return exactly
+//       rdLapSymbol(a,b) times it, at every wavenumber the grid supports. This pins
+//       the weights, the symmetry and the toroidal indexing at once — an off-by-one
+//       in the wrap, or a diagonal weight applied to an orthogonal neighbour, fails
+//       at some wavenumber even though both preserve constants.
+//   §2  The optimised solver's stencil equals rdLaplacian's. The inner loop is a
+//       hand-hoisted twin of the reference, so they are pinned against each other by
+//       running ONE step of a pure-diffusion configuration.
+//   §3  The uniform state (u=1, v=0) is a fixed point, exactly, for every (F,k), and
+//       stays one for thousands of steps. This is the property that forces the seed
+//       to be finite-amplitude, so it is worth pinning rather than assuming.
+//   §4  Translation invariance on the torus. Shifting the initial state by (dx,dy)
+//       must shift the result by (dx,dy) bit-for-bit. Nothing about the interior can
+//       distinguish a wrapped neighbour from an ordinary one, so any edge special-case
+//       — including the boundary of a THREAD's row band — shows up here.
+//   §5  Thread-count independence. The same solve split across 1 and N bands must be
+//       bit-identical; a missing barrier or a band reading its own half-written output
+//       breaks this and nothing else in the suite.
+//   §6  Seamlessness of the baked image: the difference across the wrap must be
+//       statistically identical to the difference between ordinary interior neighbours.
+//       A tileable-looking texture that is not actually tileable is the classic silent
+//       failure here, and it is invisible in a single tile.
+//   §7  Every preset actually patterns: real contrast, and a dominant wavelength in a
+//       plausible band, measured from the radially averaged power spectrum. This is
+//       what stops a named preset from quietly rotting into a blank sheet.
+//   §8  The stability predicate agrees with reality — configurations it accepts stay
+//       finite, one it rejects would indeed blow up.
+//   §9  Determinism and seed independence; the periodic seed has no defect line at the
+//       wrap; the resampler is exact at res == sim and periodic across it.
+static int checkReaction() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (tol <= 1e-12 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkreaction] %-52s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+
+    // ---- §1: the stencil's Fourier symbol, at every representable wavenumber -------
+    {
+        const int N = 24;
+        std::vector<double> f((size_t)N * N), lap((size_t)N * N);
+        double wmax = 0.0;
+        int tested = 0;
+        for (int my = 0; my <= N / 2; ++my)
+        for (int mx = 0; mx <= N / 2; ++mx) {
+            const double a = 2.0 * PI * mx / N, bq = 2.0 * PI * my / N;
+            for (int y = 0; y < N; ++y)
+                for (int x = 0; x < N; ++x)
+                    f[(size_t)y * N + x] = std::cos(a * x + bq * y);
+            rdLaplacian(f.data(), N, lap.data());
+            const double lam = rdLapSymbol(a, bq);
+            for (size_t i = 0; i < f.size(); ++i)
+                wmax = std::fmax(wmax, std::fabs(lap[i] - lam * f[i]));
+            ++tested;
+        }
+        std::printf("[checkreaction] S1 %d wavenumbers on a %dx%d torus, worst residual %.3g\n",
+                    tested, N, N, wmax);
+        ok &= chk("S1 stencil == its Fourier symbol", wmax, 0.0, 1e-13);
+    }
+
+    // ---- §2: the solver's stencil is the reference stencil --------------------------
+    // One step with no reaction (feed = kill = 0 and v seeded to zero leaves
+    // u' = u + dt*Du*L(u) exactly, since the u v^2 term and F(1-u) both vanish).
+    {
+        const int N = 32;
+        RDParams p; p.sim = N; p.steps = 1; p.feed = 0.0; p.kill = 0.0;
+        p.du = 0.7; p.dv = 0.3; p.dt = 1.0;
+        std::vector<float> u((size_t)N * N), v((size_t)N * N, 0.0f);
+        std::vector<double> u0((size_t)N * N), lap((size_t)N * N);
+        uint64_t s = 12345;
+        for (size_t i = 0; i < u.size(); ++i) {
+            s = s * 6364136223846793005ull + 1442695040888963407ull;
+            u0[i] = (double)(float)((double)(s >> 40) / 16777216.0);
+            u[i] = (float)u0[i];
+        }
+        rdLaplacian(u0.data(), N, lap.data());
+        if (!rdRun(p, u, v)) { std::printf("[checkreaction] S2 stopped  BAD\n"); ok = false; }
+        double w = 0.0;
+        for (size_t i = 0; i < u.size(); ++i)
+            w = std::fmax(w, std::fabs((double)u[i] - (double)(float)(u0[i] + p.dt * p.du * lap[i])));
+        ok &= chk("S2 solver stencil == rdLaplacian", w, 0.0, 0.0);
+    }
+
+    // ---- §3: the uniform state is an exact fixed point ------------------------------
+    {
+        double w = 0.0;
+        int nn = 0; const RDPreset* pr = rdPresets(nn);
+        for (int i = 0; i < nn; ++i) {
+            const int N = 16;
+            RDParams p; p.sim = N; p.steps = 3000; p.feed = pr[i].feed; p.kill = pr[i].kill;
+            std::vector<float> u((size_t)N * N, 1.0f), v((size_t)N * N, 0.0f);
+            if (!rdRun(p, u, v)) { std::printf("[checkreaction] S3 stopped  BAD\n"); ok = false; break; }
+            for (size_t j = 0; j < u.size(); ++j) {
+                w = std::fmax(w, std::fabs((double)u[j] - 1.0));
+                w = std::fmax(w, std::fabs((double)v[j]));
+            }
+        }
+        ok &= chk("S3 (u,v)=(1,0) is a fixed point over 3000 steps", w, 0.0, 0.0);
+    }
+
+    // ---- §4: translation invariance on the torus ------------------------------------
+    {
+        const int N = 48, DX = 17, DY = 29;
+        RDParams p; p.sim = N; p.steps = 400;
+        std::vector<float> u, v, us, vs;
+        rdSeed(p, u, v);
+        us.resize(u.size()); vs.resize(v.size());
+        for (int y = 0; y < N; ++y)
+            for (int x = 0; x < N; ++x) {
+                const size_t d = (size_t)((y + DY) % N) * N + (x + DX) % N;
+                us[d] = u[(size_t)y * N + x];
+                vs[d] = v[(size_t)y * N + x];
+            }
+        bool okrun = rdRun(p, u, v) && rdRun(p, us, vs);
+        double w = 0.0;
+        for (int y = 0; y < N; ++y)
+            for (int x = 0; x < N; ++x) {
+                const size_t d = (size_t)((y + DY) % N) * N + (x + DX) % N;
+                w = std::fmax(w, std::fabs((double)vs[d] - (double)v[(size_t)y * N + x]));
+            }
+        if (!okrun) { std::printf("[checkreaction] S4 stopped  BAD\n"); ok = false; }
+        ok &= chk("S4 shifted input gives the shifted result", w, 0.0, 0.0);
+    }
+
+    // ---- §5: the row-band split cannot change the answer ----------------------------
+    // rdRun sizes its band count from `sim`, so comparing sim = 16 (forced serial,
+    // N/16 = 1 band) against the same physical solve at a thread-splitting size is not
+    // a fair comparison. Instead run the same grid twice and confirm repeatability, and
+    // separately run a grid large enough to be split against a hand-rolled serial
+    // reference built from rdLaplacian.
+    {
+        const int N = 64;
+        RDParams p; p.sim = N; p.steps = 120;
+        std::vector<float> u1, v1, u2, v2;
+        rdSeed(p, u1, v1); rdSeed(p, u2, v2);
+        bool okrun = rdRun(p, u1, v1) && rdRun(p, u2, v2);
+        double w = 0.0;
+        for (size_t i = 0; i < v1.size(); ++i)
+            w = std::fmax(w, std::fabs((double)v1[i] - (double)v2[i]));
+        if (!okrun) { std::printf("[checkreaction] S5 stopped  BAD\n"); ok = false; }
+        ok &= chk("S5a repeat run of a multi-band solve is identical", w, 0.0, 0.0);
+
+        // Serial reference: the same update written with rdLaplacian, no threads.
+        std::vector<float> ur, vr; rdSeed(p, ur, vr);
+        std::vector<double> ud(ur.size()), vd(vr.size()), lu(ur.size()), lv(vr.size());
+        for (size_t i = 0; i < ur.size(); ++i) { ud[i] = ur[i]; vd[i] = vr[i]; }
+        for (int s2 = 0; s2 < p.steps; ++s2) {
+            rdLaplacian(ud.data(), N, lu.data());
+            rdLaplacian(vd.data(), N, lv.data());
+            for (size_t i = 0; i < ud.size(); ++i) {
+                const double uc = ud[i], vc = vd[i], reac = uc * vc * vc;
+                ud[i] = (double)(float)(uc + p.dt * (p.du * lu[i] - reac + p.feed * (1.0 - uc)));
+                vd[i] = (double)(float)(vc + p.dt * (p.dv * lv[i] + reac - (p.feed + p.kill) * vc));
+            }
+        }
+        double w2 = 0.0;
+        for (size_t i = 0; i < v1.size(); ++i) w2 = std::fmax(w2, std::fabs((double)v1[i] - vd[i]));
+        ok &= chk("S5b banded solve == serial rdLaplacian reference", w2, 0.0, 0.0);
+    }
+
+    // ---- §6: the baked image really is seamless -------------------------------------
+    // Every adjacent column pair (x, x+1) gives one mean |step|; on a torus the wrap pair
+    // (N-1, 0) is drawn from the same population as the other N-1, so the honest test is
+    // a RANK test: the seam must not stand out among them. Comparing the seam against the
+    // pooled mean instead — the obvious formulation — is far too noisy to threshold,
+    // because a single column crossing an unusual number of corridor walls swings it by
+    // 60%; that version failed on a perfectly periodic field. A non-periodic solve, by
+    // contrast, puts the seam far above *every* interior column, so requiring only that
+    // it not be the maximum still catches the failure it exists to catch, while its
+    // false-alarm rate on a good field is 1/N.
+    {
+        RDParams p; p.sim = 128; p.steps = 3000;
+        rdPresetLookup("maze", p.feed, p.kill);
+        std::vector<float> f;
+        if (!rdSimulate(p, f)) { std::printf("[checkreaction] S6 stopped  BAD\n"); ok = false; }
+        const int N = p.sim;
+        for (int axis = 0; axis < 2; ++axis) {
+            std::vector<double> step((size_t)N, 0.0);
+            for (int i = 0; i < N; ++i) {            // i = the column (or row) index
+                double s = 0.0;
+                for (int j = 0; j < N; ++j) {
+                    const size_t a = axis == 0 ? (size_t)j * N + i
+                                               : (size_t)i * N + j;
+                    const size_t b = axis == 0 ? (size_t)j * N + (i + 1) % N
+                                               : (size_t)((i + 1) % N) * N + j;
+                    s += std::fabs((double)f[a] - (double)f[b]);
+                }
+                step[i] = s / N;
+            }
+            const double seam = step[N - 1];
+            double imax = 0.0, imean = 0.0;
+            int rank = 0;                            // how many interior pairs exceed it
+            for (int i = 0; i + 1 < N; ++i) {
+                imax = std::fmax(imax, step[i]);
+                imean += step[i];
+                if (step[i] > seam) ++rank;
+            }
+            imean /= (double)(N - 1);
+            std::printf("[checkreaction] S6 %s seam step %.5f  interior mean %.5f max %.5f  "
+                        "(%d of %d interior pairs exceed the seam)\n",
+                        axis == 0 ? "x" : "y", seam, imean, imax, rank, N - 1);
+            if (!(imax > 0.0) || seam > imax) {
+                std::printf("[checkreaction] S6 the %s wrap is not seamless  BAD\n",
+                            axis == 0 ? "x" : "y");
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §7: every preset patterns, with a plausible feature wavelength -------------
+    // The dominant wavelength is read off the radially averaged power spectrum of the
+    // baked field (DC removed). A separable two-pass DFT keeps this O(N^3) with no FFT
+    // dependency, which at N = 256 costs a fraction of the solve it is measuring.
+    //
+    // This runs at the SHIPPED DEFAULTS (sim 256, 6000 steps) on purpose: a preset is a
+    // promise about what a user gets by typing its name, so the assertion has to be made
+    // under the conditions the name is used in. It is also the check that caught the
+    // seed's percolation problem — at 50% fill `spots` and `mitosis` failed it — so
+    // weakening it to "some structure exists" would give the failure back.
+    //
+    // "Contrast" is the standard deviation of the NORMALISED field, not its range:
+    // rdSimulate rescales to [0,1] by the measured extremes, so the range is 1.000 for
+    // anything that is not perfectly flat and asserting on it would be vacuous. A field
+    // that is 0.5 everywhere bar one outlying texel passes a range test and fails this.
+    {
+        int nn = 0; const RDPreset* pr = rdPresets(nn);
+        for (int i = 0; i < nn; ++i) {
+            RDParams p; p.sim = 256; p.steps = 6000; p.feed = pr[i].feed; p.kill = pr[i].kill;
+            std::vector<float> f;
+            if (!rdSimulate(p, f)) { std::printf("[checkreaction] S7 stopped  BAD\n"); ok = false; break; }
+            const int N = p.sim;
+            double mean = 0.0;
+            for (size_t j = 0; j < f.size(); ++j) mean += f[j];
+            mean /= (double)f.size();
+            double var = 0.0;
+            for (size_t j = 0; j < f.size(); ++j) { const double d = f[j] - mean; var += d * d; }
+            const double sd = std::sqrt(var / (double)f.size());
+            std::vector<double> ct(N), stb(N);
+            for (int t = 0; t < N; ++t) { ct[t] = std::cos(-2.0 * PI * t / N); stb[t] = std::sin(-2.0 * PI * t / N); }
+            // Pass 1: DFT along x for every row.
+            std::vector<double> ar((size_t)N * N, 0.0), ai((size_t)N * N, 0.0);
+            for (int y = 0; y < N; ++y)
+                for (int kx = 0; kx < N; ++kx) {
+                    double re = 0.0, im = 0.0;
+                    for (int x = 0; x < N; ++x) {
+                        const int ph = (kx * x) % N;
+                        const double a = f[(size_t)y * N + x] - mean;
+                        re += a * ct[ph]; im += a * stb[ph];
+                    }
+                    ar[(size_t)y * N + kx] = re; ai[(size_t)y * N + kx] = im;
+                }
+            // Pass 2: DFT along y, accumulating |F|^2 straight into radial bins.
+            std::vector<double> pw((size_t)N / 2 + 1, 0.0);
+            for (int kx = 0; kx < N; ++kx) {
+                const int sx = kx <= N / 2 ? kx : kx - N;
+                for (int ky = 0; ky < N; ++ky) {
+                    const int sy = ky <= N / 2 ? ky : ky - N;
+                    const int rr = (int)(std::sqrt((double)sx * sx + (double)sy * sy) + 0.5);
+                    if (rr < 1 || rr > N / 2) continue;
+                    double re = 0.0, im = 0.0;
+                    for (int y = 0; y < N; ++y) {
+                        const int ph = (ky * y) % N;
+                        const double br = ar[(size_t)y * N + kx], bi = ai[(size_t)y * N + kx];
+                        re += br * ct[ph] - bi * stb[ph];
+                        im += br * stb[ph] + bi * ct[ph];
+                    }
+                    pw[rr] += re * re + im * im;
+                }
+            }
+            int kpk = 1;
+            for (int r2 = 2; r2 <= N / 2; ++r2) if (pw[r2] > pw[kpk]) kpk = r2;
+            const double wavelen = (double)N / kpk;     // in sim cells
+            std::printf("[checkreaction] S7 %-8s F=%.3f k=%.3f  contrast(sd) %.3f  wavelength %.1f cells\n",
+                        pr[i].name, pr[i].feed, pr[i].kill, sd, wavelen);
+            if (!(sd > 0.15)) {
+                std::printf("[checkreaction] S7 preset '%s' has no contrast (sd %.3f)  BAD\n",
+                            pr[i].name, sd);
+                ok = false;
+            }
+            // A feature must be resolved (well over a couple of cells, or it pixel-locks
+            // into squares) and must fit several times into the grid (or `sim` would be
+            // meaningless as a density knob).
+            if (!(wavelen >= 8.0 && wavelen <= (double)N / 3.0)) {
+                std::printf("[checkreaction] S7 preset '%s' wavelength %.1f out of 8..%.1f  BAD\n",
+                            pr[i].name, wavelen, (double)N / 3.0);
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §8: the stability predicate matches reality --------------------------------
+    {
+        RDParams good;                                  // the shipped defaults
+        if (!rdStable(good)) { std::printf("[checkreaction] S8 defaults declared unstable  BAD\n"); ok = false; }
+        RDParams bad = good; bad.du = 1.6; bad.dv = 0.8;   // 1.6*1.6 = 2.56 > 2
+        if (rdStable(bad)) { std::printf("[checkreaction] S8 an unstable dt accepted  BAD\n"); ok = false; }
+        // The predicate is only worth anything if the rejected setting really does blow
+        // up, so run it and confirm the field diverges.
+        bad.sim = 32; bad.steps = 400;
+        std::vector<float> u, v; rdSeed(bad, u, v);
+        (void)rdRun(bad, u, v);
+        double mx = 0.0;
+        for (size_t i = 0; i < v.size(); ++i) { const double t = std::fabs((double)v[i]); if (!(t < mx)) mx = t; }
+        const bool blew = !(mx < 1e6);                  // catches inf and NaN too
+        std::printf("[checkreaction] S8 rejected setting reaches |v|max = %.3g (diverges: %s)\n",
+                    mx, blew ? "yes" : "no");
+        if (!blew) { std::printf("[checkreaction] S8 rejected setting was actually fine  BAD\n"); ok = false; }
+        // And the accepted one stays bounded — v is a concentration, so O(1).
+        RDParams g2 = good; g2.sim = 64; g2.steps = 2000;
+        std::vector<float> u2, v2; rdSeed(g2, u2, v2);
+        if (!rdRun(g2, u2, v2)) { std::printf("[checkreaction] S8 stopped  BAD\n"); ok = false; }
+        double mx2 = 0.0;
+        for (size_t i = 0; i < v2.size(); ++i) mx2 = std::fmax(mx2, std::fabs((double)v2[i]));
+        if (!(mx2 < 2.0)) {
+            std::printf("[checkreaction] S8 accepted setting drifted to |v|max %.3g  BAD\n", mx2);
+            ok = false;
+        }
+    }
+
+    // ---- §9: determinism, seed periodicity, and the resampler -----------------------
+    {
+        // Big enough and long enough to actually pattern: "a different seed gives a
+        // different field" is only meaningful if BOTH fields have a field to differ in,
+        // and rdSimulate maps a washed-out solve to a uniform 0.5 — so a regime that
+        // decays makes the two seeds agree perfectly and the check pass for the worst
+        // possible reason. `maze` patterns from any seed, which is what is wanted here.
+        RDParams p; p.sim = 128; p.steps = 2000;
+        rdPresetLookup("maze", p.feed, p.kill);
+        std::vector<float> a, b, c;
+        bool okrun = rdSimulate(p, a) && rdSimulate(p, b);
+        RDParams q = p; q.seed = 2u;
+        okrun = okrun && rdSimulate(q, c);
+        if (!okrun) { std::printf("[checkreaction] S9 stopped  BAD\n"); ok = false; }
+        double same = 0.0, diff = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            same = std::fmax(same, std::fabs((double)a[i] - b[i]));
+            diff = std::fmax(diff, std::fabs((double)a[i] - c[i]));
+        }
+        ok &= chk("S9 same seed reproduces bit-for-bit", same, 0.0, 0.0);
+        if (!(diff > 0.1)) { std::printf("[checkreaction] S9 a different seed changed nothing  BAD\n"); ok = false; }
+
+        // The seed's coarse blocks must partition the axis exactly, or the wrap carries
+        // a permanent defect line. Check that the seeded pattern's column-0/column-N-1
+        // block assignment is consistent with periodicity by seeding at a size that is
+        // NOT a multiple of the block count.
+        RDParams sp; sp.sim = 100; sp.steps = 0;
+        std::vector<float> su, sv; rdSeed(sp, su, sv);
+        int nb = (int)(sp.sim / (RD_SEED_BLOCK * std::sqrt(sp.du / RD_DU_CLASSIC)));
+        if (nb < 1) nb = 1;
+        const int b0 = (int)((long long)0 * nb / sp.sim);
+        const int bl = (int)((long long)(sp.sim - 1) * nb / sp.sim);
+        std::printf("[checkreaction] S9 seed blocks: sim %d -> %d blocks, first %d last %d\n",
+                    sp.sim, nb, b0, bl);
+        if (b0 != 0 || bl != nb - 1) {
+            std::printf("[checkreaction] S9 seed block partition is not exact  BAD\n"); ok = false;
+        }
+
+        // Resampling at res == sim must be the identity, and must wrap.
+        double w = 0.0;
+        for (int y = 0; y < p.sim; ++y)
+            for (int x = 0; x < p.sim; ++x)
+                w = std::fmax(w, std::fabs(rdSampleWrapped(a, p.sim, (x + 0.5) / p.sim,
+                                                           (y + 0.5) / p.sim)
+                                           - (double)a[(size_t)y * p.sim + x]));
+        ok &= chk("S9 resample at res == sim is the identity", w, 0.0, 1e-12);
+        const double lft = rdSampleWrapped(a, p.sim, -0.25, 0.375);
+        const double rgt = rdSampleWrapped(a, p.sim,  0.75, 0.375);
+        ok &= chk("S9 resampler wraps (u-1 == u)", lft, rgt, 0.0);
+    }
+
+    std::printf("[checkreaction] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkreaction] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic mean-curvature self-test (`-checkcurv`): the `curv` free variable
 // (O3 — non-stationary randomness). Runs with no scene and no renderer.
 //
@@ -10442,6 +10828,7 @@ static int run(int argc, char** argv) {
     bool checkWorleyOnly = false;
     bool checkGaborOnly = false;
     bool checkBlueNoiseOnly = false;
+    bool checkReactionOnly = false;
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
     bool checkSdfOnly = false;
@@ -10860,6 +11247,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkworley")) checkWorleyOnly = true;
         else if (!std::strcmp(argv[i], "-checkgabor")) checkGaborOnly = true;
         else if (!std::strcmp(argv[i], "-checkbluenoise")) checkBlueNoiseOnly = true;
+        else if (!std::strcmp(argv[i], "-checkreaction")) checkReactionOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
@@ -11050,6 +11438,7 @@ static int run(int argc, char** argv) {
     if (checkWorleyOnly)   return checkWorley();   // ditto (cellular / Worley noise)
     if (checkGaborOnly)    return checkGabor();    // ditto (anisotropic band-limited Gabor noise)
     if (checkBlueNoiseOnly) return checkBlueNoise();  // ditto (blue-noise / Poisson-disk placement)
+    if (checkReactionOnly)  return checkReaction();   // ditto (Gray-Scott reaction-diffusion bake)
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)

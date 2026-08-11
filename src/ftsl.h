@@ -73,6 +73,7 @@
 #include "upsample.h"
 #include "fur.h"         // `fur { }` groom generator — scatters `curve` strands (TODO §P1)
 #include "parallel.h"    // ft::stopRequested — cooperative `-stop` during a long load
+#include "reaction.h"    // `texture { reaction { } }` — Gray-Scott bake (TODO §O6)
 #include "color.h"
 #include "sky.h"
 #include "record_ladder.h"   // generalized record-stop delimiter ladder (J3b item 2)
@@ -2537,8 +2538,78 @@ private:
         else if (wr == "mirror") tex.wrap = TexWrap::Mirror;
         else { fail("texture '" + b.name + "': unknown wrap '" + wr + "' (repeat|clamp|mirror)"); return false; }
 
-        const Stmt* rgbS = find(b, "rgb");
-        if (rgbS) {
+        const Stmt* rxnS = find(b, "reaction");
+        const Stmt* rgbS = rxnS ? nullptr : find(b, "rgb");
+        if (rxnS) {
+            // Gray-Scott reaction-diffusion (O6). Solved once at load on a periodic
+            // `sim` grid and resampled to `res`, then treated as an ordinary texture —
+            // so `reflect texture:<name>`, `tex:<name>(u,v)` inside a pattern formula,
+            // the GPU upload and the raster preview all work with no changes anywhere.
+            // The output is grey (V in all three channels), which makes Texture::scalarAt
+            // — the sampler `tex:` and the roughness / weight maps use — return exactly
+            // the concentration.
+            if (!rxnS->val.block) { fail("texture '" + b.name + "': reaction needs a { } body"); return false; }
+            const Block& rb = *rxnS->val.block;
+            RDParams p;
+            std::string preset = strOf(rb, "preset");
+            if (!preset.empty() && !rdPresetLookup(preset, p.feed, p.kill)) {
+                fail("texture '" + b.name + "': unknown reaction preset '" + preset +
+                     "' (" + rdPresetNames() + ")");
+                return false;
+            }
+            p.feed  = dblOf(rb, "feed",  p.feed);
+            p.kill  = dblOf(rb, "kill",  p.kill);
+            p.du    = dblOf(rb, "du",    p.du);
+            p.dv    = dblOf(rb, "dv",    p.dv);
+            p.dt    = dblOf(rb, "dt",    p.dt);
+            p.steps = (int)dblOf(rb, "steps", (double)p.steps);
+            p.sim   = (int)dblOf(rb, "sim",   (double)p.sim);
+            p.seed  = (unsigned)(long long)dblOf(rb, "seed", (double)p.seed);
+            if (p.sim < 8)    p.sim = 8;    else if (p.sim > 4096)   p.sim = 4096;
+            if (p.steps < 0)  p.steps = 0;  else if (p.steps > 2000000) p.steps = 2000000;
+            // Explicit Euler past its stability bound does not degrade, it explodes to
+            // NaN in a few dozen steps. Say so at load instead of baking a dead texture.
+            if (!rdStable(p)) {
+                char msg[256];
+                std::snprintf(msg, sizeof msg,
+                              "unstable: dt*max(du,dv)*%.1f = %.3f must be <= 2 "
+                              "(dt %.4g, du %.4g, dv %.4g)",
+                              RD_LAMBDA_MAX, p.dt * (p.du > p.dv ? p.du : p.dv) * RD_LAMBDA_MAX,
+                              p.dt, p.du, p.dv);
+                fail("texture '" + b.name + "' reaction " + msg);
+                return false;
+            }
+            std::vector<float> field;
+            bool washed = false;
+            // Unlike every other texture source this one is a simulation, so a big
+            // `sim`/`steps` can stall the load for seconds with nothing on screen. Say
+            // what is being solved and how long it took, so that stall is legible.
+            const auto rdT0 = std::chrono::steady_clock::now();
+            if (!rdSimulate(p, field, &washed)) { fail("scene load stopped by request"); return false; }
+            const double rdSec = std::chrono::duration<double>(
+                                     std::chrono::steady_clock::now() - rdT0).count();
+            std::printf("[reaction] texture '%s': %dx%d grid, %d steps, F=%.4g k=%.4g "
+                        "Du=%.4g Dv=%.4g  (%.2f s)\n",
+                        b.name.c_str(), p.sim, p.sim, p.steps, p.feed, p.kill, p.du, p.dv, rdSec);
+            if (washed) {
+                std::printf("[warn] texture '%s': the reaction settled to a uniform state — "
+                            "(feed %.4g, kill %.4g) is outside the pattern-forming region; "
+                            "try `preset %s`.\n",
+                            b.name.c_str(), p.feed, p.kill, rdPresetNames().c_str());
+            }
+            int res = (int)dblOf(b, "res", (double)p.sim);
+            if (res < 1) res = 1; else if (res > 8192) res = 8192;
+            tex.encoding = TexEncoding::Linear;      // a concentration, not an sRGB colour
+            tex.w = res; tex.h = res;
+            tex.rgb.assign((size_t)res * res, Vec3{0, 0, 0});
+            for (int y = 0; y < res; ++y) {
+                const double fy = (y + 0.5) / res;
+                for (int x = 0; x < res; ++x) {
+                    const double t = rdSampleWrapped(field, p.sim, (x + 0.5) / res, fy);
+                    tex.rgb[(size_t)y * res + x] = Vec3{t, t, t};
+                }
+            }
+        } else if (rgbS) {
             // Procedural (function-defined) UV-space skin (E1): three ftsl expressions
             // r(u,v) g(u,v) b(u,v) over the surface UV, baked once to a `res`x`res`
             // LINEAR RGB grid at load, then treated as an ordinary texture — so the

@@ -4810,9 +4810,48 @@ the *randomness vocabulary* is thin. Nothing below is started.
       generalisation. Nine-section `-checkbluenoise`, none of which can pass vacuously; worked example
       `scenes/pattern_bluenoise.ftsl` (matched-density side-by-side against `worley`, freckles, cobbles,
       lichen, golf-ball dimples).
-- [ ] **O6 — reaction–diffusion.** Zero hits. Gray–Scott on a texture domain is the classic route to
-      coat patterning (spots→stripes→labyrinths as one continuous knob) and is a *bake* step, not a
-      per-hit evaluation, so it fits the existing `tex:` path: bake offline → sample in a formula.
+- [x] **O6 — reaction–diffusion.** ✅ **DONE v0.167.0** — `texture "n" { reaction { preset spots|holes|
+      maze|coral|worms|mitosis  sim … steps … seed … [feed/kill/du/dv/dt] } }` (`src/reaction.h`).
+      Gray–Scott solved once at load on a periodic grid; V is stored as a grey image. The TODO's own
+      read was right that this is a *bake*, and that turned out to be the whole design: because it is a
+      `texture` and not a `PatOp`, UV wrap, Jakob–Hanika upsampling, triplanar, `reflect texture:`,
+      `tex:<name>(u,v)` as a term in a formula, the GPU upload and the raster preview all work with
+      **zero renderer changes**. The reason it *has* to be a bake is that the value at a point is the
+      endpoint of a trajectory of the entire field — unlike every other generator here there is no
+      local closed form to evaluate per hit.
+
+      Three things were only learnt by rendering and looking, and each changed the implementation.
+      **(1) The textbook diffusion is wrong for textures.** A feature is a fixed number of grid *cells*
+      wide (~2π√(D/F)), so at Du = 0.16 a spot is ~4 cells and comes out visibly **square**, pixel-locked
+      to the lattice; the first preset set also had two names producing the identical rectilinear
+      filament network. Multiplying both coefficients by s² is a pure spatial rescale — same (F,k)
+      physics, so published parameter maps still transfer — and the defaults now ship at s = 2.5
+      (Du 1.0 / Dv 0.5), with s ≤ 2.79 forced by the explicit-Euler stability bound
+      `dt·max(Du,Dv)·1.6 ≤ 2`. All six presets were then re-chosen from a fresh scan at the rescaled
+      diffusion, tile by tile; a seventh (`waves`) was dropped for washing out. **(2) The seed decides
+      whether anything happens at all.** (u,v)=(1,0) is a fixed point *and linearly stable for every
+      F,k>0* — Gray–Scott is subcritical — so infinitesimal noise bakes a blank sheet. Beyond needing to
+      be finite-amplitude and domain-wide, both of the seed's parameters were forced by measurement: a
+      per-cell seed is smoothed away before it can nucleate (five of six presets decayed), so blocks are
+      ~one feature wide; and at 50% fill the ON blocks *percolate* into one domain-spanning region, so
+      patterning hinges on whether that single region survives — at sim = 128 `spots` lost it and left
+      one nucleus creeping across an otherwise blank texture. 25% fill keeps them isolated and every
+      preset then patterns at every `sim`/`seed`. **(3) The maze regime never converges** (~3e-3 relative
+      change per step even at 24000, vs ~4e-5 for spots): the labyrinth keeps reconnecting, so `steps`
+      there is an aesthetic choice, and the docs say so instead of implying convergence.
+
+      Periodic by construction (the Laplacian wraps, so it tiles seamlessly — not retrofittable, since
+      blending the edges would destroy the long-range correlations that make it not-noise). Threads
+      start once and rendezvous at a sense-reversing barrier rather than paying `ft::parallelFor`'s
+      per-call pool spawn 6000 times, and the result is bit-identical for any band count. Presets are
+      load-bearing, not a convenience: the pattern-forming crescent is only ~0.01 wide in k.
+      `-checkreaction` has nine sections — the stencil against its Fourier symbol at every representable
+      wavenumber, the optimised inner loop against the reference Laplacian, the uniform fixed point,
+      torus translation invariance, band-split bit-identity vs a serial reference, seam vs interior
+      gradients, per-preset contrast (as the *standard deviation* of the normalised field — its range is
+      1.0 by construction, so asserting on range would be vacuous) and dominant wavelength from a
+      radially averaged separable DFT *at the shipped defaults*, `rdStable` vs actual divergence, and
+      determinism/resampler identities. Demo `scenes/pattern_reaction.ftsl`.
 - [ ] **O7 — by-example texture synthesis / stochastic tiling.** Zero hits for `texture synthesis`,
       `wang tile`, `histogram-preserving`, `by-example`. Heitz–Neyret histogram-preserving blending is
       the standard way to tile one photo infinitely without visible repetition, and it composes with

@@ -2332,6 +2332,66 @@ UV-wrap, Jakob–Hanika upsampling, triplanar, GPU and raster paths, and
 alongside image skins and 3-D-space procedural patterns: a **UV-space procedural**.
 See `scenes/procskin.ftsl` (loom: `ProcTexture` / `func_skin`).
 
+A texture can also be **grown rather than drawn**, by a
+**Gray–Scott reaction–diffusion** simulation run once at load:
+
+```
+texture "hide" {
+    reaction { preset spots      # spots | holes | maze | coral | worms | mitosis
+               sim 256           # solve grid (see below — this is the density knob)
+               steps 6000 }      # how long the reaction runs
+    wrap repeat
+}
+```
+
+Two chemicals diffuse and react — `du/dt = Du·∇²u − uv² + F(1−u)`,
+`dv/dt = Dv·∇²v + uv² − (F+k)v` — and Turing's observation, which is the reason this
+is here, is that the *uniform* solution of such a system can be unstable to spatial
+perturbation while remaining stable in time. A featureless sheet therefore organises
+itself into spots, labyrinths or dividing blobs with an intrinsic wavelength that
+appears nowhere in the equations. That makes it categorically different from every
+other source here: `noise`, `worley`, `gabor` and `bnoise` all place features *by
+fiat*, whereas these are the **outcome of a process**, so their spacing, branch points
+and defects are correlated the way a real coat pattern's are — and this is in fact the
+standard model of exactly that (animal markings, coral, fingerprints, chemical Turing
+patterns in a gel). It is a **bake** and not a pattern op because the value at a point
+is the endpoint of a trajectory of the whole field: there is no local closed form to
+evaluate per hit. Living in `texture` means the entire existing pipeline then applies
+with no renderer changes at all — UV wrap, Jakob–Hanika upsampling, triplanar, GPU
+upload, raster preview, `reflect texture:<name>`, and `tex:<name>(u, v)` as one term
+inside a pattern formula.
+
+Notes that matter in practice:
+
+- **It tiles seamlessly.** The Laplacian wraps on both axes, so the solve runs on a
+  torus. This cannot be retrofitted — blending the edges of a finished RD field would
+  destroy precisely the long-range correlations that make it not-noise — so the
+  topology is chosen up front, and the seed is periodic for the same reason.
+- **`sim` is the density knob, not `res`.** A feature is a fixed number of *grid cells*
+  wide, so doubling `sim` puts twice as many features across the texture; `res`
+  (default `sim`) only sets the resolution the result is stored at.
+- **Presets are load-bearing.** The (F, k) plane is mostly *not* interesting — outside
+  a thin crescent every seed decays back to the uniform state — and the crescent is
+  only about 0.01 wide in `k`, so plausible-looking hand-picked numbers usually give a
+  blank texture. `feed`/`kill` are authorable for exploring it, and a solve that
+  settles to a uniform state warns at load rather than silently baking a grey sheet.
+- **The default diffusion is a rescale of the textbook one** (`Du` 1.0 / `Dv` 0.5 =
+  0.16 / 0.08 × 2.5²). Multiplying both by s² is a pure spatial rescale of the same
+  continuum problem, so published (F, k) values still mean what they say, but each
+  feature becomes s× wider in cells; at the raw 0.16 a spot is only ~4 cells across
+  and comes out visibly *square*, pixel-locked to the lattice.
+- **Explicit Euler has a stability bound**, `dt·max(Du,Dv)·1.6 ≤ 2` (the 9-point
+  stencil's Fourier symbol bottoms out at −1.6). Exceeding it does not degrade
+  gracefully, it goes to NaN in a few dozen steps, so it is a **load error**, not a
+  warning.
+- **Not every regime converges.** Spot and blob regimes settle; the `maze` regime
+  genuinely never does — its corridors keep reconnecting — so there `steps` is an
+  aesthetic choice rather than a convergence criterion.
+
+Worked example `scenes/pattern_reaction.ftsl` (a maze wall, spots gated by a noise, a
+3×3 seamless tiling, pitted flooring, and a triplanar-projected leopard torus),
+deterministic self-test `ftrace -checkreaction`.
+
 ## Procedural patterns (math-driven materials)
 
 A `pattern "name" { … }` block compiles a **scalar field** — a function of the hit
@@ -3566,7 +3626,7 @@ alone can't restore, so they are not disk-resumable.
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
-`-checkbluenoise`, `-checkcurv`,
+`-checkbluenoise`, `-checkreaction`, `-checkcurv`,
 `-checkcavity`, `-checksdf`, `-checksun`,
 `-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints

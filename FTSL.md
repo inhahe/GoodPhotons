@@ -308,6 +308,78 @@ texture "grad" {
   not apply (the grid is already linear RGB). loom: `loom.ProcTexture` /
   `loom.func_skin(name, r, g, b, …)`.
 
+### 5.2 Reaction–diffusion textures (Gray–Scott)
+
+Instead of a bitmap `file` or an `rgb` skin, a texture may be **grown by a
+simulation**: a Gray–Scott reaction–diffusion system solved once at load on a periodic
+grid.
+
+```
+texture "hide" {
+    reaction {
+        preset spots     # spots | holes | maze | coral | worms | mitosis
+        sim    256       # solve grid, default 256 (8–4096) — the DENSITY knob
+        steps  6000      # iterations, default 6000 (0–2000000)
+        seed   1         # which realisation
+      # feed 0.038  kill 0.065     # raw (F, k), overriding/instead of `preset`
+      # du 1.0  dv 0.5  dt 1.0     # diffusion + timestep (see stability, below)
+    }
+    res  512             # store resolution (default = sim, 1–8192)
+    wrap repeat
+}
+```
+
+The two chemicals obey
+
+```
+du/dt = Du ∇²u − u v² + F (1 − u)
+dv/dt = Dv ∇²v + u v² − (F + k) v
+```
+
+and Turing's point — the whole reason the block exists — is that the **uniform**
+solution of such a system can be unstable to spatial perturbation while remaining
+stable in time. A blank sheet therefore organises *itself* into spots, labyrinths or
+dividing blobs, with an intrinsic wavelength that appears nowhere in the equations.
+Every other generator in this language places features by fiat; these are the outcome
+of a process, so their spacing, branch points and defects are correlated the way a
+real coat pattern's are.
+
+It is a **bake** rather than a `pattern` op because the value at a point is the
+endpoint of a trajectory of the entire field — there is no local closed form to
+evaluate per hit. Being a `texture` means the result then flows through the unmodified
+pipeline: UV wrap, Jakob–Hanika upsampling, triplanar, GPU upload, raster preview,
+`reflect texture:<name>`, and [`tex:<name>(u, v)`](#61-expression-language) as one
+*term* inside a pattern formula. The bake is grey (the V concentration in all three
+channels), so `tex:` and the scalar maps read the concentration exactly.
+
+- **Seamless by construction.** The Laplacian wraps on both axes, so the solve is on a
+  torus and the image tiles under `wrap repeat` — `tex:hide(3*u, 3*v)` shows no joins.
+  This is not deferrable: blending the edges of a finished RD field destroys exactly
+  the long-range correlations that distinguish it from noise, so the topology (and the
+  seed, which uses an exact `x·nb/N` block partition) has to be periodic up front.
+- **`sim` sets density, `res` only sets storage.** A feature is a fixed number of grid
+  *cells* wide, so doubling `sim` puts twice as many features across the texture. Most
+  presets sit at 16–18 cells per feature; `mitosis` is much coarser and seed-dependent
+  (21–64), so it wants a larger `sim` than the rest for a comparable feature count.
+- **Presets are load-bearing.** Most of the (F, k) plane decays back to the uniform
+  state; the pattern-forming crescent is only ~0.01 wide in `k`, so hand-picked numbers
+  usually bake a blank sheet. `feed`/`kill` are exposed for exploring it, and a solve
+  that washes out prints a warning naming the presets.
+- **Default diffusion is the textbook 0.16 / 0.08 rescaled by 2.5².** That is a pure
+  spatial rescale — published (F, k) values transfer unchanged — but each feature
+  becomes 2.5× wider in cells. At the raw 0.16 a spot is only ~4 cells across and
+  comes out visibly square, pixel-locked to the lattice.
+- **Stability is checked, not hoped for.** Explicit Euler on the 9-point stencil needs
+  `dt · max(Du, Dv) · 1.6 ≤ 2`; past that the field reaches NaN within a few dozen
+  steps, so violating it is a **load error** with the arithmetic printed, not a
+  warning. (This caps the rescale at s ≈ 2.79; the defaults leave 20% margin.)
+- **`maze` never converges** — its corridors keep reconnecting — so for that regime
+  `steps` is an aesthetic choice, not a convergence criterion. The spot and blob
+  regimes do settle (per-step change ~4e-5 by 24000 steps).
+- A `-stop` lands during the bake: the solve polls the stop flag and aborts the load.
+
+Worked example `scenes/pattern_reaction.ftsl`; self-test `ftrace -checkreaction`.
+
 ---
 
 ## 6. `pattern` — procedural scalar fields
