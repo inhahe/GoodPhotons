@@ -5140,6 +5140,18 @@ that item mostly a binding exercise there.
           skip-hair queries against the old leaf-rejection path over 20 000 rays on a scene mixing
           hair curves, non-hair curves, triangles and a sphere (0 mismatches). Still unsolved: the
           tier does not save **memory** (strands + BVH stay resident, ~2.2 GB at 9 M segments).
+          **↑ the memory half is fixed as of v0.180.0.** Freeing `curveSegs` after the load would
+          not have helped — the peak *is* the BVH build (nodes + `BuildPrim` + the transient box
+          list, ~256 B/segment on top of the segments) — so the strands are now deleted *before*
+          `Scene::build()` runs, via the new `ftsl::Loaded::beforeBvh` hook (called at the end of
+          the loader, after all parsing, immediately before the build) plus `Scene::dropHairCurves()`
+          and `Scene::droppedBounds` (which keeps the scene bounding sphere, and therefore
+          environment emission, exactly what the strands would have produced). Gated off for
+          `-fur-lod`, `-dual-scatter`, the raster paths, any non-`R`/`W` mode, and the new
+          `-fur-keep-strands`; `backwardOnGpuOk()` closes the GPU hole the deletion opened. Same
+          ladder: 900 k strands 2221 MB → **875 MB** peak with a byte-identical PNG, and 3 M
+          strands (30 M segs), which used to die with `error: bad allocation`, now renders in
+          18.7 s at 2669 MB — 9 M renders at 7796 MB.
     - [x] **stage 2c — the near/far transition. ✅ DONE v0.178.0** (`-fur-lod [d0[:d1]]`,
           implies `-fur-volume`; `BackwardRenderer::pickFurTier` + `GiCtx::furTier` +
           `FurVolume::entryDist` + `FurGrid::meanRadius`). The ruler is the width of one pixel

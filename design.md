@@ -891,10 +891,51 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   - *It needed the hair-free BVH (below) to be a win at all.* As first written the tier was a
     3.8× *loss* at 90 k strands and its cost still scaled with fiber count, because `skipHair`
     rejected fibers at the BVH leaf rather than removing them from the tree. With
-    `Scene::buildNoHairBvh` it is 1.7×/3.0×/5.8× **faster** than the strands at 90 k/300 k/900 k,
-    and grows only 1.29× across that whole 100× range where the strand tier grows 4.49×.
-  - *What it still does not save is **memory***: the strands and their BVH stay resident, so the
-    tier stops traversing a coat it cannot stop storing. A coat too big to load is still too big.
+    `Scene::buildNoHairBvh` it is 1.7×/3.6×/7.0× **faster** than the strands at 90 k/300 k/900 k,
+    and grows only 1.19× across that whole 100× range where the strand tier grows 4.6×.
+  - *It saves memory too, and that took deleting the strands* (v0.180.0). The tier used to stop
+    *traversing* a coat it could not stop *storing*, so a coat too big to load stayed too big.
+    Freeing `curveSegs` after the load would not have fixed that: the peak **is** the BVH build
+    (nodes + `BuildPrim` + the transient box list, ~256 B/segment on top of the segments
+    themselves), so the strands have to be gone *before* `Scene::build()` runs. See "Deleting the
+    summarised coat" below. Measured on the same fixed-density ladder, peak working set at
+    900 k strands falls 2221 MB → **875 MB** with a byte-identical PNG, and 3 M strands
+    (30 M segments), which previously died with `error: bad allocation`, now loads and renders in
+    18.7 s at 2669 MB; 9 M renders at 7796 MB.
+- **Deleting the summarised coat** (`Scene::dropHairCurves` / `Scene::droppedBounds`, `scene.h`;
+  `ftsl::Loaded::beforeBvh`, `ftsl.h`; the prescan + hook in `main.cpp`). Once the density grid
+  and the ODF table exist, a plain `-fur-volume` render has a complete summary of geometry it will
+  never intersect — so it throws the geometry away rather than accelerating it.
+  - *It hangs off a hook because of argv ordering.* The FTSL loader builds the BVH at the end of
+    `load()`, which runs **before** main's option loop, so at build time nobody knows `-fur-volume`
+    was passed. `Loaded::beforeBvh` is called at the very end of the loader — after all parsing, so
+    `L.cameras` / `L.mode` / `L.defaultMode` are final — but immediately before `L.scene.build()`:
+    the one moment at which a summary exists and the tree does not. A matching prescan loop in
+    `main.cpp` (sharing `parseFurFlag` with the real option loop, so the two cannot drift) reads the
+    fur flags and the raster-ish flags out of argv early enough to install it.
+  - *The gating is the hard part, not the code.* The drop is suppressed for `-fur-lod` (its near
+    tier traces the strands), `-dual-scatter` (it terminates paths *at* fibers), any raster-ish
+    entry point (`raster.h` iterates `curveSegs` itself — `-raster`, `-explore`, `-fly`, `-loom`,
+    `-anim`, …), any mode other than backward `R`/`W` (forward `A`/`B`/`C` trace the curves
+    directly and would render a bald ball; `V` renders both), and explicitly by
+    `-fur-keep-strands`. When a scene's own cameras disagree with the summary the hook says so and
+    keeps the strands rather than silently rendering the wrong picture.
+  - *The bounding sphere had to be preserved by hand.* `build()` derives `sceneCenter` /
+    `sceneRadius` from the BVH root box, and that sphere sizes environment photon emission — so
+    deleting a coat would shrink the sphere to the shaved animal and change the image.
+    `dropHairCurves` accumulates the deleted extent into `Scene::droppedBounds`, which `build()`
+    unions back in. The geometry is still physically there; it just isn't traced. Empty (`lo > hi`)
+    and inert for every scene that drops nothing.
+  - *Compaction, not a second container.* `curveSegs` is stably compacted in place with a
+    `newIndex` remap, then `shrink_to_fit()` (handing the pages back is the entire point), and the
+    `Curve` records' `firstSeg` / `segCount` are rewritten through the remap. `buildNoHairBvh`
+    early-returns when no hair remains, so after a drop it is automatically a no-op and
+    `closestHit(skipHair)` falls through to `bvh` — which is already hair-free.
+  - *It opened a GPU hole that had to be closed.* Only the CPU `BackwardRenderer` honours
+    `furVol`; `renderBackwardCuda` does not. `MatType::Hair` being un-bakeable was the only thing
+    keeping fur scenes off the device, so deleting the hair removed that accident. `main.cpp`'s
+    `backwardOnGpuOk()` now vetoes the GPU explicitly whenever a fur volume is live, at all six
+    backward-GPU decision sites.
 - **The hair-free BVH** (`Scene::buildNoHairBvh` / `bvhNoHair` / `noHairPrim`, `scene.h`). A
   second acceleration structure over every primitive *except* `MatType::Hair` curve segments,
   built opt-in by `main.cpp` when `-fur-volume` or `-dual-scatter` is on, and traversed by

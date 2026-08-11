@@ -10315,6 +10315,150 @@ static furvol::FurVolume g_furVolData;
 static bool   g_furLod = false;
 static double g_furLodD0 = 1.0;
 static double g_furLodD1 = 4.0;
+// -fur-keep-strands: opt OUT of deleting the fibers once `-fur-volume` has summarised them
+// (see furDropStrandsWanted). An escape hatch for comparing against the strands, or for a
+// scene doing something with hair geometry this build hasn't anticipated.
+static bool   g_furKeepStrands = false;
+
+// The fur-LOD option table, in ONE place, because it is parsed TWICE.
+//
+// The strands have to be deleted before the loader builds a BVH over them (that build is
+// the memory peak -- Scene::dropHairCurves), and the loader runs before main's option loop.
+// So these flags are pre-scanned, exactly as `-in` and `-mode` already are, and the option
+// loop below calls the same function so there is only one definition of what they mean.
+// Idempotent: running it twice sets the same values.
+//
+// Returns true if argv[i] was one of these flags, advancing `i` past its optional value.
+static bool parseFurFlag(int argc, char** argv, int& i) {
+    const char* a = argv[i];
+    // The cell budget / diameter band are optional, so only consume the next token when it
+    // actually parses as a number -- otherwise `-fur-volume -o out.png` eats the output path.
+    const auto numArg = [&](double& out) -> bool {
+        if (i + 1 >= argc || argv[i + 1][0] == '-') return false;
+        char* end = nullptr;
+        const double v = std::strtod(argv[i + 1], &end);
+        if (!end || *end != '\0' || v < 1.0) return false;
+        ++i; out = v; return true;
+    };
+    if (!std::strcmp(a, "-dual-scatter") || !std::strcmp(a, "-dualscatter")) {
+        g_dualScatter = true; return true;
+    }
+    if (!std::strcmp(a, "-dual-grid")) {
+        g_dualGrid = true;
+        double v; if (numArg(v)) g_dualGridCells = (int)std::min(v, 3e8);
+        return true;
+    }
+    if (!std::strcmp(a, "-fur-volume")) {
+        g_furVolume = true;
+        double v; if (numArg(v)) g_furVolumeCells = (int)std::min(v, 3e8);
+        return true;
+    }
+    if (!std::strcmp(a, "-fur-keep-strands")) { g_furKeepStrands = true; return true; }
+    // -fur-lod [d0[:d1]]: the near/far transition, in fiber diameters of pixel footprint.
+    // Implies -fur-volume, since without the far tier there is nothing to fade to. One
+    // number sets the START of the band and puts the end two octaves up, which keeps the
+    // common case ("switch over at about a fiber per pixel") to a single token.
+    if (!std::strcmp(a, "-fur-lod")) {
+        g_furLod = true; g_furVolume = true;
+        if (i + 1 < argc && argv[i + 1][0] != '-') {
+            char* end = nullptr;
+            const double d0 = std::strtod(argv[i + 1], &end);
+            if (end && d0 > 0.0) {
+                if (*end == '\0') { ++i; g_furLodD0 = d0; g_furLodD1 = d0 * 4.0; }
+                else if (*end == ':') {
+                    char* e2 = nullptr;
+                    const double d1 = std::strtod(end + 1, &e2);
+                    if (e2 && *e2 == '\0' && d1 > d0) { ++i; g_furLodD0 = d0; g_furLodD1 = d1; }
+                }
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// Build the fiber density field (and, for -fur-volume, the orientation-distribution table on
+// top of it) from the scene's own curve segments. Both flags want the SAME field, so they
+// share one build at the larger budget.
+//
+// Called at most once per run, from ONE of two places: the pre-BVH hook, when the strands are
+// about to be deleted and this is therefore the last moment they exist; or main's normal
+// setup, when they are not. `g_furFieldsBuilt` is what makes those two mutually exclusive.
+static bool g_furFieldsBuilt = false;
+static void buildFurFields(const Scene& scene) {
+    if (g_furFieldsBuilt) return;
+    g_furFieldsBuilt = true;
+    const bool gridForDual = g_dualGrid && g_dualScatter;
+    if (g_dualGrid && !g_dualScatter)
+        std::printf("[ignore] -dual-grid does nothing without -dual-scatter (it only "
+                    "changes HOW the coat is measured along a shadow ray)\n");
+    if (gridForDual || g_furVolume) {
+        const int cells = std::max(gridForDual ? g_dualGridCells : 1,
+                                   g_furVolume ? g_furVolumeCells : 1);
+        const auto t0 = std::chrono::steady_clock::now();
+        g_furGridData.build(scene.curveSegs, [&](int matId) {
+            return matId >= 0 && matId < (int)scene.mats.size() &&
+                   scene.mats[matId].type == MatType::Hair;
+        }, cells);
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        const char* tag = gridForDual ? "dual-grid" : "fur-volume";
+        if (g_furGridData.valid)
+            std::printf("[%s] %dx%dx%d cells (%d occupied, %.1f MB) over %zu fiber "
+                        "segments in %.0f ms\n", tag, g_furGridData.nx, g_furGridData.ny,
+                        g_furGridData.nz, g_furGridData.occupied,
+                        g_furGridData.bytes() / (1024.0 * 1024.0), scene.curveSegs.size(), ms);
+        else if (gridForDual)
+            std::printf("[dual-grid] scene has no hair fibers -- falling back to the "
+                        "ray-shooting walk\n");
+        else
+            std::printf("[fur-volume] scene has no hair fibers -- rendering normally\n");
+    }
+    // The far tier's own half: one Bingham fit per occupied cell. Parallel because a
+    // 128^3 coat is ~1e5 Jacobi eigendecompositions plus as many table lookups, and it
+    // is embarrassingly so (each cell reads only itself).
+    if (g_furVolume && g_furGridData.valid) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = g_furVolData.build(g_furGridData, [](size_t n, auto&& f) {
+            return ft::parallelFor(n, 256, [&](size_t i) { f(i); });
+        });
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (ok && g_furVolData.valid())
+            std::printf("[fur-volume] far-tier ODF table %.1f MB in %.0f ms -- strands are "
+                        "now a MEDIUM (no fiber geometry in the backward tracer)\n",
+                        g_furVolData.bytes() / (1024.0 * 1024.0), ms);
+        // The LOD ruler, reported in world units so a "why is my close-up still
+        // aggregate?" is one line of arithmetic rather than a guess.
+        if (g_furLod && g_furVolData.valid()) {
+            const double dia = 2.0 * g_furGridData.meanRadius();
+            std::printf("[fur-lod] mean fiber diameter %.4g -- strands while a pixel is "
+                        "under %.4g wide at the coat, aggregate over %.4g, cross-faded "
+                        "between\n", dia, g_furLodD0 * dia, g_furLodD1 * dia);
+        }
+    }
+    else if (g_furLod)
+        std::printf("[ignore] -fur-lod does nothing: the scene has no hair fibers to "
+                    "build a far tier from\n");
+}
+
+#ifdef HAVE_CUDA
+// cudaBackwardSupported, plus the one thing it cannot see: the `-fur-volume` far tier lives
+// ONLY in the CPU BackwardRenderer (BackwardRenderer::furVol), and renderBackwardCuda has no
+// equivalent. Handing a coat-as-medium scene to the device kernel therefore renders the coat
+// as nothing at all.
+//
+// This used to be harmless-by-accident -- `MatType::Hair` is not POD-bakeable, so
+// cudaForwardSupported rejected every fur scene before it got here. Dropping the strands
+// removes that accident (a scene with no hair left in it bakes fine), so the gate has to be
+// stated rather than relied upon. It is stated for the keep-strands case too, because a
+// latent gate that only holds by coincidence is a bug waiting for §P3 to land the fiber
+// BCSDF on the device.
+static bool backwardOnGpuOk(const Scene& scene, const Camera& cam) {
+    if (g_furVolume && g_furVolData.valid()) return false;
+    return cudaBackwardSupported(scene, cam);
+}
+#endif
 
 // Mode W lights a surface ONLY by next-event estimation, and a shadow ray is blocked by
 // any geometry at all -- dielectrics very much included (Scene::occluded: "can't connect
@@ -12055,7 +12199,7 @@ static int runCompositeProgressive(
     const long long sppReq = (spp > 0) ? spp : 64;
     const double perSpp = (double)Nreq / (double)sppReq;
 #ifdef HAVE_CUDA
-    const bool gpuBackward = useGpu && cudaBackwardSupported(scene, cam);
+    const bool gpuBackward = useGpu && backwardOnGpuOk(scene, cam);
 #else
     const bool gpuBackward = false;
 #endif
@@ -12376,7 +12520,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // tracer (cheap there — mode W is ~1 spp).
             const bool bwOk = g_whitted
                             ? cudaBackwardWhittedSupported(scene, cam, whittedOpts)
-                            : cudaBackwardSupported(scene, cam);
+                            : backwardOnGpuOk(scene, cam);
             if (!bwOk) {
                 const char* why = g_whitted
                     ? "mode W scene is outside the deterministic GPU scope (-gi, or a "
@@ -12411,7 +12555,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             useGpu = true;
             const char* pSuffix = "";
             if (mode == 'P')
-                pSuffix = cudaBackwardSupported(scene, cam)
+                pSuffix = backwardOnGpuOk(scene, cam)
                         ? " (forward + camera-side layers)"
                         : " (forward layer; camera-side stays CPU — outside backward-GPU scope)";
             std::printf("[device] %s -> GPU: %s%s\n", wantAuto ? "auto" : "gpu",
@@ -12509,7 +12653,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if      (mode == 'R') cpuBackward = !useGpu;
         else if (mode == 'V') cpuBackward = true;
 #ifdef HAVE_CUDA
-        else if (mode == 'P') cpuBackward = !(useGpu && cudaBackwardSupported(scene, cam));
+        else if (mode == 'P') cpuBackward = !(useGpu && backwardOnGpuOk(scene, cam));
 #else
         else if (mode == 'P') cpuBackward = true;
 #endif
@@ -13562,7 +13706,16 @@ static void printHelp(const char* prog) {
 "                        resolved — so this is for fur that is SMALL ON SCREEN, where a\n"
 "                        strand is under a pixel and there is no silhouette left to lose.\n"
 "                        Shares the density field with -dual-grid (same `cells` budget\n"
-"                        meaning) and adds 16 B/cell for the orientation table\n"
+"                        meaning) and adds 16 B/cell for the orientation table. Once the\n"
+"                        grid is built the fibers are DELETED, before any BVH is built over\n"
+"                        them — so the coat costs its grid, not its geometry (a 900k-strand\n"
+"                        pelt: 2221 MB peak -> 875 MB, and a 3M-strand one that used to die\n"
+"                        with `bad allocation` now renders). Skipped automatically whenever\n"
+"                        something still needs the strands: -fur-lod, -dual-scatter,\n"
+"                        -raster/-explore, -anim/-loom, or a camera in a forward mode\n"
+"  -fur-keep-strands     opt out of that deletion: keep the fibers loaded and in the BVH\n"
+"                        even under -fur-volume. For A/B-ing the aggregate against the\n"
+"                        strands in one process, or if something needs the geometry\n"
 "  -fur-lod [d0[:d1]]    make that tier a DECISION instead of a mode: trace strands while\n"
 "                        one pixel is narrower than d0 fiber diameters where the coat\n"
 "                        begins, the aggregate once it is wider than d1, and cross-fade\n"
@@ -13933,6 +14086,19 @@ static int run(int argc, char** argv) {
             else                                     g_onUnsupported = OnUnsupported::Error;
         }
     }
+    // The fur-LOD flags, and the raster/viewer flags that veto deleting the strands, for the
+    // same reason: the decision has to be made inside the loader, before it builds a BVH over
+    // the coat. See parseFurFlag and the beforeBvh hook below. Both loops re-parse these
+    // normally further down; this pass only has to know the values early.
+    bool rasterPrescan = false;
+    for (int i = 1; i < argc; ++i) {
+        if (parseFurFlag(argc, argv, i)) continue;
+        if (!std::strcmp(argv[i], "-raster") || !std::strcmp(argv[i], "-raster-gpu") ||
+            !std::strcmp(argv[i], "-raster-bench") || !std::strcmp(argv[i], "-explore") ||
+            !std::strcmp(argv[i], "-fly") || !std::strcmp(argv[i], "-loom") ||
+            !std::strcmp(argv[i], "--loom") || !std::strcmp(argv[i], "-anim"))
+            rasterPrescan = true;
+    }
 
     // The prefer/else resolver asks this predicate whether a branch renders; when the
     // policy is fallback/strip we accept every branch (the policy handles it later at
@@ -13947,6 +14113,71 @@ static int run(int argc, char** argv) {
         : ftsl::SupportFn{};
 
     ftsl::Loaded ftslScene;
+
+    // -fur-volume: once the coat has been summarised into a density grid + ODF table, the
+    // fibers it was derived from are dead weight -- and expensive dead weight, because the
+    // BVH built over them is the run's memory PEAK. Install the pre-BVH hook so the summary
+    // is taken and the strands deleted at the one moment when neither the tree nor the
+    // rendering has happened yet. Measured on a 900k-strand coat (9M segments): 2221 MB peak
+    // working set before, and the 3M-strand rung above it did not load at all.
+    //
+    // The vetoes below are all "something still needs the geometry":
+    //   -fur-lod          the NEAR tier traces strands; only the far tier is a medium.
+    //   -dual-scatter     keeps the strands and reads only the shadow off the grid.
+    //   -raster/-explore  raster.h walks curveSegs for its own pass (a bald preview).
+    //   -anim/-loom       the fly editor re-loads scenes mid-flight through other paths.
+    //   -fur-keep-strands the operator asked for them.
+    // Plus the render mode, which is vetoed inside the hook because it is the loader -- not
+    // the command line -- that knows what the scene's cameras actually are.
+    if (g_furVolume && g_furKeepStrands)
+        std::printf("[fur-volume] -fur-keep-strands: the fibers stay loaded and in the BVH "
+                    "(they are still invisible to the far tier's rays)\n");
+    if (g_furVolume && !g_furLod && !g_dualScatter && !g_furKeepStrands && !rasterPrescan) {
+        ftslScene.beforeBvh = [&](ftsl::Loaded& L) {
+            // Every camera that could render must be a mode whose tracer honours the far
+            // tier -- i.e. the CPU backward walk (R, and W which normalises to R). A forward
+            // mode intersects the fibers directly and would render a shaved animal; mode V
+            // does both and would compare one against the other. A CLI -mode overrides the
+            // file, so it decides alone when present.
+            const auto backwardOnly = [](char m) { return m == 'R'; };
+            char blocker = 0;
+            if (cliModePrescan) {
+                if (!backwardOnly(cliModePrescan)) blocker = cliModePrescan;
+            } else {
+                const char fallback = L.defaultMode ? L.defaultMode : L.mode;
+                if (L.cameras.empty() && !backwardOnly(fallback)) blocker = fallback;
+                for (const auto& c : L.cameras) {
+                    const char m = c.mode ? c.mode : fallback;
+                    if (!backwardOnly(m)) { blocker = m; break; }
+                }
+            }
+            if (blocker) {
+                std::printf("[fur-volume] keeping the strands: mode %c traces fiber geometry "
+                            "directly (only backward R/W renders the coat as a medium)\n", blocker);
+                return;
+            }
+            // Last moment the fibers exist: take the summary off them, then delete them.
+            buildFurFields(L.scene);
+            if (!g_furVolData.valid()) return;      // no hair, or the fit failed -- nothing to drop
+            const size_t before = L.scene.curveSegs.size();
+            const auto t0 = std::chrono::steady_clock::now();
+            const size_t dropped = L.scene.dropHairCurves();
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (dropped)
+                std::printf("[fur-volume] dropped %zu of %zu curve segments in %.0f ms -- the "
+                            "coat is a medium now, so neither it nor a BVH over it is built "
+                            "(~%.0f MB not allocated; -fur-keep-strands opts out)\n",
+                            dropped, before, ms,
+                            // The segments themselves plus what a BVH over them would have
+                            // cost: nodes reserve 2N x sizeof(BvhNode), and the build holds a
+                            // BuildPrim and an Aabb per primitive on top of that.
+                            dropped * (sizeof(CurveSeg) + 2.0 * sizeof(BvhNode) +
+                                       sizeof(Aabb) + sizeof(Aabb) + sizeof(Vec3) + sizeof(int))
+                                / (1024.0 * 1024.0));
+        };
+    }
+
     bool fromFtsl = false;
     if (positionalMesh) {
         // ---- Quick mesh viewer -------------------------------------------------------
@@ -14080,9 +14311,10 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-gi-clamp") && i + 1 < argc) {
             g_giClamp = std::max(0.0, std::atof(argv[++i]));
         }
-        else if (!std::strcmp(argv[i], "-dual-scatter") || !std::strcmp(argv[i], "-dualscatter")) {
-            g_dualScatter = true;
-        }
+        // -dual-scatter / -dual-grid / -fur-volume / -fur-lod / -fur-keep-strands. Parsed by
+        // the shared table so this loop and the pre-scan above cannot drift apart; see
+        // parseFurFlag for why they are pre-scanned at all.
+        else if (parseFurFlag(argc, argv, i)) { }
         else if (!std::strcmp(argv[i], "-dual-density") && i + 1 < argc) {
             g_dualDensity = std::max(0.0, std::min(1.0, std::atof(argv[++i])));
         }
@@ -14094,44 +14326,6 @@ static int run(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-dual-max-cross") && i + 1 < argc) {
             g_dualMaxCross = std::max(1, std::atoi(argv[++i]));
-        }
-        // -dual-grid [cells]: the cell budget is optional, so only consume the next token
-        // if it parses as a number (otherwise `-dual-grid -o out.png` eats the output path).
-        else if (!std::strcmp(argv[i], "-dual-grid")) {
-            g_dualGrid = true;
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                char* end = nullptr;
-                const double v = std::strtod(argv[i + 1], &end);
-                if (end && *end == '\0' && v >= 1.0) { ++i; g_dualGridCells = (int)std::min(v, 3e8); }
-            }
-        }
-        // -fur-volume [cells]: same optional-budget parsing as -dual-grid above.
-        else if (!std::strcmp(argv[i], "-fur-volume")) {
-            g_furVolume = true;
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                char* end = nullptr;
-                const double v = std::strtod(argv[i + 1], &end);
-                if (end && *end == '\0' && v >= 1.0) { ++i; g_furVolumeCells = (int)std::min(v, 3e8); }
-            }
-        }
-        // -fur-lod [d0[:d1]]: the near/far transition, in fiber diameters of pixel footprint.
-        // Implies -fur-volume, since without the far tier there is nothing to fade to. One
-        // number sets the START of the band and puts the end two octaves up, which keeps the
-        // common case ("switch over at about a fiber per pixel") to a single token.
-        else if (!std::strcmp(argv[i], "-fur-lod")) {
-            g_furLod = true; g_furVolume = true;
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                char* end = nullptr;
-                const double a = std::strtod(argv[i + 1], &end);
-                if (end && a > 0.0) {
-                    if (*end == '\0') { ++i; g_furLodD0 = a; g_furLodD1 = a * 4.0; }
-                    else if (*end == ':') {
-                        char* e2 = nullptr;
-                        const double b = std::strtod(end + 1, &e2);
-                        if (e2 && *e2 == '\0' && b > a) { ++i; g_furLodD0 = a; g_furLodD1 = b; }
-                    }
-                }
-            }
         }
         // -denoise [amount]: the optional amount scales BOTH tolerances, so `-denoise 2`
         // is twice as aggressive and `-denoise 0.5` half. The argument is optional, so
@@ -14665,58 +14859,7 @@ static int run(int argc, char** argv) {
     // every CurveSeg -- a scene with no fur, or a run without -dual-scatter, must not pay.
     // Both flags want the SAME field, so they share one build at the larger budget.
     {
-        const bool gridForDual = g_dualGrid && g_dualScatter;
-        if (g_dualGrid && !g_dualScatter)
-            std::printf("[ignore] -dual-grid does nothing without -dual-scatter (it only "
-                        "changes HOW the coat is measured along a shadow ray)\n");
-        if (gridForDual || g_furVolume) {
-            const int cells = std::max(gridForDual ? g_dualGridCells : 1,
-                                       g_furVolume ? g_furVolumeCells : 1);
-            const auto t0 = std::chrono::steady_clock::now();
-            g_furGridData.build(scene.curveSegs, [&](int matId) {
-                return matId >= 0 && matId < (int)scene.mats.size() &&
-                       scene.mats[matId].type == MatType::Hair;
-            }, cells);
-            const double ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t0).count();
-            const char* tag = gridForDual ? "dual-grid" : "fur-volume";
-            if (g_furGridData.valid)
-                std::printf("[%s] %dx%dx%d cells (%d occupied, %.1f MB) over %zu fiber "
-                            "segments in %.0f ms\n", tag, g_furGridData.nx, g_furGridData.ny,
-                            g_furGridData.nz, g_furGridData.occupied,
-                            g_furGridData.bytes() / (1024.0 * 1024.0), scene.curveSegs.size(), ms);
-            else if (gridForDual)
-                std::printf("[dual-grid] scene has no hair fibers -- falling back to the "
-                            "ray-shooting walk\n");
-            else
-                std::printf("[fur-volume] scene has no hair fibers -- rendering normally\n");
-        }
-        // The far tier's own half: one Bingham fit per occupied cell. Parallel because a
-        // 128^3 coat is ~1e5 Jacobi eigendecompositions plus as many table lookups, and it
-        // is embarrassingly so (each cell reads only itself).
-        if (g_furVolume && g_furGridData.valid) {
-            const auto t0 = std::chrono::steady_clock::now();
-            const bool ok = g_furVolData.build(g_furGridData, [](size_t n, auto&& f) {
-                return ft::parallelFor(n, 256, [&](size_t i) { f(i); });
-            });
-            const double ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t0).count();
-            if (ok && g_furVolData.valid())
-                std::printf("[fur-volume] far-tier ODF table %.1f MB in %.0f ms -- strands are "
-                            "now a MEDIUM (no fiber geometry in the backward tracer)\n",
-                            g_furVolData.bytes() / (1024.0 * 1024.0), ms);
-            // The LOD ruler, reported in world units so a "why is my close-up still
-            // aggregate?" is one line of arithmetic rather than a guess.
-            if (g_furLod && g_furVolData.valid()) {
-                const double dia = 2.0 * g_furGridData.meanRadius();
-                std::printf("[fur-lod] mean fiber diameter %.4g -- strands while a pixel is "
-                            "under %.4g wide at the coat, aggregate over %.4g, cross-faded "
-                            "between\n", dia, g_furLodD0 * dia, g_furLodD1 * dia);
-            }
-        }
-        else if (g_furLod)
-            std::printf("[ignore] -fur-lod does nothing: the scene has no hair fibers to "
-                        "build a far tier from\n");
+        buildFurFields(scene);
 
         // The second BVH, the one every `skipHair` query traverses. Needed by anything that
         // makes fibers invisible to a ray: the -fur-volume / -fur-lod far tier (closestHit)
@@ -17549,7 +17692,7 @@ static int run(int argc, char** argv) {
             case 'R': {
                 bool onGpu = false;
 #ifdef HAVE_CUDA
-                if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
+                if (meterGpu && backwardOnGpuOk(scene, mc.cam)) {
                     mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
                                             g_maxBounceOverride, g_directOnly, g_heroC);
                     onGpu = true;
@@ -17598,7 +17741,7 @@ static int run(int argc, char** argv) {
                 Film ref;
                 bool refGpu = false;
 #ifdef HAVE_CUDA
-                if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
+                if (meterGpu && backwardOnGpuOk(scene, mc.cam)) {
                     ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
                                              g_maxBounceOverride, g_directOnly, g_heroC);
                     refGpu = true;

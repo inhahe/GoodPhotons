@@ -683,6 +683,20 @@ struct Loaded {
     // scenes and discards all but one — only the accepted candidate's warnings are
     // the author's problem.
     std::vector<std::string> unknownKeys;
+
+    // Last chance to alter the geometry before the acceleration structure is built over it.
+    // Called (if set) immediately before `scene.build()`, with the fully parsed Loaded — so
+    // the callback can see every camera and mode the file authored, which is the information
+    // needed to decide whether a cheaper representation is admissible.
+    //
+    // Exists for exactly one client: `-fur-volume`, which summarises a coat into a density
+    // grid + ODF table and then has no further use for the millions of CurveSegs it was
+    // derived from. Deleting them AFTER the load would return the memory but not save the
+    // peak, because the peak IS the BVH build over those fibers (see Scene::dropHairCurves).
+    // A hook here is the only point at which the summary exists and the tree does not.
+    //
+    // Not serialised, not part of the scene: set it on the Loaded you pass to load().
+    std::function<void(Loaded&)> beforeBvh;
 };
 
 // Normalise an authored mode letter: `W` is mode R plus the deterministic Whitted
@@ -946,6 +960,11 @@ public:
         // build() finalizes tris/BVH and the emitter set (per-emitter samplers were
         // built in addLight; finalizeEmitters computes powers, the selection CDF,
         // and the combined backward wavelength sampler).
+        // Geometry is final and every camera/mode the file authored is known, but nothing
+        // has been built over the geometry yet — the one moment at which a client can swap
+        // a summary in for the thing it summarises and not pay to accelerate both. See
+        // Loaded::beforeBvh.
+        if (L.beforeBvh) L.beforeBvh(L);
         { detail::AccelTimer _ct; L.scene.build(); }
         // build() -> finalizeEmitters() has now adopted each emitter's emitPat from the
         // material on its geometry, so this is the first moment the SHAPE of every

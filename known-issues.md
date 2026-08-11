@@ -10705,7 +10705,48 @@ and a sphere.
 
 What it does not fix is **memory** — see the next entry.
 
-## OPEN (tech debt, 2026-08-11, v0.179.0): `-fur-volume` stops *traversing* the strands but never stops *storing* them
+## ~~OPEN~~ **DONE (v0.180.0)** (tech debt, 2026-08-11, v0.179.0): `-fur-volume` stops *traversing* the strands but never stops *storing* them
+
+**Fixed in v0.180.0.** `-fur-volume` now *deletes* the fibers once it has summarised them, and —
+the part that mattered — deletes them **before** the BVH is built rather than after.
+
+The entry below proposed erasing the segments and rebuilding `bvh`. That would have been wrong,
+or at least useless for the symptom: freeing afterwards fixes only the steady state, and the peak
+*is* the BVH build. At 9 M segments that build reserves `2N` nodes × 64 B = 1.15 GB, plus a
+`BuildPrim` (~80 B) and an `Aabb` (48 B) per primitive on top of the 720 MB of `CurveSeg`s — which
+is the whole 2.2 GB. A post-hoc free would have left `bad allocation` exactly where it was.
+
+So the deletion had to happen at a moment that did not previously exist: after the loader has
+parsed everything (so the scene's cameras and modes are known) but before `Scene::build()` runs.
+That is the new `ftsl::Loaded::beforeBvh` hook. `main.cpp` installs it, and it builds the density
+grid + ODF table from the strands and then calls `Scene::dropHairCurves()`, which compacts
+`curveSegs`, rewrites the `curves` records against the compacted pool, and keeps only the fibers'
+world bounds in `Scene::droppedBounds` — unioned back into the scene bounding sphere by `build()`
+so environment emission is sized as though the coat were still there.
+
+| coat | peak WS before | peak WS after | render |
+|---|---|---|---|
+| 900 k strands / 9 M segments | 2221 MB | **875 MB** | 13.0 s, byte-identical PNG |
+| 3 M strands / 30 M segments | `error: bad allocation` | **2669 MB** | **18.7 s** — loads and renders |
+
+Proven a pure optimisation rather than argued: the 90 k / 300 k / 900 k aggregate renders are
+byte-for-byte the same md5 as v0.179.0 produced, and `-fur-volume -fur-keep-strands` (the new
+opt-out, which reproduces the old path) produces that same md5 too.
+
+Gating, which was the actual work: the drop is skipped for `-fur-lod` (its near tier traces
+strands), `-dual-scatter` (keeps them), `-raster`/`-explore`/`-anim`/`-loom` (`raster.h` walks
+`curveSegs`), `-fur-keep-strands`, and — decided *inside* the hook, because only the loader knows
+what the scene's cameras are — any camera whose effective mode is not backward `R`/`W`. A vetoed
+run says so (`[fur-volume] keeping the strands: mode B traces fiber geometry directly`).
+
+The latent GPU gate below is fixed too, and had to be: `MatType::Hair` being un-bakeable was the
+only thing keeping a fur scene off the device backward kernel, and deleting the hair removes that
+accident. `backwardOnGpuOk()` now states the gate — a live `-fur-volume` far tier forces the CPU
+backward path — instead of relying on the coincidence.
+
+The original entry follows.
+
+## ~~OPEN~~ (tech debt, 2026-08-11, v0.179.0): `-fur-volume` stops *traversing* the strands but never stops *storing* them
 
 The far tier summarises a coat into a 128³ density grid plus a 16 B/cell orientation table (96 MB
 total) and, since v0.179.0, no longer has the fibers in the BVH it walks. But `scene.curveSegs`

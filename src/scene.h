@@ -1549,6 +1549,13 @@ struct Scene {
     Bvh bvhNoHair;
     std::vector<int> noHairPrim;
 
+    // World bounds of geometry that was DELETED before the tree was built (dropHairCurves).
+    // The scene bounding sphere is derived from the BVH root box, which sizes environment
+    // photon emission — so without this a coat replaced by a medium would shrink the sphere
+    // to the shaved animal and change the image. Unioned back in by build(). Empty (lo>hi)
+    // when nothing was dropped, which is the overwhelming majority of scenes.
+    Aabb droppedBounds;
+
     // Finalize triangle normals and build the BVH. Call after all geometry is
     // added. Primitive index i: i < tris.size() -> tris[i]; else spheres[i-nTris].
     void build() {
@@ -1560,7 +1567,12 @@ struct Scene {
         // geometry). Sizes forward environment photon emission (disk radius) and
         // the env phase-space weight envGeom = 4*PI^2*R^2.
         if (!bvh.nodes.empty()) {
-            const Aabb& b = bvh.nodes[0].box;
+            Aabb b = bvh.nodes[0].box;
+            // Geometry summarised into a medium and deleted (a `-fur-volume` coat) is still
+            // physically there — it just isn't traced. Put its extent back so the bounding
+            // sphere, and therefore environment emission, is the one the strands would have
+            // produced. No-op when droppedBounds is empty.
+            if (droppedBounds.lo.x <= droppedBounds.hi.x) b.expand(droppedBounds);
             sceneCenter = b.center();
             sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
         }
@@ -1720,6 +1732,58 @@ struct Scene {
         bvhNoHair.build(boxes);
     }
     bool hasNoHairBvh() const { return !noHairPrim.empty() && !bvhNoHair.nodes.empty(); }
+
+    // Delete the hair fibers outright, keeping only their extent (droppedBounds). For the
+    // caller that has already summarised them into something cheaper — `-fur-volume`'s
+    // density grid + ODF table, which reproduce the coat without ever touching a fiber.
+    //
+    // WHY THIS IS NOT THE SAME AS buildNoHairBvh(). That one stops a ray *traversing* the
+    // strands; this one stops the process *storing* them, and the two costs are separate.
+    // The no-hair tree is built alongside the full one, so a 900k-strand coat still pays
+    // for 9M CurveSegs (~720 MB) plus a BVH over them (nodes reserve 2N x 64 B = 1.15 GB,
+    // plus the build's BuildPrim array and the transient box list) — 2.2 GB measured, and
+    // an honest `bad allocation` at 3M strands on a machine with 5 GB of free commit.
+    //
+    // WHY IT MUST RUN BEFORE build(). Freeing the segments afterwards would fix only the
+    // steady state; the peak — which is what actually fails the allocation — is the BVH
+    // build itself, and the only way not to pay that is for the fibers to be absent when
+    // the boxes are collected. Hence the ftsl::Loaded::beforeBvh hook: the one moment at
+    // which a summary can replace the geometry it summarises.
+    //
+    // Returns the number of curve segments removed (0 if the scene has no hair).
+    size_t dropHairCurves() {
+        size_t nHair = 0;
+        for (const auto& cs : curveSegs) if (isHairCurve(cs)) ++nHair;
+        if (!nHair) return 0;
+        // Compact in place, recording the new index of every survivor so the `curves`
+        // records (which address the flat pool by firstSeg/segCount) stay meaningful.
+        std::vector<int> newIndex(curveSegs.size(), -1);
+        size_t w = 0;
+        for (size_t i = 0; i < curveSegs.size(); ++i) {
+            const CurveSeg& cs = curveSegs[i];
+            if (isHairCurve(cs)) { droppedBounds.expand(curveSegBounds(cs)); continue; }
+            newIndex[i] = (int)w;
+            if (w != i) curveSegs[w] = cs;
+            ++w;
+        }
+        curveSegs.resize(w);
+        curveSegs.shrink_to_fit();       // hand the pages back; that is the point
+        // Rewrite the strand records against the compacted pool. A strand whose segments
+        // all went is kept as an empty record rather than erased, so nothing that holds a
+        // curve index (fur.h's generator ran long ago, but diagnostics print these) shifts
+        // underneath itself.
+        for (auto& c : curves) {
+            int first = -1, count = 0;
+            for (int s = c.firstSeg; s < c.firstSeg + c.segCount; ++s) {
+                if (s < 0 || s >= (int)newIndex.size() || newIndex[s] < 0) continue;
+                if (first < 0) first = newIndex[s];
+                ++count;
+            }
+            c.firstSeg = (first < 0) ? 0 : first;
+            c.segCount = count;
+        }
+        return nHair;
+    }
 
     // Transform a BLAS-local hit (from Blas::intersectLocal) back into world space for
     // instance `inst` under the world ray `r`. Positions map by toWorld; shading and

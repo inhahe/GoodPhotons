@@ -1448,7 +1448,8 @@ continuous factor instead. Direct lights and the environment both go through it.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-fur-volume [cells]` | off (`2097152` = 128³ when given) | Render every `type hair` coat as a participating medium. Backward modes (`R`, `W`) only. Shares the density field with `-dual-grid` — given both, it is built once at the larger budget — and adds 16 B/cell for the orientation table (32 MB at 128³). |
+| `-fur-volume [cells]` | off (`2097152` = 128³ when given) | Render every `type hair` coat as a participating medium. Backward modes (`R`, `W`) only. Shares the density field with `-dual-grid` — given both, it is built once at the larger budget — and adds 16 B/cell for the orientation table (32 MB at 128³). Once the field is built the fibers are **deleted**, before any BVH is built over them. |
+| `-fur-keep-strands` | off | Opt out of that deletion: keep the fibers loaded and in the BVH even under `-fur-volume`. For A/B-ing the two tiers in one process, or if something in a scene still needs the geometry. |
 
 **What it costs and buys.** It is faster than the strands it replaces, and — the point of the
 whole tier — its cost barely moves with fiber count. Measured on the same coat at three fiber
@@ -1458,14 +1459,22 @@ number of scattering events are unchanged and only geometric complexity grows), 
 
 | strands | curve segments | strands | `-fur-volume` | speed-up |
 |---|---|---|---|---|
-| 90 k | 900 k | 15.1 s | **9.1 s** | 1.7× |
-| 300 k | 3.0 M | 31.3 s | **10.3 s** | 3.0× |
-| 900 k | 9.0 M | 67.8 s | **11.7 s** | 5.8× |
+| 90 k | 900 k | 13.2 s | **7.7 s** | 1.7× |
+| 300 k | 3.0 M | 28.2 s | **7.9 s** | 3.6× |
+| 900 k | 9.0 M | 60.3 s | **8.6 s** | 7.0× |
+| 3 M | 30 M | *does not load* | **8.1 s** | — |
+| 9 M | 90 M | *does not load* | **9.2 s** | — |
 
-Across that 100× range in fiber count the aggregate grows **1.29×** and the strand tier
-**4.49×** — which is the property the tier exists for. (Before v0.179.0 it was a 3.8× *loss*
-and scaled just like the strands, because making fibers invisible was done at the BVH leaf
-rather than by removing them from the tree; see `known-issues.md`.)
+Across that **100×** range in fiber count the aggregate grows **1.19×**, and over the 10× where
+the strand tier can still be measured at all it grows **4.6×**. That is the property the tier
+exists for. The last two rows are the other half of it: at 3 M strands and above the strand tier
+dies with `error: bad allocation` (30 M `CurveSeg`s plus a BVH over them), while the aggregate —
+which deletes the fibers as soon as it has summarised them — renders in about the same time as
+the smallest coat in the table.
+
+(Before v0.179.0 the tier was a 3.8× *loss* and scaled just like the strands, because making
+fibers invisible was done at the BVH leaf rather than by removing them from the tree; before
+v0.180.0 it kept them in memory. See `known-issues.md` for both.)
 
 It is also **accurate**: developed through one shared `-exposure-anchor`, the aggregate's
 scene-linear mean luminance over the coat lands **0.9 %** below the strand reference (0.9989 of
@@ -1474,9 +1483,31 @@ independent media is the minimum of their independent free flights, which is exa
 are sampled), and it deliberately does **not** combine with `-dual-scatter`: dual scattering is
 an analytic stand-in for the very multiple scattering this path now simulates directly.
 
-What it does **not** save is memory: the strands and their BVH stay loaded, so the tier stops
-traversing a coat it does not stop storing (~2.2 GB at 900 k strands / 9 M segments here). A
-coat too large to load is still too large to render.
+**It saves memory too, which is what makes the last two rows possible.** Since v0.180.0 the
+fibers are *deleted* once the density field and the orientation table have been built from them —
+and deleted **before** the BVH is built, not after, because the BVH build over the coat *is* the
+memory peak (at 9 M segments it reserves 2 N nodes × 64 B = 1.15 GB on top of a `BuildPrim` and
+an `Aabb` per primitive and the 720 MB of segments themselves). Freeing afterwards would have
+returned the memory without ever letting a bigger coat load.
+
+| coat | before | after |
+|---|---|---|
+| 900 k strands / 9 M segments | 2221 MB peak | **875 MB** |
+| 3 M strands / 30 M segments | `error: bad allocation` | **2669 MB** |
+| 9 M strands / 90 M segments | `error: bad allocation` | **7796 MB** |
+
+The deletion is skipped automatically whenever something still needs the geometry — `-fur-lod`
+(its near tier traces strands), `-dual-scatter`, `-raster` / `-explore` / `-anim` / `-loom`, or a
+camera whose mode is not backward `R`/`W`, in which case the run says so:
+
+```
+[fur-volume] keeping the strands: mode B traces fiber geometry directly (only backward R/W
+             renders the coat as a medium)
+```
+
+`-fur-keep-strands` forces that same behaviour by hand. The image is unaffected either way: the
+dropped and kept renders are byte-for-byte identical, and both are byte-for-byte identical to
+what v0.179.0 produced.
 
 Two things are genuinely lost, both from the same cause — a collision knows its cell, not a
 strand. There is no `u`/`v`, so a hair material whose colour comes from a texture or pattern
@@ -4076,8 +4107,9 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-dual-db <d>` / `-dual-df <d>` | Override `d_b` (the local backscatter lobe) or `d_f` (the light let through the coat) on its own; either unset follows `-dual-density`. `-dual-df 0` leaves only the directly-lit term, which is how a brightness error gets attributed to one branch. |
 | `-dual-max-cross <n>` | Strands one dual-scattering shadow ray counts before it stops (default `64`). |
 | `-dual-grid [cells]` | Count dual-scattering crossings by marching a **fiber-density grid** (Zinke §4.1.2) instead of walking the strands one by one — the crossing count comes from `∫σ_t dt` with no curve intersections, and is drawn as a Poisson variate so it stays a drop-in for the walk. 1.5× faster than the walk on a dense coat, which is what turns `-dual-scatter` from a net loss into a win there. Optional argument is a cell **budget** (default `2097152` = 128³), split into roughly cubic cells over the fur's bounds; ~64 MB at the default. Needs `-dual-scatter`. See [The fiber-density grid](#the-fiber-density-grid--dual-grid). |
-| `-fur-volume [cells]` | Render `type hair` coats as a **participating medium** instead of as strands — the coat's far LOD tier. Fibers leave the BVH entirely; a ray free-flights against the same grid's `σ_t(d)` (exact inverse-CDF, not delta tracking) and each collision invents one virtual fiber, drawing its tangent from the cell's reconstructed Bingham orientation distribution and shading it with the ordinary BCSDF. Cost stops scaling with fiber count; per-strand silhouette and texture coordinates are lost, so this is for fur that is small on screen. Backward modes only. Shares the field (and the `cells` budget) with `-dual-grid`, plus 16 B/cell. See [The coat as a medium](#the-coat-as-a-medium--fur-volume). |
+| `-fur-volume [cells]` | Render `type hair` coats as a **participating medium** instead of as strands — the coat's far LOD tier. Fibers leave the BVH entirely; a ray free-flights against the same grid's `σ_t(d)` (exact inverse-CDF, not delta tracking) and each collision invents one virtual fiber, drawing its tangent from the cell's reconstructed Bingham orientation distribution and shading it with the ordinary BCSDF. Cost stops scaling with fiber count; per-strand silhouette and texture coordinates are lost, so this is for fur that is small on screen. Backward modes only. Shares the field (and the `cells` budget) with `-dual-grid`, plus 16 B/cell. Once the field is built the strands are **deleted before the BVH is built over them**, so the summary replaces the thing it summarises in memory as well as in the render — a coat that used to die with `bad allocation` now loads. Suppressed automatically when something else still needs the geometry (`-fur-lod`, `-dual-scatter`, the raster paths, a forward mode). See [The coat as a medium](#the-coat-as-a-medium--fur-volume). |
 | `-fur-lod [d0[:d1]]` | Turn that far tier from a mode into a **LOD decision**: trace strands while one pixel is narrower than `d0` fiber diameters where the coat begins, the aggregate once it is wider than `d1`, and cross-fade stochastically between (one coin per path against a smoothstep, so the switch dissolves into the sampling instead of drawing a line across the image). Implies `-fur-volume`. One number sets `d0` and puts `d1` two octaves up; default `1:4`. The ruler is the **pixel** footprint and does not shrink with `-spp`. See [Choosing a tier](#choosing-a-tier--fur-lod). |
+| `-fur-keep-strands` | Opt out of `-fur-volume`'s deletion of the strands: the fibers stay loaded and in the BVH (still invisible to the far tier's rays, which free-flight against the grid either way). For A/B-ing the two tiers in one process, or if something in a scene still needs the curve geometry. Inert without `-fur-volume`. |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
