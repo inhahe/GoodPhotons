@@ -11281,11 +11281,21 @@ bool cudaForwardSupported(const Scene& scene) {
         // CPU forward/backward fallback (like indexed palettes).
         if (matId >= 0 && matId < (int)scene.mats.size() &&
             scene.mats[matId].type == MatType::Layered) return true;
+        // The fiber BCSDF (MatType::Hair, TODO §P3) is CPU-only for now: the device
+        // shadeStep has no Hair branch, and the model needs the strand tangent and the
+        // impact parameter, which the device Hit does not carry. Like Layered, one hair
+        // material sends the whole scene to the CPU tracer, rather than letting the
+        // device silently shade strands as something they are not.
+        if (matId >= 0 && matId < (int)scene.mats.size() &&
+            scene.mats[matId].type == MatType::Hair) return true;
         if (matId >= 0 && matId < (int)scene.mats.size() &&
             scene.mats[matId].type == MatType::Mix) {
             const Material& mx = scene.mats[matId];
             if ((int)mx.mixChildren.size() > D_MIXMAX) return true;
-            for (int c : mx.mixChildren) if (oversizedMultilayer(c) || usesRecord(c)) return true;
+            for (int c : mx.mixChildren)
+                if (oversizedMultilayer(c) || usesRecord(c) ||
+                    (c >= 0 && c < (int)scene.mats.size() && scene.mats[c].type == MatType::Hair))
+                    return true;
         }
         return false;
     };

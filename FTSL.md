@@ -1152,6 +1152,7 @@ Fills a complete material; a few knobs may be overridden afterward
 | `thinfilm` | `ior`(1.5); `film_ior`(1.30); `film_thickness <nm>`(300)/`film_thickness_map`; `substrate_k <spec>`(0) |
 | `grating` | `reflect`(0.9); `groove_spacing <nm>`(1000); `groove_dir <x y z>`(0,1,0); `max_order`(3) |
 | `fluorescent` | `reflect`(0.1); `absorb <spec>`; `emit <spec>`; `yield`(1) |
+| `hair` | fiber BCSDF for `curve`/`fur` strands (Marschner R/TT/TRT, Chiang form). `reflect <spec>`(0.3) — the colour you want the *coat* to be, inverted into an interior absorption, **not** a Lambertian albedo; `sigma_a <spec>` — that absorption directly, in 1/(fiber radius), and it **wins** over `reflect` when present; `eta`(1.55); `beta_m`(0.3) longitudinal roughness; `beta_n`(0.3) azimuthal roughness; `alpha`(2.0) cuticle scale tilt in **degrees**. See REFERENCE.md § Hair and fur fibers. |
 | `multilayer` | `ior`(1.5); `substrate_k`(0); ordered `layer <n> <k> <thickness_nm>` list (outermost first) |
 | `mix` | stochastic blend of children — see §7.3 |
 | `layered` | specular coat over a weighted body — see §7.4 |
@@ -1188,8 +1189,10 @@ is clamped to [0,1], so a runaway formula cannot manufacture energy.
 back-hemisphere albedo (still energy-guarded so reflect + transmit ≤ 1) or a `filter`'s
 per-wavelength gel transmittance.
 
-Reflect patterns are supported on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy`
-and `grating`; transmit patterns on `translucent` and `filter` — the families whose slot goes
+Reflect patterns are supported on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy`,
+`grating` and `hair` (on a fiber the pattern modulates the colour that is inverted into
+`sigma_a`, so it varies the strand's absorption per hit); transmit patterns on `translucent`
+and `filter` — the families whose slot goes
 through the shared per-hit accessor. Elsewhere the spectrum is read directly (or not at all)
 and a pattern would be dropped in silence, so the loader **refuses** it there instead.
 

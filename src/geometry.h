@@ -117,6 +117,14 @@ struct Hit {
     // (+1/-1) gives the bitangent handedness (B = cross(n, tangent)*bitangentSign).
     Vec3   tangent{1, 0, 0};
     double bitangentSign = 1.0;
+    // Local fiber radius, in world units, when the hit is on a `curve` / `fur` strand;
+    // 0 on every other primitive ("not a fiber"). Needed by the hair BCSDF (§P3), whose
+    // TT lobe legitimately exits the FAR side of the strand: the near-field model
+    // approximates that exit as happening at the entry point, so a shadow / camera
+    // connection through the fiber has to start past the strand's own body instead of
+    // being occluded by it. Nothing else reads this, and the intersector already has the
+    // interpolated radius in hand, so it costs one store.
+    double fiberRadius = 0.0;
     // Mean curvature at the hit, 1/length, exposed to procedural patterns as `curv` (O3).
     // Signed RELATIVE TO THE SIDE BEING SHADED: the intersector negates it whenever it
     // flips the normal to face the ray, so a surface bulging toward the viewer is always

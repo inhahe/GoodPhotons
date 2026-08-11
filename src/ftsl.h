@@ -2840,7 +2840,11 @@ private:
     static bool reflectPatHonoured(MatType t) {
         return t == MatType::Diffuse   || t == MatType::DiffuseTransmit ||
                t == MatType::Mirror    || t == MatType::HalfMirror      ||
-               t == MatType::Glossy    || t == MatType::Grating;
+               t == MatType::Glossy    || t == MatType::Grating         ||
+               // Hair reads its colour through reflectSlot() at shading time and inverts
+               // it to sigma_a there, so a pattern/texture on it IS honoured — which is
+               // what lets a groom vary root-to-tip or per-strand.
+               t == MatType::Hair;
     }
 
     // The transmit slot is only ever READ by these two: a colored gel's T(lambda) and a
@@ -4393,6 +4397,29 @@ private:
             m.grooveSpacing = dblParam(b, "groove_spacing", 1000.0);
             Vec3 gd{0, 1, 0}; vec3Of(b, "groove_dir", gd); m.grooveDir = gd;
             m.gratingMaxOrder = (int)dblParam(b, "max_order", 3);
+        } else if (type == "hair") {
+            // Fiber BCSDF (Marschner R/TT/TRT, Chiang form) — see src/hair.h. Meant to
+            // sit on `curve` / `fur` geometry, whose intersector already reports the fiber
+            // axis as `hit.tangent`.
+            m.type = MatType::Hair;
+            // `reflect` is the colour you WANT the fiber to end up, not a Lambertian
+            // albedo: it is inverted through Chiang eq. 9 into an interior sigma_a. That
+            // inversion needs the final hairBetaN, so it happens at shading time, not here.
+            m.reflect   = reflectParam(b, m, constantSpectrum(0.3));
+            m.hairEta   = dblParam(b, "eta", 1.55);
+            auto clamp01d = [](double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); };
+            m.hairBetaM = clamp01d(dblParam(b, "beta_m", 0.3));
+            m.hairBetaN = clamp01d(dblParam(b, "beta_n", 0.3));
+            m.hairAlpha = dblParam(b, "alpha", 2.0);
+            // Physical spelling: sigma_a directly, in units of 1/(fiber radius) — which is
+            // what the Beer-Lambert term inside the unit cylinder is expressed in. When
+            // present it wins, and `reflect` is not consulted at all.
+            if (find(b, "sigma_a")) {
+                m.hairSigmaA = spectrumParam(b, "sigma_a", constantSpectrum(0.0));
+                m.hairSigmaAFromReflect = false;
+            } else {
+                m.hairSigmaAFromReflect = true;
+            }
         } else if (type == "fluorescent") {
             m.type = MatType::Fluorescent;
             m.reflect = reflectParam(b, m, constantSpectrum(0.1));

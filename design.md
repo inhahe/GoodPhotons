@@ -457,9 +457,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     mutation run will tell you which fixture that is.
 - **`hair.h`** — the **fiber BCSDF**: Marschner's (2003) R / TT / TRT lobes in Chiang et
   al.'s (2016) energy-conserving form. Header-only, `<cmath>` + `linalg.h`, no renderer
-  dependencies, so it can be unit-tested with no scene (`-checkhair`, nine sections). As of
-  0.171.0 this is the *core only* — the scattering maths and its geometry hookup, not yet a
-  `material { type hair }` in the scene language, so nothing in a render calls it yet.
+  dependencies, so it can be unit-tested with no scene (`-checkhair`, nine sections). 0.171.0
+  added the core; **0.172.0 wired it up** as `material { type hair }` — see the
+  `hair_shade.h` entry below for the Scene↔BCSDF bridge and how each renderer consumes it.
   - *Why Chiang's form and not Marschner's directly.* Marschner's `M_p` is a flat Gaussian
     in θ, which integrates to **more** than 1 as roughness grows — that is exactly where the
     2003 model's famous energy gain comes from, and why practical implementations bolt on an
@@ -505,6 +505,66 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     weight is just `fOut·|cos θ_i|/pdfOut` — and §5 asserts those agree with independent
     `f()` / `pdf()` calls to *zero* relative error, which is the cheapest possible guard
     against the classic sample/evaluate drift.
+- **`hair_shade.h`** — the **Scene ↔ `hair.h` bridge** (0.172.0). `hairShadeAt(scene, mat,
+  hit, λ, wo)` builds a `HairShade { hair::Bcsdf b; hair::Frame fr; Vec3 woLocal; double
+  radius; }` from a `Material` + `Hit`: it resolves σa (either authored directly, or inverted
+  out of the authored `reflect` colour through Chiang eq. 9 — which needs the final `beta_n`,
+  so the inversion has to happen here at shading time and not at parse time), builds the fiber
+  frame from `hit.tangent`, and recovers the impact parameter. Two exported helpers carry the
+  two things every renderer then gets wrong if left to itself:
+  - *`hairFCos(hs, wi)` returns `f · cos θ_long`, not `f`.* **The fiber projection factor is
+    the LONGITUDINAL cosine, not `dot(n, w)`.** A round strand has no azimuthal foreshortening:
+    the BCSDF is normalised against `cos θ_long = sqrt(1 − w_x²)` in the fiber frame. Using
+    `dot(n, w)` instead both double-counts the tube's curvature and breaks energy conservation,
+    and — the dangerous part — it *looks* almost right: a smooth angular error that reads as
+    "my hair is a bit dark at grazing angles". Returning the product means no call site can
+    supply its own projection.
+  - *`hairExitOffset(hs, n, w)` — TT and TRT exit the FAR side of a real solid tube.* The
+    near-field model puts every exit at the entry point, but the curve primitive is a genuine
+    solid round cone, so a connection or continuation leaving through the far side is occluded
+    by the strand's own body. Strand radii are **microns**, so the ordinary `ng * 1e-6` nudge
+    lands *inside* the tube and the ray instantly reports itself blocked by the very hair it
+    left — deleting exactly the TT forward glow a pale coat is mostly made of. The offset steps
+    `2.5 × Hit::fiberRadius` (a new field, set by `curve.h`) on the far side and degrades to
+    the ordinary epsilon on the near side. **Every shadow ray that uses it must also shorten
+    its max-t by the same amount**, or it overshoots into the light it is testing.
+  - *The sampler weight is exactly `T = Σ_p A_p ≤ 1`.* Since `f·cos = Σ_p A_p M_p N_p` and
+    `pdf = Σ_p (A_p/T) M_p N_p`, the ratio `fv·cosLong/pdf` is a deterministic per-hit number.
+    So it is simultaneously the natural Russian-roulette survival probability (β unchanged —
+    the same trick `Mirror` plays with its reflectance, except here the number is the physics
+    rather than an authored albedo) and the Whitted attenuation weight.
+  - *No Veach shading-normal adjoint, no shadow-terminator softening.* Both are corrections
+    for using an *interpolated normal* as a projection axis; a fiber does not project about its
+    normal. On curve geometry `h.n == ±h.ng` so both would evaluate to 1 anyway — the explicit
+    `isFiberMat` guards are what keep `hair` honest if it is ever put on a smooth-shaded
+    triangle mesh.
+  - *Unidirectional tracers de-hero at a strand; bidirectional ones do not.* σa is per-λ (and
+    an authored `reflect` is inverted into one per-λ), so a hero packet cannot share one fiber
+    interaction across C wavelengths — forward (`render.h`) and backward (`backward.h`) put
+    `Hair` in their dispersive/de-hero group beside `Fluorescent`. BDPT/VCM by contrast already
+    re-evaluate each secondary's `f` along the hero's sampled direction (`secF[i]`), so the
+    bundle survives a strand there — which is fortunate, since a fiber is precisely where the
+    spectral spread is interesting.
+  - *BDPT/VCM get the projection through a PRE-DIVIDE, not a special case.* Those integrators
+    speak only "f, its pdf, and a geometry term carrying cos(ns, w)", and that term is formed
+    in roughly a dozen places. Rather than teach all of them about fibers, `bdpt::bsdfF`
+    returns `hairFCos(wi) / |cos(ns, wi)|` for `Hair`, pre-dividing by the cosine BDPT is about
+    to multiply back in — so `f·G` comes out to exactly `hairFCos × cosOther/dist²` and every
+    MIS ratio, strategy weight and density conversion stays untouched and provably consistent.
+    A `hairCosGuard` floor of 1e-7 keeps the division finite at a grazing endpoint.
+  - *Modes M / S scatter but never gather.* `struct Photon { Vec3 n; float power; float
+    lambda; }` carries **no incident direction**, so a directional BCSDF has nothing to
+    evaluate against at a density-estimate gather. `sppm_render.h` and `photonmap_render.h`
+    therefore give `Hair` an explicit *scattering* case — without it, it would fall into their
+    `default:`, which treats an unknown material as a **mirror**, and would be silently wrong.
+    A strand is not a visible point and not a deposit site, the same treatment those modes
+    already give glossy/specular surfaces. Logged in `known-issues.md`.
+  - *CUDA falls back.* `cudaForwardSupported()` rejects any scene containing a `Hair`
+    material (directly or as a `mix` child): the device `shadeStep` has no Hair branch, and the
+    model needs the strand tangent and impact parameter, which the device `Hit` does not carry.
+    Like `Layered`, one hair material sends the whole scene to the CPU tracer rather than
+    letting the device silently shade strands as something they are not. `MatType::Hair` is
+    appended at the **end** of the enum because `render_cuda.cu`'s `D_*` tags are `(int)m.type`.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds

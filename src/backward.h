@@ -252,8 +252,40 @@ struct BackwardRenderer {
     // the connection distance `dist`; the diffuse contribution at wavelength λ is then
     //   (rho(λ)/PI) * SPD(λ)*invPdfλ * w      (× medium transmittance, added by caller).
     // Returns false to skip this emitter (back-facing, shadowed, or behind geometry).
+    //
+    // A FIBER vertex (`hs` non-null, MatType::Hair) reaches this same body through two
+    // substitutions rather than a parallel copy, because everything an emitter sample has
+    // to do — pick a point, form wi, test visibility, divide by the pdf — is identical;
+    // only what happens AT the shading point differs:
+    //   * the "surface response" is PI*hairFCos instead of cos(n,wi)*shadowTerminatorG, so
+    //     the caller's rho/PI (with rho == 1) leaves exactly the BCSDF-times-projection.
+    //     There is no horizon test: a strand's TT lobe legitimately lights the far side,
+    //     and both the cosine rejection and the terminator softening are corrections for
+    //     using an interpolated normal as a projection axis, which a fiber does not do.
+    //   * the shadow ray starts a couple of diameters out so the tube does not occlude its
+    //     own transmitted lobe (hair_shade.h).
     bool emitterGeom(const Scene& scene, const Hit& h, const Vec3& ngo,
-                     const Emitter& em, double u1, double u2, double& dist, double& w) const {
+                     const Emitter& em, double u1, double u2, double& dist, double& w,
+                     const HairShade* hs = nullptr) const {
+        // The surface response that multiplies the geometry weight, and the shadow ray.
+        // Both are exactly the pre-hair code when `hs` is null, so every non-fiber scene
+        // stays bit-identical (same rejections, same offset, same float ordering).
+        // (Two outputs rather than their product so the weight expressions below keep
+        // their original float ordering to the last bit; a fiber's `stG` is exactly 1.)
+        auto response = [&](const Vec3& wi, double& cosSurf, double& stG) -> bool {
+            if (hs) { cosSurf = PI * hairFCos(*hs, wi); stG = 1.0; return cosSurf > 0.0; }
+            cosSurf = dot(h.n, wi);
+            if (cosSurf <= 0) return false;
+            stG = shadowTerminatorG(wi, h.n, ngo);         // Chiang soft terminator (1 if flat)
+            if (stG <= 0.0) return false;                  // behind true geometry: hard shadow
+            return true;
+        };
+        auto blocked = [&](const Vec3& wi, double d, double shorten) -> bool {
+            if (!hs) return scene.occluded(h.p + ngo * 1e-6, wi, d - shorten);
+            const double off = hairExitOffset(*hs, h.n, wi);
+            const double len = d - off - 1e-6;
+            return len <= 0.0 || scene.occluded(h.p + wi * off, wi, len);
+        };
         if (em.collimated) return false;                  // beams aren't area-samplable
         if (em.shape == EmitterShape::Spot) {
             // Point spot: deterministic connect to the light point, weighted by the
@@ -262,13 +294,11 @@ struct BackwardRenderer {
             double dist2 = dot(toL, toL);
             dist = std::sqrt(dist2);
             Vec3 wi = toL / dist;
-            double cosSurf = dot(h.n, wi);
-            if (cosSurf <= 0) return false;
-            double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
-            if (stG <= 0.0) return false;                    // behind true geometry: hard shadow
+            double cosSurf, stG;
+            if (!response(wi, cosSurf, stG)) return false;
             double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= 0) return false;
-            if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) return false;
+            if (blocked(wi, dist, 2e-6)) return false;
             w = fall * cosSurf / dist2 * stG;                // I(w)/dist^2 (× BRDF & SPD by caller)
             return true;
         }
@@ -282,12 +312,10 @@ struct BackwardRenderer {
             // Two rng draws, matching the area-light path below, so adding a sun does
             // not reshuffle any other emitter's stream.
             Vec3 wi = em.sampleCone(-em.beamDir, u1, u2);
-            double cosSurf = dot(h.n, wi);
-            if (cosSurf <= 0) return false;
-            double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
-            if (stG <= 0.0) return false;                    // behind true geometry: hard shadow
+            double cosSurf, stG;
+            if (!response(wi, cosSurf, stG)) return false;
             dist = length(scene.sceneCenter - h.p) + scene.sceneRadius;   // to the scene exit
-            if (scene.occluded(h.p + ngo * 1e-6, wi, dist)) return false;
+            if (blocked(wi, dist, 0.0)) return false;
             w = cosSurf * em.spotOmega * stG;
             return true;
         }
@@ -309,11 +337,9 @@ struct BackwardRenderer {
                           em.sampleCylinderVisible(h.p, u1, u2, y, nLight, pdfAreaCyl);
         if (cylVisible) effArea = 1.0 / pdfAreaCyl;
         if (coneSampled) {
-            double cosSurf = dot(h.n, wi);
-            if (cosSurf <= 0) return false;
-            double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
-            if (stG <= 0.0) return false;                    // behind true geometry: hard shadow
-            if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) return false;
+            double cosSurf, stG;
+            if (!response(wi, cosSurf, stG)) return false;
+            if (blocked(wi, dist, 2e-6)) return false;
             w = cosSurf / pdfW * stG;                        // solid-angle measure
             return true;
         }
@@ -329,13 +355,11 @@ struct BackwardRenderer {
         double dist2 = dot(toL, toL);
         dist = std::sqrt(dist2);
         wi = toL / dist;
-        double cosSurf = dot(h.n, wi);
-        if (cosSurf <= 0) return false;
-        double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
-        if (stG <= 0.0) return false;                    // behind true geometry: hard shadow
+        double cosSurf, stG;
+        if (!response(wi, cosSurf, stG)) return false;
         double cosLight = dot(nLight, -wi);              // light is one-sided
         if (cosLight <= 0) return false;
-        if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) return false;
+        if (blocked(wi, dist, 2e-6)) return false;
         double G = cosSurf * cosLight / dist2;           // geometry term
         w = G * effArea * stG;                           // pdf_area = 1/effArea (visible area for cylinder)
         if (epat != 1.0) w *= epat;                      // no-op (and bit-identical) without a pattern
@@ -541,9 +565,12 @@ struct BackwardRenderer {
         u2 = ((double)(g / G) + 0.5) / (double)G;
     }
 
+    // `hs` non-null routes the connection through the fiber BCSDF (see emitterGeom); the
+    // caller then passes rho == 1, because the strand's colour is already inside the BCSDF
+    // (its sigma_a) and the PI in emitterGeom's response cancels the rho/PI below.
     double neeLight(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
                     double lambda, Pcg32& rng, const SpdCache* spdCache = nullptr,
-                    GiCtx gi = GiCtx{}) const {
+                    GiCtx gi = GiCtx{}, const HairShade* hs = nullptr) const {
         double total = 0.0;
         // Geometric normal on the shading-normal side: every light connection must lie
         // in this hemisphere too, else a smoothed shading normal would leak light in
@@ -574,7 +601,7 @@ struct BackwardRenderer {
                 if (whitted) { if (uv) gridUV(s, G, u1, u2); }
                 else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
                 double dist = 0.0, w = 0.0;
-                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w)) continue;
+                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, hs)) continue;
                 if (!haveSpd) {   // evaluated at most once per emitter, as before
                     spdV = cached ? spdCache->spd[(size_t)e * (size_t)spdCache->C]
                                   : em.spdFn(lambda);
@@ -814,9 +841,23 @@ struct BackwardRenderer {
     // skip; on success fills `wi`, `cosSurf`, `stG`, `pdfW`, `wMis`, `farDist`.
     bool envGeom(const Scene& scene, const Hit& h, Pcg32& rng, Vec3& wi,
                  double& cosSurf, double& stG, double& pdfW, double& wMis,
-                 double& farDist) const {
+                 double& farDist, const HairShade* hs = nullptr) const {
         wi = scene.sampleEnvDir(rng, pdfW);
         if (pdfW <= 0.0) return false;
+        if (hs) {
+            // Fiber: `cosSurf` carries PI*hairFCos so the caller's rho/PI (rho == 1) leaves
+            // the BCSDF-times-projection, and the MIS partner is the BCSDF's own pdf rather
+            // than the cosine-hemisphere one — the continuation below samples hair::sample.
+            cosSurf = PI * hairFCos(*hs, wi);
+            stG = 1.0;
+            if (!(cosSurf > 0.0)) return false;
+            farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
+            const double off = hairExitOffset(*hs, h.n, wi);
+            if (scene.occluded(h.p + wi * off, wi, farDist)) return false;
+            const double pdfBsdf = hair::pdf(hs->b, hs->woLocal, hair::toLocal(hs->fr, wi));
+            wMis = pdfW / (pdfW + pdfBsdf);
+            return true;
+        }
         cosSurf = dot(h.n, wi);
         const Vec3 ngo = orientedGeoN(h);
         if (cosSurf <= 0.0) return false;                       // below the shading horizon
@@ -830,9 +871,9 @@ struct BackwardRenderer {
     }
 
     double neeEnv(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
-                  double lambda, Pcg32& rng) const {
+                  double lambda, Pcg32& rng, const HairShade* hs = nullptr) const {
         Vec3 wi; double cosSurf, stG, pdfW, wMis, farDist;
-        if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist)) return 0.0;
+        if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist, hs)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
         double contrib = (rho / PI) * Lenv * cosSurf * invPdfLambda / pdfW * wMis * stG;
@@ -1112,6 +1153,40 @@ struct BackwardRenderer {
                     specularArrival = false; return true;
                 }
                 return false;                                // absorbed / terminated
+            }
+            case MatType::Hair: {
+                // Fiber BCSDF — the backward adjoint of the forward tracer's Hair case, and
+                // the same physics object (src/hair.h) bridged the same way (hair_shade.h).
+                //
+                // `wPrev` is the direction the path arrived FROM, which backward means
+                // toward the eye. That is the model's reference direction (the impact
+                // parameter h is measured against it), so this is the one place where the
+                // forward and backward tracers legitimately hand hairShadeAt() different
+                // vectors and still describe the same fiber: the BCSDF is reciprocal.
+                const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
+                const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
+                // rho == 1: the strand's colour lives in sigma_a inside the BCSDF, not in a
+                // separate Lambertian albedo (see neeLight).
+                L += thr * neeLight(scene, h, 1.0, invPdfLambda, lambda, rng, spdCache, gi, &hs);
+                if (scene.envIndex >= 0)
+                    L += thr * neeEnv(scene, h, 1.0, invPdfLambda, lambda, rng, &hs);
+                if (directOnly) return false;
+                double pdfH = 0.0, fv = 0.0;
+                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
+                                             rng.uniform(), rng.uniform(), pdfH, fv);
+                if (!(pdfH > 0.0) || !(fv > 0.0)) return false;
+                // Exactly T = sum_p A_p, the total lobe attenuation (see the forward tracer's
+                // Hair case for why the ratio collapses): a deterministic weight, so it is
+                // both the analog-RR survival probability and the Whitted attenuation.
+                const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
+                const double T = clamp01(fv * cosLong / pdfH);
+                if (whitted) { if (!whittedAttenuate(thr, T)) return false; }
+                else if (rng.uniform() >= T) return false;
+                const Vec3 wOut = hair::toWorld(hs.fr, wl);
+                contBsdfPdf = pdfH;                 // real pdf -> env-miss MIS is exact here
+                // Step clear of the strand's own body: TT/TRT exit the far side.
+                ray = Ray{h.p + wOut * hairExitOffset(hs, h.n, wOut), wOut};
+                specularArrival = false; return true;
             }
             case MatType::DiffuseTransmit: {
                 // Two-lobe Lambertian: NEE the reflect lobe in the front hemisphere and
@@ -1680,10 +1755,13 @@ struct BackwardRenderer {
                 case MatType::Multilayer:
                 case MatType::Grating:
                 case MatType::HalfMirror:
+                case MatType::Hair:
                 case MatType::Fluorescent: {
                     // Dispersive / wavelength-switching: the outgoing direction (and, for a
                     // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
-                    // cannot keep riding one shared direction past this interface.
+                    // cannot keep riding one shared direction past this interface. A fiber is
+                    // here for the same reason: its absorption is per-λ, so both the sampled
+                    // lobe and the survival probability differ across the bundle.
                     if (heroSplit && secAlive && nUp > 1) {
                         // SPLIT-AT-DISPERSION: fan out instead of de-hero'ing. Each secondary
                         // runs the SAME interaction with its OWN λ -- refracting along its own

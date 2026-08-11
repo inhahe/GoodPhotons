@@ -5,6 +5,96 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-10, v0.172.0): `type hair` cannot be gathered on in modes M / S — the photon record has no incident direction
+
+`struct Photon { Vec3 n; float power; float lambda; }` (`src/photonmap.h`) stores where a
+photon landed, how much power it carried and at what wavelength — but **not the direction it
+arrived from**. A Lambertian gather doesn't need it (`f_r = ρ/π` is directionless), which is
+why the field was never there. A fiber BCSDF is *entirely* directional: `hairFCos(hs, wi)`
+has nothing to evaluate against without `wi`.
+
+So `sppm_render.h`'s `sppmVisiblePoint` and `photonmap_render.h`'s two walks give `Hair` an
+explicit **scattering** case — sample the BCSDF, multiply throughput by `T = Σ_p A_p`, step
+clear of the strand with `hairExitOffset` — and a strand is neither a visible point nor a
+deposit site. That is the same treatment those modes already give glossy/specular surfaces,
+so a hair scene in mode `M`/`S` is *consistent*, not wrong; it just gets no photon-map
+contribution off the coat itself. Modes `W`, `R`, `A`/`B`/`C`, `D` and `V` shade hair fully.
+
+The case is load-bearing rather than cosmetic: without it `Hair` falls into those switches'
+`default:`, which treats an unknown material as a **mirror** (`thr *= reflectSlot(...); ray =
+reflect(...)`) — silently, and plausibly enough to be missed.
+
+**Proper fix:** add an incident direction to `Photon` (a packed octahedral `uint16` pair
+would cost 4 bytes on a 20-byte record, ~20 % more map memory) and let non-Lambertian
+materials be gather sites. Worth doing only if hair in the photon modes is actually wanted;
+the bidirectional modes (`D`, `V`) already cover the caustics-through-hair case.
+
+### OPEN (2026-08-10, v0.172.0): a `hair` coat is very noisy in the stochastic modes
+
+Measured on `scraps/hair_ab.ftsl` (two identical 60 000-strand coats on identical spheres,
+same lights, one `type hair` with `sigma_a 0.02`, one `type diffuse reflect 0.90`), mode `R`,
+48 spp: the fiber coat is covered in chromatic speckle while the Lambertian one is already
+smooth, and reads **~78 % of the Lambertian coat's brightness** (sRGB 54.1 vs 70.6).
+
+**The energy is not being lost — that was measured, not assumed.** Three checks:
+
+- **Single-strand furnace** (`scraps/hair_furnace.ftsl`): a `sigma_a 0` strand under a
+  uniform environment vanishes into the background. The BCSDF itself conserves.
+- **Dense-coat furnace** (`scraps/hair_coat_furnace.ftsl`, 40 000 strands, `-max-bounce 600`):
+  hair coat **(201.0, 184.8, 181.7)** vs diffuse coat (207.0, 186.6, 182.7) vs background
+  (207.4, 186.7, 183.2) — **~97 % conserved through dense inter-fiber multiple scattering**,
+  so the multi-bounce chain through thousands of strands is correct too.
+- **Deep-walk A/B** (`png/hair_ab_deep.png`, the same scene at `-max-bounce 600`): hair
+  **55.3** vs 54.1 at 32 bounces — a 2 % move, inside the noise. **Bounce truncation is
+  therefore NOT the cause of the brightness difference**, even on near-non-absorbing fiber.
+
+**Most of the remaining difference is real physics, not a bug.** A fiber scatters into the
+whole sphere and mostly FORWARD (the TT lobe), so light entering a coat penetrates toward
+whatever is underneath instead of turning around at the first strand — and in that scene what
+is underneath is a dark `skin` sphere (`reflect rgb 0.35 0.26 0.22`) that eats it. Swapping
+the core for a white one (`scraps/hair_ab_whitecore.ftsl` → `png/hair_ab_white.png`) lifts the
+hair ball from 55.3 to **61.0** against an unchanged 70.9 diffuse, recovering **about half the
+gap**; the rest is simply that `sigma_a 0.02` in 1/radius is not the same thing as a 0.90
+Lambertian albedo (per `-checkhair` §S7 the inversion is steeply non-linear — reflectance 0.80
+is only `sigma_a 0.0014`).
+
+**What is genuinely wrong is the variance**, and it has one structural cause:
+
+- **NEE is the only direct-lighting strategy at a hair vertex, with no MIS partner.** Same
+  structural gap as the `type glossy` entry further down: `backward.h` has no area-light pdf,
+  so a directly-hit emitter after a non-delta vertex is discarded (`specularArrival = false`)
+  and cannot be MIS-combined. Sampling a large area light against a peaked BCSDF is exactly
+  the high-variance case MIS exists to fix. (Env lighting is fine — `envGeom` *does* MIS hair
+  against `hair::pdf`, and it converges visibly faster.)
+
+**Proper fixes, in order of value:**
+- **Area-light MIS at non-delta vertices** — fixes the variance, and the `glossy` bug with it.
+- **Dual scattering (Zinke et al. 2008)** — TODO §P3 stage 4. Approximates the deep
+  multiple-scattering component analytically instead of walking it, which is how production
+  renderers make near-white fur both bright and fast. Not needed for *correctness* here (the
+  coat furnace already conserves), but it is what makes a pale coat cheap.
+
+`scenes/hair_basics.ftsl` therefore defaults to mode `W` (deterministic, noise-free) and uses
+realistic absorptions rather than a near-white fur, and its header says why.
+
+### OPEN (2026-08-10, v0.172.0): the GPU backends fall back to the CPU for any scene containing a `hair` material
+
+`cudaForwardSupported()` (`src/render_cuda.cu`) rejects a scene if any material — directly or
+as a `mix` child — is `MatType::Hair`, and `renderBackwardRGBCuda`'s gate rejects it through
+its `default: return false`. The device `shadeStep` has no Hair branch, and the model needs
+the strand tangent and the impact parameter, neither of which the device `Hit` carries.
+
+Like `Layered`, **one** hair material sends the whole scene to the CPU tracer. That is the
+right failure mode (better than the device silently shading strands as something they are
+not), but it means a furred character in an otherwise GPU-friendly scene loses the GPU
+entirely — and hair scenes are exactly the ones that want it, since they are also the ones
+that need the most samples (see the entry above).
+
+**Proper fix:** add `tangent` + `fiberRadius` to the device `Hit`, port `hair.h` to
+`__device__` (it is header-only and depends on nothing but `<cmath>` and `linalg.h`, so this
+is mostly a matter of `__host__ __device__` annotations and replacing `double` where it
+matters), and give `shadeStep`/`bkInteract` a `D_HAIR` case.
+
 ### OPEN (2026-08-10, v0.170.0): the sigmoid upsampling model itself is ~0.019 off at pure white, and stochastic tiling's LUT inherits that
 
 Not a tiling bug, but it surfaces there and sets the floor on `-checkstochtile` §8's

@@ -23,6 +23,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Backends & performance (`-device`, `-wavefront`)](#backends--performance--device--wavefront)
 - [Cameras](#cameras)
 - [Materials](#materials)
+  - [Hair and fur fibers (`hair`)](#hair-and-fur-fibers-hair)
 - [Spectra (SPDs, reflectances, indices)](#spectra-spds-reflectances-indices)
   - [Spectral representation vs. other renderers](#spectral-representation-vs-other-renderers)
 - [Lights](#lights)
@@ -1094,6 +1095,7 @@ Declared with `material "name" { type <type> … }`.
 | `multilayer` | N-layer Abelès transfer-matrix stack | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>` |
 | `grating` | Reflective diffraction grating | `reflect`, `groove_spacing` (nm), `groove_dir`, `max_order` |
 | `fluorescent` | Stokes-shifted fluorescence. **Note `emit` means something different here:** on a fluorescent it is the *reradiation* spectrum — the SHAPE of the Stokes-shifted emission band, normalised by its own integral — **not** self-emission, so a fluorescent surface is never a light. (`emit_map` is therefore rejected on a fluorescent: a reradiation profile isn't a surface pattern.) For a surface that both fluoresces and glows on its own, use a `mix` of a `fluorescent` and an emissive `diffuse` | `reflect` (elastic base lobe), `absorb` (excitation band), `emit` (reradiation band), `yield` (quantum yield ≤ 1) |
+| `hair` | **Fiber BCSDF** for hair / fur strands (Marschner R + TT + TRT, Chiang importance-sampled form) — a scattering model for a translucent dielectric *cylinder*, not a surface. Meant for `curve` / `fur` geometry. See [Hair and fur fibers](#hair-and-fur-fibers-hair) below | `reflect` (the colour you want the coat to be — inverted into an absorption, **not** a Lambertian albedo), or `sigma_a` (the absorption directly, which wins if present); `eta`, `beta_m`, `beta_n` (longitudinal / azimuthal roughness), `alpha` (cuticle tilt, degrees) |
 | `mix` | Stochastic blend of materials | repeated `layer <material> <weight>`; optional `weight_map texture:<name>` **or `weight_map pattern:<name>`** (2-child spatial blend mask — with a pattern this becomes a math-driven *per-point material selection*, see Procedural patterns) |
 | `layered` | Physical coat over a weighted body: reflect off the coat with prob R, else enter and pick one body lobe (energy-consistent). CPU only | `coat { reflectance fresnel\|thinfilm\|manual, ior, roughness[/roughness_map], film_ior, film_thickness[/film_thickness_map], specular }` + repeated body `layer <material> <weight>` |
 
@@ -1156,6 +1158,63 @@ isosurfaces alike — isosurface overlap is detected conservatively by comparing
 material "water" { type dielectric ior 1.33  priority 1 }
 material "glass" { type dielectric ior 1.52  priority 2 }   # wins where it overlaps water
 ```
+
+### Hair and fur fibers (`hair`)
+
+Every other material here shades a **surface**: it takes a normal, projects incoming light
+by `cos(n, w)`, and scatters into a hemisphere. A hair or fur strand is not a surface. It
+is a translucent dielectric **cylinder** a few tens of microns across, and most of the
+light that meets it goes *through* it. Shading a strand with `diffuse` therefore gets the
+two things that actually make hair look like hair exactly backwards: the coat has no
+forward glow when it is backlit, and its highlight sits in the wrong place.
+
+`type hair` implements the standard fiber BCSDF for that geometry — Marschner et al. 2003
+("Light Scattering from Human Hair Fibers") for the lobe decomposition, Chiang et al. 2016
+("A Practical and Controllable Hair and Fur Model for Production Path Tracing") for the
+importance-sampled, energy-conserving form used here:
+
+| Lobe | Path | What you see |
+|---|---|---|
+| **R** (p=0) | reflects off the cuticle | the white, unsaturated primary highlight — displaced toward the root by the tilted cuticle scales |
+| **TT** (p=1) | in one side, out the other | the strong **forward** lobe. This is the rim of light on backlit hair, and it carries the strand's colour (one crossing of the absorbing interior) |
+| **TRT** (p=2) | in, one internal bounce, out the same side | the **secondary** highlight: offset from R, and much more saturated (two crossings) |
+| residual | p ≥ 3, folded into one term | makes the lobe weights sum to exactly 1, so a non-absorbing fiber passes a white furnace test |
+
+Parameters:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `reflect` | `0.3` | The colour you want the **coat** to be. This is *not* a Lambertian albedo — it is inverted (Chiang eq. 9) into the interior absorption that reproduces that colour under multiple scattering, so what you type is roughly what converges. |
+| `sigma_a` | — | The absorption coefficient directly, in units of 1/(fiber radius). The physical spelling; when present it **wins** and `reflect` is not consulted. Real hair is roughly `rgb 0.42 0.63 1.19` (brown) to `rgb 3.3 5.2 7.6` (black). |
+| `eta` | `1.55` | Cuticle index of refraction. 1.55 is keratin. |
+| `beta_m` | `0.3` | **Longitudinal** roughness (0–1): how far the highlight smears *along* the strand. ~0.05 wet or glass fiber, ~0.3 normal hair, ~0.7 coarse animal fur. |
+| `beta_n` | `0.3` | **Azimuthal** roughness (0–1): how far it smears *around* the strand. Low values give a hard, glinting TRT. |
+| `alpha` | `2.0` | Cuticle scale tilt, in **degrees**. This is what separates R and TRT into two distinct bands; 2° is human hair. |
+
+```
+material "blonde" { type hair  reflect rgb 0.72 0.55 0.28  beta_m 0.30  beta_n 0.30 }
+material "sleek"  { type hair  sigma_a rgb 0.42 0.63 1.19  beta_m 0.10  beta_n 0.12
+                    alpha 3.0 }
+fur "coat" { on "head"  material blonde  count 70000  length 0.055  radius 0.00005 }
+```
+
+Put it on [`curve`](#curves-and-fibers-curve) or [`fur`](#grooms-fur) geometry: those
+intersectors report the fiber axis and the impact parameter, which is what the model needs.
+On a triangle mesh it still shades (the surface tangent stands in for the axis) but the
+result is not physically meaningful.
+
+Two practical notes:
+
+- **Light it broadly.** A fiber is thin, so a small or point-like source leaves most of
+  each strand's circumference unlit and the whole coat reads as black felt. Area lights,
+  and a back light to feed the TT lobe, are what make the model worth having.
+- **Mode support.** Hair renders in `W`, `R`, `A`/`B`/`C`, `D` (BDPT) and `V` (VCM). Modes
+  `M` (photon map) and `S` (SPPM) *scatter* through it correctly but never gather on it —
+  their photon records store no incident direction, so a directional fiber lobe has nothing
+  to evaluate against; a strand is treated like a glossy surface there. The GPU backends
+  fall back to the CPU tracer for any scene containing a `hair` material.
+
+See `scenes/hair_basics.ftsl`.
 
 **Parametric records.** A **record** is a named bank of per-channel look-up tables over
 a shared scalar domain `[lo,hi]`. A single per-hit **driver** scalar samples every

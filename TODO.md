@@ -5105,14 +5105,99 @@ that item mostly a binding exercise there.
         rewrite the model itself never changed except for the Bessel fix — §5 reported *zero*
         sample-vs-pdf disagreement throughout, §9 2e-14, §7's Fresnel exact, and the 3° cuticle
         tilt moving the R highlight by exactly −2.97°.
-  - [ ] **P3 stage 2** — wire it into the scene: `material { type hair … }`, forward + backward +
-        GPU paths, `sigmaAFromReflectance` driving a `color`-style authoring parameter.
+  - [x] **P3 stage 2 — scene + renderer wiring. ✅ DONE v0.172.0.** `material { type hair … }`
+        (`reflect` colour inverted into σa, or `sigma_a` directly, plus `eta` / `beta_m` /
+        `beta_n` / `alpha`), bridged by the new **`src/hair_shade.h`** and consumed by forward
+        (`render.h`), backward (`backward.h`), BDPT (`bdpt.h`), VCM (`vcm.h`), and — as an
+        explicit *scattering* case — SPPM / photon map. `scenes/hair_basics.ftsl`.
+
+        **Three things a fiber gets wrong if each renderer is left to itself, so all three live
+        in `hair_shade.h` rather than at the call sites.** (1) *The projection factor is the
+        LONGITUDINAL cosine, not `dot(n, w)`* — a round strand has no azimuthal foreshortening,
+        so `hairFCos()` returns `f · cos θ_long`, the complete BSDF-times-projection. Using
+        `dot(n,w)` double-counts the tube's curvature *and* breaks energy conservation, and the
+        dangerous part is that it looks almost right: a smooth angular error that reads as "my
+        hair is a bit dark at grazing angles". (2) *TT and TRT exit the FAR side of a real solid
+        tube.* The near-field model puts every exit at the entry point, but `curve` geometry is a
+        genuine solid round cone — and strand radii are **microns**, so the ordinary `ng * 1e-6`
+        nudge lands *inside* the hair and the ray instantly reports itself blocked by the strand
+        it just left, deleting exactly the TT forward glow a pale coat is mostly made of.
+        `hairExitOffset()` steps 2.5 × the new `Hit::fiberRadius`; and every shadow ray that uses
+        it must **shorten its max-t by the same amount** or it overshoots into the light it is
+        testing. (3) *No Veach shading-normal adjoint and no shadow-terminator softening* — both
+        correct a projection taken about an *interpolated normal*, which a fiber does not do. On
+        curve geometry `h.n == ±h.ng` so both would be 1 anyway; the explicit guards are what
+        keep `hair` honest on a smooth-shaded triangle mesh.
+
+        **The sampler weight is exactly `T = Σ_p A_p ≤ 1`,** because `f·cos = Σ_p A_p M_p N_p`
+        while `pdf = Σ_p (A_p/T) M_p N_p`. So the ratio is a *deterministic* per-hit number and
+        is simultaneously the analog-RR survival probability (β unchanged — `Mirror`'s trick,
+        except the number is physics rather than an authored albedo) and the Whitted attenuation.
+
+        **BDPT/VCM get the projection through a pre-divide, not a special case.** Those
+        integrators speak only "f, its pdf, and a geometry term carrying cos(ns,w)", formed in
+        roughly a dozen places; so `bdpt::bsdfF` returns `hairFCos(wi)/|cos(ns,wi)|`, pre-dividing
+        by the cosine BDPT is about to multiply back in. `f·G` then comes out to exactly
+        `hairFCos × cosOther/dist²` and every MIS ratio and strategy weight stays untouched.
+        Relatedly: the **unidirectional** tracers must de-hero at a strand (σa is per-λ, so a hero
+        packet cannot share one fiber interaction across C wavelengths) while BDPT/VCM need not,
+        since they already re-evaluate each secondary's f along the hero's sampled direction.
+
+        **Modes M/S scatter but cannot gather, and the case is load-bearing.** `struct Photon`
+        carries no incident direction, so a directional BCSDF has nothing to evaluate at a
+        density-estimate gather. Without an explicit `Hair` case those switches' `default:`
+        treats an unknown material as a **mirror** — silently, and plausibly enough to be missed.
+
+        **Validated by furnace, not by eye — and at coat scale, not just one strand.** A
+        `sigma_a 0` strand under a uniform environment vanishes into the background
+        (`scraps/hair_furnace.ftsl`), and — the decisive one — a **40 000-strand `sigma_a 0`
+        coat** at `-max-bounce 600` reads (201.0, 184.8, 181.7) against a (207.4, 186.7, 183.2)
+        background, i.e. **~97 % conserved through dense inter-fiber multiple scattering**
+        (`scraps/hair_coat_furnace.ftsl`). That is what makes the honest A/B result readable:
+        a fiber coat (`scraps/hair_ab.ftsl`) renders at ~78 % of a `reflect 0.90` Lambertian
+        coat's brightness and far noisier, but a 600-bounce re-run moves it only 2 % (54.1 →
+        55.3), so **it is not truncation**; swapping the dark `skin` core for a white one
+        recovers half the gap (55.3 → 61.0), which is the TT lobe correctly forward-scattering
+        light *into* whatever the coat sits on, and the remainder is just that `sigma_a 0.02`
+        is not a 0.90 albedo. The real defect is variance — NEE with no MIS partner, the same
+        `backward.h` gap as `type glossy`. All logged in `known-issues.md`.
+
+        Not done here: GPU. `cudaForwardSupported()` rejects any scene containing a `Hair`
+        material (the device `Hit` carries neither the strand tangent nor the impact parameter),
+        so one hair material sends the whole scene to the CPU tracer — logged as its own entry.
   - [ ] **P3 stage 3** — the medulla (Yan 2015/2017 TT^s/TRT^s double-cylinder lobes).
   - [ ] **P3 stage 4** — dual scattering (Zinke 2008).
 
 ---
 
 ## Progress log
+- 2026-08-10: **P3 stage 2 — `material { type hair }` wired into every renderer (v0.172.0).**
+  New `src/hair_shade.h` bridges `Scene`/`Material`/`Hit` to stage 1's `src/hair.h`; forward,
+  backward, BDPT, VCM all shade and connect to fibers, and SPPM / the photon map scatter through
+  them. `scenes/hair_basics.ftsl`. The three things that made this more than a switch case, and
+  that a fiber gets wrong if each renderer improvises: **the projection factor is the
+  LONGITUDINAL cosine, not `dot(n, w)`** (a round strand has no azimuthal foreshortening — the
+  wrong version breaks energy conservation *and* looks almost right, reading as "a bit dark at
+  grazing angles"); **TT/TRT exit the FAR side of a real solid tube**, and since strand radii are
+  microns the ordinary `ng * 1e-6` offset lands *inside* the hair, so every connection,
+  continuation and shadow ray that leaves a fiber the far way has to step 2.5 × `Hit::fiberRadius`
+  — **and shorten its max-t by the same amount** or it overshoots into the light it is testing;
+  and **a fiber takes no Veach shading-normal adjoint and no shadow-terminator softening**, both
+  being corrections for projecting about an interpolated normal. Two structural notes worth
+  keeping: BDPT/VCM absorb the odd projection through a **pre-divide** (`bsdfF` returns
+  `hairFCos/|cos|`) so none of their dozen geometry-term sites needed to learn what a fiber is;
+  and the photon modes cannot gather on hair at all, because `struct Photon` has no incident
+  direction — the explicit scattering case there is load-bearing, since the `default:` those
+  switches would otherwise take treats an unknown material as a **mirror**. Validated by furnace
+  at *coat* scale, not one strand: a 40 000-strand `sigma_a 0` coat at 600 bounces conserves
+  ~97 % of a uniform environment, so the dense multi-strand chain is right. That is what lets the
+  honest A/B be read correctly — a fiber coat at ~78 % of a `reflect 0.90` Lambertian coat is
+  **not** truncation (600 bounces moves it 2 %) but the TT lobe forward-scattering light into the
+  dark core underneath (a white core recovers half the gap) plus the steep non-linearity of the
+  σa inversion; the genuine defect is variance, from NEE having no MIS partner at a non-delta
+  vertex — the same `backward.h` gap as `type glossy`. That, the GPU CPU-fallback, and the
+  photon-gather gap are all in `known-issues.md`; area-light MIS is the fix that matters, with
+  dual scattering (stage 4) the fix for making pale coats cheap.
 - 2026-08-10: **P3 stage 1 — fiber BCSDF core (v0.171.0).** `src/hair.h` + `-checkhair` (nine
   sections, all green; the full 31-test battery re-run clean). Marschner R/TT/TRT plus a folded
   p ≥ 3 residual in Chiang's energy-conserving form. The core-only stage: no

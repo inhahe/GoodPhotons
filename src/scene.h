@@ -17,7 +17,10 @@
 #include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
 #include "record.h"      // parametric records (§records): named per-channel LUTs
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter };
+// NOTE: append new types at the END. render_cuda.cu's D_* tags are `(int)m.type` and must
+// stay 1:1 with this order, so inserting in the middle silently reinterprets every
+// uploaded material.
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter, Hair };
 
 // Materials whose last-vertex-before-camera cannot connect to the pinhole in
 // model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
@@ -48,6 +51,7 @@ inline const char* matTypeName(MatType t) {
         case MatType::Layered:         return "layered";
         case MatType::DiffuseTransmit: return "translucent";
         case MatType::Filter:          return "filter";
+        case MatType::Hair:            return "hair";
         case MatType::Diffuse:         default: return "diffuse";
     }
 }
@@ -213,6 +217,25 @@ struct Material {
     double grooveSpacing = 1000.0;             // groove period d in nanometres
     Vec3   grooveDir = {1.0, 0.0, 0.0};        // groove direction (world), projected to surface
     int    gratingMaxOrder = 3;                // highest |m| diffraction order considered
+
+    // --- Fiber BCSDF (MatType::Hair) ----------------------------------------
+    // Marschner's R / TT / TRT lobes in Chiang's energy-conserving form (src/hair.h).
+    // Meant for `curve` / `fur` geometry: the shading code recovers the impact parameter
+    // from the hit normal and the fiber tangent, so the intersector stays BCSDF-free.
+    // On a non-fiber surface (a sphere, a triangle) `hit.tangent` is the texture-u
+    // direction rather than a fiber axis, which is still a well-defined frame — the
+    // result just is not a hair.
+    double hairEta   = 1.55;   // cuticle IOR (keratin)
+    double hairBetaM = 0.3;    // longitudinal roughness [0,1] — how far the R highlight smears along the fiber
+    double hairBetaN = 0.3;    // azimuthal roughness [0,1] — how far the lobes smear around it
+    double hairAlpha = 2.0;    // cuticle scale tilt, DEGREES; splits R from TRT (the "two highlights")
+    // Interior absorption. Authored either directly as sigma_a(lambda) in 1/(fiber
+    // radius) units via `hair_sigma_a`, or — far easier to art-direct — as the colour the
+    // fiber should end up, `reflect`, inverted through Chiang eq. 9 (`sigmaAFromReflectance`)
+    // at load time. `hairSigmaAFromReflect` records which spelling was used; the inversion
+    // depends on hairBetaN, so it must run after the whole block is parsed.
+    Spectrum hairSigmaA = constantSpectrum(0.0);
+    bool     hairSigmaAFromReflect = true;
 
     // --- Fluorescence (MatType::Fluorescent) --------------------------------
     // A photon at lambda excites the dye with probability fluoAbsorb(lambda); the

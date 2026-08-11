@@ -98,6 +98,21 @@ inline Vec3 offsetOrigin(const Vec3& p, const Vec3& ng, const Vec3& dir) {
     return p + ng * (sgn * 1e-6);
 }
 
+// Fiber (MatType::Hair) variants of the same thing. A strand is a real solid tube a few
+// microns across, and its TT / TRT lobes leave through the FAR side of it — so the usual
+// ng*1e-6 nudge lands INSIDE the hair and the ray immediately reports itself occluded by
+// the very strand it left, deleting the forward glow that a pale coat is mostly made of.
+// Stepping a couple of diameters clears the tube and displaces nothing visible. Returns 0
+// (and so degrades to offsetOrigin) for every non-fiber vertex and for the near side.
+inline double fiberStep(const Hit& h, bool isHair, const Vec3& dir) {
+    return (isHair && h.fiberRadius > 0.0 && dot(h.n, dir) < 0.0)
+               ? 2.5 * h.fiberRadius + 1e-9 : 0.0;
+}
+inline Vec3 fiberOrigin(const Hit& h, bool isHair, const Vec3& dir) {
+    const double s = fiberStep(h, isHair, dir);
+    return (s > 0.0) ? h.p + dir * s : offsetOrigin(h.p, h.ng, dir);
+}
+
 // Gather-side shading-normal correction for the VERTEX-MERGE (VM / photon-density) strategy.
 // The VM contribution is a Jensen density estimate MIS-combined with the vertex-connection
 // (VC) strategies; on a smooth (interpolated-normal) mesh the merge reads incident flux per
@@ -377,6 +392,33 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
                     double num = reflLobe ? rR   : rT;
                     double den = reflLobe ? rhoR : rhoT;
                     secF[i] = (den > 0.0) ? num * tot / den : 0.0;
+                }
+            }
+            break;
+        }
+        case MatType::Hair: {
+            // Fiber BCSDF — the same object bdpt.h's randomWalk samples, with the same
+            // conventions (see bdpt::bsdfF for why f is pre-divided by |cos(ns,wi)| and
+            // why that makes the geometry term come out right). Not delta: a strand is
+            // connectible and mergeable, which is what lets VCM resolve the multiply-
+            // scattered glow inside a dense groom that a path tracer chews on.
+            const HairShade hs = hairShadeAt(scene, *mp, h, lambda, wo);
+            double pdfH = 0.0, fv = 0.0;
+            const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
+                                         rng.uniform(), rng.uniform(), pdfH, fv);
+            if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
+            wi = hair::toWorld(hs.fr, wl);
+            pdfW = pdfH;
+            pdfRevW = bdpt::bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
+            const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
+            betaFactor = clamp01(fv * cosLong / pdfH);   // == T = sum_p A_p (hair.h)
+            // sigma_a is per-λ, so each secondary re-evaluates its own fiber along the
+            // hero's sampled direction; the bundle survives a strand rather than de-heroing.
+            if (nSec) {
+                *secChromatic = true;
+                for (int i = 0; i < nSec; ++i) {
+                    const HairShade hsi = hairShadeAt(scene, *mp, h, lamAll[i + 1], wo);
+                    secF[i] = hairFCos(hsi, wi) / pdfH;
                 }
             }
             break;
@@ -696,8 +738,10 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                                 fSec[i] = bsdfF(*mp, h.n, wo, wcam, hb.lam[i + 1], scene, &h) * geo;
                                 if (fSec[i] > mxF) mxF = fSec[i];
                             }
+                            const bool isHairV = (mp->type == MatType::Hair);
                             if (mxF > 0.0 &&
-                                !scene.occluded(offsetOrigin(h.p, h.ng, wcam), wcam, distc - 2e-6)) {
+                                !scene.occluded(fiberOrigin(h, isHairV, wcam), wcam,
+                                                distc - fiberStep(h, isHairV, wcam) - 2e-6)) {
                                 double bsdfRevPdfW = bsdfPdf(*mp, h.n, wcam, wo, lambda, scene, &h);
                                 double imgPtDist = ctx.imagePlaneDist / cosAtCamera;
                                 double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
@@ -756,8 +800,11 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         // stored keeps its full nUp — it really was reached by all C wavelengths.
         if (delta && !keepBundle) nUp = 1;
         prevP = h.p;
+        // A fiber scattering out its far side steps clear of its own tube (see fiberStep).
+        const double fstep = fiberStep(h, mp->type == MatType::Hair, wi);
         double sgn = dot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
-        ray = Ray{h.p + h.ng * (sgn * 1e-6), normalize(wi)};
+        ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * fstep, normalize(wi)}
+                            : Ray{h.p + h.ng * (sgn * 1e-6), normalize(wi)};
     }
 }
 
@@ -985,8 +1032,10 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                             em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * epat;
                                 if (fLeSec[i] > mxfLe) mxfLe = fLeSec[i];
                             }
+                            const bool isHairV = (mp->type == MatType::Hair);
                             if (mxfLe > 0.0 &&
-                                !scene.occluded(offsetOrigin(h.p, h.ng, wi), wi, distL - occlEps)) {
+                                !scene.occluded(fiberOrigin(h, isHairV, wi), wi,
+                                                distL - fiberStep(h, isHairV, wi) - occlEps)) {
                                 double pdfChoice = em.power / scene.totalPower;
                                 double bsdfDirPdfW = bsdfPdf(*mp, h.n, wo, wi, lambda, scene, &h);
                                 double bsdfRevPdfW = bsdfPdf(*mp, h.n, wi, wo, lambda, scene, &h);
@@ -1066,7 +1115,14 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 double wLight = Mis(camDirPdfA) * (ctx.misVmWeight + lv.dVCM + lv.dVC * Mis(litRevPdfW));
                 double wCamera = Mis(litDirPdfA) * (ctx.misVmWeight + dVCM + dVC * Mis(camRevPdfW));
                 double misW = 1.0 / (wLight + 1.0 + wCamera);
-                if (scene.occluded(offsetOrigin(h.p, h.ng, w), w, distc - 2e-6)) continue;
+                {   // Either end may be a strand; clear both tubes (0 for non-fibers).
+                    const bool camHair = (mp->type == MatType::Hair);
+                    const bool litHair = (lv.mat && lv.mat->type == MatType::Hair);
+                    if (scene.occluded(fiberOrigin(h, camHair, w), w,
+                                       distc - fiberStep(h, camHair, w)
+                                             - fiberStep(lv.hit, litHair, w * -1.0) - 2e-6))
+                        continue;
+                }
                 double G = std::fabs(cosCam) * std::fabs(cosLit) / dist2;
                 double k = misW * G;
                 Vec3 add = cie * (k * fCam * fLit * beta * lv.beta);
@@ -1154,8 +1210,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         if (!delta) camAllDelta = false;        // disqualifies the escaped-sun strategy
         if (delta && !keepBundle) nUp = 1;      // de-hero (see traceLightSubpath)
         prevP = h.p;
+        // A fiber scattering out its far side steps clear of its own tube (see fiberStep).
+        const double fstep = fiberStep(h, mp->type == MatType::Hair, wi);
         double sgn = dot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
-        ray = Ray{h.p + h.ng * (sgn * 1e-6), normalize(wi)};
+        ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * fstep, normalize(wi)}
+                            : Ray{h.p + h.ng * (sgn * 1e-6), normalize(wi)};
     }
     return result;
 }

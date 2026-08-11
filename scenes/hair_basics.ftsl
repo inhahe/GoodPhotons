@@ -1,0 +1,178 @@
+# The `hair` MATERIAL — a fiber BCSDF, not a surface BSDF.
+#
+# Everything else in this renderer shades a SURFACE: it takes a normal, projects by
+# cos(n, w), and scatters into a hemisphere. A hair or fur strand is not a surface — it is
+# a translucent dielectric CYLINDER a few tens of microns across, and light that hits it
+# mostly goes THROUGH it. `type hair` implements the standard fiber model for that:
+#
+#   R    (p=0)  the surface reflection off the cuticle — the white specular highlight,
+#               shifted toward the root by the tilted cuticle scales (`alpha`)
+#   TT   (p=1)  in one side and out the other — the strong FORWARD lobe that makes blonde
+#               hair glow when it is backlit, and carries the strand's colour (it crosses
+#               the absorbing interior once)
+#   TRT  (p=2)  in, one internal bounce, out the same side — the coloured SECONDARY
+#               highlight, offset from R and much more saturated
+#   + a folded p>=3 residual so the lobe weights sum to 1 (white furnace test passes)
+#
+# Marschner et al. 2003 ("Light Scattering from Human Hair Fibers") for the decomposition,
+# Chiang et al. 2016 ("A Practical and Controllable Hair and Fur Model for Production
+# Path Tracing") for the importance-sampled form used here. Implementation: src/hair.h.
+#
+#   type hair
+#     reflect <spectrum>   the colour you WANT the coat to be. NOT a Lambertian albedo:
+#                          it is inverted (Chiang eq. 9) into the interior absorption that
+#                          produces that colour under multiple scattering. Default 0.3.
+#     sigma_a <spectrum>   the absorption directly, in 1/(fiber radius). When present it
+#                          WINS and `reflect` is ignored. This is the physical spelling —
+#                          e.g. real brown hair is roughly (0.42, 0.63, 1.19) in RGB.
+#     eta <n>              cuticle IOR. Keratin = 1.55 (default).
+#     beta_m <0..1>        LONGITUDINAL roughness — how far the highlight smears ALONG the
+#                          strand. 0.05 = wet/glass fiber, 0.3 = normal hair (default),
+#                          0.7 = coarse animal fur.
+#     beta_n <0..1>        AZIMUTHAL roughness — how far it smears AROUND the strand.
+#                          Low values give a hard, glinting TRT.
+#     alpha <deg>          cuticle scale tilt, degrees. 2 is human hair (default); it is
+#                          what separates the R and TRT highlights into two distinct bands.
+#
+# Put it on `curve` / `fur` geometry: the strand intersector reports the fiber axis and the
+# impact parameter, which is what the model needs. On a triangle mesh it still shades (the
+# surface tangent stands in for the axis), but the result is not physically meaningful.
+#
+# WHICH MODE. A coat's COLOUR is almost entirely MULTIPLE scattering — light threading its
+# way between hundreds of strands before it comes back out. So this scene wants a mode that
+# actually walks those paths:
+#
+#   R / D / V   correct and complete. This scene defaults to R. Hair is noisy in these
+#               modes for a structural reason (a fiber scatters into the whole SPHERE and
+#               mostly FORWARD, so a path takes many strand bounces to escape, and each one
+#               samples a peaked lobe) — budget a few hundred spp for a clean frame.
+#   W           deterministic and noise-free, but Whitted does not do the inter-strand
+#               multiple scattering, so the COATS come out nearly BLACK — you see only the
+#               R-lobe highlight. It is still the nicest way to look at the macro strand at
+#               the bottom of the frame, where single scattering is the whole story.
+#   M / S       photon map / SPPM SCATTER through hair correctly but cannot GATHER on it:
+#               their photon records carry no incident direction, so a directional fiber
+#               lobe has nothing to evaluate against. Strands render unlit.
+#
+#   ftrace -in scenes/hair_basics.ftsl -mode R -spp 512 -max-bounce 200 \
+#          -o png/hair_basics.png -window -keepwindow
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse  reflect whitewall 0.75 }
+material "grey"  { type diffuse  reflect 0.30 }
+material "skin"  { type diffuse  reflect rgb 0.35 0.26 0.22 }
+
+# --- the four coats -------------------------------------------------------------------
+# 1. Blonde, authored by COLOUR. `reflect` is inverted into sigma_a, so what you type is
+#    what the coat converges to under multiple scattering — no guessing at absorptions.
+material "blonde" { type hair  reflect rgb 0.72 0.55 0.28  beta_m 0.30  beta_n 0.30 }
+
+# 2. Chestnut, also by colour. Compare it with #3: this is what "brown hair" looks like when
+#    you ask for brown, versus what the textbook ABSORPTIONS actually produce.
+material "brown"  { type hair  reflect rgb 0.30 0.17 0.09  beta_m 0.30  beta_n 0.30 }
+
+# 3. Authored PHYSICALLY, with pbrt's measured-ish absorptions in 1/radius. Note how much
+#    larger the blue coefficient is — that RATIO, not a diffuse albedo, is what makes the TT
+#    lobe warm when the coat is lit from behind. Note also that it renders very DARK: run
+#    `ftrace -checkhair` and read section S7 — a multiple-scattering reflectance of 0.20
+#    already inverts to sigma_a 0.075, so 0.42/0.63/1.19 is a coat albedo of about 1.6 %.
+#    Real hair IS mostly black in bulk; what you read as "brown" is the highlight and the
+#    backlit rim, which is exactly what this ball shows. Smooth, too: the low beta_m/beta_n
+#    tightens both highlights into hard glints and separates R from TRT.
+material "sleek"  { type hair  sigma_a rgb 0.42 0.63 1.19  beta_m 0.10  beta_n 0.12
+                    alpha 3.0 }
+
+# 4. Pale fur: very little absorption, so most of what enters a strand leaves it again and
+#    the coat is dominated by TT — it lights up from behind instead of silhouetting.
+#    Coarse (high beta_m) like real animal fur. Watch the scale here: sigma_a is measured in
+#    1/radius and the inversion is STEEP, so 0.02 is already a pale coat and 0.12 would be a
+#    dark grey one. Push it much below this and you get genuinely white fur, which is
+#    beautiful and *very* slow: with nothing absorbing, a path random-walks through the whole
+#    coat before it escapes (see known-issues.md, and TODO §P3 stage 4 — dual scattering,
+#    the standard answer to that).
+material "polar"  { type hair  sigma_a 0.02  beta_m 0.55  beta_n 0.45  alpha 4.0 }
+
+# --- an open box ---
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material grey  }   # back wall
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material white }   # left wall
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material white }   # right wall
+
+# Key light: a broad ceiling panel. A fiber is thin, so a point-like source leaves most of
+# each strand's circumference unlit and the coat reads as black felt.
+light area {
+    origin 0.10 0.985 0.10   u 0.80 0 0   v 0 0 0.80   normal 0 -1 0
+    power 340   spd preset:d65
+}
+
+# BACK light, low and tucked in behind the row so the balls themselves occlude it (a bare
+# emitter in frame would just blow out the middle). This one is the point of the scene: it
+# is what the TT lobe eats, and it is the difference between a fiber model and a coloured
+# diffuse cylinder. A diffuse coat lit from behind is a silhouette; a real coat is a rim.
+light area {
+    origin 0.06 0.02 0.30   u 0.88 0 0   v 0 0.22 0   normal 0 0 1
+    power 150   spd preset:d65
+}
+
+sphere "b1" { center 0.16 0.20 0.55  radius 0.11  material skin }
+fur "b1_coat" {
+    on "b1"   material blonde
+    count 70000   length 0.055  length_jitter 0.35   radius 0.0005
+    droop 0.55   jitter 0.25   seed 1
+}
+
+sphere "b2" { center 0.44 0.20 0.55  radius 0.11  material skin }
+fur "b2_coat" {
+    on "b2"   material brown
+    count 70000   length 0.055  length_jitter 0.35   radius 0.0005
+    droop 0.55   jitter 0.25   seed 2
+}
+
+sphere "b3" { center 0.72 0.20 0.55  radius 0.11  material skin }
+fur "b3_coat" {
+    on "b3"   material sleek
+    count 70000   length 0.060  length_jitter 0.25   radius 0.0005
+    droop 0.40   jitter 0.15   seed 3
+}
+
+# The white one sits forward and a little higher so the back light rakes it.
+sphere "b4" { center 0.50 0.10 0.90  radius 0.075  material skin }
+fur "b4_coat" {
+    on "b4"   material polar
+    count 50000   length 0.045  length_jitter 0.40   radius 0.0006
+    droop 0.30   jitter 0.35   seed 4
+}
+
+# A single hand-authored strand, blown up ~400x, so you can actually SEE the two highlights
+# the model produces: the white R band and, offset from it toward the tip, the coloured TRT
+# band. At this radius the "fiber" is two centimetres thick, which is physical nonsense but
+# excellent pedagogy. It is deliberately DARK (low reflectance) so the two bands read against
+# the body of the fiber rather than being lost in it.
+material "macro" { type hair  sigma_a rgb 0.42 0.63 1.19  beta_m 0.08  beta_n 0.10
+                   alpha 3.0 }
+curve "macro_strand" {
+    material macro
+    basis catmull_rom
+    radius 0.022
+    radius_tip 0.018
+    point 0.06 0.05 1.12
+    point 0.30 0.15 1.15
+    point 0.62 0.15 1.15
+    point 0.90 0.05 1.12
+}
+
+# The key panel above only spans z 0.10..0.90, so the macro strand sits in front of its
+# footprint and would be lit edge-on. Its own small panel, directly overhead, is what puts
+# the R band on top of the fiber and the TRT band just below it.
+light area {
+    origin 0.15 0.97 1.00   u 0.70 0 0   v 0 0 0.30   normal 0 -1 0
+    power 90   spd preset:d65
+}
+
+camera "cam" {
+    eye 0.50 0.44 1.95   look_at 0.50 0.20 0.58   up 0 1 0   fov_y 42
+    mode R
+    film { res 640 480 }
+}
