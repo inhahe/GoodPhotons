@@ -3552,6 +3552,479 @@ static int checkGabor() {
     return ok ? 0 : 1;
 }
 
+// Filtered / band-limited fBm self-test (src/pattern.h: patOctaveFade,
+// patFilteredNoise; PatOp::FNoise, reached from a pattern expression as
+// `fnoise(x, y, z, w, octaves)`). O8. No scene, no renderer.
+//
+// The primitive claims something stronger than "it blurs": that `fnoise(p, w)` is a
+// usable estimate of the MEAN of the unfiltered field over the footprint a shading
+// sample stands for — a disc of diameter w in the surface — so that the sample reports
+// the area's colour instead of one arbitrary point in it. That is a measurable claim,
+// and §3/§5 measure it against a brute-force average of the very field being filtered.
+//
+//   §1 EXACTNESS AT w = 0. `fnoise(p, 0, 1)` is `noise(p)` to a single ulp, and
+//      `fnoise(p, 0, n)` matches an independently written octave sum BIT for bit — so
+//      the filtering is the only thing this op adds to plain fBm, and turning it off
+//      leaves the classic behaviour untouched.
+//   §2 THE WEIGHT IS THE MEASURED ONE. The per-octave weight is not a taste parameter
+//      but the linear-MMSE coefficient of this lattice, measured in scraps/. The test
+//      pins the closed form to that measurement, and separately asserts that it has
+//      not collapsed into the intuitive-but-wrong "keep everything above Nyquist,
+//      discard everything below" cutoff. Plus monotonicity and C1-ness (see §6).
+//   §3 IT TRACKS THE FOOTPRINT MEAN. Against a brute-force average of the unfiltered
+//      field over a randomly oriented disc of diameter w, `fnoise` must be
+//      substantially closer than the point sample it replaces. This is the actual
+//      claim; everything else is mechanism.
+//   §4 IT CONVERGES TO THE MEAN. Variance falls monotonically with w and the field
+//      tends to the constant 0.5 — a filter that kept contrast at every width would be
+//      filtering nothing (which is what normalising by the SURVIVING amplitude sum,
+//      the natural-looking mistake, would produce).
+//   §5 MINIFICATION SEPARATES THEM WITHOUT BOUND. Marching pixel centres across a
+//      receding plane, the point sample's error saturates — it reads one value of a
+//      field whose contrast never falls, so a distant surface stays as noisy as a near
+//      one — while `fnoise`'s keeps falling with the footprint mean it is estimating.
+//      Measured on the LOW-FREQUENCY (block-mean) part of the error, the part that no
+//      viewing distance removes and that therefore survives as visible pattern.
+//   §6 NO SWIMMING CONTOURS. Sweeping w continuously (which is what a moving camera
+//      does) must not step the value. A hard octave cutoff at Nyquist — the obvious
+//      implementation — jumps by a whole octave amplitude at the crossing, drawing a
+//      camera-dependent contour in the image; the test asserts the smooth fade's
+//      largest step is orders of magnitude smaller than that hard cutoff's.
+//   §7 OPERAND HYGIENE: octave truncation and clamping match `dturb`'s documented
+//      convention, and a non-positive or NaN width means "unfiltered" rather than
+//      "undefined".
+//   §8 THE [0,1] CONTRACT holds by construction (|sum| <= norm/2), with mean 0.5.
+//   §9 the compile path (VM == direct call, arity, spelling) and CSE (identical calls
+//      collapse, a different WIDTH does not — the width is an ordinary operand and may
+//      vary per hit).
+static int checkFNoise() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (tol <= 1e-12 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkfnoise] %-46s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+    uint64_t rng = 0xD1B54A32D192ED03ull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+    // An independently written reference for the octave SUM: powers instead of repeated
+    // doubling/halving, and no skip of a fully faded octave (it adds an exact zero, so
+    // the sums still agree bit for bit if — and only if — the production code is right).
+    // The per-octave weight itself is deliberately NOT duplicated here: it is a fit to a
+    // measured curve, so a second hand-written copy of the same constants would test
+    // typing, not behaviour. §2 pins it against the measurement instead.
+    auto refFbm = [](double x, double y, double z, double w, int no) {
+        double sum = 0.0, norm = 0.0;
+        for (int i = 0; i < no; ++i) {
+            const double f = std::pow(2.0, (double)i);
+            const double a = std::pow(0.5, (double)i);
+            norm += a;
+            sum += a * patOctaveFade(f, w) * (patValueNoise(x * f, y * f, z * f) - 0.5);
+        }
+        return 0.5 + sum / norm;
+    };
+
+    // ---- §1: w = 0 is plain fBm, and one octave of it is plain `noise` -------
+    {
+        double w1 = 0.0, wn = 0.0;
+        for (int i = 0; i < 4096; ++i) {
+            const double x = (frand() - 0.5) * 200.0, y = (frand() - 0.5) * 200.0,
+                         z = (frand() - 0.5) * 200.0;
+            w1 = std::fmax(w1, std::fabs(patFilteredNoise(x, y, z, 0.0, 1)
+                                         - patValueNoise(x, y, z)));
+            for (int no = 1; no <= PAT_FNOISE_MAX_OCT; ++no)
+                wn = std::fmax(wn, std::fabs(patFilteredNoise(x, y, z, 0.0, (double)no)
+                                             - refFbm(x, y, z, 0.0, no)));
+        }
+        ok &= chk("S1 fnoise(p, 0, 1) == noise(p)", w1, 0.0, 1.2e-16);
+        ok &= chk("S1 fnoise(p, 0, n) == reference fBm", wn, 0.0, 0.0);
+        // …and with the filter on, too: the fade is the only difference.
+        double wf = 0.0;
+        for (int i = 0; i < 2048; ++i) {
+            const double x = (frand() - 0.5) * 60.0, y = (frand() - 0.5) * 60.0,
+                         z = (frand() - 0.5) * 60.0, w = frand() * 3.0;
+            wf = std::fmax(wf, std::fabs(patFilteredNoise(x, y, z, w, 8)
+                                         - refFbm(x, y, z, w, 8)));
+        }
+        ok &= chk("S1 fnoise(p, w, 8) == reference fBm", wf, 0.0, 0.0);
+    }
+
+    // ---- §2: the octave weight is the MEASURED one ---------------------------
+    // The weight is not a taste parameter: it is the linear-MMSE coefficient
+    // a(s) = Cov(boxmean, point)/Var(point) of this very lattice, measured in
+    // scraps/fnoise_fit.py. This section is what stops the closed form from drifting
+    // away from the measurement it is a fit to.
+    {
+        struct AW { double s, a; };
+        static const AW tab[] = {   // s = freq*w, a = measured optimal weight
+            {0.125, 0.996712}, {0.250, 0.986934}, {0.375, 0.970918}, {0.500, 0.949059},
+            {0.625, 0.921878}, {0.750, 0.889994}, {0.875, 0.854101}, {1.000, 0.814940},
+            {1.250, 0.729877}, {1.500, 0.640800}, {1.750, 0.553029}, {2.000, 0.470722},
+            {2.500, 0.332205}, {3.000, 0.232408}, {3.500, 0.165357}, {4.000, 0.121233},
+            {5.000, 0.071758}, {6.000, 0.047720}, {8.000, 0.025853}, {10.00, 0.016787},
+            {12.00, 0.011987}, {16.00, 0.006733},
+        };
+        double wtab = 0.0;
+        for (const AW& e : tab) {
+            // Same s reached two ways — freq*w is the only thing the fade may depend on.
+            wtab = std::fmax(wtab, std::fabs(patOctaveFade(1.0, e.s) - e.a));
+            wtab = std::fmax(wtab, std::fabs(patOctaveFade(8.0, e.s / 8.0) - e.a));
+        }
+        ok &= chk("S2 fade matches the measured MMSE weight", wtab, 0.0, 1e-3);
+        ok &= chk("S2 fade at s = 0 is exactly 1", patOctaveFade(1.0, 1e-300), 1.0, 0.0);
+        ok &= chk("S2 fade at w = 0 is 1",      patOctaveFade(1e6, 0.0), 1.0, 0.0);
+        ok &= chk("S2 fade at w < 0 is 1",      patOctaveFade(1e6, -1.0), 1.0, 0.0);
+        ok &= chk("S2 fade of NaN width is 1",
+                  patOctaveFade(1.0, std::numeric_limits<double>::quiet_NaN()), 1.0, 0.0);
+        // The naive schedule (all of the octave up to Nyquist, none of it past period = w)
+        // is wrong at both ends, and this is the assertion that says so out loud: most of
+        // the octave is still real, correlated signal exactly where a cutoff would bin it.
+        if (!(patOctaveFade(1.0, 0.5) > 0.9 && patOctaveFade(1.0, 1.0) > 0.75)) {
+            std::printf("[checkfnoise] S2 fade has collapsed to a Nyquist cutoff  BAD\n");
+            ok = false;
+        }
+        // Exactly zero past the skip threshold — which is what lets a far-minified octave
+        // be dropped, and what makes §4's "huge footprint is the mean" exact.
+        ok &= chk("S2 fade at the skip threshold is 0",
+                  patOctaveFade(1.0, PAT_FNOISE_S_MAX), 0.0, 0.0);
+        ok &= chk("S2 fade past the skip threshold is 0", patOctaveFade(4.0, 40.0), 0.0, 0.0);
+        // Monotone all the way through the window, and C1 at both ends of the curve.
+        bool mono = true;
+        double prev = 1.0;
+        for (int i = 0; i <= 200000; ++i) {
+            const double w = (PAT_FNOISE_S_MAX + 1.0) * (double)i / 200000.0;
+            const double f = patOctaveFade(1.0, w);
+            if (f > prev + 1e-15) mono = false;
+            prev = f;
+        }
+        if (!mono) { std::printf("[checkfnoise] S2 fade is not monotone  BAD\n"); ok = false; }
+        // A one-sided difference of a function that touches its end value quadratically
+        // reports O(h) rather than 0, so the tolerance is a few multiples of h, not 0.
+        const double h = 1e-6;
+        ok &= chk("S2 fade slope at s = 0 is 0",
+                  (patOctaveFade(1.0, 0.0) - patOctaveFade(1.0, h)) / h, 0.0, 1e-4);
+        ok &= chk("S2 fade slope at the skip threshold is 0",
+                  (patOctaveFade(1.0, PAT_FNOISE_S_MAX - h)
+                   - patOctaveFade(1.0, PAT_FNOISE_S_MAX)) / h, 0.0, 1e-4);
+    }
+
+    // ---- §3: does it track the footprint mean? -------------------------------
+    // Brute-force average of the UNFILTERED field over the footprint the contract
+    // promises — a disc of DIAMETER w lying in a randomly oriented plane, since a
+    // shading sample stands for a surface patch — versus (a) the point sample it
+    // replaces and (b) fnoise. This is the actual claim; everything else is mechanism.
+    // Note that the disc is what the weight curve was measured for: run this against a
+    // 3-D cube instead and fnoise looks like it under-filters, which is a statement
+    // about the test's footprint and not about the code.
+    {
+        const int NO = 6, NB = 21;
+        // A disc quadrature: a Cartesian midpoint grid over the unit square, masked.
+        double gx[NB * NB], gy[NB * NB];
+        int nq = 0;
+        for (int j = 0; j < NB; ++j)
+        for (int i = 0; i < NB; ++i) {
+            const double a = (i + 0.5) / NB - 0.5, b = (j + 0.5) / NB - 0.5;
+            if (a * a + b * b <= 0.25) { gx[nq] = a; gy[nq] = b; ++nq; }
+        }
+        for (double w : {0.5, 1.0, 2.0}) {
+            double ePoint = 0.0, eFilt = 0.0;
+            const int NP = 128;
+            for (int p = 0; p < NP; ++p) {
+                const double x = (frand() - 0.5) * 80.0, y = (frand() - 0.5) * 80.0,
+                             z = (frand() - 0.5) * 80.0;
+                // A uniformly random plane, as an orthonormal in-plane basis (u, v).
+                const double cz = 2.0 * frand() - 1.0, ph = 6.283185307179586 * frand();
+                const double sr = std::sqrt(std::fmax(0.0, 1.0 - cz * cz));
+                const double nx = sr * std::cos(ph), ny = sr * std::sin(ph), nz = cz;
+                double ax = 0.0, ay = 0.0, az = 0.0;
+                if (std::fabs(nx) < 0.9) ax = 1.0; else ay = 1.0;
+                double ux = ay * nz - az * ny, uy = az * nx - ax * nz, uz = ax * ny - ay * nx;
+                const double ul = std::sqrt(ux * ux + uy * uy + uz * uz);
+                ux /= ul; uy /= ul; uz /= ul;
+                const double vx = ny * uz - nz * uy, vy = nz * ux - nx * uz,
+                             vz = nx * uy - ny * ux;
+                double disc = 0.0;
+                for (int q = 0; q < nq; ++q) {
+                    const double a = gx[q] * w, b = gy[q] * w;
+                    disc += refFbm(x + a * ux + b * vx, y + a * uy + b * vy,
+                                   z + a * uz + b * vz, 0.0, NO);
+                }
+                disc /= (double)nq;
+                const double pt = patFilteredNoise(x, y, z, 0.0, NO);
+                const double fl = patFilteredNoise(x, y, z, w,   NO);
+                ePoint += (pt - disc) * (pt - disc);
+                eFilt  += (fl - disc) * (fl - disc);
+            }
+            ePoint = std::sqrt(ePoint / NP);
+            eFilt  = std::sqrt(eFilt  / NP);
+            std::printf("[checkfnoise] S3 w=%.2f  rms vs footprint mean: point %.4f  "
+                        "filtered %.4f  (%.2fx better)\n", w, ePoint, eFilt,
+                        eFilt > 0.0 ? ePoint / eFilt : 0.0);
+            if (!(eFilt < 0.6 * ePoint)) {
+                std::printf("[checkfnoise] S3 filtering does not beat point sampling  BAD\n");
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §4: contrast collapses toward the mean as the footprint grows -------
+    {
+        double prevSd = 1e9;
+        bool mono = true, reported = false;
+        for (double w : {0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 64.0}) {
+            double s = 0.0, s2 = 0.0;
+            const int N = 20000;
+            for (int i = 0; i < N; ++i) {
+                const double x = (frand() - 0.5) * 400.0, y = (frand() - 0.5) * 400.0,
+                             z = (frand() - 0.5) * 400.0;
+                const double v = patFilteredNoise(x, y, z, w, 6);
+                s += v; s2 += v * v;
+            }
+            const double mean = s / N;
+            const double sd = std::sqrt(std::fmax(0.0, s2 / N - mean * mean));
+            if (sd > prevSd + 1e-4) mono = false;
+            if (w >= 64.0) {
+                ok &= chk("S4 huge footprint is the mean", sd, 0.0, 1e-12);
+                ok &= chk("S4 …and that mean is 0.5", mean, 0.5, 1e-12);
+                reported = true;
+            }
+            prevSd = sd;
+        }
+        if (!mono)     { std::printf("[checkfnoise] S4 contrast not monotone in w  BAD\n"); ok = false; }
+        if (!reported) { std::printf("[checkfnoise] S4 never reached the wide case  BAD\n"); ok = false; }
+    }
+
+    // ---- §5: minification, and the error that does NOT average away ----------
+    // A minified plane: pixel centres march across the surface in a straight line at
+    // spacing s, each standing for a disc of diameter s in that surface. Compare each
+    // scheme against the true disc average, per pixel and then as BLOCK MEANS of the
+    // error — the low-frequency part, which no amount of viewing distance or downscaling
+    // removes and which is therefore what survives as visible pattern.
+    //
+    // The claim being tested is structural, not a fixed ratio. As the surface recedes,
+    // POINT sampling's error SATURATES: it is reading one arbitrary value of a field
+    // whose contrast never falls, so a distant surface stays exactly as noisy as a near
+    // one (that is the shimmer). `fnoise`'s error instead keeps FALLING toward zero,
+    // because the thing it is estimating — the footprint mean — is itself converging to
+    // the constant 0.5 and it converges with it. So the two must separate without bound,
+    // and the assertions below are that separation, not a tuned threshold.
+    {
+      double lowPs[4] = {0,0,0,0}, lowFs[4] = {0,0,0,0};
+      int si = 0;
+      for (double s : {1.5, 3.0, 6.0, 12.0}) {
+        const int NO = 7, NS = 4096, BLK = 16, NB = 15;
+        const double dx = 0.6, dy = 0.7, dz = -0.39;   // an oblique, incommensurate walk
+        const double dl = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const double ex = dx / dl, ey = dy / dl, ez = dz / dl;
+        // The surface plane contains the walk direction; pick any perpendicular in it.
+        double fx = -ey, fy = ex, fz = 0.0;
+        const double fl = std::sqrt(fx * fx + fy * fy + fz * fz);
+        fx /= fl; fy /= fl; fz /= fl;
+        double gx[NB * NB], gy[NB * NB];
+        int nq = 0;
+        for (int j = 0; j < NB; ++j)
+        for (int i = 0; i < NB; ++i) {
+            const double a = (i + 0.5) / NB - 0.5, b = (j + 0.5) / NB - 0.5;
+            if (a * a + b * b <= 0.25) { gx[nq] = a; gy[nq] = b; ++nq; }
+        }
+        double sumP = 0.0, sumF = 0.0, blkP = 0.0, blkF = 0.0;
+        double accP = 0.0, accF = 0.0;
+        int nblk = 0;
+        for (int k = 0; k < NS; ++k) {
+            const double t = (double)k * s;
+            const double px = 11.3 + t * ex, py = -7.1 + t * ey, pz = 3.7 + t * ez;
+            double truth = 0.0;
+            for (int q = 0; q < nq; ++q) {     // the raw field's true footprint mean
+                const double a = gx[q] * s, b = gy[q] * s;
+                truth += refFbm(px + a * ex + b * fx, py + a * ey + b * fy,
+                                pz + a * ez + b * fz, 0.0, NO);
+            }
+            truth /= (double)nq;
+            const double ep = patFilteredNoise(px, py, pz, 0.0, NO) - truth;
+            const double ef = patFilteredNoise(px, py, pz, s,   NO) - truth;
+            sumP += ep * ep; sumF += ef * ef;
+            accP += ep; accF += ef;
+            if ((k + 1) % BLK == 0) {
+                blkP += (accP / BLK) * (accP / BLK);
+                blkF += (accF / BLK) * (accF / BLK);
+                accP = accF = 0.0; ++nblk;
+            }
+        }
+        const double rmsP = std::sqrt(sumP / NS), rmsF = std::sqrt(sumF / NS);
+        const double lowP = std::sqrt(blkP / nblk), lowF = std::sqrt(blkF / nblk);
+        std::printf("[checkfnoise] S5 spacing %.2f  rms err: point %.4f filtered %.4f | "
+                    "low-freq (%d-blocks): point %.4f filtered %.4f  (%.2fx)\n",
+                    s, rmsP, rmsF, BLK, lowP, lowF, lowF > 0.0 ? lowP / lowF : 0.0);
+        if (!(rmsF < 0.6 * rmsP && lowF < 0.8 * lowP)) {
+            std::printf("[checkfnoise] S5 filtering does not beat point sampling here  BAD\n");
+            ok = false;
+        }
+        lowPs[si] = lowP; lowFs[si] = lowF; ++si;
+      }
+      // The separation widens monotonically with minification…
+      for (int i = 1; i < si; ++i)
+          if (!(lowPs[i] / lowFs[i] > 1.25 * (lowPs[i-1] / lowFs[i-1]))) {
+              std::printf("[checkfnoise] S5 the advantage stops growing with minification"
+                          " (%.2fx -> %.2fx)  BAD\n",
+                          lowPs[i-1] / lowFs[i-1], lowPs[i] / lowFs[i]);
+              ok = false;
+          }
+      // …because one side has plateaued and the other has not. Point sampling's residual
+      // barely moves over the last doubling of the footprint; fnoise's roughly halves.
+      if (!(lowPs[si-1] > 0.9 * lowPs[si-2])) {
+          std::printf("[checkfnoise] S5 point-sample error did not saturate  BAD\n");
+          ok = false;
+      }
+      if (!(lowFs[si-1] < 0.6 * lowFs[si-2])) {
+          std::printf("[checkfnoise] S5 filtered error stopped converging  BAD\n");
+          ok = false;
+      }
+    }
+
+    // ---- §6: continuity in w (a moving camera sweeps it) ---------------------
+    {
+        auto hardCut = [](double x, double y, double z, double w, int no) {
+            double sum = 0.0, norm = 0.0, amp = 1.0, freq = 1.0;
+            for (int i = 0; i < no; ++i) {
+                norm += amp;
+                if (!(w > 0.0) || freq * w < 0.5)
+                    sum += amp * (patValueNoise(x * freq, y * freq, z * freq) - 0.5);
+                amp *= 0.5; freq *= 2.0;
+            }
+            return 0.5 + sum / norm;
+        };
+        double jSmooth = 0.0, jHard = 0.0;
+        const int N = 40000;
+        const double x = 3.21, y = -8.07, z = 1.44;
+        double ps = patFilteredNoise(x, y, z, 0.0, 8), ph = hardCut(x, y, z, 0.0, 8);
+        for (int i = 1; i <= N; ++i) {
+            const double w = 4.0 * (double)i / N;
+            const double vs = patFilteredNoise(x, y, z, w, 8), vh = hardCut(x, y, z, w, 8);
+            jSmooth = std::fmax(jSmooth, std::fabs(vs - ps));
+            jHard   = std::fmax(jHard,   std::fabs(vh - ph));
+            ps = vs; ph = vh;
+        }
+        std::printf("[checkfnoise] S6 largest step over a 1e-4 sweep of w: "
+                    "smooth fade %.2e  hard cutoff %.2e  (%.0fx)\n",
+                    jSmooth, jHard, jHard / jSmooth);
+        if (!(jSmooth < 0.01 * jHard)) {
+            std::printf("[checkfnoise] S6 the fade is not visibly smoother than a cutoff  BAD\n");
+            ok = false;
+        }
+    }
+
+    // ---- §7: operand hygiene -------------------------------------------------
+    {
+        const double x = 1.7, y = -2.3, z = 0.9;
+        ok &= chk("S7 octaves 0 clamps to 1",
+                  patFilteredNoise(x, y, z, 0.1, 0.0), patFilteredNoise(x, y, z, 0.1, 1.0), 0.0);
+        ok &= chk("S7 octaves -5 clamps to 1",
+                  patFilteredNoise(x, y, z, 0.1, -5.0), patFilteredNoise(x, y, z, 0.1, 1.0), 0.0);
+        ok &= chk("S7 octaves truncate (3.9 -> 3)",
+                  patFilteredNoise(x, y, z, 0.1, 3.9), patFilteredNoise(x, y, z, 0.1, 3.0), 0.0);
+        ok &= chk("S7 octaves clamp at the ceiling",
+                  patFilteredNoise(x, y, z, 0.1, 500.0),
+                  patFilteredNoise(x, y, z, 0.1, (double)PAT_FNOISE_MAX_OCT), 0.0);
+        ok &= chk("S7 negative width is unfiltered",
+                  patFilteredNoise(x, y, z, -3.0, 6.0), patFilteredNoise(x, y, z, 0.0, 6.0), 0.0);
+        ok &= chk("S7 NaN width is unfiltered",
+                  patFilteredNoise(x, y, z, std::numeric_limits<double>::quiet_NaN(), 6.0),
+                  patFilteredNoise(x, y, z, 0.0, 6.0), 0.0);
+    }
+
+    // ---- §8: the [0,1] contract and the mean ---------------------------------
+    {
+        double lo = 1e9, hi = -1e9, s = 0.0;
+        const int N = 60000;
+        for (int i = 0; i < N; ++i) {
+            const double x = (frand() - 0.5) * 500.0, y = (frand() - 0.5) * 500.0,
+                         z = (frand() - 0.5) * 500.0;
+            const double w = (i % 3 == 0) ? 0.0 : frand() * 2.0;
+            const double v = patFilteredNoise(x, y, z, w, 1 + (i % PAT_FNOISE_MAX_OCT));
+            lo = std::fmin(lo, v); hi = std::fmax(hi, v); s += v;
+        }
+        if (lo < 0.0 || hi > 1.0) {
+            std::printf("[checkfnoise] S8 left [0,1]: min %.6f max %.6f  BAD\n", lo, hi);
+            ok = false;
+        }
+        ok &= chk("S8 mean is 0.5", s / N, 0.5, 5e-3);
+    }
+
+    // ---- §9: the compile path and CSE ----------------------------------------
+    {
+        struct Case { const char* expr; double sc, w; int oct; };
+        const Case cases[] = {
+            {"fnoise(x, y, z, 0, 1)",       1.0, 0.0,  1},
+            {"fnoise(x, y, z, 0.3, 6)",     1.0, 0.3,  6},
+            {"fnoise(4*x, 4*y, 4*z, 4*0.05, 5)", 4.0, 0.2, 5},   // the scaling idiom
+        };
+        for (int ci = 0; ci < (int)(sizeof cases / sizeof cases[0]); ++ci) {
+            const Case& cs = cases[ci];
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(cs.expr, prog, perr)) {
+                std::printf("[checkfnoise] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+                ok = false; continue;
+            }
+            double wv = 0.0;
+            for (int i = 0; i < 256; ++i) {
+                const double x = (frand() - 0.5) * 40.0, y = (frand() - 0.5) * 40.0,
+                             z = (frand() - 0.5) * 40.0;
+                PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+                const double got  = patternEval(prog.data(), (int)prog.size(), c);
+                const double want = patFilteredNoise(cs.sc * x, cs.sc * y, cs.sc * z,
+                                                     cs.w, (double)cs.oct);
+                wv = std::fmax(wv, std::fabs(got - want));
+            }
+            char lbl[96]; std::snprintf(lbl, sizeof lbl, "S9 VM `%s` == direct", cs.expr);
+            ok &= chk(lbl, wv, 0.0, 0.0);
+        }
+        const char* bads[] = {
+            "fnoise(x, y, z, 1)",          // arity 5, given 4
+            "fnoise(x, y, z, 1, 2, 3)",    // arity 5, given 6
+            "fnoise(x, y, z)",             // arity 5, given 3
+            "fnois(x, y, z, 1, 2)",        // no such spelling
+        };
+        for (const char* be : bads) {
+            std::vector<PatNode> prog; std::string perr;
+            if (compilePatternExpr(be, prog, perr)) {
+                std::printf("[checkfnoise] `%s` compiled but should be rejected  BAD\n", be);
+                ok = false;
+            }
+        }
+        std::vector<PatNode> same, sameOpt, diff, diffOpt; std::string perr;
+        ok &= compilePatternExpr("fnoise(x,y,z,0.2,6) + fnoise(x,y,z,0.2,6)", same, perr);
+        ok &= compilePatternExpr("fnoise(x,y,z,0.2,6) + fnoise(x,y,z,0.4,6)", diff, perr);
+        sameOpt = same; patternOptimizeCSE(sameOpt);
+        diffOpt = diff; patternOptimizeCSE(diffOpt);
+        if (sameOpt.size() >= same.size()) {
+            std::printf("[checkfnoise] CSE did not shrink `fnoise + fnoise` (%zu -> %zu)  BAD\n",
+                        same.size(), sameOpt.size());
+            ok = false;
+        }
+        double wv = 0.0;
+        for (int i = 0; i < 128; ++i) {
+            const double x = (frand() - 0.5) * 40.0, y = (frand() - 0.5) * 40.0,
+                         z = (frand() - 0.5) * 40.0;
+            PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+            const double a = patFilteredNoise(x, y, z, 0.2, 6);
+            const double b = patFilteredNoise(x, y, z, 0.4, 6);
+            wv = std::fmax(wv, std::fabs(patternEval(sameOpt.data(), (int)sameOpt.size(), c) - 2.0 * a));
+            wv = std::fmax(wv, std::fabs(patternEval(diffOpt.data(), (int)diffOpt.size(), c) - (a + b)));
+        }
+        ok &= chk("S9 CSE'd programs evaluate right (max err)", wv, 0.0, 0.0);
+    }
+
+    std::printf("[checkfnoise] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkfnoise] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Blue-noise / Poisson-disk placement self-test (src/bluenoise.h: patBlueNoise,
 // patBNAccept, patBNPrecedes; src/pattern.h: PatOp::BlueNoise, reached from a pattern
 // expression as `bnoise/bnoise2/bnoised/bnoiseid(x, y, z, r)`). O5. No scene, no
@@ -10829,6 +11302,7 @@ static int run(int argc, char** argv) {
     bool checkGaborOnly = false;
     bool checkBlueNoiseOnly = false;
     bool checkReactionOnly = false;
+    bool checkFNoiseOnly = false;
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
     bool checkSdfOnly = false;
@@ -11248,6 +11722,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkgabor")) checkGaborOnly = true;
         else if (!std::strcmp(argv[i], "-checkbluenoise")) checkBlueNoiseOnly = true;
         else if (!std::strcmp(argv[i], "-checkreaction")) checkReactionOnly = true;
+        else if (!std::strcmp(argv[i], "-checkfnoise")) checkFNoiseOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
@@ -11439,6 +11914,7 @@ static int run(int argc, char** argv) {
     if (checkGaborOnly)    return checkGabor();    // ditto (anisotropic band-limited Gabor noise)
     if (checkBlueNoiseOnly) return checkBlueNoise();  // ditto (blue-noise / Poisson-disk placement)
     if (checkReactionOnly)  return checkReaction();   // ditto (Gray-Scott reaction-diffusion bake)
+    if (checkFNoiseOnly)    return checkFNoise();     // ditto (filtered / band-limited fBm)
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)

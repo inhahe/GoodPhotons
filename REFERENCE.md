@@ -2407,7 +2407,7 @@ or a native-primitive wrap — see below), the **mean curvature `curv`** (see
 - **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
   a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
   math, `pi`, and functions `abs sqrt sin cos tan exp log floor fract sign saturate min
-  max atan2 step pow clamp mix smoothstep noise gabor`. On top of the scalar `noise` there is
+  max atan2 step pow clamp mix smoothstep noise gabor fnoise`. On top of the scalar `noise` there is
   **vector-valued gradient noise for domain warping**: `dnoisex/y/z(x, y, z)` are the
   three decorrelated components of POV-Ray's `DNoise` vector at a point, and
   `dturbx/y/z(x, y, z, octaves, lambda, omega)` the components of its octave sum
@@ -2469,6 +2469,29 @@ or a native-primitive wrap — see below), the **mean curvature `curv`** (see
   `scenes/pattern_bluenoise.ftsl` (which puts Worley- and blue-noise-placed spots on the
   two halves of one wall at matched density), deterministic self-test
   `ftrace -checkbluenoise`.
+  And there is **filtered (band-limited) fBm** — `fnoise(x, y, z, w, octaves)`, the sum
+  of `octaves` octaves of the same lattice `noise` at lacunarity 2 and gain 0.5, again
+  `[0,1]` with mean `0.5`, but with each octave weighted by how much of it a shading
+  sample **of width `w` can actually resolve**. `w` is in the units of the coordinates
+  you hand it (scale the coordinates, scale the width) and is the **diameter of the
+  surface patch the sample stands for**; `w ≤ 0` means unfiltered and reproduces plain
+  fBm exactly, so filtering is opt-in and free when off. This is the antialiasing
+  primitive: every other noise here is evaluated at a *point*, which is a lie once the
+  sample stands for an area — the finer detail does not merely vanish, it folds down
+  into a moiré of the sampling lattice, and more samples do not fix it. The per-octave
+  weight is the **linear-MMSE coefficient measured off this very lattice**
+  (`scraps/fnoise_fit2.py`, pinned by the self-test) rather than a chosen falloff, and
+  the measurement contradicts the intuitive design twice over: the optimal weight is
+  still `0.95` **at** Nyquist and `0.81` where a naive cutoff would already have dropped
+  the octave whole, and over-filtering is *not* the safe direction — it deletes
+  low-frequency content the footprint genuinely contains and lands further from the
+  truth than no filtering at all. (For the same reason `w` means a 2-D surface patch and
+  not a solid ball: their weights differ by a whole power of `w` in the tail.) It is the
+  **deterministic** samplers this is for — mode `W`, the raster preview, and low-spp
+  backward renders; the forward photon modes already integrate each pixel's footprint
+  stochastically, so there `w` buys nothing and costs detail. Deterministic self-test
+  `ftrace -checkfnoise`, which measures the result against a brute-force footprint
+  average rather than merely asserting that it blurs.
   It can also **sample a declared image
   as a term**: `tex:<name>(u, v)` returns the mean of the texel's three linear RGB
   channels (the same `Texture::scalarAt` sampler a `texture:<name>` slot binding uses,
@@ -3626,7 +3649,7 @@ alone can't restore, so they are not disk-resumable.
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
-`-checkbluenoise`, `-checkreaction`, `-checkcurv`,
+`-checkbluenoise`, `-checkfnoise`, `-checkreaction`, `-checkcurv`,
 `-checkcavity`, `-checksdf`, `-checksun`,
 `-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints

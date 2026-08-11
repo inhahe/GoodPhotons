@@ -4502,6 +4502,12 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                            (double)ff, (double)dx, (double)dy, (double)dz);
                 break;
             }
+            case PatOp::FNoise: {  // filtered fBm (double core): promote / demote like PovFn
+                float oc = st[--sp], ww = st[--sp], zz = st[--sp], yy = st[--sp];
+                st[sp-1] = (float)patFilteredNoise((double)st[sp-1], (double)yy, (double)zz,
+                                                   (double)ww, (double)oc);
+                break;
+            }
             case PatOp::BlueNoise: {  // Poisson-disk placement (double core): promote / demote
                 float rr = st[--sp], zz = st[--sp], yy = st[--sp];
                 double b[3];

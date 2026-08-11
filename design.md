@@ -2126,6 +2126,83 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   24000 steps, but `maze` never does (~3e-3 even then) — the labyrinth keeps reconnecting —
   so there `steps` is an aesthetic choice, and the docs say so rather than implying otherwise.
 
+  **Band-limited fBm (`PatOp::FNoise`, O8, v0.168.0).** `fnoise(x, y, z, w, octaves)` in
+  `src/pattern.h` — the same lattice `noise`, summed at lacunarity 2 / gain 0.5, with each
+  octave scaled by how much of it a sample of width `w` can resolve. `w` is in the units of
+  the coordinates passed in (so a footprint of `w` metres sampled at `90*x` must be handed
+  in as `90*w` — the easiest mistake to make with this op), and `w <= 0` is plain
+  unfiltered fBm, which keeps every existing use unchanged. Every other noise here is
+  evaluated at a point, which is a lie the moment one shading sample stands for an area:
+  a feature smaller than the footprint doesn't fade out, it **folds down** into a coarse
+  pattern of the sampling lattice, and no amount of extra samples removes it because the
+  signal was never band-limited. It matters for the **deterministic** samplers — mode W,
+  the raster preview, low-spp backward. The forward photon modes spread millions of hit
+  points across each pixel's footprint, so they area-average stochastically for free and
+  `fnoise` would only cost them detail.
+
+  The whole design is in the weight, and it was **measured, not chosen**:
+
+  * *The optimal weight is the linear-MMSE coefficient*, and it has a closed form worth
+    writing down: `a(s) = Cov(footprint mean, point) / Var(point) = mean_{u∈footprint} R(u)
+    / R(0)`, the footprint-average of the noise's own autocorrelation, at `s = freq·w`.
+    That makes it a measurable quantity rather than a taste, and it is nothing like the
+    obvious schedule: the true weight is **0.949 at Nyquist** (`s = 0.5`) and still
+    **0.815 at `s = 1`**, exactly where a naive cutoff drops the octave whole. The first
+    implementation *was* that naive smoothstep and it failed §3/§5 of its own self-test by
+    filtering **worse than not filtering** — the fix was to derive and measure `a(s)`
+    (`scraps/fnoise_fit*.py`) and fit a monotone rational to it (max abs error 2.5e-4).
+  * *The footprint's **dimension** changes the tail by a whole power of `s`* — a 3-D ball
+    average decays like `s⁻³`, a 2-D surface patch like `s⁻²`, a 1-D segment like `s⁻¹` —
+    so one curve cannot serve all three, and this is not a detail that can be papered over.
+    An intermediate version fitted the **3-D cube** curve; §3 then passed and §5 still
+    failed, and the cause was exactly this mismatch (§5 was measuring against a 1-D
+    average). `w` is therefore defined as **the diameter of a disc lying in the surface**,
+    orientation-averaged, because that is what a shading sample actually stands for; the
+    self-test was rewritten to average over a randomly-oriented disc so it measures the
+    contract rather than a convenient proxy.
+  * *Over-filtering is **not** the safe direction* — the instinct that blur is conservative
+    is wrong here, and measured to be wrong: applying the 3-D curve to a 2-D footprint
+    gives only a 1.6× improvement at `s = 2` against 2.3× for the opposite mismatch,
+    because it deletes low-frequency content the footprint genuinely contains and lands
+    further from the truth than not filtering at all. Hence the docs tell an author in
+    doubt to lean toward the *minor* axis of the elliptical footprint.
+  * *Normalisation is by the **unfiltered** amplitude sum*, so a faded octave is genuinely
+    gone and the field converges to 0.5 rather than being renormalised back up into
+    something that still crawls.
+
+  `-checkfnoise` is written so it cannot pass by tuning. §2 pins the closed form against
+  the 22-entry measured disc table (reached two ways — `patOctaveFade(1, s)` and
+  `patOctaveFade(8, s/8)` — so a mis-scaled `freq·w` cannot hide), sweeps 200001 points for
+  monotonicity, and carries an explicit anti-regression that the fade has not "collapsed to
+  a Nyquist cutoff". §5 is the interesting one: it originally asserted a fixed ratio and
+  failed at 1.68×, and rather than loosen the number the test now asserts the *structure*
+  that the sweep actually revealed — point-sampling's low-frequency error **saturates**
+  under minification (0.0148 → 0.0247 → 0.0269 → 0.0262) while `fnoise`'s keeps falling
+  (0.0088 → 0.0091 → 0.0052 → 0.0028), so the two separate without bound (1.68× → 9.28×).
+  A saturating error curve is the signature of aliasing, and that is what is now pinned.
+
+  One authoring fact that only rendering revealed, and that the worked example
+  `scenes/pattern_fnoise.ftsl` exists to state: **a classic wide fBm barely aliases**. In a
+  gain-0.5 stack the fine octaves carry almost no amplitude (the seventh is 1/64 of the
+  first) and they are precisely the ones a distant sample cannot resolve, so a wide fBm
+  both aliases faintly *and* filters faintly — the first demo (7 octaves at base 9) had two
+  indistinguishable halves, which was the primitive being right rather than the demo being
+  right. What aliases visibly is a texture whose energy sits **at** the resolution limit,
+  which is also the common case in practice (grain, weave, gravel, stucco), so the demo is
+  3 octaves at base 90/m on a floor running to the horizon, split down the middle. Measured
+  off that render, mean |pixel − its 3×3 mean| by distance: plain stays at 9–11 from 3.8 m
+  to the horizon while filtered falls 9.3 → 0.0. The flat line is the point.
+
+  Wiring is the O2 checklist (enum at the end, one case in each of the three VMs,
+  `patOpStackEffect` arity 5, no payload). **Stage 2 is not done**: `w` is currently written
+  out by hand in the scene (the demo derives the floor's footprint from `fov_y/res_y`, the
+  grazing-angle stretch and the geometric mean of the two axes, which is instructive but is
+  not something an author should have to do). The renderer should hand it over as a pattern
+  variable `fw`, filled per-hit by mode W / the raster preview / backward primary hits and
+  0 in the forward modes — needing the same plumbing as `VarCurv`/`VarCavity` (a `PatCtx`
+  field, an opcode, `patternHasFreeVars`, `patOpStackEffect`, and the `dPatternEval` /
+  `dPatternEvalF` signatures).
+
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
   **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the

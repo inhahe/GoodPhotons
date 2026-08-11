@@ -237,6 +237,37 @@ enum class PatOp : int {
     // Appended at the END of the enum so the VarX..VarV scans and varName() are
     // unperturbed.
     BlueNoise,
+    // FILTERED (BAND-LIMITED) fBm (O8), spelled `fnoise(x, y, z, w, octaves)`: the sum of
+    // `octaves` octaves of the same lattice `noise`, at lacunarity 2 and gain 0.5, with
+    // each octave weighted by how much of it a footprint of width `w` (in the caller's
+    // own coordinate units) can actually resolve. Returns [0,1] with mean 0.5, like
+    // `noise`. `w <= 0` means "unfiltered" and reproduces plain fBm exactly.
+    //
+    // This is the one primitive here that is about what a texture does when it is NOT
+    // resolved. Every other noise is evaluated at a point, which is a lie whenever the
+    // shading sample stands for an AREA: once a feature is smaller than the footprint,
+    // point-sampling it reports one arbitrary member of the population instead of the
+    // population's mean, and the image gets a moiré of the sampling lattice rather than
+    // the texture. The fix is not more samples — it is to stop generating detail the
+    // sample cannot carry.
+    //
+    // What "how much it can resolve" means precisely is measured, not assumed, and the
+    // measurement contradicts the intuitive schedule at both ends — see patOctaveFade.
+    // In particular `w` is the DIAMETER OF THE SURFACE PATCH the sample stands for, and
+    // that 2-D choice matters: the weight's tail goes as w^-2 for a surface patch but
+    // w^-3 for a solid ball, so filtering a surface as though it were a volume
+    // over-blurs it badly enough to be worse than not filtering at all.
+    //
+    // The normalisation is deliberately by the UNFILTERED amplitude sum, so a faded
+    // octave really is removed rather than renormalised back in: as `w` grows the result
+    // converges to the field's mean (0.5), which is exactly what a low-pass filter must
+    // do. Normalising by the *surviving* sum would keep full contrast at every width and
+    // filter nothing.
+    //
+    // Pure function of its operands (CSE shares it), no payload, evaluated in double on
+    // every backend. Appended at the END of the enum so the VarX..VarV scans and
+    // varName() are unperturbed.
+    FNoise,
 };
 
 // Register-file size available to a CSE-optimized program (per evaluator invocation).
@@ -558,15 +589,15 @@ inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, d
 
 // ---- 3-D value noise (hash lattice + trilinear smoothstep fade) -------------
 // Deterministic integer hash so CPU and GPU agree bit-for-bit. Output in [0,1].
-inline double patHash3(int ix, int iy, int iz) {
+PATTERN_HD inline double patHash3(int ix, int iy, int iz) {
     uint32_t h = (uint32_t)ix * 374761393u + (uint32_t)iy * 668265263u
                + (uint32_t)iz * 2147483647u;
     h = (h ^ (h >> 13)) * 1274126177u;
     h ^= (h >> 16);
     return (double)h / 4294967295.0;   // [0,1]
 }
-inline double patValueNoise(double x, double y, double z) {
-    double fx = std::floor(x), fy = std::floor(y), fz = std::floor(z);
+PATTERN_HD inline double patValueNoise(double x, double y, double z) {
+    double fx = PAT_FLOOR(x), fy = PAT_FLOOR(y), fz = PAT_FLOOR(z);
     int ix = (int)fx, iy = (int)fy, iz = (int)fz;
     double tx = x - fx, ty = y - fy, tz = z - fz;
     // smoothstep fade
@@ -588,6 +619,129 @@ inline double patValueNoise(double x, double y, double z) {
     double y0  = x00 + (x10 - x00) * uy;
     double y1  = x01 + (x11 - x01) * uy;
     return y0 + (y1 - y0) * uz;
+}
+
+// ---- filtered (band-limited) fBm: `fnoise(x, y, z, w, octaves)` (O8) --------
+//
+// Highest octave count `fnoise` will run, matching `dturb`'s cap so the two octave
+// sums have the same ceiling. Beyond ~10 the gain-0.5 amplitude is below 1e-3 of the
+// base and the octave is invisible anyway.
+#define PAT_FNOISE_MAX_OCT 10
+//
+// Where the weight is windowed to zero so a far-minified octave can be skipped outright.
+#define PAT_FNOISE_S_MAX 32.0
+#define PAT_FNOISE_S_WIN 16.0
+//
+// How much of an octave of period `1/freq` survives a footprint of width `w`, both in the
+// caller's own coordinate units. Everything depends on them only through the ratio
+//
+//     s = freq * w
+//
+// the footprint's width measured in that octave's own lattice cells.
+//
+// WHAT THE RIGHT ANSWER IS, AND WHY IT IS NOT THE OBVIOUS ONE. The goal is not "attenuate
+// detail below Nyquist"; it is to make the surviving point sample the best available
+// ESTIMATE of the octave's MEAN over the footprint. Both are random variables on the same
+// lattice, so the best (least-squares) scalar multiplier of the point sample is the
+// linear-MMSE coefficient
+//
+//     a(s) = Cov(footprint mean, point) / Var(point) = mean_{u in footprint} R(u) / R(0)
+//
+// i.e. the footprint-average of the value noise's own autocorrelation. That is a property
+// of this lattice and this smoothstep interpolant — not a free parameter — so it was
+// MEASURED rather than chosen (scraps/fnoise_fit2.py, Cov/Var read off directly from
+// 20000 sample points).
+//
+// WHICH FOOTPRINT. The answer depends on the footprint's SHAPE, and in the tail on its
+// DIMENSION: a 3-D ball average decays like s^-3, a 2-D patch like s^-2, a 1-D segment
+// like s^-1, so one curve cannot serve all three and this has to pick and say so. A
+// shading sample stands for the surface patch one pixel covers — 2-D, arbitrarily
+// oriented in space — so `w` is the DIAMETER OF A DISC lying in the surface, and the
+// curve below is that disc's, averaged over orientations:
+//
+//     s      a(s)          s      a(s)           s      a(s)
+//   0.000  1.000000      1.000  0.814940       4.000  0.121233
+//   0.125  0.996712      1.250  0.729877       5.000  0.071758
+//   0.250  0.986934      1.500  0.640800       6.000  0.047720
+//   0.375  0.970918      1.750  0.553029       8.000  0.025853
+//   0.500  0.949059      2.000  0.470722      10.000  0.016787
+//   0.625  0.921878      2.500  0.332205      12.000  0.011987
+//   0.750  0.889994      3.000  0.232408      16.000  0.006733
+//   0.875  0.854101      3.500  0.165357
+//
+// Two things follow, and both are the opposite of the intuitive design. First, the naive
+// "full amplitude up to Nyquist (s = 0.5), gone by s = 1" schedule is wrong at both ends
+// and by a lot: the weight is already 0.95 AT Nyquist, and is still 0.81 at s = 1 — four
+// fifths of the octave is real, correlated signal that a cutoff there throws away.
+// Second, filtering too hard is not the safe direction. Over-filtering deletes
+// low-frequency content the footprint genuinely contains, and (measured, -checkfnoise
+// S3/S5) leaves the result FURTHER from the true footprint mean than the point sample it
+// replaced. Using this 2-D curve on a genuinely volumetric footprint (media density,
+// where the true shape is a 3-D ball) under-filters instead, which merely leaves some
+// aliasing rather than destroying signal — still ~2.3x better than point sampling at
+// s = 2, where over-filtering by the same mismatch would give only 1.6x.
+//
+// The closed form is a least-squares fit of a cheap rational to that table — the s^-2
+// tail is why it needs a numerator and not just 1/poly — times a smooth window that
+// reaches exactly zero at s = PAT_FNOISE_S_MAX so a far-minified octave can be dropped.
+// Worst absolute error over the table is 0.00025. The window costs at most ~0.002 of one
+// octave's weight, invisible next to that octave's own amplitude, and buying exactness
+// there would cost the skip. Numerator and denominator are both positive for all s >= 0
+// despite their negative coefficients (the numerator bottoms out at 0.9989, s = 0.55).
+//
+// It is C1 everywhere, and that is not cosmetic: it is the same trap `dturb`'s integer
+// octave count is documented under (REFERENCE.md "Trap 2"). An octave that switches on
+// abruptly draws a visible contour wherever the footprint crosses the threshold, and the
+// footprint is a function of the CAMERA, so the contour swims as the camera moves.
+// a'(0) = 0 (the fit has no linear term — a is even in s, the footprint being centred),
+// and the window's derivative vanishes at both of its ends.
+PATTERN_HD inline double patOctaveFade(double freq, double w) {
+    if (!(w > 0.0)) return 1.0;                  // w <= 0 (and NaN) => unfiltered
+    const double s = freq * w;
+    if (s >= PAT_FNOISE_S_MAX) return 0.0;       // octave is skippable, exactly
+    const double s2 = s * s;
+    double a = (1.0 + s2 * (-0.01091314134 + s * 0.01311777814))
+             / (1.0 + s2 * (0.1965958812
+                            + s * (0.02184531721
+                                   + s * (0.004579934569 + s * 0.006875805032))));
+    if (s > PAT_FNOISE_S_WIN) {                  // smoothstep down to exactly 0
+        const double t = (s - PAT_FNOISE_S_WIN) / (PAT_FNOISE_S_MAX - PAT_FNOISE_S_WIN);
+        a *= 1.0 - t * t * (3.0 - 2.0 * t);
+    }
+    return a;
+}
+// The octave sum itself. Lacunarity 2 and gain 0.5 are fixed rather than operands:
+// they are what makes this fBm (a 1/f spectrum), and a caller who wants other exponents
+// can sum `fnoise` calls at chosen scales. `octaves` is truncated to an integer and
+// clamped to [1, PAT_FNOISE_MAX_OCT], exactly like `dturb`.
+//
+// Normalised by the UNFILTERED amplitude sum (`norm`), so a faded octave is genuinely
+// gone: as w grows the result converges to the mean, 0.5. Dividing by the surviving sum
+// instead would restore full contrast at every width and filter nothing at all — the
+// classic mistake, and the reason a "filtered" fBm can end up looking identical to the
+// unfiltered one.
+//
+// With octaves = 1 and w = 0 this reproduces `noise(x, y, z)` to within one ulp (the
+// value makes a round trip through the zero-mean form `0.5 + (n - 0.5)`, which is exact
+// for n >= 0.25 and off by at most an ulp of 0.5 below it).
+PATTERN_HD inline double patFilteredNoise(double x, double y, double z,
+                                          double w, double octaves) {
+    int no = (int)octaves;
+    if (no < 1) no = 1;
+    if (no > PAT_FNOISE_MAX_OCT) no = PAT_FNOISE_MAX_OCT;
+    double sum = 0.0, norm = 0.0, amp = 1.0, freq = 1.0;
+    for (int i = 0; i < no; ++i) {
+        norm += amp;
+        const double fade = patOctaveFade(freq, w);
+        // Skipping a fully faded octave is a pure optimisation — its term is exactly
+        // zero — and it is what makes a distant surface CHEAPER as well as cleaner,
+        // since the octaves that get skipped are precisely the expensive high ones.
+        if (fade > 0.0)
+            sum += amp * fade * (patValueNoise(x * freq, y * freq, z * freq) - 0.5);
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    return 0.5 + sum / norm;
 }
 
 // ---- postfix evaluator ------------------------------------------------------
@@ -680,6 +834,11 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
                 patBlueNoise(st[sp-1], yy, zz, rr, b);
                 int sel = (int)nd.a;
                 st[sp-1] = (sel == 3) ? b[2] : (sel == 2) ? (b[1] - b[0]) : b[sel];
+                break;
+            }
+            case PatOp::FNoise: {
+                double oc = st[--sp], ww = st[--sp], zz = st[--sp], yy = st[--sp];
+                st[sp-1] = patFilteredNoise(st[sp-1], yy, zz, ww, oc);
                 break;
             }
             case PatOp::PovFn: {
@@ -831,6 +990,8 @@ inline bool funcOp(const std::string& s, PatOp& out, int& arity, int& povId) {
         {"smoothstep",PatOp::Smoothstep,3},{"noise",PatOp::Noise,3},
         // anisotropic Gabor noise (O4): point, frequency, steering direction
         {"gabor",PatOp::Gabor,7},
+        // filtered (band-limited) fBm (O8): point, filter width, octave count
+        {"fnoise",PatOp::FNoise,5},
     };
     for (const F& g : fs) if (s == g.n) { out = g.op; arity = g.ar; return true; }
     // Vector-noise components (O2) and Worley outputs (O1). The component /
@@ -1326,6 +1487,7 @@ inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes,
     if (op == PatOp::Worley)                      { pops = 4; return true; }
     if (op == PatOp::Gabor)                       { pops = 7; return true; }
     if (op == PatOp::BlueNoise)                   { pops = 4; return true; }
+    if (op == PatOp::FNoise)                      { pops = 5; return true; }
     if (op == PatOp::Tex)                         { pops = 2; return true; }
     if (op == PatOp::Spec)                        { pops = 1; return true; }
     if (op == PatOp::StReg)                       { pops = 0; pushes = 0; return true; }  // peeks

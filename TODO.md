@@ -4856,10 +4856,42 @@ the *randomness vocabulary* is thin. Nothing below is started.
       `wang tile`, `histogram-preserving`, `by-example`. Heitz–Neyret histogram-preserving blending is
       the standard way to tile one photo infinitely without visible repetition, and it composes with
       `PatOp::Tex` rather than replacing it.
-- [ ] **O8 — antialiasing the noise.** None of the above currently band-limits. Under minification a
-      lattice noise aliases badly; a filtered/analytically-band-limited variant (or an explicit
-      octave-cutoff driven by the screen-space footprint) is what makes procedural texture usable at
-      distance. This is a *quality* prerequisite for taking O1–O7 seriously in a beauty render.
+- [ ] **O8 — antialiasing the noise.** *Stage 1 done, v0.168.0; stage 2 (`fw`) open.* None of the above
+      currently band-limits. Under minification a lattice noise aliases badly; a
+      filtered/analytically-band-limited variant (or an explicit octave-cutoff driven by the screen-space
+      footprint) is what makes procedural texture usable at distance. This is a *quality* prerequisite
+      for taking O1–O7 seriously in a beauty render.
+  - [x] **Stage 1 — the primitive.** ✅ **DONE v0.168.0** — `fnoise(x, y, z, w, octaves)`
+        (`PatOp::FNoise`, `patFilteredNoise`/`patOctaveFade` in `src/pattern.h`): the same lattice
+        `noise` at lacunarity 2 / gain 0.5, each octave scaled by how much of it a sample of width `w`
+        can resolve. `w` is in the units of the coordinates passed in (a footprint of `w` m sampled at
+        `90*x` must be handed in as `90*w`), and `w <= 0` is plain unfiltered fBm so nothing existing
+        changes. The weight is **measured, not chosen**: it is the linear-MMSE coefficient
+        `a(s) = mean_{u∈footprint} R(u) / R(0)` at `s = freq·w`, i.e. the footprint-average of the
+        noise's own autocorrelation — 0.949 *at* Nyquist and still 0.815 at `s = 1`, nothing like the
+        cutoff the naive schedule would apply (the first implementation *was* that cutoff and filtered
+        **worse than not filtering**). Two findings worth keeping: the footprint's **dimension** shifts
+        the tail by a whole power of `s` (3-D ball `s⁻³`, 2-D patch `s⁻²`, 1-D segment `s⁻¹`), so `w` is
+        defined as the orientation-averaged **diameter of a disc lying in the surface** — what a shading
+        sample actually stands for; and **over-filtering is not the safe direction** (the 3-D curve on a
+        2-D footprint measures 1.6× at `s = 2` against 2.3× for the reverse mismatch), so an author in
+        doubt should lean to the *minor* axis. Normalisation is by the *unfiltered* amplitude sum, so a
+        faded octave is genuinely gone and the field converges to 0.5. `-checkfnoise` pins the closed
+        form against the measured disc table reached two ways, sweeps 200001 points for monotonicity,
+        carries an anti-regression that the fade has not collapsed back to a Nyquist cutoff, and — after
+        a fixed ratio failed at 1.68× — asserts the *structure* the sweep revealed rather than a tuned
+        number: point-sampling's low-frequency error **saturates** under minification while `fnoise`'s
+        keeps falling, so the two separate without bound (1.68× → 9.28×). Demo
+        `scenes/pattern_fnoise.ftsl`, whose own lesson is that a classic wide fBm barely aliases (the
+        fine octaves carry 1/64 the amplitude and are exactly the unresolvable ones), so it is 3 octaves
+        at base 90/m — energy at the resolution limit, like grain/weave/gravel/stucco.
+  - [ ] **Stage 2 — the `fw` pattern variable.** `w` is still written out by hand in the scene (the demo
+        derives it from `fov_y/res_y`, the grazing-angle stretch and the geometric mean of the two axes
+        — instructive, but not something an author should have to do). The renderer should hand the
+        per-hit world-space shading footprint over as `fw`, filled by mode W / the raster preview /
+        backward primary hits and 0 in the forward modes (which already area-average stochastically).
+        Same plumbing as `VarCurv`/`VarCavity`: a `PatCtx` field, an opcode, `patternHasFreeVars`,
+        `patOpStackEffect`, and the `dPatternEval`/`dPatternEvalF` signatures.
 
 **Ordering note.** O2 then O1 buys the most look per line of code (domain warping + cellular covers a
 huge fraction of natural texture); O8 is the one that decides whether any of it survives a real render

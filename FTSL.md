@@ -650,6 +650,46 @@ own cosine — libm's is not), validated by `-checkgabor`. Worked example:
 `scenes/pattern_gabor.ftsl` (isotropic speckle, brushed metal, wood end grain,
 flow-aligned fibre, latitude striation on a sphere).
 
+**Filtered fBm — `fnoise(x, y, z, w, octaves)`:** the sum of `octaves` octaves of the
+same lattice `noise` (lacunarity 2, gain 0.5), returning `[0,1]` with mean `0.5` — but
+with each octave weighted by how much of it a shading sample **of width `w` can
+actually resolve**. `w` is in the same coordinate units you pass in, and is the
+**diameter of the surface patch the sample stands for**. `w = 0` (or negative) means
+"unfiltered" and reproduces plain fBm exactly, so the filtering is opt-in and costs
+nothing when it is off. `octaves` is truncated and clamped to `[1, 10]`, like `dturb`.
+
+```
+# a floor that stays crisp underfoot and goes smooth in the distance instead of
+# turning into a shimmering mess: ~0.02 world units of footprint per unit of depth
+pattern "floorgrain" { expr "fnoise(6*x, 6*y, 6*z, 6*0.02*r, 7)" }
+```
+
+Note the idiom there: the coordinates are scaled by 6, so **the width is scaled by 6
+too**. `w` lives in the same space as the point.
+
+The reason this exists is what a texture does when it is *not* resolved. Every other
+noise here is evaluated at a point, which is a lie as soon as the sample stands for an
+area: once a feature is smaller than the footprint, point-sampling reports one arbitrary
+member of the population instead of the population's mean, and the image gets a moiré of
+the sampling lattice rather than the texture. More samples do not fix that; not
+generating the detail does.
+
+Two things about the weighting are worth knowing, because both are the opposite of the
+obvious design and both were **measured** rather than chosen (`-checkfnoise` pins the
+code to the measurement). First, the right weight is *not* "keep everything coarser than
+Nyquist, drop everything finer": the optimal weight is still `0.95` **at** Nyquist and
+`0.81` at the width where the naive rule would already have dropped the octave whole.
+Second, over-filtering is **not** the safe direction — it deletes low-frequency content
+the footprint genuinely contains, and ends up further from the truth than not filtering
+at all. That is also why `w` means a surface patch and not a solid ball: for a fixed
+size the two disagree by a whole power of `w`, so filtering a surface as though it were
+a volume over-blurs it past the point of being worth doing.
+
+Where this bites is the **deterministic** samplers — mode `W`, the raster preview, and
+low-sample-count backward renders. The forward photon modes already integrate the
+footprint stochastically (millions of photons land all over each pixel, so the texture
+is area-averaged for free), and there `w` only costs detail; leave it at 0 for those.
+
 **Image samples — `tex:<name>(u, v)`:** samples a declared `texture` as a *scalar term
 inside the formula*, so a photograph can be one operand of an expression rather than
 only bound wholesale to a slot:
@@ -1834,7 +1874,11 @@ and a Lipschitz bound (`max_gradient`, see §10.3).
   evenly-spread blobs, and `gabor(x,y,z,f,wx,wy,wz)` (§6.1) for directional ones —
   though a field
   driven by Gabor noise needs a generous `max_gradient`, since its slope scales with
-  `f`. The image sample
+  `f`. Filtered fBm `fnoise(x,y,z,w,octaves)` (§6.1) is accepted too, but its point is
+  antialiasing a *shading* sample and a field expression has no footprint to speak of,
+  so in practice it is only useful here with `w = 0` (where it is plain fBm) or with a
+  constant `w` used as a deliberate smoothing knob on the surface itself. The image
+  sample
   `tex:<name>(u, v)` (§6.1) is **not** available here — a field expression *defines* a
   surface, so there is no surface to sample yet; using it is a compile error.
 - **Operators:** `+ - * / % ^` and unary `-`. `^` is `pow` (right-assoc), `%` is
