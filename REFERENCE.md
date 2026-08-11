@@ -1355,7 +1355,7 @@ travelling along `d`, with `sin²θ = 1 − (d·t̂)²`. Pulling the square root
 
 > `σ_t(d) ≈ c·√(1 − dᵀTd)`
 
-and the same quadratic form `dᵀTd` **is** `⟨cos²θ⟩` in Marschner's longitudinal frame, so one
+and the same quadratic form `dᵀTd` **is** `⟨sin²θ⟩` in Marschner's longitudinal frame, so one
 DDA march yields both the optical depth and the inclination the averaged tables want. The
 key identity is that `∫σ_t dt` along a ray *is the expected number of fiber crossings* — the
 walk's `n` — obtained with no primitive tests at all.

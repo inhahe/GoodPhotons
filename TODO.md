@@ -5058,7 +5058,7 @@ that item mostly a binding exercise there.
         immediately** as the fix for the `known-issues.md` entry "`-dual-scatter` costs more than
         it saves on a dense coat": the load-bearing identity is that `∫σ_t dt` along a ray **is
         the expected number of fiber crossings**, i.e. exactly what the §4.1.1 shadow walk was
-        paying full BVH traversal to count, and `dᵀTd` is simultaneously `⟨cos²θ⟩` in Marschner's
+        paying full BVH traversal to count, and `dᵀTd` is simultaneously `⟨sin²θ⟩` in Marschner's
         frame, so one DDA march answers both questions the dual tables ask. Exposed as
         `-dual-grid [cells]` (opt-in, a cell **budget** not a resolution, ~64 MB at the 128³
         default). Measured, mode `R`, `-max-bounce 200`, fur crop vs each scene's own reference:

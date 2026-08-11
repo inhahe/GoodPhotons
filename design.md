@@ -746,7 +746,7 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   - *The load-bearing identity: `∫σ_t dt` **is** the expected number of fiber crossings.* A ray
     of length `L` through volume `V` (cross-section `A = V/L`) hits fiber *i* with probability
     `2rᵢℓᵢ sinθᵢ / A`, so the expected count over `L` is `L·σ_t(d)` — exactly the walk's `n`,
-    with no primitive tests. And `dᵀTd` is `⟨cos²θ⟩` **in Marschner's frame directly** (that
+    with no primitive tests. And `dᵀTd` is `⟨sin²θ⟩` **in Marschner's frame directly** (that
     frame's longitudinal axis *is* the tangent, which is why `hairShadowCross` computes
     `sinθ = dot(w, t)`), so one quadratic form yields both the extinction and the inclination
     the dual tables are indexed by. One DDA march, two answers.

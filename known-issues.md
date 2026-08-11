@@ -45,7 +45,7 @@ named: Zinke's §4.1.2 aggregate instead of §4.1.1 ray shooting. Each cell of a
 stores `c = (2/V)Σrℓ` and the normalised orientation tensor `T = Σrℓ t̂t̂ᵀ / Σrℓ`; then
 `σ_t(d) ≈ c√(1 − dᵀTd)`, and the load-bearing identity is that **`∫σ_t dt` along a ray *is*
 the expected number of fiber crossings** — exactly the walk's `n`, with no primitive tests.
-The same quadratic form `dᵀTd` is `⟨cos²θ⟩` in Marschner's frame, so one DDA march yields both
+The same quadratic form `dᵀTd` is `⟨sin²θ⟩` in Marschner's frame, so one DDA march yields both
 the count and the inclination the averaged tables need. Visibility is a separate, *early-outing*
 `Scene::occludedSkipHair()` query that ignores hair fibers but still lets opaque geometry block.
 
