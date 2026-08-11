@@ -455,6 +455,56 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     honest if the ball or the coat length ever change. The lesson generalises: a guard whose
     fixture makes two different implementations agree is not guarding anything, and only a
     mutation run will tell you which fixture that is.
+- **`hair.h`** — the **fiber BCSDF**: Marschner's (2003) R / TT / TRT lobes in Chiang et
+  al.'s (2016) energy-conserving form. Header-only, `<cmath>` + `linalg.h`, no renderer
+  dependencies, so it can be unit-tested with no scene (`-checkhair`, nine sections). As of
+  0.171.0 this is the *core only* — the scattering maths and its geometry hookup, not yet a
+  `material { type hair }` in the scene language, so nothing in a render calls it yet.
+  - *Why Chiang's form and not Marschner's directly.* Marschner's `M_p` is a flat Gaussian
+    in θ, which integrates to **more** than 1 as roughness grows — that is exactly where the
+    2003 model's famous energy gain comes from, and why practical implementations bolt on an
+    ad-hoc normalisation. Chiang's `M_p` is normalised on the sphere by construction (it is
+    a von Mises–Fisher-like term carrying a Bessel `I0`), and his `N_p` is a **trimmed
+    logistic** rather than a wrapped Gaussian. The logistic buys two things: its CDF is
+    elementary, so it inverts in closed form and gives an *exact* importance sampler; and
+    trimmed to exactly one revolution it stays normalised on the circle, instead of leaking
+    probability past ±π the way a wrapped Gaussian does unless you sum the wrap terms.
+  - *The p ≥ 3 residual is what makes the energy balance exact.* With four lobes
+    (R, TT, TRT, and one folded residual) the attenuations telescope algebraically at zero
+    absorption: `f + (1−f)² + (1−f)²f + (1−f)f² ≡ 1`. That is not a curiosity, it is the
+    whole verification strategy — since `f = Σ_p M_p A_p N_p / |cos θ_i|` **separates**, and
+    `M_p` and `N_p` are each normalised on their own domain, the white-furnace test collapses
+    from a noisy sphere integral into an identity assertable at 1e-12. It also quantifies the
+    thing everyone says about the three-lobe model: dropping the residual loses 0.21 % of a
+    white fiber's energy.
+  - *`h` stays out of the intersector.* The impact parameter ∈ [−1, 1] is recovered at
+    shading time by `hFromHit(n, tangent, wo)` from the hit normal and fiber tangent. The
+    curve intersector is the hottest loop in a fur render and has no business knowing a BCSDF
+    exists; §9 pins the recovery at 5e-14 and the local-frame round-trip at 8e-16.
+  - *The local frame is PBRT's (+x = fiber tangent), deliberately.* Adopting the published
+    convention means the published test values are **checks** rather than re-derivations —
+    if the frame were rotated to taste, every number in the literature would have to be
+    re-derived before it could disagree with anything, which is how a subtly wrong model gets
+    shipped. (σa being scalar-per-λ here, rather than PBRT's RGB triple, is strictly simpler
+    and needs no reconciliation.)
+  - *A real bug the tests caught, and would not have caught as a picture.* `besselI0` was
+    the usual fixed **ten-term** ascending series — fine at float precision, but 0.26 % low by
+    x = 10 and 4 % low by x = 12. `I0` sits inside `M_p`'s normalisation, so that error is not
+    cosmetic: it is a longitudinal lobe that does not integrate to one, i.e. energy invented
+    or lost, worst at grazing angles where `cos θ_i cos θ_o / v` is largest. It showed up as
+    three simultaneous failures (`∫M_p cos dθ − 1 = 5.9e-3`, the pdf's sphere integral off by
+    2.8e-3, and the two `M_p` branches disagreeing by 4.4 %) which all had the same cause. The
+    series now iterates to double convergence and hands x > 12 to the A&S 9.7.1 asymptotic
+    (12 terms, ~1e-10 relative at the crossover and better above); the three numbers became
+    2.1e-9, 9.4e-9 and 5.7e-15. The general lesson: a series truncation tuned for `float` is a
+    *model* error, not a rounding error, once it sits inside a normalisation constant.
+  - *Four independent uniforms, not PBRT's two-plus-demux.* The demux exists to preserve a
+    2-D sampler's stratification; this renderer hands out independent uniforms anyway, so
+    reusing bits of `u0` to pick the lobe would only add a correlation hazard for no benefit.
+    `sample()` fills `pdfOut` and `fOut` to match the direction it returns, so a caller's
+    weight is just `fOut·|cos θ_i|/pdfOut` — and §5 asserts those agree with independent
+    `f()` / `pdf()` calls to *zero* relative error, which is the cheapest possible guard
+    against the classic sample/evaluate drift.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds

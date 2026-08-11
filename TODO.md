@@ -5057,10 +5057,74 @@ that item mostly a binding exercise there.
       light-coloured coats are dominated by it and render dark and dead without it. All three are
       published formulae testable against published plots, so this is the *least* risky piece
       despite sounding like the hardest.
+  - [x] **P3 stage 1 — the BCSDF core. ✅ DONE v0.171.0.** `src/hair.h` (header-only, `<cmath>` +
+        `linalg.h`, no renderer dependencies) implements the four lobes — R, TT, TRT and one folded
+        p ≥ 3 residual — in **Chiang et al.'s (2016) energy-conserving form** rather than
+        Marschner's directly: Marschner's flat-Gaussian `M_p` integrates to more than 1 as
+        roughness grows (that *is* the 2003 model's energy gain), while Chiang's is normalised on
+        the sphere by construction, and his azimuthal `N_p` is a **trimmed logistic** whose CDF is
+        elementary, so it inverts in closed form into an exact importance sampler and stays
+        normalised on the circle instead of leaking past ±π like a wrapped Gaussian. `sample()`
+        takes four independent uniforms rather than PBRT's two-plus-bit-demux (the demux only
+        exists to preserve a 2-D sampler's stratification, which this renderer doesn't have, so it
+        would be pure correlation hazard). `h` is recovered at shading time by `hFromHit` so the
+        curve intersector — the hottest loop in a fur render — never learns a BCSDF exists.
+        `-checkhair` is nine sections; three things about it are worth keeping.
+
+        **The furnace test is exact algebra, not Monte Carlo.** Because `f` separates into
+        `Σ_p M_p A_p N_p / |cos θ_i|` and `M_p`, `N_p` are each normalised on their own domain, the
+        white-furnace integral collapses to `Σ_p A_p = 1` — which telescopes exactly at zero
+        absorption (`f + (1−f)² + (1−f)²f + (1−f)f² ≡ 1`) and is asserted at **1e-12**. The first
+        draft did it by uniform-sphere MC and reported 0.143 against a 0.03 tolerance: 120k samples
+        cannot estimate a lobe that narrow, so the test was measuring its own estimator. Same story
+        for the pdf's normalisation (§6). The residual lobe is precisely the term that makes the
+        sum telescope, which also quantifies the usual hand-wave: a three-lobe model loses 0.21 %
+        of a white fiber's energy.
+
+        **One of the four initial failures was a real bug, and it was in a place nobody looks.**
+        `besselI0` was the standard fixed **ten-term** ascending series — correct for `float`, but
+        0.26 % low by x = 10 and 4 % low by x = 12. `I0` lives inside `M_p`'s normalisation
+        constant, so this is not a rounding error, it is *energy invented or lost at grazing
+        angles*. It surfaced as three simultaneous failures with one cause: `∫M_p cos dθ − 1` =
+        5.9e-3, `∫pdf dω − 1` = 2.8e-3, and the two `M_p` branches disagreeing by 4.4 % beyond
+        their analytic `exp(−2/v)` gap. Iterating the series to double convergence and handing
+        x > 12 to the A&S 9.7.1 asymptotic (12 terms) took those to **2.1e-9, 9.4e-9, 5.7e-15**.
+        Lesson: a series truncation tuned for `float` becomes a *model* error, not a numerical one,
+        the moment it sits inside a normalisation.
+
+        **The other three failures were test-design defects, and fixing them made the tests
+        stronger.** §2 was stepping *across* the v = 0.1 branch split by d = 1e-5 where
+        `dM_p/dv ≈ M_p/v ≈ 100`, so it measured the function's own slope (3.8e-5) rather than the
+        ~2e-9 branch gap — now it evaluates both formulae at the *same* v. §3/§4 went from Monte
+        Carlo to 400k-point deterministic midpoint quadrature at 1e-6. §8 was counting
+        "significant peaks" at h = 0, where the three exit directions collapse to two and TT
+        (A ≈ 0.87 with the narrowest `v[1]`) stands ~74× above R + TRT, putting the second peak at
+        1.6 % of max — an amplitude threshold was simply the wrong instrument. It now works at
+        h = 0.6, where Snell puts R / TT / TRT at −73.74° / +151.81° / +17.36°, and requires a local
+        maximum of the swept BCSDF near each: measured **0.015° / 0.017° / 0.019°** off. Across the
+        rewrite the model itself never changed except for the Bessel fix — §5 reported *zero*
+        sample-vs-pdf disagreement throughout, §9 2e-14, §7's Fresnel exact, and the 3° cuticle
+        tilt moving the R highlight by exactly −2.97°.
+  - [ ] **P3 stage 2** — wire it into the scene: `material { type hair … }`, forward + backward +
+        GPU paths, `sigmaAFromReflectance` driving a `color`-style authoring parameter.
+  - [ ] **P3 stage 3** — the medulla (Yan 2015/2017 TT^s/TRT^s double-cylinder lobes).
+  - [ ] **P3 stage 4** — dual scattering (Zinke 2008).
 
 ---
 
 ## Progress log
+- 2026-08-10: **P3 stage 1 — fiber BCSDF core (v0.171.0).** `src/hair.h` + `-checkhair` (nine
+  sections, all green; the full 31-test battery re-run clean). Marschner R/TT/TRT plus a folded
+  p ≥ 3 residual in Chiang's energy-conserving form. The core-only stage: no
+  `material { type hair }` yet, so no render path calls it — stages 2–4 (scene wiring, medulla,
+  dual scattering) are still open. Two things to remember: the white-furnace and pdf-normalisation
+  tests are **exact algebra** (`Σ_p A_p = 1` telescopes; asserted at 1e-12) rather than sphere-MC,
+  because a 120k-sample uniform estimator cannot see a lobe this narrow and the first draft was
+  measuring its own noise at 0.143; and the ten-term `besselI0` inherited from the usual
+  float-precision implementations is **4 % low by x = 12**, which — sitting inside `M_p`'s
+  normalisation — is invented/lost energy at grazing angles, not a rounding error. Fixing it took
+  three separate failing numbers (5.9e-3, 2.8e-3, 4.4 %) to 2.1e-9, 9.4e-9, 5.7e-15 at once. See
+  §P3 for the detail.
 - 2026-08-08: **O1 — cellular / Worley / Voronoi noise (v0.159.0).** `src/worley.h` +
   `PatOp::Worley` expose `worley` (F1), `worley2` (F2), `worleyd` (F2−F1) and `worleyid` (flat
   per-cell id) with a *runtime* metric operand (0 Euclid / 1 Manhattan / 2 Chebyshev,

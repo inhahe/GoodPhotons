@@ -3730,7 +3730,7 @@ alone can't restore, so they are not disk-resumable.
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
 `-checkbluenoise`, `-checkfnoise`, `-checkstochtile`, `-checkreaction`, `-checkcurv`,
 `-checkcavity`, `-checksdf`, `-checksun`,
-`-checkbind`, `-checkprop`,
+`-checkbind`, `-checkprop`, `-checkhair`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
 `PASS`/`FAIL`. `-checkcurve` guards the `curve` primitive: it cross-checks the
 round-cone intersector against the exact analytic SDF, the degenerate
@@ -3743,6 +3743,21 @@ in seven sections: roots on the surface, area-uniform root distribution, determi
 across seeds, growth never pointing into the skin, clumping that collapses tips without
 moving roots, a well-formed segment chain, and a regression on the loader-ordering trap
 that once made a whole groom generate zero strands silently — see **Grooms** above.
+`-checkhair` guards the **fiber BCSDF** (Marschner's R / TT / TRT lobes in Chiang's
+energy-conserving form) in nine sections. A hair BCSDF that is subtly wrong still looks
+like hair, so every claim is a number rather than a picture — and wherever the physics
+allows it, an *exact* number rather than a Monte-Carlo estimate. Because the lobes
+separate into a longitudinal `M_p`, an azimuthal `N_p` and an attenuation `A_p`, and each
+of the three is normalised on its own domain, the white-furnace test reduces to the
+algebraic identity `Σ_p A_p = 1` — which telescopes exactly, and is asserted to `1e-12`
+instead of the ~3 % a sphere-uniform estimator could manage against a lobe this narrow.
+The rest: the two `M_p` branches agree beyond their analytic `exp(-2/v)` gap; `M_p` and
+`N_p` integrate to one under deterministic quadrature; the trimmed-logistic sampler
+inverts its own CDF; `sample()` returns exactly the `f` and pdf that `f()` and `pdf()`
+report, and its empirical density matches; absorption darkens monotonically while the R
+lobe — which never enters the fiber — survives an opaque one; the three lobes peak within
+0.02° of the azimuths Snell predicts at impact parameter `h = 0.6`, and a 3° cuticle tilt
+moves the R highlight by 2.97°; and `h` is recovered from the hit geometry to 5e-14.
 `-checkcontainer` guards the isosurface container clip: rotating an
 isosurface must not change what a ray sees, so it builds the same solid twice
 (axis-aligned and rigidly rotated) and checks that correspondingly rotated rays

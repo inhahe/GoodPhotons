@@ -165,6 +165,7 @@
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
 #include "denoise.h"            // -denoise: luma/chroma a-trous filter for MC speckle
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
+#include "hair.h"               // -checkhair: fiber BCSDF (Marschner lobes, Chiang form)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
                                // header also pulls it in, but CPU-only builds need it too
 #include "lattice_probe.h"     // -checklattice (N4a): the shared host/device probe layout.
@@ -4547,6 +4548,517 @@ static int checkStochTile() {
 
     std::printf("[checkstochtile] worst absolute error (exact checks) = %.3g\n", worst);
     std::printf("[checkstochtile] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Fiber BCSDF self-test (src/hair.h). P3 stage 1. No scene, no renderer — the model is a
+// pure function, so it can be held to its own physics rather than to a reference image.
+//
+// The reason this test is worth more than a render: a hair BCSDF that is subtly wrong
+// still looks like hair. Energy loss reads as "a slightly darker blonde", a broken
+// sampler reads as "noisier than I expected", and neither announces itself. Every claim
+// below is therefore a NUMBER the model must hit, and most of them are claims the
+// published derivation makes, so failing one localises the bug to a named term.
+//
+//   §1 WHITE FURNACE. With no absorption a fiber must scatter every photon somewhere:
+//      integral over the sphere of f * |cos theta_i| = 1, at any roughness and any
+//      incidence. This is the single strongest statement about the model, and it is the
+//      one Marschner's original formulation FAILS (it gains energy with roughness and
+//      drops the p >= 3 tail) — so it also documents why this is the Chiang form.
+//   §2 THE M_p BRANCHES AGREE. The longitudinal term switches to a log-space Bessel
+//      formulation at v = 0.1; the two branches are one function and must meet.
+//   §3 M_p IS NORMALISED over the longitudinal angle — the property that makes §1
+//      possible at all, and the exact thing Marschner's flat Gaussian gets wrong.
+//   §4 N_p IS NORMALISED over one revolution (what a wrapped Gaussian gets wrong), and
+//      its inverse-CDF sampler reproduces its own CDF.
+//   §5 SAMPLING MATCHES EVALUATION. pdf() returns exactly the density sample() draws
+//      from — checked both self-consistently and by binning the empirical density. A
+//      sampler that disagrees with its pdf still looks unbiased; it just never converges.
+//   §6 THE PDF INTEGRATES TO 1, so the lobe-selection probabilities are a real
+//      distribution and not merely proportional to one.
+//   §7 ABSORPTION AND FRESNEL BEHAVE. Energy falls monotonically with sigma_a, and the R
+//      lobe SURVIVES an opaque fiber because it never enters — which is why black hair
+//      still has a white sheen, and a discriminator an "absorb everything" bug fails.
+//   §8 THE LOBES ARE WHERE MARSCHNER SAYS. Two distinct azimuthal peaks (a plain shiny
+//      cylinder has one), and the cuticle tilt actually moves the highlight.
+//   §9 GEOMETRY. h recovered from a hit reproduces the h that generated it, and the local
+//      fiber frame round-trips. This is the join to the intersector, and a sign error
+//      here mirrors the highlight — invisible on a symmetric groom.
+static int checkHair() {
+    bool ok = true;
+    double worst = 0.0;
+    auto chk = [&](const char* what, double got, double want_, double tol) {
+        const double e = std::fabs(got - want_);
+        if (tol <= 1e-9 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkhair] %-52s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want_, e);
+        return e <= tol;
+    };
+    auto want = [&](const char* what, bool cond) {
+        if (!cond) std::printf("[checkhair] %s  BAD\n", what);
+        return cond;
+    };
+    uint64_t rng = 0xD1B54A32D192ED03ull;
+    auto frand = [&]() {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) * (1.0 / 9007199254740992.0);
+    };
+    auto sphereDir = [&](double u1, double u2) {
+        const double z = 1.0 - 2.0 * u1;
+        const double r = std::sqrt(std::max(0.0, 1.0 - z * z));
+        const double p = 2.0 * hair::kPi * u2;
+        return Vec3{z, r * std::cos(p), r * std::sin(p)};
+    };
+    auto sq = [](double x) { return x * x; };
+
+    // --- S1 white furnace ----------------------------------------------------
+    // The furnace integral is EXACT here rather than statistical, and that is worth
+    // explaining, because it turns the vaguest-sounding section into the sharpest.
+    //
+    // f is a sum of SEPARABLE terms, f = sum_p M_p(theta) A_p N_p(phi) / |cos theta_i|, so
+    //
+    //   integral of f |cos theta_i| dw = sum_p A_p * [int M_p cos dtheta] * [int N_p dphi]
+    //
+    // and S3/S4 pin those two bracketed factors at 1 to quadrature precision. The furnace
+    // test therefore reduces to the algebraic claim `sum_p A_p = 1 when T = 1`, which
+    // telescopes: f + (1-f)^2 + (1-f)^2 f + (1-f) f^2 = 1 identically in the Fresnel
+    // reflectance f. So it is asserted at 1e-12 instead of at Monte Carlo tolerance — and
+    // the p >= 3 residual is precisely the term that makes it telescope, which is the
+    // quantitative form of "Marschner's three-lobe model leaks energy".
+    {
+        double worstSum = 0.0;
+        for (double eta : {1.4, 1.55, 1.8})
+            for (double hh : {-0.99, -0.5, 0.0, 0.37, 0.95})
+                for (double cosThetaO : {0.05, 0.4, 1.0}) {
+                    double ap[hair::kPMax + 1];
+                    hair::Ap(cosThetaO, eta, hh, 1.0, ap);       // T = 1: no absorption
+                    double sum = 0.0;
+                    for (int p = 0; p <= hair::kPMax; ++p) sum += ap[p];
+                    worstSum = std::max(worstSum, std::fabs(sum - 1.0));
+                }
+        std::printf("[checkhair] S1 sum of A_p at zero absorption: worst |sum - 1| over 45 "
+                    "(eta, h, theta) combos = %.3g\n", worstSum);
+        ok &= chk("S1 the lobe attenuations do not sum to 1 (energy lost or gained)",
+                  worstSum, 0.0, 1e-12);
+        {
+            double ap[hair::kPMax + 1];
+            hair::Ap(1.0, 1.55, 0.0, 1.0, ap);
+            std::printf("[checkhair] S1 without the p>=3 residual a white fiber would lose "
+                        "%.2f%% of its energy\n", 100.0 * ap[hair::kPMax]);
+            ok &= want("S1 the residual lobe carries no energy", ap[hair::kPMax] > 1e-3);
+        }
+        // And the ASSEMBLED f, integrated with its own sampler as the importance
+        // distribution. This is the statistical half, and it catches what the algebra
+        // cannot: that f() really combines the terms that way, and that sample() covers
+        // the whole support — a sampler blind to one lobe comes out short here while
+        // passing every self-consistency check in S5.
+        double worstMC = 0.0;
+        for (double beta : {0.1, 0.4, 0.8})
+            for (double hh : {-0.8, 0.0, 0.6})
+                for (double thetaO : {0.0, 0.9}) {
+                    hair::Params pr; pr.betaM = beta; pr.betaN = beta; pr.alpha = 0.0;
+                    const hair::Bcsdf b = hair::make(pr, hh, 0.0);
+                    const Vec3 wo{std::sin(thetaO), std::cos(thetaO), 0.0};
+                    const int N = 60000;
+                    double sum = 0.0;
+                    for (int i = 0; i < N; ++i) {
+                        double pd = 0.0, fv = 0.0;
+                        const Vec3 wi = hair::sample(b, wo, frand(), frand(), frand(),
+                                                     frand(), pd, fv);
+                        if (pd > 0.0)
+                            sum += fv * std::sqrt(std::max(0.0, 1.0 - wi.x * wi.x)) / pd;
+                    }
+                    worstMC = std::max(worstMC, std::fabs(sum / N - 1.0));
+                }
+        std::printf("[checkhair] S1 furnace by the model's own sampler: worst "
+                    "|estimate - 1| over 18 combos = %.4f\n", worstMC);
+        ok &= want("S1 f and its sampler do not integrate to unit albedo", worstMC < 0.01);
+    }
+
+    // --- S2 the two M_p branches meet ----------------------------------------
+    // Compared as FORMULAE at one v, not by stepping across the crossover: stepping also
+    // moves the function itself, and M_p's slope near v = 0.1 is steep enough to swamp
+    // the thing being measured (the first draft of this test read 3.8e-5 of pure slope
+    // and looked like a bug). Their exact ratio is 1/(1 - exp(-2/v)) — the small-v branch
+    // drops the negative half of sinh — so at v = 0.1 they must agree to ~2e-9.
+    {
+        auto mpBig = [](double ci, double co, double si, double so, double v) {
+            const double a = ci * co / v, b = si * so / v;
+            return (std::exp(-b) * hair::besselI0(a)) / (std::sinh(1.0 / v) * 2.0 * v);
+        };
+        auto mpSmall = [](double ci, double co, double si, double so, double v) {
+            const double a = ci * co / v, b = si * so / v;
+            return std::exp(hair::logBesselI0(a) - b - 1.0 / v + 0.6931471805599453 +
+                            std::log(0.5 / v));
+        };
+        double worstRel = 0.0;
+        for (double v : {0.06, 0.08, 0.1, 0.13, 0.2})
+            for (double ci : {0.2, 0.6, 0.99})
+                for (double co : {0.3, 0.8}) {
+                    const double si = std::sqrt(1 - ci * ci), so = std::sqrt(1 - co * co);
+                    const double a = mpBig(ci, co, si, so, v), b2 = mpSmall(ci, co, si, so, v);
+                    if (a > 1e-300)
+                        worstRel = std::max(worstRel, std::fabs(a - b2) / a - std::exp(-2.0 / v));
+                }
+        std::printf("[checkhair] S2 M_p branches, relative gap beyond the analytic "
+                    "exp(-2/v): %.3g\n", worstRel);
+        ok &= want("S2 the two M_p branches are not the same function", worstRel < 1e-12);
+        // The Bessel evaluator's own two branches (series below 12, asymptotic above).
+        double worstB = 0.0;
+        for (double x : {8.0, 10.0, 11.0, 11.9})
+            worstB = std::max(worstB, std::fabs(hair::logBesselI0(x) -
+                                                std::log(hair::besselI0(x))));
+        std::printf("[checkhair] S2 logBesselI0 vs log(besselI0) below the split: %.3g\n",
+                    worstB);
+        ok &= want("S2 logBesselI0 disagrees with its own series", worstB < 1e-12);
+    }
+
+    // --- S3 M_p is normalised over the longitudinal angle --------------------
+    // Deterministic midpoint quadrature, not Monte Carlo. M_p at v = 0.005 is a spike
+    // 0.07 rad wide in a pi-wide domain, which uniform MC estimates terribly (the first
+    // draft wobbled by 1% and could not have detected a 0.5% normalisation error). A
+    // 400k-point grid resolves the narrowest lobe with ~900 samples across it and lands
+    // at quadrature precision instead.
+    {
+        double worstNorm = 0.0;
+        const int N = 400000;
+        for (double v : {0.005, 0.05, 0.1, 0.4, 1.0})
+            for (double thetaO : {0.0, 0.7, -1.1}) {
+                const double so = std::sin(thetaO), co = std::cos(thetaO);
+                double sum = 0.0;
+                for (int i = 0; i < N; ++i) {
+                    const double ti = -0.5 * hair::kPi + hair::kPi * (i + 0.5) / N;
+                    sum += hair::Mp(std::cos(ti), co, std::sin(ti), so, v) * std::cos(ti);
+                }
+                worstNorm = std::max(worstNorm, std::fabs(sum * hair::kPi / N - 1.0));
+            }
+        std::printf("[checkhair] S3 worst |integral M_p cos dtheta - 1| = %.3g\n", worstNorm);
+        ok &= want("S3 M_p is not normalised", worstNorm < 1e-6);
+    }
+
+    // --- S4 N_p is normalised over one revolution ----------------------------
+    {
+        double worstNorm = 0.0;
+        const int N = 400000;
+        for (double s : {0.01, 0.1, 0.3, 1.0})
+            for (int p = 0; p < hair::kPMax; ++p) {
+                double sum = 0.0;
+                for (int i = 0; i < N; ++i)
+                    sum += hair::Np(-hair::kPi + 2.0 * hair::kPi * (i + 0.5) / N,
+                                    p, s, 0.3, 0.2);
+                worstNorm = std::max(worstNorm, std::fabs(sum * 2.0 * hair::kPi / N - 1.0));
+            }
+        std::printf("[checkhair] S4 worst |integral N_p dphi - 1| = %.3g\n", worstNorm);
+        ok &= want("S4 N_p is not normalised on the circle", worstNorm < 1e-6);
+
+        double worstQ = 0.0;
+        for (double s : {0.05, 0.3}) {
+            const int N = 200000;
+            const double q = 0.4;                     // an arbitrary interior point
+            int below = 0;
+            for (int i = 0; i < N; ++i)
+                if (hair::sampleTrimmedLogistic(frand(), s, -hair::kPi, hair::kPi) < q) ++below;
+            const double wantF = (hair::logisticCdf(q, s) - hair::logisticCdf(-hair::kPi, s)) /
+                                 (hair::logisticCdf(hair::kPi, s) -
+                                  hair::logisticCdf(-hair::kPi, s));
+            worstQ = std::max(worstQ, std::fabs((double)below / N - wantF));
+        }
+        std::printf("[checkhair] S4 trimmed-logistic sampler CDF error = %.4f\n", worstQ);
+        ok &= want("S4 the trimmed-logistic sampler does not match its CDF", worstQ < 0.01);
+    }
+
+    // --- S5 sample() and pdf() are the same distribution ---------------------
+    // The test that actually protects the renderer, in two independent statements: the
+    // returned pdf equals a fresh pdf() call on the sampled direction (cheap, exact), and
+    // the EMPIRICAL density of sampled directions matches pdf() in coarse bins (dear, but
+    // the only thing that catches a sampler drawing the right shape with the wrong
+    // normalisation — which self-consistency alone cannot see).
+    {
+        hair::Params pr; pr.betaM = 0.25; pr.betaN = 0.35; pr.alpha = 2.0;
+        const hair::Bcsdf b = hair::make(pr, 0.4, 0.2);
+        const Vec3 wo = normalize(Vec3{0.35, 0.8, -0.2});
+        double worstSelf = 0.0;
+        int bad = 0;
+        for (int i = 0; i < 20000; ++i) {
+            double pd = 0.0, fv = 0.0;
+            const Vec3 wi = hair::sample(b, wo, frand(), frand(), frand(), frand(), pd, fv);
+            if (!(std::isfinite(wi.x) && std::isfinite(wi.y) && std::isfinite(wi.z))) {
+                ++bad; continue;
+            }
+            if (!(pd > 0.0)) continue;
+            worstSelf = std::max(worstSelf,
+                                 std::fabs(pd - hair::pdf(b, wo, wi)) / pd);
+            if (fv > 0.0)
+                worstSelf = std::max(worstSelf, std::fabs(fv - hair::f(b, wo, wi)) / fv);
+        }
+        std::printf("[checkhair] S5 sample() self-consistency: worst relative "
+                    "disagreement %.3g, %d non-finite directions\n", worstSelf, bad);
+        ok &= chk("S5 sample() returns a pdf/f its own evaluators disagree with",
+                  worstSelf, 0.0, 1e-12);
+        ok &= want("S5 sample() produced a non-finite direction", bad == 0);
+
+        const int NB = 8;                              // NB x NB bins in (sin theta, phi)
+        std::vector<double> histo((size_t)NB * NB, 0.0), model((size_t)NB * NB, 0.0);
+        auto binOf = [&](const Vec3& w) {
+            const int bi = (int)hair::clampd((w.x * 0.5 + 0.5) * NB, 0.0, NB - 1e-9);
+            const int bj = (int)hair::clampd(
+                (std::atan2(w.z, w.y) / (2 * hair::kPi) + 0.5) * NB, 0.0, NB - 1e-9);
+            return (size_t)bi * NB + bj;
+        };
+        const int NS = 400000;
+        int kept = 0;
+        for (int i = 0; i < NS; ++i) {
+            double pd = 0.0, fv = 0.0;
+            const Vec3 wi = hair::sample(b, wo, frand(), frand(), frand(), frand(), pd, fv);
+            if (!(pd > 0.0)) continue;
+            histo[binOf(wi)] += 1.0;
+            ++kept;
+        }
+        const int NM = 400000;
+        for (int i = 0; i < NM; ++i) {
+            const Vec3 wi = sphereDir(frand(), frand());
+            model[binOf(wi)] += hair::pdf(b, wo, wi);
+        }
+        double mtot = 0.0;
+        for (double m : model) mtot += m;
+        double worstBin = 0.0, totalVar = 0.0;
+        for (size_t i = 0; i < histo.size(); ++i) {
+            const double a = histo[i] / std::max(kept, 1);
+            const double m = model[i] / std::max(mtot, 1e-12);
+            totalVar += 0.5 * std::fabs(a - m);
+            if (a + m > 0.01) worstBin = std::max(worstBin, std::fabs(a - m) / (a + m));
+        }
+        std::printf("[checkhair] S5 sampled-vs-pdf density: total variation %.4f, "
+                    "worst significant bin %.3f\n", totalVar, worstBin);
+        ok &= want("S5 sample() does not draw from pdf()", totalVar < 0.03 && worstBin < 0.10);
+    }
+
+    // --- S6 the pdf integrates to 1 ------------------------------------------
+    //
+    // Not by Monte Carlo. The pdf is a sum of `kPMax + 1` products
+    //     pdf(wi) = sum_p  w_p * M_p(theta_i; theta_o^p) * N_p(phi)
+    // and dw = cos(theta_i) dtheta_i dphi in the fiber frame, so the integral
+    // *separates*:
+    //     int pdf dw = sum_p w_p * (int M_p cos dtheta) * (int N_p dphi).
+    // S3 already pinned the first bracket to 1 and S4 the second, both by
+    // deterministic quadrature at 1e-6. So all that is left to check is that the
+    // lobe weights themselves sum to one -- which is exact arithmetic, testable at
+    // 1e-12 instead of the ~3% a uniform-sphere estimator can manage against a lobe
+    // this narrow. (The old MC form reported 0.058 here purely as estimator noise.)
+    {
+        double worstW = 0.0;
+        bool nonNeg = true;
+        for (double beta : {0.15, 0.5, 0.85})
+            for (double hh : {-0.9, -0.7, 0.1, 0.85, 0.99})
+                for (double sa : {0.0, 0.35, 4.0})
+                    for (double thO : {-1.2, -0.3, 0.0, 0.55, 1.3}) {
+                        hair::Params pr; pr.betaM = beta; pr.betaN = beta; pr.alpha = 2.0;
+                        const hair::Bcsdf b = hair::make(pr, hh, sa);
+                        double w[hair::kPMax + 1];
+                        hair::apPdf(b, std::sin(thO), std::cos(thO), w);
+                        double s = 0.0;
+                        for (int p = 0; p <= hair::kPMax; ++p) {
+                            if (!(w[p] >= 0.0)) nonNeg = false;
+                            s += w[p];
+                        }
+                        worstW = std::max(worstW, std::fabs(s - 1.0));
+                    }
+        std::printf("[checkhair] S6 lobe-selection weights: worst |sum - 1| over 225 combos "
+                    "= %.3g\n", worstW);
+        ok &= chk("S6 the lobe weights are not a probability mass function", worstW, 0.0, 1e-12);
+        ok &= want("S6 a lobe-selection weight is negative or not finite", nonNeg);
+
+        // Guard against the separability argument itself being wrong (a stray factor
+        // that depends on both angles would slip past S3/S4/the sum above). One
+        // deterministic midpoint quadrature over the whole sphere, coarse enough to be
+        // cheap and fine enough to resolve the lobes at this roughness.
+        hair::Params pr; pr.betaM = 0.4; pr.betaN = 0.4; pr.alpha = 2.0;
+        double worstQ = 0.0;
+        for (double hh : {-0.55, 0.3}) {
+            const hair::Bcsdf b = hair::make(pr, hh, 0.35);
+            const Vec3 wo = normalize(Vec3{0.2, 0.9, 0.3});
+            const int NT = 1024, NP = 1024;
+            double sum = 0.0;
+            for (int it = 0; it < NT; ++it) {
+                const double th = -0.5 * hair::kPi + hair::kPi * (it + 0.5) / NT;
+                const double st = std::sin(th), ct = std::cos(th);
+                double row = 0.0;
+                for (int ip = 0; ip < NP; ++ip) {
+                    const double az = -hair::kPi + 2.0 * hair::kPi * (ip + 0.5) / NP;
+                    row += hair::pdf(b, wo, Vec3{st, ct * std::cos(az), ct * std::sin(az)});
+                }
+                sum += row * ct;
+            }
+            sum *= (hair::kPi / NT) * (2.0 * hair::kPi / NP);
+            worstQ = std::max(worstQ, std::fabs(sum - 1.0));
+        }
+        std::printf("[checkhair] S6 quadrature guard, worst |integral pdf dw - 1| = %.3g\n",
+                    worstQ);
+        ok &= want("S6 the BCSDF pdf is not a normalised density", worstQ < 1e-6);
+    }
+
+    // --- S7 absorption and Fresnel -------------------------------------------
+    {
+        hair::Params pr; pr.betaM = 0.3; pr.betaN = 0.3; pr.alpha = 0.0;
+        const Vec3 wo{0.0, 1.0, 0.0};
+        double prev = 1e30, e0 = 0.0;
+        bool mono = true;
+        for (double sa : {0.0, 0.05, 0.2, 0.8, 3.0}) {
+            const hair::Bcsdf b = hair::make(pr, 0.3, sa);
+            const int N = 120000;
+            double sum = 0.0;
+            for (int i = 0; i < N; ++i) {
+                const Vec3 wi = sphereDir(frand(), frand());
+                sum += hair::f(b, wo, wi) * std::sqrt(std::max(0.0, 1.0 - wi.x * wi.x));
+            }
+            const double e = sum / N * 4.0 * hair::kPi;
+            if (sa == 0.0) e0 = e;
+            if (e > prev + 1e-3) mono = false;
+            prev = e;
+        }
+        std::printf("[checkhair] S7 albedo falls %.4f -> %.4f as sigma_a goes 0 -> 3, "
+                    "monotone %s\n", e0, prev, mono ? "yes" : "NO");
+        ok &= want("S7 absorption does not monotonically darken the fiber", mono);
+
+        // Even opaque, R survives: it never enters the fiber. An implementation that
+        // applies absorption to every lobe passes everything above and fails here.
+        double apO[hair::kPMax + 1];
+        hair::Ap(1.0, pr.eta, 0.3, std::exp(-1e4), apO);
+        std::printf("[checkhair] S7 opaque fiber: A_R = %.4f, A_TT = %.3g, A_TRT = %.3g\n",
+                    apO[0], apO[1], apO[2]);
+        ok &= want("S7 the R lobe was wrongly attenuated by absorption", apO[0] > 0.02);
+        ok &= want("S7 TT survived an opaque fiber", apO[1] < 1e-12);
+
+        ok &= chk("S7 normal-incidence Fresnel", hair::frDielectric(1.0, 1.0, 1.55),
+                  sq(0.55 / 2.55), 1e-12);
+        ok &= chk("S7 grazing Fresnel -> 1", hair::frDielectric(0.0, 1.0, 1.55), 1.0, 1e-12);
+        for (double c : {0.2, 0.5, 0.8})
+            std::printf("[checkhair] S7 reflectance %.2f -> sigma_a %.4f\n",
+                        c, hair::sigmaAFromReflectance(c, 0.3));
+        ok &= want("S7 a darker target must absorb more",
+                   hair::sigmaAFromReflectance(0.2, 0.3) >
+                   hair::sigmaAFromReflectance(0.8, 0.3));
+    }
+
+    // --- S8 the lobes are where the geometry says ----------------------------
+    {
+        hair::Params pr; pr.betaM = 0.06; pr.betaN = 0.06; pr.alpha = 0.0;
+        const hair::Bcsdf b = hair::make(pr, 0.0, 0.02);     // h = 0: dead-centre hit
+        const Vec3 wo{0.0, 1.0, 0.0};
+        // At h = 0 (gammaO = gammaT = 0) the specular R exit is straight back and TT is
+        // straight through; Phi(p) must say exactly that.
+        ok &= chk("S8 R exit azimuth at h = 0",
+                  std::fabs(hair::wrapAngle(hair::Phi(0, 0, 0))), 0.0, 1e-12);
+        ok &= chk("S8 TT exit azimuth at h = 0",
+                  std::fabs(hair::wrapAngle(hair::Phi(1, 0, 0))), hair::kPi, 1e-12);
+
+        // The real test: off-centre, where R / TT / TRT leave at three *different*
+        // azimuths, does the rendered lobe actually sit where refraction says it does?
+        //
+        // Counting "significant peaks" was the wrong instrument. At h = 0 the three
+        // exit directions collapse onto two, and TT (A ~ 0.87, and the narrowest v)
+        // stands ~74x above R + TRT, so the second peak sits at ~1.6% of the max and any
+        // global amplitude threshold either misses it or admits noise. Amplitude ratios
+        // between lobes are not what this section is about. So: predict each azimuth
+        // from Snell independently of hair::Phi, then require a local maximum of the
+        // swept BCSDF within a couple of degrees of it.
+        const double hh = 0.6;
+        hair::Params p3; p3.betaM = 0.06; p3.betaN = 0.06; p3.alpha = 0.0;
+        const hair::Bcsdf b3 = hair::make(p3, hh, 0.02);
+        // wo is broadside (theta_o = 0), so the Bravais index degenerates to eta itself.
+        const double gO = std::asin(hh), gT = std::asin(hh / p3.eta);
+        ok &= chk("S8 gamma_o from the impact parameter", b3.gammaO, gO, 1e-12);
+
+        const int NS = 7200;                      // 0.05 deg -- finer than the tolerance
+        std::vector<double> curve((size_t)NS);
+        for (int i = 0; i < NS; ++i) {
+            const double phi = -hair::kPi + 2.0 * hair::kPi * (i + 0.5) / NS;
+            curve[(size_t)i] = hair::f(b3, wo, Vec3{0.0, std::cos(phi), std::sin(phi)});
+        }
+        for (int p = 0; p <= 2; ++p) {
+            const double want_ = hair::wrapAngle(2.0 * p * gT - 2.0 * gO + p * hair::kPi);
+            ok &= chk(p == 0 ? "S8 hair::Phi matches Snell for R"
+                    : p == 1 ? "S8 hair::Phi matches Snell for TT"
+                             : "S8 hair::Phi matches Snell for TRT",
+                      hair::wrapAngle(hair::Phi(p, gO, gT)), want_, 1e-12);
+            // Best point of the curve within +-10 deg of the prediction.
+            const int c = (int)std::floor((want_ + hair::kPi) / (2.0 * hair::kPi) * NS);
+            const int w = NS / 36;
+            int bi = c; double bv = -1e30;
+            for (int d = -w; d <= w; ++d) {
+                const int j = ((c + d) % NS + NS) % NS;
+                if (curve[(size_t)j] > bv) { bv = curve[(size_t)j]; bi = j; }
+            }
+            const bool isMax = curve[(size_t)bi] >= curve[(size_t)((bi + NS - 1) % NS)] &&
+                               curve[(size_t)bi] >= curve[(size_t)((bi + 1) % NS)] &&
+                               bi != ((c - w) % NS + NS) % NS &&
+                               bi != ((c + w) % NS + NS) % NS;
+            const double got = -hair::kPi + 2.0 * hair::kPi * (bi + 0.5) / NS;
+            const double err = std::fabs(hair::wrapAngle(got - want_)) * 180.0 / hair::kPi;
+            std::printf("[checkhair] S8 p=%d (%s) at h = 0.6: predicted %+7.2f deg, "
+                        "peak at %+7.2f deg (%.3f off), height %.4g\n",
+                        p, p == 0 ? "R  " : p == 1 ? "TT " : "TRT",
+                        want_ * 180.0 / hair::kPi, got * 180.0 / hair::kPi, err, bv);
+            char lbl[96];
+            std::snprintf(lbl, sizeof lbl, "S8 no local maximum near the p=%d exit", p);
+            ok &= want(lbl, isMax);
+            std::snprintf(lbl, sizeof lbl, "S8 p=%d lobe is off its predicted azimuth", p);
+            ok &= want(lbl, err < 2.0);
+        }
+
+        auto peakTheta = [&](double alphaDeg) {
+            hair::Params p2; p2.betaM = 0.06; p2.betaN = 0.06; p2.alpha = alphaDeg;
+            const hair::Bcsdf b2 = hair::make(p2, 0.0, 0.02);
+            double best = -1e30, bestT = 0.0;
+            for (int i = 0; i < 4000; ++i) {
+                const double th = -1.5 + 3.0 * i / 3999.0;
+                const double v = hair::f(b2, wo, Vec3{std::sin(th), -std::cos(th), 0.0});
+                if (v > best) { best = v; bestT = th; }
+            }
+            return bestT;
+        };
+        const double t0 = peakTheta(0.0), t3 = peakTheta(3.0);
+        std::printf("[checkhair] S8 R highlight theta: alpha=0 %.4f rad, alpha=3deg %.4f "
+                    "rad, shift %.2f deg\n", t0, t3, (t3 - t0) * 180.0 / hair::kPi);
+        ok &= want("S8 the cuticle tilt does not move the highlight",
+                   std::fabs(t3 - t0) > 0.02);
+    }
+
+    // --- S9 the geometry hookup ----------------------------------------------
+    {
+        double worstH = 0.0;
+        const Vec3 axis = normalize(Vec3{0.3, 1.0, -0.2});
+        Vec3 e1, e2; onb(axis, e1, e2);
+        for (int i = 0; i < 500; ++i) {
+            const double hTrue = frand() * 2.0 - 1.0;
+            const double gamma = std::asin(hTrue);
+            // Outward normal at a hit whose normal-plane angle to `wo` is exactly gamma.
+            const Vec3 n = e1 * std::cos(gamma) - e2 * std::sin(gamma);
+            const double thetaO = (frand() - 0.5) * 2.0;         // any longitudinal tilt
+            const Vec3 wo = normalize(axis * std::sin(thetaO) + e1 * std::cos(thetaO));
+            worstH = std::max(worstH, std::fabs(hair::hFromHit(n, axis, wo) - hTrue));
+        }
+        std::printf("[checkhair] S9 worst |h recovered - h true| over 500 hits = %.3g\n",
+                    worstH);
+        ok &= chk("S9 hFromHit does not invert the hit geometry", worstH, 0.0, 1e-9);
+
+        double worstF = 0.0;
+        for (int i = 0; i < 500; ++i) {
+            const Vec3 ax = normalize(Vec3{frand() * 2 - 1, frand() * 2 - 1, frand() * 2 - 1});
+            Vec3 a, bb; onb(ax, a, bb);
+            const double g = frand() * 2.0 * hair::kPi;
+            const hair::Frame fr = hair::frameFromHit(a * std::cos(g) + bb * std::sin(g), ax);
+            const Vec3 w = sphereDir(frand(), frand());
+            worstF = std::max(worstF, length(hair::toWorld(fr, hair::toLocal(fr, w)) - w));
+            worstF = std::max(worstF, std::fabs(hair::toLocal(fr, ax).x - 1.0));
+        }
+        std::printf("[checkhair] S9 worst frame round-trip error = %.3g\n", worstF);
+        ok &= chk("S9 the fiber frame does not round-trip", worstF, 0.0, 1e-12);
+    }
+
+    std::printf("[checkhair] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkhair] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -11846,6 +12358,7 @@ static int run(int argc, char** argv) {
     bool checkReactionOnly = false;
     bool checkFNoiseOnly = false;
     bool checkStochTileOnly = false;
+    bool checkHairOnly = false;
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
     bool checkSdfOnly = false;
@@ -12267,6 +12780,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkreaction")) checkReactionOnly = true;
         else if (!std::strcmp(argv[i], "-checkfnoise")) checkFNoiseOnly = true;
         else if (!std::strcmp(argv[i], "-checkstochtile")) checkStochTileOnly = true;
+        else if (!std::strcmp(argv[i], "-checkhair")) checkHairOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
@@ -12460,6 +12974,7 @@ static int run(int argc, char** argv) {
     if (checkReactionOnly)  return checkReaction();   // ditto (Gray-Scott reaction-diffusion bake)
     if (checkFNoiseOnly)    return checkFNoise();     // ditto (filtered / band-limited fBm)
     if (checkStochTileOnly) return checkStochTile();  // ditto (histogram-preserving tiling)
+    if (checkHairOnly)     return checkHair();     // ditto (fiber BCSDF, no scene)
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)
