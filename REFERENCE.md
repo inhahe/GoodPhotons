@@ -2030,7 +2030,8 @@ The `expr` string is compiled by the **same math VM as procedural patterns** (va
 `x y z` and `r = |p|`, plus `sin cos tan exp log sqrt abs floor fract sign min max pow
 atan2 clamp mix smoothstep noise`, the vector-noise components `dnoisex/y/z` /
 `dturbx/y/z` for gradient-noise domain warping, cellular noise
-`worley/worley2/worleyd/worleyid(x, y, z, metric)`, and the constant `pi`). Because an arbitrary field is
+`worley/worley2/worleyd/worleyid(x, y, z, metric)`, blue-noise placement
+`bnoise/bnoise2/bnoised/bnoiseid(x, y, z, r)`, and the constant `pi`). Because an arbitrary field is
 **not** a signed distance and has no analytic bound, a `function` isosurface **must**
 supply a `contained_by { min <x y z>  max <x y z> }` box (the region the surface is
 marched inside). Safe sphere-tracing needs a **Lipschitz bound** `L ≥ max|∇f|` so a step
@@ -2385,6 +2386,29 @@ or a native-primitive wrap — see below), the **mean curvature `curv`** (see
   the variance independent of `f`. Worked example `scenes/pattern_gabor.ftsl`
   (isotropic speckle, brushed metal, wood rings round an off-screen trunk, flow-aligned
   fibre), deterministic self-test `ftrace -checkgabor`.
+  Alongside Worley there is **blue-noise (Poisson-disk) placement** —
+  `bnoise(x, y, z, r)` / `bnoise2` / `bnoised` / `bnoiseid`, the same four slots over a
+  point set with a **guaranteed minimum separation** `r` (in cell units, clamped to
+  `[0,1]`). This is the placement primitive for scattered features — freckles, pores,
+  seeds, dimples, spatter. Worley's sites are a jittered lattice, so two of them can be
+  arbitrarily close (both jitter to the shared cell wall) while elsewhere the lattice
+  leaves holes; threshold F1 to draw spots and that clumping reads instantly as computer
+  texture. Evenness is a property of *where the points are* and cannot be recovered
+  downstream, which is why it needs its own primitive rather than a filter. `r` sweeps
+  continuously: at `r = 0` nothing is excluded and the set is exactly the jittered
+  lattice (so this is a strict generalisation of Worley's placement); at `r = 1` it is
+  maximally blue, keeping 0.2661 points per cell. Pair `bnoiseid` with `bnoise` to give
+  each spot its own radius — equal-sized dots read as polka dots, unequal ones as
+  freckles. Classical dart-throwing is *sequential* and so cannot answer a per-hit query
+  at all; instead acceptance here is one round of Luby's maximal-independent-set
+  algorithm under a strict total order on candidates (equivalently a Matérn type-II
+  thinning of a jittered lattice), which makes the separation a **theorem** and
+  membership a purely **local** predicate — so an unbounded set is queryable in `O(1)`
+  with no bake, no tiling and no repetition, at essentially Worley's cost (29 cells
+  hashed per query against Worley's 27). Worked example
+  `scenes/pattern_bluenoise.ftsl` (which puts Worley- and blue-noise-placed spots on the
+  two halves of one wall at matched density), deterministic self-test
+  `ftrace -checkbluenoise`.
   It can also **sample a declared image
   as a term**: `tex:<name>(u, v)` returns the mean of the texel's three linear RGB
   channels (the same `Texture::scalarAt` sampler a `texture:<name>` slot binding uses,
@@ -3541,7 +3565,8 @@ alone can't restore, so they are not disk-resumable.
 `-checkcurve`, `-checkfur`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
-`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`, `-checkcurv`,
+`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
+`-checkbluenoise`, `-checkcurv`,
 `-checkcavity`, `-checksdf`, `-checksun`,
 `-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints

@@ -483,6 +483,61 @@ F1/F2 are mathematically exact (adaptive ring search, not the common fixed
 `-checkworley`. Worked example: `scenes/pattern_worley.ftsl` (all four outputs,
 all three metrics).
 
+**Blue-noise placement — `bnoise`, `bnoise2`, `bnoised`, `bnoiseid`:** the same four
+slots as `worley`, over a **different point set** — one with a guaranteed **minimum
+separation**. All four take `(x, y, z, r)`:
+
+| function | value |
+|---|---|
+| `bnoise` | **F1** — distance to the nearest point of the set |
+| `bnoise2` | **F2** — distance to the second-nearest |
+| `bnoised` | **F2 − F1** — the crack network of *its* Voronoi diagram |
+| `bnoiseid` | flat random value in `[0,1)` owned by the F1 point |
+
+`r` is the separation radius in cell units, clamped to `[0,1]`. **No two points of the
+set are closer than `r`**, and that is a theorem about the construction, not a
+statistical tendency. Worley's sites are a jittered lattice, so two of them can be
+arbitrarily close (both jitter to the shared cell wall) while elsewhere the lattice
+leaves holes; threshold F1 to draw spots and the clumping is instantly legible as
+computer texture — fused pairs beside bald patches. Evenness is a property of *where
+the points are* and no amount of downstream filtering puts it back, which is why this
+is a separate primitive rather than a mode of `worley`.
+
+`r` sweeps continuously between the two: `r = 0` vetoes nothing and reproduces the
+jittered lattice exactly (density 1 point per cell), `r = 1` is maximally blue and keeps
+0.2661 of the candidates, with F1 spanning about `[0, 1.6]`. Matching a `worley`
+texture's spot *density* therefore needs a smaller worley cell — `0.2661^(1/3) = 0.6432`
+times the size at `r = 1`.
+
+```
+# evenly spread discs, 24 per unit, no two able to touch
+pattern "dots" { expr "1 - smoothstep(0.36, 0.42, bnoise(24*x, 24*y, 24*z, 1))" }
+
+# ...with a per-point random radius, which only the id makes possible
+pattern "freckle" {
+    expr "1 - smoothstep(0.09, 0.16 + 0.30*bnoiseid(26*x, 26*y, 26*z, 1),
+                         bnoise(26*x, 26*y, 26*z, 1))"
+}
+```
+
+Two authoring notes. Keep the largest radius below `0.5` cells if discs on adjacent
+sites must never touch. And remember the set is **solid**: a surface cuts the spheres at
+assorted depths and sees discs of radius `sqrt(R² − h²)`, so a uniform `R` already gives
+a spread of spot sizes on any surface, with a few near-tangential ones very small.
+
+Classical Poisson-disk sampling (dart throwing) cannot be used here: acceptance of a
+dart depends on every dart accepted before it, so answering "nearest point to `p`" would
+mean simulating the whole plane. Instead each cell holds one candidate carrying a random
+rank, and a candidate is kept iff no candidate within `r` outranks it — one round of
+Luby's MIS, i.e. a Matérn type-II thinning of a stratified parent. That predicate is
+**local**, so a query is O(1) at an arbitrary point of an unbounded domain with no bake,
+and the ordering is a strict *total* order (rank, then cell coordinates) so colliding
+ranks cannot let an overlapping pair through. Cost is Worley's: ~29 cells hashed per
+query against 27, thanks to a per-cell geometric bound and a rank test that runs before
+any position is computed. Bit-identical on CPU and GPU, validated by `-checkbluenoise`.
+Worked example: `scenes/pattern_bluenoise.ftsl` (a matched-density side-by-side against
+`worley`, freckles, cobbles, lichen, golf-ball dimples).
+
 **Anisotropic noise — `gabor(x, y, z, f, wx, wy, wz)`:** band-limited Gabor noise,
 returning `[0,1]` with mean `0.5` like `noise`. `f` is the frequency in **cycles per
 unit of the coordinates you pass in**, and `(wx, wy, wz)` is the **steering
@@ -1703,7 +1758,9 @@ and a Lipschitz bound (`max_gradient`, see §10.3).
   work here too — they need only coordinates — so a field can be domain-warped by
   gradient noise, and so does cellular noise
   `worley/worley2/worleyd/worleyid(x,y,z,metric)` (§6.1) for crystal/stone-like
-  fields and `gabor(x,y,z,f,wx,wy,wz)` (§6.1) for directional ones — though a field
+  fields, blue-noise placement `bnoise/bnoise2/bnoised/bnoiseid(x,y,z,r)` (§6.1) for
+  evenly-spread blobs, and `gabor(x,y,z,f,wx,wy,wz)` (§6.1) for directional ones —
+  though a field
   driven by Gabor noise needs a generous `max_gradient`, since its slope scales with
   `f`. The image sample
   `tex:<name>(u, v)` (§6.1) is **not** available here — a field expression *defines* a

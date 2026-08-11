@@ -4502,6 +4502,14 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                            (double)ff, (double)dx, (double)dy, (double)dz);
                 break;
             }
+            case PatOp::BlueNoise: {  // Poisson-disk placement (double core): promote / demote
+                float rr = st[--sp], zz = st[--sp], yy = st[--sp];
+                double b[3];
+                patBlueNoise((double)st[sp-1], (double)yy, (double)zz, (double)rr, b);
+                int sel = (int)nd.a;
+                st[sp-1] = (float)((sel == 3) ? b[2] : (sel == 2) ? (b[1] - b[0]) : b[sel]);
+                break;
+            }
             case PatOp::PovFn: {   // POV internals are double-only: promote args, demote result
                 int id = (int)nd.a;
                 int na = povFnArity(id);

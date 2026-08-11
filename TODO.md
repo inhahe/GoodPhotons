@@ -4782,12 +4782,34 @@ the *randomness vocabulary* is thin. Nothing below is started.
       stretches the kernels. Wood end grain is the demo that makes the varying-direction case obvious:
       steer radially about a vertical axis and the bands close into growth rings, one expression, no
       polar remap.
-- [ ] **O5 — blue noise / sparse convolution *placement*.** Gabor noise itself is **done** under O4
-      above (v0.165.0) — band-limited, anisotropic, sparse-convolution, and it answers the
-      "antialiases properly under minification" half of this item. What is still missing is the
-      *placement* half: blue-noise point sets for freckles, pores, spots — a Poisson-disk / dart-throwing
-      point set queryable from a pattern the way `worley` queries its jittered lattice. Note
-      `patGaborRaw`'s per-cell Poisson draw is already most of the machinery.
+- [x] **O5 — blue noise / sparse convolution *placement*.** ✅ **DONE v0.166.0** —
+      `bnoise/bnoise2/bnoised/bnoiseid(x, y, z, r)` in `src/bluenoise.h`: the same four slots as
+      `worley` (F1, F2, F2−F1, per-point id) over a point set with a **guaranteed minimum separation**
+      `r` in cell units. (The Gabor half of this item landed under O4 at v0.165.0.)
+
+      Why it had to be a new primitive: Worley's sites are a jittered lattice, so two can be
+      arbitrarily close (measured closest pair 0.026 in a 70³ block) while elsewhere the lattice leaves
+      holes — and evenness is a property of *where the points are*, so no filtering of `worley`'s output
+      recovers it.
+
+      Why dart throwing was not the answer: it is **sequential** (a dart's fate depends on every dart
+      before it), so "nearest point to `p`" would mean simulating the whole plane, against a requirement
+      of O(1) at an arbitrary point of an unbounded domain with no bake and bit-identical CPU/GPU
+      results. Instead acceptance is made **locally decidable** — one candidate per cell (jittered
+      position + 32-bit rank), kept iff nothing within `r` outranks it: one round of Luby's MIS, i.e. a
+      Matérn type-II thinning of a *stratified* parent. Separation becomes a theorem, and 3×3×3 is exact
+      for `r ≤ 1`. The order is strict and **total** (rank, then `cz/cy/cx`) — with a merely partial one,
+      colliding ranks (certain somewhere in an unbounded domain) would let an overlapping pair through.
+
+      Three results worth keeping: stratification retains 0.2665/cell, **12% above** the dense-Poisson
+      Matérn-II ceiling `3/(4π) = 0.23873`, so adding candidates per cell would make the set sparser;
+      the conflict count is not the ball volume but `E[N] = (3/2)πr⁴ − (8/5)r⁵ + (1/6)r⁶` once the
+      candidate's own (competitor-free) cell is subtracted; and two early-outs — a per-cell geometric
+      bound before hashing, and rank compared before position — hold the cost to ~29 cells hashed per
+      query against Worley's 27. `r = 0` reproduces the jittered lattice exactly, so this is a strict
+      generalisation. Nine-section `-checkbluenoise`, none of which can pass vacuously; worked example
+      `scenes/pattern_bluenoise.ftsl` (matched-density side-by-side against `worley`, freckles, cobbles,
+      lichen, golf-ball dimples).
 - [ ] **O6 — reaction–diffusion.** Zero hits. Gray–Scott on a texture domain is the classic route to
       coat patterning (spots→stripes→labyrinths as one continuous knob) and is a *bake* step, not a
       per-hit evaluation, so it fits the existing `tex:` path: bake offline → sample in a formula.

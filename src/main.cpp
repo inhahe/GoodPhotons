@@ -3552,6 +3552,517 @@ static int checkGabor() {
     return ok ? 0 : 1;
 }
 
+// Blue-noise / Poisson-disk placement self-test (src/bluenoise.h: patBlueNoise,
+// patBNAccept, patBNPrecedes; src/pattern.h: PatOp::BlueNoise, reached from a pattern
+// expression as `bnoise/bnoise2/bnoised/bnoiseid(x, y, z, r)`). O5. No scene, no
+// renderer.
+//
+// The primitive makes two claims that are worth more than a picture, so both are
+// proved here rather than eyeballed:
+//
+//   §1 ACCEPTANCE IS LOCAL AND THE 3x3x3 IS EXACT. patBNAccept prunes twice (a
+//      geometric cell bound before any hashing, then rank before position). A +-3-block
+//      brute force with neither pruning nor early-out must agree on every candidate —
+//      and the section asserts it saw both accepted and rejected ones in quantity, so
+//      it cannot pass by always answering the same thing.
+//   §2 THE QUERY IS EXACT. F1/F2/id from the adaptive ring search must equal a fixed
+//      +-6-block brute force exactly (tolerance 0), which is what validates the ring
+//      early-out and the per-cell lower bound together.
+//   §3 MINIMUM SEPARATION IS A THEOREM. Over every accepted pair in a large block, no
+//      two accepted points are closer than r. This is the property Worley's jittered
+//      lattice cannot have at any r, and the control in the same section measures how
+//      close that lattice's pairs actually get.
+//   §4 STRICT GENERALISATION: at r = 0 nothing is vetoed, so the set must be exactly
+//      the jittered lattice, i.e. Worley's placement with these hashes.
+//   §5 DENSITY vs the analytic one-round ceiling. A candidate survives with probability
+//      E[1/(N+1)] over its exclusion ball, giving (1-exp(-V))/V per cell at unit
+//      candidate density; at r = 1 that is 0.2351. Measured density must match, and
+//      must fall monotonically in r.
+//   §6 IT IS ACTUALLY BLUE, against a MATCHED CONTROL. Two independent diagnostics:
+//      (a) the number variance in fixed boxes, compared with the same candidate set
+//      randomly thinned to the SAME density — random thinning re-injects the
+//      low-frequency energy that the MIS round removes, so the control is what makes
+//      the number a claim rather than a number; (b) the radial distribution function,
+//      which must be exactly 0 inside r, show the characteristic near-contact shell
+//      above it, and relax to 1.
+//   §7 the ring cap is never approached (it exists only so a pathological input cannot
+//      loop), and non-finite inputs return without searching.
+//   §8 COST, honestly reported: mean cells hashed per query against Worley's 27-ish.
+//   §9 the compile path (all four slot spellings, VM == direct call, bad arity and
+//      unknown spellings rejected) and CSE.
+static int checkBlueNoise() {
+    double worst = 0.0;
+    bool ok = true;
+    // As in -checkgabor, `worst` accumulates only the EXACT checks (tol <= 1e-12); the
+    // statistical sections deviate by design and would swamp the headline number.
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (tol <= 1e-12 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkbluenoise] %-46s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+    uint64_t rng = 0xD1B54A32D192ED03ull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+
+    // Brute-force acceptance: no geometric prune, no rank prune, no early-out, and a
+    // +-3 neighbourhood rather than +-1 — so it also proves nothing outside +-1 matters.
+    auto bfAccept = [](int cx, int cy, int cz, double r) {
+        if (!(r > 0.0)) return true;
+        const unsigned int h0 = patBNCellHash(cx, cy, cz);
+        double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+        bool acc = true;
+        for (int dz = -3; dz <= 3; ++dz)
+        for (int dy = -3; dy <= 3; ++dy)
+        for (int dx = -3; dx <= 3; ++dx) {
+            if (dx == 0 && dy == 0 && dz == 0) continue;
+            const int nx = cx + dx, ny = cy + dy, nz = cz + dz;
+            const unsigned int nh = patBNCellHash(nx, ny, nz);
+            double qx, qy, qz; patBNPos(nh, nx, ny, nz, qx, qy, qz);
+            const double ax = qx - px, ay = qy - py, az = qz - pz;
+            if (ax * ax + ay * ay + az * az < r * r &&
+                patBNPrecedes(nh, nx, ny, nz, h0, cx, cy, cz)) acc = false;
+        }
+        return acc;
+    };
+
+    // ---- §1: acceptance is local, and the pruned test equals the brute force -------
+    {
+        long long nAcc = 0, nRej = 0, mismatch = 0;
+        for (int i = 0; i < 20000; ++i) {
+            const int cx = (int)((frand() - 0.5) * 4000.0);
+            const int cy = (int)((frand() - 0.5) * 4000.0);
+            const int cz = (int)((frand() - 0.5) * 4000.0);
+            const double r = (i % 5 == 0) ? 1.0 : frand();
+            const unsigned int h0 = patBNCellHash(cx, cy, cz);
+            double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+            const bool got = patBNAccept(cx, cy, cz, h0, px, py, pz, r);
+            const bool want = bfAccept(cx, cy, cz, r);
+            if (got != want) ++mismatch;
+            if (want) ++nAcc; else ++nRej;
+        }
+        ok &= chk("S1 pruned acceptance == +-3 brute force", (double)mismatch, 0.0, 0.0);
+        // Non-vacuity: a test that only ever saw one answer would prove nothing.
+        if (nAcc < 2000 || nRej < 2000) {
+            std::printf("[checkbluenoise] S1 degenerate sample: %lld accepted, %lld rejected  BAD\n",
+                        nAcc, nRej);
+            ok = false;
+        }
+        std::printf("[checkbluenoise] S1 %lld accepted / %lld rejected, 0 mismatches\n", nAcc, nRej);
+    }
+
+    // ---- §2: the ring search + lower bound give exactly the brute-force answer -----
+    {
+        double wf1 = 0.0, wf2 = 0.0, wid = 0.0;
+        for (int i = 0; i < 600; ++i) {
+            const double x = (frand() - 0.5) * 2000.0;
+            const double y = (frand() - 0.5) * 2000.0;
+            const double z = (frand() - 0.5) * 2000.0;
+            const double r = (i % 4 == 0) ? 1.0 : (0.2 + 0.8 * frand());
+            double out[3]; patBlueNoise(x, y, z, r, out);
+            // brute force: every candidate in +-6, filtered by bfAccept
+            const int bx = (int)std::floor(x), by = (int)std::floor(y),
+                      bz = (int)std::floor(z);
+            double b1 = 1e300, b2 = 1e300; unsigned int bid = 0u;
+            for (int dz = -6; dz <= 6; ++dz)
+            for (int dy = -6; dy <= 6; ++dy)
+            for (int dx = -6; dx <= 6; ++dx) {
+                const int cx = bx + dx, cy = by + dy, cz = bz + dz;
+                if (!bfAccept(cx, cy, cz, r)) continue;
+                const unsigned int h0 = patBNCellHash(cx, cy, cz);
+                double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+                const double ax = x - px, ay = y - py, az = z - pz;
+                const double d = std::sqrt(ax * ax + ay * ay + az * az);
+                if (d < b1) { b2 = b1; b1 = d; bid = patBNMix(h0 ^ PAT_BN_SID); }
+                else if (d < b2) b2 = d;
+            }
+            wf1 = std::fmax(wf1, std::fabs(out[0] - b1));
+            wf2 = std::fmax(wf2, std::fabs(out[1] - b2));
+            wid = std::fmax(wid, std::fabs(out[2] - (double)bid * (1.0 / 4294967296.0)));
+        }
+        ok &= chk("S2 F1 == +-6 brute force (max err)",  wf1, 0.0, 0.0);
+        ok &= chk("S2 F2 == +-6 brute force (max err)",  wf2, 0.0, 0.0);
+        ok &= chk("S2 id == +-6 brute force (max err)",  wid, 0.0, 0.0);
+    }
+
+    // ---- the shared block: every candidate in [0,N)^3, accepted flags + positions --
+    const int N = 72;
+    const int NC = N * N * N;
+    std::vector<unsigned char> acc((size_t)NC, 0);
+    std::vector<double> pos((size_t)NC * 3, 0.0);
+    const double R_MAIN = 1.0;
+    auto idx = [&](int i, int j, int k) { return ((size_t)k * N + j) * N + i; };
+    long long nAccepted = 0;
+    for (int k = 0; k < N; ++k)
+    for (int j = 0; j < N; ++j)
+    for (int i = 0; i < N; ++i) {
+        const unsigned int h0 = patBNCellHash(i, j, k);
+        double px, py, pz; patBNPos(h0, i, j, k, px, py, pz);
+        const size_t s = idx(i, j, k);
+        pos[s * 3 + 0] = px; pos[s * 3 + 1] = py; pos[s * 3 + 2] = pz;
+        if (patBNAccept(i, j, k, h0, px, py, pz, R_MAIN)) { acc[s] = 1; ++nAccepted; }
+    }
+
+    // ---- §3: minimum separation, with the jittered lattice as the control ----------
+    {
+        double minAcc = 1e300, minAll = 1e300;
+        long long pairsAcc = 0, pairsAll = 0;
+        for (int k = 1; k + 1 < N; ++k)
+        for (int j = 1; j + 1 < N; ++j)
+        for (int i = 1; i + 1 < N; ++i) {
+            const size_t s = idx(i, j, k);
+            const double px = pos[s*3], py = pos[s*3+1], pz = pos[s*3+2];
+            for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                const size_t t = idx(i + dx, j + dy, k + dz);
+                const double ax = pos[t*3] - px, ay = pos[t*3+1] - py, az = pos[t*3+2] - pz;
+                const double d = std::sqrt(ax * ax + ay * ay + az * az);
+                ++pairsAll; if (d < minAll) minAll = d;
+                if (acc[s] && acc[t]) { ++pairsAcc; if (d < minAcc) minAcc = d; }
+            }
+        }
+        std::printf("[checkbluenoise] S3 %lld accepted pairs (of %lld candidate pairs); "
+                    "closest accepted %.6f, closest candidate %.6f\n",
+                    pairsAcc, pairsAll, minAcc, minAll);
+        if (minAcc < R_MAIN) {
+            std::printf("[checkbluenoise] S3 separation VIOLATED: %.12g < r = %.12g  BAD\n",
+                        minAcc, R_MAIN);
+            ok = false;
+        }
+        if (pairsAcc < 100000) {
+            std::printf("[checkbluenoise] S3 too few accepted pairs to mean anything  BAD\n");
+            ok = false;
+        }
+        // The control: the jittered lattice this is thinned FROM has pairs an order of
+        // magnitude closer than r, which is exactly the clumping the primitive removes.
+        if (!(minAll < 0.1 * R_MAIN)) {
+            std::printf("[checkbluenoise] S3 control weak: jittered lattice min pair %.6g  BAD\n",
+                        minAll);
+            ok = false;
+        }
+    }
+
+    // ---- §4: r = 0 is exactly the jittered lattice ---------------------------------
+    {
+        double wf1 = 0.0, wid = 0.0;
+        long long allAcc = 0;
+        for (int i = 0; i < 4000; ++i) {
+            const int cx = (int)((frand() - 0.5) * 2000.0);
+            const int cy = (int)((frand() - 0.5) * 2000.0);
+            const int cz = (int)((frand() - 0.5) * 2000.0);
+            const unsigned int h0 = patBNCellHash(cx, cy, cz);
+            double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+            if (patBNAccept(cx, cy, cz, h0, px, py, pz, 0.0)) ++allAcc;
+        }
+        ok &= chk("S4 r=0 accepts every candidate", (double)allAcc, 4000.0, 0.0);
+        for (int i = 0; i < 400; ++i) {
+            const double x = (frand() - 0.5) * 800.0, y = (frand() - 0.5) * 800.0,
+                         z = (frand() - 0.5) * 800.0;
+            double out[3]; patBlueNoise(x, y, z, 0.0, out);
+            const int bx = (int)std::floor(x), by = (int)std::floor(y),
+                      bz = (int)std::floor(z);
+            double b1 = 1e300; unsigned int bid = 0u;
+            for (int dz = -4; dz <= 4; ++dz)
+            for (int dy = -4; dy <= 4; ++dy)
+            for (int dx = -4; dx <= 4; ++dx) {
+                const int cx = bx + dx, cy = by + dy, cz = bz + dz;
+                const unsigned int h0 = patBNCellHash(cx, cy, cz);
+                double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+                const double ax = x - px, ay = y - py, az = z - pz;
+                const double d = std::sqrt(ax * ax + ay * ay + az * az);
+                if (d < b1) { b1 = d; bid = patBNMix(h0 ^ PAT_BN_SID); }
+            }
+            wf1 = std::fmax(wf1, std::fabs(out[0] - b1));
+            wid = std::fmax(wid, std::fabs(out[2] - (double)bid * (1.0 / 4294967296.0)));
+        }
+        ok &= chk("S4 r=0 F1 == jittered-lattice F1", wf1, 0.0, 0.0);
+        ok &= chk("S4 r=0 id == jittered-lattice id", wid, 0.0, 0.0);
+    }
+
+    // ---- §5: the conflict count is analytic, and acceptance is purely by rank ------
+    {
+        // E[N], the expected number of OTHER candidates within r of a candidate, is NOT
+        // the ball volume: the candidate's own cell holds no competitor, so the cell's
+        // self-overlap has to come out of it. That overlap's kernel is the per-axis
+        // triangle (1-|w|), so for r <= 1 (where the ball never leaves the +-1 block)
+        //     E[N] = INT_{|w|<r} [ 1 - PROD_a (1-|w_a|) ] dw
+        //          = 3/2 pi r^4 - 8/5 r^5 + 1/6 r^6
+        // the ball volume 4/3 pi r^3 having cancelled against the overlap's lead term.
+        // At r = 1 that is 3.2791, well under the 4.1888 a naive volume argument gives —
+        // the stratification is already doing work before any rank is compared.
+        auto meanN = [](double r) {
+            const double r2 = r * r, r4 = r2 * r2;
+            return 1.5 * 3.14159265358979323846 * r4 - 1.6 * r4 * r + r4 * r2 / 6.0;
+        };
+        double prev = 2.0, densAtOne = 0.0;
+        for (int q = 0; q <= 4; ++q) {
+            const double r = 0.25 * q;
+            const int M = 48;
+            long long nAcc = 0, nConf = 0, hist[64] = {0};
+            for (int k = 0; k < M; ++k)
+            for (int j = 0; j < M; ++j)
+            for (int i = 0; i < M; ++i) {
+                const int cx = 5000 + i, cy = -3000 + j, cz = 900 + k;
+                const unsigned int h0 = patBNCellHash(cx, cy, cz);
+                double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+                if (patBNAccept(cx, cy, cz, h0, px, py, pz, r)) ++nAcc;
+                int n = 0;
+                for (int dz = -1; dz <= 1; ++dz)
+                for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0 && dz == 0) continue;
+                    const int nx = cx + dx, ny = cy + dy, nz = cz + dz;
+                    const unsigned int nh = patBNCellHash(nx, ny, nz);
+                    double qx, qy, qz; patBNPos(nh, nx, ny, nz, qx, qy, qz);
+                    const double ax = qx - px, ay = qy - py, az = qz - pz;
+                    if (ax * ax + ay * ay + az * az < r * r) ++n;
+                }
+                nConf += n;
+                if (n < 64) ++hist[n];
+            }
+            const double cells = (double)M * M * M;
+            const double eN = (double)nConf / cells, dens = (double)nAcc / cells;
+            // If the ranks are iid uniform AND independent of the positions, then a
+            // candidate with n conflicts is accepted with probability exactly 1/(n+1),
+            // so the measured acceptance rate must be reproduced by the measured
+            // conflict HISTOGRAM alone. The two sides come from different data (rank
+            // comparisons vs distances), so this is a real check on the hash — it is
+            // what fails if the rank and the position, both derived from the same cell
+            // hash, are not effectively independent of each other.
+            double model = 0.0;
+            for (int n = 0; n < 64; ++n) model += (double)hist[n] / ((double)(n + 1) * cells);
+            std::printf("[checkbluenoise] S5 r=%.2f: E[N] %.4f (closed form %.4f), "
+                        "density %.4f (rank model %.4f)\n", r, eN, meanN(r), dens, model);
+            char lb[80];
+            std::snprintf(lb, sizeof lb, "S5 r=%.2f E[N] vs closed form", r);
+            ok &= chk(lb, eN, meanN(r), 0.002 + 0.02 * meanN(r));
+            std::snprintf(lb, sizeof lb, "S5 r=%.2f density vs rank model", r);
+            ok &= chk(lb, dens, model, 0.006);
+            if (dens > prev) {
+                std::printf("[checkbluenoise] S5 density not monotone in r  BAD\n");
+                ok = false;
+            }
+            prev = dens;
+            if (q == 4) densAtOne = dens;
+        }
+        // One candidate per cell is not a cheap approximation to a dense candidate
+        // process — it is strictly BETTER than one. Matern-II thinning of a Poisson
+        // parent of intensity L retains (1-exp(-L*V))/V, which rises to 1/V = 3/(4pi)
+        // = 0.2387 as L -> inf. The stratified single candidate beats that ceiling,
+        // because stratification removes the close candidate pairs that would otherwise
+        // have consumed the rank competition for nothing.
+        const double poissonCeiling = 3.0 / (4.0 * 3.14159265358979323846);
+        std::printf("[checkbluenoise] S5 density at r=1 %.5f vs dense-Poisson Matern-II "
+                    "ceiling %.5f\n", densAtOne, poissonCeiling);
+        if (!(densAtOne > poissonCeiling)) {
+            std::printf("[checkbluenoise] S5 stratification did not beat the Poisson ceiling  BAD\n");
+            ok = false;
+        }
+        ok &= chk("S5 block density agrees with the sweep",
+                  (double)nAccepted / (double)NC, densAtOne, 0.006);
+    }
+
+    // ---- §6: it is actually blue, against a matched random-thinning control --------
+    {
+        // (a) number variance in fixed boxes. Random thinning of the SAME candidate set
+        // to the SAME density is the control: it keeps the density and the lattice, and
+        // differs only in that the choice ignores geometry.
+        const int L = 6, NB = N / L;
+        const double keep = (double)nAccepted / (double)NC;
+        std::vector<double> cntB((size_t)NB * NB * NB, 0.0), cntC((size_t)NB * NB * NB, 0.0);
+        for (int k = 0; k < N; ++k)
+        for (int j = 0; j < N; ++j)
+        for (int i = 0; i < N; ++i) {
+            const size_t b = ((size_t)(k / L) * NB + (j / L)) * NB + (i / L);
+            if (acc[idx(i, j, k)]) cntB[b] += 1.0;
+            // deterministic coin, independent of the MIS decision
+            const unsigned int c = patBNMix(patBNCellHash(i, j, k) ^ 0x1b873593u);
+            if ((double)c * (1.0 / 4294967296.0) < keep) cntC[b] += 1.0;
+        }
+        auto varOverMean = [](const std::vector<double>& v) {
+            double m = 0.0; for (double t : v) m += t; m /= (double)v.size();
+            double s = 0.0; for (double t : v) s += (t - m) * (t - m);
+            s /= (double)(v.size() - 1);
+            return m > 0.0 ? s / m : 0.0;
+        };
+        const double vb = varOverMean(cntB), vc = varOverMean(cntC);
+        std::printf("[checkbluenoise] S6a number variance/mean in %d^3 boxes: "
+                    "blue %.4f vs thinned-lattice control %.4f\n", L, vb, vc);
+        if (!(vb < 0.75 * vc)) {
+            std::printf("[checkbluenoise] S6a density fluctuation not suppressed vs control  BAD\n");
+            ok = false;
+        }
+        // (b) radial distribution function of the accepted set.
+        const int NBIN = 30; const double DMAX = 3.0, DB = DMAX / NBIN;
+        std::vector<double> hist((size_t)NBIN, 0.0);
+        long long centres = 0;
+        const double rho = keep;
+        for (int k = 4; k + 4 < N; ++k)
+        for (int j = 4; j + 4 < N; ++j)
+        for (int i = 4; i + 4 < N; ++i) {
+            const size_t s = idx(i, j, k);
+            if (!acc[s]) continue;
+            ++centres;
+            const double px = pos[s*3], py = pos[s*3+1], pz = pos[s*3+2];
+            for (int dz = -4; dz <= 4; ++dz)
+            for (int dy = -4; dy <= 4; ++dy)
+            for (int dx = -4; dx <= 4; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                const size_t t = idx(i + dx, j + dy, k + dz);
+                if (!acc[t]) continue;
+                const double ax = pos[t*3] - px, ay = pos[t*3+1] - py, az = pos[t*3+2] - pz;
+                const double d = std::sqrt(ax * ax + ay * ay + az * az);
+                if (d < DMAX) hist[(size_t)(d / DB)] += 1.0;
+            }
+        }
+        double gPeak = 0.0; int gPeakBin = -1; double gInside = 0.0, gFar = 0.0;
+        int nFar = 0;
+        for (int b = 0; b < NBIN; ++b) {
+            const double d0 = b * DB, d1 = d0 + DB;
+            const double shell = 4.0 / 3.0 * 3.14159265358979323846 * (d1*d1*d1 - d0*d0*d0);
+            const double g = hist[b] / ((double)centres * rho * shell);
+            if (d1 <= R_MAIN) gInside += hist[b];
+            if (d0 >= 2.4) { gFar += g; ++nFar; }
+            if (g > gPeak) { gPeak = g; gPeakBin = b; }
+        }
+        gFar /= (double)(nFar > 0 ? nFar : 1);
+        std::printf("[checkbluenoise] S6b g(d): 0 inside r (%.0f pairs), peak %.3f at d~%.2f, "
+                    "g(d>2.4) -> %.3f\n", gInside, gPeak, (gPeakBin + 0.5) * DB, gFar);
+        ok &= chk("S6b pairs inside the exclusion radius", gInside, 0.0, 0.0);
+        // The near-contact shell is the signature that separates this from "a Poisson
+        // process with a hole punched in it", which would rise monotonically to g = 1
+        // with no overshoot at all. Matern-II overshoots; measured ~1.21 at d ~ 1.05.
+        if (!(gPeak > 1.15)) {
+            std::printf("[checkbluenoise] S6b no near-contact shell (peak %.3f)  BAD\n", gPeak);
+            ok = false;
+        }
+        ok &= chk("S6b g(d) relaxes to 1 far out", gFar, 1.0, 0.06);
+    }
+
+    // ---- §7: the ring cap is never approached; non-finite inputs bail --------------
+    {
+        // Deepest ring actually needed = the largest F2 seen, +1 (the loop breaks when
+        // R-1 >= F2). Report it against PAT_BN_RINGCAP.
+        double maxF2 = 0.0;
+        for (int i = 0; i < 200000; ++i) {
+            const double x = (frand() - 0.5) * 20000.0;
+            const double y = (frand() - 0.5) * 20000.0;
+            const double z = (frand() - 0.5) * 20000.0;
+            double out[3]; patBlueNoise(x, y, z, 1.0, out);
+            if (out[1] > maxF2) maxF2 = out[1];
+        }
+        const int deepest = (int)std::ceil(maxF2) + 1;
+        std::printf("[checkbluenoise] S7 deepest ring needed over 200k queries: %d "
+                    "(cap %d, max F2 %.3f)\n", deepest, PAT_BN_RINGCAP, maxF2);
+        if (deepest >= PAT_BN_RINGCAP) {
+            std::printf("[checkbluenoise] S7 ring cap reachable — results could be clamped  BAD\n");
+            ok = false;
+        }
+        double bad[3];
+        const double nan_ = std::numeric_limits<double>::quiet_NaN();
+        patBlueNoise(nan_, 0.0, 0.0, 1.0, bad);
+        ok &= chk("S7 NaN x -> 0", bad[0] + bad[1] + bad[2], 0.0, 0.0);
+        patBlueNoise(0.0, std::numeric_limits<double>::infinity(), 0.0, 1.0, bad);
+        ok &= chk("S7 inf y -> 0", bad[0] + bad[1] + bad[2], 0.0, 0.0);
+        // r outside [0,1] clamps rather than corrupting the neighbourhood exactness.
+        double c1[3], c2[3];
+        patBlueNoise(3.7, -2.1, 0.9, 5.0, c1);
+        patBlueNoise(3.7, -2.1, 0.9, 1.0, c2);
+        ok &= chk("S7 r>1 clamps to r=1", c1[0], c2[0], 0.0);
+        patBlueNoise(3.7, -2.1, 0.9, -4.0, c1);
+        patBlueNoise(3.7, -2.1, 0.9,  0.0, c2);
+        ok &= chk("S7 r<0 clamps to r=0", c1[0], c2[0], 0.0);
+    }
+
+    // ---- §8: cost, reported against Worley's -------------------------------------
+    {
+        double sum = 0.0; int mx = 0;
+        for (int i = 0; i < 20000; ++i) {
+            const double x = (frand() - 0.5) * 4000.0;
+            const double y = (frand() - 0.5) * 4000.0;
+            const double z = (frand() - 0.5) * 4000.0;
+            double out[3]; int vis = 0;
+            patBlueNoiseC(x, y, z, 1.0, out, &vis);
+            sum += vis; if (vis > mx) mx = vis;
+        }
+        const double mean = sum / 20000.0;
+        std::printf("[checkbluenoise] S8 cells hashed per query: mean %.1f, max %d "
+                    "(Worley reads ~27)\n", mean, mx);
+        if (mean > 200.0) {
+            std::printf("[checkbluenoise] S8 query cost regressed past 200 cells  BAD\n");
+            ok = false;
+        }
+    }
+
+    // ---- §9: the compile path and CSE ----------------------------------------------
+    {
+        const char* bads[] = { "bnoise(x,y,z)", "bnoise(x,y,z,1,2)", "bnoise3(x,y,z,1)",
+                               "bnoisex(x,y,z,1)", "bnoiseid(x,y)" };
+        for (const char* be : bads) {
+            std::vector<PatNode> prog; std::string perr;
+            if (compilePatternExpr(be, prog, perr)) {
+                std::printf("[checkbluenoise] `%s` compiled but should be rejected  BAD\n", be);
+                ok = false;
+            }
+        }
+        const char* names[4] = { "bnoise", "bnoise2", "bnoised", "bnoiseid" };
+        double wv = 0.0;
+        for (int sel = 0; sel < 4; ++sel) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "%s(x,y,z,0.8)", names[sel]);
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(buf, prog, perr)) {
+                std::printf("[checkbluenoise] `%s` failed to compile: %s  BAD\n", buf, perr.c_str());
+                ok = false; continue;
+            }
+            patternOptimizeCSE(prog);
+            for (int i = 0; i < 64; ++i) {
+                const double x = (frand() - 0.5) * 200.0, y = (frand() - 0.5) * 200.0,
+                             z = (frand() - 0.5) * 200.0;
+                PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+                double b[3]; patBlueNoise(x, y, z, 0.8, b);
+                const double want = (sel == 3) ? b[2] : (sel == 2) ? (b[1] - b[0]) : b[sel];
+                wv = std::fmax(wv, std::fabs(patternEval(prog.data(), (int)prog.size(), c) - want));
+            }
+        }
+        ok &= chk("S9 all four slots: VM == direct call", wv, 0.0, 0.0);
+        std::vector<PatNode> same, diff; std::string perr;
+        ok &= compilePatternExpr("bnoise(x,y,z,1) + bnoise(x,y,z,1)", same, perr);
+        ok &= compilePatternExpr("bnoise(x,y,z,1) + bnoise2(x,y,z,1)", diff, perr);
+        const size_t n0 = same.size();
+        patternOptimizeCSE(same);
+        if (same.size() >= n0) {
+            std::printf("[checkbluenoise] CSE did not shrink `bnoise + bnoise` (%zu -> %zu)  BAD\n",
+                        n0, same.size());
+            ok = false;
+        }
+        // Different SLOTS of the same call must NOT collapse: the selector lives in `a`.
+        const size_t d0 = diff.size();
+        patternOptimizeCSE(diff);
+        double wd = 0.0;
+        for (int i = 0; i < 64; ++i) {
+            const double x = (frand() - 0.5) * 200.0, y = (frand() - 0.5) * 200.0,
+                         z = (frand() - 0.5) * 200.0;
+            PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+            double b[3]; patBlueNoise(x, y, z, 1.0, b);
+            wd = std::fmax(wd, std::fabs(patternEval(diff.data(), (int)diff.size(), c)
+                                         - (b[0] + b[1])));
+        }
+        (void)d0;
+        ok &= chk("S9 distinct slots stay distinct under CSE", wd, 0.0, 0.0);
+    }
+
+    std::printf("[checkbluenoise] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkbluenoise] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic mean-curvature self-test (`-checkcurv`): the `curv` free variable
 // (O3 — non-stationary randomness). Runs with no scene and no renderer.
 //
@@ -9930,6 +10441,7 @@ static int run(int argc, char** argv) {
     bool checkVNoiseOnly = false;
     bool checkWorleyOnly = false;
     bool checkGaborOnly = false;
+    bool checkBlueNoiseOnly = false;
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
     bool checkSdfOnly = false;
@@ -10347,6 +10859,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkvnoise")) checkVNoiseOnly = true;
         else if (!std::strcmp(argv[i], "-checkworley")) checkWorleyOnly = true;
         else if (!std::strcmp(argv[i], "-checkgabor")) checkGaborOnly = true;
+        else if (!std::strcmp(argv[i], "-checkbluenoise")) checkBlueNoiseOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
@@ -10536,6 +11049,7 @@ static int run(int argc, char** argv) {
     if (checkVNoiseOnly)   return checkVNoise();   // ditto (vector noise / domain warp)
     if (checkWorleyOnly)   return checkWorley();   // ditto (cellular / Worley noise)
     if (checkGaborOnly)    return checkGabor();    // ditto (anisotropic band-limited Gabor noise)
+    if (checkBlueNoiseOnly) return checkBlueNoise();  // ditto (blue-noise / Poisson-disk placement)
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)

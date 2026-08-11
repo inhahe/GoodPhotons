@@ -176,6 +176,13 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
                 st[sp-1] = patGabor(st[sp-1], yy, zz, ff, dx, dy, dz);
                 break;
             }
+            case PatOp::BlueNoise: { // Poisson-disk placement: a = 0 F1 / 1 F2 / 2 F2-F1 / 3 id
+                double rr = st[--sp], zz = st[--sp], yy = st[--sp], b[3];
+                patBlueNoise(st[sp-1], yy, zz, rr, b);
+                int sel = (int)nd.a;
+                st[sp-1] = (sel == 3) ? b[2] : (sel == 2) ? (b[1] - b[0]) : b[sel];
+                break;
+            }
             case PatOp::PovFn: {
                 int id = (int)nd.a;
                 int na = povFnArity(id);

@@ -26,6 +26,7 @@
 #include "linalg.h"
 #include "pov_functions.h"   // exact POV-Ray internal isosurface functions (f_torus, ...)
 #include "worley.h"          // 3-D cellular (Worley/Voronoi) noise (host+device)
+#include "bluenoise.h"       // blue-noise (Poisson-disk) point set (host+device)
 #include "gabor.h"           // anisotropic band-limited Gabor noise (host+device)
 
 // The grid sampler below is shared verbatim by the CPU evaluator and the CUDA
@@ -214,6 +215,28 @@ enum class PatOp : int {
     // bit-identical between host and device. Appended at the END of the enum, so the
     // VarX..VarV scans and varName() are unperturbed.
     Gabor,
+    // BLUE-NOISE (POISSON-DISK) POINT SET (O5), spelled `bnoise(x, y, z, r)` with the
+    // output selector in `a` (0 = F1 distance to the nearest point of the set, 1 = F2,
+    // 2 = F2-F1, 3 = the F1 point's random id in [0,1)) — the same four-slot shape as
+    // Worley, deliberately, because it answers the same question about a DIFFERENT
+    // point set.
+    //
+    // Worley's sites are a jittered lattice, so they clump: two sites either side of a
+    // cell wall can be arbitrarily close, and thresholding F1 to draw spots fuses them
+    // into peanuts. Scattered natural features (freckles, pores, seeds, spatter) have a
+    // guaranteed MINIMUM SEPARATION instead, which is a property of the point set and
+    // cannot be recovered downstream. `r` is that separation in cell units, clamped to
+    // [0,1]: r = 0 reduces exactly to the jittered lattice (so this op is a strict
+    // generalisation of Worley's placement), r = 1 is maximally blue.
+    //
+    // Acceptance is one round of Luby's MIS under a strict total order on candidates,
+    // which makes the separation a theorem and — the point — makes membership a purely
+    // LOCAL predicate, so an unbounded set is queryable in O(1) with no bake and no
+    // tiling. See bluenoise.h. Pure function of its operands (CSE shares it; `a` keys
+    // the node), evaluated in double on every backend via PAT_BN_HD patBlueNoise.
+    // Appended at the END of the enum so the VarX..VarV scans and varName() are
+    // unperturbed.
+    BlueNoise,
 };
 
 // Register-file size available to a CSE-optimized program (per evaluator invocation).
@@ -652,6 +675,13 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
                 st[sp-1] = patGabor(st[sp-1], yy, zz, ff, dx, dy, dz);
                 break;
             }
+            case PatOp::BlueNoise: {
+                double rr = st[--sp], zz = st[--sp], yy = st[--sp], b[3];
+                patBlueNoise(st[sp-1], yy, zz, rr, b);
+                int sel = (int)nd.a;
+                st[sp-1] = (sel == 3) ? b[2] : (sel == 2) ? (b[1] - b[0]) : b[sel];
+                break;
+            }
             case PatOp::PovFn: {
                 int id = (int)nd.a;
                 int na = povFnArity(id);
@@ -813,6 +843,10 @@ inline bool funcOp(const std::string& s, PatOp& out, int& arity, int& povId) {
         {"dturbx",PatOp::DTurb,6,0},{"dturby",PatOp::DTurb,6,1},{"dturbz",PatOp::DTurb,6,2},
         {"worley",PatOp::Worley,4,0},{"worley2",PatOp::Worley,4,1},
         {"worleyd",PatOp::Worley,4,2},{"worleyid",PatOp::Worley,4,3},
+        // blue-noise / Poisson-disk placement (O5): same four slots as Worley,
+        // over a point set with a guaranteed minimum separation `r`.
+        {"bnoise",PatOp::BlueNoise,4,0},{"bnoise2",PatOp::BlueNoise,4,1},
+        {"bnoised",PatOp::BlueNoise,4,2},{"bnoiseid",PatOp::BlueNoise,4,3},
     };
     for (const V& g : vfs) if (s == g.n) { out = g.op; arity = g.ar; povId = g.comp; return true; }
     int id, ar;
@@ -1136,7 +1170,7 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
             PatNode nd; nd.op = op;
             if      (op == PatOp::PovFn) nd.a = (double)povId;
             else if (op == PatOp::DNoise || op == PatOp::DTurb ||
-                     op == PatOp::Worley)
+                     op == PatOp::Worley || op == PatOp::BlueNoise)
                                          nd.a = (double)povId;   // component / output index
             else if (op == PatOp::Tex)   nd.a = (double)t.texId;    // resolved at tokenize
             else if (op == PatOp::Spec)  nd.a = (double)t.texId;    // shares the resolved-index slot
@@ -1291,6 +1325,7 @@ inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes,
     if (op == PatOp::DTurb)                       { pops = 6; return true; }
     if (op == PatOp::Worley)                      { pops = 4; return true; }
     if (op == PatOp::Gabor)                       { pops = 7; return true; }
+    if (op == PatOp::BlueNoise)                   { pops = 4; return true; }
     if (op == PatOp::Tex)                         { pops = 2; return true; }
     if (op == PatOp::Spec)                        { pops = 1; return true; }
     if (op == PatOp::StReg)                       { pops = 0; pushes = 0; return true; }  // peeks

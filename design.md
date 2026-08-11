@@ -2001,6 +2001,71 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   picks rather than everything up to the lattice Nyquist, so it is the one noise here that
   minifies gracefully.
 
+  **Blue-noise / Poisson-disk placement (`PatOp::BlueNoise`, O5, v0.166.0).**
+  `src/bluenoise.h`, `bnoise/bnoise2/bnoised/bnoiseid(x, y, z, r)` — the same four slots as
+  `worley` (F1, F2, F2−F1, per-point id) over a **different point set**: one with a
+  guaranteed minimum separation `r` in cell units. Worley's sites are a jittered lattice,
+  one point per cell placed uniformly inside it, so two of them can be arbitrarily close
+  (both jitter to the shared wall — measured closest pair 0.026 in a 70³ block) while
+  elsewhere the lattice leaves holes. Threshold F1 to draw spots and that clumping is
+  instantly legible as computer texture. It is also **unrecoverable downstream**: evenness
+  is a property of *where the points are*, so no filter over `worley`'s output puts it
+  back. Hence a new primitive rather than a mode.
+
+  The obvious construction can't be used. Dart throwing (Bridson) is inherently
+  **sequential** — a dart's acceptance depends on every dart accepted before it — so
+  answering "nearest point to `p`" would mean simulating the whole plane, against a
+  requirement of O(1) at an arbitrary point of an *unbounded* domain, no bake,
+  bit-identical on CPU and GPU. The fix is to make acceptance **locally decidable**: every
+  cell carries one candidate (jittered position + 32-bit rank), and a candidate is kept iff
+  no candidate within `r` outranks it. That is one round of Luby's MIS, equivalently a
+  Matérn type-II hardcore thinning whose parent is stratified rather than Poisson. Minimum
+  separation is then a *theorem*, and the acceptance neighbourhood is exactly 3×3×3
+  provided `r ≤ 1` (a candidate two cells out is >2−1 = 1 ≥ `r` away on one axis alone).
+  Three details carry weight:
+
+  * **`patBNPrecedes` is a strict *total* order** — rank, then `cz`, `cy`, `cx`. Totality is
+    not pedantry: ranks collide with probability ~n/2³², which over an unbounded domain is
+    certain *somewhere*, and under a merely partial order a colliding pair would each fail
+    to outrank the other and both be kept, overlapping. The tie-break on cell coordinates
+    closes the only hole in the separation proof.
+  * **Stratification beats the dense-Poisson ceiling.** Matérn-II on a Poisson parent of
+    intensity `L` retains `(1−e^{−LV})/V → 1/V = 3/(4π) = 0.23873` as `L→∞`. One stratified
+    candidate per cell yields 0.2665, *12% above* that ceiling, because stratification
+    removes the close candidate pairs that consume rank competition for nothing — so adding
+    candidates per cell would make the result sparser, not denser. Along the way the
+    conflict count had to be derived properly: it is **not** the ball volume, because the
+    candidate's own cell holds no competitor, and subtracting the cube's self-overlap
+    (per-axis triangle kernel) gives `E[N] = (3/2)πr⁴ − (8/5)r⁵ + (1/6)r⁶` for `r ≤ 1`
+    (3.2791 at `r=1`, against 4.1888 from the naive argument). A first version of the
+    self-test failed on the naive number; the fix was to redo the integral and confirm it
+    by Monte Carlo (`scraps/bn_density.py`), not to widen the tolerance.
+  * **Two early-outs keep the cost at Worley's** — 29 cells hashed per query against 27.
+    A per-cell *geometric* lower bound (distance from the query to the nearest point of the
+    cell) is tested before anything is hashed; and inside the acceptance test **rank is
+    compared before position**, because the rank *is* the base cell hash (free) while the
+    position costs three more mixes, so half the neighbours are dismissed for one mix.
+
+  `r` is a genuine knob and a strict generalisation: `r = 0` vetoes nothing and reproduces
+  the jittered lattice exactly (density 1/cell — `-checkbluenoise` §4 asserts equality),
+  `r = 1` is maximally blue at 0.2661/cell with F1 in ~[0, 1.6]. Matching a `worley`
+  texture's spot density therefore wants a worley cell `0.2661^(1/3) = 0.6432×` the size,
+  which is what the demo's side-by-side back wall does. Device-side the query is
+  `__noinline__`: inlined into `dPatternEval` it pushed the function to regcount 179 against
+  the BDPT kernels' 168 and ptxas refused the build, so its frame is now paid only by
+  programs that call it. `-checkbluenoise` has nine sections, each written so it cannot pass
+  vacuously — pruned acceptance vs an unpruned ±3-block brute force (plus an assertion that
+  both outcomes were seen thousands of times), F1/F2/id vs a ±6-block brute force at
+  tolerance 0, minimum separation over every accepted pair in a 72³ block with the jittered
+  lattice as control, the `r=0` identity, `E[N]` vs the closed form *and* density vs a rank
+  model built from different data (a real test of rank/position independence, since both
+  derive from one hash), number variance against a matched random-thinning control, the
+  radial distribution function, ring depth and NaN/`r`-clamp guards, cells hashed per query,
+  and the compile path. Worked example `scenes/pattern_bluenoise.ftsl`. One authoring fact
+  that only rendering revealed: these are **solid** 3-D point sets, so a surface cuts the
+  spheres at assorted depths and sees discs of radius `sqrt(R²−h²)` — a uniform `R` already
+  gives a spread of spot sizes, with near-tangential ones very small.
+
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
   **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the
