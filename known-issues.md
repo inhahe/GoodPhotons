@@ -5,6 +5,47 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-11, v0.181.0): `ftrace -stop <pid>` does not stop a `-viewer` / `-explore` GUI process, but reports that it did
+
+`-stop` is documented (and used everywhere in this repo, including `CLAUDE.md`) as *the* safe way
+to end any ftrace process, precisely so nobody reaches for `taskkill /F` and risks a driver TDR.
+It only covers **render** processes, though: the stop sentinel is polled by the render chunk loop
+and by the scene loader, and the `-viewer` GUI event loop polls neither. So stopping the loom
+native viewer silently does nothing.
+
+The bad part is not the gap, it is that **the exit status lies**:
+
+```
+$ ftrace -stop 311504
+[stop] warning: pid 311504 isn't a running ftrace render (dropping the sentinel anyway)
+[stop] asked pid 311504 to finish and exit cleanly.
+[stop] done — stopped cleanly.
+$ powershell -c "Get-Process ftrace | Select Id,MainWindowTitle"
+    Id MainWindowTitle
+311504 ftrace 🪟 loom viewer     <-- still running
+```
+
+`[stop] done — stopped cleanly.` is printed after a wait that the process was never going to
+satisfy, and the exit code is 0. The `isn't a running ftrace render` warning is the only hint,
+and it is easy to read as pedantry rather than "this command did nothing". Anything that chains
+off `-stop` (notably `build.bat`, which fails to copy `ftrace.exe` while a viewer holds it open)
+will therefore proceed on a false premise — which is exactly the situation that tempts a
+`taskkill /F`, the one thing the rule forbids.
+
+**Repro.** `ftrace -viewer <sidecar.json> -loom <scene.py>`, then `ftrace -stop <pid>` — the
+window stays up and the command still reports success.
+
+**Proper fix.** Two parts, both needed:
+1. Have the viewer/`-explore` GUI loop poll the same stop flag the render loop polls (once per
+   frame is plenty) and post itself a `WM_CLOSE`, so `-stop` genuinely covers *every* ftrace
+   process as documented.
+2. Make `-stop` honest regardless: if the process is still alive when the wait window expires,
+   print that it did **not** stop and exit non-zero, instead of unconditionally printing
+   `stopped cleanly`. The current message is wrong even for a wedged render.
+
+Until (1) lands, the correct way to close a viewer is to close its window (clicking the X, or
+`PostMessage(hwnd, WM_CLOSE, 0, 0)` — the graceful path, *not* `taskkill /F`).
+
 ### OPEN (2026-08-10, v0.174.0): `-dual-scatter` drops the coat's indirect illumination
 
 *(This entry originally logged two limitations. **Part 1 — "slower than the reference on an
