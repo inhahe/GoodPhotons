@@ -4143,8 +4143,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   index it happens to share. A cache that hits its **cap** covers a prefix, and the clock
   running off the end drops back to (a) — without that fallback play deadlocks there,
   since nothing posts, so nothing lands, so the clock never moves. Measured on
-  `scatter_modulated_sweep` (96 frames, 603 MB): a requested 24 fps is delivered at
-  `cache 0.01 + raymarch 20` per frame, against 6.5 fps bake-paced.
+  `scatter_modulated_sweep` (96 frames, 1863 MB at 19.4 MB/frame since the profile went
+  30×200): a requested 24 fps is delivered at `cache 0.01 + raymarch 20` per frame, against
+  3.4 fps bake-paced. Note the cache is ~3× what it was at 18×120, so the default 1024 MB
+  cap no longer covers this clock — which is why, since 0.183.2, the walk **projects** the
+  total after 4 frames (enough for a stable MB/frame, early enough to still be a warning)
+  and prints either "fits the N MB cap" or the shortfall plus the `-prebake-cap` value that
+  would cache everything. A prefix cache degrades silently otherwise: the loop runs at the
+  target rate until it walks off the end of the cache and then stutters, which reads as a
+  performance bug rather than as a budget that was set too low.
   Two measurement rules the feature had to fix to be believable: a cached frame **clears**
   `bake`/`sidecar`/`ftsl` (otherwise the breakdown prints work that did not happen, its
   parts summing to several times the period beside them), and the fps EMA smooths the

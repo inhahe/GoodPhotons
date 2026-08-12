@@ -3427,6 +3427,7 @@ struct PlayCache {
     int         bakeNext = 0;        // frame the next prebake post asks for
     int         bakeHave = 0;        // frames stored (including the one held live)
     bool        capped = false;      // prebake stopped early: the cache covers a prefix
+    bool        projected = false;   // the up-front size projection has been printed once
     int         liveIdx = -1;        // the frame the LIVE locals hold; that slot is empty
     // Cached playback is paced by a wall clock, not by the bake — that is the whole
     // point. 0 means "as fast as it will go", which is the honest way to measure the
@@ -3436,7 +3437,8 @@ struct PlayCache {
 
     void drop() {
         f.clear(); key.clear(); bytes = 0; baking = false;
-        bakeNext = 0; bakeHave = 0; capped = false; liveIdx = -1; lastStepQpc = 0;
+        bakeNext = 0; bakeHave = 0; capped = false; projected = false;
+        liveIdx = -1; lastStepQpc = 0;
     }
     bool holds(int i) const { return i >= 0 && i < (int)f.size() && f[i].have; }
     // Can frame `i` be shown without going to loom? Either it is in a slot, or the
@@ -4163,16 +4165,50 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
                 }
 
                 if (cache.baking) {
+                    // Project the whole clock's cost as soon as the per-frame cost is
+                    // known, and say so UP FRONT. Otherwise a short cap announces itself
+                    // only once it has already been hit, which reads as a status line
+                    // rather than as a thing to act on -- and the consequence is a silent
+                    // performance cliff mid-loop, where the cached prefix plays at the
+                    // target fps and the rest drops to whatever a live bake costs. Four
+                    // frames is enough for a stable average (frames of one clock differ
+                    // in tessellation, not in kind) while still landing early in a walk.
+                    if (!cache.projected && cache.bakeHave >= 4) {
+                        cache.projected = true;
+                        const double perFrame = cache.bytes / 1048576.0 / cache.bakeHave;
+                        const double total    = perFrame * live.frames;
+                        if (total > cache.capMB) {
+                            // Round the suggestion up with headroom: landing exactly on
+                            // the cap is the one case that still ends capped.
+                            const int want = (int)(total * 1.1) + 1;
+                            std::printf("[prebake] ~%.1f MB/frame x %d frames = ~%.0f MB, "
+                                        "over the %d MB cap: only ~%d frames will cache and "
+                                        "play will stutter past there. Use -prebake-cap %d "
+                                        "for the whole clock.\n",
+                                        perFrame, live.frames, total, cache.capMB,
+                                        (int)(cache.capMB / perFrame), want);
+                        } else {
+                            std::printf("[prebake] ~%.1f MB/frame x %d frames = ~%.0f MB, "
+                                        "fits the %d MB cap\n",
+                                        perFrame, live.frames, total, cache.capMB);
+                        }
+                        std::fflush(stdout);
+                    }
                     // Stop at the cap rather than at the end of the clock if the cap
                     // comes first: a prefix cache still plays from memory as far as it
                     // goes, which beats refusing to cache a long clock at all.
                     if (cache.bytes >= capBytes) {
                         cache.capped = true;
                         cache.baking = false;
+                        const double perFrame = cache.bakeHave
+                            ? cache.bytes / 1048576.0 / cache.bakeHave : 0.0;
+                        const int want = perFrame > 0.0
+                            ? (int)(perFrame * live.frames * 1.1) + 1 : 0;
                         std::printf("[prebake] cap %d MB reached at frame %d/%d "
-                                    "(%.0f MB); the rest will bake on demand\n",
+                                    "(%.0f MB); the rest will bake on demand"
+                                    " -- re-run with -prebake-cap %d to cache all %d\n",
                                     cache.capMB, cache.bakeHave, live.frames,
-                                    cache.bytes / 1048576.0);
+                                    cache.bytes / 1048576.0, want, live.frames);
                     } else if (cache.bakeNext >= live.frames) {
                         cache.baking = false;
                         std::printf("[prebake] %d frames cached, %.0f MB (%.1f MB/frame)\n",

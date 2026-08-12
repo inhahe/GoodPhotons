@@ -5,26 +5,26 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### BUG: the loom viewer can die silently after `-prebake` hits its memory cap
+### FIXED (2026-08-12, v0.183.2): `-prebake` announced a too-small cap only after hitting it, so playback fell off a cliff mid-loop with no warning
 
-Observed 2026-08-12 on `-viewer scatter_modulated_sweep.json -loom scatter_modulated_sweep.py
--play -prebake` (default cap). The prebake filled to `cap 1024 MB reached at frame 53/96
-(1029 MB); the rest will bake on demand`, played the on-demand tail for a while, then the
-process vanished mid-frame — no error on stdout, no WER/Application event. The same command
-with `-prebake-cap 150` (cap reached at frame 8/96) ran fine for a minute, and with
-`-prebake-cap 2600` (whole clock cached, 1863 MB) it has been stable, so the trigger looks
-like *continuing to bake on demand while already sitting at the cap*, not the cap itself.
-12.8 GB was free at the time, so a plain OOM is not an obvious explanation. Needs a repro
-under a debugger (`cdb`) to get a stack; suspect an allocation failure or a cache-eviction
-path that frees a frame still referenced by the in-flight render.
+*(NOT the "viewer died silently" report briefly logged here — that was the user closing the
+window with the X button. There was no crash. Left as a note because the sizing problem it
+surfaced was real.)*
 
-**Related sizing note, not a bug:** this scene costs **19.4 MB/frame** to cache, so the whole
-96-frame clock needs 1863 MB and the default `-prebake-cap 1024` covers only 53 frames. The
-effect is a silent performance cliff mid-loop — cached frames play at ~24 fps (`cache 0.01`),
-uncached ones drop to ~3.4 fps because `bake` (loom's Python rebuild, ~140–240 ms) dominates.
-Worth considering: have `-prebake` report the projected total up front (it knows MB/frame
-after a few frames) and suggest the cap needed for full coverage, rather than only announcing
-the shortfall after the fact.
+A prebaked frame of `scatter_modulated_sweep` costs **19.4 MB**, so its 96-frame clock needs
+1863 MB and the default `-prebake-cap 1024` covered only 53 frames. Nothing said so until the
+walk was already half done, and the symptom was a silent performance cliff mid-loop: cached
+frames play at ~24 fps (`cache 0.01`), uncached ones drop to ~3.4 fps because `bake` — loom's
+Python rebuild, 140–240 ms — dominates everything else (`raymarch` is only ~25 ms).
+
+**Fix** (`src/viewer_gui.cpp`): the walk now projects the whole clock's cost after 4 frames,
+when MB/frame is first known but the walk has barely started, and prints it **up front** —
+either "fits the N MB cap" or the shortfall plus the exact `-prebake-cap` value that would
+cache everything (per-frame × frames × 1.1, so the suggestion clears the cap rather than
+landing on it). The cap-reached line carries the same suggestion. Verified: at `-prebake-cap
+300` it predicts "~19.4 MB/frame x 96 frames = ~1863 MB … only ~15 frames will cache … Use
+-prebake-cap 2050", the walk then caps at frame 16/96, and re-running at the suggested 2050
+caches all 96 frames (1863 MB) and holds ~24 fps for the whole loop.
 
 ### TECH DEBT: `intersectTri` orients the hit normal by the *interpolated* normal, so it can report a front-facing triangle as a backface
 
