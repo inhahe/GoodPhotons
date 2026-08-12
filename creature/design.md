@@ -871,6 +871,13 @@ out/             generated MJCF/FTSL, checkpoints, logs  (git-ignored)
 notes/           capture rig notes, literature
 ```
 
+`notes/capture.md` is the **capture protocol** and is operational, not just rationale: the two-mode
+rule (motion and groom never share a recording), the 4× GoPro HERO 12 decision and the settings that
+silently corrupt geometry, camera placement with the depth-error argument for 90° spacing,
+capture-volume sizing per gait, calibration and sync as on-site checklists, a table mapping *what you
+shoot* → *which morph knob it makes identifiable*, and a ~2-hour session shot list with its
+thermal/storage/power limits. Read it before a shoot; the fitting side it feeds is todo.md **P5**.
+
 ## Environment
 
 - Python 3.14 in `.venv`, MuJoCo 3.11, PyTorch (CUDA), RTX 4090.

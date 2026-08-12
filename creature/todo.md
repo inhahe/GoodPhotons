@@ -360,7 +360,11 @@ implementation plan"** at the end of this section, added 2026-08-08.)*
       free, footfall onsets beat video timing by an order of magnitude (a physics-plausibility aid
       for this very phase), and P12's vocal library cannot be collected retroactively. capture.md
       §Audio has the protocol, including the third mode it adds: the vocal session, audio's groom
-      mode.
+      mode. **The operational half is now written too** (2026-08-12): camera placement and the
+      depth-error argument for 90° spacing, capture-volume sizing (the 3 m arena fits walk and trot
+      but only ~1 gallop stride per pass — pick a mitigation deliberately), calibration and sync as
+      on-site checklists, a **capture → which-morph-knob table**, and a ~2-hour session shot list
+      with the thermal/storage/power limits that end a session early.
 
 ### The implementation plan *(added 2026-08-08)*
 
