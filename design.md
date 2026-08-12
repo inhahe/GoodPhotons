@@ -3956,6 +3956,24 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   path-trace runs on the GPU), so it precomputes `rasterBackend`/`cpuBackend`/`gpuBackend`
   once and re-stamps per branch rather than reporting whichever device the frame started
   on.
+- **The title bar also says when the render has *finished*** (`markLiveWindowDone()` /
+  `noteFinishReason()`, same block in `main.cpp`). Before this the only end-of-render
+  signal in the window was that the progress text stopped changing — indistinguishable
+  from a render still inside a long chunk between repaints, and worst under
+  `-keepwindow`, whose whole purpose is to outlive the render. Now `liveTitle()` prefixes
+  `✔ DONE — <why>` once the render is over, e.g. `✔ DONE — noise target met  —  ftrace —
+  …`. A **prefix**, because both the taskbar button and a narrow title bar truncate on
+  the right. The reason is not decided by the window code: each progressive driver
+  (`runSppProgressive`, `runCompositeProgressive`, the A/B/C batch loop, the shared
+  multi-camera loop, and the non-chunked fixed-`-n` path) already tracks *which* budget
+  tripped — it now keeps a `metTime` alongside its existing `metNoise` and calls
+  `noteFinishReason("noise target met" / "time budget reached" / "photon target reached"
+  / "sample target reached" / "stopped early")` on the way out. `main()` reads that
+  string once, after `run()` returns, rather than letting the drivers set the title
+  themselves: a multi-camera flight runs one driver **per frame**, so only the last one's
+  finish is the *render's* finish. The catch block records `"stopped by an error"`, and
+  `setLiveTitle()` caches the last mode/progress text (`g_windowRest`) so adding the
+  prefix keeps the final `…40133 spp, ~0.50% noise` line rather than blanking it.
 - Repaint granularity is bounded below by the renderer's chunk size, not by this timer:
   `gpuSppChunks` / `cpuSppChunks` retarget ~0.15 s per chunk with a 1 spp floor, so a 480²
   `-mode W -spp 8` frame gets one repaint per spp and the first complete image lands after
