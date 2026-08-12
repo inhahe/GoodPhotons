@@ -4053,10 +4053,23 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   buffers are keyed on `MeshView::geomGen` (bumped only where `adoptSidecar` installs a new
   tessellation), an orbit / zoom / colour-mode change costs one 144-byte constant-buffer
   write, not a re-projection of every vertex. The union bounds used to frame the view are
-  baked with the upload for the same reason. Shading stays the flat two-sided lambert
-  `0.30 + 0.70*|n.z|` of the CPU path, with the face normal taken per-pixel from
-  `cross(ddx(vp), ddy(vp))` — exact under this orthographic projection — and the wireframe
-  is a real second depth-tested `D3D11_FILL_WIREFRAME` pass. The **curve and field panes
+  baked with the upload for the same reason. Shading is two-sided lambert
+  `0.30 + 0.70*|n.z|` from a **real interpolated per-vertex normal**: the vertex format is
+  position + uv + `NORMAL`, and `buildMeshPaneVerts` derives the normals on upload with the
+  same crease-limited angle-weighted algorithm ftrace's loader uses (`src/mesh.h`) —
+  position weld at `1e-6 x diag`, Thürmer–Wüthrich corner-angle weights, neighbours merged
+  only inside the crease angle, corners split back apart where their normals disagree.
+  The angle comes from the sidecar: loom now ships `mesh.smooth` as the *resolved crease
+  angle in degrees* (`loom.scene.smooth_crease_deg`, the same number its `mesh { smooth
+  <deg> }` carries), so the preview creases exactly where the render will; authored
+  `normals`, if a sidecar ever carries them, win outright, and a strand tubed by the pane
+  itself asks for ftrace's default 40°. This replaced a per-pixel face normal rebuilt from
+  `cross(ddx(vp), ddy(vp))`, which could only show facets *and* — because `ddx`/`ddy` are
+  evaluated over 2×2 pixel quads — emitted a garbage normal wherever a quad straddled a
+  triangle boundary, painting a one-pixel band of wrong shading along every edge (the
+  "jagged seams" on loom's sweeps). The target is **4× MSAA** (`pickSamples` falls back to
+  2×/1× if the device refuses) resolved into the single-sample texture ImGui samples, and
+  the wireframe is a real second depth-tested `D3D11_FILL_WIREFRAME` pass. The **curve and field panes
   still project on the CPU**; they draw lines rather than solid surfaces, so the occlusion
   bug does not bite them, but they are the same port waiting to happen.
   **Live re-derivation (§F4 item 2, `-loom <scene.py>`)** uses `LoomLink` (a child

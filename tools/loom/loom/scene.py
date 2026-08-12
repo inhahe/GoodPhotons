@@ -746,26 +746,38 @@ class Group(Element):
 FTRACE_DEFAULT_CREASE_DEG = 40.0
 
 
-def _smooth_clause(smooth) -> str:
-    """Render the ``smooth`` part of a ``mesh { ... }`` block (with trailing spaces).
+def smooth_crease_deg(smooth) -> float:
+    """Resolve a ``smooth=`` argument to a crease angle in DEGREES (0.0 == flat).
 
     Accepts the historical 0/1 flag *and* an explicit crease angle:
 
     ``False`` / ``0`` / ``None``
-        Omit the directive: the mesh keeps its geometric normals (flat).  Note this
-        is deliberately not ``smooth 0`` — ftrace reads a present-but-zero angle as
-        "smoothing ON with a 0 deg threshold", which merges nothing but still pays
-        for the position weld and the adjacency build.
+        ``0.0`` — no smoothing; the mesh keeps its geometric normals (flat).
     ``True`` / ``1``
-        ``smooth 40`` — ftrace's own default crease angle, i.e. what a bare
-        ``smooth`` means in hand-written ftsl.
+        ``40.0`` — ftrace's own default crease angle, i.e. what a bare ``smooth``
+        means in hand-written ftsl.
     any other number
-        ``smooth <that angle>``, in degrees.
+        that number, in degrees.
+
+    This is the one place the flag-vs-angle question is answered, so the ftsl
+    emitter (:func:`_smooth_clause`) and the viewer sidecar (which ships the angle
+    to the F4 mesh pane, so the preview creases where the render will) agree.
     """
     if smooth is None or smooth is False:
-        return ""
+        return 0.0
     ang = (FTRACE_DEFAULT_CREASE_DEG
            if smooth is True or float(smooth) == 1.0 else float(smooth))
+    return ang if ang > 0.0 else 0.0
+
+
+def _smooth_clause(smooth) -> str:
+    """Render the ``smooth`` part of a ``mesh { ... }`` block (with trailing spaces).
+
+    Flat meshes emit nothing at all — deliberately not ``smooth 0``, since ftrace
+    reads a present-but-zero angle as "smoothing ON with a 0 deg threshold", which
+    merges nothing but still pays for the position weld and the adjacency build.
+    """
+    ang = smooth_crease_deg(smooth)
     if ang <= 0.0:
         return ""
     return f"smooth {ang:g}  "

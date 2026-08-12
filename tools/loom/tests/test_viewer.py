@@ -167,6 +167,42 @@ def test_introspect_swept_mesh_carries_tessellated_geometry():
         assert len(f) == 3 and all(0 <= i < nv for i in f)
 
 
+def test_introspect_mesh_carries_the_resolved_crease_angle():
+    """F4: the sidecar ships ``smooth`` as the resolved crease angle in DEGREES —
+    the same number the emitted ftsl's ``mesh { smooth <deg> }`` carries — so the
+    viewer's 3-D pane creases its preview normals exactly where the render will.
+    Shipping the raw 0/1 flag instead would make the pane smooth a 1-degree
+    threshold, i.e. nothing, which is the bug that made every sweep look faceted."""
+    from loom.scene import Scene, Camera, tube, IsoMesh, FTRACE_DEFAULT_CREASE_DEG
+    from loom.data import PointPath
+    from loom import X, Y, Z
+    path = PointPath([(0, 0, 0), (1, 0, 0), (2, 1, 0)], closed=False)
+
+    def sm(scene):
+        d = introspect(scene)
+        return [o for o in d["objects"] if o["kind"] == "swept_mesh"][0]["mesh"]["smooth"]
+
+    on = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+    on.add(tube(path, radius=0.2, count=8, closed_spine=False, material="m", smooth=1))
+    assert sm(on) == FTRACE_DEFAULT_CREASE_DEG
+
+    off = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+    off.add(tube(path, radius=0.2, count=8, closed_spine=False, material="m", smooth=0))
+    assert sm(off) == 0.0
+
+    tuned = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+    tuned.add(tube(path, radius=0.2, count=8, closed_spine=False, material="m", smooth=12.5))
+    assert sm(tuned) == 12.5
+
+    # iso meshes carry it too — same mesh pane, same crease question
+    iso = Scene(Camera(eye=(0, 0, 3), look_at=(0, 0, 0)))
+    iso.add(IsoMesh(X * X + Y * Y + Z * Z + (-(0.6 * 0.6)), bounds=1.0, res=12,
+                    iso=0.0, material="skin", smooth=1))
+    d = introspect(iso)
+    assert [o for o in d["objects"] if o["kind"] == "iso_mesh"][0]["mesh"]["smooth"] \
+        == FTRACE_DEFAULT_CREASE_DEG
+
+
 def test_introspect_iso_mesh_carries_marching_cubes_geometry():
     """F7 (MC fallback): an iso_mesh object carries its marching-cubes triangle
     mesh (vertices + 0-based faces) baked at the clock, so the Meshes tab can draw

@@ -1181,9 +1181,13 @@ tools/loom/
   in the shared 3-D orbit view (grid node positions reconstructed from axes+shape in C-order), with 3-of-N
   dim pickers, a heatmap-channel / ch0·1·2→RGB colour selector, click-to-inspect, and per-extra-dim slice
   sliders for N-D grids. **F4 core is complete:** `_describe_element` emits each `SweptMesh`'s tessellated
-  `mesh` (`vertices`/`faces`/`uvs`, from `sweep_rings`+`skin_rings` at the clock), and the viewer's
-  **Meshes tab** (`collectMeshes`/`drawMeshPane`) draws it as a shaded, painter's-depth-sorted triangle
-  surface with two-sided lambert lighting, a wireframe overlay, and grey/per-object/UV-checker/**texture**
+  `mesh` (`vertices`/`faces`/`uvs`, from `sweep_rings`+`skin_rings` at the clock, plus `smooth` — the
+  resolved crease angle in DEGREES from `smooth_crease_deg`, which is also what the emitted
+  `mesh { smooth <deg> }` carries), and the viewer's
+  **Meshes tab** (`collectMeshes`/`drawMeshPane`) draws it as a shaded, GPU z-buffered, 4x multisampled
+  triangle surface with two-sided lambert lighting off **crease-smoothed per-vertex normals**
+  (`buildMeshPaneVerts`, mirroring `src/mesh.h` at the sidecar's crease angle, so the preview creases
+  where the render will), a wireframe overlay, and grey/per-object/UV-checker/**texture**
   colouring (orbiting is view-only). **F4 textures are complete:** `introspect` emits a `materials` list
   (type/props + the resolved `texture` each binds) and a `textures` list — image skins as
   `file`/`encoding`/`filter`/`wrap`, formula skins as their three `r`/`g`/`b` UV expressions + `res`.

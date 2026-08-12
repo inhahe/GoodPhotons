@@ -5,6 +5,69 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-08-12, v0.183.0): the loom viewer's Meshes pane had no vertex normals at all, and rebuilt a face normal per pixel from `ddx`/`ddy` — one band of wrong shading along every triangle edge
+
+*(The second half of "why do sweeps look tessellated in the viewer?" — the first half was
+the crease-angle bug below, which is renderer-side. Even with that fixed, the **preview**
+still looked faceted and, more distinctively, its seams looked jagged. Three separate
+causes, all now fixed in `src/viewer_gui.cpp`.)*
+
+**1. `MeshGeom` carried no normals, so the pane structurally could not smooth-shade.**
+The vertex format was `{x,y,z,u,v}` — position and UV only. Whatever the sidecar said
+about smoothing, the pane had nowhere to put a shading normal.
+
+**2. The pixel shader reconstructed a FACE normal from screen-space derivatives:**
+
+```hlsl
+float3 n = normalize(cross(ddx(i.vp), ddy(i.vp)));   // viewer_gui.cpp, old PS
+sh = 0.30 + 0.70 * abs(n.z);
+```
+
+That is exact for a flat face under this orthographic projection, which is why it was
+written — but `ddx`/`ddy` are evaluated over **2×2 pixel quads**. A quad straddling a
+triangle boundary differentiates across *two different triangles*, so its derivative is
+meaningless and the normal it yields is garbage. The result is a one-pixel band of wrong
+shading tracing **every single edge in the mesh** — which is exactly what read as "the
+seams look jagged", and why it looked worse, not better, as tessellation got finer (more
+edges = more bands). Note this artifact is invisible in a screenshot of a *flat-shaded*
+CPU render, so it was never attributable to the geometry.
+
+**3. No MSAA.** `SampleDesc.Count = 1`, against a hard-edged silhouette on a flat
+background — the case where aliasing is most visible and MSAA cheapest.
+
+**Fix.**
+
+* `MeshPaneVert` is now `{x,y,z,u,v,nx,ny,nz}` with a `NORMAL` element in the input layout;
+  the VS rotates it into the view basis (the rows are orthonormal, so no inverse-transpose
+  is needed) and the PS shades from the interpolated value. The `ddx`/`ddy` path is gone.
+* `buildMeshPaneVerts()` derives the normals on upload using **the same algorithm ftrace's
+  own loader uses** (`src/mesh.h:182-290`), deliberately mirrored rather than reinvented:
+  weld by position first (`eps = 1e-6 × bounding diagonal` — a sweep's seam ring is two
+  coincident vertices that must share a normal), accumulate face normals weighted by the
+  corner's interior angle (Thürmer & Wüthrich, tessellation-independent where area
+  weighting is not), merge only neighbours inside the crease angle, fall back to the face
+  normal for an isolated corner. It then re-indexes, which `mesh.h` does not have to:
+  `mesh.h` stores normals per triangle *corner*, but a vertex buffer is indexed, so corners
+  of one vertex whose normals disagree (either side of a crease) are split into separate
+  vertices here and corners that agree collapse back onto one.
+* **Where the crease angle comes from.** `loom.scene.smooth_crease_deg()` is now the single
+  place the flag-vs-angle question is answered, and both consumers read it: the ftsl emitter
+  (`_smooth_clause`) and the sidecar, which ships `mesh.smooth` as the resolved angle in
+  degrees. So the preview creases exactly where the render will, including "flat" (0) and a
+  tuned angle. Authored per-vertex `normals` in the sidecar win outright, matching the way
+  OBJ `vn` beats `smooth` in the loader. A strand the pane tubes itself has no authored
+  `smooth`, so it asks for ftrace's default 40° — which correctly merges the ~36° step
+  around a 10-gon profile and correctly keeps the 90° cap rim sharp.
+* The offscreen target is **4× MSAA** resolved into the single-sample texture ImGui samples
+  (`pickSamples()` falls back to 2×/1× if the device refuses either format; an MSAA texture
+  cannot be bound as an SRV, so the resolve is mandatory, and it sits outside the `vb && ib`
+  guard so an empty scene still shows its clear colour).
+
+**Verified**: `scatter_modulated_sweep.json` (2160 verts / 4320 tris) in the Meshes pane —
+smooth shading with no facets, no edge bands, and a clean silhouette. Regression test
+`test_introspect_mesh_carries_the_resolved_crease_angle` (tools/loom/tests/test_viewer.py)
+pins the sidecar contract; the C++ side has no test harness, so it was checked by eye.
+
 ### FIXED (2026-08-12): loom emitted `smooth` as a 0/1 flag into ftrace's `mesh { smooth <deg> }`, which is a CREASE ANGLE — so every swept / iso mesh rendered fully faceted
 
 *(Found while answering "why do sweeps show obvious tessellation in the loom viewer?" — the
@@ -4290,9 +4353,11 @@ RTV + **D32_FLOAT depth-stencil view** with runtime-compiled HLSL, then shown wi
 - Geometry uploads **once per tessellation** (`MeshView::geomGen`, bumped in `adoptSidecar`),
   so an orbit / zoom / colour-mode change is a 144-byte constant-buffer write and nothing else.
   Union bounds are baked with the upload rather than rescanned per frame.
-- Flat two-sided lambert is *preserved exactly* (`0.30 + 0.70*|n.z|`), with the face normal
+- Flat two-sided lambert was *preserved exactly* (`0.30 + 0.70*|n.z|`), with the face normal
   recovered per-pixel from `cross(ddx(vp), ddy(vp))`; under the orthographic orbit projection
-  that is exact, not an approximation.
+  that is exact for the interior of a face. **Superseded in v0.183.0** — `ddx`/`ddy` are
+  quad-based, so it was *not* exact at a face BOUNDARY, and it painted a band of garbage
+  shading along every edge. See the per-vertex-normal entry at the top of this file.
 - The wireframe is now a **real second depth-tested pass** (`D3D11_FILL_WIREFRAME`,
   LESS_EQUAL + a small negative depth bias) instead of relying on fill/wire interleaving.
 - The UV checker is now evaluated **per-pixel** at the interpolated UV instead of once at the
