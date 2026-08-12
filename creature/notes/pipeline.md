@@ -23,18 +23,27 @@ cd "D:\visual studio projects\forward raytracer\creature"
 ## The shape of it
 
 ```
-   cards            A. ingest        B. 2D keypoints      C. fit          D. rig        E. train        F. use
-  ────────         ───────────       ─────────────       ────────       ────────      ──────────     ─────────
-  4x .mp4   ──►  calibrate + sync ──►  DLC / SLEAP   ──►  anatomy  ──►  ftcl_build ──►  train.py  ──►  eval/view
-  4x .wav        session/calib.json    kp2d.h5           theta_animal   rig_report      + AMP demos     FTSL bake
-                 session/sync.json                       + motion .npz  morph_sweep     + morph rand
-                   TO BUILD              EXTERNAL          TO BUILD        EXISTS       PARTLY EXISTS   PARTLY
+   cards            A. ingest      B. 2D observations    C. fit          D. rig        E. train        F. use
+  ────────         ───────────     ────────────────     ────────       ────────      ──────────     ─────────
+  4x .mp4   ──►  calibrate + sync ──►  DLC / SLEAP  ──►  anatomy  ──►  ftcl_build ──►  train.py  ──►  eval/view
+  4x .wav        session/calib.json    kp2d.h5          theta_animal   rig_report      + AMP demos     FTSL bake
+                 session/sync.json     ↑ joints         + motion .npz  morph_sweep     + morph rand
+                                       SAM2 masks.h5
+                                       ↑ girth
+                   TO BUILD              EXTERNAL         TO BUILD        EXISTS       PARTLY EXISTS   PARTLY
 ```
 
-The three arrows that carry the data are the three file formats worth freezing early:
+**Stage B produces two things, not one, and the second is easy to forget.** Keypoints pin the
+*skeleton*; they say nothing whatsoever about `trunk_radius`, `limb_gracility` or the belly. Girth
+lives **only** in the contour, so the silhouette masks are not a refinement — without them the outer
+CMA-ES loop is blind to half the morph vector (todo.md P5 §"The objective, term by term": E_sil "is
+the term that carries the anatomy"). A pipeline that ships keypoints and skips masks fits a skeleton
+and then guesses the animal's shape.
+
+The four arrows that carry data are the four file formats worth freezing early:
 `session/calib.json` (camera models + extrinsics + ground plane), `session/kp2d.h5` (per-view 2D
-keypoint tracks + confidences), and `out/theta_animal.json` (the 26-number morph vector). Everything
-else is internal.
+keypoint tracks + confidences), `session/masks.h5` (per-view binary silhouettes), and
+`out/theta_animal.json` (the 26-number morph vector). Everything else is internal.
 
 ---
 
@@ -63,7 +72,9 @@ calibration that is wrong is *not detectable from the footage afterwards*.
 wand/board bundle adjustment is the well-trodden path for extrinsics. capture.md already commits to
 the fisheye model and to undistorting *keypoints*, never frames.
 
-## Stage B — 2D keypoints   `EXTERNAL (DLC / SLEAP) + TO BUILD glue`
+## Stage B — 2D observations: keypoints **and** silhouettes   `EXTERNAL + TO BUILD glue`
+
+### B1 — keypoints (the skeleton)
 
 ```bash
 # The correspondence file is the single source of truth; the detector project is GENERATED
@@ -84,6 +95,36 @@ rig can express landmark **sites**, and `creaturelab` has *no site support at al
 `site` occurrences in `schema.py`, `emit_mjcf.py` or `rigs/canis.ftcl`. That work item is already
 listed in todo.md P5 §"The keypoint↔rig interface must be authored". It is the first thing on the
 critical path, it needs no footage, and it can be done today.
+
+### B2 — silhouettes (the girth)   `EXTERNAL (SAM2) + TO BUILD glue`
+
+```bash
+# One prompt per clip per view - a few clicks on the animal in the first frame - then
+# SAM2 propagates through the clip. Background subtraction is the fallback in a
+# controlled space. Only the passes shot against an uncluttered backdrop need this
+# (capture.md's "silhouette-friendly passes" row).
+python tools/masks_import.py  --session sessions/2026-08-20_rex  --from sam2/rex \
+    --clips stand_* walk_*
+#   -> sessions/.../masks.h5   (per take, per view: T x H x W binary, RLE-packed)
+
+# Precompute the distance transform of each observed silhouette BOUNDARY once, because
+# the fit samples it a few hundred times per frame per candidate theta and a per-
+# evaluation DT would dominate the whole CMA-ES budget.
+python tools/masks_dt.py  --session sessions/2026-08-20_rex
+#   -> sessions/.../masks_dt.h5   (float16 DT + its bilinear gradient)
+```
+
+**Why this is cheap and why it needs no renderer.** E_sil is a *one-directional* (model→observed)
+chamfer: sample the projected occluding contours of the model's capsule geoms, do a bilinear lookup
+into the precomputed DT, and the lookup is its own analytic gradient. That is robust to segmentation
+holes and clutter, is O(#contour samples), and — the load-bearing part — needs **no rasteriser and
+no differentiable renderer**. This is why "don't build a soft renderer" survives contact with the
+silhouette term.
+
+**The correction it will need:** fur inflates the silhouette, so E_sil measures the *coat*, not the
+body. `trunk_radius` and `limb_gracility` come out biased fat by roughly the coat depth, and
+capture.md flags this. Decide deliberately whether to subtract a coat allowance or to accept that θ
+describes the groomed animal.
 
 ## Stage C — fit: anatomy, then motion   `TO BUILD` — this is P5, the research risk
 
@@ -112,6 +153,30 @@ python tools/fit_report.py  out/theta_rex.json  out/motion/
 
 Order is not negotiable: **anatomy first, then freeze it, then motion.** Reprojection error through
 the wrong skeleton is meaningless. todo.md P5 §"Anatomy before motion" has the cost model.
+
+`fit_anatomy.py` reads **both** stage-B products — `kp2d.h5` *and* `masks_dt.h5` — plus `calib.json`
+and the one number video cannot give it. What each input is actually responsible for:
+
+| the objective term | weight | what it is the only source of | input |
+|---|---|---|---|
+| **E_kp** reprojection (Huber δ=2 px, ×confidence) | 1 (reference scale) | bone **lengths**, joint angles | `kp2d.h5` |
+| **E_sil** chamfer on the DT | 0.3 | **girth** — `trunk_radius`, `limb_gracility`, belly | `masks_dt.h5` |
+| **E_temp** 2nd differences of qpos | 0.05, stage 2 only | — (regulariser; 140 fps is what lets plain 2nd differences replace a motion prior) | — |
+| **E_lim** log-barrier on authored ranges | 0.01 | — (keeps θ legal) | `canis.ftcl` |
+| **E_phys** `mj_inverse` torque envelope, floor penetration, stance slip | **a gate, not a loop term** | flags bad frames as AMP demos | `tune.py` statics |
+| — | — | **`body_mass` and mass distribution: kinematically invisible.** No term sees them. | **a bathroom scale** |
+
+Two facts about the inner loop that decide whether the budget is hours or days, both from P5:
+
+- **Initialisation is nearly free, and it is where the 4-camera decision pays.** RANSAC-triangulated
+  keypoints give 3D limb-segment lengths *directly*, so θ₀ = per-segment medians over the calm clips
+  and q₀ = bone-length-aware analytic IK on the triangulated points. CMA-ES polishes; it never
+  searches blind.
+- **Warm starts are load-bearing, not an optimisation.** Per candidate θ: rebuild the model once
+  (build + `tune.py`, one-shot statics — milliseconds, *not* a closed-loop process), then pose-fit a
+  fixed ~300-frame subset warm-started from the best-so-far member's trajectory. Seconds per
+  candidate ⇒ 13 × a few hundred generations = hours. Cold inner solves make the same fit take days.
+  `validate.py`'s collapse-counting never runs inside the fit.
 
 ## Stage D — turn the fit into a concrete rig   `EXISTS` (one small addition wanted)
 
@@ -160,6 +225,14 @@ not a consumer of it.
 |---|---|---|
 | `--demos out/motion/*.npz` — AMP discriminator over the fitted motion | P2 | **not started.** `ppo.py` was written anticipating "an AMP discriminator sharing the rollout", so the rollout structure is ready; the discriminator, its replay buffer and the style-reward mix are not. |
 | `--morph-center out/theta_rex.json --morph-scale 0.4` — randomise bodies per env | P4 | **mostly plumbed.** `build_body(cfg, morph=...)` already accepts a morph dict, and `sensing.py` already rides `morph_norm` in the observation "from day one". What is missing is only that `train.py` builds `[body] * n` — one shared body — instead of a list of distinct ones. |
+
+**A warning about where the design detail is thin, and it is not where you would guess.** The *fit*
+is specified down to weights, metrics and a cost model (todo.md P5 §"The implementation plan"). The
+*training* additions are not: P2 is four checkboxes plus a paragraph on why AMP beats DeepMimic, and
+P4 is five. There is nowhere in this repo that says how the discriminator is structured, what its
+observation is, how the style reward mixes with the task reward, or how demo frames failing the
+E_phys gate get down-weighted. P1's write-up is detailed because it was *built*; P2/P4's is thin
+because they have not been. Expect to design AMP when you get there rather than to implement a plan.
 
 The intended command, once both exist:
 
