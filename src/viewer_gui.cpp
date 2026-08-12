@@ -399,7 +399,238 @@ struct MeshGeom {
     std::vector<int>   faces;   // flat index triples
     int                nfaces = 0;
     std::vector<float> uvs;     // flat uv (2 per vertex), may be empty
+    std::vector<float> normals; // flat xyz (3 per vertex), may be empty (authored)
+    // Crease angle in DEGREES the object asked for, mirroring `mesh { smooth <deg> }`
+    // in the emitted ftsl; 0 == flat. Authored `normals` win over it, exactly as
+    // OBJ `vn` wins over `smooth` in src/mesh.h. See buildMeshPaneVerts().
+    double             smoothDeg = 0.0;
 };
+
+// ftrace's own default crease angle (src/ftsl.h: a bare `smooth` means 40 deg).
+// Used for geometry the pane tubes itself, which has no authored `smooth`.
+static const double MESH_PANE_CREASE_DEG = 40.0;
+
+// --------------------------------------------------------------------------
+// Per-vertex shading normals for the mesh pane, computed the way ftrace's own
+// loader computes them (src/mesh.h) so the preview creases where the render will.
+//
+// The pane used to have no normals at all: the pixel shader rebuilt a FACE normal
+// from screen-space derivatives of the view position. That can only ever show
+// facets — and worse, ddx/ddy are evaluated over 2x2 pixel quads, so every quad
+// straddling a triangle edge differentiates across two different triangles and
+// emits a garbage normal, painting a one-pixel band of wrong shading along every
+// single edge in the mesh. That is what read as "jagged seams" on loom's sweeps.
+//
+// Mirrors src/mesh.h exactly, and for the same reasons:
+//   * weld by POSITION first (eps = 1e-6 * bounding diagonal), because a swept
+//     surface's seam ring is two coincident vertices that must share a normal;
+//   * accumulate face normals weighted by the CORNER'S INTERIOR ANGLE (Thurmer &
+//     Wuthrich), which is tessellation-independent where area weighting is not;
+//   * only merge a neighbour whose normal is within the crease angle, so a cap rim
+//     or a hard fold stays sharp instead of being smeared round;
+//   * fall back to the face normal when a corner has no qualifying neighbours.
+// The one thing it must do that mesh.h does not is re-index: mesh.h stores normals
+// per triangle CORNER, while a vertex buffer is indexed, so corners of the same
+// vertex that ended up with different normals (either side of a crease) are split
+// into separate vertices here.
+// --------------------------------------------------------------------------
+struct MeshPaneVert { float x, y, z, u, v, nx, ny, nz; };
+
+static void buildMeshPaneVerts(const MeshGeom& m,
+                               std::vector<MeshPaneVert>& outV,
+                               std::vector<uint32_t>&     outI) {
+    outV.clear();
+    outI.clear();
+    const bool hasUv = (int)m.uvs.size() >= 2 * m.nverts;
+    auto uvOf = [&](int i, int c) { return hasUv ? m.uvs[(size_t)i * 2 + c] : 0.0f; };
+    auto pos  = [&](int i, int c) { return (double)m.verts[(size_t)i * 3 + c]; };
+
+    // Valid triangles only — a malformed face is skipped, exactly as before.
+    std::vector<int> tri;
+    tri.reserve((size_t)m.nfaces * 3);
+    for (int f = 0; f < m.nfaces; ++f) {
+        int a = m.faces[(size_t)f * 3 + 0], b = m.faces[(size_t)f * 3 + 1],
+            c = m.faces[(size_t)f * 3 + 2];
+        if (a < 0 || b < 0 || c < 0 || a >= m.nverts || b >= m.nverts || c >= m.nverts)
+            continue;
+        tri.push_back(a); tri.push_back(b); tri.push_back(c);
+    }
+    const int nt = (int)tri.size() / 3;
+
+    // Authored normals win, exactly as OBJ `vn` wins over `smooth` in mesh.h; so
+    // does "no smoothing asked for", which keeps the flat look but now via a real
+    // per-vertex normal rather than a derivative guess.
+    if (!m.normals.empty() || m.smoothDeg <= 0.0) {
+        const bool authored = !m.normals.empty();
+        if (authored) {
+            outV.reserve((size_t)m.nverts);
+            for (int i = 0; i < m.nverts; ++i) {
+                double nx = m.normals[(size_t)i * 3 + 0], ny = m.normals[(size_t)i * 3 + 1],
+                       nz = m.normals[(size_t)i * 3 + 2];
+                double l = std::sqrt(nx * nx + ny * ny + nz * nz);
+                if (l > 1e-12) { nx /= l; ny /= l; nz /= l; } else { nx = ny = 0.0; nz = 1.0; }
+                outV.push_back({ m.verts[(size_t)i * 3 + 0], m.verts[(size_t)i * 3 + 1],
+                                 m.verts[(size_t)i * 3 + 2], uvOf(i, 0), uvOf(i, 1),
+                                 (float)nx, (float)ny, (float)nz });
+            }
+            outI.assign(tri.begin(), tri.end());
+            return;
+        }
+        // Flat: one vertex per corner carrying its face normal. Duplicating is the
+        // point — a shared vertex cannot hold two faces' normals.
+        outV.reserve((size_t)nt * 3);
+        outI.reserve((size_t)nt * 3);
+        for (int f = 0; f < nt; ++f) {
+            const int a = tri[(size_t)f * 3 + 0], b = tri[(size_t)f * 3 + 1], c = tri[(size_t)f * 3 + 2];
+            double e0[3], e1[3], n[3];
+            for (int k = 0; k < 3; ++k) { e0[k] = pos(b, k) - pos(a, k); e1[k] = pos(c, k) - pos(a, k); }
+            n[0] = e0[1] * e1[2] - e0[2] * e1[1];
+            n[1] = e0[2] * e1[0] - e0[0] * e1[2];
+            n[2] = e0[0] * e1[1] - e0[1] * e1[0];
+            double l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            if (l > 1e-20) { n[0] /= l; n[1] /= l; n[2] /= l; } else { n[0] = n[1] = 0.0; n[2] = 1.0; }
+            const int ids[3] = { a, b, c };
+            for (int cc = 0; cc < 3; ++cc) {
+                int i = ids[cc];
+                outI.push_back((uint32_t)outV.size());
+                outV.push_back({ m.verts[(size_t)i * 3 + 0], m.verts[(size_t)i * 3 + 1],
+                                 m.verts[(size_t)i * 3 + 2], uvOf(i, 0), uvOf(i, 1),
+                                 (float)n[0], (float)n[1], (float)n[2] });
+            }
+        }
+        return;
+    }
+
+    // ---- crease-limited angle-weighted smoothing (the mesh.h algorithm) ----
+    std::vector<double> fn((size_t)nt * 3, 0.0);   // face normals
+    std::vector<double> ang((size_t)nt * 3, 0.0);  // per-corner interior angle
+    for (int f = 0; f < nt; ++f) {
+        const int idx[3] = { tri[(size_t)f * 3 + 0], tri[(size_t)f * 3 + 1], tri[(size_t)f * 3 + 2] };
+        double p[3][3];
+        for (int c = 0; c < 3; ++c) for (int k = 0; k < 3; ++k) p[c][k] = pos(idx[c], k);
+        double e0[3], e1[3], n[3];
+        for (int k = 0; k < 3; ++k) { e0[k] = p[1][k] - p[0][k]; e1[k] = p[2][k] - p[0][k]; }
+        n[0] = e0[1] * e1[2] - e0[2] * e1[1];
+        n[1] = e0[2] * e1[0] - e0[0] * e1[2];
+        n[2] = e0[0] * e1[1] - e0[1] * e1[0];
+        double l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (l > 1e-20) { n[0] /= l; n[1] /= l; n[2] /= l; } else { n[0] = n[1] = 0.0; n[2] = 1.0; }
+        for (int k = 0; k < 3; ++k) fn[(size_t)f * 3 + k] = n[k];
+        for (int c = 0; c < 3; ++c) {
+            double a[3], b[3];
+            for (int k = 0; k < 3; ++k) {
+                a[k] = p[(c + 1) % 3][k] - p[c][k];
+                b[k] = p[(c + 2) % 3][k] - p[c][k];
+            }
+            double la = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+            double lb = std::sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
+            double t = 0.0;
+            if (la > 1e-20 && lb > 1e-20) {
+                double d = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb);
+                t = std::acos(d < -1.0 ? -1.0 : (d > 1.0 ? 1.0 : d));
+            }
+            ang[(size_t)f * 3 + c] = t;
+        }
+    }
+
+    // Weld by quantized position: a sweep's seam is two coincident vertices that
+    // MUST share a normal, and an OBJ/sidecar can duplicate a position freely.
+    double lo[3] = { 1e300, 1e300, 1e300 }, hi[3] = { -1e300, -1e300, -1e300 };
+    for (int i = 0; i < m.nverts; ++i)
+        for (int k = 0; k < 3; ++k) {
+            double v = pos(i, k);
+            lo[k] = std::min(lo[k], v); hi[k] = std::max(hi[k], v);
+        }
+    double dsq = 0.0;
+    for (int k = 0; k < 3; ++k) { double d = hi[k] - lo[k]; if (d > 0.0) dsq += d * d; }
+    const double eps  = std::max(std::sqrt(dsq) * 1e-6, 1e-12);
+    const double invE = 1.0 / eps;
+
+    struct QKey { long long a, b, c; bool operator==(const QKey& o) const { return a == o.a && b == o.b && c == o.c; } };
+    struct QHash {
+        size_t operator()(const QKey& k) const {
+            unsigned long long h = 1469598103934665603ull;
+            auto mix = [&](long long x) {
+                unsigned long long u = (unsigned long long)x;
+                for (int i = 0; i < 8; ++i) { h ^= (u & 0xff); h *= 1099511628211ull; u >>= 8; }
+            };
+            mix(k.a); mix(k.b); mix(k.c);
+            return (size_t)h;
+        }
+    };
+    std::unordered_map<QKey, int, QHash> weld;
+    weld.reserve((size_t)m.nverts * 2);
+    std::vector<int> rep((size_t)m.nverts, 0);
+    int nw = 0;
+    for (int i = 0; i < m.nverts; ++i) {
+        QKey k{ (long long)std::llround(pos(i, 0) * invE),
+                (long long)std::llround(pos(i, 1) * invE),
+                (long long)std::llround(pos(i, 2) * invE) };
+        auto it = weld.find(k);
+        if (it == weld.end()) { weld.emplace(k, nw); rep[i] = nw++; }
+        else                  rep[i] = it->second;
+    }
+
+    // CSR adjacency: welded vertex -> the triangle corners that touch it.
+    std::vector<int> voff((size_t)nw + 1, 0), vcorner((size_t)nt * 3, 0);
+    for (int c = 0; c < nt * 3; ++c) ++voff[(size_t)rep[tri[(size_t)c]] + 1];
+    for (int i = 0; i < nw; ++i) voff[(size_t)i + 1] += voff[(size_t)i];
+    {
+        std::vector<int> cur(voff.begin(), voff.end() - 1);
+        for (int c = 0; c < nt * 3; ++c) vcorner[(size_t)cur[(size_t)rep[tri[(size_t)c]]]++] = c;
+    }
+
+    const double cosThresh = std::cos(m.smoothDeg * 3.14159265358979323846 / 180.0);
+
+    // Split corners whose smoothed normals differ (either side of a crease) into
+    // separate vertices; corners that agree collapse back onto one.
+    struct SKey { int v; long long a, b, c; bool operator==(const SKey& o) const { return v == o.v && a == o.a && b == o.b && c == o.c; } };
+    struct SHash {
+        size_t operator()(const SKey& k) const {
+            unsigned long long h = 1469598103934665603ull;
+            auto mix = [&](long long x) {
+                unsigned long long u = (unsigned long long)x;
+                for (int i = 0; i < 8; ++i) { h ^= (u & 0xff); h *= 1099511628211ull; u >>= 8; }
+            };
+            mix(k.v); mix(k.a); mix(k.b); mix(k.c);
+            return (size_t)h;
+        }
+    };
+    std::unordered_map<SKey, uint32_t, SHash> emitted;
+    emitted.reserve((size_t)m.nverts * 2);
+    outV.reserve((size_t)m.nverts);
+    outI.reserve((size_t)nt * 3);
+
+    for (int c = 0; c < nt * 3; ++c) {
+        const int f = c / 3;
+        const int i = tri[(size_t)c];
+        const double* fni = &fn[(size_t)f * 3];
+        double s[3] = { 0.0, 0.0, 0.0 };
+        const int w = rep[i];
+        for (int a = voff[(size_t)w]; a < voff[(size_t)w + 1]; ++a) {
+            const int cid = vcorner[(size_t)a];
+            const double* fnj = &fn[(size_t)(cid / 3) * 3];
+            if (fni[0] * fnj[0] + fni[1] * fnj[1] + fni[2] * fnj[2] < cosThresh) continue;
+            const double wgt = ang[(size_t)cid];
+            for (int k = 0; k < 3; ++k) s[k] += fnj[k] * wgt;
+        }
+        double l = std::sqrt(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+        if (l > 1e-12) { for (int k = 0; k < 3; ++k) s[k] /= l; }
+        else           { for (int k = 0; k < 3; ++k) s[k] = fni[k]; }
+
+        SKey key{ i, (long long)std::llround(s[0] * 10000.0),
+                     (long long)std::llround(s[1] * 10000.0),
+                     (long long)std::llround(s[2] * 10000.0) };
+        auto it = emitted.find(key);
+        if (it != emitted.end()) { outI.push_back(it->second); continue; }
+        uint32_t at = (uint32_t)outV.size();
+        outV.push_back({ m.verts[(size_t)i * 3 + 0], m.verts[(size_t)i * 3 + 1],
+                         m.verts[(size_t)i * 3 + 2], uvOf(i, 0), uvOf(i, 1),
+                         (float)s[0], (float)s[1], (float)s[2] });
+        emitted.emplace(key, at);
+        outI.push_back(at);
+    }
+}
 
 // A loom `Strand` ships NO triangles: it emits ftrace's native `curve` primitive,
 // which the renderer flattens into a watertight chain of round cones itself. This
@@ -517,6 +748,11 @@ static bool strandToMesh(const minijson::Value& s, MeshGeom& g) {
     }
     g.nverts = (int)g.verts.size() / 3;
     g.nfaces = (int)g.faces.size() / 3;
+    // A tube is a smooth surface that a 10-gon only approximates, so shade it as
+    // one. ftrace's default crease angle does the right thing on both features
+    // here: the ~36 deg step around the profile is under it and gets merged, the
+    // 90 deg rim where a flat cap meets the tube is over it and stays sharp.
+    g.smoothDeg = MESH_PANE_CREASE_DEG;
     return g.nfaces > 0;
 }
 
@@ -557,6 +793,16 @@ static std::vector<MeshGeom> collectMeshes(const Sidecar& sc) {
                 for (int k = 0; k < 2; ++k)
                     g.uvs.push_back(p.isArray() && k < (int)p.arr.size()
                                         ? (float)p.arr[k].asNumber(0.0) : 0.0f);
+        // Shading normals: authored ones if loom shipped them (the .ftmesh format
+        // carries a normals block), otherwise the crease angle it asked for, which
+        // the pane resolves into per-vertex normals itself — see buildMeshPaneVerts.
+        if (const minijson::Value* nn = m->find("normals"); nn && nn->isArray())
+            for (const auto& p : nn->arr)
+                for (int k = 0; k < 3; ++k)
+                    g.normals.push_back(p.isArray() && k < (int)p.arr.size()
+                                            ? (float)p.arr[k].asNumber(0.0) : 0.0f);
+        if ((int)g.normals.size() < 3 * g.nverts) g.normals.clear();
+        if (const minijson::Value* sm = m->find("smooth")) g.smoothDeg = sm->asNumber(0.0);
         meshes.push_back(std::move(g));
     };
     for (const auto& o : objs->arr) visit(o);
@@ -1453,14 +1699,21 @@ static void drawFieldPane(const std::vector<FieldGeom>& fields, FieldView& view)
 // render target that has a depth-stencil view, and show that target with
 // ImGui::Image — the same trick the Render pane uses for its raymarch.
 //
-// Shading is kept identical to the old CPU path: flat two-sided lambert
-// 0.30 + 0.70*|n.z| with n the FACE normal in the rotated view basis. The GPU
-// recovers that per-pixel from screen-space derivatives of the view-space
-// position; under the orthographic projection used here that is exact, not an
-// approximation. The one deliberate improvement is the UV checker, which is now
-// evaluated per-pixel at the interpolated UV instead of once at the triangle
-// centroid — the whole point of a UV checker is to show UV distortion *within* a
-// face, which a flat centroid sample cannot do.
+// Shading is two-sided lambert, 0.30 + 0.70*|n.z| with n in the rotated view
+// basis, from the INTERPOLATED per-vertex normal (buildMeshPaneVerts above). It
+// used to reconstruct a flat face normal per pixel from screen-space derivatives
+// of the view position instead, which was wrong twice over: it could only ever
+// show facets, and ddx/ddy work on 2x2 pixel quads, so a quad straddling a
+// triangle edge differentiated across two triangles and produced a garbage normal
+// — a one-pixel band of wrong shading along every edge, which is what loom's
+// sweeps looked like ("jagged seams"). A real NORMAL element fixes both.
+// The UV checker is likewise evaluated per-pixel at the interpolated UV instead of
+// once at the triangle centroid — the whole point of a UV checker is to show UV
+// distortion *within* a face, which a flat centroid sample cannot do.
+//
+// The target is 4x multisampled and resolved before the pane shows it: the mesh is
+// a hard-edged silhouette against a flat background, where aliasing is at its most
+// visible and MSAA at its cheapest.
 // --------------------------------------------------------------------------
 struct MeshGpu {
     // pipeline objects (created once, on first use)
@@ -1486,17 +1739,22 @@ struct MeshGpu {
     float    mid[3] = { 0, 0, 0 };  // union-bounds centre / extents, baked with the upload
     float    ext = 1.0f, diag = 1.0f;
 
-    // offscreen colour + depth target, resized to the pane
-    ID3D11Texture2D*          colorTex = nullptr;
-    ID3D11RenderTargetView*   rtv      = nullptr;
+    // Offscreen colour + depth target, resized to the pane. Drawing goes into the
+    // MULTISAMPLED pair (msTex/depthTex) and is resolved down into colorTex, which
+    // is the single-sample texture ImGui samples — an MSAA texture cannot be bound
+    // as a shader resource, so the resolve is not optional.
+    ID3D11Texture2D*          colorTex = nullptr;   // resolve destination, SRV
     ID3D11ShaderResourceView* srv      = nullptr;
-    ID3D11Texture2D*          depthTex = nullptr;
+    ID3D11Texture2D*          msTex    = nullptr;   // MSAA colour, render target
+    ID3D11RenderTargetView*   rtv      = nullptr;
+    ID3D11Texture2D*          depthTex = nullptr;   // MSAA depth
     ID3D11DepthStencilView*   dsv      = nullptr;
+    UINT samples = 1;               // what the device actually granted (4 if it can)
     int texW = 0, texH = 0;
 
     std::string err;                // non-empty => the pane says so instead of drawing
 
-    struct Vert { float x, y, z, u, v; };
+    using Vert = MeshPaneVert;   // position + uv + shading normal
     // Must match the cbuffer in the shader below (144 B, a multiple of 16).
     struct CB {
         float mvp[16];
@@ -1515,6 +1773,7 @@ struct MeshGpu {
     void releaseTargets() {
         if (srv)      { srv->Release();      srv = nullptr; }
         if (rtv)      { rtv->Release();      rtv = nullptr; }
+        if (msTex)    { msTex->Release();    msTex = nullptr; }
         if (colorTex) { colorTex->Release(); colorTex = nullptr; }
         if (dsv)      { dsv->Release();      dsv = nullptr; }
         if (depthTex) { depthTex->Release(); depthTex = nullptr; }
@@ -1547,15 +1806,15 @@ cbuffer CB : register(b0) {
     float4 baseColor;
     float4 opts;
 };
-struct VSIn  { float3 p : POSITION; float2 uv : TEXCOORD0; };
-struct VSOut { float4 pos : SV_Position; float3 vp : TEXCOORD1; float2 uv : TEXCOORD0; };
+struct VSIn  { float3 p : POSITION; float2 uv : TEXCOORD0; float3 n : NORMAL; };
+struct VSOut { float4 pos : SV_Position; float3 vn : TEXCOORD1; float2 uv : TEXCOORD0; };
 VSOut main(VSIn i) {
     VSOut o;
     o.pos = mul(mvp, float4(i.p, 1.0));
-    // view-space position, used ONLY for the flat face normal via ddx/ddy
-    o.vp  = float3(dot(rot0.xyz, i.p) + rot0.w,
-                   dot(rot1.xyz, i.p) + rot1.w,
-                   dot(rot2.xyz, i.p) + rot2.w);
+    // shading normal rotated into the view basis. The rows are orthonormal, so the
+    // basis is its own inverse-transpose and the normal transforms like a point
+    // minus the translation (rot*.w, which positions do carry, is dropped here).
+    o.vn  = float3(dot(rot0.xyz, i.n), dot(rot1.xyz, i.n), dot(rot2.xyz, i.n));
     o.uv  = i.uv;
     return o;
 }
@@ -1570,7 +1829,7 @@ cbuffer CB : register(b0) {
 };
 Texture2D    tex0  : register(t0);
 SamplerState samp0 : register(s0);
-struct VSOut { float4 pos : SV_Position; float3 vp : TEXCOORD1; float2 uv : TEXCOORD0; };
+struct VSOut { float4 pos : SV_Position; float3 vn : TEXCOORD1; float2 uv : TEXCOORD0; };
 float4 main(VSOut i) : SV_Target {
     float3 base = baseColor.rgb;
     int mode = (int)opts.y;
@@ -1587,8 +1846,8 @@ float4 main(VSOut i) : SV_Target {
     }
     float sh = 1.0;
     if (opts.x > 0.5) {
-        float3 n = normalize(cross(ddx(i.vp), ddy(i.vp)));
-        sh = 0.30 + 0.70 * abs(n.z);          // two-sided lambert, flat per face
+        float3 n = normalize(i.vn);
+        sh = 0.30 + 0.70 * abs(n.z);          // two-sided lambert, headlight along z
     }
     return float4(base * sh, baseColor.a);
 }
@@ -1616,8 +1875,9 @@ float4 main(VSOut i) : SV_Target {
         const D3D11_INPUT_ELEMENT_DESC il[] = {
             { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
             { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         };
-        HRESULT hr = dev->CreateInputLayout(il, 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), &layout);
+        HRESULT hr = dev->CreateInputLayout(il, 3, vsb->GetBufferPointer(), vsb->GetBufferSize(), &layout);
         vsb->Release();
         if (FAILED(hr)) return fail("CreateInputLayout failed", nullptr);
 
@@ -1632,6 +1892,7 @@ float4 main(VSOut i) : SV_Target {
         rd.FillMode = D3D11_FILL_SOLID;
         rd.CullMode = D3D11_CULL_NONE;          // surfaces are drawn two-sided
         rd.DepthClipEnable = TRUE;
+        rd.MultisampleEnable = TRUE;            // ignored when the target is 1x
         if (FAILED(dev->CreateRasterizerState(&rd, &rsSolid))) return fail("rasterizer(solid) failed", nullptr);
         rd.FillMode = D3D11_FILL_WIREFRAME;
         // The wire pass draws the SAME triangles, so pull it a hair toward the eye;
@@ -1672,20 +1933,47 @@ float4 main(VSOut i) : SV_Target {
         return true;
     }
 
+    // Highest sample count <= 4 the device supports for BOTH the colour and depth
+    // formats, so a driver that can't do 4x silently gets 2x or 1x rather than a
+    // failed pane. 4x is where MSAA's quality/cost curve knees for a silhouette.
+    static UINT pickSamples(ID3D11Device* dev) {
+        for (UINT s = 4; s > 1; s >>= 1) {
+            UINT qc = 0, qd = 0;
+            if (FAILED(dev->CheckMultisampleQualityLevels(DXGI_FORMAT_R8G8B8A8_UNORM, s, &qc)) || !qc) continue;
+            if (FAILED(dev->CheckMultisampleQualityLevels(DXGI_FORMAT_D32_FLOAT, s, &qd)) || !qd) continue;
+            return s;
+        }
+        return 1;
+    }
+
     bool ensureTargets(ID3D11Device* dev, int W, int H) {
         if (W < 1) W = 1;
         if (H < 1) H = 1;
         if (colorTex && texW == W && texH == H) return true;
         releaseTargets();
+        samples = pickSamples(dev);
+
         D3D11_TEXTURE2D_DESC td = {};
         td.Width = W; td.Height = H; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
+        // The resolve destination. It keeps BIND_RENDER_TARGET so the samples==1
+        // path can render straight into it and skip the resolve entirely.
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(dev->CreateTexture2D(&td, nullptr, &colorTex))) { err = "mesh colour target failed"; return false; }
-        if (FAILED(dev->CreateRenderTargetView(colorTex, nullptr, &rtv))) { releaseTargets(); err = "mesh RTV failed"; return false; }
         if (FAILED(dev->CreateShaderResourceView(colorTex, nullptr, &srv))) { releaseTargets(); err = "mesh SRV failed"; return false; }
+
+        if (samples > 1) {
+            td.SampleDesc.Count = samples;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET;   // MSAA can't also be an SRV
+            if (FAILED(dev->CreateTexture2D(&td, nullptr, &msTex))) { releaseTargets(); err = "mesh MSAA target failed"; return false; }
+            if (FAILED(dev->CreateRenderTargetView(msTex, nullptr, &rtv))) { releaseTargets(); err = "mesh RTV failed"; return false; }
+        } else {
+            if (FAILED(dev->CreateRenderTargetView(colorTex, nullptr, &rtv))) { releaseTargets(); err = "mesh RTV failed"; return false; }
+        }
+
+        td.SampleDesc.Count = samples;
         td.Format = DXGI_FORMAT_D32_FLOAT;
         td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
         if (FAILED(dev->CreateTexture2D(&td, nullptr, &depthTex))) { releaseTargets(); err = "mesh depth target failed"; return false; }
@@ -1701,29 +1989,19 @@ float4 main(VSOut i) : SV_Target {
         releaseGeom();
         std::vector<Vert>     verts;
         std::vector<uint32_t> idx;
+        std::vector<Vert>     mv;     // scratch, reused across meshes
+        std::vector<uint32_t> mi_;
         ranges.resize(meshes.size());
         for (size_t mi = 0; mi < meshes.size(); ++mi) {
             const MeshGeom& m = meshes[mi];
             Range r;
             r.baseVertex = (INT)verts.size();
             r.firstIndex = (UINT)idx.size();
-            bool hasUv = (int)m.uvs.size() >= 2 * m.nverts;
-            for (int i = 0; i < m.nverts; ++i) {
-                Vert v;
-                v.x = m.verts[(size_t)i * 3 + 0];
-                v.y = m.verts[(size_t)i * 3 + 1];
-                v.z = m.verts[(size_t)i * 3 + 2];
-                v.u = hasUv ? m.uvs[(size_t)i * 2 + 0] : 0.0f;
-                v.v = hasUv ? m.uvs[(size_t)i * 2 + 1] : 0.0f;
-                verts.push_back(v);
-            }
-            for (int f = 0; f < m.nfaces; ++f) {
-                int f0 = m.faces[(size_t)f * 3 + 0], f1 = m.faces[(size_t)f * 3 + 1],
-                    f2 = m.faces[(size_t)f * 3 + 2];
-                if (f0 < 0 || f1 < 0 || f2 < 0 || f0 >= m.nverts || f1 >= m.nverts || f2 >= m.nverts)
-                    continue;   // a malformed face is skipped, exactly as before
-                idx.push_back((uint32_t)f0); idx.push_back((uint32_t)f1); idx.push_back((uint32_t)f2);
-            }
+            // Shading normals are resolved here (crease-smoothed, which can split a
+            // vertex), so this owns both the vertices and the indices for the mesh.
+            buildMeshPaneVerts(m, mv, mi_);
+            verts.insert(verts.end(), mv.begin(), mv.end());
+            idx.insert(idx.end(), mi_.begin(), mi_.end());
             r.indexCount = (UINT)idx.size() - r.firstIndex;
             ranges[mi] = r;
         }
@@ -1964,6 +2242,10 @@ static bool drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
             ID3D11RenderTargetView* noRtv[1] = { nullptr };
             ctx->OMSetRenderTargets(1, noRtv, nullptr);
         }
+        // Collapse the multisampled target into the single-sample texture ImGui
+        // draws. Outside the vb/ib guard so an empty scene still shows the clear.
+        if (gpu.msTex && gpu.colorTex)
+            ctx->ResolveSubresource(gpu.colorTex, 0, gpu.msTex, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
     }
 
     if (ok && gpu.srv) {
@@ -3145,6 +3427,7 @@ struct PlayCache {
     int         bakeNext = 0;        // frame the next prebake post asks for
     int         bakeHave = 0;        // frames stored (including the one held live)
     bool        capped = false;      // prebake stopped early: the cache covers a prefix
+    bool        projected = false;   // the up-front size projection has been printed once
     int         liveIdx = -1;        // the frame the LIVE locals hold; that slot is empty
     // Cached playback is paced by a wall clock, not by the bake — that is the whole
     // point. 0 means "as fast as it will go", which is the honest way to measure the
@@ -3154,7 +3437,8 @@ struct PlayCache {
 
     void drop() {
         f.clear(); key.clear(); bytes = 0; baking = false;
-        bakeNext = 0; bakeHave = 0; capped = false; liveIdx = -1; lastStepQpc = 0;
+        bakeNext = 0; bakeHave = 0; capped = false; projected = false;
+        liveIdx = -1; lastStepQpc = 0;
     }
     bool holds(int i) const { return i >= 0 && i < (int)f.size() && f[i].have; }
     // Can frame `i` be shown without going to loom? Either it is in a slot, or the
@@ -3194,7 +3478,8 @@ static size_t playFrameBytes(const PlayFrame& pf) {
         for (const auto& p : f.points)
             n += p.pos.capacity() * 4 + p.val.capacity() * 4 + p.idx.capacity() * 4;
     for (const auto& m : pf.meshes)
-        n += m.verts.capacity() * 4 + m.uvs.capacity() * 4 + m.faces.capacity() * 4;
+        n += m.verts.capacity() * 4 + m.uvs.capacity() * 4 + m.faces.capacity() * 4
+           + m.normals.capacity() * 4;
     const Scene& s = pf.loaded.scene;
     n += s.tris.capacity() * sizeof(Tri)
        + s.spheres.capacity() * sizeof(Sphere)
@@ -3880,16 +4165,50 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
                 }
 
                 if (cache.baking) {
+                    // Project the whole clock's cost as soon as the per-frame cost is
+                    // known, and say so UP FRONT. Otherwise a short cap announces itself
+                    // only once it has already been hit, which reads as a status line
+                    // rather than as a thing to act on -- and the consequence is a silent
+                    // performance cliff mid-loop, where the cached prefix plays at the
+                    // target fps and the rest drops to whatever a live bake costs. Four
+                    // frames is enough for a stable average (frames of one clock differ
+                    // in tessellation, not in kind) while still landing early in a walk.
+                    if (!cache.projected && cache.bakeHave >= 4) {
+                        cache.projected = true;
+                        const double perFrame = cache.bytes / 1048576.0 / cache.bakeHave;
+                        const double total    = perFrame * live.frames;
+                        if (total > cache.capMB) {
+                            // Round the suggestion up with headroom: landing exactly on
+                            // the cap is the one case that still ends capped.
+                            const int want = (int)(total * 1.1) + 1;
+                            std::printf("[prebake] ~%.1f MB/frame x %d frames = ~%.0f MB, "
+                                        "over the %d MB cap: only ~%d frames will cache and "
+                                        "play will stutter past there. Use -prebake-cap %d "
+                                        "for the whole clock.\n",
+                                        perFrame, live.frames, total, cache.capMB,
+                                        (int)(cache.capMB / perFrame), want);
+                        } else {
+                            std::printf("[prebake] ~%.1f MB/frame x %d frames = ~%.0f MB, "
+                                        "fits the %d MB cap\n",
+                                        perFrame, live.frames, total, cache.capMB);
+                        }
+                        std::fflush(stdout);
+                    }
                     // Stop at the cap rather than at the end of the clock if the cap
                     // comes first: a prefix cache still plays from memory as far as it
                     // goes, which beats refusing to cache a long clock at all.
                     if (cache.bytes >= capBytes) {
                         cache.capped = true;
                         cache.baking = false;
+                        const double perFrame = cache.bakeHave
+                            ? cache.bytes / 1048576.0 / cache.bakeHave : 0.0;
+                        const int want = perFrame > 0.0
+                            ? (int)(perFrame * live.frames * 1.1) + 1 : 0;
                         std::printf("[prebake] cap %d MB reached at frame %d/%d "
-                                    "(%.0f MB); the rest will bake on demand\n",
+                                    "(%.0f MB); the rest will bake on demand"
+                                    " -- re-run with -prebake-cap %d to cache all %d\n",
                                     cache.capMB, cache.bakeHave, live.frames,
-                                    cache.bytes / 1048576.0);
+                                    cache.bytes / 1048576.0, want, live.frames);
                     } else if (cache.bakeNext >= live.frames) {
                         cache.baking = false;
                         std::printf("[prebake] %d frames cached, %.0f MB (%.1f MB/frame)\n",

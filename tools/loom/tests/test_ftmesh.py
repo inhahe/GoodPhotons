@@ -156,23 +156,33 @@ def test_mesh_format_switches_the_file_but_not_the_scene():
         names = sorted(os.listdir(tmp))
         assert "tubeo.obj" in names and "tubeb.ftmesh" in names
         # The emitted ftsl differs only in the referenced filename: same block, same
-        # `smooth`, same material. ftrace dispatches on the extension.
+        # material. ftrace dispatches on the extension.
         assert obj_txt.replace("tubeo.obj", "X") == ftm_txt.replace("tubeb.ftmesh", "X")
-        assert 'smooth' in ftm_txt
+        # A default sweep ships ANALYTIC normals, so there is deliberately no `smooth`
+        # clause to crease-guess with: authored normals win over it in the loader, and
+        # omitting it also skips the loader's position weld + adjacency build.
+        assert 'smooth' not in ftm_txt
 
-        # ...and the geometry inside is the same mesh.
+        # ...and the geometry inside is the same mesh, normals included.
         v, f, n, u = read_ftmesh(os.path.join(tmp, "tubeb.ftmesh"))
         with open(os.path.join(tmp, "tubeo.obj"), encoding="utf-8") as fh:
             lines = fh.read().splitlines()
         ov = [tuple(float(x) for x in ln.split()[1:4])
               for ln in lines if ln.startswith("v ")]
-        of = [tuple(int(x) - 1 for x in ln.split()[1:4])
+        on = [tuple(float(x) for x in ln.split()[1:4])
+              for ln in lines if ln.startswith("vn ")]
+        # OBJ faces are `v//vn` triples when normals are present
+        of = [tuple(int(x.split("//")[0]) - 1 for x in ln.split()[1:4])
               for ln in lines if ln.startswith("f ")]
         assert f == of
         assert len(v) == len(ov)
+        assert n is not None and len(n) == len(v) == len(on)
         # OBJ text went through %.6g, so agreement is only to ~1e-6 relative -- which
         # is the point: the binary side is the more faithful of the two.
         for a, b in zip(v, ov):
+            for ca, cb in zip(a, b):
+                assert ca == pytest.approx(cb, abs=1e-5)
+        for a, b in zip(n, on):
             for ca, cb in zip(a, b):
                 assert ca == pytest.approx(cb, abs=1e-5)
 

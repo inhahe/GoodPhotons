@@ -407,8 +407,12 @@ positions reconstructed from the fixed lattice), coloured either by a **heatmap 
 selectable channel** or by **channels 0/1/2 → RGB**; **click any point to inspect** its
 position and every channel value, and for N-D grids **per-extra-dim slice sliders** collapse
 the dims you're not viewing to a chosen lattice index. A **Meshes tab** draws `SweptMesh`
-surfaces (tubes, ribbons, blobs) as a **shaded, GPU z-buffered triangle mesh** — flat two-sided
-lambert lighting, an optional depth-tested wireframe overlay, and grey / per-object-tint /
+surfaces (tubes, ribbons, blobs) as a **shaded, GPU z-buffered, 4× multisampled triangle
+mesh** — two-sided lambert lighting off **real per-vertex normals** (a `SweptMesh` hands over
+the swept surface's *analytic* normals, so it is seamless at any tessellation; anything else
+falls back to the same angle-weighted crease algorithm the renderer's mesh loader uses, at the
+very crease angle the object's `smooth=` asked for, so the preview creases where the render
+will), an optional depth-tested wireframe overlay, and grey / per-object-tint /
 UV-checker / **texture** colouring; orbiting spins the existing tessellation (view-only) and is
 free, since the geometry is uploaded once and re-uploaded only when the tessellation itself
 changes. Being a real depth buffer, **interpenetrating surfaces** — a swept tube threading an

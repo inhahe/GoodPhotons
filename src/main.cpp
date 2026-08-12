@@ -11428,19 +11428,53 @@ static std::string backendLabel(bool gpu, int nThreads) {
     if (gpu) return "GPU";
     return "CPU (" + std::to_string(std::max(1, nThreads)) + " threads)";
 }
+// --- "this render has finished" indicator -----------------------------------
+// A -keepwindow preview stays on screen after the render completes, and up to now the
+// only thing the title bar did at that moment was STOP CHANGING: the last progress text
+// ("[time] 58.3s / 60s, 4096 spp, ~1.56% noise") just froze there. That is
+// indistinguishable from a render still grinding through a long chunk between repaints,
+// so "is it still calculating?" could only be answered by watching the console. The
+// finish is now stated outright: once run() returns, markLiveWindowDone() stamps the
+// reason the render stopped and liveTitle() PREFIXES it, so the checkmark leads both the
+// title bar and the taskbar button (which truncates on the right, hence the prefix).
+static bool        g_windowDone = false;
+static std::string g_windowDoneWhy;
+// Why the render loop stopped, recorded by whichever driver ran it. Read once by main()
+// after run() returns rather than applied by the driver itself, because a multi-camera
+// flight runs one driver per frame and only the LAST one's finish is the render's finish.
+static std::string g_finishReason;
+static void noteFinishReason(const std::string& why) { g_finishReason = why; }
+// Last mode/progress text put on the title, so re-titling (e.g. to add the DONE prefix)
+// keeps the final progress line instead of blanking it.
+static std::string g_windowRest;
 // The ONE place a live-window title is assembled: subject — mode/progress — device.
 // Every setTitle call site goes through this so the device tag cannot be forgotten at
 // one of them (there are a dozen: the placeholder, tessellation, exposure metering, the
 // raster preview, mode W, the path-tracer and the per-camera flight loop). `rest` is the
 // mode/progress part; either half may be empty (the backend is blank until it resolves).
 static std::string liveTitle(const std::string& rest) {
-    std::string t = g_windowTitle;
+    std::string t;
+    if (g_windowDone) {
+        t = "\xE2\x9C\x94 DONE";
+        if (!g_windowDoneWhy.empty()) t += " \xE2\x80\x94 " + g_windowDoneWhy;
+        t += "  \xE2\x80\x94  ";
+    }
+    t += g_windowTitle;
     if (!rest.empty())            t += "  \xE2\x80\x94  " + rest;
     if (!g_windowBackend.empty()) t += "  \xE2\x80\x94  " + g_windowBackend;
     return t;
 }
 static void setLiveTitle(const std::string& rest) {
+    g_windowRest = rest;
     if (g_liveWin && !g_liveWin->closed()) g_liveWin->setTitle(liveTitle(rest));
+}
+// Flip the title over to "finished". `why` is the stop cause in the user's own terms
+// ("noise target met", "time budget reached", ...) — the point of the feature is that the
+// window says *which* budget ended the render, not merely that something ended it.
+static void markLiveWindowDone(const std::string& why) {
+    g_windowDone   = true;
+    g_windowDoneWhy = why;
+    setLiveTitle(g_windowRest);      // keep the last progress text, add the prefix
 }
 // Human-readable name for a transport mode char (title bar + diagnostics).
 static const char* modeLabel(char m) {
@@ -11569,7 +11603,7 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
     std::string rest = g_windowMode;
     if (status && *status)
         rest += (rest.empty() ? "" : "  \xE2\x80\x94  ") + std::string(status);
-    g_liveWin->setTitle(liveTitle(rest));
+    setLiveTitle(rest);   // caches `rest` so the DONE prefix can be added without losing it
     if (g_liveWin->closed()) g_stopRequested = 1;
     g_lastWindowPaint = std::chrono::steady_clock::now();
     const double cost = std::chrono::duration<double>(g_lastWindowPaint - tPaint).count();
@@ -12130,6 +12164,7 @@ static int runSppProgressive(
     auto lastSave = t0;
     bool writeOk = true;
     bool metNoise = false;
+    bool metTime  = false;      // which budget ended it — reported in the window title
     long long finalSpp = 0;
 
     SppProgress prog;
@@ -12152,6 +12187,7 @@ static int runSppProgressive(
         bool timeUp   = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
         bool noiseMet = (!g_whitted && noiseTarget > 0.0 && totalSpp > 0 && noisePct <= noiseTarget);
         if (noiseMet) metNoise = true;
+        if (timeUp)   metTime  = true;
         bool stop = stopped || timeUp || noiseMet;
         bool done = stop || final;
         // Two independent cadences (see g_windowIntervalSec): -interval drives the
@@ -12209,6 +12245,11 @@ static int runSppProgressive(
 #ifdef SIGBREAK
     std::signal(SIGBREAK, prevBrk);
 #endif
+    noteFinishReason(g_stopRequested ? "stopped early"
+                   : metNoise        ? "noise target met"
+                   : metTime         ? "time budget reached"
+                   : runForever      ? "stopped"
+                                     : "sample target reached");
     if (g_stopRequested)
         std::printf("\n[stop] interrupted at %lld spp — image saved.\n", finalSpp);
     else if (metNoise)
@@ -12276,6 +12317,7 @@ static int runCompositeProgressive(
     auto lastSave = t0;
     bool writeOk = true;
     bool metNoise = false;
+    bool metTime  = false;      // which budget ended it — reported in the window title
     long long batchSpp = 1;   // adapts toward ~0.5 s of combined work per iteration
 
     // Compositing is split from persisting so the live window can repaint on its own
@@ -12347,6 +12389,7 @@ static int runCompositeProgressive(
         bool timeUp   = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
         bool noiseMet = (noiseTarget > 0.0 && acc.spp > 0 && noisePct <= noiseTarget);
         if (noiseMet) metNoise = true;
+        if (timeUp)   metTime  = true;
         bool done = stopped || timeUp || noiseMet;
         bool wantSave = done || sinceSave >= intervalSec;
         bool wantWin  = done || liveWindowDue();      // window repaints on its own cadence
@@ -12381,6 +12424,11 @@ static int runCompositeProgressive(
 #ifdef SIGBREAK
     std::signal(SIGBREAK, prevBrk);
 #endif
+    noteFinishReason(g_stopRequested ? "stopped early"
+                   : metNoise        ? "noise target met"
+                   : metTime         ? "time budget reached"
+                   : runForever      ? "stopped"
+                                     : "photon/sample target reached");
     if (g_stopRequested)
         std::printf("\n[stop] interrupted at %lld photons / %lld spp — image saved.\n", acc.N, acc.spp);
     else if (metNoise)
@@ -13178,6 +13226,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         auto lastSave = t0;
         long long batches = 0;
         bool metNoise = false;
+        bool metTime  = false;      // which budget ended it — reported in the window title
         for (;;) {
             runBatch(batchN); ++batches;
             double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
@@ -13204,6 +13253,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // black frame from "converging" at 0% on the very first batch).
             bool noiseMet = (noiseTarget > 0.0 && meanHits > 0.0 && noisePct <= noiseTarget);
             if (noiseMet) metNoise = true;
+            if (timeUp)   metTime  = true;
             bool totalDone = chunkFixed && N > 0 && acc.N >= N;   // fixed-N window render
             bool done = stopped || timeUp || noiseMet || totalDone;
             bool wantSave = done || wantStatus;
@@ -13250,6 +13300,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #ifdef SIGBREAK
         std::signal(SIGBREAK, prevBrk);
 #endif
+        noteFinishReason(g_stopRequested ? "stopped early"
+                       : metNoise        ? "noise target met"
+                       : metTime         ? "time budget reached"
+                       : runForever      ? "stopped"
+                                         : "photon target reached");
         if (g_stopRequested) std::printf("\n[stop] interrupted — image and checkpoint saved.\n");
         else if (metNoise) std::printf("[noise] reached the ~%.2g%% target at %lld photons — image saved.\n",
                                        noiseTarget, acc.N);
@@ -13264,6 +13319,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     (resume && acc.N > 0) ? " [resuming]" : "");
         runBatch(N);
         writeOut(/*announceCheckpoint*/true);
+        noteFinishReason(g_stopRequested ? "stopped early" : "photon target reached");
     }
 
     double tot = acc.energy.absorbed + acc.energy.sensor + acc.energy.escaped + acc.energy.residual;
@@ -13837,7 +13893,9 @@ static void printHelp(const char* prog) {
 "  -prebake              with -viewer: bake the whole clock into memory on open, then\n"
 "                        play from cache at a real frame rate instead of at loom's\n"
 "  -prebake-cap <MB>     memory budget for -prebake (default 1024); a cache that hits\n"
-"                        the cap covers a prefix and the rest still bakes on demand\n"
+"                        the cap covers a prefix and the rest still bakes on demand.\n"
+"                        The walk projects the clock's total cost up front and prints\n"
+"                        the -prebake-cap value needed to cache all of it\n"
 "  -h | --help           show this help and exit\n"
 "  -version | -V         print the version and exit\n"
 "\n"
@@ -18116,6 +18174,7 @@ static int run(int argc, char** argv) {
             auto lastSave = t0;
             long long batches = 0;
             bool metNoise = false;
+            bool metTime  = false;   // which budget ended it — reported in the window title
             for (;;) {
                 runBatch(batchN); ++batches;
                 double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
@@ -18148,6 +18207,7 @@ static int run(int argc, char** argv) {
                 }
                 bool noiseMet = (noiseTarget > 0.0 && meanHits > 0.0 && noisePct <= noiseTarget);
                 if (noiseMet) metNoise = true;
+                if (timeUp)   metTime  = true;
                 bool totalDone = chunkFixed && N > 0 && accN >= N;
                 bool done = stopped || timeUp || noiseMet || totalDone;
                 bool wantSave = done || wantStatus;
@@ -18192,6 +18252,11 @@ static int run(int argc, char** argv) {
 #ifdef SIGBREAK
             std::signal(SIGBREAK, prevBrk);
 #endif
+            noteFinishReason(g_stopRequested ? "stopped early"
+                           : metNoise        ? "noise target met"
+                           : metTime         ? "time budget reached"
+                           : runForever      ? "stopped"
+                                             : "photon target reached");
             if (g_stopRequested) std::printf("\n[stop] interrupted — images and checkpoints saved.\n");
             else if (metNoise) std::printf("[noise] reached the ~%.2g%% target at %lld photons — images saved.\n",
                                            noiseTarget, accN);
@@ -18590,7 +18655,15 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         rc = 1;
+        noteFinishReason("stopped by an error");
     }
+    // Say so in the title bar. Rendering is over the moment run() returns, whether the
+    // window is about to be torn down or (with -keepwindow) held open for inspection —
+    // and in the held case this is the ONLY on-screen signal that nothing is still
+    // converging, since the progress text simply stops changing. A no-op when there is
+    // no window; the reason comes from whichever driver last hit its budget.
+    if (g_liveWin && !g_liveWin->closed())
+        markLiveWindowDone(g_finishReason.empty() ? "render complete" : g_finishReason);
     // -keepwindow / -hold: keep the finished image on screen. The live window runs its
     // own UI thread, so we just block here until the user closes it (or it's already gone)
     // rather than letting process exit tear it down the instant the render completes.

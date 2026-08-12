@@ -3956,6 +3956,24 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   path-trace runs on the GPU), so it precomputes `rasterBackend`/`cpuBackend`/`gpuBackend`
   once and re-stamps per branch rather than reporting whichever device the frame started
   on.
+- **The title bar also says when the render has *finished*** (`markLiveWindowDone()` /
+  `noteFinishReason()`, same block in `main.cpp`). Before this the only end-of-render
+  signal in the window was that the progress text stopped changing — indistinguishable
+  from a render still inside a long chunk between repaints, and worst under
+  `-keepwindow`, whose whole purpose is to outlive the render. Now `liveTitle()` prefixes
+  `✔ DONE — <why>` once the render is over, e.g. `✔ DONE — noise target met  —  ftrace —
+  …`. A **prefix**, because both the taskbar button and a narrow title bar truncate on
+  the right. The reason is not decided by the window code: each progressive driver
+  (`runSppProgressive`, `runCompositeProgressive`, the A/B/C batch loop, the shared
+  multi-camera loop, and the non-chunked fixed-`-n` path) already tracks *which* budget
+  tripped — it now keeps a `metTime` alongside its existing `metNoise` and calls
+  `noteFinishReason("noise target met" / "time budget reached" / "photon target reached"
+  / "sample target reached" / "stopped early")` on the way out. `main()` reads that
+  string once, after `run()` returns, rather than letting the drivers set the title
+  themselves: a multi-camera flight runs one driver **per frame**, so only the last one's
+  finish is the *render's* finish. The catch block records `"stopped by an error"`, and
+  `setLiveTitle()` caches the last mode/progress text (`g_windowRest`) so adding the
+  prefix keeps the final `…40133 spp, ~0.50% noise` line rather than blanking it.
 - Repaint granularity is bounded below by the renderer's chunk size, not by this timer:
   `gpuSppChunks` / `cpuSppChunks` retarget ~0.15 s per chunk with a 1 spp floor, so a 480²
   `-mode W -spp 8` frame gets one repaint per spp and the first complete image lands after
@@ -4043,6 +4061,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   companion `.ftsl` with ftrace's own `ftsl::load` and calling `renderIsoPreviewCuda`, and
   the **Meshes** pane bakes procedural skins through ftrace's own pattern VM — so the
   preview and the renderer share one implementation rather than two that can drift.
+  That preview kernel (`kIsoPreview`) shades two-sided, and since 0.183.1 it picks the side
+  from the **geometric** normal, not the shading normal: it first undoes any flip
+  `intersectTri` applied by testing the *interpolated* normal (`dot(N, Ng) < 0`), then
+  applies one genuine backface test (`dot(Ng, V) < 0`) to both. Testing `dot(N, V)`
+  directly — what it used to do — inverts `N·L` in the ~1-px band at every silhouette where
+  a smooth normal grazes through zero on a still-front-facing triangle, stippling the
+  outline with light and dark specks. `raster.h` decides the same flip once per triangle at
+  projection time and the path tracer re-derives it via `ngo`, for the same reason; see
+  `known-issues.md` for the underlying `intersectTri` convention that all three work around.
   The Meshes pane is **z-buffered on the GPU** (`MeshGpu`): the sidecar's tessellation is
   uploaded once into one interleaved vertex buffer + index buffer (per-mesh
   `firstIndex/indexCount/baseVertex` ranges, so each mesh is still its own draw call with
@@ -4053,10 +4080,31 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   buffers are keyed on `MeshView::geomGen` (bumped only where `adoptSidecar` installs a new
   tessellation), an orbit / zoom / colour-mode change costs one 144-byte constant-buffer
   write, not a re-projection of every vertex. The union bounds used to frame the view are
-  baked with the upload for the same reason. Shading stays the flat two-sided lambert
-  `0.30 + 0.70*|n.z|` of the CPU path, with the face normal taken per-pixel from
-  `cross(ddx(vp), ddy(vp))` — exact under this orthographic projection — and the wireframe
-  is a real second depth-tested `D3D11_FILL_WIREFRAME` pass. The **curve and field panes
+  baked with the upload for the same reason. Shading is two-sided lambert
+  `0.30 + 0.70*|n.z|` from a **real interpolated per-vertex normal**: the vertex format is
+  position + uv + `NORMAL`, and `buildMeshPaneVerts` derives the normals on upload with the
+  same crease-limited angle-weighted algorithm ftrace's loader uses (`src/mesh.h`) —
+  position weld at `1e-6 x diag`, Thürmer–Wüthrich corner-angle weights, neighbours merged
+  only inside the crease angle, corners split back apart where their normals disagree.
+  The angle comes from the sidecar: loom ships `mesh.smooth` as the *resolved crease
+  angle in degrees* (`loom.scene.smooth_crease_deg`, the same number its `mesh { smooth
+  <deg> }` carries), so the preview creases exactly where the render will, and a strand
+  tubed by the pane itself asks for ftrace's default 40°. **Authored `normals` in the
+  sidecar win outright**, matching the way OBJ `vn` beats `smooth` in the loader — and as
+  of 2026-08-12 that is the common case, because a `SweptMesh` with the default
+  `smooth=True` ships its surface's *analytic* per-vertex normals (`loom.sweep.ring_normals`
+  differentiates the ring lattice, which is literally a parameterisation of the swept
+  surface). That matters because a crease angle is fundamentally a guess: on a smooth but
+  coarsely-sampled profile — `r(a) = 1 + 0.34·cos(3a)` at 18 samples — dihedrals reach 119°
+  and 18% of edges refuse to merge at 40°, so the surface renders faceted, correctly by the
+  rule and wrongly by the surface. The generator knows; the triangles cannot.
+  This replaced a per-pixel face normal rebuilt from
+  `cross(ddx(vp), ddy(vp))`, which could only show facets *and* — because `ddx`/`ddy` are
+  evaluated over 2×2 pixel quads — emitted a garbage normal wherever a quad straddled a
+  triangle boundary, painting a one-pixel band of wrong shading along every edge (the
+  "jagged seams" on loom's sweeps). The target is **4× MSAA** (`pickSamples` falls back to
+  2×/1× if the device refuses) resolved into the single-sample texture ImGui samples, and
+  the wireframe is a real second depth-tested `D3D11_FILL_WIREFRAME` pass. The **curve and field panes
   still project on the CPU**; they draw lines rather than solid surfaces, so the occlusion
   bug does not bite them, but they are the same port waiting to happen.
   **Live re-derivation (§F4 item 2, `-loom <scene.py>`)** uses `LoomLink` (a child
@@ -4113,8 +4161,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   index it happens to share. A cache that hits its **cap** covers a prefix, and the clock
   running off the end drops back to (a) — without that fallback play deadlocks there,
   since nothing posts, so nothing lands, so the clock never moves. Measured on
-  `scatter_modulated_sweep` (96 frames, 603 MB): a requested 24 fps is delivered at
-  `cache 0.01 + raymarch 20` per frame, against 6.5 fps bake-paced.
+  `scatter_modulated_sweep` (96 frames, 1863 MB at 19.4 MB/frame since the profile went
+  30×200): a requested 24 fps is delivered at `cache 0.01 + raymarch 20` per frame, against
+  3.4 fps bake-paced. Note the cache is ~3× what it was at 18×120, so the default 1024 MB
+  cap no longer covers this clock — which is why, since 0.183.2, the walk **projects** the
+  total after 4 frames (enough for a stable MB/frame, early enough to still be a warning)
+  and prints either "fits the N MB cap" or the shortfall plus the `-prebake-cap` value that
+  would cache everything. A prefix cache degrades silently otherwise: the loop runs at the
+  target rate until it walks off the end of the cache and then stutters, which reads as a
+  performance bug rather than as a budget that was set too low.
   Two measurement rules the feature had to fix to be believable: a cached frame **clears**
   `bake`/`sidecar`/`ftsl` (otherwise the breakdown prints work that did not happen, its
   parts summing to several times the period beside them), and the fps EMA smooths the

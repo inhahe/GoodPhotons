@@ -204,9 +204,13 @@ def _swept_mesh_geometry(sm: Any, clock: Optional[Clock]) -> Dict[str, Any]:
     plain lists instead of writing an OBJ: ``vertices`` (flat 3-vectors), ``faces``
     (0-based index triples), ``uvs`` (per-vertex ``(u, v)`` from the ring/profile
     lattice; ``u`` along the spine, ``v`` around the profile), plus ``rings``/
-    ``profile_count`` so the viewer knows the lattice shape."""
+    ``profile_count`` so the viewer knows the lattice shape, ``smooth`` — the
+    resolved crease angle in DEGREES (0 == flat), so the F4 pane creases its
+    preview normals exactly where the render will — and, when ``smooth=True`` asked
+    for them, the surface's analytic per-vertex ``normals``."""
     import math
     from . import sweep as _sweep
+    from . import scene as _scene
     from .signals.core import Cache
     clk = clock if clock is not None else Clock(t=0.0, frame=0, frames=1, fps=1.0)
     cache = Cache()
@@ -231,9 +235,17 @@ def _swept_mesh_geometry(sm: Any, clock: Optional[Clock]) -> Dict[str, Any]:
     ud = n if sm.closed_spine else max(1, n - 1)
     vd = k if sm.closed_profile else max(1, k - 1)
     uvs = [[i / ud, j / vd] for i in range(n) for j in range(k)]
-    return {"vertices": [list(v) for v in verts],
-            "faces": [list(f) for f in faces],
-            "uvs": uvs, "rings": n, "profile_count": k}
+    out = {"vertices": [list(v) for v in verts],
+           "faces": [list(f) for f in faces],
+           "uvs": uvs, "rings": n, "profile_count": k,
+           "smooth": _scene.smooth_crease_deg(sm.smooth)}
+    # Mirror `SweptMesh.emit`: a plain `smooth=True` hands over the surface's real
+    # normals, so the pane shades exactly what the renderer will rather than
+    # re-deriving them from a crease guess that can't know the profile is smooth.
+    if _scene.wants_analytic_normals(sm.smooth):
+        out["normals"] = [list(v) for v in
+                          _sweep.ring_normals(rings, sm.closed_spine, sm.closed_profile)]
+    return out
 
 
 def _strand_geometry(st: Any, clock: Optional[Clock]) -> Dict[str, Any]:
@@ -276,15 +288,18 @@ def _iso_mesh_geometry(im: Any, clock: Optional[Clock]) -> Dict[str, Any]:
     ``clock`` via marching cubes (F7's MC-mesh fallback path) — the same bake
     ``IsoMesh.emit`` does, but returned as plain lists so the viewer's Meshes tab
     can draw it.  ``vertices`` are world-space 3-vectors and ``faces`` 0-based index
-    triples; marching cubes has no natural UVs, so none are emitted."""
+    triples; marching cubes has no natural UVs, so none are emitted.  ``smooth`` is
+    the resolved crease angle in DEGREES (0 == flat), matching the emitted ftsl."""
     from . import mcubes as _mc
+    from . import scene as _scene
     from .signals.core import Cache
     clk = clock if clock is not None else Clock(t=0.0, frame=0, frames=1, fps=1.0)
     verts, faces = _mc.mesh_field(
         im.field, bounds=im.bounds, res=im.res, iso=im.iso,
         clock=clk, cache=Cache(), adaptive=im.adaptive, coarse=im.coarse)
     return {"vertices": [list(v) for v in verts],
-            "faces": [list(f) for f in faces], "iso": im.iso}
+            "faces": [list(f) for f in faces], "iso": im.iso,
+            "smooth": _scene.smooth_crease_deg(im.smooth)}
 
 
 def _describe_dataset(obj: Any, kind: str, clock: Optional[Clock]) -> Dict[str, Any]:

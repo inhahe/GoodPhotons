@@ -5,6 +5,369 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-08-12, v0.183.2): `-prebake` announced a too-small cap only after hitting it, so playback fell off a cliff mid-loop with no warning
+
+*(NOT the "viewer died silently" report briefly logged here — that was the user closing the
+window with the X button. There was no crash. Left as a note because the sizing problem it
+surfaced was real.)*
+
+A prebaked frame of `scatter_modulated_sweep` costs **19.4 MB**, so its 96-frame clock needs
+1863 MB and the default `-prebake-cap 1024` covered only 53 frames. Nothing said so until the
+walk was already half done, and the symptom was a silent performance cliff mid-loop: cached
+frames play at ~24 fps (`cache 0.01`), uncached ones drop to ~3.4 fps because `bake` — loom's
+Python rebuild, 140–240 ms — dominates everything else (`raymarch` is only ~25 ms).
+
+**Fix** (`src/viewer_gui.cpp`): the walk now projects the whole clock's cost after 4 frames,
+when MB/frame is first known but the walk has barely started, and prints it **up front** —
+either "fits the N MB cap" or the shortfall plus the exact `-prebake-cap` value that would
+cache everything (per-frame × frames × 1.1, so the suggestion clears the cap rather than
+landing on it). The cap-reached line carries the same suggestion. Verified: at `-prebake-cap
+300` it predicts "~19.4 MB/frame x 96 frames = ~1863 MB … only ~15 frames will cache … Use
+-prebake-cap 2050", the walk then caps at frame 16/96, and re-running at the suggested 2050
+caches all 96 frames (1863 MB) and holds ~24 fps for the whole loop.
+
+### TECH DEBT: `intersectTri` orients the hit normal by the *interpolated* normal, so it can report a front-facing triangle as a backface
+
+`src/geometry.h:337` and `src/render_cuda.cu:2607` both decide
+
+```cpp
+bool flipped = !(dot(rd, ns) < 0);   // ns = the interpolated shading normal
+```
+
+and flip `hit.n` accordingly, leaving `hit.ng = tri.gn` alone. On a smooth-shaded mesh
+`ns` grazes through zero in a ~1-px band at every silhouette *while the triangle is still
+geometrically front-facing*, so `flipped` goes true on a surface the ray plainly hit from
+the outside. Host and device agree, so this is a consistent convention rather than a
+CPU/GPU desync — but it is the wrong quantity to test, and it is a live trap for any new
+consumer of `DHit`/`Hit` that reasonably assumes "flipped means backface".
+
+Everything downstream currently compensates, which is why it has never shown as a bug in a
+final image: the path tracer re-derives the shading side from the geometric normal
+(`ngo = (dot(h.ng, h.n) >= 0) ? h.ng : -h.ng`) and then softens across the geometric
+horizon (Chiang 2019, `render_cuda.cu:3513`); `raster.h` decides its flip once per triangle
+at projection time; and the CUDA preview kernel now does the same (entry below). So the
+compensations are three separate ad-hoc patches for one upstream convention.
+
+Second consumer, easy to miss: `flipped` also signs **curvature**
+(`hit.curv = flipped ? -tri.curvature : tri.curvature`, O3), so a grazing hit reports a
+bulge as a pit.
+
+**Measured impact on final renders: none.** A/B at 84032 spp (0.34 % noise): a 96×48
+smooth-normal sphere *mesh* beside ftrace's *analytic* sphere, same radius, same material,
+mirror-symmetric lighting, path traced (`scraps/rim.ftsl`, `scraps/mksphere.py`). If the
+convention cost anything the mesh rim would darken relative to the analytic one. Mean
+luminance by annulus (r/R), mesh vs analytic:
+
+| 0–0.6 | 0.6–0.9 | 0.90–0.96 | 0.96–0.99 | 0.99–1.00 |
+|---|---|---|---|---|
+| +0.03 % | −0.48 % | −0.94 % | −0.38 % | −0.56 % |
+
+The mesh is uniformly ~0.5 % darker at *every* radius including the deep interior — that is
+the inscribed polygon, not a rim effect. There is **no** deficit concentrated at the
+silhouette, so the downstream compensations genuinely work. This is latent debt, not a
+live rendering bug.
+
+**Proper fix** (PBRT's convention): decide facing from geometry and keep the shading normal
+a shading normal —
+
+```cpp
+Vec3 ns = <interpolated>;
+if (dot(ns, tri.gn) < 0) ns = -ns;            // authored normals agree with winding
+bool flipped = dot(r.d, tri.gn) >= 0;         // facing is a GEOMETRIC question
+hit.ng = flipped ? -tri.gn : tri.gn;
+hit.n  = flipped ? -ns     : ns;              // both sides flip together
+```
+
+Then `hit.n` and `hit.ng` are always in the same hemisphere by construction, which makes all
+~8 copies of `ngo = (dot(h.ng, h.n) >= 0) ? h.ng : -h.ng` dead code, fixes the curvature
+sign, and lets `flipped` finally mean what its name says. In the graze band `hit.n` would
+then legitimately face away from the ray — which is precisely the case the shading-horizon
+softening already exists to handle.
+
+Not done yet because it changes the reported facing of grazing hits in *every* CPU and GPU
+render, and the measurement above says the payoff is hygiene rather than image quality — so
+it wants its own before/after sweep over the scene corpus, not a drive-by edit to the
+hottest loop in the renderer.
+
+### FIXED (2026-08-12, v0.183.1): the CUDA preview kernel stippled light and dark specks along every smooth-shaded silhouette
+
+*(Reported as "a lot of stary light and dark pixels around where the edges of the shape meet
+the walls behind it" in the loom viewer's Render pane, right after sweeps started shipping
+analytic normals. It is not a regression in the normals — it is the bug above, newly
+reachable.)*
+
+`kIsoPreview` shaded two-sided by re-testing the shading normal against the view vector:
+
+```cpp
+DVec3 N = normalize(h.n);
+if (dot(N, V) < 0) N = -N;          // two-sided preview
+```
+
+`h.n` arrives already mis-oriented from `intersectTri` for exactly the grazing pixels where
+`dot(N, V)` is itself near zero, so this repeated the upstream mistake instead of correcting
+it: one pixel dropped to ambient while its neighbour lit from the far side, tracing every
+outline in salt-and-pepper. It needed a mesh carrying smooth normals *across* a silhouette
+to show up at all — flat or crease-split facets step over the graze band rather than sliding
+through it — which is why loom's analytic sweep normals surfaced a bug that predates them.
+
+**Fix** (`src/render_cuda.cu`, `kIsoPreview`): orient from the geometric normal, in two steps
+— undo any silhouette-graze flip (`dot(N, Ng) < 0`), then apply one genuine backface test
+(`dot(Ng, V) < 0`) to both. `raster.h:1661` already carried the identical fix with a comment
+describing the identical symptom ("dark speckles on the sphere's rim"), so the preview kernel
+was simply the one renderer that never got it.
+
+**Verified.** Three controlled variants at 900×900 — A: analytic normals 30×200, B: crease-40
+at 30×200, C: crease-40 at 18×120 (the exact pre-change state). Outliers vs a 3×3 median,
+threshold 28/px:
+
+| | dark | light | light dev/chan (median) | max dev |
+|---|---|---|---|---|
+| A before | 873 | 361 | **81.0** | 135.3 |
+| A after | 662 | 113 | 12.7 | 70.7 |
+| C (pre-change baseline) | 841 | 369 | 18.3 | 98.7 |
+
+So the fixed build is *quieter than the state the user remembers as clean*, and the bright
+specks — the loud half of the report — fell from a median 81/channel deviation to 12.7, i.e.
+ordinary antialiasing. 94–96% of what remains sits on a structural edge, where a median filter
+always flags something. Confirmed by eye in the loom viewer's Render pane at native
+resolution: the silhouette is clean. (The dotted dark curve still visible near the mesh is
+scene geometry, not speckle — it is the `track` trail of radius-0.017 spheres, sub-pixel at
+that distance, which resolves into visible spheres at the near end of the same curve.)
+The path tracer was checked separately (150 s render of variant A) and never had the bug.
+
+### FIXED (2026-08-12): swept meshes still looked faceted after both normal bugs were fixed — because a crease angle cannot tell a coarsely-sampled smooth curve from a real fold
+
+*(The third and last part of "why do sweeps look tessellated?". The first two were bugs —
+loom emitting a flag as an angle, and the viewer having no normals. This one is not a bug in
+anything; it is the crease heuristic working exactly as specified and still giving the wrong
+answer, which is why it survived both fixes.)*
+
+**The measurement.** `scatter_modulated_sweep` at the old 18-side profile, 2160 verts / 4320
+tris / 6480 interior edges:
+
+| dihedral | p50 | p90 | p95 | p99 | max |
+|---|---|---|---|---|---|
+| degrees | 19.2 | 56.0 | 79.1 | 93.2 | **119.1** |
+
+At ftrace's default 40° crease only **82.1%** of edges merge. The other ~18% stay split, and a
+split vertex is a visible seam.
+
+**Why raising the angle is not the fix.** The profile is `r(a) = 1 + 0.34·cos(3a)` — an
+analytically smooth closed curve with **no corners anywhere**. Its valleys simply turn fast:
+worst step is 62.0° at 18 samples, 47.7° at 24, 32.4° at 36, 19.6° at 64. So the big dihedrals
+are *sampling coarseness*, not geometry. But from a bag of triangles a coarsely-sampled smooth
+curve and a genuine sharp fold are **the same input**, so the heuristic has to guess, and any
+threshold high enough to smooth this profile would also erase a square tube's 90° corners.
+Only the *generator* knows which it is.
+
+**Fix — the generator stops guessing.** A sweep's ring lattice *is* a parameterisation `P(u,v)`
+of the surface, so the true normal is `∂P/∂v × ∂P/∂u` (that order: `skin_rings` winds a quad
+`(i,j) (i,j+1) (i+1,j+1)`, whose geometric normal is `cross(dv, du)`). New
+`loom.sweep.ring_normals(rings, closed_spine, closed_profile)` computes it by central
+differences, one-sided at open ends, wrapping on closed ones.
+
+* **`smooth=` is now three-way.** `True`/`1` (the default) → ship analytic normals and emit
+  **no** `smooth` clause; `<deg>` → keep the crease heuristic, for profiles with genuine
+  corners; `False`/`0` → flat. `loom.scene.wants_analytic_normals()` is the one place that
+  question is answered, read by both `SweptMesh.emit` and the viewer sidecar. Omitting the
+  clause is not just cosmetic: authored normals beat `smooth` in the loader anyway, and
+  skipping it also skips the loader's position weld + adjacency build.
+* Normals now ride the whole emit path: `encode_obj`/`write_obj` grew a `normals` argument
+  (emitting `vn` and `f v//vn` triples), and `EmitCtx.write_mesh(name, verts, faces, normals)`
+  hands them to whichever of OBJ / ftmesh is selected. `ftmesh` already had a normals block.
+* **`IsoMesh` deliberately unchanged.** Marching cubes has no lattice to differentiate, so it
+  keeps `smooth_crease_deg`.
+
+**What this does NOT fix: the silhouette.** A shading normal cannot round an outline — that is
+the actual polygon. `scatter_modulated_sweep`'s `sides`/`count` therefore went 18×120 → 30×200
+(2160 → 6000 verts, still trivial), which is where the outline facets stop being visible in the
+Meshes pane at full-screen size. Interior shading no longer depends on density at all.
+
+**Verified**: the Meshes pane on `scatter_modulated_sweep.json` at native resolution — no
+seams, no facet bands, smooth outline. Tests in `tools/loom/tests/test_sweep.py`:
+`ring_normals` is *exact* on a torus (both parameters circular, so central differences carry no
+truncation error), agrees with `skin_rings`' winding on closed/open spines and profiles,
+converges second-order under profile refinement, and lands within a third of the crease angle
+of the true surface on the very profile that defeats the heuristic. 1406 loom tests pass.
+No `ftrace.exe` rebuild: the C++ side already preferred authored `normals` as of v0.183.0.
+
+### FIXED (2026-08-12, v0.183.0): the loom viewer's Meshes pane had no vertex normals at all, and rebuilt a face normal per pixel from `ddx`/`ddy` — one band of wrong shading along every triangle edge
+
+*(The second half of "why do sweeps look tessellated in the viewer?" — the first half was
+the crease-angle bug below, which is renderer-side. Even with that fixed, the **preview**
+still looked faceted and, more distinctively, its seams looked jagged. Three separate
+causes, all now fixed in `src/viewer_gui.cpp`.)*
+
+**1. `MeshGeom` carried no normals, so the pane structurally could not smooth-shade.**
+The vertex format was `{x,y,z,u,v}` — position and UV only. Whatever the sidecar said
+about smoothing, the pane had nowhere to put a shading normal.
+
+**2. The pixel shader reconstructed a FACE normal from screen-space derivatives:**
+
+```hlsl
+float3 n = normalize(cross(ddx(i.vp), ddy(i.vp)));   // viewer_gui.cpp, old PS
+sh = 0.30 + 0.70 * abs(n.z);
+```
+
+That is exact for a flat face under this orthographic projection, which is why it was
+written — but `ddx`/`ddy` are evaluated over **2×2 pixel quads**. A quad straddling a
+triangle boundary differentiates across *two different triangles*, so its derivative is
+meaningless and the normal it yields is garbage. The result is a one-pixel band of wrong
+shading tracing **every single edge in the mesh** — which is exactly what read as "the
+seams look jagged", and why it looked worse, not better, as tessellation got finer (more
+edges = more bands). Note this artifact is invisible in a screenshot of a *flat-shaded*
+CPU render, so it was never attributable to the geometry.
+
+**3. No MSAA.** `SampleDesc.Count = 1`, against a hard-edged silhouette on a flat
+background — the case where aliasing is most visible and MSAA cheapest.
+
+**Fix.**
+
+* `MeshPaneVert` is now `{x,y,z,u,v,nx,ny,nz}` with a `NORMAL` element in the input layout;
+  the VS rotates it into the view basis (the rows are orthonormal, so no inverse-transpose
+  is needed) and the PS shades from the interpolated value. The `ddx`/`ddy` path is gone.
+* `buildMeshPaneVerts()` derives the normals on upload using **the same algorithm ftrace's
+  own loader uses** (`src/mesh.h:182-290`), deliberately mirrored rather than reinvented:
+  weld by position first (`eps = 1e-6 × bounding diagonal` — a sweep's seam ring is two
+  coincident vertices that must share a normal), accumulate face normals weighted by the
+  corner's interior angle (Thürmer & Wüthrich, tessellation-independent where area
+  weighting is not), merge only neighbours inside the crease angle, fall back to the face
+  normal for an isolated corner. It then re-indexes, which `mesh.h` does not have to:
+  `mesh.h` stores normals per triangle *corner*, but a vertex buffer is indexed, so corners
+  of one vertex whose normals disagree (either side of a crease) are split into separate
+  vertices here and corners that agree collapse back onto one.
+* **Where the crease angle comes from.** `loom.scene.smooth_crease_deg()` is now the single
+  place the flag-vs-angle question is answered, and both consumers read it: the ftsl emitter
+  (`_smooth_clause`) and the sidecar, which ships `mesh.smooth` as the resolved angle in
+  degrees. So the preview creases exactly where the render will, including "flat" (0) and a
+  tuned angle. Authored per-vertex `normals` in the sidecar win outright, matching the way
+  OBJ `vn` beats `smooth` in the loader. A strand the pane tubes itself has no authored
+  `smooth`, so it asks for ftrace's default 40° — which correctly merges the ~36° step
+  around a 10-gon profile and correctly keeps the 90° cap rim sharp.
+* The offscreen target is **4× MSAA** resolved into the single-sample texture ImGui samples
+  (`pickSamples()` falls back to 2×/1× if the device refuses either format; an MSAA texture
+  cannot be bound as an SRV, so the resolve is mandatory, and it sits outside the `vb && ib`
+  guard so an empty scene still shows its clear colour).
+
+**Verified**: `scatter_modulated_sweep.json` (2160 verts / 4320 tris) in the Meshes pane —
+smooth shading with no facets, no edge bands, and a clean silhouette. Regression test
+`test_introspect_mesh_carries_the_resolved_crease_angle` (tools/loom/tests/test_viewer.py)
+pins the sidecar contract; the C++ side has no test harness, so it was checked by eye.
+
+### FIXED (2026-08-12): loom emitted `smooth` as a 0/1 flag into ftrace's `mesh { smooth <deg> }`, which is a CREASE ANGLE — so every swept / iso mesh rendered fully faceted
+
+*(Found while answering "why do sweeps show obvious tessellation in the loom viewer?" — the
+answer was not tessellation density. See the sweep-primitive entry below, whose "sweeps
+tessellate well" claim this bug had been silently falsifying.)*
+
+**The units mismatch.** ftrace's mesh block takes a crease angle in **degrees**
+(`ftsl.h:5172`): faces are welded into a shared shading normal only where their normals differ
+by *less* than it (`cosThresh = cos(creaseAngleDeg * π/180)`, `mesh.h:254`), so authored creases
+survive. A bare `smooth` means 40°. loom, however, has always treated its `smooth=` as a
+boolean and interpolated it straight into the block:
+
+```python
+return (f'mesh {{ file "{path.as_posix()}"  smooth {self.smooth}  '   # scene.py, SweptMesh + IsoMesh
+        f'material "{self.material}" }}')
+```
+
+With the default `smooth: int = 1` that emits **`smooth 1`** — a *one-degree* crease threshold.
+
+**Why that smooths nothing.** Measured on `tube()`'s own defaults (`count=64`, `sides=12`,
+768 verts / 1536 tris), dihedral angles between adjacent faces are min/median/max
+**0.00 / 5.43 / 30.03°** — the profile seam steps a full `360/sides = 30°`. Against the
+thresholds:
+
+| crease | edges merged |
+|---|---|
+| 0° (loom's `smooth=0`) | 0 / 2304 (0%) |
+| **1° (loom's `smooth=1`, the default)** | **768 / 2304 (33%)** |
+| 40° (ftrace's own default) | 2304 / 2304 (100%) |
+
+The 33% is entirely the exactly-coplanar diagonals *inside* each quad. Every edge that
+actually needed smoothing stayed sharp, so the mesh was flat-shaded in effect — **at any
+tessellation density**. Raising `count`/`sides` could never fix it; it just made smaller
+facets. Confirmed visually in `png/sweepsmooth/` (mode R, 256 spp, identical scenes differing
+only in the angle): stepped tonal bands vs. a continuous gradient, max per-pixel Δ 38/255.
+
+**Fixed** in `tools/loom/loom/scene.py` — a shared `_smooth_clause()` maps the historical flag
+onto a real angle: `True`/`1` → `smooth 40` (ftrace's default), `False`/`0`/`None` → omit the
+directive entirely (deliberately *not* `smooth 0`, which ftrace reads as "smoothing on, 0°
+threshold" — a no-op that still pays for the position weld and adjacency build), and any other
+number passes through as an explicit angle. Annotations widened `int` → `float` on `SweptMesh`,
+`IsoMesh`, `ribbon`, `tube`, `blob`, `fan`. Backwards-compatible: every existing loom script
+passes 0 or 1. Regression tests in `tools/loom/tests/test_sweep.py` cover both the emitted
+angle and the geometric fact that makes a small one useless; 1399 loom tests pass.
+
+**Left alone deliberately:** `ribbon()` and `fan()` still default to `smooth=0`. That is now an
+honest "flat", where before it was indistinguishable from the broken `smooth=1`. Whether a
+bending ribbon *should* smooth along its spine by default is an aesthetic call, not part of
+this bug.
+
+**Optional follow-up — DONE (2026-08-12), see the analytic-normals entry at the top of this
+file.** `sweep.py` now emits true per-vertex normals (`ring_normals`) and `EmitCtx.write_mesh`
+grew the `normals` parameter this note asked for. The objection recorded here — that
+crease-smoothing keeps a *square* profile's 90° corners sharp while analytic normals would
+round them — was the right objection, and it is why `smooth=<deg>` still selects the heuristic:
+a per-vertex normal cannot express a sharp edge without splitting the vertex, so a profile with
+genuine corners must keep asking for the crease path. Precedent for the analytic route existed
+in `tools/make_mesh.py --smooth` (`FTSL.md:500`).
+
+### WON'T DO for now (2026-08-12): sweeps as a native FTSL primitive — the blocker is not the bounding box
+
+Recording the rationale because the question recurs ("a sweep can be indefinitely long and
+winding, so there's no reasonable bounding box for it — right?").
+
+**The bounding box is the easy part, and the codebase already proves it.** A hair strand is
+just as long and winding, and it *is* a primitive. The trick is that the BVH leaf is never the
+whole curve: `curve.h` dices each strand into `CurveSeg` round cones (`Curve` holds only
+`firstSeg`/`segCount` into a flat pool) and bounds each one tightly —
+
+```cpp
+// Exact world bound of one round cone: the union of its two end spheres' boxes.
+inline Aabb curveSegBounds(const CurveSeg& s) {   // curve.h:106
+```
+
+— described in-comment as "tight, not merely conservative". A sweep would bound identically:
+one leaf per spine span, box = hull of the two end profile polygons plus sagitta slack for the
+spine's curvature between samples. That is the same linearization error the curve code already
+absorbs when it flattens Catmull-Rom/Bézier spans into cones.
+
+Where the intuition *does* land is `implicit.h`, which is the one-primitive-one-leaf-one-box
+design (`Aabb bounds; // conservative world AABB (BVH leaf box + ray clip)`, `implicit.h:236`).
+A long winding implicit does get a huge mostly-empty box that every clipping ray pays to march.
+So the failure mode is real — it is an artifact of not subdividing, not of sweeps.
+
+**The actual reasons it stays a loom-side mesh generator (`tools/loom/loom/sweep.py`):**
+
+1. **No closed-form intersection.** A round cone is solvable algebraically; an arbitrary
+   profile with varying scale and twist is not. That means per-span Newton iteration or
+   marching — implicit-surface cost without implicit-surface generality.
+2. **The frame is globally sequential.** Per `sweep.py`'s docstring, the rotation-minimizing
+   frame is carried from the start by Wang double-reflection, and on a closed spine the
+   residual twist is redistributed over the whole loop. So the surface at spine parameter *s*
+   depends on the entire history from 0 to *s* and on loop closure — not locally evaluable
+   inside an intersector. Precomputing per-span frames fixes it, but then you are storing
+   per-span data anyway, which erodes the reason to prefer a primitive over a mesh.
+3. **Self-intersection.** Where the profile radius exceeds the spine's curvature radius the
+   surface folds through itself. On a mesh that is a harmless artifact; analytically it makes
+   inside/outside ill-defined, which breaks refraction and participating media.
+4. **The porting tax.** Every primitive needs a CPU intersector, a GPU device twin (`CurveSeg`
+   appears 27× in `render_cuda.cu`), a raster path, and coverage across modes A/B/C/R/D/U/M/W.
+   This dominates the cost of any new primitive here.
+5. **The payoff is small, because sweeps tessellate well.** A sphere or cone tessellates
+   *badly* — facets show on the silhouette at any zoom, which is exactly why they are
+   primitives. A sweep's natural discretization is already a quad grid over a small profile
+   polygon, so modest triangle counts give an essentially exact surface on a mesh path that is
+   already optimized on every backend. **Caveat:** this argument was untestable in practice
+   until the crease-angle bug above was fixed — swept meshes were flat-shaded regardless of
+   density, which looked exactly like "meshing isn't good enough for sweeps".
+
+**When to revisit:** large scale range (zooming deep enough that any fixed tessellation breaks
+down), or memory at very high sweep counts — the same argument that eventually justified curves
+for fur. Note `strand()` already covers the common round-fiber case with the native `curve`
+primitive; `tube()` exists for when you need the triangles, a `twist`, or `turns`.
+
 ### FIXED (2026-08-11, v0.181.0 → v0.182.0): `ftrace -stop <pid>` did not stop a `-viewer` GUI process, but reported that it did
 
 *(Filed as OPEN and fixed the same day; the description below is the original report, with what
@@ -4176,9 +4539,11 @@ RTV + **D32_FLOAT depth-stencil view** with runtime-compiled HLSL, then shown wi
 - Geometry uploads **once per tessellation** (`MeshView::geomGen`, bumped in `adoptSidecar`),
   so an orbit / zoom / colour-mode change is a 144-byte constant-buffer write and nothing else.
   Union bounds are baked with the upload rather than rescanned per frame.
-- Flat two-sided lambert is *preserved exactly* (`0.30 + 0.70*|n.z|`), with the face normal
+- Flat two-sided lambert was *preserved exactly* (`0.30 + 0.70*|n.z|`), with the face normal
   recovered per-pixel from `cross(ddx(vp), ddy(vp))`; under the orthographic orbit projection
-  that is exact, not an approximation.
+  that is exact for the interior of a face. **Superseded in v0.183.0** — `ddx`/`ddy` are
+  quad-based, so it was *not* exact at a face BOUNDARY, and it painted a band of garbage
+  shading along every edge. See the per-vertex-normal entry at the top of this file.
 - The wireframe is now a **real second depth-tested pass** (`D3D11_FILL_WIREFRAME`,
   LESS_EQUAL + a small negative depth bias) instead of relying on fill/wire interleaving.
 - The UV checker is now evaluated **per-pixel** at the interpolated UV instead of once at the

@@ -367,6 +367,44 @@ Note this is separate from, and downstream of, the RMF
 holonomy unwind above, which closes correctly on its own (`sweep.py:rmf_frames` transports
 `R[n−1]` one more reflection onto point 0's tangent and distributes the `deficit` linearly).
 
+**`smooth=` is three-way, because a crease angle is a guess the generator doesn't have to make
+(added 2026-08-12).** ftrace's `mesh { smooth <deg> }` merges two faces when their normals
+differ by less than `<deg>`, which is the only thing you *can* do given a bag of triangles —
+and it is not enough, because from triangles alone a coarsely-sampled smooth curve and a
+genuine sharp fold are the same input. Measured on `scatter_modulated_sweep`'s
+`r(a) = 1 + 0.34·cos(3a)` profile at 18 samples: dihedrals run to **119°** and only 82% of
+edges fall under the 40° default, yet the profile is analytically smooth with no corners at
+all — its valleys just turn 62° per step. Any threshold high enough to fix it would erase a
+square tube's 90° corners.
+
+A sweep does not have to guess. Its ring lattice **is** a parameterisation `P(u,v)`, so
+`ring_normals()` returns the true normal `∂P/∂v × ∂P/∂u` by central differences (one-sided at
+open ends, wrapping on closed ones). Note the order: `skin_rings` winds a quad
+`(i,j) (i,j+1) (i+1,j+1)`, whose geometric normal is `cross(dv, du)` — flip it and every normal
+points into the solid. So:
+
+| `smooth=` | what ships | for |
+|---|---|---|
+| `True` / `1` (default) | analytic per-vertex normals, **no** `smooth` clause | smooth surfaces — seamless at *any* tessellation |
+| `<deg>` | a `smooth <deg>` clause, no normals | profiles with genuine corners (a square tube's 4 edges must stay sharp, and a per-vertex normal cannot express a sharp edge without splitting the vertex) |
+| `False` / `0` | neither | flat |
+
+`scene.wants_analytic_normals()` is the single place that question is answered; both
+`SweptMesh.emit` and the viewer sidecar read it. Omitting the clause when normals are present
+is not cosmetic: authored normals beat `smooth` in the loader regardless, and skipping it also
+skips the loader's position weld + adjacency build. The normals ride whichever format
+`EmitCtx.write_mesh(name, verts, faces, normals)` selects — OBJ as `vn` + `f v//vn`, ftmesh in
+its normals block. **`IsoMesh` keeps the heuristic**: marching cubes has no lattice to
+differentiate.
+
+This fixes *shading* at any density; it does not fix the **silhouette**, which is the actual
+polygon and only more segments can round. Tests:
+`tests/test_sweep.py::test_ring_normals_are_exact_on_a_torus` (a torus is circular in both
+parameters, so central differences carry no truncation error — the answer must match the closed
+form to floating point), `..._agree_with_the_winding_of_skin_rings`,
+`..._converge_second_order_under_refinement`, and
+`test_analytic_normals_beat_a_crease_angle_where_the_heuristic_must_guess`.
+
 **Consequence for animation: animate `twist`, keep `turns` a static int.** A continuously
 driven `turns` on a closed spine is broken at almost every value it passes through.
 `SweptMesh._check_turns` therefore **warns once per element** when a closed spine gets a
@@ -1181,9 +1219,16 @@ tools/loom/
   in the shared 3-D orbit view (grid node positions reconstructed from axes+shape in C-order), with 3-of-N
   dim pickers, a heatmap-channel / ch0·1·2→RGB colour selector, click-to-inspect, and per-extra-dim slice
   sliders for N-D grids. **F4 core is complete:** `_describe_element` emits each `SweptMesh`'s tessellated
-  `mesh` (`vertices`/`faces`/`uvs`, from `sweep_rings`+`skin_rings` at the clock), and the viewer's
-  **Meshes tab** (`collectMeshes`/`drawMeshPane`) draws it as a shaded, painter's-depth-sorted triangle
-  surface with two-sided lambert lighting, a wireframe overlay, and grey/per-object/UV-checker/**texture**
+  `mesh` (`vertices`/`faces`/`uvs`, from `sweep_rings`+`skin_rings` at the clock, plus `smooth` — the
+  resolved crease angle in DEGREES from `smooth_crease_deg`, which is also what the emitted
+  `mesh { smooth <deg> }` carries — and, for a plain `smooth=True`, `normals`: the surface's
+  **analytic** per-vertex normals from `ring_normals`, which win outright over `smooth` exactly as
+  OBJ `vn` beats it in ftrace's loader), and the viewer's
+  **Meshes tab** (`collectMeshes`/`drawMeshPane`) draws it as a shaded, GPU z-buffered, 4x multisampled
+  triangle surface with two-sided lambert lighting off those normals, or failing that
+  **crease-smoothed** ones
+  (`buildMeshPaneVerts`, mirroring `src/mesh.h` at the sidecar's crease angle, so the preview creases
+  where the render will), a wireframe overlay, and grey/per-object/UV-checker/**texture**
   colouring (orbiting is view-only). **F4 textures are complete:** `introspect` emits a `materials` list
   (type/props + the resolved `texture` each binds) and a `textures` list — image skins as
   `file`/`encoding`/`filter`/`wrap`, formula skins as their three `r`/`g`/`b` UV expressions + `res`.
