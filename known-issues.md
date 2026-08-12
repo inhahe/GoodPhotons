@@ -48,10 +48,46 @@ horizon (Chiang 2019, `render_cuda.cu:3513`); `raster.h` decides its flip once p
 at projection time; and the CUDA preview kernel now does the same (entry below). So the
 compensations are three separate ad-hoc patches for one upstream convention.
 
-**Proper fix**: orient by `tri.gn` (`flipped = dot(rd, tri.gn) >= 0`) and let the shading
-normal stay a shading normal. Not done here because it changes the reported facing of
-grazing hits in *every* CPU and GPU render, so it needs its own before/after sweep over the
-scene corpus rather than being folded into a preview-speckle fix.
+Second consumer, easy to miss: `flipped` also signs **curvature**
+(`hit.curv = flipped ? -tri.curvature : tri.curvature`, O3), so a grazing hit reports a
+bulge as a pit.
+
+**Measured impact on final renders: none.** A/B at 84032 spp (0.34 % noise): a 96×48
+smooth-normal sphere *mesh* beside ftrace's *analytic* sphere, same radius, same material,
+mirror-symmetric lighting, path traced (`scraps/rim.ftsl`, `scraps/mksphere.py`). If the
+convention cost anything the mesh rim would darken relative to the analytic one. Mean
+luminance by annulus (r/R), mesh vs analytic:
+
+| 0–0.6 | 0.6–0.9 | 0.90–0.96 | 0.96–0.99 | 0.99–1.00 |
+|---|---|---|---|---|
+| +0.03 % | −0.48 % | −0.94 % | −0.38 % | −0.56 % |
+
+The mesh is uniformly ~0.5 % darker at *every* radius including the deep interior — that is
+the inscribed polygon, not a rim effect. There is **no** deficit concentrated at the
+silhouette, so the downstream compensations genuinely work. This is latent debt, not a
+live rendering bug.
+
+**Proper fix** (PBRT's convention): decide facing from geometry and keep the shading normal
+a shading normal —
+
+```cpp
+Vec3 ns = <interpolated>;
+if (dot(ns, tri.gn) < 0) ns = -ns;            // authored normals agree with winding
+bool flipped = dot(r.d, tri.gn) >= 0;         // facing is a GEOMETRIC question
+hit.ng = flipped ? -tri.gn : tri.gn;
+hit.n  = flipped ? -ns     : ns;              // both sides flip together
+```
+
+Then `hit.n` and `hit.ng` are always in the same hemisphere by construction, which makes all
+~8 copies of `ngo = (dot(h.ng, h.n) >= 0) ? h.ng : -h.ng` dead code, fixes the curvature
+sign, and lets `flipped` finally mean what its name says. In the graze band `hit.n` would
+then legitimately face away from the ray — which is precisely the case the shading-horizon
+softening already exists to handle.
+
+Not done yet because it changes the reported facing of grazing hits in *every* CPU and GPU
+render, and the measurement above says the payoff is hygiene rather than image quality — so
+it wants its own before/after sweep over the scene corpus, not a drive-by edit to the
+hottest loop in the renderer.
 
 ### FIXED (2026-08-12, v0.183.1): the CUDA preview kernel stippled light and dark specks along every smooth-shaded silhouette
 
