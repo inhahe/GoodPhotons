@@ -314,6 +314,15 @@ distribution.
 - [ ] Morph vector (bone lengths, masses, attachment points, muscle strengths) as a
       first-class policy input
 - [ ] Domain randomisation over morph space during training
+- [ ] **`--morph <file>` on `ftcl_build.py` / `rig_report.py` / `train.py`** — load a fitted
+      θ from `out/theta_*.json` instead of typing twenty-six `--set` pairs by hand. Small, and it
+      is the interface P5's output plugs into (`notes/pipeline.md` stage D).
+- [ ] **Distinct bodies per env in `train.py`, plus `--morph-center` / `--morph-scale`.** This is
+      the *only* missing piece of the P4 loop, and it is smaller than it looks: `build_body(cfg,
+      morph=...)` already accepts a morph dict, and `sensing.py` already carries `morph_norm` in the
+      observation "from day one" — so the conditioning channel exists and is already being fed. What
+      `train.py` does today is build `[body] * n`, one shared body for every env. Replacing that with
+      a list of distinct sampled bodies is the whole change.
 - [ ] **Bar:** a body never seen in training walks with the same character — **within its body
       plan.** That qualifier is load-bearing and is not hedging: the morph space is *not* one global
       manifold. You cannot interpolate a leg into a wing, because the midpoint body has neither
@@ -327,6 +336,19 @@ distribution.
 *(The checkboxes below are the intent. The load-bearing decisions — the optimiser, the objective
 term by term, the keypoint↔rig interface, what a θ evaluation costs — are pinned in **"The
 implementation plan"** at the end of this section, added 2026-08-08.)*
+
+*(The **commands** — what you actually type, stage by stage, from four camera cards to a trained
+policy — are in `notes/pipeline.md`, added 2026-08-12. That page is where this phase's unbuilt
+tools have their CLIs specified, so they are designed once rather than improvised per-tool.)*
+
+- [ ] **`tools/fit_selftest.py` FIRST — before any real footage exists.** Project the P2 public dog
+      mocap through a synthetic copy of the four calibrated cameras, corrupt it with measured
+      detector noise, and check the fit recovers ground truth; use it to tune the four objective
+      weights, then freeze them to `notes/fit_weights.json`. It is simultaneously the weight
+      calibration and the honest answer to "does this pipeline work at all", it runs against
+      *public* data, and it needs no camera. Doing it before shooting is the single highest-value
+      ordering decision in this phase: it is the only way to find out the fit is broken *before* an
+      animal, an owner and a two-hour session have been spent on unusable footage.
 
 - [ ] **Be clear that fitting yields TWO things, and they are consumed by different phases.**
       (i) **The animal's anatomy** — the morph vector θ_animal (bone lengths, proportions, mass

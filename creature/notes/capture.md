@@ -13,6 +13,14 @@ The rest of the page is *why*. The one rule that must not be violated on the day
 [the two-mode split](#the-rig-serves-two-jobs-and-they-must-not-share-a-mode): motion and groom
 never share a recording.
 
+**What happens to the footage afterwards is `notes/pipeline.md`** — the command sequence from four
+camera cards to a trained policy. Read it *before* shooting, because it says plainly which stages are
+unbuilt: the ingest, calibration, keypoint-import and fit tools that consume this page's output do
+not exist yet. The ordering decision it argues for is the one that affects *when you shoot*: run the
+synthetic self-test (`tools/fit_selftest.py`, also unbuilt) against public mocap first, so that a
+broken fit is discovered before an animal, an owner and a two-hour session have been spent on footage
+the pipeline cannot use.
+
 ## The rig serves two jobs, and they must not share a mode
 
 The single most important thing on this page: **motion is dynamic, groom is static.** They want

@@ -878,6 +878,17 @@ capture-volume sizing per gait, calibration and sync as on-site checklists, a ta
 shoot* → *which morph knob it makes identifiable*, and a ~2-hour session shot list with its
 thermal/storage/power limits. Read it before a shoot; the fitting side it feeds is todo.md **P5**.
 
+`notes/pipeline.md` is the other half of the same story: **the command sequence** from four camera
+cards to a trained policy, stage by stage, with every stage marked `EXISTS` / `PARTLY EXISTS` /
+`TO BUILD` / `EXTERNAL`. Its headline finding is worth repeating here — **nothing in this repo reads
+a video file today.** Only stages D–F (rig build, train, eval) exist; ingest/calibrate, 2D keypoints
+and the anatomy+motion fit are unbuilt (todo.md P5), and `tools/train.py` currently trains from
+scratch on the authored rig against a hand-designed reward, consuming no captured data at all. The
+commands it lists for those stages are *specifications*, written so the tools have a target and so a
+capture session is not shot against a pipeline whose shape is undecided. It also names the three file
+formats worth freezing early — `session/calib.json`, `session/kp2d.h5`, `out/theta_animal.json` —
+and ends with the four things on the critical path that need no footage at all.
+
 ## Environment
 
 - Python 3.14 in `.venv`, MuJoCo 3.11, PyTorch (CUDA), RTX 4090.
