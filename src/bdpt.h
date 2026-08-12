@@ -65,7 +65,8 @@ inline double glossyExponent(double roughness) {
 inline bool isConnectibleMat(const Material& m) {
     return m.type == MatType::Diffuse || m.type == MatType::Glossy ||
            m.type == MatType::Fluorescent ||   // fluoro's elastic base is diffuse-like
-           m.type == MatType::DiffuseTransmit;  // two-sided Lambertian (finite BSDF both sides)
+           m.type == MatType::DiffuseTransmit ||  // two-sided Lambertian (finite BSDF both sides)
+           m.type == MatType::Hair;               // fiber BCSDF: narrow lobes, but finite
 }
 
 // A two-sided (transmissive) connectible material scatters into BOTH hemispheres, so a
@@ -75,7 +76,36 @@ inline bool isConnectibleMat(const Material& m) {
 // returns 0 for unsupported directions) is the real validity gate, and the geometry term
 // uses |cos| accordingly.
 inline bool isTwoSidedMat(const Material& m) {
-    return m.type == MatType::DiffuseTransmit;
+    return m.type == MatType::DiffuseTransmit || m.type == MatType::Hair;
+}
+
+// A fiber takes NO shading-normal adjoint correction: that correction rescales a
+// projection taken about an interpolated normal, and a strand projects longitudinally
+// instead (hair_shade.h). On curve geometry ns == +-ng so it would be 1 regardless;
+// the test is what keeps `hair` correct on a triangle mesh with smoothed normals.
+inline bool isFiberMat(const Material& m) { return m.type == MatType::Hair; }
+
+// --- Fiber (MatType::Hair) in a bidirectional estimator ---------------------------
+//
+// BDPT's whole vocabulary is "f, its pdf, and a geometry term carrying cos(ns, w) at
+// each endpoint". A fiber's projection is NOT cos(ns, w) — it is the strand's
+// longitudinal cosine (see hair_shade.h) — so rather than special-casing the geometry
+// term at every one of the ~dozen places it is formed, `bsdfF` returns
+//     hairFCos(wi) / |cos(ns, wi)|,
+// i.e. it pre-divides by the cosine BDPT is about to multiply back in. The product
+// f*G then carries exactly hairFCos, which is the right answer, and every MIS ratio,
+// every strategy weight and every connection stays untouched. (This is also how PBRT
+// puts hair inside a plain path tracer, for the same reason.) The clamp keeps the
+// division finite at a grazing endpoint, where G's own cosine is heading to zero and
+// the product is well-behaved regardless.
+inline double hairCosGuard(double c) { return (c < 1e-7) ? 1e-7 : c; }
+
+// The BCSDF at a fiber vertex, referenced to the direction the subpath ARRIVED from.
+// `wo` is that direction (toward the previous vertex), which is what the impact
+// parameter is measured against — see hairShadeAt.
+inline HairShade hairAt(const Scene& scene, const Material& m, const Hit& h,
+                        double lambda, const Vec3& wo) {
+    return hairShadeAt(scene, m, h, lambda, wo);
 }
 
 // Clamped reflect/transmit albedos of a DiffuseTransmit vertex (energy guard shared by
@@ -135,6 +165,14 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
             double rho = sameSide ? rhoR : rhoT;
             return rho / PI;
         }
+        case MatType::Hair: {
+            // Needs the hit (the fiber frame comes from the strand tangent), so a
+            // texture-less caller cannot evaluate it — that only happens for vertices
+            // that carry no Hit, which are never fiber vertices.
+            if (!hitForTex) return 0.0;
+            const HairShade hs = hairAt(scene, m, *hitForTex, lambda, wo);
+            return hairFCos(hs, wi) / hairCosGuard(std::fabs(cosWi));
+        }
         default: return 0.0;   // delta materials have no finite BSDF value
     }
 }
@@ -174,6 +212,13 @@ inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const V
             bool sameSide = (cosWi * cosWo) > 0.0;
             double pSel = sameSide ? rhoR / tot : rhoT / tot;
             return pSel * std::fabs(cosWi) / PI;
+        }
+        case MatType::Hair: {
+            // The BCSDF's own sampling density (hair.h), in solid angle — exactly the
+            // density hair::sample draws from, so MIS is consistent by construction.
+            if (!hitForTex) return 0.0;
+            const HairShade hs = hairAt(scene, m, *hitForTex, lambda, wo);
+            return hair::pdf(hs.b, hs.woLocal, hair::toLocal(hs.fr, wi));
         }
         default: return 0.0;
     }
@@ -714,6 +759,35 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 }
                 break;
             }
+            case MatType::Hair: {
+                // Fiber BCSDF. NOT delta — the lobes are narrow but finite — so a strand
+                // vertex is fully connectible and BDPT's light-tracing strategies can
+                // splat a backlit hair directly, which is exactly the transport a
+                // unidirectional tracer struggles with.
+                const HairShade hs = hairAt(scene, *mp, h, lambda, wo);
+                double pdfH = 0.0, fv = 0.0;
+                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
+                                             rng.uniform(), rng.uniform(), pdfH, fv);
+                if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
+                wi = hair::toWorld(hs.fr, wl);
+                pdfW    = pdfH;
+                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
+                // f*cos/pdf collapses exactly to T = sum_p A_p (see hair.h): the total
+                // Fresnel-and-Beer attenuation of the four lobes.
+                const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
+                betaFactor = clamp01(fv * cosLong / pdfH);
+                // Per-λ absorption means each secondary gets its OWN fiber evaluated along
+                // the hero's sampled direction: f_i*cos/pdf_hero. Unlike the unidirectional
+                // tracers (which de-hero at a strand), the bundle survives a fiber here —
+                // and a fiber is precisely where the spectral spread is interesting, since
+                // sigma_a is what colours the TT/TRT lobes.
+                secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i) {
+                    const HairShade hsi = hairAt(scene, *mp, h, hb.lam[i + 1], wo);
+                    secF[i] = hairFCos(hsi, wi) / pdfH;
+                }
+                break;
+            }
             case MatType::Mirror: {
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
                 wi = reflect(ray.d, cur.ns);
@@ -840,7 +914,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // continuation `wi` is the outgoing direction (= Veach's wo). Exactly 1 when
         // ns==ng, so flat triangles / analytic spheres stay bit-identical, and the eye
         // (Radiance) subpath — which smooth-shades for free — is untouched.
-        if (mode == Mode::Importance && !delta) {
+        // (A fiber is excluded: the Veach correction rescales a projection taken about an
+        // interpolated shading normal, and a strand does not project about its normal at
+        // all — its factor is longitudinal. On a curve ns == ±ng so this would evaluate to
+        // 1 anyway; the guard is what keeps `hair` honest on a triangle mesh.)
+        if (mode == Mode::Importance && !delta && mp->type != MatType::Hair) {
             Vec3 ngo = (dot(cur.ng, cur.ns) >= 0.0) ? cur.ng : cur.ng * -1.0;
             const double adj = shadingAdjointCorr(wo, normalize(wi), cur.ns, ngo);
             beta *= adj;                                     // purely geometric: same for every λ
@@ -857,9 +935,15 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // continuation without consulting λ, so they set `keepBundle` and carry the
         // secondaries through on a per-λ `secF` instead (see those cases above).
         if (delta && !keepBundle) nUp = 1;
-        // Spawn the continuation from the correct side of the geometric normal.
+        // Spawn the continuation from the correct side of the geometric normal. A fiber
+        // leaving on the far side has to clear the strand's own tube instead, or its TT
+        // and TRT lobes immediately re-hit the hair they just left (hair_shade.h).
+        const bool fiberFar = (mp->type == MatType::Hair) && h.fiberRadius > 0.0 &&
+                              dot(wi, cur.ns) < 0.0;
         double sgn = dot(wi, cur.ng) >= 0.0 ? 1.0 : -1.0;
-        ray = Ray{cur.p + cur.ng * (sgn * 1e-6), normalize(wi)};
+        ray = fiberFar
+                  ? Ray{cur.p + normalize(wi) * (2.5 * h.fiberRadius + 1e-9), normalize(wi)}
+                  : Ray{cur.p + cur.ng * (sgn * 1e-6), normalize(wi)};
         pdfFwd = delta ? 0.0 : pdfW;
     }
 }
@@ -1167,7 +1251,23 @@ inline Vec3 offsetOrigin(const Vertex& v, const Vec3& dir) {
 // the exact point is used (the transmittance factor accounts for the fog it sits in).
 inline Vec3 connOrigin(const Vertex& v, const Vec3& dir) {
     if (v.type == VType::Medium) return v.p;
+    // A fiber connecting out the FAR side has to clear the strand's own body: strand
+    // radii are microns, so ng*1e-6 lands inside the tube and the connection reports
+    // itself occluded, deleting exactly the TT glow that makes light hair look lit.
+    if (v.mat && v.mat->type == MatType::Hair && v.hit.fiberRadius > 0.0 &&
+        dot(v.ns, dir) < 0.0)
+        return v.p + dir * (2.5 * v.hit.fiberRadius + 1e-9);
     return offsetOrigin(v, dir);
+}
+
+// How much shorter the shadow ray is than the full endpoint distance, given that
+// connOrigin may have moved the start point forward along `dir`. Keeps the ray from
+// overshooting into the light it is testing visibility to.
+inline double connShorten(const Vertex& v, const Vec3& dir, double eps) {
+    if (v.type != VType::Medium && v.mat && v.mat->type == MatType::Hair &&
+        v.hit.fiberRadius > 0.0 && dot(v.ns, dir) < 0.0)
+        return 2.5 * v.hit.fiberRadius + 1e-9 + eps;
+    return eps;
 }
 
 // --- Connect one strategy (s,t) --------------------------------------------------
@@ -1259,7 +1359,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             // Adjoint shading-normal correction: qs is a LIGHT-subpath (particle) vertex
             // whose f is evaluated toward the camera (wcam = outgoing). 1 when ns==ng.
             // The correction and stG are pure geometry — shared by every wavelength.
-            const double adj = shadingAdjointCorr(wo, wcam, qs.ns, ngo) * stG;
+            const double adj = (isFiberMat(*qs.mat) ? 1.0
+                                                    : shadingAdjointCorr(wo, wcam, qs.ns, ngo)) * stG;
             f *= adj;
             for (int i = 0; i + 1 < nUp; ++i)
                 fSec[i] = bsdfF(*qs.mat, qs.ns, wo, wcam, hb.lam[i + 1], scene, &qs.hit) * adj;
@@ -1269,7 +1370,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
             if (mxF <= 0.0) return 0.0;
         }
-        if (scene.occluded(connOrigin(qs, wcam), wcam, dist - 2e-6)) return 0.0;
+        if (scene.occluded(connOrigin(qs, wcam), wcam, dist - connShorten(qs, wcam, 2e-6))) return 0.0;
         // Transmittance of the fog the connection ray crosses (1 in vacuum, no RNG).
         // Evaluated at the hero only: the hero gate disables bundling when the scene has
         // any medium, so Tr is exactly 1 whenever nUp > 1.
@@ -1377,7 +1478,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             }
             if (mxLe <= 0.0) return 0.0;
         }
-        if (scene.occluded(connOrigin(pt, wi), wi, dist - occlEps)) return 0.0;
+        if (scene.occluded(connOrigin(pt, wi), wi, dist - connShorten(pt, wi, occlEps))) return 0.0;
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
         double Tr = mats.mediaTransmittance(scene, pt.p, wi, dist, lambda, rng);
         double G = std::fabs(cosSurf) * Wgeom;
@@ -1446,7 +1547,9 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             // vertex; outgoing = w*-1 toward the eye vertex). The eye endpoint pt is a
             // Radiance vertex and gets NO correction. 1 when ns==ng (flat/analytic).
             // Pure geometry, so it applies unchanged to every wavelength.
-            const double adjL = shadingAdjointCorr(woL, w * -1.0, qs.ns, ngoL);
+            const double adjL = isFiberMat(*qs.mat)
+                                    ? 1.0
+                                    : shadingAdjointCorr(woL, w * -1.0, qs.ns, ngoL);
             fL *= adjL;
             for (int i = 0; i + 1 < nUp; ++i)
                 fLSec[i] = bsdfF(*qs.mat, qs.ns, woL, w * -1.0, hb.lam[i + 1], scene, &qs.hit)
@@ -1460,7 +1563,12 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             }
             if (mxE <= 0.0 || mxL <= 0.0) return 0.0;
         }
-        if (scene.occluded(connOrigin(pt, w), w, dist - 2e-6)) return 0.0;
+        // Both ENDS can be fibers here, and a connection arriving at a strand from its far
+        // side would clip the tube just short of the vertex, so stop the shadow ray early at
+        // that end too. Adds an exact 0.0 for every non-fiber pair.
+        if (scene.occluded(connOrigin(pt, w), w,
+                           dist - connShorten(pt, w, 2e-6) - connShorten(qs, w * -1.0, 0.0)))
+            return 0.0;
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
         double Tr = mats.mediaTransmittance(scene, pt.p, w, dist, lambda, rng);
         double G = std::fabs(cosE) * std::fabs(cosL) / dist2;

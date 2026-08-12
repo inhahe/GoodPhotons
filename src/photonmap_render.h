@@ -246,6 +246,24 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
             }
+            case MatType::Hair: {
+                // Fiber BCSDF — scatter through it, but do NOT gather here: the photon
+                // payload carries no incident direction, so a directional BCSDF density
+                // estimate is impossible (see sppm_render.h's Hair case and
+                // known-issues.md). Treated like the glossy/specular cases around it.
+                const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
+                const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
+                double pdfH = 0.0, fv = 0.0;
+                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
+                                             rng.uniform(), rng.uniform(), pdfH, fv);
+                if (!(pdfH > 0.0) || !(fv > 0.0)) return L;
+                const double cosLong =
+                    hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
+                thr *= clamp01(fv * cosLong / pdfH);       // == T = sum_p A_p
+                const Vec3 wo = hair::toWorld(hs.fr, wl);
+                ray = Ray{h.p + wo * hairExitOffset(hs, h.n, wo), wo};
+                break;
+            }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
@@ -428,6 +446,22 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 double t = clamp01(transmitSlot(scene, m, h, lambda));
                 thr *= t;
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                break;
+            }
+            case MatType::Hair: {
+                // Fiber BCSDF — scattered through, never a gather site (the photon
+                // payload has no incident direction; see photonGatherSub's Hair case).
+                const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
+                const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
+                double pdfH = 0.0, fv = 0.0;
+                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
+                                             rng.uniform(), rng.uniform(), pdfH, fv);
+                if (!(pdfH > 0.0) || !(fv > 0.0)) return L;
+                const double cosLong =
+                    hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
+                thr *= clamp01(fv * cosLong / pdfH);       // == T = sum_p A_p
+                const Vec3 wo = hair::toWorld(hs.fr, wl);
+                ray = Ray{h.p + wo * hairExitOffset(hs, h.n, wo), wo};
                 break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect

@@ -72,7 +72,9 @@
 #include "fbx.h"
 #include "upsample.h"
 #include "fur.h"         // `fur { }` groom generator — scatters `curve` strands (TODO §P1)
+#include "hair.h"        // hair::Species — the measured fur presets `material { type hair }` names
 #include "parallel.h"    // ft::stopRequested — cooperative `-stop` during a long load
+#include "reaction.h"    // `texture { reaction { } }` — Gray-Scott bake (TODO §O6)
 #include "color.h"
 #include "sky.h"
 #include "record_ladder.h"   // generalized record-stop delimiter ladder (J3b item 2)
@@ -681,6 +683,20 @@ struct Loaded {
     // scenes and discards all but one — only the accepted candidate's warnings are
     // the author's problem.
     std::vector<std::string> unknownKeys;
+
+    // Last chance to alter the geometry before the acceleration structure is built over it.
+    // Called (if set) immediately before `scene.build()`, with the fully parsed Loaded — so
+    // the callback can see every camera and mode the file authored, which is the information
+    // needed to decide whether a cheaper representation is admissible.
+    //
+    // Exists for exactly one client: `-fur-volume`, which summarises a coat into a density
+    // grid + ODF table and then has no further use for the millions of CurveSegs it was
+    // derived from. Deleting them AFTER the load would return the memory but not save the
+    // peak, because the peak IS the BVH build over those fibers (see Scene::dropHairCurves).
+    // A hook here is the only point at which the summary exists and the tree does not.
+    //
+    // Not serialised, not part of the scene: set it on the Loaded you pass to load().
+    std::function<void(Loaded&)> beforeBvh;
 };
 
 // Normalise an authored mode letter: `W` is mode R plus the deterministic Whitted
@@ -944,6 +960,11 @@ public:
         // build() finalizes tris/BVH and the emitter set (per-emitter samplers were
         // built in addLight; finalizeEmitters computes powers, the selection CDF,
         // and the combined backward wavelength sampler).
+        // Geometry is final and every camera/mode the file authored is known, but nothing
+        // has been built over the geometry yet — the one moment at which a client can swap
+        // a summary in for the thing it summarises and not pay to accelerate both. See
+        // Loaded::beforeBvh.
+        if (L.beforeBvh) L.beforeBvh(L);
         { detail::AccelTimer _ct; L.scene.build(); }
         // build() -> finalizeEmitters() has now adopted each emitter's emitPat from the
         // material on its geometry, so this is the first moment the SHAPE of every
@@ -1100,8 +1121,15 @@ public:
             if (e.emitPat < 0) continue;
             if (e.emitPat < (int)L.scene.patterns.size()) {
                 for (const PatNode& n : L.scene.patterns[e.emitPat].nodes) {
-                    if (n.op != PatOp::VarCurv && n.op != PatOp::VarCavity) continue;
-                    const char* which = (n.op == PatOp::VarCurv) ? "curv" : "cavity";
+                    // `fw` (O8 s2) is refused here for a strictly stronger version of the
+                    // same reason: not only does a sampled emitter point carry no shading
+                    // footprint, the footprint is a property of the VIEW rather than of the
+                    // surface, so an emitted profile driven by it would depend on where the
+                    // camera happens to be — which no emission profile may.
+                    if (n.op != PatOp::VarCurv && n.op != PatOp::VarCavity &&
+                        n.op != PatOp::VarFootprint) continue;
+                    const char* which = (n.op == PatOp::VarCurv)   ? "curv"
+                                      : (n.op == PatOp::VarCavity) ? "cavity" : "fw";
                     fail(std::string("an emit pattern cannot read `") + which +
                          "` — an emitter's sampled point carries no such value, so the "
                          "emitted profile would disagree with the one emission-on-hit "
@@ -2536,9 +2564,101 @@ private:
         else if (wr == "clamp")  tex.wrap = TexWrap::Clamp;
         else if (wr == "mirror") tex.wrap = TexWrap::Mirror;
         else { fail("texture '" + b.name + "': unknown wrap '" + wr + "' (repeat|clamp|mirror)"); return false; }
+        // O7: histogram-preserving stochastic tiling (Heitz-Neyret). `tiling none` is the
+        // ordinary lattice repeat; `tiling stochastic` blends three randomly offset crops
+        // through a rank transform so the repeat stops being visible. See stochtile.h.
+        std::string tl = strOf(b, "tiling", "none");
+        if (tl == "stochastic") {
+            tex.stoch.on    = 1;
+            tex.stoch.patch = dblOf(b, "patch", 1.0);
+            tex.stoch.seed  = (unsigned)(long long)dblOf(b, "seed", 0.0);
+            if (!(tex.stoch.patch > 0.0)) {
+                fail("texture '" + b.name + "': patch must be > 0"); return false;
+            }
+            if (tex.wrap != TexWrap::Repeat) {
+                // Not a hard error, but silence would be worse: the setting is inert.
+                std::printf("[warn] texture '%s': `wrap %s` is ignored under `tiling "
+                            "stochastic` — the lattice offsets fetch arbitrarily far "
+                            "outside [0,1], so the fetch always repeats.\n",
+                            b.name.c_str(), wr.c_str());
+            }
+        } else if (tl != "none") {
+            fail("texture '" + b.name + "': unknown tiling '" + tl + "' (none|stochastic)");
+            return false;
+        }
 
-        const Stmt* rgbS = find(b, "rgb");
-        if (rgbS) {
+        const Stmt* rxnS = find(b, "reaction");
+        const Stmt* rgbS = rxnS ? nullptr : find(b, "rgb");
+        if (rxnS) {
+            // Gray-Scott reaction-diffusion (O6). Solved once at load on a periodic
+            // `sim` grid and resampled to `res`, then treated as an ordinary texture —
+            // so `reflect texture:<name>`, `tex:<name>(u,v)` inside a pattern formula,
+            // the GPU upload and the raster preview all work with no changes anywhere.
+            // The output is grey (V in all three channels), which makes Texture::scalarAt
+            // — the sampler `tex:` and the roughness / weight maps use — return exactly
+            // the concentration.
+            if (!rxnS->val.block) { fail("texture '" + b.name + "': reaction needs a { } body"); return false; }
+            const Block& rb = *rxnS->val.block;
+            RDParams p;
+            std::string preset = strOf(rb, "preset");
+            if (!preset.empty() && !rdPresetLookup(preset, p.feed, p.kill)) {
+                fail("texture '" + b.name + "': unknown reaction preset '" + preset +
+                     "' (" + rdPresetNames() + ")");
+                return false;
+            }
+            p.feed  = dblOf(rb, "feed",  p.feed);
+            p.kill  = dblOf(rb, "kill",  p.kill);
+            p.du    = dblOf(rb, "du",    p.du);
+            p.dv    = dblOf(rb, "dv",    p.dv);
+            p.dt    = dblOf(rb, "dt",    p.dt);
+            p.steps = (int)dblOf(rb, "steps", (double)p.steps);
+            p.sim   = (int)dblOf(rb, "sim",   (double)p.sim);
+            p.seed  = (unsigned)(long long)dblOf(rb, "seed", (double)p.seed);
+            if (p.sim < 8)    p.sim = 8;    else if (p.sim > 4096)   p.sim = 4096;
+            if (p.steps < 0)  p.steps = 0;  else if (p.steps > 2000000) p.steps = 2000000;
+            // Explicit Euler past its stability bound does not degrade, it explodes to
+            // NaN in a few dozen steps. Say so at load instead of baking a dead texture.
+            if (!rdStable(p)) {
+                char msg[256];
+                std::snprintf(msg, sizeof msg,
+                              "unstable: dt*max(du,dv)*%.1f = %.3f must be <= 2 "
+                              "(dt %.4g, du %.4g, dv %.4g)",
+                              RD_LAMBDA_MAX, p.dt * (p.du > p.dv ? p.du : p.dv) * RD_LAMBDA_MAX,
+                              p.dt, p.du, p.dv);
+                fail("texture '" + b.name + "' reaction " + msg);
+                return false;
+            }
+            std::vector<float> field;
+            bool washed = false;
+            // Unlike every other texture source this one is a simulation, so a big
+            // `sim`/`steps` can stall the load for seconds with nothing on screen. Say
+            // what is being solved and how long it took, so that stall is legible.
+            const auto rdT0 = std::chrono::steady_clock::now();
+            if (!rdSimulate(p, field, &washed)) { fail("scene load stopped by request"); return false; }
+            const double rdSec = std::chrono::duration<double>(
+                                     std::chrono::steady_clock::now() - rdT0).count();
+            std::printf("[reaction] texture '%s': %dx%d grid, %d steps, F=%.4g k=%.4g "
+                        "Du=%.4g Dv=%.4g  (%.2f s)\n",
+                        b.name.c_str(), p.sim, p.sim, p.steps, p.feed, p.kill, p.du, p.dv, rdSec);
+            if (washed) {
+                std::printf("[warn] texture '%s': the reaction settled to a uniform state — "
+                            "(feed %.4g, kill %.4g) is outside the pattern-forming region; "
+                            "try `preset %s`.\n",
+                            b.name.c_str(), p.feed, p.kill, rdPresetNames().c_str());
+            }
+            int res = (int)dblOf(b, "res", (double)p.sim);
+            if (res < 1) res = 1; else if (res > 8192) res = 8192;
+            tex.encoding = TexEncoding::Linear;      // a concentration, not an sRGB colour
+            tex.w = res; tex.h = res;
+            tex.rgb.assign((size_t)res * res, Vec3{0, 0, 0});
+            for (int y = 0; y < res; ++y) {
+                const double fy = (y + 0.5) / res;
+                for (int x = 0; x < res; ++x) {
+                    const double t = rdSampleWrapped(field, p.sim, (x + 0.5) / res, fy);
+                    tex.rgb[(size_t)y * res + x] = Vec3{t, t, t};
+                }
+            }
+        } else if (rgbS) {
             // Procedural (function-defined) UV-space skin (E1): three ftsl expressions
             // r(u,v) g(u,v) b(u,v) over the surface UV, baked once to a `res`x`res`
             // LINEAR RGB grid at load, then treated as an ordinary texture — so the
@@ -2619,6 +2739,26 @@ private:
         // the one most likely to be running when a `-stop` arrives; false means it was
         // abandoned mid-fit and the half-built texture must not enter the scene.
         if (!tex.buildReflCoeff()) { fail("scene load stopped by request"); return false; }
+        // O7: rank-transform every plane the texture might be asked for — the linear-RGB
+        // colour plane and the grayscale scalar plane. Deliberately NOT the Jakob-Hanika
+        // coefficients: coefficient space is not a colour space, so blending there fringes
+        // blue-cyan (see stochtile.h). The blend runs in RGB and the blended colour is
+        // converted through the shared coefficient LUT at shading time.
+        if (tex.stoch.on) {
+            if (tex.hasPalette()) {
+                // An index map's texels are categorical labels; blending three of them
+                // through a histogram would silently invent palette entries.
+                fail("texture '" + b.name + "': `tiling stochastic` cannot be combined with "
+                     "`palette` — palette indices are categorical and must not be blended");
+                return false;
+            }
+            const auto stT0 = std::chrono::steady_clock::now();
+            tex.buildStochastic();
+            const double stSec = std::chrono::duration<double>(
+                                     std::chrono::steady_clock::now() - stT0).count();
+            std::printf("[tiling] texture '%s': stochastic, %dx%d, patch %.3g, seed %u  (%.2f s)\n",
+                        b.name.c_str(), tex.w, tex.h, tex.stoch.patch, tex.stoch.seed, stSec);
+        }
         int id = (int)L.scene.textures.size();
         L.scene.textures.push_back(std::move(tex));
         textureIndex_[b.name] = id;
@@ -2720,7 +2860,11 @@ private:
     static bool reflectPatHonoured(MatType t) {
         return t == MatType::Diffuse   || t == MatType::DiffuseTransmit ||
                t == MatType::Mirror    || t == MatType::HalfMirror      ||
-               t == MatType::Glossy    || t == MatType::Grating;
+               t == MatType::Glossy    || t == MatType::Grating         ||
+               // Hair reads its colour through reflectSlot() at shading time and inverts
+               // it to sigma_a there, so a pattern/texture on it IS honoured — which is
+               // what lets a groom vary root-to-tip or per-strand.
+               t == MatType::Hair;
     }
 
     // The transmit slot is only ever READ by these two: a colored gel's T(lambda) and a
@@ -4175,11 +4319,31 @@ private:
     Material buildMaterial(const Block& b, Loaded& L) {
         if (isRecordOverrideBlock(b)) return buildRecordOverrideMaterial(b, L);
         Material m;
-        // Built-in whole-material recipe: `preset <name>` fills a complete material
-        // (metal / glass / iridescent film). A few common knobs may still be
-        // overridden afterwards so a preset can be lightly retuned.
-        if (find(b, "preset")) {
+        // `preset <name>` is one keyword with two populations behind it. Most names are a
+        // whole-material recipe (metal / glass / iridescent film) handled right here; the
+        // ten names in Yan et al. (2017) Table 4 are measured FUR FIBERS, which are a
+        // parameter set for `type hair` rather than a material of their own. Those are
+        // recognised first and routed to the hair branch below, where every hair key can
+        // still override them — and naming a species implies `type hair`, so
+        // `material "fox" { preset redfox }` is enough on its own.
+        hair::Species furSp{};
+        bool furPreset = false;
+        if (const Stmt* prs = find(b, "preset"); prs && !prs->val.words.empty())
+            furPreset = hair::findSpecies(prs->val.words[0].c_str(), furSp);
+        if (find(b, "preset") && !furPreset) {
             std::string pname = strOf(b, "preset", "");
+            if (strOf(b, "type", "") == "hair") {
+                // `type hair` narrows the namespace to the species table, so say so rather
+                // than reporting the generic miss — the recipe presets are all surfaces and
+                // none of them would have meant anything here.
+                std::string known;
+                int nsp = 0;
+                const hair::Species* tab = hair::speciesTable(nsp);
+                for (int i = 0; i < nsp; ++i) { if (i) known += ", "; known += tab[i].name; }
+                fail("material '" + b.name + "': unknown hair preset '" + pname +
+                     "' — the measured species are " + known);
+                return m;
+            }
             if (!resolveMaterialPreset(pname, m)) { fail("unknown material preset '" + pname + "'"); return m; }
             if (find(b, "roughness")) {
                 if (!bindScalarPattern(b, "roughness", m.roughnessPat) &&
@@ -4196,7 +4360,7 @@ private:
             checkSlotPatsSupported(b, m);
             return m;
         }
-        std::string type = strOf(b, "type", "diffuse");
+        std::string type = strOf(b, "type", furPreset ? "hair" : "diffuse");
         if (type == "diffuse") {
             m.type = MatType::Diffuse;
             // `reflect texture:<name>` binds a spatially-varying albedo; otherwise a
@@ -4273,6 +4437,64 @@ private:
             m.grooveSpacing = dblParam(b, "groove_spacing", 1000.0);
             Vec3 gd{0, 1, 0}; vec3Of(b, "groove_dir", gd); m.grooveDir = gd;
             m.gratingMaxOrder = (int)dblParam(b, "max_order", 3);
+        } else if (type == "hair") {
+            // Fiber BCSDF (Marschner R/TT/TRT, Chiang form) — see src/hair.h. Meant to
+            // sit on `curve` / `fur` geometry, whose intersector already reports the fiber
+            // axis as `hit.tangent`.
+            m.type = MatType::Hair;
+            auto clamp01d = [](double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); };
+
+            // `preset <species>` loads one row of Yan et al. (2017) Table 4 — a real fitted
+            // fur fiber, medulla and all. It only supplies DEFAULTS: every slot below still
+            // reads its own key first, so `preset redfox  beta_n 0.1` is a red fox with the
+            // glint sharpened, and nothing has to be re-typed to change one thing. The
+            // table's angles are in degrees (that is how goniophotometry reports them), so
+            // they go through hair::betaMFromDegrees / betaNFromDegrees on the way into
+            // Chiang's perceptual [0,1] knobs.
+            // (The name was resolved at the top of buildMaterial, which is also where a
+            // miss is reported — a species name implies `type hair`, so the lookup has to
+            // happen before the type dispatch, not inside it.)
+            const bool havePreset = furPreset;
+            const hair::Species& sp = furSp;
+
+            // `reflect` is the colour you WANT the fiber to end up, not a Lambertian
+            // albedo: it is inverted through Chiang eq. 9 into an interior sigma_a. That
+            // inversion needs the final hairBetaN, so it happens at shading time, not here.
+            m.reflect   = reflectParam(b, m, constantSpectrum(0.3));
+            m.hairEta   = dblParam(b, "eta",    havePreset ? sp.eta      : 1.55);
+            m.hairAlpha = dblParam(b, "alpha",  havePreset ? sp.alphaDeg : 2.0);
+            m.hairBetaM = clamp01d(dblParam(b, "beta_m",
+                                   havePreset ? hair::betaMFromDegrees(sp.betaMDeg) : 0.3));
+            m.hairBetaN = clamp01d(dblParam(b, "beta_n",
+                                   havePreset ? hair::betaNFromDegrees(sp.betaNDeg) : 0.3));
+
+            // The medulla (Yan et al. 2017). `medulla` is kappa, the scattering core's
+            // radius as a fraction of the fiber's; 0 leaves a solid Marschner cylinder and
+            // makes the other three inert, so an existing `hair` material is untouched.
+            m.hairKappa      = clamp01d(dblParam(b, "medulla",
+                                                 havePreset ? sp.kappa : 0.0));
+            m.hairMedullaG   = std::max(-0.999, std::min(0.999,
+                                        dblParam(b, "medulla_g", havePreset ? sp.mG : 0.0)));
+            m.hairMedullaSigmaS = spectrumParam(b, "medulla_sigma_s",
+                                    constantSpectrum(havePreset ? sp.mSigmaS : 0.0));
+            m.hairMedullaSigmaA = spectrumParam(b, "medulla_sigma_a",
+                                    constantSpectrum(havePreset ? sp.mSigmaA : 0.0));
+
+            // Physical spelling: sigma_a directly, in units of 1/(fiber radius) — which is
+            // what the Beer-Lambert term inside the unit cylinder is expressed in. When
+            // present it wins, and `reflect` is not consulted at all. A preset carries a
+            // measured cortex absorption, so it selects this branch too — but an explicit
+            // `reflect` on the same block still wins over the preset, because a colour is
+            // the thing an author is most likely to actually want to change.
+            if (find(b, "sigma_a")) {
+                m.hairSigmaA = spectrumParam(b, "sigma_a", constantSpectrum(0.0));
+                m.hairSigmaAFromReflect = false;
+            } else if (havePreset && !find(b, "reflect")) {
+                m.hairSigmaA = constantSpectrum(sp.sigmaCA);
+                m.hairSigmaAFromReflect = false;
+            } else {
+                m.hairSigmaAFromReflect = true;
+            }
         } else if (type == "fluorescent") {
             m.type = MatType::Fluorescent;
             m.reflect = reflectParam(b, m, constantSpectrum(0.1));

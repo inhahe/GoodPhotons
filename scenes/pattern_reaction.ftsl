@@ -1,0 +1,134 @@
+# pattern_reaction.ftsl — Gray-Scott reaction-diffusion baked into a texture (O6).
+#
+#   texture "name" { reaction { preset spots|holes|maze|coral|worms|mitosis
+#                               [feed <F>] [kill <k>] [du <Du>] [dv <Dv>] [dt <dt>]
+#                               [steps <n>] [sim <n>] [seed <n>] }
+#                    [res <n>] [filter …] [wrap …] }
+#
+# Two chemicals diffuse and react:
+#
+#   du/dt = Du L(u) - u v^2 + F (1 - u)
+#   dv/dt = Dv L(v) + u v^2 - (F + k) v
+#
+# Turing's point is that the UNIFORM solution of such a system can be unstable to
+# spatial perturbation while stable in time, so a blank sheet spontaneously organises
+# itself into spots or labyrinths with an intrinsic wavelength that appears nowhere in
+# the equations. That makes this a categorically different texture source from
+# everything else here: `noise`, `worley`, `gabor` and `bnoise` all place features by
+# fiat, whereas these features are the OUTCOME OF A PROCESS, so their spacing, their
+# branch points and their defects are correlated the way a real coat pattern's are.
+#
+# It is a bake rather than a pattern op because the value at a point is the endpoint of
+# a trajectory of the whole field — there is no local closed form to evaluate per hit.
+# So it goes through `texture`, and then the ENTIRE existing pipeline applies unchanged:
+# UV wrap, Jakob-Hanika spectral upsampling, triplanar projection, GPU upload, raster
+# preview, `reflect texture:<name>`, and `tex:<name>(u,v)` as one term inside a pattern
+# formula. No renderer path knows reaction-diffusion exists. Every surface below leans
+# on a different part of that:
+#
+#   back wall  — MAZE, thresholded into two inks by a pattern that samples it with
+#                `tex:`. Note the labyrinth has no dead ends of its own making: the
+#                corridors are all the same width because the wavelength is set by the
+#                chemistry, not by a random number.
+#   left wall  — SPOTS composed with a second procedural: the dots are only allowed to
+#                appear where a low-frequency noise says so, so the wall reads as a
+#                pelt that fades to plain hide. This is the composability argument —
+#                a bound slot could not do it.
+#   right wall — CORAL sampled at 3x3 TILES (`tex:coral(3*u, 3*v)`). The solve runs on a
+#                torus, so the tiling is seamless by construction; look for the joins,
+#                they are not there. This cannot be retrofitted onto an RD field, since
+#                blending its edges would destroy exactly the long-range correlations
+#                that make it not-noise.
+#   floor      — HOLES, and the same field again through `curv`-free plain arithmetic:
+#                the pits are darkened and a world-space term tints them, mixing surface
+#                data with scene geometry.
+#   torus      — SPOTS bound STRAIGHT to a material slot and box-projected with
+#                `uv triplanar`, no unwrap and no vt in the OBJ. A leopard donut.
+#
+# The (F, k) plane is mostly not interesting — outside a thin crescent every seed decays
+# back to the uniform state, and the crescent is only ~0.01 wide in k — so the presets
+# are load-bearing rather than a convenience. `ftrace -checkreaction` asserts that each
+# one still has real contrast and a plausible feature wavelength.
+#
+#   ftrace -in scenes/pattern_reaction.ftsl -n 40000000 -window -keepwindow \
+#          -o png/pattern_reaction.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# The four bakes. `sim` is the solve grid, and since a feature is a fixed number of
+# GRID CELLS wide, sim is really the how-many-features-across knob; `res` is just the
+# resolution the result is stored at. `steps` is how long the reaction runs — the spot
+# regimes converge, but the maze regime genuinely never settles (its corridors keep
+# reconnecting), so there `steps` is an aesthetic choice, not a convergence criterion.
+texture "rdmaze"  { reaction { preset maze    sim 256 steps 6000 } wrap repeat }
+texture "rdspots" { reaction { preset spots   sim 256 steps 6000 } wrap repeat }
+texture "rdcoral" { reaction { preset coral   sim 192 steps 6000 } wrap repeat }
+texture "rdholes" { reaction { preset holes   sim 224 steps 6000 } wrap repeat }
+
+# BACK WALL — the labyrinth, hardened into two inks.
+pattern "maze" { expr "smoothstep(0.35, 0.65, tex:rdmaze(u, v))" }
+
+# LEFT WALL — the dots gated by a slow noise, so the pelt thins out across the wall.
+# Two independent generators, one of which is a physical simulation, combined by an
+# ordinary expression.
+pattern "pelt" {
+    expr "smoothstep(0.5, 0.72, tex:rdspots(u, v)) * smoothstep(0.15, 0.50, noise(1.6*x, 1.6*y, 1.6*z))"
+}
+
+# RIGHT WALL — 3x3 tiles of the coral bake. Seamless because the solve is periodic.
+pattern "reef" { expr "smoothstep(0.30, 0.70, tex:rdcoral(3*u, 3*v))" }
+
+# FLOOR — the pits, tinted by a world-space band so the map is not purely surface data.
+pattern "pitted" {
+    expr "saturate(smoothstep(0.30, 0.60, tex:rdholes(2*u, 2*v)) + 0.25*sin(9*x))"
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "ink"   { type diffuse reflect rgb 0.05 0.06 0.08 }
+material "bone"  { type diffuse reflect rgb 0.90 0.87 0.79 }
+material "rust"  { type diffuse reflect rgb 0.62 0.24 0.10 }
+material "sea"   { type diffuse reflect rgb 0.09 0.34 0.38 }
+material "sand"  { type diffuse reflect rgb 0.76 0.66 0.44 }
+material "tan"   { type diffuse reflect rgb 0.82 0.63 0.29 }
+
+material "backwall"  { type mix  layer "bone" 0.5  layer "ink"  0.5  weight_map pattern:maze   }
+# `weight_map` t is the probability of the FIRST layer, and `pelt` is ~0 over the plain
+# hide and ~1 on a dot, so "ink" has to be listed first for the dots to be the dark thing
+# on a light coat rather than the other way round.
+material "leftwall"  { type mix  layer "ink"  0.5  layer "tan"  0.5  weight_map pattern:pelt   }
+material "rightwall" { type mix  layer "sea"  0.5  layer "bone" 0.5  weight_map pattern:reef   }
+material "floormat"  { type mix  layer "sand" 0.5  layer "rust" 0.5  weight_map pattern:pitted }
+
+# The torus binds the bake DIRECTLY to a slot — greyscale albedo, no pattern involved —
+# which is the whole "it is just a texture" claim in one line.
+material "leopard"   { type diffuse reflect texture:rdspots }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material floormat  }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white     }   # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material backwall  }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material leftwall  }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material rightwall }   # right
+
+# Triplanar box projection at 2 repeats per world unit — the OBJ carries no vt, and
+# nothing about the projection code had to learn what a reaction texture is.
+mesh {
+    file      scenes/torus.obj
+    material  leopard
+    uv        triplanar scale=2
+    scale     0.62
+    translate 0.5 0.30 0.5
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 400 400 }
+}

@@ -308,6 +308,121 @@ texture "grad" {
   not apply (the grid is already linear RGB). loom: `loom.ProcTexture` /
   `loom.func_skin(name, r, g, b, …)`.
 
+### 5.2 Reaction–diffusion textures (Gray–Scott)
+
+Instead of a bitmap `file` or an `rgb` skin, a texture may be **grown by a
+simulation**: a Gray–Scott reaction–diffusion system solved once at load on a periodic
+grid.
+
+```
+texture "hide" {
+    reaction {
+        preset spots     # spots | holes | maze | coral | worms | mitosis
+        sim    256       # solve grid, default 256 (8–4096) — the DENSITY knob
+        steps  6000      # iterations, default 6000 (0–2000000)
+        seed   1         # which realisation
+      # feed 0.038  kill 0.065     # raw (F, k), overriding/instead of `preset`
+      # du 1.0  dv 0.5  dt 1.0     # diffusion + timestep (see stability, below)
+    }
+    res  512             # store resolution (default = sim, 1–8192)
+    wrap repeat
+}
+```
+
+The two chemicals obey
+
+```
+du/dt = Du ∇²u − u v² + F (1 − u)
+dv/dt = Dv ∇²v + u v² − (F + k) v
+```
+
+and Turing's point — the whole reason the block exists — is that the **uniform**
+solution of such a system can be unstable to spatial perturbation while remaining
+stable in time. A blank sheet therefore organises *itself* into spots, labyrinths or
+dividing blobs, with an intrinsic wavelength that appears nowhere in the equations.
+Every other generator in this language places features by fiat; these are the outcome
+of a process, so their spacing, branch points and defects are correlated the way a
+real coat pattern's are.
+
+It is a **bake** rather than a `pattern` op because the value at a point is the
+endpoint of a trajectory of the entire field — there is no local closed form to
+evaluate per hit. Being a `texture` means the result then flows through the unmodified
+pipeline: UV wrap, Jakob–Hanika upsampling, triplanar, GPU upload, raster preview,
+`reflect texture:<name>`, and [`tex:<name>(u, v)`](#61-expression-language) as one
+*term* inside a pattern formula. The bake is grey (the V concentration in all three
+channels), so `tex:` and the scalar maps read the concentration exactly.
+
+- **Seamless by construction.** The Laplacian wraps on both axes, so the solve is on a
+  torus and the image tiles under `wrap repeat` — `tex:hide(3*u, 3*v)` shows no joins.
+  This is not deferrable: blending the edges of a finished RD field destroys exactly
+  the long-range correlations that distinguish it from noise, so the topology (and the
+  seed, which uses an exact `x·nb/N` block partition) has to be periodic up front.
+- **`sim` sets density, `res` only sets storage.** A feature is a fixed number of grid
+  *cells* wide, so doubling `sim` puts twice as many features across the texture. Most
+  presets sit at 16–18 cells per feature; `mitosis` is much coarser and seed-dependent
+  (21–64), so it wants a larger `sim` than the rest for a comparable feature count.
+- **Presets are load-bearing.** Most of the (F, k) plane decays back to the uniform
+  state; the pattern-forming crescent is only ~0.01 wide in `k`, so hand-picked numbers
+  usually bake a blank sheet. `feed`/`kill` are exposed for exploring it, and a solve
+  that washes out prints a warning naming the presets.
+- **Default diffusion is the textbook 0.16 / 0.08 rescaled by 2.5².** That is a pure
+  spatial rescale — published (F, k) values transfer unchanged — but each feature
+  becomes 2.5× wider in cells. At the raw 0.16 a spot is only ~4 cells across and
+  comes out visibly square, pixel-locked to the lattice.
+- **Stability is checked, not hoped for.** Explicit Euler on the 9-point stencil needs
+  `dt · max(Du, Dv) · 1.6 ≤ 2`; past that the field reaches NaN within a few dozen
+  steps, so violating it is a **load error** with the arithmetic printed, not a
+  warning. (This caps the rescale at s ≈ 2.79; the defaults leave 20% margin.)
+- **`maze` never converges** — its corridors keep reconnecting — so for that regime
+  `steps` is an aesthetic choice, not a convergence criterion. The spot and blob
+  regimes do settle (per-step change ~4e-5 by 24000 steps).
+- A `-stop` lands during the bake: the solve polls the stop flag and aborts the load.
+
+Worked example `scenes/pattern_reaction.ftsl`; self-test `ftrace -checkreaction`.
+
+### 5.3 Stochastic tiling (`tiling stochastic`)
+
+Any image texture may be tiled so the **repeat lattice is invisible**, by
+histogram-preserving blending (Heitz & Neyret 2018):
+
+```
+texture "lichen" {
+    file   scenes/lichen.ppm
+    wrap   repeat
+    tiling stochastic      # none (default) | stochastic
+    patch  1.0             # lattice cell size, in texture repeats (default 1.0, > 0)
+    seed   3               # which realisation of the crop offsets (default 0)
+}
+```
+
+- `patch` is in **texture repeats**, so it composes with whatever UV scale the
+  projection applies; `1.0` is the paper's default. Smaller cells shuffle harder but
+  blur features bigger than a cell.
+- `seed` selects the realisation and reproduces exactly across backends.
+- `tiling`/`patch`/`seed` are only meaningful on `file` textures (an `rgb` skin or a
+  `reaction` bake is already procedural / seamless). `patch` and `seed` are ignored
+  when `tiling` is `none`.
+
+What it does per shading point: sample **three** randomly offset crops on a triangle
+lattice and blend them with the barycentric weights. Because a plain average of three
+crops of a bimodal image produces the mean of its two modes — a colour the source never
+contains — the blend runs in a **rank-transformed** space instead: each channel is
+mapped at load onto `N(1/2, 1/6)`, the taps are blended there, the variance the average
+destroyed is restored by dividing the centred blend by `sqrt(Σwᵢ²)`, and the result is
+inverted through a stored 1-D LUT. Histogram, contrast and colour statistics survive.
+
+The blend is in **linear RGB**, then converted to a reflectance through one shared 64³
+Jakob–Hanika coefficient LUT (built lazily on first use). Blending the coefficients
+themselves would be wrong — coefficient space is not a colour space, and doing so
+fringes blue-cyan. Because all three backends (spectral CPU, CUDA, mode-`W` raster) run
+that same operator on the same planes, they agree.
+
+Costs three texture taps instead of one and roughly doubles the texture's memory (the
+rank-transform planes). Works with every UV source including `triplanar`, with
+`reflect texture:<name>`, and inside `tex:<name>(u, v)` pattern terms.
+
+Worked A/B example `scenes/stochtile.ftsl`; self-test `ftrace -checkstochtile`.
+
 ---
 
 ## 6. `pattern` — procedural scalar fields
@@ -341,7 +456,8 @@ film thickness, mix weight). Patterns are evaluated per hit.
 **Variables:** `x y z` (world position), `f` (field value, for isosurfaces),
 `nx ny nz` (surface normal), `r` (`|p|`), `u v` (surface texture coordinates — on
 meshes and on native primitives that declare a `uv` wrap, see §9), `curv` (mean
-curvature — see below), `cavity` (enclosure — see below). Constant `pi`.
+curvature — see below), `cavity` (enclosure — see below), `fw` (shading footprint —
+see `fnoise` below). Constant `pi`.
 
 **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
 `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args).
@@ -483,6 +599,61 @@ F1/F2 are mathematically exact (adaptive ring search, not the common fixed
 `-checkworley`. Worked example: `scenes/pattern_worley.ftsl` (all four outputs,
 all three metrics).
 
+**Blue-noise placement — `bnoise`, `bnoise2`, `bnoised`, `bnoiseid`:** the same four
+slots as `worley`, over a **different point set** — one with a guaranteed **minimum
+separation**. All four take `(x, y, z, r)`:
+
+| function | value |
+|---|---|
+| `bnoise` | **F1** — distance to the nearest point of the set |
+| `bnoise2` | **F2** — distance to the second-nearest |
+| `bnoised` | **F2 − F1** — the crack network of *its* Voronoi diagram |
+| `bnoiseid` | flat random value in `[0,1)` owned by the F1 point |
+
+`r` is the separation radius in cell units, clamped to `[0,1]`. **No two points of the
+set are closer than `r`**, and that is a theorem about the construction, not a
+statistical tendency. Worley's sites are a jittered lattice, so two of them can be
+arbitrarily close (both jitter to the shared cell wall) while elsewhere the lattice
+leaves holes; threshold F1 to draw spots and the clumping is instantly legible as
+computer texture — fused pairs beside bald patches. Evenness is a property of *where
+the points are* and no amount of downstream filtering puts it back, which is why this
+is a separate primitive rather than a mode of `worley`.
+
+`r` sweeps continuously between the two: `r = 0` vetoes nothing and reproduces the
+jittered lattice exactly (density 1 point per cell), `r = 1` is maximally blue and keeps
+0.2661 of the candidates, with F1 spanning about `[0, 1.6]`. Matching a `worley`
+texture's spot *density* therefore needs a smaller worley cell — `0.2661^(1/3) = 0.6432`
+times the size at `r = 1`.
+
+```
+# evenly spread discs, 24 per unit, no two able to touch
+pattern "dots" { expr "1 - smoothstep(0.36, 0.42, bnoise(24*x, 24*y, 24*z, 1))" }
+
+# ...with a per-point random radius, which only the id makes possible
+pattern "freckle" {
+    expr "1 - smoothstep(0.09, 0.16 + 0.30*bnoiseid(26*x, 26*y, 26*z, 1),
+                         bnoise(26*x, 26*y, 26*z, 1))"
+}
+```
+
+Two authoring notes. Keep the largest radius below `0.5` cells if discs on adjacent
+sites must never touch. And remember the set is **solid**: a surface cuts the spheres at
+assorted depths and sees discs of radius `sqrt(R² − h²)`, so a uniform `R` already gives
+a spread of spot sizes on any surface, with a few near-tangential ones very small.
+
+Classical Poisson-disk sampling (dart throwing) cannot be used here: acceptance of a
+dart depends on every dart accepted before it, so answering "nearest point to `p`" would
+mean simulating the whole plane. Instead each cell holds one candidate carrying a random
+rank, and a candidate is kept iff no candidate within `r` outranks it — one round of
+Luby's MIS, i.e. a Matérn type-II thinning of a stratified parent. That predicate is
+**local**, so a query is O(1) at an arbitrary point of an unbounded domain with no bake,
+and the ordering is a strict *total* order (rank, then cell coordinates) so colliding
+ranks cannot let an overlapping pair through. Cost is Worley's: ~29 cells hashed per
+query against 27, thanks to a per-cell geometric bound and a rank test that runs before
+any position is computed. Bit-identical on CPU and GPU, validated by `-checkbluenoise`.
+Worked example: `scenes/pattern_bluenoise.ftsl` (a matched-density side-by-side against
+`worley`, freckles, cobbles, lichen, golf-ball dimples).
+
 **Anisotropic noise — `gabor(x, y, z, f, wx, wy, wz)`:** band-limited Gabor noise,
 returning `[0,1]` with mean `0.5` like `noise`. `f` is the frequency in **cycles per
 unit of the coordinates you pass in**, and `(wx, wy, wz)` is the **steering
@@ -522,6 +693,79 @@ one noise here that minifies gracefully. Bit-identical on CPU and GPU (including
 own cosine — libm's is not), validated by `-checkgabor`. Worked example:
 `scenes/pattern_gabor.ftsl` (isotropic speckle, brushed metal, wood end grain,
 flow-aligned fibre, latitude striation on a sphere).
+
+**Filtered fBm — `fnoise(x, y, z, w, octaves)`:** the sum of `octaves` octaves of the
+same lattice `noise` (lacunarity 2, gain 0.5), returning `[0,1]` with mean `0.5` — but
+with each octave weighted by how much of it a shading sample **of width `w` can
+actually resolve**. `w` is in the same coordinate units you pass in, and is the
+**diameter of the surface patch the sample stands for**. `w = 0` (or negative) means
+"unfiltered" and reproduces plain fBm exactly, so the filtering is opt-in and costs
+nothing when it is off. `octaves` is truncated and clamped to `[1, 10]`, like `dturb`.
+
+```
+# a floor that stays crisp underfoot and goes smooth in the distance instead of
+# turning into a shimmering mess -- `fw` is the renderer's own footprint at this hit
+pattern "floorgrain" { expr "fnoise(6*x, 6*y, 6*z, 6*fw, 7)" }
+```
+
+Note the idiom there: the coordinates are scaled by 6, so **the width is scaled by 6
+too**. `w` lives in the same space as the point, and `fw` is always in **world units**,
+so scaling it is your job. Getting that wrong is the easiest mistake to make with
+`fnoise` — the filter is then off by that factor and either does nothing or erases the
+texture.
+
+**The footprint variable — `fw`:** the world-space **diameter of the surface patch one
+shading sample stands for**, computed by the renderer at the hit and handed to the
+pattern. It is exactly what `fnoise`'s `w` wants (scaled to your coordinates), and it
+follows the camera: move it, change `fov_y`, change the film resolution, raise `-spp`,
+and the filtering adjusts itself. A hand-written expression in terms of `r` cannot do
+that.
+
+`fw` is derived from three things: the solid angle one pixel subtends (so fisheye and
+panoramic lenses need no special case), the hit distance, and the obliquity. A pixel's
+footprint on a slanted surface is an **ellipse** with minor axis `d` and major axis
+`d/|cos|`; `fw` reports their geometric mean, the diameter of the disc of equal area.
+At `|cos| < 0.02` the stretch is clamped, or every silhouette would filter to a flat
+grey band. Supersampling divides it by `sqrt(spp)`: jittered samples already average
+over the footprint, so the filter backs off on its own as a render converges, and one
+scene can serve both a 1-spp preview and a ground-truth render.
+
+**`fw` is 0 wherever the renderer cannot honestly answer**, and 0 means *unfiltered* —
+never a small blur. It is 0 in the forward photon modes and in stochastic mode `R`
+(which already area-average, see below), at **secondary bounces** (a reflection would
+need ray differentials to know how much its footprint spread), and inside implicit
+field / medium formulas (which are evaluated at march samples, not at a surface). It
+is filled at primary hits in mode `W` and at every pixel of the raster preview. For
+the same reason it is **rejected in `emit` patterns**: an emitter's radiance is a
+property of the surface, not of who is looking at it.
+
+The reason this exists is what a texture does when it is *not* resolved. Every other
+noise here is evaluated at a point, which is a lie as soon as the sample stands for an
+area: once a feature is smaller than the footprint, point-sampling reports one arbitrary
+member of the population instead of the population's mean, and the image gets a moiré of
+the sampling lattice rather than the texture. More samples do not fix that; not
+generating the detail does.
+
+Two things about the weighting are worth knowing, because both are the opposite of the
+obvious design and both were **measured** rather than chosen (`-checkfnoise` pins the
+code to the measurement). First, the right weight is *not* "keep everything coarser than
+Nyquist, drop everything finer": the optimal weight is still `0.95` **at** Nyquist and
+`0.81` at the width where the naive rule would already have dropped the octave whole.
+Second, over-filtering is **not** the safe direction — it deletes low-frequency content
+the footprint genuinely contains, and ends up further from the truth than not filtering
+at all. That is also why `w` means a surface patch and not a solid ball: for a fixed
+size the two disagree by a whole power of `w`, so filtering a surface as though it were
+a volume over-blurs it past the point of being worth doing.
+
+Where this bites is the **deterministic** samplers — mode `W`, the raster preview, and
+low-sample-count backward renders. The forward photon modes already integrate the
+footprint stochastically (millions of photons land all over each pixel, so the texture
+is area-averaged for free), and there `w` only costs detail; that is why `fw` reads 0
+there and the expression filters nothing without you having to write a special case.
+
+Validated by `-checkfnoise`. Worked example: `scenes/pattern_fnoise.ftsl` (a floor
+running to the horizon, split down the frame: plain fBm on one side, the identical
+field through `fnoise(…, 90*fw, 3)` on the other).
 
 **Image samples — `tex:<name>(u, v)`:** samples a declared `texture` as a *scalar term
 inside the formula*, so a photograph can be one operand of an expression rather than
@@ -908,6 +1152,7 @@ Fills a complete material; a few knobs may be overridden afterward
 | `thinfilm` | `ior`(1.5); `film_ior`(1.30); `film_thickness <nm>`(300)/`film_thickness_map`; `substrate_k <spec>`(0) |
 | `grating` | `reflect`(0.9); `groove_spacing <nm>`(1000); `groove_dir <x y z>`(0,1,0); `max_order`(3) |
 | `fluorescent` | `reflect`(0.1); `absorb <spec>`; `emit <spec>`; `yield`(1) |
+| `hair` | fiber BCSDF for `curve`/`fur` strands (Marschner R/TT/TRT, Chiang form). `reflect <spec>`(0.3) — the colour you want the *coat* to be, inverted into an interior absorption, **not** a Lambertian albedo; `sigma_a <spec>` — that absorption directly, in 1/(fiber radius), and it **wins** over `reflect` when present; `eta`(1.55); `beta_m`(0.3) longitudinal roughness; `beta_n`(0.3) azimuthal roughness; `alpha`(2.0) cuticle scale tilt in **degrees**. The scattering **medulla** (Yan et al. 2017), which is what makes fur read as fur rather than hair: `medulla`(0) is κ, the core radius as a fraction of the fiber's, and 0 leaves a solid cylinder and makes the rest inert; `medulla_sigma_s`(0); `medulla_sigma_a`(0); `medulla_g`(0) core anisotropy. `preset <species>` loads a measured fiber — `bobcat cat deer dog mouse rabbit raccoon redfox springbok human` — as **defaults**, so any key written alongside it still wins. See REFERENCE.md § Hair and fur fibers. |
 | `multilayer` | `ior`(1.5); `substrate_k`(0); ordered `layer <n> <k> <thickness_nm>` list (outermost first) |
 | `mix` | stochastic blend of children — see §7.3 |
 | `layered` | specular coat over a weighted body — see §7.4 |
@@ -944,8 +1189,10 @@ is clamped to [0,1], so a runaway formula cannot manufacture energy.
 back-hemisphere albedo (still energy-guarded so reflect + transmit ≤ 1) or a `filter`'s
 per-wavelength gel transmittance.
 
-Reflect patterns are supported on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy`
-and `grating`; transmit patterns on `translucent` and `filter` — the families whose slot goes
+Reflect patterns are supported on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy`,
+`grating` and `hair` (on a fiber the pattern modulates the colour that is inverted into
+`sigma_a`, so it varies the strand's absorption per hit); transmit patterns on `translucent`
+and `filter` — the families whose slot goes
 through the shared per-hit accessor. Elsewhere the spectrum is read directly (or not at all)
 and a pattern would be dropped in silence, so the loader **refuses** it there instead.
 
@@ -1703,9 +1950,15 @@ and a Lipschitz bound (`max_gradient`, see §10.3).
   work here too — they need only coordinates — so a field can be domain-warped by
   gradient noise, and so does cellular noise
   `worley/worley2/worleyd/worleyid(x,y,z,metric)` (§6.1) for crystal/stone-like
-  fields and `gabor(x,y,z,f,wx,wy,wz)` (§6.1) for directional ones — though a field
+  fields, blue-noise placement `bnoise/bnoise2/bnoised/bnoiseid(x,y,z,r)` (§6.1) for
+  evenly-spread blobs, and `gabor(x,y,z,f,wx,wy,wz)` (§6.1) for directional ones —
+  though a field
   driven by Gabor noise needs a generous `max_gradient`, since its slope scales with
-  `f`. The image sample
+  `f`. Filtered fBm `fnoise(x,y,z,w,octaves)` (§6.1) is accepted too, but its point is
+  antialiasing a *shading* sample and a field expression has no footprint to speak of,
+  so in practice it is only useful here with `w = 0` (where it is plain fBm) or with a
+  constant `w` used as a deliberate smoothing knob on the surface itself. The image
+  sample
   `tex:<name>(u, v)` (§6.1) is **not** available here — a field expression *defines* a
   surface, so there is no surface to sample yet; using it is a compile error.
 - **Operators:** `+ - * / % ^` and unary `-`. `^` is `pow` (right-assoc), `%` is

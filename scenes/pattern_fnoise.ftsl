@@ -1,0 +1,152 @@
+# pattern_fnoise.ftsl — filtered (band-limited) fBm (O8).
+#
+#   fnoise(x, y, z, w, octaves)
+#
+# The same lattice `noise`, summed over `octaves` at lacunarity 2 and gain 0.5, with
+# each octave weighted by how much of it a shading sample OF WIDTH w can actually
+# resolve. `w` is in the units of the coordinates you pass in, and is the diameter of
+# the surface patch that one sample stands for. `w <= 0` is plain, unfiltered fBm.
+#
+# WHAT THIS SCENE IS FOR. Every other noise in ftrace is evaluated at a point. That is
+# a lie the moment one shading sample stands for an area: once a feature is smaller than
+# the footprint, point-sampling reports one arbitrary member of the population instead
+# of the population's mean. The detail does not politely fade out — it FOLDS DOWN into a
+# coarse pattern of the sampling lattice, and no amount of extra samples removes it,
+# because you are sampling a signal that was never band-limited in the first place.
+#
+# So the floor here runs away to the horizon, split down the middle of the frame. (The
+# camera looks down +z with +y up, so world +x is screen-LEFT — mind that when reading
+# the expression below.)
+#
+#     LEFT  of frame (x > 0)   plain fBm, point-sampled. Crisp underfoot; past a few
+#                     metres it stops resolving and just keeps a fixed hash of
+#                     pixel-scale speckle all the way to the horizon, with nothing to
+#                     do with the texture. In a flyby that speckle crawls.
+#     RIGHT of frame (x < 0)   the identical field through `fnoise`, with the renderer's
+#                     own footprint (`fw`) handed in. At the bottom edge of the frame it
+#                     keeps 92% of the coarsest octave and a third of the finest — the
+#                     near field still reads as the same material — and from there it
+#                     settles smoothly toward the mean instead of breaking up.
+#
+# Measured off the render — mean |pixel - its 3x3 mean| over each half, by row, which
+# is a direct read of how much pixel-to-pixel hash a row carries:
+#
+#     distance    3.8 m   5.4 m   7.8 m    15 m    26 m   horizon
+#     plain         8.2     9.5     8.9     9.5    10.9      9.1
+#     filtered      5.5     5.7     2.5     0.5     0.3      0.0
+#     ratio        1.50x   1.66x   3.55x     21x     34x    >100x
+#
+# Read the `plain` row, not the ratio: it does not fall with distance AT ALL. A texture
+# 26 m away, whose features are a hundredth of a pixel across, still delivers exactly as
+# much pixel-scale contrast as the one underfoot. That flat line IS the aliasing — the
+# folded-down energy belongs to the sampling lattice, not to the texture, so minifying
+# further cannot shrink it and neither can a bigger render. The `filtered` row is what
+# minification is supposed to look like.
+#
+# Render it in mode W (deterministic, one sample per pixel), which is where this
+# matters:
+#
+#   ftrace -in scenes/pattern_fnoise.ftsl -mode W -spp 1 -r 900 600 \
+#          -window -keepwindow -o png/pattern_fnoise.png
+#
+# The forward photon modes do NOT need this. There each pixel accumulates millions of
+# photons whose hit points are spread all over its footprint, so the texture is already
+# area-averaged — stochastically, for free — and `fnoise` would only cost detail. It is
+# the deterministic samplers that need it: mode W, the raster preview, and low-spp
+# backward renders.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# ---------------------------------------------------------------------------------
+# THE FOOTPRINT — the pattern variable `fw`. `fnoise` needs to be told how wide the
+# sample is, and the renderer knows: `fw` is the world-space diameter of the surface
+# patch that ONE shading sample stands for, filled at every primary hit in mode W and
+# in the preview rasterizer, and 0 (= unknown = unfiltered) everywhere the renderer
+# cannot honestly say — the forward photon modes, secondary bounces, stochastic mode R.
+#
+#   NOTE the factor of 90 on it. The noise is sampled at 90*x, so a footprint of w
+#   metres is 90*w in the space the noise lives in. Getting this wrong is the easiest
+#   mistake to make with `fnoise`: the width must be scaled exactly as the coordinates
+#   are, or the filter is off by that factor and either does nothing or erases the
+#   texture. `fw` is always in world units; the scaling is yours to apply.
+#
+# It is worth seeing what `fw` actually contains, so here it is derived by hand for
+# this exact shot. The camera stands at eye height h = 1.6 looking down the floor, so
+# for a floor point at distance d from it:
+#
+#   * one pixel subtends a fixed solid angle, so the footprint ACROSS the view
+#     direction is a*d — it grows linearly with distance. (`fw` takes `a` as the
+#     diameter of the disc subtending one pixel's solid angle, which for this square
+#     900x600 / fov_y 40 pixel is 1.369e-3 — the tan expansion and the equal-area disc
+#     conversion together make it ~18% wider than the naive fov_y/res_y = 1.164e-3.)
+#   * the floor is seen at a grazing angle, cos = h/d between the ray and the surface
+#     normal, which stretches the footprint ALONG the view direction by d/h, giving
+#     a*d^2/h.
+#
+# The footprint is therefore a long thin ellipse, not a disc, and a single scalar width
+# has to choose. `fw` returns the geometric mean sqrt(a*d * a*d^2/h) = a*d^1.5/sqrt(h)
+# — the disc of EQUAL AREA, and the standard compromise: the minor axis alone would
+# leave the long direction aliased, the major axis alone would smear the short one to
+# mush. (Filtering too hard is the worse mistake of the two — see REFERENCE.md — so
+# when in doubt lean to the minor.) At |cos| below 0.02 the stretch is clamped, or a
+# silhouette would filter to a flat grey band.
+#
+# So `90*fw` here is the same quantity the earlier revision of this scene spelled out
+# as `90 * 9.1987e-4 * pow(x*x + z*z + 2.56, 0.75)` — with the sample width taken
+# properly rather than approximated, and with no dependence on the camera staying where
+# it is. Move the camera, change the fov, change the resolution, raise -spp, and `fw`
+# follows; the hand-written version silently stops being true.
+#
+# WHY 3 OCTAVES AT BASE 90 AND NOT A CLASSIC WIDE fBm. This took a re-render to get
+# right and is worth knowing before authoring with `fnoise`. In a gain-0.5 octave stack
+# the fine octaves carry almost no amplitude — the seventh is 1/64 of the first — and
+# the fine octaves are exactly the ones a distant sample cannot resolve. So a wide fBm
+# both ALIASES faintly and FILTERS faintly: at 5 m the first attempt here (7 octaves at
+# base 9) still resolved its dominant octave perfectly, the filter correctly left it
+# alone, and the two halves of the frame were indistinguishable. That is the primitive
+# being right, not the demo being right.
+#
+# What aliases visibly is a texture whose energy sits AT the resolution limit — which is
+# also the common case in practice: grain, weave, gravel, stucco, sandpaper. Base 90/m
+# puts the coarsest octave at 1.1 cm — half-period 5.6 mm, which the footprint outgrows
+# at d = 3.0 m, about 2.5 m out along the floor and just short of the bottom edge of the
+# frame (d = 3.5 m there). So every octave is undersampled over the whole visible floor
+# and the transition lands where it can be seen.
+
+# `step(0, x)` is 1 where x > 0, i.e. over the LEFT half of the frame (see the note on
+# handedness above), so the left half gets the raw field and the right half the filtered
+# one. Everything else about the two sides — the lattice, the octave count, the
+# material, the light — is identical, so every difference in the image is the filtering
+# and nothing else. The two `fnoise` calls differ ONLY in the fourth operand.
+pattern "floor_split" {
+    expr "0.18 + 0.62 * mix(fnoise(90*x, 90*y + 0.5, 90*z, 90*fw, 3),
+                            fnoise(90*x, 90*y + 0.5, 90*z, 0,     3),
+                            step(0, x))"
+}
+
+material "floor" { type diffuse  reflect pattern:floor_split }
+material "grey"  { type diffuse  reflect rgb 0.35 0.35 0.35 }
+
+# A floor 300 m wide and 400 m long — wide enough that it still fills the frame at the
+# far end, and long enough that the far end is far beyond the resolving distance.
+quad { origin -150 0 -5   u 0 0 405   v 300 0 0   material floor }
+
+# A low marker wall at the far end, so the eye has something to read the horizon
+# against and the floor does not simply run off into the sky.
+quad { origin -150 0 400   u 300 0 0   v 0 6 0   material grey }
+
+light sun {
+    elevation 38   azimuth 15
+    angle     0.53
+    spd       preset:bb5800
+    intensity 3
+}
+
+camera "cam" {
+    eye 0 1.6 0   look_at 0 0 12   up 0 1 0   fov_y 40
+    mode W
+    film { res 900 600 }
+}

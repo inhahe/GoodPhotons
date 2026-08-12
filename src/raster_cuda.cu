@@ -124,6 +124,7 @@
 #include "raster_cuda.h"
 #include "camera.h"    // Camera, CAM_RECTILINEAR
 #include "pattern_device.cuh"   // DPattern / DPatEnvT / dPatternEval — shared with render_cuda.cu
+#include "stochtile.h"          // O7: the host/device-shared histogram-preserving tiling operator
 
 namespace raster_cuda {
 
@@ -181,6 +182,22 @@ struct DTex {
     // member hook below and has no second parameter to hand it — so the pointer is carried
     // per record. It is patched in after the texel array is allocated (upload()).
     const float3* texels;
+    // O7 stochastic tiling. The Gaussianized planes this backend needs — RGB (for the skin
+    // colour and normal maps) and gray (for `tex:`) — live end to end in ONE shared float
+    // pool, exactly like the texels, so a stochastic texture costs one extra offset here:
+    //
+    //   [ gaussRgb 3n | lutRgb 3L | gaussGray n | lutGray L ]     n = w*h, L = STOCH_LUT_N
+    //
+    // The layout is derivable from w/h alone, so no second offset is needed. `stochPool` is
+    // the device base, patched in with `texels` for the same reason (patScalarAt takes no
+    // pool argument). The COEFFICIENT planes are not uploaded: this backend shades from
+    // linear RGB and never evaluates a reflectance spectrum.
+    StochTile    stoch;
+    int          stochOff;    // first float of this texture's slice, or -1
+    const float* stochPool;
+    __device__ const float* stochBase() const {
+        return (stoch.on && stochOff >= 0 && stochPool) ? stochPool + stochOff : nullptr;
+    }
     // The pattern VM's `tex:` hook. Mirrors the host's Texture::scalarAt (the mean of the
     // three linear channels at (u,v)); defined out of line below, next to dSampleRgb.
     __device__ double patScalarAt(double u, double v) const;
@@ -197,6 +214,12 @@ struct DCam {
     float  tanHalfX, tanHalfY;
     int    projection;     // CAM_RECTILINEAR (0) or a fisheye/panoramic lens map
     float  rEdge;          // image radius at the vertical film edge (angular projections)
+    // O8 stage 2: Camera::footprintPerDist(1) — the world-space diameter of the surface
+    // patch ONE PIXEL stands for at unit distance, head-on. kShade turns it into the
+    // per-pixel `fw` a pattern sees, so fnoise() band-limits itself in the preview too.
+    // The preview is 1 sample per pixel with no jitter at all, so it is the single most
+    // alias-prone view in the renderer and wants this most.
+    float  fwPerDist;
 };
 
 // A projected screen sub-triangle, SPLIT into what each pass actually reads:
@@ -320,6 +343,12 @@ __device__ inline float3 dSampleRgb(const DTex* meta, const float3* texels, int 
                                     float u, float v) {
     const DTex& t = meta[ti];
     if (!t.valid) return mk(0.5f, 0.5f, 0.5f);
+    if (const float* sb = t.stochBase()) {   // O7 — twin of Texture::sampleRgb's branch
+        const size_t n = (size_t)t.w * t.h;
+        double o[3];
+        stochSample(t.stoch, sb, sb + 3 * n, 3, t.w, t.h, t.filter, (double)u, (double)v, o);
+        return mk((float)o[0], (float)o[1], (float)o[2]);
+    }
     const float3* px = texels + t.offset;
     if (t.filter == 0) {   // nearest
         int x = wrapIdxD((int)floorf(u * t.w), t.w, t.wrap);
@@ -344,6 +373,15 @@ __device__ inline float3 dSampleRgb(const DTex* meta, const float3* texels, int 
 // `tex:` node inside a pattern reads exactly the texels a bound skin would.
 __device__ inline double DTex::patScalarAt(double u, double v) const {
     if (!valid || !texels) return 0.5;
+    // O7: the GRAY plane, not the mean of the three stochastic colour channels — the host's
+    // scalarAt gives the scalar its own rank transform, and this has to be the same map.
+    if (const float* sb = stochBase()) {
+        const size_t n = (size_t)w * h;
+        const float* gg = sb + 3 * n + 3 * STOCH_LUT_N;
+        double o[1];
+        stochSample(stoch, gg, gg + n, 1, w, h, filter, u, v, o);
+        return o[0];
+    }
     // dSampleRgb indexes meta[ti] and offsets texels itself; this record IS meta[ti] and
     // `texels` is the shared base, so passing (this, texels, 0) samples exactly this map.
     float3 c = dSampleRgb(this, texels, 0, (float)u, (float)v);
@@ -813,6 +851,21 @@ __device__ inline float3 dTriTangent(float3 p0, float3 p1, float3 p2,
     return (l > 1e-12f) ? T * (1.0f / l) : mk(0.0f, 0.0f, 0.0f);
 }
 
+// O8 stage 2: the `fw` a pattern sees at this preview pixel — the world-space diameter of
+// the patch one pixel covers on this surface. cam.fwPerDist carries the per-unit-distance
+// part (Camera::footprintPerDist at the window's resolution); patShadingFootprint adds the
+// distance and the obliquity, so this shares its geometric-mean/cos-floor convention with
+// the CPU tracer and the mode-W kernel bit for bit. Called only when a pattern is actually
+// bound, so a pattern-free preview pays nothing.
+__device__ inline double dRasterFw(const DCam& cam, float3 wpos, float3 wn) {
+    float3 dv = wpos - cam.eye;
+    double d2 = (double)dot3(dv, dv);
+    if (!(d2 > 0.0)) return 0.0;
+    double dist = sqrt(d2);
+    float3 nn = normalize3(wn);
+    return patShadingFootprint((double)cam.fwPerDist, dist, (double)dot3(dv, nn) / dist);
+}
+
 // ---------------------------------------------------------------------------
 // Pass C: resolve + shade each pixel once. Decode the winning slot, recompute barycentrics
 // at the pixel centre (same float math as kRaster, so the winner's 1/depth reproduces),
@@ -901,9 +954,11 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             // none either, so the two previews agree; `curv` is a tracer-only input.
             // cavity = 0 for a stronger reason: the probe needs whole-scene ray
             // traversal, and the raster preview has no BVH at all — it exists precisely
-            // to avoid one. Both are logged in known-issues.md.
+            // to avoid one. Both are logged in known-issues.md. `fw` (O8 stage 2), by
+            // contrast, IS filled: a rasterizer knows its own pixel footprint exactly.
             wt = dPatternEval(patNodes + wp.off, wp.n, qx, qy, qz, 0.0,
-                              pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, 0.0, 0.0, patEnv);
+                              pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, 0.0, 0.0,
+                              dRasterFw(cam, wpos, wn), patEnv);
         } else if (mx.weightTex >= 0 && mx.weightTex < nTex) {
             wt = texMeta[mx.weightTex].patScalarAt((double)uu, (double)vv);
         }
@@ -936,7 +991,8 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         // approximates, matching both the CPU preview and the tracer's own hit context.
         // curv/cavity = 0 here for the same reason as the mix-weight site above.
         double s = dPatternEval(patNodes + pp.off, pp.n, px, py, pz, 0.0,
-                                pn.x, pn.y, pn.z, r, (double)uu, (double)vv, 0.0, 0.0, patEnv);
+                                pn.x, pn.y, pn.z, r, (double)uu, (double)vv, 0.0, 0.0,
+                                dRasterFw(cam, wpos, wn), patEnv);
         col = col * (float)fmin(1.0, fmax(0.0, s));
     }
     if (emissive) { accum[i] = col * emisBoost; return; }   // raw emitter radiance
@@ -1206,6 +1262,7 @@ struct Scene {
     DTex*    dtexMeta = nullptr;
     float3*  dtexels  = nullptr;
     int      nTex     = 0;
+    float*   dstoch   = nullptr;   // O7: shared Gaussianized-plane pool (see DTex::stochOff)
     // Procedural patterns (§4) bound to a triangle's albedo/emission: one flat PatNode pool
     // sliced per pattern by DPattern, plus the grid/scatter sample tables and the flat float
     // pool they read (all uploaded verbatim from the host Scene — same POD, same maths).
@@ -1299,6 +1356,7 @@ void destroy(Scene* sc) {
     if (sc->dlights)  cudaFree(sc->dlights);
     if (sc->dtexMeta) cudaFree(sc->dtexMeta);
     if (sc->dtexels)  cudaFree(sc->dtexels);
+    if (sc->dstoch)   cudaFree(sc->dstoch);
     if (sc->dpatNodes) cudaFree(sc->dpatNodes);
     if (sc->dpatterns) cudaFree(sc->dpatterns);
     if (sc->dgrids)    cudaFree(sc->dgrids);
@@ -1384,6 +1442,7 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
     // boundary would invent a colour that is in no spectrum.
     std::vector<DTex>   htexMeta;
     std::vector<float3> htexels;
+    std::vector<float>  hstoch;
     if (textures && !textures->empty()) {
         htexMeta.resize(textures->size());
         for (size_t i = 0; i < textures->size(); ++i) {
@@ -1395,6 +1454,19 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
             m.offset = (int)htexels.size();
             m.valid  = tx.valid() ? 1 : 0;
             m.texels = nullptr;   // patched to the device base once dtexels is allocated
+            // O7: append this texture's Gaussianized slice in the order DTex::stochBase
+            // documents. Copied verbatim off the host — never re-derived here, or the
+            // preview would drift off the render's crop of the image.
+            m.stoch = tx.stoch; m.stochOff = -1; m.stochPool = nullptr;
+            if (m.valid && tx.stochastic() && !tx.gaussGray.empty()) {
+                m.stochOff = (int)hstoch.size();
+                hstoch.insert(hstoch.end(), tx.gaussRgb.begin(),  tx.gaussRgb.end());
+                hstoch.insert(hstoch.end(), tx.lutRgb.begin(),    tx.lutRgb.end());
+                hstoch.insert(hstoch.end(), tx.gaussGray.begin(), tx.gaussGray.end());
+                hstoch.insert(hstoch.end(), tx.lutGray.begin(),   tx.lutGray.end());
+            } else {
+                m.stoch.on = 0;
+            }
             if (m.valid && tx.hasPalette() && !tx.paletteRgb.empty()) {
                 const int np = (int)tx.paletteRgb.size();
                 for (const Vec3& c : tx.rgb) {
@@ -1458,6 +1530,8 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         ok = tryMalloc((void**)&sc->dtexMeta, sizeof(DTex) * htexMeta.size());
     if (ok && !htexels.empty())
         ok = tryMalloc((void**)&sc->dtexels, sizeof(float3) * htexels.size());
+    if (ok && !hstoch.empty())
+        ok = tryMalloc((void**)&sc->dstoch, sizeof(float) * hstoch.size());
     if (ok && !hpatNodes.empty())
         ok = tryMalloc((void**)&sc->dpatNodes, sizeof(PatNode) * hpatNodes.size());
     if (ok && !hpat.empty())
@@ -1475,7 +1549,7 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
     // The pattern VM reaches a texture through DTex::patScalarAt, which has no texel-array
     // parameter — so each record carries the DEVICE base pointer. It only exists now that
     // dtexels is allocated, hence the patch here (before the meta upload below).
-    for (DTex& m : htexMeta) m.texels = sc->dtexels;
+    for (DTex& m : htexMeta) { m.texels = sc->dtexels; m.stochPool = sc->dstoch; }
 
     if (cudaMemcpy(sc->dtris, h.data(), sizeof(DPTri) * tris.size(),
                    cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
@@ -1487,6 +1561,9 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
                    cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
     if (!htexels.empty() &&
         cudaMemcpy(sc->dtexels, htexels.data(), sizeof(float3) * htexels.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    if (!hstoch.empty() &&
+        cudaMemcpy(sc->dstoch, hstoch.data(), sizeof(float) * hstoch.size(),
                    cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
     if (!hpatNodes.empty() &&
         cudaMemcpy(sc->dpatNodes, hpatNodes.data(), sizeof(PatNode) * hpatNodes.size(),
@@ -1601,6 +1678,10 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
     dc.tanHalfX = (float)cam.tanHalfX; dc.tanHalfY = (float)cam.tanHalfY;
     dc.projection = cam.projection;
     dc.rEdge = (float)cam.rEdge;
+    // O8 stage 2. The preview draws this camera at W*H, which need not be the camera's own
+    // film resolution, so pass W/H as the pixel-count override. spp = 1: the rasterizer
+    // takes exactly one un-jittered sample per pixel.
+    dc.fwPerDist = (float)cam.footprintPerDist(1, W, H);
 
     const float3 bg = make_float3(0.06f, 0.07f, 0.09f);
     const float  EMIS_BOOST = 4.0f;

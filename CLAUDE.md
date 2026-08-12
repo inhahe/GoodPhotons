@@ -117,9 +117,22 @@ stop, and it is always the answer:
   the CUDA context through the graceful-shutdown path, then exit. It waits (up to
   120 s) for the process to actually be gone, so you can chain a rebuild straight
   after it. It also releases a window being held open by `-keepwindow`.
-- **`ftrace -stop`** (bare) — *lists* every live render: pid + scene → output. Use
-  this to find the pid rather than grepping `tasklist`.
-- **`ftrace -stop all`** — stops every live render.
+- **`ftrace -stop`** (bare) — *lists* every live ftrace process: pid + scene → output.
+  Use this to find the pid rather than grepping `tasklist`.
+- **`ftrace -stop all`** — stops every live ftrace process.
+
+**It covers the GUIs too, not just renders (since 0.182.0).** A `-viewer` (loom native
+viewer) or `-explore` process is listed by a bare `-stop` and shuts down cleanly when
+targeted — the GUI loop polls the same flag a render polls, then leaves through its
+normal teardown. So a viewer holding `ftrace.exe` open and failing your rebuild is a
+`-stop`, never a force-kill.
+
+**Trust the exit code (since 0.182.0).** `-stop` exits **0** only when every target is
+genuinely gone (a pid that was already dead counts, and says `nothing to stop`). If a
+target is still alive when the 120 s window expires it prints `[stop] FAILED — still
+running after 120s: <pids>` and exits **2**. Before 0.182.0 it printed `stopped cleanly`
+and exited 0 unconditionally, so a failed stop looked like a successful one — if you see
+the FAILED line, investigate; still don't reach for `taskkill /F`.
 
 ftrace prints the exact command you need when it starts holding a window
 (`[window] render done — close the preview window to exit (or run: ftrace -stop

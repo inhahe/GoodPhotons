@@ -187,6 +187,32 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
             }
+            case MatType::Hair: {
+                // Fiber BCSDF (src/hair.h via hair_shade.h). A strand is deliberately NOT
+                // recorded as a visible point: the photon payload (`struct Photon` in
+                // photonmap.h) stores only position/normal/power/lambda and carries NO
+                // incident direction, so the density estimate cannot evaluate a
+                // DIRECTIONAL BCSDF at the gather — there is nothing to plug in for wi.
+                // So hair is treated the way these modes already treat glossy and
+                // specular surfaces: the camera walk SCATTERS through it correctly and
+                // records its visible point on whatever diffuse surface lies beyond.
+                // (Logged in known-issues.md; modes R/D/V shade strands fully.)
+                const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
+                const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
+                double pdfH = 0.0, fv = 0.0;
+                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
+                                             rng.uniform(), rng.uniform(), pdfH, fv);
+                if (!(pdfH > 0.0) || !(fv > 0.0)) return;
+                // Exactly T = sum_p A_p, the total lobe attenuation (see render.h's Hair
+                // case for why the ratio collapses to a deterministic number).
+                const double cosLong =
+                    hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
+                thr *= clamp01(fv * cosLong / pdfH);
+                const Vec3 wo = hair::toWorld(hs.fr, wl);
+                // TT/TRT leave through the FAR side of a real solid tube.
+                ray = Ray{h.p + wo * hairExitOffset(hs, h.n, wo), wo};
+                break;
+            }
             default: {
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};

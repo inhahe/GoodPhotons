@@ -17,7 +17,10 @@
 #include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
 #include "record.h"      // parametric records (§records): named per-channel LUTs
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter };
+// NOTE: append new types at the END. render_cuda.cu's D_* tags are `(int)m.type` and must
+// stay 1:1 with this order, so inserting in the middle silently reinterprets every
+// uploaded material.
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter, Hair };
 
 // Materials whose last-vertex-before-camera cannot connect to the pinhole in
 // model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
@@ -48,6 +51,7 @@ inline const char* matTypeName(MatType t) {
         case MatType::Layered:         return "layered";
         case MatType::DiffuseTransmit: return "translucent";
         case MatType::Filter:          return "filter";
+        case MatType::Hair:            return "hair";
         case MatType::Diffuse:         default: return "diffuse";
     }
 }
@@ -213,6 +217,39 @@ struct Material {
     double grooveSpacing = 1000.0;             // groove period d in nanometres
     Vec3   grooveDir = {1.0, 0.0, 0.0};        // groove direction (world), projected to surface
     int    gratingMaxOrder = 3;                // highest |m| diffraction order considered
+
+    // --- Fiber BCSDF (MatType::Hair) ----------------------------------------
+    // Marschner's R / TT / TRT lobes in Chiang's energy-conserving form (src/hair.h).
+    // Meant for `curve` / `fur` geometry: the shading code recovers the impact parameter
+    // from the hit normal and the fiber tangent, so the intersector stays BCSDF-free.
+    // On a non-fiber surface (a sphere, a triangle) `hit.tangent` is the texture-u
+    // direction rather than a fiber axis, which is still a well-defined frame — the
+    // result just is not a hair.
+    double hairEta   = 1.55;   // cuticle IOR (keratin)
+    double hairBetaM = 0.3;    // longitudinal roughness [0,1] — how far the R highlight smears along the fiber
+    double hairBetaN = 0.3;    // azimuthal roughness [0,1] — how far the lobes smear around it
+    double hairAlpha = 2.0;    // cuticle scale tilt, DEGREES; splits R from TRT (the "two highlights")
+    // Interior absorption. Authored either directly as sigma_a(lambda) in 1/(fiber
+    // radius) units via `hair_sigma_a`, or — far easier to art-direct — as the colour the
+    // fiber should end up, `reflect`, inverted through Chiang eq. 9 (`sigmaAFromReflectance`)
+    // at load time. `hairSigmaAFromReflect` records which spelling was used; the inversion
+    // depends on hairBetaN, so it must run after the whole block is parsed.
+    Spectrum hairSigmaA = constantSpectrum(0.0);
+    bool     hairSigmaAFromReflect = true;
+    // --- The MEDULLA (Yan et al. 2015/2017) ---------------------------------
+    // The scattering core that makes fur fur. `hairKappa` (the medullary index: medulla
+    // radius / fiber radius) is the master switch — at its 0 default the fiber is a solid
+    // cylinder and the model is exactly stage 1, so no existing scene moves. Real fitted
+    // values run 0.36 (human) to 0.91 (deer); fur is mostly medulla.
+    //
+    // Both coefficients are spectra, in 1/(fiber radius) like `hairSigmaA`, because a
+    // medulla is genuinely wavelength-selective when it is pigmented (Carrlee & Horelick
+    // found pigment filling brown bear medullas) — and because keeping them spectral costs
+    // nothing here and would be a breaking change to add later.
+    double   hairKappa       = 0.0;   // medullary index [0, 1)
+    Spectrum hairMedullaSigmaS = constantSpectrum(0.0);   // scattering in the medulla
+    Spectrum hairMedullaSigmaA = constantSpectrum(0.0);   // absorption in the medulla
+    double   hairMedullaG    = 0.0;   // Henyey-Greenstein anisotropy of that scattering
 
     // --- Fluorescence (MatType::Fluorescent) --------------------------------
     // A photon at lambda excites the dye with probability fluoAbsorb(lambda); the
@@ -1504,6 +1541,21 @@ struct Scene {
 
     Bvh bvh;   // acceleration structure over tris (0..nTris) then spheres.
 
+    // The same acceleration structure MINUS the hair fibers — the tree a `skipHair` query
+    // traverses when a coat is being rendered as a medium (`-fur-volume` / the far `-fur-lod`
+    // tier). Empty unless buildNoHairBvh() was called; `skipHair` then falls back to the leaf
+    // test on `bvh`, which is correct but does not skip the traversal. `noHairPrim` maps a
+    // leaf of this tree back to a GLOBAL prim index so both trees decode identically.
+    Bvh bvhNoHair;
+    std::vector<int> noHairPrim;
+
+    // World bounds of geometry that was DELETED before the tree was built (dropHairCurves).
+    // The scene bounding sphere is derived from the BVH root box, which sizes environment
+    // photon emission — so without this a coat replaced by a medium would shrink the sphere
+    // to the shaved animal and change the image. Unioned back in by build(). Empty (lo>hi)
+    // when nothing was dropped, which is the overwhelming majority of scenes.
+    Aabb droppedBounds;
+
     // Finalize triangle normals and build the BVH. Call after all geometry is
     // added. Primitive index i: i < tris.size() -> tris[i]; else spheres[i-nTris].
     void build() {
@@ -1515,7 +1567,12 @@ struct Scene {
         // geometry). Sizes forward environment photon emission (disk radius) and
         // the env phase-space weight envGeom = 4*PI^2*R^2.
         if (!bvh.nodes.empty()) {
-            const Aabb& b = bvh.nodes[0].box;
+            Aabb b = bvh.nodes[0].box;
+            // Geometry summarised into a medium and deleted (a `-fur-volume` coat) is still
+            // physically there — it just isn't traced. Put its extent back so the bounding
+            // sphere, and therefore environment emission, is the one the strands would have
+            // produced. No-op when droppedBounds is empty.
+            if (droppedBounds.lo.x <= droppedBounds.hi.x) b.expand(droppedBounds);
             sceneCenter = b.center();
             sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
         }
@@ -1580,25 +1637,49 @@ struct Scene {
         return summary;
     }
 
-    void buildBvh() {
+    // Is this curve segment one of the fibers a fur grid summarises? Grass and wire are
+    // curves too, and only `MatType::Hair` is ever replaced by a medium — so this one
+    // predicate defines "hair" for the no-hair BVH, for `closestHit(skipHair)` and for
+    // `occludedSkipHair` alike, and they must agree or a ray would find geometry the tree
+    // it traversed does not contain.
+    bool isHairCurve(const CurveSeg& cs) const {
+        return cs.matId >= 0 && cs.matId < (int)mats.size() &&
+               mats[cs.matId].type == MatType::Hair;
+    }
+
+    // Primitive bounds in THE canonical order — tris, spheres, implicits, curve segments,
+    // instances — which is the order every `prim` index in this file decodes against.
+    // Factored out because the no-hair BVH must lay its boxes out against exactly the same
+    // numbering; two copies of this loop would be two chances for the trees to disagree.
+    //
+    // With `dropHair`, hair curve segments are omitted and `remap` (required) receives, for
+    // each box kept, the GLOBAL prim index it came from — so the caller can decode a leaf
+    // from the filtered tree with the unfiltered arithmetic.
+    void collectPrimBoxes(std::vector<Aabb>& boxes, bool dropHair, std::vector<int>* remap) const {
         const double pad = 1e-6;       // avoid zero-thickness slabs on flat prims
-        std::vector<Aabb> boxes;
-        boxes.reserve(tris.size() + spheres.size());
+        boxes.clear();
+        boxes.reserve(tris.size() + spheres.size() + implicits.size() +
+                      curveSegs.size() + instances.size());
+        if (remap) { remap->clear(); remap->reserve(boxes.capacity()); }
+        int g = 0;                     // running GLOBAL prim index
+        const auto keep = [&](const Aabb& b) { boxes.push_back(b); if (remap) remap->push_back(g); };
         for (const auto& t : tris) {
             Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
             b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
-            boxes.push_back(b);
+            keep(b); ++g;
         }
         for (const auto& s : spheres) {
             Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
-            boxes.push_back(b);
+            keep(b); ++g;
         }
-        boxes.reserve(boxes.size() + implicits.size() + curveSegs.size() + instances.size());
-        for (const auto& im : implicits) boxes.push_back(im.bounds);
+        for (const auto& im : implicits) { keep(im.bounds); ++g; }
         // One leaf per round cone, NOT per strand: a whole hair's box is mostly empty,
         // and a BVH over long thin near-collinear boxes is exactly the degeneracy
         // TODO §P1 warned about. Per-segment bounds are also exact for what is tested.
-        for (const auto& cs : curveSegs) boxes.push_back(curveSegBounds(cs));
+        for (const auto& cs : curveSegs) {
+            if (!(dropHair && isHairCurve(cs))) keep(curveSegBounds(cs));
+            ++g;
+        }
         // One TLAS leaf per instance: the BLAS's local bounding box transformed into
         // world space (union of its 8 transformed corners — the tightest world AABB
         // of a rotated box short of re-bounding the actual triangles).
@@ -1611,9 +1692,97 @@ struct Scene {
                              (c & 4) ? lb.hi.z : lb.lo.z };
                 wb.expand(inst.toWorld.apply(corner));
             }
-            boxes.push_back(wb);
+            keep(wb); ++g;
         }
+    }
+
+    void buildBvh() {
+        std::vector<Aabb> boxes;
+        collectPrimBoxes(boxes, /*dropHair=*/false, nullptr);
         bvh.build(boxes);
+    }
+
+    // Build the second tree, the one `skipHair` queries traverse. Opt-in (main.cpp calls it
+    // only when a coat is actually going to be rendered as a medium) because it costs a
+    // second BVH build over nearly the whole scene.
+    //
+    // WHY A SECOND TREE AND NOT JUST THE LEAF TEST. Rejecting hair at the leaf — which is
+    // what `skipHair` did before v0.179.0 — does not skip the *traversal*. The ray still
+    // descends into every hair leaf its box overlaps, and, far worse, because no fiber ever
+    // survives to shorten tMax the descent cannot PRUNE: a coat that the strand tier exits
+    // at the first fiber is walked end to end by the aggregate tier. Measured on a 200x150
+    // 200-spp render of the same coat at fixed optical density, that made the aggregate tier
+    // ~3x SLOWER than the strands it replaced *and* left its cost scaling linearly with
+    // fiber count — the exact property the aggregate representation exists to break:
+    //
+    //     strands   90k -> 300k -> 900k :  13.1s   30.5s   66.2s
+    //     aggregate 90k -> 300k -> 900k :  44.2s   82.1s  195.2s   (3.4x, 2.7x, 3.0x)
+    //
+    // With the fibers absent from the tree instead of rejected in it, the far tier's
+    // traversal is over the coat's SUPPORT (the ball, the room) and no longer sees the
+    // fibers at all.
+    void buildNoHairBvh() {
+        bvhNoHair = Bvh{};
+        noHairPrim.clear();
+        size_t nHair = 0;
+        for (const auto& cs : curveSegs) if (isHairCurve(cs)) ++nHair;
+        if (!nHair) return;      // nothing to exclude: `bvh` already IS the no-hair tree
+        std::vector<Aabb> boxes;
+        collectPrimBoxes(boxes, /*dropHair=*/true, &noHairPrim);
+        bvhNoHair.build(boxes);
+    }
+    bool hasNoHairBvh() const { return !noHairPrim.empty() && !bvhNoHair.nodes.empty(); }
+
+    // Delete the hair fibers outright, keeping only their extent (droppedBounds). For the
+    // caller that has already summarised them into something cheaper — `-fur-volume`'s
+    // density grid + ODF table, which reproduce the coat without ever touching a fiber.
+    //
+    // WHY THIS IS NOT THE SAME AS buildNoHairBvh(). That one stops a ray *traversing* the
+    // strands; this one stops the process *storing* them, and the two costs are separate.
+    // The no-hair tree is built alongside the full one, so a 900k-strand coat still pays
+    // for 9M CurveSegs (~720 MB) plus a BVH over them (nodes reserve 2N x 64 B = 1.15 GB,
+    // plus the build's BuildPrim array and the transient box list) — 2.2 GB measured, and
+    // an honest `bad allocation` at 3M strands on a machine with 5 GB of free commit.
+    //
+    // WHY IT MUST RUN BEFORE build(). Freeing the segments afterwards would fix only the
+    // steady state; the peak — which is what actually fails the allocation — is the BVH
+    // build itself, and the only way not to pay that is for the fibers to be absent when
+    // the boxes are collected. Hence the ftsl::Loaded::beforeBvh hook: the one moment at
+    // which a summary can replace the geometry it summarises.
+    //
+    // Returns the number of curve segments removed (0 if the scene has no hair).
+    size_t dropHairCurves() {
+        size_t nHair = 0;
+        for (const auto& cs : curveSegs) if (isHairCurve(cs)) ++nHair;
+        if (!nHair) return 0;
+        // Compact in place, recording the new index of every survivor so the `curves`
+        // records (which address the flat pool by firstSeg/segCount) stay meaningful.
+        std::vector<int> newIndex(curveSegs.size(), -1);
+        size_t w = 0;
+        for (size_t i = 0; i < curveSegs.size(); ++i) {
+            const CurveSeg& cs = curveSegs[i];
+            if (isHairCurve(cs)) { droppedBounds.expand(curveSegBounds(cs)); continue; }
+            newIndex[i] = (int)w;
+            if (w != i) curveSegs[w] = cs;
+            ++w;
+        }
+        curveSegs.resize(w);
+        curveSegs.shrink_to_fit();       // hand the pages back; that is the point
+        // Rewrite the strand records against the compacted pool. A strand whose segments
+        // all went is kept as an empty record rather than erased, so nothing that holds a
+        // curve index (fur.h's generator ran long ago, but diagnostics print these) shifts
+        // underneath itself.
+        for (auto& c : curves) {
+            int first = -1, count = 0;
+            for (int s = c.firstSeg; s < c.firstSeg + c.segCount; ++s) {
+                if (s < 0 || s >= (int)newIndex.size() || newIndex[s] < 0) continue;
+                if (first < 0) first = newIndex[s];
+                ++count;
+            }
+            c.firstSeg = (first < 0) ? 0 : first;
+            c.segCount = count;
+        }
+        return nHair;
     }
 
     // Transform a BLAS-local hit (from Blas::intersectLocal) back into world space for
@@ -1669,7 +1838,14 @@ struct Scene {
         if (pl > 1e-12) h.n = pert * (1.0 / pl);
     }
 
-    Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr) const {
+    // `skipHair` makes fibers INVISIBLE to the closest-hit query, the same way
+    // `occludedSkipHair` below makes them invisible to a shadow ray, and for the same
+    // reason: when a coat is being rendered as a MEDIUM (`-fur-volume`, the far LOD tier)
+    // the strands are summarised by the density grid, and hitting one as geometry would
+    // count it twice — once as a surface and once as optical depth. As there, only
+    // `MatType::Hair` curves are skipped: grass and wire are curves too and stay solid.
+    Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr,
+                   bool skipHair = false) const {
         Hit h;
         double tMax = DBL_MAX;
         const size_t nT = tris.size();
@@ -1686,11 +1862,18 @@ struct Scene {
         // Built once per ray, not per implicit hit: three pointer copies either way, and
         // the lambda is called many times.
         const PatTables tabs = patTables();
-        bvh.traverseClosest(r, tmin, tMax, [&](int prim, double& tm) {
+        // One leaf body, indexed by GLOBAL prim, so both trees decode the same way. The
+        // leaf-level hair rejection stays as the fallback for when no no-hair tree was
+        // built; when there is one, the fibers are simply not in it and the test never fires.
+        const auto leaf = [&](int prim, double& tm) {
             if (prim < (int)nT)            { if (intersectTri(sh, r, tris[prim], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs)) tm = h.t; }
-            else if (prim < (int)(nT + nS + nI + nC)) { if (intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], tmin, h)) tm = h.t; }
+            else if (prim < (int)(nT + nS + nI + nC)) {
+                const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
+                if (skipHair && isHairCurve(cs)) return;
+                if (intersectCurveSeg(cray, r, cs, tmin, h)) tm = h.t;
+            }
             else {
                 const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
                 Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
@@ -1700,7 +1883,12 @@ struct Scene {
                     h = lh; tm = h.t;
                 }
             }
-        }, stats);
+        };
+        if (skipHair && hasNoHairBvh())
+            bvhNoHair.traverseClosest(r, tmin, tMax,
+                [&](int lp, double& tm) { leaf(noHairPrim[lp], tm); }, stats);
+        else
+            bvh.traverseClosest(r, tmin, tMax, leaf, stats);
         applyNormalMap(h);
         return h;
     }
@@ -1731,6 +1919,115 @@ struct Scene {
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             return blasList[inst.blasId].occludedLocal(lr, tmin, seg);  // world seg == local seg
         });
+    }
+
+    // Like occluded(), but fibers are INVISIBLE to it: only non-hair geometry blocks.
+    //
+    // This is the visibility half of the density-grid path (`-dual-grid`). When a coat's
+    // attenuation is read off a `FurGrid` instead of by walking strands, something still has
+    // to answer "is there a wall between this fiber and the light?", and `occluded` cannot:
+    // it stops at the first strand and reports the coat itself as a blocker. Splitting the
+    // question this way is also what makes the grid pay — unlike `walkFibers`, this one CAN
+    // early-out on the first opaque hit, and in a coat's own shadow it almost always does.
+    bool occludedSkipHair(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
+        Ray r{o, dir};
+        const size_t nT = tris.size();
+        const size_t nS = spheres.size();
+        const size_t nI = implicits.size();
+        const size_t nC = curveSegs.size();
+        const double seg = maxDist - tmin;
+        if (!(seg > 0.0)) return false;
+        const TriShear sh = makeTriShear(r.d);
+        const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};
+        const PatTables tabs = patTables();
+        const auto leaf = [&](int prim) {
+            Hit h; h.t = seg;
+            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
+            if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
+            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
+            if (prim < (int)(nT + nS + nI + nC)) {
+                // A curve, but not necessarily a FIBER: grass and wire are curves too, and a
+                // curve whose material is not Hair is ordinary opaque geometry that must
+                // still block. Only the ones the grid summarises are skipped.
+                const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
+                if (isHairCurve(cs)) return false;
+                return intersectCurveSeg(cray, r, cs, tmin, h, /*anyHit=*/true);
+            }
+            const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
+            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
+            return blasList[inst.blasId].occludedLocal(lr, tmin, seg);
+        };
+        // The no-hair tree matters MORE here than in closestHit: an any-hit query that
+        // rejects every fiber it reaches can never early-out inside a coat, so on `bvh` this
+        // walks the whole coat before concluding "not blocked". On the filtered tree it walks
+        // only the geometry that can actually block.
+        if (hasNoHairBvh())
+            return bvhNoHair.traverseAny(r, tmin, seg, [&](int lp) { return leaf(noHairPrim[lp]); });
+        return bvh.traverseAny(r, tmin, seg, leaf);
+    }
+
+    // Like occluded(), but a shadow ray through a COAT does not stop at the first strand:
+    // it reports every fiber it crosses and keeps going. This is the "ray shooting"
+    // implementation of Zinke et al. 2008 §4.1.1 — the accurate one, as opposed to their
+    // voxelised forward-scattering maps or deep-opacity-map GPU variant, both of which
+    // exist to avoid retracing and neither of which a ray tracer needs.
+    //
+    // Returns false the moment anything that is not a fiber blocks the segment; otherwise
+    // true, having called `onFiber(hit)` once per strand crossed.
+    //
+    // THIS IS ONE TRAVERSAL, NOT ONE PER STRAND. The obvious implementation — closestHit,
+    // step past the strand, repeat — costs a full root-down BVH descent per crossing, and a
+    // coat crosses dozens, so it made `-dual-scatter` about 3x SLOWER than the brute-force
+    // path tracing it was meant to replace. Riding `traverseAny` instead visits every
+    // primitive overlapping the segment exactly once (`primIdx` is a permutation, so no
+    // primitive is reported twice) and costs one descent total.
+    //
+    // Order does not matter, which is what makes that legal: T_f is a product and sigma_f^2
+    // a sum, both commutative, and if anything opaque overlaps the segment at all the whole
+    // connection is dark no matter where along it the blocker sits. So the callback returns
+    // "true = stop" only for a blocker, and fiber crossings accumulate as a side effect.
+    //
+    // The caller is expected to start the ray already clear of the strand it is standing on
+    // (hairExitOffset), since nothing here excludes a self-hit.
+    //
+    // `maxCrossings` bounds the cost: a dense coat's transmittance is a product of numbers
+    // below 1, so by the time this many strands have been crossed there is nothing left to
+    // carry and stopping early is a rounding error, not a cutoff artefact.
+    template <class F>
+    bool walkFibers(const Vec3& o, const Vec3& dir, double maxDist, F&& onFiber,
+                    int maxCrossings = 64) const {
+        const Ray r{o, dir};
+        const double tmin = 1e-6;
+        const double seg  = maxDist - tmin;
+        if (!(seg > 0.0)) return true;
+        const size_t nT = tris.size();
+        const size_t nS = spheres.size();
+        const size_t nI = implicits.size();
+        const size_t nC = curveSegs.size();
+        const TriShear sh = makeTriShear(r.d);
+        const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};
+        const PatTables tabs = patTables();
+        int crossed = 0;
+        const bool blocked = bvh.traverseAny(r, tmin, seg, [&](int prim) {
+            Hit h; h.t = seg;
+            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
+            if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
+            if (prim < (int)(nT + nS + nI))
+                return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
+            if (prim < (int)(nT + nS + nI + nC)) {
+                // A fiber: full hit data, since the model needs the axis and the impact
+                // parameter, not just "something is there".
+                if (!intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], tmin, h)) return false;
+                if (h.matId < 0 || h.matId >= (int)mats.size()) return true;
+                if (mats[h.matId].type != MatType::Hair || h.fiberRadius <= 0.0) return true;
+                if (crossed < maxCrossings) { ++crossed; onFiber(h); }
+                return false;                                  // keep going through the coat
+            }
+            const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
+            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
+            return blasList[inst.blasId].occludedLocal(lr, tmin, seg);
+        });
+        return !blocked;
     }
 
     // --- deterministic sampling helpers for emitterSeal ---------------------------
@@ -1956,7 +2253,7 @@ inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
         h.cavity = cavityAt(scene, h);
         h.cavityDone = true;
     }
-    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v, h.curv, h.cavity);
+    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v, h.curv, h.cavity, h.fw);
     bindPatScene(c, scene);
     return c;
 }

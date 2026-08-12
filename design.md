@@ -455,6 +455,561 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     honest if the ball or the coat length ever change. The lesson generalises: a guard whose
     fixture makes two different implementations agree is not guarding anything, and only a
     mutation run will tell you which fixture that is.
+- **`hair.h`** — the **fiber BCSDF**: Marschner's (2003) R / TT / TRT lobes in Chiang et
+  al.'s (2016) energy-conserving form. Header-only, `<cmath>` + `linalg.h`, no renderer
+  dependencies, so it can be unit-tested with no scene (`-checkhair`, eleven sections). 0.171.0
+  added the core; **0.172.0 wired it up** as `material { type hair }` — see the
+  `hair_shade.h` entry below for the Scene↔BCSDF bridge and how each renderer consumes it;
+  **0.173.0 added the medulla**, the scattering core that separates fur from hair; **0.174.0
+  added dual scattering** (`hair::Dual`, `-dual-scatter`), which is about a *coat* rather
+  than a fiber.
+  - *Why Chiang's form and not Marschner's directly.* Marschner's `M_p` is a flat Gaussian
+    in θ, which integrates to **more** than 1 as roughness grows — that is exactly where the
+    2003 model's famous energy gain comes from, and why practical implementations bolt on an
+    ad-hoc normalisation. Chiang's `M_p` is normalised on the sphere by construction (it is
+    a von Mises–Fisher-like term carrying a Bessel `I0`), and his `N_p` is a **trimmed
+    logistic** rather than a wrapped Gaussian. The logistic buys two things: its CDF is
+    elementary, so it inverts in closed form and gives an *exact* importance sampler; and
+    trimmed to exactly one revolution it stays normalised on the circle, instead of leaking
+    probability past ±π the way a wrapped Gaussian does unless you sum the wrap terms.
+  - *The p ≥ 3 residual is what makes the energy balance exact.* With four lobes
+    (R, TT, TRT, and one folded residual) the attenuations telescope algebraically at zero
+    absorption: `f + (1−f)² + (1−f)²f + (1−f)f² ≡ 1`. That is not a curiosity, it is the
+    whole verification strategy — since `f = Σ_p M_p A_p N_p / |cos θ_i|` **separates**, and
+    `M_p` and `N_p` are each normalised on their own domain, the white-furnace test collapses
+    from a noisy sphere integral into an identity assertable at 1e-12. It also quantifies the
+    thing everyone says about the three-lobe model: dropping the residual loses 0.21 % of a
+    white fiber's energy.
+  - *`h` stays out of the intersector.* The impact parameter ∈ [−1, 1] is recovered at
+    shading time by `hFromHit(n, tangent, wo)` from the hit normal and fiber tangent. The
+    curve intersector is the hottest loop in a fur render and has no business knowing a BCSDF
+    exists; §9 pins the recovery at 5e-14 and the local-frame round-trip at 8e-16.
+  - *The local frame is PBRT's (+x = fiber tangent), deliberately.* Adopting the published
+    convention means the published test values are **checks** rather than re-derivations —
+    if the frame were rotated to taste, every number in the literature would have to be
+    re-derived before it could disagree with anything, which is how a subtly wrong model gets
+    shipped. (σa being scalar-per-λ here, rather than PBRT's RGB triple, is strictly simpler
+    and needs no reconciliation.)
+  - *A real bug the tests caught, and would not have caught as a picture.* `besselI0` was
+    the usual fixed **ten-term** ascending series — fine at float precision, but 0.26 % low by
+    x = 10 and 4 % low by x = 12. `I0` sits inside `M_p`'s normalisation, so that error is not
+    cosmetic: it is a longitudinal lobe that does not integrate to one, i.e. energy invented
+    or lost, worst at grazing angles where `cos θ_i cos θ_o / v` is largest. It showed up as
+    three simultaneous failures (`∫M_p cos dθ − 1 = 5.9e-3`, the pdf's sphere integral off by
+    2.8e-3, and the two `M_p` branches disagreeing by 4.4 %) which all had the same cause. The
+    series now iterates to double convergence and hands x > 12 to the A&S 9.7.1 asymptotic
+    (12 terms, ~1e-10 relative at the crossover and better above); the three numbers became
+    2.1e-9, 9.4e-9 and 5.7e-15. The general lesson: a series truncation tuned for `float` is a
+    *model* error, not a rounding error, once it sits inside a normalisation constant.
+  - *Four independent uniforms, not PBRT's two-plus-demux.* The demux exists to preserve a
+    2-D sampler's stratification; this renderer hands out independent uniforms anyway, so
+    reusing bits of `u0` to pick the lobe would only add a correlation hazard for no benefit.
+    `sample()` fills `pdfOut` and `fOut` to match the direction it returns, so a caller's
+    weight is just `fOut·|cos θ_i|/pdfOut` — and §5 asserts those agree with independent
+    `f()` / `pdf()` calls to *zero* relative error, which is the cheapest possible guard
+    against the classic sample/evaluate drift.
+  - *The medulla (0.173.0), and why it grafts on instead of replacing anything.* A fur fiber
+    is a hair with a wide scattering core; Yan et al. (2017) model it as a **double
+    cylinder** and add two scattered lobes TT^s / TRT^s to Marschner's three. Their decisive
+    simplification is to give cortex and medulla the **same IOR**, so the interior ray does
+    not refract at the core boundary: the path topology stays exactly R/TT/TRT and the
+    medulla only changes what happens *along* a chord. That is why the whole feature is one
+    `Chord` struct out of `refractGeom` plus two extra lobes, rather than a second model.
+    With `kappa = 0` every added term is provably inert and `refractGeom` takes a branch that
+    reproduces the stage-1 expression to the last bit.
+  - *The scattered lobes are a DIFFERENCE, which is what keeps the furnace exact.* Yan's
+    eq. 20 leaves the scattered *fraction* implicit in the normalisation of their measured
+    `C^N` table. Supplying it the obvious way — `1 − exp(−σ_s·chord)` times a Fresnel guess —
+    does not conserve energy, because the scattered light then pays a different toll leaving
+    the fiber than the specular light it was taken from. So `ApScattered` runs the stage-1
+    chain **twice**: once with the real medulla, once with the core replaced by cortex. The
+    gap between the two totals *is* the energy the medulla removed, by construction. Multiply
+    by the core's single-scattering albedo (keep what scattered, not what was absorbed) and
+    Yan's `Tb` (the trip out), and at zero absorption the six lobes sum to
+    `Σ_medullated + (1 − Σ_medullated) = 1` — an algebraic identity, asserted at 1e-12 over
+    405 (κ, σ_s, g, h, θ) combinations exactly as the solid fiber is.
+  - *Similarity theory stands in for `C^M` / `C^N`, and is checked against a random walk.*
+    Yan's angular profiles are 24×16×16×720 Monte-Carlo tables, rank-16 tensor-decomposed to
+    150 KB — and never published. Re-deriving them would mean shipping either a 600 MB
+    simulation or a blob nobody can check. Instead one number does the work: after reduced
+    optical depth `τ' = (1−g)σ_s·chord`, the transmitted mean cosine decays as `exp(−τ')`,
+    which drives both the longitudinal variance and the azimuthal logistic width, with the
+    right limits at both ends (thin core → the specular lobe; thick core → azimuthally
+    uniform, which is what a diffusive core should look like). Because that is a claim about
+    an actual walk rather than a fit, §S10 checks it against one: free flights along the
+    chord, Henyey–Greenstein deflections composed as real 3-D rotations, mean cosine measured
+    over 120 000 walks. It tracks the analytic value to 0.003 — and the same section
+    re-derives the medulla half-chord by **bisection** rather than
+    `sqrt(κ² − sin²γ_t)`, so a swapped radius would surface as a geometry error instead of
+    hiding inside a plausible-looking spread.
+  - *Measured species are data, not presets-as-code.* `hair::speciesTable()` is Yan Table 4
+    verbatim — ten fitted fibers, angles left in **degrees** and σ's in 1/radius exactly as
+    printed, so the table can be diffed against the paper line by line. The degree→perceptual
+    conversion happens on the way out through `betaMFromDegrees` / `betaNFromDegrees`, which
+    invert Chiang's fitted polynomials by their leading quadratic (the β²⁰/β²² terms exist
+    only to blow up in the last few percent before β = 1 and are numerically absent below
+    that; the largest measurement in the table is 18.94°, where the cubic-and-up terms
+    contribute < 1e-9). The FTSL `preset` keyword feeds the row in as *defaults only*, so
+    every key an author also writes still wins — `preset redfox  beta_n 0.05` needs nothing
+    re-typed. Note what the table says: every animal Yan measured has κ ∈ [0.65, 0.91] and
+    human hair 0.36, i.e. the medulla is not a refinement of the hair model, it is the
+    difference between hair and fur.
+  - *Dual scattering (0.174.0) — the coat, not the fiber.* A pale coat's appearance is
+    **mostly** multiple scattering: a single blonde fiber is nearly transparent, and a head
+    of blonde hair is bright because light has crossed dozens of strands. Brute force means
+    100+ bounces per path, which is why white fur is the slowest thing here. Zinke et al.
+    (2008) split that radiance in two — a **global** term (light arriving *through* the coat,
+    attenuated by `Π ā_f` and blurred by `Σ β̄_f²` along the shadow path) and a **local** term
+    (light that scattered backward out of the strands behind and came back, a closed form
+    `Ā_b` with mean shift `Δ̄_b` and width `σ̄_b`). `hair::Dual` is six curves over 48
+    inclination bins plus those three derived ones, built once per material/λ/σ_a.
+  - *The curves are MEASURED from our own BCSDF, not from Marschner's three lobes.*
+    `makeDual` importance-samples `hair::sample()` on a Halton lattice and splits the samples
+    by azimuthal half (`wi.y < 0` ⇒ forward). The sampler's weight `f·cosθ/pdf` has
+    expectation `Σ_p A_p` — the §S1 furnace total — so `ā_f + ā_b` **is** that total, split
+    two ways. The table therefore inherits energy conservation exactly rather than
+    approximating it (§S11 asserts `ā_f + ā_b = 1` to four decimals at every inclination),
+    and it picks up the medulla's TT^s / TRT^s lobes for free, which a Marschner-lobe
+    derivation would have had to be re-done for. `ᾱ` and `β̄` fall out of the same pass as the
+    first two moments of the deviation `θ_i + θ_o`.
+  - *The exact series are summed; eq. 16/17 are checked, not used — and eq. 16 has a sign
+    typo.* Zinke states `Δ̄_b` and `σ̄_b` as power-series fits, because the exact forms are a
+    sum over `i ≥ 1` and a triple sum over `i, j, k`. But substituting `k = j+1+q` makes the
+    exponent `m = 2(i+q)` independent of `j`, so `j` is just a multiplicity of `i`, and with
+    `n = i+q` the triple sum collapses to `Σ_n x^n · n(n+1)/2 · X(2n)` — one loop, converging
+    geometrically. `dualSeries` computes it, so there is no reason to inherit a fit's error:
+    `u = a_b²/(1−a_f²)²` is *not* small for any plausible coat (`a_f = a_b = 0.5` already
+    gives 0.44). Summing the coefficients closed-form also settles a discrepancy: `Δ̄_b`'s
+    coefficient of `ᾱ_b` is exactly `(1+3u)/(1+u) = 1 + 2u + O(u²)`, where eq. 16 prints
+    `1 − 2u`. §S11 demonstrates it rather than asserting it — it shrinks `a_b` and shows the
+    printed form's error is O(u¹·⁰⁰) while the sign-corrected one is O(u¹·⁹⁸). `dualDeltaFit`
+    keeps both behind a `signFix` flag purely so the test can compare them; the renderer
+    itself never calls either.
+  - *`fBack`'s prefactor is derived, not copied — because the normalisations differ.* The
+    paper writes `2 Ā_b g / (π cos²θ_d)`, which is Marschner's convention (`S = M N / cos²θ_d`).
+    `hair.h` is Chiang's (`f = Σ_p A_p M_p N_p / |cos θ_i|`, so `∫ f cos θ_i dω = Σ_p A_p`).
+    Requiring the same of the backscatter lobe — unit-area Gaussian in `dev`, density `1/π`
+    over the π-wide backward azimuths, total albedo `Ā_b` — gives `Ā_b g / (π cos²θ_i)`: the
+    `2` goes and the cosine is the sample's. Worth well under a percent on a real coat (the
+    lobe is a few per cent of the radiance), but it removes a guarded `cos²θ_d` denominator
+    that was a 10⁴ firefly multiplier waiting to happen.
+- **`hair_shade.h`** — the **Scene ↔ `hair.h` bridge** (0.172.0). `hairShadeAt(scene, mat,
+  hit, λ, wo)` builds a `HairShade { hair::Bcsdf b; hair::Frame fr; Vec3 woLocal; double
+  radius; }` from a `Material` + `Hit`: it resolves σa (either authored directly, or inverted
+  out of the authored `reflect` colour through Chiang eq. 9 — which needs the final `beta_n`,
+  so the inversion has to happen here at shading time and not at parse time), builds the fiber
+  frame from `hit.tangent`, and recovers the impact parameter. Two exported helpers carry the
+  two things every renderer then gets wrong if left to itself:
+  - *`hairFCos(hs, wi)` returns `f · cos θ_long`, not `f`.* **The fiber projection factor is
+    the LONGITUDINAL cosine, not `dot(n, w)`.** A round strand has no azimuthal foreshortening:
+    the BCSDF is normalised against `cos θ_long = sqrt(1 − w_x²)` in the fiber frame. Using
+    `dot(n, w)` instead both double-counts the tube's curvature and breaks energy conservation,
+    and — the dangerous part — it *looks* almost right: a smooth angular error that reads as
+    "my hair is a bit dark at grazing angles". Returning the product means no call site can
+    supply its own projection.
+  - *`hairExitOffset(hs, n, w)` — TT and TRT exit the FAR side of a real solid tube.* The
+    near-field model puts every exit at the entry point, but the curve primitive is a genuine
+    solid round cone, so a connection or continuation leaving through the far side is occluded
+    by the strand's own body. Strand radii are **microns**, so the ordinary `ng * 1e-6` nudge
+    lands *inside* the tube and the ray instantly reports itself blocked by the very hair it
+    left — deleting exactly the TT forward glow a pale coat is mostly made of. The offset steps
+    `2.5 × Hit::fiberRadius` (a new field, set by `curve.h`) on the far side and degrades to
+    the ordinary epsilon on the near side. **Every shadow ray that uses it must also shorten
+    its max-t by the same amount**, or it overshoots into the light it is testing.
+  - *The sampler weight is exactly `T = Σ_p A_p ≤ 1`.* Since `f·cos = Σ_p A_p M_p N_p` and
+    `pdf = Σ_p (A_p/T) M_p N_p`, the ratio `fv·cosLong/pdf` is a deterministic per-hit number.
+    So it is simultaneously the natural Russian-roulette survival probability (β unchanged —
+    the same trick `Mirror` plays with its reflectance, except here the number is the physics
+    rather than an authored albedo) and the Whitted attenuation weight.
+  - *No Veach shading-normal adjoint, no shadow-terminator softening.* Both are corrections
+    for using an *interpolated normal* as a projection axis; a fiber does not project about its
+    normal. On curve geometry `h.n == ±h.ng` so both would evaluate to 1 anyway — the explicit
+    `isFiberMat` guards are what keep `hair` honest if it is ever put on a smooth-shaded
+    triangle mesh.
+  - *Unidirectional tracers de-hero at a strand; bidirectional ones do not.* σa is per-λ (and
+    an authored `reflect` is inverted into one per-λ), so a hero packet cannot share one fiber
+    interaction across C wavelengths — forward (`render.h`) and backward (`backward.h`) put
+    `Hair` in their dispersive/de-hero group beside `Fluorescent`. BDPT/VCM by contrast already
+    re-evaluate each secondary's `f` along the hero's sampled direction (`secF[i]`), so the
+    bundle survives a strand there — which is fortunate, since a fiber is precisely where the
+    spectral spread is interesting.
+  - *BDPT/VCM get the projection through a PRE-DIVIDE, not a special case.* Those integrators
+    speak only "f, its pdf, and a geometry term carrying cos(ns, w)", and that term is formed
+    in roughly a dozen places. Rather than teach all of them about fibers, `bdpt::bsdfF`
+    returns `hairFCos(wi) / |cos(ns, wi)|` for `Hair`, pre-dividing by the cosine BDPT is about
+    to multiply back in — so `f·G` comes out to exactly `hairFCos × cosOther/dist²` and every
+    MIS ratio, strategy weight and density conversion stays untouched and provably consistent.
+    A `hairCosGuard` floor of 1e-7 keeps the division finite at a grazing endpoint.
+  - *Modes M / S scatter but never gather.* `struct Photon { Vec3 n; float power; float
+    lambda; }` carries **no incident direction**, so a directional BCSDF has nothing to
+    evaluate against at a density-estimate gather. `sppm_render.h` and `photonmap_render.h`
+    therefore give `Hair` an explicit *scattering* case — without it, it would fall into their
+    `default:`, which treats an unknown material as a **mirror**, and would be silently wrong.
+    A strand is not a visible point and not a deposit site, the same treatment those modes
+    already give glossy/specular surfaces. Logged in `known-issues.md`.
+  - *Dual scattering rides the NEE connection, and terminates the path (0.174.0).* The
+    coat-level half of Zinke lives here: `hairDualFor()` caches a `hair::Dual` per
+    `(material, λ bin, σ_a bin)` (λ to 10 nm, σ_a sqrt-spaced over 64 levels) behind a mutex,
+    built *outside* the lock so racing threads each build one and the loser's copy is
+    dropped; `hairDualResponse()` walks the shadow ray with `Scene::walkFibers` and
+    accumulates `T_f = Π ā_f(θ)` and `σ̄_f² = Σ β̄_f(θ)²` over the strands it crosses, using
+    each crossed fiber's OWN table (a two-toned coat attenuates correctly) — or, under
+    `-dual-grid`, gets the same two quantities from one DDA march of the fiber-density grid
+    via `hairShadowGrid()` (see `fur_grid.h` below); and
+    `hairDualFCos()` evaluates Zinke's Figure-5 combination. `n = 0` crossings means directly
+    lit, and the shading point gets `f_s + d_b f_back`; otherwise it gets
+    `T_f d_f (f_s + d_b f_back)` evaluated at a direction drawn from the forward spread.
+    Four things are worth naming:
+    - *It replaces the estimator inside `emitterGeom` and `envGeom`, not the emitter loop.*
+      `neeLight`'s four emitter branches (sun / cone-sampled / spot / area) all funnel through
+      one `response` lambda, so dual scattering is one extra first branch there plus a
+      `blocked` override — every non-dual path stays bit-identical, and there is no fourth
+      copy of the emitter-sampling code to drift. `envGeom` gets the same substitution, with
+      `wMis = 1`: the path ends here, so there is no BCSDF-sampled partner to weight against.
+      Leaving the sky on single scattering would have lit a coat's sunlit side with the full
+      model and its sky-lit side with a bare fiber.
+    - *`hair::f` must be paired with ITS OWN cosine — this was a 13.4× error.* The shading
+      integral is `∫ f(ω_o,ω_i) L_in(ω_i) cos θ_i dω_i`, so the projection belongs to the
+      direction the light actually arrives from, which under `n > 0` is the spread draw and
+      not the light. And `hair::f` is in Chiang's normalisation, ending in `/= |cos θ_i|`, so
+      pairing it with its own cosine cancels exactly. The first version took `cos θ` from the
+      light direction; after a dozen crossings `σ̄_f` exceeds a radian, so the Gaussian draw
+      lands near the fiber axis constantly, `|cos θ_i|` hits its clamp, and `f` comes back
+      amplified with no cosine to undo it. Measured on `scenes/fur_species.ftsl`: 13.4× too
+      bright overall, 67× at the 99th percentile. Fixed, the same scene lands at 0.82× of its
+      reference with the firefly tail gone (max 3.5 vs the reference's 10.1).
+    - *The N^G table is replaced by a Monte-Carlo draw.* The paper precomputes a 2-D
+      azimuthally-convolved `N^G` and widens each lobe's variance to account for light
+      arriving *spread* rather than from a point. A path tracer does not need that: draw ONE
+      direction from the spread distribution per connection (`hairSpreadDir` — a Gaussian of
+      width `σ̄_f` in θ about the light, uniform over the forward azimuthal half) and let the
+      pixel average do the integral. Unbiased with respect to the approximation, and no
+      second table. It also means the spread is *spent*: `f_back`'s Gaussian is NOT widened
+      by `σ̄_f²` the way eq. 10 does, because `dev` already carries that blur — Zinke widens
+      analytically only because his incident direction is still the light's.
+    - *It TERMINATES the path at a fiber vertex, deliberately.* The analytic terms already
+      carry the coat's multiple scattering; continuing the path would double-count it. So
+      `-dual-scatter` makes fur one-bounce while everything else in the scene keeps full path
+      tracing. This is the one place in the renderer where a flag buys speed with bias, and
+      it is documented as such — the reference is `-mode R` without it. What the coat gives
+      up is *indirect* illumination: lights and the environment both go through the model,
+      but light that bounced off the room first never reaches the fur. Measured on the fur
+      alone against each scene's own 200-bounce reference: a pale coat lit only by an area
+      light lands at 0.77× at the paper's `d = 0.7` and 0.99× at `d = 0.9` (single scattering
+      alone: 0.17×) for 2.1× the speed; the same coat under a constant sky 0.92× for 2.4×;
+      but `scenes/fur_species.ftsl` — an absorbing medullated coat in a white room — only
+      0.57×, *and* 1.6× slower than its reference, because a dark coat's brute-force paths
+      die in a couple of bounces while the fiber walk still cannot early-out. That case is
+      logged in `known-issues.md`; the fix Zinke gives for it is §4.1.2's voxel density grid
+      instead of BVH ray shooting.
+  - *CUDA runs hair natively (0.181.0).* `hair.h` is ported wholesale to `__device__`
+    doubles as `render_cuda.cu`'s `dhair` namespace (`D_HAIR = (int)MatType::Hair`, still
+    appended at the **end** of the enum because the `D_*` tags are `(int)m.type`); the device
+    `Hit` carries `fiberRadius` stamped by the curve intersector (the tangent already rode in
+    `tan`). Forward: `interactHair` — connect-then-scatter like Fluorescent (narrow-but-finite
+    lobes are camera-visible, so it splats to every mode-A/B camera via `splatSurfaceAllHair`
+    before sampling), RR on the fiber throughput `fv·cosLong/pdf`, far-side TT/TRT exits
+    offset by `dHairExitOffset`; the hero tracer de-heroes onto it (σ_a is per-λ). Backward:
+    `bkInteractHair` + NEE with `rho = 1` where `bkEmitterGeom`/`bkNeeLight`/`bkEnvGeom`/
+    `bkNeeEnv` take an optional `DHairShade*` and swap the surface cosine for the full-sphere
+    `π·hairFCos` fiber response. Both bodies are `__noinline__` so the fat double-precision
+    frames (DHairShade + `dhair::sample` locals) stay out of the shared tracer frames and out
+    of every kernel's statically-computed MIN_STACK. One porting trap is load-bearing:
+    `hair.h`'s `besselI0 ↔ logBesselI0` mutual recursion (runtime-safe, statically a cycle)
+    made nvlink mark every kernel reaching them "stack size cannot be statically determined",
+    which strips MIN_STACK and drops those kernels to the 1 KB `cudaLimitStackSize` default —
+    every GPU render then died of stack overflow, hair or not. The device pair is therefore
+    split into acyclic cores (`besselI0Series` / `logBesselI0Asym`) with branch-picking
+    wrappers, bit-identical per branch. Validated on `hair_basics`: CPU/GPU channel means
+    agree ≤0.5 %; mode R 19.7× faster, mode B 6.4× (RTX 4090). Still CPU-only: `-dual-scatter`
+    hair (host-side approximation — the gate lives in `main.cpp`'s `backwardOnGpuOk`), and
+    hair scenes in the BDPT / photon-map GPU backends (their vertex/gather machinery shades
+    non-specular vertices as Lambertian; they reject via `sceneUsesHairMaterial`, and the
+    VCM / SPPM backends inherit the reject by chaining those gates).
+- **`Scene::walkFibers`** (`scene.h`, 0.174.0) — the shadow-ray traversal dual scattering
+  needs and nothing else has: call back for every `Hair` strand crossed, and report `false`
+  if anything opaque is in the way.
+  - *One traversal, not one per strand — and this is the difference between the feature
+    being worth having and not.* The obvious implementation is `closestHit`, step past the
+    strand by `2.5 × fiberRadius` (the `hairExitOffset` clearance, so a micron-radius tube
+    cannot re-report itself), repeat. That was the first version, and it made `-dual-scatter`
+    **2.8× slower** than the brute-force path tracing it exists to replace: a coat crosses
+    dozens of strands and each crossing paid a full root-down BVH descent. Riding
+    `bvh.traverseAny` instead visits every primitive overlapping the segment exactly once
+    (`primIdx` is a permutation, so nothing is reported twice) for one descent total.
+  - *Why unordered traversal is legal here.* `T_f` is a product and `σ̄_f²` a sum — both
+    commutative — and an opaque blocker anywhere along the segment kills the connection
+    regardless of where it sits relative to the strands. So the any-hit callback returns
+    "stop" only for a blocker, and the fiber crossings accumulate as a side effect. The cost
+    of that trade is that nothing excludes a self-hit any more, so the caller must start the
+    ray already clear of its own strand (which `hairDualResponse` does anyway).
+  - *The crossing count is bounded, and overflow fails BRIGHT.* `maxCrossings`
+    (`-dual-max-cross`, default 64) caps how many strands are accumulated; past it the ray
+    is still treated as reaching the light with what it has. A dense coat can exceed any
+    bound, and stopping *dark* there would paint a hard black silhouette exactly where the
+    coat is thickest — the most visible possible failure.
+- **`fur_grid.h`** (0.175.0) — the **fiber-density + orientation grid**, Zinke's §4.1.2
+  aggregate, behind `-dual-grid`. It replaces `walkFibers` as the *counting* half of the
+  global term, and it exists because that walk is the one thing in dual scattering that
+  cannot early-out (see the `known-issues.md` entry it closes: `fur_species` 84.8 s → 57.4 s,
+  from *slower* than its own path-traced reference to 1.06× faster).
+  - *The two aggregates.* A fiber of radius `r`, length `ℓ`, unit tangent `t̂` presents
+    cross-section `2rℓ√(1 − (d·t̂)²)` to a ray along `d`. Exact directional extinction would
+    need every strand; pulling the root outside the sum (Jensen) collapses the whole cell onto
+    two quantities that *aggregate*: a scalar `c = (2/V)Σ rᵢℓᵢ` and a normalised symmetric
+    `T = Σ rᵢℓᵢ t̂ᵢt̂ᵢᵀ / Σ rᵢℓᵢ`, giving `σ_t(d) ≈ c√(1 − dᵀTd)`. `FurCell` is exactly 32 B
+    (7 floats + a material id), so 128³ is 64 MB.
+  - *The load-bearing identity: `∫σ_t dt` **is** the expected number of fiber crossings.* A ray
+    of length `L` through volume `V` (cross-section `A = V/L`) hits fiber *i* with probability
+    `2rᵢℓᵢ sinθᵢ / A`, so the expected count over `L` is `L·σ_t(d)` — exactly the walk's `n`,
+    with no primitive tests. And `dᵀTd` is `⟨sin²θ⟩` **in Marschner's frame directly** (that
+    frame's longitudinal axis *is* the tangent, which is why `hairShadowCross` computes
+    `sinθ = dot(w, t)`), so one quadratic form yields both the extinction and the inclination
+    the dual tables are indexed by. One DDA march, two answers.
+  - *The count is SAMPLED, not rounded — this is the whole correctness argument.* `τ` is a
+    *mean*; the walk returns a random *draw*, and `hairDualFCos` is not linear in it.
+    Substituting the mean breaks three things at once: `a_f^τ` instead of
+    `E[a_f^N] = e^{τ(a_f−1)}` (0.107 vs 0.135 at `a_f = 0.8`, `τ = 10` — 26% too dark); the
+    spread becomes one fixed width instead of a distribution of widths; and the `n == 0`
+    *directly lit* branch could never fire, so a rim strand at `τ = 0.3` would always be dimmed
+    by a density factor applied to light that never met a fiber. `hairShadowGrid` therefore
+    draws `N ~ Poisson(τ)` by CDF inversion from a single extra uniform (`HairDualCtx::u3`),
+    which makes the grid an **exact drop-in** for the walk rather than merely a fast
+    approximation of it. *A draft that rounded came out closer to the path-traced reference
+    than the walk did — and that was a symptom, not a success.*
+  - *Visibility is a separate query, and that is the other half of why it pays.*
+    `Scene::occludedSkipHair()` (`scene.h`) is an ordinary occlusion test that treats `Hair`
+    curve segments as invisible but still lets grass/wire curves and all opaque geometry block.
+    Unlike `walkFibers` it **can** stop at the first blocker.
+  - *Build (3 passes).* Radius-inflated AABB over fiber segments only, degenerate axes padded;
+    roughly-cubic axes derived from a cell **budget** rather than a resolution, so one number
+    bounds memory whatever the coat's aspect ratio. Then each round cone is sub-sampled at
+    0.5 × the smallest cell edge and whole `r·dl` pieces are deposited into the midpoint's cell
+    — which conserves `Σ rℓ` *exactly*, asserted by `-checkfurgrid` §1. Material id is
+    winner-take-all by mass margin, and the side table for that is only allocated when the scene
+    actually mixes fiber materials. 187 ms over 900k segments, 423 ms over 2.48M.
+  - *What it deliberately loses.* (a) The Jensen step is biased **high by at most +3.98%** —
+    one-signed, so a grid never *under*-attenuates — and is *exactly zero* where a cell's fibers
+    are locally parallel (`T` rank-1, the root factors out), worst at full isotropy
+    (`√(2/3) = 0.8165` vs the true `⟨sinθ⟩ = π/4 = 0.7854`). (b) The tangent's **sign** is not
+    in `T`, since `t̂t̂ᵀ == (−t̂)(−t̂)ᵀ`, so each cell also carries the **first** moment
+    `v = Σrℓt̂ / Σrℓ` as a 12:12 octahedral direction plus an 8-bit coherence, packed into the
+    4 bytes `tzz` used to occupy (`tzz = 1 − txx − tyy` because `T` is unit-trace by
+    construction) — a first *and* a second moment for the same 32 bytes. `-dual-grid`'s own
+    lookup still marginalises over both signs (`furAvgSigned` evaluates the table at ±θ and
+    averages), which is right for it because the dual tables are near-even in θ; the aggregate
+    far tier (`fur_volume.h`) uses the first moment instead, and needs to — see below.
+    (c) The crossed material's tables are evaluated at the **shading point's** texture
+    coordinates, where the walk had each crossed fiber's own. All three are approximations on
+    top of an approximation, which is why `-dual-grid` is opt-in and the walk stays the default.
+  - *The walk path is byte-for-byte unchanged.* `u3` is drawn only when `dc.grid` is set, so an
+    existing `-dual-scatter` render is bit-identical rather than merely equal in expectation
+    (verified with `cmp`).
+  - *`-checkfurgrid`* validates the model against the **shipping curve intersector**, not
+    against another closed form — see `REFERENCE.md`. Two of its five sections exist because
+    earlier drafts got a wrong answer that *looked* right: capsule end caps are `πr²` of a
+    stadium of area `2rℓ sinθ + πr²`, i.e. 5% for an isolated test segment (and correctly zero
+    for a chained strand, where every cap but the two ends is interior to the chain); and a
+    coarse grid straddling a density taper dilutes `σ_t` along exactly the rays being measured,
+    by almost precisely enough to cancel the Jensen bias and certify a broken model.
+- **`fur_volume.h`** — the **aggregate scattering model** that turns a `FurGrid` cell into a
+  participating medium, so distant fur can be *marched* instead of intersected. Validated by
+  `-checkfurvol` (six sections).
+  - *The model is three steps at a collision.* `σ_t(d) = c·√(1 − dᵀTd)` gives the free flight
+    (∫σ_t dt is literally Zinke's **expected number of fiber crossings**, with no primitive
+    tests); a tangent is drawn from a reconstructed **orientation distribution**; and the
+    existing `hair::` BCSDF is evaluated at a *virtual* hit whose normal `fiberNormalFor()`
+    reconstructs from that tangent and an offset `h`. Nothing about the fiber shading model
+    changes — only where its inputs come from.
+  - *The ODF is a **Bingham**, `p(t̂) ∝ exp(t̂ᵀBt̂)`* — the maximum-entropy distribution on the
+    sphere with a given second moment, i.e. the one that assumes nothing beyond what the grid
+    stored. Two cheaper families were built and measured against explicit fiber populations
+    first, and both fail a case fur actually contains: a **Watson mixture** on `T`'s
+    eigenvectors turns a *girdle* (strands every which way within a plane, what a coat does
+    over a whorl) into two orthogonal deltas (L1 error 0.43), and the **ACG** fixes the girdle
+    but its polynomial tails smear a tight combed clump over twice the sphere it should
+    (0.26). Bingham is Gaussian-tailed like Watson *and* covers girdles like the ACG, and wins
+    on every population measured (0.006 / 0.080 / 0.040 / 0.023). The comparison table lives
+    in the header comment so the two rejected families stay rejected.
+  - *`B` is obtained from `T` by a startup table.* The moment map has a closed-form azimuthal
+    integral in **exponentially scaled** modified Bessels `k_n = e⁻ˣIₙ(x)` (unscaled, both the
+    exponential and `I₀` overflow well before the concentration a near-parallel cell needs),
+    with a `c = w·sinh(κz)` substitution that keeps ~40 quadrature nodes inside a peak of
+    half-width `1/√(2b)` however sharp it gets. The inverse is a damped Newton over the
+    eigenvalue triangle sheared onto the unit square, run once and interpolated. **Its
+    variables are the *gap* `log(1+b₁−b₂)` and the *floor* `log(1+b₂)`, not the two b's** —
+    in the obvious parameterisation the whole `τ₃ = 0` edge (every planar cell) pins both
+    coordinates at their maximum with only their difference distinguishing points, and the
+    Newton stalls there, silently returning the *girdle* solution for a **parallel** cell.
+    That bug cost a factor of 10 in table accuracy (1.15e-2 → 1.15e-3).
+  - *Sampling is Kent, Ganeiber & Mardia (2013)*: an ACG proposal `Ω = I + 2Λ/b_k` sampled in
+    closed form as `normalize(Ω^(−1/2)z)`, accepted with `e^(−t̂ᵀΛt̂)(t̂ᵀΩt̂)^(3/2)/M`.
+    Acceptance is 100% at isotropy, ~90% on a girdle, never below ~50%.
+  - *The tangent's sign is drawn separately, and this is not optional.* The axis part of the
+    ODF is antipodally symmetric by construction, so a sampled **axis** is aligned with the
+    cell's first moment `v` with probability `(1+|v|)/2` — exact for a two-delta population
+    and right at both endpoints. Skipping it (drawing the sign uniformly) moved the aggregate
+    response **27% even on a perfectly parallel cell**, because the ~3° cuticle tilt `α` tips
+    R/TRT toward the root and so breaks `t̂ → −t̂` symmetry. Keeping the axis and the sign as
+    separate steps is what leaves `T` untouched by the choice, since `t̂t̂ᵀ == (−t̂)(−t̂)ᵀ`.
+  - *`-checkfurvol` §6 measures **L1 over the whole outgoing sphere**, not a worst-case
+    pointwise ratio.* The first draft took the worst ratio over three random `wi` and reported
+    3.59 for a combed clump — an alarming number that meant nothing, picked up in a direction
+    the tight true lobe cannot reach and where *both* functions are ~0. A path tracer sees the
+    integral, so the error that matters is `Σ|S_agg − S_true| / Σ S_true`.
+  - *The white-furnace test that is **not** there.* Averaging `f·|cos|/pdf` over BCSDF samples
+    is **vacuous** in this model and the first draft shipped it: `apPdf` normalises the very
+    `A_p` that `f` sums, so the ratio is identically `Σ_p A_p` — exactly 1.0 (dev 0.00e+00)
+    whether or not the tangent, the normal or the frame are right. That is a useful *fact*
+    (an aggregate collision's throughput multiplier is the fiber albedo with zero variance)
+    but it is not a test, and a green line that cannot fail is worse than no line.
+  - *`FurVolume` — the medium itself, and why the expensive half is a side table.*
+    `FurODF::fromCell` is a Jacobi eigendecomposition, a table lookup and a root find: nothing
+    once per cell, ruinous once per *collision*, and a path through a dense coat collides tens
+    of times. So it runs once per occupied cell at startup into **16 bytes** — two 16:16
+    octahedral eigenvectors (the third is their cross product; Gram-Schmidt at decode repairs
+    the ~0.002° quantisation costs) and three halves (`b₀`, `b₁`, Kent's `b_k`). `b_k` is
+    *refined* at decode by three Newton steps rather than trusted, because the rejection bound
+    `M` is only an upper bound when `b_k` really is the root and a half-precision one is not
+    (`-checkfurvol` §7 isolates that refine: `|1/M · M_exact − 1| = 5.6e-16`).
+  - *Free flight is **exact**, not delta-tracked.* Along a *fixed* ray the direction argument of
+    `σ_t(d)` never changes, so `σ_t` is piecewise constant on the DDA's own cell segments and
+    `∫σ_t dt = −log(1−u)` inverts by running subtraction inside the same march that computes τ.
+    No majorant, no null collisions, no dependence on the density ratio between the densest and
+    emptiest cell — and a coat (a thin dense skin inside a mostly empty box) is precisely the
+    case delta tracking handles worst. `-checkfurvol` §8 falsifies the claim the only way it
+    can be falsified: survival vs `exp(−τ)` as a binomial z-score over 268 rays × 400 draws.
+- **`-fur-volume` — the coat as a medium** (P2 stage 2b, `backward.h`). Where `-dual-grid`
+  keeps the strands and reads only the *shadow* off the grid, this replaces the strands
+  outright: `BackwardRenderer::furVol` non-null makes `Scene::closestHit` skip every
+  `MatType::Hair` curve (a new `skipHair` flag mirroring `occludedSkipHair`) and the tracer
+  free-flights against `σ_t(d)` instead. Both the scalar and the hero loop; the hero loop
+  de-heros at a collision, exactly as it already does at a `Hair` surface, because a fiber's
+  response is wavelength-dependent through `σ_a`.
+  - *Composition with fog is a **minimum**, not a special case.* The fur flight is sampled
+    before the fog block and shortens `dSurf`. That is exact rather than convenient: the first
+    collision in a union of independent media is the minimum of their independent free flights,
+    and taking the min this way also attributes the collision to the right medium.
+  - *NEE needed a third visibility path.* `scene.occluded` reports the very strands the tier is
+    pretending not to have as blockers — used unchanged, the coat self-shadows to black. So
+    `HairShade::aggregate` selects `occludedSkipHair` (walls only) **plus**
+    `FurVolume::transmittance` as a continuous `exp(−τ)` factor folded into the response, in
+    both `emitterGeom` and `envGeom`. This is the same shape as the dual-scattering
+    substitution: the shadow ray becomes part of the shading rather than a separate binary test.
+  - *No dual-scattering branch, on purpose.* Dual scattering is an **analytic stand-in** for
+    exactly the multiple scattering this path now simulates directly; running both double-counts
+    it. `-fur-volume` therefore does not end the path at a fiber the way `-dual-scatter` does.
+  - *What it is and is not for.* What it buys is that cost stops scaling with **fiber count**,
+    and that the coat finally has an aggregate representation a footprint-based LOD decision can
+    switch to (stage 2c). What it loses is everything that lived on an individual strand: no
+    silhouette, and no `u`/`v` at a collision, so a textured hair `reflect` reads at the default
+    `Hit`'s coordinates — the same class of approximation as `-dual-grid`'s textured `σ_a`.
+  - *It needed the hair-free BVH (below) to be a win at all.* As first written the tier was a
+    3.8× *loss* at 90 k strands and its cost still scaled with fiber count, because `skipHair`
+    rejected fibers at the BVH leaf rather than removing them from the tree. With
+    `Scene::buildNoHairBvh` it is 1.7×/3.6×/7.0× **faster** than the strands at 90 k/300 k/900 k,
+    and grows only 1.19× across that whole 100× range where the strand tier grows 4.6×.
+  - *It saves memory too, and that took deleting the strands* (v0.180.0). The tier used to stop
+    *traversing* a coat it could not stop *storing*, so a coat too big to load stayed too big.
+    Freeing `curveSegs` after the load would not have fixed that: the peak **is** the BVH build
+    (nodes + `BuildPrim` + the transient box list, ~256 B/segment on top of the segments
+    themselves), so the strands have to be gone *before* `Scene::build()` runs. See "Deleting the
+    summarised coat" below. Measured on the same fixed-density ladder, peak working set at
+    900 k strands falls 2221 MB → **875 MB** with a byte-identical PNG, and 3 M strands
+    (30 M segments), which previously died with `error: bad allocation`, now loads and renders in
+    18.7 s at 2669 MB; 9 M renders at 7796 MB.
+- **Deleting the summarised coat** (`Scene::dropHairCurves` / `Scene::droppedBounds`, `scene.h`;
+  `ftsl::Loaded::beforeBvh`, `ftsl.h`; the prescan + hook in `main.cpp`). Once the density grid
+  and the ODF table exist, a plain `-fur-volume` render has a complete summary of geometry it will
+  never intersect — so it throws the geometry away rather than accelerating it.
+  - *It hangs off a hook because of argv ordering.* The FTSL loader builds the BVH at the end of
+    `load()`, which runs **before** main's option loop, so at build time nobody knows `-fur-volume`
+    was passed. `Loaded::beforeBvh` is called at the very end of the loader — after all parsing, so
+    `L.cameras` / `L.mode` / `L.defaultMode` are final — but immediately before `L.scene.build()`:
+    the one moment at which a summary exists and the tree does not. A matching prescan loop in
+    `main.cpp` (sharing `parseFurFlag` with the real option loop, so the two cannot drift) reads the
+    fur flags and the raster-ish flags out of argv early enough to install it.
+  - *The gating is the hard part, not the code.* The drop is suppressed for `-fur-lod` (its near
+    tier traces the strands), `-dual-scatter` (it terminates paths *at* fibers), any raster-ish
+    entry point (`raster.h` iterates `curveSegs` itself — `-raster`, `-explore`, `-fly`, `-loom`,
+    `-anim`, …), any mode other than backward `R`/`W` (forward `A`/`B`/`C` trace the curves
+    directly and would render a bald ball; `V` renders both), and explicitly by
+    `-fur-keep-strands`. When a scene's own cameras disagree with the summary the hook says so and
+    keeps the strands rather than silently rendering the wrong picture.
+  - *The bounding sphere had to be preserved by hand.* `build()` derives `sceneCenter` /
+    `sceneRadius` from the BVH root box, and that sphere sizes environment photon emission — so
+    deleting a coat would shrink the sphere to the shaved animal and change the image.
+    `dropHairCurves` accumulates the deleted extent into `Scene::droppedBounds`, which `build()`
+    unions back in. The geometry is still physically there; it just isn't traced. Empty (`lo > hi`)
+    and inert for every scene that drops nothing.
+  - *Compaction, not a second container.* `curveSegs` is stably compacted in place with a
+    `newIndex` remap, then `shrink_to_fit()` (handing the pages back is the entire point), and the
+    `Curve` records' `firstSeg` / `segCount` are rewritten through the remap. `buildNoHairBvh`
+    early-returns when no hair remains, so after a drop it is automatically a no-op and
+    `closestHit(skipHair)` falls through to `bvh` — which is already hair-free.
+  - *It opened a GPU hole that had to be closed.* Only the CPU `BackwardRenderer` honours
+    `furVol`; `renderBackwardCuda` does not. `MatType::Hair` being un-bakeable was the only thing
+    keeping fur scenes off the device, so deleting the hair removed that accident. `main.cpp`'s
+    `backwardOnGpuOk()` now vetoes the GPU explicitly whenever a fur volume is live, at all six
+    backward-GPU decision sites.
+- **The hair-free BVH** (`Scene::buildNoHairBvh` / `bvhNoHair` / `noHairPrim`, `scene.h`). A
+  second acceleration structure over every primitive *except* `MatType::Hair` curve segments,
+  built opt-in by `main.cpp` when `-fur-volume` or `-dual-scatter` is on, and traversed by
+  `closestHit(skipHair=true)` and `occludedSkipHair`.
+  - *Why a whole second tree rather than the leaf test it replaces.* Rejecting a fiber when the
+    traversal reaches its leaf does not skip the traversal, and — the part that actually hurt —
+    because no fiber ever survives to shorten `tMax`, the descent cannot **prune**. A coat the
+    strand tier exits at the first fiber was walked end to end by the aggregate tier, which is
+    why the far tier was slower than the strands *and* why its cost kept scaling with fiber
+    count. The any-hit case is worse still: a shadow ray that rejects every fiber it reaches can
+    never early-out inside a coat.
+  - *One box list, two trees.* `collectPrimBoxes(boxes, dropHair, remap)` is the single
+    definition of primitive order; the filtered tree records a `noHairPrim` map from its own leaf
+    index back to the **global** prim index, so both trees decode with the same arithmetic. Two
+    copies of that loop would be two chances for the trees to disagree about what prim 7 is.
+  - *`isHairCurve` is the one predicate.* The tree, `closestHit`'s fallback and
+    `occludedSkipHair` must agree exactly on what a fiber is — grass and wire are curves too and
+    must keep blocking — so all three call it. The leaf-level test survives as the fallback for
+    when no filtered tree was built.
+  - *Pure optimisation, verified as one.* All six benchmark renders and a `-dual-scatter` render
+    are bit-identical to the pre-change binary; `-checkfurvol` §10 runs both queries over 20 000
+    rays on a scene mixing hair curves, non-hair curves, triangles and a sphere, once on the
+    filtered tree and once with `noHairPrim` swapped out so the old path runs, and requires zero
+    mismatches.
+- **`-fur-lod` — choosing a tier** (P2 stage 2c, `backward.h`). Turns the above from a mode
+  into a decision. The ruler is the width of one pixel where the coat starts, in fiber
+  diameters: `Camera::footprintPerDist(1)` × `FurVolume::entryDist` ÷ `FurGrid::meanRadius()×2`.
+  Strands below `d0`, medium above `d1`, stochastic smoothstep crossfade between.
+  - *The ruler is the **pixel**, not the sample* — `footprintPerDist(1)`, never
+    `footprintPerDist(spp)`, which is the exact opposite of what `fwPerDist` does two fields
+    above it in the same struct. `fw` band-limits a sampler that cannot average over its own
+    pixel, so more samples must relax it. LOD is not that: a sub-pixel silhouette cannot reach
+    the final image at *any* sample count, because the reconstruction filter averages it away
+    and the aggregate is precisely that average. A ruler that shrank with `-spp` would make a
+    converged render switch tiers relative to its own preview — the pop the flag exists to
+    prevent.
+  - *The crossfade is stochastic and per path*, one coin against a smoothstep, not a weighted
+    sum. A blend needs both estimators evaluated (in the band, dearer than either tier alone)
+    and would still have to reconcile two incompatible visibility conventions inside one path.
+    The coin is unbiased for the same blend and mode R already averages hundreds of paths per
+    pixel. Smoothstep, not a ramp, so neither edge of the band is itself an edge.
+  - *The choice is sticky*, carried in `GiCtx::furTier` so a gather ray and a `-herosplit`
+    re-entry inherit rather than re-roll. A path that half-believed in the strands would test
+    visibility against geometry its own vertices were not built from, double-counting the coat.
+  - *`entryDist` uses the grid's AABB, not the first fiber* — finding the first fiber means the
+    BVH traversal the far tier exists to avoid, and the two differ by at most the coat's own
+    depth, far inside an octave-wide transition band.
+  - *Outside the band it costs nothing, exactly.* No coin is drawn unless the footprint lies
+    inside [`d0`, `d1`], so the rng stream is untouched and the endpoints are **byte-identical**
+    rather than merely close. Confirmed by sweeping the threshold over one fixed coat
+    (200×150, 400 spp): `-fur-lod 100:200`, `40:80` and `24:48` all md5 the same as the no-flag
+    strand render, `4:8` md5s the same as plain `-fur-volume`, and only `12:24` lands in the
+    band (coat mean Y 0.67620 vs 0.67641 strands / 0.67353 aggregate). The endpoints are 0.43 %
+    apart, which is why it does not pop — the fade only has to hide a change in noise character.
+  - `-checkfurvol` §9 checks `entryDist` **against the march** (zero optical depth may lie
+    behind it) and the realised aggregate fraction against the smoothstep: monotone, and
+    exactly 0 and 1 at the ends — a coat one-in-a-thousand aggregate at point-blank range is a
+    coat with sparkling holes in it.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds
@@ -2000,6 +2555,311 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   This also lands most of O8 as a side effect: the spectrum is a narrow band the author
   picks rather than everything up to the lattice Nyquist, so it is the one noise here that
   minifies gracefully.
+
+  **Blue-noise / Poisson-disk placement (`PatOp::BlueNoise`, O5, v0.166.0).**
+  `src/bluenoise.h`, `bnoise/bnoise2/bnoised/bnoiseid(x, y, z, r)` — the same four slots as
+  `worley` (F1, F2, F2−F1, per-point id) over a **different point set**: one with a
+  guaranteed minimum separation `r` in cell units. Worley's sites are a jittered lattice,
+  one point per cell placed uniformly inside it, so two of them can be arbitrarily close
+  (both jitter to the shared wall — measured closest pair 0.026 in a 70³ block) while
+  elsewhere the lattice leaves holes. Threshold F1 to draw spots and that clumping is
+  instantly legible as computer texture. It is also **unrecoverable downstream**: evenness
+  is a property of *where the points are*, so no filter over `worley`'s output puts it
+  back. Hence a new primitive rather than a mode.
+
+  The obvious construction can't be used. Dart throwing (Bridson) is inherently
+  **sequential** — a dart's acceptance depends on every dart accepted before it — so
+  answering "nearest point to `p`" would mean simulating the whole plane, against a
+  requirement of O(1) at an arbitrary point of an *unbounded* domain, no bake,
+  bit-identical on CPU and GPU. The fix is to make acceptance **locally decidable**: every
+  cell carries one candidate (jittered position + 32-bit rank), and a candidate is kept iff
+  no candidate within `r` outranks it. That is one round of Luby's MIS, equivalently a
+  Matérn type-II hardcore thinning whose parent is stratified rather than Poisson. Minimum
+  separation is then a *theorem*, and the acceptance neighbourhood is exactly 3×3×3
+  provided `r ≤ 1` (a candidate two cells out is >2−1 = 1 ≥ `r` away on one axis alone).
+  Three details carry weight:
+
+  * **`patBNPrecedes` is a strict *total* order** — rank, then `cz`, `cy`, `cx`. Totality is
+    not pedantry: ranks collide with probability ~n/2³², which over an unbounded domain is
+    certain *somewhere*, and under a merely partial order a colliding pair would each fail
+    to outrank the other and both be kept, overlapping. The tie-break on cell coordinates
+    closes the only hole in the separation proof.
+  * **Stratification beats the dense-Poisson ceiling.** Matérn-II on a Poisson parent of
+    intensity `L` retains `(1−e^{−LV})/V → 1/V = 3/(4π) = 0.23873` as `L→∞`. One stratified
+    candidate per cell yields 0.2665, *12% above* that ceiling, because stratification
+    removes the close candidate pairs that consume rank competition for nothing — so adding
+    candidates per cell would make the result sparser, not denser. Along the way the
+    conflict count had to be derived properly: it is **not** the ball volume, because the
+    candidate's own cell holds no competitor, and subtracting the cube's self-overlap
+    (per-axis triangle kernel) gives `E[N] = (3/2)πr⁴ − (8/5)r⁵ + (1/6)r⁶` for `r ≤ 1`
+    (3.2791 at `r=1`, against 4.1888 from the naive argument). A first version of the
+    self-test failed on the naive number; the fix was to redo the integral and confirm it
+    by Monte Carlo (`scraps/bn_density.py`), not to widen the tolerance.
+  * **Two early-outs keep the cost at Worley's** — 29 cells hashed per query against 27.
+    A per-cell *geometric* lower bound (distance from the query to the nearest point of the
+    cell) is tested before anything is hashed; and inside the acceptance test **rank is
+    compared before position**, because the rank *is* the base cell hash (free) while the
+    position costs three more mixes, so half the neighbours are dismissed for one mix.
+
+  `r` is a genuine knob and a strict generalisation: `r = 0` vetoes nothing and reproduces
+  the jittered lattice exactly (density 1/cell — `-checkbluenoise` §4 asserts equality),
+  `r = 1` is maximally blue at 0.2661/cell with F1 in ~[0, 1.6]. Matching a `worley`
+  texture's spot density therefore wants a worley cell `0.2661^(1/3) = 0.6432×` the size,
+  which is what the demo's side-by-side back wall does. Device-side the query is
+  `__noinline__`: inlined into `dPatternEval` it pushed the function to regcount 179 against
+  the BDPT kernels' 168 and ptxas refused the build, so its frame is now paid only by
+  programs that call it. `-checkbluenoise` has nine sections, each written so it cannot pass
+  vacuously — pruned acceptance vs an unpruned ±3-block brute force (plus an assertion that
+  both outcomes were seen thousands of times), F1/F2/id vs a ±6-block brute force at
+  tolerance 0, minimum separation over every accepted pair in a 72³ block with the jittered
+  lattice as control, the `r=0` identity, `E[N]` vs the closed form *and* density vs a rank
+  model built from different data (a real test of rank/position independence, since both
+  derive from one hash), number variance against a matched random-thinning control, the
+  radial distribution function, ring depth and NaN/`r`-clamp guards, cells hashed per query,
+  and the compile path. Worked example `scenes/pattern_bluenoise.ftsl`. One authoring fact
+  that only rendering revealed: these are **solid** 3-D point sets, so a surface cuts the
+  spheres at assorted depths and sees discs of radius `sqrt(R²−h²)` — a uniform `R` already
+  gives a spread of spot sizes, with near-tangential ones very small.
+
+  **Reaction–diffusion textures (`src/reaction.h`, O6, v0.167.0).** `texture "n" { reaction
+  { … } }` solves Gray–Scott — `du/dt = Du∇²u − uv² + F(1−u)`, `dv/dt = Dv∇²v + uv² −
+  (F+k)v` — once at load and stores V as a grey image. Turing's result is that the uniform
+  solution of such a system can be unstable to spatial perturbation while stable in time, so
+  the features are the **outcome of a process** rather than placed by fiat as `noise` /
+  `worley` / `gabor` / `bnoise` all do; their spacing, branch points and defects are
+  correlated the way a real coat pattern's are. It is a bake and not a `PatOp` because the
+  value at a point is the endpoint of a trajectory of the whole field — no local closed form
+  exists — and `texture` is exactly the shape of "an offline solve producing an image". That
+  choice is what makes it free: UV wrap, Jakob–Hanika upsampling, triplanar, `reflect
+  texture:`, `tex:<name>(u,v)` as a pattern term, GPU upload and the raster preview all work
+  with **zero renderer changes**, and the demo exercises each. Design points, all of them
+  measured rather than assumed:
+  • *Periodic by construction.* The Laplacian wraps, so the solve is on a torus. Not
+  retrofittable — blending the edges of a finished field destroys the long-range correlations
+  that make it not-noise — so the topology, and the seed's exact `x·nb/N` block partition,
+  are periodic up front.
+  • *The 9-point stencil* (0.2 ortho / 0.05 diag / −1) is Pearson's, so published (F,k) maps
+  transfer directly, and it is far more isotropic than the 5-point one, whose axis bias shows
+  as square grain in the labyrinth regimes.
+  • *The default diffusion is the classic 0.16/0.08 rescaled by s² = 2.5².* This was a real
+  bug found by looking at renders, not by reasoning: a feature is a fixed number of grid
+  *cells* wide (~2π√(D/F)), so at the textbook Du a spot is ~4 cells and comes out visibly
+  **square**, pixel-locked to the lattice. Scaling both coefficients by s² is a pure spatial
+  rescale — identical (F,k) physics, features s× wider — and s ≤ 2.79 by stability, so 2.5
+  leaves 20% margin.
+  • *Stability is a load error.* Explicit Euler needs `dt·max(Du,Dv)·1.6 ≤ 2` (the stencil's
+  Fourier symbol bottoms out at −1.6 at a=b=π); past it the field NaNs within a few dozen
+  steps, which is not a graceful degradation, so `rdStable` rejects at load with the
+  arithmetic printed.
+  • *The seed is the subtle part.* (u,v)=(1,0) is a fixed point **and linearly stable for
+  every F,k>0** — Gray–Scott is subcritical — so infinitesimal noise gives a blank sheet; the
+  perturbation must be finite-amplitude and domain-wide. Both its parameters were forced by
+  measurement: a per-cell seed is smoothed away before it nucleates (five of six presets
+  decayed), so blocks are ~one feature wide; and at 50% fill the ON blocks *percolate* into
+  one domain-spanning region, after which patterning hinges on whether that one region
+  survives — at sim=128 `spots` lost it and left a single nucleus creeping across a blank
+  texture. 25% fill keeps the blocks isolated, and then every preset patterns at every `sim`
+  and `seed`.
+  • *Threading.* `ft::parallelFor` spawns a pool per call, so paying it 6000 times costs more
+  than the arithmetic; threads start once and rendezvous at a sense-reversing `RDBarrier`,
+  with double buffers indexed by step parity. Every cell reads only the previous buffer and
+  there is no reduction, so the result is bit-identical for any band count (`-checkreaction`
+  §5b pins it against a serial `rdLaplacian` reference at tolerance 0). Thread 0 alone polls
+  `-stop`, *before* its compute phase, so the barrier publishes one shared answer.
+  • *Presets are load-bearing, not a convenience*: the pattern-forming crescent is ~0.01 wide
+  in k, so hand-picked numbers usually bake nothing. The six shipped were chosen by scanning
+  the plane and **looking** at every tile — which is how the lattice-locking bug surfaced —
+  and a seventh (`waves`) was dropped because it washed out at the rescaled diffusion.
+  `-checkreaction` §7 re-derives contrast (as the *standard deviation* of the normalised
+  field; its range is 1.0 by construction, so asserting on range would be vacuous) and the
+  dominant wavelength from a radially averaged separable DFT, at the shipped defaults, so a
+  preset name cannot rot silently. Its other sections pin the stencil against its Fourier
+  symbol at every representable wavenumber, the optimised loop against the reference
+  Laplacian, the uniform fixed point, torus translation invariance, seam vs interior
+  gradients, `rdStable` against actual divergence, and determinism/resampler identities.
+  • *Not everything converges*: spot regimes settle to ~4e-5 relative change per step by
+  24000 steps, but `maze` never does (~3e-3 even then) — the labyrinth keeps reconnecting —
+  so there `steps` is an aesthetic choice, and the docs say so rather than implying otherwise.
+
+  **Band-limited fBm (`PatOp::FNoise`, O8, v0.168.0).** `fnoise(x, y, z, w, octaves)` in
+  `src/pattern.h` — the same lattice `noise`, summed at lacunarity 2 / gain 0.5, with each
+  octave scaled by how much of it a sample of width `w` can resolve. `w` is in the units of
+  the coordinates passed in (so a footprint of `w` metres sampled at `90*x` must be handed
+  in as `90*w` — the easiest mistake to make with this op), and `w <= 0` is plain
+  unfiltered fBm, which keeps every existing use unchanged. Every other noise here is
+  evaluated at a point, which is a lie the moment one shading sample stands for an area:
+  a feature smaller than the footprint doesn't fade out, it **folds down** into a coarse
+  pattern of the sampling lattice, and no amount of extra samples removes it because the
+  signal was never band-limited. It matters for the **deterministic** samplers — mode W,
+  the raster preview, low-spp backward. The forward photon modes spread millions of hit
+  points across each pixel's footprint, so they area-average stochastically for free and
+  `fnoise` would only cost them detail.
+
+  The whole design is in the weight, and it was **measured, not chosen**:
+
+  * *The optimal weight is the linear-MMSE coefficient*, and it has a closed form worth
+    writing down: `a(s) = Cov(footprint mean, point) / Var(point) = mean_{u∈footprint} R(u)
+    / R(0)`, the footprint-average of the noise's own autocorrelation, at `s = freq·w`.
+    That makes it a measurable quantity rather than a taste, and it is nothing like the
+    obvious schedule: the true weight is **0.949 at Nyquist** (`s = 0.5`) and still
+    **0.815 at `s = 1`**, exactly where a naive cutoff drops the octave whole. The first
+    implementation *was* that naive smoothstep and it failed §3/§5 of its own self-test by
+    filtering **worse than not filtering** — the fix was to derive and measure `a(s)`
+    (`scraps/fnoise_fit*.py`) and fit a monotone rational to it (max abs error 2.5e-4).
+  * *The footprint's **dimension** changes the tail by a whole power of `s`* — a 3-D ball
+    average decays like `s⁻³`, a 2-D surface patch like `s⁻²`, a 1-D segment like `s⁻¹` —
+    so one curve cannot serve all three, and this is not a detail that can be papered over.
+    An intermediate version fitted the **3-D cube** curve; §3 then passed and §5 still
+    failed, and the cause was exactly this mismatch (§5 was measuring against a 1-D
+    average). `w` is therefore defined as **the diameter of a disc lying in the surface**,
+    orientation-averaged, because that is what a shading sample actually stands for; the
+    self-test was rewritten to average over a randomly-oriented disc so it measures the
+    contract rather than a convenient proxy.
+  * *Over-filtering is **not** the safe direction* — the instinct that blur is conservative
+    is wrong here, and measured to be wrong: applying the 3-D curve to a 2-D footprint
+    gives only a 1.6× improvement at `s = 2` against 2.3× for the opposite mismatch,
+    because it deletes low-frequency content the footprint genuinely contains and lands
+    further from the truth than not filtering at all. Hence the docs tell an author in
+    doubt to lean toward the *minor* axis of the elliptical footprint.
+  * *Normalisation is by the **unfiltered** amplitude sum*, so a faded octave is genuinely
+    gone and the field converges to 0.5 rather than being renormalised back up into
+    something that still crawls.
+
+  `-checkfnoise` is written so it cannot pass by tuning. §2 pins the closed form against
+  the 22-entry measured disc table (reached two ways — `patOctaveFade(1, s)` and
+  `patOctaveFade(8, s/8)` — so a mis-scaled `freq·w` cannot hide), sweeps 200001 points for
+  monotonicity, and carries an explicit anti-regression that the fade has not "collapsed to
+  a Nyquist cutoff". §5 is the interesting one: it originally asserted a fixed ratio and
+  failed at 1.68×, and rather than loosen the number the test now asserts the *structure*
+  that the sweep actually revealed — point-sampling's low-frequency error **saturates**
+  under minification (0.0148 → 0.0247 → 0.0269 → 0.0262) while `fnoise`'s keeps falling
+  (0.0088 → 0.0091 → 0.0052 → 0.0028), so the two separate without bound (1.68× → 9.28×).
+  A saturating error curve is the signature of aliasing, and that is what is now pinned.
+
+  One authoring fact that only rendering revealed, and that the worked example
+  `scenes/pattern_fnoise.ftsl` exists to state: **a classic wide fBm barely aliases**. In a
+  gain-0.5 stack the fine octaves carry almost no amplitude (the seventh is 1/64 of the
+  first) and they are precisely the ones a distant sample cannot resolve, so a wide fBm
+  both aliases faintly *and* filters faintly — the first demo (7 octaves at base 9) had two
+  indistinguishable halves, which was the primitive being right rather than the demo being
+  right. What aliases visibly is a texture whose energy sits **at** the resolution limit,
+  which is also the common case in practice (grain, weave, gravel, stucco), so the demo is
+  3 octaves at base 90/m on a floor running to the horizon, split down the middle. Measured
+  off that render, mean |pixel − its 3×3 mean| by distance: plain stays at 9–11 from 3.8 m
+  to the horizon while filtered falls 9.3 → 0.0. The flat line is the point.
+
+  Wiring is the O2 checklist (enum at the end, one case in each of the three VMs,
+  `patOpStackEffect` arity 5, no payload).
+
+  **Stage 2 — the `fw` variable** (v0.169.0). The author should not have to derive `w`;
+  the renderer knows it. `fw` is the world-space **diameter of the surface patch one
+  shading sample stands for**, and it is split in two so that no two backends can disagree
+  about it: `Camera::footprintPerDist(spp, rx, ry)` returns the distance-independent
+  coefficient, and `patShadingFootprint(perDist, dist, cosSurf)` in `pattern.h` (shared
+  `__host__ __device__`) combines it with one hit. Three decisions are load-bearing:
+
+  - **The pixel's angular size comes from `pixelSolidAngle()`**, converted to the diameter
+    of the disc subtending it (`2·√(Ω/π)`), not from `fov_y/res_y`. That makes fisheye and
+    panoramic lenses fall out for free, and it is ~18% wider than the naive number for a
+    square pixel (the tan expansion plus the equal-area conversion). Evaluated **on axis**:
+    the off-axis variation is a cos³ effect, an order of magnitude below the obliquity
+    term, and taking it on-axis keeps `fw` from depending on which pixel a surface lands in.
+  - **Obliquity uses the geometric mean of the ellipse axes** (`d/√|cos|` — the disc of
+    equal area), floored at `|cos| = 0.02`. Not the major axis: stage 1 measured that
+    over-filtering is the worse mismatch, so ties break toward the minor. Without the floor
+    every silhouette would filter to a flat grey band.
+  - **0 means unknown means UNFILTERED**, never a small blur. `fw` is filled only where the
+    renderer can answer honestly: primary hits in mode W (`BackwardRenderer::fwPerDist` /
+    `DScene::bkFwPerDist`, stamped at `b == 0 && gi.depth == 0` in both the scalar and hero
+    path loops — `b == 0`, *not* `b == bounce0`, since a heroSplit re-entry resumes deeper)
+    and every pixel of both raster previews (`dRasterFw` / `raster.h`'s shade pass, which
+    pass `W`/`H` as the resolution override because the preview window is not the camera's
+    film). It stays 0 in the forward modes and stochastic mode R — a sampler that jitters
+    over its own footprint is already area-averaging, and filtering on top would only cost
+    detail — at secondary bounces (ray cones through specular bounces are the obvious
+    extension, and `curv` is already sitting at every hit waiting to drive them), and in
+    implicit-field/medium formulas, where a filtered SDF would round off the very detail
+    the sphere-trace is looking for and make its distance bound non-conservative at grazing
+    angles. Like `curv`/`cavity` it is rejected in an `emit` pattern, for the strictly
+    stronger reason that it is view-dependent.
+
+  `spp` divides it by `√spp`, and mode W latches ONE `g_fwSpp` for the whole run (the run's
+  requested `-spp`, not a chunk's) so every chunk of a progressive or resumed render filters
+  identically and their average stays a render of one image. `-checkfnoise` §10 pins the
+  geometric-mean / cos-floor / zero-is-unfiltered conventions, the `1/√spp` and
+  resolution-override scalings, and the variable's parse / free-var / VM wiring. CPU and GPU
+  mode W were measured to differ no more with `fw` than without it (max 8/255 of one channel
+  on 0.9% of the demo's pixels, against 9/255 on 1.1% for the same scene with `fw` removed —
+  i.e. entirely the pre-existing float/double divergence). The demo scene now reads
+  `fnoise(90*x, 90*y + 0.5, 90*z, 90*fw, 3)`, and its hand derivation is kept in the
+  comment as the explanation of what `fw` contains.
+
+  **Stochastic tiling (`src/stochtile.h`, O7, v0.170.0).** `texture "n" { tiling stochastic
+  patch <p> seed <s> }` is Heitz & Neyret's (HPG 2018) histogram-preserving blending: at each
+  shading point, three randomly offset crops on a triangle lattice, blended with the
+  barycentric weights. The problem is **not** seams — the demo's source is deliberately
+  seamlessly periodic and still fails, because at six repeats per metre the eye locks onto
+  the same rosette marching in a grid, which no wrap mode can address. The naive fix is worse
+  than the disease: averaging three crops of a bimodal image emits the mean of its two modes,
+  a colour occurring nowhere in the source, and the wall goes to soup. So each channel is
+  **rank-transformed** at load onto `N(1/2, 1/6)` (`gaussRgb` / `gaussGray` planes), the taps
+  are blended there, the variance the average destroyed is restored by dividing the centred
+  blend by `sqrt(Σwᵢ²)`, and the result is inverted through a stored 1-D LUT (`lutRgb` /
+  `lutGray`). `E[Σwᵢ²] = 1/2` for Dirichlet(1,1,1) weights, so an unrestored blend sits at
+  `1/√2 = 0.707×` the source's sd; `-checkstochtile` measures 0.4999 and 0.708× against those
+  closed forms. Architecture points, each of which was forced by a measurement:
+  • *The blend is in linear RGB, not in Jakob–Hanika coefficient space.* Blending coefficients
+  per channel produced visible blue-cyan fringing, because coefficient space is not a colour
+  space: `R = sigmoid(p(t))` is nonlinear in `c`, so a weighted mean of coefficient triples is
+  not the weighted mean of the colours. The three taps are therefore blended as RGB and the
+  blended colour converted through **one shared, texture-independent** 64³ coefficient LUT
+  (`upsample::coeffLut`, `stochJhCoeff`), built lazily and threaded (~0.6 s, 3.1 MB) on first
+  stochastic-texture load. This is also what makes the three backends agree: the spectral CPU
+  path (`Texture::reflectanceAt`), CUDA (`dTexReflAt`) and the mode-W raster preview run the
+  *identical* operator on the *identical* planes, differing only in where the planes live.
+  • *The LUT's real problem was conditioning, not resolution.* A colour whose reflectance is
+  pinned at 0 or 1 across the band needs `|p| → ∞`; the unbounded fitter returns `|c| = 1.6e6`
+  at the white corner, and trilinear interpolation between that and a moderate neighbour is
+  meaningless — worst reflectance error 0.81. The fix is **projected Gauss-Newton**:
+  `fitSigmoid` takes an optional `pMax`, and inside its backtracking line search the trial
+  point is pulled back into the bounded set (`upsample::clampSaturated`) *before* being
+  scored, so what the search accepts is the best **bounded** colour match rather than an
+  unbounded one mangled afterwards. Bounding a finished fit instead costs 0.037 of
+  `|XYZ − target|` near white; projecting inside the loop lets the remaining freedom
+  compensate for the clip. `clampSaturated` soft-compresses `p` through `pMax·tanh(p/pMax)`
+  (identity for small `p`, and it preserves every root exactly, so the wavelengths where R
+  crosses ½ do not move) and weighted-least-squares a quadratic back through the compressed
+  curve over 380–730 nm with weight `max(dSigmoid(pc), 1e-3)`. Three simpler alternatives were
+  implemented and rejected on measurement, and the source comment records each: uniform
+  scaling of `c` (shrinks the unsaturated middle; dark saturated red `|dR| = 0.97`), a 3-node
+  clamp at 360/595/830 nm (`|dR| = 1.0` near white — the fit is *unconstrained* where the CMFs
+  vanish, so those nodes hold noise), and one at 400/550/700 nm (`|XYZ − target| = 0.37` near
+  white, because white's fit puts its roots within a nanometre of exactly 400 and 700). A
+  CMF-weighted LS also lost (worst 0.037 → 0.088).
+  • *The right metric is round-trip `|XYZ − target|`, not reflectance agreement with
+  `upsample::fit`.* Comparing curves is a trap for exactly the reason above: two coefficient
+  triples producing the identical colour can differ by `|dR| = 1` past 700 nm where the CMFs
+  are zero. `-checkstochtile` §8 therefore scores XYZ round-trip over 3000 colours (half cubed
+  toward black) and carries the un-tabulated fit as a **control**, holding the LUT to "no
+  worse than the fitter it stands in for" (`wL < wF + 0.025`) rather than to an unachievable
+  ideal. Grid size was picked from a sweep, not taste: 48³ worst 0.036, 64³ worst 0.019, 80³
+  worst 0.016 — it stops improving because the residual is no longer the table but the
+  sigmoid-of-a-quadratic model's own 0.019 error at pure white, so `STOCH_JH_N = 64`,
+  `STOCH_JH_PMAX = 60`.
+  • *Validated in the render, not only in the unit test.* `scenes/stochtile.ftsl` rendered on
+  all three backends and compared statistically: the lattice autocorrelation at exactly one
+  repeat (64 px) is +0.998/+1.000/+1.000 on the plain half and **+0.017 on the stochastic
+  half — the same value to three decimals on all three renderers**, which is the real
+  evidence they run one operator rather than three similar ones. And the operator's own claim
+  holds end to end: the stochastic half's mean and sd (0.2690 / 0.1485) match the plain half's
+  (0.2679 / 0.1492), i.e. the histogram survived the blend rather than regressing to the mean.
+  CPU vs CUDA spectral differ by mean |Δ| 0.0058 with means agreeing to 0.0005, so the
+  difference is Monte Carlo noise between two independent runs, not a systematic split.
+  • *A latent `fitSigmoid` divergence was found on the way and fixed.* Undamped Gauss-Newton
+  diverged for dark saturated colours (red at Y=0.001 gave `|XYZ − target| = 1.41`, blue at
+  Y=0.01 gave 1.40); the backtracking line search brought those to 0.0008 / 0.0001, and §8
+  now asserts them so they cannot regress. This affected *every* Jakob–Hanika upsample in the
+  renderer, not just the tiling LUT.
 
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
@@ -3710,8 +4570,45 @@ invisible under a sandboxed shell) and `Local\` objects are per-session.
   per frame by the `-serve` loop; an external stop means "shut the process down", so it
   must survive that clear — and it also breaks the `-keepwindow` hold.
 
-`-stop all` targets every live render, a bare `-stop` lists them, and both wait (≤120 s)
-for the targets to actually exit so a rebuild can be scripted immediately after.
+`-stop all` targets every live ftrace process, a bare `-stop` lists them, and both wait
+(≤120 s) for the targets to actually exit so a rebuild can be scripted immediately after.
+
+### Stopping the loom VIEWER, and an honest exit code (0.182.0)
+
+The channel was render-only until 0.182.0, and in the worst possible way: the `-viewer`
+branch `return`s before `stopChannelStart()`, so a viewer published no `.run` file — and
+the wait loop's predicate was `alive && exists(<pid>.run)`, which for an *unpublished* pid
+is false on the very first poll. `-stop <viewer-pid>` therefore printed
+`[stop] done — stopped cleanly.` and exited **0** while the viewer kept running. That is
+worse than not supporting the viewer at all: the one command the project offers instead of
+`taskkill /F` reported success for a stop it had not performed, and anything chaining off
+it (`build.bat`, which can't copy `ftrace.exe` while a viewer holds it open) proceeded on a
+false premise — straight back to the force-kill the channel exists to prevent. Three
+changes close it:
+
+- **The viewer registers.** `stopChannelStart(sidecar + " -> (loom viewer)")` /
+  `stopChannelEnd()` now bracket `runViewerGui`, so a viewer is listed by a bare `-stop`
+  and is a legal target. Nothing in the channel was ever render-specific.
+- **The GUI polls.** `viewer_gui.cpp`'s `PeekMessage` loop calls `ft::stopRequested()` once
+  per frame (the probe is installed at `main.cpp:18485`, *before* the viewer dispatch) and
+  sets `done`, leaving through the ordinary teardown that releases D3D11, the loom python
+  child and the window. `-explore` needed nothing: its loop already reads `g_stopRequested`
+  directly (`main.cpp:17092`), and it registers because `stopChannelStart` precedes `run()`.
+- **The wait can't lie.** `stopTargetGone()` replaces the conjunction: on Windows process
+  liveness is authoritative and is the *only* thing consulted, so a live target is never
+  counted as gone. (Off Windows `ftraceProcessAlive()` is a conservative "yes", so there the
+  `.run` file disappearing is still the signal.) A pid that was already dead returns 0 with
+  `nothing to stop`; a pid alive but unregistered stays a target and, if it outlives the
+  deadline, the command prints `[stop] FAILED — still running after 120s` and exits **2**.
+
+The directory scan also **reaps orphan `.stop` sentinels**, not just orphan `.run` files. A
+sentinel is normally deleted by the target that consumes it, so one only survives when nobody
+is left to consume it — the target died first, or never watched the channel (the
+alive-but-unregistered path drops one deliberately). Eight had piled up over five days before
+this was noticed. It is housekeeping rather than a safety net: `stopChannelStart` already
+deletes any sentinel bearing its own pid before starting its watcher, so a recycled pid cannot
+inherit somebody else's stop and kill itself at startup. The reaper only fires once the owner
+is gone, so a sentinel still in flight to a live target is never snatched away.
 
 ### Stopping during SCENE LOAD (0.138.2)
 

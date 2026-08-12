@@ -23,6 +23,7 @@
 #include "lights.h"
 #include "meng_table.h"
 #include "parallel.h"
+#include "stochtile.h"   // STOCH_JH_N / stochJhCoeff — the device shares this table
 
 namespace upsample {
 
@@ -38,6 +39,7 @@ inline double reflAt(const std::array<double, 3>& c, double lambda) {
     double p = c[0] * t * t + c[1] * t + c[2];
     return sigmoid(p);
 }
+
 
 // Precomputed integration weights: wX/Y/Z(λ) = k·D65(λ)·CMF(λ)·dλ, sampled on a
 // fixed grid, with k chosen so a unit reflectance integrates to the D65 white
@@ -74,6 +76,80 @@ struct Basis {
 
 inline const Basis& basis() { static Basis b; return b; }
 
+// Soft-clip a fitted coefficient vector so the quadratic it encodes stays bounded,
+// WITHOUT disturbing the part of the curve that is actually doing any work.
+//
+// Why it is needed: the model is R = sigmoid(p(t)), so a colour whose reflectance is
+// pinned at 0 or 1 across the band can only be expressed by |p| -> infinity. The fitter
+// duly returns |c| in the millions at the white and black corners. That is harmless for
+// a single evaluation but fatal for a LOOKUP TABLE, because interpolating between a
+// corner like that and its moderate neighbour sweeps p through every intermediate value.
+//
+// How: soft-compress p through pMax*tanh(p/pMax) — which is the identity to within a
+// part in 1e5 while |p| < pMax/5, so an unsaturated curve is untouched, and which keeps
+// every ROOT of p exactly where it was, so the wavelengths at which the reflectance
+// crosses 1/2 do not move — then least-squares a quadratic back through the compressed
+// curve. The weight is dSigmoid(p), the sensitivity of reflectance to p: minimising
+// sum w*(q - p')^2 is a first-order stand-in for minimising sum (R(q) - R(p'))^2, which
+// is what we actually care about. A floor keeps the normal equations conditioned where
+// the whole curve is saturated and the weights would otherwise all be ~1e-6.
+//
+// Two simpler things were tried first and are wrong, both measured:
+//   * Scale c uniformly until max|p| <= pMax. Preserves roots, but shrinks the
+//     UNSATURATED part of the curve along with the saturated part — a dark saturated red
+//     came out with |dR| = 0.97.
+//   * Read p at three wavelengths, clamp each, and rebuild the quadratic through them
+//     (exact wherever it does not clamp, which is seductive). It moves the roots, and
+//     near white the fit puts its roots within a nanometre or two of 400 and 700 nm —
+//     precisely where one wants to put the outer nodes — so white lost the 400-430 and
+//     670-700 nm ends of its spectrum: |XYZ - target| = 0.37.
+inline std::array<double, 3> clampSaturated(const std::array<double, 3>& c,
+                                            double pMax = 60.0) {
+    auto p = [&](double t) { return c[0] * t * t + c[1] * t + c[2]; };
+    // Cheap exit: if the curve never saturates hard, it is already representable.
+    {
+        const double tLo = tOf(380.0), tHi = tOf(730.0);
+        double m = std::max(std::fabs(p(tLo)), std::fabs(p(tHi)));
+        if (std::fabs(c[0]) > 1e-300) {
+            const double tv = -c[1] / (2.0 * c[0]);
+            if (tv > tLo && tv < tHi) m = std::max(m, std::fabs(p(tv)));
+        }
+        if (!(m > pMax)) return c;              // also catches NaN: leave it alone
+    }
+    // Weighted least squares of {t^2, t, 1} against the compressed curve, over the
+    // visible band only (outside it the original fit is unconstrained, so its values
+    // there are noise and must not be fitted to). Weighting by the CMF as well was tried
+    // and measures worse (worst |XYZ - target| 0.037 -> 0.088): it lets the band edges,
+    // where the observer is nearly blind but the curve still has to stay high for a
+    // white, drift away.
+    double A[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, rhs[3] = {0, 0, 0};
+    for (double lam = 380.0; lam <= 730.0 + 1e-9; lam += 5.0) {
+        const double t  = tOf(lam);
+        const double pc = pMax * std::tanh(p(t) / pMax);
+        const double w  = std::max(dSigmoid(pc), 1e-3);
+        const double bs[3] = {t * t, t, 1.0};
+        for (int a = 0; a < 3; ++a) {
+            for (int b = 0; b < 3; ++b) A[a][b] += w * bs[a] * bs[b];
+            rhs[a] += w * bs[a] * pc;
+        }
+    }
+    auto det3 = [](const double m[3][3]) {
+        return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+             - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+             + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    };
+    const double D = det3(A);
+    if (!(std::fabs(D) > 1e-30)) return c;
+    std::array<double, 3> out{};
+    for (int k = 0; k < 3; ++k) {
+        double M[3][3];
+        for (int a = 0; a < 3; ++a)
+            for (int b = 0; b < 3; ++b) M[a][b] = (b == k) ? rhs[a] : A[a][b];
+        out[k] = det3(M) / D;
+    }
+    return out;
+}
+
 // Linear sRGB (D65) -> XYZ. Inverse of color.h's xyzToLinearSrgb matrix.
 inline void linSrgbToXyz(double r, double g, double b, double& X, double& Y, double& Z) {
     X = 0.4124 * r + 0.3576 * g + 0.1805 * b;
@@ -85,56 +161,108 @@ inline void linSrgbToXyz(double r, double g, double b, double& X, double& Y, dou
 // weight set (wX/Y/Z(λ)·dλ, already built), reproduces the target XYZ. Gauss-Newton
 // with a Cramer's-rule 3×3 solve. Shared by the reflectance fit (D65-weighted basis)
 // and the illuminant fit (bare-observer basis) — identical solver, different weights.
+//
+// The step is BACKTRACKED. An undamped Gauss-Newton step here does not merely converge
+// slowly on hard targets — it diverges outright, because the model is a sigmoid of a
+// quadratic and a dark saturated colour needs |c| in the hundreds (the sigmoid has to
+// be pinned near 0 across most of the band and lifted in a narrow window). Out there
+// dSigmoid is ~0, so the Jacobian is nearly singular, Cramer's rule returns an enormous
+// Δ, and the iterate is thrown somewhere with an even worse residual; 40 such steps
+// wander and the returned coefficients are unrelated to the request. Measured before
+// this guard, with a 95-sample D65 basis: pure red at luminance 0.001 came back with
+// |XYZ - target| = 1.41 and pure blue at 0.01 with 1.40 — i.e. a *black* red rendered
+// with the tristimulus of something bright. Greys and mid-tones were unaffected, which
+// is why it survived: it only bites where the colour is both dark and saturated.
+// Halving the step until the residual actually decreases costs a few extra spectrum
+// evaluations on the hard cases and nothing on the easy ones, and turns those same two
+// fits into 1e-9. See `-checkupsample` §fit.
 inline std::array<double, 3> fitSigmoid(int N, const double* lam,
                                         const double* wX, const double* wY, const double* wZ,
-                                        double tX, double tY, double tZ) {
+                                        double tX, double tY, double tZ, double pMax = 0.0) {
     std::array<double, 3> c{0.0, 0.0, 0.0};   // start at S ≡ 0.5 (mid gray)
-    for (int iter = 0; iter < 40; ++iter) {
-        // Residual and 3×3 Jacobian dXYZ/dc.
+    // ||XYZ(c) - target||^2, and (optionally) the Jacobian at c.
+    auto eval = [&](const std::array<double, 3>& cc, double J[3][3]) {
         double X = 0, Y = 0, Z = 0;
-        double J[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+        if (J) for (int a = 0; a < 3; ++a) for (int b = 0; b < 3; ++b) J[a][b] = 0.0;
         for (int i = 0; i < N; ++i) {
-            double t = tOf(lam[i]);
-            double p = c[0] * t * t + c[1] * t + c[2];
-            double s = sigmoid(p), ds = dSigmoid(p);
+            const double t = tOf(lam[i]);
+            const double p = cc[0] * t * t + cc[1] * t + cc[2];
+            const double s = sigmoid(p);
             X += s * wX[i]; Y += s * wY[i]; Z += s * wZ[i];
-            double dc[3] = {t * t, t, 1.0};
-            for (int j = 0; j < 3; ++j) {
-                J[0][j] += ds * dc[j] * wX[i];
-                J[1][j] += ds * dc[j] * wY[i];
-                J[2][j] += ds * dc[j] * wZ[i];
+            if (J) {
+                const double ds = dSigmoid(p);
+                const double dc[3] = {t * t, t, 1.0};
+                for (int j = 0; j < 3; ++j) {
+                    J[0][j] += ds * dc[j] * wX[i];
+                    J[1][j] += ds * dc[j] * wY[i];
+                    J[2][j] += ds * dc[j] * wZ[i];
+                }
             }
         }
-        double rX = X - tX, rY = Y - tY, rZ = Z - tZ;
-        if (rX * rX + rY * rY + rZ * rZ < 1e-14) break;
-        // Solve J·Δ = residual (3×3) via Cramer's rule.
-        double det = J[0][0] * (J[1][1] * J[2][2] - J[1][2] * J[2][1])
-                   - J[0][1] * (J[1][0] * J[2][2] - J[1][2] * J[2][0])
-                   + J[0][2] * (J[1][0] * J[2][1] - J[1][1] * J[2][0]);
-        if (std::fabs(det) < 1e-18) break;
-        double rhs[3] = {rX, rY, rZ};
+        const double rX = X - tX, rY = Y - tY, rZ = Z - tZ;
+        return rX * rX + rY * rY + rZ * rZ;
+    };
+
+    double J[3][3];
+    double err = eval(c, J);
+    for (int iter = 0; iter < 60; ++iter) {
+        if (err < 1e-14) break;
+        // Solve J·Δ = residual (3×3) via Cramer's rule. Recomputing the residual here
+        // is redundant with eval(), so eval() reports err and we re-derive the residual
+        // vector from the same pass by evaluating XYZ once more only when stepping.
+        double X = 0, Y = 0, Z = 0;
+        for (int i = 0; i < N; ++i) {
+            const double t = tOf(lam[i]);
+            const double s = sigmoid(c[0] * t * t + c[1] * t + c[2]);
+            X += s * wX[i]; Y += s * wY[i]; Z += s * wZ[i];
+        }
+        const double rhs[3] = {X - tX, Y - tY, Z - tZ};
+        const double det = J[0][0] * (J[1][1] * J[2][2] - J[1][2] * J[2][1])
+                         - J[0][1] * (J[1][0] * J[2][2] - J[1][2] * J[2][0])
+                         + J[0][2] * (J[1][0] * J[2][1] - J[1][1] * J[2][0]);
+        if (std::fabs(det) < 1e-30) break;
         double d[3];
         for (int col = 0; col < 3; ++col) {
             double M[3][3];
             for (int a = 0; a < 3; ++a) for (int bb = 0; bb < 3; ++bb) M[a][bb] = J[a][bb];
             for (int a = 0; a < 3; ++a) M[a][col] = rhs[a];
-            double dc = M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1])
-                      - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0])
-                      + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+            const double dc = M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1])
+                            - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0])
+                            + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
             d[col] = dc / det;
         }
-        // Damped step for stability on saturated colours.
-        const double relax = 1.0;
-        c[0] -= relax * d[0]; c[1] -= relax * d[1]; c[2] -= relax * d[2];
+        // Backtracking line search: accept the first step that lowers the residual.
+        bool moved = false;
+        double relax = 1.0;
+        for (int bt = 0; bt < 30; ++bt, relax *= 0.5) {
+            std::array<double, 3> t{c[0] - relax * d[0], c[1] - relax * d[1],
+                                    c[2] - relax * d[2]};
+            // PROJECTED Gauss-Newton (pMax > 0, used only when building the LUT): pull the
+            // trial point back into the bounded set before scoring it, so what the line
+            // search accepts is the best BOUNDED colour match rather than an unbounded one
+            // that is then mangled after the fact. Soft-clipping the finished fit instead
+            // costs 0.037 of |XYZ - target| near white; doing it inside the loop lets the
+            // remaining freedom compensate for the clip.
+            if (pMax > 0.0) t = clampSaturated(t, pMax);
+            double Jt[3][3];
+            const double e = eval(t, Jt);
+            if (e < err) {
+                c = t; err = e;
+                for (int a = 0; a < 3; ++a) for (int b = 0; b < 3; ++b) J[a][b] = Jt[a][b];
+                moved = true;
+                break;
+            }
+        }
+        if (!moved) break;      // no downhill step exists along this direction
     }
     return c;
 }
 
 // Fit sigmoid coefficients for a linear-sRGB *reflectance* colour (D65-weighted basis).
-inline std::array<double, 3> fit(double r, double g, double b) {
+inline std::array<double, 3> fit(double r, double g, double b, double pMax = 0.0) {
     const Basis& B = basis();
     double tX, tY, tZ; linSrgbToXyz(r, g, b, tX, tY, tZ);
-    return fitSigmoid(B.N, B.lam, B.wX, B.wY, B.wZ, tX, tY, tZ);
+    return fitSigmoid(B.N, B.lam, B.wX, B.wY, B.wZ, tX, tY, tZ, pMax);
 }
 
 // --- Bulk fit: fit(...) for a whole image, DEDUPLICATED and THREADED ---------------
@@ -162,7 +290,8 @@ inline std::array<double, 3> fit(double r, double g, double b) {
 // Returns false if a clean stop (`ftrace -stop`, Ctrl-C) was requested while it ran, in
 // which case `out` is only partially written and the caller must abandon the load rather
 // than render with a half-filled coefficient table.
-[[nodiscard]] inline bool fitMany(const Vec3* in, size_t n, std::array<double, 3>* out) {
+[[nodiscard]] inline bool fitMany(const Vec3* in, size_t n, std::array<double, 3>* out,
+                                  double pMax = 0.0) {
     if (!in || !out || n == 0) return true;
     (void)basis();
 
@@ -208,10 +337,70 @@ inline std::array<double, 3> fit(double r, double g, double b) {
 
     std::vector<std::array<double, 3>> uc(uniq.size());
     if (!ft::parallelFor(uniq.size(), 64, [&](size_t i) {
-            uc[i] = fit(uniq[i].x, uniq[i].y, uniq[i].z);
+            uc[i] = fit(uniq[i].x, uniq[i].y, uniq[i].z, pMax);
         }))
         return false;
     return ft::parallelFor(n, 65536, [&](size_t i) { out[i] = uc[which[i]]; });
+}
+
+// --- Global linear-RGB -> coefficient LUT ------------------------------------
+// `fit` is a 60-iteration Gauss-Newton with a line search — microseconds, fine once
+// per distinct texel at load, hopeless per shading point. Stochastic tiling needs
+// exactly that, though: it *invents* a colour at every hit (a blend of three crops,
+// see stochtile.h) and then has to hand the renderer a spectrum for it.
+//
+// So: tabulate. The table is a pure function of the colour, shared by every texture
+// and every backend, and is built lazily on first use — a scene with no stochastic
+// texture never pays for it.
+//
+// Two details that are not free choices:
+//
+//   * The grid is warped by sqrt (i.e. indexed by sqrt(channel), inverted by squaring).
+//     A LINEAR grid is badly wrong: the coefficients move fastest near black, where a
+//     dark colour needs the sigmoid pinned low across the whole band. Measured on the
+//     demo image's own colours, 48^3 linear gives mean |dR| 1.0e-2 and worst 2.4e-2 —
+//     visibly off. The same 48^3 with the sqrt warp gives mean 1.4e-4, worst 4.3e-3,
+//     and a full round trip through the LUT and back out to linear sRGB reproduces the
+//     un-tabulated result to within 1e-4. sqrt specifically (rather than the sRGB
+//     exponent 1/2.2, which measures the same) because the lookup is on the hot path
+//     and sqrt is one instruction where pow is a library call.
+//     The residual worst case now sits near WHITE, not black, and is the model's own
+//     limit rather than the table's — see STOCH_JH_N's comment for the resolution sweep.
+//
+//   * `STOCH_JH_N` lives in stochtile.h, not here, because the DEVICE has to do the
+//     same trilinear lookup into the same table and stochtile.h is the header both
+//     sides share. This function only *builds* it.
+//
+// THE ENTRIES MUST BE BOUNDED, and this is not cosmetic: the fitter returns |c| = 1.6e6
+// at the white corner, and trilinear interpolation between a node like that and its
+// moderate neighbour is meaningless — a colour a few percent off white came out with
+// |dR| = 0.81. So the table is built with the fit's PROJECTED variant (fit(..., pMax)),
+// which keeps every iterate inside |p| <= STOCH_JH_PMAX via clampSaturated. Bounding the
+// finished fit instead is measurably worse (worst |XYZ - target| near white 0.037 vs
+// 0.005) because the clip then has no chance to be compensated for.
+inline const std::vector<float>& coeffLut() {
+    static const std::vector<float> tbl = [] {
+        const int N = STOCH_JH_N;
+        std::vector<Vec3> rgb((size_t)N * N * N);
+        for (int i = 0; i < N; ++i)
+            for (int j = 0; j < N; ++j)
+                for (int k = 0; k < N; ++k) {
+                    // Undo the sqrt warp: the grid is uniform in sqrt(channel).
+                    const double r = (double)i / (N - 1), g = (double)j / (N - 1),
+                                 b = (double)k / (N - 1);
+                    rgb[((size_t)i * N + j) * N + k] = Vec3{r * r, g * g, b * b};
+                }
+        std::vector<std::array<double, 3>> c(rgb.size());
+        // A stop during this build leaves `c` partly written; the entries are
+        // value-initialised to {0,0,0} (mid grey), which is a harmless placeholder for
+        // a load that is being abandoned anyway.
+        (void)fitMany(rgb.data(), rgb.size(), c.data(), STOCH_JH_PMAX);
+        std::vector<float> out(rgb.size() * 3);
+        for (size_t i = 0; i < rgb.size(); ++i)
+            for (int k = 0; k < 3; ++k) out[i * 3 + k] = (float)c[i][k];
+        return out;
+    }();
+    return tbl;
 }
 
 // --- RGB -> illuminant (emission) spectrum upsampling ------------------------

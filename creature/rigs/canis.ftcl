@@ -1,0 +1,398 @@
+# canis -- a medium dog, ~25 kg, withers ~0.58 m.
+#
+# The point of this file is NOT the dog. It is that there is not a single hardcoded
+# dimension in the skeleton: every length, radius and attachment point below is written in
+# terms of a named morph parameter. That is what makes P4 (morphology-conditioned control)
+# and P6 (stylization) possible at all -- see design.md, "Why a layer above MJCF".
+#
+# Convention: z up, x forward, y left.  Segment poses are given as an angle from
+# straight-down, positive = the distal end swings FORWARD (+x). All joints read zero in
+# this pose, so the reference pose IS the standing pose, which is what makes the joint
+# ranges below readable.
+
+creature "canis" {
+    doc "Medium dog, torque-actuated. P0/P1 rig."
+    mass (M)
+
+    # ---------------------------------------------------------------- morphology vector
+    # Ranges are simultaneously: the domain-randomisation bounds during training, the
+    # policy's conditioning normalisation, and the artist's slider limits.
+    morph {
+        param body_scale     { default 1.0    range 0.55 1.70
+                               doc "whole-animal size; Chihuahua .. Great Dane" }
+
+        param trunk_len      { default 0.42m  range 0.26m 0.62m }
+        param trunk_radius   { default 0.105m range 0.070m 0.150m }
+        param neck_len       { default 0.20m  range 0.10m  0.36m }
+        param head_len       { default 0.20m  range 0.12m  0.30m }
+        param tail_len       { default 0.30m  range 0.02m  0.62m }
+
+        param femur_len      { default 0.185m range 0.115m 0.285m }
+        param tibia_len      { default 0.195m range 0.115m 0.300m }
+        param hmeta_len      { default 0.130m range 0.060m 0.230m
+                               doc "hind metatarsus -- the long 'backwards knee' segment" }
+
+        param scapula_len    { default 0.170m range 0.100m 0.265m }
+        param humerus_len    { default 0.160m range 0.095m 0.250m }
+        param radius_len     { default 0.175m range 0.100m 0.280m }
+        param fmeta_len      { default 0.100m range 0.045m 0.185m }
+        param paw_len        { default 0.070m range 0.035m 0.120m }
+
+        param limb_gracility { default 1.0    range 0.60 1.65
+                               doc "limb thickness; greyhound .. mastiff" }
+        param hip_width      { default 0.085m range 0.050m 0.145m }
+        param shoulder_width { default 0.075m range 0.045m 0.135m }
+        param body_mass      { default 21kg  range 3kg 78kg
+                               doc "mass at body_scale = 1; scaled isometrically below" }
+
+        # Posture. Stance angles are morphology too -- a crouched corgi and an upright
+        # sighthound differ here more than in bone length -- and they are the cheapest
+        # randomisation axis in the file.
+        param stance_femur   { default 30deg  range 12deg 46deg }
+        param stance_tibia   { default -40deg range -58deg -22deg }
+        param stance_hmeta   { default 18deg  range 4deg  34deg }
+        param stance_scapula { default 20deg  range 6deg  34deg }
+        param stance_humerus { default -35deg range -52deg -18deg }
+        param stance_radius  { default 8deg   range -6deg 22deg }
+        param stance_fmeta   { default -5deg  range -18deg 10deg }
+        param stance_paw     { default 75deg  range 62deg 86deg }
+    }
+
+    # ------------------------------------------------------------- derived measurements
+    derive {
+        s      = body_scale
+        g      = limb_gracility * body_scale        # radii scale with size AND build
+
+        # Isometric by default: doubling every length multiplies mass by eight. Setting
+        # body_mass away from its default is then the honest "heavier/lighter for the same
+        # frame" knob -- exactly the single-parameter change that a keyframe pipeline
+        # would have to re-animate from scratch.
+        M      = body_mass * s^3
+
+        L_trunk = trunk_len * s
+        R_trunk = trunk_radius * s
+        L_neck  = neck_len * s
+        L_head  = head_len * s
+        L_tail  = tail_len * s
+
+        L_femur = femur_len * s
+        L_tibia = tibia_len * s
+        L_hmeta = hmeta_len * s
+        L_scap  = scapula_len * s
+        L_hum   = humerus_len * s
+        L_rad   = radius_len * s
+        L_fmeta = fmeta_len * s
+        L_paw   = paw_len * s
+
+        W_hip   = hip_width * s
+        W_sho   = shoulder_width * s
+
+        # unit direction of each segment: (sin a, 0, -cos a)
+        d_femur_x = sin(stance_femur)     d_femur_z = -cos(stance_femur)
+        d_tibia_x = sin(stance_tibia)     d_tibia_z = -cos(stance_tibia)
+        d_hmeta_x = sin(stance_hmeta)     d_hmeta_z = -cos(stance_hmeta)
+        d_scap_x  = sin(stance_scapula)   d_scap_z  = -cos(stance_scapula)
+        d_hum_x   = sin(stance_humerus)   d_hum_z   = -cos(stance_humerus)
+        d_rad_x   = sin(stance_radius)    d_rad_z   = -cos(stance_radius)
+        d_fmeta_x = sin(stance_fmeta)     d_fmeta_z = -cos(stance_fmeta)
+        d_paw_x   = sin(stance_paw)       d_paw_z   = -cos(stance_paw)
+
+        # How far each limb reaches below its attachment point, in the standing pose.
+        # These are what keep the back level when any bone length is randomised -- without
+        # them, lengthening a tibia would tilt the whole animal.
+        hind_drop = L_femur * cos(stance_femur) + L_tibia * cos(stance_tibia)
+                  + L_hmeta * cos(stance_hmeta) + L_paw * cos(stance_paw)
+        fore_drop = L_scap * cos(stance_scapula) + L_hum * cos(stance_humerus)
+                  + L_rad * cos(stance_radius) + L_fmeta * cos(stance_fmeta)
+                  + L_paw * cos(stance_paw)
+
+        scap_z    = R_trunk * 0.8          # scapula rides high on the ribcage
+        pelvis_z  = hind_drop
+        thorax_z  = fore_drop - scap_z
+        back_rise = thorax_z - pelvis_z    # withers above croup, as in a real dog
+
+        R_femur = 0.028m * g   R_tibia = 0.024m * g   R_hmeta = 0.018m * g
+        R_scap  = 0.026m * g   R_hum   = 0.028m * g   R_rad   = 0.022m * g
+        R_fmeta = 0.017m * g   R_paw   = 0.022m * g
+        R_neck  = 0.055m * s
+    }
+
+    world {
+        gravity 0 0 -9.81
+        timestep 0.002
+        integrator implicitfast
+        ground yes
+    }
+
+    defaults {
+        # No joint_damping or joint_armature here, deliberately. Both are absolute units --
+        # N*m*s/rad and kg*m^2 -- so a single number is right for one body and wrong for
+        # every morph of it. The 0.008 kg*m^2 that used to sit here was 0.7% of this dog's
+        # spine inertia and 3790% of its paw inertia, in the *unmorphed* rig: the paw joints
+        # were 97.4% rotor and 2.6% animal. Damping comes from posture.damping_ratio and
+        # armature from joint_armature_ratio below, both of which are dimensionless and
+        # therefore survive being morphed.
+        joint_armature_ratio 0.1
+        geom_friction  0.9 0.005 0.0001
+        motor_gear     28
+        rgba 0.62 0.55 0.47 1
+    }
+
+    # ------------------------------------------------------------------- passive tone
+    # Ligaments, joint capsules and resting muscle tone -- what holds a standing dog up
+    # while it is asleep on its feet. Declared as a GOAL, not as gains: creaturelab/tune.py
+    # measures this body's actual static load and sizes each spring to meet it.
+    #
+    # Writing `stiffness 150` on the joints instead would pin the rig to one body. N*m/rad
+    # scales as mass * length^2, so every one of body_scale, body_mass, the bone lengths
+    # and the stance angles invalidates it -- and the failure is silent, because a
+    # mis-sprung model still loads and still simulates. This is the same argument that
+    # `mass (M)` makes for density, one layer up.
+    posture {
+        sag           4deg      # how far a joint may give under the standing load
+        tone_floor    0.12      # tone for the joints that carry nothing standing square:
+                                # a fraction of the subtree weight they would carry if
+                                # the animal leaned on them
+        buckle_margin 1.8       # a standing dog stacks stifle and shoulder near the line
+                                # of the ground reaction, so they hold almost no torque --
+                                # and would fold instantly if their springs were sized
+                                # from that torque. This sets them from the compressive
+                                # load instead. 1.0 is neutrally stable; give it headroom.
+        damping_ratio 0.55      # of critical. Near-critical settles fastest but also
+                                # fights the policy; slightly under keeps the limb live.
+        # No `max_stiffness` here on purpose. It reads like a harmless integrator guard,
+        # but a single N*m/rad number is body-specific in exactly the way this block
+        # exists to avoid: 4000 was slack for a 21 kg dog and binding for a 140 kg one, so
+        # it quietly under-sprung the large end of the morph range and let it fall over,
+        # while reporting a tidy round number. The real limit is numerical and per-joint,
+        # and `tune.stiffness_ceiling` derives it from the timestep and integrator that
+        # `world` already declares.
+    }
+
+    # -------------------------------------------------------------- proprioception
+    # What the policy is allowed to know, and how stale and how noisy it is. Declared
+    # here for the same reason `posture` is: these are properties of the *animal*, not of
+    # a training run, so they have to travel with the rig or a retrained policy silently
+    # gets a different body to control.
+    #
+    # `hub "head"` is the load-bearing line. A conduction delay is a distance over a
+    # velocity, so it needs a destination, and putting the destination at the head makes
+    # hind-limb afferents travel further than fore-limb ones -- the real asymmetry, and it
+    # falls out of the morph vector instead of being authored. Leaving this at its default
+    # (the pelvis, which is the root) would reverse it.
+    sensing {
+        hub "head"
+        conduction    60          # m/s, large myelinated afferent
+        central_delay 0.010       # s of processing that does not shrink with the animal
+        angle_noise   0.004       # of each joint's own range
+        rate_noise    0.02        # of the body's own rate scale
+        force_noise   0.03        # of body weight
+        vestibular_noise 0.01
+    }
+
+    # ------------------------------------------------------------------------- skeleton
+    skeleton {
+        root "pelvis"
+
+        bone "pelvis" {
+            origin 0 0 (pelvis_z)
+            geom capsule { from -0.06 0 0  to 0.06 0 0.01  radius (R_trunk*0.78) }
+        }
+
+        # One spine segment for now. Real spinal flexibility (and, for felids, the
+        # floating scapula) is P3 -- it is a large part of what makes a gait read as the
+        # right species, and it deserves more than a single hinge.
+        bone "spine" {
+            parent "pelvis"
+            origin (L_trunk*0.5) 0 (back_rise*0.5)
+            joint hinge { name "spine_pitch" axis 0 1 0  range -22deg 22deg }
+            joint hinge { name "spine_yaw"   axis 0 0 1  range -26deg 26deg }
+            geom capsule { from (-L_trunk*0.22) 0 0  to (L_trunk*0.22) 0 0
+                           radius (R_trunk*0.92) }
+        }
+
+        bone "thorax" {
+            parent "spine"
+            origin (L_trunk*0.5) 0 (back_rise*0.5)
+            geom capsule { from (-L_trunk*0.16) 0 0  to (L_trunk*0.16) 0 0.01
+                           radius (R_trunk) }
+        }
+
+        bone "neck" {
+            parent "thorax"
+            origin (L_trunk*0.20) 0 (R_trunk*0.55)
+            joint hinge { name "neck_pitch" axis 0 1 0  range -55deg 50deg }
+            joint hinge { name "neck_yaw"   axis 0 0 1  range -55deg 55deg }
+            geom capsule { from 0 0 0  to (L_neck*0.94) 0 (L_neck*0.34) radius (R_neck) }
+        }
+
+        bone "head" {
+            parent "neck"
+            origin (L_neck*0.94) 0 (L_neck*0.34)
+            joint hinge { name "head_pitch" axis 0 1 0  range -45deg 45deg }
+            geom ellipsoid { at (L_head*0.30) 0 0
+                             size (L_head*0.34) (L_head*0.24) (L_head*0.26) }
+            geom capsule { from (L_head*0.52) 0 -0.01  to (L_head*0.98) 0 -0.02
+                           radius (L_head*0.13) }
+        }
+
+        bone "tail1" {
+            parent "pelvis"
+            origin -0.07 0 (R_trunk*0.55)
+            joint hinge { name "tail1_pitch" axis 0 1 0 range -50deg 60deg }
+            joint hinge { name "tail1_yaw"   axis 0 0 1 range -55deg 55deg }
+            geom capsule { from 0 0 0  to (-L_tail*0.5) 0 (L_tail*0.12)
+                           radius (0.017m*g) }
+        }
+        bone "tail2" {
+            parent "tail1"
+            origin (-L_tail*0.5) 0 (L_tail*0.12)
+            joint hinge { name "tail2_pitch" axis 0 1 0 range -55deg 55deg }
+            joint hinge { name "tail2_yaw"   axis 0 0 1 range -55deg 55deg }
+            geom capsule { from 0 0 0  to (-L_tail*0.5) 0 (-L_tail*0.06)
+                           radius (0.012m*g) }
+        }
+
+        # ---------------------------------------------------------------- hind limb, left
+        bone "femur_l" {
+            parent "pelvis"
+            origin -0.02 (W_hip) 0
+            joint hinge { name "hip_l_abduct" axis 1 0 0  range -22deg 22deg }
+            joint hinge { name "hip_l_flex"   axis 0 1 0  range -55deg 75deg }
+            geom capsule { from 0 0 0  to (L_femur*d_femur_x) 0 (L_femur*d_femur_z)
+                           radius (R_femur) }
+        }
+        bone "tibia_l" {
+            parent "femur_l"
+            origin (L_femur*d_femur_x) 0 (L_femur*d_femur_z)
+            joint hinge { name "stifle_l" axis 0 1 0  range -85deg 8deg }
+            geom capsule { from 0 0 0  to (L_tibia*d_tibia_x) 0 (L_tibia*d_tibia_z)
+                           radius (R_tibia) }
+        }
+        bone "hmeta_l" {
+            parent "tibia_l"
+            origin (L_tibia*d_tibia_x) 0 (L_tibia*d_tibia_z)
+            joint hinge { name "hock_l" axis 0 1 0  range -14deg 78deg }
+            geom capsule { from 0 0 0  to (L_hmeta*d_hmeta_x) 0 (L_hmeta*d_hmeta_z)
+                           radius (R_hmeta) }
+        }
+        bone "hpaw_l" {
+            parent "hmeta_l"
+            origin (L_hmeta*d_hmeta_x) 0 (L_hmeta*d_hmeta_z)
+            joint hinge { name "hpaw_l_flex" axis 0 1 0  range -45deg 32deg }
+            geom capsule { from 0 0 0  to (L_paw*d_paw_x) 0 (L_paw*d_paw_z)
+                           radius (R_paw) }
+        }
+
+        # --------------------------------------------------------------- hind limb, right
+        bone "femur_r" {
+            parent "pelvis"
+            origin -0.02 (-W_hip) 0
+            joint hinge { name "hip_r_abduct" axis 1 0 0  range -22deg 22deg }
+            joint hinge { name "hip_r_flex"   axis 0 1 0  range -55deg 75deg }
+            geom capsule { from 0 0 0  to (L_femur*d_femur_x) 0 (L_femur*d_femur_z)
+                           radius (R_femur) }
+        }
+        bone "tibia_r" {
+            parent "femur_r"
+            origin (L_femur*d_femur_x) 0 (L_femur*d_femur_z)
+            joint hinge { name "stifle_r" axis 0 1 0  range -85deg 8deg }
+            geom capsule { from 0 0 0  to (L_tibia*d_tibia_x) 0 (L_tibia*d_tibia_z)
+                           radius (R_tibia) }
+        }
+        bone "hmeta_r" {
+            parent "tibia_r"
+            origin (L_tibia*d_tibia_x) 0 (L_tibia*d_tibia_z)
+            joint hinge { name "hock_r" axis 0 1 0  range -14deg 78deg }
+            geom capsule { from 0 0 0  to (L_hmeta*d_hmeta_x) 0 (L_hmeta*d_hmeta_z)
+                           radius (R_hmeta) }
+        }
+        bone "hpaw_r" {
+            parent "hmeta_r"
+            origin (L_hmeta*d_hmeta_x) 0 (L_hmeta*d_hmeta_z)
+            joint hinge { name "hpaw_r_flex" axis 0 1 0  range -45deg 32deg }
+            geom capsule { from 0 0 0  to (L_paw*d_paw_x) 0 (L_paw*d_paw_z)
+                           radius (R_paw) }
+        }
+
+        # ---------------------------------------------------------------- fore limb, left
+        # The scapula is hinged to the thorax here. In a real quadruped -- emphatically in
+        # felids -- it is not articulated to the axial skeleton at all; it floats in a
+        # muscular sling, and that float is a large part of what makes the gait read
+        # correctly. Replacing this hinge with the sling is a P3 item.
+        bone "scap_l" {
+            parent "thorax"
+            origin (L_trunk*0.13) (W_sho) (scap_z)
+            joint hinge { name "scap_l_swing" axis 0 1 0  range -28deg 28deg }
+            geom capsule { from 0 0 0  to (L_scap*d_scap_x) 0 (L_scap*d_scap_z)
+                           radius (R_scap) }
+        }
+        bone "hum_l" {
+            parent "scap_l"
+            origin (L_scap*d_scap_x) 0 (L_scap*d_scap_z)
+            joint hinge { name "shoulder_l_abduct" axis 1 0 0  range -18deg 18deg }
+            joint hinge { name "shoulder_l_flex"   axis 0 1 0  range -62deg 50deg }
+            geom capsule { from 0 0 0  to (L_hum*d_hum_x) 0 (L_hum*d_hum_z)
+                           radius (R_hum) }
+        }
+        bone "rad_l" {
+            parent "hum_l"
+            origin (L_hum*d_hum_x) 0 (L_hum*d_hum_z)
+            joint hinge { name "elbow_l" axis 0 1 0  range -8deg 88deg }
+            geom capsule { from 0 0 0  to (L_rad*d_rad_x) 0 (L_rad*d_rad_z)
+                           radius (R_rad) }
+        }
+        bone "fmeta_l" {
+            parent "rad_l"
+            origin (L_rad*d_rad_x) 0 (L_rad*d_rad_z)
+            joint hinge { name "carpus_l" axis 0 1 0  range -40deg 45deg }
+            geom capsule { from 0 0 0  to (L_fmeta*d_fmeta_x) 0 (L_fmeta*d_fmeta_z)
+                           radius (R_fmeta) }
+        }
+        bone "fpaw_l" {
+            parent "fmeta_l"
+            origin (L_fmeta*d_fmeta_x) 0 (L_fmeta*d_fmeta_z)
+            joint hinge { name "fpaw_l_flex" axis 0 1 0  range -45deg 32deg }
+            geom capsule { from 0 0 0  to (L_paw*d_paw_x) 0 (L_paw*d_paw_z)
+                           radius (R_paw) }
+        }
+
+        # --------------------------------------------------------------- fore limb, right
+        bone "scap_r" {
+            parent "thorax"
+            origin (L_trunk*0.13) (-W_sho) (scap_z)
+            joint hinge { name "scap_r_swing" axis 0 1 0  range -28deg 28deg }
+            geom capsule { from 0 0 0  to (L_scap*d_scap_x) 0 (L_scap*d_scap_z)
+                           radius (R_scap) }
+        }
+        bone "hum_r" {
+            parent "scap_r"
+            origin (L_scap*d_scap_x) 0 (L_scap*d_scap_z)
+            joint hinge { name "shoulder_r_abduct" axis 1 0 0  range -18deg 18deg }
+            joint hinge { name "shoulder_r_flex"   axis 0 1 0  range -62deg 50deg }
+            geom capsule { from 0 0 0  to (L_hum*d_hum_x) 0 (L_hum*d_hum_z)
+                           radius (R_hum) }
+        }
+        bone "rad_r" {
+            parent "hum_r"
+            origin (L_hum*d_hum_x) 0 (L_hum*d_hum_z)
+            joint hinge { name "elbow_r" axis 0 1 0  range -8deg 88deg }
+            geom capsule { from 0 0 0  to (L_rad*d_rad_x) 0 (L_rad*d_rad_z)
+                           radius (R_rad) }
+        }
+        bone "fmeta_r" {
+            parent "rad_r"
+            origin (L_rad*d_rad_x) 0 (L_rad*d_rad_z)
+            joint hinge { name "carpus_r" axis 0 1 0  range -40deg 45deg }
+            geom capsule { from 0 0 0  to (L_fmeta*d_fmeta_x) 0 (L_fmeta*d_fmeta_z)
+                           radius (R_fmeta) }
+        }
+        bone "fpaw_r" {
+            parent "fmeta_r"
+            origin (L_fmeta*d_fmeta_x) 0 (L_fmeta*d_fmeta_z)
+            joint hinge { name "fpaw_r_flex" axis 0 1 0  range -45deg 32deg }
+            geom capsule { from 0 0 0  to (L_paw*d_paw_x) 0 (L_paw*d_paw_z)
+                           radius (R_paw) }
+        }
+    }
+}

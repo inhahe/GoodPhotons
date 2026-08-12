@@ -53,37 +53,18 @@ __host__ __device__ inline DPatEnvT<TexT> dPatEnvNoneT() {
     return e;
 }
 
-// Deterministic integer-hash 3-D value noise; matches patHash3/patValueNoise so the GPU
-// and CPU produce the same noise field. Output in [0,1].
+// Deterministic integer-hash 3-D value noise. These used to be a hand-kept COPY of
+// pattern.h's patHash3/patValueNoise, with a comment promising the two matched; they are
+// now thin forwarders to the originals, which are `PATTERN_HD` (host+device) exactly like
+// patWorley/patGabor/povNoise already were. Bit-identity between the CPU and GPU noise
+// field is therefore structural rather than a promise two bodies have to keep — and it
+// has to be, because `fnoise` (O8) sums this same lattice octave by octave and would
+// amplify any drift by the octave count.
 __device__ static inline double dPatHash3(int ix, int iy, int iz) {
-    unsigned int h = (unsigned int)ix * 374761393u + (unsigned int)iy * 668265263u
-                   + (unsigned int)iz * 2147483647u;
-    h = (h ^ (h >> 13)) * 1274126177u;
-    h ^= (h >> 16);
-    return (double)h / 4294967295.0;
+    return patHash3(ix, iy, iz);
 }
 __device__ static inline double dPatValueNoise(double x, double y, double z) {
-    double fx = floor(x), fy = floor(y), fz = floor(z);
-    int ix = (int)fx, iy = (int)fy, iz = (int)fz;
-    double tx = x - fx, ty = y - fy, tz = z - fz;
-    double ux = tx * tx * (3.0 - 2.0 * tx);
-    double uy = ty * ty * (3.0 - 2.0 * ty);
-    double uz = tz * tz * (3.0 - 2.0 * tz);
-    double c000 = dPatHash3(ix,     iy,     iz);
-    double c100 = dPatHash3(ix + 1, iy,     iz);
-    double c010 = dPatHash3(ix,     iy + 1, iz);
-    double c110 = dPatHash3(ix + 1, iy + 1, iz);
-    double c001 = dPatHash3(ix,     iy,     iz + 1);
-    double c101 = dPatHash3(ix + 1, iy,     iz + 1);
-    double c011 = dPatHash3(ix,     iy + 1, iz + 1);
-    double c111 = dPatHash3(ix + 1, iy + 1, iz + 1);
-    double x00 = c000 + (c100 - c000) * ux;
-    double x10 = c010 + (c110 - c010) * ux;
-    double x01 = c001 + (c101 - c001) * ux;
-    double x11 = c011 + (c111 - c011) * ux;
-    double y0  = x00 + (x10 - x00) * uy;
-    double y1  = x01 + (x11 - x01) * uy;
-    return y0 + (y1 - y0) * uz;
+    return patValueNoise(x, y, z);
 }
 
 // Postfix scalar-stack evaluator (exact port of patternEval). PatNode/PatOp are the POD
@@ -96,7 +77,7 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
                                       double u, double v, double curv, double cavity,
-                                      const DPatEnvT<TexT>& env) {
+                                      double fw, const DPatEnvT<TexT>& env) {
     double st[64]; int sp = 0;
     double reg[PAT_CSE_REGS];   // CSE registers; StReg always precedes LdReg, so no init
     for (int i = 0; i < n; ++i) {
@@ -115,6 +96,7 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
             case PatOp::VarV:     st[sp++] = v;  break;
             case PatOp::VarCurv:  st[sp++] = curv; break; // mean curvature at the hit (O3); 0 wherever there is no surface (field/medium sites)
             case PatOp::VarCavity: st[sp++] = cavity; break; // hemispherical enclosure at the hit (O3 s2); 0 at field/medium sites, which have no surface
+            case PatOp::VarFootprint: st[sp++] = fw; break;  // shading footprint diameter (O8 s2); 0 = unknown = unfiltered, which is every site but a mode-W/raster primary hit
             case PatOp::VarT:     st[sp++] = 0.0; break;  // flyby timeline: never in scope on-device (camera_curve exprs are consumed at load)
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = fabs(st[sp-1]); break;
@@ -174,6 +156,18 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
                 double dz = st[--sp], dy = st[--sp], dx = st[--sp];
                 double ff = st[--sp], zz = st[--sp], yy = st[--sp];
                 st[sp-1] = patGabor(st[sp-1], yy, zz, ff, dx, dy, dz);
+                break;
+            }
+            case PatOp::BlueNoise: { // Poisson-disk placement: a = 0 F1 / 1 F2 / 2 F2-F1 / 3 id
+                double rr = st[--sp], zz = st[--sp], yy = st[--sp], b[3];
+                patBlueNoise(st[sp-1], yy, zz, rr, b);
+                int sel = (int)nd.a;
+                st[sp-1] = (sel == 3) ? b[2] : (sel == 2) ? (b[1] - b[0]) : b[sel];
+                break;
+            }
+            case PatOp::FNoise: {   // filtered (band-limited) fBm — the shared PATTERN_HD core
+                double oc = st[--sp], ww = st[--sp], zz = st[--sp], yy = st[--sp];
+                st[sp-1] = patFilteredNoise(st[sp-1], yy, zz, ww, oc);
                 break;
             }
             case PatOp::PovFn: {

@@ -165,6 +165,9 @@
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
 #include "denoise.h"            // -denoise: luma/chroma a-trous filter for MC speckle
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
+#include "fur_grid.h"           // -checkfurgrid / -dual-grid: voxel fiber density + orientation grid
+#include "fur_volume.h"         // -checkfurvol: aggregate fiber scattering (P2 stage 2)
+#include "hair.h"               // -checkhair: fiber BCSDF (Marschner lobes, Chiang form)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
                                // header also pulls it in, but CPU-only builds need it too
 #include "lattice_probe.h"     // -checklattice (N4a): the shared host/device probe layout.
@@ -1389,6 +1392,1047 @@ static int checkFur(long long strands) {
     }
 
     std::printf("[checkfur] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// FUR DENSITY GRID self-test  (-checkfurgrid; fur_grid.h, TODO §P2)
+// ---------------------------------------------------------------------------
+// `FurGrid` replaces "walk the strands" with "integrate a mean field", and the whole
+// construction rests on one identity that is easy to state and easy to get quietly wrong:
+//
+//     INT sigma_t(d) dt  ==  the EXPECTED NUMBER OF FIBERS the ray would have crossed.
+//
+// If that holds, dual scattering can read `n` and `<sin^2 theta>` off a DDA march instead
+// of a BVH traversal that cannot early-out. If it is off by a factor, every coat lit
+// through the grid is the wrong brightness and nothing in the renderer will say so — it
+// will just look like a shading bug. So section 4 checks it against the SHIPPING curve
+// intersector on a randomly generated fiber population, not against another closed form.
+//
+// The earlier sections isolate the pieces that identity is built from: mass conservation
+// (deposition loses nothing), the tensor's exactness on aligned tangents, its known and
+// bounded 4% over-estimate at isotropy, and the DDA covering exactly the ray's path.
+static int checkFurGrid() {
+    int fails = 0;
+    auto anyFiber = [](int) { return true; };
+
+    // ---- 1. mass conservation -------------------------------------------------------
+    // Deposition sub-samples each round cone and drops whole `r*dl` pieces into cells, so
+    // `sum over cells of c*V/2` must reproduce `sum over fibers of r*l` to float precision.
+    // Anything else means a piece landed outside the grid (bounds bug) or was double-added.
+    {
+        Pcg32 rng; rng.seed(1234, 1);
+        std::vector<CurveSeg> segs;
+        double analytic = 0.0;
+        for (int i = 0; i < 4000; ++i) {
+            CurveSeg s;
+            s.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
+            s.p1 = s.p0 + Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5) * 0.15;
+            s.r0 = 0.0004 + 0.0002 * rng.uniform();
+            s.r1 = 0.0004 + 0.0002 * rng.uniform();
+            segs.push_back(s);
+            // Deposition uses the midpoint radius of each sub-piece, which integrates the
+            // linear radius taper exactly, so the analytic mass is the trapezoid.
+            analytic += 0.5 * (s.r0 + s.r1) * length(s.p1 - s.p0);
+        }
+        FurGrid g; g.build(segs, anyFiber, 32 * 32 * 32);
+        double summed = 0.0;
+        for (const FurCell& fc : g.cells) summed += 0.5 * (double)fc.c * g.cellVol;
+        const double rel = std::fabs(summed - analytic) / std::max(1e-30, analytic);
+        const bool ok = g.valid && rel < 2e-5 && std::fabs(g.totalRL - analytic) / analytic < 2e-12;
+        if (!ok) ++fails;
+        std::printf("[checkfurgrid] 1. mass conservation: %dx%dx%d cells (%d occupied, %.1f KB), "
+                    "sum(c*V/2)=%.9g vs sum(r*l)=%.9g, rel %.2e -> %s\n",
+                    g.nx, g.ny, g.nz, g.occupied, g.bytes() / 1024.0,
+                    summed, analytic, rel, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 2. aligned tangents: the tensor is EXACT ------------------------------------
+    // When every strand in a cell shares a tangent, T is the rank-1 projector t*t^T and
+    // `d^T T d` is `(d.t)^2` with no approximation at all. Both the inclination the
+    // dual-scattering tables get looked up at and the sqrt(1-...) extinction factor are
+    // then exact, which is the case real (combed) fur sits nearest to.
+    {
+        const Vec3 t = normalize(Vec3(0.3, 0.9, -0.2));
+        Pcg32 rng; rng.seed(77, 1);
+        std::vector<CurveSeg> segs;
+        for (int i = 0; i < 3000; ++i) {
+            CurveSeg s;
+            s.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
+            s.p1 = s.p0 + t * 0.05;
+            s.r0 = s.r1 = 5e-4;
+            segs.push_back(s);
+        }
+        FurGrid g; g.build(segs, anyFiber, 16 * 16 * 16);
+        double worst = 0.0;
+        for (int k = 0; k < 64; ++k) {
+            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            const double want = dot(d, t) * dot(d, t);
+            for (const FurCell& fc : g.cells) {
+                if (fc.c <= 0.0f) continue;
+                worst = std::max(worst, std::fabs(FurGrid::furSin2(fc, d) - want));
+            }
+        }
+        const bool ok = worst < 1e-6;
+        if (!ok) ++fails;
+        std::printf("[checkfurgrid] 2. aligned tangents exact: worst |d'Td - (d.t)^2| over "
+                    "%d cells x 64 dirs = %.3e -> %s\n", g.occupied, worst, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 3. isotropic tangents: the KNOWN, BOUNDED over-estimate ---------------------
+    // The one approximation in the model is pulling the square root outside the sum. Its
+    // worst case is perfect orientation isotropy, where the grid reports sqrt(1 - 1/3) =
+    // 0.8165 against the true <sin theta> over the sphere = pi/4 = 0.7854: a 3.98%
+    // OVER-estimate of extinction. That number is worth pinning down as a test rather than
+    // a comment, because it is the error budget the whole far-tier LOD inherits, and
+    // because it being one-signed (grids never under-attenuate) is what makes it safe.
+    {
+        Pcg32 rng; rng.seed(4242, 1);
+        std::vector<CurveSeg> segs;
+        std::vector<Vec3> tangents;
+        for (int i = 0; i < 20000; ++i) {
+            const double z = 2.0 * rng.uniform() - 1.0, phi = 2.0 * PI * rng.uniform();
+            const double s = std::sqrt(std::max(0.0, 1.0 - z * z));
+            const Vec3 t(s * std::cos(phi), s * std::sin(phi), z);
+            CurveSeg cs;
+            cs.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
+            cs.p1 = cs.p0 + t * 0.02;
+            cs.r0 = cs.r1 = 5e-4;
+            segs.push_back(cs); tangents.push_back(t);
+        }
+        // One cell, so every tangent shares a tensor and the comparison is apples to apples.
+        FurGrid g; g.build(segs, anyFiber, 1);
+        double ratioSum = 0.0; int n = 0;
+        for (int k = 0; k < 32; ++k) {
+            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            double exact = 0.0;
+            for (const Vec3& t : tangents) {
+                const double c = dot(d, t);
+                exact += std::sqrt(std::max(0.0, 1.0 - c * c));
+            }
+            exact /= tangents.size();
+            double approx = 0.0; int cellsSeen = 0;
+            for (const FurCell& fc : g.cells) {
+                if (fc.c <= 0.0f) continue;
+                approx += std::sqrt(std::max(0.0, 1.0 - FurGrid::furSin2(fc, d))); ++cellsSeen;
+            }
+            if (!cellsSeen) continue;
+            approx /= cellsSeen;
+            ratioSum += approx / std::max(1e-12, exact); ++n;
+        }
+        const double ratio = n ? ratioSum / n : 0.0;
+        const double want  = std::sqrt(2.0 / 3.0) / (PI / 4.0);   // 1.03972...
+        const bool ok = n > 0 && std::fabs(ratio - want) < 0.01 && ratio > 1.0;
+        if (!ok) ++fails;
+        std::printf("[checkfurgrid] 3. isotropic over-estimate: grid/exact = %.4f "
+                    "(predicted sqrt(2/3)/(pi/4) = %.4f, i.e. +%.2f%%) -> %s\n",
+                    ratio, want, 100.0 * (want - 1.0), ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 4. THE IDENTITY: tau == expected crossings ----------------------------------
+    // The load-bearing one. Generate a random fiber population, then for each of many rays
+    // count the fibers ACTUALLY crossed with the shipping `intersectCurveSeg`, and compare
+    // the mean of those counts against the mean of the grid's tau. Two independent routes
+    // to the same number; if the mean-field derivation has a factor wrong, this is where it
+    // shows. (Per-ray they must differ — one is a Poisson draw and the other its mean —
+    // so the test is on the ENSEMBLE mean.)
+    //
+    // Two known biases have to be kept below the tolerance or they would mask a real error,
+    // and getting this wrong is instructive enough to write down:
+    //
+    //   * CAPS. `intersectCurveSeg` traces a round CONE — a cylinder plus two end balls —
+    //     whose silhouette is a stadium of area `2 r l sin(theta) + pi r^2`, while the model
+    //     is the cylinder term only. Dropping the caps is CORRECT for hair, because a strand
+    //     is a *chain* of round cones sharing end spheres, so every cap but the two at the
+    //     ends of the whole strand is interior and presents no cross-section. It is wrong
+    //     for a population of ISOLATED segments, where the cap term is `2r/l` of the total.
+    //     The first draft of this test used r=8e-4, l=0.03 — a 5.3% cap term — and read as a
+    //     4.7% model deficit that looked exactly like a bad factor. Fibers here are thin and
+    //     long (2r/l = 0.4%) so the term is negligible, which is also the real-fur regime.
+    //   * JENSEN (§3). The over-estimate from pulling the sqrt out of the sum only appears
+    //     once a cell holds many DIFFERENTLY-oriented tangents. On the fine grid it is
+    //     absent — a few deposits per cell, so T is very nearly rank-1 and the sqrt is exact
+    //     per cell — and that is what makes a tight tolerance meaningful here. The SAME
+    //     population is then re-gridded coarsely, where every cell sees hundreds of tangents
+    //     and §3's +4.0% must reappear. Getting both numbers from one population is the
+    //     point: it shows the bias is a RESOLUTION effect, not a modelling error.
+    //
+    // The geometry is arranged so nothing else can contaminate the coarse arm. Strand roots
+    // fill [0,1]^3 while the rays are confined to a narrow tube through the middle, because
+    // a coarse cell averages density over its whole width: if the rays only sampled the
+    // interior of a population whose density TAPERS at the edges, coarse cells straddling
+    // the taper would report a diluted density along exactly the paths being measured, and
+    // that dilution came out at -4% here — cancelling the +4% Jensen bias almost exactly and
+    // making a broken model look correct. Keeping the tube inside the flat region (|coord -
+    // 0.5| < 0.15 against a taper that only starts at 0.15 from each face) removes it.
+    // Longitudinally there is no such worry: every ray crosses the box completely, and a
+    // piecewise-constant field integrates to the true mass along a full crossing by §1.
+    {
+        Pcg32 rng; rng.seed(9001, 1);
+        std::vector<CurveSeg> segs;
+        const double segLen = 0.15;
+        for (int i = 0; i < 68000; ++i) {
+            const double z = 2.0 * rng.uniform() - 1.0, phi = 2.0 * PI * rng.uniform();
+            const double s = std::sqrt(std::max(0.0, 1.0 - z * z));
+            CurveSeg cs;
+            cs.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
+            cs.p1 = cs.p0 + Vec3(s * std::cos(phi), s * std::sin(phi), z) * segLen;
+            cs.r0 = cs.r1 = 3e-4;                          // 2r/l = 0.4%: caps negligible
+            segs.push_back(cs);
+        }
+        FurGrid fine;   fine.build(segs, anyFiber, 128 * 128 * 128);
+        FurGrid coarse; coarse.build(segs, anyFiber, 8 * 8 * 8);
+        const int NR = 5000;
+        double sumFine = 0.0, sumCoarse = 0.0, sumHits = 0.0;
+        for (int k = 0; k < NR; ++k) {
+            const Vec3 o(-1.0, 0.35 + 0.3 * rng.uniform(), 0.35 + 0.3 * rng.uniform());
+            const Vec3 tgt(2.0, 0.35 + 0.3 * rng.uniform(), 0.35 + 0.3 * rng.uniform());
+            const Vec3 d = normalize(tgt - o);
+            const double maxD = length(tgt - o);
+            sumFine   += fine.march(o, d, maxD).tau;
+            sumCoarse += coarse.march(o, d, maxD).tau;
+            const Ray r{o, d};
+            const CurveRay cr = makeCurveRay(d);
+            int hits = 0;
+            for (const CurveSeg& cs : segs) {
+                Hit h; h.t = maxD;
+                if (intersectCurveSeg(cr, r, cs, 1e-6, h, /*anyHit=*/true)) ++hits;
+            }
+            sumHits += hits;
+        }
+        const double mFine = sumFine / NR, mCoarse = sumCoarse / NR, mHit = sumHits / NR;
+        const double eFine = mFine / std::max(1e-12, mHit) - 1.0;
+        const double eCoarse = mCoarse / std::max(1e-12, mHit) - 1.0;
+        const double jensen = std::sqrt(2.0 / 3.0) / (PI / 4.0) - 1.0;   // 0.0397
+        // Tolerance is set by the brute-force count's own Poisson noise: the standard error
+        // of the mean is sqrt(mHit/NR), about 1% of mHit here, so 2.5% is ~2.5 sigma.
+        const bool ok = std::fabs(eFine) < 0.025 && std::fabs(eCoarse - jensen) < 0.025;
+        if (!ok) ++fails;
+        std::printf("[checkfurgrid] 4. tau == expected crossings: %d rays vs %zu-segment brute "
+                    "force (%.4f crossings/ray, +-%.2f%% s.e.); fine %dx%dx%d %.4f (%+.2f%%, want "
+                    "~0), coarse %dx%dx%d %.4f (%+.2f%%, want +%.2f%% Jensen) -> %s\n",
+                    NR, segs.size(), mHit, 100.0 * std::sqrt(mHit / NR) / std::max(1e-12, mHit),
+                    fine.nx, fine.ny, fine.nz, mFine, 100.0 * eFine,
+                    coarse.nx, coarse.ny, coarse.nz, mCoarse, 100.0 * eCoarse,
+                    100.0 * jensen, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 5. DDA covers the path exactly ---------------------------------------------
+    // The march must integrate sigma_t over exactly the ray's intersection with the grid —
+    // no cell skipped, none counted twice, none clipped at the wrong bound. Checked against
+    // a fine-step Riemann sum of the SAME field through `sigmaAt` point lookups: a
+    // deliberately stupid reference that shares no bookkeeping with the DDA, so agreement
+    // means the DDA's cell-by-cell accounting is right rather than that both are wrong the
+    // same way. Directions include the axis-aligned degenerate ones, where a component of
+    // `dir` is zero and the DDA has to take its `1e300` branch instead of dividing.
+    //
+    // (An earlier draft compared against `sigma_t * clipped length` on a "uniform" lattice
+    // instead. It failed by exactly 50%, and the DDA was innocent: the grid's AABB is
+    // radius-inflated, so the boundary cells hold less fiber mass than the interior ones and
+    // the field was never uniform in the first place. The reference was wrong, not the code
+    // — worth remembering before trusting a closed form over a brute-force one.)
+    {
+        std::vector<CurveSeg> segs;
+        for (int i = 0; i < 40; ++i)
+            for (int j = 0; j < 40; ++j) {
+                CurveSeg s;
+                s.p0 = Vec3(i / 40.0 + 0.0125, j / 40.0 + 0.0125, 0.0);
+                s.p1 = Vec3(i / 40.0 + 0.0125, j / 40.0 + 0.0125, 1.0);
+                s.r0 = s.r1 = 1e-3;
+                segs.push_back(s);
+            }
+        FurGrid g; g.build(segs, anyFiber, 20 * 20 * 20);
+        const Vec3 dirs[7] = {normalize(Vec3(1, 0, 0)), normalize(Vec3(0, 1, 0)),
+                              normalize(Vec3(0, 0, 1)), normalize(Vec3(1, 1, 0)),
+                              normalize(Vec3(1, 0.3, 0.7)), normalize(Vec3(-0.4, 1, -0.9)),
+                              normalize(Vec3(-1, -1, -1))};
+        double worst = 0.0; int checked = 0;
+        for (const Vec3& d : dirs) {
+            const Vec3 c = (g.lo + g.hi) * 0.5;
+            // Two offsets per direction: dead-centre, and shifted so the entry face is hit
+            // off-axis (a centred ray through an axis-aligned lattice is the easy case).
+            for (int off = 0; off < 2; ++off) {
+                Vec3 t, b; onb(d, t, b);
+                const Vec3 o = c - d * 4.0 + (off ? t * 0.137 + b * 0.041 : Vec3(0, 0, 0));
+                const FurMarch m = g.march(o, d, 8.0);
+                if (!m.hit) continue;
+                // Reference: fine-step midpoint rule over the same field.
+                const int NS = 400000;
+                const double h = 8.0 / NS;
+                double ref = 0.0;
+                for (int k = 0; k < NS; ++k) ref += g.sigmaAt(o + d * ((k + 0.5) * h), d) * h;
+                worst = std::max(worst, std::fabs(m.tau - ref) / std::max(1e-12, ref));
+                ++checked;
+            }
+        }
+        // Tolerance is the Riemann sum's own O(h) edge error, not the DDA's: the reference
+        // mis-resolves each cell boundary by up to half a step, and there are ~20 of them.
+        const bool ok = checked == 14 && worst < 2e-3;
+        if (!ok) ++fails;
+        std::printf("[checkfurgrid] 5. DDA path coverage: worst |tau - Riemann|/Riemann over "
+                    "%d rays = %.3e -> %s\n", checked, worst, ok ? "PASS" : "FAIL");
+    }
+
+    std::printf("[checkfurgrid] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// FUR AGGREGATE-SCATTERING self-test  (-checkfurvol; fur_volume.h, TODO §P2 stage 2)
+// ---------------------------------------------------------------------------
+// `fur_grid.h` says how much fiber is along a ray; `fur_volume.h` says what light does when
+// it meets that fiber. The second is where a volumetric fur LOD normally goes wrong,
+// because the usual failure is not a visible artefact — it is a phase function that quietly
+// loses or invents energy, or an orientation distribution that reproduces the mean but not
+// the shape, and either one reads as "the coat is the wrong colour" rather than as a bug.
+//
+// So the sections below pin the chain down link by link, in the order a photon walks it:
+// the eigen-decomposition that reads the cell (1), the Watson kernel the reconstruction is
+// built from (2), the reconstruction reproducing the cell's tensor EXACTLY (3), the virtual
+// fiber hit being a true inverse of the real one (4), the cross-section weighting agreeing
+// with the grid's own extinction to within the known Jensen bound (5), and finally the whole
+// aggregate collision conserving energy in a white furnace (6).
+static int checkFurVol() {
+    int fails = 0;
+
+    // ---- 1. symmetric eigendecomposition --------------------------------------------
+    // Everything downstream is expressed in T's eigenbasis, so an eigenbasis that is not
+    // orthonormal — the classic failure of the closed-form 3x3 solution when two eigenvalues
+    // coincide, which for fur is the COMMON case (an axially symmetric or isotropic cell) —
+    // would silently tilt every reconstructed tangent.
+    {
+        Pcg32 rng; rng.seed(9001, 1);
+        double worstRes = 0.0, worstOrth = 0.0, worstOrder = 0.0;
+        for (int trial = 0; trial < 500; ++trial) {
+            // Build a genuine second-moment matrix from a random tangent population, so the
+            // matrices under test are the ones the grid actually produces (PSD, unit trace).
+            double m[6] = {0, 0, 0, 0, 0, 0};
+            const int n = 40;
+            // A deliberately degenerate mix: a third of the trials are axially symmetric.
+            const bool axial = (trial % 3) == 0;
+            const Vec3 ax = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            for (int i = 0; i < n; ++i) {
+                Vec3 t;
+                if (axial) {
+                    Vec3 a, b; onb(ax, a, b);
+                    const double u = 2.0 * rng.uniform() - 1.0;
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u)), ph = 2.0 * PI * rng.uniform();
+                    t = normalize(ax * u + a * (r * std::cos(ph)) + b * (r * std::sin(ph)));
+                } else {
+                    t = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+                }
+                m[0] += t.x * t.x; m[1] += t.y * t.y; m[2] += t.z * t.z;
+                m[3] += t.x * t.y; m[4] += t.x * t.z; m[5] += t.y * t.z;
+            }
+            for (int k = 0; k < 6; ++k) m[k] /= n;
+            Vec3 e[3]; double lam[3];
+            furvol::symEigen3(m, e, lam);
+            const double M[3][3] = {{m[0], m[3], m[4]}, {m[3], m[1], m[5]}, {m[4], m[5], m[2]}};
+            for (int i = 0; i < 3; ++i) {
+                const Vec3 v = e[i];
+                const Vec3 Mv{M[0][0] * v.x + M[0][1] * v.y + M[0][2] * v.z,
+                              M[1][0] * v.x + M[1][1] * v.y + M[1][2] * v.z,
+                              M[2][0] * v.x + M[2][1] * v.y + M[2][2] * v.z};
+                worstRes = std::max(worstRes, length(Mv - v * lam[i]));
+                for (int j = 0; j < 3; ++j)
+                    worstOrth = std::max(worstOrth,
+                                         std::fabs(dot(e[i], e[j]) - (i == j ? 1.0 : 0.0)));
+            }
+            worstOrder = std::max(worstOrder, std::max(lam[1] - lam[0], lam[2] - lam[1]));
+        }
+        const bool ok = worstRes < 1e-12 && worstOrth < 1e-12 && worstOrder <= 0.0;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 1. eigen: worst |Mv-lv| %.2e, worst orthonormality %.2e, "
+                    "descending %s -> %s\n",
+                    worstRes, worstOrth, worstOrder <= 0.0 ? "yes" : "NO",
+                    ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 2. the Bingham table inverts its own moment map ------------------------------
+    // Everything downstream assumes `bingham().lookup(tau)` returns concentrations whose
+    // distribution really has second moment `tau`. Four things sit between those: a scaled-
+    // Bessel azimuthal reduction, a Simpson quadrature on a sinh-warped grid, a damped Newton
+    // inversion, and bilinear interpolation between grid nodes. This checks the composition
+    // at OFF-NODE points (on-node it would only be re-testing Newton's own convergence), by
+    // feeding the looked-up concentrations back through the forward integral. It sweeps the
+    // whole eigenvalue triangle, so the parallel, girdle and isotropic corners are all
+    // covered along with everything between them.
+    {
+        double worst = 0.0, worstTau[3] = {0, 0, 0};
+        const int M = 17;
+        for (int j = 0; j < M; ++j)
+            for (int i = 0; i < M; ++i) {
+                // Half-cell offsets put every sample between grid nodes.
+                const double Ap = (i + 0.5) / M, Bp = (j + 0.5) / M;
+                double tau[3]; furvol::BinghamTable::tauAt(Ap, Bp, tau);
+                double b[3];   furvol::bingham().lookup(tau, b);
+                double m[3];   furvol::BinghamTable::moments(b[0], b[1], m);
+                double e = 0.0;
+                for (int k = 0; k < 3; ++k) e = std::max(e, std::fabs(m[k] - tau[k]));
+                if (e > worst) { worst = e; for (int k = 0; k < 3; ++k) worstTau[k] = tau[k]; }
+            }
+        const bool ok = worst < 4e-3;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 2. Bingham table: worst |moment(lookup(tau)) - tau| over %d "
+                    "off-node points = %.2e (at tau=(%.3f %.3f %.3f)) -> %s\n",
+                    M * M, worst, worstTau[0], worstTau[1], worstTau[2], ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 3. the reconstructed ODF reproduces the cell's tensor EXACTLY ----------------
+    // This is the property the model was designed around: the phase function and the
+    // extinction are read off the same T, so if the ODF's own second moment drifted from T
+    // the two halves of the medium would disagree and a coat would scatter as if it were
+    // denser (or thinner) than it attenuates. Five populations are used, chosen to sit at
+    // the corners of the space: parallel (T rank-1), isotropic, a girdle (the case the
+    // two-lobe reconstruction handles WORST, kept in deliberately), a random mixture, and a
+    // 75/25 SIGN SPLIT along one axis, which has exactly the same rank-1 T as `parallel` and
+    // exists only to exercise the first moment.
+    //
+    // The first moment is checked here too, but only where the rule is EXACT. `orient` points
+    // a sampled axis along the cell's mean tangent with probability `(1 + |v|)/2`, which
+    // reproduces E[t] exactly for a population that is two opposed deltas (`parallel`,
+    // `signed`) and approximately otherwise: for a spread population E[t] also picks up the
+    // Watson lobe's own E[|u|], which is not |v|. Asserting exactness where it does not hold
+    // would be asserting a coincidence, so the other three only REPORT the recovered
+    // coherence — the quantity that actually drives the sign choice.
+    {
+        struct Pop { const char* name; int kind; bool signExact; };
+        const Pop pops[5] = {{"parallel", 0, true},  {"isotropic", 1, false}, {"girdle", 2, false},
+                             {"random", 3, false},   {"signed 75", 4, true}};
+        double worst = 0.0; const char* worstName = "";
+        double worstFirst = 0.0; const char* worstFirstName = "";
+        for (const Pop& p : pops) {
+            Pcg32 rng; rng.seed(505 + p.kind, 1);
+            const Vec3 ax = normalize(Vec3(0.3, -0.8, 0.5));
+            Vec3 pa, pb; onb(ax, pa, pb);
+            double m[6] = {0, 0, 0, 0, 0, 0};
+            Vec3 mv{0, 0, 0};
+            const int n = 20000;
+            for (int i = 0; i < n; ++i) {
+                Vec3 t;
+                const double ph = 2.0 * PI * rng.uniform();
+                if (p.kind == 0) t = ax;
+                else if (p.kind == 1) {
+                    const double u = 2.0 * rng.uniform() - 1.0;
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                } else if (p.kind == 2) {
+                    t = pa * std::cos(ph) + pb * std::sin(ph);          // uniform in a plane
+                } else if (p.kind == 3) {
+                    const double u = 0.6 + 0.4 * rng.uniform();          // a combed clump
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                } else {
+                    t = (i % 4 == 0) ? ax * -1.0 : ax;                   // 75% one way
+                }
+                mv = mv + t;
+                m[0] += t.x * t.x; m[1] += t.y * t.y; m[2] += t.z * t.z;
+                m[3] += t.x * t.y; m[4] += t.x * t.z; m[5] += t.y * t.z;
+            }
+            for (int k = 0; k < 6; ++k) m[k] /= n;
+            mv = mv * (1.0 / n);
+            FurCell fc;
+            fc.c = 1.0f;
+            fc.txx = (float)m[0]; fc.tyy = (float)m[1];
+            fc.txy = (float)m[3]; fc.txz = (float)m[4]; fc.tyz = (float)m[5];
+            fc.mdir = furPackMean(mv, std::min(1.0, length(mv)));
+            const furvol::FurODF odf = furvol::FurODF::fromCell(fc);
+            double q[6] = {0, 0, 0, 0, 0, 0};
+            Vec3 qv{0, 0, 0};
+            const int N = 400000;
+            for (int i = 0; i < N; ++i) {
+                const Vec3 t = odf.sample(rng);
+                qv = qv + t;
+                q[0] += t.x * t.x; q[1] += t.y * t.y; q[2] += t.z * t.z;
+                q[3] += t.x * t.y; q[4] += t.x * t.z; q[5] += t.y * t.z;
+            }
+            double e = 0.0;
+            for (int k = 0; k < 6; ++k) e = std::max(e, std::fabs(q[k] / N - m[k]));
+            if (e > worst) { worst = e; worstName = p.name; }
+            qv = qv * (1.0 / N);
+            const double fe = length(qv - mv);
+            if (p.signExact && fe > worstFirst) { worstFirst = fe; worstFirstName = p.name; }
+            std::printf("[checkfurvol]    %-10s tau=(%.3f %.3f %.3f) b=(%.1f %.1f) coh=%.3f "
+                        "T err %.2e  E[t] err %.2e%s\n",
+                        p.name, odf.tau[0], odf.tau[1], odf.tau[2], odf.b[0], odf.b[1],
+                        furMeanCoherence(fc.mdir), e, fe, p.signExact ? " (asserted)" : "");
+        }
+        const bool ok = worst < 4e-3 && worstFirst < 4e-3;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 3. ODF second moment == T: worst component error %.2e (%s); "
+                    "first moment where exact %.2e (%s); 4e5 draws -> %s\n",
+                    worst, worstName, worstFirst, worstFirstName, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 4. the virtual fiber hit inverts the real one -------------------------------
+    // In a volume there is no surface to measure the impact parameter from, so h is drawn
+    // and the normal that WOULD have produced it is reconstructed. If that reconstruction
+    // were off by a sign or a rotation the BCSDF would be evaluated at the wrong h, which
+    // shifts the TRT caustic and the whole azimuthal structure without ever producing a NaN
+    // or an obviously wrong picture. Round-tripping through the shipping `hair::hFromHit`
+    // is the sharpest possible statement of "these two paths agree".
+    {
+        Pcg32 rng; rng.seed(606, 1);
+        double worst = 0.0;
+        for (int i = 0; i < 200000; ++i) {
+            const Vec3 t  = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            const Vec3 wo = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            if (std::fabs(dot(t, wo)) > 0.999) continue;      // end-on: h is undefined, not wrong
+            const double h = 2.0 * rng.uniform() - 1.0;
+            const Vec3 n = furvol::fiberNormalFor(t, wo, h);
+            worst = std::max(worst, std::fabs(hair::hFromHit(n, t, wo) - h));
+        }
+        const bool ok = worst < 1e-9;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 4. virtual hit: worst |hFromHit(fiberNormalFor(h)) - h| over "
+                    "2e5 draws = %.2e -> %s\n", worst, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 5. cross-section weighting agrees with the grid's extinction -----------------
+    // The sampler draws tangents by rejecting with probability sin(angle(d,t)), so its
+    // ACCEPTANCE RATE is the exact <sin theta> of the cell — the very quantity `FurGrid`
+    // approximates by pulling the root outside the sum. Comparing the two closes the loop
+    // between the two files: the ratio must be 1 for a parallel cell (nothing to approximate)
+    // and 1.0398 at isotropy (the known, one-signed Jensen bound), and it must never exceed
+    // that, because "the grid never under-attenuates" is what makes the bias safe to ship.
+    {
+        Pcg32 rng; rng.seed(707, 1);
+        double worstRatio = 0.0, parallelRatio = 1.0, isoRatio = 1.0;
+        for (int kind = 0; kind < 3; ++kind) {
+            const Vec3 ax = normalize(Vec3(0.2, 0.9, -0.35));
+            Vec3 pa, pb; onb(ax, pa, pb);
+            double m[6] = {0, 0, 0, 0, 0, 0};
+            const int n = 20000;
+            for (int i = 0; i < n; ++i) {
+                Vec3 t; const double ph = 2.0 * PI * rng.uniform();
+                if (kind == 0) t = ax;
+                else if (kind == 1) {
+                    const double u = 2.0 * rng.uniform() - 1.0;
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                } else {
+                    const double u = 0.75 + 0.25 * rng.uniform();
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                }
+                m[0] += t.x * t.x; m[1] += t.y * t.y; m[2] += t.z * t.z;
+                m[3] += t.x * t.y; m[4] += t.x * t.z; m[5] += t.y * t.z;
+            }
+            for (int k = 0; k < 6; ++k) m[k] /= n;
+            FurCell fc; fc.c = 1.0f;
+            fc.txx = (float)m[0]; fc.tyy = (float)m[1];
+            fc.txy = (float)m[3]; fc.txz = (float)m[4]; fc.tyz = (float)m[5];
+            const furvol::FurODF odf = furvol::FurODF::fromCell(fc);
+            // Average over directions so the number is a property of the cell, not of one ray.
+            double sumTrue = 0.0, sumGrid = 0.0;
+            const int NDIR = 24, NT = 20000;
+            for (int d = 0; d < NDIR; ++d) {
+                const Vec3 dir = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                                rng.uniform() - 0.5));
+                double acc = 0.0;
+                for (int i = 0; i < NT; ++i) {
+                    const Vec3 t = odf.sample(rng);
+                    const double c = dot(t, dir);
+                    acc += std::sqrt(std::max(0.0, 1.0 - c * c));
+                }
+                sumTrue += acc / NT;
+                sumGrid += FurGrid::sigmaT(fc, dir);
+            }
+            const double ratio = sumGrid / std::max(1e-30, sumTrue);
+            if (kind == 0) parallelRatio = ratio;
+            if (kind == 1) isoRatio = ratio;
+            worstRatio = std::max(worstRatio, ratio);
+        }
+        const bool ok = std::fabs(parallelRatio - 1.0) < 3e-3 &&
+                        std::fabs(isoRatio - 1.0398) < 6e-3 && worstRatio < 1.0398 + 6e-3;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 5. Jensen bound: grid sigma_t / sampled <sin> = %.4f parallel, "
+                    "%.4f isotropic (bound 1.0398), worst %.4f -> %s\n",
+                    parallelRatio, isoRatio, worstRatio, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 6. the aggregate phase function vs the fiber population it stands for --------
+    // This is the section that decides whether the far tier is worth having, because it
+    // measures the ONE thing the reconstruction can still get wrong after sections 1-5: the
+    // SHAPE of the orientation distribution. A cell's true directional source is
+    //
+    //     S_true(d -> wi) = (1/V) SUM_i 2 r_i l_i sin(theta_i) * E_h[ f_i * |cos| ]
+    //
+    // and the aggregate replaces the sum over strands with `sigma_t(d)` times an expectation
+    // over the reconstructed ODF. Their difference factors into exactly two pieces: the
+    // Jensen factor (section 5, bounded at 1.0398, divided out here) and the SHAPE error,
+    // which is 0 if and only if the reconstruction stands in for the population properly.
+    // Section 3 only pinned the second MOMENT; this pins the function that moment has to
+    // stand in for.
+    //
+    // THE METRIC IS L1 OVER THE WHOLE OUTGOING SPHERE, not a worst-case pointwise ratio. An
+    // earlier draft took the worst ratio over three random `wi`, and reported 3.59 for a
+    // combed clump — an alarming number that meant almost nothing, because it was picked up
+    // in a direction the tight true lobe cannot reach at all and where BOTH functions are
+    // near zero. What a path tracer actually sees is the integral, so the error that matters
+    // is `sum|S_agg - S_true| / sum S_true` over a Fibonacci sphere of outgoing directions:
+    // a genuine "what fraction of the scattered energy goes to the wrong place". `energy`
+    // (the ratio of the two sums) is reported alongside it as the part that survives even a
+    // perfectly diffuse mis-shaping.
+    //
+    // NOTE ON THE TEST THAT IS *NOT* HERE. The obvious check — sample the BCSDF at a virtual
+    // hit and average `f * |cos| / pdf`, expecting the white-furnace 1 — is VACUOUS in this
+    // model, and the first draft of this section shipped it. `apPdf` normalises the very
+    // `A_p` that `f` sums, so the ratio is identically `SUM_p A_p` for every sample, every
+    // direction and every frame: it returns exactly 1.0 (dev 0.00e+00) whether or not the
+    // tangent, the normal or the frame are right. That is a useful FACT — it means an
+    // aggregate collision's throughput multiplier is the fiber's albedo with no variance at
+    // all — but it is not a test, and a green line that cannot fail is worse than no line.
+    {
+        struct Pop { const char* name; int kind; double tol; };
+        const Pop pops[4] = {{"parallel", 0, 0.02}, {"combed", 1, 0.12},
+                             {"isotropic", 2, 0.06}, {"girdle", 3, 0.05}};
+        hair::Params pr;
+        pr.betaM = 0.3; pr.betaN = 0.3; pr.alpha = 2.0;
+        const double sigmaA = 0.2;
+        const int NF = 2000;     // explicit strands making up the truth
+        const int NA = 4000;     // ODF draws standing in for them
+        const int MH = 12;       // h quadrature nodes (deterministic: E_h is a smooth 1-D integral)
+        const int NW = 24;       // outgoing directions, Fibonacci-spaced over the whole sphere
+        std::vector<Vec3> wis((size_t)NW);
+        for (int k = 0; k < NW; ++k) {
+            const double z  = 1.0 - 2.0 * (k + 0.5) / NW;
+            const double r  = std::sqrt(std::max(0.0, 1.0 - z * z));
+            const double ph = 2.0 * PI * (k * 0.6180339887498949);
+            wis[(size_t)k] = Vec3(r * std::cos(ph), r * std::sin(ph), z);
+        }
+        bool allOk = true;
+        for (const Pop& p : pops) {
+            Pcg32 rng; rng.seed(880 + p.kind, 1);
+            const Vec3 ax = normalize(Vec3(0.15, 0.95, -0.27));
+            Vec3 pa, pb; onb(ax, pa, pb);
+            std::vector<Vec3> pop((size_t)NF);
+            double m[6] = {0, 0, 0, 0, 0, 0};
+            Vec3 mv{0, 0, 0};
+            for (int i = 0; i < NF; ++i) {
+                Vec3 t; const double ph = 2.0 * PI * rng.uniform();
+                if (p.kind == 0) t = ax;
+                else if (p.kind == 1) {
+                    const double u = 0.85 + 0.15 * rng.uniform();       // a combed clump
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                } else if (p.kind == 2) {
+                    const double u = 2.0 * rng.uniform() - 1.0;
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                } else {
+                    t = pa * std::cos(ph) + pb * std::sin(ph);
+                }
+                pop[(size_t)i] = t;
+                mv = mv + t;
+                m[0] += t.x * t.x; m[1] += t.y * t.y; m[2] += t.z * t.z;
+                m[3] += t.x * t.y; m[4] += t.x * t.z; m[5] += t.y * t.z;
+            }
+            for (int k = 0; k < 6; ++k) m[k] /= NF;
+            mv = mv * (1.0 / NF);
+            FurCell fc; fc.c = 1.0f;
+            fc.txx = (float)m[0]; fc.tyy = (float)m[1];
+            fc.txy = (float)m[3]; fc.txz = (float)m[4]; fc.tyz = (float)m[5];
+            fc.mdir = furPackMean(mv, std::min(1.0, length(mv)));
+            const furvol::FurODF odf = furvol::FurODF::fromCell(fc);
+
+            // One strand's contribution to every outgoing direction at once: the Bcsdf and the
+            // frame depend only on (t, wo, h), so they are built MH times, not MH*NW times.
+            auto addFiber = [&](const Vec3& t, const Vec3& wo, double wSin, double* out) {
+                for (int q = 0; q < MH; ++q) {
+                    const double h = 2.0 * (q + 0.5) / MH - 1.0;
+                    const hair::Bcsdf b = hair::make(pr, h, sigmaA);
+                    const hair::Frame fr = hair::frameFromHit(furvol::fiberNormalFor(t, wo, h), t);
+                    const Vec3 woL = hair::toLocal(fr, wo);
+                    for (int k = 0; k < NW; ++k) {
+                        const Vec3 wiL = hair::toLocal(fr, wis[(size_t)k]);
+                        const double cosLong =
+                            hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wiL.x, -1.0, 1.0)));
+                        out[k] += wSin * hair::f(b, woL, wiL) * cosLong;
+                    }
+                }
+            };
+
+            double worstShape = 0.0, worstEnergy = 0.0;
+            for (int pass = 0; pass < 3; ++pass) {
+                const Vec3 d  = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                               rng.uniform() - 0.5));
+                const Vec3 wo = d * -1.0;                        // arrival direction, reversed
+                std::vector<double> truth((size_t)NW, 0.0), agg((size_t)NW, 0.0);
+                for (int i = 0; i < NF; ++i) {
+                    const double c = dot(pop[(size_t)i], d);
+                    addFiber(pop[(size_t)i], wo, std::sqrt(std::max(0.0, 1.0 - c * c)),
+                             truth.data());
+                }
+                // The aggregate side is quasi-random in the two dimensions that shape the
+                // lobe (|u| and azimuth), so what this measures is the model's error and not
+                // the sampler's: a plain pseudo-random draw needed ~10x the samples to get
+                // the same digit.
+                auto halton = [](int n, int base) {
+                    double f = 1.0 / base, r = 0.0;
+                    while (n > 0) { r += f * (n % base); n /= base; f /= base; }
+                    return r;
+                };
+                double sn = 0.0;
+                for (int j = 0; j < NA; ++j) {
+                    const double uq[6] = {halton(j + 1, 2), halton(j + 1, 3), halton(j + 1, 5),
+                                          halton(j + 1, 7), halton(j + 1, 11), rng.uniform()};
+                    const Vec3 t = odf.sample(uq, rng);
+                    const double c = dot(t, d);
+                    const double s = std::sqrt(std::max(0.0, 1.0 - c * c));
+                    addFiber(t, wo, s, agg.data());
+                    sn += s;
+                }
+                sn /= NA;
+                // The Jensen factor is section 5's business, so divide it out and leave only
+                // the shape error: scale the aggregate by sigma_t/(c*<sin>) and compare.
+                const double jensen = FurGrid::sigmaT(fc, d) / std::max(1e-30, sn);
+                const double kT = 1.0 / NF, kA = jensen / NA;
+                double sumT = 0.0, sumA = 0.0, l1 = 0.0;
+                for (int k = 0; k < NW; ++k) {
+                    const double a = agg[(size_t)k] * kA, b = truth[(size_t)k] * kT;
+                    sumA += a; sumT += b; l1 += std::fabs(a - b);
+                }
+                worstShape  = std::max(worstShape, l1 / std::max(1e-30, sumT));
+                worstEnergy = std::max(worstEnergy,
+                                       std::fabs(sumA / std::max(1e-30, sumT) - 1.0));
+            }
+            const bool ok = worstShape < p.tol;
+            if (!ok) allOk = false;
+            std::printf("[checkfurvol]    %-10s L1 shape error %.4f (tol %.2f), energy off by "
+                        "%.4f%s\n", p.name, worstShape, p.tol, worstEnergy, ok ? "" : "  <-- FAIL");
+        }
+        if (!allOk) ++fails;
+        // The tolerances are set just above the measured Bingham numbers (0.006 / 0.080 /
+        // 0.040 / 0.023), not at some round "close enough" figure, because their whole job is
+        // to catch a REGRESSION in the ODF family. The two families tried before this one
+        // would each fail two of these four lines: a Watson mixture turns the girdle into two
+        // orthogonal lobes (0.43) and the ACG's polynomial tails smear the combed clump
+        // (0.26). See the table at the head of fur_volume.h. What is left is not a modelling
+        // defect but the honest residual of standing in for N strands with one smooth ODF —
+        // `parallel` is nonzero only because BMAX caps the concentration short of a delta.
+        std::printf("[checkfurvol] 6. aggregate phase vs the real population -> %s\n",
+                    allOk ? "PASS" : "FAIL");
+    }
+
+    // A coat-like field for the two medium sections: a slab of clumped, mostly-combed
+    // strands, which is the geometry the far tier will actually be asked to march.
+    FurGrid coat;
+    {
+        Pcg32 rng; rng.seed(31337, 5);
+        std::vector<CurveSeg> segs;
+        for (int c = 0; c < 900; ++c) {
+            const Vec3 root(rng.uniform(), 0.02 * rng.uniform(), rng.uniform());
+            const Vec3 comb = normalize(Vec3(0.25 + 0.1 * rng.uniform(), 1.0, 0.1 * rng.uniform()));
+            Vec3 p = root;
+            for (int k = 0; k < 8; ++k) {
+                CurveSeg s;
+                s.p0 = p;
+                const Vec3 jit(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5);
+                p = p + (comb + jit * 0.35) * 0.03;
+                s.p1 = p;
+                s.r0 = 0.0006; s.r1 = 0.0005;
+                segs.push_back(s);
+            }
+        }
+        coat.build(segs, [](int) { return true; }, 48 * 48 * 48);
+    }
+    furvol::FurVolume vol;
+    vol.build(coat, [](size_t n, auto&& f) {
+        for (size_t i = 0; i < n; ++i) f(i);       // serial: the test wants determinism
+        return true;
+    });
+
+    // ---- 7. the per-cell ODF cache is the ODF ----------------------------------------
+    // `FurVolume` exists because `FurODF::fromCell` is far too expensive to run per
+    // collision, so what it stores has to BE what that call would have produced. The two
+    // eigenvectors survive as 16:16 octahedral directions and the concentrations as halves,
+    // and the question is whether that quantisation is invisible where it matters.
+    //
+    // It is not enough to compare the stored numbers: b is ~3000 in a combed cell, where a
+    // half's spacing is 2, and the eigenvectors of a nearly-isotropic cell are arbitrary
+    // (any orthonormal frame diagonalises a multiple of I). BOTH of those are harmless, and
+    // a component-wise check would fail on both. So what is compared is the thing that
+    // actually gets used: the SECOND MOMENT of the reconstructed distribution, which is
+    // basis-free, saturates exactly where the half loses precision, and is the one quantity
+    // the whole file is built to preserve.
+    {
+        Pcg32 rng; rng.seed(4242, 7);
+        double worstT = 0.0, worstBk = 0.0;
+        int checked = 0;
+        for (size_t ci = 0; ci < coat.cells.size(); ++ci) {
+            if (!(coat.cells[ci].c > 0.0f)) continue;
+            if ((ci % 37) != 0) continue;                  // a spread sample, not all 30k
+            ++checked;
+            const furvol::FurODF ref = furvol::FurODF::fromCell(coat.cells[ci]);
+            const furvol::FurODF got = vol.odfAt(ci);
+            // Kent's bk is STORED as a half and refined by three Newton steps at decode. The
+            // check that matters is not that it matches the uncached bk — it cannot, because
+            // the decoded `b` it is a root for is itself a half and so is a slightly different
+            // number — but that the refine lands on the true root OF THE DECODED lam. If it
+            // did not, `invM` would stop being an upper bound and the rejection sampler would
+            // quietly become biased rather than merely inefficient. So: recompute bk cold, by
+            // bisection, from the same decoded lam, and demand machine precision.
+            {
+                const double bkCold = furvol::FurODF::kentBk(got.lam);
+                const double mCold  = std::exp(-(3.0 - bkCold) * 0.5) * std::pow(3.0 / bkCold, 1.5);
+                worstBk = std::max(worstBk, std::fabs(got.invM * mCold - 1.0));
+            }
+            double mr[6] = {0, 0, 0, 0, 0, 0}, mg[6] = {0, 0, 0, 0, 0, 0};
+            const int NS = 3000;
+            for (int s = 0; s < NS; ++s) {
+                const Vec3 a = ref.sample(rng), b = got.sample(rng);
+                const double* av = &a.x; const double* bv = &b.x;
+                for (int i = 0, k = 0; i < 3; ++i)
+                    for (int j = i; j < 3; ++j, ++k) { mr[k] += av[i] * av[j]; mg[k] += bv[i] * bv[j]; }
+            }
+            for (int k = 0; k < 6; ++k)
+                worstT = std::max(worstT, std::fabs(mr[k] - mg[k]) / NS);
+        }
+        // 3000 draws put the Monte Carlo noise floor at ~1e-2 per component, so this is a
+        // check that the cache is not GROSSLY wrong; §8 and the render are what pin it.
+        const bool ok = checked > 100 && worstT < 3e-2 && worstBk < 1e-12;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 7. ODF cache (%.1f KB over %d cells, %d sampled): worst second-"
+                    "moment drift %.2e, worst |1/M - 1/M_exact| %.2e -> %s\n",
+                    vol.bytes() / 1024.0, coat.occupied, checked, worstT, worstBk,
+                    ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 8. free flight is EXACT, not delta-tracked -----------------------------------
+    // `sigma_t(d)` is piecewise constant along a fixed ray, so the collision distance can be
+    // drawn by inverting the optical depth inside the DDA instead of by delta tracking
+    // against a majorant. The claim that makes is falsifiable: the probability of reaching
+    // distance L without colliding must be exactly `exp(-tau(L))`, with `tau` the very
+    // quantity `FurGrid::march` reports and `-checkfurgrid` §4 already tied to the number of
+    // strands real rays hit. If the inversion were even slightly wrong — an off-by-one cell,
+    // a dropped segment, a majorant left in — the survival curve would drift from it.
+    //
+    // A majorant-based tracker would also be measurably worse HERE and not just in theory: a
+    // coat is a thin skin of very dense cells inside a mostly empty box, which is the exact
+    // shape delta tracking handles worst.
+    {
+        Pcg32 rng; rng.seed(90210, 3);
+        const int NR = 400, NS = 400;
+        double worst = 0.0, worstAt = 0.0;
+        int    zeroHits = 0;
+        for (int r = 0; r < NR; ++r) {
+            const Vec3 o(rng.uniform() * 0.8 + 0.1, -0.05, rng.uniform() * 0.8 + 0.1);
+            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, 1.0, rng.uniform() - 0.5));
+            const double L = 0.35;
+            const double tau = coat.march(o, d, L).tau;
+            if (!(tau > 0.05)) continue;                  // a ray that saw no coat proves nothing
+            ++zeroHits;
+            int survived = 0;
+            for (int s = 0; s < NS; ++s)
+                if (!vol.sampleFlight(o, d, L, rng.uniform()).hit) ++survived;
+            const double emp = (double)survived / NS;
+            const double ana = std::exp(-tau);
+            // Binomial standard error at this sample count, so the bar scales with p.
+            const double se = std::sqrt(std::max(1e-12, ana * (1.0 - ana) / NS));
+            const double z  = std::fabs(emp - ana) / std::max(1e-6, se);
+            if (z > worst) { worst = z; worstAt = tau; }
+        }
+        // Worst of ~400 z-scores: the expected maximum of 400 standard normals is ~3.0, so
+        // 5 sigma is a real failure and not a tail. Also asserted: the flight never reports a
+        // collision beyond the segment, and never inside an empty cell.
+        bool clean = true;
+        for (int s = 0; s < 20000 && clean; ++s) {
+            const Vec3 o(rng.uniform(), rng.uniform() * 0.4 - 0.1, rng.uniform());
+            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            const double L = 0.2 + 0.3 * rng.uniform();
+            const auto f = vol.sampleFlight(o, d, L, rng.uniform());
+            if (!f.hit) continue;
+            if (!(f.t > 0.0) || f.t > L + 1e-9) clean = false;
+            else if (!(coat.cells[f.ci].c > 0.0f)) clean = false;
+            else if (coat.at(o + d * f.t) != &coat.cells[f.ci]) clean = false;   // right cell
+        }
+        const bool ok = zeroHits > 100 && worst < 5.0 && clean;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 8. free flight: survival vs exp(-tau) over %d rays x %d draws, "
+                    "worst %.2f sigma (at tau=%.2f), %s -> %s\n",
+                    zeroHits, NS, worst, worstAt,
+                    clean ? "collisions in-range and in the right cell" : "BAD COLLISION",
+                    ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 9. the near/far transition (-fur-lod, P2 stage 2c) --------------------------
+    // Two independent things, because they fail in different ways. `entryDist` is the LOD's
+    // ruler and is checked AGAINST THE MARCH rather than against itself: if it were short,
+    // the segment before it would contain fiber mass; if it were long, a collision could
+    // happen before it. `pickFurTier` is a stochastic crossfade, so what has to hold is that
+    // its realised aggregate fraction tracks the smoothstep it claims -- and, at the two
+    // ends, that it is not merely close to 0 and 1 but EXACTLY so, since a coat that is
+    // one-in-a-thousand aggregate at point-blank range is a coat with sparkling holes in it.
+    {
+        BackwardRenderer br;
+        br.furVol = &vol;
+        Pcg32 rng; rng.seed(90210, 3);
+
+        double worstGap = 0.0;         // fiber mass found strictly before entryDist
+        int    misses = 0, inside = 0, hits = 0;
+        for (int s = 0; s < 20000; ++s) {
+            const Vec3 o(rng.uniform() * 3.0 - 1.0, rng.uniform() * 3.0 - 1.0,
+                         rng.uniform() * 3.0 - 1.0);
+            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                          rng.uniform() - 0.5));
+            const double te = vol.entryDist(o, d);
+            if (te < 0.0) {   // claimed miss: the whole ray must be empty
+                ++misses;
+                worstGap = std::max(worstGap, coat.march(o, d, 1e3).tau);
+                continue;
+            }
+            if (te == 0.0) { ++inside; continue; }
+            ++hits;
+            worstGap = std::max(worstGap, coat.march(o, d, te * (1.0 - 1e-9)).tau);
+        }
+
+        // The crossfade. One fiber diameter is the unit; put the band at [1, 4] diameters and
+        // walk a camera in along the +y axis so the footprint at the coat sweeps through it.
+        const double dia = 2.0 * coat.meanRadius();
+        br.furLodW0 = 1.0 * dia;
+        br.furLodW1 = 4.0 * dia;
+        const double perDist = 1.0;              // 1 world unit of pixel per unit of distance
+        br.furLodPerDist = perDist;
+        const Vec3 look(0.0, -1.0, 0.0);         // straight down at the slab from above, so
+                                                 // entryDist is just the drop to coat.hi.y
+        const int NW = 13, NP = 20000;
+        double worstBlend = 0.0, prevFrac = -1.0; bool monotone = true;
+        double endNear = -1.0, endFar = -1.0;
+        for (int k = 0; k < NW; ++k) {
+            // Footprint wanted where the coat starts, swept from below the band to above it.
+            const double want = dia * (0.5 + 4.0 * k / (NW - 1.0));
+            const Vec3 o(0.5 * (coat.lo.x + coat.hi.x), coat.hi.y + want,
+                         0.5 * (coat.lo.z + coat.hi.z));
+            const Ray r{o, look};
+            const double te = vol.entryDist(o, look);
+            if (te < 0.0) continue;
+            const double w = perDist * te;
+            const double x = (w - br.furLodW0) / (br.furLodW1 - br.furLodW0);
+            const double xc = x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x);
+            const double expect = xc * xc * (3.0 - 2.0 * xc);
+            int agg = 0;
+            for (int i = 0; i < NP; ++i) agg += (br.pickFurTier(r, rng) == 2) ? 1 : 0;
+            const double frac = (double)agg / NP;
+            worstBlend = std::max(worstBlend, std::fabs(frac - expect));
+            if (frac < prevFrac - 1e-9) monotone = false;
+            prevFrac = frac;
+            if (w <= br.furLodW0) endNear = std::max(endNear, frac);      // must be exactly 0
+            if (w >= br.furLodW1) endFar = std::min(endFar < 0.0 ? 1.0 : endFar, frac);
+        }
+        // A tier roll must cost nothing when the transition is not configured.
+        BackwardRenderer off; off.furVol = &vol;
+        const bool uncond = off.pickFurTier(Ray{Vec3(0.5, 2.0, 0.5), Vec3(0, -1, 0)}, rng) == 2;
+        BackwardRenderer none;
+        const bool noVol = none.pickFurTier(Ray{Vec3(0.5, 2.0, 0.5), Vec3(0, -1, 0)}, rng) == 1;
+
+        const bool ok = worstGap < 1e-12 && hits > 500 && misses > 100 &&
+                        worstBlend < 0.02 && monotone && endNear == 0.0 &&
+                        (endFar < 0.0 || endFar == 1.0) && uncond && noVol;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 9. LOD: entryDist leaves %.1e optical depth behind it over "
+                    "%d entering + %d missing rays; crossfade tracks smoothstep to %.4f over "
+                    "%d widths (%s, ends %g/%g) -> %s\n",
+                    worstGap, hits, misses, worstBlend, NW,
+                    monotone ? "monotone" : "NOT MONOTONE", endNear,
+                    endFar < 0.0 ? 1.0 : endFar, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 10. the hair-free BVH answers exactly what the leaf test answered ------------
+    // `buildNoHairBvh` is a pure OPTIMISATION: it removes the fibers from the tree instead of
+    // rejecting them at its leaves. So the only thing that can go wrong is that it changes an
+    // ANSWER, and there are two distinct ways it could. It could drop too much -- the two
+    // trees number their primitives differently, so a mis-built `noHairPrim` remap would
+    // decode a leaf as the wrong primitive and quietly lose a wall. Or it could drop too
+    // little, i.e. disagree with `isHairCurve` about what a fiber is: grass and wire are
+    // curves too, and a non-Hair curve must still block a skip-hair ray. The scene below has
+    // all four populations on purpose -- hair curves, NON-hair curves, triangles and a sphere,
+    // interleaved in space -- and both queries are run twice over the same rays, once on the
+    // filtered tree and once with the remap swapped out so the old leaf-rejection path runs.
+    // Identical answers are the whole claim.
+    {
+        Scene sc;
+        Material hair;  hair.type = MatType::Hair;    sc.mats.push_back(hair);   // 0
+        Material dif;   dif.type  = MatType::Diffuse; sc.mats.push_back(dif);    // 1
+        Pcg32 rng; rng.seed(4242, 11);
+
+        // The coat: hair curves that must become invisible.
+        for (int c = 0; c < 700; ++c) {
+            Vec3 p(rng.uniform(), 0.02 * rng.uniform(), rng.uniform());
+            const Vec3 comb = normalize(Vec3(0.25, 1.0, 0.1));
+            for (int k = 0; k < 8; ++k) {
+                CurveSeg s; s.p0 = p;
+                const Vec3 jit(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5);
+                p = p + (comb + jit * 0.35) * 0.03;
+                s.p1 = p; s.r0 = 0.0006; s.r1 = 0.0005; s.matId = 0;
+                sc.curveSegs.push_back(s);
+            }
+        }
+        // Wire: curves that are NOT hair and must keep blocking, threaded through the same
+        // space so a remap error cannot hide behind them being somewhere else.
+        for (int c = 0; c < 40; ++c) {
+            Vec3 p(rng.uniform(), 0.4 * rng.uniform(), rng.uniform());
+            for (int k = 0; k < 6; ++k) {
+                CurveSeg s; s.p0 = p;
+                p = p + normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                       rng.uniform() - 0.5)) * 0.05;
+                s.p1 = p; s.r0 = s.r1 = 0.004; s.matId = 1;
+                sc.curveSegs.push_back(s);
+            }
+        }
+        // A floor (two triangles) under the coat and a ball above it: the solid geometry a
+        // skip-hair ray is supposed to find, on both sides of the fibers.
+        const Vec3 a(-1, -0.05, -1), b(2, -0.05, -1), cc(2, -0.05, 2), d(-1, -0.05, 2);
+        for (auto tri : {std::array<Vec3,3>{a, b, cc}, std::array<Vec3,3>{a, cc, d}}) {
+            Tri t; t.v0 = tri[0]; t.v1 = tri[1]; t.v2 = tri[2]; t.matId = 1;
+            t.finalize(); sc.tris.push_back(t);
+        }
+        Sphere sp; sp.c = Vec3(0.5, 0.75, 0.5); sp.r = 0.12; sp.matId = 1;
+        sc.spheres.push_back(sp);
+
+        sc.build();
+        sc.buildNoHairBvh();
+
+        int diffs = 0, occDiffs = 0, solidHits = 0, wireHits = 0, blocked = 0;
+        const bool built = sc.hasNoHairBvh();
+        for (int s = 0; s < 20000 && built; ++s) {
+            const Vec3 o(rng.uniform() * 2.0 - 0.5, rng.uniform() * 1.2 - 0.1,
+                         rng.uniform() * 2.0 - 0.5);
+            const Vec3 dir = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                            rng.uniform() - 0.5));
+            const Ray r{o, dir};
+            const Hit got = sc.closestHit(r, 1e-6, nullptr, /*skipHair=*/true);
+            const bool occGot = sc.occludedSkipHair(o, dir, 2.0);
+            // Swap the remap out: `hasNoHairBvh()` goes false and both queries fall back to
+            // the full tree plus the leaf-level rejection, which is the reference answer.
+            std::vector<int> saved; saved.swap(sc.noHairPrim);
+            const Hit ref = sc.closestHit(r, 1e-6, nullptr, /*skipHair=*/true);
+            const bool occRef = sc.occludedSkipHair(o, dir, 2.0);
+            saved.swap(sc.noHairPrim);
+
+            if (got.valid != ref.valid || got.matId != ref.matId ||
+                (ref.valid && (std::fabs(got.t - ref.t) > 1e-12 ||
+                               length(got.n - ref.n) > 1e-12))) ++diffs;
+            if (occGot != occRef) ++occDiffs;
+            if (ref.valid) { ++solidHits; if (ref.fiberRadius > 0.0) ++wireHits; }
+            if (occRef) ++blocked;
+        }
+        // A skip-hair hit on a fiber radius means a NON-hair curve was hit, which is the
+        // population a too-eager filter would have deleted; if none were hit the test proves
+        // nothing about them.
+        const bool ok = built && diffs == 0 && occDiffs == 0 &&
+                        solidHits > 1000 && wireHits > 0 && blocked > 1000;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 10. hair-free BVH (%zu of %zu prims) agrees with the leaf "
+                    "test on %d closest-hits (%d solid, %d non-hair curve) and %d occlusions "
+                    "(%d blocked): %d + %d mismatches -> %s\n",
+                    sc.noHairPrim.size(),
+                    sc.tris.size() + sc.spheres.size() + sc.curveSegs.size(),
+                    20000, solidHits, wireHits, 20000, blocked, diffs, occDiffs,
+                    ok ? "PASS" : "FAIL");
+    }
+
+    std::printf("[checkfurvol] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return fails;
 }
 
@@ -3549,6 +4593,2698 @@ static int checkGabor() {
 
     std::printf("[checkgabor] worst absolute error (exact checks) = %.3g\n", worst);
     std::printf("[checkgabor] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Filtered / band-limited fBm self-test (src/pattern.h: patOctaveFade,
+// patFilteredNoise; PatOp::FNoise, reached from a pattern expression as
+// `fnoise(x, y, z, w, octaves)`). O8. No scene, no renderer.
+//
+// The primitive claims something stronger than "it blurs": that `fnoise(p, w)` is a
+// usable estimate of the MEAN of the unfiltered field over the footprint a shading
+// sample stands for — a disc of diameter w in the surface — so that the sample reports
+// the area's colour instead of one arbitrary point in it. That is a measurable claim,
+// and §3/§5 measure it against a brute-force average of the very field being filtered.
+//
+//   §1 EXACTNESS AT w = 0. `fnoise(p, 0, 1)` is `noise(p)` to a single ulp, and
+//      `fnoise(p, 0, n)` matches an independently written octave sum BIT for bit — so
+//      the filtering is the only thing this op adds to plain fBm, and turning it off
+//      leaves the classic behaviour untouched.
+//   §2 THE WEIGHT IS THE MEASURED ONE. The per-octave weight is not a taste parameter
+//      but the linear-MMSE coefficient of this lattice, measured in scraps/. The test
+//      pins the closed form to that measurement, and separately asserts that it has
+//      not collapsed into the intuitive-but-wrong "keep everything above Nyquist,
+//      discard everything below" cutoff. Plus monotonicity and C1-ness (see §6).
+//   §3 IT TRACKS THE FOOTPRINT MEAN. Against a brute-force average of the unfiltered
+//      field over a randomly oriented disc of diameter w, `fnoise` must be
+//      substantially closer than the point sample it replaces. This is the actual
+//      claim; everything else is mechanism.
+//   §4 IT CONVERGES TO THE MEAN. Variance falls monotonically with w and the field
+//      tends to the constant 0.5 — a filter that kept contrast at every width would be
+//      filtering nothing (which is what normalising by the SURVIVING amplitude sum,
+//      the natural-looking mistake, would produce).
+//   §5 MINIFICATION SEPARATES THEM WITHOUT BOUND. Marching pixel centres across a
+//      receding plane, the point sample's error saturates — it reads one value of a
+//      field whose contrast never falls, so a distant surface stays as noisy as a near
+//      one — while `fnoise`'s keeps falling with the footprint mean it is estimating.
+//      Measured on the LOW-FREQUENCY (block-mean) part of the error, the part that no
+//      viewing distance removes and that therefore survives as visible pattern.
+//   §6 NO SWIMMING CONTOURS. Sweeping w continuously (which is what a moving camera
+//      does) must not step the value. A hard octave cutoff at Nyquist — the obvious
+//      implementation — jumps by a whole octave amplitude at the crossing, drawing a
+//      camera-dependent contour in the image; the test asserts the smooth fade's
+//      largest step is orders of magnitude smaller than that hard cutoff's.
+//   §7 OPERAND HYGIENE: octave truncation and clamping match `dturb`'s documented
+//      convention, and a non-positive or NaN width means "unfiltered" rather than
+//      "undefined".
+//   §8 THE [0,1] CONTRACT holds by construction (|sum| <= norm/2), with mean 0.5.
+//   §9 the compile path (VM == direct call, arity, spelling) and CSE (identical calls
+//      collapse, a different WIDTH does not — the width is an ordinary operand and may
+//      vary per hit).
+static int checkFNoise() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (tol <= 1e-12 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkfnoise] %-46s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+    uint64_t rng = 0xD1B54A32D192ED03ull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+    // An independently written reference for the octave SUM: powers instead of repeated
+    // doubling/halving, and no skip of a fully faded octave (it adds an exact zero, so
+    // the sums still agree bit for bit if — and only if — the production code is right).
+    // The per-octave weight itself is deliberately NOT duplicated here: it is a fit to a
+    // measured curve, so a second hand-written copy of the same constants would test
+    // typing, not behaviour. §2 pins it against the measurement instead.
+    auto refFbm = [](double x, double y, double z, double w, int no) {
+        double sum = 0.0, norm = 0.0;
+        for (int i = 0; i < no; ++i) {
+            const double f = std::pow(2.0, (double)i);
+            const double a = std::pow(0.5, (double)i);
+            norm += a;
+            sum += a * patOctaveFade(f, w) * (patValueNoise(x * f, y * f, z * f) - 0.5);
+        }
+        return 0.5 + sum / norm;
+    };
+
+    // ---- §1: w = 0 is plain fBm, and one octave of it is plain `noise` -------
+    {
+        double w1 = 0.0, wn = 0.0;
+        for (int i = 0; i < 4096; ++i) {
+            const double x = (frand() - 0.5) * 200.0, y = (frand() - 0.5) * 200.0,
+                         z = (frand() - 0.5) * 200.0;
+            w1 = std::fmax(w1, std::fabs(patFilteredNoise(x, y, z, 0.0, 1)
+                                         - patValueNoise(x, y, z)));
+            for (int no = 1; no <= PAT_FNOISE_MAX_OCT; ++no)
+                wn = std::fmax(wn, std::fabs(patFilteredNoise(x, y, z, 0.0, (double)no)
+                                             - refFbm(x, y, z, 0.0, no)));
+        }
+        ok &= chk("S1 fnoise(p, 0, 1) == noise(p)", w1, 0.0, 1.2e-16);
+        ok &= chk("S1 fnoise(p, 0, n) == reference fBm", wn, 0.0, 0.0);
+        // …and with the filter on, too: the fade is the only difference.
+        double wf = 0.0;
+        for (int i = 0; i < 2048; ++i) {
+            const double x = (frand() - 0.5) * 60.0, y = (frand() - 0.5) * 60.0,
+                         z = (frand() - 0.5) * 60.0, w = frand() * 3.0;
+            wf = std::fmax(wf, std::fabs(patFilteredNoise(x, y, z, w, 8)
+                                         - refFbm(x, y, z, w, 8)));
+        }
+        ok &= chk("S1 fnoise(p, w, 8) == reference fBm", wf, 0.0, 0.0);
+    }
+
+    // ---- §2: the octave weight is the MEASURED one ---------------------------
+    // The weight is not a taste parameter: it is the linear-MMSE coefficient
+    // a(s) = Cov(boxmean, point)/Var(point) of this very lattice, measured in
+    // scraps/fnoise_fit.py. This section is what stops the closed form from drifting
+    // away from the measurement it is a fit to.
+    {
+        struct AW { double s, a; };
+        static const AW tab[] = {   // s = freq*w, a = measured optimal weight
+            {0.125, 0.996712}, {0.250, 0.986934}, {0.375, 0.970918}, {0.500, 0.949059},
+            {0.625, 0.921878}, {0.750, 0.889994}, {0.875, 0.854101}, {1.000, 0.814940},
+            {1.250, 0.729877}, {1.500, 0.640800}, {1.750, 0.553029}, {2.000, 0.470722},
+            {2.500, 0.332205}, {3.000, 0.232408}, {3.500, 0.165357}, {4.000, 0.121233},
+            {5.000, 0.071758}, {6.000, 0.047720}, {8.000, 0.025853}, {10.00, 0.016787},
+            {12.00, 0.011987}, {16.00, 0.006733},
+        };
+        double wtab = 0.0;
+        for (const AW& e : tab) {
+            // Same s reached two ways — freq*w is the only thing the fade may depend on.
+            wtab = std::fmax(wtab, std::fabs(patOctaveFade(1.0, e.s) - e.a));
+            wtab = std::fmax(wtab, std::fabs(patOctaveFade(8.0, e.s / 8.0) - e.a));
+        }
+        ok &= chk("S2 fade matches the measured MMSE weight", wtab, 0.0, 1e-3);
+        ok &= chk("S2 fade at s = 0 is exactly 1", patOctaveFade(1.0, 1e-300), 1.0, 0.0);
+        ok &= chk("S2 fade at w = 0 is 1",      patOctaveFade(1e6, 0.0), 1.0, 0.0);
+        ok &= chk("S2 fade at w < 0 is 1",      patOctaveFade(1e6, -1.0), 1.0, 0.0);
+        ok &= chk("S2 fade of NaN width is 1",
+                  patOctaveFade(1.0, std::numeric_limits<double>::quiet_NaN()), 1.0, 0.0);
+        // The naive schedule (all of the octave up to Nyquist, none of it past period = w)
+        // is wrong at both ends, and this is the assertion that says so out loud: most of
+        // the octave is still real, correlated signal exactly where a cutoff would bin it.
+        if (!(patOctaveFade(1.0, 0.5) > 0.9 && patOctaveFade(1.0, 1.0) > 0.75)) {
+            std::printf("[checkfnoise] S2 fade has collapsed to a Nyquist cutoff  BAD\n");
+            ok = false;
+        }
+        // Exactly zero past the skip threshold — which is what lets a far-minified octave
+        // be dropped, and what makes §4's "huge footprint is the mean" exact.
+        ok &= chk("S2 fade at the skip threshold is 0",
+                  patOctaveFade(1.0, PAT_FNOISE_S_MAX), 0.0, 0.0);
+        ok &= chk("S2 fade past the skip threshold is 0", patOctaveFade(4.0, 40.0), 0.0, 0.0);
+        // Monotone all the way through the window, and C1 at both ends of the curve.
+        bool mono = true;
+        double prev = 1.0;
+        for (int i = 0; i <= 200000; ++i) {
+            const double w = (PAT_FNOISE_S_MAX + 1.0) * (double)i / 200000.0;
+            const double f = patOctaveFade(1.0, w);
+            if (f > prev + 1e-15) mono = false;
+            prev = f;
+        }
+        if (!mono) { std::printf("[checkfnoise] S2 fade is not monotone  BAD\n"); ok = false; }
+        // A one-sided difference of a function that touches its end value quadratically
+        // reports O(h) rather than 0, so the tolerance is a few multiples of h, not 0.
+        const double h = 1e-6;
+        ok &= chk("S2 fade slope at s = 0 is 0",
+                  (patOctaveFade(1.0, 0.0) - patOctaveFade(1.0, h)) / h, 0.0, 1e-4);
+        ok &= chk("S2 fade slope at the skip threshold is 0",
+                  (patOctaveFade(1.0, PAT_FNOISE_S_MAX - h)
+                   - patOctaveFade(1.0, PAT_FNOISE_S_MAX)) / h, 0.0, 1e-4);
+    }
+
+    // ---- §3: does it track the footprint mean? -------------------------------
+    // Brute-force average of the UNFILTERED field over the footprint the contract
+    // promises — a disc of DIAMETER w lying in a randomly oriented plane, since a
+    // shading sample stands for a surface patch — versus (a) the point sample it
+    // replaces and (b) fnoise. This is the actual claim; everything else is mechanism.
+    // Note that the disc is what the weight curve was measured for: run this against a
+    // 3-D cube instead and fnoise looks like it under-filters, which is a statement
+    // about the test's footprint and not about the code.
+    {
+        const int NO = 6, NB = 21;
+        // A disc quadrature: a Cartesian midpoint grid over the unit square, masked.
+        double gx[NB * NB], gy[NB * NB];
+        int nq = 0;
+        for (int j = 0; j < NB; ++j)
+        for (int i = 0; i < NB; ++i) {
+            const double a = (i + 0.5) / NB - 0.5, b = (j + 0.5) / NB - 0.5;
+            if (a * a + b * b <= 0.25) { gx[nq] = a; gy[nq] = b; ++nq; }
+        }
+        for (double w : {0.5, 1.0, 2.0}) {
+            double ePoint = 0.0, eFilt = 0.0;
+            const int NP = 128;
+            for (int p = 0; p < NP; ++p) {
+                const double x = (frand() - 0.5) * 80.0, y = (frand() - 0.5) * 80.0,
+                             z = (frand() - 0.5) * 80.0;
+                // A uniformly random plane, as an orthonormal in-plane basis (u, v).
+                const double cz = 2.0 * frand() - 1.0, ph = 6.283185307179586 * frand();
+                const double sr = std::sqrt(std::fmax(0.0, 1.0 - cz * cz));
+                const double nx = sr * std::cos(ph), ny = sr * std::sin(ph), nz = cz;
+                double ax = 0.0, ay = 0.0, az = 0.0;
+                if (std::fabs(nx) < 0.9) ax = 1.0; else ay = 1.0;
+                double ux = ay * nz - az * ny, uy = az * nx - ax * nz, uz = ax * ny - ay * nx;
+                const double ul = std::sqrt(ux * ux + uy * uy + uz * uz);
+                ux /= ul; uy /= ul; uz /= ul;
+                const double vx = ny * uz - nz * uy, vy = nz * ux - nx * uz,
+                             vz = nx * uy - ny * ux;
+                double disc = 0.0;
+                for (int q = 0; q < nq; ++q) {
+                    const double a = gx[q] * w, b = gy[q] * w;
+                    disc += refFbm(x + a * ux + b * vx, y + a * uy + b * vy,
+                                   z + a * uz + b * vz, 0.0, NO);
+                }
+                disc /= (double)nq;
+                const double pt = patFilteredNoise(x, y, z, 0.0, NO);
+                const double fl = patFilteredNoise(x, y, z, w,   NO);
+                ePoint += (pt - disc) * (pt - disc);
+                eFilt  += (fl - disc) * (fl - disc);
+            }
+            ePoint = std::sqrt(ePoint / NP);
+            eFilt  = std::sqrt(eFilt  / NP);
+            std::printf("[checkfnoise] S3 w=%.2f  rms vs footprint mean: point %.4f  "
+                        "filtered %.4f  (%.2fx better)\n", w, ePoint, eFilt,
+                        eFilt > 0.0 ? ePoint / eFilt : 0.0);
+            if (!(eFilt < 0.6 * ePoint)) {
+                std::printf("[checkfnoise] S3 filtering does not beat point sampling  BAD\n");
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §4: contrast collapses toward the mean as the footprint grows -------
+    {
+        double prevSd = 1e9;
+        bool mono = true, reported = false;
+        for (double w : {0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 64.0}) {
+            double s = 0.0, s2 = 0.0;
+            const int N = 20000;
+            for (int i = 0; i < N; ++i) {
+                const double x = (frand() - 0.5) * 400.0, y = (frand() - 0.5) * 400.0,
+                             z = (frand() - 0.5) * 400.0;
+                const double v = patFilteredNoise(x, y, z, w, 6);
+                s += v; s2 += v * v;
+            }
+            const double mean = s / N;
+            const double sd = std::sqrt(std::fmax(0.0, s2 / N - mean * mean));
+            if (sd > prevSd + 1e-4) mono = false;
+            if (w >= 64.0) {
+                ok &= chk("S4 huge footprint is the mean", sd, 0.0, 1e-12);
+                ok &= chk("S4 …and that mean is 0.5", mean, 0.5, 1e-12);
+                reported = true;
+            }
+            prevSd = sd;
+        }
+        if (!mono)     { std::printf("[checkfnoise] S4 contrast not monotone in w  BAD\n"); ok = false; }
+        if (!reported) { std::printf("[checkfnoise] S4 never reached the wide case  BAD\n"); ok = false; }
+    }
+
+    // ---- §5: minification, and the error that does NOT average away ----------
+    // A minified plane: pixel centres march across the surface in a straight line at
+    // spacing s, each standing for a disc of diameter s in that surface. Compare each
+    // scheme against the true disc average, per pixel and then as BLOCK MEANS of the
+    // error — the low-frequency part, which no amount of viewing distance or downscaling
+    // removes and which is therefore what survives as visible pattern.
+    //
+    // The claim being tested is structural, not a fixed ratio. As the surface recedes,
+    // POINT sampling's error SATURATES: it is reading one arbitrary value of a field
+    // whose contrast never falls, so a distant surface stays exactly as noisy as a near
+    // one (that is the shimmer). `fnoise`'s error instead keeps FALLING toward zero,
+    // because the thing it is estimating — the footprint mean — is itself converging to
+    // the constant 0.5 and it converges with it. So the two must separate without bound,
+    // and the assertions below are that separation, not a tuned threshold.
+    {
+      double lowPs[4] = {0,0,0,0}, lowFs[4] = {0,0,0,0};
+      int si = 0;
+      for (double s : {1.5, 3.0, 6.0, 12.0}) {
+        const int NO = 7, NS = 4096, BLK = 16, NB = 15;
+        const double dx = 0.6, dy = 0.7, dz = -0.39;   // an oblique, incommensurate walk
+        const double dl = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const double ex = dx / dl, ey = dy / dl, ez = dz / dl;
+        // The surface plane contains the walk direction; pick any perpendicular in it.
+        double fx = -ey, fy = ex, fz = 0.0;
+        const double fl = std::sqrt(fx * fx + fy * fy + fz * fz);
+        fx /= fl; fy /= fl; fz /= fl;
+        double gx[NB * NB], gy[NB * NB];
+        int nq = 0;
+        for (int j = 0; j < NB; ++j)
+        for (int i = 0; i < NB; ++i) {
+            const double a = (i + 0.5) / NB - 0.5, b = (j + 0.5) / NB - 0.5;
+            if (a * a + b * b <= 0.25) { gx[nq] = a; gy[nq] = b; ++nq; }
+        }
+        double sumP = 0.0, sumF = 0.0, blkP = 0.0, blkF = 0.0;
+        double accP = 0.0, accF = 0.0;
+        int nblk = 0;
+        for (int k = 0; k < NS; ++k) {
+            const double t = (double)k * s;
+            const double px = 11.3 + t * ex, py = -7.1 + t * ey, pz = 3.7 + t * ez;
+            double truth = 0.0;
+            for (int q = 0; q < nq; ++q) {     // the raw field's true footprint mean
+                const double a = gx[q] * s, b = gy[q] * s;
+                truth += refFbm(px + a * ex + b * fx, py + a * ey + b * fy,
+                                pz + a * ez + b * fz, 0.0, NO);
+            }
+            truth /= (double)nq;
+            const double ep = patFilteredNoise(px, py, pz, 0.0, NO) - truth;
+            const double ef = patFilteredNoise(px, py, pz, s,   NO) - truth;
+            sumP += ep * ep; sumF += ef * ef;
+            accP += ep; accF += ef;
+            if ((k + 1) % BLK == 0) {
+                blkP += (accP / BLK) * (accP / BLK);
+                blkF += (accF / BLK) * (accF / BLK);
+                accP = accF = 0.0; ++nblk;
+            }
+        }
+        const double rmsP = std::sqrt(sumP / NS), rmsF = std::sqrt(sumF / NS);
+        const double lowP = std::sqrt(blkP / nblk), lowF = std::sqrt(blkF / nblk);
+        std::printf("[checkfnoise] S5 spacing %.2f  rms err: point %.4f filtered %.4f | "
+                    "low-freq (%d-blocks): point %.4f filtered %.4f  (%.2fx)\n",
+                    s, rmsP, rmsF, BLK, lowP, lowF, lowF > 0.0 ? lowP / lowF : 0.0);
+        if (!(rmsF < 0.6 * rmsP && lowF < 0.8 * lowP)) {
+            std::printf("[checkfnoise] S5 filtering does not beat point sampling here  BAD\n");
+            ok = false;
+        }
+        lowPs[si] = lowP; lowFs[si] = lowF; ++si;
+      }
+      // The separation widens monotonically with minification…
+      for (int i = 1; i < si; ++i)
+          if (!(lowPs[i] / lowFs[i] > 1.25 * (lowPs[i-1] / lowFs[i-1]))) {
+              std::printf("[checkfnoise] S5 the advantage stops growing with minification"
+                          " (%.2fx -> %.2fx)  BAD\n",
+                          lowPs[i-1] / lowFs[i-1], lowPs[i] / lowFs[i]);
+              ok = false;
+          }
+      // …because one side has plateaued and the other has not. Point sampling's residual
+      // barely moves over the last doubling of the footprint; fnoise's roughly halves.
+      if (!(lowPs[si-1] > 0.9 * lowPs[si-2])) {
+          std::printf("[checkfnoise] S5 point-sample error did not saturate  BAD\n");
+          ok = false;
+      }
+      if (!(lowFs[si-1] < 0.6 * lowFs[si-2])) {
+          std::printf("[checkfnoise] S5 filtered error stopped converging  BAD\n");
+          ok = false;
+      }
+    }
+
+    // ---- §6: continuity in w (a moving camera sweeps it) ---------------------
+    {
+        auto hardCut = [](double x, double y, double z, double w, int no) {
+            double sum = 0.0, norm = 0.0, amp = 1.0, freq = 1.0;
+            for (int i = 0; i < no; ++i) {
+                norm += amp;
+                if (!(w > 0.0) || freq * w < 0.5)
+                    sum += amp * (patValueNoise(x * freq, y * freq, z * freq) - 0.5);
+                amp *= 0.5; freq *= 2.0;
+            }
+            return 0.5 + sum / norm;
+        };
+        double jSmooth = 0.0, jHard = 0.0;
+        const int N = 40000;
+        const double x = 3.21, y = -8.07, z = 1.44;
+        double ps = patFilteredNoise(x, y, z, 0.0, 8), ph = hardCut(x, y, z, 0.0, 8);
+        for (int i = 1; i <= N; ++i) {
+            const double w = 4.0 * (double)i / N;
+            const double vs = patFilteredNoise(x, y, z, w, 8), vh = hardCut(x, y, z, w, 8);
+            jSmooth = std::fmax(jSmooth, std::fabs(vs - ps));
+            jHard   = std::fmax(jHard,   std::fabs(vh - ph));
+            ps = vs; ph = vh;
+        }
+        std::printf("[checkfnoise] S6 largest step over a 1e-4 sweep of w: "
+                    "smooth fade %.2e  hard cutoff %.2e  (%.0fx)\n",
+                    jSmooth, jHard, jHard / jSmooth);
+        if (!(jSmooth < 0.01 * jHard)) {
+            std::printf("[checkfnoise] S6 the fade is not visibly smoother than a cutoff  BAD\n");
+            ok = false;
+        }
+    }
+
+    // ---- §7: operand hygiene -------------------------------------------------
+    {
+        const double x = 1.7, y = -2.3, z = 0.9;
+        ok &= chk("S7 octaves 0 clamps to 1",
+                  patFilteredNoise(x, y, z, 0.1, 0.0), patFilteredNoise(x, y, z, 0.1, 1.0), 0.0);
+        ok &= chk("S7 octaves -5 clamps to 1",
+                  patFilteredNoise(x, y, z, 0.1, -5.0), patFilteredNoise(x, y, z, 0.1, 1.0), 0.0);
+        ok &= chk("S7 octaves truncate (3.9 -> 3)",
+                  patFilteredNoise(x, y, z, 0.1, 3.9), patFilteredNoise(x, y, z, 0.1, 3.0), 0.0);
+        ok &= chk("S7 octaves clamp at the ceiling",
+                  patFilteredNoise(x, y, z, 0.1, 500.0),
+                  patFilteredNoise(x, y, z, 0.1, (double)PAT_FNOISE_MAX_OCT), 0.0);
+        ok &= chk("S7 negative width is unfiltered",
+                  patFilteredNoise(x, y, z, -3.0, 6.0), patFilteredNoise(x, y, z, 0.0, 6.0), 0.0);
+        ok &= chk("S7 NaN width is unfiltered",
+                  patFilteredNoise(x, y, z, std::numeric_limits<double>::quiet_NaN(), 6.0),
+                  patFilteredNoise(x, y, z, 0.0, 6.0), 0.0);
+    }
+
+    // ---- §8: the [0,1] contract and the mean ---------------------------------
+    {
+        double lo = 1e9, hi = -1e9, s = 0.0;
+        const int N = 60000;
+        for (int i = 0; i < N; ++i) {
+            const double x = (frand() - 0.5) * 500.0, y = (frand() - 0.5) * 500.0,
+                         z = (frand() - 0.5) * 500.0;
+            const double w = (i % 3 == 0) ? 0.0 : frand() * 2.0;
+            const double v = patFilteredNoise(x, y, z, w, 1 + (i % PAT_FNOISE_MAX_OCT));
+            lo = std::fmin(lo, v); hi = std::fmax(hi, v); s += v;
+        }
+        if (lo < 0.0 || hi > 1.0) {
+            std::printf("[checkfnoise] S8 left [0,1]: min %.6f max %.6f  BAD\n", lo, hi);
+            ok = false;
+        }
+        ok &= chk("S8 mean is 0.5", s / N, 0.5, 5e-3);
+    }
+
+    // ---- §9: the compile path and CSE ----------------------------------------
+    {
+        struct Case { const char* expr; double sc, w; int oct; };
+        const Case cases[] = {
+            {"fnoise(x, y, z, 0, 1)",       1.0, 0.0,  1},
+            {"fnoise(x, y, z, 0.3, 6)",     1.0, 0.3,  6},
+            {"fnoise(4*x, 4*y, 4*z, 4*0.05, 5)", 4.0, 0.2, 5},   // the scaling idiom
+        };
+        for (int ci = 0; ci < (int)(sizeof cases / sizeof cases[0]); ++ci) {
+            const Case& cs = cases[ci];
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(cs.expr, prog, perr)) {
+                std::printf("[checkfnoise] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+                ok = false; continue;
+            }
+            double wv = 0.0;
+            for (int i = 0; i < 256; ++i) {
+                const double x = (frand() - 0.5) * 40.0, y = (frand() - 0.5) * 40.0,
+                             z = (frand() - 0.5) * 40.0;
+                PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+                const double got  = patternEval(prog.data(), (int)prog.size(), c);
+                const double want = patFilteredNoise(cs.sc * x, cs.sc * y, cs.sc * z,
+                                                     cs.w, (double)cs.oct);
+                wv = std::fmax(wv, std::fabs(got - want));
+            }
+            char lbl[96]; std::snprintf(lbl, sizeof lbl, "S9 VM `%s` == direct", cs.expr);
+            ok &= chk(lbl, wv, 0.0, 0.0);
+        }
+        const char* bads[] = {
+            "fnoise(x, y, z, 1)",          // arity 5, given 4
+            "fnoise(x, y, z, 1, 2, 3)",    // arity 5, given 6
+            "fnoise(x, y, z)",             // arity 5, given 3
+            "fnois(x, y, z, 1, 2)",        // no such spelling
+        };
+        for (const char* be : bads) {
+            std::vector<PatNode> prog; std::string perr;
+            if (compilePatternExpr(be, prog, perr)) {
+                std::printf("[checkfnoise] `%s` compiled but should be rejected  BAD\n", be);
+                ok = false;
+            }
+        }
+        std::vector<PatNode> same, sameOpt, diff, diffOpt; std::string perr;
+        ok &= compilePatternExpr("fnoise(x,y,z,0.2,6) + fnoise(x,y,z,0.2,6)", same, perr);
+        ok &= compilePatternExpr("fnoise(x,y,z,0.2,6) + fnoise(x,y,z,0.4,6)", diff, perr);
+        sameOpt = same; patternOptimizeCSE(sameOpt);
+        diffOpt = diff; patternOptimizeCSE(diffOpt);
+        if (sameOpt.size() >= same.size()) {
+            std::printf("[checkfnoise] CSE did not shrink `fnoise + fnoise` (%zu -> %zu)  BAD\n",
+                        same.size(), sameOpt.size());
+            ok = false;
+        }
+        double wv = 0.0;
+        for (int i = 0; i < 128; ++i) {
+            const double x = (frand() - 0.5) * 40.0, y = (frand() - 0.5) * 40.0,
+                         z = (frand() - 0.5) * 40.0;
+            PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+            const double a = patFilteredNoise(x, y, z, 0.2, 6);
+            const double b = patFilteredNoise(x, y, z, 0.4, 6);
+            wv = std::fmax(wv, std::fabs(patternEval(sameOpt.data(), (int)sameOpt.size(), c) - 2.0 * a));
+            wv = std::fmax(wv, std::fabs(patternEval(diffOpt.data(), (int)diffOpt.size(), c) - (a + b)));
+        }
+        ok &= chk("S9 CSE'd programs evaluate right (max err)", wv, 0.0, 0.0);
+    }
+
+    // ---- §10: the `fw` shading footprint (O8 stage 2) ------------------------
+    // patShadingFootprint() is the ONE place the renderer turns a camera coefficient +
+    // hit geometry into the `w` an fnoise() sees, and it is compiled into the CPU tracer,
+    // the mode-W megakernel and both preview rasterizers. If its convention drifts, the
+    // same scene filters differently on CPU and GPU — a deterministic difference, not
+    // noise — so pin the convention here rather than in a render comparison.
+    {
+        // Head-on, the footprint is just the coefficient times the distance.
+        ok &= chk("S10 head-on is perDist*dist", patShadingFootprint(0.004, 25.0, -1.0),
+                  0.1, 1e-15);
+        // The sign of cos is the ray-vs-normal orientation, which says nothing about how
+        // stretched the footprint is; only its magnitude may matter.
+        ok &= chk("S10 cos sign is ignored", patShadingFootprint(0.004, 25.0, 0.37),
+                  patShadingFootprint(0.004, 25.0, -0.37), 0.0);
+        // Obliquity: the pixel's footprint is an ellipse with minor axis d and major axis
+        // d/|cos|; `fw` is their geometric mean, i.e. d/sqrt(|cos|) — the diameter of the
+        // disc of EQUAL AREA. (Not the major axis: over-filtering is the worse mismatch.)
+        ok &= chk("S10 obliquity is the geometric mean of the ellipse axes",
+                  patShadingFootprint(0.004, 25.0, 0.25), 0.1 / std::sqrt(0.25), 1e-15);
+        // Grazing hits would otherwise send `fw` to infinity and grey out a whole silhouette.
+        ok &= chk("S10 cos floor caps the grazing blowup",
+                  patShadingFootprint(0.004, 25.0, 1e-9),
+                  0.1 / std::sqrt(PAT_FW_COS_MIN), 1e-15);
+        ok &= chk("S10 cos NaN takes the floor too",
+                  patShadingFootprint(0.004, 25.0, std::numeric_limits<double>::quiet_NaN()),
+                  0.1 / std::sqrt(PAT_FW_COS_MIN), 1e-15);
+        // 0 means UNKNOWN at both ends (no camera coefficient / no hit), and unknown must
+        // mean UNFILTERED — never a tiny-but-nonzero width, which would be a silent blur.
+        ok &= chk("S10 zero coefficient => unfiltered", patShadingFootprint(0.0, 25.0, 1.0), 0.0, 0.0);
+        ok &= chk("S10 zero distance => unfiltered",    patShadingFootprint(0.004, 0.0, 1.0), 0.0, 0.0);
+        ok &= chk("S10 negative distance => unfiltered", patShadingFootprint(0.004, -3.0, 1.0), 0.0, 0.0);
+        // Supersampling backs the filter off as 1/sqrt(spp) — the property that lets one
+        // scene serve both a 1-spp preview and a converged render (Camera::footprintPerDist).
+        Camera fc;
+        fc.lookAt(Vec3{0, 0, 0}, Vec3{0, 0, 1}, Vec3{0, 1, 0}, 40.0, 800, 600);
+        const double p1 = fc.footprintPerDist(1), p16 = fc.footprintPerDist(16);
+        ok &= chk("S10 footprintPerDist falls as 1/sqrt(spp)", p16 * 4.0, p1, 1e-12);
+        // A pixel's footprint IS the disc subtending the pixel's solid angle.
+        ok &= chk("S10 footprintPerDist subtends the pixel solid angle",
+                  PI * (p1 * 0.5) * (p1 * 0.5), fc.pixelSolidAngle(1.0), 1e-15);
+        // Halving the raster the camera is drawn into doubles the per-pixel footprint.
+        ok &= chk("S10 resolution override rescales the footprint",
+                  fc.footprintPerDist(1, 400, 300), 2.0 * p1, 1e-12);
+        ok &= chk("S10 resolution override at the film res is a no-op",
+                  fc.footprintPerDist(1, 800, 600), p1, 0.0);
+        // The variable itself: parse, print, stack effect, and the free-variable test that
+        // decides whether a pattern may be baked to a constant.
+        {
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr("fnoise(20*x, 20*y, 20*z, 20*fw, 4)", prog, perr)) {
+                std::printf("[checkfnoise] S10 compile of an `fw` expression FAILED: %s\n",
+                            perr.c_str());
+                ok = false;
+            } else {
+                if (!patternHasFreeVars(prog)) {
+                    std::printf("[checkfnoise] S10 `fw` did not register as a free var  BAD\n");
+                    ok = false;
+                }
+                double wv2 = 0.0;
+                for (int i = 0; i < 128; ++i) {
+                    const double x = (frand() - 0.5) * 8.0, y = (frand() - 0.5) * 8.0,
+                                 z = (frand() - 0.5) * 8.0, f = frand() * 0.05;
+                    PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1}, 0.0, 0.0, 0.0, 0.0, f);
+                    wv2 = std::fmax(wv2, std::fabs(patternEval(prog.data(), (int)prog.size(), c)
+                                                   - patFilteredNoise(20*x, 20*y, 20*z, 20*f, 4)));
+                }
+                ok &= chk("S10 the VM reads `fw` from the PatCtx", wv2, 0.0, 0.0);
+                // A hit with no footprint must give the unfiltered field, not a blurred one.
+                PatCtx c0 = makePatCtx(Vec3{1.5, -0.5, 2.0}, 0.0, Vec3{0, 0, 1});
+                ok &= chk("S10 default PatCtx leaves fnoise unfiltered",
+                          patternEval(prog.data(), (int)prog.size(), c0),
+                          patFilteredNoise(30.0, -10.0, 40.0, 0.0, 4), 0.0);
+            }
+        }
+    }
+
+    std::printf("[checkfnoise] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkfnoise] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Histogram-preserving stochastic tiling self-test (src/stochtile.h, and the Texture
+// branches it drives). O7. No scene, no renderer.
+//
+// The feature makes exactly one claim that a picture cannot settle: that blending three
+// randomly offset crops of an image hides the repeat WITHOUT the contrast loss that makes
+// the naive cross-fade unusable. Both halves of that are measured here, against a control
+// that is the naive blend itself — so §4 cannot pass by being a no-op, and §5 cannot pass
+// by washing the image out.
+//
+//   §1 THE RANK TRANSFORM ROUND-TRIPS. Acklam+Halley's quantile against std::erfc to
+//      full double precision, then T^-1(T(x)) == x over every texel of a deliberately
+//      awkward histogram (skewed, clipped at both ends, with a spike). This is the piece
+//      everything else rests on: if T^-1 is not T's inverse, the operator changes the
+//      image's colours even where it does no blending at all.
+//   §2 T REALLY GAUSSIANIZES. The transformed plane's mean and standard deviation must be
+//      1/2 and 1/6, and its deciles must be the normal's — for an input histogram that is
+//      nothing like a Gaussian. (Rank-based, so this holds for ANY input; the section
+//      exists because a fitted mean/variance "Gaussianization" would fail it.)
+//   §3 THE LATTICE IS A PARTITION OF UNITY. Exactly three distinct vertices anywhere,
+//      weights non-negative and summing to 1 to 1e-12, and the assembled operator is
+//      continuous across cell boundaries — the seam test, which a naive tiling of square
+//      cells fails outright.
+//   §4 THE HEADLINE: VARIANCE IS PRESERVED, AND THE CONTROL LOSES IT. Over many random
+//      lookups the operator's output standard deviation must match the source's, and its
+//      deciles must match the source's — while the SAME three taps with the SAME weights,
+//      averaged the obvious way, must come out measurably flatter. The predicted loss is
+//      not a guess: barycentrics of a uniform point in a triangle are Dirichlet(1,1,1),
+//      so E[sum w^2] = 1/2 and the naive blend's standard deviation should land near
+//      1/sqrt(2) = 0.707 of the source's. The test asserts that prediction too.
+//   §5 THE REPEAT IS ACTUALLY BROKEN. Plain tiling satisfies f(u+1,v) == f(u,v) exactly,
+//      which is the artefact. Under the operator the mean |f(u+1,v) - f(u,v)| must rise to
+//      a substantial fraction of the mean difference between two UNRELATED lookups — i.e.
+//      a one-repeat shift now looks like new content, not the same content again.
+//   §6 SEED AND PATCH ARE LIVE, AND THE OPERATOR IS DETERMINISTIC. Two seeds must give
+//      different crops; the same call twice must be bit-identical (the backends rely on
+//      that — the lattice hash is integer precisely so a CPU and a GPU cannot disagree).
+//   §7 THE TEXTURE INTEGRATION. sampleRgb / scalarAt / reflectanceAt all take the branch,
+//      stay in range, and — the anti-regression that matters — a texture with `tiling
+//      none` is bit-identical to what it was before the feature existed.
+static int checkStochTile() {
+    bool ok = true;
+    double worst = 0.0;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (tol <= 1e-12 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkstochtile] %-52s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+    auto want = [&](const char* what, bool cond) {
+        if (!cond) std::printf("[checkstochtile] %s  BAD\n", what);
+        return cond;
+    };
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    auto frand = [&]() {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+
+    // ---- the test image -----------------------------------------------------
+    // Short correlation length (so two random crops are near-independent, which is what
+    // makes §4's variance arithmetic a prediction rather than a fudge) but a violently
+    // non-Gaussian histogram: a smooth value-noise field pushed through a fourth power,
+    // then clipped. Skewed, spiky at 0, hard-clipped at 1 — everything a fitted Gaussian
+    // transform would mangle and a rank transform must not.
+    const int TW = 96, TH = 96;
+    const size_t TN = (size_t)TW * TH;
+    std::vector<double> src(TN);
+    for (int y = 0; y < TH; ++y) {
+        for (int x = 0; x < TW; ++x) {
+            const double f = patValueNoise(x * 0.34, y * 0.34, 11.5);
+            double v = std::pow(f, 4.0) * 1.6;
+            if (v > 1.0) v = 1.0;
+            src[(size_t)y * TW + x] = v;
+        }
+    }
+    auto meanOf = [](const std::vector<double>& a) {
+        double s = 0.0; for (double v : a) s += v; return s / (double)a.size();
+    };
+    auto sdOf = [&](const std::vector<double>& a) {
+        const double m = meanOf(a);
+        double s = 0.0; for (double v : a) s += (v - m) * (v - m);
+        return std::sqrt(s / (double)a.size());
+    };
+    auto decilesOf = [](std::vector<double> a, double d[9]) {
+        std::sort(a.begin(), a.end());
+        for (int k = 1; k <= 9; ++k) {
+            double t = 0.1 * k * (double)(a.size() - 1);
+            size_t i = (size_t)t; double fr = t - (double)i;
+            d[k - 1] = (i + 1 < a.size()) ? a[i] * (1 - fr) + a[i + 1] * fr : a.back();
+        }
+    };
+
+    std::vector<float> gauss, lut;
+    Texture::gaussianizePlanes(TN, 1, [&](size_t i, int) { return src[i]; }, gauss, lut);
+
+    // A float copy of the source, so §4/§5 can take *plain* bilinear tiled samples through
+    // exactly the same fetch path the operator uses. This is the honest control: bilinear
+    // filtering is itself a low-pass, so it costs variance no matter how the texture is
+    // tiled, and that loss must not be charged to the blending operator. Comparing the
+    // operator against the texel histogram instead would report a ~7% "contrast loss" that
+    // plain tiling suffers just as much.
+    std::vector<float> srcF(TN);
+    for (size_t i = 0; i < TN; ++i) srcF[i] = (float)src[i];
+
+    // ---- §1 the rank transform round-trips ----------------------------------
+    {
+        double wq = 0.0;
+        for (int k = 1; k < 400; ++k) {
+            const double p = (double)k / 400.0;
+            wq = std::max(wq, std::fabs(stochNormalCdf(stochNormalQuantile(p)) - p));
+        }
+        ok &= chk("S1 quantile inverts the normal CDF", wq, 0.0, 1e-14);
+        ok &= chk("S1 quantile(1/2)", stochNormalQuantile(0.5), 0.0, 1e-14);
+        ok &= chk("S1 quantile(0.975)", stochNormalQuantile(0.975), 1.959963984540054, 1e-12);
+        // T^-1(T(x)) over every texel. The LUT has 2048 entries and the source has 9216,
+        // so the reconstruction is an interpolation of the sorted values, not a lookup —
+        // the error reported here is the whole cost of storing T^-1 as a table.
+        double wr = 0.0;
+        for (size_t i = 0; i < TN; ++i)
+            wr = std::max(wr, std::fabs(stochInvT(lut.data(), (double)gauss[i]) - src[i]));
+        std::printf("[checkstochtile] S1 worst |T^-1(T(x)) - x| over %zu texels = %.3g\n", TN, wr);
+        ok &= want("S1 the inverse LUT does not reconstruct the image", wr < 5e-3);
+    }
+
+    // ---- §2 the transformed plane is N(1/2, 1/6) ----------------------------
+    {
+        std::vector<double> g(TN);
+        for (size_t i = 0; i < TN; ++i) g[i] = (double)gauss[i];
+        const double gm = meanOf(g), gs = sdOf(g);
+        ok &= chk("S2 Gaussianized mean", gm, STOCH_G_MEAN, 1e-6);
+        // Untruncated (the plane is float and the LUT's domain is +-6 sigma), so this is
+        // 1/6 to within the discreteness of n mid-rank quantiles — not merely "close".
+        ok &= chk("S2 Gaussianized sd", gs, STOCH_G_SIGMA, 5e-4);
+        double gd[9], sd[9];
+        decilesOf(g, gd);
+        decilesOf(src, sd);
+        double wd = 0.0;
+        for (int k = 0; k < 9; ++k)
+            wd = std::max(wd, std::fabs(gd[k] - (STOCH_G_MEAN + STOCH_G_SIGMA *
+                                                 stochNormalQuantile(0.1 * (k + 1)))));
+        ok &= chk("S2 Gaussianized deciles match the normal's", wd, 0.0, 2e-3);
+        // The control: the SOURCE's deciles are nothing like the normal's, so §2 is a
+        // claim about the transform rather than about the test image.
+        double wsrc = 0.0;
+        for (int k = 0; k < 9; ++k)
+            wsrc = std::max(wsrc, std::fabs(sd[k] - (STOCH_G_MEAN + STOCH_G_SIGMA *
+                                                     stochNormalQuantile(0.1 * (k + 1)))));
+        std::printf("[checkstochtile] S2 decile distance from normal: source %.4f  "
+                    "transformed %.4f\n", wsrc, wd);
+        ok &= want("S2 the source was already Gaussian — the test proves nothing", wsrc > 0.05);
+    }
+
+    // ---- §3 the lattice --------------------------------------------------------
+    StochTile st; st.on = 1; st.patch = 1.0; st.seed = 7u;
+    {
+        double wsum = 0.0, wneg = 0.0;
+        bool distinct = true;
+        for (int i = 0; i < 20000; ++i) {
+            const double u = (frand() - 0.5) * 40.0, v = (frand() - 0.5) * 40.0;
+            double w[3], ou[3], ov[3];
+            stochTriGrid(u, v, st.patch, st.seed, w, ou, ov);
+            wsum = std::max(wsum, std::fabs(w[0] + w[1] + w[2] - 1.0));
+            for (int k = 0; k < 3; ++k) wneg = std::min(wneg, w[k]);
+            for (int a = 0; a < 3; ++a)
+                for (int b = a + 1; b < 3; ++b)
+                    if (ou[a] == ou[b] && ov[a] == ov[b]) distinct = false;
+        }
+        ok &= chk("S3 barycentrics sum to 1", wsum, 0.0, 1e-12);
+        ok &= want("S3 a barycentric went negative", wneg >= 0.0);
+        ok &= want("S3 two lattice taps collided", distinct);
+        // Continuity: the operator must not step anywhere, least of all where the tap set
+        // changes. A cell-based tiling with a hard boundary would show O(range) jumps here.
+        const double eps = 1e-7;
+        double jump = 0.0;
+        for (int i = 0; i < 20000; ++i) {
+            const double u = frand() * 8.0, v = frand() * 8.0;
+            double a[1], b[1];
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, a);
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u + eps, v + eps, b);
+            jump = std::max(jump, std::fabs(a[0] - b[0]));
+        }
+        std::printf("[checkstochtile] S3 largest step over a %.0e UV nudge = %.3g\n", eps, jump);
+        ok &= want("S3 the operator is discontinuous", jump < 1e-2);
+    }
+
+    // ---- §4 variance preservation, against the naive blend ------------------
+    {
+        const int N = 200000;
+        std::vector<double> out(N), naive(N), plain(N);
+        double swsq = 0.0;
+        for (int i = 0; i < N; ++i) {
+            const double u = frand() * 16.0, v = frand() * 16.0;
+            double o[1];
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, o);
+            out[i] = o[0];
+            // Reference: ordinary repeat tiling, same bilinear fetch, no blending at all.
+            // Everything below is measured against THIS, not against the texel histogram,
+            // because the bilinear low-pass costs contrast in plain tiling too.
+            double p[1];
+            stochFetch(srcF.data(), 1, TW, TH, 1, u, v, p);
+            plain[i] = p[0];
+            // The control: identical lattice, identical weights, identical taps — but
+            // averaged in the image's own space with no variance restoration. This is
+            // what a by-hand implementation of "blend three random crops" produces.
+            double w[3], ou[3], ov[3];
+            stochTriGrid(u, v, st.patch, st.seed, w, ou, ov);
+            swsq += w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
+            double acc = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                double g1[1];
+                stochFetch(gauss.data(), 1, TW, TH, 1, u + ou[k], v + ov[k], g1);
+                acc += w[k] * stochInvT(lut.data(), g1[0]);
+            }
+            naive[i] = acc;
+        }
+        const double ssd = sdOf(src), psd = sdOf(plain), osd = sdOf(out), nsd = sdOf(naive);
+        std::printf("[checkstochtile] S4 sd: texels %.4f  plain tiling %.4f  "
+                    "operator %.4f (%.3fx plain)  naive blend %.4f (%.3fx plain)\n",
+                    ssd, psd, osd, osd / psd, nsd, nsd / psd);
+        std::printf("[checkstochtile] S4 mean sum(w^2) = %.4f (Dirichlet prediction 0.5), "
+                    "so the naive blend should sit near %.3fx\n",
+                    swsq / N, std::sqrt(swsq / N));
+        ok &= chk("S4 E[sum w^2] over the triangle", swsq / N, 0.5, 5e-3);
+        ok &= want("S4 the operator did not preserve contrast",
+                   osd / psd > 0.95 && osd / psd < 1.05);
+        ok &= want("S4 the naive control did not lose contrast", nsd / psd < 0.88);
+        // Not just the second moment: the whole distribution.
+        double od[9], pd[9];
+        decilesOf(out, od);
+        decilesOf(plain, pd);
+        double wd = 0.0, wn = 0.0;
+        std::vector<double> nv = naive; double nd[9]; decilesOf(nv, nd);
+        for (int k = 0; k < 9; ++k) {
+            wd = std::max(wd, std::fabs(od[k] - pd[k]));
+            wn = std::max(wn, std::fabs(nd[k] - pd[k]));
+        }
+        std::printf("[checkstochtile] S4 worst decile shift: operator %.4f  naive %.4f\n", wd, wn);
+        ok &= want("S4 the output histogram drifted from plain tiling's", wd < 0.05);
+        ok &= want("S4 the naive control's histogram did not drift", wn > wd * 1.5);
+    }
+
+    // ---- §5 the repeat is broken -------------------------------------------
+    {
+        const int N = 60000;
+        double dRepeat = 0.0, dRandom = 0.0, dPlain = 0.0;
+        for (int i = 0; i < N; ++i) {
+            const double u = frand() * 16.0, v = frand() * 16.0;
+            double a[1], b[1], c[1];
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, a);
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u + 1.0, v, b);
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1,
+                        frand() * 16.0, frand() * 16.0, c);
+            dRepeat += std::fabs(a[0] - b[0]);
+            dRandom += std::fabs(a[0] - c[0]);
+            // Plain tiling: exactly periodic, so this difference is identically zero and
+            // the eye is free to find the lattice.
+            double p0[1], p1[1];
+            stochFetch(gauss.data(), 1, TW, TH, 1, u, v, p0);
+            stochFetch(gauss.data(), 1, TW, TH, 1, u + 1.0, v, p1);
+            dPlain += std::fabs(p0[0] - p1[0]);
+        }
+        dRepeat /= N; dRandom /= N; dPlain /= N;
+        std::printf("[checkstochtile] S5 mean |f(u+1,v) - f(u,v)|: plain %.3g  stochastic "
+                    "%.4f  (unrelated pair %.4f, ratio %.3f)\n",
+                    dPlain, dRepeat, dRandom, dRepeat / dRandom);
+        ok &= chk("S5 plain tiling is exactly periodic", dPlain, 0.0, 1e-12);
+        ok &= want("S5 a one-repeat shift still returns the same content",
+                   dRepeat / dRandom > 0.8);
+    }
+
+    // ---- §6 seed / patch / determinism --------------------------------------
+    {
+        StochTile s2 = st; s2.seed = 8u;
+        StochTile s3 = st; s3.patch = 3.0;
+        double diffSeed = 0.0, diffPatch = 0.0;
+        bool identical = true;
+        for (int i = 0; i < 5000; ++i) {
+            const double u = frand() * 8.0, v = frand() * 8.0;
+            double a[1], b[1], c[1], d[1];
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, a);
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, d);
+            stochSample(s2, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, b);
+            stochSample(s3, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, c);
+            if (a[0] != d[0]) identical = false;
+            diffSeed  += std::fabs(a[0] - b[0]);
+            diffPatch += std::fabs(a[0] - c[0]);
+        }
+        ok &= want("S6 the operator is not deterministic", identical);
+        ok &= want("S6 `seed` does not change the crop", diffSeed / 5000.0 > 0.02);
+        ok &= want("S6 `patch` does not change the lattice", diffPatch / 5000.0 > 0.02);
+    }
+
+    // ---- §7 the Texture integration -----------------------------------------
+    {
+        Texture plain;
+        plain.name = "chk"; plain.w = TW; plain.h = TH;
+        plain.encoding = TexEncoding::Linear;
+        plain.rgb.resize(TN);
+        for (size_t i = 0; i < TN; ++i) {
+            const double s = src[i];
+            plain.rgb[i] = Vec3{s, s * 0.6 + 0.2, 1.0 - s};
+        }
+        Texture stoc = plain;
+        if (!plain.buildReflCoeff() || !stoc.buildReflCoeff()) {
+            ok &= want("S7 buildReflCoeff failed", false);
+        }
+        stoc.stoch = st;
+        stoc.buildStochastic();
+        ok &= want("S7 buildStochastic left a plane empty",
+                   stoc.stochastic() && !stoc.gaussGray.empty() && !stoc.lutRgb.empty());
+        // The anti-regression: enabling the feature must not perturb a texture that did
+        // not ask for it. Bit-for-bit, at every sampler.
+        bool same = true;
+        double devRgb = 0.0, devScl = 0.0, devRfl = 0.0;
+        double lo = 1e9, hi = -1e9;
+        for (int i = 0; i < 4000; ++i) {
+            const double u = frand() * 4.0, v = frand() * 4.0;
+            const double lam = 400.0 + frand() * 300.0;
+            Texture ref = plain;   // a copy that never saw buildStochastic
+            (void)ref;
+            const Vec3 p0 = plain.sampleRgb(u, v);
+            const Vec3 s0 = stoc.sampleRgb(u, v);
+            devRgb = std::max(devRgb, std::fabs(p0.x - s0.x));
+            devScl = std::max(devScl, std::fabs(plain.scalarAt(u, v) - stoc.scalarAt(u, v)));
+            devRfl = std::max(devRfl, std::fabs(plain.reflectanceAt(u, v, lam) -
+                                                stoc.reflectanceAt(u, v, lam)));
+            lo = std::min(lo, std::min(s0.x, std::min(s0.y, s0.z)));
+            hi = std::max(hi, std::max(s0.x, std::max(s0.y, s0.z)));
+            const double r = stoc.reflectanceAt(u, v, lam);
+            if (!(r >= 0.0 && r <= 1.0)) same = false;
+        }
+        ok &= want("S7 a stochastic reflectance left [0,1]", same);
+        ok &= want("S7 sampleRgb left the source's range",
+                   lo >= -1e-9 && hi <= 1.0 + 1e-9);
+        std::printf("[checkstochtile] S7 stochastic vs plain, max |delta|: rgb %.4f  "
+                    "scalar %.4f  reflectance %.4f\n", devRgb, devScl, devRfl);
+        ok &= want("S7 `tiling stochastic` had no effect on any sampler",
+                   devRgb > 0.05 && devScl > 0.02 && devRfl > 0.02);
+        // ...and a texture left at `tiling none` is untouched by all of the above.
+        Texture untouched;
+        untouched.name = "chk2"; untouched.w = TW; untouched.h = TH;
+        untouched.encoding = TexEncoding::Linear;
+        untouched.rgb = plain.rgb;
+        if (!untouched.buildReflCoeff()) ok &= want("S7 buildReflCoeff failed (2)", false);
+        untouched.buildStochastic();   // a no-op when stoch.on == 0
+        double drift = 0.0;
+        for (int i = 0; i < 2000; ++i) {
+            const double u = frand() * 4.0, v = frand() * 4.0;
+            const Vec3 a = plain.sampleRgb(u, v), b = untouched.sampleRgb(u, v);
+            drift = std::max(drift, std::fabs(a.x - b.x) + std::fabs(a.y - b.y) +
+                                    std::fabs(a.z - b.z));
+            drift = std::max(drift, std::fabs(plain.scalarAt(u, v) - untouched.scalarAt(u, v)));
+        }
+        ok &= chk("S7 `tiling none` is bit-identical to before", drift, 0.0, 0.0);
+    }
+
+    // ---- §8 the shared RGB -> Jakob-Hanika coefficient LUT ---------------------
+    // The spectral path blends in linear RGB and converts the blended COLOUR through
+    // upsample::coeffLut(). The thing that must hold is that the tabulated spectrum still
+    // IS the requested colour, so the metric here is the round-trip |XYZ - target|:
+    // integrate the LUT's reflectance against the same CMF/D65 basis the fitter used and
+    // compare to the colour that was asked for. That is exactly what a renderer sees.
+    //
+    // Comparing the LUT's reflectance CURVE against upsample::fit's would be the obvious
+    // test and is a trap: the fit is unconstrained wherever the CMFs vanish, so two
+    // coefficient triples that produce the identical colour can differ by |dR| = 1 out at
+    // 700+ nm. The un-tabulated fit is therefore carried alongside as a control — the LUT
+    // is allowed to be no worse than the fitter it is standing in for, not perfect.
+    //
+    // The grid is sqrt-warped because a linear one is hopeless near black (measured:
+    // 48^3 linear gives mean |dR| 1.0e-2 / worst 2.4e-2 on the lichen asset, vs 1.4e-4 /
+    // 4.3e-3 warped), so half the samples below are pushed hard toward zero.
+    {
+        const float* lut = upsample::coeffLut().data();
+        const upsample::Basis& B = upsample::basis();
+        auto xyzErr = [&](const double* c, double r, double g, double b) {
+            double tX, tY, tZ; upsample::linSrgbToXyz(r, g, b, tX, tY, tZ);
+            double X = 0, Y = 0, Z = 0;
+            for (int s = 0; s < upsample::Basis::N; ++s) {
+                const double sv = stochReflAt(c, B.lam[s]);
+                X += sv * B.wX[s]; Y += sv * B.wY[s]; Z += sv * B.wZ[s];
+            }
+            return std::sqrt((X - tX) * (X - tX) + (Y - tY) * (Y - tY) + (Z - tZ) * (Z - tZ));
+        };
+        auto fitErr = [&](double r, double g, double b) {
+            const auto f = upsample::fit(r, g, b);
+            const double c[3] = {f[0], f[1], f[2]};
+            return xyzErr(c, r, g, b);
+        };
+        double wL = 0.0, sL = 0.0, wF = 0.0, sF = 0.0; int n8 = 0;
+        double wr = 0, wg = 0, wb = 0;
+        for (int i = 0; i < 3000; ++i) {
+            // Half uniform over the cube, half cubed toward black — the regime the warp
+            // exists for and where a linear table falls apart.
+            const bool dark = (i & 1) != 0;
+            auto pick = [&]() { const double x = frand(); return dark ? x * x * x : x; };
+            const double r = pick(), g = pick(), b = pick();
+            double c[3];
+            stochJhCoeff(lut, r, g, b, c);
+            const double eL = xyzErr(c, r, g, b), eF = fitErr(r, g, b);
+            if (eL > wL) { wL = eL; wr = r; wg = g; wb = b; }
+            wF = std::max(wF, eF); sL += eL; sF += eF; ++n8;
+        }
+        std::printf("[checkstochtile] S8 round-trip |XYZ - target|: LUT mean %.5f worst "
+                    "%.4f at rgb (%.3f %.3f %.3f)  |  un-tabulated fit mean %.5f worst "
+                    "%.4f\n", sL / n8, wL, wr, wg, wb, sF / n8, wF);
+        ok &= want("S8 the LUT does not reproduce the requested colour", sL / n8 < 1e-3);
+        ok &= want("S8 the LUT has a bad outlier", wL < 0.03);
+        ok &= want("S8 the LUT is much worse than the fitter it replaces", wL < wF + 0.025);
+        // At the grid nodes no interpolation happens, so the LUT must be as good as the
+        // fitter to within the deliberate soft clip (upsample::clampSaturated) and float
+        // storage. A larger gap is an indexing or warp bug, not a resolution limit.
+        double nodeGap = 0.0;
+        for (int i = 0; i < STOCH_JH_N; i += 7)
+            for (int j = 0; j < STOCH_JH_N; j += 11)
+                for (int k = 0; k < STOCH_JH_N; k += 13) {
+                    // The grid is uniform in sqrt(channel), so the colour AT node i is
+                    // the square of the node coordinate.
+                    const double gr = (double)i / (STOCH_JH_N - 1);
+                    const double gg = (double)j / (STOCH_JH_N - 1);
+                    const double gb = (double)k / (STOCH_JH_N - 1);
+                    const double r = gr * gr, g = gg * gg, b = gb * gb;
+                    double c[3];
+                    stochJhCoeff(lut, r, g, b, c);
+                    nodeGap = std::max(nodeGap, xyzErr(c, r, g, b) - fitErr(r, g, b));
+                }
+        std::printf("[checkstochtile] S8 grid-node error above the fitter = %.3g\n", nodeGap);
+        ok &= want("S8 the LUT is not exact at its own grid nodes", nodeGap < 5e-3);
+        // The fitter itself. upsample::fitSigmoid used to diverge for DARK SATURATED
+        // colours: the sigmoid-of-a-quadratic needs |c| in the hundreds there, so dSigmoid
+        // underflows, the Gauss-Newton Jacobian goes near-singular and Cramer's rule
+        // returns an enormous step. Measured before the backtracking line search was
+        // added: red at Y=0.001 gave |XYZ - target| = 1.41 and blue at Y=0.01 gave 1.40,
+        // i.e. the "fit" was not even the right colour. Those two are asserted by name so
+        // the line search cannot be removed without this failing.
+        const double rDark = fitErr(1e-3, 0.0, 0.0), bDark = fitErr(0.0, 0.0, 1e-2);
+        std::printf("[checkstochtile] S8 fit residual: dark red %.4f (was 1.41)  "
+                    "dark blue %.4f (was 1.40)\n", rDark, bDark);
+        ok &= want("S8 fitSigmoid diverges on dark saturated red", rDark < 1e-3);
+        ok &= want("S8 fitSigmoid diverges on dark saturated blue", bDark < 1e-3);
+    }
+
+    std::printf("[checkstochtile] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkstochtile] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Fiber BCSDF self-test (src/hair.h). P3 stage 1. No scene, no renderer — the model is a
+// pure function, so it can be held to its own physics rather than to a reference image.
+//
+// The reason this test is worth more than a render: a hair BCSDF that is subtly wrong
+// still looks like hair. Energy loss reads as "a slightly darker blonde", a broken
+// sampler reads as "noisier than I expected", and neither announces itself. Every claim
+// below is therefore a NUMBER the model must hit, and most of them are claims the
+// published derivation makes, so failing one localises the bug to a named term.
+//
+//   §1 WHITE FURNACE. With no absorption a fiber must scatter every photon somewhere:
+//      integral over the sphere of f * |cos theta_i| = 1, at any roughness and any
+//      incidence. This is the single strongest statement about the model, and it is the
+//      one Marschner's original formulation FAILS (it gains energy with roughness and
+//      drops the p >= 3 tail) — so it also documents why this is the Chiang form.
+//   §2 THE M_p BRANCHES AGREE. The longitudinal term switches to a log-space Bessel
+//      formulation at v = 0.1; the two branches are one function and must meet.
+//   §3 M_p IS NORMALISED over the longitudinal angle — the property that makes §1
+//      possible at all, and the exact thing Marschner's flat Gaussian gets wrong.
+//   §4 N_p IS NORMALISED over one revolution (what a wrapped Gaussian gets wrong), and
+//      its inverse-CDF sampler reproduces its own CDF.
+//   §5 SAMPLING MATCHES EVALUATION. pdf() returns exactly the density sample() draws
+//      from — checked both self-consistently and by binning the empirical density. A
+//      sampler that disagrees with its pdf still looks unbiased; it just never converges.
+//   §6 THE PDF INTEGRATES TO 1, so the lobe-selection probabilities are a real
+//      distribution and not merely proportional to one.
+//   §7 ABSORPTION AND FRESNEL BEHAVE. Energy falls monotonically with sigma_a, and the R
+//      lobe SURVIVES an opaque fiber because it never enters — which is why black hair
+//      still has a white sheen, and a discriminator an "absorb everything" bug fails.
+//   §8 THE LOBES ARE WHERE MARSCHNER SAYS. Two distinct azimuthal peaks (a plain shiny
+//      cylinder has one), and the cuticle tilt actually moves the highlight.
+//   §9 GEOMETRY. h recovered from a hit reproduces the h that generated it, and the local
+//      fiber frame round-trips. This is the join to the intersector, and a sign error
+//      here mirrors the highlight — invisible on a symmetric groom.
+static int checkHair() {
+    bool ok = true;
+    double worst = 0.0;
+    auto chk = [&](const char* what, double got, double want_, double tol) {
+        const double e = std::fabs(got - want_);
+        if (tol <= 1e-9 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkhair] %-52s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want_, e);
+        return e <= tol;
+    };
+    auto want = [&](const char* what, bool cond) {
+        if (!cond) std::printf("[checkhair] %s  BAD\n", what);
+        return cond;
+    };
+    uint64_t rng = 0xD1B54A32D192ED03ull;
+    auto frand = [&]() {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) * (1.0 / 9007199254740992.0);
+    };
+    auto sphereDir = [&](double u1, double u2) {
+        const double z = 1.0 - 2.0 * u1;
+        const double r = std::sqrt(std::max(0.0, 1.0 - z * z));
+        const double p = 2.0 * hair::kPi * u2;
+        return Vec3{z, r * std::cos(p), r * std::sin(p)};
+    };
+    auto sq = [](double x) { return x * x; };
+
+    // --- S1 white furnace ----------------------------------------------------
+    // The furnace integral is EXACT here rather than statistical, and that is worth
+    // explaining, because it turns the vaguest-sounding section into the sharpest.
+    //
+    // f is a sum of SEPARABLE terms, f = sum_p M_p(theta) A_p N_p(phi) / |cos theta_i|, so
+    //
+    //   integral of f |cos theta_i| dw = sum_p A_p * [int M_p cos dtheta] * [int N_p dphi]
+    //
+    // and S3/S4 pin those two bracketed factors at 1 to quadrature precision. The furnace
+    // test therefore reduces to the algebraic claim `sum_p A_p = 1 when T = 1`, which
+    // telescopes: f + (1-f)^2 + (1-f)^2 f + (1-f) f^2 = 1 identically in the Fresnel
+    // reflectance f. So it is asserted at 1e-12 instead of at Monte Carlo tolerance — and
+    // the p >= 3 residual is precisely the term that makes it telescope, which is the
+    // quantitative form of "Marschner's three-lobe model leaks energy".
+    {
+        double worstSum = 0.0;
+        for (double eta : {1.4, 1.55, 1.8})
+            for (double hh : {-0.99, -0.5, 0.0, 0.37, 0.95})
+                for (double cosThetaO : {0.05, 0.4, 1.0}) {
+                    double ap[hair::kPMax + 1];
+                    hair::Ap(cosThetaO, eta, hh, 1.0, ap);       // T = 1: no absorption
+                    double sum = 0.0;
+                    for (int p = 0; p <= hair::kPMax; ++p) sum += ap[p];
+                    worstSum = std::max(worstSum, std::fabs(sum - 1.0));
+                }
+        std::printf("[checkhair] S1 sum of A_p at zero absorption: worst |sum - 1| over 45 "
+                    "(eta, h, theta) combos = %.3g\n", worstSum);
+        ok &= chk("S1 the lobe attenuations do not sum to 1 (energy lost or gained)",
+                  worstSum, 0.0, 1e-12);
+        {
+            double ap[hair::kPMax + 1];
+            hair::Ap(1.0, 1.55, 0.0, 1.0, ap);
+            std::printf("[checkhair] S1 without the p>=3 residual a white fiber would lose "
+                        "%.2f%% of its energy\n", 100.0 * ap[hair::kPMax]);
+            ok &= want("S1 the residual lobe carries no energy", ap[hair::kPMax] > 1e-3);
+        }
+        // And the ASSEMBLED f, integrated with its own sampler as the importance
+        // distribution. This is the statistical half, and it catches what the algebra
+        // cannot: that f() really combines the terms that way, and that sample() covers
+        // the whole support — a sampler blind to one lobe comes out short here while
+        // passing every self-consistency check in S5.
+        // The MEDULLA has to pass the same furnace, and this is the test that matters for
+        // stage 3: a scattering core removes energy from the specular chain, and unless the
+        // TT^s / TRT^s lobes carry back exactly what it removed, a white fur fiber loses
+        // light. ApScattered is built as a DIFFERENCE of two chains precisely so that this
+        // closes as algebra rather than as a fit — with sigma_a = 0 everywhere the six
+        // lobes sum to 1 identically, for any kappa, sigma_s or g.
+        {
+            double worstMed = 0.0;
+            for (double kap : {0.2, 0.6, 0.95})
+                for (double ss : {0.1, 2.5, 40.0})
+                    for (double g : {-0.5, 0.0, 0.8})
+                        for (double hh : {-0.97, -0.3, 0.0, 0.55, 0.99})
+                            for (double thO : {-1.1, 0.0, 0.7}) {
+                                hair::Params pr;
+                                pr.betaM = 0.3; pr.betaN = 0.3; pr.alpha = 2.0;
+                                pr.kappa = kap; pr.mSigmaS = ss; pr.mSigmaA = 0.0; pr.mG = g;
+                                const hair::Bcsdf b = hair::make(pr, hh, 0.0);
+                                double w[hair::kNLobes];
+                                const double sTh = std::sin(thO), cTh = std::cos(thO);
+                                const hair::Chord ch = hair::refractGeom(b, sTh, cTh);
+                                double ap[hair::kPMax + 1], aps[2];
+                                hair::Ap(cTh, b.eta, b.h, ch.T, ap);
+                                hair::ApScattered(ch, cTh, b.eta, b.h, aps);
+                                (void)w;
+                                double sum = aps[0] + aps[1];
+                                for (int p = 0; p <= hair::kPMax; ++p) sum += ap[p];
+                                worstMed = std::max(worstMed, std::fabs(sum - 1.0));
+                            }
+            std::printf("[checkhair] S1 medulla: worst |sum of all 6 A_p - 1| over 405 "
+                        "(kappa, sigma_s, g, h, theta) combos = %.3g\n", worstMed);
+            ok &= chk("S1 a scattering medulla loses or invents energy",
+                      worstMed, 0.0, 1e-12);
+        }
+        double worstMC = 0.0;
+        for (double beta : {0.1, 0.4, 0.8})
+            for (double hh : {-0.8, 0.0, 0.6})
+                for (double thetaO : {0.0, 0.9})
+                for (int med = 0; med < 2; ++med) {
+                    hair::Params pr; pr.betaM = beta; pr.betaN = beta; pr.alpha = 0.0;
+                    if (med) { pr.kappa = 0.85; pr.mSigmaS = 3.0; pr.mSigmaA = 0.0; pr.mG = 0.3; }
+                    const hair::Bcsdf b = hair::make(pr, hh, 0.0);
+                    const Vec3 wo{std::sin(thetaO), std::cos(thetaO), 0.0};
+                    const int N = 60000;
+                    double sum = 0.0;
+                    for (int i = 0; i < N; ++i) {
+                        double pd = 0.0, fv = 0.0;
+                        const Vec3 wi = hair::sample(b, wo, frand(), frand(), frand(),
+                                                     frand(), pd, fv);
+                        if (pd > 0.0)
+                            sum += fv * std::sqrt(std::max(0.0, 1.0 - wi.x * wi.x)) / pd;
+                    }
+                    worstMC = std::max(worstMC, std::fabs(sum / N - 1.0));
+                }
+        std::printf("[checkhair] S1 furnace by the model's own sampler: worst "
+                    "|estimate - 1| over 36 combos (half medullated) = %.4f\n", worstMC);
+        ok &= want("S1 f and its sampler do not integrate to unit albedo", worstMC < 0.01);
+    }
+
+    // --- S2 the two M_p branches meet ----------------------------------------
+    // Compared as FORMULAE at one v, not by stepping across the crossover: stepping also
+    // moves the function itself, and M_p's slope near v = 0.1 is steep enough to swamp
+    // the thing being measured (the first draft of this test read 3.8e-5 of pure slope
+    // and looked like a bug). Their exact ratio is 1/(1 - exp(-2/v)) — the small-v branch
+    // drops the negative half of sinh — so at v = 0.1 they must agree to ~2e-9.
+    {
+        auto mpBig = [](double ci, double co, double si, double so, double v) {
+            const double a = ci * co / v, b = si * so / v;
+            return (std::exp(-b) * hair::besselI0(a)) / (std::sinh(1.0 / v) * 2.0 * v);
+        };
+        auto mpSmall = [](double ci, double co, double si, double so, double v) {
+            const double a = ci * co / v, b = si * so / v;
+            return std::exp(hair::logBesselI0(a) - b - 1.0 / v + 0.6931471805599453 +
+                            std::log(0.5 / v));
+        };
+        double worstRel = 0.0;
+        for (double v : {0.06, 0.08, 0.1, 0.13, 0.2})
+            for (double ci : {0.2, 0.6, 0.99})
+                for (double co : {0.3, 0.8}) {
+                    const double si = std::sqrt(1 - ci * ci), so = std::sqrt(1 - co * co);
+                    const double a = mpBig(ci, co, si, so, v), b2 = mpSmall(ci, co, si, so, v);
+                    if (a > 1e-300)
+                        worstRel = std::max(worstRel, std::fabs(a - b2) / a - std::exp(-2.0 / v));
+                }
+        std::printf("[checkhair] S2 M_p branches, relative gap beyond the analytic "
+                    "exp(-2/v): %.3g\n", worstRel);
+        ok &= want("S2 the two M_p branches are not the same function", worstRel < 1e-12);
+        // The Bessel evaluator's own two branches (series below 12, asymptotic above).
+        double worstB = 0.0;
+        for (double x : {8.0, 10.0, 11.0, 11.9})
+            worstB = std::max(worstB, std::fabs(hair::logBesselI0(x) -
+                                                std::log(hair::besselI0(x))));
+        std::printf("[checkhair] S2 logBesselI0 vs log(besselI0) below the split: %.3g\n",
+                    worstB);
+        ok &= want("S2 logBesselI0 disagrees with its own series", worstB < 1e-12);
+    }
+
+    // --- S3 M_p is normalised over the longitudinal angle --------------------
+    // Deterministic midpoint quadrature, not Monte Carlo. M_p at v = 0.005 is a spike
+    // 0.07 rad wide in a pi-wide domain, which uniform MC estimates terribly (the first
+    // draft wobbled by 1% and could not have detected a 0.5% normalisation error). A
+    // 400k-point grid resolves the narrowest lobe with ~900 samples across it and lands
+    // at quadrature precision instead.
+    {
+        double worstNorm = 0.0;
+        const int N = 400000;
+        for (double v : {0.005, 0.05, 0.1, 0.4, 1.0})
+            for (double thetaO : {0.0, 0.7, -1.1}) {
+                const double so = std::sin(thetaO), co = std::cos(thetaO);
+                double sum = 0.0;
+                for (int i = 0; i < N; ++i) {
+                    const double ti = -0.5 * hair::kPi + hair::kPi * (i + 0.5) / N;
+                    sum += hair::Mp(std::cos(ti), co, std::sin(ti), so, v) * std::cos(ti);
+                }
+                worstNorm = std::max(worstNorm, std::fabs(sum * hair::kPi / N - 1.0));
+            }
+        std::printf("[checkhair] S3 worst |integral M_p cos dtheta - 1| = %.3g\n", worstNorm);
+        ok &= want("S3 M_p is not normalised", worstNorm < 1e-6);
+    }
+
+    // --- S4 N_p is normalised over one revolution ----------------------------
+    {
+        double worstNorm = 0.0;
+        const int N = 400000;
+        for (double s : {0.01, 0.1, 0.3, 1.0})
+            for (int p = 0; p < hair::kPMax; ++p) {
+                double sum = 0.0;
+                for (int i = 0; i < N; ++i)
+                    sum += hair::Np(-hair::kPi + 2.0 * hair::kPi * (i + 0.5) / N,
+                                    p, s, 0.3, 0.2);
+                worstNorm = std::max(worstNorm, std::fabs(sum * 2.0 * hair::kPi / N - 1.0));
+            }
+        std::printf("[checkhair] S4 worst |integral N_p dphi - 1| = %.3g\n", worstNorm);
+        ok &= want("S4 N_p is not normalised on the circle", worstNorm < 1e-6);
+
+        double worstQ = 0.0;
+        for (double s : {0.05, 0.3}) {
+            const int N = 200000;
+            const double q = 0.4;                     // an arbitrary interior point
+            int below = 0;
+            for (int i = 0; i < N; ++i)
+                if (hair::sampleTrimmedLogistic(frand(), s, -hair::kPi, hair::kPi) < q) ++below;
+            const double wantF = (hair::logisticCdf(q, s) - hair::logisticCdf(-hair::kPi, s)) /
+                                 (hair::logisticCdf(hair::kPi, s) -
+                                  hair::logisticCdf(-hair::kPi, s));
+            worstQ = std::max(worstQ, std::fabs((double)below / N - wantF));
+        }
+        std::printf("[checkhair] S4 trimmed-logistic sampler CDF error = %.4f\n", worstQ);
+        ok &= want("S4 the trimmed-logistic sampler does not match its CDF", worstQ < 0.01);
+    }
+
+    // --- S5 sample() and pdf() are the same distribution ---------------------
+    // The test that actually protects the renderer, in two independent statements: the
+    // returned pdf equals a fresh pdf() call on the sampled direction (cheap, exact), and
+    // the EMPIRICAL density of sampled directions matches pdf() in coarse bins (dear, but
+    // the only thing that catches a sampler drawing the right shape with the wrong
+    // normalisation — which self-consistency alone cannot see).
+    {
+        hair::Params pr; pr.betaM = 0.25; pr.betaN = 0.35; pr.alpha = 2.0;
+        const hair::Bcsdf b = hair::make(pr, 0.4, 0.2);
+        const Vec3 wo = normalize(Vec3{0.35, 0.8, -0.2});
+        double worstSelf = 0.0;
+        int bad = 0;
+        for (int i = 0; i < 20000; ++i) {
+            double pd = 0.0, fv = 0.0;
+            const Vec3 wi = hair::sample(b, wo, frand(), frand(), frand(), frand(), pd, fv);
+            if (!(std::isfinite(wi.x) && std::isfinite(wi.y) && std::isfinite(wi.z))) {
+                ++bad; continue;
+            }
+            if (!(pd > 0.0)) continue;
+            worstSelf = std::max(worstSelf,
+                                 std::fabs(pd - hair::pdf(b, wo, wi)) / pd);
+            if (fv > 0.0)
+                worstSelf = std::max(worstSelf, std::fabs(fv - hair::f(b, wo, wi)) / fv);
+        }
+        std::printf("[checkhair] S5 sample() self-consistency: worst relative "
+                    "disagreement %.3g, %d non-finite directions\n", worstSelf, bad);
+        ok &= chk("S5 sample() returns a pdf/f its own evaluators disagree with",
+                  worstSelf, 0.0, 1e-12);
+        ok &= want("S5 sample() produced a non-finite direction", bad == 0);
+
+        const int NB = 8;                              // NB x NB bins in (sin theta, phi)
+        std::vector<double> histo((size_t)NB * NB, 0.0), model((size_t)NB * NB, 0.0);
+        auto binOf = [&](const Vec3& w) {
+            const int bi = (int)hair::clampd((w.x * 0.5 + 0.5) * NB, 0.0, NB - 1e-9);
+            const int bj = (int)hair::clampd(
+                (std::atan2(w.z, w.y) / (2 * hair::kPi) + 0.5) * NB, 0.0, NB - 1e-9);
+            return (size_t)bi * NB + bj;
+        };
+        const int NS = 400000;
+        int kept = 0;
+        for (int i = 0; i < NS; ++i) {
+            double pd = 0.0, fv = 0.0;
+            const Vec3 wi = hair::sample(b, wo, frand(), frand(), frand(), frand(), pd, fv);
+            if (!(pd > 0.0)) continue;
+            histo[binOf(wi)] += 1.0;
+            ++kept;
+        }
+        const int NM = 400000;
+        for (int i = 0; i < NM; ++i) {
+            const Vec3 wi = sphereDir(frand(), frand());
+            model[binOf(wi)] += hair::pdf(b, wo, wi);
+        }
+        double mtot = 0.0;
+        for (double m : model) mtot += m;
+        double worstBin = 0.0, totalVar = 0.0;
+        for (size_t i = 0; i < histo.size(); ++i) {
+            const double a = histo[i] / std::max(kept, 1);
+            const double m = model[i] / std::max(mtot, 1e-12);
+            totalVar += 0.5 * std::fabs(a - m);
+            if (a + m > 0.01) worstBin = std::max(worstBin, std::fabs(a - m) / (a + m));
+        }
+        std::printf("[checkhair] S5 sampled-vs-pdf density: total variation %.4f, "
+                    "worst significant bin %.3f\n", totalVar, worstBin);
+        ok &= want("S5 sample() does not draw from pdf()", totalVar < 0.03 && worstBin < 0.10);
+    }
+
+    // --- S6 the pdf integrates to 1 ------------------------------------------
+    //
+    // Not by Monte Carlo. The pdf is a sum of `kPMax + 1` products
+    //     pdf(wi) = sum_p  w_p * M_p(theta_i; theta_o^p) * N_p(phi)
+    // and dw = cos(theta_i) dtheta_i dphi in the fiber frame, so the integral
+    // *separates*:
+    //     int pdf dw = sum_p w_p * (int M_p cos dtheta) * (int N_p dphi).
+    // S3 already pinned the first bracket to 1 and S4 the second, both by
+    // deterministic quadrature at 1e-6. So all that is left to check is that the
+    // lobe weights themselves sum to one -- which is exact arithmetic, testable at
+    // 1e-12 instead of the ~3% a uniform-sphere estimator can manage against a lobe
+    // this narrow. (The old MC form reported 0.058 here purely as estimator noise.)
+    {
+        double worstW = 0.0;
+        bool nonNeg = true;
+        for (double beta : {0.15, 0.5, 0.85})
+            for (double hh : {-0.9, -0.7, 0.1, 0.85, 0.99})
+                for (double sa : {0.0, 0.35, 4.0})
+                    for (double thO : {-1.2, -0.3, 0.0, 0.55, 1.3})
+                    for (int med = 0; med < 2; ++med) {
+                        hair::Params pr; pr.betaM = beta; pr.betaN = beta; pr.alpha = 2.0;
+                        if (med) {   // a medullated fur fiber must be a pmf too
+                            pr.kappa = 0.8; pr.mSigmaS = 2.4; pr.mSigmaA = 0.1; pr.mG = 0.4;
+                        }
+                        const hair::Bcsdf b = hair::make(pr, hh, sa);
+                        double w[hair::kNLobes];
+                        hair::apPdf(b, std::sin(thO), std::cos(thO), w);
+                        double s = 0.0;
+                        for (int p = 0; p < hair::kNLobes; ++p) {
+                            if (!(w[p] >= 0.0)) nonNeg = false;
+                            s += w[p];
+                        }
+                        worstW = std::max(worstW, std::fabs(s - 1.0));
+                    }
+        std::printf("[checkhair] S6 lobe-selection weights: worst |sum - 1| over 450 combos "
+                    "(half of them medullated) = %.3g\n", worstW);
+        ok &= chk("S6 the lobe weights are not a probability mass function", worstW, 0.0, 1e-12);
+        ok &= want("S6 a lobe-selection weight is negative or not finite", nonNeg);
+
+        // Guard against the separability argument itself being wrong (a stray factor
+        // that depends on both angles would slip past S3/S4/the sum above). One
+        // deterministic midpoint quadrature over the whole sphere, coarse enough to be
+        // cheap and fine enough to resolve the lobes at this roughness.
+        hair::Params pr; pr.betaM = 0.4; pr.betaN = 0.4; pr.alpha = 2.0;
+        double worstQ = 0.0;
+        for (double hh : {-0.55, 0.3}) {
+            const hair::Bcsdf b = hair::make(pr, hh, 0.35);
+            const Vec3 wo = normalize(Vec3{0.2, 0.9, 0.3});
+            const int NT = 1024, NP = 1024;
+            double sum = 0.0;
+            for (int it = 0; it < NT; ++it) {
+                const double th = -0.5 * hair::kPi + hair::kPi * (it + 0.5) / NT;
+                const double st = std::sin(th), ct = std::cos(th);
+                double row = 0.0;
+                for (int ip = 0; ip < NP; ++ip) {
+                    const double az = -hair::kPi + 2.0 * hair::kPi * (ip + 0.5) / NP;
+                    row += hair::pdf(b, wo, Vec3{st, ct * std::cos(az), ct * std::sin(az)});
+                }
+                sum += row * ct;
+            }
+            sum *= (hair::kPi / NT) * (2.0 * hair::kPi / NP);
+            worstQ = std::max(worstQ, std::fabs(sum - 1.0));
+        }
+        std::printf("[checkhair] S6 quadrature guard, worst |integral pdf dw - 1| = %.3g\n",
+                    worstQ);
+        ok &= want("S6 the BCSDF pdf is not a normalised density", worstQ < 1e-6);
+    }
+
+    // --- S7 absorption and Fresnel -------------------------------------------
+    {
+        hair::Params pr; pr.betaM = 0.3; pr.betaN = 0.3; pr.alpha = 0.0;
+        const Vec3 wo{0.0, 1.0, 0.0};
+        double prev = 1e30, e0 = 0.0;
+        bool mono = true;
+        for (double sa : {0.0, 0.05, 0.2, 0.8, 3.0}) {
+            const hair::Bcsdf b = hair::make(pr, 0.3, sa);
+            const int N = 120000;
+            double sum = 0.0;
+            for (int i = 0; i < N; ++i) {
+                const Vec3 wi = sphereDir(frand(), frand());
+                sum += hair::f(b, wo, wi) * std::sqrt(std::max(0.0, 1.0 - wi.x * wi.x));
+            }
+            const double e = sum / N * 4.0 * hair::kPi;
+            if (sa == 0.0) e0 = e;
+            if (e > prev + 1e-3) mono = false;
+            prev = e;
+        }
+        std::printf("[checkhair] S7 albedo falls %.4f -> %.4f as sigma_a goes 0 -> 3, "
+                    "monotone %s\n", e0, prev, mono ? "yes" : "NO");
+        ok &= want("S7 absorption does not monotonically darken the fiber", mono);
+
+        // Even opaque, R survives: it never enters the fiber. An implementation that
+        // applies absorption to every lobe passes everything above and fails here.
+        double apO[hair::kPMax + 1];
+        hair::Ap(1.0, pr.eta, 0.3, std::exp(-1e4), apO);
+        std::printf("[checkhair] S7 opaque fiber: A_R = %.4f, A_TT = %.3g, A_TRT = %.3g\n",
+                    apO[0], apO[1], apO[2]);
+        ok &= want("S7 the R lobe was wrongly attenuated by absorption", apO[0] > 0.02);
+        ok &= want("S7 TT survived an opaque fiber", apO[1] < 1e-12);
+
+        ok &= chk("S7 normal-incidence Fresnel", hair::frDielectric(1.0, 1.0, 1.55),
+                  sq(0.55 / 2.55), 1e-12);
+        ok &= chk("S7 grazing Fresnel -> 1", hair::frDielectric(0.0, 1.0, 1.55), 1.0, 1e-12);
+        for (double c : {0.2, 0.5, 0.8})
+            std::printf("[checkhair] S7 reflectance %.2f -> sigma_a %.4f\n",
+                        c, hair::sigmaAFromReflectance(c, 0.3));
+        ok &= want("S7 a darker target must absorb more",
+                   hair::sigmaAFromReflectance(0.2, 0.3) >
+                   hair::sigmaAFromReflectance(0.8, 0.3));
+    }
+
+    // --- S8 the lobes are where the geometry says ----------------------------
+    {
+        hair::Params pr; pr.betaM = 0.06; pr.betaN = 0.06; pr.alpha = 0.0;
+        const hair::Bcsdf b = hair::make(pr, 0.0, 0.02);     // h = 0: dead-centre hit
+        const Vec3 wo{0.0, 1.0, 0.0};
+        // At h = 0 (gammaO = gammaT = 0) the specular R exit is straight back and TT is
+        // straight through; Phi(p) must say exactly that.
+        ok &= chk("S8 R exit azimuth at h = 0",
+                  std::fabs(hair::wrapAngle(hair::Phi(0, 0, 0))), 0.0, 1e-12);
+        ok &= chk("S8 TT exit azimuth at h = 0",
+                  std::fabs(hair::wrapAngle(hair::Phi(1, 0, 0))), hair::kPi, 1e-12);
+
+        // The real test: off-centre, where R / TT / TRT leave at three *different*
+        // azimuths, does the rendered lobe actually sit where refraction says it does?
+        //
+        // Counting "significant peaks" was the wrong instrument. At h = 0 the three
+        // exit directions collapse onto two, and TT (A ~ 0.87, and the narrowest v)
+        // stands ~74x above R + TRT, so the second peak sits at ~1.6% of the max and any
+        // global amplitude threshold either misses it or admits noise. Amplitude ratios
+        // between lobes are not what this section is about. So: predict each azimuth
+        // from Snell independently of hair::Phi, then require a local maximum of the
+        // swept BCSDF within a couple of degrees of it.
+        const double hh = 0.6;
+        hair::Params p3; p3.betaM = 0.06; p3.betaN = 0.06; p3.alpha = 0.0;
+        const hair::Bcsdf b3 = hair::make(p3, hh, 0.02);
+        // wo is broadside (theta_o = 0), so the Bravais index degenerates to eta itself.
+        const double gO = std::asin(hh), gT = std::asin(hh / p3.eta);
+        ok &= chk("S8 gamma_o from the impact parameter", b3.gammaO, gO, 1e-12);
+
+        const int NS = 7200;                      // 0.05 deg -- finer than the tolerance
+        std::vector<double> curve((size_t)NS);
+        for (int i = 0; i < NS; ++i) {
+            const double phi = -hair::kPi + 2.0 * hair::kPi * (i + 0.5) / NS;
+            curve[(size_t)i] = hair::f(b3, wo, Vec3{0.0, std::cos(phi), std::sin(phi)});
+        }
+        for (int p = 0; p <= 2; ++p) {
+            const double want_ = hair::wrapAngle(2.0 * p * gT - 2.0 * gO + p * hair::kPi);
+            ok &= chk(p == 0 ? "S8 hair::Phi matches Snell for R"
+                    : p == 1 ? "S8 hair::Phi matches Snell for TT"
+                             : "S8 hair::Phi matches Snell for TRT",
+                      hair::wrapAngle(hair::Phi(p, gO, gT)), want_, 1e-12);
+            // Best point of the curve within +-10 deg of the prediction.
+            const int c = (int)std::floor((want_ + hair::kPi) / (2.0 * hair::kPi) * NS);
+            const int w = NS / 36;
+            int bi = c; double bv = -1e30;
+            for (int d = -w; d <= w; ++d) {
+                const int j = ((c + d) % NS + NS) % NS;
+                if (curve[(size_t)j] > bv) { bv = curve[(size_t)j]; bi = j; }
+            }
+            const bool isMax = curve[(size_t)bi] >= curve[(size_t)((bi + NS - 1) % NS)] &&
+                               curve[(size_t)bi] >= curve[(size_t)((bi + 1) % NS)] &&
+                               bi != ((c - w) % NS + NS) % NS &&
+                               bi != ((c + w) % NS + NS) % NS;
+            const double got = -hair::kPi + 2.0 * hair::kPi * (bi + 0.5) / NS;
+            const double err = std::fabs(hair::wrapAngle(got - want_)) * 180.0 / hair::kPi;
+            std::printf("[checkhair] S8 p=%d (%s) at h = 0.6: predicted %+7.2f deg, "
+                        "peak at %+7.2f deg (%.3f off), height %.4g\n",
+                        p, p == 0 ? "R  " : p == 1 ? "TT " : "TRT",
+                        want_ * 180.0 / hair::kPi, got * 180.0 / hair::kPi, err, bv);
+            char lbl[96];
+            std::snprintf(lbl, sizeof lbl, "S8 no local maximum near the p=%d exit", p);
+            ok &= want(lbl, isMax);
+            std::snprintf(lbl, sizeof lbl, "S8 p=%d lobe is off its predicted azimuth", p);
+            ok &= want(lbl, err < 2.0);
+        }
+
+        auto peakTheta = [&](double alphaDeg) {
+            hair::Params p2; p2.betaM = 0.06; p2.betaN = 0.06; p2.alpha = alphaDeg;
+            const hair::Bcsdf b2 = hair::make(p2, 0.0, 0.02);
+            double best = -1e30, bestT = 0.0;
+            for (int i = 0; i < 4000; ++i) {
+                const double th = -1.5 + 3.0 * i / 3999.0;
+                const double v = hair::f(b2, wo, Vec3{std::sin(th), -std::cos(th), 0.0});
+                if (v > best) { best = v; bestT = th; }
+            }
+            return bestT;
+        };
+        const double t0 = peakTheta(0.0), t3 = peakTheta(3.0);
+        std::printf("[checkhair] S8 R highlight theta: alpha=0 %.4f rad, alpha=3deg %.4f "
+                    "rad, shift %.2f deg\n", t0, t3, (t3 - t0) * 180.0 / hair::kPi);
+        ok &= want("S8 the cuticle tilt does not move the highlight",
+                   std::fabs(t3 - t0) > 0.02);
+    }
+
+    // --- S9 the geometry hookup ----------------------------------------------
+    {
+        double worstH = 0.0;
+        const Vec3 axis = normalize(Vec3{0.3, 1.0, -0.2});
+        Vec3 e1, e2; onb(axis, e1, e2);
+        for (int i = 0; i < 500; ++i) {
+            const double hTrue = frand() * 2.0 - 1.0;
+            const double gamma = std::asin(hTrue);
+            // Outward normal at a hit whose normal-plane angle to `wo` is exactly gamma.
+            const Vec3 n = e1 * std::cos(gamma) - e2 * std::sin(gamma);
+            const double thetaO = (frand() - 0.5) * 2.0;         // any longitudinal tilt
+            const Vec3 wo = normalize(axis * std::sin(thetaO) + e1 * std::cos(thetaO));
+            worstH = std::max(worstH, std::fabs(hair::hFromHit(n, axis, wo) - hTrue));
+        }
+        std::printf("[checkhair] S9 worst |h recovered - h true| over 500 hits = %.3g\n",
+                    worstH);
+        ok &= chk("S9 hFromHit does not invert the hit geometry", worstH, 0.0, 1e-9);
+
+        double worstF = 0.0;
+        for (int i = 0; i < 500; ++i) {
+            const Vec3 ax = normalize(Vec3{frand() * 2 - 1, frand() * 2 - 1, frand() * 2 - 1});
+            Vec3 a, bb; onb(ax, a, bb);
+            const double g = frand() * 2.0 * hair::kPi;
+            const hair::Frame fr = hair::frameFromHit(a * std::cos(g) + bb * std::sin(g), ax);
+            const Vec3 w = sphereDir(frand(), frand());
+            worstF = std::max(worstF, length(hair::toWorld(fr, hair::toLocal(fr, w)) - w));
+            worstF = std::max(worstF, std::fabs(hair::toLocal(fr, ax).x - 1.0));
+        }
+        std::printf("[checkhair] S9 worst frame round-trip error = %.3g\n", worstF);
+        ok &= chk("S9 the fiber frame does not round-trip", worstF, 0.0, 1e-12);
+    }
+
+    // --- S10 the medulla's directional memory ---------------------------------
+    // scatteredSpread() is the one part of the medulla that is NOT taken from Yan et al.
+    // (2017) directly: their C^M / C^N are 24x16x16x720 Monte-Carlo tables that were never
+    // published, so in their place stands one number from similarity theory — after reduced
+    // optical depth tau' = (1-g) sigma_s L, the exit direction has forgotten the entry
+    // direction as exp(-tau').
+    //
+    // That is a claim about an actual random walk, so it is checked against one, with no
+    // closed form anywhere on the right-hand side: sample free flights along the chord,
+    // deflect by a Henyey-Greenstein angle at each, compose the deflections as real 3-D
+    // rotations, and average the cosine between the direction that went in and the one that
+    // came out. The composition is where this could go wrong and the algebra could not
+    // notice — g multiplies per event only because the first Legendre moment of a
+    // composition of independent rotations is the product of the moments, and that is a
+    // property of the rotations, not of the exponent.
+    //
+    // The medulla half-chord is re-derived here too, by bisecting the distance-to-axis
+    // function rather than evaluating sqrt(kappa^2 - sin^2 gammaT), so a sign or a swapped
+    // radius in refractGeom's geometry would show up as a chord error rather than hiding
+    // inside a spread that happens to look plausible.
+    {
+        auto sampleHG = [](double g, double u) {
+            if (std::fabs(g) < 1e-4) return 2.0 * u - 1.0;
+            const double s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u);
+            return hair::clampd((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+        };
+        double worstChord = 0.0, worstSpread = 0.0;
+        int combos = 0;
+        const int kWalks = 120000;
+        const double thetaO = 0.3;
+        for (double kappa : {0.35, 0.95})
+        for (double sigS  : {0.3, 1.5, 5.0})
+        for (double gAn   : {-0.4, 0.0, 0.5, 0.85})
+        for (double h     : {0.0, 0.4}) {
+            hair::Params pr;
+            pr.kappa = kappa; pr.mSigmaS = sigS; pr.mSigmaA = 0.0; pr.mG = gAn;
+            const hair::Bcsdf b = hair::make(pr, h, 0.0);
+            const hair::Chord ch = hair::refractGeom(b, std::sin(thetaO), std::cos(thetaO));
+            const double d = std::fabs(std::sin(ch.gammaT));   // chord's distance from axis
+            if (d >= kappa - 1e-3) continue;                   // grazes / misses the core
+            ++combos;
+
+            // (a) half-chord by bisection on |(d, t)| - kappa, which is a root-find rather
+            // than the algebraic sqrt refractGeom uses.
+            double lo = 0.0, hi = 1.0;
+            for (int it = 0; it < 200; ++it) {
+                const double mid = 0.5 * (lo + hi);
+                (std::sqrt(d * d + mid * mid) < kappa ? lo : hi) = mid;
+            }
+            const double smNum = 0.5 * (lo + hi);
+            const double cosThetaT = std::sqrt(1.0 - hair::sqr(std::sin(thetaO) / pr.eta));
+            const double L = 2.0 * smNum / cosThetaT;          // path travelled in the core
+            worstChord = std::max(worstChord,
+                                  std::fabs((1.0 - gAn) * sigS * L - ch.tauP));
+
+            // (b) the walk. Free flights are drawn along the path parameter, so the number
+            // of events is Poisson(sigma_s L) as it must be, but the DIRECTIONS are built
+            // by actually rotating.
+            double sumCos = 0.0;
+            for (int k = 0; k < kWalks; ++k) {
+                Vec3 w{0, 0, 1};
+                double s = 0.0;
+                for (;;) {
+                    s += -std::log(std::max(1e-12, 1.0 - frand())) / sigS;
+                    if (s >= L) break;
+                    const double ct = sampleHG(gAn, frand());
+                    const double st = std::sqrt(std::max(0.0, 1.0 - ct * ct));
+                    const double ph = 2.0 * hair::kPi * frand();
+                    Vec3 e1, e2; onb(w, e1, e2);
+                    w = normalize(w * ct + (e1 * std::cos(ph) + e2 * std::sin(ph)) * st);
+                }
+                sumCos += w.z;
+            }
+            const double spreadMC = 1.0 - sumCos / double(kWalks);
+            worstSpread = std::max(worstSpread,
+                                   std::fabs(spreadMC - hair::scatteredSpread(ch)));
+        }
+        std::printf("[checkhair] S10 medulla half-chord, worst |tau' bisected - tau' "
+                    "analytic| over %d combos = %.3g\n", combos, worstChord);
+        ok &= chk("S10 the medulla chord geometry is wrong", worstChord, 0.0, 1e-9);
+        std::printf("[checkhair] S10 scatteredSpread vs a %d-walk HG random walk: worst "
+                    "absolute gap = %.4f\n", kWalks, worstSpread);
+        ok &= want("S10 scatteredSpread does not match an actual random walk",
+                   worstSpread < 0.012);
+    }
+
+    // --- S11 the dual-scattering tables ----------------------------------------
+    // `hair::Dual` is the bridge between one fiber and a coat of them (P3 stage 4). Three
+    // things are worth pinning down, and only one of them is a fit.
+    //
+    //  (a) THE SPLIT IS EXACT. `a_f` and `a_b` are not separate integrals: they are the
+    //      furnace total of §S1 partitioned by which azimuthal half the sample landed in.
+    //      So `a_f + a_b` must be 1 for a white fiber, at every inclination, medullated or
+    //      not — with only Monte-Carlo error between them and 1.
+    //  (b) THE TRIPLE SUM COLLAPSES. Zinke eq. 13 sums over i >= 1, 0 <= j < i, k > j.
+    //      Substituting k = j+1+q makes the exponent m = 2(i+q) independent of j, so j is
+    //      a multiplicity of i, and with n = i+q the whole thing is a single sum weighted
+    //      by n(n+1)/2. Setting X = 1 must reproduce the paper's closed form. This is what
+    //      licenses `dualSeries` to compute the eq. 16/17 numerators exactly instead of
+    //      approximating them.
+    //  (c) EQ. 16 HAS A SIGN TYPO, AND THAT IS PROVABLE. Delta_b is linear in alpha_f and
+    //      alpha_b, so its two coefficients can be summed in closed form and compared with
+    //      what eq. 16 claims — no fiber, no Monte Carlo, no fit slack. Writing x = a_f^2
+    //      and u = a_b^2/(1-x)^2:
+    //          coefficient of alpha_b = (1 + 3u)/(1 + u)               = 1 + 2u + O(u^2)
+    //          coefficient of alpha_f = [2(1-x)^2 + 2 a_b^2 (1+2x)]
+    //                                   / [(1-x)((1-x)^2 + a_b^2)]     = eq.16's, to O(u)
+    //      Both are asserted against `dualSeries` to 1e-9 below, which also checks the
+    //      i,j,k -> n collapse for a *weighted* summand and not just the X=1 case of (b).
+    //      eq. 16's alpha_f term then reproduces the second line to first order, but its
+    //      alpha_b term reads 1 - 2u where the expansion says 1 + 2u. The two forms agree
+    //      as a_b -> 0, which is why the typo survives the paper's own plots; the test
+    //      shrinks a_b and watches the printed form's error stay first-order in u while
+    //      the corrected form's falls away quadratically.
+    //
+    //      Note what is NOT asserted: how closely eq. 16/17 track the exact sums on a real
+    //      fiber. They are expansions in u, and u = a_b^2/(1-a_f^2)^2 is not small for any
+    //      plausible coat (a_f = a_b = 0.5 already gives u = 0.44), so the residual is
+    //      first-order-in-nothing and scales with however large the measured alpha/beta
+    //      happen to be. That gap is printed for information — and is exactly why this
+    //      implementation evaluates the exact sums rather than the fits.
+    {
+        // (b) first: pure algebra, no fiber needed.
+        double worstSum = 0.0;
+        for (double af : {0.1, 0.3, 0.5, 0.7, 0.9, 0.97}) {
+            const double x = af * af;
+            double num = 0.0, xn = 1.0;
+            for (int n = 1; n <= 20000; ++n) { xn *= x; num += xn * 0.5 * n * (n + 1.0); }
+            const double closed = x / ((1.0 - x) * (1.0 - x) * (1.0 - x));
+            worstSum = std::max(worstSum, std::fabs(num - closed) / closed);
+        }
+        std::printf("[checkhair] S11 eq.13's triple sum vs its closed form, worst relative "
+                    "gap = %.3g\n", worstSum);
+        ok &= chk("S11 the i,j,k -> n collapse behind dualSeries is wrong", worstSum, 0.0, 1e-9);
+
+        // (c): the two coefficients of Delta_b in closed form, against dualSeries.
+        {
+            double worstCb = 0.0, worstCf = 0.0;
+            for (double af : {0.2, 0.4, 0.5, 0.6, 0.75, 0.9})
+            for (double ab : {0.05, 0.2, 0.4, 0.7, 1.0}) {
+                const double x = af * af, om = 1.0 - x;
+                const double Ab = ab * x / om + ab*ab*ab * x / (om*om*om);
+                // alpha_b's coefficient: set alpha_f = 0, alpha_b = 1.
+                const double cb = (ab * hair::dualSeries(x, false, 0.0, 1.0, false) +
+                                   ab*ab*ab * hair::dualSeries(x, true, 0.0, 1.0, false)) / Ab;
+                const double u = ab*ab / (om*om);
+                worstCb = std::max(worstCb, std::fabs(cb - (1.0 + 3.0*u) / (1.0 + u)));
+                // alpha_f's coefficient: set alpha_f = 1, alpha_b = 0.
+                const double cf = (ab * hair::dualSeries(x, false, 1.0, 0.0, false) +
+                                   ab*ab*ab * hair::dualSeries(x, true, 1.0, 0.0, false)) / Ab;
+                const double cfClosed = (2.0*om*om + 2.0*ab*ab*(1.0 + 2.0*x)) /
+                                        (om * (om*om + ab*ab));
+                worstCf = std::max(worstCf, std::fabs(cf - cfClosed) / cfClosed);
+            }
+            std::printf("[checkhair] S11 Delta_b's alpha_b / alpha_f coefficients vs their closed "
+                        "forms: %.3g abs, %.3g rel\n", worstCb, worstCf);
+            ok &= chk("S11 dualSeries does not reproduce Delta_b's closed-form coefficients",
+                      worstCb + worstCf, 0.0, 1e-9);
+
+            // The sign typo, isolated: only alpha_b is nonzero, so the whole discrepancy is
+            // the 1 -+ 2u term. Shrinking a_b drives u down; the corrected form's error must
+            // vanish an order in u faster than the printed one's.
+            const double afS = 0.5, x = afS*afS, om = 1.0 - x;
+            double ratioSmall = 0.0, ordPaper = 0.0, ordFixed = 0.0;
+            double ePaperPrev = 0.0, eFixedPrev = 0.0;
+            for (int s = 0; s < 4; ++s) {
+                const double ab = 0.2 * std::pow(0.1, s);
+                const double Ab = ab * x / om + ab*ab*ab * x / (om*om*om);
+                const double exact = (ab * hair::dualSeries(x, false, 0.0, 1.0, false) +
+                                      ab*ab*ab * hair::dualSeries(x, true, 0.0, 1.0, false)) / Ab;
+                const double eP = std::fabs(hair::dualDeltaFit(afS, ab, 0.0, 1.0, false) - exact);
+                const double eF = std::fabs(hair::dualDeltaFit(afS, ab, 0.0, 1.0, true)  - exact);
+                if (s > 0) {   // each step divides u by 100
+                    ordPaper = std::log10(ePaperPrev / eP) / 2.0;
+                    ordFixed = std::log10(eFixedPrev / eF) / 2.0;
+                }
+                ePaperPrev = eP; eFixedPrev = eF;
+                ratioSmall = eP / std::max(eF, 1e-300);
+            }
+            std::printf("[checkhair] S11 eq.16's alpha_b term: as printed it is O(u^%.2f), "
+                        "sign-corrected O(u^%.2f); at u=2e-6 it is %.3g x more wrong\n",
+                        ordPaper, ordFixed, ratioSmall);
+            ok &= want("S11 eq.16 as printed is not first-order wrong in u, so the 1-2u / 1+2u "
+                       "sign typo is not demonstrated", ordPaper > 0.9 && ordPaper < 1.1);
+            ok &= want("S11 the sign-corrected eq.16 is not second-order accurate in u",
+                       ordFixed > 1.9);
+        }
+
+        // (a): build real tables. Two fibers — a solid human-like one and a medullated
+        // cat — each in a white furnace and again with real absorption.
+        double worstFurnace = 0.0;
+        double worstDeltaPaper = 0.0, worstDeltaFixed = 0.0, worstSigma = 0.0;
+        double minSigmaSlack = 1e30;
+        double afWhite = 0.0, afDark = 0.0;
+        for (int which = 0; which < 2; ++which) {
+            hair::Params pr;
+            if (which == 1) {   // cat: a big scattering core
+                hair::Species sp{};
+                hair::findSpecies("cat", sp);
+                pr.eta = sp.eta; pr.alpha = sp.alphaDeg;
+                pr.betaM = hair::betaMFromDegrees(sp.betaMDeg);
+                pr.betaN = hair::betaNFromDegrees(sp.betaNDeg);
+                pr.kappa = sp.kappa; pr.mSigmaS = sp.mSigmaS; pr.mG = sp.mG;
+            }
+            const hair::Dual dw = hair::makeDual(pr, 0.0, 8192);   // white furnace
+            for (int i = 0; i < hair::Dual::N; ++i)
+                worstFurnace = std::max(worstFurnace, std::fabs(dw.af[i] + dw.ab[i] - 1.0));
+            // The fits, compared against the exact weighted sums the table actually holds —
+            // informational. What IS asserted is an invariant the exact sum cannot violate:
+            // sigma_b averages sqrt(2n beta_f^2 + beta_b^2) and sqrt(2n beta_f^2 + 3 beta_b^2),
+            // every term of which is at least beta_b, so the multiply-scattered backward lobe
+            // is never narrower than the single-scattered one.
+            for (int i = 0; i < hair::Dual::N; ++i) {
+                const double af = hair::clampd(dw.af[i], 0.0, 0.9999), ab = dw.ab[i];
+                worstDeltaPaper = std::max(worstDeltaPaper, std::fabs(
+                    hair::dualDeltaFit(af, ab, dw.alphaF[i], dw.alphaB[i], false) - dw.deltaB[i]));
+                worstDeltaFixed = std::max(worstDeltaFixed, std::fabs(
+                    hair::dualDeltaFit(af, ab, dw.alphaF[i], dw.alphaB[i], true) - dw.deltaB[i]));
+                worstSigma = std::max(worstSigma, std::fabs(
+                    hair::dualSigmaFit(af, ab, dw.betaF[i], dw.betaB[i]) - dw.sigmaB[i]));
+                minSigmaSlack = std::min(minSigmaSlack, dw.sigmaB[i] - dw.betaB[i]);
+                ok &= want("S11 a dual table entry is not finite",
+                           std::isfinite(dw.Ab[i]) && std::isfinite(dw.deltaB[i]) &&
+                           std::isfinite(dw.sigmaB[i]) && dw.Ab[i] >= 0.0);
+            }
+            if (which == 0) {
+                afWhite = dw.af[hair::Dual::N / 2];
+                const hair::Dual dd = hair::makeDual(pr, 3.0, 8192);   // strongly absorbing
+                afDark = dd.af[hair::Dual::N / 2];
+            }
+        }
+        std::printf("[checkhair] S11 a_f + a_b vs the §S1 furnace total, worst over 2 fibers "
+                    "x %d inclinations = %.4f\n", hair::Dual::N, worstFurnace);
+        ok &= want("S11 the forward/backward split does not conserve energy",
+                   worstFurnace < 0.01);
+        std::printf("[checkhair] S11 absorption cuts forward attenuation %.4f -> %.4f "
+                    "(sigma_a 0 -> 3)\n", afWhite, afDark);
+        ok &= want("S11 a_f is not reduced by absorption", afDark < afWhite);
+        std::printf("[checkhair] S11 sigma_b - beta_b over the built tables, smallest = %.4f "
+                    "(multiple scattering never narrows the backward lobe)\n", minSigmaSlack);
+        ok &= want("S11 sigma_b came out narrower than beta_b", minSigmaSlack > -1e-9);
+        std::printf("[checkhair] S11 on real fibers eq.16/17 miss the exact sums by %.3f rad "
+                    "(as printed) / %.3f rad (sign-corrected) / %.3f rad spread -- u is not "
+                    "small, so the exact sums are used\n",
+                    worstDeltaPaper, worstDeltaFixed, worstSigma);
+    }
+
+    std::printf("[checkhair] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkhair] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Blue-noise / Poisson-disk placement self-test (src/bluenoise.h: patBlueNoise,
+// patBNAccept, patBNPrecedes; src/pattern.h: PatOp::BlueNoise, reached from a pattern
+// expression as `bnoise/bnoise2/bnoised/bnoiseid(x, y, z, r)`). O5. No scene, no
+// renderer.
+//
+// The primitive makes two claims that are worth more than a picture, so both are
+// proved here rather than eyeballed:
+//
+//   §1 ACCEPTANCE IS LOCAL AND THE 3x3x3 IS EXACT. patBNAccept prunes twice (a
+//      geometric cell bound before any hashing, then rank before position). A +-3-block
+//      brute force with neither pruning nor early-out must agree on every candidate —
+//      and the section asserts it saw both accepted and rejected ones in quantity, so
+//      it cannot pass by always answering the same thing.
+//   §2 THE QUERY IS EXACT. F1/F2/id from the adaptive ring search must equal a fixed
+//      +-6-block brute force exactly (tolerance 0), which is what validates the ring
+//      early-out and the per-cell lower bound together.
+//   §3 MINIMUM SEPARATION IS A THEOREM. Over every accepted pair in a large block, no
+//      two accepted points are closer than r. This is the property Worley's jittered
+//      lattice cannot have at any r, and the control in the same section measures how
+//      close that lattice's pairs actually get.
+//   §4 STRICT GENERALISATION: at r = 0 nothing is vetoed, so the set must be exactly
+//      the jittered lattice, i.e. Worley's placement with these hashes.
+//   §5 DENSITY vs the analytic one-round ceiling. A candidate survives with probability
+//      E[1/(N+1)] over its exclusion ball, giving (1-exp(-V))/V per cell at unit
+//      candidate density; at r = 1 that is 0.2351. Measured density must match, and
+//      must fall monotonically in r.
+//   §6 IT IS ACTUALLY BLUE, against a MATCHED CONTROL. Two independent diagnostics:
+//      (a) the number variance in fixed boxes, compared with the same candidate set
+//      randomly thinned to the SAME density — random thinning re-injects the
+//      low-frequency energy that the MIS round removes, so the control is what makes
+//      the number a claim rather than a number; (b) the radial distribution function,
+//      which must be exactly 0 inside r, show the characteristic near-contact shell
+//      above it, and relax to 1.
+//   §7 the ring cap is never approached (it exists only so a pathological input cannot
+//      loop), and non-finite inputs return without searching.
+//   §8 COST, honestly reported: mean cells hashed per query against Worley's 27-ish.
+//   §9 the compile path (all four slot spellings, VM == direct call, bad arity and
+//      unknown spellings rejected) and CSE.
+static int checkBlueNoise() {
+    double worst = 0.0;
+    bool ok = true;
+    // As in -checkgabor, `worst` accumulates only the EXACT checks (tol <= 1e-12); the
+    // statistical sections deviate by design and would swamp the headline number.
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (tol <= 1e-12 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkbluenoise] %-46s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+    uint64_t rng = 0xD1B54A32D192ED03ull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+
+    // Brute-force acceptance: no geometric prune, no rank prune, no early-out, and a
+    // +-3 neighbourhood rather than +-1 — so it also proves nothing outside +-1 matters.
+    auto bfAccept = [](int cx, int cy, int cz, double r) {
+        if (!(r > 0.0)) return true;
+        const unsigned int h0 = patBNCellHash(cx, cy, cz);
+        double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+        bool acc = true;
+        for (int dz = -3; dz <= 3; ++dz)
+        for (int dy = -3; dy <= 3; ++dy)
+        for (int dx = -3; dx <= 3; ++dx) {
+            if (dx == 0 && dy == 0 && dz == 0) continue;
+            const int nx = cx + dx, ny = cy + dy, nz = cz + dz;
+            const unsigned int nh = patBNCellHash(nx, ny, nz);
+            double qx, qy, qz; patBNPos(nh, nx, ny, nz, qx, qy, qz);
+            const double ax = qx - px, ay = qy - py, az = qz - pz;
+            if (ax * ax + ay * ay + az * az < r * r &&
+                patBNPrecedes(nh, nx, ny, nz, h0, cx, cy, cz)) acc = false;
+        }
+        return acc;
+    };
+
+    // ---- §1: acceptance is local, and the pruned test equals the brute force -------
+    {
+        long long nAcc = 0, nRej = 0, mismatch = 0;
+        for (int i = 0; i < 20000; ++i) {
+            const int cx = (int)((frand() - 0.5) * 4000.0);
+            const int cy = (int)((frand() - 0.5) * 4000.0);
+            const int cz = (int)((frand() - 0.5) * 4000.0);
+            const double r = (i % 5 == 0) ? 1.0 : frand();
+            const unsigned int h0 = patBNCellHash(cx, cy, cz);
+            double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+            const bool got = patBNAccept(cx, cy, cz, h0, px, py, pz, r);
+            const bool want = bfAccept(cx, cy, cz, r);
+            if (got != want) ++mismatch;
+            if (want) ++nAcc; else ++nRej;
+        }
+        ok &= chk("S1 pruned acceptance == +-3 brute force", (double)mismatch, 0.0, 0.0);
+        // Non-vacuity: a test that only ever saw one answer would prove nothing.
+        if (nAcc < 2000 || nRej < 2000) {
+            std::printf("[checkbluenoise] S1 degenerate sample: %lld accepted, %lld rejected  BAD\n",
+                        nAcc, nRej);
+            ok = false;
+        }
+        std::printf("[checkbluenoise] S1 %lld accepted / %lld rejected, 0 mismatches\n", nAcc, nRej);
+    }
+
+    // ---- §2: the ring search + lower bound give exactly the brute-force answer -----
+    {
+        double wf1 = 0.0, wf2 = 0.0, wid = 0.0;
+        for (int i = 0; i < 600; ++i) {
+            const double x = (frand() - 0.5) * 2000.0;
+            const double y = (frand() - 0.5) * 2000.0;
+            const double z = (frand() - 0.5) * 2000.0;
+            const double r = (i % 4 == 0) ? 1.0 : (0.2 + 0.8 * frand());
+            double out[3]; patBlueNoise(x, y, z, r, out);
+            // brute force: every candidate in +-6, filtered by bfAccept
+            const int bx = (int)std::floor(x), by = (int)std::floor(y),
+                      bz = (int)std::floor(z);
+            double b1 = 1e300, b2 = 1e300; unsigned int bid = 0u;
+            for (int dz = -6; dz <= 6; ++dz)
+            for (int dy = -6; dy <= 6; ++dy)
+            for (int dx = -6; dx <= 6; ++dx) {
+                const int cx = bx + dx, cy = by + dy, cz = bz + dz;
+                if (!bfAccept(cx, cy, cz, r)) continue;
+                const unsigned int h0 = patBNCellHash(cx, cy, cz);
+                double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+                const double ax = x - px, ay = y - py, az = z - pz;
+                const double d = std::sqrt(ax * ax + ay * ay + az * az);
+                if (d < b1) { b2 = b1; b1 = d; bid = patBNMix(h0 ^ PAT_BN_SID); }
+                else if (d < b2) b2 = d;
+            }
+            wf1 = std::fmax(wf1, std::fabs(out[0] - b1));
+            wf2 = std::fmax(wf2, std::fabs(out[1] - b2));
+            wid = std::fmax(wid, std::fabs(out[2] - (double)bid * (1.0 / 4294967296.0)));
+        }
+        ok &= chk("S2 F1 == +-6 brute force (max err)",  wf1, 0.0, 0.0);
+        ok &= chk("S2 F2 == +-6 brute force (max err)",  wf2, 0.0, 0.0);
+        ok &= chk("S2 id == +-6 brute force (max err)",  wid, 0.0, 0.0);
+    }
+
+    // ---- the shared block: every candidate in [0,N)^3, accepted flags + positions --
+    const int N = 72;
+    const int NC = N * N * N;
+    std::vector<unsigned char> acc((size_t)NC, 0);
+    std::vector<double> pos((size_t)NC * 3, 0.0);
+    const double R_MAIN = 1.0;
+    auto idx = [&](int i, int j, int k) { return ((size_t)k * N + j) * N + i; };
+    long long nAccepted = 0;
+    for (int k = 0; k < N; ++k)
+    for (int j = 0; j < N; ++j)
+    for (int i = 0; i < N; ++i) {
+        const unsigned int h0 = patBNCellHash(i, j, k);
+        double px, py, pz; patBNPos(h0, i, j, k, px, py, pz);
+        const size_t s = idx(i, j, k);
+        pos[s * 3 + 0] = px; pos[s * 3 + 1] = py; pos[s * 3 + 2] = pz;
+        if (patBNAccept(i, j, k, h0, px, py, pz, R_MAIN)) { acc[s] = 1; ++nAccepted; }
+    }
+
+    // ---- §3: minimum separation, with the jittered lattice as the control ----------
+    {
+        double minAcc = 1e300, minAll = 1e300;
+        long long pairsAcc = 0, pairsAll = 0;
+        for (int k = 1; k + 1 < N; ++k)
+        for (int j = 1; j + 1 < N; ++j)
+        for (int i = 1; i + 1 < N; ++i) {
+            const size_t s = idx(i, j, k);
+            const double px = pos[s*3], py = pos[s*3+1], pz = pos[s*3+2];
+            for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                const size_t t = idx(i + dx, j + dy, k + dz);
+                const double ax = pos[t*3] - px, ay = pos[t*3+1] - py, az = pos[t*3+2] - pz;
+                const double d = std::sqrt(ax * ax + ay * ay + az * az);
+                ++pairsAll; if (d < minAll) minAll = d;
+                if (acc[s] && acc[t]) { ++pairsAcc; if (d < minAcc) minAcc = d; }
+            }
+        }
+        std::printf("[checkbluenoise] S3 %lld accepted pairs (of %lld candidate pairs); "
+                    "closest accepted %.6f, closest candidate %.6f\n",
+                    pairsAcc, pairsAll, minAcc, minAll);
+        if (minAcc < R_MAIN) {
+            std::printf("[checkbluenoise] S3 separation VIOLATED: %.12g < r = %.12g  BAD\n",
+                        minAcc, R_MAIN);
+            ok = false;
+        }
+        if (pairsAcc < 100000) {
+            std::printf("[checkbluenoise] S3 too few accepted pairs to mean anything  BAD\n");
+            ok = false;
+        }
+        // The control: the jittered lattice this is thinned FROM has pairs an order of
+        // magnitude closer than r, which is exactly the clumping the primitive removes.
+        if (!(minAll < 0.1 * R_MAIN)) {
+            std::printf("[checkbluenoise] S3 control weak: jittered lattice min pair %.6g  BAD\n",
+                        minAll);
+            ok = false;
+        }
+    }
+
+    // ---- §4: r = 0 is exactly the jittered lattice ---------------------------------
+    {
+        double wf1 = 0.0, wid = 0.0;
+        long long allAcc = 0;
+        for (int i = 0; i < 4000; ++i) {
+            const int cx = (int)((frand() - 0.5) * 2000.0);
+            const int cy = (int)((frand() - 0.5) * 2000.0);
+            const int cz = (int)((frand() - 0.5) * 2000.0);
+            const unsigned int h0 = patBNCellHash(cx, cy, cz);
+            double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+            if (patBNAccept(cx, cy, cz, h0, px, py, pz, 0.0)) ++allAcc;
+        }
+        ok &= chk("S4 r=0 accepts every candidate", (double)allAcc, 4000.0, 0.0);
+        for (int i = 0; i < 400; ++i) {
+            const double x = (frand() - 0.5) * 800.0, y = (frand() - 0.5) * 800.0,
+                         z = (frand() - 0.5) * 800.0;
+            double out[3]; patBlueNoise(x, y, z, 0.0, out);
+            const int bx = (int)std::floor(x), by = (int)std::floor(y),
+                      bz = (int)std::floor(z);
+            double b1 = 1e300; unsigned int bid = 0u;
+            for (int dz = -4; dz <= 4; ++dz)
+            for (int dy = -4; dy <= 4; ++dy)
+            for (int dx = -4; dx <= 4; ++dx) {
+                const int cx = bx + dx, cy = by + dy, cz = bz + dz;
+                const unsigned int h0 = patBNCellHash(cx, cy, cz);
+                double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+                const double ax = x - px, ay = y - py, az = z - pz;
+                const double d = std::sqrt(ax * ax + ay * ay + az * az);
+                if (d < b1) { b1 = d; bid = patBNMix(h0 ^ PAT_BN_SID); }
+            }
+            wf1 = std::fmax(wf1, std::fabs(out[0] - b1));
+            wid = std::fmax(wid, std::fabs(out[2] - (double)bid * (1.0 / 4294967296.0)));
+        }
+        ok &= chk("S4 r=0 F1 == jittered-lattice F1", wf1, 0.0, 0.0);
+        ok &= chk("S4 r=0 id == jittered-lattice id", wid, 0.0, 0.0);
+    }
+
+    // ---- §5: the conflict count is analytic, and acceptance is purely by rank ------
+    {
+        // E[N], the expected number of OTHER candidates within r of a candidate, is NOT
+        // the ball volume: the candidate's own cell holds no competitor, so the cell's
+        // self-overlap has to come out of it. That overlap's kernel is the per-axis
+        // triangle (1-|w|), so for r <= 1 (where the ball never leaves the +-1 block)
+        //     E[N] = INT_{|w|<r} [ 1 - PROD_a (1-|w_a|) ] dw
+        //          = 3/2 pi r^4 - 8/5 r^5 + 1/6 r^6
+        // the ball volume 4/3 pi r^3 having cancelled against the overlap's lead term.
+        // At r = 1 that is 3.2791, well under the 4.1888 a naive volume argument gives —
+        // the stratification is already doing work before any rank is compared.
+        auto meanN = [](double r) {
+            const double r2 = r * r, r4 = r2 * r2;
+            return 1.5 * 3.14159265358979323846 * r4 - 1.6 * r4 * r + r4 * r2 / 6.0;
+        };
+        double prev = 2.0, densAtOne = 0.0;
+        for (int q = 0; q <= 4; ++q) {
+            const double r = 0.25 * q;
+            const int M = 48;
+            long long nAcc = 0, nConf = 0, hist[64] = {0};
+            for (int k = 0; k < M; ++k)
+            for (int j = 0; j < M; ++j)
+            for (int i = 0; i < M; ++i) {
+                const int cx = 5000 + i, cy = -3000 + j, cz = 900 + k;
+                const unsigned int h0 = patBNCellHash(cx, cy, cz);
+                double px, py, pz; patBNPos(h0, cx, cy, cz, px, py, pz);
+                if (patBNAccept(cx, cy, cz, h0, px, py, pz, r)) ++nAcc;
+                int n = 0;
+                for (int dz = -1; dz <= 1; ++dz)
+                for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0 && dz == 0) continue;
+                    const int nx = cx + dx, ny = cy + dy, nz = cz + dz;
+                    const unsigned int nh = patBNCellHash(nx, ny, nz);
+                    double qx, qy, qz; patBNPos(nh, nx, ny, nz, qx, qy, qz);
+                    const double ax = qx - px, ay = qy - py, az = qz - pz;
+                    if (ax * ax + ay * ay + az * az < r * r) ++n;
+                }
+                nConf += n;
+                if (n < 64) ++hist[n];
+            }
+            const double cells = (double)M * M * M;
+            const double eN = (double)nConf / cells, dens = (double)nAcc / cells;
+            // If the ranks are iid uniform AND independent of the positions, then a
+            // candidate with n conflicts is accepted with probability exactly 1/(n+1),
+            // so the measured acceptance rate must be reproduced by the measured
+            // conflict HISTOGRAM alone. The two sides come from different data (rank
+            // comparisons vs distances), so this is a real check on the hash — it is
+            // what fails if the rank and the position, both derived from the same cell
+            // hash, are not effectively independent of each other.
+            double model = 0.0;
+            for (int n = 0; n < 64; ++n) model += (double)hist[n] / ((double)(n + 1) * cells);
+            std::printf("[checkbluenoise] S5 r=%.2f: E[N] %.4f (closed form %.4f), "
+                        "density %.4f (rank model %.4f)\n", r, eN, meanN(r), dens, model);
+            char lb[80];
+            std::snprintf(lb, sizeof lb, "S5 r=%.2f E[N] vs closed form", r);
+            ok &= chk(lb, eN, meanN(r), 0.002 + 0.02 * meanN(r));
+            std::snprintf(lb, sizeof lb, "S5 r=%.2f density vs rank model", r);
+            ok &= chk(lb, dens, model, 0.006);
+            if (dens > prev) {
+                std::printf("[checkbluenoise] S5 density not monotone in r  BAD\n");
+                ok = false;
+            }
+            prev = dens;
+            if (q == 4) densAtOne = dens;
+        }
+        // One candidate per cell is not a cheap approximation to a dense candidate
+        // process — it is strictly BETTER than one. Matern-II thinning of a Poisson
+        // parent of intensity L retains (1-exp(-L*V))/V, which rises to 1/V = 3/(4pi)
+        // = 0.2387 as L -> inf. The stratified single candidate beats that ceiling,
+        // because stratification removes the close candidate pairs that would otherwise
+        // have consumed the rank competition for nothing.
+        const double poissonCeiling = 3.0 / (4.0 * 3.14159265358979323846);
+        std::printf("[checkbluenoise] S5 density at r=1 %.5f vs dense-Poisson Matern-II "
+                    "ceiling %.5f\n", densAtOne, poissonCeiling);
+        if (!(densAtOne > poissonCeiling)) {
+            std::printf("[checkbluenoise] S5 stratification did not beat the Poisson ceiling  BAD\n");
+            ok = false;
+        }
+        ok &= chk("S5 block density agrees with the sweep",
+                  (double)nAccepted / (double)NC, densAtOne, 0.006);
+    }
+
+    // ---- §6: it is actually blue, against a matched random-thinning control --------
+    {
+        // (a) number variance in fixed boxes. Random thinning of the SAME candidate set
+        // to the SAME density is the control: it keeps the density and the lattice, and
+        // differs only in that the choice ignores geometry.
+        const int L = 6, NB = N / L;
+        const double keep = (double)nAccepted / (double)NC;
+        std::vector<double> cntB((size_t)NB * NB * NB, 0.0), cntC((size_t)NB * NB * NB, 0.0);
+        for (int k = 0; k < N; ++k)
+        for (int j = 0; j < N; ++j)
+        for (int i = 0; i < N; ++i) {
+            const size_t b = ((size_t)(k / L) * NB + (j / L)) * NB + (i / L);
+            if (acc[idx(i, j, k)]) cntB[b] += 1.0;
+            // deterministic coin, independent of the MIS decision
+            const unsigned int c = patBNMix(patBNCellHash(i, j, k) ^ 0x1b873593u);
+            if ((double)c * (1.0 / 4294967296.0) < keep) cntC[b] += 1.0;
+        }
+        auto varOverMean = [](const std::vector<double>& v) {
+            double m = 0.0; for (double t : v) m += t; m /= (double)v.size();
+            double s = 0.0; for (double t : v) s += (t - m) * (t - m);
+            s /= (double)(v.size() - 1);
+            return m > 0.0 ? s / m : 0.0;
+        };
+        const double vb = varOverMean(cntB), vc = varOverMean(cntC);
+        std::printf("[checkbluenoise] S6a number variance/mean in %d^3 boxes: "
+                    "blue %.4f vs thinned-lattice control %.4f\n", L, vb, vc);
+        if (!(vb < 0.75 * vc)) {
+            std::printf("[checkbluenoise] S6a density fluctuation not suppressed vs control  BAD\n");
+            ok = false;
+        }
+        // (b) radial distribution function of the accepted set.
+        const int NBIN = 30; const double DMAX = 3.0, DB = DMAX / NBIN;
+        std::vector<double> hist((size_t)NBIN, 0.0);
+        long long centres = 0;
+        const double rho = keep;
+        for (int k = 4; k + 4 < N; ++k)
+        for (int j = 4; j + 4 < N; ++j)
+        for (int i = 4; i + 4 < N; ++i) {
+            const size_t s = idx(i, j, k);
+            if (!acc[s]) continue;
+            ++centres;
+            const double px = pos[s*3], py = pos[s*3+1], pz = pos[s*3+2];
+            for (int dz = -4; dz <= 4; ++dz)
+            for (int dy = -4; dy <= 4; ++dy)
+            for (int dx = -4; dx <= 4; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                const size_t t = idx(i + dx, j + dy, k + dz);
+                if (!acc[t]) continue;
+                const double ax = pos[t*3] - px, ay = pos[t*3+1] - py, az = pos[t*3+2] - pz;
+                const double d = std::sqrt(ax * ax + ay * ay + az * az);
+                if (d < DMAX) hist[(size_t)(d / DB)] += 1.0;
+            }
+        }
+        double gPeak = 0.0; int gPeakBin = -1; double gInside = 0.0, gFar = 0.0;
+        int nFar = 0;
+        for (int b = 0; b < NBIN; ++b) {
+            const double d0 = b * DB, d1 = d0 + DB;
+            const double shell = 4.0 / 3.0 * 3.14159265358979323846 * (d1*d1*d1 - d0*d0*d0);
+            const double g = hist[b] / ((double)centres * rho * shell);
+            if (d1 <= R_MAIN) gInside += hist[b];
+            if (d0 >= 2.4) { gFar += g; ++nFar; }
+            if (g > gPeak) { gPeak = g; gPeakBin = b; }
+        }
+        gFar /= (double)(nFar > 0 ? nFar : 1);
+        std::printf("[checkbluenoise] S6b g(d): 0 inside r (%.0f pairs), peak %.3f at d~%.2f, "
+                    "g(d>2.4) -> %.3f\n", gInside, gPeak, (gPeakBin + 0.5) * DB, gFar);
+        ok &= chk("S6b pairs inside the exclusion radius", gInside, 0.0, 0.0);
+        // The near-contact shell is the signature that separates this from "a Poisson
+        // process with a hole punched in it", which would rise monotonically to g = 1
+        // with no overshoot at all. Matern-II overshoots; measured ~1.21 at d ~ 1.05.
+        if (!(gPeak > 1.15)) {
+            std::printf("[checkbluenoise] S6b no near-contact shell (peak %.3f)  BAD\n", gPeak);
+            ok = false;
+        }
+        ok &= chk("S6b g(d) relaxes to 1 far out", gFar, 1.0, 0.06);
+    }
+
+    // ---- §7: the ring cap is never approached; non-finite inputs bail --------------
+    {
+        // Deepest ring actually needed = the largest F2 seen, +1 (the loop breaks when
+        // R-1 >= F2). Report it against PAT_BN_RINGCAP.
+        double maxF2 = 0.0;
+        for (int i = 0; i < 200000; ++i) {
+            const double x = (frand() - 0.5) * 20000.0;
+            const double y = (frand() - 0.5) * 20000.0;
+            const double z = (frand() - 0.5) * 20000.0;
+            double out[3]; patBlueNoise(x, y, z, 1.0, out);
+            if (out[1] > maxF2) maxF2 = out[1];
+        }
+        const int deepest = (int)std::ceil(maxF2) + 1;
+        std::printf("[checkbluenoise] S7 deepest ring needed over 200k queries: %d "
+                    "(cap %d, max F2 %.3f)\n", deepest, PAT_BN_RINGCAP, maxF2);
+        if (deepest >= PAT_BN_RINGCAP) {
+            std::printf("[checkbluenoise] S7 ring cap reachable — results could be clamped  BAD\n");
+            ok = false;
+        }
+        double bad[3];
+        const double nan_ = std::numeric_limits<double>::quiet_NaN();
+        patBlueNoise(nan_, 0.0, 0.0, 1.0, bad);
+        ok &= chk("S7 NaN x -> 0", bad[0] + bad[1] + bad[2], 0.0, 0.0);
+        patBlueNoise(0.0, std::numeric_limits<double>::infinity(), 0.0, 1.0, bad);
+        ok &= chk("S7 inf y -> 0", bad[0] + bad[1] + bad[2], 0.0, 0.0);
+        // r outside [0,1] clamps rather than corrupting the neighbourhood exactness.
+        double c1[3], c2[3];
+        patBlueNoise(3.7, -2.1, 0.9, 5.0, c1);
+        patBlueNoise(3.7, -2.1, 0.9, 1.0, c2);
+        ok &= chk("S7 r>1 clamps to r=1", c1[0], c2[0], 0.0);
+        patBlueNoise(3.7, -2.1, 0.9, -4.0, c1);
+        patBlueNoise(3.7, -2.1, 0.9,  0.0, c2);
+        ok &= chk("S7 r<0 clamps to r=0", c1[0], c2[0], 0.0);
+    }
+
+    // ---- §8: cost, reported against Worley's -------------------------------------
+    {
+        double sum = 0.0; int mx = 0;
+        for (int i = 0; i < 20000; ++i) {
+            const double x = (frand() - 0.5) * 4000.0;
+            const double y = (frand() - 0.5) * 4000.0;
+            const double z = (frand() - 0.5) * 4000.0;
+            double out[3]; int vis = 0;
+            patBlueNoiseC(x, y, z, 1.0, out, &vis);
+            sum += vis; if (vis > mx) mx = vis;
+        }
+        const double mean = sum / 20000.0;
+        std::printf("[checkbluenoise] S8 cells hashed per query: mean %.1f, max %d "
+                    "(Worley reads ~27)\n", mean, mx);
+        if (mean > 200.0) {
+            std::printf("[checkbluenoise] S8 query cost regressed past 200 cells  BAD\n");
+            ok = false;
+        }
+    }
+
+    // ---- §9: the compile path and CSE ----------------------------------------------
+    {
+        const char* bads[] = { "bnoise(x,y,z)", "bnoise(x,y,z,1,2)", "bnoise3(x,y,z,1)",
+                               "bnoisex(x,y,z,1)", "bnoiseid(x,y)" };
+        for (const char* be : bads) {
+            std::vector<PatNode> prog; std::string perr;
+            if (compilePatternExpr(be, prog, perr)) {
+                std::printf("[checkbluenoise] `%s` compiled but should be rejected  BAD\n", be);
+                ok = false;
+            }
+        }
+        const char* names[4] = { "bnoise", "bnoise2", "bnoised", "bnoiseid" };
+        double wv = 0.0;
+        for (int sel = 0; sel < 4; ++sel) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "%s(x,y,z,0.8)", names[sel]);
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(buf, prog, perr)) {
+                std::printf("[checkbluenoise] `%s` failed to compile: %s  BAD\n", buf, perr.c_str());
+                ok = false; continue;
+            }
+            patternOptimizeCSE(prog);
+            for (int i = 0; i < 64; ++i) {
+                const double x = (frand() - 0.5) * 200.0, y = (frand() - 0.5) * 200.0,
+                             z = (frand() - 0.5) * 200.0;
+                PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+                double b[3]; patBlueNoise(x, y, z, 0.8, b);
+                const double want = (sel == 3) ? b[2] : (sel == 2) ? (b[1] - b[0]) : b[sel];
+                wv = std::fmax(wv, std::fabs(patternEval(prog.data(), (int)prog.size(), c) - want));
+            }
+        }
+        ok &= chk("S9 all four slots: VM == direct call", wv, 0.0, 0.0);
+        std::vector<PatNode> same, diff; std::string perr;
+        ok &= compilePatternExpr("bnoise(x,y,z,1) + bnoise(x,y,z,1)", same, perr);
+        ok &= compilePatternExpr("bnoise(x,y,z,1) + bnoise2(x,y,z,1)", diff, perr);
+        const size_t n0 = same.size();
+        patternOptimizeCSE(same);
+        if (same.size() >= n0) {
+            std::printf("[checkbluenoise] CSE did not shrink `bnoise + bnoise` (%zu -> %zu)  BAD\n",
+                        n0, same.size());
+            ok = false;
+        }
+        // Different SLOTS of the same call must NOT collapse: the selector lives in `a`.
+        const size_t d0 = diff.size();
+        patternOptimizeCSE(diff);
+        double wd = 0.0;
+        for (int i = 0; i < 64; ++i) {
+            const double x = (frand() - 0.5) * 200.0, y = (frand() - 0.5) * 200.0,
+                         z = (frand() - 0.5) * 200.0;
+            PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+            double b[3]; patBlueNoise(x, y, z, 1.0, b);
+            wd = std::fmax(wd, std::fabs(patternEval(diff.data(), (int)diff.size(), c)
+                                         - (b[0] + b[1])));
+        }
+        (void)d0;
+        ok &= chk("S9 distinct slots stay distinct under CSE", wd, 0.0, 0.0);
+    }
+
+    std::printf("[checkbluenoise] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkbluenoise] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Deterministic Gray-Scott self-test (`-checkreaction`): the reaction-diffusion bake
+// behind `texture { reaction { } }` (O6). Runs with no scene and no renderer.
+//
+// A reaction-diffusion solve has no closed form to compare against, so the checks are
+// built around the things that ARE exactly knowable about it:
+//
+//   §1  The discrete Laplacian's Fourier symbol. cos(a x + b y) on the torus is an
+//       exact eigenvector of the 9-point stencil, so the stencil must return exactly
+//       rdLapSymbol(a,b) times it, at every wavenumber the grid supports. This pins
+//       the weights, the symmetry and the toroidal indexing at once — an off-by-one
+//       in the wrap, or a diagonal weight applied to an orthogonal neighbour, fails
+//       at some wavenumber even though both preserve constants.
+//   §2  The optimised solver's stencil equals rdLaplacian's. The inner loop is a
+//       hand-hoisted twin of the reference, so they are pinned against each other by
+//       running ONE step of a pure-diffusion configuration.
+//   §3  The uniform state (u=1, v=0) is a fixed point, exactly, for every (F,k), and
+//       stays one for thousands of steps. This is the property that forces the seed
+//       to be finite-amplitude, so it is worth pinning rather than assuming.
+//   §4  Translation invariance on the torus. Shifting the initial state by (dx,dy)
+//       must shift the result by (dx,dy) bit-for-bit. Nothing about the interior can
+//       distinguish a wrapped neighbour from an ordinary one, so any edge special-case
+//       — including the boundary of a THREAD's row band — shows up here.
+//   §5  Thread-count independence. The same solve split across 1 and N bands must be
+//       bit-identical; a missing barrier or a band reading its own half-written output
+//       breaks this and nothing else in the suite.
+//   §6  Seamlessness of the baked image: the difference across the wrap must be
+//       statistically identical to the difference between ordinary interior neighbours.
+//       A tileable-looking texture that is not actually tileable is the classic silent
+//       failure here, and it is invisible in a single tile.
+//   §7  Every preset actually patterns: real contrast, and a dominant wavelength in a
+//       plausible band, measured from the radially averaged power spectrum. This is
+//       what stops a named preset from quietly rotting into a blank sheet.
+//   §8  The stability predicate agrees with reality — configurations it accepts stay
+//       finite, one it rejects would indeed blow up.
+//   §9  Determinism and seed independence; the periodic seed has no defect line at the
+//       wrap; the resampler is exact at res == sim and periodic across it.
+static int checkReaction() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (tol <= 1e-12 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkreaction] %-52s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+
+    // ---- §1: the stencil's Fourier symbol, at every representable wavenumber -------
+    {
+        const int N = 24;
+        std::vector<double> f((size_t)N * N), lap((size_t)N * N);
+        double wmax = 0.0;
+        int tested = 0;
+        for (int my = 0; my <= N / 2; ++my)
+        for (int mx = 0; mx <= N / 2; ++mx) {
+            const double a = 2.0 * PI * mx / N, bq = 2.0 * PI * my / N;
+            for (int y = 0; y < N; ++y)
+                for (int x = 0; x < N; ++x)
+                    f[(size_t)y * N + x] = std::cos(a * x + bq * y);
+            rdLaplacian(f.data(), N, lap.data());
+            const double lam = rdLapSymbol(a, bq);
+            for (size_t i = 0; i < f.size(); ++i)
+                wmax = std::fmax(wmax, std::fabs(lap[i] - lam * f[i]));
+            ++tested;
+        }
+        std::printf("[checkreaction] S1 %d wavenumbers on a %dx%d torus, worst residual %.3g\n",
+                    tested, N, N, wmax);
+        ok &= chk("S1 stencil == its Fourier symbol", wmax, 0.0, 1e-13);
+    }
+
+    // ---- §2: the solver's stencil is the reference stencil --------------------------
+    // One step with no reaction (feed = kill = 0 and v seeded to zero leaves
+    // u' = u + dt*Du*L(u) exactly, since the u v^2 term and F(1-u) both vanish).
+    {
+        const int N = 32;
+        RDParams p; p.sim = N; p.steps = 1; p.feed = 0.0; p.kill = 0.0;
+        p.du = 0.7; p.dv = 0.3; p.dt = 1.0;
+        std::vector<float> u((size_t)N * N), v((size_t)N * N, 0.0f);
+        std::vector<double> u0((size_t)N * N), lap((size_t)N * N);
+        uint64_t s = 12345;
+        for (size_t i = 0; i < u.size(); ++i) {
+            s = s * 6364136223846793005ull + 1442695040888963407ull;
+            u0[i] = (double)(float)((double)(s >> 40) / 16777216.0);
+            u[i] = (float)u0[i];
+        }
+        rdLaplacian(u0.data(), N, lap.data());
+        if (!rdRun(p, u, v)) { std::printf("[checkreaction] S2 stopped  BAD\n"); ok = false; }
+        double w = 0.0;
+        for (size_t i = 0; i < u.size(); ++i)
+            w = std::fmax(w, std::fabs((double)u[i] - (double)(float)(u0[i] + p.dt * p.du * lap[i])));
+        ok &= chk("S2 solver stencil == rdLaplacian", w, 0.0, 0.0);
+    }
+
+    // ---- §3: the uniform state is an exact fixed point ------------------------------
+    {
+        double w = 0.0;
+        int nn = 0; const RDPreset* pr = rdPresets(nn);
+        for (int i = 0; i < nn; ++i) {
+            const int N = 16;
+            RDParams p; p.sim = N; p.steps = 3000; p.feed = pr[i].feed; p.kill = pr[i].kill;
+            std::vector<float> u((size_t)N * N, 1.0f), v((size_t)N * N, 0.0f);
+            if (!rdRun(p, u, v)) { std::printf("[checkreaction] S3 stopped  BAD\n"); ok = false; break; }
+            for (size_t j = 0; j < u.size(); ++j) {
+                w = std::fmax(w, std::fabs((double)u[j] - 1.0));
+                w = std::fmax(w, std::fabs((double)v[j]));
+            }
+        }
+        ok &= chk("S3 (u,v)=(1,0) is a fixed point over 3000 steps", w, 0.0, 0.0);
+    }
+
+    // ---- §4: translation invariance on the torus ------------------------------------
+    {
+        const int N = 48, DX = 17, DY = 29;
+        RDParams p; p.sim = N; p.steps = 400;
+        std::vector<float> u, v, us, vs;
+        rdSeed(p, u, v);
+        us.resize(u.size()); vs.resize(v.size());
+        for (int y = 0; y < N; ++y)
+            for (int x = 0; x < N; ++x) {
+                const size_t d = (size_t)((y + DY) % N) * N + (x + DX) % N;
+                us[d] = u[(size_t)y * N + x];
+                vs[d] = v[(size_t)y * N + x];
+            }
+        bool okrun = rdRun(p, u, v) && rdRun(p, us, vs);
+        double w = 0.0;
+        for (int y = 0; y < N; ++y)
+            for (int x = 0; x < N; ++x) {
+                const size_t d = (size_t)((y + DY) % N) * N + (x + DX) % N;
+                w = std::fmax(w, std::fabs((double)vs[d] - (double)v[(size_t)y * N + x]));
+            }
+        if (!okrun) { std::printf("[checkreaction] S4 stopped  BAD\n"); ok = false; }
+        ok &= chk("S4 shifted input gives the shifted result", w, 0.0, 0.0);
+    }
+
+    // ---- §5: the row-band split cannot change the answer ----------------------------
+    // rdRun sizes its band count from `sim`, so comparing sim = 16 (forced serial,
+    // N/16 = 1 band) against the same physical solve at a thread-splitting size is not
+    // a fair comparison. Instead run the same grid twice and confirm repeatability, and
+    // separately run a grid large enough to be split against a hand-rolled serial
+    // reference built from rdLaplacian.
+    {
+        const int N = 64;
+        RDParams p; p.sim = N; p.steps = 120;
+        std::vector<float> u1, v1, u2, v2;
+        rdSeed(p, u1, v1); rdSeed(p, u2, v2);
+        bool okrun = rdRun(p, u1, v1) && rdRun(p, u2, v2);
+        double w = 0.0;
+        for (size_t i = 0; i < v1.size(); ++i)
+            w = std::fmax(w, std::fabs((double)v1[i] - (double)v2[i]));
+        if (!okrun) { std::printf("[checkreaction] S5 stopped  BAD\n"); ok = false; }
+        ok &= chk("S5a repeat run of a multi-band solve is identical", w, 0.0, 0.0);
+
+        // Serial reference: the same update written with rdLaplacian, no threads.
+        std::vector<float> ur, vr; rdSeed(p, ur, vr);
+        std::vector<double> ud(ur.size()), vd(vr.size()), lu(ur.size()), lv(vr.size());
+        for (size_t i = 0; i < ur.size(); ++i) { ud[i] = ur[i]; vd[i] = vr[i]; }
+        for (int s2 = 0; s2 < p.steps; ++s2) {
+            rdLaplacian(ud.data(), N, lu.data());
+            rdLaplacian(vd.data(), N, lv.data());
+            for (size_t i = 0; i < ud.size(); ++i) {
+                const double uc = ud[i], vc = vd[i], reac = uc * vc * vc;
+                ud[i] = (double)(float)(uc + p.dt * (p.du * lu[i] - reac + p.feed * (1.0 - uc)));
+                vd[i] = (double)(float)(vc + p.dt * (p.dv * lv[i] + reac - (p.feed + p.kill) * vc));
+            }
+        }
+        double w2 = 0.0;
+        for (size_t i = 0; i < v1.size(); ++i) w2 = std::fmax(w2, std::fabs((double)v1[i] - vd[i]));
+        ok &= chk("S5b banded solve == serial rdLaplacian reference", w2, 0.0, 0.0);
+    }
+
+    // ---- §6: the baked image really is seamless -------------------------------------
+    // Every adjacent column pair (x, x+1) gives one mean |step|; on a torus the wrap pair
+    // (N-1, 0) is drawn from the same population as the other N-1, so the honest test is
+    // a RANK test: the seam must not stand out among them. Comparing the seam against the
+    // pooled mean instead — the obvious formulation — is far too noisy to threshold,
+    // because a single column crossing an unusual number of corridor walls swings it by
+    // 60%; that version failed on a perfectly periodic field. A non-periodic solve, by
+    // contrast, puts the seam far above *every* interior column, so requiring only that
+    // it not be the maximum still catches the failure it exists to catch, while its
+    // false-alarm rate on a good field is 1/N.
+    {
+        RDParams p; p.sim = 128; p.steps = 3000;
+        rdPresetLookup("maze", p.feed, p.kill);
+        std::vector<float> f;
+        if (!rdSimulate(p, f)) { std::printf("[checkreaction] S6 stopped  BAD\n"); ok = false; }
+        const int N = p.sim;
+        for (int axis = 0; axis < 2; ++axis) {
+            std::vector<double> step((size_t)N, 0.0);
+            for (int i = 0; i < N; ++i) {            // i = the column (or row) index
+                double s = 0.0;
+                for (int j = 0; j < N; ++j) {
+                    const size_t a = axis == 0 ? (size_t)j * N + i
+                                               : (size_t)i * N + j;
+                    const size_t b = axis == 0 ? (size_t)j * N + (i + 1) % N
+                                               : (size_t)((i + 1) % N) * N + j;
+                    s += std::fabs((double)f[a] - (double)f[b]);
+                }
+                step[i] = s / N;
+            }
+            const double seam = step[N - 1];
+            double imax = 0.0, imean = 0.0;
+            int rank = 0;                            // how many interior pairs exceed it
+            for (int i = 0; i + 1 < N; ++i) {
+                imax = std::fmax(imax, step[i]);
+                imean += step[i];
+                if (step[i] > seam) ++rank;
+            }
+            imean /= (double)(N - 1);
+            std::printf("[checkreaction] S6 %s seam step %.5f  interior mean %.5f max %.5f  "
+                        "(%d of %d interior pairs exceed the seam)\n",
+                        axis == 0 ? "x" : "y", seam, imean, imax, rank, N - 1);
+            if (!(imax > 0.0) || seam > imax) {
+                std::printf("[checkreaction] S6 the %s wrap is not seamless  BAD\n",
+                            axis == 0 ? "x" : "y");
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §7: every preset patterns, with a plausible feature wavelength -------------
+    // The dominant wavelength is read off the radially averaged power spectrum of the
+    // baked field (DC removed). A separable two-pass DFT keeps this O(N^3) with no FFT
+    // dependency, which at N = 256 costs a fraction of the solve it is measuring.
+    //
+    // This runs at the SHIPPED DEFAULTS (sim 256, 6000 steps) on purpose: a preset is a
+    // promise about what a user gets by typing its name, so the assertion has to be made
+    // under the conditions the name is used in. It is also the check that caught the
+    // seed's percolation problem — at 50% fill `spots` and `mitosis` failed it — so
+    // weakening it to "some structure exists" would give the failure back.
+    //
+    // "Contrast" is the standard deviation of the NORMALISED field, not its range:
+    // rdSimulate rescales to [0,1] by the measured extremes, so the range is 1.000 for
+    // anything that is not perfectly flat and asserting on it would be vacuous. A field
+    // that is 0.5 everywhere bar one outlying texel passes a range test and fails this.
+    {
+        int nn = 0; const RDPreset* pr = rdPresets(nn);
+        for (int i = 0; i < nn; ++i) {
+            RDParams p; p.sim = 256; p.steps = 6000; p.feed = pr[i].feed; p.kill = pr[i].kill;
+            std::vector<float> f;
+            if (!rdSimulate(p, f)) { std::printf("[checkreaction] S7 stopped  BAD\n"); ok = false; break; }
+            const int N = p.sim;
+            double mean = 0.0;
+            for (size_t j = 0; j < f.size(); ++j) mean += f[j];
+            mean /= (double)f.size();
+            double var = 0.0;
+            for (size_t j = 0; j < f.size(); ++j) { const double d = f[j] - mean; var += d * d; }
+            const double sd = std::sqrt(var / (double)f.size());
+            std::vector<double> ct(N), stb(N);
+            for (int t = 0; t < N; ++t) { ct[t] = std::cos(-2.0 * PI * t / N); stb[t] = std::sin(-2.0 * PI * t / N); }
+            // Pass 1: DFT along x for every row.
+            std::vector<double> ar((size_t)N * N, 0.0), ai((size_t)N * N, 0.0);
+            for (int y = 0; y < N; ++y)
+                for (int kx = 0; kx < N; ++kx) {
+                    double re = 0.0, im = 0.0;
+                    for (int x = 0; x < N; ++x) {
+                        const int ph = (kx * x) % N;
+                        const double a = f[(size_t)y * N + x] - mean;
+                        re += a * ct[ph]; im += a * stb[ph];
+                    }
+                    ar[(size_t)y * N + kx] = re; ai[(size_t)y * N + kx] = im;
+                }
+            // Pass 2: DFT along y, accumulating |F|^2 straight into radial bins.
+            std::vector<double> pw((size_t)N / 2 + 1, 0.0);
+            for (int kx = 0; kx < N; ++kx) {
+                const int sx = kx <= N / 2 ? kx : kx - N;
+                for (int ky = 0; ky < N; ++ky) {
+                    const int sy = ky <= N / 2 ? ky : ky - N;
+                    const int rr = (int)(std::sqrt((double)sx * sx + (double)sy * sy) + 0.5);
+                    if (rr < 1 || rr > N / 2) continue;
+                    double re = 0.0, im = 0.0;
+                    for (int y = 0; y < N; ++y) {
+                        const int ph = (ky * y) % N;
+                        const double br = ar[(size_t)y * N + kx], bi = ai[(size_t)y * N + kx];
+                        re += br * ct[ph] - bi * stb[ph];
+                        im += br * stb[ph] + bi * ct[ph];
+                    }
+                    pw[rr] += re * re + im * im;
+                }
+            }
+            int kpk = 1;
+            for (int r2 = 2; r2 <= N / 2; ++r2) if (pw[r2] > pw[kpk]) kpk = r2;
+            const double wavelen = (double)N / kpk;     // in sim cells
+            std::printf("[checkreaction] S7 %-8s F=%.3f k=%.3f  contrast(sd) %.3f  wavelength %.1f cells\n",
+                        pr[i].name, pr[i].feed, pr[i].kill, sd, wavelen);
+            if (!(sd > 0.15)) {
+                std::printf("[checkreaction] S7 preset '%s' has no contrast (sd %.3f)  BAD\n",
+                            pr[i].name, sd);
+                ok = false;
+            }
+            // A feature must be resolved (well over a couple of cells, or it pixel-locks
+            // into squares) and must fit several times into the grid (or `sim` would be
+            // meaningless as a density knob).
+            if (!(wavelen >= 8.0 && wavelen <= (double)N / 3.0)) {
+                std::printf("[checkreaction] S7 preset '%s' wavelength %.1f out of 8..%.1f  BAD\n",
+                            pr[i].name, wavelen, (double)N / 3.0);
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §8: the stability predicate matches reality --------------------------------
+    {
+        RDParams good;                                  // the shipped defaults
+        if (!rdStable(good)) { std::printf("[checkreaction] S8 defaults declared unstable  BAD\n"); ok = false; }
+        RDParams bad = good; bad.du = 1.6; bad.dv = 0.8;   // 1.6*1.6 = 2.56 > 2
+        if (rdStable(bad)) { std::printf("[checkreaction] S8 an unstable dt accepted  BAD\n"); ok = false; }
+        // The predicate is only worth anything if the rejected setting really does blow
+        // up, so run it and confirm the field diverges.
+        bad.sim = 32; bad.steps = 400;
+        std::vector<float> u, v; rdSeed(bad, u, v);
+        (void)rdRun(bad, u, v);
+        double mx = 0.0;
+        for (size_t i = 0; i < v.size(); ++i) { const double t = std::fabs((double)v[i]); if (!(t < mx)) mx = t; }
+        const bool blew = !(mx < 1e6);                  // catches inf and NaN too
+        std::printf("[checkreaction] S8 rejected setting reaches |v|max = %.3g (diverges: %s)\n",
+                    mx, blew ? "yes" : "no");
+        if (!blew) { std::printf("[checkreaction] S8 rejected setting was actually fine  BAD\n"); ok = false; }
+        // And the accepted one stays bounded — v is a concentration, so O(1).
+        RDParams g2 = good; g2.sim = 64; g2.steps = 2000;
+        std::vector<float> u2, v2; rdSeed(g2, u2, v2);
+        if (!rdRun(g2, u2, v2)) { std::printf("[checkreaction] S8 stopped  BAD\n"); ok = false; }
+        double mx2 = 0.0;
+        for (size_t i = 0; i < v2.size(); ++i) mx2 = std::fmax(mx2, std::fabs((double)v2[i]));
+        if (!(mx2 < 2.0)) {
+            std::printf("[checkreaction] S8 accepted setting drifted to |v|max %.3g  BAD\n", mx2);
+            ok = false;
+        }
+    }
+
+    // ---- §9: determinism, seed periodicity, and the resampler -----------------------
+    {
+        // Big enough and long enough to actually pattern: "a different seed gives a
+        // different field" is only meaningful if BOTH fields have a field to differ in,
+        // and rdSimulate maps a washed-out solve to a uniform 0.5 — so a regime that
+        // decays makes the two seeds agree perfectly and the check pass for the worst
+        // possible reason. `maze` patterns from any seed, which is what is wanted here.
+        RDParams p; p.sim = 128; p.steps = 2000;
+        rdPresetLookup("maze", p.feed, p.kill);
+        std::vector<float> a, b, c;
+        bool okrun = rdSimulate(p, a) && rdSimulate(p, b);
+        RDParams q = p; q.seed = 2u;
+        okrun = okrun && rdSimulate(q, c);
+        if (!okrun) { std::printf("[checkreaction] S9 stopped  BAD\n"); ok = false; }
+        double same = 0.0, diff = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            same = std::fmax(same, std::fabs((double)a[i] - b[i]));
+            diff = std::fmax(diff, std::fabs((double)a[i] - c[i]));
+        }
+        ok &= chk("S9 same seed reproduces bit-for-bit", same, 0.0, 0.0);
+        if (!(diff > 0.1)) { std::printf("[checkreaction] S9 a different seed changed nothing  BAD\n"); ok = false; }
+
+        // The seed's coarse blocks must partition the axis exactly, or the wrap carries
+        // a permanent defect line. Check that the seeded pattern's column-0/column-N-1
+        // block assignment is consistent with periodicity by seeding at a size that is
+        // NOT a multiple of the block count.
+        RDParams sp; sp.sim = 100; sp.steps = 0;
+        std::vector<float> su, sv; rdSeed(sp, su, sv);
+        int nb = (int)(sp.sim / (RD_SEED_BLOCK * std::sqrt(sp.du / RD_DU_CLASSIC)));
+        if (nb < 1) nb = 1;
+        const int b0 = (int)((long long)0 * nb / sp.sim);
+        const int bl = (int)((long long)(sp.sim - 1) * nb / sp.sim);
+        std::printf("[checkreaction] S9 seed blocks: sim %d -> %d blocks, first %d last %d\n",
+                    sp.sim, nb, b0, bl);
+        if (b0 != 0 || bl != nb - 1) {
+            std::printf("[checkreaction] S9 seed block partition is not exact  BAD\n"); ok = false;
+        }
+
+        // Resampling at res == sim must be the identity, and must wrap.
+        double w = 0.0;
+        for (int y = 0; y < p.sim; ++y)
+            for (int x = 0; x < p.sim; ++x)
+                w = std::fmax(w, std::fabs(rdSampleWrapped(a, p.sim, (x + 0.5) / p.sim,
+                                                           (y + 0.5) / p.sim)
+                                           - (double)a[(size_t)y * p.sim + x]));
+        ok &= chk("S9 resample at res == sim is the identity", w, 0.0, 1e-12);
+        const double lft = rdSampleWrapped(a, p.sim, -0.25, 0.375);
+        const double rgt = rdSampleWrapped(a, p.sim,  0.75, 0.375);
+        ok &= chk("S9 resampler wraps (u-1 == u)", lft, rgt, 0.0);
+    }
+
+    std::printf("[checkreaction] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkreaction] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -6521,6 +10257,15 @@ static bool g_whitted = false;
 static int  g_whittedGrid = 4;
 static double g_ambient = 0.0;
 
+// The samples-per-pixel figure the shading footprint `fw` (O8 stage 2) is computed
+// against — the run's REQUESTED -spp, latched once during argument parsing. It is not
+// read from the per-call chunk size on purpose: a progressive or resumed render hands
+// renderBackward a few spp at a time, and if each chunk sized its own filter the chunks
+// would be renders of DIFFERENT images and averaging them would be meaningless. One
+// number for the whole run keeps every chunk consistent, so the only thing accumulating
+// samples changes is the noise. See Camera::footprintPerDist for what spp does to it.
+static long long g_fwSpp = 1;
+
 // -gi: mode W's deterministic ONE-BOUNCE GATHER, the real thing g_ambient only stands in
 // for. A flat constant cannot reproduce contact darkening (it lights a crevice exactly as
 // much as an exposed face) or colour bleeding (it is grey, where light that has bounced
@@ -6538,6 +10283,187 @@ static int g_giBounce = 4;
 // returned radiance, which is what tames the caustic-through-the-gather contour aliasing.
 // See BackwardRenderer::giClamp for the full rationale.
 static double g_giClamp = 0.0;
+
+// -dual-scatter (P3 stage 4): replace the fur coat's multiple-scattering random walk with
+// Zinke et al. 2008's two analytic terms. Biased, one-bounce fur, orders of magnitude
+// cheaper on a pale coat. See BackwardRenderer::dualScatter.
+static bool   g_dualScatter = false;
+static double g_dualDensity = 0.7;    // -dual-density: Zinke's d_f = d_b
+static double g_dualDb = -1.0;        // -dual-db: override d_b alone (<0 = follow -dual-density)
+static double g_dualDf = -1.0;        // -dual-df: override d_f alone
+static int    g_dualMaxCross = 64;    // -dual-max-cross
+// -dual-grid: Zinke §4.1.2. Built once from the scene's own fibers before rendering and
+// shared, read-only, by every render thread. `g_dualGridCells` is a BUDGET, not an axis
+// count -- FurGrid picks roughly-cubic axes that fit that many cells in the coat's box.
+static bool   g_dualGrid = false;
+static int    g_dualGridCells = 128 * 128 * 128;
+static FurGrid g_furGridData;
+// -fur-volume: P2 stage 2b, the coat's FAR LOD tier. Reuses exactly the same density field
+// (so `-dual-grid -fur-volume` builds it once, at the larger of the two budgets) and adds a
+// 16-byte-per-cell orientation-distribution table on top. Where -dual-grid keeps the strands
+// and only reads the SHADOW off the grid, this replaces the strands outright: the camera ray
+// stops intersecting fibers and free-flights against sigma_t instead. Backward modes only.
+static bool   g_furVolume = false;
+static int    g_furVolumeCells = 128 * 128 * 128;
+static furvol::FurVolume g_furVolData;
+// -fur-lod: P2 stage 2c, the near/far transition. Turns the tier above from unconditional
+// into a decision made per camera path, measured in FIBER DIAMETERS of pixel footprint --
+// strands while a pixel is narrower than `g_furLodD0` diameters, the aggregate once it is
+// wider than `g_furLodD1`, and a stochastic smoothstep crossfade between the two so the
+// switch cannot draw a line across the image. Implies -fur-volume (there is nothing to
+// transition TO otherwise). Off => the stage-2b behaviour, whichever tier was asked for.
+static bool   g_furLod = false;
+static double g_furLodD0 = 1.0;
+static double g_furLodD1 = 4.0;
+// -fur-keep-strands: opt OUT of deleting the fibers once `-fur-volume` has summarised them
+// (see furDropStrandsWanted). An escape hatch for comparing against the strands, or for a
+// scene doing something with hair geometry this build hasn't anticipated.
+static bool   g_furKeepStrands = false;
+
+// The fur-LOD option table, in ONE place, because it is parsed TWICE.
+//
+// The strands have to be deleted before the loader builds a BVH over them (that build is
+// the memory peak -- Scene::dropHairCurves), and the loader runs before main's option loop.
+// So these flags are pre-scanned, exactly as `-in` and `-mode` already are, and the option
+// loop below calls the same function so there is only one definition of what they mean.
+// Idempotent: running it twice sets the same values.
+//
+// Returns true if argv[i] was one of these flags, advancing `i` past its optional value.
+static bool parseFurFlag(int argc, char** argv, int& i) {
+    const char* a = argv[i];
+    // The cell budget / diameter band are optional, so only consume the next token when it
+    // actually parses as a number -- otherwise `-fur-volume -o out.png` eats the output path.
+    const auto numArg = [&](double& out) -> bool {
+        if (i + 1 >= argc || argv[i + 1][0] == '-') return false;
+        char* end = nullptr;
+        const double v = std::strtod(argv[i + 1], &end);
+        if (!end || *end != '\0' || v < 1.0) return false;
+        ++i; out = v; return true;
+    };
+    if (!std::strcmp(a, "-dual-scatter") || !std::strcmp(a, "-dualscatter")) {
+        g_dualScatter = true; return true;
+    }
+    if (!std::strcmp(a, "-dual-grid")) {
+        g_dualGrid = true;
+        double v; if (numArg(v)) g_dualGridCells = (int)std::min(v, 3e8);
+        return true;
+    }
+    if (!std::strcmp(a, "-fur-volume")) {
+        g_furVolume = true;
+        double v; if (numArg(v)) g_furVolumeCells = (int)std::min(v, 3e8);
+        return true;
+    }
+    if (!std::strcmp(a, "-fur-keep-strands")) { g_furKeepStrands = true; return true; }
+    // -fur-lod [d0[:d1]]: the near/far transition, in fiber diameters of pixel footprint.
+    // Implies -fur-volume, since without the far tier there is nothing to fade to. One
+    // number sets the START of the band and puts the end two octaves up, which keeps the
+    // common case ("switch over at about a fiber per pixel") to a single token.
+    if (!std::strcmp(a, "-fur-lod")) {
+        g_furLod = true; g_furVolume = true;
+        if (i + 1 < argc && argv[i + 1][0] != '-') {
+            char* end = nullptr;
+            const double d0 = std::strtod(argv[i + 1], &end);
+            if (end && d0 > 0.0) {
+                if (*end == '\0') { ++i; g_furLodD0 = d0; g_furLodD1 = d0 * 4.0; }
+                else if (*end == ':') {
+                    char* e2 = nullptr;
+                    const double d1 = std::strtod(end + 1, &e2);
+                    if (e2 && *e2 == '\0' && d1 > d0) { ++i; g_furLodD0 = d0; g_furLodD1 = d1; }
+                }
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// Build the fiber density field (and, for -fur-volume, the orientation-distribution table on
+// top of it) from the scene's own curve segments. Both flags want the SAME field, so they
+// share one build at the larger budget.
+//
+// Called at most once per run, from ONE of two places: the pre-BVH hook, when the strands are
+// about to be deleted and this is therefore the last moment they exist; or main's normal
+// setup, when they are not. `g_furFieldsBuilt` is what makes those two mutually exclusive.
+static bool g_furFieldsBuilt = false;
+static void buildFurFields(const Scene& scene) {
+    if (g_furFieldsBuilt) return;
+    g_furFieldsBuilt = true;
+    const bool gridForDual = g_dualGrid && g_dualScatter;
+    if (g_dualGrid && !g_dualScatter)
+        std::printf("[ignore] -dual-grid does nothing without -dual-scatter (it only "
+                    "changes HOW the coat is measured along a shadow ray)\n");
+    if (gridForDual || g_furVolume) {
+        const int cells = std::max(gridForDual ? g_dualGridCells : 1,
+                                   g_furVolume ? g_furVolumeCells : 1);
+        const auto t0 = std::chrono::steady_clock::now();
+        g_furGridData.build(scene.curveSegs, [&](int matId) {
+            return matId >= 0 && matId < (int)scene.mats.size() &&
+                   scene.mats[matId].type == MatType::Hair;
+        }, cells);
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        const char* tag = gridForDual ? "dual-grid" : "fur-volume";
+        if (g_furGridData.valid)
+            std::printf("[%s] %dx%dx%d cells (%d occupied, %.1f MB) over %zu fiber "
+                        "segments in %.0f ms\n", tag, g_furGridData.nx, g_furGridData.ny,
+                        g_furGridData.nz, g_furGridData.occupied,
+                        g_furGridData.bytes() / (1024.0 * 1024.0), scene.curveSegs.size(), ms);
+        else if (gridForDual)
+            std::printf("[dual-grid] scene has no hair fibers -- falling back to the "
+                        "ray-shooting walk\n");
+        else
+            std::printf("[fur-volume] scene has no hair fibers -- rendering normally\n");
+    }
+    // The far tier's own half: one Bingham fit per occupied cell. Parallel because a
+    // 128^3 coat is ~1e5 Jacobi eigendecompositions plus as many table lookups, and it
+    // is embarrassingly so (each cell reads only itself).
+    if (g_furVolume && g_furGridData.valid) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = g_furVolData.build(g_furGridData, [](size_t n, auto&& f) {
+            return ft::parallelFor(n, 256, [&](size_t i) { f(i); });
+        });
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (ok && g_furVolData.valid())
+            std::printf("[fur-volume] far-tier ODF table %.1f MB in %.0f ms -- strands are "
+                        "now a MEDIUM (no fiber geometry in the backward tracer)\n",
+                        g_furVolData.bytes() / (1024.0 * 1024.0), ms);
+        // The LOD ruler, reported in world units so a "why is my close-up still
+        // aggregate?" is one line of arithmetic rather than a guess.
+        if (g_furLod && g_furVolData.valid()) {
+            const double dia = 2.0 * g_furGridData.meanRadius();
+            std::printf("[fur-lod] mean fiber diameter %.4g -- strands while a pixel is "
+                        "under %.4g wide at the coat, aggregate over %.4g, cross-faded "
+                        "between\n", dia, g_furLodD0 * dia, g_furLodD1 * dia);
+        }
+    }
+    else if (g_furLod)
+        std::printf("[ignore] -fur-lod does nothing: the scene has no hair fibers to "
+                    "build a far tier from\n");
+}
+
+#ifdef HAVE_CUDA
+// cudaBackwardSupported, plus the two things it cannot see (both RENDER OPTIONS, not scene
+// properties):
+//   * the `-fur-volume` far tier lives ONLY in the CPU BackwardRenderer
+//     (BackwardRenderer::furVol), and renderBackwardCuda has no equivalent. Handing a
+//     coat-as-medium scene to the device kernel therefore renders the coat as nothing at all.
+//   * `-dual-scatter` replaces the coat's multiple-scattering random walk with the
+//     Zinke dual-scattering approximation (BackwardRenderer::dualScatter) — CPU-only; the
+//     device D_HAIR case is the plain single-fiber walk. Running it on the GPU would
+//     silently drop the option, so a hair scene under -dual-scatter stays on the CPU.
+//
+// (§P3 landed the single-fiber BCSDF on the device in 0.181.0, so plain hair scenes no
+// longer fall back — these two option gates are now the ONLY reasons a fur scene leaves
+// the GPU backward path.)
+static bool backwardOnGpuOk(const Scene& scene, const Camera& cam) {
+    if (g_furVolume && g_furVolData.valid()) return false;
+    if (g_dualScatter)
+        for (const auto& m : scene.mats)
+            if (m.type == MatType::Hair) return false;
+    return cudaBackwardSupported(scene, cam);
+}
+#endif
 
 // Mode W lights a surface ONLY by next-event estimation, and a shadow ray is blocked by
 // any geometry at all -- dielectrics very much included (Scene::occluded: "can't connect
@@ -7007,6 +10933,25 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         br.ambient = g_ambient * scene.ambientRef();
         br.giDirs = g_gi; br.giGrid = g_giGrid; br.giBounce = g_giBounce;
         br.giClamp = g_giClamp * scene.ambientRef();   // same scaling as -ambient above
+        br.dualScatter = g_dualScatter; br.dualDensity = g_dualDensity;
+        br.dualMaxCross = g_dualMaxCross;
+        br.dualDb = g_dualDb; br.dualDf = g_dualDf;
+        br.furGrid = g_furGridData.valid ? &g_furGridData : nullptr;
+        br.furVol  = g_furVolData.valid() ? &g_furVolData : nullptr;
+        // Shading footprint for `fw` (O8 stage 2). Mode W only — see fwPerDist for why a
+        // stochastic sampler wants none — and derived from the run's REQUESTED spp rather
+        // than this call's chunk, so every chunk of a progressive or resumed render filters
+        // identically and their average stays a render of one image.
+        br.fwPerDist = br.whitted ? cam.footprintPerDist((int)g_fwSpp) : 0.0;
+        // -fur-lod (P2 stage 2c): the fur LOD ruler. footprintPerDist(1) and NOT (g_fwSpp) --
+        // this is the PIXEL's width, and it must not shrink with -spp; see the long note at
+        // BackwardRenderer::furLodPerDist for why LOD is the opposite case from `fw`.
+        if (g_furLod && g_furVolData.valid()) {
+            const double dia = 2.0 * g_furGridData.meanRadius();
+            br.furLodPerDist = cam.footprintPerDist(1);
+            br.furLodW0 = g_furLodD0 * dia;
+            br.furLodW1 = g_furLodD1 * dia;
+        }
         int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
         br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
     };
@@ -7320,22 +11265,49 @@ static void stopChannelEnd() {
     if (!g_stopRunFile.empty()) std::filesystem::remove(g_stopRunFile, ec);
 }
 
-// `ftrace -stop [<pid>|all]`: list running renders, or ask one/all of them to finish
-// cleanly. Never loads a scene, never touches the GPU; returns a process exit code.
+// Has a stop target actually gone? On Windows the process check is authoritative, so it
+// is the ONLY thing consulted: a target still alive has not stopped, whatever its .run
+// file says. (The old test also required the .run file to exist, which quietly inverted
+// the meaning for any process that never published one — an unregistered pid counted as
+// "gone" on the first poll and the command reported a clean stop it had not performed.)
+// Off Windows ftraceProcessAlive() is a conservative "yes", so fall back to the .run
+// file disappearing — published on entry, removed by stopChannelEnd().
+static bool stopTargetGone(long pid, const std::filesystem::path& dir) {
+#ifdef _WIN32
+    (void)dir;
+    return !ftraceProcessAlive(pid);
+#else
+    std::error_code ec;
+    return !std::filesystem::exists(dir / (std::to_string(pid) + ".run"), ec);
+#endif
+}
+
+// `ftrace -stop [<pid>|all]`: list running ftrace processes, or ask one/all of them to
+// finish cleanly. Never loads a scene, never touches the GPU; returns a process exit
+// code — 0 only when every target is genuinely gone, so a caller can chain a rebuild.
 static int runStopCommand(const char* who) {
     std::filesystem::path dir = stopChannelDir();
     if (dir.empty()) {
         std::fprintf(stderr, "error: -stop cannot reach the ftrace stop-channel directory\n");
         return 1;
     }
-    // Every live render, reaping .run files whose owner is gone (hard kill / crash).
+    // Every live ftrace process, reaping .run files whose owner is gone (hard kill / crash)
+    // and .stop sentinels nobody is left to consume. An unconsumed sentinel outlives its
+    // target whenever the target died first or never watched the channel at all (the
+    // "alive but unregistered" case below deliberately drops one), so without a reaper the
+    // directory only ever grows. `stopChannelStart` already deletes its own stale sentinel
+    // before starting its watcher, so a recycled pid cannot inherit a stop — this is
+    // housekeeping, not the safety net. Only reap once the owner is gone, so a sentinel
+    // still in flight to a live target is never snatched out from under it.
     std::vector<std::pair<long, std::string>> live;
     std::error_code ec;
     for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
-        if (de.path().extension() != ".run") continue;
+        const std::string ext = de.path().extension().string();
+        if (ext != ".run" && ext != ".stop") continue;
         const long pid = std::strtol(de.path().stem().string().c_str(), nullptr, 10);
         if (pid <= 0) continue;
         if (!ftraceProcessAlive(pid)) { std::filesystem::remove(de.path(), ec); continue; }
+        if (ext != ".run") continue;                 // a live target's pending sentinel
         std::string what;
         { std::ifstream f(de.path()); std::getline(f, what); }
         live.emplace_back(pid, what);
@@ -7343,8 +11315,8 @@ static int runStopCommand(const char* who) {
     std::sort(live.begin(), live.end());
 
     if (!who) {                                   // bare -stop: just list what's running
-        if (live.empty()) { std::printf("[stop] no ftrace renders are running.\n"); return 0; }
-        std::printf("[stop] running renders — stop one with `ftrace -stop <pid>`, "
+        if (live.empty()) { std::printf("[stop] no ftrace processes are running.\n"); return 0; }
+        std::printf("[stop] running ftrace processes — stop one with `ftrace -stop <pid>`, "
                     "all with `ftrace -stop all`:\n");
         for (const auto& p : live) std::printf("    pid %-7ld %s\n", p.first, p.second.c_str());
         return 0;
@@ -7353,7 +11325,7 @@ static int runStopCommand(const char* who) {
     std::vector<long> targets;
     if (!std::strcmp(who, "all")) {
         for (const auto& p : live) targets.push_back(p.first);
-        if (targets.empty()) { std::printf("[stop] no ftrace renders are running.\n"); return 0; }
+        if (targets.empty()) { std::printf("[stop] no ftrace processes are running.\n"); return 0; }
     } else {
         char* end = nullptr;
         const long pid = std::strtol(who, &end, 10);
@@ -7363,9 +11335,20 @@ static int runStopCommand(const char* who) {
         }
         bool known = false;
         for (const auto& p : live) if (p.first == pid) known = true;
-        if (!known)
-            std::printf("[stop] warning: pid %ld isn't a running ftrace render "
-                        "(dropping the sentinel anyway)\n", pid);
+        if (!known) {
+            // Already gone is a success: the caller wanted it stopped, and it is.
+            if (!ftraceProcessAlive(pid)) {
+                std::printf("[stop] pid %ld is not running — nothing to stop.\n", pid);
+                return 0;
+            }
+            // Alive but never published a .run file, so it is not an ftrace process this
+            // build can reach. Drop the sentinel in case it is watching, but do NOT let
+            // the wait below treat "unregistered" as "finished" — it stays a target, and
+            // if it is still alive at the deadline this command fails loudly.
+            std::printf("[stop] warning: pid %ld is running but is not a registered ftrace\n"
+                        "       process (no stop-channel entry). Dropping the sentinel anyway;\n"
+                        "       it will only stop if it happens to be watching for one.\n", pid);
+        }
         targets.push_back(pid);
     }
 
@@ -7388,16 +11371,18 @@ static int runStopCommand(const char* who) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
         std::vector<long> still;
         for (long pid : pending)
-            if (ftraceProcessAlive(pid) &&
-                std::filesystem::exists(dir / (std::to_string(pid) + ".run"), ec))
-                still.push_back(pid);
+            if (!stopTargetGone(pid, dir)) still.push_back(pid);
         pending.swap(still);
     }
+    // Only claim a clean stop when every target is actually gone — this exit code is what
+    // build.bat and friends chain off, so a false 0 sends them at an exe that is still
+    // locked, which is precisely the dead end that tempts a `taskkill /F`.
     if (pending.empty()) { std::printf("[stop] done — stopped cleanly.\n"); return 0; }
-    std::printf("[stop] still running after 120s:");
+    std::printf("[stop] FAILED — still running after 120s:");
     for (long pid : pending) std::printf(" %ld", pid);
     std::printf("\n[stop] it may be mid-write, or in a long non-chunked batch "
-                "(a bare -n render with no -window/-time/-noise budget writes only at the end).\n");
+                "(a bare -n render with no -window/-time/-noise budget writes only at the end),\n"
+                "       or it may not be an ftrace process at all. Nothing was force-killed.\n");
     return 2;
 }
 
@@ -8259,7 +12244,7 @@ static int runCompositeProgressive(
     const long long sppReq = (spp > 0) ? spp : 64;
     const double perSpp = (double)Nreq / (double)sppReq;
 #ifdef HAVE_CUDA
-    const bool gpuBackward = useGpu && cudaBackwardSupported(scene, cam);
+    const bool gpuBackward = useGpu && backwardOnGpuOk(scene, cam);
 #else
     const bool gpuBackward = false;
 #endif
@@ -8537,6 +12522,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     whittedOpts.heroSplit = hero::gSplit || g_whitted;
     whittedOpts.ambient   = g_ambient * scene.ambientRef();
     whittedOpts.giClamp   = g_giClamp * scene.ambientRef();   // same scaling as ambient
+    // O8 stage 2: same footprint coefficient the CPU worker gives BackwardRenderer, from the
+    // run's requested spp (not a chunk's), so CPU and GPU mode W filter fnoise() identically.
+    whittedOpts.fwPerDist = cam.footprintPerDist((int)g_fwSpp);
 #endif
     bool useGpu = false;
     if (!wantGpu && !wantAuto && std::strcmp(device, "cpu"))
@@ -8577,7 +12565,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // tracer (cheap there — mode W is ~1 spp).
             const bool bwOk = g_whitted
                             ? cudaBackwardWhittedSupported(scene, cam, whittedOpts)
-                            : cudaBackwardSupported(scene, cam);
+                            : backwardOnGpuOk(scene, cam);
             if (!bwOk) {
                 const char* why = g_whitted
                     ? "mode W scene is outside the deterministic GPU scope (-gi, or a "
@@ -8612,7 +12600,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             useGpu = true;
             const char* pSuffix = "";
             if (mode == 'P')
-                pSuffix = cudaBackwardSupported(scene, cam)
+                pSuffix = backwardOnGpuOk(scene, cam)
                         ? " (forward + camera-side layers)"
                         : " (forward layer; camera-side stays CPU — outside backward-GPU scope)";
             std::printf("[device] %s -> GPU: %s%s\n", wantAuto ? "auto" : "gpu",
@@ -8710,7 +12698,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if      (mode == 'R') cpuBackward = !useGpu;
         else if (mode == 'V') cpuBackward = true;
 #ifdef HAVE_CUDA
-        else if (mode == 'P') cpuBackward = !(useGpu && cudaBackwardSupported(scene, cam));
+        else if (mode == 'P') cpuBackward = !(useGpu && backwardOnGpuOk(scene, cam));
 #else
         else if (mode == 'P') cpuBackward = true;
 #endif
@@ -9725,6 +13713,65 @@ static void printHelp(const char* prog) {
 "                        escaping gather ray returns, so the gather's fill is effectively\n"
 "                        min(-ambient, x) and a smaller x just darkens the whole scene\n"
 "\n"
+"Fur (mode R):\n"
+"  -dual-scatter         approximate a coat's MULTIPLE scattering analytically (Zinke\n"
+"                        et al. 2008) instead of path-tracing it. The shadow ray counts\n"
+"                        the strands it crosses and turns them into a forward-scattering\n"
+"                        transmittance + spread; local backscattering becomes one extra\n"
+"                        BCSDF lobe. Biased, and the fiber vertex ENDS the path (the\n"
+"                        analytic terms already carry the bounces) — but a pale coat that\n"
+"                        needs -max-bounce 200 renders as direct lighting. Fur only;\n"
+"                        every other material keeps full path tracing\n"
+"  -dual-density <d>     Zinke's density factor, \"how enclosed is a strand\" (default 0.7,\n"
+"                        the paper's value; realistic range 0.6-0.8). Scales the whole\n"
+"                        multiple-scattering contribution\n"
+"  -dual-db <d>          override d_b (the local backscatter lobe's weight) alone\n"
+"  -dual-df <d>          override d_f (the light let through the coat) alone. Either one\n"
+"                        unset follows -dual-density; -dual-df 0 leaves only the directly\n"
+"                        lit term, which is how you attribute a brightness error\n"
+"  -dual-max-cross <n>   strands one shadow ray counts before it stops (default 64)\n"
+"  -dual-grid [cells]    measure the coat by marching a voxel density field instead of by\n"
+"                        crossing every strand (Zinke §4.1.2 rather than §4.1.1). The walk\n"
+"                        cannot early-out — a fiber does not block a shadow ray, it\n"
+"                        accumulates — so on a dense coat it is the cost of -dual-scatter;\n"
+"                        the grid is O(cells) with no primitive tests, and its optical depth\n"
+"                        IS the expected crossing count (-checkfurgrid verifies that against\n"
+"                        the real intersector). Approximate in two known ways: extinction is\n"
+"                        over-estimated by up to 4%% where a cell's tangents are isotropic,\n"
+"                        and a per-strand colour TEXTURE is sampled at the shading fiber\n"
+"                        rather than the crossed ones. `cells` is a budget, not an axis\n"
+"                        count (default 2097152, i.e. 128^3; 32 B/cell)\n"
+"  -fur-volume [cells]   render the coat as a PARTICIPATING MEDIUM instead of as strands\n"
+"                        (backward modes R/W; the far LOD tier). Fibers vanish from the BVH\n"
+"                        entirely: a ray free-flights against the same grid's sigma_t and\n"
+"                        each collision invents one virtual fiber, drawing its tangent from\n"
+"                        the cell's reconstructed orientation distribution and shading it\n"
+"                        with the ordinary BCSDF. Cost stops scaling with fiber count and\n"
+"                        starts scaling with optical depth, and the geometry is no longer\n"
+"                        resolved — so this is for fur that is SMALL ON SCREEN, where a\n"
+"                        strand is under a pixel and there is no silhouette left to lose.\n"
+"                        Shares the density field with -dual-grid (same `cells` budget\n"
+"                        meaning) and adds 16 B/cell for the orientation table. Once the\n"
+"                        grid is built the fibers are DELETED, before any BVH is built over\n"
+"                        them — so the coat costs its grid, not its geometry (a 900k-strand\n"
+"                        pelt: 2221 MB peak -> 875 MB, and a 3M-strand one that used to die\n"
+"                        with `bad allocation` now renders). Skipped automatically whenever\n"
+"                        something still needs the strands: -fur-lod, -dual-scatter,\n"
+"                        -raster/-explore, -anim/-loom, or a camera in a forward mode\n"
+"  -fur-keep-strands     opt out of that deletion: keep the fibers loaded and in the BVH\n"
+"                        even under -fur-volume. For A/B-ing the aggregate against the\n"
+"                        strands in one process, or if something needs the geometry\n"
+"  -fur-lod [d0[:d1]]    make that tier a DECISION instead of a mode: trace strands while\n"
+"                        one pixel is narrower than d0 fiber diameters where the coat\n"
+"                        begins, the aggregate once it is wider than d1, and cross-fade\n"
+"                        stochastically in between (a per-path coin against a smoothstep,\n"
+"                        so the switch dissolves into the sampling instead of drawing a\n"
+"                        line across the image). Implies -fur-volume. One number sets d0\n"
+"                        and puts d1 two octaves up. Defaults 1:4. The ruler is the PIXEL\n"
+"                        footprint and does not shrink with -spp — no number of samples\n"
+"                        can put a sub-pixel silhouette into the final image, so a\n"
+"                        converged render must pick the same tier as its own preview\n"
+"\n"
 "Denoising (post-pass on the linear image; affects the file AND the live window):\n"
 "  -denoise [amount]     edge-aware a-trous filter for SPECTRAL speckle. CHROMA ONLY by\n"
 "                        default: luma is left bit-identical, so no detail is lost. MC\n"
@@ -9898,6 +13945,8 @@ static int run(int argc, char** argv) {
     bool checkImplicitOnly = false;
     bool checkCurveOnly = false;
     bool checkFurOnly = false;
+    bool checkFurGridOnly = false;
+    bool checkFurVolOnly = false;
     bool checkContainerOnly = false;
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
@@ -9930,6 +13979,11 @@ static int run(int argc, char** argv) {
     bool checkVNoiseOnly = false;
     bool checkWorleyOnly = false;
     bool checkGaborOnly = false;
+    bool checkBlueNoiseOnly = false;
+    bool checkReactionOnly = false;
+    bool checkFNoiseOnly = false;
+    bool checkStochTileOnly = false;
+    bool checkHairOnly = false;
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
     bool checkSdfOnly = false;
@@ -10077,6 +14131,19 @@ static int run(int argc, char** argv) {
             else                                     g_onUnsupported = OnUnsupported::Error;
         }
     }
+    // The fur-LOD flags, and the raster/viewer flags that veto deleting the strands, for the
+    // same reason: the decision has to be made inside the loader, before it builds a BVH over
+    // the coat. See parseFurFlag and the beforeBvh hook below. Both loops re-parse these
+    // normally further down; this pass only has to know the values early.
+    bool rasterPrescan = false;
+    for (int i = 1; i < argc; ++i) {
+        if (parseFurFlag(argc, argv, i)) continue;
+        if (!std::strcmp(argv[i], "-raster") || !std::strcmp(argv[i], "-raster-gpu") ||
+            !std::strcmp(argv[i], "-raster-bench") || !std::strcmp(argv[i], "-explore") ||
+            !std::strcmp(argv[i], "-fly") || !std::strcmp(argv[i], "-loom") ||
+            !std::strcmp(argv[i], "--loom") || !std::strcmp(argv[i], "-anim"))
+            rasterPrescan = true;
+    }
 
     // The prefer/else resolver asks this predicate whether a branch renders; when the
     // policy is fallback/strip we accept every branch (the policy handles it later at
@@ -10091,6 +14158,71 @@ static int run(int argc, char** argv) {
         : ftsl::SupportFn{};
 
     ftsl::Loaded ftslScene;
+
+    // -fur-volume: once the coat has been summarised into a density grid + ODF table, the
+    // fibers it was derived from are dead weight -- and expensive dead weight, because the
+    // BVH built over them is the run's memory PEAK. Install the pre-BVH hook so the summary
+    // is taken and the strands deleted at the one moment when neither the tree nor the
+    // rendering has happened yet. Measured on a 900k-strand coat (9M segments): 2221 MB peak
+    // working set before, and the 3M-strand rung above it did not load at all.
+    //
+    // The vetoes below are all "something still needs the geometry":
+    //   -fur-lod          the NEAR tier traces strands; only the far tier is a medium.
+    //   -dual-scatter     keeps the strands and reads only the shadow off the grid.
+    //   -raster/-explore  raster.h walks curveSegs for its own pass (a bald preview).
+    //   -anim/-loom       the fly editor re-loads scenes mid-flight through other paths.
+    //   -fur-keep-strands the operator asked for them.
+    // Plus the render mode, which is vetoed inside the hook because it is the loader -- not
+    // the command line -- that knows what the scene's cameras actually are.
+    if (g_furVolume && g_furKeepStrands)
+        std::printf("[fur-volume] -fur-keep-strands: the fibers stay loaded and in the BVH "
+                    "(they are still invisible to the far tier's rays)\n");
+    if (g_furVolume && !g_furLod && !g_dualScatter && !g_furKeepStrands && !rasterPrescan) {
+        ftslScene.beforeBvh = [&](ftsl::Loaded& L) {
+            // Every camera that could render must be a mode whose tracer honours the far
+            // tier -- i.e. the CPU backward walk (R, and W which normalises to R). A forward
+            // mode intersects the fibers directly and would render a shaved animal; mode V
+            // does both and would compare one against the other. A CLI -mode overrides the
+            // file, so it decides alone when present.
+            const auto backwardOnly = [](char m) { return m == 'R'; };
+            char blocker = 0;
+            if (cliModePrescan) {
+                if (!backwardOnly(cliModePrescan)) blocker = cliModePrescan;
+            } else {
+                const char fallback = L.defaultMode ? L.defaultMode : L.mode;
+                if (L.cameras.empty() && !backwardOnly(fallback)) blocker = fallback;
+                for (const auto& c : L.cameras) {
+                    const char m = c.mode ? c.mode : fallback;
+                    if (!backwardOnly(m)) { blocker = m; break; }
+                }
+            }
+            if (blocker) {
+                std::printf("[fur-volume] keeping the strands: mode %c traces fiber geometry "
+                            "directly (only backward R/W renders the coat as a medium)\n", blocker);
+                return;
+            }
+            // Last moment the fibers exist: take the summary off them, then delete them.
+            buildFurFields(L.scene);
+            if (!g_furVolData.valid()) return;      // no hair, or the fit failed -- nothing to drop
+            const size_t before = L.scene.curveSegs.size();
+            const auto t0 = std::chrono::steady_clock::now();
+            const size_t dropped = L.scene.dropHairCurves();
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (dropped)
+                std::printf("[fur-volume] dropped %zu of %zu curve segments in %.0f ms -- the "
+                            "coat is a medium now, so neither it nor a BVH over it is built "
+                            "(~%.0f MB not allocated; -fur-keep-strands opts out)\n",
+                            dropped, before, ms,
+                            // The segments themselves plus what a BVH over them would have
+                            // cost: nodes reserve 2N x sizeof(BvhNode), and the build holds a
+                            // BuildPrim and an Aabb per primitive on top of that.
+                            dropped * (sizeof(CurveSeg) + 2.0 * sizeof(BvhNode) +
+                                       sizeof(Aabb) + sizeof(Aabb) + sizeof(Vec3) + sizeof(int))
+                                / (1024.0 * 1024.0));
+        };
+    }
+
     bool fromFtsl = false;
     if (positionalMesh) {
         // ---- Quick mesh viewer -------------------------------------------------------
@@ -10224,6 +14356,22 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-gi-clamp") && i + 1 < argc) {
             g_giClamp = std::max(0.0, std::atof(argv[++i]));
         }
+        // -dual-scatter / -dual-grid / -fur-volume / -fur-lod / -fur-keep-strands. Parsed by
+        // the shared table so this loop and the pre-scan above cannot drift apart; see
+        // parseFurFlag for why they are pre-scanned at all.
+        else if (parseFurFlag(argc, argv, i)) { }
+        else if (!std::strcmp(argv[i], "-dual-density") && i + 1 < argc) {
+            g_dualDensity = std::max(0.0, std::min(1.0, std::atof(argv[++i])));
+        }
+        else if (!std::strcmp(argv[i], "-dual-db") && i + 1 < argc) {
+            g_dualDb = std::max(0.0, std::min(1.0, std::atof(argv[++i])));
+        }
+        else if (!std::strcmp(argv[i], "-dual-df") && i + 1 < argc) {
+            g_dualDf = std::max(0.0, std::min(1.0, std::atof(argv[++i])));
+        }
+        else if (!std::strcmp(argv[i], "-dual-max-cross") && i + 1 < argc) {
+            g_dualMaxCross = std::max(1, std::atoi(argv[++i]));
+        }
         // -denoise [amount]: the optional amount scales BOTH tolerances, so `-denoise 2`
         // is twice as aggressive and `-denoise 0.5` half. The argument is optional, so
         // only consume the next token if it actually parses as a number — otherwise
@@ -10307,6 +14455,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkimplicit")) checkImplicitOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurve")) checkCurveOnly = true;
         else if (!std::strcmp(argv[i], "-checkfur")) checkFurOnly = true;
+        else if (!std::strcmp(argv[i], "-checkfurgrid")) checkFurGridOnly = true;
+        else if (!std::strcmp(argv[i], "-checkfurvol")) checkFurVolOnly = true;
         else if (!std::strcmp(argv[i], "-checkcontainer")) checkContainerOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
@@ -10347,6 +14497,11 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkvnoise")) checkVNoiseOnly = true;
         else if (!std::strcmp(argv[i], "-checkworley")) checkWorleyOnly = true;
         else if (!std::strcmp(argv[i], "-checkgabor")) checkGaborOnly = true;
+        else if (!std::strcmp(argv[i], "-checkbluenoise")) checkBlueNoiseOnly = true;
+        else if (!std::strcmp(argv[i], "-checkreaction")) checkReactionOnly = true;
+        else if (!std::strcmp(argv[i], "-checkfnoise")) checkFNoiseOnly = true;
+        else if (!std::strcmp(argv[i], "-checkstochtile")) checkStochTileOnly = true;
+        else if (!std::strcmp(argv[i], "-checkhair")) checkHairOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
@@ -10522,6 +14677,8 @@ static int run(int argc, char** argv) {
     if (checkImplicitOnly) return checkImplicit(500'000) == 0 ? 0 : 1; // deterministic, no scene needed
     if (checkCurveOnly)    return checkCurve(200'000) == 0 ? 0 : 1;    // deterministic, no scene needed
     if (checkFurOnly)      return checkFur(50'000) == 0 ? 0 : 1;      // deterministic, no scene needed
+    if (checkFurGridOnly)  return checkFurGrid() == 0 ? 0 : 1;        // deterministic, no scene needed
+    if (checkFurVolOnly)   return checkFurVol() == 0 ? 0 : 1;         // deterministic, no scene needed
     if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
@@ -10536,6 +14693,11 @@ static int run(int argc, char** argv) {
     if (checkVNoiseOnly)   return checkVNoise();   // ditto (vector noise / domain warp)
     if (checkWorleyOnly)   return checkWorley();   // ditto (cellular / Worley noise)
     if (checkGaborOnly)    return checkGabor();    // ditto (anisotropic band-limited Gabor noise)
+    if (checkBlueNoiseOnly) return checkBlueNoise();  // ditto (blue-noise / Poisson-disk placement)
+    if (checkReactionOnly)  return checkReaction();   // ditto (Gray-Scott reaction-diffusion bake)
+    if (checkFNoiseOnly)    return checkFNoise();     // ditto (filtered / band-limited fBm)
+    if (checkStochTileOnly) return checkStochTile();  // ditto (histogram-preserving tiling)
+    if (checkHairOnly)     return checkHair();     // ditto (fiber BCSDF, no scene)
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)
@@ -10672,6 +14834,7 @@ static int run(int argc, char** argv) {
     // scene would silently still render the biased preview.
     if (ftslScene.whitted && !modeFromCli) g_whitted = true;
     g_directOnly = directOnly || g_whitted;   // -mode W implies it
+    g_fwSpp = spp > 0 ? spp : 1;              // latch the footprint's spp (see g_fwSpp)
     if (maxBounceOverride >= 1) std::printf("[ignore] max bounce = %d\n", maxBounceOverride);
     // The interactive viewer renders its live preview in mode W whatever the run's mode is
     // (press T), so mode W's settings have to be honoured in an -explore run too -- else
@@ -10734,6 +14897,34 @@ static int run(int argc, char** argv) {
         else
             std::printf("[hero] split-at-dispersion ON (C=%d fan-out; backward R/W on CPU+GPU, "
                         "forward modes A/B/C and photon-map M/S on the CPU)\n", g_heroC);
+    }
+
+    // -dual-grid / -fur-volume: build the fiber density field once, before any render thread
+    // exists. Placed here rather than at scene load because it is opt-in and costs a pass over
+    // every CurveSeg -- a scene with no fur, or a run without -dual-scatter, must not pay.
+    // Both flags want the SAME field, so they share one build at the larger budget.
+    {
+        buildFurFields(scene);
+
+        // The second BVH, the one every `skipHair` query traverses. Needed by anything that
+        // makes fibers invisible to a ray: the -fur-volume / -fur-lod far tier (closestHit)
+        // and -dual-scatter's shadow ray (occludedSkipHair). Without it those queries reject
+        // fibers at the LEAF, which does not skip the traversal and, because no fiber ever
+        // shortens tMax, cannot prune either -- see Scene::buildNoHairBvh for the measurement
+        // that made this necessary. Opt-in because it is a second BVH build over ~the whole
+        // scene, and a render that never sets skipHair would pay it for nothing.
+        if (g_furVolume || g_dualScatter) {
+            const auto t0 = std::chrono::steady_clock::now();
+            scene.buildNoHairBvh();
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (scene.hasNoHairBvh())
+                std::printf("[fur] hair-free BVH over %zu of %zu prims in %.0f ms -- the coat is "
+                            "not in the tree a skip-hair ray walks\n",
+                            scene.noHairPrim.size(),
+                            scene.tris.size() + scene.spheres.size() + scene.implicits.size() +
+                            scene.curveSegs.size() + scene.instances.size(), ms);
+        }
     }
 
     if (checkBvhOnly) {
@@ -13546,7 +17737,7 @@ static int run(int argc, char** argv) {
             case 'R': {
                 bool onGpu = false;
 #ifdef HAVE_CUDA
-                if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
+                if (meterGpu && backwardOnGpuOk(scene, mc.cam)) {
                     mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
                                             g_maxBounceOverride, g_directOnly, g_heroC);
                     onGpu = true;
@@ -13595,7 +17786,7 @@ static int run(int argc, char** argv) {
                 Film ref;
                 bool refGpu = false;
 #ifdef HAVE_CUDA
-                if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
+                if (meterGpu && backwardOnGpuOk(scene, mc.cam)) {
                     ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
                                              g_maxBounceOverride, g_directOnly, g_heroC);
                     refGpu = true;
@@ -14346,9 +18537,18 @@ int main(int argc, char** argv) {
                     viewerLoom = argv[++i];
                 }
             }
-            if (viewerSidecar)
-                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "", viewerPlay,
-                                    viewerPrebake, viewerCapMB);
+            if (viewerSidecar) {
+                // Publish the viewer in the stop channel too. It is not a render, but it
+                // IS a long-lived ftrace process holding ftrace.exe (and a python child)
+                // open, so `-stop` has to be able to list and end it — otherwise the only
+                // way out is the force-kill the whole channel exists to avoid. The GUI
+                // loop polls ft::stopRequested() once per frame; see viewer_gui.cpp.
+                stopChannelStart(std::string(viewerSidecar) + " -> (loom viewer)");
+                int vrc = runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "", viewerPlay,
+                                       viewerPrebake, viewerCapMB);
+                stopChannelEnd();
+                return vrc;
+            }
             if (viewerLoom) {
                 // -loom names a live channel, and there are two of them: the viewer's F4
                 // re-introspection (-viewer) and the fly editor's E2 value channel

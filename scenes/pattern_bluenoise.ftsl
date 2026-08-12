@@ -1,0 +1,125 @@
+# pattern_bluenoise.ftsl — blue-noise / Poisson-disk placement (O5).
+#
+#   bnoise  (x, y, z, r)  -> F1, distance to the nearest point of the set
+#   bnoise2 (x, y, z, r)  -> F2, second nearest
+#   bnoised (x, y, z, r)  -> F2 - F1, the crack network of its Voronoi diagram
+#   bnoiseid(x, y, z, r)  -> the F1 point's random id in [0,1)
+#
+# The same four slots as `worley`, over a different POINT SET. Worley's sites are a
+# jittered lattice, so two of them can be arbitrarily close (both jitter to the shared
+# cell wall) and elsewhere the lattice leaves holes. Threshold F1 to draw spots and that
+# clumping is instantly legible as computer texture: pairs of freckles fused into
+# peanuts, bald patches beside them. `bnoise`'s sites have a guaranteed MINIMUM
+# SEPARATION r (in cell units, 0..1), which is a property of the placement and cannot be
+# recovered afterwards by any amount of filtering.
+#
+#   ftrace -in scenes/pattern_bluenoise.ftsl -n 40000000 -window -keepwindow \
+#          -o png/pattern_bluenoise.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# ---------------------------------------------------------------------------------
+# BACK WALL — THE COMPARISON, at MATCHED DENSITY. Left half of the wall places the
+# spots with `worley`, right half with `bnoise`; everything else about the two is
+# identical, including the spot radius in metres.
+#
+# Matching the density is the whole point of the exercise, and it is not automatic:
+# worley has exactly one site per cell, bnoise (at r = 1) keeps 0.2661 of them, so to
+# get the same number of spots per square metre the worley side needs a cell
+# 0.2661^(1/3) = 0.6432x the size — 15.44 cells/m against bnoise's 24. Then a disc of
+# radius 1.75 cm is 0.42 cells on the bnoise side and 0.270 on the worley side.
+#
+# Both sides also show a spread of disc SIZES, and that is not the id trick used on the
+# left wall — it is slicing. These are SOLID point sets in 3-D, so a wall cuts the
+# spheres of radius R at assorted depths h and sees discs of radius sqrt(R^2 - h^2).
+# That happens equally on both halves, so it does not disturb the comparison; it is
+# worth knowing about when authoring, because it means a uniform R still gives varied
+# spots on any surface, and a few near-tangential ones come out very small.
+#
+# What you should see: the same number of discs drawn from the same size distribution,
+# arriving in clumps with bare patches between them on the left, and evenly spread on
+# the right. Look for touching/overlapping pairs — the left half has them, the right
+# half provably cannot.
+pattern "compare" {
+    expr "mix(1 - smoothstep(0.2316, 0.2702, worley(15.44*x, 15.44*y, 15.44*z, 0)),
+              1 - smoothstep(0.3600, 0.4200, bnoise(24*x,    24*y,    24*z,    1)),
+              step(0.5, x))"
+}
+
+# LEFT WALL (the x = 0 plane) — FRECKLES. Real freckles are evenly spread AND unequal
+# in size; the even spread is `bnoise`, the unequal size is `bnoiseid`, which returns a
+# per-point random number so each disc can pick its own radius. Radii stay below 0.5
+# cells so that discs on adjacent sites still cannot touch.
+pattern "freckle" {
+    expr "1 - smoothstep((0.16 + 0.30*bnoiseid(26*x, 26*y, 26*z, 1)) * 0.55,
+                          0.16 + 0.30*bnoiseid(26*x, 26*y, 26*z, 1),
+                          bnoise(26*x, 26*y, 26*z, 1))"
+}
+
+# FLOOR — COBBLES. F2 - F1 is the ridge midway between two sites, i.e. the crack network
+# of the Voronoi diagram of the point set. Over blue-noise sites those cells come out
+# roughly equal in size and roundish; over Worley's jittered lattice the same expression
+# gives cells that vary wildly and squeeze into slivers wherever two sites nearly
+# coincide. Same expression, better stones, purely because of where the seeds are.
+pattern "cobble" { expr "smoothstep(0.03, 0.22, bnoised(7*x, 7*y, 7*z, 1))" }
+
+# RIGHT WALL (the x = 1 plane) — LICHEN. The discs get a wide size spread from the id,
+# and their edges are then eaten into by a fine noise, so they read as colonies rather
+# than as dots. The colonies still never merge, because their SITES cannot come closer
+# than one cell however ragged the edges get — the separation guarantee survives the
+# post-processing, which is exactly why it belongs in the placement.
+pattern "lichen" {
+    expr "1 - smoothstep(0.10, 0.42,
+                         bnoise(11*x, 11*y, 11*z, 1)
+                         / (0.35 + 0.85*bnoiseid(11*x, 11*y, 11*z, 1))
+                         + 0.30*noise(40*x, 40*y, 40*z))"
+}
+
+# SPHERE — GOLF-BALL DIMPLES. The one place where even spacing is not a matter of taste:
+# a golf ball's dimples are packed as evenly as the surface allows, and a lattice
+# placement wrapped onto a sphere looks obviously wrong. Uniform radius here, so the
+# regularity of the spacing is the only thing left to look at.
+pattern "dimple" { expr "1 - smoothstep(0.34, 0.46, bnoise(26*x, 26*y, 26*z, 1))" }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "ink"   { type diffuse reflect rgb 0.07 0.07 0.10 }
+material "lite"  { type diffuse reflect rgb 0.92 0.92 0.92 }
+material "skin"  { type diffuse reflect rgb 0.82 0.66 0.55 }
+material "spot"  { type diffuse reflect rgb 0.55 0.32 0.20 }
+material "stone" { type diffuse reflect rgb 0.52 0.50 0.46 }
+material "grout" { type diffuse reflect rgb 0.16 0.15 0.14 }
+material "bark"  { type diffuse reflect rgb 0.34 0.30 0.26 }
+material "moss"  { type diffuse reflect rgb 0.42 0.55 0.28 }
+material "ball"  { type diffuse reflect rgb 0.92 0.92 0.90 }
+material "pit"   { type diffuse reflect rgb 0.40 0.42 0.46 }
+
+# A `weight_map` value of 1 selects the FIRST layer, so in every one of these the first
+# layer is the FEATURE (the disc, the stone, the colony, the dimple) and the second is
+# the background it sits on.
+material "backwall"  { type mix  layer "lite"  0.5  layer "ink"   0.5  weight_map pattern:compare }
+material "leftwall"  { type mix  layer "spot"  0.5  layer "skin"  0.5  weight_map pattern:freckle }
+material "rightwall" { type mix  layer "moss"  0.5  layer "bark"  0.5  weight_map pattern:lichen  }
+material "floormat"  { type mix  layer "stone" 0.5  layer "grout" 0.5  weight_map pattern:cobble  }
+material "ballmat"   { type mix  layer "pit"   0.5  layer "ball"  0.5  weight_map pattern:dimple  }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material floormat }
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material backwall }
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material leftwall }
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material rightwall }
+
+sphere { center 0.62 0.24 0.62   radius 0.22   material ballmat }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 400 400 }
+}

@@ -24,6 +24,7 @@
 #include "medium_stack.h"
 #include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
+#include "hair_shade.h" // fiber BCSDF bridge (MatType::Hair, TODO §P3)
 
 struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
@@ -483,11 +484,34 @@ struct Renderer {
         double cosSurf = 0, corr = 0, denom = 0, stG = 0, dist = 0;
         Vec3 wdir;
     };
+    // A FIBER vertex connects differently, in three ways that all live down here rather
+    // than in the caller (see hair_shade.h for why the projection factor changes):
+    //   (1) the projection is the strand's longitudinal cosine, folded into `hairFCos`
+    //       together with the BCSDF, so `cosSurf` is forced to 1 and plays no part;
+    //   (2) TT transmits, so the camera sitting BEHIND the shading normal is a legitimate
+    //       and often bright connection — the surface path's `cosSurf <= 0` rejection
+    //       would delete the forward glow that a pale coat is mostly made of;
+    //   (3) the shadow ray has to start past the strand's own body, or the tube occludes
+    //       its own transmitted lobe.
+    // `shadowTerminatorG` and the Veach shading-normal adjoint are both corrections for
+    // an interpolated surface normal used as a projection axis; the fiber does not use its
+    // normal that way, so both are exactly 1 here rather than approximately so.
     bool connectGeom(const Scene& scene, const Camera& cam, const Vec3& p, const Vec3& n,
-                     const Vec3& ng, const Vec3& wi, ConnGeom& g) const {
+                     const Vec3& ng, const Vec3& wi, ConnGeom& g,
+                     const HairShade* hs = nullptr) const {
         Vec3 toCam = cam.eye - p;
         g.dist = length(toCam);
         g.wdir = toCam / g.dist;
+        if (hs) {
+            g.cosSurf = 1.0; g.corr = 1.0; g.stG = 1.0;
+            double cosCamH, dist2H;
+            if (!cam.project(p, g.px, g.py, cosCamH, dist2H)) return false;
+            const double off = hairExitOffset(*hs, n, g.wdir);
+            if (off >= g.dist) return false;
+            if (scene.occluded(p + g.wdir * off, g.wdir, g.dist - off - 1e-6)) return false;
+            g.denom = dist2H * cam.pixelSolidAngle(cosCamH);
+            return true;
+        }
         g.cosSurf = dot(n, g.wdir);
         // Reject connections below the shading horizon; soften across the GEOMETRIC
         // horizon (`ng` is the geometric normal on the shading side). A smoothed shading
@@ -519,10 +543,13 @@ struct Renderer {
     // reproduces the classic G * We = cosSurf*cosCam/dist^2 * 1/(A_pix cosCam^4).
     void connect(const Scene& scene, const Camera& cam, Film& film,
                  const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
-                 double lambda, double beta, double rho, Pcg32& rng) const {
+                 double lambda, double beta, double rho, Pcg32& rng,
+                 const HairShade* hs = nullptr) const {
         ConnGeom g;
-        if (!connectGeom(scene, cam, p, n, ng, wi, g)) return;
-        double f = rho / PI;
+        if (!connectGeom(scene, cam, p, n, ng, wi, g, hs)) return;
+        // For a fiber, `hairFCos` IS f*projection (hair_shade.h); cosSurf is 1 so the
+        // arithmetic below stays one shared expression instead of two near-copies.
+        double f = hs ? hairFCos(*hs, g.wdir) : rho / PI;
         double contrib = beta * f * g.cosSurf * g.corr / g.denom * g.stG;
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
@@ -590,7 +617,8 @@ struct Renderer {
     // fisheye needs a wide-angle lens element, so author fisheye with model B instead.
     void connectLens(const Scene& scene, const Camera& cam, Film& film,
                      const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
-                     double lambda, double beta, double rho, Pcg32& rng) const {
+                     double lambda, double beta, double rho, Pcg32& rng,
+                     const HairShade* hs = nullptr) const {
         double R = cam.apertureR;
         double rr = R * std::sqrt(rng.uniform());
         double a  = 2.0 * PI * rng.uniform();
@@ -601,20 +629,30 @@ struct Renderer {
         Vec3 wdir = toA / dist;
         double cosSurf = dot(n, wdir);
         // Below the shading horizon reject; soften across the geometric horizon (see
-        // connect()): no-op for flat/sphere (stG == 1).
-        if (cosSurf <= 0) return;                        // pupil behind the shading surface
-        double stG = shadowTerminatorG(wdir, n, ng);
-        if (stG <= 0.0) return;                          // pupil behind true geometry: hard cutoff
+        // connect()): no-op for flat/sphere (stG == 1). A FIBER skips both — its
+        // transmitted lobe legitimately exits the far side, and its projection is
+        // longitudinal rather than normal-relative (see hair_shade.h / connectGeom).
+        double stG = 1.0;
+        if (!hs) {
+            if (cosSurf <= 0) return;                    // pupil behind the shading surface
+            stG = shadowTerminatorG(wdir, n, ng);
+            if (stG <= 0.0) return;                      // pupil behind true geometry: hard cutoff
+        }
         double cosLens = -dot(wdir, cam.w);              // cosine at the lens (w faces the scene)
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6)) return;
+        const double off = hs ? hairExitOffset(*hs, n, wdir) : 1e-6;
+        if (off >= dist) return;
+        if (scene.occluded(p + (hs ? wdir : ng) * off, wdir, dist - off - 1e-6)) return;
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
         // cosSurf carries the Veach shading-normal adjoint correction (see connect()).
-        double corr = shadingAdjointCorr(wi, wdir, n, ng);
-        double contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
+        // For a fiber the BRDF-times-projection is hairFCos, and the pi it would be
+        // divided by is the same pi that pi*R^2 supplies — hence the explicit factor.
+        double corr = hs ? 1.0 : shadingAdjointCorr(wi, wdir, n, ng);
+        double fcos = hs ? PI * hairFCos(*hs, wdir) : rho * cosSurf;
+        double contrib = beta * fcos * corr * cosLens * (R * R) / (dist * dist) * stG;
         // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification). The line above deposits
         // radiant FLUX through the pupil into the film CELL (it carries the pupil area
         // R^2 but no 1/cell-area), whereas mode B's connect() deposits RADIANCE (it
@@ -775,6 +813,25 @@ struct Renderer {
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film)
                 camSplat(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lambda, beta, rho, rng);
+    }
+
+    // Fiber (MatType::Hair) analogue of camSplat/camSplatAll. The BCSDF and its projection
+    // arrive together in `hs` (hair_shade.h), so there is no `rho` to pass: the 0.0 below is
+    // the ignored Lambertian slot. `wi` is likewise unused — the fiber does not take the
+    // Veach shading-normal correction — but it is kept in the signature so the call sites
+    // read the same as the surface ones.
+    void camSplatHair(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
+                      const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda,
+                      double beta, const HairShade& hs, Pcg32& rng) const {
+        if (lensMode) connectLens(scene, cam, film, p, n, ng, wi, lambda, beta, 0.0, rng, &hs);
+        else          connect(scene, cam, film, p, n, ng, wi, lambda, beta, 0.0, rng, &hs);
+    }
+    void camSplatAllHair(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
+                         const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda,
+                         double beta, const HairShade& hs, Pcg32& rng) const {
+        for (int c = 0; c < nCam; ++c)
+            if (cams[c].cam && cams[c].film)
+                camSplatHair(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lambda, beta, hs, rng);
     }
 
     // Hero-wavelength routing (mode A finite lens or mode B pinhole), splatting all `nUp`
@@ -1387,6 +1444,44 @@ struct Renderer {
                 ray = Ray{h.p + h.n * 1e-6, wo};
                 return true;                        // beta otherwise unchanged (see above)
             }
+            case MatType::Hair: {
+                // Fiber BCSDF (Marschner/Chiang; src/hair.h, bridged by hair_shade.h).
+                //
+                // It sits in this function rather than beside Diffuse because, like the
+                // dielectric family, it is wavelength-COUPLED: the absorption sigma_a is a
+                // per-λ quantity, and an authored `reflect` colour is inverted into one
+                // per-λ, so a hero packet cannot share one fiber interaction across C
+                // wavelengths — tracePhotonHero de-heroes onto this path instead.
+                //
+                // The interaction is a connect-then-scatter, like Fluorescent: the lobes are
+                // narrow but finite, so the vertex IS visible to a mode-B pinhole and must
+                // splat before it scatters.
+                const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the light-side vertex
+                const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
+                if (nCam > 0 && !forwardCatch)
+                    camSplatAllHair(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wPrev,
+                                    lambda, beta, hs, rng);
+
+                double pdf = 0.0, fv = 0.0;
+                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
+                                             rng.uniform(), rng.uniform(), pdf, fv);
+                if (!(pdf > 0.0) || !(fv > 0.0)) { e.absorbed += beta; return false; }
+                // The BCSDF is built so this ratio is EXACTLY T = sum_p A_p <= 1 (the total
+                // Fresnel/Beer attenuation over the lobes) — the per-lobe pdf weights are
+                // A_p/T and everything else cancels. So it is a deterministic survival
+                // probability, and Russian-rouletting on it leaves beta untouched: the same
+                // trick Mirror plays with its reflectance, but here the number is the
+                // physics rather than an authored albedo.
+                const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
+                const double T = clamp01(fv * cosLong / pdf);
+                if (rng.uniform() >= T) { e.absorbed += beta; return false; }
+                const Vec3 wo = hair::toWorld(hs.fr, wl);
+                // TT and TRT leave through the FAR side of a real solid strand, so step
+                // clear of the tube's own body (hair_shade.h); on the near side this is the
+                // ordinary 1e-6 offset.
+                ray = Ray{h.p + wo * hairExitOffset(hs, h.n, wo), wo};
+                return true;                        // beta unchanged (RR carried the weight)
+            }
             default: return true;                   // unreachable (diffuse handled by callers)
         }
     }
@@ -1758,9 +1853,13 @@ struct Renderer {
                 case MatType::HalfMirror:
                 case MatType::Filter:
                 case MatType::Glossy:
+                case MatType::Hair:
                 case MatType::Fluorescent: {
                     // Specular / wavelength-switching lobes, all handled by the shared
-                    // helper (single source of truth with tracePhotonHero).
+                    // helper (single source of truth with tracePhotonHero). Hair is here
+                    // rather than with Diffuse because it does its own camera splat (its
+                    // projection factor is the strand's longitudinal cosine, not dot(n,w))
+                    // and its own Russian roulette on the exact lobe attenuation.
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e))
                         return;
                     continue;
@@ -2135,10 +2234,16 @@ struct Renderer {
                 case MatType::Multilayer:
                 case MatType::Grating:
                 case MatType::HalfMirror:
+                case MatType::Hair:
                 case MatType::Fluorescent: {
                     // Dispersive / wavelength-switching: the outgoing direction (and, for a
                     // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
-                    // cannot keep riding one shared direction past this interface.
+                    // cannot keep riding one shared direction past this interface. A fiber
+                    // belongs here for the same reason: its absorption sigma_a is per-λ, so
+                    // the lobe attenuations A_p — and hence both the sampled direction and
+                    // the survival probability — differ across the bundle. With -herosplit
+                    // each wavelength gets its own strand interaction (that IS the coloured
+                    // TT/TRT spread); otherwise the bundle de-heroes onto the scalar path.
                     if (heroSplit && secAlive && nUp > 1) {
                         // SPLIT-AT-DISPERSION (-herosplit): fan out instead of de-hero'ing.
                         // Each secondary runs the SAME interaction with its OWN λ — so it

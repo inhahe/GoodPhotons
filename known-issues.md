@@ -5,6 +5,305 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-08-11, v0.181.0 → v0.182.0): `ftrace -stop <pid>` did not stop a `-viewer` GUI process, but reported that it did
+
+*(Filed as OPEN and fixed the same day; the description below is the original report, with what
+shipped appended. It supersedes the 2026-08-06 v0.142.0 entry further down, which spotted the
+missing `stopChannelStart` but not the lying exit code. The title originally also accused
+`-explore` — wrongly: `-explore`'s loop has always polled `g_stopRequested` directly
+(`main.cpp:17092`) and it registers in the channel because `stopChannelStart` precedes `run()`.
+The `-viewer` branch was the only gap.)*
+
+`-stop` is documented (and used everywhere in this repo, including `CLAUDE.md`) as *the* safe way
+to end any ftrace process, precisely so nobody reaches for `taskkill /F` and risks a driver TDR.
+It only covers **render** processes, though: the stop sentinel is polled by the render chunk loop
+and by the scene loader, and the `-viewer` GUI event loop polls neither. So stopping the loom
+native viewer silently does nothing.
+
+The bad part is not the gap, it is that **the exit status lies**:
+
+```
+$ ftrace -stop 311504
+[stop] warning: pid 311504 isn't a running ftrace render (dropping the sentinel anyway)
+[stop] asked pid 311504 to finish and exit cleanly.
+[stop] done — stopped cleanly.
+$ powershell -c "Get-Process ftrace | Select Id,MainWindowTitle"
+    Id MainWindowTitle
+311504 ftrace 🪟 loom viewer     <-- still running
+```
+
+`[stop] done — stopped cleanly.` is printed after a wait that the process was never going to
+satisfy, and the exit code is 0. The `isn't a running ftrace render` warning is the only hint,
+and it is easy to read as pedantry rather than "this command did nothing". Anything that chains
+off `-stop` (notably `build.bat`, which fails to copy `ftrace.exe` while a viewer holds it open)
+will therefore proceed on a false premise — which is exactly the situation that tempts a
+`taskkill /F`, the one thing the rule forbids.
+
+**Repro.** `ftrace -viewer <sidecar.json> -loom <scene.py>`, then `ftrace -stop <pid>` — the
+window stays up and the command still reports success.
+
+**Proper fix.** Two parts, both needed:
+1. Have the viewer/`-explore` GUI loop poll the same stop flag the render loop polls (once per
+   frame is plenty) and post itself a `WM_CLOSE`, so `-stop` genuinely covers *every* ftrace
+   process as documented.
+2. Make `-stop` honest regardless: if the process is still alive when the wait window expires,
+   print that it did **not** stop and exit non-zero, instead of unconditionally printing
+   `stopped cleanly`. The current message is wrong even for a wedged render.
+
+Until (1) lands, the correct way to close a viewer is to close its window (clicking the X, or
+`PostMessage(hwnd, WM_CLOSE, 0, 0)` — the graceful path, *not* `taskkill /F`).
+
+---
+
+**What shipped (v0.182.0).** Both parts, plus a third that turned out to be the actual reason
+the exit code lied.
+
+- **The viewer registers.** `main.cpp:18531` now brackets `runViewerGui` with
+  `stopChannelStart(sidecar + " -> (loom viewer)")` / `stopChannelEnd()`, so a bare `-stop`
+  lists it and `-stop <pid>` is a legal target. Nothing in the channel was ever render-specific.
+- **The GUI polls.** `viewer_gui.cpp:3773`, in the `PeekMessage` loop: `if (!done &&
+  ft::stopRequested())` → print, `done = true`, break. It leaves through the ordinary exit path
+  rather than a synthesized `WM_CLOSE`, which reaches the same teardown (D3D11, the loom python
+  child, the window) with one less message round-trip. The probe is installed at
+  `main.cpp:18485`, *before* the viewer dispatch, so `ft::stopRequested()` is live there.
+- **The wait predicate was the real liar.** It was `ftraceProcessAlive(pid) &&
+  exists(<pid>.run)` — a conjunction that is false on the *first* poll for any process that
+  never published a `.run` file, so an unregistered pid was classified "gone" instantly and the
+  120 s wait never even ran. New `stopTargetGone()` (`main.cpp:11275`) consults only process
+  liveness on Windows, where it is authoritative; off Windows `ftraceProcessAlive()` is a
+  conservative "yes", so there the `.run` file disappearing remains the signal. Consequences:
+  an already-dead pid returns 0 with `nothing to stop`; an alive-but-unregistered pid *stays* a
+  target (with a loud warning) instead of being written off; and a target that outlives the
+  deadline prints `[stop] FAILED — still running after 120s: <pids>` and exits **2**.
+
+Also reworded the listing from "renders" to "ftrace processes", since it no longer only lists
+renders.
+
+**Found while testing: orphan `.stop` sentinels were never reaped.** The channel directory held
+eight of them going back five days. A sentinel is deleted by the target that consumes it, so one
+survives whenever nobody is left to consume it — the target died first, or never watched the
+channel (and the new alive-but-unregistered path drops one deliberately, so this would only have
+got worse). Not a correctness bug — `stopChannelStart` already deletes any sentinel bearing its
+own pid before starting its watcher, so a recycled pid can't inherit somebody else's stop — but
+unbounded litter in a shared temp directory. The same directory scan that already reaps dead
+`.run` files now reaps dead `.stop` files too, and only once the owner is gone, so a sentinel
+still in flight to a live target is never snatched away.
+
+Verified end to end: a live viewer appears in a bare `-stop`; `-stop <pid>` closes it in 0.6 s
+and returns 0, with no orphaned loom python child; a dead pid returns 0; an alive non-ftrace pid
+warns, waits the full 120 s and exits 2; and an ordinary `-forever -keepwindow` render still
+stops in 3.2 s with `[stop] interrupted — image and checkpoint saved.`, a valid Cornell-box PNG
+and a resumable 38 M-photon `.ftbuf`.
+
+### OPEN (2026-08-10, v0.174.0): `-dual-scatter` drops the coat's indirect illumination
+
+*(This entry originally logged two limitations. **Part 1 — "slower than the reference on an
+absorbing coat" — was FIXED in v0.175.0 by `-dual-grid`**; see the FIXED entry immediately
+below. Part 2 remains open.)*
+
+Measured against each scene's own 200-bounce path-traced reference on the fur alone (a
+centred crop, scene-linear mean luminance):
+
+| Scene | single scattering | `-dual-scatter` | `+ -dual-grid` |
+|---|---|---|---|
+| `scenes/_dual_pale_lamp.ftsl` — pale coat, one area light, black room | 0.17× | 0.77× (0.99× at `-dual-density 0.9`) | 0.81× |
+| `scenes/_dual_pale_sky.ftsl` — the same coat under a constant sky | 0.80× | 0.89× | 0.89× |
+| `scenes/fur_species.ftsl` — medullated, absorbing, white room | 0.37× | 0.67× | 0.68× |
+
+**The coat loses indirect illumination.** `-dual-scatter` terminates the path at a fiber
+vertex (necessarily — continuing would double-count the multiple scattering the analytic
+terms already carry). Direct lights and the environment both go through the model, but light
+that bounced off the room *first* never reaches the fur. That is most of the `fur_species`
+deficit: in the black-room fixture, where there is no indirect illumination to lose, the same
+coat lands at 0.77× / 0.99×.
+
+*Proper fix:* treat the coat as an aggregate and gather the incident field from all
+directions through `Ψ`, rather than only along NEE connections — i.e. the same aggregate-BSDF
+LOD that P2 wants. Until then this is a documented bias, and `REFERENCE.md` says so.
+
+### FIXED (2026-08-10, v0.175.0): `-dual-scatter` cost more than it saved on a dense/absorbing coat — the fiber walk could not early-out
+
+`Scene::walkFibers` has to traverse the *whole* shadow segment: it needs every crossing, so
+unlike an ordinary occlusion query it cannot stop at the first blocker. On a pale coat that
+is still a bargain (the brute-force alternative is 100+ bounces). On `scenes/fur_species.ftsl`
+— medullated, absorbing, 2.48M segments — the reference's paths die in two or three bounces,
+there is little multiple scattering to approximate, and the full-segment walk was **pure
+overhead**: 84.8 s against the reference's own 60.6 s, i.e. the flag made the render *slower*.
+
+**Fixed by `-dual-grid`** (`src/fur_grid.h`, new), which is the proper fix this entry already
+named: Zinke's §4.1.2 aggregate instead of §4.1.1 ray shooting. Each cell of a voxel grid
+stores `c = (2/V)Σrℓ` and the normalised orientation tensor `T = Σrℓ t̂t̂ᵀ / Σrℓ`; then
+`σ_t(d) ≈ c√(1 − dᵀTd)`, and the load-bearing identity is that **`∫σ_t dt` along a ray *is*
+the expected number of fiber crossings** — exactly the walk's `n`, with no primitive tests.
+The same quadratic form `dᵀTd` is `⟨sin²θ⟩` in Marschner's frame, so one DDA march yields both
+the count and the inclination the averaged tables need. Visibility is a separate, *early-outing*
+`Scene::occludedSkipHair()` query that ignores hair fibers but still lets opaque geometry block.
+
+Measured, mode `R`, `-max-bounce 200`, fur crop: `fur_species` **84.8 s → 57.4 s** (1.48× faster
+than the walk, and now 1.06× faster than the reference it used to lose to), at unchanged
+accuracy (0.672× → 0.678×). Pale-coat fixtures 18.2 → 14.1 s and 15.5 → 14.0 s.
+
+Two things this cost, both deliberate and both why the flag is opt-in:
+
+- **The crossing count must be *sampled*, not rounded.** `τ` is a mean and the shader is not
+  linear in it. Rounding breaks three things at once: `a_f^τ` instead of `E[a_f^N] = e^{τ(a_f−1)}`
+  (26% too dark at `a_f = 0.8`, `τ = 10`), a spread that is one fixed width instead of a
+  distribution, and — the visible one — `hairDualFCos`'s `n == 0` *directly lit* branch could
+  never fire, so a rim strand at `τ = 0.3` would always be dimmed instead of being fully lit 70%
+  of the time. Drawing `N ~ Poisson(τ)` by CDF inversion from one extra uniform makes the grid an
+  exact drop-in. (An early draft that rounded landed *closer* to the reference than the walk did —
+  for the wrong reason. Being closer to the reference is not the goal; being a drop-in is.)
+- **Jensen's inequality biases `σ_t` high by at most +3.98%**, one-signed (grids never
+  under-attenuate), and *exactly zero* wherever a cell's fibers are locally parallel. Plus two
+  smaller losses: the shading point's own texture coordinates are used for the crossed material's
+  tables, and the tangent's sign is unrecoverable from `t̂t̂ᵀ` so the tables are evaluated at ±θ
+  and averaged.
+
+`-dual-max-cross` is still honoured (it clamps `τ` and the Poisson draw), so its bright-failure
+mode is unchanged rather than removed. The walk remains the default and is **byte-for-byte
+identical** to before — the fourth uniform is only drawn when the grid is active, verified with
+`cmp`. New self-test `-checkfurgrid` (five sections) validates the model against the real curve
+intersector.
+
+### OPEN (2026-08-10, v0.172.0): `type hair` cannot be gathered on in modes M / S — the photon record has no incident direction
+
+`struct Photon { Vec3 n; float power; float lambda; }` (`src/photonmap.h`) stores where a
+photon landed, how much power it carried and at what wavelength — but **not the direction it
+arrived from**. A Lambertian gather doesn't need it (`f_r = ρ/π` is directionless), which is
+why the field was never there. A fiber BCSDF is *entirely* directional: `hairFCos(hs, wi)`
+has nothing to evaluate against without `wi`.
+
+So `sppm_render.h`'s `sppmVisiblePoint` and `photonmap_render.h`'s two walks give `Hair` an
+explicit **scattering** case — sample the BCSDF, multiply throughput by `T = Σ_p A_p`, step
+clear of the strand with `hairExitOffset` — and a strand is neither a visible point nor a
+deposit site. That is the same treatment those modes already give glossy/specular surfaces,
+so a hair scene in mode `M`/`S` is *consistent*, not wrong; it just gets no photon-map
+contribution off the coat itself. Modes `W`, `R`, `A`/`B`/`C`, `D` and `V` shade hair fully.
+
+The case is load-bearing rather than cosmetic: without it `Hair` falls into those switches'
+`default:`, which treats an unknown material as a **mirror** (`thr *= reflectSlot(...); ray =
+reflect(...)`) — silently, and plausibly enough to be missed.
+
+**Proper fix:** add an incident direction to `Photon` (a packed octahedral `uint16` pair
+would cost 4 bytes on a 20-byte record, ~20 % more map memory) and let non-Lambertian
+materials be gather sites. Worth doing only if hair in the photon modes is actually wanted;
+the bidirectional modes (`D`, `V`) already cover the caustics-through-hair case.
+
+### OPEN (2026-08-10, v0.172.0): a `hair` coat is very noisy in the stochastic modes
+
+Measured on `scraps/hair_ab.ftsl` (two identical 60 000-strand coats on identical spheres,
+same lights, one `type hair` with `sigma_a 0.02`, one `type diffuse reflect 0.90`), mode `R`,
+48 spp: the fiber coat is covered in chromatic speckle while the Lambertian one is already
+smooth, and reads **~78 % of the Lambertian coat's brightness** (sRGB 54.1 vs 70.6).
+
+**The energy is not being lost — that was measured, not assumed.** Three checks:
+
+- **Single-strand furnace** (`scraps/hair_furnace.ftsl`): a `sigma_a 0` strand under a
+  uniform environment vanishes into the background. The BCSDF itself conserves.
+- **Dense-coat furnace** (`scraps/hair_coat_furnace.ftsl`, 40 000 strands, `-max-bounce 600`):
+  hair coat **(201.0, 184.8, 181.7)** vs diffuse coat (207.0, 186.6, 182.7) vs background
+  (207.4, 186.7, 183.2) — **~97 % conserved through dense inter-fiber multiple scattering**,
+  so the multi-bounce chain through thousands of strands is correct too.
+- **Deep-walk A/B** (`png/hair_ab_deep.png`, the same scene at `-max-bounce 600`): hair
+  **55.3** vs 54.1 at 32 bounces — a 2 % move, inside the noise. **Bounce truncation is
+  therefore NOT the cause of the brightness difference**, even on near-non-absorbing fiber.
+
+**Most of the remaining difference is real physics, not a bug.** A fiber scatters into the
+whole sphere and mostly FORWARD (the TT lobe), so light entering a coat penetrates toward
+whatever is underneath instead of turning around at the first strand — and in that scene what
+is underneath is a dark `skin` sphere (`reflect rgb 0.35 0.26 0.22`) that eats it. Swapping
+the core for a white one (`scraps/hair_ab_whitecore.ftsl` → `png/hair_ab_white.png`) lifts the
+hair ball from 55.3 to **61.0** against an unchanged 70.9 diffuse, recovering **about half the
+gap**; the rest is simply that `sigma_a 0.02` in 1/radius is not the same thing as a 0.90
+Lambertian albedo (per `-checkhair` §S7 the inversion is steeply non-linear — reflectance 0.80
+is only `sigma_a 0.0014`).
+
+**What is genuinely wrong is the variance**, and it has one structural cause:
+
+- **NEE is the only direct-lighting strategy at a hair vertex, with no MIS partner.** Hair
+  *does* NEE (unlike `type glossy`, which further down is logged as doing no direct lighting
+  at all) — but the other half of the MIS pair is thrown away. `src/backward.h:1422` counts a
+  directly-hit emitter only `if (m.isLight && specularArrival && ...)`, and every non-delta
+  bounce clears `specularArrival`, so after a hair vertex the BSDF-sampling strategy simply
+  never contributes. It cannot be weighted in instead, because there is no area-light
+  solid-angle pdf at the hit to build the balance heuristic from. The estimator is still
+  **unbiased** (NEE alone covers area lights); it is just NEE alone against a peaked BCSDF,
+  which is exactly the high-variance case MIS exists to fix. Environment lighting is the
+  control that proves it: `envGeom` *does* have a pdf and *does* MIS hair against
+  `hair::pdf` (line 1347–1352), and an env-lit coat converges visibly faster than an
+  area-lit one.
+
+**Proper fixes, in order of value:**
+- **An area-light solid-angle pdf, and MIS at non-delta vertices** — i.e. drop the
+  `specularArrival` gate at `backward.h:1422` and weight the emitter hit against `contBsdfPdf`
+  the way the env branch already does twenty lines earlier. This is the one change that helps
+  every peaked non-delta lobe in modes R/W at once, hair and glossy included.
+- **Dual scattering (Zinke et al. 2008)** — TODO §P3 stage 4. Approximates the deep
+  multiple-scattering component analytically instead of walking it, which is how production
+  renderers make near-white fur both bright and fast. Not needed for *correctness* here (the
+  coat furnace already conserves), but it is what makes a pale coat cheap.
+
+`scenes/hair_basics.ftsl` therefore defaults to mode `W` (deterministic, noise-free) and uses
+realistic absorptions rather than a near-white fur, and its header says why.
+
+### DONE (2026-08-11, v0.181.0): the GPU backends no longer fall back to the CPU for `hair` materials
+
+Was: `cudaForwardSupported()` rejected any scene whose material set contained `MatType::Hair`
+(directly or as a `mix` child), and the backward gate rejected it through `default: return
+false` — one strand of fur sent the whole scene to the CPU tracer, and hair scenes are
+exactly the ones that need the most samples.
+
+Fixed exactly along the lines sketched here: the device `Hit` now carries `fiberRadius`
+(stamped by the curve intersector; the tangent already rode in `Hit.tan`), `hair.h` is ported
+to `__device__` doubles as the `dhair` namespace in `src/render_cuda.cu`, the forward tracer
+interacts through `interactHair` (connect-then-scatter with mode-A/B splats, hero de-heroes),
+and the backward tracer through `bkInteractHair` + a rho=1 NEE whose light/env geometry terms
+swap the surface cosine for the full-sphere `π·hairFCos` fiber response. Validated CPU-vs-GPU
+on `hair_basics`: channel means agree to ≤0.5 % in both directions; mode R runs **19.7×**
+faster on the RTX 4090 (368 s → 19 s at 64 spp), mode B **6.4×** (72 s → 11 s at 20 M
+photons).
+
+Still CPU-only, by design: `-dual-scatter` hair (the approximation is host-side), and hair
+scenes in the BDPT (`D`), photon-map (`M`/`S`) and VCM (`U`) GPU backends, whose
+vertex/gather machinery treats every non-specular vertex as Lambertian — those fall back
+exactly as before.
+
+The port also surfaced (and fixed) a nasty CUDA build hazard, recorded here because the
+failure is total and looks nothing like its cause: `hair.h`'s `besselI0` ↔ `logBesselI0` are
+mutually recursive (each one's other-range branch calls the other; runtime-safe, the branches
+partition on `x > 12`). Ported as-is, that *static* cycle made nvlink declare the stack of
+every kernel that can reach them "cannot be statically determined", which strips those
+kernels' `MIN_STACK_SIZE` attribute — the driver then stops auto-reserving their real stack
+need (7–15 KB) and they run on the 1 KB `cudaLimitStackSize` default. Result: **every** GPU
+render, hair or not, died at launch with `illegal memory access` (device stack overflow, per
+compute-sanitizer). The device port therefore splits the pair into two cross-call-free cores
+(`besselI0Series`, `logBesselI0Asym`) plus branch-picking wrappers — bit-identical values,
+acyclic call graph, real MIN_STACK restored (kTrace 10072 B / kBackward 15456 B / kWfShade
+8840 B). If a future device function ever reintroduces a static call cycle, the tell is the
+nvlink warning `Stack size for entry function '…' cannot be statically determined`.
+
+### OPEN (2026-08-10, v0.170.0): the sigmoid upsampling model itself is ~0.019 off at pure white, and stochastic tiling's LUT inherits that
+
+Not a tiling bug, but it surfaces there and sets the floor on `-checkstochtile` §8's
+tolerance, so it is worth naming. Jakob–Hanika represents a reflectance as
+`R(λ) = sigmoid(p(t))` with `p` **quadratic** in `t = (λ−595)/235`. A colour pinned at
+R ≡ 1 across the whole band therefore needs `|p| → ∞`, which is not representable, and the
+stochastic-tiling LUT bounds `|p| ≤ 60` (`STOCH_JH_PMAX`) precisely so its entries stay
+interpolable. The residual round-trip error is worst at the gamut extremes: **0.014–0.019 of
+`|XYZ − target|` near pure white**, against a mean of 2.7e-4 over 3000 random colours.
+
+Measured to be the *model's* limit and not the table's: a 48³ grid is worst 0.036, 64³ is
+0.019 and 80³ is 0.016, i.e. resolution stops buying anything once the un-tabulated fitter's
+own 0.019 at white dominates. §8 therefore holds the LUT to the fitter as a control
+(`worst_LUT < worst_fit + 0.025`) rather than to zero.
+
+**Proper fix** (if it ever matters visually — it currently does not; 0.019 in XYZ on a pure
+white texel is well under a JND at the exposures these renders use): raise the polynomial
+degree, or switch to a bounded parameterisation of the sigmoid's argument so saturation is
+representable at finite coordinates. Both change `upsample::fit`'s coefficient count and so
+touch the CPU/CUDA/raster reflectance evaluators and the on-disk `.ftbuf` assumptions
+together — a real refactor, not a tweak, which is why it is logged rather than done.
+
 ### OPEN (2026-08-09, v0.161.0): `curv` reads 0 on an ISOSURFACE, so curvature-driven materials silently flatten there
 
 `curv` (O3 stage 1) is analytic on a `sphere`, per-radius on a `curve`, and per-face on a
@@ -60,7 +359,7 @@ rather than obviously absent, and the fix is mechanical.
 ### OPEN (2026-08-10, v0.162.0): `cavity` reads 0 in BOTH preview rasterizers, and unlike `curv` this one is not mechanical
 
 Same symptom as the entry above and a strictly harder cause. `raster.h` and
-`raster_cuda.cu:~902/~935` both pass `0.0` for the cavity argument of `dPatternEval` /
+`raster_cuda.cu:~927/~961` both pass `0.0` for the cavity argument of `dPatternEval` /
 `makePatCtx`, so a `mix` gated on `cavity` previews as one layer everywhere — `-explore`
 on `scenes/pattern_cavity.ftsl` shows a spotlessly clean room.
 
@@ -79,6 +378,29 @@ Currently (c), and that is defensible: `cavity`'s whole point is contact grime, 
 a look-development concern, not a composition/motion one, and the preview already ignores
 roughness and film-thickness maps by design. Logged so that a future "make the preview
 show patterns properly" pass doesn't assume this one falls out with `curv`.
+
+### TECH DEBT (2026-08-10, v0.169.0): `fw` is 0 at every secondary bounce, so `fnoise` does not band-limit in a reflection
+
+O8 stage 2 fills the shading footprint `fw` at **primary** hits only — mode W's camera
+segment (`bkRadiance` / `bkRadianceHeroLoop` at `b == 0 && gi.depth == 0`, and the CPU
+twin in `backward.h`) and every pixel of the two raster previews. A surface seen *through*
+a mirror, a lens or a glossy bounce gets `fw = 0`, i.e. unfiltered, so an `fnoise` floor
+that band-limits correctly when looked at directly still aliases in its own reflection.
+
+This is the honest behaviour rather than a bug — 0 is defined as "unknown", and the
+alternative of reusing the primary vertex's footprint would be *wrong* in a way that shows
+(a convex mirror spreads the footprint by its curvature, a concave one focuses it, and a
+refraction rescales it by the index ratio). But it is a real gap, and the fix is known:
+carry a **ray cone** (Akenine-Möller et al., "Texture Level of Detail Strategies for
+Real-Time Ray Tracing") — one width + one spread angle per ray, widened at each bounce by
+the surface's curvature and the BSDF lobe. The renderer is unusually well set up for it:
+`Hit::curv` is already the mean curvature at every hit (O3 stage 1), which is exactly the
+term the cone's spread update needs, so the work is the plumbing (two floats on the ray,
+an update at each `refractOrReflect` / glossy scatter) rather than any new geometry query.
+
+Cost of leaving it: reflections of high-frequency procedural texture shimmer in mode W and
+in low-spp mode R. Mitigated in practice because stochastic mode R jitters and averages,
+and because most reflective surfaces in a scene are not also the aliasing-prone ones.
 
 ### OPEN (2026-08-10, v0.163.0): an `sdf` over a self-overlapping mesh is exact outside but not inside
 
@@ -1215,7 +1537,13 @@ with pixels and is the *only* SM-bound phase (hence the only one a foreign GPU p
 `readback` is pixels and mostly CPU. Read `upload` against `bake + sidecar + ftsl` to decide whether
 a resident GPU scene is worth building **for the scene actually in front of you**.
 
-### OPEN (2026-08-06, v0.142.0): `ftrace -stop` cannot see or stop the VIEWER — the one CUDA-using process with no clean CLI shutdown
+### DONE (2026-08-06, v0.142.0 → fixed in v0.182.0): `ftrace -stop` cannot see or stop the VIEWER — the one CUDA-using process with no clean CLI shutdown
+
+**Fixed in v0.182.0, along the lines proposed below.** See the FIXED entry at the top of this
+file for what shipped; the one thing this entry did not anticipate is that the bug was worse
+than "does nothing" — the wait loop's `alive && exists(<pid>.run)` predicate made an
+*unregistered* pid look already-gone, so the command also reported a clean stop and exited 0.
+
 
 **Symptom.** `ftrace -stop` (bare) lists live renders and finds nothing while a `-viewer` process is
 running and driving CUDA through the Render pane. `ftrace -stop <viewer-pid>` likewise does nothing.
@@ -6701,6 +7029,21 @@ disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.
 
 ## Recently fixed
 
+### `upsample::fitSigmoid` diverged for dark saturated colours — FIXED 2026-08-10 (v0.170.0)
+
+Found while building O7's Jakob–Hanika coefficient LUT, but it was **not** specific to
+tiling: it affected every JH upsample in the renderer (image textures, `rgb` colours,
+procedural skins). The Gauss-Newton solve in `src/upsample.h` took a full undamped step,
+which for colours near the black corner of a saturated hue overshot into the flat tail of
+the sigmoid, where the Jacobian is ~0 and the next step is enormous. Measured round-trip
+`|XYZ − target|`: red at Y=0.001 → **1.41**; blue at Y=0.01 → **1.40** (i.e. the returned
+spectrum was not the requested colour in any sense).
+
+**Fix:** a backtracking line search — halve the step until the residual actually decreases.
+Those two cases now come back at 0.0008 and 0.0001, and `ftrace -checkstochtile` §8 asserts
+both (`fitErr(1e-3,0,0) < 1e-3`, `fitErr(0,0,1e-2) < 1e-3`) with the old values in the
+comment, so a regression names itself.
+
 ### loom rejected its own `reflect pattern:<name>` emission — FIXED 2026-07-28 (v0.93.0)
 
 `loom/grammar/bindings.py::as_color_binding` treated a `pattern:<name>` value as an error in
@@ -10447,3 +10790,167 @@ validation — it is that the fixtures now spell lights that exist:
 `Light("sphere", center=…, radius=…, power=…)` in `test_image_term.py`,
 `test_material_bundle.py` and `test_viewer.py`, and `Light("collimated", origin=…, dir=…)`
 in `test_grammar_scene.py` (which deliberately round-trips a *non-default* subtype).
+
+## DONE (2026-08-11, v0.179.0): `-fur-volume`'s far tier is *slower* than the strands it replaces at modest fiber counts
+
+**Resolved.** The cause was not the per-collision work this entry blamed below — it was that
+`skipHair` rejected fibers at the BVH *leaf*, which never skipped the traversal and, because no
+fiber survived to shorten `tMax`, could not prune either: the far tier walked the whole coat's
+BVH on every ray, where the strand tier stopped at the first fiber. `Scene::buildNoHairBvh()`
+now builds a second tree with the fibers absent, and `closestHit(skipHair)` /
+`occludedSkipHair` traverse that. Same scene, 200×150, 200 spp, `-max-bounce 32`, at fixed
+optical density (count ×k, radius ÷k, so the picture and the collision count are unchanged and
+only geometric complexity grows):
+
+| strands | segments | strand tier | far tier before | far tier after | speed-up |
+|---|---|---|---|---|---|
+| 90 k | 900 k | 15.1 s | 44.2 s | **9.1 s** | 4.9× |
+| 300 k | 3.0 M | 31.3 s | 82.1 s | **10.3 s** | 8.0× |
+| 900 k | 9.0 M | 67.8 s | 195.2 s | **11.7 s** | 16.7× |
+
+So the crossover this entry asked for turns out to be **below 90 k strands** — the far tier is
+now faster than the strands everywhere measured (1.7× / 3.0× / 5.8×). More to the point, the
+"cost is independent of fiber count" claim below is finally *true*: over a 100× range in fiber
+count the far tier grows 1.29×, the strand tier 4.49×. All six renders are **bit-identical** to
+the pre-fix binary (md5), as is a `-dual-scatter` render, so this was a pure optimisation;
+`-checkfurvol` §10 is the standing proof, cross-checking both queries against the old
+leaf-rejection path over 20 000 rays on a scene mixing hair curves, non-hair curves, triangles
+and a sphere.
+
+What it does not fix is **memory** — see the next entry.
+
+## ~~OPEN~~ **DONE (v0.180.0)** (tech debt, 2026-08-11, v0.179.0): `-fur-volume` stops *traversing* the strands but never stops *storing* them
+
+**Fixed in v0.180.0.** `-fur-volume` now *deletes* the fibers once it has summarised them, and —
+the part that mattered — deletes them **before** the BVH is built rather than after.
+
+The entry below proposed erasing the segments and rebuilding `bvh`. That would have been wrong,
+or at least useless for the symptom: freeing afterwards fixes only the steady state, and the peak
+*is* the BVH build. At 9 M segments that build reserves `2N` nodes × 64 B = 1.15 GB, plus a
+`BuildPrim` (~80 B) and an `Aabb` (48 B) per primitive on top of the 720 MB of `CurveSeg`s — which
+is the whole 2.2 GB. A post-hoc free would have left `bad allocation` exactly where it was.
+
+So the deletion had to happen at a moment that did not previously exist: after the loader has
+parsed everything (so the scene's cameras and modes are known) but before `Scene::build()` runs.
+That is the new `ftsl::Loaded::beforeBvh` hook. `main.cpp` installs it, and it builds the density
+grid + ODF table from the strands and then calls `Scene::dropHairCurves()`, which compacts
+`curveSegs`, rewrites the `curves` records against the compacted pool, and keeps only the fibers'
+world bounds in `Scene::droppedBounds` — unioned back into the scene bounding sphere by `build()`
+so environment emission is sized as though the coat were still there.
+
+| coat | peak WS before | peak WS after | render |
+|---|---|---|---|
+| 900 k strands / 9 M segments | 2221 MB | **875 MB** | 13.0 s, byte-identical PNG |
+| 3 M strands / 30 M segments | `error: bad allocation` | **2669 MB** | **18.7 s** — loads and renders |
+
+Proven a pure optimisation rather than argued: the 90 k / 300 k / 900 k aggregate renders are
+byte-for-byte the same md5 as v0.179.0 produced, and `-fur-volume -fur-keep-strands` (the new
+opt-out, which reproduces the old path) produces that same md5 too.
+
+Gating, which was the actual work: the drop is skipped for `-fur-lod` (its near tier traces
+strands), `-dual-scatter` (keeps them), `-raster`/`-explore`/`-anim`/`-loom` (`raster.h` walks
+`curveSegs`), `-fur-keep-strands`, and — decided *inside* the hook, because only the loader knows
+what the scene's cameras are — any camera whose effective mode is not backward `R`/`W`. A vetoed
+run says so (`[fur-volume] keeping the strands: mode B traces fiber geometry directly`).
+
+The latent GPU gate below is fixed too, and had to be: `MatType::Hair` being un-bakeable was the
+only thing keeping a fur scene off the device backward kernel, and deleting the hair removes that
+accident. `backwardOnGpuOk()` now states the gate — a live `-fur-volume` far tier forces the CPU
+backward path — instead of relying on the coincidence.
+
+The original entry follows.
+
+## ~~OPEN~~ (tech debt, 2026-08-11, v0.179.0): `-fur-volume` stops *traversing* the strands but never stops *storing* them
+
+The far tier summarises a coat into a 128³ density grid plus a 16 B/cell orientation table (96 MB
+total) and, since v0.179.0, no longer has the fibers in the BVH it walks. But `scene.curveSegs`
+and the full `bvh` are still built and still resident, because `main.cpp` builds the grid *from*
+`scene.curveSegs` and nothing frees them afterwards. So the representation that exists to make a
+coat cheap does not make it **fit**: measured peak working set on the benchmark scene is 2.2 GB
+at 900 k strands / 9 M segments (~247 B per segment), and 3 M strands (30 M segments) dies with
+`error: bad allocation`. A coat too large to load is still too large to render, which blocks the
+obvious next question — where the aggregate's accuracy finally breaks down — because the fiber
+counts where that would show up cannot be loaded.
+
+**The proper fix.** After the grid and the ODF table are built, plain `-fur-volume` (i.e. *not*
+`-fur-lod`, whose near tier needs the strands, and not `-dual-scatter`, which keeps them) can
+erase the `MatType::Hair` curve segments and rebuild `bvh` — `Scene::buildBvh()` already rebuilds
+from scratch over the current vectors, and `collectPrimBoxes` already knows how to drop hair, so
+the mechanics are in place. The care needed is in the gating, not the code: it must not fire for
+a forward mode (A/B/C trace the curves directly and would render a bald ball), nor for the raster
+path (`raster.h` iterates `curveSegs` for its own pass), and the decision has to be made where
+the render mode is known. Cheapest correct version is probably to drop the strands only for
+backward modes with `-fur-volume` and no `-fur-lod`/`-dual-scatter`, and to say so in the log
+line the way the hair-free BVH already does.
+
+**Related, latent, not worth code today.** `MatType::Hair` is CPU-only on the GPU
+(`cudaForwardSupported` in `render_cuda.cu` rejects any scene containing it), so every fur scene
+falls back to the CPU and `-fur-volume` is never reached on-device. If §P3 ever lands the fiber
+BCSDF on the GPU that stops being true, and `-fur-volume` / `-fur-lod` will need an explicit
+device gate in `main.cpp` — otherwise the GPU megakernel will trace the strands and silently
+ignore the flag.
+
+**Repro.**
+```
+ftrace -in scraps/furbench/coat_900k.ftsl -mode R -r 40 30 -spp 1 -window -o png/furbench/p.png
+# ...peak working set ~2.2 GB.  Then the rung that does not fit:
+ftrace -in scraps/furbench/coat_3m.ftsl  -mode R -r 40 30 -spp 1 -window -o png/furbench/p.png
+# -> error: bad allocation
+```
+(Note the machine this was measured on had ~5 GB of *commit* free, not 64 GB — check
+`FreeVirtualMemory`, not `FreePhysicalMemory`, before concluding a given rung is unloadable.)
+
+The original entry follows.
+
+## ~~OPEN~~ (tech debt, 2026-08-11, v0.177.0): `-fur-volume`'s far tier is *slower* than the strands it replaces at modest fiber counts
+
+`-fur-volume` (P2 stage 2b, `src/fur_volume.h` + `BackwardRenderer::furInteract` in
+`src/backward.h`) is correct but not yet a win. Measured on `scenes/_dual_pale_sky.ftsl`
+(90 k strands / 900 k curve segments, coat filling the frame), mode `R`, 200×150,
+`-max-bounce 200`, equal 150 s wall clock:
+
+| | samples | noise |
+|---|---|---|
+| strands (reference) | 2223 spp | 2.12 % |
+| `-fur-volume` | 583 spp | 4.14 % |
+
+~3.8× fewer samples per second. Accuracy is fine — developed through one shared
+`-exposure-anchor 2e-14`, the aggregate's scene-linear mean luminance over the coat is 0.9 %
+below the strand reference (0.61783 vs 0.62317), 0.2 % below over the whole frame — so this is
+purely a cost problem.
+
+**Why.** The number of collisions along a path *is* the number of fiber crossings, identical
+either way, so the only thing the tier saves is BVH traversal — and a 900 k-segment curve BVH
+is cheap. Against that saving it pays, per collision: a DDA march through the density grid for
+the free flight, a Bingham ODF reconstruction (`odfAt`), and a cross-section-importance tangent
+draw (`sampleTangentXsec`). At 90 k strands the new per-collision work costs more than the
+traversal it removes.
+
+**Why it is still the right thing.** The cost is independent of fiber count — the same grid,
+the same march, whether a cell holds 10³ or 10⁷ fibers — so the crossover is somewhere above
+this scene, and it is the aggregate representation stage 2c's footprint LOD needs to exist at
+all. But the crossover point has **not been measured**, and it should be: render the same coat
+at 90 k / 900 k / 9 M strands and find where the curves cross. If the crossover turns out to be
+implausibly high, the per-collision work is where to look — `odfAt` currently reconstructs the
+Bingham normalisation per collision and could be cached into the cell's side table at build
+time, and the DDA re-walks from the ray origin rather than resuming a cursor.
+
+**Repro** (outputs and logs from the original run are kept in `png/furlod/`).
+```
+ftrace -in scenes/_dual_pale_sky.ftsl -mode R -r 200 150 -max-bounce 200 -checkpoint \
+    -o png/furlod/fv_ref2.png -time 150 -window -keepwindow
+ftrace -in scenes/_dual_pale_sky.ftsl -mode R -r 200 150 -max-bounce 200 -fur-volume -checkpoint \
+    -o png/furlod/fv_agg2.png -time 150 -window -keepwindow
+ftrace -topng png/furlod/fv_ref2.png.ftbuf png/furlod/fv_ref2_a.png -exposure-anchor 2e-14
+ftrace -topng png/furlod/fv_agg2.png.ftbuf png/furlod/fv_agg2_a.png -exposure-anchor 2e-14
+python scraps/_coatcmp.py png/furlod/fv_ref2_a.png png/furlod/fv_agg2_a.png
+```
+(`-checkpoint` is what writes the `.ftbuf` sidecars the two `-topng` lines re-develop; without
+it the renders finish but there is nothing to re-expose against a shared anchor.)
+
+**Update (2026-08-11, v0.178.0):** `-fur-lod` (P2 stage 2c) now keeps this cost off the near
+field entirely — below `d0` fiber diameters of pixel footprint a render is byte-identical to the
+strand render, so the 3.8× only applies where the aggregate is actually wanted. That makes the
+cost problem much less pressing, but it does not answer the crossover question, which is still
+the thing to measure: render the same coat at 90 k / 900 k / 9 M strands and find where the two
+curves cross.

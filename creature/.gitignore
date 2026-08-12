@@ -1,0 +1,18 @@
+# Generated artefacts: everything in here is reproducible from a .ftcl plus a morph vector,
+# which is the entire point of the creature layer being a generator.
+out/
+*.log
+
+# Environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Training artefacts (P1 onward)
+runs/
+checkpoints/
+*.pt
+*.onnx
+
+# Throwaway calibration/analysis scripts (see CLAUDE.md conventions)
+scraps/

@@ -1,0 +1,35 @@
+# A/B fixture for `-dual-scatter`: a PALE, nearly non-absorbing coat in a BLACK room, so
+# the only light on the fur is the area light itself. That isolates dual scattering's OWN
+# error from the indirect illumination its terminated path throws away (see known-issues).
+# Compare: -mode R -max-bounce 200 with and without -dual-scatter, cropped to the ball.
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse  reflect 0.0 }
+material "grey"  { type diffuse  reflect 0.0 }
+material "skin"  { type diffuse  reflect 0.0 }
+
+# A nearly non-absorbing fiber: one strand is almost transparent, a coat of them is bright.
+material "polar" { type hair  sigma_a 0.02  beta_m 0.35  beta_n 0.35  alpha 3.0 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material grey  }   # back wall
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material white }   # left wall
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material white }   # right wall
+
+light area {
+    origin 0.10 0.985 0.10   u 0.80 0 0   v 0 0 0.80   normal 0 -1 0
+    power 260   spd preset:d65
+}
+
+sphere "ball" { center 0.50 0.32 0.55  radius 0.18  material skin }
+fur "ball_coat" {
+    on "ball"
+    material polar
+    count 90000   points 6   length 0.045  length_jitter 0.3
+    radius 0.0004  lift 0.85  jitter 0.25
+    gravity 0 -1 0  droop 0.35
+}
+
+camera "cam" { eye 0.5 0.42 1.90   look_at 0.5 0.32 0.55   up 0 1 0   fov_y 45 }

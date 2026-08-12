@@ -48,6 +48,7 @@
 #include "medium_stack.h" // nested-dielectric priority stack
 #include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
+#include "fur_volume.h"   // -fur-volume: the aggregate far-tier fur medium
 
 struct BackwardRenderer {
     int maxBounce = 32;
@@ -71,6 +72,20 @@ struct BackwardRenderer {
     // cheap stand-in for the GI this mode drops. ABSOLUTE spectral radiance -- the CLI's
     // dimensionless -ambient is multiplied by Scene::ambientRef() before it lands here.
     double ambient = 0.0;
+
+    // ---- shading footprint for `fw` / `fnoise` (O8 stage 2) -------------------------
+    // Camera::footprintPerDist(spp) — the world-space width one camera sample covers per
+    // unit of distance — or 0 to leave Hit::fw unfilled. Only the CAMERA segment of the
+    // path is stamped (the first hit of a depth-0 trace); a gather ray and every bounce
+    // after the first leave `fw` at 0, since no ray differentials are propagated through
+    // a scatter and 0 correctly means "do not filter".
+    //
+    // Deliberately set ONLY for mode W by the driver, and this is the interesting part of
+    // the design rather than an oversight: `fw` exists for a sampler that cannot average
+    // over the pixel, and stochastic mode R at N jittered samples per pixel IS averaging
+    // over it — for exactly the reason the forward photon modes need no help. Filtering a
+    // sampler that already integrates its own footprint only deletes detail it earned.
+    double fwPerDist = 0.0;
 
     // ---- deterministic one-bounce gather ("radiosity" for mode W) -------------------
     // `ambient` alone cannot reproduce two things real bounce light does, and both are
@@ -139,6 +154,90 @@ struct BackwardRenderer {
     // `-gi 0 -ambient min(ambient, c)` on both the CPU and the GPU.
     double giClamp = 0.0;
 
+    // ---- dual scattering for fur (P3 stage 4; Zinke et al. 2008) --------------------
+    // A pale coat is the worst case this renderer has: almost nothing is absorbed, so the
+    // light that reaches the eye has crossed dozens of strands, and an unbiased path
+    // tracer has to walk every one of them. `dualScatter` replaces that walk with Zinke's
+    // two closed-form terms — global forward scattering measured along the shadow ray,
+    // local backscattering folded into one extra BCSDF lobe (see hair.h's `Dual`).
+    //
+    // It is BIASED, and deliberately so: the point is that a fur render that needs
+    // -max-bounce 200 and thousands of samples becomes a direct-lighting render. Because
+    // the multiple scattering is now analytic, a fiber vertex must NOT also continue the
+    // path — that would count the same light twice — so this implies a one-bounce fur.
+    // Everything else in the scene keeps full path tracing.
+    bool   dualScatter = false;
+    double dualDensity = 0.7;   // Zinke's d_f = d_b, "how enclosed is a strand": 0.6-0.8
+    // The paper sets d_f = d_b, and so does `dualDensity`; these override one of them on
+    // its own. Negative means "follow dualDensity". They exist because the two terms are
+    // physically different (d_b weights the local backscatter lobe, d_f the light let
+    // through the coat) and being able to switch one off is the only way to attribute a
+    // brightness error to one of them.
+    double dualDb = -1.0;
+    double dualDf = -1.0;
+    int    dualMaxCross = 64;   // strands counted along one shadow ray before giving up
+    // Non-null swaps Zinke's §4.1.1 ray shooting for his §4.1.2 density grid: the coat is
+    // measured by marching a voxel field instead of by crossing every strand (`-dual-grid`,
+    // built in main.cpp from the scene's own fibers). See hairShadowGrid.
+    const FurGrid* furGrid = nullptr;
+
+    // AGGREGATE FUR (`-fur-volume`, P2 stage 2b): the coat's FAR LOD tier. Non-null replaces
+    // the strands entirely with a participating medium whose extinction is the same grid's
+    // `sigma_t(d)` — the camera ray no longer intersects fibers at all (closestHit is called
+    // with skipHair), it free-flights against the density field, and each collision invents
+    // ONE virtual fiber by drawing a tangent from the cell's reconstructed orientation
+    // distribution (fur_volume.h) and shading it with the ordinary BCSDF.
+    //
+    // This is a different trade from `-dual-grid` above, which keeps the strands and only
+    // reads the SHADOW through the grid. Here the geometry is gone, so cost stops scaling
+    // with fiber count and starts scaling with optical depth — the point of a far tier — at
+    // the price of losing everything that lived on individual strands: no per-strand
+    // silhouette, and no uv at a collision, so a textured `reflect` reads at the default
+    // Hit's coordinates (the same class of approximation as -dual-grid's textured sigma_a).
+    const furvol::FurVolume* furVol = nullptr;
+
+    // ---- the near/far transition (`-fur-lod`, P2 stage 2c) --------------------------
+    // `furVol` alone is unconditional: every path goes through the medium, however close
+    // the coat is. These three turn it into a LOD DECISION — strands while a fiber still
+    // has a silhouette a pixel can see, the aggregate once it does not, and a stochastic
+    // crossfade in between so the switch dissolves instead of drawing a line across the
+    // image. `furLodW1 <= 0` disables the transition and restores the unconditional tier.
+    //
+    // The footprint here is the PIXEL's, `Camera::footprintPerDist(1)`, and NOT the
+    // sample's — which is the one thing about this that is easy to get backwards, and the
+    // opposite of what `fwPerDist` above does. `fw` band-limits a sampler that cannot
+    // average over its own pixel, so more samples must relax it (see fwPerDist). LOD is
+    // not that: if a fiber is thinner than a pixel, no number of samples will put its
+    // silhouette in the final image — the reconstruction filter averages it away — and
+    // the aggregate is precisely that average. So the ruler must not shrink with -spp,
+    // or a converged render would silently switch tiers relative to its own preview.
+    double furLodPerDist = 0.0;  // Camera::footprintPerDist(1) — 0 also disables
+    double furLodW0 = 0.0;       // pixel width (world units) at which the fade STARTS
+    double furLodW1 = 0.0;       // ...and at which it is fully aggregate
+
+    // Choose this path's fur tier. Returns 1 (strands) or 2 (aggregate); see GiCtx::furTier
+    // for why it is per-path and sticky.
+    //
+    // The crossfade is STOCHASTIC — a per-path coin against a smoothstep of the footprint —
+    // rather than a weighted sum of two renders, for the reason stochastic LOD usually wins:
+    // a blend of two estimators needs both of them evaluated, which in the band would cost
+    // more than either tier alone and would still have to reconcile two incompatible
+    // visibility conventions inside one path. A coin costs nothing, is unbiased for the same
+    // blend, and mode R is already averaging hundreds of paths per pixel, so what the image
+    // shows is the blend and not the coin. Smoothstep (not a linear ramp) because the
+    // derivative at both ends is zero, so neither edge of the band is itself an edge.
+    unsigned char pickFurTier(const Ray& r, Pcg32& rng) const {
+        if (!furVol || !furVol->valid()) return 1;
+        if (!(furLodW1 > furLodW0) || !(furLodPerDist > 0.0)) return 2;  // no LOD configured
+        const double te = furVol->entryDist(r.o, r.d);
+        if (te < 0.0) return 2;              // misses the coat's box: it holds no fiber to lose
+        const double w = furLodPerDist * te;
+        if (w <= furLodW0) return 1;
+        if (w >= furLodW1) return 2;
+        const double x = (w - furLodW0) / (furLodW1 - furLodW0);
+        return rng.uniform() < x * x * (3.0 - 2.0 * x) ? 2 : 1;
+    }
+
     // Where a path sits relative to the gather. `depth == 0` is a camera path (it does
     // the gather); `depth == 1` is a gather ray (it does NOT recurse, uses `giGrid`, and
     // terminates its own diffuse vertices on the flat `ambient` tail). `sIdx` is the
@@ -151,6 +250,12 @@ struct BackwardRenderer {
         int depth = 0;
         unsigned long long sIdx = 0;
         int bounce = 0;
+        // -fur-lod: which fur tier THIS PATH chose (0 = not yet decided, 1 = strands,
+        // 2 = aggregate). Decided once, on the path's first segment, and then carried --
+        // a gather ray and a heroSplit re-entry inherit it rather than re-rolling, because
+        // a path that half-believed in the strands would test visibility against geometry
+        // its own vertices were not built from. See pickFurTier().
+        unsigned char furTier = 0;
     };
 
     // One direction of the fixed gather lattice: point `j` of an `n`-point Fibonacci
@@ -238,8 +343,69 @@ struct BackwardRenderer {
     // the connection distance `dist`; the diffuse contribution at wavelength λ is then
     //   (rho(λ)/PI) * SPD(λ)*invPdfλ * w      (× medium transmittance, added by caller).
     // Returns false to skip this emitter (back-facing, shadowed, or behind geometry).
+    //
+    // A FIBER vertex (`hs` non-null, MatType::Hair) reaches this same body through two
+    // substitutions rather than a parallel copy, because everything an emitter sample has
+    // to do — pick a point, form wi, test visibility, divide by the pdf — is identical;
+    // only what happens AT the shading point differs:
+    //   * the "surface response" is PI*hairFCos instead of cos(n,wi)*shadowTerminatorG, so
+    //     the caller's rho/PI (with rho == 1) leaves exactly the BCSDF-times-projection.
+    //     There is no horizon test: a strand's TT lobe legitimately lights the far side,
+    //     and both the cosine rejection and the terminator softening are corrections for
+    //     using an interpolated normal as a projection axis, which a fiber does not do.
+    //   * the shadow ray starts a couple of diameters out so the tube does not occlude its
+    //     own transmitted lobe (hair_shade.h).
     bool emitterGeom(const Scene& scene, const Hit& h, const Vec3& ngo,
-                     const Emitter& em, double u1, double u2, double& dist, double& w) const {
+                     const Emitter& em, double u1, double u2, double& dist, double& w,
+                     const HairShade* hs = nullptr,
+                     const HairDualCtx* dctx = nullptr) const {
+        // Dual scattering (P3 stage 4) makes the shadow ray part of the SHADING: what it
+        // counts on the way to the light is the forward-scattering transmittance, so the
+        // response and the visibility test stop being separable. `response` therefore
+        // does both and `blocked` only reports what it found. Everything else — emitter
+        // sampling, pdfs, weights — is untouched, which is the whole reason this is one
+        // substitution rather than a fourth copy of the emitter loop.
+        bool dualBlocked = false;
+        // The surface response that multiplies the geometry weight, and the shadow ray.
+        // Both are exactly the pre-hair code when `hs` is null, so every non-fiber scene
+        // stays bit-identical (same rejections, same offset, same float ordering).
+        // (Two outputs rather than their product so the weight expressions below keep
+        // their original float ordering to the last bit; a fiber's `stG` is exactly 1.)
+        auto response = [&](const Vec3& wi, double& cosSurf, double& stG) -> bool {
+            if (hs && dctx) {
+                cosSurf = PI * hairDualResponse(*dctx, *hs, h, wi, dist, dualBlocked);
+                stG = 1.0; return !dualBlocked && cosSurf > 0.0;
+            }
+            if (hs) {
+                cosSurf = PI * hairFCos(*hs, wi);
+                // An AGGREGATE fiber sits inside a medium, so the connection also carries the
+                // coat's transmittance — `exp(-tau)`, the probability of crossing no fiber on
+                // the way out. That is the same quantity the strand walk estimates by finding
+                // nothing in the way; it is continuous rather than binary only because the
+                // strands it would have tested no longer exist to be tested.
+                if (hs->aggregate && furVol)
+                    cosSurf *= furVol->transmittance(h.p, wi, dist);
+                stG = 1.0; return cosSurf > 0.0;
+            }
+            cosSurf = dot(h.n, wi);
+            if (cosSurf <= 0) return false;
+            stG = shadowTerminatorG(wi, h.n, ngo);         // Chiang soft terminator (1 if flat)
+            if (stG <= 0.0) return false;                  // behind true geometry: hard shadow
+            return true;
+        };
+        auto blocked = [&](const Vec3& wi, double d, double shorten) -> bool {
+            if (hs && dctx) return dualBlocked;     // already walked, inside response()
+            if (!hs) return scene.occluded(h.p + ngo * 1e-6, wi, d - shorten);
+            const double off = hairExitOffset(*hs, h.n, wi);
+            const double len = d - off - 1e-6;
+            if (len <= 0.0) return true;
+            // Aggregate: the coat is optical depth, not geometry (it was already applied in
+            // `response`), so only a WALL blocks. Calling `occluded` here would report the
+            // very strands the far tier is pretending not to have as blockers and make the
+            // whole coat self-shadow to black.
+            if (hs->aggregate) return scene.occludedSkipHair(h.p + wi * off, wi, len);
+            return scene.occluded(h.p + wi * off, wi, len);
+        };
         if (em.collimated) return false;                  // beams aren't area-samplable
         if (em.shape == EmitterShape::Spot) {
             // Point spot: deterministic connect to the light point, weighted by the
@@ -248,13 +414,11 @@ struct BackwardRenderer {
             double dist2 = dot(toL, toL);
             dist = std::sqrt(dist2);
             Vec3 wi = toL / dist;
-            double cosSurf = dot(h.n, wi);
-            if (cosSurf <= 0) return false;
-            double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
-            if (stG <= 0.0) return false;                    // behind true geometry: hard shadow
+            double cosSurf, stG;
+            if (!response(wi, cosSurf, stG)) return false;
             double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= 0) return false;
-            if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) return false;
+            if (blocked(wi, dist, 2e-6)) return false;
             w = fall * cosSurf / dist2 * stG;                // I(w)/dist^2 (× BRDF & SPD by caller)
             return true;
         }
@@ -268,12 +432,12 @@ struct BackwardRenderer {
             // Two rng draws, matching the area-light path below, so adding a sun does
             // not reshuffle any other emitter's stream.
             Vec3 wi = em.sampleCone(-em.beamDir, u1, u2);
-            double cosSurf = dot(h.n, wi);
-            if (cosSurf <= 0) return false;
-            double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
-            if (stG <= 0.0) return false;                    // behind true geometry: hard shadow
+            // `dist` before `response`, not after: a dual-scattering response walks the
+            // shadow segment itself and so needs its length. Nothing else reads it here.
             dist = length(scene.sceneCenter - h.p) + scene.sceneRadius;   // to the scene exit
-            if (scene.occluded(h.p + ngo * 1e-6, wi, dist)) return false;
+            double cosSurf, stG;
+            if (!response(wi, cosSurf, stG)) return false;
+            if (blocked(wi, dist, 0.0)) return false;
             w = cosSurf * em.spotOmega * stG;
             return true;
         }
@@ -295,11 +459,9 @@ struct BackwardRenderer {
                           em.sampleCylinderVisible(h.p, u1, u2, y, nLight, pdfAreaCyl);
         if (cylVisible) effArea = 1.0 / pdfAreaCyl;
         if (coneSampled) {
-            double cosSurf = dot(h.n, wi);
-            if (cosSurf <= 0) return false;
-            double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
-            if (stG <= 0.0) return false;                    // behind true geometry: hard shadow
-            if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) return false;
+            double cosSurf, stG;
+            if (!response(wi, cosSurf, stG)) return false;
+            if (blocked(wi, dist, 2e-6)) return false;
             w = cosSurf / pdfW * stG;                        // solid-angle measure
             return true;
         }
@@ -315,13 +477,11 @@ struct BackwardRenderer {
         double dist2 = dot(toL, toL);
         dist = std::sqrt(dist2);
         wi = toL / dist;
-        double cosSurf = dot(h.n, wi);
-        if (cosSurf <= 0) return false;
-        double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
-        if (stG <= 0.0) return false;                    // behind true geometry: hard shadow
         double cosLight = dot(nLight, -wi);              // light is one-sided
-        if (cosLight <= 0) return false;
-        if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) return false;
+        if (cosLight <= 0) return false;                 // tested first: a dual-scattering
+        double cosSurf, stG;                             // response is a shadow WALK, and
+        if (!response(wi, cosSurf, stG)) return false;    // a back-facing sample is free to skip
+        if (blocked(wi, dist, 2e-6)) return false;
         double G = cosSurf * cosLight / dist2;           // geometry term
         w = G * effArea * stG;                           // pdf_area = 1/effArea (visible area for cylinder)
         if (epat != 1.0) w *= epat;                      // no-op (and bit-identical) without a pattern
@@ -527,9 +687,13 @@ struct BackwardRenderer {
         u2 = ((double)(g / G) + 0.5) / (double)G;
     }
 
+    // `hs` non-null routes the connection through the fiber BCSDF (see emitterGeom); the
+    // caller then passes rho == 1, because the strand's colour is already inside the BCSDF
+    // (its sigma_a) and the PI in emitterGeom's response cancels the rho/PI below.
     double neeLight(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
                     double lambda, Pcg32& rng, const SpdCache* spdCache = nullptr,
-                    GiCtx gi = GiCtx{}) const {
+                    GiCtx gi = GiCtx{}, const HairShade* hs = nullptr,
+                    const HairDualCtx* dctx = nullptr) const {
         double total = 0.0;
         // Geometric normal on the shading-normal side: every light connection must lie
         // in this hemisphere too, else a smoothed shading normal would leak light in
@@ -560,7 +724,20 @@ struct BackwardRenderer {
                 if (whitted) { if (uv) gridUV(s, G, u1, u2); }
                 else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
                 double dist = 0.0, w = 0.0;
-                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w)) continue;
+                // Dual scattering draws its one forward-spread sample here, per emitter
+                // sample, unconditionally — so the rng stream depends on the scene's
+                // lights and not on how many strands a shadow ray happened to cross.
+                HairDualCtx dc;
+                if (dctx) {
+                    dc = *dctx;
+                    dc.u0 = rng.uniform(); dc.u1 = rng.uniform(); dc.u2 = rng.uniform();
+                    // Only the grid path needs a fourth (its Poisson crossing count),
+                    // and drawing it only there keeps every existing -dual-scatter walk
+                    // render bit-identical rather than merely equal in expectation.
+                    if (dc.grid) dc.u3 = rng.uniform();
+                }
+                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, hs,
+                                 dctx ? &dc : nullptr)) continue;
                 if (!haveSpd) {   // evaluated at most once per emitter, as before
                     spdV = cached ? spdCache->spd[(size_t)e * (size_t)spdCache->C]
                                   : em.spdFn(lambda);
@@ -642,7 +819,7 @@ struct BackwardRenderer {
         double acc[hero::kHeroMax];
         for (int i = 0; i < nUp; ++i) acc[i] = 0.0;
         double wSum = 0.0;
-        const GiCtx sub{gi.depth + 1, gi.sIdx};
+        const GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
         for (int j = 0; j < n; ++j) {
             const Vec3 d = giDir(j, n, p1, p2);
             const double c = dot(h.n, d);
@@ -676,7 +853,7 @@ struct BackwardRenderer {
         double p1, p2;
         giPhases(gi.sIdx, p1, p2);
         double acc = 0.0, wSum = 0.0;
-        const GiCtx sub{gi.depth + 1, gi.sIdx};
+        const GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
         for (int j = 0; j < n; ++j) {
             const Vec3 d = giDir(j, n, p1, p2);
             const double c = dot(h.n, d);
@@ -800,9 +977,42 @@ struct BackwardRenderer {
     // skip; on success fills `wi`, `cosSurf`, `stG`, `pdfW`, `wMis`, `farDist`.
     bool envGeom(const Scene& scene, const Hit& h, Pcg32& rng, Vec3& wi,
                  double& cosSurf, double& stG, double& pdfW, double& wMis,
-                 double& farDist) const {
+                 double& farDist, const HairShade* hs = nullptr,
+                 const HairDualCtx* dctx = nullptr) const {
         wi = scene.sampleEnvDir(rng, pdfW);
         if (pdfW <= 0.0) return false;
+        if (hs && dctx) {
+            // Same substitution as emitterGeom: under dual scattering the shadow ray IS
+            // part of the shading, so response and visibility come back together. The sky
+            // has to go through it too — leaving the env connection on single scattering
+            // would light a coat's sunlit side by the full model and its sky-lit side by a
+            // bare fiber. And there is no MIS partner here (`dualScatter` ends the path, so
+            // nothing samples the BCSDF), which is exactly why wMis is 1.
+            farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
+            bool dualBlocked = false;
+            cosSurf = PI * hairDualResponse(*dctx, *hs, h, wi, farDist, dualBlocked);
+            stG = 1.0; wMis = 1.0;
+            return !dualBlocked && cosSurf > 0.0;
+        }
+        if (hs) {
+            // Fiber: `cosSurf` carries PI*hairFCos so the caller's rho/PI (rho == 1) leaves
+            // the BCSDF-times-projection, and the MIS partner is the BCSDF's own pdf rather
+            // than the cosine-hemisphere one — the continuation below samples hair::sample.
+            cosSurf = PI * hairFCos(*hs, wi);
+            stG = 1.0;
+            farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
+            // Aggregate fiber: coat transmittance instead of strand geometry, and only walls
+            // occlude. Same substitution as emitterGeom — see the comments there.
+            if (hs->aggregate && furVol)
+                cosSurf *= furVol->transmittance(h.p, wi, farDist);
+            if (!(cosSurf > 0.0)) return false;
+            const double off = hairExitOffset(*hs, h.n, wi);
+            if (hs->aggregate ? scene.occludedSkipHair(h.p + wi * off, wi, farDist)
+                              : scene.occluded(h.p + wi * off, wi, farDist)) return false;
+            const double pdfBsdf = hair::pdf(hs->b, hs->woLocal, hair::toLocal(hs->fr, wi));
+            wMis = pdfW / (pdfW + pdfBsdf);
+            return true;
+        }
         cosSurf = dot(h.n, wi);
         const Vec3 ngo = orientedGeoN(h);
         if (cosSurf <= 0.0) return false;                       // below the shading horizon
@@ -816,9 +1026,22 @@ struct BackwardRenderer {
     }
 
     double neeEnv(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
-                  double lambda, Pcg32& rng) const {
+                  double lambda, Pcg32& rng, const HairShade* hs = nullptr,
+                  const HairDualCtx* dctx = nullptr) const {
         Vec3 wi; double cosSurf, stG, pdfW, wMis, farDist;
-        if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist)) return 0.0;
+        // As in neeLight: the one forward-spread draw is taken unconditionally, so the rng
+        // stream does not depend on how many strands this particular shadow ray crossed.
+        HairDualCtx dc;
+        if (dctx) {
+            dc = *dctx;
+            dc.u0 = rng.uniform(); dc.u1 = rng.uniform(); dc.u2 = rng.uniform();
+            // Only the grid path needs a fourth (its Poisson crossing count),
+            // and drawing it only there keeps every existing -dual-scatter walk
+            // render bit-identical rather than merely equal in expectation.
+            if (dc.grid) dc.u3 = rng.uniform();
+        }
+        if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist, hs,
+                     dctx ? &dc : nullptr)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
         double contrib = (rho / PI) * Lenv * cosSurf * invPdfLambda / pdfW * wMis * stG;
@@ -869,6 +1092,65 @@ struct BackwardRenderer {
     // Returns true if the path continues (ray + state updated), false if it terminated
     // (L already holds this path's final value). A `break` in the old switch maps to
     // `return true`, a `return L` maps to `return false`.
+    // ONE AGGREGATE-FUR COLLISION (`-fur-volume`, P2 stage 2b). The counterpart of
+    // interactMaterial for a vertex the BVH never produced: the free flight below found a
+    // collision at `fl`, and everything the Hair case needs is INVENTED from the cell's
+    // reconstructed orientation distribution instead of read off a strand.
+    //
+    //   * the tangent is drawn from the cell's Bingham ODF, importance-sampled BY
+    //     CROSS-SECTION — a ray meets a perpendicular fiber more often than a parallel one,
+    //     and that factor is exactly what makes the aggregate response match the population
+    //     (`-checkfurvol` §6);
+    //   * the impact parameter is uniform on [-1, 1], as it is for a ray crossing a cylinder
+    //     at a uniform offset, and `fiberNormalFor` reconstructs the normal that WOULD have
+    //     produced it, so `hairShadeAt` — which recovers h from (n, tangent, wPrev) — gets
+    //     back exactly the h that was drawn (§4 round-trips the pair to 2.5e-11);
+    //   * `fiberRadius` is 0: there is no tube to step past, so hairExitOffset degrades to
+    //     the ordinary 1e-6 surface offset.
+    //
+    // There is deliberately NO dual-scattering branch. Dual scattering is an analytic
+    // stand-in for the multiple scattering inside a coat; this path simulates that multiple
+    // scattering directly, so using both would count it twice.
+    //
+    // Returns true if the path continues, false if it terminated (L already final), exactly
+    // like interactMaterial.
+    bool furInteract(const Scene& scene, const furvol::FurVolume::Flight& fl, Ray& ray,
+                     double lambda, double invPdfLambda, double& thr, double& L,
+                     bool& specularArrival, double& contBsdfPdf, Pcg32& rng,
+                     const SpdCache* spdCache, GiCtx gi) const {
+        const FurCell& fc = furVol->grid->cells[fl.ci];
+        if (fc.matId < 0 || fc.matId >= (int)scene.mats.size()) return false;
+        const Material& fmat = scene.mats[fc.matId];
+        if (fmat.type != MatType::Hair) return false;
+        const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
+        Hit vh;                            // the virtual fiber hit
+        vh.valid   = true;
+        vh.t       = fl.t;
+        vh.p       = ray.o + ray.d * fl.t;
+        vh.matId   = fc.matId;
+        vh.tangent = furvol::sampleTangentXsec(furVol->odfAt(fl.ci), ray.d, rng);
+        vh.n       = furvol::fiberNormalFor(vh.tangent, wPrev, 2.0 * rng.uniform() - 1.0);
+        vh.fiberRadius = 0.0;
+        HairShade hs = hairShadeAt(scene, fmat, vh, lambda, wPrev);
+        hs.aggregate = true;               // NEE: skip strands in the BVH, use transmittance
+        L += thr * neeLight(scene, vh, 1.0, invPdfLambda, lambda, rng, spdCache, gi, &hs);
+        if (scene.envIndex >= 0)
+            L += thr * neeEnv(scene, vh, 1.0, invPdfLambda, lambda, rng, &hs);
+        if (directOnly) return false;      // Whitted: single scatter only
+        double pdfH = 0.0, fv = 0.0;
+        const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
+                                     rng.uniform(), rng.uniform(), pdfH, fv);
+        if (!(pdfH > 0.0) || !(fv > 0.0)) return false;
+        const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
+        const double Tlobe = clamp01(fv * cosLong / pdfH);      // == sum_p A_p
+        if (whitted) { if (!whittedAttenuate(thr, Tlobe)) return false; }
+        else if (rng.uniform() >= Tlobe) return false;          // analog absorption
+        ray = Ray{vh.p, hair::toWorld(hs.fr, wl)};
+        contBsdfPdf = pdfH;
+        specularArrival = false;
+        return true;
+    }
+
     bool interactMaterial(const Scene& scene, const Material& m, const Hit& h, Renderer& mats,
                           Ray& ray, double& lambda, double& invPdfLambda, double& thr, double& L,
                           bool& specularArrival, double& contBsdfPdf, MediumStack& stk,
@@ -1099,6 +1381,56 @@ struct BackwardRenderer {
                 }
                 return false;                                // absorbed / terminated
             }
+            case MatType::Hair: {
+                // Fiber BCSDF — the backward adjoint of the forward tracer's Hair case, and
+                // the same physics object (src/hair.h) bridged the same way (hair_shade.h).
+                //
+                // `wPrev` is the direction the path arrived FROM, which backward means
+                // toward the eye. That is the model's reference direction (the impact
+                // parameter h is measured against it), so this is the one place where the
+                // forward and backward tracers legitimately hand hairShadeAt() different
+                // vectors and still describe the same fiber: the BCSDF is reciprocal.
+                const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
+                const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
+                // Dual scattering (stage 4): the connection carries the coat's whole
+                // multiple-scattering response, so this vertex both gets a different
+                // response function and ENDS the path — continuing it would count the
+                // light the analytic terms already account for a second time.
+                HairDualCtx dc;
+                if (dualScatter) {
+                    dc.scene = &scene;
+                    dc.dual = hairDualFor(scene, m, h.matId, h, lambda);
+                    dc.lambda = lambda;
+                    dc.db = dualDb >= 0.0 ? dualDb : dualDensity;
+                    dc.df = dualDf >= 0.0 ? dualDf : dualDensity;
+                    dc.maxCross = dualMaxCross;
+                    dc.grid = furGrid;
+                }
+                // rho == 1: the strand's colour lives in sigma_a inside the BCSDF, not in a
+                // separate Lambertian albedo (see neeLight).
+                L += thr * neeLight(scene, h, 1.0, invPdfLambda, lambda, rng, spdCache, gi, &hs,
+                                    dualScatter ? &dc : nullptr);
+                if (scene.envIndex >= 0)
+                    L += thr * neeEnv(scene, h, 1.0, invPdfLambda, lambda, rng, &hs,
+                                      dualScatter ? &dc : nullptr);
+                if (directOnly || dualScatter) return false;
+                double pdfH = 0.0, fv = 0.0;
+                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
+                                             rng.uniform(), rng.uniform(), pdfH, fv);
+                if (!(pdfH > 0.0) || !(fv > 0.0)) return false;
+                // Exactly T = sum_p A_p, the total lobe attenuation (see the forward tracer's
+                // Hair case for why the ratio collapses): a deterministic weight, so it is
+                // both the analog-RR survival probability and the Whitted attenuation.
+                const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
+                const double T = clamp01(fv * cosLong / pdfH);
+                if (whitted) { if (!whittedAttenuate(thr, T)) return false; }
+                else if (rng.uniform() >= T) return false;
+                const Vec3 wOut = hair::toWorld(hs.fr, wl);
+                contBsdfPdf = pdfH;                 // real pdf -> env-miss MIS is exact here
+                // Step clear of the strand's own body: TT/TRT exit the far side.
+                ray = Ray{h.p + wOut * hairExitOffset(hs, h.n, wOut), wOut};
+                specularArrival = false; return true;
+            }
             case MatType::DiffuseTransmit: {
                 // Two-lobe Lambertian: NEE the reflect lobe in the front hemisphere and
                 // the transmit lobe in the back (a normal-flipped Hit reuses neeLight/env).
@@ -1203,8 +1535,32 @@ struct BackwardRenderer {
             // it stops and we fall through to the straight-ray body.
             if (grinAny) grin::march(scene, ray);
 
-            Hit h = scene.closestHit(ray);
+            // Which fur tier this path believes in — rolled once, on its first segment, and
+            // then fixed for the rest of the path (GiCtx::furTier). Without -fur-lod this is
+            // simply "aggregate whenever furVol is set", i.e. the unconditional stage-2b tier.
+            if (!gi.furTier) gi.furTier = pickFurTier(ray, rng);
+            const bool useVol = furVol && gi.furTier == 2;
+
+            // With the coat rendered as a medium the strands are NOT geometry any more: they
+            // are the extinction the free flight below samples, so intersecting them too
+            // would count every fiber twice.
+            Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/useVol);
+            if (b == 0 && gi.depth == 0 && h.valid)         // camera segment only — see fwPerDist
+                h.fw = patShadingFootprint(fwPerDist, h.t, dot(ray.d, h.n));
             double dSurf = h.valid ? h.t : 1e30;
+
+            // AGGREGATE FUR (the far LOD tier): sample a free flight against the coat's own
+            // density field. Sampled BEFORE the fog block and allowed to shorten `dSurf`,
+            // which is not a fudge but exactly the right composition: the first collision in
+            // a union of independent media is the MINIMUM of their independent free flights,
+            // and taking the min this way also attributes the collision to the right medium.
+            // (`sampleFlight` is an exact inverse-CDF draw, not delta tracking — see
+            // fur_volume.h for why a fixed ray makes sigma_t piecewise constant.)
+            furvol::FurVolume::Flight fl;
+            if (useVol && furVol->valid()) {
+                fl = furVol->sampleFlight(ray.o, ray.d, dSurf, rng.uniform());
+                if (fl.hit) dSurf = fl.t;
+            }
 
             // Homogeneous fog: sample a free-flight collision that competes with
             // the surface. On a volume collision, estimate direct light via phase-
@@ -1232,6 +1588,15 @@ struct BackwardRenderer {
                         continue;
                     }
                 }
+            }
+
+            // The fur collision itself (furInteract): the Hair case with the hit INVENTED
+            // rather than found. Beer-Lambert over the leg first, as the fog branch does.
+            if (fl.hit) {
+                { double a = curAbsorb(lambda); if (a > 0.0) thr *= std::exp(-a * fl.t); }
+                if (!furInteract(scene, fl, ray, lambda, invPdfLambda, thr, L,
+                                 specularArrival, contBsdfPdf, rng, spdCache, gi)) return L;
+                continue;
             }
 
             // Ray escaped the scene: pick up the environment radiance from the escape
@@ -1403,13 +1768,30 @@ struct BackwardRenderer {
         for (int b = bounce0; b < maxB; ++b) {
             int nUp = secAlive ? C : 1;   // wavelengths still being propagated
             gi.bounce = b;                // see the scalar twin: mode W's per-vertex lattice
-            Hit h = scene.closestHit(ray);
+            // The scalar twin's tier roll. Sticky through GiCtx, which is what makes a
+            // heroSplit re-entry (which resumes this loop mid-path) keep the parent's tier.
+            if (!gi.furTier) gi.furTier = pickFurTier(ray, rng);
+            const bool useVol = furVol && gi.furTier == 2;
+            Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/useVol);
+            // Camera segment only — see fwPerDist. `b == 0` and not `b == bounce0`: a
+            // heroSplit re-entry resumes this loop at a DEEPER bounce, and that segment
+            // has already been through an interface, so its footprint is not the camera's.
+            if (b == 0 && gi.depth == 0 && h.valid)
+                h.fw = patShadingFootprint(fwPerDist, h.t, dot(ray.d, h.n));
             double dSurf = h.valid ? h.t : 1e30;
+
+            // Aggregate fur: the same free flight the scalar twin samples, shortening `dSurf`
+            // so the in-glass absorption below is integrated to the collision and not past it.
+            furvol::FurVolume::Flight fl;
+            if (useVol && furVol->valid()) {
+                fl = furVol->sampleFlight(ray.o, ray.d, dSurf, rng.uniform());
+                if (fl.hit) dSurf = fl.t;
+            }
 
             // Beer-Lambert over the in-glass segment. A non-empty stack implies we've
             // already de-hero'd (dielectric entry de-heros), so nUp == 1 whenever
             // absorption is non-zero; the loop still handles the general case.
-            if (h.valid) {
+            if (h.valid || fl.hit) {
                 int mi = stk.topMat();
                 if (mi >= 0) {
                     for (int i = 0; i < nUp; ++i) {
@@ -1417,6 +1799,18 @@ struct BackwardRenderer {
                         if (a > 0.0) thr[i] *= std::exp(-a * dSurf);
                     }
                 }
+            }
+
+            // A fiber's response is wavelength-dependent through sigma_a, so a fur collision
+            // takes the same policy the Hair material takes below: terminate the secondaries,
+            // boost the hero, and run the shared scalar interaction on it.
+            if (fl.hit) {
+                deHero();
+                if (!furInteract(scene, fl, ray, lam[0], invPdf[0], thr[0], L[0],
+                                 specularArrival, contBsdfPdf, rng, spdCache, gi)) {
+                    finish(); return;
+                }
+                continue;
             }
 
             if (!h.valid) {              // env-miss (full weight on specular arrival, else MIS)
@@ -1659,10 +2053,13 @@ struct BackwardRenderer {
                 case MatType::Multilayer:
                 case MatType::Grating:
                 case MatType::HalfMirror:
+                case MatType::Hair:
                 case MatType::Fluorescent: {
                     // Dispersive / wavelength-switching: the outgoing direction (and, for a
                     // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
-                    // cannot keep riding one shared direction past this interface.
+                    // cannot keep riding one shared direction past this interface. A fiber is
+                    // here for the same reason: its absorption is per-λ, so both the sampled
+                    // lobe and the survival probability differ across the bundle.
                     if (heroSplit && secAlive && nUp > 1) {
                         // SPLIT-AT-DISPERSION: fan out instead of de-hero'ing. Each secondary
                         // runs the SAME interaction with its OWN λ -- refracting along its own

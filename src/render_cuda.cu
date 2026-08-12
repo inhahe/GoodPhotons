@@ -81,6 +81,7 @@
 #include "render_cuda.h"
 #include "render_progress.h"
 #include "pattern_device.cuh"   // DPattern / DPatEnvT / dPatternEval — shared with raster_cuda.cu
+#include "stochtile.h"    // O7: the host/device-shared histogram-preserving tiling operator
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
 #include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
@@ -260,7 +261,7 @@ HD static inline Real clamp01(Real x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 // (MatType::Layered) has no device branch (Layered scenes fall back to the CPU tracer via
 // cudaForwardSupported), but the placeholder keeps D_DIFFUSETRANSMIT aligned at index 11.
 enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCENT, D_THINFILM,
-       D_GRATING, D_MIX, D_MULTILAYER, D_LAYERED, D_DIFFUSETRANSMIT, D_FILTER };
+       D_GRATING, D_MIX, D_MULTILAYER, D_LAYERED, D_DIFFUSETRANSMIT, D_FILTER, D_HAIR };
 
 // Maximum child lobes in a Mix material on the GPU. Scenes whose mix materials
 // exceed this fall back to the CPU forward tracer (cudaForwardSupported).
@@ -285,6 +286,19 @@ struct DTexture {
                            // (roughness/film-thickness, §9.4) — dTexScalarAt twin
     const double* rgb;     // 3*w*h linear RGB, uploaded only for NORMAL-MAP textures
                            // (C6) — dTexNormalAt twin (needs true vector direction)
+    // O7 stochastic tiling: the parameters plus the two Gaussianized plane sets and
+    // their inverse LUTs, mirroring Texture::gauss*/lut* one for one. All null (and
+    // stoch.on == 0) unless the texture asked for `tiling stochastic`; the samplers below
+    // then take exactly the same branch the host does, over the same float data, so the
+    // two backends land on the same crop of the image with the same weights.
+    // `jhLut` is the ONE shared, texture-independent RGB -> Jakob-Hanika coefficient
+    // table (upsample::coeffLut(), sqrt-warped STOCH_JH_N^3); the spectral path blends
+    // in linear RGB and then converts through it, because blending JH coefficients per
+    // channel leaves the image's colour manifold (see stochtile.h).
+    StochTile    stoch;
+    const float* gaussRgb;   const float* lutRgb;
+    const float* gaussGray;  const float* lutGray;
+    const float* jhLut;
     // The pattern VM's `tex:` hook (pattern_device.cuh). Defined out of line below,
     // next to dTexScalarAt, which it forwards to.
     __device__ double patScalarAt(double u, double v) const;
@@ -435,6 +449,18 @@ struct DMaterial {
     DVec3  rgbTransmit;
     DVec3  rgbAbsorb;
     double rgbIor;
+    // Hair fiber BCSDF (MatType::Hair — device twin of Material::hair* fields, hair.h /
+    // hair_shade.h). Single-fiber Marschner/Chiang R/TT/TRT + residual, plus the Yan 2017
+    // medulla scattered lobes when hairKappa > 0. hairSigmaAFromReflect != 0 means derive
+    // the cortex absorption from the material's diffuse reflectance colour per-wavelength
+    // (Chiang eq. 9, via dDiffuseRho so textures/patterns tint the fiber); otherwise
+    // hairSigmaA[] is the explicit absorption spectrum. Dual scattering and the fur-volume
+    // aggregate stay CPU-only (main.cpp gates them off the GPU path).
+    double hairEta, hairBetaM, hairBetaN, hairAlpha, hairKappa, hairMedullaG;
+    double hairSigmaA[SPEC_N];
+    double hairMedullaSigmaS[SPEC_N];
+    double hairMedullaSigmaA[SPEC_N];
+    int    hairSigmaAFromReflect;
 };
 // Sentinel for an unset dielectric priority (device twin of host INT_MIN).
 #define D_NO_PRIORITY (-2147483647 - 1)
@@ -1012,6 +1038,14 @@ struct DScene {
     int    bkHeroSplit;
     double bkAmbient;
     double bkGiClamp;
+    // O8 stage 2: the camera's footprint coefficient — the world-space patch diameter one
+    // shading sample stands for AT UNIT DISTANCE, head-on (Camera::footprintPerDist(spp)).
+    // The kernel turns it into a per-hit `fw` at the camera segment via
+    // patShadingFootprint(). Device twin of BackwardRenderer::fwPerDist, and set for the
+    // same narrow case: mode W only. 0 = unknown, so `fw` stays 0 and fnoise() runs
+    // unfiltered — which is what stochastic mode R wants, since jittering over the pixel
+    // already averages the footprint.
+    double bkFwPerDist;
 };
 
 // Everything the pattern VM (dPatternEval) needs beyond the scalar variables: the
@@ -1683,7 +1717,7 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p, const D
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, env);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, 0.0, env);
     return d > 0.0 ? d : 0.0;
 }
 
@@ -1787,7 +1821,7 @@ __device__ static double dMedNAt(const DMedium& m, const DVec3& p, const DPatEnv
     if (m.iorN <= 0 || !m.ior) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double n = dPatternEval(m.ior, m.iorN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, env);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, 0.0, env);
     return n > 1e-3 ? n : 1e-3;
 }
 
@@ -2036,6 +2070,18 @@ struct DHit {
     // start with cavityDone = garbage and could return an uninitialised cavity.
     mutable Real cavity = (Real)0;
     mutable bool cavityDone = false;
+    // O8 stage 2 shading footprint (device twin of Hit::fw): the world-space diameter of
+    // the surface patch this shading sample stands for. Like cavity it is NOT written by
+    // any intersector — it is a property of the ARRIVING RAY, not of the geometry — so it
+    // is stamped by the kernel at the camera segment and left 0 (= unknown = unfiltered)
+    // everywhere else. Default-initialised for the same reason cavity is.
+    Real fw = (Real)0;
+    // Hair fiber cross-section radius at the hit (device twin of Hit::fiberRadius).
+    // Written ONLY by the curve-segment intersector; every other primitive leaves the
+    // default 0. Consumed by the hair BCSDF exit-offset (dHairExitOffset) so far-side
+    // (TT) exit rays clear the fiber body. Default-initialised for the same reason
+    // cavity/fw are: most intersectors never touch it.
+    Real fiberRadius = (Real)0;
 };
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
@@ -2076,7 +2122,7 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
             if (!exprPool) return BIG;
             double r = sqrt(px*px + py*py + pz*pz);
             return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
-                                0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, env);
+                                0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, 0.0, env);
         }
         case DF_BOX: {
             double r = nd.p[3];
@@ -2762,6 +2808,7 @@ __device__ static bool intersectCurveSeg(const DCurveRay& cr, const DVec3& ro, c
     const Real rLoc = s.r0 + (s.r1 - s.r0) * f;
     const Real hSign = (dot(rd, ng) < (Real)0) ? (Real)1 : (Real)-1;
     hit.curv = (rLoc > (Real)1e-12) ? hSign * (Real)0.5 / rLoc : (Real)0;
+    hit.fiberRadius = rLoc;   // hair BCSDF exit offset (dHairExitOffset)
     return true;
 }
 
@@ -3576,6 +3623,633 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 
+// ==================== hair fiber BCSDF (device twin of hair.h) ====================
+// Port of src/hair.h's single-fiber Marschner/Chiang BCSDF — lobes p = 0 (R), 1 (TT),
+// 2 (TRT) and a p >= 3 residual — plus the Yan 2017 medulla scattered lobes TT^s / TRT^s
+// (kappa > 0). See hair.h for the full physics commentary; this is a line-for-line
+// transliteration, kept in the same order so the two files can be diffed.
+//
+// NOT ported: dual scattering (hair.h lines 754+ / hair_shade.h's HairDualCtx) and the
+// fur-volume aggregate — both stay CPU-only (main.cpp's backwardOnGpuOk gates them off
+// the GPU path), exactly like the CPU-only Layered material.
+//
+// PRECISION. The internal math is deliberately DOUBLE even when Real is float. The
+// longitudinal M_p works in log space with exp/log cancellations at magnitude ~1/v
+// (tens of thousands for a smooth fiber), where float's 24-bit mantissa corrupts the
+// exponent by whole units; and the residual-lobe energy identities (furnace closure,
+// -checkhair §1) were established in double. The BCSDF runs a handful of times per hair
+// VERTEX while the BVH traverses hundreds of thousands of curve segments per RAY, so
+// FP64 here is not the bottleneck. Only the frame/impact-parameter geometry (built from
+// Real-precision hit data, which is already float-noisy) stays in Real.
+namespace dhair {
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr int kPMax  = 3;                    // R, TT, TRT + residual index
+constexpr int kSTT   = kPMax + 1;            // 4: medulla-scattered TT^s
+constexpr int kSTRT  = kPMax + 2;            // 5: medulla-scattered TRT^s
+constexpr int kNLobes = kPMax + 3;           // 6
+
+__device__ static inline double sqr(double x) { return x * x; }
+__device__ static inline double safeSqrt(double x) { return sqrt(fmax(0.0, x)); }
+__device__ static inline double clampd(double x, double lo, double hi) { return x < lo ? lo : (x > hi ? hi : x); }
+
+// Minimal double-precision direction triple for the LOCAL FIBER FRAME (+x = tangent).
+// Not DVec3: the BCSDF math stays double regardless of Real (see precision note above).
+struct V3 { double x, y, z; };
+
+// Bessel I0 in two pure halves, deliberately NOT the CPU's mutually-recursive
+// besselI0 <-> logBesselI0 shape: on the device that static cycle (each one's
+// other-range branch calling the other) made nvlink declare the stack of EVERY
+// kernel that can reach dhair "cannot be statically determined" (kTrace, kBackward,
+// kWfShade). Undetermined kernels lose their MIN_STACK attribute, so the driver
+// stops auto-reserving their real stack need (~7-12 KB measured on 0.180.x) and
+// falls back to the 1 KB cudaLimitStackSize default -- and every render, hair or
+// not, died of device stack overflow. Two cross-call-free cores keep the call graph
+// acyclic; each public wrapper picks the branch with the same expressions as
+// before, so values are bit-identical.
+//
+// Small-x core: ascending series sum_k (x/2)^{2k} / (k!)^2, iterated to double
+// convergence (used for |x| <= 12).
+__device__ static double besselI0Series(double x) {
+    const double q = 0.25 * x * x;
+    double t = 1.0, sum = 1.0;
+    for (int k = 1; k < 64; ++k) {
+        t *= q / (double(k) * double(k));
+        sum += t;
+        if (t < 1e-18 * sum) break;
+    }
+    return sum;
+}
+// Large-x core (|x| > 12), in log space so it cannot overflow:
+// A&S 9.7.1: I0(x) ~ e^x / sqrt(2 pi x) * sum_k prod_j (2j-1)^2 / (k! (8x)^k).
+__device__ static double logBesselI0Asym(double x) {
+    double t = 1.0, sum = 1.0;
+    for (int k = 1; k <= 12; ++k) {
+        t *= sqr(2.0 * k - 1.0) / (8.0 * x * double(k));
+        sum += t;
+    }
+    return x - 0.5 * log(2.0 * kPi * x) + log(sum);
+}
+__device__ static double besselI0(double x) {
+    x = fabs(x);
+    return (x > 12.0) ? exp(logBesselI0Asym(x)) : besselI0Series(x);
+}
+__device__ static double logBesselI0(double x) {
+    x = fabs(x);
+    return (x > 12.0) ? logBesselI0Asym(x) : log(besselI0Series(x));
+}
+
+// Longitudinal lobe M_p: normalised Gaussian on the sphere (d'Eon); log branch for
+// small v where the Bessel I0 normalisation overflows.
+__device__ static double Mp(double cosThetaI, double cosThetaO,
+                            double sinThetaI, double sinThetaO, double v) {
+    const double a = cosThetaI * cosThetaO / v;
+    const double b = sinThetaI * sinThetaO / v;
+    if (v <= 0.1)
+        return exp(logBesselI0(a) - b - 1.0 / v + 0.6931471805599453 + log(0.5 / v));
+    return (exp(-b) * besselI0(a)) / (sinh(1.0 / v) * 2.0 * v);
+}
+
+// Azimuthal machinery: exact specular exit angle Phi + trimmed-logistic smear N_p.
+__device__ static inline double Phi(int p, double gammaO, double gammaT) {
+    return 2.0 * p * gammaT - 2.0 * gammaO + p * kPi;
+}
+__device__ static inline double logistic(double x, double s) {
+    x = fabs(x);
+    const double e = exp(-x / s);
+    return e / (s * sqr(1.0 + e));
+}
+__device__ static inline double logisticCdf(double x, double s) { return 1.0 / (1.0 + exp(-x / s)); }
+__device__ static inline double trimmedLogistic(double x, double s, double a, double b) {
+    return logistic(x, s) / (logisticCdf(b, s) - logisticCdf(a, s));
+}
+__device__ static inline double sampleTrimmedLogistic(double u, double s, double a, double b) {
+    const double k = logisticCdf(b, s) - logisticCdf(a, s);
+    double x = -s * log(1.0 / (u * k + logisticCdf(a, s)) - 1.0);
+    return clampd(x, a, b);
+}
+__device__ static inline double wrapAngle(double phi) {
+    while (phi > kPi)  phi -= 2.0 * kPi;
+    while (phi < -kPi) phi += 2.0 * kPi;
+    return phi;
+}
+__device__ static inline double Np(double phi, int p, double s, double gammaO, double gammaT) {
+    return trimmedLogistic(wrapAngle(phi - Phi(p, gammaO, gammaT)), s, -kPi, kPi);
+}
+
+__device__ static double frDielectric(double cosThetaI, double etaI, double etaT) {
+    cosThetaI = clampd(cosThetaI, -1.0, 1.0);
+    if (cosThetaI < 0.0) { double tmp = etaI; etaI = etaT; etaT = tmp; cosThetaI = -cosThetaI; }
+    const double sinThetaI = safeSqrt(1.0 - sqr(cosThetaI));
+    const double sinThetaT = etaI / etaT * sinThetaI;
+    if (sinThetaT >= 1.0) return 1.0;                        // total internal reflection
+    const double cosThetaT = safeSqrt(1.0 - sqr(sinThetaT));
+    const double rParl = ((etaT * cosThetaI) - (etaI * cosThetaT)) /
+                         ((etaT * cosThetaI) + (etaI * cosThetaT));
+    const double rPerp = ((etaI * cosThetaI) - (etaT * cosThetaT)) /
+                         ((etaI * cosThetaI) + (etaT * cosThetaT));
+    return 0.5 * (rParl * rParl + rPerp * rPerp);
+}
+
+// Attenuation A_p: Fresnel at each crossing + Beer-Lambert through the interior; the
+// p = kPMax entry is the closed-form geometric tail (energy conservation).
+__device__ static void Ap(double cosThetaO, double eta, double h, double T, double ap[kPMax + 1]) {
+    const double cosGammaO = safeSqrt(1.0 - h * h);
+    const double f = frDielectric(cosThetaO * cosGammaO, 1.0, eta);
+    ap[0] = f;                                   // R
+    ap[1] = sqr(1.0 - f) * T;                    // TT
+    for (int p = 2; p < kPMax; ++p) ap[p] = ap[p - 1] * T * f;
+    const double denom = 1.0 - T * f;
+    ap[kPMax] = (denom > 1e-12) ? ap[kPMax - 1] * f * T / denom : 0.0;
+}
+
+// Authored parameters (device twin of hair::Params; see hair.h for semantics).
+struct Params {
+    double eta   = 1.55;
+    double betaM = 0.3;
+    double betaN = 0.3;
+    double alpha = 2.0;
+    double kappa   = 0.0;   // medullary index, [0, 1)
+    double mSigmaS = 0.0;   // medulla scattering, per fiber radius
+    double mSigmaA = 0.0;   // medulla absorption, per fiber radius
+    double mG      = 0.0;   // medulla HG anisotropy
+};
+
+// Hit-and-parameter constants hoisted out of f()/pdf()/sample().
+struct Bcsdf {
+    double h = 0.0, gammaO = 0.0;
+    double eta = 1.55, sigmaA = 0.0;
+    double v[kPMax + 1] = {0, 0, 0, 0};   // longitudinal variances per lobe
+    double s = 0.0;                       // azimuthal logistic scale
+    double sin2kAlpha[3] = {0, 0, 0}, cos2kAlpha[3] = {1, 1, 1};
+    bool   hasMedulla = false;
+    double kappa = 0.0, mSigmaS = 0.0, mSigmaA = 0.0, mG = 0.0;
+};
+
+// One interior traversal: refracted azimuth + the five chord-derived survival terms.
+struct Chord {
+    double gammaT   = 0.0;
+    double T        = 1.0;   // survival of the unscattered path across one traversal
+    double Tsolid   = 1.0;   // same with the medulla replaced by cortex
+    double albedoM  = 0.0;   // medulla single-scattering albedo
+    double Tb       = 1.0;   // Yan eq. 20 post-scatter escape
+    double tauP     = 0.0;   // reduced optical depth (1-g) sigma_s chord
+};
+
+__device__ static Bcsdf make(const Params& pr, double h, double sigmaA) {
+    Bcsdf b;
+    b.h      = clampd(h, -1.0, 1.0);
+    b.gammaO = asin(b.h);
+    b.eta    = pr.eta;
+    b.sigmaA = fmax(0.0, sigmaA);
+    // Chiang's perceptual-roughness fits (hair.h::make).
+    const double bm = clampd(pr.betaM, 1e-4, 1.0);
+    const double bn = clampd(pr.betaN, 1e-4, 1.0);
+    b.v[0] = sqr(0.726 * bm + 0.812 * sqr(bm) + 3.7 * pow(bm, 20.0));
+    b.v[1] = 0.25 * b.v[0];
+    b.v[2] = 4.0 * b.v[0];
+    for (int p = 3; p <= kPMax; ++p) b.v[p] = b.v[2];
+    b.s = 0.626657069 *      // sqrt(pi/8)
+          (0.265 * bn + 1.194 * sqr(bn) + 5.372 * pow(bn, 22.0));
+    // Cuticle tilt double-angle recurrence.
+    b.sin2kAlpha[0] = sin(pr.alpha * kPi / 180.0);
+    b.cos2kAlpha[0] = safeSqrt(1.0 - sqr(b.sin2kAlpha[0]));
+    for (int i = 1; i < 3; ++i) {
+        b.sin2kAlpha[i] = 2.0 * b.cos2kAlpha[i - 1] * b.sin2kAlpha[i - 1];
+        b.cos2kAlpha[i] = sqr(b.cos2kAlpha[i - 1]) - sqr(b.sin2kAlpha[i - 1]);
+    }
+    b.kappa   = clampd(pr.kappa, 0.0, 0.999);
+    b.mSigmaS = fmax(0.0, pr.mSigmaS);
+    b.mSigmaA = fmax(0.0, pr.mSigmaA);
+    b.mG      = clampd(pr.mG, -0.999, 0.999);
+    b.hasMedulla = (b.kappa > 0.0) && (b.mSigmaS + b.mSigmaA > 0.0);
+    return b;
+}
+
+// Apply the lobe-p cuticle tilt to the outgoing longitudinal angle.
+__device__ static void tiltO(const Bcsdf& b, int p, double sinThetaO, double cosThetaO,
+                             double& sinThetaOp, double& cosThetaOp) {
+    if (p == 0) {
+        sinThetaOp = sinThetaO * b.cos2kAlpha[1] - cosThetaO * b.sin2kAlpha[1];
+        cosThetaOp = cosThetaO * b.cos2kAlpha[1] + sinThetaO * b.sin2kAlpha[1];
+    } else if (p == 1) {
+        sinThetaOp = sinThetaO * b.cos2kAlpha[0] + cosThetaO * b.sin2kAlpha[0];
+        cosThetaOp = cosThetaO * b.cos2kAlpha[0] - sinThetaO * b.sin2kAlpha[0];
+    } else if (p == 2) {
+        sinThetaOp = sinThetaO * b.cos2kAlpha[2] + cosThetaO * b.sin2kAlpha[2];
+        cosThetaOp = cosThetaO * b.cos2kAlpha[2] - sinThetaO * b.sin2kAlpha[2];
+    } else {
+        sinThetaOp = sinThetaO;
+        cosThetaOp = cosThetaO;
+    }
+    cosThetaOp = fabs(cosThetaOp);
+}
+
+// Refraction geometry + interior chords (Bravais virtual index; Yan's double cylinder).
+__device__ static Chord refractGeom(const Bcsdf& b, double sinThetaO, double cosThetaO) {
+    Chord ch;
+    const double etap      = safeSqrt(sqr(b.eta) - sqr(sinThetaO)) / fmax(cosThetaO, 1e-9);
+    const double sinGammaT = clampd(b.h / etap, -1.0, 1.0);
+    const double cosGammaT = safeSqrt(1.0 - sqr(sinGammaT));
+    ch.gammaT = asin(sinGammaT);
+    const double sinThetaT = sinThetaO / b.eta;
+    const double cosThetaT = safeSqrt(1.0 - sqr(sinThetaT));
+    const double invCosT = 1.0 / fmax(cosThetaT, 1e-9);
+
+    if (!b.hasMedulla) {
+        ch.T = exp(-b.sigmaA * (2.0 * cosGammaT * invCosT));
+        ch.Tsolid = ch.T;
+        return ch;
+    }
+
+    const double sm = safeSqrt(sqr(b.kappa) - sqr(sinGammaT));   // half-chord in medulla
+    const double sc = fmax(0.0, cosGammaT - sm);                 // half-chord in cortex
+    const double mExt = b.mSigmaS + b.mSigmaA;                   // medulla extinction
+    ch.T      = exp(-(2.0 * sc * b.sigmaA + 2.0 * sm * mExt) * invCosT);
+    ch.Tsolid = exp(-(2.0 * cosGammaT * b.sigmaA) * invCosT);
+    ch.albedoM = (mExt > 1e-12) ? b.mSigmaS / mExt : 0.0;
+    ch.Tb = exp(-(b.kappa * b.mSigmaA + (1.0 - b.kappa) * b.sigmaA) * invCosT);
+    ch.tauP = (1.0 - clampd(b.mG, -0.999, 0.999)) * b.mSigmaS * (2.0 * sm) * invCosT;
+    return ch;
+}
+
+// Similarity-theory smear of the scattered lobes' exit direction, in [0, 1).
+__device__ static inline double scatteredSpread(const Chord& ch) {
+    return 1.0 - exp(-fmax(0.0, ch.tauP));
+}
+
+// Attenuation of the scattered lobes A^s_p, computed as a DIFFERENCE so the white
+// furnace closes exactly (see hair.h::ApScattered).
+__device__ static void ApScattered(const Chord& ch, double cosThetaO, double eta, double h,
+                                   double aps[2]) {
+    aps[0] = aps[1] = 0.0;
+    if (ch.albedoM <= 0.0) return;
+    double apMed[kPMax + 1], apSolid[kPMax + 1];
+    Ap(cosThetaO, eta, h, ch.T, apMed);
+    Ap(cosThetaO, eta, h, ch.Tsolid, apSolid);
+    double missing = 0.0;
+    for (int p = 0; p <= kPMax; ++p) missing += apSolid[p] - apMed[p];
+    if (!(missing > 0.0)) return;                 // Tsolid >= T always, but be defensive
+    const double total = missing * ch.albedoM * ch.Tb;
+    const double cosGammaO = safeSqrt(1.0 - h * h);
+    const double F = frDielectric(cosThetaO * cosGammaO, 1.0, eta);
+    const double norm = 1.0 + F;
+    aps[0] = total * (1.0 / norm);
+    aps[1] = total * (F / norm);
+}
+
+// Exit azimuth of a scattered lobe (Yan eq. 21).
+__device__ static inline double PhiS(int p, double gammaO, double gammaT) {
+    return (gammaT - gammaO) + double(p - 1) * (kPi + 2.0 * gammaT);
+}
+__device__ static inline double scatteredV(const Bcsdf& b, int p, double spread) {
+    return b.v[p] + spread;
+}
+__device__ static inline double scatteredS(const Bcsdf& b, double spread) {
+    return b.s + 2.0 * spread;
+}
+
+// The BCSDF value for wo -> wi (local fiber frame). Already divided by |cos theta_i|
+// (surface-BRDF convention; see hair.h's cosine note).
+//
+// f / pdf / sample / dHairShadeAt are all __noinline__ ON PURPOSE: they carry big
+// double-precision frames (per-lobe attenuation + Mp/Np locals), and several SHARED
+// functions (bkEmitterGeom, bkEnvGeom, interactSpecular's dispatch) contain guarded
+// calls to them. Inlined, those locals would merge permanently into the shared tracer
+// frames, inflating every kernel's statically-computed MIN_STACK (the per-thread
+// stack the driver auto-reserves at launch) — and the driver multiplies that by
+// ~200k resident threads of VRAM, hair scene or not. As calls, the frames only go
+// live on actual hair evaluations, and MIN_STACK grows by the one deepest hair
+// chain instead of leaking hair bytes into every frame on the path.
+__device__ __noinline__ static double f(const Bcsdf& b, const V3& wo, const V3& wi) {
+    const double sinThetaO = clampd(wo.x, -1.0, 1.0), cosThetaO = safeSqrt(1.0 - sqr(sinThetaO));
+    const double sinThetaI = clampd(wi.x, -1.0, 1.0), cosThetaI = safeSqrt(1.0 - sqr(sinThetaI));
+    const double phiO = atan2(wo.z, wo.y);
+    const double phiI = atan2(wi.z, wi.y);
+    const double phi  = phiI - phiO;
+
+    const Chord ch = refractGeom(b, sinThetaO, cosThetaO);
+    const double gammaT = ch.gammaT;
+
+    double ap[kPMax + 1];
+    Ap(cosThetaO, b.eta, b.h, ch.T, ap);
+
+    double sum = 0.0;
+    for (int p = 0; p < kPMax; ++p) {
+        double sinThetaOp, cosThetaOp;
+        tiltO(b, p, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp);
+        sum += Mp(cosThetaI, cosThetaOp, sinThetaI, sinThetaOp, b.v[p]) * ap[p] *
+               Np(phi, p, b.s, b.gammaO, gammaT);
+    }
+    sum += Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, b.v[kPMax]) * ap[kPMax] *
+           (0.5 / kPi);
+
+    if (b.hasMedulla) {
+        double aps[2];
+        ApScattered(ch, cosThetaO, b.eta, b.h, aps);
+        const double spread = scatteredSpread(ch);
+        const double ss = scatteredS(b, spread);
+        for (int k = 0; k < 2; ++k) {
+            if (aps[k] <= 0.0) continue;
+            const int p = k + 1;                       // TT^s -> 1, TRT^s -> 2
+            double sinThetaOp, cosThetaOp;
+            tiltO(b, p, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp);
+            sum += Mp(cosThetaI, cosThetaOp, sinThetaI, sinThetaOp,
+                      scatteredV(b, p, spread)) * aps[k] *
+                   trimmedLogistic(wrapAngle(phi - PhiS(p, b.gammaO, gammaT)), ss, -kPi, kPi);
+        }
+    }
+
+    const double absCosI = fabs(cosThetaI);
+    if (absCosI > 1e-9) sum /= absCosI;
+    return isfinite(sum) ? fmax(0.0, sum) : 0.0;
+}
+
+// Discrete lobe-choice probabilities, proportional to the energy each carries.
+__device__ static void apPdf(const Bcsdf& b, double sinThetaO, double cosThetaO, double pdf[kNLobes]) {
+    const Chord ch = refractGeom(b, sinThetaO, cosThetaO);
+    double ap[kPMax + 1];
+    Ap(cosThetaO, b.eta, b.h, ch.T, ap);
+    double aps[2] = {0.0, 0.0};
+    if (b.hasMedulla) ApScattered(ch, cosThetaO, b.eta, b.h, aps);
+    double total = 0.0;
+    for (int p = 0; p <= kPMax; ++p) total += ap[p];
+    total += aps[0] + aps[1];
+    if (total <= 1e-12) {                     // degenerate: fall back to uniform
+        const int n = b.hasMedulla ? kNLobes : (kPMax + 1);
+        for (int p = 0; p < kNLobes; ++p) pdf[p] = (p < n) ? 1.0 / double(n) : 0.0;
+        return;
+    }
+    for (int p = 0; p <= kPMax; ++p) pdf[p] = ap[p] / total;
+    pdf[kSTT]  = aps[0] / total;
+    pdf[kSTRT] = aps[1] / total;
+}
+
+__device__ __noinline__ static double pdf(const Bcsdf& b, const V3& wo, const V3& wi) {   // __noinline__: see f above
+    const double sinThetaO = clampd(wo.x, -1.0, 1.0), cosThetaO = safeSqrt(1.0 - sqr(sinThetaO));
+    const double sinThetaI = clampd(wi.x, -1.0, 1.0), cosThetaI = safeSqrt(1.0 - sqr(sinThetaI));
+    const double phi = atan2(wi.z, wi.y) - atan2(wo.z, wo.y);
+
+    const Chord ch = refractGeom(b, sinThetaO, cosThetaO);
+    const double gammaT = ch.gammaT;
+    double ap[kNLobes];
+    apPdf(b, sinThetaO, cosThetaO, ap);
+
+    double sum = 0.0;
+    for (int p = 0; p < kPMax; ++p) {
+        double sinThetaOp, cosThetaOp;
+        tiltO(b, p, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp);
+        sum += Mp(cosThetaI, cosThetaOp, sinThetaI, sinThetaOp, b.v[p]) * ap[p] *
+               Np(phi, p, b.s, b.gammaO, gammaT);
+    }
+    sum += Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, b.v[kPMax]) * ap[kPMax] *
+           (0.5 / kPi);
+    if (b.hasMedulla) {
+        const double spread = scatteredSpread(ch);
+        const double ss = scatteredS(b, spread);
+        for (int k = 0; k < 2; ++k) {
+            const double w = ap[kSTT + k];
+            if (w <= 0.0) continue;
+            const int p = k + 1;
+            double sinThetaOp, cosThetaOp;
+            tiltO(b, p, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp);
+            sum += Mp(cosThetaI, cosThetaOp, sinThetaI, sinThetaOp,
+                      scatteredV(b, p, spread)) * w *
+                   trimmedLogistic(wrapAngle(phi - PhiS(p, b.gammaO, gammaT)), ss, -kPi, kPi);
+        }
+    }
+    return isfinite(sum) ? fmax(0.0, sum) : 0.0;
+}
+
+// Importance-sample an outgoing direction; pdfOut/fOut are filled to match, so a
+// caller's weight is fOut * |cos theta_i| / pdfOut (see hair.h::sample).
+__device__ __noinline__ static V3 sample(const Bcsdf& b, const V3& wo, double u0, double u1, double u2,
+                            double u3, double& pdfOut, double& fOut) {   // __noinline__: see f above
+    const double sinThetaO = clampd(wo.x, -1.0, 1.0), cosThetaO = safeSqrt(1.0 - sqr(sinThetaO));
+    const double phiO = atan2(wo.z, wo.y);
+
+    const Chord ch = refractGeom(b, sinThetaO, cosThetaO);
+    const double gammaT = ch.gammaT;
+    double ap[kNLobes];
+    apPdf(b, sinThetaO, cosThetaO, ap);
+
+    const int nLobes = b.hasMedulla ? kNLobes : (kPMax + 1);
+    int lobe = 0;
+    { double c = 0.0;
+      for (; lobe < nLobes - 1; ++lobe) { c += ap[lobe]; if (u0 < c) break; } }
+
+    const bool  scattered = (lobe >= kSTT);
+    const int   p  = scattered ? (lobe - kSTT + 1) : lobe;
+    const double spread = scattered ? scatteredSpread(ch) : 0.0;
+    const double vUse = scattered ? scatteredV(b, p, spread) : b.v[p];
+
+    double sinThetaOp, cosThetaOp;
+    tiltO(b, p, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp);
+
+    // Longitudinal: exact inversion of M_p (Ou & Pellacini). The 1e-5 floor prevents a
+    // log(0) NaN direction.
+    u1 = fmax(u1, 1e-5);
+    const double cosTheta =
+        1.0 + vUse * log(u1 + (1.0 - u1) * exp(-2.0 / vUse));
+    const double sinTheta = safeSqrt(1.0 - sqr(cosTheta));
+    const double cosPhi   = cos(2.0 * kPi * u2);
+    const double sinThetaI = clampd(-cosTheta * sinThetaOp + sinTheta * cosPhi * cosThetaOp,
+                                    -1.0, 1.0);
+    const double cosThetaI = safeSqrt(1.0 - sqr(sinThetaI));
+
+    // Azimuthal: specular exit + trimmed-logistic offset; uniform for the residual.
+    double dphi;
+    if (scattered)
+        dphi = PhiS(p, b.gammaO, gammaT) +
+               sampleTrimmedLogistic(u3, scatteredS(b, spread), -kPi, kPi);
+    else if (p < kPMax)
+        dphi = Phi(p, b.gammaO, gammaT) + sampleTrimmedLogistic(u3, b.s, -kPi, kPi);
+    else
+        dphi = 2.0 * kPi * u3;
+    const double phiI = phiO + dphi;
+
+    const V3 wi{sinThetaI, cosThetaI * cos(phiI), cosThetaI * sin(phiI)};
+    pdfOut = pdf(b, wo, wi);
+    fOut   = f(b, wo, wi);
+    return wi;
+}
+
+// Absorption from a target multiply-scattered reflectance (Chiang eq. 9).
+__device__ static double sigmaAFromReflectance(double c, double betaN) {
+    c = clampd(c, 1e-4, 1.0 - 1e-6);
+    const double bn = clampd(betaN, 1e-4, 1.0);
+    const double d = 5.969 - 0.215 * bn + 2.532 * sqr(bn) - 10.73 * pow(bn, 3.0) +
+                     5.574 * pow(bn, 4.0) + 0.245 * pow(bn, 5.0);
+    return sqr(log(c) / d);
+}
+
+// --- Hooking the model to a hit (device twins of hair.h's frame helpers) -------
+// Impact parameter h = sin(gamma_o), signed about the fiber axis, recovered from the
+// outward normal + tangent the curve intersector wrote. Guard threshold is 1e-7 (not
+// the CPU's 1e-12): the hit data is Real precision, so below ~1e-7 the perpendicular
+// components are float noise and "exactly end-on" (h = 0) is the honest answer.
+__device__ static double hFromHit(const DVec3& n, const DVec3& tangent, const DVec3& wo) {
+    const DVec3 ax = normalize(tangent);
+    DVec3 nPerp = n  - ax * dot(ax, n);
+    DVec3 oPerp = wo - ax * dot(ax, wo);
+    const Real nl = length(nPerp), ol = length(oPerp);
+    if (nl < (Real)1e-7 || ol < (Real)1e-7) return 0.0;   // end-on: axis degenerate
+    nPerp = nPerp * ((Real)1 / nl);
+    oPerp = oPerp * ((Real)1 / ol);
+    const double cosGamma = clampd((double)dot(nPerp, oPerp), -1.0, 1.0);
+    const double sign = ((double)dot(cross(nPerp, oPerp), ax) < 0.0) ? -1.0 : 1.0;
+    return sign * safeSqrt(1.0 - sqr(cosGamma));
+}
+
+// World <-> local fiber frame; x = tangent, y built from the surface normal so the
+// frame is continuous around the fiber.
+struct Frame { DVec3 x, y, z; };
+
+__device__ static Frame frameFromHit(const DVec3& n, const DVec3& tangent) {
+    Frame fr;
+    fr.x = normalize(tangent);
+    DVec3 yy = n - fr.x * dot(fr.x, n);
+    const Real yl = length(yy);
+    if (yl > (Real)1e-7) {
+        fr.y = yy * ((Real)1 / yl);
+    } else {                                  // degenerate: any perpendicular will do
+        DVec3 t, bt; onb(fr.x, t, bt); fr.y = t;
+    }
+    fr.z = cross(fr.x, fr.y);
+    return fr;
+}
+
+__device__ static inline V3 toLocal(const Frame& fr, const DVec3& w) {
+    return V3{(double)dot(w, fr.x), (double)dot(w, fr.y), (double)dot(w, fr.z)};
+}
+__device__ static inline DVec3 toWorld(const Frame& fr, const V3& w) {
+    return fr.x * (Real)w.x + fr.y * (Real)w.y + fr.z * (Real)w.z;
+}
+
+}  // namespace dhair
+
+// Everything needed to evaluate or sample the fiber BCSDF at one hit, for one
+// wavelength — device twin of hair_shade.h's HairShade. No `aggregate` flag: the
+// fur-volume tier is CPU-only, so a device fiber is always a real BVH strand.
+struct DHairShade {
+    dhair::Bcsdf b;
+    dhair::Frame fr;
+    dhair::V3    woLocal;   // the direction the path ARRIVED from, in the fiber frame
+    Real         radius;    // world fiber radius at the hit (0 = not on a strand)
+};
+
+// Forward declaration: dHairShadeAt's from-reflectance path reads the material's diffuse
+// reflectance (textures/patterns/records included); dDiffuseRho is defined further down
+// with the texture helpers.
+__device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda);
+
+// Build the BCSDF at a hit — device twin of hairShadeAt. `wPrev` points away from the
+// surface, back along the path that got here (toward the light for the forward tracer,
+// toward the eye for the backward one); it is the reference direction h is measured from.
+__device__ __noinline__ static DHairShade dHairShadeAt(const DScene& sc, const DMaterial& m,
+                                          const DHit& h,   // __noinline__: see dhair::f
+                                          Real lambda, const DVec3& wPrev) {
+    dhair::Params pr;
+    pr.eta   = m.hairEta;
+    pr.betaM = m.hairBetaM;
+    pr.betaN = m.hairBetaN;
+    pr.alpha = m.hairAlpha;
+    pr.kappa = m.hairKappa;
+    pr.mG    = m.hairMedullaG;
+    pr.mSigmaS = fmax(0.0, (double)specLookup(m.hairMedullaSigmaS, lambda));
+    pr.mSigmaA = fmax(0.0, (double)specLookup(m.hairMedullaSigmaA, lambda));
+
+    double sigmaA;
+    if (m.hairSigmaAFromReflect) {
+        // Chiang eq. 9 per-wavelength: invert the authored reflectance (via dDiffuseRho,
+        // so textures/patterns/records tint the fiber) into the absorption producing it.
+        double c = (double)dDiffuseRho(sc, m, h, lambda);
+        c = c < 0.0 ? 0.0 : (c > 1.0 ? 1.0 : c);
+        sigmaA = dhair::sigmaAFromReflectance(c, m.hairBetaN);
+    } else {
+        sigmaA = fmax(0.0, (double)specLookup(m.hairSigmaA, lambda));
+    }
+
+    DHairShade s;
+    // h.n is oriented against the arriving ray, so it is the normal on the side the path
+    // came from — the side h and gamma_o are defined from.
+    s.fr      = dhair::frameFromHit(h.n, h.tangent);
+    s.woLocal = dhair::toLocal(s.fr, wPrev);
+    s.b       = dhair::make(pr, dhair::hFromHit(h.n, h.tangent, wPrev), sigmaA);
+    s.radius  = h.fiberRadius;
+    return s;
+}
+
+// The complete "BCSDF times projection" factor toward a world direction: for a fiber the
+// projection is the LONGITUDINAL cosine sqrt(1 - w_x^2), not dot(n, w) — a round strand's
+// projected width is the same from every azimuth (see hair_shade.h's header comment).
+__device__ static inline Real dHairFCos(const DHairShade& s, const DVec3& wWorld) {
+    const dhair::V3 wl = dhair::toLocal(s.fr, wWorld);
+    const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
+    return (Real)(dhair::f(s.b, s.woLocal, wl) * cosLong);
+}
+
+// How far a connection or scattered ray must step to clear the strand's own body: TT/TRT
+// exit the FAR side of a solid tube, so leaving against the arrival-side normal steps
+// 2.5 radii (or the ordinary RAY_EPS when that is larger — float-safe floor).
+__device__ static inline Real dHairExitOffset(const DHairShade& s, const DVec3& n, const DVec3& w) {
+    if (dot(n, w) >= (Real)0) return RAY_EPS;        // leaving on the arrival side
+    return fmax(RAY_EPS, (Real)2.5 * s.radius);
+}
+
+// Fiber (D_HAIR) twin of connect(): mode-B pinhole splat from a hair vertex. Mirrors the
+// CPU connectGeom/connect `hs` branches (render.h): the projection is folded into
+// dHairFCos (cosSurf, the Veach corr and the terminator stG are all exactly 1 — the fiber
+// does not use its normal as a projection axis); TT transmits, so a camera BEHIND the
+// shading normal is a legitimate, often bright connection (no horizon reject); and the
+// shadow ray starts past the strand's own body (dHairExitOffset), or the tube would
+// occlude its own transmitted lobe.
+__device__ static void connectHair(const DScene& sc, const DCamera& cam, double* film, double* hits,
+                                   const DVec3& p, const DVec3& n, const DHairShade& hs,
+                                   Real lambda, Real beta, DRng& rng) {
+    DVec3 toCam = cam.eye - p;
+    Real dist = length(toCam);
+    DVec3 wdir = toCam / dist;
+    int px, py; Real cosCam, dist2;
+    if (!cam.project(p, px, py, cosCam, dist2)) return;
+    const Real off = dHairExitOffset(hs, n, wdir);
+    if (off >= dist) return;
+    if (occluded(sc, p + wdir * off, wdir, dist - off - RAY_EPS)) return;
+    Real f = dHairFCos(hs, wdir);
+    double solidAngle = cam.pixelSolidAngle(cosCam);
+    Real contrib = beta * f / (Real)((double)dist2 * solidAngle);
+    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
+}
+// Fiber (D_HAIR) twin of connectLens(): model-A finite-lens next-event splat from a hair
+// vertex. fcos = PI * dHairFCos — the BCSDF's 1/pi convention meets the pupil pdf's
+// pi R^2 (see CPU connectLens); corr and stG are 1, and there is no horizon reject.
+__device__ static void connectLensHair(const DScene& sc, const DCamera& cam, double* film, double* hits,
+                                       const DVec3& p, const DVec3& n, const DHairShade& hs,
+                                       Real lambda, Real beta, DRng& rng) {
+    Real R  = (Real)cam.apertureR;
+    Real rr = R * sqrt(rng.uniform());
+    Real a  = (Real)(2.0 * DPI) * rng.uniform();
+    DVec3 A = cam.eye + cam.u * (rr * cos(a)) + cam.v * (rr * sin(a));
+    DVec3 toA = A - p;
+    Real dist = length(toA);
+    if (dist < (Real)1e-9) return;
+    DVec3 wdir = toA / dist;
+    Real cosLens = -dot(wdir, cam.w);                // cosine at the lens (w faces scene)
+    if (cosLens <= (Real)1e-6) return;               // not heading toward the film
+    int px, py;
+    if (!cam.lensImage(A, wdir, px, py)) return;
+    const Real off = dHairExitOffset(hs, n, wdir);
+    if (off >= dist) return;
+    if (occluded(sc, p + wdir * off, wdir, dist - off - RAY_EPS)) return;
+    Real fcos = (Real)DPI * dHairFCos(hs, wdir);
+    Real contrib = beta * fcos * cosLens * (R * R) / (dist * dist);
+    // Same flux -> film-irradiance normaliser as connectLens (see there).
+    contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
+    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
+}
+
 // A set of cameras sharing ONE photon trace (the multi-camera forward pass). The
 // forward tracer only ever SPLATS to a camera (project/connect); it never generates
 // camera rays, so a single photon path can deposit into every camera at once — the
@@ -3668,6 +4342,17 @@ __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int 
     for (int c = 0; c < cs.nCam; ++c) {
         if (camMode == CAM_B) connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
         else if (camMode == CAM_A) connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
+    }
+}
+// Fiber (D_HAIR) analogue of splatSurfaceAll — device twin of Renderer::camSplatAllHair.
+// The BCSDF and its projection arrive together in `hs`, so there is no rho/wi/ng: the
+// fiber takes neither the Lambertian rho nor the Veach shading-normal correction.
+__device__ static void splatSurfaceAllHair(const DScene& sc, const DCamSet& cs, int camMode,
+                                           const DVec3& p, const DVec3& n, const DHairShade& hs,
+                                           Real lambda, Real beta, DRng& rng) {
+    for (int c = 0; c < cs.nCam; ++c) {
+        if (camMode == CAM_B) connectHair(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, hs, lambda, beta, rng);
+        else if (camMode == CAM_A) connectLensHair(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, hs, lambda, beta, rng);
     }
 }
 // Append a photon record at a diffuse / translucent vertex (device twin of
@@ -4256,6 +4941,17 @@ __device__ static int dWrapIndex(int i, int n, int wrap) {
 // (v flipped so v=0 is the image bottom) then evaluate the sigmoid. The exact
 // device twin of Texture::reflectanceAt (nearest + bilinear filtering).
 __device__ static Real dTexReflAt(const DTexture& tx, Real u, Real v, Real lambda) {
+    if (tx.stoch.on && tx.gaussRgb && tx.jhLut) {   // O7 — twin of Texture::reflectanceAt
+        // Blend the three crops in linear RGB — the same planes, lattice and weights the
+        // raster preview uses — then convert that colour to a spectrum through the shared
+        // LUT. See stochtile.h for why this is not done in coefficient space.
+        double c[3];
+        stochSample(tx.stoch, tx.gaussRgb, tx.lutRgb, 3, tx.w, tx.h, tx.filter,
+                    (double)u, (double)v, c);
+        double cs[3];
+        stochJhCoeff(tx.jhLut, c[0], c[1], c[2], cs);
+        return dReflAt(cs, lambda);
+    }
     if (tx.filter == 0) {   // Nearest
         int x = dWrapIndex((int)floor((double)u * tx.w), tx.w, tx.wrap);
         int y = dWrapIndex((int)floor((1.0 - (double)v) * tx.h), tx.h, tx.wrap);
@@ -4301,6 +4997,12 @@ __device__ static Real dTexReflTriplanar(const DTexture& tx, const DVec3& p, con
 // maps (roughness, film thickness, §9.4). v flipped so v=0 is the image bottom.
 __device__ static double dTexScalarAt(const DTexture& tx, Real u, Real v) {
     if (!tx.gray) return 0.5;
+    if (tx.stoch.on && tx.gaussGray) {   // O7 — twin of Texture::scalarAt's branch
+        double o[1];
+        stochSample(tx.stoch, tx.gaussGray, tx.lutGray, 1, tx.w, tx.h, tx.filter,
+                    (double)u, (double)v, o);
+        return o[0];
+    }
     if (tx.filter == 0) {   // Nearest
         int x = dWrapIndex((int)floor((double)u * tx.w), tx.w, tx.wrap);
         int y = dWrapIndex((int)floor((1.0 - (double)v) * tx.h), tx.h, tx.wrap);
@@ -4326,6 +5028,15 @@ __device__ inline double DTexture::patScalarAt(double u, double v) const {
 // the linear RGB, remaps [0,1]->[-1,1], normalizes. v flipped so v=0 is image bottom.
 __device__ static DVec3 dTexNormalAt(const DTexture& tx, Real u, Real v) {
     if (!tx.rgb) return DVec3{(Real)0, (Real)0, (Real)1};
+    if (tx.stoch.on && tx.gaussRgb) {   // O7 — the host reaches this via sampleRgb
+        double o[3];
+        stochSample(tx.stoch, tx.gaussRgb, tx.lutRgb, 3, tx.w, tx.h, tx.filter,
+                    (double)u, (double)v, o);
+        DVec3 n{(Real)(2.0 * o[0] - 1.0), (Real)(2.0 * o[1] - 1.0), (Real)(2.0 * o[2] - 1.0)};
+        Real l = (Real)sqrt((double)(n.x * n.x + n.y * n.y + n.z * n.z));
+        return (l > (Real)1e-12) ? DVec3{n.x / l, n.y / l, n.z / l}
+                                 : DVec3{(Real)0, (Real)0, (Real)1};
+    }
     auto texel = [&](int x, int y) -> DVec3 {
         size_t o = ((size_t)y * tx.w + x) * 3;
         return DVec3{(Real)tx.rgb[o], (Real)tx.rgb[o + 1], (Real)tx.rgb[o + 2]};
@@ -4436,6 +5147,13 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
             // field path builds its PatCtx with curv = 0 too).
             case PatOp::VarCurv:  st[sp++] = 0.0f; break;
             case PatOp::VarCavity: st[sp++] = 0.0f; break;
+            // `fw` (O8 stage 2) is 0 here for a second, stronger reason: a field formula
+            // is evaluated at march samples along a ray, not at a shading point, so there
+            // is no footprint to speak of — and 0 means "unknown", i.e. fnoise() runs
+            // unfiltered, which is what the sphere-tracer needs (a filtered SDF would
+            // round off the very detail the march is trying to find, and would make the
+            // distance bound non-conservative at grazing angles).
+            case PatOp::VarFootprint: st[sp++] = 0.0f; break;
             case PatOp::VarT:     st[sp++] = 0.0f; break;
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = fabsf(st[sp-1]); break;
@@ -4502,6 +5220,20 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                            (double)ff, (double)dx, (double)dy, (double)dz);
                 break;
             }
+            case PatOp::FNoise: {  // filtered fBm (double core): promote / demote like PovFn
+                float oc = st[--sp], ww = st[--sp], zz = st[--sp], yy = st[--sp];
+                st[sp-1] = (float)patFilteredNoise((double)st[sp-1], (double)yy, (double)zz,
+                                                   (double)ww, (double)oc);
+                break;
+            }
+            case PatOp::BlueNoise: {  // Poisson-disk placement (double core): promote / demote
+                float rr = st[--sp], zz = st[--sp], yy = st[--sp];
+                double b[3];
+                patBlueNoise((double)st[sp-1], (double)yy, (double)zz, (double)rr, b);
+                int sel = (int)nd.a;
+                st[sp-1] = (float)((sel == 3) ? b[2] : (sel == 2) ? (b[1] - b[0]) : b[sel]);
+                break;
+            }
             case PatOp::PovFn: {   // POV internals are double-only: promote args, demote result
                 int id = (int)nd.a;
                 int na = povFnArity(id);
@@ -4558,7 +5290,7 @@ __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit&
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), dPatEnvOf(sc));
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
 }
 
 // Fritsch-Carlson monotone-cubic tangent at node k (device twin of recFCTangent).
@@ -4578,7 +5310,7 @@ __device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, 
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), dPatEnvOf(sc));
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
 }
 // Sample a scalar record channel at driver position `d` (device twin of recSampleScalar):
 // evaluate each stop's per-hit expression, then interpolate by the record's interp mode.
@@ -4625,14 +5357,14 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
     if (m.recRoughMode == 0) {                             // direct scalar expression
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h),
+                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
                          dPatEnvOf(sc));
     } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
         v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
     } else {                                               // per-hit driven
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h),
+                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
                                 dPatEnvOf(sc));
         v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
                              m.recRoughInterp, h, d);
@@ -4734,7 +5466,7 @@ __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
-                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h),
+                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
                             dPatEnvOf(sc));
     out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
                      (double)m.recReflLo, (double)m.recReflHi, d, lambda);
@@ -4814,7 +5546,7 @@ __device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
     double px = y.x, py = y.y, pz = y.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return clamp01(dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                                nOut.x, nOut.y, nOut.z, r, uu, vv, 0.0, 0.0, dPatEnvOf(sc)));
+                                nOut.x, nOut.y, nOut.z, r, uu, vv, 0.0, 0.0, 0.0, dPatEnvOf(sc)));
 }
 
 // Draw a point on `em` and return the emission-pattern multiplier there, so a caller can
@@ -5081,6 +5813,49 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     return true;
 }
 
+// Fiber (D_HAIR) interaction — the body of interactSpecular's hair branch, split out
+// and explicitly __noinline__. NOT a style choice: the BCSDF works in double precision
+// through a fat frame (DHairShade = fiber frame + Bcsdf + the dhair::sample locals),
+// and inlined into interactSpecular those locals would merge into the shared
+// shadeStep/traceHeroPhoton frames, permanently inflating every kernel's
+// statically-computed MIN_STACK — which the driver reserves per thread × ~200k
+// resident threads of VRAM on every launch, hair scene or not. As a separate call
+// frame the bytes are only on the stack during an actual hair hit, and MIN_STACK
+// grows by max(hair chain, other chains) instead of their sum.
+//
+// Fiber BCSDF (Marschner/Chiang + Yan medulla; dhair above). It routes through
+// interactSpecular rather than beside Diffuse because, like the dielectric family, it
+// is wavelength-COUPLED: sigma_a is per-λ and an authored reflectance is inverted
+// per-λ, so the hero tracer de-heroes onto this path. The interaction is a
+// connect-then-scatter, like Fluorescent: the lobes are narrow but finite, so the
+// vertex IS visible to a mode-A/B camera and must splat before it scatters.
+// Device twin of the CPU MatType::Hair case (render.h).
+__device__ __noinline__ static int interactHair(const DScene& sc, const DCamSet& cs,
+        int camMode, const DMaterial& m, const DHit& h,
+        DVec3& ro, DVec3& rd, Real beta, Real lambda, DRng& rng, double& eAbsorbed) {
+    const DVec3 wPrev = -rd;                       // toward the light-side vertex
+    const DHairShade hs = dHairShadeAt(sc, m, h, lambda, wPrev);
+    if (camMode == CAM_A || camMode == CAM_B)
+        splatSurfaceAllHair(sc, cs, camMode, h.p, h.n, hs, lambda, beta, rng);
+
+    const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
+    double pdf = 0.0, fv = 0.0;
+    const dhair::V3 wl = dhair::sample(hs.b, hs.woLocal, u0, u1, u2, u3, pdf, fv);
+    if (!(pdf > 0.0) || !(fv > 0.0)) { eAbsorbed += beta; return WF_TERMINATE; }
+    // fv*cosLong/pdf is EXACTLY T = sum_p A_p <= 1 (the total Fresnel/Beer
+    // attenuation over the lobes — per-lobe pdf weights are A_p/T and everything
+    // else cancels), so Russian-roulette on it and leave beta untouched: the same
+    // trick Mirror plays with its reflectance, but the number is the physics.
+    const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
+    double T = fv * cosLong / pdf; T = T < 0.0 ? 0.0 : (T > 1.0 ? 1.0 : T);
+    if ((double)rng.uniform() >= T) { eAbsorbed += beta; return WF_TERMINATE; }
+    const DVec3 wo = dhair::toWorld(hs.fr, wl);
+    // TT and TRT leave through the FAR side of a real solid strand, so step clear
+    // of the tube's own body (dHairExitOffset); near side is the ordinary RAY_EPS.
+    ro = h.p + wo * dHairExitOffset(hs, h.n, wo); rd = wo;
+    return WF_CONTINUE;   // beta unchanged (RR carried the weight)
+}
+
 // Specular / wavelength-switching material interaction (the nine families that are NOT
 // Diffuse / DiffuseTransmit): Dielectric, ThinFilm, Multilayer, Mirror, Grating,
 // HalfMirror, Filter, Glossy, Fluorescent. Split out of shadeStep so BOTH the scalar
@@ -5170,8 +5945,12 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         { DVec3 wo = cosineHemisphere(h.n, rng);
           beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
           ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
+    } else if (m.type == D_HAIR) {
+        // Split out (__noinline__) so its fat double-precision frame is only paid on an
+        // actual hair hit — see the comment on interactHair.
+        return interactHair(sc, cs, camMode, m, h, ro, rd, beta, lambda, rng, eAbsorbed);
     }
-    return WF_CONTINUE;   // unreachable: caller dispatches only the nine specular types
+    return WF_CONTINUE;   // unreachable: caller dispatches only the specular types
 }
 
 // Advance a photon by one bounce given its precomputed intersection `h`. Mutates
@@ -5292,8 +6071,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     const DMaterial& m = *mptr;
     if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER ||
         m.type == D_MIRROR || m.type == D_GRATING || m.type == D_HALFMIRROR ||
-        m.type == D_FILTER || m.type == D_GLOSSY || m.type == D_FLUORESCENT) {
-        // The nine specular / wavelength-switching lobes — shared with the hero tracer.
+        m.type == D_FILTER || m.type == D_GLOSSY || m.type == D_FLUORESCENT ||
+        m.type == D_HAIR) {
+        // The specular / wavelength-switching lobes (+ the fiber BCSDF, which is
+        // wavelength-coupled like them) — shared with the hero tracer.
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
                                 ro, rd, beta, lambda, rng, eAbsorbed, stk);
     } else if (m.type == D_DIFFUSETRANSMIT) {
@@ -5655,9 +6436,13 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     }
 
     if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER ||
-        m.type == D_GRATING || m.type == D_HALFMIRROR || m.type == D_FLUORESCENT) {
+        m.type == D_GRATING || m.type == D_HALFMIRROR || m.type == D_FLUORESCENT ||
+        m.type == D_HAIR) {
         // Dispersive / wavelength-switching: terminate secondaries, boost the hero ×C, then
-        // run the shared scalar interaction on the (now single-λ) hero channel.
+        // run the shared scalar interaction on the (now single-λ) hero channel. Hair rides
+        // here because its sigma_a (and the reflectance→absorption inversion) is per-λ, so
+        // one fiber interaction cannot be shared across C wavelengths — matching the CPU
+        // tracePhotonHero, which de-heroes onto the scalar MatType::Hair path.
         beta[0] *= (Real)C; secAlive = false;
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
                                 ro, rd, beta[0], lam[0], rng, eAbsorbed, stk);
@@ -6503,8 +7288,31 @@ struct BkNeeGeom {
 __device__ static bool dEmitterNeedsUV(const DEmitter& em) {
     return !em.collimated && em.shape != 2;
 }
+// Hair-fiber NEE response + shadow ray (device twins of the `hs` branches inside
+// backward.h emitterGeom's `response` / `blocked` lambdas). A fiber has no hemisphere:
+// the response is the full-sphere PI * f_hair * cosLong (the PI cancels neeLight's
+// Lambertian 1/PI; callers pass rho = 1) with the shadow-terminator gate forced to 1,
+// and the shadow ray starts from the BCSDF exit offset along wi ITSELF — a normal-offset
+// origin would still sit inside the fiber's own thickness for far-side (TT) exits.
+__device__ static bool bkHairResponse(const DHairShade& hsv, const DVec3& wi,
+                                      Real& cosSurf, Real& stG) {
+    cosSurf = (Real)DPI * dHairFCos(hsv, wi);
+    stG = (Real)1;
+    return cosSurf > (Real)0;
+}
+__device__ static bool bkHairBlocked(const DScene& sc, const DHit& h, const DHairShade& hsv,
+                                     const DVec3& wi, Real d) {
+    const Real off = dHairExitOffset(hsv, h.n, wi);
+    const Real len = d - off - RAY_EPS;
+    if (len <= (Real)0) return true;
+    return occluded(sc, h.p + wi * off, wi, len);
+}
+// `hs` non-null = the shading vertex is a hair fiber: swap the cosine/terminator response
+// and the surface-offset shadow ray for the hair versions above (all remaining geometry —
+// point sampling, falloff, cosLight, 1/dist^2 — is shared). No rng draw moves either way.
 __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec3& ngo,
-                                     const DEmitter& em, Real su1, Real su2, BkNeeGeom& g) {
+                                     const DEmitter& em, Real su1, Real su2, BkNeeGeom& g,
+                                     const DHairShade* hs = nullptr) {
     if (em.shape == 2) {
         // Point spot (device twin of emitterGeom's spot branch): deterministic connect
         // to the light point, cone falloff toward the surface, no rng draw. Peak
@@ -6513,13 +7321,18 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.dist2 = dot(toL, toL);
         g.dist  = sqrt(g.dist2);
         g.wi = toL / g.dist;
-        g.cosSurf = dot(h.n, g.wi);
-        if (g.cosSurf <= (Real)0) return false;
-        g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
-        if (g.stG <= (Real)0) return false;
+        if (hs) {
+            if (!bkHairResponse(*hs, g.wi, g.cosSurf, g.stG)) return false;
+        } else {
+            g.cosSurf = dot(h.n, g.wi);
+            if (g.cosSurf <= (Real)0) return false;
+            g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
+            if (g.stG <= (Real)0) return false;
+        }
         g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
         if (g.fall <= (Real)0) return false;
-        if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
+        if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
+               : occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
         g.G = (Real)0; g.spot = true; g.sun = false;
         return true;
     }
@@ -6530,13 +7343,18 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         // the whole λ-independent weight is cosSurf/pdfW = cosSurf*Omega. Two sample
         // coordinates, matching the area path (see dEmitterNeedsUV).
         g.wi = dSunSampleCone(em, em.beamDir * (Real)(-1), (double)su1, (double)su2);
-        g.cosSurf = dot(h.n, g.wi);
-        if (g.cosSurf <= (Real)0) return false;
-        g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
-        if (g.stG <= (Real)0) return false;
+        if (hs) {
+            if (!bkHairResponse(*hs, g.wi, g.cosSurf, g.stG)) return false;
+        } else {
+            g.cosSurf = dot(h.n, g.wi);
+            if (g.cosSurf <= (Real)0) return false;
+            g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
+            if (g.stG <= (Real)0) return false;
+        }
         g.dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
         g.dist2 = g.dist * g.dist;
-        if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist)) return false;
+        if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
+               : occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist)) return false;
         g.wSun = (Real)((double)g.cosSurf * em.spotOmega * (double)g.stG);
         g.G = (Real)0; g.fall = (Real)1; g.spot = false; g.sun = true;
         return true;
@@ -6553,17 +7371,22 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     g.dist2 = dot(toL, toL);
     g.dist = sqrt(g.dist2);
     g.wi = toL / g.dist;
-    g.cosSurf = dot(h.n, g.wi);
-    if (g.cosSurf <= 0) return false;
-    // Geometric-hemisphere softening (matches CPU backward.h neeLight): the light must lie
-    // on the geometric front side too, ramped smoothly instead of a hard cutoff (Chiang
-    // 2019). No-op when h.n==h.ng (flat tris / analytic spheres, stG==1); shadow ray offset
-    // along the geometric normal so it clears the true surface.
-    g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
-    if (g.stG <= (Real)0) return false;
+    if (hs) {
+        if (!bkHairResponse(*hs, g.wi, g.cosSurf, g.stG)) return false;
+    } else {
+        g.cosSurf = dot(h.n, g.wi);
+        if (g.cosSurf <= 0) return false;
+        // Geometric-hemisphere softening (matches CPU backward.h neeLight): the light must lie
+        // on the geometric front side too, ramped smoothly instead of a hard cutoff (Chiang
+        // 2019). No-op when h.n==h.ng (flat tris / analytic spheres, stG==1); shadow ray offset
+        // along the geometric normal so it clears the true surface.
+        g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
+        if (g.stG <= (Real)0) return false;
+    }
     Real cosLight = dot(nL, -g.wi);               // light is one-sided
     if (cosLight <= 0) return false;
-    if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
+    if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
+           : occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
     g.G = g.cosSurf * cosLight / g.dist2;
     if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
     g.fall = (Real)1; g.spot = false; g.sun = false;
@@ -6574,9 +7397,12 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
 // vertex (the coarser bkGiGrid — its soft-shadow detail is about to be averaged over giDirs
 // directions anyway, so paying bkGrid^2 there multiplies the gather's cost for no return).
 // Ignored unless sc.bkWhitted.
+// `hs` non-null = hair-fiber vertex: the caller passes rho = 1 and bkEmitterGeom swaps in
+// the PI*hairFCos response, so f * w collapses to f_hair * cosLong * (light geometry) —
+// the exact CPU neeLight convention (backward.h).
 __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                                     double invPdfLambda, Real lambda, DRng& rng,
-                                    int giDepth = 0) {
+                                    int giDepth = 0, const DHairShade* hs = nullptr) {
     double total = 0.0;
     Real f = rho / (Real)DPI;                         // Lambertian BRDF
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
@@ -6598,7 +7424,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
             if (whitted) { if (uv) dGridUV(s, G, u1, u2); }
             else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
             BkNeeGeom g;
-            if (!bkEmitterGeom(sc, h, ngo0, em, u1, u2, g)) continue;
+            if (!bkEmitterGeom(sc, h, ngo0, em, u1, u2, g, hs)) continue;
             double contrib = g.sun
                 ? (double)(f * g.wSun) * emitW
                 : g.spot
@@ -6742,7 +7568,8 @@ struct BkEnvGeom {
     double wMis;      // balance heuristic vs. the cosine-sampled continuation
     double farDist;   // shadow-ray length to the scene exit
 };
-__device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkEnvGeom& g) {
+__device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkEnvGeom& g,
+                                 const DHairShade* hs = nullptr) {
     // Sample an incoming env direction: image env importance-samples the luminance CDF
     // (dEnvSample gives dir + solid-angle pdfW), constant env is uniform on the sphere
     // (pdf 1/4pi). Both draw exactly two uniforms in the same order as the CPU
@@ -6757,6 +7584,22 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
         g.wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
         g.pdfW = 1.0 / (4.0 * DPI);
     }
+    if (hs) {
+        // Hair fiber (device twin of backward.h envGeom's hs branch): full-sphere response
+        // PI*hairFCos with stG = 1 (a fiber has no hemisphere or terminator), shadow ray
+        // from the fiber exit offset with the FULL farDist length, and the MIS counterpart
+        // is the hair BCSDF's own pdf for wi rather than the cosine hemisphere — the
+        // continuation this NEE sample competes against is dhair::sample.
+        g.cosSurf = (Real)DPI * dHairFCos(*hs, g.wi);
+        if (!(g.cosSurf > (Real)0)) return false;
+        g.stG = (Real)1;
+        g.farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
+        const Real off = dHairExitOffset(*hs, h.n, g.wi);
+        if (occluded(sc, h.p + g.wi * off, g.wi, (Real)g.farDist)) return false;
+        const double pdfBsdf = dhair::pdf(hs->b, hs->woLocal, dhair::toLocal(hs->fr, g.wi));
+        g.wMis = g.pdfW / (g.pdfW + pdfBsdf);
+        return true;
+    }
     g.cosSurf = dot(h.n, g.wi);
     if (g.cosSurf <= (Real)0) return false;                 // below the shading horizon
     DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
@@ -6770,10 +7613,11 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
 }
 
 __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
-                                  double invPdfLambda, Real lambda, DRng& rng) {
+                                  double invPdfLambda, Real lambda, DRng& rng,
+                                  const DHairShade* hs = nullptr) {
     if (sc.envIndex < 0) return 0.0;
     BkEnvGeom g;
-    if (!bkEnvGeom(sc, h, rng, g)) return 0.0;
+    if (!bkEnvGeom(sc, h, rng, g, hs)) return 0.0;
     double Lenv = (sc.env.scale != nullptr) ? dEnvRadiance(sc.env, g.wi, lambda)
                                             : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
     if (Lenv <= 0.0) return 0.0;
@@ -6877,6 +7721,53 @@ __device__ static void bkGiGatherHero(const DScene& sc, int diffraction, const D
                                       const Real* rho, double* L, const double* thr,
                                       const Real* lam, const double* invPdf, int nUp,
                                       DRng& rng, DGiCtx gi);
+
+// Backward hair-fiber interaction — the body of bkInteract's D_HAIR case, split out and
+// explicitly __noinline__ for the same reason as the forward interactHair (see its
+// comment): inlined, the double-precision DHairShade/dhair locals would merge into the
+// shared bkInteract/bkRadiance frames and permanently inflate kBackward's MIN_STACK
+// (driver-reserved per thread × ~200k resident threads, hair scene or not). As a
+// separate frame the bytes are live only during a hair hit. Plain function (not a
+// template): hair never gathers, so one instantiation serves bkInteract<false>/<true>.
+//
+// Hair fiber BCSDF (device twin of backward.h MatType::Hair). NEE runs with rho = 1:
+// bkEmitterGeom / bkEnvGeom swap the surface cosine for the full-sphere PI*hairFCos
+// response, so neeLight's f = rho/PI times that is exactly f_hair * cosLong * (light
+// geometry). (-dual-scatter hair scenes are gated to the CPU by backwardOnGpuOk, so
+// there is no dual-scatter path here.) Returns the bkInteract contract: true = path
+// continues (ro/rd set), false = terminated.
+__device__ __noinline__ static bool bkInteractHair(const DScene& sc, const DMaterial& m,
+        const DHit& h, bool directOnly, bool whitted,
+        DVec3& ro, DVec3& rd, Real lambda, double invPdfLambda,
+        double& thr, double& L, bool& specularArrival,
+        double& contBsdfPdf, DRng& rng, int giDepth) {
+    const DVec3 wPrev = rd * (Real)(-1);
+    const DHairShade hsv = dHairShadeAt(sc, m, h, lambda, wPrev);
+    L += thr * bkNeeLight(sc, h, (Real)1, invPdfLambda, lambda, rng, giDepth, &hsv);
+    if (sc.envIndex >= 0)
+        L += thr * bkNeeEnv(sc, h, (Real)1, invPdfLambda, lambda, rng, &hsv);
+    if (directOnly) return false;             // mode W -direct: direct fiber light only
+    // Continuation: importance-sample the BCSDF. Named u's — C++ leaves argument
+    // evaluation order unspecified, and these four MUST come off the stream in order.
+    const double u0 = rng.uniform(), u1 = rng.uniform(),
+                 u2 = rng.uniform(), u3 = rng.uniform();
+    double pdfH = 0.0, fv = 0.0;
+    const dhair::V3 wl = dhair::sample(hsv.b, hsv.woLocal, u0, u1, u2, u3, pdfH, fv);
+    if (!(pdfH > 0.0) || !(fv > 0.0)) return false;
+    // Survive with T = f*cosLong/pdf (= sum of lobe albedos when the sample is
+    // exact), throughput otherwise unchanged — the same analog RR as the CPU and
+    // the forward tracer. Mode W carries T as weight instead of flipping the coin.
+    const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
+    double T = fv * cosLong / pdfH; T = T < 0.0 ? 0.0 : (T > 1.0 ? 1.0 : T);
+    if (whitted) { if (!dWhittedAttenuate(thr, T)) return false; }
+    else if ((double)rng.uniform() >= T) return false;
+    const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
+    contBsdfPdf = pdfH;                       // env-escape MIS vs the hair pdf
+    ro = h.p + wOut * dHairExitOffset(hsv, h.n, wOut);
+    rd = wOut;
+    specularArrival = false;                  // NEE covered direct light here
+    return true;
+}
 
 // Handle ONE surface material interaction on a single wavelength — the whole material
 // switch, factored out of bkRadiance (device twin of backward.h interactMaterial) so the
@@ -7099,6 +7990,12 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             }
             return false;                                                     // absorbed / terminated
         }
+        case D_HAIR:
+            // Split out (__noinline__) so its fat double-precision frame is only paid
+            // on an actual hair hit — see the comment on bkInteractHair.
+            return bkInteractHair(sc, *mp, h, directOnly, whitted, ro, rd, lambda,
+                                  invPdfLambda, thr, L, specularArrival, contBsdfPdf,
+                                  rng, gi.depth);
         case D_DIFFUSE:
         default: {
             Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
@@ -7168,6 +8065,12 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // below then samples along the post-bend straight segment, matching the CPU order.
         if (sc.hasGrin) dGrinMarch(sc, ro, rd);
         DHit h = closestHit(sc, ro, rd);
+        // O8 stage 2: stamp the shading footprint on the CAMERA SEGMENT only (host twin:
+        // backward.h radiance()). A secondary bounce would need ray differentials /
+        // cones to know how much its own footprint spread, so it keeps fw = 0
+        // (= unknown = unfiltered) rather than reusing the primary's number.
+        if (b == 0 && gi.depth == 0 && h.valid)
+            h.fw = (Real)patShadingFootprint(sc.bkFwPerDist, (double)h.t, (double)dot(rd, h.n));
         Real dSurf = h.valid ? h.t : (Real)1e30;
         // Participating media: sample a free-flight collision (superposition over all
         // media — homogeneous = exact free-flight, heterogeneous = Woodcock/delta
@@ -7340,6 +8243,11 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         int nUp = secAlive ? C : 1;                    // wavelengths still being propagated
         gi.bounce = b;                                 // see the scalar twin: mode W's per-vertex lattice
         DHit h = closestHit(sc, ro, rd);
+        // O8 stage 2 footprint, camera segment only — see the scalar twin. The test is
+        // `b == 0`, NOT `b == bounce0`: a heroSplit re-entry resumes at a DEEPER bounce,
+        // and that sub-path's first vertex is not a camera vertex.
+        if (b == 0 && gi.depth == 0 && h.valid)
+            h.fw = (Real)patShadingFootprint(sc.bkFwPerDist, (double)h.t, (double)dot(rd, h.n));
 
         // Beer-Lambert over the in-glass segment. A non-empty stack implies the bundle already
         // collapsed to one λ here (a dielectric entry either de-heros or splits, and the split
@@ -7515,10 +8423,12 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
             }
             case D_DIELECTRIC: case D_THINFILM: case D_MULTILAYER:
             case D_GRATING:    case D_HALFMIRROR:
-            case D_FLUORESCENT: {
+            case D_FLUORESCENT: case D_HAIR: {
                 // Dispersive / wavelength-switching: the outgoing direction (and, for a
                 // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
-                // cannot keep riding one shared direction past this interface.
+                // cannot keep riding one shared direction past this interface. Hair is
+                // λ-coupled too: σ_a(λ) steers the lobe-selection pdf, so its sampled
+                // direction cannot be shared across the bundle either.
                 if constexpr (AllowSplit) {
                 if (secAlive && nUp > 1) {
                     // SPLIT-AT-DISPERSION: fan out instead of de-hero'ing. Each secondary
@@ -11195,11 +12105,19 @@ bool cudaForwardSupported(const Scene& scene) {
         // CPU forward/backward fallback (like indexed palettes).
         if (matId >= 0 && matId < (int)scene.mats.size() &&
             scene.mats[matId].type == MatType::Layered) return true;
+        // The fiber BCSDF (MatType::Hair) runs on the device as of 0.181.0: the dhair
+        // namespace ports hair.h's single-fiber Marschner/Chiang + Yan-medulla model, the
+        // curve intersector fills DHit::fiberRadius/tangent, and shadeStep / bkRadiance
+        // have D_HAIR branches. Dual scattering and the fur aggregate volume are still
+        // CPU-only, but both are RENDER-OPTION gates (-dual-scatter / -fur-volume in
+        // main.cpp's backwardOnGpuOk), not scene-material properties, so no reject here.
         if (matId >= 0 && matId < (int)scene.mats.size() &&
             scene.mats[matId].type == MatType::Mix) {
             const Material& mx = scene.mats[matId];
             if ((int)mx.mixChildren.size() > D_MIXMAX) return true;
-            for (int c : mx.mixChildren) if (oversizedMultilayer(c) || usesRecord(c)) return true;
+            for (int c : mx.mixChildren)
+                if (oversizedMultilayer(c) || usesRecord(c))
+                    return true;
         }
         return false;
     };
@@ -11250,6 +12168,30 @@ bool cudaForwardSupported(const Scene& scene) {
     return true;
 }
 
+// Does any primitive bind a hair material (directly or as a Mix child)? The device
+// FORWARD and BACKWARD tracers shade hair (0.181.0), but the BDPT and photon-map
+// machinery does not: dBsdfF / dBsdfPdf / dRandomWalk / dConnectBDPT have no fiber
+// branch (a hair vertex needs the strand frame, the impact parameter and a non-cosine
+// connection response in the MIS densities), and the mode-M gather treats every query
+// surface as Lambertian. Those gates call this and fall back to their CPU twins.
+static bool sceneUsesHairMaterial(const Scene& scene) {
+    auto isHair = [&](int matId) {
+        if (matId < 0 || matId >= (int)scene.mats.size()) return false;
+        const Material& m = scene.mats[matId];
+        if (m.type == MatType::Hair) return true;
+        if (m.type == MatType::Mix)
+            for (int c : m.mixChildren)
+                if (c >= 0 && c < (int)scene.mats.size() &&
+                    scene.mats[c].type == MatType::Hair) return true;
+        return false;
+    };
+    for (const auto& t : scene.tris)       if (isHair(t.matId)) return true;
+    for (const auto& s : scene.spheres)    if (isHair(s.matId)) return true;
+    for (const auto& im : scene.implicits) if (isHair(im.matId)) return true;
+    for (const auto& cs : scene.curveSegs) if (isHair(cs.matId)) return true;
+    return false;
+}
+
 // Bake a Spectrum into a SPEC_N table over [DLMIN, DLMAX].
 static void bakeSpec(const Spectrum& s, double* tab) {
     for (int i = 0; i < SPEC_N; ++i) {
@@ -11288,6 +12230,13 @@ static void freeUpload(DUpload& up) {
 static void buildUploadScene(const Scene& scene, DUpload& up) {
     using namespace gpu;
     auto keep = [&](void* p) { if (p) up.frees.push_back(p); return p; };
+
+    // NOTE: no cudaLimitStackSize fiddling here, deliberately. The kernels' call
+    // graphs are kept statically acyclic (see the dhair Bessel comment) so nvlink can
+    // record a real per-kernel MIN_STACK_SIZE and the driver auto-reserves exactly
+    // that much per thread at launch — the mechanism the tracers have always relied
+    // on (they need 6–12 KB, far beyond the 1 KB cudaLimitStackSize default, which
+    // only matters as the fallback when MIN_STACK is undeterminable).
 
     // --- bake geometry ---
     // Convert one host Tri (already in its own space) into a device DTri. Shared by the
@@ -11643,6 +12592,22 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                 // (>64 stops: recRoughMode stays -1; cudaForwardSupported gates it to CPU.)
             }
         }
+        // --- hair fiber BCSDF (MatType::Hair) ---
+        // Baked unconditionally (the fields are defaults/zero spectra on every other
+        // type, and dHairShadeAt only reads them behind a D_HAIR dispatch). The
+        // from-reflectance inversion is NOT pre-baked: it depends on the diffuse rho at
+        // the hit (texture/pattern-driven), so the device inverts per-hit exactly like
+        // the CPU hairShadeAt.
+        d.hairEta      = m.hairEta;
+        d.hairBetaM    = m.hairBetaM;
+        d.hairBetaN    = m.hairBetaN;
+        d.hairAlpha    = m.hairAlpha;
+        d.hairKappa    = m.hairKappa;
+        d.hairMedullaG = m.hairMedullaG;
+        bakeSpec(m.hairSigmaA,        d.hairSigmaA);
+        bakeSpec(m.hairMedullaSigmaS, d.hairMedullaSigmaS);
+        bakeSpec(m.hairMedullaSigmaA, d.hairMedullaSigmaA);
+        d.hairSigmaAFromReflect = m.hairSigmaAFromReflect ? 1 : 0;
     }
 
     // --- upload geometry/materials ---
@@ -11818,6 +12783,9 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             usedAsNormal[m.normalTex] = 1;
     std::vector<DTexture> dtex;
     size_t txIdx = 0;
+    // O7: the RGB -> Jakob-Hanika coefficient table is texture-independent, so upload it
+    // once (lazily — only if some texture is actually stochastic) and share the pointer.
+    const float* d_jhLut = nullptr;
     for (const auto& tx : scene.textures) {
         DTexture dt;
         dt.w = tx.w; dt.h = tx.h;
@@ -11857,6 +12825,17 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         } else {
             dt.rgb = nullptr;
         }
+        // O7: the Gaussianized plane sets, already built (and already float) on the host —
+        // uploaded verbatim so the device transform IS the host transform, not a re-derived
+        // one. Empty vectors upload as null and the samplers fall through to plain tiling.
+        dt.stoch = tx.stoch;
+        auto up1 = [&](const std::vector<float>& v) -> const float* {
+            return v.empty() ? nullptr : (const float*)keep(uploadVec(v));
+        };
+        dt.gaussRgb   = up1(tx.gaussRgb);    dt.lutRgb   = up1(tx.lutRgb);
+        dt.gaussGray  = up1(tx.gaussGray);   dt.lutGray  = up1(tx.lutGray);
+        if (dt.gaussRgb && !d_jhLut) d_jhLut = up1(upsample::coeffLut());
+        dt.jhLut = dt.gaussRgb ? d_jhLut : nullptr;
         dtex.push_back(dt);
         ++txIdx;
     }
@@ -12060,6 +13039,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.bkGiGrid    = 1;
     sc.bkGiBounce  = 4;
     sc.bkGiClamp   = 0.0;
+    sc.bkFwPerDist = 0.0;   // O8 stage 2: unknown footprint => fnoise() unfiltered
     // Split-at-dispersion is NOT a mode-W-only knob: `-herosplit` applies to plain mode R too
     // (see BackwardRenderer::heroSplit, which takes the same default), so default it from the
     // global rather than to 0. Before v0.111.0 the device could not split at all and GPU mode
@@ -12431,6 +13411,9 @@ bool cudaBdptSupported(const Scene& scene) {
     // ratio-tracking transmittance, matching the CPU BDPT), and only area/sphere/cylinder
     // Lambertian emitters (no spot/env/collimated).
     if (!cudaForwardSupported(scene)) return false;
+    // Hair runs on the device forward/backward tracers but NOT in the BDPT vertex
+    // machinery (see sceneUsesHairMaterial) — a hair scene falls back to the CPU BDPT.
+    if (sceneUsesHairMaterial(scene)) return false;
     // M9: the GPU BDPT kernel now threads the per-hit texcoords (DVertex.u/v -> DHit)
     // through dBsdfF / dBsdfPdf / dRandomWalk / dConnect, so per-hit-driven throughput
     // slots evaluate consistently in the sampler AND the pdf/eval — MIS-safe. Enabled:
@@ -12810,6 +13793,7 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
         up.sc.bkGiClamp   = whitted->giClamp;
         up.sc.bkHeroSplit = whitted->heroSplit ? 1 : 0;
         up.sc.bkAmbient   = whitted->ambient;
+        up.sc.bkFwPerDist = whitted->fwPerDist;   // O8 stage 2 (mode W only — see DScene)
     }
     // Hero-wavelength bundle (`-heroc N`). bkRadianceHero covers the plain surface walk
     // only, so fall back to the single-λ estimator when the scene needs a branch it does
@@ -13196,6 +14180,10 @@ bool cudaPhotonMapSupported(const Scene& scene) {
     // point, so the two agree. Participating media (fog) are supported — the forward deposit
     // pass runs the same Woodcock free-flight as the CPU tracePhoton.
     if (!cudaForwardSupported(scene)) return false;
+    // Hair runs on the device forward tracer but the mode-M gather shades every query
+    // point as Lambertian (see sceneUsesHairMaterial) — hair scenes go to the CPU
+    // photon map (and, via the chained gates, CPU SPPM).
+    if (sceneUsesHairMaterial(scene)) return false;
     return true;
 }
 

@@ -30,6 +30,7 @@ int runViewerGui(const std::string&, const std::string&, bool, bool, int) {
 #include "backends/imgui_impl_dx11.h"
 #include "third_party/json.h"      // minijson: the vendored JSON parser
 #include "loomlink.h"              // the shared `python -m loom.<server>` child link
+#include "parallel.h"              // ft::stopRequested — cooperative `ftrace -stop <pid>`
 #include <map>
 #include <unordered_map>
 #include <functional>
@@ -3762,6 +3763,17 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
             TranslateMessage(&msg);
             DispatchMessage(&msg);
             if (msg.message == WM_QUIT) done = true;
+        }
+        // `ftrace -stop <pid>` must reach EVERY ftrace process, not just renders — it is
+        // the one sanctioned alternative to `taskkill /F`, and a viewer holding the exe
+        // open is exactly what makes a rebuild fail and tempts the force-kill. A render
+        // polls the flag at its chunk boundary; the GUI has no chunk, so poll once per
+        // frame (~free) and shut down through the ordinary exit path, releasing D3D11,
+        // the loom child process and the window the same way closing it by hand does.
+        if (!done && ft::stopRequested()) {
+            std::printf("[stop] external stop requested — closing the loom viewer.\n");
+            std::fflush(stdout);
+            done = true;
         }
         if (done) break;
 
