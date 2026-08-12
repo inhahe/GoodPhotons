@@ -2596,14 +2596,23 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     if (t < tmin || t >= hit.t) return false;
     Real b0 = U * invDet, b1 = V * invDet, b2 = W * invDet;   // barycentric of v0,v1,v2
     hit.t = t; hit.p = ro + rd * t; hit.valid = true;
-    hit.ng = tri.gn;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
     hit.u = b0 * tri.uv0.x + b1 * tri.uv1.x + b2 * tri.uv2.x;
     hit.v = b0 * tri.uv0.y + b1 * tri.uv1.y + b2 * tri.uv2.y;
     DVec3 ns = tri.n0 * b0 + tri.n1 * b1 + tri.n2 * b2;
     Real nl = dot(ns, ns);
     ns = (nl > (Real)1e-18) ? ns * ((Real)1 / sqrt(nl)) : tri.gn;
-    bool flipped = !(dot(rd, ns) < 0);
+    // Facing is decided from the GEOMETRIC normal, exactly as the host intersectTri
+    // does — see the long comment there for why the shading normal cannot answer it
+    // (it grazes through zero at every silhouette while the facet is still
+    // front-facing). The faceforward of gn onto ns handles a mesh whose winding
+    // disagrees with its authored `vn`; hit.ng stays un-ray-flipped because
+    // `entering` / one-sided-emitter tests read the side off it. The two copies MUST
+    // agree: a CPU/GPU split here shows up as one device shading silhouettes
+    // differently from the other.
+    DVec3 gn = (dot(tri.gn, ns) < 0) ? -tri.gn : tri.gn;
+    bool flipped = !(dot(rd, gn) < 0);
+    hit.ng = gn;
     hit.n = flipped ? -ns : ns;
     hit.tangent = tri.tangent;                 // per-triangle tangent (C6 normal mapping)
     hit.bitangentSign = (Real)tri.bitangentSign;

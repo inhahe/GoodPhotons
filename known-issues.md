@@ -26,9 +26,14 @@ landing on it). The cap-reached line carries the same suggestion. Verified: at `
 -prebake-cap 2050", the walk then caps at frame 16/96, and re-running at the suggested 2050
 caches all 96 frames (1863 MB) and holds ~24 fps for the whole loop.
 
-### TECH DEBT: `intersectTri` orients the hit normal by the *interpolated* normal, so it can report a front-facing triangle as a backface
+### FIXED (2026-08-12, v0.185.0): `intersectTri` oriented the hit normal by the *interpolated* normal, so it could report a front-facing triangle as a backface
 
-`src/geometry.h:337` and `src/render_cuda.cu:2607` both decide
+*(Fix, sweep results and one genuine image bug it turned out to be hiding are at the bottom
+of this entry. The original write-up follows, unedited except for tense, because its
+"measured impact: none" conclusion was **wrong** and it is worth keeping the reasoning that
+led there.)*
+
+`src/geometry.h:337` and `src/render_cuda.cu:2607` both decided
 
 ```cpp
 bool flipped = !(dot(rd, ns) < 0);   // ns = the interpolated shading normal
@@ -88,6 +93,81 @@ Not done yet because it changes the reported facing of grazing hits in *every* C
 render, and the measurement above says the payoff is hygiene rather than image quality — so
 it wants its own before/after sweep over the scene corpus, not a drive-by edit to the
 hottest loop in the renderer.
+
+---
+
+**FIXED.** Shipped with the before/after sweep the entry asked for. Two things about the
+write-up above turned out to be wrong.
+
+**Wrong #1 — the proposed fix would have broken the renderer.** The snippet above flips
+`hit.ng` and `hit.n` together and calls the ~8 `ngo = (dot(h.ng, h.n) >= 0) ? h.ng : -h.ng`
+lines dead code. They are not dead. Reading all 135 `.ng` call sites: about **30** of them
+read the *side of the surface* off `hit.ng`, not merely a direction —
+`bool entering = dot(d, h.ng) < 0` for refraction and medium crossing (`render.h:193`,
+`render.h:2351`, `backward.h:1170`, `vcm.h:444`, `render_cuda.cu:3226`, …) and
+`dot(rd, h.ng) < 0` for one-sided emitter tests (`backward.h:1696`,
+`render_cuda.cu:8152/8301/8902`). A `hit.ng` pre-flipped toward the ray makes **both
+unconditionally true**: every dielectric would run its IOR ratio one way forever and every
+one-sided emitter would glow from behind. `hit.ng` must stay un-ray-flipped, and the `ngo`
+lines are the correct, load-bearing accessor for "geometric normal on the shaded side".
+
+What shipped instead is PBRT's actual `Triangle::Intersect` convention — faceforward the
+**geometric** normal onto the **shading** normal, then decide facing from the geometric one:
+
+```cpp
+Vec3 gn = (dot(tri.gn, ns) < 0) ? -tri.gn : tri.gn;   // fixes a global winding-vs-vn flip
+bool flipped = !(dot(r.d, gn) < 0);                   // facing is a GEOMETRIC question
+hit.ng = gn;                                          // NOT ray-flipped — see above
+hit.n  = flipped ? -ns : ns;
+hit.curv = flipped ? -tri.curvature : tri.curvature;
+```
+
+`dot(tri.gn, ns)` sits near ±1 on any sane mesh, so unlike `dot(r.d, ns)` it never grazes
+zero at a silhouette. `orientedGeoN(h)` now provably equals `flipped ? -gn : gn`, and
+`entering == !flipped`.
+
+**Wrong #2 — "measured impact on final renders: none" was measuring the wrong thing.** The
+annulus table above only compares a *diffuse* mesh sphere to a *diffuse* analytic sphere,
+where the compensations really do work. Put a **dielectric** on the same mesh and the old
+convention is catastrophic, because `entering` is derived from `hit.ng` and the old code
+never faceforwarded it. `scraps/mksphere.py` emits a sphere whose winding normal opposes its
+`vn` on **all 8832** faces (0 agree) — perfectly ordinary for a generated mesh, and
+invisible on a diffuse surface. Rendered as glass at 512 spp against the analytic sphere it
+is supposed to duplicate:
+
+| meshed dielectric vs. analytic twin | mean abs diff (8-bit) | correlation |
+|---|---|---|
+| **before** | 38.50 | **0.068** |
+| **after** | 4.18 | **0.871** |
+
+Before the fix the meshed glass sphere was essentially *uncorrelated* with the analytic one;
+after, it matches to within tessellation faceting. So this was a live rendering bug, not
+hygiene — it just needed a refractive material and an inward-wound mesh to surface.
+
+**Sweep** (`scraps/tri/sweep.py before|after|compare`): 33 `-check*` self-tests, **0
+regressions**; 9-scene corpus at fixed spp with `-exposure-anchor` pinned so two runs of one
+binary are bit-identical.
+
+| scene | maxdiff | mean | >1/255 | note |
+|---|---|---|---|---|
+| `sphmesh_smooth` (GPU) | 16 | 0.0026 | 0.056 % | the silhouette band, as predicted |
+| `sphmesh_cpu` | 19 | 0.0026 | 0.046 % | host twin, same band |
+| `sphmesh_glass` | 255 | 38.61 | 48.2 % | the fix above |
+| `sphmesh_flat`, `sphmesh_light`, `cornell_R/W/B/D` | 0 | 0 | 0 % | **bit-identical** |
+
+The flat-shaded control is bit-identical by construction: with no `vn`, `ns == gn`, so the
+faceforward cannot fire and the old and new predicates are the same test.
+
+**Regression guard: `ftrace -checktrinormal`** (`src/main.cpp`, `checkTriNormal()`), eight
+sections over in-memory tessellated spheres, no renderer. §1 fans rays at the limb; **§1b**
+is the one that matters — the ring fan does *not* catch the old predicate (verified by
+restoring it and rebuilding: §1 still passes), because the corner whose normal has turned
+away lies on the far hemisphere, so no camera-style ray reaches it. §1b instead constructs
+the disagreement directly, `d = normalize(ns − gn)`, and hands it to `intersectTri` one
+triangle at a time; the old code fails **11904 / 11904** of those rays on `n`, `curv` and
+`orientedGeoN`. §2 repeats everything on an inside-out-wound copy (the `mksphere.py` case),
+§3 pins back faces, §4 pins that `hit.ng` is never ray-flipped, §6 pins the flat control,
+§7 cross-checks against the analytic sphere (worst normal disagreement 0.372°).
 
 ### FIXED (2026-08-12, v0.183.1): the CUDA preview kernel stippled light and dark specks along every smooth-shaded silhouette
 
