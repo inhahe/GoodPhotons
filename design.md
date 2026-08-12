@@ -4059,11 +4059,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   same crease-limited angle-weighted algorithm ftrace's loader uses (`src/mesh.h`) —
   position weld at `1e-6 x diag`, Thürmer–Wüthrich corner-angle weights, neighbours merged
   only inside the crease angle, corners split back apart where their normals disagree.
-  The angle comes from the sidecar: loom now ships `mesh.smooth` as the *resolved crease
+  The angle comes from the sidecar: loom ships `mesh.smooth` as the *resolved crease
   angle in degrees* (`loom.scene.smooth_crease_deg`, the same number its `mesh { smooth
-  <deg> }` carries), so the preview creases exactly where the render will; authored
-  `normals`, if a sidecar ever carries them, win outright, and a strand tubed by the pane
-  itself asks for ftrace's default 40°. This replaced a per-pixel face normal rebuilt from
+  <deg> }` carries), so the preview creases exactly where the render will, and a strand
+  tubed by the pane itself asks for ftrace's default 40°. **Authored `normals` in the
+  sidecar win outright**, matching the way OBJ `vn` beats `smooth` in the loader — and as
+  of 2026-08-12 that is the common case, because a `SweptMesh` with the default
+  `smooth=True` ships its surface's *analytic* per-vertex normals (`loom.sweep.ring_normals`
+  differentiates the ring lattice, which is literally a parameterisation of the swept
+  surface). That matters because a crease angle is fundamentally a guess: on a smooth but
+  coarsely-sampled profile — `r(a) = 1 + 0.34·cos(3a)` at 18 samples — dihedrals reach 119°
+  and 18% of edges refuse to merge at 40°, so the surface renders faceted, correctly by the
+  rule and wrongly by the surface. The generator knows; the triangles cannot.
+  This replaced a per-pixel face normal rebuilt from
   `cross(ddx(vp), ddy(vp))`, which could only show facets *and* — because `ddx`/`ddy` are
   evaluated over 2×2 pixel quads — emitted a garbage normal wherever a quad straddled a
   triangle boundary, painting a one-pixel band of wrong shading along every edge (the

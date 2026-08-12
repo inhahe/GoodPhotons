@@ -204,9 +204,10 @@ def _swept_mesh_geometry(sm: Any, clock: Optional[Clock]) -> Dict[str, Any]:
     plain lists instead of writing an OBJ: ``vertices`` (flat 3-vectors), ``faces``
     (0-based index triples), ``uvs`` (per-vertex ``(u, v)`` from the ring/profile
     lattice; ``u`` along the spine, ``v`` around the profile), plus ``rings``/
-    ``profile_count`` so the viewer knows the lattice shape, and ``smooth`` — the
+    ``profile_count`` so the viewer knows the lattice shape, ``smooth`` — the
     resolved crease angle in DEGREES (0 == flat), so the F4 pane creases its
-    preview normals exactly where the render will."""
+    preview normals exactly where the render will — and, when ``smooth=True`` asked
+    for them, the surface's analytic per-vertex ``normals``."""
     import math
     from . import sweep as _sweep
     from . import scene as _scene
@@ -234,10 +235,17 @@ def _swept_mesh_geometry(sm: Any, clock: Optional[Clock]) -> Dict[str, Any]:
     ud = n if sm.closed_spine else max(1, n - 1)
     vd = k if sm.closed_profile else max(1, k - 1)
     uvs = [[i / ud, j / vd] for i in range(n) for j in range(k)]
-    return {"vertices": [list(v) for v in verts],
-            "faces": [list(f) for f in faces],
-            "uvs": uvs, "rings": n, "profile_count": k,
-            "smooth": _scene.smooth_crease_deg(sm.smooth)}
+    out = {"vertices": [list(v) for v in verts],
+           "faces": [list(f) for f in faces],
+           "uvs": uvs, "rings": n, "profile_count": k,
+           "smooth": _scene.smooth_crease_deg(sm.smooth)}
+    # Mirror `SweptMesh.emit`: a plain `smooth=True` hands over the surface's real
+    # normals, so the pane shades exactly what the renderer will rather than
+    # re-deriving them from a crease guess that can't know the profile is smooth.
+    if _scene.wants_analytic_normals(sm.smooth):
+        out["normals"] = [list(v) for v in
+                          _sweep.ring_normals(rings, sm.closed_spine, sm.closed_profile)]
+    return out
 
 
 def _strand_geometry(st: Any, clock: Optional[Clock]) -> Dict[str, Any]:

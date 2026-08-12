@@ -770,6 +770,30 @@ def smooth_crease_deg(smooth) -> float:
     return ang if ang > 0.0 else 0.0
 
 
+def wants_analytic_normals(smooth) -> bool:
+    """Does this ``smooth=`` ask for REAL per-vertex normals rather than the crease
+    heuristic?  True for the plain on-flag (``True`` / ``1``), which is the default.
+
+    The crease heuristic works from triangles alone, and there a coarsely-sampled
+    *smooth* curve and a genuine sharp fold are literally the same thing — both are a
+    big dihedral — so it has to guess.  On the lobed profile ``r(a) = 1 +
+    0.34*cos(3a)`` at 18 samples it guesses wrong: the valleys turn 62 deg per step,
+    over any sane crease angle, so they stay faceted however finely the spine is
+    sampled.  A generator that knows its surface is smooth doesn't have to guess, so
+    a bare ``smooth=True`` now means "hand over the analytic normals" (see
+    :func:`loom.sweep.ring_normals`) and the result has no seams at any tessellation.
+
+    Passing an explicit ANGLE instead opts back into the crease heuristic — which is
+    what you want when the profile has genuine corners (a square tube's four edges
+    should stay sharp, and no per-vertex normal can express a sharp edge without
+    splitting the vertex).  So the three settings read as: ``True`` = smooth surface,
+    ``<deg>`` = smooth-except-past-this-fold, ``False`` = flat.
+    """
+    if smooth is None or smooth is False:
+        return False
+    return smooth is True or float(smooth) == 1.0
+
+
 def _smooth_clause(smooth) -> str:
     """Render the ``smooth`` part of a ``mesh { ... }`` block (with trailing spaces).
 
@@ -827,7 +851,14 @@ class SweptMesh(Element):
         self.closed_spine = closed_spine
         self.closed_profile = closed_profile
         self.material = material
-        self.smooth = smooth   # 0/1 flag or an explicit crease angle; see _smooth_clause
+        # Three-way, and the middle case is not a subset of the first:
+        #   True / 1  -> ship the surface's ANALYTIC normals (ring_normals); seamless at
+        #                any tessellation, and no `smooth` clause is emitted at all.
+        #   <deg>     -> the crease heuristic at that angle, for profiles with genuine
+        #                corners a per-vertex normal could not express without splitting.
+        #   False / 0 -> flat.
+        # See wants_analytic_normals() / smooth_crease_deg() / _smooth_clause().
+        self.smooth = smooth
         self.name = name
         self.scale_profile = scale_profile
         self._warned_turns = False
@@ -877,8 +908,16 @@ class SweptMesh(Element):
             twists.append(base_tw + turns * 2.0 * math.pi * u)
         rings = _sweep.sweep_rings(pts, self.profile, scales, twists, self.closed_spine)
         verts, faces = _sweep.skin_rings(rings, self.closed_spine, self.closed_profile)
-        path = ctx.write_mesh(self.name, verts, faces)
-        return (f'mesh {{ file "{path.as_posix()}"  {_smooth_clause(self.smooth)}'
+        # A plain `smooth=True` ships the surface's REAL normals (the lattice is the
+        # parameterisation, so they're a central difference away) and no `smooth`
+        # clause: authored normals win over crease smoothing anyway, and skipping the
+        # clause also skips the loader's position weld + adjacency build. An explicit
+        # angle keeps the crease heuristic, for profiles with genuine corners.
+        normals = (_sweep.ring_normals(rings, self.closed_spine, self.closed_profile)
+                   if wants_analytic_normals(self.smooth) else None)
+        path = ctx.write_mesh(self.name, verts, faces, normals)
+        clause = "" if normals is not None else _smooth_clause(self.smooth)
+        return (f'mesh {{ file "{path.as_posix()}"  {clause}'
                 f'material "{self.material}" }}')
 
 

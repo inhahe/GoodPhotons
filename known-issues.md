@@ -5,6 +5,62 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-08-12): swept meshes still looked faceted after both normal bugs were fixed — because a crease angle cannot tell a coarsely-sampled smooth curve from a real fold
+
+*(The third and last part of "why do sweeps look tessellated?". The first two were bugs —
+loom emitting a flag as an angle, and the viewer having no normals. This one is not a bug in
+anything; it is the crease heuristic working exactly as specified and still giving the wrong
+answer, which is why it survived both fixes.)*
+
+**The measurement.** `scatter_modulated_sweep` at the old 18-side profile, 2160 verts / 4320
+tris / 6480 interior edges:
+
+| dihedral | p50 | p90 | p95 | p99 | max |
+|---|---|---|---|---|---|
+| degrees | 19.2 | 56.0 | 79.1 | 93.2 | **119.1** |
+
+At ftrace's default 40° crease only **82.1%** of edges merge. The other ~18% stay split, and a
+split vertex is a visible seam.
+
+**Why raising the angle is not the fix.** The profile is `r(a) = 1 + 0.34·cos(3a)` — an
+analytically smooth closed curve with **no corners anywhere**. Its valleys simply turn fast:
+worst step is 62.0° at 18 samples, 47.7° at 24, 32.4° at 36, 19.6° at 64. So the big dihedrals
+are *sampling coarseness*, not geometry. But from a bag of triangles a coarsely-sampled smooth
+curve and a genuine sharp fold are **the same input**, so the heuristic has to guess, and any
+threshold high enough to smooth this profile would also erase a square tube's 90° corners.
+Only the *generator* knows which it is.
+
+**Fix — the generator stops guessing.** A sweep's ring lattice *is* a parameterisation `P(u,v)`
+of the surface, so the true normal is `∂P/∂v × ∂P/∂u` (that order: `skin_rings` winds a quad
+`(i,j) (i,j+1) (i+1,j+1)`, whose geometric normal is `cross(dv, du)`). New
+`loom.sweep.ring_normals(rings, closed_spine, closed_profile)` computes it by central
+differences, one-sided at open ends, wrapping on closed ones.
+
+* **`smooth=` is now three-way.** `True`/`1` (the default) → ship analytic normals and emit
+  **no** `smooth` clause; `<deg>` → keep the crease heuristic, for profiles with genuine
+  corners; `False`/`0` → flat. `loom.scene.wants_analytic_normals()` is the one place that
+  question is answered, read by both `SweptMesh.emit` and the viewer sidecar. Omitting the
+  clause is not just cosmetic: authored normals beat `smooth` in the loader anyway, and
+  skipping it also skips the loader's position weld + adjacency build.
+* Normals now ride the whole emit path: `encode_obj`/`write_obj` grew a `normals` argument
+  (emitting `vn` and `f v//vn` triples), and `EmitCtx.write_mesh(name, verts, faces, normals)`
+  hands them to whichever of OBJ / ftmesh is selected. `ftmesh` already had a normals block.
+* **`IsoMesh` deliberately unchanged.** Marching cubes has no lattice to differentiate, so it
+  keeps `smooth_crease_deg`.
+
+**What this does NOT fix: the silhouette.** A shading normal cannot round an outline — that is
+the actual polygon. `scatter_modulated_sweep`'s `sides`/`count` therefore went 18×120 → 30×200
+(2160 → 6000 verts, still trivial), which is where the outline facets stop being visible in the
+Meshes pane at full-screen size. Interior shading no longer depends on density at all.
+
+**Verified**: the Meshes pane on `scatter_modulated_sweep.json` at native resolution — no
+seams, no facet bands, smooth outline. Tests in `tools/loom/tests/test_sweep.py`:
+`ring_normals` is *exact* on a torus (both parameters circular, so central differences carry no
+truncation error), agrees with `skin_rings`' winding on closed/open spines and profiles,
+converges second-order under profile refinement, and lands within a third of the crease angle
+of the true surface on the very profile that defeats the heuristic. 1406 loom tests pass.
+No `ftrace.exe` rebuild: the C++ side already preferred authored `normals` as of v0.183.0.
+
 ### FIXED (2026-08-12, v0.183.0): the loom viewer's Meshes pane had no vertex normals at all, and rebuilt a face normal per pixel from `ddx`/`ddy` — one band of wrong shading along every triangle edge
 
 *(The second half of "why do sweeps look tessellated in the viewer?" — the first half was
@@ -118,14 +174,14 @@ honest "flat", where before it was indistinguishable from the broken `smooth=1`.
 bending ribbon *should* smooth along its spine by default is an aesthetic call, not part of
 this bug.
 
-**Optional follow-up:** `sweep.py` could emit true per-vertex normals instead of relying on the
-crease heuristic — it already has the RMF frames and the profile, so the analytic normal is
-nearly free, and `ftmesh.py` can already carry normals (`ftmesh.py:85`: supplying them makes
-ftrace skip crease-smoothing). `EmitCtx.write_mesh(name, verts, faces)` would need a normals
-parameter. Not obviously better, though: crease-smoothing automatically keeps a *square*
-profile's 90° corners sharp, whereas analytic normals would round them unless the emitter also
-split vertices at profile corners. Precedent for the analytic route exists in
-`tools/make_mesh.py --smooth` (`FTSL.md:500`).
+**Optional follow-up — DONE (2026-08-12), see the analytic-normals entry at the top of this
+file.** `sweep.py` now emits true per-vertex normals (`ring_normals`) and `EmitCtx.write_mesh`
+grew the `normals` parameter this note asked for. The objection recorded here — that
+crease-smoothing keeps a *square* profile's 90° corners sharp while analytic normals would
+round them — was the right objection, and it is why `smooth=<deg>` still selects the heuristic:
+a per-vertex normal cannot express a sharp edge without splitting the vertex, so a profile with
+genuine corners must keep asking for the crease path. Precedent for the analytic route existed
+in `tools/make_mesh.py --smooth` (`FTSL.md:500`).
 
 ### WON'T DO for now (2026-08-12): sweeps as a native FTSL primitive — the blocker is not the bounding box
 

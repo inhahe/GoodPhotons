@@ -142,8 +142,8 @@ def build(clock=None,
           roll_swing: float = 1.0,
           profile_lobes: int = 3,
           profile_bulge: float = 0.34,
-          sides: int = 18,
-          count: int = 120,
+          sides: int = 30,
+          count: int = 200,
           show_plot: bool = True) -> Scene:
     """A lobed profile swept along a ring whose shape is read off a scatter plot.
 
@@ -157,6 +157,14 @@ def build(clock=None,
     ``helix_turns`` is **static and integral on purpose** — see the note on the two
     twist channels in the module docstring. It is the one control here that is not
     modulated, because it cannot be without tearing the seam.
+
+    ``sides``/``count`` are set for a clean **silhouette**, not for clean shading.
+    Shading stopped needing them once ``smooth=1`` began shipping the sweep's analytic
+    per-vertex normals (see :func:`loom.sweep.ring_normals`) — those are seamless at
+    any density. The outline is not: it is the actual polygon, so the only thing that
+    rounds it is more segments. 30x200 is where the facets stop being visible in the
+    loom viewer's mesh pane at full-screen size; below about 24x160 they return along
+    the limbs, and the mesh is small enough (6k verts) that buying the margin is free.
     """
     nodes = max(3, int(nodes))
 

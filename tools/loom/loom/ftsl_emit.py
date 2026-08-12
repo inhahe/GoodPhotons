@@ -79,31 +79,37 @@ class EmitCtx:
             d.mkdir(parents=True, exist_ok=True)
         return d / f"{name}{self.tag}.{ext}"
 
-    def write_mesh(self, name: str, verts, faces) -> Path:
+    def write_mesh(self, name: str, verts, faces, normals=None) -> Path:
         """Serialise one indexed mesh in this context's format; return its path.
 
         Every file-backed mesh element goes through here, so the format choice is
         made in exactly one place and the two element types cannot drift apart.
         With a ``mesh_sink`` the bytes go into the dict instead of to the path, but
         the path is still what the caller gets and still what the scene text names.
+
+        ``normals``, when given, is one per vertex and rides along in whichever
+        format is selected (OBJ ``vn`` / the ftmesh normals block).  Both formats
+        have carried normals all along; this is the parameter that lets a generator
+        that KNOWS its surface is smooth say so, instead of leaving the loader to
+        guess from dihedral angles.
         """
         sink = self.mesh_sink
         if self.mesh_format == "ftmesh":
             path = self.asset_path(name, "ftmesh")
             if sink is None:
                 from .ftmesh import write_ftmesh
-                write_ftmesh(path, verts, faces)
+                write_ftmesh(path, verts, faces, normals=normals)
             else:
                 from .ftmesh import encode
-                sink[path.as_posix()] = encode(verts, faces)
+                sink[path.as_posix()] = encode(verts, faces, normals=normals)
         elif self.mesh_format == "obj":
             path = self.asset_path(name, "obj")
             if sink is None:
                 from .sweep import write_obj
-                write_obj(path, verts, faces)
+                write_obj(path, verts, faces, normals)
             else:
                 from .sweep import encode_obj
-                sink[path.as_posix()] = encode_obj(verts, faces).encode("utf-8")
+                sink[path.as_posix()] = encode_obj(verts, faces, normals).encode("utf-8")
         else:
             raise ValueError(
                 f"EmitCtx.mesh_format must be 'obj' or 'ftmesh', got {self.mesh_format!r}")
