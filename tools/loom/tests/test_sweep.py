@@ -243,6 +243,70 @@ def test_sweptmesh_warns_once_on_fractional_turns_closed_spine():
         assert ok == [], f"integer turns + uniform twist must be silent, got {ok}"
 
 
+# ---- the `smooth` flag is a CREASE ANGLE downstream ------------------------
+# Regression: loom emitted its 0/1 flag straight into ftrace's `mesh { smooth <deg> }`,
+# which is an angle in DEGREES.  `smooth 1` therefore asked for a 1-degree crease
+# threshold, and since ftrace merges two faces only when their normals differ by LESS
+# than that, nothing on a real sweep was ever smoothed — a tube's facets step ~30 deg
+# around the profile.  Every swept mesh rendered fully faceted at any tessellation
+# density.  Guard both halves: the emitted angle, and the geometric fact that makes a
+# small angle useless.
+
+def test_smooth_flag_emits_a_usable_crease_angle():
+    from loom.scene import _smooth_clause, FTRACE_DEFAULT_CREASE_DEG
+
+    # The 0/1 flag every loom preset authors must become ftrace's default angle,
+    # NOT the literal "1".
+    on = _smooth_clause(1)
+    assert "smooth 1 " not in on, f"1 leaked through as a 1-degree crease: {on!r}"
+    assert f"smooth {FTRACE_DEFAULT_CREASE_DEG:g}" in on, on
+    assert _smooth_clause(True) == on
+
+    # Off omits the directive entirely rather than emitting `smooth 0`, which ftrace
+    # reads as "smoothing on, 0-degree threshold" — a no-op that still costs the weld.
+    for off in (0, False, None):
+        assert _smooth_clause(off) == "", f"{off!r} should emit nothing"
+
+    # An explicit angle passes through.
+    assert "smooth 25" in _smooth_clause(25.0)
+    assert "smooth 12.5" in _smooth_clause(12.5)
+
+
+def test_default_tube_facets_exceed_a_one_degree_crease():
+    """Why `smooth 1` was a no-op: the facets are nowhere near coplanar."""
+    from collections import defaultdict
+
+    n, sides = 64, 12                      # loom's tube() defaults
+    pts = _circle_spine(n, 1.0)
+    rings = sweep_rings(pts, circle_profile(sides, 1.0), [0.1] * n, [0.0] * n, True)
+    verts, faces = skin_rings(rings, True, True)
+
+    def face_normal(f):
+        a, b, c = verts[f[0]], verts[f[1]], verts[f[2]]
+        return _norm(_cross(_sub(b, a), _sub(c, a)))
+
+    edges = defaultdict(list)
+    for fi, f in enumerate(faces):
+        for k in range(3):
+            edges[tuple(sorted((f[k], f[(k + 1) % 3])))].append(fi)
+
+    angles = []
+    for fs in edges.values():
+        if len(fs) == 2:
+            d = max(-1.0, min(1.0, _dot(face_normal(faces[fs[0]]), face_normal(faces[fs[1]]))))
+            angles.append(math.degrees(math.acos(d)))
+
+    # The profile seam steps a full 360/sides between adjacent facets.
+    assert max(angles) > 0.9 * (360.0 / sides), f"max dihedral {max(angles):.1f} deg"
+
+    def merged_at(thr):
+        return sum(1 for a in angles if a < thr)
+
+    # At 1 deg only the exactly-coplanar in-quad diagonals merge; at 40 deg, everything.
+    assert merged_at(1.0) < 0.5 * len(angles), "a 1-degree crease should smooth almost nothing"
+    assert merged_at(40.0) == len(angles), "40 deg should smooth the whole tube"
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

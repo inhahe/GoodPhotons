@@ -5,6 +5,120 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-08-12): loom emitted `smooth` as a 0/1 flag into ftrace's `mesh { smooth <deg> }`, which is a CREASE ANGLE — so every swept / iso mesh rendered fully faceted
+
+*(Found while answering "why do sweeps show obvious tessellation in the loom viewer?" — the
+answer was not tessellation density. See the sweep-primitive entry below, whose "sweeps
+tessellate well" claim this bug had been silently falsifying.)*
+
+**The units mismatch.** ftrace's mesh block takes a crease angle in **degrees**
+(`ftsl.h:5172`): faces are welded into a shared shading normal only where their normals differ
+by *less* than it (`cosThresh = cos(creaseAngleDeg * π/180)`, `mesh.h:254`), so authored creases
+survive. A bare `smooth` means 40°. loom, however, has always treated its `smooth=` as a
+boolean and interpolated it straight into the block:
+
+```python
+return (f'mesh {{ file "{path.as_posix()}"  smooth {self.smooth}  '   # scene.py, SweptMesh + IsoMesh
+        f'material "{self.material}" }}')
+```
+
+With the default `smooth: int = 1` that emits **`smooth 1`** — a *one-degree* crease threshold.
+
+**Why that smooths nothing.** Measured on `tube()`'s own defaults (`count=64`, `sides=12`,
+768 verts / 1536 tris), dihedral angles between adjacent faces are min/median/max
+**0.00 / 5.43 / 30.03°** — the profile seam steps a full `360/sides = 30°`. Against the
+thresholds:
+
+| crease | edges merged |
+|---|---|
+| 0° (loom's `smooth=0`) | 0 / 2304 (0%) |
+| **1° (loom's `smooth=1`, the default)** | **768 / 2304 (33%)** |
+| 40° (ftrace's own default) | 2304 / 2304 (100%) |
+
+The 33% is entirely the exactly-coplanar diagonals *inside* each quad. Every edge that
+actually needed smoothing stayed sharp, so the mesh was flat-shaded in effect — **at any
+tessellation density**. Raising `count`/`sides` could never fix it; it just made smaller
+facets. Confirmed visually in `png/sweepsmooth/` (mode R, 256 spp, identical scenes differing
+only in the angle): stepped tonal bands vs. a continuous gradient, max per-pixel Δ 38/255.
+
+**Fixed** in `tools/loom/loom/scene.py` — a shared `_smooth_clause()` maps the historical flag
+onto a real angle: `True`/`1` → `smooth 40` (ftrace's default), `False`/`0`/`None` → omit the
+directive entirely (deliberately *not* `smooth 0`, which ftrace reads as "smoothing on, 0°
+threshold" — a no-op that still pays for the position weld and adjacency build), and any other
+number passes through as an explicit angle. Annotations widened `int` → `float` on `SweptMesh`,
+`IsoMesh`, `ribbon`, `tube`, `blob`, `fan`. Backwards-compatible: every existing loom script
+passes 0 or 1. Regression tests in `tools/loom/tests/test_sweep.py` cover both the emitted
+angle and the geometric fact that makes a small one useless; 1399 loom tests pass.
+
+**Left alone deliberately:** `ribbon()` and `fan()` still default to `smooth=0`. That is now an
+honest "flat", where before it was indistinguishable from the broken `smooth=1`. Whether a
+bending ribbon *should* smooth along its spine by default is an aesthetic call, not part of
+this bug.
+
+**Optional follow-up:** `sweep.py` could emit true per-vertex normals instead of relying on the
+crease heuristic — it already has the RMF frames and the profile, so the analytic normal is
+nearly free, and `ftmesh.py` can already carry normals (`ftmesh.py:85`: supplying them makes
+ftrace skip crease-smoothing). `EmitCtx.write_mesh(name, verts, faces)` would need a normals
+parameter. Not obviously better, though: crease-smoothing automatically keeps a *square*
+profile's 90° corners sharp, whereas analytic normals would round them unless the emitter also
+split vertices at profile corners. Precedent for the analytic route exists in
+`tools/make_mesh.py --smooth` (`FTSL.md:500`).
+
+### WON'T DO for now (2026-08-12): sweeps as a native FTSL primitive — the blocker is not the bounding box
+
+Recording the rationale because the question recurs ("a sweep can be indefinitely long and
+winding, so there's no reasonable bounding box for it — right?").
+
+**The bounding box is the easy part, and the codebase already proves it.** A hair strand is
+just as long and winding, and it *is* a primitive. The trick is that the BVH leaf is never the
+whole curve: `curve.h` dices each strand into `CurveSeg` round cones (`Curve` holds only
+`firstSeg`/`segCount` into a flat pool) and bounds each one tightly —
+
+```cpp
+// Exact world bound of one round cone: the union of its two end spheres' boxes.
+inline Aabb curveSegBounds(const CurveSeg& s) {   // curve.h:106
+```
+
+— described in-comment as "tight, not merely conservative". A sweep would bound identically:
+one leaf per spine span, box = hull of the two end profile polygons plus sagitta slack for the
+spine's curvature between samples. That is the same linearization error the curve code already
+absorbs when it flattens Catmull-Rom/Bézier spans into cones.
+
+Where the intuition *does* land is `implicit.h`, which is the one-primitive-one-leaf-one-box
+design (`Aabb bounds; // conservative world AABB (BVH leaf box + ray clip)`, `implicit.h:236`).
+A long winding implicit does get a huge mostly-empty box that every clipping ray pays to march.
+So the failure mode is real — it is an artifact of not subdividing, not of sweeps.
+
+**The actual reasons it stays a loom-side mesh generator (`tools/loom/loom/sweep.py`):**
+
+1. **No closed-form intersection.** A round cone is solvable algebraically; an arbitrary
+   profile with varying scale and twist is not. That means per-span Newton iteration or
+   marching — implicit-surface cost without implicit-surface generality.
+2. **The frame is globally sequential.** Per `sweep.py`'s docstring, the rotation-minimizing
+   frame is carried from the start by Wang double-reflection, and on a closed spine the
+   residual twist is redistributed over the whole loop. So the surface at spine parameter *s*
+   depends on the entire history from 0 to *s* and on loop closure — not locally evaluable
+   inside an intersector. Precomputing per-span frames fixes it, but then you are storing
+   per-span data anyway, which erodes the reason to prefer a primitive over a mesh.
+3. **Self-intersection.** Where the profile radius exceeds the spine's curvature radius the
+   surface folds through itself. On a mesh that is a harmless artifact; analytically it makes
+   inside/outside ill-defined, which breaks refraction and participating media.
+4. **The porting tax.** Every primitive needs a CPU intersector, a GPU device twin (`CurveSeg`
+   appears 27× in `render_cuda.cu`), a raster path, and coverage across modes A/B/C/R/D/U/M/W.
+   This dominates the cost of any new primitive here.
+5. **The payoff is small, because sweeps tessellate well.** A sphere or cone tessellates
+   *badly* — facets show on the silhouette at any zoom, which is exactly why they are
+   primitives. A sweep's natural discretization is already a quad grid over a small profile
+   polygon, so modest triangle counts give an essentially exact surface on a mesh path that is
+   already optimized on every backend. **Caveat:** this argument was untestable in practice
+   until the crease-angle bug above was fixed — swept meshes were flat-shaded regardless of
+   density, which looked exactly like "meshing isn't good enough for sweeps".
+
+**When to revisit:** large scale range (zooming deep enough that any fixed tessellation breaks
+down), or memory at very high sweep counts — the same argument that eventually justified curves
+for fur. Note `strand()` already covers the common round-fiber case with the native `curve`
+primitive; `tube()` exists for when you need the triangles, a `twist`, or `turns`.
+
 ### FIXED (2026-08-11, v0.181.0 → v0.182.0): `ftrace -stop <pid>` did not stop a `-viewer` GUI process, but reported that it did
 
 *(Filed as OPEN and fixed the same day; the description below is the original report, with what

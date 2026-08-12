@@ -734,6 +734,43 @@ class Group(Element):
         return "\n".join(emit_element(c, ctx) for c in self.children)
 
 
+# ftrace's `mesh { smooth <deg> }` argument is a CREASE ANGLE IN DEGREES, not a
+# boolean: the loader merges two faces' normals only where they differ by LESS than
+# it (`cosThresh` in src/mesh.h), so genuine creases stay sharp.  loom has always
+# authored `smooth=` as a 0/1 flag and emitted it straight through, which meant
+# `smooth 1` asked for a ONE-DEGREE threshold — that merges nothing on a real sweep
+# (a 12-sided tube steps 30 deg around its profile, ~5 deg along the spine), so every
+# swept and iso mesh came out fully faceted no matter how finely it was tessellated.
+# Map the flag onto ftrace's own default angle instead, and let a caller pass a real
+# angle if they want to tune where the crease cutoff falls.
+FTRACE_DEFAULT_CREASE_DEG = 40.0
+
+
+def _smooth_clause(smooth) -> str:
+    """Render the ``smooth`` part of a ``mesh { ... }`` block (with trailing spaces).
+
+    Accepts the historical 0/1 flag *and* an explicit crease angle:
+
+    ``False`` / ``0`` / ``None``
+        Omit the directive: the mesh keeps its geometric normals (flat).  Note this
+        is deliberately not ``smooth 0`` — ftrace reads a present-but-zero angle as
+        "smoothing ON with a 0 deg threshold", which merges nothing but still pays
+        for the position weld and the adjacency build.
+    ``True`` / ``1``
+        ``smooth 40`` — ftrace's own default crease angle, i.e. what a bare
+        ``smooth`` means in hand-written ftsl.
+    any other number
+        ``smooth <that angle>``, in degrees.
+    """
+    if smooth is None or smooth is False:
+        return ""
+    ang = (FTRACE_DEFAULT_CREASE_DEG
+           if smooth is True or float(smooth) == 1.0 else float(smooth))
+    if ang <= 0.0:
+        return ""
+    return f"smooth {ang:g}  "
+
+
 class SweptMesh(Element):
     """A profile swept along a spine curve into a triangle mesh (M4 sweep engine).
 
@@ -765,7 +802,7 @@ class SweptMesh(Element):
     def __init__(self, spine: Union[LoopCurve, PointPath], profile: Sequence[Tuple[float, float]],
                  *, count: int = 64, scale=1.0, twist=0.0, turns=0.0,
                  closed_spine: bool = True, closed_profile: bool = True,
-                 material: str = "default", smooth: int = 1, name: str = "swept",
+                 material: str = "default", smooth: float = 1, name: str = "swept",
                  scale_profile: Optional[Callable[[float], float]] = None) -> None:
         if isinstance(spine, PointPath):
             spine = LoopCurve(spine, Const(0.0))
@@ -778,7 +815,7 @@ class SweptMesh(Element):
         self.closed_spine = closed_spine
         self.closed_profile = closed_profile
         self.material = material
-        self.smooth = int(smooth)
+        self.smooth = smooth   # 0/1 flag or an explicit crease angle; see _smooth_clause
         self.name = name
         self.scale_profile = scale_profile
         self._warned_turns = False
@@ -829,7 +866,7 @@ class SweptMesh(Element):
         rings = _sweep.sweep_rings(pts, self.profile, scales, twists, self.closed_spine)
         verts, faces = _sweep.skin_rings(rings, self.closed_spine, self.closed_profile)
         path = ctx.write_mesh(self.name, verts, faces)
-        return (f'mesh {{ file "{path.as_posix()}"  smooth {self.smooth}  '
+        return (f'mesh {{ file "{path.as_posix()}"  {_smooth_clause(self.smooth)}'
                 f'material "{self.material}" }}')
 
 
@@ -855,7 +892,7 @@ class IsoMesh(Element):
 
     def __init__(self, field, *, bounds=1.0, res=48, iso: float = 0.0,
                  adaptive: bool = False, coarse: int = 8,
-                 material: str = "default", smooth: int = 1, name: str = "isomesh") -> None:
+                 material: str = "default", smooth: float = 1, name: str = "isomesh") -> None:
         self.field = field
         self.bounds = bounds
         self.res = res
@@ -863,7 +900,7 @@ class IsoMesh(Element):
         self.adaptive = bool(adaptive)
         self.coarse = int(coarse)
         self.material = material
-        self.smooth = int(smooth)
+        self.smooth = smooth   # 0/1 flag or an explicit crease angle; see _smooth_clause
         self.name = name
         self._cache_static: Optional[Tuple[list, list]] = None
 
@@ -888,7 +925,7 @@ class IsoMesh(Element):
             if self._static():
                 self._cache_static = (verts, faces)
         path = ctx.write_mesh(self.name, verts, faces)
-        return (f'mesh {{ file "{path.as_posix()}"  smooth {self.smooth}  '
+        return (f'mesh {{ file "{path.as_posix()}"  {_smooth_clause(self.smooth)}'
                 f'material "{self.material}" }}')
 
 
@@ -1050,7 +1087,7 @@ def hair(spine, *, radius: float = 0.004, tip: float = 0.0005,
 
 
 def ribbon(spine, *, width: float = 0.3, material: str = "default", count: int = 64,
-           twist=0.0, turns=0.0, closed_spine: bool = True, smooth: int = 0,
+           twist=0.0, turns=0.0, closed_spine: bool = True, smooth: float = 0,
            name: str = "ribbon") -> SweptMesh:
     """A flat strip (open line profile) swept along the spine."""
     return SweptMesh(spine, _sweep.line_profile(width), count=count, scale=1.0,
@@ -1060,7 +1097,7 @@ def ribbon(spine, *, width: float = 0.3, material: str = "default", count: int =
 
 def tube(spine, *, radius: float = 0.1, sides: int = 12, material: str = "default",
          count: int = 64, twist=0.0, turns=0.0, closed_spine: bool = True,
-         smooth: int = 1, name: str = "tube") -> SweptMesh:
+         smooth: float = 1, name: str = "tube") -> SweptMesh:
     """A closed circular tube swept along the spine, as a triangle mesh.
 
     For a plain round fiber prefer :func:`strand`, which emits ftrace's native ``curve``
@@ -1075,7 +1112,7 @@ def tube(spine, *, radius: float = 0.1, sides: int = 12, material: str = "defaul
 
 def blob(spine, *, radius: float = 0.15, sides: int = 16, bulge: float = 0.6,
          lobes: int = 2, material: str = "default", count: int = 96,
-         twist=0.0, turns=0.0, closed_spine: bool = True, smooth: int = 1,
+         twist=0.0, turns=0.0, closed_spine: bool = True, smooth: float = 1,
          name: str = "blob") -> SweptMesh:
     """A tube whose radius swells and pinches around the loop (``lobes`` bulges)."""
     def _prof(u: float) -> float:
@@ -1087,7 +1124,7 @@ def blob(spine, *, radius: float = 0.15, sides: int = 16, bulge: float = 0.6,
 
 
 def fan(spine, *, width: float = 0.4, material: str = "default", count: int = 64,
-        twist=0.0, turns=0.0, smooth: int = 0, name: str = "fan") -> SweptMesh:
+        twist=0.0, turns=0.0, smooth: float = 0, name: str = "fan") -> SweptMesh:
     """An open ribbon swept along an *open* spine (fans out end to end)."""
     return SweptMesh(spine, _sweep.line_profile(width), count=count, scale=1.0,
                      twist=twist, turns=turns, closed_spine=False,
