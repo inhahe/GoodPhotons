@@ -4043,6 +4043,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   companion `.ftsl` with ftrace's own `ftsl::load` and calling `renderIsoPreviewCuda`, and
   the **Meshes** pane bakes procedural skins through ftrace's own pattern VM — so the
   preview and the renderer share one implementation rather than two that can drift.
+  That preview kernel (`kIsoPreview`) shades two-sided, and since 0.183.1 it picks the side
+  from the **geometric** normal, not the shading normal: it first undoes any flip
+  `intersectTri` applied by testing the *interpolated* normal (`dot(N, Ng) < 0`), then
+  applies one genuine backface test (`dot(Ng, V) < 0`) to both. Testing `dot(N, V)`
+  directly — what it used to do — inverts `N·L` in the ~1-px band at every silhouette where
+  a smooth normal grazes through zero on a still-front-facing triangle, stippling the
+  outline with light and dark specks. `raster.h` decides the same flip once per triangle at
+  projection time and the path tracer re-derives it via `ngo`, for the same reason; see
+  `known-issues.md` for the underlying `intersectTri` convention that all three work around.
   The Meshes pane is **z-buffered on the GPU** (`MeshGpu`): the sidecar's tessellation is
   uploaded once into one interleaved vertex buffer + index buffer (per-mesh
   `firstIndex/indexCount/baseVertex` ranges, so each mesh is still its own draw call with

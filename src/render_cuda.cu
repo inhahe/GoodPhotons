@@ -9147,9 +9147,27 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
             col = (tri > 0.0) ? dSkinTri(texMeta, texels, ti, h.p, h.n, tri)
                               : dSkinRgb(texMeta, texels, ti, h.u, h.v);
         }
-        DVec3 N = normalize(h.n);
-        DVec3 V = normalize(cam.eye - h.p);
-        if (dot(N, V) < 0) N = -N;                            // two-sided preview
+        // Two-sided preview, oriented from the GEOMETRIC normal.
+        //
+        // `intersectTri` orients hit.n by the *interpolated* normal
+        // (`flipped = !(dot(rd, ns) < 0)`), and on a smooth-shaded mesh that grazes
+        // through zero in a ~1-px band at every silhouette while the triangle is still
+        // front-facing. Flipping there inverts N·L with it, so one pixel drops to
+        // ambient while its neighbour lights up from the far side — a stipple of light
+        // and dark specks tracing every outline. Re-testing dot(N,V) here only repeated
+        // the same mistake. raster.h hit this exact bug and fixed it the same way (see
+        // the note in its shade loop, which decides the flip once per triangle at
+        // projection time); the path tracer's `ngo` likewise derives the geometric
+        // normal for the shading side rather than trusting a grazing shading normal.
+        //
+        // Invisible until a mesh actually carries smooth normals across a silhouette,
+        // which is why loom's analytic sweep normals surfaced it: flat/creased facets
+        // step across the graze band instead of sliding through it.
+        DVec3 N  = normalize(h.n);
+        DVec3 Ng = normalize(h.ng);
+        DVec3 V  = normalize(cam.eye - h.p);
+        if (dot(N, Ng) < 0) N = -N;        // undo a silhouette-graze flip
+        if (dot(Ng, V) < 0) N = -N;        // genuine backface: shade the side we see
         double lit = 0.0;
         for (int k = 0; k < pl.nLights; ++k) {
             const DPLight& lp = pl.lights[k];

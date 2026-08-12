@@ -5,6 +5,79 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT: `intersectTri` orients the hit normal by the *interpolated* normal, so it can report a front-facing triangle as a backface
+
+`src/geometry.h:337` and `src/render_cuda.cu:2607` both decide
+
+```cpp
+bool flipped = !(dot(rd, ns) < 0);   // ns = the interpolated shading normal
+```
+
+and flip `hit.n` accordingly, leaving `hit.ng = tri.gn` alone. On a smooth-shaded mesh
+`ns` grazes through zero in a ~1-px band at every silhouette *while the triangle is still
+geometrically front-facing*, so `flipped` goes true on a surface the ray plainly hit from
+the outside. Host and device agree, so this is a consistent convention rather than a
+CPU/GPU desync — but it is the wrong quantity to test, and it is a live trap for any new
+consumer of `DHit`/`Hit` that reasonably assumes "flipped means backface".
+
+Everything downstream currently compensates, which is why it has never shown as a bug in a
+final image: the path tracer re-derives the shading side from the geometric normal
+(`ngo = (dot(h.ng, h.n) >= 0) ? h.ng : -h.ng`) and then softens across the geometric
+horizon (Chiang 2019, `render_cuda.cu:3513`); `raster.h` decides its flip once per triangle
+at projection time; and the CUDA preview kernel now does the same (entry below). So the
+compensations are three separate ad-hoc patches for one upstream convention.
+
+**Proper fix**: orient by `tri.gn` (`flipped = dot(rd, tri.gn) >= 0`) and let the shading
+normal stay a shading normal. Not done here because it changes the reported facing of
+grazing hits in *every* CPU and GPU render, so it needs its own before/after sweep over the
+scene corpus rather than being folded into a preview-speckle fix.
+
+### FIXED (2026-08-12, v0.183.1): the CUDA preview kernel stippled light and dark specks along every smooth-shaded silhouette
+
+*(Reported as "a lot of stary light and dark pixels around where the edges of the shape meet
+the walls behind it" in the loom viewer's Render pane, right after sweeps started shipping
+analytic normals. It is not a regression in the normals — it is the bug above, newly
+reachable.)*
+
+`kIsoPreview` shaded two-sided by re-testing the shading normal against the view vector:
+
+```cpp
+DVec3 N = normalize(h.n);
+if (dot(N, V) < 0) N = -N;          // two-sided preview
+```
+
+`h.n` arrives already mis-oriented from `intersectTri` for exactly the grazing pixels where
+`dot(N, V)` is itself near zero, so this repeated the upstream mistake instead of correcting
+it: one pixel dropped to ambient while its neighbour lit from the far side, tracing every
+outline in salt-and-pepper. It needed a mesh carrying smooth normals *across* a silhouette
+to show up at all — flat or crease-split facets step over the graze band rather than sliding
+through it — which is why loom's analytic sweep normals surfaced a bug that predates them.
+
+**Fix** (`src/render_cuda.cu`, `kIsoPreview`): orient from the geometric normal, in two steps
+— undo any silhouette-graze flip (`dot(N, Ng) < 0`), then apply one genuine backface test
+(`dot(Ng, V) < 0`) to both. `raster.h:1661` already carried the identical fix with a comment
+describing the identical symptom ("dark speckles on the sphere's rim"), so the preview kernel
+was simply the one renderer that never got it.
+
+**Verified.** Three controlled variants at 900×900 — A: analytic normals 30×200, B: crease-40
+at 30×200, C: crease-40 at 18×120 (the exact pre-change state). Outliers vs a 3×3 median,
+threshold 28/px:
+
+| | dark | light | light dev/chan (median) | max dev |
+|---|---|---|---|---|
+| A before | 873 | 361 | **81.0** | 135.3 |
+| A after | 662 | 113 | 12.7 | 70.7 |
+| C (pre-change baseline) | 841 | 369 | 18.3 | 98.7 |
+
+So the fixed build is *quieter than the state the user remembers as clean*, and the bright
+specks — the loud half of the report — fell from a median 81/channel deviation to 12.7, i.e.
+ordinary antialiasing. 94–96% of what remains sits on a structural edge, where a median filter
+always flags something. Confirmed by eye in the loom viewer's Render pane at native
+resolution: the silhouette is clean. (The dotted dark curve still visible near the mesh is
+scene geometry, not speckle — it is the `track` trail of radius-0.017 spheres, sub-pixel at
+that distance, which resolves into visible spheres at the near end of the same curve.)
+The path tracer was checked separately (150 s render of variant A) and never had the bug.
+
 ### FIXED (2026-08-12): swept meshes still looked faceted after both normal bugs were fixed — because a crease angle cannot tell a coarsely-sampled smooth curve from a real fold
 
 *(The third and last part of "why do sweeps look tessellated?". The first two were bugs —
