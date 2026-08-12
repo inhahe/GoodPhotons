@@ -5,6 +5,27 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG: the loom viewer can die silently after `-prebake` hits its memory cap
+
+Observed 2026-08-12 on `-viewer scatter_modulated_sweep.json -loom scatter_modulated_sweep.py
+-play -prebake` (default cap). The prebake filled to `cap 1024 MB reached at frame 53/96
+(1029 MB); the rest will bake on demand`, played the on-demand tail for a while, then the
+process vanished mid-frame — no error on stdout, no WER/Application event. The same command
+with `-prebake-cap 150` (cap reached at frame 8/96) ran fine for a minute, and with
+`-prebake-cap 2600` (whole clock cached, 1863 MB) it has been stable, so the trigger looks
+like *continuing to bake on demand while already sitting at the cap*, not the cap itself.
+12.8 GB was free at the time, so a plain OOM is not an obvious explanation. Needs a repro
+under a debugger (`cdb`) to get a stack; suspect an allocation failure or a cache-eviction
+path that frees a frame still referenced by the in-flight render.
+
+**Related sizing note, not a bug:** this scene costs **19.4 MB/frame** to cache, so the whole
+96-frame clock needs 1863 MB and the default `-prebake-cap 1024` covers only 53 frames. The
+effect is a silent performance cliff mid-loop — cached frames play at ~24 fps (`cache 0.01`),
+uncached ones drop to ~3.4 fps because `bake` (loom's Python rebuild, ~140–240 ms) dominates.
+Worth considering: have `-prebake` report the projected total up front (it knows MB/frame
+after a few frames) and suggest the cap needed for full coverage, rather than only announcing
+the shortfall after the fact.
+
 ### TECH DEBT: `intersectTri` orients the hit normal by the *interpolated* normal, so it can report a front-facing triangle as a backface
 
 `src/geometry.h:337` and `src/render_cuda.cu:2607` both decide
