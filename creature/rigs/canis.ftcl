@@ -191,12 +191,31 @@ creature "canis" {
     }
 
     # ------------------------------------------------------------------------- skeleton
+    #
+    # SITES are the canis v1 keypoint set (21 landmarks: nose, occiput, withers,
+    # tail_base, tail_tip, and per leg x4 {hip|shoulder, stifle|elbow, hock|carpus,
+    # paw tip}). They are the rig's half of the keypoint<->rig interface; the detector's
+    # half is `notes/keypoints.yaml`, which maps DLC/SLEAP names onto these.
+    #
+    # Every `at` below is written in morph parameters, like everything else in this file.
+    # A landmark authored as a literal would be right for one dog and wrong for every
+    # morph of it -- and the resulting bias is indistinguishable, inside E_kp, from the
+    # fit simply being bad. So the withers moves when trunk_radius does, and the elbow
+    # moves when humerus_len does, for free.
+    #
+    # The joint landmarks sit at their JOINT CENTRES rather than at the palpable bony
+    # prominence (the point of the hock is the tuber calcanei, a couple of cm caudal to
+    # the hock's axis). That is the convention a human labeller can actually reproduce
+    # from video, and it is what keypoints.yaml documents -- but it is a convention, not
+    # a fact, and it must match whatever the labelling guide tells the annotator.
     skeleton {
         root "pelvis"
 
         bone "pelvis" {
             origin 0 0 (pelvis_z)
             geom capsule { from -0.06 0 0  to 0.06 0 0.01  radius (R_trunk*0.78) }
+            site "tail_base" { at -0.07 0 (R_trunk*0.55)  kind rigid
+                               doc "where the tail leaves the croup" }
         }
 
         # One spine segment for now. Real spinal flexibility (and, for felids, the
@@ -216,6 +235,8 @@ creature "canis" {
             origin (L_trunk*0.5) 0 (back_rise*0.5)
             geom capsule { from (-L_trunk*0.16) 0 0  to (L_trunk*0.16) 0 0.01
                            radius (R_trunk) }
+            site "withers" { at (L_trunk*0.10) 0 (R_trunk)  kind rigid
+                             doc "highest point of the shoulder; the height standard" }
         }
 
         bone "neck" {
@@ -234,6 +255,10 @@ creature "canis" {
                              size (L_head*0.34) (L_head*0.24) (L_head*0.26) }
             geom capsule { from (L_head*0.52) 0 -0.01  to (L_head*0.98) 0 -0.02
                            radius (L_head*0.13) }
+            site "nose"    { at (L_head*1.09) 0 -0.02   kind rigid
+                             doc "tip of the muzzle" }
+            site "occiput" { at (L_head*0.02) 0 (L_head*0.20)  kind rigid
+                             doc "back of the skull, between the ears" }
         }
 
         bone "tail1" {
@@ -251,6 +276,12 @@ creature "canis" {
             joint hinge { name "tail2_yaw"   axis 0 0 1 range -55deg 55deg }
             geom capsule { from 0 0 0  to (-L_tail*0.5) 0 (-L_tail*0.06)
                            radius (0.012m*g) }
+            # SOFT, and the only landmark here that is. A tail tip is a tuft of hair on a
+            # whip, so both the animal and the detector put it in a different place every
+            # frame. Marked soft so the fit gives it a wide Huber instead of letting it
+            # yank on the pelvis.
+            site "tail_tip" { at (-L_tail*0.5) 0 (-L_tail*0.06)  kind soft
+                              doc "distal end of the tail" }
         }
 
         # ---------------------------------------------------------------- hind limb, left
@@ -261,6 +292,8 @@ creature "canis" {
             joint hinge { name "hip_l_flex"   axis 0 1 0  range -55deg 75deg }
             geom capsule { from 0 0 0  to (L_femur*d_femur_x) 0 (L_femur*d_femur_z)
                            radius (R_femur) }
+            site "hip_l" { at 0 0 0  kind rigid
+                           doc "hip joint centre (greater trochanter)" }
         }
         bone "tibia_l" {
             parent "femur_l"
@@ -268,6 +301,7 @@ creature "canis" {
             joint hinge { name "stifle_l" axis 0 1 0  range -85deg 8deg }
             geom capsule { from 0 0 0  to (L_tibia*d_tibia_x) 0 (L_tibia*d_tibia_z)
                            radius (R_tibia) }
+            site "stifle_l" { at 0 0 0  kind rigid  doc "stifle (knee) joint centre" }
         }
         bone "hmeta_l" {
             parent "tibia_l"
@@ -275,6 +309,7 @@ creature "canis" {
             joint hinge { name "hock_l" axis 0 1 0  range -14deg 78deg }
             geom capsule { from 0 0 0  to (L_hmeta*d_hmeta_x) 0 (L_hmeta*d_hmeta_z)
                            radius (R_hmeta) }
+            site "hock_l" { at 0 0 0  kind rigid  doc "hock (tarsus) joint centre" }
         }
         bone "hpaw_l" {
             parent "hmeta_l"
@@ -282,6 +317,8 @@ creature "canis" {
             joint hinge { name "hpaw_l_flex" axis 0 1 0  range -45deg 32deg }
             geom capsule { from 0 0 0  to (L_paw*d_paw_x) 0 (L_paw*d_paw_z)
                            radius (R_paw) }
+            site "hpaw_l_tip" { at (L_paw*d_paw_x) 0 (L_paw*d_paw_z)  kind rigid
+                                doc "hind left paw, distal end" }
         }
 
         # --------------------------------------------------------------- hind limb, right
@@ -292,6 +329,8 @@ creature "canis" {
             joint hinge { name "hip_r_flex"   axis 0 1 0  range -55deg 75deg }
             geom capsule { from 0 0 0  to (L_femur*d_femur_x) 0 (L_femur*d_femur_z)
                            radius (R_femur) }
+            site "hip_r" { at 0 0 0  kind rigid
+                           doc "hip joint centre (greater trochanter)" }
         }
         bone "tibia_r" {
             parent "femur_r"
@@ -299,6 +338,7 @@ creature "canis" {
             joint hinge { name "stifle_r" axis 0 1 0  range -85deg 8deg }
             geom capsule { from 0 0 0  to (L_tibia*d_tibia_x) 0 (L_tibia*d_tibia_z)
                            radius (R_tibia) }
+            site "stifle_r" { at 0 0 0  kind rigid  doc "stifle (knee) joint centre" }
         }
         bone "hmeta_r" {
             parent "tibia_r"
@@ -306,6 +346,7 @@ creature "canis" {
             joint hinge { name "hock_r" axis 0 1 0  range -14deg 78deg }
             geom capsule { from 0 0 0  to (L_hmeta*d_hmeta_x) 0 (L_hmeta*d_hmeta_z)
                            radius (R_hmeta) }
+            site "hock_r" { at 0 0 0  kind rigid  doc "hock (tarsus) joint centre" }
         }
         bone "hpaw_r" {
             parent "hmeta_r"
@@ -313,6 +354,8 @@ creature "canis" {
             joint hinge { name "hpaw_r_flex" axis 0 1 0  range -45deg 32deg }
             geom capsule { from 0 0 0  to (L_paw*d_paw_x) 0 (L_paw*d_paw_z)
                            radius (R_paw) }
+            site "hpaw_r_tip" { at (L_paw*d_paw_x) 0 (L_paw*d_paw_z)  kind rigid
+                                doc "hind right paw, distal end" }
         }
 
         # ---------------------------------------------------------------- fore limb, left
@@ -334,6 +377,8 @@ creature "canis" {
             joint hinge { name "shoulder_l_flex"   axis 0 1 0  range -62deg 50deg }
             geom capsule { from 0 0 0  to (L_hum*d_hum_x) 0 (L_hum*d_hum_z)
                            radius (R_hum) }
+            site "shoulder_l" { at 0 0 0  kind rigid
+                                doc "scapulohumeral (shoulder) joint centre" }
         }
         bone "rad_l" {
             parent "hum_l"
@@ -341,6 +386,7 @@ creature "canis" {
             joint hinge { name "elbow_l" axis 0 1 0  range -8deg 88deg }
             geom capsule { from 0 0 0  to (L_rad*d_rad_x) 0 (L_rad*d_rad_z)
                            radius (R_rad) }
+            site "elbow_l" { at 0 0 0  kind rigid  doc "elbow joint centre" }
         }
         bone "fmeta_l" {
             parent "rad_l"
@@ -348,6 +394,7 @@ creature "canis" {
             joint hinge { name "carpus_l" axis 0 1 0  range -40deg 45deg }
             geom capsule { from 0 0 0  to (L_fmeta*d_fmeta_x) 0 (L_fmeta*d_fmeta_z)
                            radius (R_fmeta) }
+            site "carpus_l" { at 0 0 0  kind rigid  doc "carpus (wrist) joint centre" }
         }
         bone "fpaw_l" {
             parent "fmeta_l"
@@ -355,6 +402,8 @@ creature "canis" {
             joint hinge { name "fpaw_l_flex" axis 0 1 0  range -45deg 32deg }
             geom capsule { from 0 0 0  to (L_paw*d_paw_x) 0 (L_paw*d_paw_z)
                            radius (R_paw) }
+            site "fpaw_l_tip" { at (L_paw*d_paw_x) 0 (L_paw*d_paw_z)  kind rigid
+                                doc "fore left paw, distal end" }
         }
 
         # --------------------------------------------------------------- fore limb, right
@@ -372,6 +421,8 @@ creature "canis" {
             joint hinge { name "shoulder_r_flex"   axis 0 1 0  range -62deg 50deg }
             geom capsule { from 0 0 0  to (L_hum*d_hum_x) 0 (L_hum*d_hum_z)
                            radius (R_hum) }
+            site "shoulder_r" { at 0 0 0  kind rigid
+                                doc "scapulohumeral (shoulder) joint centre" }
         }
         bone "rad_r" {
             parent "hum_r"
@@ -379,6 +430,7 @@ creature "canis" {
             joint hinge { name "elbow_r" axis 0 1 0  range -8deg 88deg }
             geom capsule { from 0 0 0  to (L_rad*d_rad_x) 0 (L_rad*d_rad_z)
                            radius (R_rad) }
+            site "elbow_r" { at 0 0 0  kind rigid  doc "elbow joint centre" }
         }
         bone "fmeta_r" {
             parent "rad_r"
@@ -386,6 +438,7 @@ creature "canis" {
             joint hinge { name "carpus_r" axis 0 1 0  range -40deg 45deg }
             geom capsule { from 0 0 0  to (L_fmeta*d_fmeta_x) 0 (L_fmeta*d_fmeta_z)
                            radius (R_fmeta) }
+            site "carpus_r" { at 0 0 0  kind rigid  doc "carpus (wrist) joint centre" }
         }
         bone "fpaw_r" {
             parent "fmeta_r"
@@ -393,6 +446,8 @@ creature "canis" {
             joint hinge { name "fpaw_r_flex" axis 0 1 0  range -45deg 32deg }
             geom capsule { from 0 0 0  to (L_paw*d_paw_x) 0 (L_paw*d_paw_z)
                            radius (R_paw) }
+            site "fpaw_r_tip" { at (L_paw*d_paw_x) 0 (L_paw*d_paw_z)  kind rigid
+                                doc "fore right paw, distal end" }
         }
     }
 }

@@ -14,12 +14,25 @@ The rest of the page is *why*. The one rule that must not be violated on the day
 never share a recording.
 
 **What happens to the footage afterwards is `notes/pipeline.md`** — the command sequence from four
-camera cards to a trained policy. Read it *before* shooting, because it says plainly which stages are
-unbuilt: the ingest, calibration, keypoint-import and fit tools that consume this page's output do
-not exist yet. The ordering decision it argues for is the one that affects *when you shoot*: run the
-synthetic self-test (`tools/fit_selftest.py`, also unbuilt) against public mocap first, so that a
-broken fit is discovered before an animal, an owner and a two-hour session have been spent on footage
-the pipeline cannot use.
+camera cards to a trained policy — and **`notes/training.md`** for the training commands
+specifically. Read pipeline.md *before* shooting, because it says plainly which stages are unbuilt:
+the ingest, calibration and keypoint-import glue, and the anatomy/motion fits that consume this
+page's output, do not exist yet.
+
+The ordering decision that affects *when you shoot*: run the self-test first, so a broken fit is
+discovered before an animal, an owner and a two-hour session have been spent on footage the
+pipeline cannot use. Half of it now exists and is worth running the day you calibrate —
+
+```bash
+python tools/fit_selftest.py --calib sessions/.../calib.json
+```
+
+— which projects known poses through *your* calibrated cameras and checks the solver recovers
+them. It has already earned its keep: it found a stale-Jacobian bug that on real footage would
+have been misdiagnosed as a bad calibration. What it does **not** yet do is the part its name
+refers to — replaying public mocap of a *real* dog, which is the only version that tests whether a
+real animal is representable by the rig at all, rather than testing the optimiser against poses
+the rig can trivially reach.
 
 ## The rig serves two jobs, and they must not share a mode
 

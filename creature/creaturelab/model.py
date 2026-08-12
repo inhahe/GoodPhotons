@@ -48,6 +48,29 @@ class Joint:
 
 
 @dataclass
+class Site:
+    """A named landmark: where the outside world is allowed to point at the anatomy.
+
+    Massless and non-colliding, so adding one can never change the physics -- which is
+    what makes it safe to author as many as the fitting pipeline wants. Two consumers:
+    `mj_jacSite` (the fit needs d site-position / d qpos, and MuJoCo only provides it for
+    sites), and `notes/keypoints.yaml`, which maps detector keypoint names onto these.
+
+    `kind` separates a bony prominence a detector can re-find to within a couple of pixels
+    from a soft-tissue landmark that slides over the skeleton by centimetres. Both are
+    useful; treating them as equally trustworthy is what lets a wandering belly marker
+    drag the skeleton fit.
+    """
+    name: str
+    bone: str
+    at: Vec3 = (0.0, 0.0, 0.0)
+    kind: str = "rigid"                                  # 'rigid' | 'soft'
+    size: float = 0.008
+    rgba: tuple[float, float, float, float] | None = None
+    doc: str = ""
+
+
+@dataclass
 class Bone:
     name: str
     parent: str | None = None
@@ -57,6 +80,7 @@ class Bone:
     rgba: tuple[float, float, float, float] | None = None
     joints: list[Joint] = field(default_factory=list)
     geoms: list[Geom] = field(default_factory=list)
+    sites: list[Site] = field(default_factory=list)
 
 
 @dataclass
@@ -183,6 +207,18 @@ class Creature:
     @property
     def actuated_joints(self) -> list[Joint]:
         return [j for b in self.bones for j in b.joints if j.actuated]
+
+    @property
+    def sites(self) -> list[Site]:
+        """Every landmark, in a stable order (bone order, then declaration order)."""
+        return [s for b in self.bones for s in b.sites]
+
+    def site(self, name: str) -> Site:
+        for b in self.bones:
+            for s in b.sites:
+                if s.name == name:
+                    return s
+        raise KeyError(name)
 
     def morph_vector(self) -> list[float]:
         """The RL conditioning vector, in a stable order (declaration order)."""

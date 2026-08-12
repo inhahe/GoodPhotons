@@ -50,6 +50,31 @@ JOINT = BlockSpec(
     },
 )
 
+SITE = BlockSpec(
+    label="name",
+    doc="A named massless landmark on a bone: an anatomical point the outside world "
+        "refers to. The keypoint<->rig interface (notes/keypoints.yaml) and MuJoCo's "
+        "`mj_jacSite` both address the rig through these.",
+    props={
+        # `at` is 3 EXPRESSIONS, like every other position in the file, and that is the
+        # whole point rather than an implementation convenience. A landmark is a fact
+        # about the anatomy: the lateral humeral epicondyle is at the distal end of the
+        # humerus, so it MUST move when `humerus_len` does. Writing it as a literal
+        # 0.16 m makes it correct for exactly one body and silently wrong for every
+        # morph of it -- which would put a systematic bias straight into E_kp, where it
+        # is indistinguishable from a bad fit. This is the rig's founding rule
+        # (design.md, "Why a layer above MJCF") applied to landmarks.
+        "at": Prop(3, required=True, doc="position in bone-local coords, in morph params"),
+        "kind": Prop(1, kind="word", choices=("rigid", "soft"),
+                     doc="rigid = bony prominence a detector can find repeatably; "
+                         "soft = skin/flesh landmark that slides over the bone (belly, "
+                         "mid-tail), and gets a wider Huber in the fit"),
+        "size": Prop(1, doc="visualisation radius only; a site has no mass or collision"),
+        "rgba": Prop(4),
+        "doc": Prop(1, kind="str"),
+    },
+)
+
 BONE = BlockSpec(
     label="name",
     doc="A rigid segment. Bones form a tree; the one without a parent is the root.",
@@ -60,7 +85,7 @@ BONE = BlockSpec(
         "mass": Prop(1, doc="total mass of this bone, distributed over its geoms"),
         "rgba": Prop(4),
     },
-    blocks={"joint": JOINT, "geom": GEOM},
+    blocks={"joint": JOINT, "geom": GEOM, "site": SITE},
 )
 
 SKELETON = BlockSpec(
@@ -193,5 +218,5 @@ CREATURE = BlockSpec(
 
 ROOT = BlockSpec(blocks={"creature": CREATURE})
 
-__all__ = ["ROOT", "CREATURE", "SKELETON", "BONE", "JOINT", "GEOM", "MORPH", "PARAM",
-           "DERIVE", "WORLD", "DEFAULTS", "POSTURE", "SENSING", "VARIADIC"]
+__all__ = ["ROOT", "CREATURE", "SKELETON", "BONE", "JOINT", "GEOM", "SITE", "MORPH",
+           "PARAM", "DERIVE", "WORLD", "DEFAULTS", "POSTURE", "SENSING", "VARIADIC"]

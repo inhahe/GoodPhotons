@@ -14,8 +14,13 @@ at the XML:
 * **Where does the standing pose actually put the feet?** A limb that doesn't reach the
   ground in the reference pose makes every later result meaningless.
 
+* **Where are the landmarks?** The sites are the rig's half of the keypoint<->rig
+  interface, so a fit that reprojects badly needs a way to ask whether the rig is putting
+  the withers somewhere sane before blaming the detector.
+
     python tools/rig_report.py rigs/canis.ftcl
     python tools/rig_report.py rigs/canis.ftcl --set body_scale=1.6
+    python tools/rig_report.py rigs/canis.ftcl --morph out/theta_rex.json --sites
 """
 from __future__ import annotations
 
@@ -25,11 +30,17 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from creaturelab.console import use_utf8  # noqa: E402
+
+use_utf8()   # before argparse: --help is the thing a cp1252 console cannot print
+
 import numpy as np                                     # noqa: E402
 
 from ftcl.errors import FtclError                      # noqa: E402
+from creaturelab.build import load                     # noqa: E402
 from creaturelab.emit_mjcf import (geom_z_extent, natural_mass,  # noqa: E402
                                    place_on_ground, to_mjcf)
+from creaturelab.morph_io import morph_from_args, parse_sets   # noqa: E402
 from creaturelab.tune import (SEAT, build_tuned,        # noqa: E402
                               steps_per_cycle_floor)
 from creaturelab.validate import (NUDGE_FRACTION, stand_test,   # noqa: E402
@@ -52,18 +63,19 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("rig")
     ap.add_argument("--set", nargs="*", metavar="NAME=VAL", default=[])
+    ap.add_argument("--morph", metavar="FILE",
+                    help="load a fitted morph vector (out/theta_*.json); --set still wins")
+    ap.add_argument("--sites", action="store_true",
+                    help="list the landmarks and where the standing pose puts them")
     ap.add_argument("--top", type=int, default=12, help="how many joints to list")
     args = ap.parse_args()
 
-    sets = {}
-    for p in args.set:
-        k, v = p.split("=", 1)
-        sets[k.strip()] = float(v)
-
     import mujoco
     try:
+        sets = morph_from_args(args.rig, args.morph, parse_sets(args.set),
+                               load(args.rig).params)
         creature, model, data, nat, loads = build(args.rig, sets, -SEAT)
-    except FtclError as e:
+    except (FtclError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
@@ -98,6 +110,56 @@ def main() -> int:
     if th is not None and pv is not None:
         print(f"withers {withers_height(model, data):.3f} m   croup {pv[2]:.3f} m   "
               f"back rise {th[2]-pv[2]:+.3f} m")
+
+    # --- landmarks -----------------------------------------------------------------------
+    # Always summarised, listed in full only on request: 21 rows is too much for the
+    # default report, but "how many landmarks does this rig even have" is exactly the
+    # question you ask when a fit reprojects badly, and the answer used to be unavailable.
+    if creature.sites:
+        n_soft = sum(1 for s in creature.sites if s.kind == "soft")
+        print(f"landmarks {len(creature.sites)}  ({len(creature.sites) - n_soft} rigid, "
+              f"{n_soft} soft)" + ("" if args.sites else "   -- use --sites to list"))
+    elif args.sites:
+        print("landmarks: none -- this rig has no `site` blocks, so it cannot be fit "
+              "to video (notes/pipeline.md stage B)")
+
+    if args.sites and creature.sites:
+        print(f"\n  {'site':14s} {'bone':10s} {'kind':5s} "
+              f"{'world x':>8s} {'y':>8s} {'z':>8s}   {'bone-local x':>12s} "
+              f"{'y':>8s} {'z':>8s}")
+        for s in creature.sites:
+            sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, s.name)
+            p = data.site_xpos[sid]
+            print(f"  {s.name:14s} {s.bone:10s} {s.kind:5s} "
+                  f"{p[0]:+8.4f} {p[1]:+8.4f} {p[2]:+8.4f}   "
+                  f"{s.at[0]:+12.4f} {s.at[1]:+8.4f} {s.at[2]:+8.4f}")
+
+        # Landmark symmetry, checked separately from the torque symmetry below. A site
+        # mirrored wrongly is invisible in the joint torques -- it has no mass and exerts
+        # no force -- but it would put a constant left/right bias into E_kp, which the fit
+        # can only absorb by yawing the whole skeleton. Nothing else in this report can
+        # see that.
+        by = {s.name: data.site_xpos[
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, s.name)] for s in creature.sites}
+        worst, pair = 0.0, None
+        for name, p in by.items():
+            mate = (name.replace("_l_", "_r_") if "_l_" in name
+                    else name[:-2] + "_r" if name.endswith("_l") else None)
+            if mate and mate in by:
+                q = by[mate]
+                # mirror in the y=0 plane: x and z must match, y must negate
+                d = max(abs(p[0] - q[0]), abs(p[2] - q[2]), abs(p[1] + q[1]))
+                # `pair is None or ...`, not a bare `d > worst`. Mirrored site positions
+                # come out BIT-IDENTICAL, so every d is exactly 0.0, so a bare `>` never
+                # fires and the check silently prints nothing on precisely the rigs that
+                # pass it. (The torque check below had the same shape and survived only
+                # because inverse dynamics never returns two exactly equal floats.)
+                if pair is None or d > worst:
+                    worst, pair = d, (name, mate)
+        if pair:
+            print(f"  left/right landmark mirror error: {worst:.3e} m "
+                  f"({pair[0]} vs {pair[1]})  "
+                  + ("symmetric" if worst < 1e-9 else "*** ASYMMETRIC ***"))
 
     # --- static load and the passive tone sized from it ----------------------------------
     ncon = int(data.ncon)
@@ -151,7 +213,7 @@ def main() -> int:
             mate = name.replace("_l_", "_r_") if "_l_" in name else name[:-2] + "_r"
             if mate in by_name:
                 d = abs(abs(v) - abs(by_name[mate]))
-                if d > worst:
+                if worst_pair is None or d > worst:   # see the landmark check above
                     worst, worst_pair = d, (name, mate)
     if worst_pair:
         ok = "symmetric" if worst < 1e-6 else "*** ASYMMETRIC ***"

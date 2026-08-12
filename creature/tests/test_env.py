@@ -131,8 +131,8 @@ def test_angle_normalisation_maps_range_to_pm_one(body):
 # ------------------------------------------------------------------------ the delay lines
 def test_delay_line_returns_signals_late():
     """A step injected now must not appear immediately on a lagged channel."""
-    spec = _fake_spec(dim=3, lags=[0.0, 1.0, 2.5])
-    prop = sensing.BatchProprioception(spec, 1, np.random.default_rng(0))
+    prop = sensing.BatchProprioception(_fake_batch(1, dim=3, lags=[0.0, 1.0, 2.5]),
+                                       1, np.random.default_rng(0))
     prop.reset(np.array([0]), np.zeros((1, 3)), np.zeros((1, 1)))
     seen = []
     for k in range(6):
@@ -155,8 +155,8 @@ def test_delay_line_history_is_seeded_not_zeroed():
     Zero-filling gives the policy a first observation claiming the animal was inverted and
     airborne a moment ago; the resulting flail looks exactly like a physics bug.
     """
-    spec = _fake_spec(dim=2, lags=[3.0, 3.0])
-    prop = sensing.BatchProprioception(spec, 2, np.random.default_rng(0))
+    prop = sensing.BatchProprioception(_fake_batch(2, dim=2, lags=[3.0, 3.0]),
+                                       2, np.random.default_rng(0))
     obs0 = np.array([[5.0, -5.0], [1.0, -1.0]])
     prop.reset(np.array([0, 1]), obs0, np.zeros((2, 1)))
     got = prop.sense(obs0)
@@ -171,8 +171,8 @@ def test_delay_line_history_is_long_enough_for_the_lerp():
     stale value it would read does no harm and the bug survives every behavioural test.
     """
     for lag in (2.0, 2.5, 3.0):
-        spec = _fake_spec(dim=1, lags=[lag])
-        prop = sensing.BatchProprioception(spec, 1, np.random.default_rng(0))
+        prop = sensing.BatchProprioception(_fake_batch(1, dim=1, lags=[lag]),
+                                           1, np.random.default_rng(0))
         assert prop.hist >= int(np.floor(lag)) + 2
 
 
@@ -192,6 +192,11 @@ def _fake_spec(dim: int, lags: list[float]) -> sensing.ObsSpec:
         max_delay=int(np.ceil(max(lags))))
 
 
+def _fake_batch(n: int, dim: int, lags: list[float]) -> sensing.BatchSpec:
+    """`n` identical fake bodies, stacked the way a vector env stacks real ones."""
+    return sensing.batch_spec([_fake_spec(dim, lags) for _ in range(n)])
+
+
 # ------------------------------------------------------------------------- actuator work
 def test_energy_chunks_divide_the_frame_skip():
     for skip in (1, 2, 6, 10, 12):
@@ -209,7 +214,7 @@ def test_actuator_work_integrates_a_known_power():
     raw = sensing.make_raw(spec, 2, energy_samples=4)
     raw.work_tau[:] = 3.0
     raw.work_vel[:] = 2.0                       # |tau.qdot| = 6 per joint, 1 joint
-    w = sensing.actuator_work(spec, raw, chunk_dt=0.005)
+    w = sensing.actuator_work(raw, chunk_dt=0.005)
     assert np.allclose(w, 6.0 * 4 * 0.005)
 
 
@@ -219,7 +224,7 @@ def test_actuator_work_does_not_cancel_negative_work():
     raw = sensing.make_raw(spec, 1, energy_samples=2)
     raw.work_tau[0, :, 0] = [1.0, 1.0, 1.0]
     raw.work_vel[0, :, 0] = [1.0, -1.0, 1.0]
-    w = sensing.actuator_work(spec, raw, chunk_dt=1.0)
+    w = sensing.actuator_work(raw, chunk_dt=1.0)
     assert w[0] == pytest.approx(2.0), "power was signed, so braking looked free"
 
 
@@ -290,11 +295,11 @@ def test_rate_channels_actually_saturate(body):
     """
     e = CreatureEnv(body, cfg())
     e.reset(seed=0)
-    s, raw = body.spec, e.vec.raw
+    s, bs, raw = body.spec, e.vec.bspec, e.vec.raw
     raw.qvel_j[:] = 1e4 / s.time                       # absurd but finite
     raw.qvel_free[:, 3:6] = 1e4 / s.time
     raw.qvel_free[:, 0:3] = 1e4 * s.speed
-    out = sensing.assemble(s, raw, np.zeros((1, e.act_dim)), e.vec.command, e.vec.morph,
+    out = sensing.assemble(bs, raw, np.zeros((1, e.act_dim)), e.vec.command, e.vec.morph,
                            np.zeros((1, e.obs_dim)))
     for group in ("joint_rate", "vestibular"):
         v = np.abs(out[0, s.slices[group]])
@@ -437,6 +442,60 @@ def test_exploded_physics_terminates_without_poisoning_the_observation(body):
     assert info["sane"][0] and not term[0], "the healthy env was affected too"
     # MuJoCo swallowed the NaN, which is exactly why the counter is the detector.
     assert np.all(np.isfinite(v.datas[1].qvel))
+
+
+def test_finite_nonsense_is_insane_too(body):
+    """Divergence that stays finite must terminate as surely as a NaN does.
+
+    MuJoCo's warning counters fire on NaN/Inf and on nothing else, so a body flung across the
+    world at hundreds of Froude reads as a perfectly healthy sample: it earns a reward, its
+    `c_energy` (which is unbounded above) enters the mean, and its rows train the policy. That
+    is the observed failure in known-issues #6 -- a `sane` row logging -445 Froude of root
+    speed. The test drives the root velocity itself rather than waiting for a real blow-up,
+    because the whole point of the check is that the state it catches is *reachable* by
+    integration and therefore not reproducible on demand.
+
+    The threshold is expressed in the body's own Froude scale, so this is simultaneously a
+    check that a large *body* is not penalised for its correspondingly larger speeds.
+    """
+    c = cfg()
+    v = VecCreatureEnv([body] * 2, c, seed=0, workers=1)
+    v.reset(seed=0)
+    # Fast, but well inside what a galloping animal reaches; must survive.
+    v.datas[1].qvel[0] = 3.0 * v.bspec.speed[1]
+    _, _, term, _, info = v.step(np.zeros((2, v.act_dim)))
+    assert info["sane"][1] and not term[1], "a plausible gallop was flagged as divergence"
+
+    v.reset(seed=0)
+    v.datas[1].qvel[0] = 500.0 * v.bspec.speed[1]
+    _, r, term, _, info = v.step(np.zeros((2, v.act_dim)))
+    assert not info["sane"][1] and term[1], "finite nonsense passed as physics"
+    assert r[1] == pytest.approx(-1.0)
+    assert info["sane"][0] and not term[0], "the healthy env was affected too"
+    assert np.all(np.isfinite(v.datas[1].qvel)), "this was meant to be the finite case"
+
+
+def test_finite_nonsense_is_judged_per_body(zoo):
+    """The divergence bar is per-env, in each body's own units -- not body zero's.
+
+    A shared bar would read as a size bias: the same absolute speed is ordinary for a large
+    animal and impossible for a small one, so a batch of mixed morphs would terminate its
+    smallest bodies for moving at all. `BatchSpec` exists to stop exactly this class of
+    mistake, and a scalar threshold applied to a batch is the easiest way to reintroduce it.
+    """
+    c = cfg()
+    v = VecCreatureEnv(zoo, c, seed=0, workers=1)
+    v.reset(seed=0)
+    for i in range(len(zoo)):
+        v.datas[i].qvel[0] = 10.0 * v.bspec.speed[i]      # same *dimensionless* speed each
+    _, _, _, _, info = v.step(np.zeros((v.n, v.act_dim)))
+    assert np.all(info["sane"]), "an identical Froude number read differently per body"
+
+    v.reset(seed=0)
+    for i in range(len(zoo)):
+        v.datas[i].qvel[0] = 500.0 * v.bspec.speed[i]
+    _, _, term, _, info = v.step(np.zeros((v.n, v.act_dim)))
+    assert not np.any(info["sane"]) and np.all(term)
 
 
 def test_a_recovered_env_is_sane_again_after_reset(body):
@@ -636,3 +695,112 @@ def test_curriculum_advances_from_a_real_rollout(body):
     for _ in range(int(0.2 * c.control_hz) + 1):
         v.step(a)
     assert v.speed_cap > 0.3, "a full episode of perfect tracking earned no promotion"
+
+
+# --------------------------------------------------------------- a batch of DIFFERENT bodies
+# P4's morph randomisation puts a different animal in every env. Everything below is a way
+# the batched pass can quietly keep using body zero's numbers for all of them: nothing
+# raises, the shapes all agree, and the only symptom is that the policy generalises worse
+# than the training curve says it should.
+
+@pytest.fixture(scope="module")
+def zoo():
+    """Three genuinely different animals, small to large."""
+    return [build_body(cfg(), morph={"body_scale": s}) for s in (0.7, 1.0, 1.5)]
+
+
+def test_each_env_is_normalised_by_its_own_scale(zoo):
+    """The dynamic-similarity claim, checked on a heterogeneous batch.
+
+    Identical *physical* state fed to three different bodies must come out as three
+    different observations -- because a metre per second is a different Froude number to a
+    small dog than to a big one. If the batch shared body zero's scales the three rows
+    would be identical, which is exactly the bug, and it is invisible in every shape check.
+    """
+    v = VecCreatureEnv(zoo, cfg(), seed=0, workers=1)
+    v.reset(seed=0)
+    raw = v.raw
+    raw.qvel_j[:] = 1.0                       # same rad/s
+    raw.qvel_free[:] = 0.0
+    raw.qvel_free[:, 0] = 1.0                 # same m/s forward
+    raw.contact[:] = 100.0                    # same newtons
+    raw.xmat[:] = np.eye(3)
+    out = sensing.assemble(v.bspec, raw, np.zeros((3, v.act_dim)), v.command, v.morph,
+                           np.zeros((3, v.obs_dim)))
+    s = v.spec.slices
+
+    rate = out[:, s["joint_rate"]][:, 0]
+    assert np.all(np.diff(rate) > 0), "joint rate did not scale with each body's own period"
+    vel = out[:, s["vestibular"].start + 6]
+    assert np.all(np.diff(vel) < 0), "a fixed m/s is a SMALLER Froude number on a bigger dog"
+    con = out[:, s["contact"]][:, 0]
+    assert np.all(np.diff(con) < 0), "a fixed force is a smaller fraction of a heavier dog"
+
+    # ...and each row must equal what that body's own spec predicts, not merely differ.
+    for i, b in enumerate(zoo):
+        assert rate[i] == pytest.approx(b.spec.time)
+        assert vel[i] == pytest.approx(1.0 / b.spec.speed)
+    v.close()
+
+
+def test_each_env_has_its_own_conduction_lag(zoo):
+    """A bigger animal is genuinely more sluggish, per env, not per batch.
+
+    The delay line indexes a shared ring buffer; making the lags per-env means the gather
+    needs an env index as well as a channel index. Get that wrong and every env silently
+    reads body zero's lag -- restoring exactly the single global delay constant that
+    `sensing`'s whole second design decision exists to avoid.
+    """
+    v = VecCreatureEnv(zoo, cfg(), seed=0, workers=1)
+    lags = v.bspec.obs_delay
+    assert np.all(np.diff(lags.max(axis=1)) > 0), "the three bodies share one lag profile"
+
+    # Inject a step and watch it arrive at three different times on the slowest channel.
+    chan = int(np.argmax(lags[-1]))
+    prop = v.prop
+    prop.reset(np.arange(3), np.zeros((3, v.obs_dim)), np.zeros((3, v.act_dim)))
+    arrival = np.full(3, -1)
+    pulse = np.zeros((3, v.obs_dim))
+    pulse[:, chan] = 1.0
+    for k in range(int(lags[:, chan].max()) + 3):
+        prop.advance()
+        seen = prop.sense(pulse if k >= 1 else np.zeros((3, v.obs_dim)))
+        for i in range(3):
+            if arrival[i] < 0 and seen[i, chan] > 0.99:
+                arrival[i] = k
+    assert np.all(arrival > 0), f"the pulse never fully arrived: {arrival}"
+    assert arrival[0] < arrival[2], f"small and large body saw it at the same step: {arrival}"
+    v.close()
+
+
+def test_a_mixed_batch_steps_every_body_against_its_own_model(zoo):
+    """The physics threads must not all be stepping body zero.
+
+    Cheap to get wrong (`self.bodies[0].model` instead of `self.bodies[i].model` reads
+    fine) and the run would look healthy: every env would simply be the same dog.
+    """
+    v = VecCreatureEnv(zoo, cfg(), seed=0, workers=1)
+    v.reset(seed=0)
+    for _ in range(20):
+        obs, rew, term, _, _ = v.step(np.zeros((3, v.act_dim)))
+    assert np.isfinite(obs).all() and not term.any()
+    # Root height is not sensed, so it is an independent witness of which model ran.
+    z = v.raw.root_z
+    assert np.all(np.diff(z) > 0.01), f"three sizes of dog stood at the same height: {z}"
+    assert len({id(d) for d in v.datas}) == 3
+    v.close()
+
+
+def test_termination_height_is_per_body(zoo):
+    """`min_height` is a fraction of the body's OWN withers, so the threshold must differ."""
+    v = VecCreatureEnv(zoo, cfg(), seed=0, workers=1)
+    assert np.all(np.diff(v.withers) > 0)
+    assert v.withers.shape == (3,), "withers must stay one number per env"
+    v.close()
+
+
+def test_mixing_incompatible_layouts_is_refused(body):
+    """Same rig, different foot set: every shape agrees and every channel means something else."""
+    other = build_body(cfg(), foot_names=["fpaw_l", "fpaw_r"])
+    with pytest.raises(ValueError):
+        sensing.batch_spec([body.spec, other.spec])

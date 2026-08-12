@@ -2,6 +2,8 @@
 
     python tools/ftcl_build.py rigs/canis.ftcl -o out/canis.xml --check
     python tools/ftcl_build.py rigs/canis.ftcl --set body_scale=1.4 limb_gracility=0.7
+    python tools/ftcl_build.py rigs/canis.ftcl --morph out/theta_rex.json --check
+    python tools/ftcl_build.py rigs/canis.ftcl --random --save-morph out/theta_rand.json
     python tools/ftcl_build.py rigs/canis.ftcl --view
 """
 from __future__ import annotations
@@ -12,22 +14,17 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from creaturelab.console import use_utf8  # noqa: E402
+
+use_utf8()   # before argparse: --help is the thing a cp1252 console cannot print
+
 from ftcl.errors import FtclError                     # noqa: E402
 from creaturelab.build import load, sample_morph      # noqa: E402
+from creaturelab.morph_io import morph_from_args, parse_sets, save_morph   # noqa: E402
 from creaturelab.emit_mjcf import place_on_ground, to_mjcf   # noqa: E402
 from creaturelab.tune import build_tuned              # noqa: E402
 from creaturelab.validate import (NUDGE_FRACTION, stand_test,   # noqa: E402
                                   withers_height)
-
-
-def parse_sets(pairs) -> dict[str, float]:
-    out = {}
-    for p in pairs or []:
-        if "=" not in p:
-            raise SystemExit(f"--set expects name=value, got {p!r}")
-        k, v = p.split("=", 1)
-        out[k.strip()] = float(v)
-    return out
 
 
 def main() -> int:
@@ -36,6 +33,10 @@ def main() -> int:
     ap.add_argument("rig")
     ap.add_argument("-o", "--out", help="write MJCF here (default out/<name>.xml)")
     ap.add_argument("--set", nargs="*", metavar="NAME=VAL", help="override morph params")
+    ap.add_argument("--morph", metavar="FILE",
+                    help="load a fitted morph vector (out/theta_*.json); --set still wins")
+    ap.add_argument("--save-morph", metavar="FILE",
+                    help="write the morph vector actually used, for reuse downstream")
     ap.add_argument("--random", action="store_true", help="sample a random morph vector")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--scale", type=float, default=1.0,
@@ -47,22 +48,36 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        morph = parse_sets(args.set)
+        # Load the rig's parameter list before applying the file, so a typo'd name in a
+        # theta file is reported against the file rather than surfacing later as a
+        # generic build error. `load` with no overrides cannot fail on morph names.
+        params = load(args.rig).params
+        morph = morph_from_args(args.rig, args.morph, parse_sets(args.set), params)
         if args.random:
             import random
-            # One cheap load just to learn the parameter list, then sample within it.
-            params = load(args.rig, morph).params
             sampled = sample_morph(params, random.Random(args.seed), args.scale)
-            sampled.update(morph)                    # explicit --set still wins
+            sampled.update(morph)          # explicit --set and --morph still win
             morph = sampled
         # `build_tuned`, not `load`: an untuned rig has no passive tone and folds up the
         # instant gravity touches it, so --check on a bare `load` would measure the
         # collapse of a body nobody intends to simulate. The tone pass is part of what
         # "compile this rig" means.
         creature, loads = build_tuned(args.rig, morph)
-    except FtclError as e:
+    except (FtclError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+
+    if args.save_morph:
+        # `creature.morph`, not the `morph` dict above: the former is the full 26-vector
+        # after defaults and range clamping have been applied, which is the thing that
+        # actually built this body. Saving the sparse override dict instead would produce
+        # a file that reproduces the body only as long as the rig's defaults never change.
+        save_morph(args.save_morph, creature.morph, rig=args.rig,
+                   creature=creature.name,
+                   source=("random sample seed=%d scale=%g" % (args.seed, args.scale))
+                   if args.random else "ftcl_build --set/--morph")
+        if not args.quiet:
+            print(f"morph vector ({len(creature.morph)} params) -> {args.save_morph}")
 
     xml = to_mjcf(creature)
     out = args.out or os.path.join("out", f"{creature.name}.xml")

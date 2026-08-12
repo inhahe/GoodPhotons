@@ -314,15 +314,23 @@ distribution.
 - [ ] Morph vector (bone lengths, masses, attachment points, muscle strengths) as a
       first-class policy input
 - [ ] Domain randomisation over morph space during training
-- [ ] **`--morph <file>` on `ftcl_build.py` / `rig_report.py` / `train.py`** — load a fitted
-      θ from `out/theta_*.json` instead of typing twenty-six `--set` pairs by hand. Small, and it
-      is the interface P5's output plugs into (`notes/pipeline.md` stage D).
-- [ ] **Distinct bodies per env in `train.py`, plus `--morph-center` / `--morph-scale`.** This is
-      the *only* missing piece of the P4 loop, and it is smaller than it looks: `build_body(cfg,
-      morph=...)` already accepts a morph dict, and `sensing.py` already carries `morph_norm` in the
-      observation "from day one" — so the conditioning channel exists and is already being fed. What
-      `train.py` does today is build `[body] * n`, one shared body for every env. Replacing that with
-      a list of distinct sampled bodies is the whole change.
+- [x] **`--morph <file>` on `ftcl_build.py` / `rig_report.py` / `train.py`** — **DONE**, and on
+      `morph_sweep.py` too. Loads a fitted θ from `out/theta_*.json` instead of twenty-six `--set`
+      pairs; `--set NAME=VAL` overrides individual entries so you can load the fitted animal and
+      then poke one parameter. Reader and format live in `creaturelab/morph_io.py`
+      (`notes/pipeline.md` stage D).
+- [x] **Distinct bodies per env in `train.py`, plus `--morph` / `--morph-scale`.** **DONE**
+      (the centre flag is spelled `--morph`, not `--morph-center`, so it is the same flag every
+      other tool takes). `--morph-bodies` (default 8) compiles that many distinct animals and cycles
+      them over the envs; the pool is capped separately from `--envs` because distinct bodies are a
+      *variance* knob, not just a cost one — 64 distinct bodies means no single animal is seen often
+      enough early for the policy to get any of them standing, while ~8 over 64 envs trains visibly
+      faster to the same asymptote. The zoo is seeded off `--seed` so a resume rebuilds it
+      identically (a different zoo mid-run is a change of task, and shows up as an unexplained step
+      in the curve), and evaluation deliberately scores the **centre** body only, so `best.pt`
+      cannot track a lucky draw of bodies. Commands: `notes/training.md`.
+      **Uncovered known-issues #6** — randomised bodies trip MuJoCo QACC instability warnings the
+      default body never does — which is still open.
 - [ ] **Bar:** a body never seen in training walks with the same character — **within its body
       plan.** That qualifier is load-bearing and is not hedging: the morph space is *not* one global
       manifold. You cannot interpolate a leg into a wing, because the midpoint body has neither
@@ -341,7 +349,19 @@ implementation plan"** at the end of this section, added 2026-08-08.)*
 policy — are in `notes/pipeline.md`, added 2026-08-12. That page is where this phase's unbuilt
 tools have their CLIs specified, so they are designed once rather than improvised per-tool.)*
 
-- [ ] **`tools/fit_selftest.py` FIRST — before any real footage exists.** Project the P2 public dog
+- [~] **`tools/fit_selftest.py` FIRST — before any real footage exists.** **PARTLY DONE**: the
+      camera model (`creaturelab/camera.py`), the pose solve (`creaturelab/fit.py`) and the
+      round-trip driver all exist and pass. Clean observations are recovered exactly; the default
+      corruption comes back at ~23 mm median against ~34 mm for free-point triangulation of the same
+      data. It has already earned its keep — it caught a stale-Jacobian bug (`mj_jacSite` needs
+      `mj_comPos`, which `mj_kinematics` does not write) that on real footage would have been
+      misdiagnosed as a bad calibration, and an initialiser whose claimed benefit evaporated once
+      that Jacobian was fixed. **Still missing: the `--mocap` half**, which is the part the name
+      refers to. A synthetic pose is by construction inside the rig's reachable set, so what passes
+      today tests the *optimiser*, not the *model*: it says the solver, cameras, Jacobian and
+      keypoint correspondence agree, not that a real dog is representable by `canis.ftcl`. Weight
+      tuning also waits on E_sil — there is only one objective term to weight today.
+      *(Original item:)* Project the P2 public dog
       mocap through a synthetic copy of the four calibrated cameras, corrupt it with measured
       detector noise, and check the fit recovers ground truth; use it to tune the four objective
       weights, then freeze them to `notes/fit_weights.json`. It is simultaneously the weight
@@ -494,11 +514,15 @@ sites. Concrete work items:
       at the lateral humeral epicondyle must move when `humerus_len` does; a numeric offset goes
       stale under morph, which is this project's founding rule applied to landmarks. Emit as
       MJCF `<site>`; list them in `rig_report.py`.
-- [ ] **`notes/keypoints.yaml` — the single source of truth** for the correspondence: DLC/SLEAP
-      keypoint name → rig site name, per-keypoint σ_px, class `rigid|soft` (soft — belly,
-      mid-tail — gets a wide Huber), schema-versioned. The DLC/SLEAP project config is
-      *generated from this file*; the two ends of the interface never restate each other.
-- [ ] **canis v1 keypoint set (~21)**: nose, occiput, withers, croup/tail-base, tail-tip, and
+- [x] **`notes/keypoints.yaml` — the single source of truth** for the correspondence — **DONE**.
+      DLC/SLEAP keypoint name → rig site name, per-keypoint σ_px, class `rigid|soft` (soft — belly,
+      mid-tail — gets a wide Huber), schema-versioned; loaded by `creaturelab/keypoints.py`, and
+      `tools/keypoints_project.py` generates the DLC/SLEAP project config *from this file* so the
+      two ends of the interface never restate each other. `tests/test_keypoints.py` fails if the
+      file and `rigs/canis.ftcl` drift apart in *either* direction — a keypoint naming a site the
+      rig lacks, and a rig site no keypoint covers, the second of which is otherwise silent.
+      **σ_px is still a declared placeholder** (`sigma_px_measured: false`); see known-issues #7.
+- [x] **canis v1 keypoint set (~21)** — **DONE**, 21 landmarks: nose, occiput, withers, croup/tail-base, tail-tip, and
       per leg ×4: {shoulder|hip point, elbow|stifle, carpus|hock, paw}.
 
 #### Monocular, re-rated *(this resolves an inconsistency the plan carried for two days)*
