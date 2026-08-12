@@ -8065,6 +8065,356 @@ static int checkCavity() {
     return ok ? 0 : 1;
 }
 
+// Triangle NORMAL-ORIENTATION self-test (`-checktrinormal`): pins the convention
+// intersectTri uses to decide which SIDE of a face a ray hit. Pure geometry — builds
+// tessellated spheres in memory and fires rays at them; no renderer, no BVH, no scene.
+//
+// The bug this exists to prevent. intersectTri used to decide facing with
+//
+//     bool flipped = !(dot(r.d, ns) < 0);        // ns = INTERPOLATED SHADING normal
+//
+// which is the one quantity that cannot answer the question. Smooth shading means the
+// interpolated normal keeps rotating past where the flat facet stopped, so on the
+// front-facing facets nearest the silhouette `dot(r.d, ns)` passes through zero while the
+// facet is still geometrically front-facing. Every consumer of `flipped` inverted in that
+// band: `hit.n` pointed INTO the surface, and `hit.curv` reported the sphere's bulge as a
+// pit. The fix is PBRT's `Triangle::Intersect` convention — faceforward the geometric
+// normal onto the shading normal, then decide facing from the GEOMETRIC one:
+//
+//     Vec3 gn = (dot(tri.gn, ns) < 0) ? -tri.gn : tri.gn;
+//     bool flipped = !(dot(r.d, gn) < 0);
+//
+// `dot(tri.gn, ns)` sits near +/-1 on any sane mesh, so unlike `dot(r.d, ns)` it never
+// grazes zero; its only job is a GLOBAL winding-vs-`vn` disagreement.
+//
+// What each section defends:
+//   §1 the silhouette band, the actual bug. Rays fired at impact parameters marching
+//      right up to the limb of a smooth unit sphere must ALL report a front hit:
+//      dot(d,n) < 0, dot(ng,n) >= 0, curv > 0, entering. The old code fails the
+//      outermost rings here and nowhere else, which is exactly why it survived years of
+//      whole-image validation — it is a one-pixel rim.
+//   §2 the same mesh WOUND INSIDE OUT (faces ordered so every `gn` opposes its `vn` —
+//      what scraps/mksphere.py actually emits, and what made the meshed dielectric in
+//      the sweep render nothing like its analytic twin). The faceforward must make this
+//      mesh behave identically to §1. Without it `hit.ng` points inward everywhere, so
+//      `entering = dot(d, ng) < 0` is inverted and a dielectric runs its IOR ratio
+//      backwards.
+//   §3 back faces still read as back faces: a ray fired from INSIDE the sphere must get
+//      dot(d,n) < 0 (n flipped toward it), dot(ng,n) < 0 (ng did NOT flip), curv < 0
+//      (from the inside a bulge IS a pit), and NOT entering. §1+§2 alone are passed by
+//      the degenerate "always front" mutation; this is what stops it.
+//   §4 `hit.ng` is never ray-flipped, on either winding. This is the invariant ~30
+//      downstream sites depend on (`bool entering = dot(d, h.ng) < 0` for refraction and
+//      medium crossing; `dot(rd, h.ng) < 0` for one-sided emitters). A "tidier" version
+//      of this fix that faceforwards `ng` onto the RAY instead makes both of those
+//      unconditionally true and silently breaks every dielectric in the repo.
+//   §5 orientedGeoN(h) — the accessor for "geometric normal on the shaded side" — agrees
+//      with the shading side to a strict hemisphere on every hit. Since both fields now
+//      derive from the same `gn`, this is exact, not approximate.
+//   §6 the FLAT control: the same sphere with no vertex normals (n0==n1==n2==gn) must
+//      give BIT-IDENTICAL n/ng and curv == 0. The faceforward is a no-op when ns == gn,
+//      so no flat-shaded scene may move by a single ulp.
+//   §7 agreement with the ANALYTIC sphere. The mesh and intersectSphere are independent
+//      implementations of "which side did I hit"; on the same ray they must return the
+//      same side, the same sign of curv, and normals within the tessellation angle.
+static int checkTriNormal() {
+    bool ok = true;
+    auto chkb = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checktrinormal] %-52s BAD\n", what); ok = false; }
+        return cond;
+    };
+
+    // A UV-tessellated unit sphere at the origin with EXACT outward vertex normals
+    // (n = p), so its interpolated shading normal is the ideal sphere normal and its
+    // per-face curvature is +1. `invert` reverses the winding of every face WITHOUT
+    // touching the vertex normals, i.e. gn == -vn everywhere (§2).
+    auto makeSphere = [](int nu, int nv, bool smooth, bool invert) {
+        std::vector<Tri> tris;
+        auto P = [](double th, double ph) {
+            return Vec3{ std::sin(th) * std::cos(ph), std::cos(th), std::sin(th) * std::sin(ph) };
+        };
+        for (int i = 0; i < nv; i++) {
+            double t0 = M_PI * i / nv, t1 = M_PI * (i + 1) / nv;
+            for (int j = 0; j < nu; j++) {
+                double p0 = 2 * M_PI * j / nu, p1 = 2 * M_PI * (j + 1) / nu;
+                Vec3 a = P(t0, p0), b = P(t1, p0), c = P(t1, p1), d = P(t0, p1);
+                // (a,c,b) / (a,d,c) is the OUTWARD winding for this parametrization
+                // (cross(e_theta, e_phi) points inward, so the naive order would give a
+                // sphere whose faces all face in — checked by S0 below).
+                Vec3 quadv[2][3] = { { a, c, b }, { a, d, c } };
+                for (auto& q : quadv) {
+                    Tri t;
+                    if (invert) { t.v0 = q[0]; t.v1 = q[2]; t.v2 = q[1]; }
+                    else        { t.v0 = q[0]; t.v1 = q[1]; t.v2 = q[2]; }
+                    if (smooth) {
+                        // vertex normal == position on a unit sphere, and INDEPENDENT of
+                        // the winding: that is the whole point of §2.
+                        t.n0 = t.v0; t.n1 = t.v1; t.n2 = t.v2;
+                    }
+                    // Drop the degenerate slivers at the two poles, where a whole edge
+                    // collapses to a point. Must be tested on the AREA, not on the edge
+                    // lengths: the south-pole triangle has b == c, so both edges from v0
+                    // are long while the cross product is exactly zero (and finalize()
+                    // would normalize it into NaNs that quietly poison every later test).
+                    Vec3 cr = cross(t.v1 - t.v0, t.v2 - t.v0);
+                    if (dot(cr, cr) < 1e-24) continue;
+                    t.finalize();
+                    tris.push_back(t);
+                }
+            }
+        }
+        return tris;
+    };
+
+    // Brute-force nearest hit over a triangle soup (no BVH: this test is about the
+    // intersector's normal convention, not about traversal).
+    auto trace = [](const std::vector<Tri>& tris, const Ray& r, Hit& h) {
+        h = Hit{};
+        TriShear sh = makeTriShear(r.d);
+        for (const auto& t : tris) intersectTri(sh, r, t, 1e-9, h);
+        return h.valid;
+    };
+
+    const int NU = 64, NV = 32;
+    std::vector<Tri> smoothCcw = makeSphere(NU, NV, true,  false);
+    std::vector<Tri> smoothCw  = makeSphere(NU, NV, true,  true);
+    std::vector<Tri> flatCcw   = makeSphere(NU, NV, false, false);
+
+    // Sanity: the two windings really do disagree with each other about `gn`, else §2
+    // is vacuous.
+    {
+        int opposed = 0;
+        for (size_t i = 0; i < smoothCcw.size(); i++)
+            if (dot(smoothCcw[i].gn, smoothCw[i].gn) < 0) opposed++;
+        chkb("S0 inverted mesh really is inverted",
+             opposed == (int)smoothCcw.size());
+        int agree = 0;
+        for (const auto& t : smoothCw)
+            if (dot(t.gn, t.n0 + t.n1 + t.n2) > 0) agree++;
+        chkb("S0 inverted mesh: no face's winding agrees with its vn", agree == 0);
+        // ...and the reference mesh is genuinely OUTWARD-wound, else §6's flat control
+        // (which has no vn to faceforward onto) is testing the wrong sphere.
+        int outward = 0;
+        for (const auto& t : smoothCcw)
+            if (dot(t.gn, t.v0 + t.v1 + t.v2) > 0) outward++;
+        chkb("S0 reference mesh is outward-wound", outward == (int)smoothCcw.size());
+        chkb("S0 no NaN/degenerate faces survived",
+             std::all_of(smoothCcw.begin(), smoothCcw.end(),
+                         [](const Tri& t) { return std::isfinite(dot(t.gn, t.gn)); }));
+    }
+
+    // Fire a fan of parallel rays from -z at impact parameters marching out to the limb.
+    // The outermost rings are the silhouette band where the old convention broke.
+    struct Ring { double frac; const char* lbl; };
+    const Ring rings[] = {
+        { 0.10, "core" }, { 0.50, "mid" }, { 0.90, "outer" },
+        { 0.97, "near-limb" }, { 0.995, "limb" }, { 0.999, "limb+" },
+    };
+    const int NPHI = 96;
+
+    auto frontFan = [&](const char* tag, const std::vector<Tri>& tris, bool smooth) {
+        for (const Ring& ring : rings) {
+            int misses = 0, badSide = 0, badNg = 0, badCurv = 0, badEnter = 0, badOgn = 0;
+            for (int k = 0; k < NPHI; k++) {
+                double a = 2 * M_PI * (k + 0.37) / NPHI;
+                Vec3 o{ ring.frac * std::cos(a), ring.frac * std::sin(a), -4.0 };
+                Ray r; r.o = o; r.d = Vec3{ 0, 0, 1 };
+                Hit h;
+                if (!trace(tris, r, h)) { misses++; continue; }
+                if (!(dot(r.d, h.n) < 0.0))                        badSide++;
+                if (!(dot(h.ng, h.n) >= 0.0))                      badNg++;
+                if (smooth ? !(h.curv > 0.0) : !(h.curv == 0.0))   badCurv++;
+                if (!(dot(r.d, h.ng) < 0.0))                       badEnter++;
+                if (!(dot(orientedGeoN(h), h.n) > 0.0))            badOgn++;
+            }
+            char lbl[128];
+            // A ring at 0.999 can legitimately miss the tessellated (inscribed) sphere;
+            // what may not happen is a HIT that reports the wrong side.
+            std::snprintf(lbl, sizeof lbl, "S1 %s %s: front hit faces the ray", tag, ring.lbl);
+            chkb(lbl, badSide == 0);
+            std::snprintf(lbl, sizeof lbl, "S1 %s %s: ng agrees with shaded side", tag, ring.lbl);
+            chkb(lbl, badNg == 0);
+            std::snprintf(lbl, sizeof lbl, "S1 %s %s: curv sign correct", tag, ring.lbl);
+            chkb(lbl, badCurv == 0);
+            std::snprintf(lbl, sizeof lbl, "S1 %s %s: entering (dot(d,ng) < 0)", tag, ring.lbl);
+            chkb(lbl, badEnter == 0);
+            std::snprintf(lbl, sizeof lbl, "S1 %s %s: orientedGeoN on the shaded side", tag, ring.lbl);
+            chkb(lbl, badOgn == 0);
+            if (ring.frac < 0.99) {
+                std::snprintf(lbl, sizeof lbl, "S1 %s %s: every ray hits", tag, ring.lbl);
+                chkb(lbl, misses == 0);
+            }
+        }
+    };
+
+    frontFan("smooth", smoothCcw, true);     // §1
+    frontFan("inverted", smoothCw, true);    // §2 — must behave identically
+    frontFan("flat", flatCcw, false);        // §6 (sign half; the bitwise half is below)
+
+    // ---- §1b: the silhouette band, CONSTRUCTED rather than sampled ------------
+    // The ring fan above sweeps the limb but cannot guarantee it lands in the handful of
+    // pixels where the original bug lived, and empirically it does not: with the old
+    // `dot(r.d, ns)` predicate restored, §1's rings all still pass. Nor does aiming a
+    // camera-style parallel ray at the offending point work — the corner whose normal
+    // has turned away lies on the FAR hemisphere, so a ray from -z hits the near sheet
+    // instead and never reaches the facet under test.
+    //
+    // So construct the configuration exactly and hand it to intersectTri directly, one
+    // triangle at a time (no scene, nothing to occlude it). Every facet of a smooth mesh
+    // has its own silhouette — a viewing direction at which its interpolated normal has
+    // turned past its plane — so rather than hunting for the limb, take each corner's
+    // neighbourhood (where `ns` deviates most from `gn`) and pick the ray direction
+    //
+    //     d = normalize(ns - gn)      =>   dot(d, gn) = c - 1 < 0    (front-facing)
+    //                                      dot(d, ns) = 1 - c > 0    (ns has turned away)
+    //
+    // which is the disagreement itself, distilled. Note what is NOT asserted here:
+    // `dot(d, h.n) < 0`. In this band the shading normal genuinely points away from the
+    // ray on a front-facing hit — that is what a shading normal IS, and the renderer
+    // handles it downstream (shadowTerminatorG). The bug was never that; it was that the
+    // old code responded by NEGATING ns, `hit.n` and `hit.curv` along with it, turning a
+    // sphere's bulge into a pit in a one-pixel rim. Vacuity would make this section
+    // meaningless, so the straddler count is asserted too.
+    auto silhouetteSweep = [&](const char* tag, const std::vector<Tri>& tris) {
+        int straddlers = 0, hits = 0;
+        int badN = 0, badNg = 0, badCurv = 0, badOgn = 0;
+        for (const auto& t : tris) {
+            Vec3 vn = t.n0 + t.n1 + t.n2;
+            Vec3 gnf = (dot(t.gn, vn) < 0.0) ? t.gn * -1.0 : t.gn;   // authored outward side
+            const Vec3 V[3] = { t.v0, t.v1, t.v2 };
+            const Vec3 N[3] = { t.n0, t.n1, t.n2 };
+            for (int i = 0; i < 3; i++) {
+                Vec3 p  = V[i] * 0.94 + V[(i + 1) % 3] * 0.03 + V[(i + 2) % 3] * 0.03;
+                Vec3 ns = normalize(N[i] * 0.94 + N[(i + 1) % 3] * 0.03 + N[(i + 2) % 3] * 0.03);
+                Vec3 dv = ns - gnf;
+                double dl = std::sqrt(dot(dv, dv));
+                if (dl < 1e-6) continue;            // ns == gn: no disagreement to exploit
+                Vec3 d = dv * (1.0 / dl);
+                if (!(dot(d, gnf) < 0.0) || !(dot(d, ns) > 0.0)) continue;
+                straddlers++;
+                Ray r; r.o = p - d * 2.0; r.d = d;
+                Hit h;
+                if (!intersectTri(r, t, 1e-9, h)) continue;
+                hits++;
+                if (!(dot(h.n, gnf) > 0.0))          badN++;    // ns must NOT be negated
+                if (!(dot(h.ng, gnf) > 0.0))         badNg++;   // ng on the authored side
+                if (!(h.curv > 0.0))                 badCurv++; // a bulge is still a bulge
+                if (!(dot(orientedGeoN(h), gnf) > 0.0)) badOgn++;
+            }
+        }
+        char lbl[128];
+        std::snprintf(lbl, sizeof lbl, "S1b %s: limb-straddling facets exist (not vacuous)", tag);
+        chkb(lbl, straddlers > 64 && hits > 64);
+        std::snprintf(lbl, sizeof lbl, "S1b %s: shading normal not negated on a front hit", tag);
+        chkb(lbl, badN == 0);
+        std::snprintf(lbl, sizeof lbl, "S1b %s: ng stays on the authored side", tag);
+        chkb(lbl, badNg == 0);
+        std::snprintf(lbl, sizeof lbl, "S1b %s: a bulge is not reported as a pit", tag);
+        chkb(lbl, badCurv == 0);
+        std::snprintf(lbl, sizeof lbl, "S1b %s: orientedGeoN on the authored side", tag);
+        chkb(lbl, badOgn == 0);
+        std::printf("[checktrinormal] S1b %-9s %d silhouette rays, %d hit, "
+                    "%d/%d/%d/%d bad (n/ng/curv/orientedGeoN)\n",
+                    tag, straddlers, hits, badN, badNg, badCurv, badOgn);
+    };
+    silhouetteSweep("smooth", smoothCcw);
+    silhouetteSweep("inverted", smoothCw);
+
+    // ---- §3: back faces still read as back faces -----------------------------
+    {
+        int bad = 0, n = 0;
+        for (int k = 0; k < 64; k++) {
+            double a = 2 * M_PI * (k + 0.11) / 64, e = -1.0 + 2.0 * (k + 0.5) / 64;
+            Vec3 dir = normalize(Vec3{ std::sqrt(std::max(0.0, 1 - e * e)) * std::cos(a),
+                                       e,
+                                       std::sqrt(std::max(0.0, 1 - e * e)) * std::sin(a) });
+            for (const auto* tris : { &smoothCcw, &smoothCw }) {
+                Ray r; r.o = Vec3{ 0.02, -0.01, 0.03 }; r.d = dir;
+                Hit h;
+                if (!trace(*tris, r, h)) { bad++; continue; }
+                n++;
+                if (!(dot(r.d, h.n) < 0.0))    bad++;   // n flipped toward the ray
+                if (!(dot(h.ng, h.n) < 0.0))   bad++;   // ng did NOT flip
+                if (!(h.curv < 0.0))           bad++;   // a bulge seen from inside is a pit
+                if (!(dot(r.d, h.ng) > 0.0))   bad++;   // NOT entering
+            }
+        }
+        chkb("S3 rays from inside report the back side", bad == 0 && n == 128);
+    }
+
+    // ---- §4: hit.ng is never ray-flipped -------------------------------------
+    // Same surface point approached from opposite directions must return the SAME ng.
+    {
+        int bad = 0;
+        for (const auto* tris : { &smoothCcw, &smoothCw, &flatCcw }) {
+            for (int k = 0; k < 48; k++) {
+                double a = 2 * M_PI * (k + 0.23) / 48;
+                Vec3 p{ 0.7 * std::cos(a), 0.7 * std::sin(a), 0.0 };
+                Hit hOut, hIn;
+                Ray rOut; rOut.o = p + Vec3{ 0, 0, -4 }; rOut.d = Vec3{ 0, 0,  1 };
+                Ray rIn;  rIn.o  = Vec3{ 0.01, 0.02, 0.5 }; rIn.d = normalize(
+                    Vec3{ p.x, p.y, -0.4 } - rIn.o);
+                if (!trace(*tris, rOut, hOut) || !trace(*tris, rIn, hIn)) continue;
+                // Both rays reach the -z hemisphere here; ng must not depend on the ray.
+                if (dot(hOut.ng, Vec3{ 0, 0, -1 }) <= 0.0) bad++;   // outward, ray-independent
+                if (dot(hIn.ng,  Vec3{ 0, 0, -1 }) <= 0.0) bad++;
+            }
+        }
+        chkb("S4 ng is ray-independent (outward on both windings)", bad == 0);
+    }
+
+    // ---- §6: the flat control is BIT-identical to the pre-fix behaviour -------
+    // With no vertex normals ns == gn exactly, so the faceforward cannot fire and the
+    // old `dot(r.d, ns)` and the new `dot(r.d, gn)` are the same test. Verified by
+    // evaluating both predicates on every hit and requiring they never disagree.
+    {
+        int bad = 0, n = 0;
+        for (int k = 0; k < 512; k++) {
+            double a = 2 * M_PI * (k + 0.31) / 512;
+            double rr = 0.999 * std::sqrt((k + 0.5) / 512.0);
+            Ray r; r.o = Vec3{ rr * std::cos(a), rr * std::sin(a), -4 }; r.d = Vec3{ 0, 0, 1 };
+            Hit h;
+            if (!trace(flatCcw, r, h)) continue;
+            n++;
+            if (h.curv != 0.0) bad++;                        // a facet is exactly flat
+            if (!(std::fabs(dot(h.n, h.ng) - 1.0) < 1e-12)) bad++;  // n == ng exactly
+        }
+        chkb("S6 flat mesh: curv == 0 and n == ng on every hit", bad == 0 && n > 400);
+    }
+
+    // ---- §7: agreement with the analytic sphere ------------------------------
+    {
+        Sphere sp; sp.c = Vec3{ 0, 0, 0 }; sp.r = 1.0;
+        int bad = 0, n = 0;
+        double worstAng = 0.0;
+        for (int k = 0; k < 512; k++) {
+            double a = 2 * M_PI * (k + 0.19) / 512;
+            double rr = 0.95 * std::sqrt((k + 0.5) / 512.0);
+            Ray r; r.o = Vec3{ rr * std::cos(a), rr * std::sin(a), -4 }; r.d = Vec3{ 0, 0, 1 };
+            Hit hm, ha;
+            if (!trace(smoothCcw, r, hm)) continue;
+            ha = Hit{};
+            if (!intersectSphere(r, sp, 1e-9, ha)) continue;
+            n++;
+            if ((dot(r.d, hm.n) < 0) != (dot(r.d, ha.n) < 0))     bad++;   // same side
+            if ((hm.curv > 0) != (ha.curv > 0))                   bad++;   // same curv sign
+            if ((dot(r.d, hm.ng) < 0) != (dot(r.d, ha.ng) < 0))   bad++;   // same entering
+            double ang = std::acos(std::min(1.0, std::max(-1.0, dot(hm.n, ha.n))));
+            if (ang > worstAng) worstAng = ang;
+        }
+        chkb("S7 mesh and analytic sphere agree on the side", bad == 0 && n > 400);
+        // Tessellation error only: a 64x32 sphere's interpolated normal is within a few
+        // degrees of the exact one. A sign error would show up as ~180 degrees.
+        chkb("S7 mesh normal within tessellation error of analytic",
+             worstAng < 0.05);
+        std::printf("[checktrinormal] worst mesh-vs-analytic normal angle = %.4f deg\n",
+                    worstAng * 180.0 / M_PI);
+    }
+
+    std::printf("[checktrinormal] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic signed-distance-field self-test (`-checksdf`): the `sdf` element (O3
 // stage 3 — non-stationary randomness). Bakes tiny meshes in memory; no renderer.
 //
@@ -14044,6 +14394,7 @@ static int run(int argc, char** argv) {
     bool checkHairOnly = false;
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
+    bool checkTriNormalOnly = false;
     bool checkSdfOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
@@ -14562,6 +14913,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkhair")) checkHairOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
+        else if (!std::strcmp(argv[i], "-checktrinormal")) checkTriNormalOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
@@ -14758,6 +15110,7 @@ static int run(int argc, char** argv) {
     if (checkHairOnly)     return checkHair();     // ditto (fiber BCSDF, no scene)
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
+    if (checkTriNormalOnly) return checkTriNormal(); // ditto (intersectTri's side/normal convention)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed

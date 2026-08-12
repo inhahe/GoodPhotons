@@ -324,16 +324,42 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     if (t < tmin || t >= hit.t) return false;
     double b0 = U * invDet, b1 = V * invDet, b2 = W * invDet;   // barycentric of v0,v1,v2
     hit.t = t; hit.p = r.o + r.d * t; hit.valid = true;
-    hit.ng = tri.gn;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
     // Barycentric-interpolated UV and shading normal (matches the old M-T convention:
-    // b0,b1,b2 == w0,u,v). Orient the shading normal against the ray like the geo normal.
+    // b0,b1,b2 == w0,u,v).
     hit.u = b0 * tri.uv0.x + b1 * tri.uv1.x + b2 * tri.uv2.x;
     hit.v = b0 * tri.uv0.y + b1 * tri.uv1.y + b2 * tri.uv2.y;
     Vec3 ns = tri.n0 * b0 + tri.n1 * b1 + tri.n2 * b2;
     double nl = dot(ns, ns);
     ns = (nl > 1e-18) ? ns * (1.0 / std::sqrt(nl)) : tri.gn;
-    bool flipped = !(dot(r.d, ns) < 0.0);
+    // --- Which side of this triangle did the ray hit? (PBRT's convention.) -------
+    //
+    // This used to ask `dot(r.d, ns) < 0` — the SHADING normal. That is the one
+    // quantity that cannot answer the question. A smooth mesh's interpolated normal
+    // keeps rotating past where the flat facet stopped (that is the entire point of
+    // smooth shading), so it grazes through zero in a thin band all around every
+    // silhouette WHILE THE FACET IS STILL GEOMETRICALLY FRONT-FACING. In that band the
+    // flag called "backface" was really reporting "the smooth normal happened to tilt
+    // away", and everything derived from it inverted: `hit.n` pointed into the surface,
+    // and `hit.curv` reported a bulge as a pit (O3).
+    //
+    // Facing is a geometric question, so the flat winding normal answers it. The
+    // shading normal's only job here is to fix a *global* winding-vs-`vn` disagreement
+    // (an OBJ whose faces are wound opposite to its authored normals), which is what
+    // the faceforward below is for — and unlike `dot(r.d, ns)`, `dot(tri.gn, ns)` sits
+    // near +/-1 for any sane mesh instead of passing through zero at silhouettes, so it
+    // is a stable test. This mirrors PBRT's `Triangle::Intersect`, which likewise
+    // faceforwards the geometric normal onto the shading normal and then decides
+    // front/back from the geometric one.
+    Vec3 gn = (dot(tri.gn, ns) < 0.0) ? Vec3{-tri.gn.x, -tri.gn.y, -tri.gn.z} : tri.gn;
+    bool flipped = !(dot(r.d, gn) < 0.0);
+    // NB `hit.ng` is deliberately NOT flipped toward the ray, here or in any other
+    // primitive: downstream `bool entering = dot(d, h.ng) < 0` (refraction, medium
+    // crossing) and `dot(rd, h.ng) < 0` (one-sided emitter tests) read the side OFF it,
+    // and a pre-flipped `ng` would make both unconditionally true. Callers that want the
+    // geometric normal on the *shaded* side use orientedGeoN(h), which — now that both
+    // fields derive from the same `gn` — provably equals `flipped ? -gn : gn`.
+    hit.ng = gn;
     hit.n = flipped ? -ns : ns;
     hit.tangent = tri.tangent;             // per-triangle tangent (constant across the face)
     hit.bitangentSign = tri.bitangentSign; // for tangent-space normal mapping (C6)

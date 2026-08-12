@@ -213,6 +213,37 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (`__fmul_rn`/`__fsub_rn`, plus `double` overloads for the `Real = double` build) — see
   `render_cuda.cu`. Exactly the same failure and the same fix as the rasterizer's
   `edgeRow`/`edgeAt` below. Fixed 0.116.0; measurement in `known-issues.md`.
+  - *NORMAL ORIENTATION — the one convention every primitive and every consumer shares
+    (settled 0.185.0, PBRT's `Triangle::Intersect`).* A `Hit` carries two normals and they
+    mean different things:
+    - **`hit.ng`** — the **geometric** normal, faceforwarded onto the hemisphere the mesh's
+      authored `vn` picked (`gn = dot(tri.gn, ns) < 0 ? -tri.gn : tri.gn`), and **never**
+      flipped toward the ray. That last clause is load-bearing, not stylistic: ~30 sites
+      read the *side of the surface* off it — `bool entering = dot(d, h.ng) < 0` for
+      refraction and medium crossing, `dot(rd, h.ng) < 0` for one-sided emitters — and a
+      pre-flipped `ng` makes both unconditionally true, i.e. every dielectric runs its IOR
+      ratio one way forever. Every other primitive (sphere, quad, curve, implicit) already
+      obeyed this; triangles were the exception.
+    - **`hit.n`** — the **shading** normal, `±ns`, with the sign chosen from
+      `flipped = !(dot(r.d, gn) < 0)` — a **geometric** test. It used to be
+      `!(dot(r.d, ns) < 0)`, the interpolated normal, which is the one quantity that cannot
+      answer "which side did I hit": smooth shading means `ns` keeps rotating past the
+      facet, so it grazes through zero in a ~1-px band at every silhouette *while the facet
+      is still front-facing*. `dot(tri.gn, ns)` instead sits near ±1 on any sane mesh, so
+      the faceforward is stable; its only job is a *global* winding-vs-`vn` disagreement.
+    - **`hit.curv`** is signed by the same `flipped` (a bulge seen from behind is a pit), so
+      the old predicate reported a sphere's bulge as a pit around its own outline.
+    - Consequences that other code may rely on: `orientedGeoN(h)` — the accessor for
+      "geometric normal on the *shaded* side", and **not** dead code — provably equals
+      `flipped ? -gn : gn`; and `entering == !flipped`. In the silhouette band `hit.n`
+      legitimately faces *away* from the ray on a front-facing hit; that is what a shading
+      normal is, and `shadowTerminatorG` (Chiang 2019) is what handles it.
+    - The host (`geometry.h`) and device (`render_cuda.cu`) copies must stay identical or
+      one backend shades silhouettes differently from the other. Guarded by
+      **`ftrace -checktrinormal`** (`checkTriNormal()` in `main.cpp`); a flat-shaded mesh is
+      bit-identical by construction, since `ns == gn` makes the faceforward a no-op and the
+      old and new predicates the same test. Full history, sweep numbers and the *refractive*
+      mesh bug this was hiding: `known-issues.md`.
 - **`curve.h`** — the **curve / fiber** primitive (hair, fur, grass, wire, thread),
   added 0.150.0 for TODO §P1. A `curve` is control points + a radius; the loader
   **flattens it at load time** into a chain of `CurveSeg` **round cones** (the convex
