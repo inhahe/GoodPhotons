@@ -130,6 +130,17 @@ def _body_el(parent: ET.Element, bone: Bone, creature: Creature, is_root: bool) 
         _geom_el(body, g, creature, m, f"{bone.name}_g{k}" if len(bone.geoms) > 1
                  else bone.name)
 
+    # Sites are emitted AFTER the geoms and carry no mass, density or contact attributes,
+    # so `inertiafromgeom="auto"` cannot see them. That is deliberate and load-bearing:
+    # adding a landmark must be provably free, or nobody will author the 21 the fit wants
+    # for fear of perturbing a trained policy's body.
+    for s in bone.sites:
+        el = ET.SubElement(body, "site", {
+            "name": s.name, "pos": _v(s.at), "size": _n(s.size), "group": "3"})
+        el.set("rgba", _v(s.rgba if s.rgba is not None
+                          else ((0.9, 0.25, 0.2, 1.0) if s.kind == "rigid"
+                                else (0.25, 0.55, 0.9, 1.0))))
+
     for child in creature.children_of(bone.name):
         _body_el(body, child, creature, False)
     return body

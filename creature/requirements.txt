@@ -24,6 +24,7 @@ pluggy==1.6.0
 Pygments==2.20.0
 PyOpenGL==3.1.10
 pytest==9.1.1
+PyYAML==6.0.3        # notes/keypoints.yaml, the detector<->rig correspondence
 scipy==1.18.0
 setuptools==78.1.0
 sympy==1.14.0

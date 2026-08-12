@@ -15,6 +15,17 @@ shows where that starts to bite:
     python tools/morph_sweep.py rigs/canis.ftcl -n 24
     python tools/morph_sweep.py rigs/canis.ftcl -n 24 --scale 0.25 0.5 0.75 1.0
     python tools/morph_sweep.py rigs/canis.ftcl -n 8 --verbose
+
+`--morph` moves the centre of the distribution off the rig's defaults and onto a *fitted*
+animal, which is the question P4 actually asks. Stage C hands you `out/theta_rex.json`;
+`train.py --morph out/theta_rex.json --morph-scale 0.5` then trains over a neighbourhood of
+that dog. Whether that neighbourhood is habitable is not a property of the rig — a θ sitting
+near the edge of a declared range has most of its neighbourhood clipped against that edge,
+and a real animal is far likelier to be near an edge than the defaults are. So sweep the
+same centre you intend to train on, and read the yield before spending the training run:
+
+    python tools/morph_sweep.py rigs/canis.ftcl --morph out/theta_rex.json -n 24 \\
+                                --scale 0.25 0.5 1.0
 """
 from __future__ import annotations
 
@@ -26,17 +37,22 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from creaturelab.console import use_utf8  # noqa: E402
+
+use_utf8()   # before argparse: --help is the thing a cp1252 console cannot print
+
 from ftcl.errors import FtclError                      # noqa: E402
 from creaturelab.build import load, sample_morph       # noqa: E402
 from creaturelab.emit_mjcf import to_mjcf              # noqa: E402
+from creaturelab.morph_io import morph_from_args, parse_sets   # noqa: E402
 from creaturelab.tune import UnstablePose, build_tuned  # noqa: E402
 from creaturelab.validate import stand_test            # noqa: E402
 
 
-def one(rig: str, params, seed: int, scale: float):
+def one(rig: str, params, seed: int, scale: float, center=None):
     """Build one randomised body and report (outcome, detail). Never raises."""
     import mujoco
-    morph = sample_morph(params, random.Random(seed), scale)
+    morph = sample_morph(params, random.Random(seed), scale, center)
     try:
         creature, loads = build_tuned(rig, morph)
     except UnstablePose as e:
@@ -64,23 +80,33 @@ def main() -> int:
     ap.add_argument("--scale", type=float, nargs="*", default=[1.0],
                     help="randomisation widths to test")
     ap.add_argument("--seed", type=int, default=0, help="first seed; samples are seed..seed+n")
+    ap.add_argument("--morph", metavar="FILE",
+                    help="centre the distribution on a fitted morph (out/theta_*.json) "
+                         "instead of the rig defaults -- the same body train.py trains around")
+    ap.add_argument("--set", nargs="*", metavar="NAME=VAL", default=[],
+                    help="override individual centre params; wins over --morph")
     ap.add_argument("--verbose", action="store_true", help="one line per sample")
     args = ap.parse_args()
 
     try:
         params = load(args.rig).params
-    except FtclError as e:
+        center = morph_from_args(args.rig, args.morph, parse_sets(args.set), params) or None
+    except (FtclError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    print(f"{args.rig}: {len(params)} morph parameters, {args.count} samples per scale")
+    where = f"centred on {args.morph}" if args.morph else "centred on the rig defaults"
+    if center and not args.morph:
+        where = f"centred on the rig defaults with {len(center)} override(s)"
+    print(f"{args.rig}: {len(params)} morph parameters, {args.count} samples per scale, "
+          f"{where}")
     worst = 1.0
     for scale in args.scale:
         tally: dict[str, int] = {}
         t0 = time.time()
         for i in range(args.count):
             seed = args.seed + i
-            outcome, detail = one(args.rig, params, seed, scale)
+            outcome, detail = one(args.rig, params, seed, scale, center)
             tally[outcome] = tally.get(outcome, 0) + 1
             if args.verbose or outcome in ("error", "collapses"):
                 print(f"  scale {scale:.2f} seed {seed:3d}  {outcome:9s}  {detail}")

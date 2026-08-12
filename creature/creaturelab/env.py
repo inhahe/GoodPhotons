@@ -174,13 +174,16 @@ class VecCreatureEnv:
         self.bodies = bodies
         self.n = len(bodies)
         self.auto_reset = auto_reset
+        # `spec` is the LAYOUT reference only -- dims, slices, the index tables that address
+        # `MjData`. Every quantity that depends on the body (its length and pendulum period,
+        # its joint ranges, its conduction lags) is read from `bspec`, which is per-env; and
+        # the per-env physics functions take `self.bodies[i].spec` directly. Reaching for
+        # `self.spec` to normalise something is the bug `BatchSpec` exists to prevent.
         self.spec = bodies[0].spec
-        self.obs_dim = self.spec.dim
-        self.act_dim = len(self.spec.act_delay)
+        self.bspec = sensing.batch_spec([b.spec for b in bodies])
+        self.obs_dim = self.bspec.dim
+        self.act_dim = self.bspec.act_dim
         for b in bodies:
-            if b.spec.dim != self.obs_dim or len(b.spec.act_delay) != self.act_dim:
-                raise ValueError("all bodies in a vector env must share an observation and "
-                                 "action layout (same rig, same foot set)")
             if b.frame_skip != bodies[0].frame_skip:
                 raise ValueError("all bodies in a vector env must share a frame skip")
 
@@ -192,7 +195,7 @@ class VecCreatureEnv:
 
         self.datas = [mujoco.MjData(b.model) for b in bodies]
         self.rng = np.random.default_rng(seed)
-        self.prop = sensing.BatchProprioception(self.spec, self.n, self.rng)
+        self.prop = sensing.BatchProprioception(self.bspec, self.n, self.rng)
         self.raw = sensing.make_raw(self.spec, self.n, self.chunks)
 
         w = max(1, workers if workers is not None else min(self.n, (os.cpu_count() or 4)))
@@ -214,7 +217,7 @@ class VecCreatureEnv:
         self.final_obs = np.zeros((self.n, self.obs_dim))
         self.command = np.zeros((self.n, 3))
         self.morph = np.array([b.spec.morph_norm for b in bodies])
-        self.withers = np.array([b.withers for b in bodies])
+        self.withers = self.bspec.length
         self._raw_obs = np.zeros((self.n, self.obs_dim))
         self._scratch = np.zeros((self.n, self.obs_dim))
         self._prev_action = np.zeros((self.n, self.act_dim))
@@ -373,7 +376,7 @@ class VecCreatureEnv:
 
         from .emit_mjcf import place_on_ground
 
-        m, d, s, c = self.bodies[i].model, self.datas[i], self.spec, self.cfg
+        m, d, s, c = self.bodies[i].model, self.datas[i], self.bodies[i].spec, self.cfg
         mujoco.mj_resetData(m, d)
         place_on_ground(m, d)
 
@@ -407,7 +410,7 @@ class VecCreatureEnv:
         # Assembled on the full batch (one numpy call beats len(idx) of them) but only the
         # reset rows are published, so a mid-batch auto-reset cannot disturb the envs that
         # are still running.
-        fresh = sensing.assemble(self.spec, self.raw, self._prev_action, self.command,
+        fresh = sensing.assemble(self.bspec, self.raw, self._prev_action, self.command,
                                  self.morph, self._scratch)
         self._raw_obs[idx] = fresh[idx]
         self.prop.reset(idx, fresh[idx], self._prev_action[idx])
@@ -425,7 +428,7 @@ class VecCreatureEnv:
         """The only code that runs in the thread pool. Touches `MjData` and nothing else."""
         import mujoco
 
-        m, d, s = self.bodies[i].model, self.datas[i], self.spec
+        m, d, s = self.bodies[i].model, self.datas[i], self.bodies[i].spec
         d.ctrl[:] = self._ctrl[i]
         tau, vel, sel = self.raw.work_tau[i], self.raw.work_vel[i], s.dof_sel
         tau[0] = d.qfrc_actuator[sel]
@@ -441,7 +444,7 @@ class VecCreatureEnv:
             self._physics(i)
 
     def step(self, actions: np.ndarray):
-        cfg, s = self.cfg, self.spec
+        cfg, s = self.cfg, self.bspec
         action = np.clip(np.asarray(actions, dtype=float).reshape(self.n, self.act_dim),
                          -1.0, 1.0)
 
@@ -453,6 +456,11 @@ class VecCreatureEnv:
         else:
             list(self.pool.map(self._physics_span, self._spans))
         self._steps += 1
+
+        # MuJoCo's own warning counters only fire on NaN/Inf. A body can also be *finite* and
+        # still not be physics -- hundreds of Froude of root speed -- which reaches the reward
+        # (`c_energy`) and the progress trace looking like a real sample. See known-issues #6.
+        sensing.flag_divergence(s, self.raw)
 
         # ---- observation -----------------------------------------------------------------
         sane = self.raw.sane
@@ -468,7 +476,7 @@ class VecCreatureEnv:
 
         # ---- reward, every term dimensionless --------------------------------------------
         R = self.raw.xmat
-        v_local = np.einsum("nji,nj->ni", R, self.raw.qvel_free[:, 0:3]) / s.speed
+        v_local = np.einsum("nji,nj->ni", R, self.raw.qvel_free[:, 0:3]) / s.speed_col
         yaw_rate = self.raw.qvel_free[:, 5] * s.time
         cmd = self.command
 
@@ -476,7 +484,7 @@ class VecCreatureEnv:
         r_speed = np.exp(-e_v / (cfg.speed_tol ** 2))
         r_yaw = np.exp(-((yaw_rate - cmd[:, 2]) ** 2) / (cfg.yaw_tol ** 2))
 
-        power = sensing.actuator_work(s, self.raw, self.chunk_dt) / cfg.control_dt
+        power = sensing.actuator_work(self.raw, self.chunk_dt) / cfg.control_dt
         c_energy = power / (s.weight * s.speed)              # ~ cost of transport
         c_rate = np.mean((action - self._prev_action) ** 2, axis=1)
         c_torque = np.mean(action ** 2, axis=1)

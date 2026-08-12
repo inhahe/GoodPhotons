@@ -369,6 +369,83 @@ class RawState:
     warn: np.ndarray               # (N,) int  -- cumulative MuJoCo bad-value warning count
 
 
+@dataclass
+class BatchSpec:
+    """N bodies' worth of `ObsSpec`, stacked so the batched pass can differ per env.
+
+    Until P4 every env in a vector env held the *same* body, so one `ObsSpec` served all of
+    them and the batched code multiplied by scalars. The moment the bodies differ that is
+    wrong in a specific and nasty way: `time`, `speed` and `weight` are each body's OWN
+    units, and the dynamic-similarity argument this module is built on -- "the same number
+    means the same thing on a Chihuahua and a Great Dane" -- holds only if each body is
+    divided by its own. Normalise every env by body zero's scales and the observation stops
+    being body-local, which is exactly the property morph generalisation rests on. It would
+    not crash and it would not obviously fail; it would quietly cap how well the policy
+    transfers, and the cost of discovering that is a full retrain.
+
+    The layout (dim, slices, names, actuator count) must be identical across bodies and is
+    checked rather than stacked -- a vector env whose rows mean different things cannot be
+    fed to one network at all.
+
+    Per-env scalars are kept in BOTH shapes, deliberately. Flat `(N,)` is what the reward
+    wants, since every quantity there is one number per env; `(N, 1)` is what the
+    observation wants, since it divides `(N, k)` blocks. Mixing them up does not raise --
+    `(N,) * (N,)` is fine and `(N,) * (N, 1)` broadcasts to a silent `(N, N)` -- so the two
+    forms are named apart rather than left to a `[:, None]` at each of a dozen call sites.
+    """
+
+    dim: int
+    slices: dict[str, slice]
+    n: int
+    length: np.ndarray             # (N,)    withers height, m
+    time: np.ndarray               # (N,)    sqrt(L/g)
+    speed: np.ndarray              # (N,)    sqrt(g*L)
+    weight: np.ndarray             # (N,)    m*g
+    ang_scale: np.ndarray          # (N, nu)
+    ang_bias: np.ndarray           # (N, nu)
+    obs_delay: np.ndarray          # (N, dim)
+    act_delay: np.ndarray          # (N, nu)
+    obs_noise: np.ndarray          # (N, dim)
+
+    def __post_init__(self) -> None:
+        # Views, not copies: `[:, None]` on a contiguous array shares its buffer.
+        self.time_col = self.time[:, None]
+        self.speed_col = self.speed[:, None]
+        self.weight_col = self.weight[:, None]
+
+    @property
+    def act_dim(self) -> int:
+        return self.act_delay.shape[1]
+
+
+def batch_spec(specs: list[ObsSpec]) -> BatchSpec:
+    """Stack per-body specs. Raises if their observation layouts disagree."""
+    head = specs[0]
+    for i, s in enumerate(specs[1:], 1):
+        if s.dim != head.dim or len(s.act_delay) != len(head.act_delay):
+            raise ValueError(f"body {i} has a {s.dim}-channel observation and "
+                             f"{len(s.act_delay)} actuators; body 0 has {head.dim} and "
+                             f"{len(head.act_delay)} -- one vector env cannot mix them")
+        if s.names != head.names:
+            # Same length, different meaning: the worst version of this, because every
+            # shape check passes and the policy is fed a channel that means stifle on half
+            # its envs and elbow on the other half.
+            bad = next(a for a, b in zip(s.names, head.names) if a != b)
+            raise ValueError(f"body {i}'s observation layout differs from body 0's "
+                             f"(first mismatch: {bad!r}) -- same rig, different foot set?")
+
+    def row(f):
+        return np.array([getattr(s, f) for s in specs], dtype=float)
+
+    return BatchSpec(
+        dim=head.dim, slices=head.slices, n=len(specs),
+        length=row("length"), time=row("time"), speed=row("speed"),
+        weight=row("weight"),
+        ang_scale=row("ang_scale"), ang_bias=row("ang_bias"),
+        obs_delay=row("obs_delay"), act_delay=row("act_delay"),
+        obs_noise=row("obs_noise"))
+
+
 def make_raw(spec: ObsSpec, n: int, energy_samples: int) -> RawState:
     nu = len(spec.jnt_lo)
     c = energy_samples + 1
@@ -445,6 +522,39 @@ def gather_state(model, data, spec: ObsSpec, raw: RawState, i: int) -> None:
     raw.warn[i] = warn
 
 
+#: How far past the physiological range a body has to be moving before the step is called
+#: divergence rather than motion. In the body's own units, so it means the same thing on a
+#: terrier and a wolfhound -- which is the entire reason those units exist.
+#:
+#: `gather_state` catches the blow-ups MuJoCo itself notices, and that covers NaN, Inf and
+#: MuJoCo's own silent reset. It does not cover a *large but finite* divergence: a randomised
+#: morph run logged a root speed of -445 Froude (~1100 m/s) on a step that was still `sane`,
+#: because nothing there was Inf. `RATE_CLIP` then hid it from the policy and `r_speed`
+#: saturated to zero, so the only visible damage was to `c_energy` and to the run's own
+#: progress trace -- which is exactly the unreadable-log failure the `sane` mask exists to
+#: prevent. See known-issues.md issue 6.
+#:
+#: Deliberately generous. Peak locomotion is ~2-3 Froude and a fall through one body length
+#: reaches ~5, so 50 cannot be tripped by any motion an animal can actually perform, and the
+#: check is a divergence detector rather than a second, sneakier RATE_CLIP.
+INSANE_SPEED = 50.0
+INSANE_RATE = 100.0
+
+
+def flag_divergence(spec: BatchSpec, raw: RawState) -> np.ndarray:
+    """Clear `raw.sane` for envs whose state is finite but not physical. Batched.
+
+    Deliberately *not* done inside `gather_state`: that runs in the thread pool, where every
+    microsecond is GIL-held and serialises the whole vec env. This reads the rows the pool
+    already copied out, so it costs a handful of numpy calls for the entire batch.
+    """
+    lin = np.abs(raw.qvel_free[:, 0:3]).max(axis=1) / spec.speed
+    ang = np.abs(raw.qvel_free[:, 3:6]).max(axis=1) * spec.time
+    jnt = np.abs(raw.qvel_j).max(axis=1) * spec.time
+    raw.sane &= (lin < INSANE_SPEED) & (ang < INSANE_RATE) & (jnt < INSANE_RATE)
+    return raw.sane
+
+
 #: Saturation limit for every rate-like channel, in the body's own Froude units.
 #:
 #: Real afferents saturate, and this is not a safety net bolted on after the fact -- it is
@@ -462,13 +572,19 @@ def gather_state(model, data, spec: ObsSpec, raw: RawState, i: int) -> None:
 RATE_CLIP = 8.0
 
 
-def assemble(spec: ObsSpec, raw: RawState, prev_action: np.ndarray,
+def assemble(spec: BatchSpec, raw: RawState, prev_action: np.ndarray,
              command: np.ndarray, morph: np.ndarray, out: np.ndarray) -> np.ndarray:
-    """Normalise a whole batch of raw state into observations. No delay, no noise yet."""
+    """Normalise a whole batch of raw state into observations. No delay, no noise yet.
+
+    `spec` is a `BatchSpec`: every scale used here is per-env, because each body is
+    normalised by its own length and pendulum period. See `BatchSpec` for why sharing one
+    body's scales across a heterogeneous batch is silently damaging rather than merely
+    approximate.
+    """
     s = spec.slices
     out[:, s["joint_angle"]] = np.clip(raw.qpos_j * spec.ang_scale + spec.ang_bias,
                                        -2.0, 2.0)
-    np.clip(raw.qvel_j * spec.time, -RATE_CLIP, RATE_CLIP, out=out[:, s["joint_rate"]])
+    np.clip(raw.qvel_j * spec.time_col, -RATE_CLIP, RATE_CLIP, out=out[:, s["joint_rate"]])
     out[:, s["efference"]] = prev_action
 
     v = s["vestibular"].start
@@ -479,20 +595,24 @@ def assemble(spec: ObsSpec, raw: RawState, prev_action: np.ndarray,
     out[:, v + 0:v + 3] = R[:, 2, :]
     # MuJoCo free-joint velocity: qvel[0:3] is linear in the WORLD frame, qvel[3:6] angular
     # in the BODY frame. So the angular part is already local; the linear part needs R.T.
-    np.clip(raw.qvel_free[:, 3:6] * spec.time, -RATE_CLIP, RATE_CLIP,
+    np.clip(raw.qvel_free[:, 3:6] * spec.time_col, -RATE_CLIP, RATE_CLIP,
             out=out[:, v + 3:v + 6])
     np.einsum("nji,nj->ni", R, raw.qvel_free[:, 0:3], out=out[:, v + 6:v + 9])
-    out[:, v + 6:v + 9] /= spec.speed
+    out[:, v + 6:v + 9] /= spec.speed_col
     np.clip(out[:, v + 6:v + 9], -RATE_CLIP, RATE_CLIP, out=out[:, v + 6:v + 9])
 
-    np.minimum(raw.contact / spec.weight, 2.0, out=out[:, s["contact"]])
+    np.minimum(raw.contact / spec.weight_col, 2.0, out=out[:, s["contact"]])
     out[:, s["command"]] = command
     out[:, s["morph"]] = morph
     return out
 
 
-def actuator_work(spec: ObsSpec, raw: RawState, chunk_dt: float) -> np.ndarray:
+def actuator_work(raw: RawState, chunk_dt: float) -> np.ndarray:
     """Mechanical work each body's actuators delivered over the last control step, J.
+
+    Takes no spec: it reads only the raw per-env samples, so it is already correct for a
+    batch of *different* bodies. (It used to take one, unused -- which would have read as
+    "this has been checked against the body" at exactly the moment it hadn't.)
 
     Trapezoid-integrated over `C + 1` samples of |tau . qdot| taken inside the frame skip.
     Sampling every *physics* step is exact, and is what this did first; each sample also
@@ -531,14 +651,22 @@ class BatchProprioception:
     All N envs share one `head`, because a vec env steps them in lockstep. That is what lets
     the whole read be two fancy-index gathers on a (N, hist, dim) array instead of N
     separate ones.
+
+    The lags are per-env as well as per-channel, because they are derived from the body:
+    conduction delay is `central + path_length / velocity`, so a bigger animal in env 7 is
+    genuinely more sluggish than a small one in env 3. That is the whole point of measuring
+    the path through the built tree rather than authoring a constant, and it survives into
+    a heterogeneous batch only if the index arrays are (N, dim) rather than (dim,).
     """
 
-    def __init__(self, spec: ObsSpec, n_env: int, rng: np.random.Generator):
+    def __init__(self, spec: BatchSpec, n_env: int, rng: np.random.Generator):
         self.spec = spec
         self.n_env = n_env
         self.rng = rng
-        self._obs_lo = np.floor(spec.obs_delay).astype(np.int32)
-        self._act_lo = np.floor(spec.act_delay).astype(np.int32)
+        if spec.n != n_env:
+            raise ValueError(f"spec covers {spec.n} bodies, env has {n_env}")
+        self._obs_lo = np.floor(spec.obs_delay).astype(np.int32)     # (N, dim)
+        self._act_lo = np.floor(spec.act_delay).astype(np.int32)     # (N, nu)
         self._obs_w = spec.obs_delay - self._obs_lo
         self._act_w = spec.act_delay - self._act_lo
         # The lerp reads `floor(lag)` and one step further back, so the history must hold
@@ -549,12 +677,18 @@ class BatchProprioception:
         self.hist = int(max(self._obs_lo.max(initial=0),
                             self._act_lo.max(initial=0))) + 2
         self.obs_buf = np.zeros((n_env, self.hist, spec.dim))
-        self.act_buf = np.zeros((n_env, self.hist, len(spec.act_delay)))
+        self.act_buf = np.zeros((n_env, self.hist, spec.act_dim))
         self.head = 0
-        self._obs_chan = np.arange(spec.dim)
-        self._act_chan = np.arange(len(spec.act_delay))
-        self._noise_idx = np.nonzero(spec.obs_noise > 0)[0]
-        self._noise_sig = spec.obs_noise[self._noise_idx]
+        # Broadcast index grids for the two gathers. `_env` is (N, 1) and the channel rows
+        # are (1, k), so `buf[_env, lo, _obs_chan]` picks each env's own lag per channel.
+        self._env = np.arange(n_env)[:, None]
+        self._obs_chan = np.arange(spec.dim)[None, :]
+        self._act_chan = np.arange(spec.act_dim)[None, :]
+        # Noise is per-env too, but the *set* of noisy channels is a property of the
+        # observation layout, so it is shared. Taking the union keeps the gather dense:
+        # a channel noisy on one body and silent on another simply gets a zero sigma there.
+        self._noise_idx = np.nonzero(spec.obs_noise.max(axis=0) > 0)[0]
+        self._noise_sig = spec.obs_noise[:, self._noise_idx]          # (N, noisy)
 
     def reset(self, idx, obs0: np.ndarray, action0: np.ndarray) -> None:
         """Fill the whole history of envs `idx` with a freshly-reset state.
@@ -571,8 +705,8 @@ class BatchProprioception:
         self.obs_buf[:, self.head] = raw_obs
         lo = (self.head - self._obs_lo) % self.hist
         hi = (lo - 1) % self.hist                     # one step further into the past
-        a = self.obs_buf[:, lo, self._obs_chan]
-        b = self.obs_buf[:, hi, self._obs_chan]
+        a = self.obs_buf[self._env, lo, self._obs_chan]
+        b = self.obs_buf[self._env, hi, self._obs_chan]
         o = np.add(a, (b - a) * self._obs_w, out=out)
         if self._noise_idx.size:
             o[:, self._noise_idx] += (
@@ -585,8 +719,8 @@ class BatchProprioception:
         self.act_buf[:, self.head] = action
         lo = (self.head - self._act_lo) % self.hist
         hi = (lo - 1) % self.hist
-        a = self.act_buf[:, lo, self._act_chan]
-        b = self.act_buf[:, hi, self._act_chan]
+        a = self.act_buf[self._env, lo, self._act_chan]
+        b = self.act_buf[self._env, hi, self._act_chan]
         return a + (b - a) * self._act_w
 
     def advance(self) -> None:

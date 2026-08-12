@@ -150,9 +150,142 @@ with `init_log_std` — a policy that has narrowed its σ during training trips 
 `target_kl` on a smaller parameter move, which is part of why the epoch count never recovers
 as the run matures.
 
+### 6. Randomised bodies trip MuJoCo instability warnings that the default body never does
+
+Found while wiring `train.py --morph-scale` (distinct bodies per env, P4). Same command,
+same step count, same seed, only the bodies differ:
+
+```
+python tools/train.py --steps 1.5e4 --envs 8 --horizon 32 --out scraps/trainbase
+    ->   0 "Nan, Inf or huge value in QACC" warnings
+python tools/train.py --steps 1.5e4 --envs 8 --horizon 32 --morph-scale 0.5 \
+                      --morph-bodies 4 --out scraps/trainzoo
+    -> 102 warnings, overwhelmingly at DOF 22-26 = fpaw_r_flex and the tail chain
+```
+
+**Not** a build-time problem and **not** a stepping problem on its own. Each of these was
+measured directly and came back clean:
+
+| probe | result |
+|---|---|
+| building the same 4 morphed bodies | 0 warnings |
+| 4000 steps of uniform random actions, per body | 0 insane steps |
+| 6000 steps of *held saturated* (±1) actions, per body | 0 insane |
+| the 4-body pool over 8 envs, 1 worker and 8 workers | 0 insane |
+| 20 PPO `collect` updates on the same pool | 0 insane, peak speed 1.6 Froude |
+
+So it needs the real PPO action distribution to reproduce, and the last probe above did
+not reproduce it — which is the unfinished part of this entry.
+
+**The damage is bounded but real.** `sensing.gather_state`'s detector does work (verified
+by forcing `qvel = 1e8`: `warning.number[mjWARN_BADQACC]` survives MuJoCo's own
+`mj_resetData`, so `sane` goes False, `env.step` pays −1 and terminates, and `ppo.collect`
+masks the row out of the logged means). What it does *not* catch is a large-but-finite
+divergence: the zoo run logged `spd +19.5` and `spd -445.2` Froude on rows that were still
+`sane`. 445 Froude is ~1100 m/s. That number is clipped out of the observation by
+`RATE_CLIP`, and `r_speed` saturates to zero, so the policy sees nothing wrong — but it
+goes into `c_energy` at full size and into the run's own progress trace, which is exactly
+the "unreadable log" failure that the `sane` mask was added to fix.
+
+Two things to do, in order:
+
+1. ~~**Widen the sanity test to cover finite nonsense.**~~ **DONE.**
+   `sensing.flag_divergence(spec, raw)`, called from `env.step` right after the physics pool
+   returns, clears `raw.sane` for any env whose root speed exceeds `INSANE_SPEED = 50`
+   Froude or whose angular / joint rates exceed `INSANE_RATE = 100` per pendulum period.
+   Every bound is in the env's *own* body scales, so it neither penalises a large body nor
+   lets a small one away with anything — `test_finite_nonsense_is_judged_per_body` drives
+   three morphs to an identical *dimensionless* speed and asserts they agree. 50 Froude is
+   deliberately generous: peak locomotion is 2–3 and a free fall through one body length
+   reaches ~5, so nothing reachable by an animal is near it. Deliberately outside the thread
+   pool, which is GIL-held and serialises the whole vec env; it reads rows the pool already
+   copied out, so it is a handful of numpy calls for the entire batch.
+   Covered by `test_finite_nonsense_is_insane_too` (both directions: a 3-Froude gallop
+   survives, 500 Froude terminates and pays −1 while staying finite).
+2. **Then find the mechanism.** *(still open — this is what keeps the entry open.)*
+   The DOF distribution points at the tail chain, which
+   `sensing.RATE_CLIP`'s own comment already fingers as "light, long and barely damped" —
+   the suspicion is that `tune.stiffness_ceiling`, which is derived per joint from
+   `I(2πf)²`, is satisfied while the *damping* on those joints is not enough at the morphed
+   inertia (see issue 4, which says the ceiling ignores damping — this may be the same bug
+   arriving from the other end).
+
+---
+
+### 7. `fit_sequence`'s warm start is unproven, and `sigma_px` is still a placeholder
+
+Two open questions left by the pose fit (`creaturelab/fit.py`), neither of which blocks
+anything today but both of which get *harder* to answer once real footage exists.
+
+**(a) The warm start buys 3–4%, not the order of magnitude the design assumed.**
+`fit_sequence` carries each frame's solution into the next. The obvious justification —
+"fewer LM iterations" — is measurably false: `init_root` already makes a cold start cheap
+and independent of the initial guess, so a warm-started frame costs about the same and
+sometimes slightly more. The intended justification is *continuity*: a limb occluded for a
+run of frames is nearly unconstrained, and re-solving it from scratch each frame lets it
+wander inside its null space, which is indistinguishable from motion downstream (it becomes
+acceleration in the AMP demos and torque in the E_phys gate). Measured on synthetic clips,
+including one with five landmarks hidden in three of four views for the whole clip:
+
+```
+                warm     cold (each frame independent)
+root     0.0086   0.0090      mean |2nd difference|
+joints   0.2615   0.2708
+```
+
+3–4%. Too small to build on, so `tests/test_fit.py::test_a_sequence_tracks_the_motion`
+deliberately asserts only that the sequence path is not *worse* — an assertion tuned to pass
+at one seed would turn this open question into a claim. **What would settle it:** real
+footage, where occlusion is longer, correlated between views and not drawn from a uniform;
+or a synthetic clip with a deliberately adversarial occlusion schedule (one limb hidden in
+*all* views for 20+ frames, which the current generator cannot express because it draws
+occlusion i.i.d. per frame). Keep the structure regardless — E_temp and the E_phys gate
+operate on a trajectory, not on frames.
+
+**(b) `notes/keypoints.yaml` still says `sigma_px_measured: false`.** Every σ is the 6.0 px
+placeholder, so σ currently carries no relative weighting at all — the fit weights all 21
+landmarks equally in everything except the Huber width, which comes from `class` instead.
+That is why `tools/fit_selftest.py`'s verdict is *relative* (beat free-point triangulation,
+stay under the ray-uncertainty floor) rather than an absolute millimetre bar: an absolute bar
+would be measuring the placeholder. The real numbers come from the detector's own
+cross-validation error per body part, once one is trained;
+`tools/keypoints_project.py` prints a note to stderr while the flag is false, and
+`tests/test_keypoints.py::test_the_placeholder_sigma_is_flagged_as_a_placeholder` fails if
+the flag is flipped without the numbers changing.
+
 ---
 
 ## Done
+
+### `--help` crashed on two tools, because the console could not encode `θ`  **DONE**
+
+*(found 2026-08-12, while verifying the commands going into `notes/training.md`.)*
+`tools/morph_sweep.py --help` and `tools/fit_selftest.py --help` both died with
+
+```
+UnicodeEncodeError: 'charmap' codec can't encode character '\u03b8' in position 1596
+```
+
+raised from inside `argparse._print_message`. Their module docstrings refer to the morph vector as
+Greek theta, argparse echoes the docstring into the help text, and Windows hands a process's
+`sys.stdout` the console's ANSI code page (cp1252) with `errors="strict"`. The tools themselves ran
+perfectly; only the *first thing anyone types about them* was guaranteed to fail. The same fault
+would have taken down any long run that printed a non-ASCII character in its final summary — after
+doing all the work.
+
+Nothing caught it, for two compounding reasons: pytest replaces `sys.stdout` with a UTF-8-capable
+capture object, so the bug **cannot exist in-process** under the suite, and every existing test
+imported the tool modules rather than executing them. It needed a real subprocess with a narrow
+encoding to appear at all.
+
+Fixed by `creaturelab/console.py`'s `use_utf8()`, called by all six tools before argparse. The
+tempting fix — deleting the offending characters from the docstrings — was rejected: it leaves the
+process still unable to print them, so it regresses silently at the next degree sign, and it makes
+the docs worse to route around a bug that is not in the docs. `tests/test_tools_cli.py` pins both
+halves: it runs every tool's `--help` in a subprocess under a forced `PYTHONIOENCODING=cp1252` (so
+the test reproduces a Windows console on any machine) and asserts the output is *byte-identical* to
+the UTF-8 run — which is what fails if someone later strips the characters instead. A final test
+asserts some tool's help still contains non-ASCII at all, so the suite cannot quietly go vacuous.
 
 ### 3. The default rig was passively unstable in roll, and neither guard could see it  **DONE**
 

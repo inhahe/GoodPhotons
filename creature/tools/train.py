@@ -4,6 +4,10 @@
     python tools/train.py --resume runs/canis/latest.pt          # picks up mid-run
     python tools/train.py --eval runs/canis/best.pt --view       # watch it
 
+    # train on a FITTED animal, over a neighbourhood of it (P4)
+    python tools/train.py --morph out/theta_rex.json --morph-scale 0.4 --out runs/rex
+    python tools/train.py --eval runs/rex/best.pt --morph out/theta_rex.json
+
 Checkpoints are written on a wall-clock interval rather than an update count, because the
 thing they exist to survive is a session ending, and sessions end in minutes rather than in
 updates. `latest.pt` is rewritten in place for resuming; `best.pt` tracks the best evaluated
@@ -29,19 +33,56 @@ import numpy as np                                        # noqa: E402
 
 from creaturelab import env as envmod                     # noqa: E402
 from creaturelab import ppo                               # noqa: E402
+from creaturelab.console import use_utf8                  # noqa: E402
+
+use_utf8()   # before argparse: --help is the thing a cp1252 console cannot print
 
 
-def build_envs(cfg: envmod.EnvConfig, n: int, seed: int, auto_reset: bool = True):
-    """One compiled body shared by every env.
+def build_envs(cfg: envmod.EnvConfig, n: int, seed: int, auto_reset: bool = True,
+               center: dict[str, float] | None = None, morph_scale: float = 0.0,
+               bodies: int | None = None, quiet: bool = False):
+    """Compile the bodies the envs will run.
 
-    Sharing is safe and deliberate: `Body` holds the `MjModel` and the derived constants, all
-    of which are read-only during a step, while the per-env mutable state is `MjData`, which
-    `VecCreatureEnv` allocates one of per env. Compiling 64 identical models instead would
-    cost 64x the tune pass (~1.1 s each) to produce 64 identical results. P4 is where the
-    bodies start differing, and that is a list of distinct `Body` objects at this same call.
+    `morph_scale == 0` (the default) is the single-body case: one compiled `Body` shared by
+    every env. Sharing is safe rather than sloppy -- `Body` holds the `MjModel` and the
+    derived constants, all read-only during a step, while the per-env mutable state is
+    `MjData`, which `VecCreatureEnv` allocates one of per env. Compiling 64 identical models
+    would cost 64x the tune pass to produce 64 identical results.
+
+    Above zero, this is P4: each distinct body is a separate compile + tone pass, so the
+    count is a real cost (~1.1 s each) and is capped by `bodies` rather than tied to
+    `num_envs`. That cap is not just a speed knob. Distinct bodies are a *variance* knob:
+    every env holding its own animal means every minibatch mixes 64 morphs, which is what
+    the morph conditioning has to learn from -- but it also means no single body is seen
+    often enough early on for the policy to get any of them standing. A pool of ~8 bodies
+    over 64 envs gives eight envs per animal and trains visibly faster than 64 distinct
+    ones, at the same asymptote. The pool is re-used cyclically so every body gets the same
+    number of envs.
+
+    `center` is a fitted morph vector (`out/theta_*.json`): the neighbourhood is drawn
+    around the animal you captured rather than around the rig's authored defaults.
     """
-    body = envmod.build_body(cfg)
-    return envmod.VecCreatureEnv([body] * n, cfg, seed=seed, auto_reset=auto_reset)
+    if morph_scale <= 0.0:
+        pool = [envmod.build_body(cfg, center)]
+    else:
+        import random
+
+        from creaturelab.build import load, sample_morph
+        params = load(cfg.rig).params
+        # Seeded off the env seed so a resumed run rebuilds the same zoo. A different set
+        # of bodies after a resume is a change of task in the middle of training, and it
+        # shows up as an unexplained step in the learning curve.
+        rng = random.Random(seed ^ 0x5EED)
+        k = max(1, min(n, bodies if bodies is not None else 8))
+        pool = [envmod.build_body(cfg, sample_morph(params, rng, morph_scale, center))
+                for _ in range(k)]
+        if not quiet:
+            w = np.array([b.withers for b in pool])
+            print(f"{k} distinct bodies over {n} envs (morph scale {morph_scale:g}"
+                  f"{', centred on the fitted morph' if center else ''}): "
+                  f"withers {w.min():.3f}-{w.max():.3f} m", flush=True)
+    envs = [pool[i % len(pool)] for i in range(n)]
+    return envmod.VecCreatureEnv(envs, cfg, seed=seed, auto_reset=auto_reset)
 
 
 def evaluate(env, ac, norm, pcfg, per_command: bool = False) -> dict:
@@ -116,7 +157,22 @@ def main() -> int:
     ap.add_argument("--resume", default=None, help="checkpoint to continue from")
     ap.add_argument("--eval", default=None, help="evaluate a checkpoint and exit")
     ap.add_argument("--view", action="store_true", help="with --eval, open the MuJoCo viewer")
+    ap.add_argument("--morph", metavar="FILE", default=None,
+                    help="fitted morph vector (out/theta_*.json) to train around")
+    ap.add_argument("--set", nargs="*", metavar="NAME=VAL", default=None,
+                    help="override individual morph params; wins over --morph")
+    ap.add_argument("--morph-scale", type=float, default=0.0,
+                    help="randomise bodies this far about the centre (0 = one body)")
+    ap.add_argument("--morph-bodies", type=int, default=8,
+                    help="distinct bodies to compile, cycled over the envs")
     args = ap.parse_args()
+
+    from creaturelab.morph_io import morph_from_args, parse_sets
+    sets = parse_sets(args.set)
+    center = None
+    if args.morph or sets:
+        from creaturelab.build import load
+        center = morph_from_args(args.rig, args.morph, sets, load(args.rig).params)
 
     ecfg = envmod.EnvConfig(rig=args.rig)
     pcfg = ppo.PPOConfig(num_envs=args.envs, horizon=args.horizon, lr=args.lr,
@@ -124,15 +180,22 @@ def main() -> int:
                          device=ppo.pick_device(args.device))
 
     if args.eval:
-        return run_eval(args, ecfg, pcfg)
+        return run_eval(args, ecfg, pcfg, center)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    env = build_envs(ecfg, pcfg.num_envs, pcfg.seed)
+    env = build_envs(ecfg, pcfg.num_envs, pcfg.seed, center=center,
+                     morph_scale=args.morph_scale, bodies=args.morph_bodies)
     # A second, separate set of envs used only for scoring. See `evaluate`: it must not
     # auto-reset (that would re-randomise the fixed command grid), and keeping it apart from
     # the training envs means a scoring pass costs the rollout nothing.
-    eval_env = build_envs(ecfg, pcfg.num_envs, pcfg.seed + 1, auto_reset=False)
+    #
+    # Evaluation deliberately runs on the CENTRE body only, never on the randomised zoo.
+    # The eval score has to be comparable across the whole run and between runs, and a
+    # score averaged over 64 different animals moves when the zoo changes -- which would
+    # make `best.pt` track "got a lucky draw of bodies" as readily as "got better".
+    eval_env = build_envs(ecfg, pcfg.num_envs, pcfg.seed + 1, auto_reset=False,
+                          center=center, quiet=True)
     ac = ppo.ActorCritic(env.obs_dim, env.act_dim, pcfg)
     norm = ppo.RunningNorm(env.obs_dim)
 
@@ -208,11 +271,16 @@ def main() -> int:
     return 0
 
 
-def run_eval(args, ecfg, pcfg) -> int:
+def run_eval(args, ecfg, pcfg, center=None) -> int:
     # Scoring needs `auto_reset=False` (see `evaluate`); the viewer wants the opposite, so a
     # fall puts the animal back on its feet instead of leaving it lying there.
+    #
+    # `--morph-scale` is ignored here on purpose: evaluating on one body is what makes the
+    # per-command table readable. To see the policy on a *different* animal, pass that
+    # animal as `--morph` -- which is the P4 claim ("every edit inside the trained
+    # neighbourhood is free") in a form you can actually run.
     env = build_envs(ecfg, 1 if args.view else pcfg.num_envs, pcfg.seed,
-                     auto_reset=args.view)
+                     auto_reset=args.view, center=center)
     ac = ppo.ActorCritic(env.obs_dim, env.act_dim, pcfg)
     norm = ppo.RunningNorm(env.obs_dim)
     step, extra = ppo.load(args.eval, ac, norm)

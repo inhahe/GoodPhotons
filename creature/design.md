@@ -130,6 +130,54 @@ Add ligaments as soft nonlinear end-stops and tendons as springs — much of qua
 locomotion energy is elastic recoil, not muscle work — and the *passive* skeletal layer
 does most of the characteristic work before a single muscle fires.
 
+### Sites: the rig's half of the keypoint interface
+
+A **site** is a named, massless landmark fixed to a bone — no mass, no inertia, no
+collision geometry. Bones already say where the skeleton is; sites say where the *outside
+world's* named anatomical points are on it, which is a different question with a different
+consumer. The fit needs "where is the withers on this body?" as a differentiable function
+of the morph vector; the renderer and the annotator need it as a name.
+
+Three properties make this worth a first-class concept rather than a convention:
+
+1. **A site is an `Expr` over morph params, exactly like every other geometric quantity.**
+   This is the rig's founding rule applied to landmarks, and it is not cosmetic here: a
+   landmark written as a literal is correct for exactly one body, and on any other body its
+   bias is *indistinguishable inside E_kp from a bad fit*. The optimiser would trade a
+   mis-placed withers against a wrong trunk length and report convergence.
+2. **Sites are provably outside the physics.** `tests/test_keypoints.py`'s sibling in
+   `test_rig.py` strips every `<site>` element from the emitted MJCF and compiles both
+   versions: `body_mass`, `body_inertia`, `body_ipos`, `body_iquat` and `dof_M0` are
+   bit-identical. That is what makes it safe to add 21 landmarks to a rig a trained policy
+   already depends on — the dynamics cannot have changed.
+3. **MuJoCo already differentiates them.** `mj_jacSite` gives ∂(site world position)/∂q
+   directly, which is the entire Jacobian E_kp needs. Without it the fit would need a
+   hand-written kinematic chain that could drift from the model; with it, the reprojection
+   term is a few lines.
+
+Site names are **global**, not per-bone, and the builder rejects duplicates. The reason is
+the consumer: `notes/keypoints.yaml` refers to a site by name alone, because an annotator
+naming a landmark should not have to know which bone the rigger hung it on.
+
+`notes/keypoints.yaml` is the other half — the single source of truth for the
+detector↔rig correspondence, and the *only* place it is written down. The DLC/SLEAP
+project config is **generated** from it (`tools/keypoints_project.py --emit dlc`), never
+maintained alongside it. An interface whose two ends each restate the mapping has two
+places to be wrong and they disagree silently: the detector emits `l_elbow`, the fit looks
+for `elbow_l`, that landmark contributes nothing, and the only symptom is that one limb
+fits slightly worse than the other. Nothing raises. `tools/keypoints_project.py --check`
+points the same comparison at a config that has already been edited in the DLC GUI, which
+is the one remaining way drift can be introduced.
+
+Two fields in that file are load-bearing beyond the name mapping. `class: rigid|soft`
+selects the Huber width — a soft landmark's residual is dominated by real tissue sliding
+that a rigid-body model *cannot* represent, so treating it as rigid lets a wandering
+marker drag the whole skeleton. And `guide` is not documentation: every joint site sits at
+the **joint centre**, not at the palpable prominence a person instinctively clicks (the
+point of the hock is centimetres caudal to the hock's axis), so without the guide text
+every frame carries a constant offset — and a constant offset is precisely what the
+anatomy fit absorbs by making the bone the wrong length.
+
 ### Passive tone: declare the goal, measure the gains
 
 A bare skeleton folds up. Real ones don't, and not because the animal is thinking about
@@ -870,6 +918,128 @@ tests/           pytest
 out/             generated MJCF/FTSL, checkpoints, logs  (git-ignored)
 notes/           capture rig notes, literature
 ```
+
+`notes/capture.md` is the **capture protocol** and is operational, not just rationale: the two-mode
+rule (motion and groom never share a recording), the 4× GoPro HERO 12 decision and the settings that
+silently corrupt geometry, camera placement with the depth-error argument for 90° spacing,
+capture-volume sizing per gait, calibration and sync as on-site checklists, a table mapping *what you
+shoot* → *which morph knob it makes identifiable*, and a ~2-hour session shot list with its
+thermal/storage/power limits. Read it before a shoot; the fitting side it feeds is todo.md **P5**.
+
+`notes/pipeline.md` is the other half of the same story: **the command sequence** from four camera
+cards to a trained policy, stage by stage, with every stage marked `EXISTS` / `PARTLY EXISTS` /
+`TO BUILD` / `EXTERNAL`. Its headline finding is worth repeating here — **nothing in this repo reads
+a video file today.** Stages D–F (rig build, train, eval) exist, and stage C's *pose* solve now
+exists too (`creaturelab/fit.py`, exercised end-to-end by `tools/fit_selftest.py` against synthetic
+cameras — see §"The pose fit" below); ingest/calibrate, 2D keypoints and the anatomy search over θ
+are still unbuilt (todo.md P5), and `tools/train.py` currently trains from
+scratch on the authored rig against a hand-designed reward, consuming no captured data at all. The
+commands it lists for those stages are *specifications*, written so the tools have a target and so a
+capture session is not shot against a pipeline whose shape is undecided. It also names the four file
+formats worth freezing early — `session/calib.json`, `session/kp2d.h5`, `session/masks.h5`,
+`out/theta_animal.json` — and ends with the four things on the critical path that need no footage at
+all.
+
+`notes/training.md` is stage E expanded into a reference: every `train.py` flag, what each field of
+the progress line means, the checkpoint/resume contract, and the P4 morph-randomisation commands
+with the argument for ~8 bodies over 64 envs. Its load-bearing section is **"the one thing you must
+actually check"** — a real run from this tree that scored `eval_return` 603, survived every episode
+and held under 3° of tilt, while moving at 0.001 Froude against commands up to 0.8. It had learned
+to stand still and collect the near-zero commands for free. That is exactly the local optimum the
+reward and the curriculum are both designed around (§"The command curriculum" above), and **no
+scalar in the log distinguishes it from success** — only the per-command table from `--eval` does,
+which is why that table is printed by default rather than hidden behind a flag.
+
+`notes/keypoints.yaml` is the detector↔rig correspondence (see §"Sites" above): 21 canis landmarks,
+each mapping an annotator-facing `label` to a rig `site`, with a per-landmark noise sigma, a
+rigid/soft class that sets the Huber width, and the labelling instruction that keeps the annotator
+clicking joint centres. `tests/test_keypoints.py` fails if it and `rigs/canis.ftcl` ever drift apart,
+in either direction — a keypoint naming a site the rig lacks *and* a rig site no keypoint covers,
+the second of which is otherwise entirely silent.
+
+`out/theta_<animal>.json` (`creaturelab/morph_io.py`) is the narrow waist between the two halves of
+the project: stage C's fit produces one, stages D–F consume one, and neither end knows anything about
+the other beyond this file. It is deliberately boring — a name→number map, a schema version, and
+enough provenance (`rig`, `creature`, `source`) to answer "where did this dog come from?" six months
+later. A θ with no record of which rig it was fit against is actively dangerous, because parameter
+names are per-rig: applied to a different rig it either errors (good) or, if the names happen to
+overlap, silently builds a chimera. Unknown parameter names are a hard error naming the *file*;
+missing ones stay at the rig defaults and are reported, which is what makes a partial θ ("just the
+leg lengths I measured") useful. `--morph FILE` on `ftcl_build.py`, `rig_report.py`, `morph_sweep.py`
+and `train.py` all read it, with `--set NAME=VAL` overriding it so you can load the fitted animal and
+then poke one parameter.
+
+**Every tool calls `creaturelab/console.py`'s `use_utf8()` before parsing arguments**, and the
+reason is worth one line so it is not "cleaned up" later. These docstrings talk about θ, use
+en-dashes and print degree signs; Windows gives a process's `sys.stdout` the console's ANSI code
+page (cp1252) with `errors="strict"`, so argparse echoing a docstring into help text raised
+`UnicodeEncodeError` from inside `_print_message`. `morph_sweep.py --help` and `fit_selftest.py
+--help` both died that way while the tools themselves ran fine — the first thing anyone types about
+a tool was the one thing guaranteed to fail. The fix widens the stream rather than narrowing the
+docs, because stripping the characters would leave the process still unable to print them and would
+regress silently at the next degree sign; `tests/test_tools_cli.py` pins both halves by running
+every tool's `--help` in a subprocess under a forced `PYTHONIOENCODING=cp1252` and asserting the
+output is byte-identical to the UTF-8 run. It is a called function rather than an import side
+effect because `creaturelab` is a library and must not reach out and mutate its host's streams.
+
+`session/calib.json` (`creaturelab/camera.py`) is the second frozen format, and the one with the
+least margin for error: **a calibration that is wrong is not detectable from the footage
+afterwards**, and every later stage — including the E_phys floor gate — reads it and believes it. So
+the schema carries its own verification numbers (`rms_px`, plus `drift_px`, the closing re-shoot's
+disagreement with the opening one that capture.md makes mandatory), and `load_calib` refuses rather
+than warns: a non-orthonormal `R` (a scaled extrinsic silently rescales the whole animal, which the
+morph fit then absorbs into `body_scale`), a reflection, a duplicate camera name, a `pinhole` model
+carrying distortion coefficients, or a file with only one camera — from which a 3D pose is not
+observable at all, though the fit will happily run and return one.
+
+The camera model is `cv::fisheye`, and **keypoints are undistorted, never frames** (capture.md).
+That splits into two directions used by different callers, which is deliberate: `project()` is the
+full nonlinear map and is used only to manufacture synthetic views, while the fit runs on
+`undistort()` → `project_linear()`, leaving the objective a clean pinhole whose Jacobian is four
+entries of a 2×3 instead of the derivative of an 8th-order polynomial. Because the self-test
+generates through one path and fits through the other, a disagreement between the distortion model
+and its inverse surfaces as recovery error instead of cancelling out.
+
+### The pose fit: `creaturelab/fit.py`
+
+E_kp — reprojection error minimised **directly in the simulator's own `qpos`** (todo.md P5). The
+unknown is the same vector the policy is later trained on, so there is no retargeting stage, no
+correspondence between two skeletons to maintain, and no way for the fitted motion to be unreachable
+by the body that has to reproduce it. Levenberg–Marquardt with Marquardt scaling (`λ·diag(JᵀJ)`, not
+`λI`, or a shared damping penalises root translation in metres and a toe joint in radians equally
+and in practice freezes the root); the Jacobian analytic through `mj_jacSite`; the free joint stepped
+with `mj_integratePos` so the root quaternion stays on the unit sphere; joint limits imposed by
+projection rather than a barrier, because a barrier's gradient blows up exactly where LM most needs
+a large step. The Huber width comes from `keypoints.yaml`'s `class` (2 px rigid / 8 px soft) — which
+is what makes `class` load-bearing rather than documentation — and observations below
+`PoseFitter.CONF_FLOOR` are *rejected*, not down-weighted, because a detector emits a coordinate for
+an occluded part too and it is typically the centroid of the animal.
+
+`triangulate` + `init_root` place the root by Kabsch-aligning the model's landmarks onto free
+triangulated points before LM starts. Measured, this buys **start-independence and bounded cost, not
+accuracy**: the fitted pose becomes bit-identical from initial guesses 0 m, 1 m and 3 m off, at a
+constant ~30 LM iterations, against 38 → 50 and rising without it. A fit whose answer moves when the
+initial guess moves is not a measurement, and on real footage nothing would notice.
+
+**Two things this deliberately is not.** It is not the anatomy search — θ is fixed here; CMA-ES over
+the morph vector wraps this loop in `tools/fit_anatomy.py` (unbuilt). And it is not the whole
+objective: E_sil (the only source of girth), E_temp, E_lim as a barrier and the E_phys gate are all
+still to come. See `notes/pipeline.md` stage C.
+
+`tools/fit_selftest.py` is the yardstick, and it runs **before any footage exists**: build a body,
+pose it, project its landmarks through a synthetic four-GoPro ring, corrupt the result the way a real
+detector does (per-landmark σ, occlusion, gross outliers, left/right swaps), throw the truth away and
+measure what comes back. Its verdict is deliberately *relative* — beat free-point triangulation of the
+same observations, and stay under the ray-uncertainty floor — because `keypoints.yaml` still says
+`sigma_px_measured: false`, so any absolute millimetre bar would be measuring the placeholder.
+Beating unskeletoned triangulation is the sharper test anyway: it asks whether the skeleton is
+*adding* information, and a wrong correspondence or a camera-convention error fails it while leaving
+the reprojection number looking fine (a broken fit drives its own reprojection to zero by contorting
+the body). With clean observations recovery is exact to 0.0 mm; with the default corruption it is
+~24 mm against ~34 mm unskeletoned. **What it cannot tell you:** a synthetic pose is by construction
+inside the rig's reachable set, so this measures the optimiser, not the model — whether a real dog is
+representable by `canis.ftcl` needs public P2 mocap replayed through the same cameras (`--mocap`,
+still to build).
 
 ## Environment
 

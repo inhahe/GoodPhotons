@@ -1,7 +1,38 @@
 # Capture rig
 
 *(Created 2026-08-06. Referenced from `todo.md` P5 and P9, which pointed at this file before it
-existed.)*
+existed. Extended 2026-08-12 with the operational half — placement, calibration, sync, shot list,
+budget — which the original covered only as "4 cameras at ~3 m".)*
+
+**If you are about to shoot, read these four in this order:**
+[What each thing you capture actually unlocks](#what-each-thing-you-capture-actually-unlocks) ·
+[The session: shot list, time, and the physical limits](#the-session-shot-list-time-and-the-physical-limits) ·
+[Where the cameras go](#where-the-cameras-go) ·
+[Sync — the on-site procedure](#sync--the-on-site-procedure).
+The rest of the page is *why*. The one rule that must not be violated on the day is
+[the two-mode split](#the-rig-serves-two-jobs-and-they-must-not-share-a-mode): motion and groom
+never share a recording.
+
+**What happens to the footage afterwards is `notes/pipeline.md`** — the command sequence from four
+camera cards to a trained policy — and **`notes/training.md`** for the training commands
+specifically. Read pipeline.md *before* shooting, because it says plainly which stages are unbuilt:
+the ingest, calibration and keypoint-import glue, and the anatomy/motion fits that consume this
+page's output, do not exist yet.
+
+The ordering decision that affects *when you shoot*: run the self-test first, so a broken fit is
+discovered before an animal, an owner and a two-hour session have been spent on footage the
+pipeline cannot use. Half of it now exists and is worth running the day you calibrate —
+
+```bash
+python tools/fit_selftest.py --calib sessions/.../calib.json
+```
+
+— which projects known poses through *your* calibrated cameras and checks the solver recovers
+them. It has already earned its keep: it found a stale-Jacobian bug that on real footage would
+have been misdiagnosed as a bad calibration. What it does **not** yet do is the part its name
+refers to — replaying public mocap of a *real* dog, which is the only version that tests whether a
+real animal is representable by the rig at all, rather than testing the optimiser against poses
+the rig can trivially reach.
 
 ## The rig serves two jobs, and they must not share a mode
 
@@ -148,6 +179,215 @@ the answer is training data and view redundancy, not set dressing:
   other three. This robustness argument — not just occlusion coverage — is why the minimum is 4
   and not 3.
 - Reprojection-error gating + temporal smoothness (P5's regularisers) mop up what RANSAC misses.
+
+## Where the cameras go  *(added 2026-08-12 — this page named a camera count and a distance and then stopped; the geometry was never written down)*
+
+### The number that decides the layout: depth error
+
+For a triangulated point at range `Z` from a pair with baseline `B`, the along-depth uncertainty is
+roughly
+
+```
+sigma_Z  ~  (Z / B) * p * sigma_px          p = the pixel footprint at the subject
+```
+
+At the working distance this page already specifies (~3 m) with the native wide lens (~92° H),
+4K gives **p ≈ 1.6 mm/px**, and P5's Huber δ = 2 px is a fair stand-in for `sigma_px`. So:
+
+| pair separation around the subject | baseline at Z = 3 m | sigma_Z |
+|---|---|---|
+| 90° | 4.2 m | **~2.3 mm** — parity with lateral error |
+| 60° | 3.0 m | ~3.2 mm |
+| 40° | 2.1 m | ~4.6 mm |
+| 20° | 1.0 m | ~9.2 mm — 4× worse for no saving |
+
+That table is the whole argument for spreading the cameras rather than clustering them: below ~40°
+separation, depth is the dominant error and bone-length estimates inherit it. Against femur lengths
+of 0.115–0.285 m, 2–3 mm is a **~1–2 % length measurement**, which is the accuracy the anatomy fit
+actually runs on.
+
+### The layout
+
+**Four cameras at the corners of a square, ~90° apart, on a circle of radius ~3 m, aimed at its
+centre.** Then every pair is either 90° (excellent) or 180° (degenerate on its own, but each
+camera has two 90° partners, so no keypoint is ever left with only the bad pair).
+
+- **Stagger the heights: two at ~1.6 m tilted down ~20°, two at ~0.7 m tilted down ~5°.** The high
+  pair sees floor contacts and the far-side legs over the body; the low pair sees the leg segments
+  near-side-on, which is where limb keypoints are most confidently detected. Elevation is an
+  *occlusion* argument, not a conditioning one — a quadruped occludes its far legs with its own
+  trunk, and that is the failure the 4-camera minimum exists to fix.
+- **Never put all four on one line or one arc.** Two lateral views 20° apart are, per the table
+  above, one lateral view with extra storage cost.
+- **90° also breaks left/right limb confusion**, which is the characteristic DLC/SLEAP failure on a
+  purely lateral view — the near and far legs cross the same image region and the detector swaps
+  them. A view down the animal's long axis makes the swap geometrically impossible, and P5's RANSAC
+  gate then outvotes it rather than averaging it in.
+- **Front/rear views are what make `hip_width` and `shoulder_width` identifiable at all.** Those two
+  morph params are almost invisible from the side. If the layout drifts toward "two lateral pairs",
+  those knobs stop being fit and start being guessed.
+- Rigid mounts, not tripod-with-a-loose-pan-head. §Settings turns EIS off precisely so extrinsics
+  are constant; a camera that gets nudged mid-session invalidates every frame after the nudge.
+  Mark the floor positions with tape so a knocked tripod can be put back and re-verified rather
+  than re-calibrated from scratch.
+
+### Capture-volume sizing — and why gallop does not fit in it
+
+At 3 m with ~92° H FOV a frame covers ~6.2 m across, but the volume where the animal is in **all
+four** views is much smaller: roughly a **3 × 3 m** footprint. Set that against how far a dog
+travels per stride:
+
+| gait | speed | stride length | strides per pass through a 3 m volume |
+|---|---|---|---|
+| walk | ~1.2 m/s | ~1.2 m | ~2.5 |
+| trot | ~2.5–3 m/s | ~1.6 m | ~2 |
+| gallop | ~8–10 m/s | ~2.5–3.5 m | **~1** |
+
+So the arena as specified is sized for **walk and trot**, and gallop gets about one stride per pass.
+There is no free fix; pick one deliberately and write down which:
+
+- **more passes** — the cheapest option, and the default. ~10 clean gallop strides then means ~10+
+  usable passes rather than ~5.
+- **pull the cameras back to ~5 m** — doubles the volume, but `p` grows to ~2.7 mm/px and `sigma_Z`
+  to ~4 mm; the anatomy fit degrades from ~1–2 % to ~3 %.
+- **the corridor layout** — abandon the circle for a straight runway with two cameras per side,
+  staggered along the run and toed in so their fields overlap across a ~6 m working segment. Buys
+  length at the cost of the 90° property over part of the run (pairs across the corridor stay wide;
+  pairs along it do not). Worth it only if gallop specifically is the goal.
+
+Decide this per session and record it in the session log — extrinsics are per-layout, so switching
+layouts mid-session means re-calibrating.
+
+## Calibration — the on-site procedure
+
+Intrinsics are **per camera per capture mode**; extrinsics are per layout and die the moment a
+tripod moves. Both are cheap to redo and catastrophic to get wrong, so both happen every session.
+
+1. **Board.** ChArUco, not a plain checkerboard — partial views still solve, which matters because
+   the frame *edges and corners* are where fisheye distortion is strongest and where you most need
+   coverage. Size it for the volume: **~0.6–1.0 m** on a side. A laptop-sized board at 3 m is a few
+   hundred pixels and will not constrain the distortion tails.
+2. **Intrinsics, per camera, in the exact mode you will shoot** (4K120 and 2.7K240 are *different
+   intrinsics*): 30–60 stills or a slow sweep, board deliberately pushed into all four corners and
+   tilted hard. Fit `cv::fisheye` (or omnidir). **Never in-camera Linear** — §Settings.
+3. **Extrinsics:** wave the board slowly through the whole working volume so it is seen by
+   overlapping camera pairs, then bundle-adjust (this is exactly what Anipose's calibration does).
+   Cover the volume at multiple heights, including floor level.
+4. **Scale and floor.** The board's known square size is what makes the whole reconstruction
+   *metric* — without it the fit is shape-up-to-scale and `body_scale` is meaningless. Also lay the
+   board flat on the floor for a few frames: that fixes the ground plane, which E_phys's
+   floor-penetration and foot-slip gates need.
+5. **Verify before the animal arrives:** triangulate the board corners and check the recovered
+   square size against the printed one, and check reprojection RMS is ≲1 px. A calibration that is
+   wrong is not detectable from the footage afterwards.
+6. **Re-shoot calibration at the END of the session too.** If a tripod drifted, the two calibrations
+   disagree and you know which takes to distrust — this costs two minutes and is the only thing
+   that turns a silent corruption into a detected one.
+
+## Sync — the on-site procedure
+
+§Sync above explains *why* timecode is not genlock. The steps:
+
+1. **GoPro Labs firmware on all four cameras** (already recommended above for QR-code config).
+2. **Set all four from one QR code** — mode, fps, Protune lock, RAW audio. Identical settings is a
+   correctness requirement, not tidiness: mismatched shutter changes blur, and mismatched mode
+   changes intrinsics.
+3. **Wireless timecode sync at the start of the session, and again every ~2 hours** — the internal
+   clocks drift.
+4. **Clap-and-flash at the head of every single take.** One frame-exact event in all four views (and
+   all mic tracks, §Audio). This is the verification of the timecode and the fallback if it failed;
+   it costs one second and there is no way to reconstruct it later.
+5. **Roll all four before the clap and stop all four after the take.** Do not start a camera late.
+6. **Residual offset is up to one frame interval** between any two cameras, and no procedure removes
+   it — this is why the fps spec exists. Interpolate keypoint tracks onto a common clock (the
+   timecode makes that possible) rather than assuming frame *n* is simultaneous across cameras.
+
+## What each thing you capture actually unlocks
+
+The question this page kept getting asked and never answered: *what do I have to shoot to turn which
+knob?* Against `canis.ftcl`'s 26-parameter morph vector and the downstream phases:
+
+| capture | what it makes identifiable / possible | how much |
+|---|---|---|
+| **Calm standing square**, all four feet planted, animal settled | the 8 `stance_*` params — nearly a third of the morph vector — plus the cleanest frames for the length params. The single highest-value clip on this list. | 3–5 takes × 5–10 s |
+| **Slow walk, straight, both directions** | the 12 length params (`trunk/neck/head/tail/femur/tibia/hmeta/scapula/humerus/radius/fmeta/paw`) by triangulated-segment medians; θ₀ initialisation; AMP walk demos | ≥10 clean strides ⇒ ~5 passes/direction |
+| **Trot** | AMP trot demos; the gait the P2-mocap yardstick comparison is run on | ≥10 clean strides ⇒ ~5 passes/direction |
+| **Gallop** | AMP gallop demos; the flight phase is the strongest E_phys signal | ≥10 strides ⇒ ~10+ passes (see volume sizing) |
+| **Front-on and rear-on passes** | `hip_width`, `shoulder_width` — weakly constrained from lateral views | 2–3 passes each |
+| **Turns / circles, both directions** | left-right asymmetry check (a healthy animal should fit symmetric; a large asymmetry means a bad calibration or a limp); P10's yaw channel | 2–3 circles each way |
+| **Sit, lie down, get up, shake, scratch, head turns** | P10 §Postural transitions and the channel inventory; also the *actual* joint ranges, which the authored `.ftcl` limits are currently a guess at | 3–5 takes each |
+| **Silhouette-friendly passes** (animal clearly separable from background) | `trunk_radius`, `limb_gracility` — these live **only** in E_sil, never in keypoints | woven through the above; prefer an uncluttered backdrop for a few passes |
+| **The animal on a bathroom scale** | `body_mass` — kinematically invisible, no amount of footage recovers it (todo.md P5 §Identifiability honesty) | one number, once |
+| **A tape measure on 2–3 bones** | an independent check that the metric scale is right before you trust 26 fitted numbers | 5 minutes |
+| **Groom stills session** (separate; §two-mode rule) | P7's ~10–30 groom params: pattern, direction field, density, silhouette-length | own session, ~30–45 min |
+| **Vocal session** (separate; §Audio) | P12's sample library | own session |
+
+Two caveats that belong here rather than downstream:
+
+- **`body_scale` is a gauge freedom.** It multiplies every length, so it is degenerate with the
+  twelve length params unless the fit fixes a convention (fit lengths at `body_scale = 1`, or fit
+  `body_scale` from total length and the rest as ratios). Nothing you capture resolves this; it is
+  a parameterisation choice and the fit has to make it explicitly.
+- **Fur inflates the silhouette.** E_sil measures the *coat*, so `limb_gracility` and `trunk_radius`
+  fit from a fluffy animal describe the fluff, not the bone. On a long-coated subject expect a
+  systematic overestimate — and note that the groom session is the thing that can eventually
+  measure and subtract it.
+
+### "What do I capture to make a *new* creature?" — nothing, and that is the design
+
+Worth stating plainly because it is the most natural wrong assumption. You do **not** capture a
+second animal to get a second creature. The capture produces `θ_animal` — a point in the
+pre-authored template's morph space — and every other creature in that body plan is *another point
+in the same space*, reachable by dragging sliders in P8's editor with no new footage at all. See
+todo.md **P6 §Converting a captured animal**: the order is author template → capture + fit θ → edit
+anatomy → train **once**, conditioned on morph and randomised over a *generous neighbourhood* of θ.
+
+The capture-side consequence is a single instruction: **capture the animal that sits nearest the
+centre of the region you eventually want to explore**, and set the morph ranges generously before
+training. What a new capture *is* needed for is a **different body plan** — a different template,
+different topology, and P4's morph manifold explicitly does not span those (you cannot interpolate a
+leg into a wing; see P11).
+
+## The session: shot list, time, and the physical limits
+
+A realistic first motion session, in order:
+
+| # | step | time |
+|---|---|---|
+| 1 | rig placement, tape the floor marks, power/cards in | 20 min |
+| 2 | QR-config all four, timecode sync, RAW audio on | 5 min |
+| 3 | calibration: intrinsics (if mode changed) + extrinsics + floor + verify | 15–20 min |
+| 4 | weigh the animal; tape-measure a couple of bones; log it | 5 min |
+| 5 | **standing square** takes | 5 min |
+| 6 | walk passes, both directions | 10–15 min |
+| 7 | trot passes, both directions | 10–15 min |
+| 8 | gallop passes (if the space allows) | 15–20 min |
+| 9 | front/rear passes, circles | 10 min |
+| 10 | postural transitions, shake, scratch, head turns | 10–15 min |
+| 11 | closing calibration re-shoot | 5 min |
+| | **total on site** | **~2 hours** |
+
+What that yields, roughly: ~15–25 min of *recorded* footage, of which — with an uncooperative
+subject — expect **10–25 % usable** after culling for occlusion, frame-edge exits, detector failure
+and the E_phys gate. So ~3–5 min of usable footage, of which the anatomy fit needs only ~300 frames
+(todo.md P5: "every 4th frame of a few standing/walking clips") and the AMP demos need perhaps
+30–60 s. **The binding constraint is variety and cleanliness, not duration** — this is not a
+"record for hours" problem, it is a "get ten clean strides of each gait" problem.
+
+Three physical limits that will end a session early if unplanned for:
+
+- **Thermal.** A HERO 12 at 4K120 in a warm room overheats in roughly 20–30 min of continuous
+  recording. Short per-take rolls (which the clap-per-take protocol already implies) are the
+  mitigation; continuous rolling is not viable.
+- **Storage.** 4K120 runs ~100–120 Mbps ⇒ ~0.8 GB/min/camera ⇒ **~3.4 GB/min for the rig**. Twenty
+  minutes of recording is ~70 GB. 256 GB cards minimum, V30 or better, and offload before the
+  session ends — a card swap mid-session is also a chance to knock a tripod.
+- **Power.** High-fps recording drains a HERO battery in well under an hour. External USB power on
+  all four, or the session ends at step 8.
+
+**Log every session**: layout used, camera modes, calibration files, the animal's mass, what was
+shot in each take, and anything that went wrong (a nudged tripod, a failed timecode). A take with no
+provenance is a take you will not trust in six months.
 
 ### Groom mode hardware note
 

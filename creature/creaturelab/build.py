@@ -18,7 +18,7 @@ from ftcl.expr import Env, Expr
 from ftcl.parser import Node, parse_file, parse_string
 
 from .model import (Bone, Creature, Defaults, Geom, Joint, MorphParam, Posture,
-                    Sensing, World)
+                    Sensing, Site, World)
 from .schema import ROOT
 
 
@@ -170,6 +170,16 @@ def build_bone(bnode: Node, env: Env, defaults: Defaults, src: str | None) -> Bo
             raise FtclError(f"{g.kind} geom in bone '{bone.name}' needs 'size'",
                             gnode.loc, src)
         bone.geoms.append(g)
+    for snode in bnode.all("site"):
+        bone.sites.append(Site(
+            name=snode.name,
+            bone=bone.name,
+            at=_vec(snode, "at", env, (0.0, 0.0, 0.0)),
+            kind=_word(snode, "kind", "rigid"),
+            size=_f(snode, "size", env, 0.008),
+            rgba=_vec(snode, "rgba", env),
+            doc=_str(snode, "doc", "") or "",
+        ))
     if not bone.geoms:
         raise FtclError(f"bone '{bone.name}' has no geom, so it has no mass or inertia "
                         f"-- give it one, or the simulator will produce a singular model",
@@ -189,6 +199,16 @@ def validate_tree(creature: Creature, src: str | None, locs: dict[str, object]) 
         dupes = sorted({b.name for b in creature.bones
                         if [x.name for x in creature.bones].count(b.name) > 1})
         raise FtclError(f"duplicate bone name(s): {', '.join(dupes)}")
+
+    # Site names are checked GLOBALLY unique, not per-bone: MJCF's namespace is flat, and
+    # more importantly `notes/keypoints.yaml` maps a detector keypoint onto a bare site
+    # name with no bone qualifier. A duplicate would make that mapping ambiguous, and the
+    # fit would silently pull one landmark towards the wrong bone.
+    site_names = [s.name for b in creature.bones for s in b.sites]
+    if len(set(site_names)) != len(site_names):
+        dupes = sorted({n for n in site_names if site_names.count(n) > 1})
+        raise FtclError(f"duplicate site name(s): {', '.join(dupes)} -- site names are "
+                        f"global, because keypoints.yaml refers to them without a bone")
 
     roots = [b for b in creature.bones if not b.parent]
     for b in creature.bones:
@@ -334,20 +354,34 @@ def load_string(text: str, morph: dict[str, float] | None = None,
 
 
 def sample_morph(params, rng: random.Random | None = None,
-                 scale: float = 1.0) -> dict[str, float]:
+                 scale: float = 1.0,
+                 center: dict[str, float] | None = None) -> dict[str, float]:
     """Draw a morph vector for domain randomisation.
 
-    `scale` shrinks the sampled range about each default, so a curriculum can widen the
+    `scale` shrinks the sampled range about each centre, so a curriculum can widen the
     body distribution over training instead of starting at full spread -- policies that
     see the whole morph space from step one tend to learn a mushy average gait.
+
+    `center` moves that neighbourhood onto a *fitted* animal (`out/theta_*.json`) instead
+    of the rig's authored defaults. This is the shape design.md's morphology section
+    argues for: train once over a generous neighbourhood of the animal you actually
+    captured, and every later edit inside that region is free. Centring on the rig default
+    when the fitted dog sits near one edge of the range spends most of the randomisation
+    budget on bodies that will never be asked for.
+
+    The sampled interval is always clipped back into the parameter's declared `[lo, hi]`.
+    That range is not advisory: it is what `tune.py`'s tone pass and the viability checks
+    were validated over, so a fitted value near an edge must not push the sampler past it.
+    Each side keeps its own half-width, so an asymmetric range stays asymmetric.
     """
     rng = rng or random.Random()
     out: dict[str, float] = {}
     for p in params:
+        c = float(center[p.name]) if center and p.name in center else p.default
         if not p.randomize or p.lo is None or p.hi is None:
-            out[p.name] = p.default
+            out[p.name] = c
             continue
-        lo = p.default + (p.lo - p.default) * scale
-        hi = p.default + (p.hi - p.default) * scale
-        out[p.name] = rng.uniform(lo, hi)
+        lo = max(p.lo, c - (p.default - p.lo) * scale)
+        hi = min(p.hi, c + (p.hi - p.default) * scale)
+        out[p.name] = rng.uniform(lo, hi) if hi > lo else lo
     return out

@@ -1,0 +1,221 @@
+# ---------------------------------------------------------------------------------------
+# The keypoint <-> rig correspondence: the SINGLE SOURCE OF TRUTH for the interface
+# between the 2D detector and the skeleton.  (schema: creature/keypoints@1)
+#
+# Created 2026-08-12, unblocked by site support landing in the grammar/schema/emitter.
+# todo.md P5 called this "the first thing on the critical path"; notes/pipeline.md stage B
+# is where it is used.
+#
+# THE RULE THAT MAKES THIS FILE WORTH HAVING: the DLC/SLEAP project config is GENERATED
+# from this file (`tools/keypoints_project.py --emit dlc`), never written alongside it. An
+# interface whose two ends each restate the correspondence has two places to be wrong, and
+# they disagree silently -- the detector happily outputs a keypoint named `l_elbow`, the
+# fit happily looks for `elbow_l`, and the only symptom is that one landmark contributes
+# nothing and the foreleg fits a little worse than the hind. Generating one end from the
+# other makes that class of bug unrepresentable.
+#
+# `site:` must name a site that exists in the rig. `tools/rig_report.py --sites` lists
+# them; the check is enforced by tests/test_keypoints.py, which fails if this file and
+# rigs/canis.ftcl ever drift apart.
+# ---------------------------------------------------------------------------------------
+
+schema: creature/keypoints@1
+rig: rigs/canis.ftcl
+creature: canis
+
+# Default detector noise, in pixels, at the capture resolution. This is a PLACEHOLDER
+# until it is measured: fit_selftest.py's synthetic replay corrupts ground truth with
+# these numbers, so if they are optimistic the self-test reports a fit quality the real
+# pipeline will never reach. Measure it from held-out labelled frames (the RMS between two
+# human labellers on the same frame is the honest floor) and replace this.
+sigma_px_default: 6.0
+sigma_px_measured: false        # flip to true, with a date, once the above is real
+
+# How a keypoint's class changes what the fit does with it.
+#   rigid -- a bony prominence, repeatably findable; standard Huber (delta = 2 px).
+#   soft  -- skin/flesh that slides over the skeleton by centimetres between frames.
+#            Gets a WIDE Huber, because its residual is dominated by real tissue motion
+#            that the rigid-body model cannot represent, not by detector error. Treating
+#            it as rigid lets a wandering marker drag the whole skeleton.
+huber_delta_px:
+  rigid: 2.0
+  soft: 8.0
+
+# ---------------------------------------------------------------------------------------
+# THE CORRESPONDENCE.  21 landmarks, canis v1 (todo.md P5).
+#
+# `label` is the string the human annotator sees and the detector emits. It is spelled the
+# way a person naturally says it out loud, because the annotator reads it a few thousand
+# times; `site` is the rig's internal name. They are deliberately allowed to differ -- that
+# is the entire reason a mapping file exists rather than a naming convention.
+#
+# `guide` is not decoration. Every joint site in the rig sits at the JOINT CENTRE, not at
+# the palpable bony prominence a person would instinctively click (the point of the hock
+# is the tuber calcanei, a few cm caudal to the hock's axis of rotation). If the annotator
+# clicks the prominence and the rig means the centre, every frame carries a constant
+# offset, and a constant offset is exactly what the anatomy fit will absorb by making the
+# bone the wrong length. So the guide text IS the calibration of the interface.
+# ---------------------------------------------------------------------------------------
+
+keypoints:
+
+  # --- axial ---------------------------------------------------------------------------
+  - label: nose
+    site: nose
+    class: rigid
+    guide: "Tip of the nose leather. Not the nostril."
+
+  - label: occiput
+    site: occiput
+    class: rigid
+    sigma_px: 8.0            # between the ears: no sharp feature, so noisier than most
+    guide: "Highest point of the back of the skull, midway between the ear bases."
+
+  - label: withers
+    site: withers
+    class: rigid
+    guide: "Top of the shoulder, above the point of the shoulder blade. The point a
+            breed standard measures height to."
+
+  - label: tail_base
+    site: tail_base
+    class: rigid
+    guide: "Where the tail leaves the body, on the dorsal midline."
+
+  - label: tail_tip
+    site: tail_tip
+    class: soft
+    sigma_px: 14.0
+    guide: "End of the tail, ignoring hair. Expect this one to be bad and label it
+            anyway -- it is the only landmark that constrains tail_len at all."
+
+  # --- fore limbs ----------------------------------------------------------------------
+  # Right/left is the ANIMAL's right/left, never the viewer's. This is the single most
+  # common labelling error in a multi-view session, it is invisible in any one view, and
+  # it produces a fit that looks converged and has the legs swapped.
+  - label: shoulder_left
+    site: shoulder_l
+    class: rigid
+    guide: "Shoulder joint centre: roughly a third of the way from the point of the
+            shoulder back towards the withers, at the depth of the joint."
+
+  - label: elbow_left
+    site: elbow_l
+    class: rigid
+    guide: "Elbow joint centre, level with the caudal edge of the chest."
+
+  - label: carpus_left
+    site: carpus_l
+    class: rigid
+    guide: "Wrist joint centre -- the obvious bend above the pastern."
+
+  - label: forepaw_left
+    site: fpaw_l_tip
+    class: rigid
+    guide: "Front of the paw where it meets the ground. Not the toenail."
+
+  - label: shoulder_right
+    site: shoulder_r
+    class: rigid
+    guide: "As shoulder_left, on the animal's right."
+
+  - label: elbow_right
+    site: elbow_r
+    class: rigid
+    guide: "As elbow_left, on the animal's right."
+
+  - label: carpus_right
+    site: carpus_r
+    class: rigid
+    guide: "As carpus_left, on the animal's right."
+
+  - label: forepaw_right
+    site: fpaw_r_tip
+    class: rigid
+    guide: "As forepaw_left, on the animal's right."
+
+  # --- hind limbs ----------------------------------------------------------------------
+  - label: hip_left
+    site: hip_l
+    class: rigid
+    sigma_px: 9.0            # deeply buried under muscle; the least reliable rigid point
+    guide: "Hip joint centre, under the point of the hip. Deep -- estimate it rather
+            than clicking the visible bump."
+
+  - label: stifle_left
+    site: stifle_l
+    class: rigid
+    guide: "Stifle (knee) joint centre, on the front of the leg just below the flank."
+
+  - label: hock_left
+    site: hock_l
+    class: rigid
+    guide: "Hock joint CENTRE -- the axis the joint turns about, NOT the point of the
+            hock sticking out behind it."
+
+  - label: hindpaw_left
+    site: hpaw_l_tip
+    class: rigid
+    guide: "Front of the hind paw where it meets the ground."
+
+  - label: hip_right
+    site: hip_r
+    class: rigid
+    sigma_px: 9.0
+    guide: "As hip_left, on the animal's right."
+
+  - label: stifle_right
+    site: stifle_r
+    class: rigid
+    guide: "As stifle_left, on the animal's right."
+
+  - label: hock_right
+    site: hock_r
+    class: rigid
+    guide: "As hock_left, on the animal's right. The CENTRE, not the point."
+
+  - label: hindpaw_right
+    site: hpaw_r_tip
+    class: rigid
+    guide: "As hindpaw_left, on the animal's right."
+
+# ---------------------------------------------------------------------------------------
+# Skeleton edges, for the detector's part-affinity / skeleton config and for the labelling
+# UI's overlay. Purely presentational -- the fit gets its connectivity from the rig -- but
+# a labeller working without the overlay swaps left and right far more often.
+# ---------------------------------------------------------------------------------------
+skeleton:
+  - [nose, occiput]
+  - [occiput, withers]
+  - [withers, tail_base]
+  - [tail_base, tail_tip]
+  - [withers, shoulder_left]
+  - [shoulder_left, elbow_left]
+  - [elbow_left, carpus_left]
+  - [carpus_left, forepaw_left]
+  - [withers, shoulder_right]
+  - [shoulder_right, elbow_right]
+  - [elbow_right, carpus_right]
+  - [carpus_right, forepaw_right]
+  - [tail_base, hip_left]
+  - [hip_left, stifle_left]
+  - [stifle_left, hock_left]
+  - [hock_left, hindpaw_left]
+  - [tail_base, hip_right]
+  - [hip_right, stifle_right]
+  - [stifle_right, hock_right]
+  - [hock_right, hindpaw_right]
+
+# ---------------------------------------------------------------------------------------
+# WHAT IS NOT HERE, and deliberately
+#
+# * No girth landmark. Girth (trunk_radius, limb_gracility, the belly) is not recoverable
+#   from point landmarks at all -- it lives in the CONTOUR, which is E_sil's job, from the
+#   SAM2 masks of pipeline.md stage B2. Adding a "belly" keypoint would look like progress
+#   and would measure a point that no annotator can place twice in the same spot.
+# * No body_mass. Kinematically invisible: no reprojection term can see it. It comes from
+#   a bathroom scale (todo.md P5, Identifiability honesty).
+# * No spine or neck intermediate points, though the rig has the joints. A dog's back has
+#   no repeatably-labellable feature between the withers and the croup, so those keypoints
+#   would be noise dressed as data.
+# ---------------------------------------------------------------------------------------

@@ -434,3 +434,123 @@ def test_an_authored_stiffness_is_not_overridden():
     from creaturelab.tune import apply_posture
     apply_posture(creature)
     assert creature.bone("femur_l").joints[0].stiffness == 12345.0
+
+
+# --- sites: the keypoint<->rig interface --------------------------------------------------
+
+def test_sites_do_not_touch_the_physics():
+    """A landmark must be provably free, or nobody will author the 21 the fit needs.
+
+    The failure this guards against does not raise: give a site a mass, a density or a
+    default `group`/contype and MuJoCo happily folds it into `inertiafromgeom`, so the
+    body silently gains inertia and a trained policy is now controlling a different
+    animal. Stripping the site elements out of the emitted XML and diffing the compiled
+    model is the only check that actually proves it.
+    """
+    import re
+    xml = to_mjcf(load(RIG))
+    stripped = re.sub(r"<site [^>]*/>\s*", "", xml)
+    assert xml.count("<site") == 21 and stripped.count("<site") == 0
+    a = mujoco.MjModel.from_xml_string(xml)
+    b = mujoco.MjModel.from_xml_string(stripped)
+    for field in ("body_mass", "body_inertia", "body_ipos", "body_iquat", "dof_M0"):
+        assert np.array_equal(getattr(a, field), getattr(b, field)), field
+    assert a.nsite == 21 and b.nsite == 0
+
+
+def test_every_site_moves_with_the_morph_parameter_it_belongs_to():
+    """The founding rule, applied to landmarks (schema.SITE's docstring).
+
+    A site authored as a literal would sit still while the bone it names grows, and the
+    resulting bias is indistinguishable inside E_kp from the fit merely being bad -- it
+    would be discovered, if ever, as an unexplained reprojection floor. So: lengthen the
+    humerus and the elbow must move; widen the trunk and the withers must rise.
+    """
+    def world_sites(morph):
+        creature = load(RIG, morph)
+        model = mujoco.MjModel.from_xml_string(to_mjcf(creature))
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+        return {mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, i):
+                data.site_xpos[i].copy() for i in range(model.nsite)}
+
+    base = world_sites({})
+    assert len(base) == 21
+
+    # The elbow is the distal end of the humerus, so it must track humerus_len -- but the
+    # expected displacement is NOT the 80 mm the humerus grew. `fore_drop` raises the
+    # thorax by exactly the extra vertical reach, which is the mechanism that keeps the
+    # back level under randomisation, so the elbow's z is unchanged *by construction* and
+    # the entire displacement is horizontal: 80 mm * sin(35 deg) = 46 mm. Asserting the
+    # value rather than a loose ">" is what makes this test agree with the rig's design
+    # instead of accidentally passing on a rig that had drifted.
+    longer = world_sites({"humerus_len": 0.24})
+    delta = longer["elbow_l"] - base["elbow_l"]
+    expect = 0.08 * math.sin(math.radians(35.0))
+    assert abs(delta[2]) < 2e-3, f"elbow_l changed height by {delta[2] * 1000:.1f} mm; " \
+                                 f"fore_drop should have cancelled it exactly"
+    assert np.linalg.norm(delta) == pytest.approx(expect, abs=3e-3), \
+        f"elbow_l moved {np.linalg.norm(delta) * 1000:.1f} mm for +8 cm of humerus, " \
+        f"expected ~{expect * 1000:.0f} mm"
+
+    # The withers sits on top of the ribcage, so it must track trunk_radius -- and again
+    # the answer is not the naive one. The site is at +R_trunk in the thorax frame, but
+    # the scapula rides at `scap_z = R_trunk*0.8`, so a fatter trunk lifts the shoulder
+    # and the thorax has to drop by 0.8*dR to keep the feet on the ground. The withers
+    # therefore rises by exactly (1 - 0.8)*dR. Getting 40 mm here instead of 8 would mean
+    # the ribcage had stopped carrying the scapula, which is a real rig regression that a
+    # loose ">" threshold would sail straight past.
+    d_radius = 0.145 - 0.105
+    fatter = world_sites({"trunk_radius": 0.145})
+    rise = fatter["withers"][2] - base["withers"][2]
+    assert rise == pytest.approx(0.2 * d_radius, abs=1e-3), \
+        f"withers rose {rise * 1000:.1f} mm for +{d_radius * 1000:.0f} mm of trunk " \
+        f"radius; expected {0.2 * d_radius * 1000:.0f} mm"
+
+    # and the whole set must scale with body_scale -- no landmark left behind
+    big = world_sites({"body_scale": 1.6})
+    for name in base:
+        assert not np.allclose(big[name], base[name], atol=1e-6), \
+            f"site '{name}' did not move when body_scale did"
+
+
+def test_site_jacobians_are_available_and_nonzero():
+    """`mj_jacSite` is the reason sites exist: the fit's LM step needs d p / d qpos.
+
+    Without a site MuJoCo will not give this at all, which is what made the keypoint
+    interface unimplementable (todo.md P5).
+    """
+    creature = load(RIG)
+    model = mujoco.MjModel.from_xml_string(to_mjcf(creature))
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "hpaw_l_tip")
+    jacp = np.zeros((3, model.nv))
+    mujoco.mj_jacSite(model, data, jacp, None, sid)
+    # the hind paw is moved by the hip, stifle and hock -- and by nothing in the foreleg
+    assert np.abs(jacp).max() > 0.05
+    for joint in ("stifle_l", "hock_l"):
+        dof = model.jnt_dofadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint)]
+        assert np.abs(jacp[:, dof]).max() > 1e-3, f"{joint} does not move hpaw_l_tip"
+    for joint in ("elbow_l", "carpus_l"):
+        dof = model.jnt_dofadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint)]
+        assert np.abs(jacp[:, dof]).max() < 1e-9, f"{joint} moves hpaw_l_tip (wrong tree)"
+
+
+def test_duplicate_site_names_are_rejected():
+    """keypoints.yaml refers to a site by bare name, so a duplicate is ambiguous."""
+    from ftcl.errors import FtclError
+    from creaturelab.build import load_string
+    text = """
+    creature "x" {
+        skeleton {
+            bone "a" { geom sphere { at 0 0 0 radius 0.1 }
+                       site "p" { at 0 0 0 } }
+            bone "b" { parent "a" origin 0 0 0.2
+                       geom sphere { at 0 0 0 radius 0.1 }
+                       site "p" { at 0 0 0 } }
+        }
+    }
+    """
+    with pytest.raises(FtclError, match="duplicate site name"):
+        load_string(text)
