@@ -4570,8 +4570,45 @@ invisible under a sandboxed shell) and `Local\` objects are per-session.
   per frame by the `-serve` loop; an external stop means "shut the process down", so it
   must survive that clear — and it also breaks the `-keepwindow` hold.
 
-`-stop all` targets every live render, a bare `-stop` lists them, and both wait (≤120 s)
-for the targets to actually exit so a rebuild can be scripted immediately after.
+`-stop all` targets every live ftrace process, a bare `-stop` lists them, and both wait
+(≤120 s) for the targets to actually exit so a rebuild can be scripted immediately after.
+
+### Stopping the loom VIEWER, and an honest exit code (0.182.0)
+
+The channel was render-only until 0.182.0, and in the worst possible way: the `-viewer`
+branch `return`s before `stopChannelStart()`, so a viewer published no `.run` file — and
+the wait loop's predicate was `alive && exists(<pid>.run)`, which for an *unpublished* pid
+is false on the very first poll. `-stop <viewer-pid>` therefore printed
+`[stop] done — stopped cleanly.` and exited **0** while the viewer kept running. That is
+worse than not supporting the viewer at all: the one command the project offers instead of
+`taskkill /F` reported success for a stop it had not performed, and anything chaining off
+it (`build.bat`, which can't copy `ftrace.exe` while a viewer holds it open) proceeded on a
+false premise — straight back to the force-kill the channel exists to prevent. Three
+changes close it:
+
+- **The viewer registers.** `stopChannelStart(sidecar + " -> (loom viewer)")` /
+  `stopChannelEnd()` now bracket `runViewerGui`, so a viewer is listed by a bare `-stop`
+  and is a legal target. Nothing in the channel was ever render-specific.
+- **The GUI polls.** `viewer_gui.cpp`'s `PeekMessage` loop calls `ft::stopRequested()` once
+  per frame (the probe is installed at `main.cpp:18485`, *before* the viewer dispatch) and
+  sets `done`, leaving through the ordinary teardown that releases D3D11, the loom python
+  child and the window. `-explore` needed nothing: its loop already reads `g_stopRequested`
+  directly (`main.cpp:17092`), and it registers because `stopChannelStart` precedes `run()`.
+- **The wait can't lie.** `stopTargetGone()` replaces the conjunction: on Windows process
+  liveness is authoritative and is the *only* thing consulted, so a live target is never
+  counted as gone. (Off Windows `ftraceProcessAlive()` is a conservative "yes", so there the
+  `.run` file disappearing is still the signal.) A pid that was already dead returns 0 with
+  `nothing to stop`; a pid alive but unregistered stays a target and, if it outlives the
+  deadline, the command prints `[stop] FAILED — still running after 120s` and exits **2**.
+
+The directory scan also **reaps orphan `.stop` sentinels**, not just orphan `.run` files. A
+sentinel is normally deleted by the target that consumes it, so one only survives when nobody
+is left to consume it — the target died first, or never watched the channel (the
+alive-but-unregistered path drops one deliberately). Eight had piled up over five days before
+this was noticed. It is housekeeping rather than a safety net: `stopChannelStart` already
+deletes any sentinel bearing its own pid before starting its watcher, so a recycled pid cannot
+inherit somebody else's stop and kill itself at startup. The reaper only fires once the owner
+is gone, so a sentinel still in flight to a live target is never snatched away.
 
 ### Stopping during SCENE LOAD (0.138.2)
 

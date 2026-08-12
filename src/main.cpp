@@ -11265,22 +11265,49 @@ static void stopChannelEnd() {
     if (!g_stopRunFile.empty()) std::filesystem::remove(g_stopRunFile, ec);
 }
 
-// `ftrace -stop [<pid>|all]`: list running renders, or ask one/all of them to finish
-// cleanly. Never loads a scene, never touches the GPU; returns a process exit code.
+// Has a stop target actually gone? On Windows the process check is authoritative, so it
+// is the ONLY thing consulted: a target still alive has not stopped, whatever its .run
+// file says. (The old test also required the .run file to exist, which quietly inverted
+// the meaning for any process that never published one — an unregistered pid counted as
+// "gone" on the first poll and the command reported a clean stop it had not performed.)
+// Off Windows ftraceProcessAlive() is a conservative "yes", so fall back to the .run
+// file disappearing — published on entry, removed by stopChannelEnd().
+static bool stopTargetGone(long pid, const std::filesystem::path& dir) {
+#ifdef _WIN32
+    (void)dir;
+    return !ftraceProcessAlive(pid);
+#else
+    std::error_code ec;
+    return !std::filesystem::exists(dir / (std::to_string(pid) + ".run"), ec);
+#endif
+}
+
+// `ftrace -stop [<pid>|all]`: list running ftrace processes, or ask one/all of them to
+// finish cleanly. Never loads a scene, never touches the GPU; returns a process exit
+// code — 0 only when every target is genuinely gone, so a caller can chain a rebuild.
 static int runStopCommand(const char* who) {
     std::filesystem::path dir = stopChannelDir();
     if (dir.empty()) {
         std::fprintf(stderr, "error: -stop cannot reach the ftrace stop-channel directory\n");
         return 1;
     }
-    // Every live render, reaping .run files whose owner is gone (hard kill / crash).
+    // Every live ftrace process, reaping .run files whose owner is gone (hard kill / crash)
+    // and .stop sentinels nobody is left to consume. An unconsumed sentinel outlives its
+    // target whenever the target died first or never watched the channel at all (the
+    // "alive but unregistered" case below deliberately drops one), so without a reaper the
+    // directory only ever grows. `stopChannelStart` already deletes its own stale sentinel
+    // before starting its watcher, so a recycled pid cannot inherit a stop — this is
+    // housekeeping, not the safety net. Only reap once the owner is gone, so a sentinel
+    // still in flight to a live target is never snatched out from under it.
     std::vector<std::pair<long, std::string>> live;
     std::error_code ec;
     for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
-        if (de.path().extension() != ".run") continue;
+        const std::string ext = de.path().extension().string();
+        if (ext != ".run" && ext != ".stop") continue;
         const long pid = std::strtol(de.path().stem().string().c_str(), nullptr, 10);
         if (pid <= 0) continue;
         if (!ftraceProcessAlive(pid)) { std::filesystem::remove(de.path(), ec); continue; }
+        if (ext != ".run") continue;                 // a live target's pending sentinel
         std::string what;
         { std::ifstream f(de.path()); std::getline(f, what); }
         live.emplace_back(pid, what);
@@ -11288,8 +11315,8 @@ static int runStopCommand(const char* who) {
     std::sort(live.begin(), live.end());
 
     if (!who) {                                   // bare -stop: just list what's running
-        if (live.empty()) { std::printf("[stop] no ftrace renders are running.\n"); return 0; }
-        std::printf("[stop] running renders — stop one with `ftrace -stop <pid>`, "
+        if (live.empty()) { std::printf("[stop] no ftrace processes are running.\n"); return 0; }
+        std::printf("[stop] running ftrace processes — stop one with `ftrace -stop <pid>`, "
                     "all with `ftrace -stop all`:\n");
         for (const auto& p : live) std::printf("    pid %-7ld %s\n", p.first, p.second.c_str());
         return 0;
@@ -11298,7 +11325,7 @@ static int runStopCommand(const char* who) {
     std::vector<long> targets;
     if (!std::strcmp(who, "all")) {
         for (const auto& p : live) targets.push_back(p.first);
-        if (targets.empty()) { std::printf("[stop] no ftrace renders are running.\n"); return 0; }
+        if (targets.empty()) { std::printf("[stop] no ftrace processes are running.\n"); return 0; }
     } else {
         char* end = nullptr;
         const long pid = std::strtol(who, &end, 10);
@@ -11308,9 +11335,20 @@ static int runStopCommand(const char* who) {
         }
         bool known = false;
         for (const auto& p : live) if (p.first == pid) known = true;
-        if (!known)
-            std::printf("[stop] warning: pid %ld isn't a running ftrace render "
-                        "(dropping the sentinel anyway)\n", pid);
+        if (!known) {
+            // Already gone is a success: the caller wanted it stopped, and it is.
+            if (!ftraceProcessAlive(pid)) {
+                std::printf("[stop] pid %ld is not running — nothing to stop.\n", pid);
+                return 0;
+            }
+            // Alive but never published a .run file, so it is not an ftrace process this
+            // build can reach. Drop the sentinel in case it is watching, but do NOT let
+            // the wait below treat "unregistered" as "finished" — it stays a target, and
+            // if it is still alive at the deadline this command fails loudly.
+            std::printf("[stop] warning: pid %ld is running but is not a registered ftrace\n"
+                        "       process (no stop-channel entry). Dropping the sentinel anyway;\n"
+                        "       it will only stop if it happens to be watching for one.\n", pid);
+        }
         targets.push_back(pid);
     }
 
@@ -11333,16 +11371,18 @@ static int runStopCommand(const char* who) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
         std::vector<long> still;
         for (long pid : pending)
-            if (ftraceProcessAlive(pid) &&
-                std::filesystem::exists(dir / (std::to_string(pid) + ".run"), ec))
-                still.push_back(pid);
+            if (!stopTargetGone(pid, dir)) still.push_back(pid);
         pending.swap(still);
     }
+    // Only claim a clean stop when every target is actually gone — this exit code is what
+    // build.bat and friends chain off, so a false 0 sends them at an exe that is still
+    // locked, which is precisely the dead end that tempts a `taskkill /F`.
     if (pending.empty()) { std::printf("[stop] done — stopped cleanly.\n"); return 0; }
-    std::printf("[stop] still running after 120s:");
+    std::printf("[stop] FAILED — still running after 120s:");
     for (long pid : pending) std::printf(" %ld", pid);
     std::printf("\n[stop] it may be mid-write, or in a long non-chunked batch "
-                "(a bare -n render with no -window/-time/-noise budget writes only at the end).\n");
+                "(a bare -n render with no -window/-time/-noise budget writes only at the end),\n"
+                "       or it may not be an ftrace process at all. Nothing was force-killed.\n");
     return 2;
 }
 
@@ -18497,9 +18537,18 @@ int main(int argc, char** argv) {
                     viewerLoom = argv[++i];
                 }
             }
-            if (viewerSidecar)
-                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "", viewerPlay,
-                                    viewerPrebake, viewerCapMB);
+            if (viewerSidecar) {
+                // Publish the viewer in the stop channel too. It is not a render, but it
+                // IS a long-lived ftrace process holding ftrace.exe (and a python child)
+                // open, so `-stop` has to be able to list and end it — otherwise the only
+                // way out is the force-kill the whole channel exists to avoid. The GUI
+                // loop polls ft::stopRequested() once per frame; see viewer_gui.cpp.
+                stopChannelStart(std::string(viewerSidecar) + " -> (loom viewer)");
+                int vrc = runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "", viewerPlay,
+                                       viewerPrebake, viewerCapMB);
+                stopChannelEnd();
+                return vrc;
+            }
             if (viewerLoom) {
                 // -loom names a live channel, and there are two of them: the viewer's F4
                 // re-introspection (-viewer) and the fly editor's E2 value channel

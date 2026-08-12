@@ -5,7 +5,14 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-08-11, v0.181.0): `ftrace -stop <pid>` does not stop a `-viewer` / `-explore` GUI process, but reports that it did
+### FIXED (2026-08-11, v0.181.0 → v0.182.0): `ftrace -stop <pid>` did not stop a `-viewer` GUI process, but reported that it did
+
+*(Filed as OPEN and fixed the same day; the description below is the original report, with what
+shipped appended. It supersedes the 2026-08-06 v0.142.0 entry further down, which spotted the
+missing `stopChannelStart` but not the lying exit code. The title originally also accused
+`-explore` — wrongly: `-explore`'s loop has always polled `g_stopRequested` directly
+(`main.cpp:17092`) and it registers in the channel because `stopChannelStart` precedes `run()`.
+The `-viewer` branch was the only gap.)*
 
 `-stop` is documented (and used everywhere in this repo, including `CLAUDE.md`) as *the* safe way
 to end any ftrace process, precisely so nobody reaches for `taskkill /F` and risks a driver TDR.
@@ -45,6 +52,48 @@ window stays up and the command still reports success.
 
 Until (1) lands, the correct way to close a viewer is to close its window (clicking the X, or
 `PostMessage(hwnd, WM_CLOSE, 0, 0)` — the graceful path, *not* `taskkill /F`).
+
+---
+
+**What shipped (v0.182.0).** Both parts, plus a third that turned out to be the actual reason
+the exit code lied.
+
+- **The viewer registers.** `main.cpp:18531` now brackets `runViewerGui` with
+  `stopChannelStart(sidecar + " -> (loom viewer)")` / `stopChannelEnd()`, so a bare `-stop`
+  lists it and `-stop <pid>` is a legal target. Nothing in the channel was ever render-specific.
+- **The GUI polls.** `viewer_gui.cpp:3773`, in the `PeekMessage` loop: `if (!done &&
+  ft::stopRequested())` → print, `done = true`, break. It leaves through the ordinary exit path
+  rather than a synthesized `WM_CLOSE`, which reaches the same teardown (D3D11, the loom python
+  child, the window) with one less message round-trip. The probe is installed at
+  `main.cpp:18485`, *before* the viewer dispatch, so `ft::stopRequested()` is live there.
+- **The wait predicate was the real liar.** It was `ftraceProcessAlive(pid) &&
+  exists(<pid>.run)` — a conjunction that is false on the *first* poll for any process that
+  never published a `.run` file, so an unregistered pid was classified "gone" instantly and the
+  120 s wait never even ran. New `stopTargetGone()` (`main.cpp:11275`) consults only process
+  liveness on Windows, where it is authoritative; off Windows `ftraceProcessAlive()` is a
+  conservative "yes", so there the `.run` file disappearing remains the signal. Consequences:
+  an already-dead pid returns 0 with `nothing to stop`; an alive-but-unregistered pid *stays* a
+  target (with a loud warning) instead of being written off; and a target that outlives the
+  deadline prints `[stop] FAILED — still running after 120s: <pids>` and exits **2**.
+
+Also reworded the listing from "renders" to "ftrace processes", since it no longer only lists
+renders.
+
+**Found while testing: orphan `.stop` sentinels were never reaped.** The channel directory held
+eight of them going back five days. A sentinel is deleted by the target that consumes it, so one
+survives whenever nobody is left to consume it — the target died first, or never watched the
+channel (and the new alive-but-unregistered path drops one deliberately, so this would only have
+got worse). Not a correctness bug — `stopChannelStart` already deletes any sentinel bearing its
+own pid before starting its watcher, so a recycled pid can't inherit somebody else's stop — but
+unbounded litter in a shared temp directory. The same directory scan that already reaps dead
+`.run` files now reaps dead `.stop` files too, and only once the owner is gone, so a sentinel
+still in flight to a live target is never snatched away.
+
+Verified end to end: a live viewer appears in a bare `-stop`; `-stop <pid>` closes it in 0.6 s
+and returns 0, with no orphaned loom python child; a dead pid returns 0; an alive non-ftrace pid
+warns, waits the full 120 s and exits 2; and an ordinary `-forever -keepwindow` render still
+stops in 3.2 s with `[stop] interrupted — image and checkpoint saved.`, a valid Cornell-box PNG
+and a resumable 38 M-photon `.ftbuf`.
 
 ### OPEN (2026-08-10, v0.174.0): `-dual-scatter` drops the coat's indirect illumination
 
@@ -1488,7 +1537,13 @@ with pixels and is the *only* SM-bound phase (hence the only one a foreign GPU p
 `readback` is pixels and mostly CPU. Read `upload` against `bake + sidecar + ftsl` to decide whether
 a resident GPU scene is worth building **for the scene actually in front of you**.
 
-### OPEN (2026-08-06, v0.142.0): `ftrace -stop` cannot see or stop the VIEWER — the one CUDA-using process with no clean CLI shutdown
+### DONE (2026-08-06, v0.142.0 → fixed in v0.182.0): `ftrace -stop` cannot see or stop the VIEWER — the one CUDA-using process with no clean CLI shutdown
+
+**Fixed in v0.182.0, along the lines proposed below.** See the FIXED entry at the top of this
+file for what shipped; the one thing this entry did not anticipate is that the bug was worse
+than "does nothing" — the wait loop's `alive && exists(<pid>.run)` predicate made an
+*unregistered* pid look already-gone, so the command also reported a clean stop and exited 0.
+
 
 **Symptom.** `ftrace -stop` (bare) lists live renders and finds nothing while a `-viewer` process is
 running and driving CUDA through the Render pane. `ftrace -stop <viewer-pid>` likewise does nothing.
