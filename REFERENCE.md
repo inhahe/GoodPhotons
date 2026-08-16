@@ -2083,6 +2083,14 @@ exactly as authored. Emissive meshes count as lights, so a scene lit *only* by o
 needs no separate `light` block. (Meshes that import their own materials — glTF/GLB —
 are not auto-lit; bind an FTSL `emit` material instead.)
 
+Because the sampling is uniform by area and takes no account of the shading point,
+keep an emissive mesh **spatially compact** — one fixture per `mesh` block rather than
+every sign in a building in one OBJ. Parts of an emitter that are shadowed from a given
+receiver still consume their share of its shadow rays and return nothing, so a single
+emitter spread across separate rooms is measurably noisier than the same panels split
+into separate `mesh` blocks. A compact shape (a ring, a ball, a panel) costs nothing:
+a tessellated emissive sphere is as clean as the analytic `light sphere`.
+
 **Emissive non-mesh geometry (glowing solids).** `emit` is a property of the
 *material*, not of the `mesh` block, so binding an emissive material to anything else —
 a `sphere`, a `quad`, a CSG solid, a marched `isosurface`, a `curve` fiber — makes it glow

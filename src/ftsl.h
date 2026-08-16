@@ -5273,6 +5273,13 @@ private:
                         std::swap(tr.v1, tr.v2);
                         std::swap(tr.uv1, tr.uv2);
                         std::swap(tr.n1, tr.n2);
+                        // Supplied per-vertex SHADING normals followed the old winding, so
+                        // they have to be reversed too — finalize() only substitutes gn for
+                        // normals that are absent (zero-length), it never re-derives supplied
+                        // ones, and leaving them inward would fight the new geometric normal.
+                        tr.n0 = tr.n0 * -1.0;
+                        tr.n1 = tr.n1 * -1.0;
+                        tr.n2 = tr.n2 * -1.0;
                         tr.finalize();
                     }
                 }

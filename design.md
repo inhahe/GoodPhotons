@@ -150,7 +150,7 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   The Preetham sky's `sun_disk separate` option
   (`sky::SunDisk`) unbakes the solar disc from the env map and registers an
   energy-matched Sun instead — the same picture, converging ~20× faster in forward modes.
-  **Mesh area lights** (since 0.41.0): a
+  **Mesh area lights** (since 0.186.0): a
   material with an `emit` spectrum bound to a `mesh` registers an
   `EmitterShape::Mesh` emitter (`Scene::addMeshLight`) holding a per-triangle
   cumulative-area CDF (`Emitter::meshTris`, `EmitTri`); `samplePoint` binary-searches

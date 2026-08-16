@@ -5,6 +5,74 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-15, v0.186.0): a mesh area light is sampled UNIFORMLY BY AREA, so every occluded or backfacing part of the emitter still costs samples
+
+`EmitterShape::Mesh` (added for mesh area lights, C5) picks a triangle from a
+cumulative-area CDF and then samples it barycentrically — `Emitter::samplePoint`
+(`src/scene.h`) and its device mirror `emitterSamplePoint` (`src/render_cuda.cu`,
+`shape == 5`). That is **correct but blind**: the draw ignores where the shading point
+is, so any triangle that is backfacing (`cosLight <= 0`, rejected in `emitterGeom`,
+`src/backward.h`) or shadowed from the receiver still consumes its share of the NEE
+budget and returns zero.
+
+**Measured, in a controlled A/B** (`scraps/occl_one.ftsl` vs `scraps/occl_two.ftsl`,
+mode R, 32 spp, GPU). Both scenes light the same box with the same visible 0.3 × 0.3 m
+ceiling panel at the same 1200 lm; `occl_two` merely gives the *same* mesh emitter a
+second identical panel sealed inside an opaque crate 2.5 m away (`lumens 2400` over
+twice the area leaves the visible panel at exactly 1200 lm). The sealed panel
+contributes nothing, and indeed the converged images agree — patch mean 19.334 vs
+19.263 (0.4 %). But the high-frequency noise in that patch rises **2.488 → 3.251, a
+1.31× penalty** for a 50 % waste, i.e. ~1.7× the samples for the same quality. Scale
+that to a room whose signage is one mesh of dozens of scattered patches and only a few
+are visible from any given point, and the factor grows with the number of patches.
+
+Where it does **not** hurt, also measured, so the entry isn't overstated: a compact
+convex emitter is fine. A 2304-triangle emissive sphere (`scraps/sph_mesh.ftsl`) is
+indistinguishable from the analytic cone-sampled `light sphere`
+(`scraps/sph_ref.ftsl`) in both brightness and noise — mode R 32 spp: image mean
+15.3586 vs 15.3514, patch noise 3.013 vs 3.030; mode B: absorbed 0.5562 vs 0.5567.
+Enlarging it to r = 0.4 m in a 1 m box (`scraps/big_*.ftsl`) still shows no penalty
+(3.809 vs 3.891). The cost is specifically **occlusion and orientation diversity**
+within one emitter, not triangle count and not curvature.
+
+*(An earlier revision of this entry blamed a torus that "stalls at ~50 % noise and never
+converges". That was misdiagnosed: `scenes/torus.obj` is inward-wound (signed volume
+−0.107), so one-sided emission radiated into its own hollow. Fixed in v0.186.0 by the
+loader's closed-shell auto-orientation; that scene now reaches 0.4 % noise in 45 s.)*
+
+This is the "room lit only by emissive signs" case, i.e. exactly the workload mesh area
+lights exist for, so the weakness is squarely on the feature's main path.
+
+**Proper fix — importance-sample the emit-triangles, not the area.** Two options, in
+increasing order of payoff and effort:
+
+1. **Light BVH / adaptive light tree** (Conty & Kulla, *Importance Sampling of Many
+   Lights with Adaptive Tree Splitting*; the approach in Arnold / Cycles / PBRT-v4).
+   Build a BVH over `Emitter::meshTris` at `addMeshLight` time, storing per-node flux,
+   bounding cone of normals, and bounds; at a shading point descend it choosing children
+   by an estimated contribution (solid angle × cos bound × flux / dist²). Returns the
+   chosen triangle **and** its selection pdf, so `emitterGeom`'s `pdf_area` becomes
+   `pdfSelect / triArea` instead of `1/area`. Self-contained: touches `samplePoint` +
+   the pdf in `emitterGeom`/BDPT, not the transport. Needs a device mirror of the tree.
+2. **ReSTIR DI** (spatiotemporal reservoir resampling) on top of that. Strictly larger
+   win for many-emitter scenes and it is what real-time engines use for this exact case
+   (Unreal's new `LumenRef` cinematic mode, 2026-08-15, is lit entirely by emissive
+   meshes and is almost certainly ReSTIR-family). Not a licensing concern — the
+   technique is published; UE's own source is EULA-restricted and must not be copied.
+
+**Workaround until then:** keep an emissive mesh spatially compact — one fixture per
+`mesh` block rather than every sign in the building in a single OBJ — so that mutual
+occlusion inside one emitter stays low. Splitting into several `mesh` blocks does not by
+itself fix the problem (emitter selection is power-weighted, and is equally blind to the
+shading point), but it does stop one draw from having to choose among patches in
+different rooms.
+
+**Note the scope.** The underlying gap is that ftrace has **no many-lights importance
+sampling anywhere** — emitter selection is a power CDF and within an emitter the draw is
+uniform. Mesh lights merely make it easy to author the pathological case. Fix (1) should
+therefore be built to serve *both* levels: a tree over emitters whose mesh-emitter leaves
+descend into that emitter's own triangle tree.
+
 ### FIXED (2026-08-12, v0.183.2): `-prebake` announced a too-small cap only after hitting it, so playback fell off a cliff mid-loop with no warning
 
 *(NOT the "viewer died silently" report briefly logged here — that was the user closing the
@@ -7824,7 +7892,7 @@ follow-up, not a bug:
   dielectric. Proper fix: read `extensions.KHR_materials_transmission`/`_ior` → map to
   `MatType::Dielectric` with the given ior; other extensions as feasible.
 - **No `emissiveFactor` import.** Emissive glTF materials load unlit. The underlying
-  mechanism now exists — mesh-emitter area lights shipped in 0.41.0 (C5): an FTSL `emit`
+  mechanism now exists — mesh-emitter area lights shipped in 0.186.0 (C5): an FTSL `emit`
   material bound to a `mesh` registers an `EmitterShape::Mesh` sampled light. What's
   missing is wiring glTF's `emissiveFactor`/`KHR_materials_emissive_strength` into that
   path (set `Material::emit` from the factor and call `Scene::addMeshLight` for the
@@ -9797,7 +9865,7 @@ estimator, so it would return exactly the noise mode W exists to remove.
     ftrace's loader is OBJ-only (convert first); mesh `to_world` with
     rotation/shear only partly expressible (translate+scale + euler). (Mesh
     area-emitters *do* now have an FTSL equivalent — a `mesh` bound to an `emit`
-    material, since 0.41.0 — so the exporter could emit that instead of dropping the
+    material, since 0.186.0 — so the exporter could emit that instead of dropping the
     emission; not yet wired up.)
   - **Possible follow-ups:** map `.ply` via an auto OBJ conversion; emissive-mesh
     support (needs an emissive-triangle light primitive in the core); rough
