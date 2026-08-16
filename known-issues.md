@@ -68,10 +68,37 @@ shading point), but it does stop one draw from having to choose among patches in
 different rooms.
 
 **Note the scope.** The underlying gap is that ftrace has **no many-lights importance
-sampling anywhere** — emitter selection is a power CDF and within an emitter the draw is
-uniform. Mesh lights merely make it easy to author the pathological case. Fix (1) should
+sampling anywhere** — the forward/BDPT/VCM side selects an emitter from a power CDF
+(`selectEmitter`, `src/render_cuda.cu:4911`) and within an emitter the draw is uniform.
+Mesh lights merely make it easy to author the pathological case. Fix (1) should
 therefore be built to serve *both* levels: a tree over emitters whose mesh-emitter leaves
 descend into that emitter's own triangle tree.
+
+**The backward renderer is worse than "blind" — it does not select an emitter at all, it
+SPLITS over every one of them.** `BackwardRenderer::neeLight` (`src/backward.h:709-752`,
+device mirrors at `src/render_cuda.cu:7419/7466/7506`) runs `for (e = 0; e < nEm; ++e)`
+and casts a shadow ray to **every** emitter at **every** non-specular vertex. That is an
+unbiased splitting estimator, but its cost is O(N_lights) per bounce with no
+corresponding gain once the lights are redundant.
+
+Measured (`scraps/gen_manylights.py` → `scraps/ml{001,004,016,064,256}.ftsl`: the same
+4 × 2 × 4 m white room, the same **total** 20 000 lm, split across N ceiling panels;
+mode R, 256 spp, 256², RTX 4090):
+
+| N lights | time | reported noise | image mean |
+|---:|---:|---:|---:|
+| 1 | 0.4 s | 6.25 % | 38.7 |
+| 4 | 0.7 s | 6.25 % | 40.6 |
+| 16 | 3.3 s | 6.25 % | 39.6 |
+| 64 | 15.1 s | 6.25 % | 39.4 |
+| 256 | 75.9 s | 6.25 % | 37.7 |
+
+Linear in N, **190× the time for the same image at the same noise**. This is the single
+largest known avoidable cost in mode R and it is what a light tree actually buys: switch
+`neeLight` from splitting-over-all to selecting one (or a few, via adaptive tree
+splitting) importance-weighted emitters, cost O(log N). The `selectEmitter` power-CDF
+binary search already in the CUDA scene is the hook the tree should replace, and the
+backward NEE should start using it.
 
 ### FIXED (2026-08-12, v0.183.2): `-prebake` announced a too-small cap only after hitting it, so playback fell off a cliff mid-loop with no warning
 

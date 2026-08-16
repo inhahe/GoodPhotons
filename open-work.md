@@ -41,6 +41,15 @@ factor grows with the number of independently-visible patches. A compact convex 
 fine — a 2304-tri emissive sphere matches the analytic cone-sampled `light sphere` exactly —
 so this is specifically about occlusion and orientation diversity.
 
+**Bigger, and separately measured (2026-08-15):** the backward renderer does not *select* an
+emitter at all — `BackwardRenderer::neeLight` (`src/backward.h:709`) and its CUDA mirrors
+(`src/render_cuda.cu:7419/7466/7506`) **split over every emitter at every non-specular
+vertex**. Same room, same total 20 000 lm, mode R 256 spp 256² (`scraps/gen_manylights.py`):
+1 light 0.4 s, 16 lights 3.3 s, 64 lights 15.1 s, 256 lights **75.9 s** — all at an identical
+6.25 % noise. 190× the cost for the same image. That is the largest known avoidable cost in
+mode R, and the same light tree fixes it (select one importance-weighted emitter, or a few
+via adaptive splitting, instead of all N).
+
 Fix: a Conty–Kulla adaptive light tree (Arnold / Cycles / PBRT-v4) built to serve **both**
 levels — a tree over emitters whose mesh-emitter leaves descend into that emitter's own
 triangle tree — returning a selection pdf so `emitterGeom`'s `pdf_area` becomes
