@@ -5,10 +5,18 @@ long prose blocks whose opening paragraph reads like a plan but whose later
 `**STATUS (date) … DONE**` sub-paragraph says it landed. That makes "what's actually left?"
 expensive to answer.
 
-**This file is the actionable extract, as of 2026-08-08 (ftrace v0.159.0).** It carries only
+**This file is the actionable extract, as of 2026-08-15 (ftrace v0.186.0).** It carries only
 work that is genuinely undone *and* not explicitly ruled out. `TODO.md` remains the
 authoritative design text — every item below names its section/item ID there, and the full
 rationale, prior art and scoping live in that entry, not here.
+
+> **Status, 2026-08-15: section 1 is empty — nothing is both unblocked and undone.**
+> The O (procedural noise), P2/P3 (fur), C (mesh/VDB), E, K, F and B batches have all
+> landed; §J3b's only remaining item is the one the user excluded. What is left is
+> section 2 (waiting on *you*, not on code) and the standing exclusions at the bottom.
+> The one piece of *new* work identified since is not a TODO.md item at all but a
+> `known-issues.md` entry: **many-lights importance sampling** (a light BVH / Conty–Kulla
+> tree, optionally ReSTIR DI on top), logged when mesh area lights shipped in v0.186.0.
 
 Keep the two in sync: when an item below lands, mark it DONE in **both** files (or delete it
 here and record the DONE in `TODO.md`). When a new open item appears in `TODO.md`, add it here.
@@ -19,6 +27,26 @@ without asking.
 ---
 
 ## 1. Unblocked — nothing external is stopping these
+
+### Many-lights importance sampling — a light BVH, then optionally ReSTIR DI  *(ftrace)*
+*Not a TODO.md item — logged in `known-issues.md` (first Open entry) when mesh area lights
+shipped in v0.186.0. The only genuinely open, unblocked engineering work as of 2026-08-15.*
+
+Emitter selection is a **power CDF** and, within an emitter, the draw is **uniform** (by area
+for `Mesh`, by surface for quad/cylinder). Neither consults the shading point, so any part of
+a light that is backfacing or shadowed still spends its share of the NEE budget and returns
+zero. Measured in a controlled A/B (`scraps/occl_one.ftsl` vs `scraps/occl_two.ftsl`): an
+emitter half of which is permanently occluded costs **1.31× the noise at equal spp**, and the
+factor grows with the number of independently-visible patches. A compact convex emitter is
+fine — a 2304-tri emissive sphere matches the analytic cone-sampled `light sphere` exactly —
+so this is specifically about occlusion and orientation diversity.
+
+Fix: a Conty–Kulla adaptive light tree (Arnold / Cycles / PBRT-v4) built to serve **both**
+levels — a tree over emitters whose mesh-emitter leaves descend into that emitter's own
+triangle tree — returning a selection pdf so `emitterGeom`'s `pdf_area` becomes
+`pdfSelect / triArea`. Self-contained: `samplePoint` + the pdf in `emitterGeom`/BDPT, not the
+transport; needs a device mirror. ReSTIR DI is the larger follow-on. See the known-issues
+entry for the full write-up and the measurement scenes.
 
 ### ~~K1 remainder — user-supplied named RGB→spectral mapping~~  **DONE 2026-07-28 (v0.90.0)**
 *TODO.md §K, item K1 — now closed.*
@@ -117,33 +145,34 @@ materials attached to geometry, and calls a dielectric dispersive only if its `i
 actually varies over 400–700 nm, so a constant-IOR dielectric doesn't nag. Print-only; the mode-W
 image is byte-identical to 0.137.0.
 
-### O — procedural-texture / noise roadmap  *(ftrace; added to TODO.md 2026-08-07)*
-*TODO.md §O (the "third bullet point" batch, user-greenlit 2026-08-07).*
+### ~~O — procedural-texture / noise roadmap~~  **DONE 2026-08-10 (O1–O8 complete)**
+*TODO.md §O (the "third bullet point" batch, user-greenlit 2026-08-07) — now closed.*
 
-- ~~**O2** vector-valued noise (`DNoise`/`DTurbulence`) for domain warping~~ **DONE 2026-08-08
-  (v0.158.0)** — `dnoisex/y/z`, `dturbx/y/z`, `-checkvnoise`, `scenes/pattern_warp.ftsl`.
-- ~~**O1** cellular / Worley / Voronoi noise~~ **DONE 2026-08-08 (v0.159.0)** — `worley` /
-  `worley2` / `worleyd` / `worleyid` with a runtime Euclid/Manhattan/Chebyshev metric operand,
-  exact adaptive ring search, `-checkworley`, `scenes/pattern_worley.ftsl`.
-- **O3** non-stationary randomness (mostly idiom + docs; needs curvature/cavity primitives)
-- **O4** anisotropic / flow-aligned noise (needs a per-hit tangent frame + flow-field binding)
-- **O5** blue noise / Gabor noise / sparse convolution
-- **O6** reaction–diffusion (a *bake* step feeding the existing `tex:` path)
-- **O7** by-example synthesis / histogram-preserving tiling (composes with `PatOp::Tex`)
-- **O8** band-limiting / antialiasing the noise under minification (the quality gate for O1–O7
-  at distance)
+- **O2** vector noise for domain warping — v0.158.0 (`dnoisex/y/z`, `dturbx/y/z`).
+- **O1** cellular / Worley / Voronoi — v0.159.0 (`worley`/`worley2`/`worleyd`/`worleyid`).
+- **O3** non-stationary randomness — 2026-08-10, all four sub-items.
+- **O4** anisotropic / flow-aligned noise — v0.165.0 (`gabor(...)`).
+- **O5** blue noise / sparse-convolution placement — v0.166.0.
+- **O6** reaction–diffusion — v0.167.0 (`texture "n" { reaction { … } }`).
+- **O7** by-example synthesis / stochastic tiling — v0.170.0 (Heitz–Neyret).
+- **O8** band-limiting / antialiasing — v0.168.0 (stage 1) + v0.169.0 (stage 2).
 
-### P2 / P3 — fur follow-ons  *(ftrace)*
+### ~~P2 / P3 — fur follow-ons~~  **DONE (P3 v0.174.0, P2 v0.178.0)**
 *TODO.md §P (P1 shipped v0.150.0: the native `curve` primitive; the `fur` groom generator
-shipped v0.152.0).*
+shipped v0.152.0) — now closed.*
 
-- **P2** sub-pixel variance + aggregate-BSDF LOD (fibers thinner than a pixel).
-- **P3** fiber BCSDF: Marschner R/TT/TRT baseline, medulla lobes (Yan 2015/2017) for animal
-  fur, dual scattering (Zinke 2008) for light coats.
+- **P3** fiber BCSDF — v0.174.0, all four stages: Marschner R/TT/TRT core (v0.171.0), scene +
+  renderer wiring (v0.172.0), Yan's double-cylinder medulla (v0.173.0), Zinke dual
+  scattering (v0.174.0).
+- **P2** sub-pixel variance + aggregate-BSDF LOD — v0.178.0: the fiber density/orientation
+  grid (v0.175.0) then the aggregate volumetric far tier, incl. `-fur-volume`.
 
-### J3b — loom N-D / generalized-grammar superset  *(loom)*
-*TODO.md §J3b — four generalizations; item 4 (N-D record input domain) is excluded (user,
-2026-07-25), the rest are open.*
+### ~~J3b — loom N-D / generalized-grammar superset~~  **effectively closed**
+*TODO.md §J3b.* Items 1 (arbitrary channel arity), 2 (generalized stop grammar / delimiter
+ladder) and 3 (uniform named-input binding, parts a–d) all shipped, in ftrace as well as
+loom (v0.86.0 / v0.87.0 / v0.57.0). The checkbox stays open only because of **item 4**
+(N-D record *input* domain), which the user put out of scope on 2026-07-25 — see the
+exclusions table. Nothing here is actionable without reversing that decision.
 
 ---
 
