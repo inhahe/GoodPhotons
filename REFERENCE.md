@@ -969,9 +969,16 @@ early, so their specular-first pixels stay black.
 At a diffuse vertex the path does its own next-event estimate as usual and then asks the
 cache what the *rest* of the path is worth; if the cache can answer confidently, the path
 adds that value and stops instead of tracing another handful of bounces. It is off by
-default, CPU-only (the GPU backward kernel has no cache — a `-radcache` render that lands
-on `-device gpu` simply ignores it), and inert in mode `W` and under `-direct-only`, which
-terminate diffuse paths themselves and so have no tail for a cached value to stand in for.
+default, CPU-only, and inert in mode `W` and under `-direct-only`, which terminate diffuse
+paths themselves and so have no tail for a cached value to stand in for.
+
+> **Pass `-device cpu`.** The GPU backward megakernel has no cache, and `-device auto`
+> prefers the GPU for mode `R` on any machine that has one — so the obvious spelling
+> `ftrace scene -mode R -radcache` uses no cache at all. The render is correct either way;
+> it is simply not accelerated. ftrace now says so when it happens:
+> `[radcache] IGNORED: the GPU backward megakernel has no cache -- pass -device cpu`,
+> printed once, next to the `[device]` line. The same notice covers the other inert
+> combinations (`-whitted`, `-direct-only`, a forward mode).
 
 Two properties make it different from a classical irradiance cache:
 

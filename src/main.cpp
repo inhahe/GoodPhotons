@@ -13376,6 +13376,32 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         }
     }
 
+    // Same "the device is now resolved" moment, for -radcache. The cache is read from
+    // exactly ONE place -- BackwardRenderer::radianceHeroLoop, on the CPU -- so a
+    // -radcache run that lands anywhere else renders perfectly correctly and reports
+    // nothing at all. That is the worst kind of no-op: the flag was accepted, the image
+    // is right, and the only evidence it did nothing is a missing status line the user
+    // has no reason to be looking for. Say so out loud instead.
+    //
+    // The GPU case is the one that actually bites, because `-device auto` picks the GPU
+    // for mode R on any machine that has one -- so the natural spelling `ftrace scene
+    // -mode R -radcache` silently does nothing. Porting bkRadianceHeroLoop is open work
+    // (see open-work.md); until then this warning IS the feature's device story.
+    if (g_radCache) {
+        const char* why = nullptr;
+        if (g_whitted)
+            why = "-whitted traces no indirect bounces, so there is no tail to cache";
+        else if (g_directOnly)
+            why = "-direct-only traces no indirect bounces, so there is no tail to cache";
+        else if (mode != 'R' && mode != 'V' && mode != 'P')
+            why = "only the backward tracer reads the cache; use -mode R";
+        else if (mode == 'R' && useGpu)
+            why = "the GPU backward megakernel has no cache -- pass -device cpu";
+        if (why)
+            std::fprintf(stderr, "[radcache] IGNORED: %s. The render is unaffected and "
+                                 "correct; it is simply not using the cache.\n", why);
+    }
+
     // The wavefront (streaming) backend only applies to a forward render on the GPU.
     if (wavefront) {
         if (useGpu && gpuForwardMode)

@@ -53,9 +53,14 @@ irradiance caching generally, and `-radcache` does not escape it. Don't use it f
 `camera_curve` / `camera_path` sequences. Fixing this properly means a temporally-stable
 table (persist and re-use across frames, with cells aged rather than rebuilt).
 
-**4. Three code paths have no cache at all**, so passing `-radcache` there is a silent no-op:
+**4. Three code paths have no cache at all.** Since v0.190.1 `runRender` says so out loud —
+`[radcache] IGNORED: <reason>. The render is unaffected and correct; it is simply not using
+the cache.` — at the point the device is resolved. Before that it was a *silent* no-op, and
+on any machine with a GPU it was the **default** one, because `-device auto` picks the GPU
+for mode `R`: `ftrace scene -mode R -radcache` accepted the flag, rendered correctly, and
+used no cache, with a missing status line as the only evidence.
 - **the GPU backward kernel** (`bkRadianceHeroLoop`, `src/render_cuda.cu` ~8637/8661/8822) —
-  hence the `-device cpu` requirement. Logged in `open-work.md`.
+  hence the `-device cpu` requirement. Porting it is logged in `open-work.md`.
 - **the scalar `radiance()` path** in `src/backward.h`, taken when `heroC == 1`, or when the
   path enters participating media, GRIN, or the finite-lens camera. Only the hero-wavelength
   loop reads the cache.

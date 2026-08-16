@@ -140,10 +140,13 @@ statement to make, not code to write.
   staying on the host between chunks. What does *not* port trivially is reader verification —
   `radBank->vals.push_back` is a per-thread `std::vector`, and the device needs either a
   bump-allocated append buffer or an atomic-counter slab, drained back to the host each chunk.
-  **Either do this, or make the no-op explicit**: refuse `-radcache` with a clear error when
-  the resolved device is `gpu`, rather than accepting the flag and ignoring it. The explicit
-  refusal is a ten-minute change and should land regardless — it is strictly better than the
-  current silence, and it stops being needed only once the port exists.
+  **The silence is fixed (v0.190.1); the port is not.** `runRender` now prints
+  `[radcache] IGNORED: the GPU backward megakernel has no cache -- pass -device cpu` at the
+  point the device is resolved, alongside the existing `[medium]` warning. This mattered more
+  than it sounds: `-device auto` picks the GPU for mode `R` on any machine that has one, so
+  the natural spelling `ftrace scene -mode R -radcache` was doing *nothing at all* on the
+  development machine, correctly and without complaint. The warning is the feature's device
+  story until the kernel gains a read site.
 * **The scalar `radiance()` path** in `src/backward.h`. Taken whenever `heroC == 1`, and
   whenever a path enters participating media, a GRIN medium, or the finite-lens camera. The
   read placement is the same (after this vertex's NEE, before the continuation roulette) and

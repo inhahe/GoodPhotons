@@ -1786,6 +1786,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   seamless loop cannot flicker, and `-radcache` fails exactly that test — its cells depend
   on render order and on what the update pass happened to sample, so it is opt-in and
   documented as unsuitable for animation.
+
+  **It reaches exactly one code path, and 0.190.1 makes that audible.** The GPU backward
+  megakernel (`bkRadianceHeroLoop`, `render_cuda.cu`) and the scalar `radiance()` fallback
+  (`heroC == 1`, media, GRIN, finite lens) have no read site, so `-radcache` there was a
+  *silent* no-op — and, because `-device auto` prefers the GPU for mode `R`, it was the
+  **default** no-op on any machine with a GPU: flag accepted, image correct, cache unused,
+  a missing status line the only evidence. `runRender` now prints
+  `[radcache] IGNORED: <reason>` at the same "device is resolved" moment as the existing
+  `[medium]` warning, covering the GPU case, `-whitted`, `-direct-only` and the forward
+  modes. Porting the read site to the device is in `open-work.md`; the hard part there is
+  not the table (flat POD array, upload-after-update / read-only-during-chunk) but
+  verification's per-thread `std::vector` of records, which needs an atomic-counter slab
+  drained to the host each chunk.
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
   Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,
