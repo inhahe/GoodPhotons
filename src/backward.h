@@ -305,55 +305,49 @@ struct BackwardRenderer {
 
     // ---- radiance cache (-radcache; OFF by default, and biased) ---------------------
     // A world-space cache of indirect irradiance at diffuse vertices. Once a path is at
-    // least `radMinBounce` bounces deep and lands in a cell that already holds enough
-    // samples at every live wavelength, it stops tracing and reads E/pi out of the cache
-    // instead of continuing. See radcache.h for the derivation (a Lambertian vertex
-    // multiplies throughput by rho alone, so a finished path measures its own incident
-    // radiance for free and the cache trains itself off the paths already being traced).
+    // least `radMinBounce` bounces deep and lands in a cell the update pass has filled in,
+    // it stops tracing and reads E/pi out of the cache instead of continuing. See
+    // radcache.h for the estimator and for why the data comes from a dedicated update pass
+    // rather than from the camera paths themselves.
     //
     // Three invariants keep this honest, and all three are load-bearing:
     //   * `radCache == nullptr` (no -radcache) must leave mode R BIT-IDENTICAL. Nothing
     //     below may consume an rng draw, reorder one, or change a branch unless the cache
     //     is actually on -- mode R is this renderer's unbiased reference.
-    //   * The table is READ-ONLY during a pass. Deposits go to this thread's `radBank`
-    //     and are merged between chunks, so a lookup is a plain read: no atomics, no false
-    //     sharing, and a chunk's image does not depend on thread scheduling.
-    //   * Whichever paths are allowed to deposit, the rule must not select on WHERE THE PATH
-    //     WENT. Both deposit modes below satisfy that; the tempting middle ground (every path
-    //     that did not happen to terminate on the cache) does not, and measures 1.8% dark.
+    //   * The table is READ-ONLY during a pass. Marks and samples go to this thread's
+    //     `radBank` and are merged between chunks, so a lookup is a plain read: no atomics,
+    //     no false sharing, and a chunk's image does not depend on thread scheduling.
+    //   * Camera paths MUST NOT be the training set. A path's chance to contribute cannot be
+    //     allowed to depend on where it went, and every rule that keys on a path's fate keys
+    //     on its direction too (measured: 1.8% dark on cornell.ftsl for the natural-looking
+    //     "deposit unless you terminated on the cache" rule). The update pass sidesteps the
+    //     whole question -- it samples per CELL, so there is no path population to select.
     const RadianceCache* radCache = nullptr;   // shared, immutable during a pass
-    RadCacheBank*        radBank  = nullptr;   // THIS thread's deposit bank (per-thread!)
+    RadCacheBank*        radBank  = nullptr;   // THIS thread's mark/sample bank (per-thread!)
     int    radMinBounce = 2;     // no cache termination before this bounce index
-    // Fraction of camera paths that IGNORE the cache and run to full length anyway. Without
-    // it the cache freezes: once every cell is confident nothing traces deep again, so a
-    // moving light or a slow-converging corner would keep answering with its stale mean
-    // forever. These paths still deposit, so the cache keeps refining for the whole render.
-    double radTrainFrac = 0.15;
-    // Deposit policy. Two self-consistent choices, and the difference is bias-vs-data-rate:
-    //
-    //   false (TRAINING-ONLY) -- only the radTrainFrac paths that ignore the cache deposit.
-    //     Every deposit is then a plain, full-length, unbiased path-tracer sample, so cell
-    //     averaging is the only bias in the feature. The price is the data rate: at the
-    //     default 15% the table fills ~7x slower, and since a cell needs minSamples at each
-    //     of 16 bins before it answers, a scene with many cells can finish the whole render
-    //     without the cache ever becoming confident (measured on fur_creature: 0.4 samples
-    //     per bin, 0% termination -- pure overhead, no win).
-    //
-    //   true (BOOTSTRAP) -- every path deposits, whether or not it read the cache, INCLUDING
-    //     paths that terminated on it. That is the important part: it is depositing on the
-    //     non-terminated subset that selects directionally, not depositing on cache readers.
-    //     Depositing on ALL of them selects on nothing. What it costs instead is exactness:
-    //     a deposit made by a cache reader contains the cache's own estimate, so the table
-    //     converges to a fixed point of itself rather than to the truth. The fixed point is
-    //     stable (each feedback round trip is attenuated by the albedo rho < 1, so an error
-    //     eps decays as eps*rho^k) and it is the truth when the cache is right -- but a
-    //     systematic error, once in, is reinforced rather than washed out.
-    bool radDepositAll = false;
+    // Fraction of camera paths that IGNORE the cache and trace to full length anyway. Purely
+    // a QUALITY knob -- the table is fed by the update pass, not by camera paths, so nothing
+    // depends on it -- and it defaults to 0. Raise it to blend exact paths back into a
+    // preview, at proportional cost.
+    double radTrainFrac = 0.0;
+    // -radcache-audit: read the cache but do NOT terminate, recording both the value the
+    // cache offered and the value the traced tail actually delivered (see RadCacheBank's
+    // audit fields). A render with this on is a cache-OFF render numerically -- every path
+    // runs to full length -- so the audit measures the cache's per-read systematic error
+    // against an exact reference in the same run, with the pixel noise cancelling out.
+    bool   radAudit = false;
+    // -radcache-validate: fraction of readable vertices that trace their tail to full length
+    // instead of terminating, and report (offer, tail) back to the cell they would have read.
+    // This is the one measurement the update pass CANNOT make, because it is taken through the
+    // readers' own weighting: it sees cell averaging, normal-cone spread and unsampled tails
+    // exactly in the proportions the image is actually built from. Cheap (the coin is drawn
+    // once per path, and a validating path is just a cache-OFF path) and self-limiting: a cell
+    // that turns out to be right gets corr == 1 and costs nothing but the sampling.
+    double radValidate = 0.05;
 
     // Is the cache live for this render? Mode W (`whitted`) and -direct-only both terminate
-    // diffuse paths themselves, so a deposit from one would record a sub-path that never
-    // gathered its indirect light -- systematically too dark. Gate the feature off there
-    // rather than depositing garbage.
+    // diffuse paths themselves rather than gathering indirect light, so there is no path tail
+    // for a cached value to stand in for; gate the feature off there.
     bool rcActive() const {
         return radCache && radCache->ready() && !whitted && !directOnly;
     }
@@ -1910,95 +1904,51 @@ struct BackwardRenderer {
         Renderer mats; mats.diffraction = diffraction;
 
         // ---- -radcache bookkeeping (inert, and free, when the cache is off) -------------
-        // Each diffuse vertex this path leaves is remembered so that when the path FINISHES
-        // we can hand the cache a sample of the radiance that arrived along the direction we
-        // chose. The identity is exact rather than an approximation:
-        //
-        //     everything L gains after this vertex  ==  thrA[i] * L_i(omega)
-        //
-        // because a Lambertian continuation multiplies throughput by rho alone, so
-        // (L[i] - Lat[i]) / thrA[i] IS one unbiased sample of L_i(omega); its cosine-weighted
-        // mean over the hemisphere is E/pi, which is the number a terminating path wants.
-        // See radcache.h.
-        //
-        // The stack is a fixed 12 deep: beyond a dozen diffuse bounces the remaining energy
-        // is a fraction of a percent, and dropping those deposits costs nothing but keeps the
-        // frame free of a heap allocation on the hot path.
-        // Hero channel only (index 0) -- see the deposit note in finish().
-        struct RcPend {
-            Vec3   p, n;
-            double Lat[1];    // L[0] as it stood at the last re-base (see deHero)
-            double thrA[1];   // throughput AFTER the rho/q reweight, re-based at a de-hero
-            double part[1];   // value banked at earlier re-bases
-            double lam[1];
-        };
-        static constexpr int kRcMaxPend = 12;
-        RcPend rcPend[kRcMaxPend];
-        int  rcNPend = 0;
-        bool rcTerminated = false;   // this path read its tail out of the cache
+        // Camera paths do not train the table -- the update pass does (radcache.h) -- so all
+        // that is left here is: MARK the cells this path visits, and possibly READ one and
+        // stop. Both are gated on `rcOn`, so a run without -radcache is bit-identical.
         const bool rcOn = rcActive() && radBank != nullptr;
-        // May THIS path record pending vertices at all? (Deposit policy: see radDepositAll.)
-        const bool rcDep = rcOn && (radDepositAll || rcTrain);
+        // Verification state (-radcache-validate, and -radcache-audit). A small random
+        // fraction of readable vertices do NOT terminate: they record what the cache offered,
+        // snapshot the running L, and then trace the tail to full length anyway. The
+        // difference between the final L and that snapshot is exactly what the traced tail
+        // delivered, i.e. the quantity the cached number claims to equal, weighted exactly as
+        // a reader weights it (thr * rho * invPdf are already folded into both sides).
+        //
+        // Only the FIRST readable vertex of a path is scored, because a second one lies
+        // INSIDE the tail the first is being measured against -- scoring both would let a
+        // cell's error contaminate its own reference.
+        //
+        // The coin is flipped BEFORE the tail is known, so selection cannot depend on how the
+        // tail turns out; that is what makes Sum(tail)/Sum(offer) an unbiased estimate of the
+        // cell's systematic error as used. See the header prose in radcache.h.
+        bool     rcValidated = false;
+        uint64_t rcValKey    = 0;
+        double   rcValOffer  = 0.0;   // RAW cache mean, un-corrected: the val record's divisor
+        double   rcValCorr   = 1.0;   // correction in force, for the audit's "as delivered"
+        double   rcValSnap   = 0.0;
 
         auto finish = [&]() {
-            // WHO DEPOSITS is not a detail -- it is what makes the cached number unbiased.
-            // The rule that must hold is that a vertex's chance to deposit cannot depend on
-            // WHERE THE PATH WENT AFTER IT. The tempting middle ground -- every path that did
-            // not happen to terminate on the cache -- breaks exactly that: a vertex only gets
-            // to deposit if the direction it sampled led somewhere the cache was NOT yet
-            // confident about, i.e. the sparsely-visited, typically darker half of its
-            // hemisphere. Measured on cornell.ftsl that biased the whole frame 1.8% dark
-            // (2.9% in the centre). Both supported policies avoid it: training-only paths
-            // ignore the cache from the outset (so their deposits are plain unbiased
-            // path-tracer samples), and radDepositAll deposits on every path including the
-            // terminated ones (so there is no subset to select). Never the middle.
-            // ONLY THE HERO DEPOSITS, and that is the second half of the same argument. A
-            // de-hero kills the secondaries mid-path, so L[i>0] is a TRUNCATED sub-path and
-            // cannot be deposited -- but whether a path de-heros depends on where it went
-            // (through the glass ball or past it), so skipping just those secondaries would
-            // train the table only on the directions that missed the specular geometry. That
-            // is the same directional selection the training-path rule above exists to avoid,
-            // and it is worth exactly as much: on cornell.ftsl, banking the hero correctly but
-            // still letting the surviving secondaries in left 1.3% of darkening on the table.
-            // The hero is never truncated and never dropped, so hero-only deposits are clean
-            // in every scene. The cost is 1/C of the sample rate, which is affordable: the
-            // hero lambda is stratified across the whole spectrum, so all 16 bins still fill.
-            if (rcDep && (radDepositAll || !rcTerminated)) {
-                for (int k = 0; k < rcNPend; ++k) {
-                    const RcPend& q = rcPend[k];
-                    if (!(q.thrA[0] > 0.0)) continue;
-                    const double v = q.part[0] + (L[0] - q.Lat[0]) / q.thrA[0];
-                    if (!(v >= 0.0) || !std::isfinite(v)) continue;
-                    radBank->push(q.p, q.n, q.lam[0], v);
+            for (int i = 0; i < C; ++i) Lout[i] = L[i];
+            if (rcValidated) {
+                double tail = 0.0;
+                for (int i = 0; i < C; ++i) tail += L[i];
+                const double got = tail - rcValSnap;
+                if (radAudit) {
+                    // Pure measurement mode: score the offer as actually delivered (raw*corr)
+                    // against the tail, and do NOT feed the result back into the table -- an
+                    // audit that corrects what it measures is measuring its own feedback.
+                    radBank->auditCache  += rcValOffer * rcValCorr;
+                    radBank->auditTrace  += got;
+                    radBank->auditTrace2 += got * got;
+                    ++radBank->auditN;
+                } else {
+                    radBank->vals.push_back(RadCacheVal{ rcValKey, rcValOffer, got });
                 }
             }
-            for (int i = 0; i < C; ++i) Lout[i] = L[i];
         };
         auto deHero = [&]() {            // terminate secondaries, boost hero ×C
             if (!secAlive) return;
-            // -radcache: a de-hero breaks the plain (L - Lat)/thrA identity in two different
-            // ways, and BOTH have to be handled or the cache comes out systematically dark.
-            // (Measured: dropping these deposits outright cost 1.9% on cornell.ftsl, whose
-            // glass sphere de-heros constantly, while the same box with a diffuse sphere --
-            // no de-hero at all -- came out to 0.02%. So this is the whole error term.)
-            //
-            //   * The HERO gets thr[0] *= C, an artificial boost that is there to keep the
-            //     BUNDLE's expectation right after the secondaries are killed. Everything
-            //     L[0] gains from here on is therefore C x too large to read as lambda_0's
-            //     own incident radiance. Fixed exactly, not approximately: bank the value
-            //     accrued so far, re-base Lat to the current L, and fold the C into thrA. The
-            //     sum of the two segments is then the correct single number.
-            //   * The SECONDARIES simply stop accumulating -- nothing more will ever be added
-            //     to L[i>0] -- so their (L - Lat) is a truncated path, not a finished one.
-            //     That is why finish() deposits the hero only; see the note there.
-            if (rcDep) {
-                for (int k = 0; k < rcNPend; ++k) {
-                    RcPend& q = rcPend[k];
-                    if (q.thrA[0] > 0.0) q.part[0] += (L[0] - q.Lat[0]) / q.thrA[0];
-                    q.Lat[0]   = L[0];
-                    q.thrA[0] *= (double)C;
-                }
-            }
             thr[0] *= (double)C;
             secAlive = false;
         };
@@ -2402,15 +2352,63 @@ struct BackwardRenderer {
                     // on a partially-confident cell would mean some lambda continued and some
                     // did not, which turns a spectral bundle into a tinted one -- a colour
                     // error, not noise, so no amount of spp would clean it up.
-                    if (rcOn && !rcTrain && b >= radMinBounce) {
+                    if (rcOn && b >= radMinBounce) {
+                        // MARK FIRST, unconditionally. A mark says "something will want to
+                        // read here", and it is what puts the cell on the update pass's work
+                        // list -- so it has to happen on the miss (that is the cell that most
+                        // needs filling) and on a training path (which is not reading, but its
+                        // twin next chunk will). Marking is deduplicated per thread against a
+                        // direct-mapped filter, so the millionth path across a cell is free.
+                        const uint64_t ck = radCache->cellKey(h.p, h.n);
+                        radBank->mark(ck, (size_t)RadianceCache::mix(ck), h.p, h.n);
                         double e[hero::kHeroMax];
-                        if (radCache->lookupBundle(h.p, h.n, lam, nUp, e)) {
+                        double j0 = 0.0, j1 = 0.0, j2 = 0.0;
+                        // Only draw the dither when it is actually enabled: an unused draw
+                        // would still perturb the stream and make -radcache-jitter 0 differ
+                        // from the arrangement every measurement so far was taken on.
+                        if (radCache->jitter > 0.0) {
+                            j0 = rng.uniform(); j1 = rng.uniform(); j2 = rng.uniform();
+                        }
+                        double   corr = 1.0;
+                        uint64_t ckey = 0;
+                        // `!rcValidated`: once this path has been chosen to measure a cell,
+                        // every vertex from here on is INSIDE the tail that is the measurement.
+                        // Letting one of them terminate into the cache would score the cell
+                        // against "direct light + somebody else's cached tail" -- the same
+                        // self-feeding that rcTrain exists to prevent on the update side.
+                        if (!rcTrain && !rcValidated &&
+                            radCache->lookupBundle(h.p, h.n, lam, nUp, e, &corr,
+                                                   &ckey, j0, j1, j2)) {
                             // Exactly what continuing would have contributed in expectation:
                             // surviving RR with probability q and reweighting by rho/q gives
                             // thr*rho*E[L_i], and E[L_i] over the cosine hemisphere is E/pi.
-                            for (int i = 0; i < nUp; ++i) L[i] += thr[i] * rho[i] * e[i];
-                            ++radBank->nTerm;
-                            rcTerminated = true; finish(); return;
+                            // e[] is PHYSICAL radiance (update rays run with invPdf == 1, see
+                            // radcache.h), so the reader restores its OWN 1/pdf(λ) weight here.
+                            // `corr` is the correction the verification pass has learned for
+                            // this cell; it is 1 until enough validation paths have scored it.
+                            double raw = 0.0;
+                            for (int i = 0; i < nUp; ++i)
+                                raw += thr[i] * rho[i] * e[i] * invPdf[i];
+                            // VALIDATION COIN. Drawn here, before anything about the tail is
+                            // known, so the validation set cannot be selected by a path's
+                            // fate. A validating path takes NOTHING from the cache and traces
+                            // to full length: its pixel contribution stays exact, and what it
+                            // collects from here on is the measurement the cell is scored by.
+                            const bool validate =
+                                radAudit || (radValidate > 0.0 && rng.uniform() < radValidate);
+                            if (validate) {
+                                rcValidated = true;
+                                rcValKey    = ckey;
+                                rcValOffer  = raw;
+                                rcValCorr   = corr;
+                                rcValSnap   = 0.0;
+                                for (int i = 0; i < C; ++i) rcValSnap += L[i];
+                            } else {
+                                for (int i = 0; i < nUp; ++i)
+                                    L[i] += thr[i] * rho[i] * e[i] * invPdf[i] * corr;
+                                ++radBank->nTerm;
+                                finish(); return;
+                            }
                         }
                         ++radBank->nMiss;
                     }
@@ -2424,16 +2422,6 @@ struct BackwardRenderer {
                     const double q = hero::maxOf(rho, nUp);
                     if (rng.uniform() >= q) { finish(); return; }         // RR absorb
                     for (int i = 0; i < nUp; ++i) thr[i] *= rho[i] / q;   // bounded reweight
-                    // -radcache: remember this vertex so finish() can hand the cache a sample
-                    // of what came back along wOut. Recorded HERE, after the reweight, because
-                    // the identity needs thr_AFTER: everything L gains from now on is exactly
-                    // thr_after * L_i(omega).
-                    if (rcDep && rcNPend < kRcMaxPend) {
-                        RcPend& q2 = rcPend[rcNPend++];
-                        q2.p = h.p; q2.n = h.n;
-                        q2.Lat[0] = L[0]; q2.thrA[0] = thr[0]; q2.lam[0] = lam[0];
-                        q2.part[0] = 0.0;
-                    }
                     Vec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
                     ray = Ray{h.p + h.n * 1e-6, wOut};
@@ -2442,6 +2430,113 @@ struct BackwardRenderer {
             }
         }
         finish();
+    }
+
+    // ---- -radcache: one update round over cache cells [i0, i1) of `rc.live` ------------
+    //
+    // THIS is what fills the table. For each cell the round shoots `rc.rays` cosine-
+    // hemisphere rays from the cell's representative surface point and averages what comes
+    // back; `apply()` then folds the average into the cell's live value. A ray is just the
+    // ordinary path tracer re-launched with unit throughput -- it does NEE at every vertex it
+    // reaches and it may itself terminate on the cache, which is how light propagates one
+    // further bounce per round (a progressive radiosity solve riding along with the image).
+    //
+    // Why it starts at `bounce0 = 1` with `specularArrival = false` and
+    // `contBsdfPdf = cos/pi`: the cell is the vertex the READER is standing on, and the
+    // reader does its own NEE there. So the update ray must behave exactly like the
+    // continuation the reader would have traced -- one bounce already spent, arriving by a
+    // cosine-sampled BSDF direction, so an emitter hit on the very first segment carries the
+    // correct MIS weight against the reader's NEE instead of being counted twice.
+    //
+    // WAVELENGTHS ARE STRATIFIED ACROSS THE BINS, not drawn from the emission CDF: ray k of a
+    // cell's own round r takes bin (r*rays + k) mod kBins, jittered within it. Each ray is
+    // MONOCHROMATIC (C == 1), which is what makes a per-bin cache correct at all -- a hero
+    // bundle de-heros at a dispersive interface or a fur fiber, and a de-hero is only unbiased
+    // in the BUNDLE AVERAGE, not per channel (hero boosted x C, secondaries truncated). See
+    // radcache.h. `invPdf` is 1, so the returned L is physical radiance in exactly the units a
+    // cell stores; the reader restores its own 1/pdf(lambda) weight.
+    //
+    // Thread safety: caller partitions `slots` into disjoint ranges, so each thread owns its
+    // cells' scratch outright -- no atomics. The rays MARK through `radBank`, which is
+    // per-thread and merged next chunk, so the cache grows into the parts of the scene only
+    // update rays can see. Nothing here mutates the live values; `apply()` does that after
+    // the join.
+    void updateRadCacheCells(const Scene& scene, RadianceCache& rc, const uint32_t* slots,
+                             size_t i0, size_t i1, long long* outSamples) const {
+        if (!radCache || !slots || i1 <= i0) return;
+        const int nRays = std::max(1, rc.rays);
+        long long produced = 0;
+
+        // Per-ray SPD table for NEE, as renderRows builds it (one evaluation per DISTINCT
+        // emission curve rather than per emitter). C == 1 here, so it is nBase wide.
+        const int nEm = (int)scene.emitters.size();
+        const bool haveBases = ((int)scene.spdBaseIdx.size() == nEm) &&
+                               ((int)scene.spdScale.size() == nEm) && !scene.spdBase.empty();
+        std::vector<int>    fbIdx;
+        std::vector<double> fbScale;
+        if (!haveBases) {
+            fbIdx.resize((size_t)nEm);
+            for (int e = 0; e < nEm; ++e) fbIdx[(size_t)e] = e;
+            fbScale.assign((size_t)nEm, 1.0);
+        }
+        const int     nBase   = haveBases ? (int)scene.spdBase.size() : nEm;
+        const int*    baseIdx = haveBases ? scene.spdBaseIdx.data() : fbIdx.data();
+        const double* baseScl = haveBases ? scene.spdScale.data()   : fbScale.data();
+        std::vector<double> baseBuf((size_t)std::max(1, nBase));
+
+        for (size_t li = i0; li < i1; ++li) {
+            const uint32_t slot = slots[li];
+            const RadCacheCell& c = rc.cell[slot];
+            const Vec3 p = c.point();
+            Vec3 n = c.normal();
+            const double nl = std::sqrt(dot(n, n));
+            if (!(nl > 0.0)) continue;
+            n = n / nl;
+            const uint32_t round = c.upRound;   // the CELL's own round counter, not a global
+            // Seeded from the SLOT and that counter, never from a running index: the cell's
+            // sample sequence is then independent of how the work list was ordered or split
+            // across threads, so a 4-thread and a 32-thread render fill the table identically.
+            Pcg32 rng;
+            seedUnit(rng, RadianceCache::mix(((uint64_t)slot << 24) ^ (uint64_t)(round + 1)),
+                     0x9E3779B97F4A7C15ULL);
+            for (int k = 0; k < nRays; ++k) {
+                const int    b   = rc.scheduleBin(round, k);
+                double       lam = rc.lambdaOfBin(b, rng.uniform());
+                double       inv = 1.0, thr = 1.0, Lout = 0.0;
+                for (int g = 0; g < nBase; ++g)
+                    baseBuf[(size_t)g] = haveBases ? scene.spdBase[g](lam)
+                                                   : scene.emitters[g].spdFn(lam);
+                SpdCache spdCache{&lam, baseBuf.data(), baseIdx, baseScl, 1, 0};
+                const Vec3 wOut = cosineHemisphere(n, rng);
+                const double cosT = dot(wOut, n);
+                if (!(cosT > 0.0)) continue;
+                Ray ray{p + n * 1e-6, wOut};
+                // rcTrain=true: the update ray MARKS the cells it crosses (so the cache
+                // grows into geometry only update rays can see) but NEVER READS one. That
+                // distinction is the difference between an unbiased cache and a diverging
+                // one. If an update ray were allowed to terminate into the cache, the value
+                // it deposits would be `direct + <someone else's cached tail>` -- a fixed
+                // point of the cache's own error rather than an estimate of the truth. With
+                // a fraction f of an update ray's energy arriving through cache reads, any
+                // structural error e (cell averaging, normal-cone averaging) is amplified to
+                // e/(1-f); at the 59% termination rate cornell reaches that is a 2.4x
+                // multiplier, and it showed up as a measured 2.7% darkening of the image
+                // centre. It also corrupts the confidence gate: reading a MEAN instead of
+                // sampling the tail collapses the sample variance, so cells pass the
+                // standard-error test early while carrying inherited bias, which is exactly
+                // the wrong way round. Pure path-traced update rays cost more (they run to
+                // full length), but the budget governor already bounds that spend, and an
+                // unbiased number is the only kind worth storing.
+                radianceHeroLoop(scene, ray, MediumStack{}, &lam, &inv, &thr, /*C=*/1,
+                                 /*secAlive=*/false, /*specularArrival=*/false,
+                                 /*contBsdfPdf=*/cosT / PI, /*bounce0=*/1, &Lout, rng,
+                                 &spdCache, GiCtx{}, /*rcTrain=*/true);
+                if (!(Lout >= 0.0) || !std::isfinite(Lout)) continue;
+                rc.addSampleAt(slot, b, Lout);
+                ++produced;
+            }
+        }
+        if (outSamples) *outSamples += produced;
     }
 
     // Render `spp` samples per pixel into `film` (accumulates cieXYZ * radiance,

@@ -21,6 +21,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Mode `W` — the deterministic (POV-Ray-style) preview](#mode-w--the-deterministic-pov-ray-style-preview)
   - [Speed / accuracy / ability tradeoffs](#speed--accuracy--ability-tradeoffs)
   - [Analytic specular connections — what mode `B` can image directly](#analytic-specular-connections--what-mode-b-can-image-directly)
+  - [Radiance cache (`-radcache`) — mode `R`, CPU](#radiance-cache--radcache--mode-r-cpu)
   - [Backends & performance (`-device`, `-wavefront`)](#backends--performance--device--wavefront)
 - [Cameras](#cameras)
 - [Materials](#materials)
@@ -961,6 +962,76 @@ same kind of gap. For any of those use `P`, `D`, `R`, or the photon-map family.
 
 The connections are **pinhole-only**: `A` (finite lens) and `C` (forward catch) return
 early, so their specular-first pixels stay black.
+
+### Radiance cache (`-radcache`) — mode `R`, CPU
+
+`-radcache` puts a **world-space cache of outgoing diffuse radiance** behind mode `R`.
+At a diffuse vertex the path does its own next-event estimate as usual and then asks the
+cache what the *rest* of the path is worth; if the cache can answer confidently, the path
+adds that value and stops instead of tracing another handful of bounces. It is off by
+default, CPU-only (the GPU backward kernel has no cache — a `-radcache` render that lands
+on `-device gpu` simply ignores it), and inert in mode `W` and under `-direct-only`, which
+terminate diffuse paths themselves and so have no tail for a cached value to stand in for.
+
+Two properties make it different from a classical irradiance cache:
+
+- **Camera paths never write it.** A separate *update pass* between chunks shoots its own
+  rays from the cells that camera paths marked, under a budget expressed as update samples
+  *per cache consult the chunk actually made*. So a cache miss is free — the path just keeps
+  tracing exactly as it would have without the flag — and an unresolved corner renders
+  exactly rather than answering with noise.
+- **The readers check its work.** A random `-radcache-validate` fraction of readable
+  vertices do **not** terminate: they record what the cache offered, trace the tail to full
+  length anyway, and report the pair back to the cell. A cell whose measured ratio is well
+  determined is rescaled; one the readers prove wrong but cannot pin down is retired and
+  stops answering. This is the only measurement that sees the cache's error *as the image
+  actually uses it* — cell averaging, normal-cone spread and unsampled tails all included,
+  weighted exactly as readers weight them.
+
+Measured on `scenes/cornell.ftsl` and `scenes/_cornell_diffuse.ftsl` (the same box with the
+dispersive sphere swapped for a grey lambertian — the control that separates "the cache is
+wrong" from "the cache is being asked to average something that does not average"), 200²,
+1024 spp, against a cache-off render of the same budget (`rel-RMS` is after an 8×8 box
+downsample, so Monte-Carlo noise averages out and what is left is structure):
+
+| Scene | validate | consults terminated | ray queries | vs. cache off | energy bias | rel-RMS |
+|---|---|---|---|---|---|---|
+| Cornell (dispersive SF10 sphere) | off | 55.9 % | 128.2 M | −12.3 % | −1.17 % | 3.20 % |
+| Cornell (dispersive SF10 sphere) | 0.05 | 38.4 % | 133.3 M | −8.9 % | −0.29 % | 1.26 % |
+| Cornell, all diffuse | off | 87.2 % | 111.0 M | −14.9 % | +0.10 % | 1.03 % |
+| Cornell, all diffuse | 0.05 | 75.0 % | 113.0 M | −13.4 % | −0.02 % | 0.65 % |
+
+Verification costs roughly a third of the speedup and buys back roughly three quarters of
+the error — which is why it is on by default. The residual is concentrated **specular and
+caustic** transport: `-radcache-audit` on the glass Cornell measures the *raw* cache at
+−18.8 % ± 0.31 % per read, against −0.3 % for the same scene with the sphere made diffuse.
+A cell whose update rays never happen to find the caustic cannot know it is missing it,
+which is precisely the failure verification exists to catch.
+
+**When it does not help.** The cache pays only once its cells are resolved, and a cell is
+resolved by the update pass, not by the image. On a scene whose visible surface area dwarfs
+the table — `scenes/fur_creature.ftsl`, where 8.7 k cells try to cover a fur coat — 0.3 %
+of consults terminate and the cache is simply neutral (at a fixed 128 spp it costs 210 k
+extra ray queries out of 23.9 M, or 0.9 %). It is not a general speed switch; it is a win
+on well-behaved diffuse interiors at a coarse cell size.
+
+**Cell size is the dominant knob, and coarser is faster.** Cells tile a *surface*, so
+halving the edge multiplies the cell count ~4× while dividing the consults-per-cell — and
+so the rate at which a cell resolves — by the same factor. The default is automatic and is
+a **pixel footprint**, not a fraction of the scene: the world size of a ~32-pixel square at
+the distance the camera is actually looking. That makes the economics resolution-invariant
+(4× the resolution gives 4× the cells *and* 4× the paths to fill them). `-radcache-cell`
+overrides it.
+
+See the [command-line reference](#command-line-reference) for the full flag list, and
+`known-issues.md` for the limits worth knowing before you switch it on (it is CPU/mode-`R`
+only, it has no cache in the scalar `radiance()` path, and it is **not** safe for animation
+— cell contents depend on render order, so the residual error flickers between frames).
+To reproduce or extend the numbers above, `tools/rcrun.sh <outbase> <scene> [flags]` runs
+one measurement (minimised live window, clean `ftrace -stop` release, `[raystats]` echoed)
+and `tools/pfmcmp.py ref.pfm test.pfm` produces the last three columns. Compare ray
+queries rather than wall clock — repeat runs of an identical render on the development
+machine varied 18.5 s / 25.8 s / 27.2 s.
 
 ### Backends & performance (`-device`, `-wavefront`)
 
@@ -4135,6 +4206,26 @@ add-on), this doubles as a Blender → FTSL path.
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
 | `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, and `V`; **number of passes** for SPPM (`S`) and VCM (`U`) |
 | `-n <photons>` (mode `S`) | Photons traced **per pass** (SPPM rebuilds a bounded map each pass). *(Mode `U` ignores `-n` — its light-path count follows the film resolution.)* |
+
+**Radiance cache** (mode `R`, CPU) — see [Radiance cache](#radiance-cache--radcache--mode-r-cpu)
+above for what it is and when it pays. Every `-radcache-*` flag implies `-radcache`, so the
+knob alone is enough to turn the feature on.
+
+| Flag | Meaning |
+|---|---|
+| `-radcache` / `-no-radcache` | Turn the world-space diffuse-radiance cache on / back off. Off by default. Mode `R` on the **CPU** only; ignored in mode `W` and under `-direct-only`, which have no path tail to cache |
+| `-radcache-cell <w>` | Level-0 cell edge in world units. Default: automatic — the world size of a ~32-pixel square at the camera's viewing distance, which keeps the economics resolution-invariant. **The dominant knob, and coarser is faster**: cells tile a surface, so halving the edge multiplies the cell count ~4× and quarters the consults each cell gets to resolve itself with |
+| `-radcache-validate <f>` | Fraction of cache reads that trace their tail to full length anyway and report back what the cache *should* have said (default `0.05`). This is what bounds the error — a cell the readers prove wrong is rescaled or retired. `0` disables it and trusts the update pass alone (measured: 4× the energy bias and 2.5× the structural error on a dispersive Cornell) |
+| `-radcache-tol <f>` | Required relative standard error per spectral bin before a cell may answer (default `0.2`). A cell that can't reach it within `-radcache-max` is retired and those paths just trace exactly |
+| `-radcache-budget <f>` | Update samples a chunk may spend **per cache consult it made** — the overhead ceiling, expressed against the work the cache is being asked to do rather than the size of the table (default `0.25`) |
+| `-radcache-warm <n>` | Multiplier on that budget for the **first** chunk (default `8`), where the multi-bounce propagation happens and every later chunk's saving comes from |
+| `-radcache-rays <n>` | Update rays per cell per round (default `16` = one per spectral bin, so a round sweeps the whole spectrum) |
+| `-radcache-samples <n>` | Samples per bin before a cell's measured error is believed at all (default `8`; old name `-radcache-passes` still works) |
+| `-radcache-max <n>` | Samples per bin a cell may be *projected* to need before it is written off as too noisy to cache (default `4096`) |
+| `-radcache-cells <n>` | Table capacity in cells, rounded up to a power of two (default `262144`, ~98 MB). The status line warns when cells start being dropped |
+| `-radcache-jitter <f>` | Dither the lookup position by `f` cell widths (default `0`), turning cell boundaries into noise instead of a visible edge. Off by default because dithering also widens the set of cells a pixel reads from — measured *worse* (1.5 % → 6.4 % RMS) on a Cornell box, since a neighbour cell's error is frozen and cross-surface cells get sampled |
+| `-radcache-train <f>` | Fraction of camera paths that ignore the cache entirely and trace fully (default `0`). A quality/preview blend, not a correctness knob — the table is fed by the update pass, so nothing depends on it |
+| `-radcache-audit` | **Diagnostic.** Read the cache but never terminate on it, and report what it *offered* against what the traced tail actually delivered, together with the audit's own standard error. The image is a cache-off image; the extra line is the cache's systematic error per read, measured free of render noise. Disables the verification feedback, so it measures the *raw* table |
 
 **Scene-ignore (speed knobs)** — rasterizer-style flags that strip or cap expensive
 scene features so a render (especially the backward camera modes `R`/`P`, and the fast

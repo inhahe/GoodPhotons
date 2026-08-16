@@ -5,6 +5,82 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-16, v0.190.0): `-radcache` is opt-in because it is *approximate*, and its residual error concentrates on caustics/specular — plus three hard limits
+
+`-radcache` (`src/radcache.h`, read site in `BackwardRenderer::radianceHeroLoop`,
+`src/backward.h`) is a world-space diffuse radiance cache for mode `R` on the CPU. It is
+**off by default and must stay that way** — it trades a bounded, measured bias for fewer
+rays. This entry records what that bias is, and the three places the feature simply isn't
+present. None of it is a bug in the sense of "the code is doing the wrong thing"; it is the
+shape of the approximation, written down so it isn't rediscovered as a surprise.
+
+**1. Residual error concentrates on caustics and specular transport.** Measured at 200²,
+1024 spp, mode `R`, `-device cpu`, against the same render with the cache off:
+
+| scene | validate | terminated | rays | vs OFF | energy bias | rel-RMS @8× | max \|rel\| |
+|---|---|---|---|---|---|---|---|
+| `scenes/cornell.ftsl` (dispersive SF10 sphere) | 0 (off) | 55.9 % | 128.2 M | −12.3 % | −1.17 % | 3.20 % | 24.8 % |
+| " | **0.05** (default) | 38.4 % | 133.3 M | −8.9 % | −0.29 % | 1.26 % | 6.7 % |
+| " | 0.15 | 27.0 % | 136.8 M | −6.4 % | −0.15 % | 1.05 % | 7.7 % |
+| `scenes/_cornell_diffuse.ftsl` (all diffuse) | 0 (off) | 87.2 % | 111.0 M | −14.9 % | +0.10 % | 1.03 % | — |
+| " | **0.05** (default) | 75.0 % | 113.0 M | −13.4 % | −0.02 % | 0.65 % | — |
+
+The all-diffuse control is essentially exact (−0.02 % energy, 0.65 % rel-RMS). The glass
+Cornell is not: `-radcache-audit` on the *raw, uncorrected* table scored 7.11 M reads and
+reported **−18.80 % systematic error per read (audit SE ±0.31 %)** — i.e. the cell mean is
+genuinely, measurably darker than the tail it replaces, because a caustic's radiance varies
+enormously *within* one cell and across the 54 normal buckets, and cell averaging is a
+low-pass filter. Reader verification (`-radcache-validate`, default 0.05) is what pulls that
+back to −0.29 %: it corrects the cells it can pin down and retires the ones it can prove
+wrong but can't (22 corrected / 8 retired on that scene). **The residual 1.26 % rel-RMS and
+6.7 % worst pixel are still there**, and they sit on the caustic. Proper fixes, none done:
+a directional (SH / spherical-Gaussian) cell payload instead of a scalar mean per normal
+bucket; a caustic-aware refusal to cache cells whose sample variance stays high; or
+splitting cells adaptively on measured variance rather than on a fixed pixel footprint.
+
+**2. No benefit on scenes whose surface area dwarfs the table.** On `fur_creature` the cache
+fills 8.7 k cells and terminates **0.3 %** of vertices; at a fixed 128 spp the update pass
+costs 210 k rays out of 23.86 M (0.9 %) and equal-time is a wash. Fur/hair-class geometry
+presents so much distinct surface that no reader ever revisits a cell often enough to
+amortise filling it. `-radcache` is not a general speed switch and shouldn't be sold as one;
+it pays on architectural/interior scenes with large re-visited diffuse surfaces.
+
+**3. Unsuitable for animation or any seamless loop.** Cell contents depend on how many
+update samples a cell happened to receive, which depends on render order and chunk
+boundaries — so two adjacent frames of a flyby get *different* cells and the residual error
+flickers. This is the same objection `design.md`'s `backward.h` `-gi` note raises against
+irradiance caching generally, and `-radcache` does not escape it. Don't use it for
+`camera_curve` / `camera_path` sequences. Fixing this properly means a temporally-stable
+table (persist and re-use across frames, with cells aged rather than rebuilt).
+
+**4. Three code paths have no cache at all**, so passing `-radcache` there is a silent no-op:
+- **the GPU backward kernel** (`bkRadianceHeroLoop`, `src/render_cuda.cu` ~8637/8661/8822) —
+  hence the `-device cpu` requirement. Logged in `open-work.md`.
+- **the scalar `radiance()` path** in `src/backward.h`, taken when `heroC == 1`, or when the
+  path enters participating media, GRIN, or the finite-lens camera. Only the hero-wavelength
+  loop reads the cache.
+- **modes other than `R`** (forward `A`/`B`/`C`, BDPT, VCM, SPPM).
+
+**Repro.** `tools/rcrun.sh` is the serial driver (200², 1024 spp, mode `R`, `-device cpu`,
+minimised live window, clean `ftrace -stop` release); `tools/pfmcmp.py` is the HDR compare
+that produces the last three columns. `scenes/_cornell_diffuse.ftsl` is the all-diffuse
+control — same box, the SF10 sphere swapped for a grey lambertian.
+```
+sh tools/rcrun.sh png/rc_off scenes/cornell.ftsl
+sh tools/rcrun.sh png/rc_on  scenes/cornell.ftsl -radcache
+sh tools/rcrun.sh png/rc_v0  scenes/cornell.ftsl -radcache -radcache-validate 0
+python tools/pfmcmp.py png/rc_off.pfm png/rc_on.pfm
+python tools/pfmcmp.py png/rc_off.pfm png/rc_v0.pfm
+
+# the raw, uncorrected per-read bias (audit never terminates and never feeds back):
+./ftrace.exe scenes/cornell.ftsl -device cpu -mode R -r 200 200 -spp 1024 \
+    -radcache -radcache-audit -window-min -keepwindow -o png/rc_audit.png
+```
+Compare `[raystats]`, not wall clock — three repeats of one *identical* cache-off render on
+this machine came back 18.5 s / 25.8 s / 27.2 s, a spread wider than the effect being
+measured. That variance is also what once made a nonexistent 15 % "regression" look real
+enough to write a fix for; see the `chunkTerm` comment in `src/radcache.h`.
+
 ### PARTLY FIXED (2026-08-16, v0.188.0): forward mode `B` rendered every mirror pure BLACK — flat panels and mirror spheres now image; mesh mirrors, mirror-in-mirror and rough specular still don't
 
 **The gap.** A forward light tracer connects each photon vertex to the pinhole and splats.

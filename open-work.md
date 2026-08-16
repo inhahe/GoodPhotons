@@ -27,6 +27,12 @@ rationale, prior art and scoping live in that entry, not here.
 > closed — flat mirror panels and mirror spheres image via analytic specular camera
 > connections. Mirrored *meshes*, mirror-in-mirror, the 64-plane cap and the finite-lens
 > modes `A`/`C` remain; they are the second entry in section 1.
+>
+> **Update 2026-08-16 (v0.190.0):** the world-space diffuse radiance cache (`-radcache`,
+> `src/radcache.h`) shipped for mode `R` on the CPU. It is opt-in and approximate — see the
+> first `known-issues.md` entry for the measured bias. What it leaves open is the third
+> entry in section 1: the GPU kernel and the scalar `radiance()` path have no cache, and a
+> `-radcache` run on the GPU is a silent no-op that should at minimum become an error.
 
 Keep the two in sync: when an item below lands, mark it DONE in **both** files (or delete it
 here and record the DONE in `TODO.md`). When a new open item appears in `TODO.md`, add it here.
@@ -115,6 +121,41 @@ and mirror-sphere connectors shipped in v0.188.0.*
 * **Modes `A`/`C`.** Pinhole-only — `lensMode`/`forwardCatch` return early, so the finite-lens
   physical camera still shows black mirrors. Needs the connection integrated over the aperture
   rather than through a point.
+
+### `-radcache` reaches only one code path — the GPU kernel and the scalar `radiance()` have no cache  *(ftrace)*
+*Not a TODO.md item — logged when the radiance cache shipped in v0.190.0. See the first
+`known-issues.md` entry for the measured accuracy picture and the reasons it is opt-in.*
+
+The world-space diffuse radiance cache (`src/radcache.h`) is read from exactly one place:
+`BackwardRenderer::radianceHeroLoop` in `src/backward.h`, on the CPU, in mode `R`. Everything
+else silently ignores `-radcache`. Two of those gaps are worth closing; the third is a
+statement to make, not code to write.
+
+* **The GPU backward kernel.** `bkRadianceHeroLoop` (`src/render_cuda.cu`, ~8637 / 8661 /
+  8822) is the device twin of the loop that reads the cache, and it has no read site. This is
+  why `-device cpu` is currently mandatory (a `-radcache` run on the GPU renders correctly and
+  reports nothing, which is the worst kind of no-op — it looks like it worked). The table
+  itself ports cleanly: it is a flat open-addressed array of POD cells with a 64-bit key, so
+  the natural shape is upload-after-update / read-only-during-chunk, with the update pass
+  staying on the host between chunks. What does *not* port trivially is reader verification —
+  `radBank->vals.push_back` is a per-thread `std::vector`, and the device needs either a
+  bump-allocated append buffer or an atomic-counter slab, drained back to the host each chunk.
+  **Either do this, or make the no-op explicit**: refuse `-radcache` with a clear error when
+  the resolved device is `gpu`, rather than accepting the flag and ignoring it. The explicit
+  refusal is a ten-minute change and should land regardless — it is strictly better than the
+  current silence, and it stops being needed only once the port exists.
+* **The scalar `radiance()` path** in `src/backward.h`. Taken whenever `heroC == 1`, and
+  whenever a path enters participating media, a GRIN medium, or the finite-lens camera. The
+  read placement is the same (after this vertex's NEE, before the continuation roulette) and
+  the partition argument is identical, so this is mostly a transcription — but the media case
+  needs thought: a cell records radiance leaving a *surface*, and a path that terminates into
+  it from inside a medium must still carry the medium's transmittance along the tail it did
+  not trace, which the cell does not know about. Simplest correct answer is to keep the cache
+  read disabled while `inMedium` and enable it only on the surface-to-surface segments.
+* **Modes other than `R`.** Forward `A`/`B`/`C`, BDPT, VCM and SPPM have no cache and are not
+  obviously improved by one (their vertices are light-side, so the "what lies beyond this
+  vertex" quantity a cell stores is the wrong quantity). No work planned; recorded so the
+  absence reads as a decision rather than an oversight.
 
 ### ~~K1 remainder — user-supplied named RGB→spectral mapping~~  **DONE 2026-07-28 (v0.90.0)**
 *TODO.md §K, item K1 — now closed.*

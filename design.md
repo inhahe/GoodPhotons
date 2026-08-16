@@ -1732,6 +1732,60 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   **Not yet using it:** the forward/BDPT/VCM `selectEmitter` power CDF
   (`render_cuda.cu`), and a mesh emitter's own triangles (still area-sampled) — both
   tracked in `known-issues.md`.
+- **`radcache.h`** (0.190.0) — the **world-space diffuse radiance cache** behind
+  `-radcache`, mode `R` on the CPU. A clipmapped hash of cells (54-bit quantised
+  position, clipmap level, 54 normal buckets) each holding a 16-bin spectral mean, its
+  variance and a confidence flag; `backward.h`'s `radianceHeroLoop` reads it at a diffuse
+  vertex *after* that vertex's own NEE and *before* the continuation roulette, adds
+  `thr·ρ·(E/π)·invPdf` and stops. That placement is what makes the partition exact: direct
+  light is counted once by the reader, everything beyond the vertex once by the cache.
+
+  **Camera paths never write it**, which is the design's load-bearing asymmetry and the
+  reason a miss is free. A separate update pass between chunks (`main.cpp`
+  `renderBackwardBand` → `mergeMarks` / `takeWork` /
+  `BackwardRenderer::updateRadCacheCells` / `apply`) shoots its own cosine rays from the
+  cells camera paths *marked*, under a budget of update samples **per cache consult the
+  chunk actually made** — proportional to the work the cache is being asked to do, not to
+  the size of the table. So an unresolved corner renders exactly rather than answering
+  with noise, and the table is immutable for the whole of any render pass (merge, update
+  and apply all run after the join), which makes its state a pure function of the chunks
+  rendered so far rather than of the thread interleaving.
+
+  **Update rays must not read the cache** (`rcTrain=true` on the update path). Otherwise a
+  cell stores `direct + somebody else's cached tail` — a fixed point of the cache's own
+  error, amplified by `1/(1−f)` — and the collapsed sample variance corrupts the very
+  confidence gate that is supposed to catch it.
+
+  **Verification against the readers** (`-radcache-validate`, default 0.05) is what
+  actually bounds the error. A random fraction of readable vertices decline to terminate,
+  trace the tail to full length, and report `(offer, tail)` back to the cell; `Σtail/Σoffer`
+  is an unbiased estimate of that cell's *total* systematic error **as used** — cell
+  averaging, normal-cone spread and unsampled tails, weighted exactly as readers weight
+  them. Well determined → adopt as `corr`; provably wrong but unpinnable → retire; not
+  enough data → 1. Two details are load-bearing: the coin is flipped **before** the tail is
+  known (an earlier fate-selected design measured 1.8 % dark), and `lookupBundle` returns
+  the **raw** mean with `corr` handed back separately, so a validation record is an
+  absolute measurement rather than one relative to a correction that is itself moving.
+
+  **Why 54 normal buckets** (6 faces × 3×3, not 6 × 1): a 90° face bucket folds a sphere's
+  normals into one average, a systematic error no spp removes. The 3×3 split keeps the face
+  *centre* in its own bucket, so an exactly axis-aligned normal cannot be shattered across
+  four buckets by ±1e-17 of rounding; a flat surface pays nothing either way.
+
+  **Auto cell size is a pixel footprint, not a scene fraction** (`main.cpp`,
+  `32 · 2·d·tanHalfY / resY`). What pays for a cell is the number of camera samples that
+  read it, which the image sets, not the scene — so this keeps the economics
+  resolution-invariant (4× the resolution gives 4× the cells *and* 4× the paths).
+
+  Measured, and the limits, in `REFERENCE.md` → *Radiance cache*; the residual failure mode
+  (concentrated specular/caustic transport, −18.8 % ± 0.31 % per raw read on a dispersive
+  Cornell vs −0.3 % all-diffuse) and the fur-class scenes it does not help are in
+  `known-issues.md`. **Not the same decision as mode `W`'s `-gi` gather**, which
+  deliberately has no cache (see the three constraints under `backward.h`'s `-gi` note):
+  that estimator must stay a pure function of `(index, sample index)` so an animated
+  seamless loop cannot flicker, and `-radcache` fails exactly that test — its cells depend
+  on render order and on what the update pass happened to sample, so it is opt-in and
+  documented as unsuitable for animation.
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
   Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,
