@@ -4373,6 +4373,82 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `R`, `D`): the live status line (`[live] … photons, ~N% noise`) and noise estimation for
   `-noise` budgets.
 
+## Analytic specular camera connections (forward mode `B`, 0.160.0 / 0.188.0)
+
+The forward tracer draws a surface by *connecting* each photon vertex to the camera. A
+**specular** vertex has no such connection — a delta lobe scatters into exactly one
+direction, so the density of "aims at the pinhole" is zero — and `tracePhoton` therefore
+skips the camera connect at every `isSpecularType()` material. That is the SDS gap: every
+directly-seen mirror/glass surface rendered **pure black** in `B` while `R` drew it.
+
+Where the specular geometry is simple, the connection is *solved* instead of sampled. Both
+CPU (`render.h`) and GPU (`render_cuda.cu`) implement the same three connectors, and the
+device versions do all the precision-critical math in `double` regardless of the render
+`Real`, so the two backends agree.
+
+| Connector (CPU / GPU) | Surface | Reflection point | Geometry factor `G` |
+|---|---|---|---|
+| `connectSpecularSphere`(`Inside`) / `dConnectSpecularSphere` | smooth `dielectric` sphere, eye outside or inside | 1-D root scan of a planar miss function + 40-step bisection (≤4 roots = multiple refracted images) | ray differentials, `eps²/\|dA×dB\|` |
+| `connectSpecularSphereMirror` / `dConnectSpecularSphereMirror` | `mirror`/`halfmirror`/roughness-0 `glossy` **sphere** | same scan, one reflection instead of two refractions | same, re-expressed as an equivalent unfolded distance `D = 1/√G` so it shares one splat with the plane |
+| `connectSpecularPlane` / `dConnectSpecularPlane` | coplanar **mirror triangles** (a flat panel) | **unfolding** — no root solve at all | exactly `1/D²`, `D = \|p − eye′\|` |
+
+**Unfolding** is what makes the flat case closed-form. Mirroring the eye across the plane,
+`eye′ = eye − 2·(dot(n,eye) − d)·n`, turns the bent chain `p → R → eye` into the straight
+segment `p → eye′`; `R` is where that segment crosses the plane, and the specular Jacobian
+is `dΩ_eye/dA_perp = 1/D²` with `D = |p − R| + |R − eye|` — i.e. `connect()`'s own
+inverse-square law measured along the folded-out path. So the mirror estimator *is*
+`connect()` with a longer, bent distance and one reflectance factor.
+
+**Per-plane, not per-triangle.** `Scene::buildMirrorPlanes` (`scene.h`, run at the tail of
+`Scene::build` because it needs finalized `Tri::gn`) groups mirror-material triangles by a
+quantised `(n, d)` key — normal canonically oriented, since a mirror is two-sided — into
+`Scene::mirrorPlanes`, each carrying the plane, the member AABB and the total area.
+That makes the per-photon-vertex cost **O(#mirror surfaces)**, not O(#mirror triangles),
+and it is capped at `kMaxMirrorPlanes = 64` (largest-area planes win). The list uploads
+verbatim to `DScene::mirrorPlanes` as `DMirrorPlane`.
+
+**One traversal does three jobs.** A plane does not know where its panel *ends*, so
+`mirrorSeenAt` / `dMirrorSeenAt` casts one `closestHit(eye → R)` and requires
+`|hit.t − dE| ≤ 1e-4·(1+dE)` **and** `isPlanarMirrorMat(mats[hit.matId])`. That
+simultaneously proves (a) the authored panel really contains `R`, (b) the eye-side leg is
+unoccluded, and (c) hands back a real `Hit`, so `reflectSlot` reads the mirror's
+texture/pattern reflectance at the exact point. The light-side leg is a separate
+`occluded()`, and `splatMirrorLegs` / `dSplatMirrorLegs` applies fog transmittance on both
+legs.
+
+**Which materials qualify** (`isPlanarMirrorMat`, `scene.h`; `dIsPlanarMirrorMat`):
+`mirror`; `halfmirror` (its reflect *probability* is its specular reflectance in
+expectation); `glossy` only when `roughness <= 0 && roughnessTex < 0 && roughnessPat < 0`.
+
+**Hero bundles.** A mirror is achromatic, so ONE geometry solve serves the whole live-λ
+bundle and only the reflectance varies per λ — hence `camSpecularSplatAllVtxN`
+(`…AllVtx` is now a 1-λ wrapper over it) and the split of `SpecVtx::term()` into a
+λ-independent `shape()` plus the per-λ weight. A dielectric sphere is dispersive and
+**cannot** share geometry: each λ traces its own refracted image, which is exactly what
+makes a glass-orb caustic image chromatic. Its loop nesting (λ → sphere → camera) was
+preserved verbatim through the refactor, and `term()` was left byte-identical rather than
+being expressed through `shape()` (`w*(cos/π) ≠ (w/π)*cos` in floating point), so every
+pre-existing image is bit-for-bit unchanged (verified against a baseline binary built from
+the previous commit, CPU and GPU).
+
+**Known limits** — all deliberate, all documented in `REFERENCE.md` and tracked in
+`known-issues.md`: ONE specular vertex per connection (a mirror inside a mirror is still
+black); **pinhole only** (`lensMode` / `forwardCatch` return early, so `A`/`C` are
+unchanged); flat mirrors must be authored as world-space triangles (an instanced/BLAS
+mirror is not collected, and beyond `kMaxMirrorPlanes` the surplus planes are dropped);
+only a `halfmirror`'s *reflected* leg is built, so what lies behind a beamsplitter is still
+a delta transmission and stays black; rough specular is not a delta and needs a real
+estimator. Use `P`/`D`/`R`/`M`/`S`/`U` for those.
+
+**Test scenes.** `scenes/_mirror_fwd.ftsl` (flat panel), `scenes/_mirror_sphere_fwd.ftsl`
+(mirror ball) and `scenes/_mirror_mats_fwd.ftsl` (one panel each of `mirror`, `halfmirror`
+and roughness-0 `glossy`, black-backed so the comparison is reflection-only). All three put
+the emitters *outside* the frustum, so the lit result exists only by reflection and a
+regressed connector shows up as black rather than as a subtle level shift. Meter them with
+`-hdr` + `scraps/cmp_pfm.py`, comparing each mirror's pixel box against a mirror-free patch
+of the same frame — mode `B` and mode `R` carry a systematic ~0.6–1 % offset everywhere, so
+the mirror-free patch, not 1.0, is the number the mirror box has to match.
+
 ## Watertight raster coverage (shared by both backends, 0.98.2)
 
 Both rasterizers decide pixel coverage with **canonical edge functions**, so a pixel lying

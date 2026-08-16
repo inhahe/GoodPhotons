@@ -22,6 +22,11 @@ rationale, prior art and scoping live in that entry, not here.
 > devices (75.9 s → 2.7 s GPU / 524.7 s → 7.0 s CPU on the 256-light benchmark, unbiased).
 > What remains of that entry is the *mesh-triangle* level, using the tree for
 > forward/BDPT/VCM emitter selection, and ReSTIR DI — see section 1.
+>
+> **Update 2026-08-16 (v0.188.0):** forward mode `B`'s black-mirror gap is now partly
+> closed — flat mirror panels and mirror spheres image via analytic specular camera
+> connections. Mirrored *meshes*, mirror-in-mirror, the 64-plane cap and the finite-lens
+> modes `A`/`C` remain; they are the second entry in section 1.
 
 Keep the two in sync: when an item below lands, mark it DONE in **both** files (or delete it
 here and record the DONE in `TODO.md`). When a new open item appears in `TODO.md`, add it here.
@@ -78,6 +83,38 @@ triangle tree — returning a selection pdf so `emitterGeom`'s `pdf_area` become
 `pdfSelect / triArea`. Self-contained: `samplePoint` + the pdf in `emitterGeom`/BDPT, not the
 transport; needs a device mirror. ReSTIR DI is the larger follow-on. See the known-issues
 entry for the full write-up and the measurement scenes.
+
+### Analytic specular camera connections — the rest of the mirrors  *(ftrace)*
+*Not a TODO.md item — the remainder of the `known-issues.md` entry opened when the flat-panel
+and mirror-sphere connectors shipped in v0.188.0.*
+
+> **PARTLY DONE 2026-08-16 (v0.188.0).** Forward mode `B` used to render **every** mirror pure
+> black: a specular vertex has a delta BSDF, so its pinhole connection pdf is zero and
+> `tracePhoton` skipped the camera connect. Two analytic connectors now construct that vertex
+> deterministically — `connectSpecularPlane` (exact eye-unfolding across a plane) and
+> `connectSpecularSphereMirror` (Alhazen scan + bisection, ray-differential geometry factor),
+> both with CUDA twins. Mirror-box agreement with the mode-`R` reference went 0.00028 → 1.0078
+> against a 1.0060 outside-box control, GPU matching CPU. See `design.md`, *Analytic specular
+> camera connections*.
+
+**Still open, in rough order of value:**
+* **Mirrored meshes.** `Scene::buildMirrorPlanes()` collects only *coplanar* world-space mirror
+  triangles, so a curved or faceted mirrored mesh — `gallery_rain`'s chrome ring is the
+  standing example — is not collected and still renders black. Wants either a per-triangle
+  connector or a curved-mesh Alhazen solve generalising the sphere's. Instanced / BLAS mirrors
+  are likewise skipped.
+* **Lift the 64-plane cap.** `kMaxMirrorPlanes = 64` exists because the per-photon-vertex loop
+  is O(#mirror surfaces) with no spatial index. The planes already carry AABBs; indexing them
+  removes both the cap and the linear scan.
+* **Mirror-in-mirror.** One specular vertex per connection today; a chain of two unfoldings
+  would cover the common hall-of-mirrors case.
+* **A `halfmirror`'s transmitted side.** Only the reflected leg is built, so whatever is
+  behind a beamsplitter stays black — measured at a 19 % deficit on
+  `scenes/_mirror_mats_fwd.ftsl` before that scene grew its black backing. The fix is the
+  mirror-image of the plane connector: unfold *through* the plane rather than across it.
+* **Modes `A`/`C`.** Pinhole-only — `lensMode`/`forwardCatch` return early, so the finite-lens
+  physical camera still shows black mirrors. Needs the connection integrated over the aperture
+  rather than through a point.
 
 ### ~~K1 remainder — user-supplied named RGB→spectral mapping~~  **DONE 2026-07-28 (v0.90.0)**
 *TODO.md §K, item K1 — now closed.*

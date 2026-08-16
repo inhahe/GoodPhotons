@@ -1,0 +1,45 @@
+# Forward-mode MIRROR test — the SDS gap the planar specular camera connection fills.
+#
+# A closed room whose back wall carries a flat silvered mirror panel. Two small sphere
+# lights sit OUTSIDE the camera's frustum (one high behind the eye, one low off to the
+# left), so they are invisible head-on and appear ONLY as bright spots in the mirror,
+# surrounded by the mirrored room. That reflection is the one thing a forward light
+# tracer could not draw: a specular vertex has no pinhole connection, so mode B used to
+# render the whole mirror panel pure BLACK while mode R showed it correctly.
+#
+#   ftrace -in scenes/_mirror_fwd.ftsl -mode R -spp 512 -o png/_mirror_fwd_R.png
+#   ftrace -in scenes/_mirror_fwd.ftsl -mode B -time 60 -o png/_mirror_fwd_B.png
+
+scene { units meters  spectral 360 830 1 }
+
+material "white"  { type diffuse reflect whitewall 0.75 }
+material "red"    { type diffuse reflect redwall }
+material "green"  { type diffuse reflect greenwall }
+material "mirror" { type mirror  reflect 0.95 }
+
+# --- closed room: x,y in [0,1], z in [0,2]; the camera sits inside at z = 1.8 ---
+quad { origin 0 0 0   u 1 0 0   v 0 0 2   material white }   # floor
+quad { origin 0 1 0   u 0 0 2   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back  (z = 0)
+quad { origin 0 0 2   u 1 0 0   v 0 1 0   material white }   # front (z = 2, behind the eye)
+quad { origin 0 0 0   u 0 0 2   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 2   material green }   # right
+
+# --- the MIRROR: a flat panel just in front of the back wall, facing +z -----
+quad { origin 0.15 0.15 0.02   u 0.7 0 0   v 0 0.7 0   material mirror }
+
+# --- reflection-only emitters: both are outside the 45-deg frustum from the eye ---
+light sphere { center 0.50 0.88 1.65   radius 0.05   spd preset:bb6500 }
+light sphere { center 0.22 0.30 1.50   radius 0.04   spd rgb 1.0 0.12 0.06 }
+
+# --- ceiling area light (lights the room so the walls are not black) -------
+light area {
+    origin 0.35 0.999 0.70   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb5000
+}
+
+camera "cam" {
+    eye 0.5 0.5 1.8   look_at 0.5 0.5 0.0   up 0 1 0   fov_y 45
+    mode B
+    film { res 400 400 }
+}

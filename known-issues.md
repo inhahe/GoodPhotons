@@ -5,6 +5,84 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PARTLY FIXED (2026-08-16, v0.188.0): forward mode `B` rendered every mirror pure BLACK — flat panels and mirror spheres now image; mesh mirrors, mirror-in-mirror and rough specular still don't
+
+**The gap.** A forward light tracer connects each photon vertex to the pinhole and splats.
+A specular vertex has a *delta* BSDF, so the pdf of the connection direction being exactly
+the mirror direction is zero, and `tracePhoton` (`src/render.h`) skipped the camera connect
+for every `isSpecularType()` material. Net effect: a mirror seen directly by the camera in
+mode `B` rendered **pure black**, while mode `R` drew it correctly. `scenes/gallery_rain.ftsl`'s
+header noticed the symptom ("in mode B every piece of glass and the chrome ring go black")
+without naming the cause.
+
+**What 0.188.0 fixes.** Two new analytic connectors that construct the specular vertex
+deterministically instead of hoping to sample it (see `design.md`, *Analytic specular camera
+connections*, for the derivation):
+
+| surface | CPU / GPU connector | reflection point | geometry factor |
+|---|---|---|---|
+| flat mirror panel | `connectSpecularPlane` / `dConnectSpecularPlane` | exact — unfold the eye across the plane, intersect | exact, `G = 1/D²` with `D = \|p − eye′\|` |
+| mirror sphere | `connectSpecularSphereMirror` / `dConnectSpecularSphereMirror` | Alhazen, scan + bisection (≤ 4 roots) | ray differentials, `G = eps²/\|dA×dB\|`, re-expressed as `D = 1/sqrt(G)` |
+
+Qualifying materials (`isPlanarMirrorMat` / `dIsPlanarMirrorMat`): `Mirror`, `HalfMirror`
+(its reflect *probability* is its specular reflectance in expectation), and `Glossy` **only**
+when perfectly smooth (`roughness <= 0` and neither a roughness texture nor pattern).
+All three are pinned by `scenes/_mirror_mats_fwd.ftsl` — three coplanar panels, one per
+material, each backed by a black absorber so the comparison is reflection-only. Measured
+B/R per panel: `mirror` 1.01097, `halfmirror` 1.01390, `glossy roughness 0` 1.01105, against
+a mirror-free wall control of 1.00504.
+
+**Validated** on two scenes written for it — `scenes/_mirror_fwd.ftsl` (flat panel) and
+`scenes/_mirror_sphere_fwd.ftsl` (mirror ball). Both put a closed room around the mirror and
+two sphere lights *outside* the camera frustum, so the emitters are visible only by
+reflection. Mode `B` is metered against a mode-`R` reference over the mirror's pixel box,
+with a mirror-free region of the same frame as the control (`scraps/cmp_pfm.py` on `-hdr`
+PFMs — B/R carry a systematic ~0.6–0.9 % offset everywhere, so the control is what says
+whether the *mirror* is right):
+
+| scene | build | **mirror box** (B/R) | mirror-free control |
+|---|---|---|---|
+| flat panel | pre-feature GPU | **0.00028** (black) | 1.00599 |
+| flat panel | 0.188.0 GPU | **1.00779** | 1.00597 |
+| flat panel | 0.188.0 CPU | **1.00790** | 1.00617 |
+| mirror ball | pre-feature GPU | **0.00000** (black) | 1.00893 |
+| mirror ball | 0.188.0 GPU | **1.00449** | 1.00941 |
+| mirror ball | 0.188.0 CPU | **1.00430** | 1.00856 |
+
+i.e. the mirror lands on the same ratio as the rest of the frame — well inside the B/R
+offset — where it used to be *identically zero*, and GPU matches CPU.
+
+Bit-identity of everything else was checked against a baseline binary built from the
+previous commit (`git worktree` at HEAD~): **13 mirror-free scenes, PNG-md5 identical on
+GPU and 12 on CPU**, including `cornell`/`absolute`, whose dielectric spheres run the
+neighbouring `connectSpecularSphere` loop the refactor re-nested.
+
+**Still black by design — the remaining open part of this issue:**
+* **Mesh mirrors that aren't flat world-space triangles.** `Scene::buildMirrorPlanes()`
+  groups *coplanar* mirror triangles by a quantised `(n, d)` key, so a curved or faceted
+  mirrored mesh (`gallery_rain`'s chrome ring, a mirrored torus) is not collected and stays
+  black. Proper fix: a per-triangle connector, or a curved-mesh Alhazen solve like the
+  sphere's. Instanced / BLAS mirrors are likewise not collected — the planes are gathered
+  from world-space geometry only.
+* **Only 64 mirror planes.** `Scene::kMaxMirrorPlanes = 64`; the largest-area planes win and
+  the rest render black. The per-photon-vertex loop is O(#mirror surfaces) with no spatial
+  index, which is what the cap is really protecting against. Proper fix: index the planes
+  (they are already AABB-tagged) instead of capping them.
+* **One specular vertex per connection.** A mirror seen *in* another mirror needs a chain of
+  two unfoldings and is not built; those pixels stay black.
+* **A `halfmirror`'s transmitted image.** The connector builds only the *reflected* leg, so
+  whatever is behind a beamsplitter is still seen through a delta transmission and stays
+  black. Measured on `scenes/_mirror_mats_fwd.ftsl` before its black backing was added: the
+  panel read **0.811** of the mode-`R` reference, the whole 19 % deficit being the
+  transmitted wall behind it. (With the backing in place — reflection only — the same panel
+  reads 1.014.) The fix is the mirror-image of the existing plane connector: unfold *through*
+  the plane instead of across it.
+* **Rough specular is not a delta**, so a rough `Glossy` mirror is excluded — it is not
+  actually broken (it has a finite pdf and connects normally), just not accelerated here.
+* **Pinhole only.** `lensMode` / `forwardCatch` return early, so modes `A` and `C` — the
+  finite-lens physical camera — get no analytic specular connection and still show black
+  mirrors. Extending it needs the connection integrated over the aperture, not a point.
+
 ### FIXED-BY-GUARD (2026-08-16, v0.187.0): building with the VS 2026 BuildTools preview as nvcc's host compiler silently miscompiles the device code — every GPU render comes out BLACK, with no CUDA error
 
 Found while building a baseline binary in a `git worktree` for an A/B regression: the
@@ -10729,6 +10807,11 @@ Measured (v0.130.0, `-mode B -time 150` vs the 1180-spp mode-D still): the frame
 the chrome ring rendering solid black and heavy photon noise everywhere else. The scene header
 calls this "a real downgrade... in mode B every piece of glass and the chrome ring go black",
 which is true as far as it goes but understates how far from usable the result now is.
+
+*(Partly overtaken by 0.188.0's analytic specular connections — see the entry at the top of
+this file. The chrome ring is a mirrored **mesh**, not a flat panel or a sphere, so it is
+still not collected and still renders black. The two compounding causes below are unaffected
+and remain the substance of this issue.)*
 
 Two compounding causes, both created by removing the room:
 * **57% of every photon escapes to infinity** (`escaped=0.5662`) instead of bouncing off a wall

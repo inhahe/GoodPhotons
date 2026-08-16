@@ -320,6 +320,28 @@ struct Material {
     int mixWeightTex = -1;
 };
 
+// A PLANAR-SPECULAR (perfect-mirror) material: one whose reflection off a flat face is
+// an exact mirror image — a delta lobe with a plain reflectance and no bending — so the
+// forward light tracer can connect a photon vertex to the pinhole THROUGH it by
+// unfolding the eye across the plane (render.h connectSpecularPlane). This is what
+// fills the forward-mode SDS gap for mirrors; see Scene::mirrorPlanes.
+//
+//  - Mirror     — the case this exists for.
+//  - HalfMirror — a lossless reflect/transmit split whose reflect PROBABILITY is, in
+//                 expectation, exactly its specular reflectance, so the same estimator
+//                 applies with `reflect` read as a coefficient.
+//  - Glossy     — only when its lobe is a genuine delta: roughness pinned at 0 with
+//                 nothing spatially varying it (a texture or pattern could open the
+//                 lobe anywhere on the face, and the connection would then be wrong on
+//                 part of it). `mirror` and `glossy roughness 0` are the same surface.
+// Everything else either spreads the lobe, bends the path (dielectric, grating), or
+// switches wavelength — none of which unfold to a straight line.
+inline bool isPlanarMirrorMat(const Material& m) {
+    if (m.type == MatType::Mirror || m.type == MatType::HalfMirror) return true;
+    return m.type == MatType::Glossy && m.roughness <= 0.0 &&
+           m.roughnessTex < 0 && m.roughnessPat < 0;
+}
+
 // Resolve a Mix material to one of its child material indices using a single
 // uniform u in [0,1). Returns the chosen child index, or -1 if the photon falls
 // in the leftover (1 - sum weights) absorption slice. Non-Mix materials never
@@ -1564,6 +1586,108 @@ struct Scene {
             spdBaseGeom[(size_t)spdBaseIdx[e]] += emitters[e].geomWeight() * spdScale[e];
     }
 
+    // ---- planar specular reflectors (the forward-mode mirror connection) -----
+    // Every set of COPLANAR mirror faces in `tris`, collapsed to the one thing the
+    // forward tracer's camera connection actually needs: the plane. Unfolding the eye
+    // across a plane turns the bent path  vertex -> mirror -> eye  into a straight
+    // segment, so the reflection point is an intersection rather than a root solve and
+    // the specular Jacobian is just 1/(unfolded distance)^2. That is per-PLANE work, not
+    // per-triangle — a mirror split into two quads' worth of tris costs one entry, and
+    // the per-photon-vertex loop stays O(#mirror surfaces) instead of O(#triangles).
+    //
+    // Empty for every scene without a flat mirror, and the connection code returns
+    // immediately when it is empty, so nothing existing pays for this.
+    struct MirrorPlane {
+        Vec3   n{0, 0, 1};      // unit plane normal (canonically oriented, see build)
+        double d = 0.0;         // plane equation: dot(n, x) == d
+        Vec3   lo{0, 0, 0};     // AABB of the member faces — a cheap reject before the
+        Vec3   hi{0, 0, 0};     // BVH query that confirms the mirror is really there
+        double area = 0.0;      // total face area (used to rank when capping the list)
+    };
+    std::vector<MirrorPlane> mirrorPlanes;
+
+    // At most this many distinct mirror planes are tracked. A flat mirror is one or two
+    // planes; a faceted "mirror" mesh (a disco ball, a tessellated chrome sphere) would
+    // otherwise contribute thousands, and each one costs a BVH query per photon vertex.
+    // Past the cap the largest-area planes win, which is exactly the set a viewer would
+    // notice — and the rest keep the old behaviour (black in mode B) rather than making
+    // the render unusably slow.
+    static constexpr int kMaxMirrorPlanes = 64;
+
+    // Group the mirror-material triangles by plane. Called from build(), after
+    // Tri::finalize() has filled in the geometric normals.
+    void buildMirrorPlanes() {
+        mirrorPlanes.clear();
+        // Quantised plane key, so the two tris of a quad (identical gn and offset) and
+        // any coplanar neighbours land in one bucket. The tolerance is deliberately
+        // coarse relative to double precision: faces meant to be coplanar are authored
+        // that way, and a tri that misses the bucket simply gets its own plane.
+        struct Key { long long a, b, c, d; };
+        struct KeyHash {
+            size_t operator()(const Key& k) const {
+                size_t h = 1469598103934665603ull;
+                for (long long v : {k.a, k.b, k.c, k.d})
+                    h = (h ^ (size_t)v) * 1099511628211ull;
+                return h;
+            }
+        };
+        struct KeyEq {
+            bool operator()(const Key& x, const Key& y) const {
+                return x.a == y.a && x.b == y.b && x.c == y.c && x.d == y.d;
+            }
+        };
+        std::unordered_map<Key, int, KeyHash, KeyEq> byPlane;
+        for (const Tri& t : tris) {
+            if (t.matId < 0 || t.matId >= (int)mats.size()) continue;
+            if (!isPlanarMirrorMat(mats[t.matId])) continue;
+            Vec3 n = t.gn;
+            double nl = length(n);
+            if (nl < 1e-12) continue;
+            n = n * (1.0 / nl);
+            // Canonical orientation: a mirror reflects from either face, so the two
+            // sides of one plane must not split into two entries. Flip so the first
+            // significant component is positive.
+            const double sx = std::fabs(n.x), sy = std::fabs(n.y), sz = std::fabs(n.z);
+            const double lead = (sx >= sy && sx >= sz) ? n.x : ((sy >= sz) ? n.y : n.z);
+            if (lead < 0.0) n = Vec3{-n.x, -n.y, -n.z};
+            double d = dot(n, t.v0);
+            const double qPos = 1e5, qDir = 1e6;   // 10 um in position, 1e-6 in direction
+            Key k{(long long)std::llround(n.x * qDir), (long long)std::llround(n.y * qDir),
+                  (long long)std::llround(n.z * qDir), (long long)std::llround(d * qPos)};
+            auto it = byPlane.find(k);
+            int idx;
+            if (it == byPlane.end()) {
+                idx = (int)mirrorPlanes.size();
+                byPlane.emplace(k, idx);
+                MirrorPlane mp;
+                mp.n = n; mp.d = d;
+                mp.lo = t.v0; mp.hi = t.v0;
+                mirrorPlanes.push_back(mp);
+            } else {
+                idx = it->second;
+            }
+            MirrorPlane& mp = mirrorPlanes[(size_t)idx];
+            for (const Vec3& v : {t.v0, t.v1, t.v2}) {
+                mp.lo.x = std::min(mp.lo.x, v.x); mp.hi.x = std::max(mp.hi.x, v.x);
+                mp.lo.y = std::min(mp.lo.y, v.y); mp.hi.y = std::max(mp.hi.y, v.y);
+                mp.lo.z = std::min(mp.lo.z, v.z); mp.hi.z = std::max(mp.hi.z, v.z);
+            }
+            mp.area += 0.5 * length(cross(t.v1 - t.v0, t.v2 - t.v0));
+        }
+        if ((int)mirrorPlanes.size() > kMaxMirrorPlanes) {
+            std::sort(mirrorPlanes.begin(), mirrorPlanes.end(),
+                      [](const MirrorPlane& a, const MirrorPlane& b) { return a.area > b.area; });
+            mirrorPlanes.resize(kMaxMirrorPlanes);
+        }
+        // Pad the reject box by a hair so a reflection point landing exactly on an edge
+        // is not thrown away by rounding (the BVH query is the authoritative test).
+        for (MirrorPlane& mp : mirrorPlanes) {
+            const double pad = 1e-6 * (1.0 + length(mp.hi - mp.lo));
+            mp.lo = mp.lo - Vec3{pad, pad, pad};
+            mp.hi = mp.hi + Vec3{pad, pad, pad};
+        }
+    }
+
     // ---- light BVH (Conty & Kulla) ------------------------------------------
     // Built by finalizeEmitters() from the finished emitter list. `lightTree` is the
     // node array (root at lightTreeRoot); `lightTreeAlways` holds the emitters that
@@ -1749,6 +1873,7 @@ struct Scene {
         for (auto& t : tris) t.finalize();
         for (auto& bl : blasList) bl.build();   // shared instanced assets (local space)
         buildBvh();
+        buildMirrorPlanes();   // needs the finalized geometric normals
         // Scene bounding sphere from the BVH root AABB: center = box center, radius
         // = half the box diagonal (the box circumradius, guaranteed to enclose all
         // geometry). Sizes forward environment photon emission (disk radius) and

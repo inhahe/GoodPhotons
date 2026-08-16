@@ -20,6 +20,7 @@ Three neighbouring documents cover what this one only summarises:
 - [Render modes (`-mode`, or per-camera `mode`)](#render-modes--mode-or-per-camera-mode)
   - [Mode `W` — the deterministic (POV-Ray-style) preview](#mode-w--the-deterministic-pov-ray-style-preview)
   - [Speed / accuracy / ability tradeoffs](#speed--accuracy--ability-tradeoffs)
+  - [Analytic specular connections — what mode `B` can image directly](#analytic-specular-connections--what-mode-b-can-image-directly)
   - [Backends & performance (`-device`, `-wavefront`)](#backends--performance--device--wavefront)
 - [Cameras](#cameras)
 - [Materials](#materials)
@@ -715,8 +716,8 @@ that converges to the same physical image.
 | Mode | Best for | Speed | Specular-first | Depth of field | Caustics | GPU | Main limitation |
 |---|---|---|---|---|---|---|---|
 | **`-raster`** *(preview)* | Composition & camera-motion preview | Instant | — *(flat ghost/tint)* | ✗ | ✗ | ✓ *(`-device gpu`; else threaded CPU)* | **No light transport at all** — no shadows, reflection, refraction or GI (`-see-through` fakes clear glass) |
-| `B` *(default)* | Diffuse & caustic-heavy scenes | **Fastest** | ✗ *(black)* | ✗ | ✓ | ✓ | Can't shade a directly-seen mirror/glass; no depth of field |
-| `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black |
+| `B` *(default)* | Diffuse & caustic-heavy scenes | **Fastest** | ~ *(mirrors + glass spheres)* | ✗ | ✓ | ✓ | Other specular-first pixels (mesh glass, rough specular, mirror-in-mirror) still black; no depth of field |
+| `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black (the analytic connections are pinhole-only) |
 | `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
 | `R` | Quiet reference; any first hit; **fluorescence** | Medium | ✓ | ✓ *(physical lens)* | ✗ *(noisy)* | ✓ | Noisy on caustics |
 | `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe; fully on the GPU |
@@ -730,9 +731,15 @@ that converges to the same physical image.
 - **`B` — pinhole splat (default, fastest).** Every photon that hits a
   camera-visible surface splats to the pinhole, so essentially no photons are
   wasted — **orders of magnitude faster** than physically catching photons through
-  an aperture. GPU-accelerated. *Cost:* a pinhole has no depth of field, and it
-  **cannot render specular-first pixels** (a mirror/glass surface seen directly
-  splats nothing and stays black — use `P`, `D`, or `R` for those). Best default
+  an aperture. GPU-accelerated. *Cost:* a pinhole has no depth of field, and a
+  specular surface has no ordinary connection to it (a delta reflection/refraction has
+  ~zero probability of aiming at a point), so **specular-first pixels are black unless
+  the connection can be solved in closed form**. Two families now are — see
+  **[Analytic specular connections](#analytic-specular-connections-what-mode-b-can-image-directly)**
+  below: a **smooth mirror** (flat panel or sphere, including `halfmirror` and
+  roughness-0 `glossy`) and a **smooth dielectric sphere**. Everything else specular —
+  a glass *mesh*, a rough specular surface, a mirror seen inside another mirror —
+  still renders black; use `P`, `D`, or `R` for those. Best default
   for diffuse and caustic-heavy scenes. In an *absolute-EV* scene an authored
   `fstop`/`lens` still sets exposure here — the pinhole has no depth of field, but it
   applies the camera-equation light-gathering term `(π/4)/N²`, so f/2 is exactly four
@@ -922,6 +929,38 @@ and `-spp 3` followed by `-resume -spp 5` gives bit-for-bit the pixels of a plai
 (note that `-spp` under `-resume` means *additional* samples, not a total). Only the
 persistent-state photon modes `M`/`S`/`U` (whose per-pass state a film alone can't restore)
 stay non-resumable.
+
+### Analytic specular connections — what mode `B` can image directly
+
+Forward light tracing images a surface by *connecting* each photon vertex to the
+camera. A **specular** vertex has no such connection: a perfect mirror scatters into
+exactly one direction, so the probability that it aims at a pinhole is zero. That is why
+mode `B` (and `A`/`C`) historically rendered every directly-seen mirror or glass surface
+**pure black** while mode `R` drew it correctly — the classic SDS gap.
+
+Where the specular geometry is simple enough, the connection can be **solved in closed
+form** instead of sampled, and then it is drawn exactly. Mode `B` does this for:
+
+| Directly-seen surface | How the connection is solved | Since |
+|---|---|---|
+| **Flat mirror panel** — coplanar `mirror` / `halfmirror` / roughness-0 `glossy` triangles | *Unfolding*: the eye is mirrored across the plane, so the bent path `p → R → eye` becomes a straight segment and the specular Jacobian is exactly `1/D²` along it | 0.188.0 |
+| **Mirror sphere** — a `sphere` primitive with the same materials | 1-D root solve in the plane through (eye, vertex, centre) + ray-differential Jacobian | 0.188.0 |
+| **Smooth dielectric sphere** — a `sphere` with `type dielectric`, seen from outside *or* flown through | Same root solve, with two refractions (dispersive: each λ gets its own image, which is what makes the glass-orb caustic image chromatic) | 0.160.0 |
+
+So a mirrored wall, the room reflected in it, and lights that are only visible *in* the
+reflection now render in mode `B` — on both the CPU and the GPU, which agree.
+
+**Still black in `B`, by design:** a glass or mirror **mesh** (only world-space triangles
+grouped into planes, and analytic spheres, are collected — an instanced/BLAS mirror is
+not, and at most 64 distinct mirror planes are, largest-area first), a **rough** specular
+surface (it is no longer a delta, so it needs a real estimator), the **transmitted** side
+of a `halfmirror` (only its reflected leg is built, so whatever is behind a beamsplitter
+stays black), and **more than one specular vertex** in a row — a mirror seen *inside*
+another mirror, or glass in front of a mirror. Fog *inside* a dielectric shell is the
+same kind of gap. For any of those use `P`, `D`, `R`, or the photon-map family.
+
+The connections are **pinhole-only**: `A` (finite lens) and `C` (forward catch) return
+early, so their specular-first pixels stay black.
 
 ### Backends & performance (`-device`, `-wavefront`)
 

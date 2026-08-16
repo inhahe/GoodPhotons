@@ -1,0 +1,91 @@
+# Forward-mode mirror test — the OTHER two materials the specular camera connection accepts.
+#
+# scenes/_mirror_fwd.ftsl proves the flat connector on a plain `mirror`. `isPlanarMirrorMat`
+# also admits two more, and each is admitted for a reason worth pinning:
+#
+#   * `halfmirror` — a lossless beamsplitter whose `reflect` is a *probability*, not a
+#     reflectance. Forward tracing flips that coin per photon; the connector instead takes
+#     it as the reflectance, which is the same thing in expectation. If that identification
+#     were wrong the panel would come out at the wrong brightness, not black — so it needs a
+#     metered check, not an eyeball.
+#   * `glossy` with `roughness 0` — a genuine delta lobe wearing a non-delta material type.
+#     Admitted only when the roughness is 0 AND there is no roughness texture or pattern
+#     (a textured one is not a delta at every point, so it is refused wholesale).
+#
+# Three panels side by side on the back wall, all seeing the same room:
+#   left   = mirror     reflect 0.6
+#   middle = halfmirror reflect 0.6   (should match the left panel, in expectation)
+#   right  = glossy     reflect 0.6 roughness 0   (likewise)
+#
+# Each panel is backed by a BLACK absorber 5 mm behind it. That is not decoration — a
+# `halfmirror` is a lossless beamsplitter, so without it the middle panel would also show
+# the *transmitted* white wall behind, which is a specular transmission and therefore has no
+# forward camera connection either. The black backing removes that second, unrelated gap
+# from the measurement, leaving only the question this scene is asking: does the connector
+# reproduce a 0.6 reflect *probability* as a 0.6 reflectance? (Measured with it present,
+# the middle panel reads 0.81 of the mode-R reference; the deficit is entirely that
+# transmitted image.)
+#
+# Mode R is the reference. The three panels do NOT read alike even in R — each sits at a
+# different x and so reflects a different part of the room (left sees the red wall, middle
+# the lit ceiling and front wall, right the green wall) — so the test is per-panel: each
+# panel's B/R ratio must match the ratio a mirror-free patch of the same frame reports.
+#
+# Measured (v0.188.0, GPU, `-mode R -spp 4096` vs `-mode B -time 120`, boxes inset 6 px):
+#
+#     mirror      1.01097      halfmirror  1.01390
+#     glossy 0    1.01105      wall control 1.00504
+#
+# — all three within ~1 % of the control, i.e. all three materials connect correctly.
+#
+#   ftrace -in scenes/_mirror_mats_fwd.ftsl -mode R -spp 512 -hdr -o png/_mmR.png
+#   ftrace -in scenes/_mirror_mats_fwd.ftsl -mode B -time 120 -hdr -o png/_mmB.png
+
+scene { units meters  spectral 360 830 1 }
+
+material "white"  { type diffuse reflect whitewall 0.75 }
+material "red"    { type diffuse reflect redwall }
+material "green"  { type diffuse reflect greenwall }
+
+material "black"  { type diffuse    reflect 0.0 }
+
+material "m_mir"  { type mirror     reflect 0.6 }
+material "m_half" { type halfmirror reflect 0.6 }
+material "m_gls"  { type glossy     reflect 0.6   roughness 0 }
+
+# --- closed room: x,y in [0,1], z in [0,2]; the camera sits inside at z = 1.8 ---
+quad { origin 0 0 0   u 1 0 0   v 0 0 2   material white }   # floor
+quad { origin 0 1 0   u 0 0 2   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back  (z = 0)
+quad { origin 0 0 2   u 1 0 0   v 0 1 0   material white }   # front (z = 2, behind the eye)
+quad { origin 0 0 0   u 0 0 2   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 2   material green }   # right
+
+# --- three coplanar-but-separate panels just in front of the back wall, facing +z ---
+# Each is its own material, so buildMirrorPlanes() sees three planes at the same (n, d)
+# only if it grouped by geometry alone — it groups per material-qualified triangle set, and
+# the per-plane closestHit is what tells the three apart at connect time.
+quad { origin 0.06 0.30 0.02   u 0.26 0 0   v 0 0.40 0   material m_mir  }
+quad { origin 0.37 0.30 0.02   u 0.26 0 0   v 0 0.40 0   material m_half }
+quad { origin 0.68 0.30 0.02   u 0.26 0 0   v 0 0.40 0   material m_gls  }
+
+# --- black backing, 5 mm behind each panel (see the header) ----------------
+quad { origin 0.06 0.30 0.015   u 0.26 0 0   v 0 0.40 0   material black }
+quad { origin 0.37 0.30 0.015   u 0.26 0 0   v 0 0.40 0   material black }
+quad { origin 0.68 0.30 0.015   u 0.26 0 0   v 0 0.40 0   material black }
+
+# --- reflection-only emitters: both are outside the 45-deg frustum from the eye ---
+light sphere { center 0.50 0.88 1.65   radius 0.05   spd preset:bb6500 }
+light sphere { center 0.22 0.30 1.50   radius 0.04   spd rgb 1.0 0.12 0.06 }
+
+# --- ceiling area light (lights the room so the walls are not black) -------
+light area {
+    origin 0.35 0.999 0.70   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb5000
+}
+
+camera "cam" {
+    eye 0.5 0.5 1.8   look_at 0.5 0.5 0.0   up 0 1 0   fov_y 45
+    mode B
+    film { res 400 400 }
+}

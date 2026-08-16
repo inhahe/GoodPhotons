@@ -888,6 +888,17 @@ struct Renderer {
             double cosSurf = dot(np, wP);
             return cosSurf <= 0.0 ? -1.0 : (weight / PI) * cosSurf;
         }
+        // The WAVELENGTH-INDEPENDENT half of term(): everything but `weight` (which is
+        // the per-λ albedo). The mirror connectors solve one shared geometry for the
+        // whole hero bundle — a flat/metallic reflection does not disperse — so they
+        // evaluate this once and multiply by each λ's weight. term() keeps its own
+        // arithmetic rather than being expressed through this, so the dielectric-sphere
+        // path's float ordering (and therefore its images) stay bit-identical.
+        double shape(const Vec3& wP) const {
+            if (volume) return hgPhase(dot(wIn, wP), g);
+            double cosSurf = dot(np, wP);
+            return cosSurf <= 0.0 ? -1.0 : cosSurf / PI;
+        }
     };
 
     // Trace a ray from `o` (outside sphere S) that ENTERS S, crosses the glass, and
@@ -1229,44 +1240,329 @@ struct Renderer {
         }
     }
 
+    // ===================================================================
+    //  Analytic specular connection by REFLECTION in a perfect mirror.
+    //
+    //  The same missing-path problem connectSpecularSphere solves for glass, solved
+    //  for mirrors — and this is the case that actually shows: mode B renders every
+    //  mirror surface pure BLACK, because a delta reflection has no pinhole
+    //  connection, so a mirrored wall (and every emitter reflected in it) simply is
+    //  not drawn, while mode R draws it correctly.
+    //
+    //  Reflection is far kinder than refraction: UNFOLDING the eye across the mirror
+    //  (eye' = the eye's mirror image) turns the bent chain  p -> R -> eye  into the
+    //  straight segment  p -> eye'. So there is no root solve for a plane — R is just
+    //  where that segment crosses the plane — and the specular Jacobian, which the
+    //  sphere code has to estimate with ray differentials, is exactly
+    //      G = dOmega_eye / dA_perp = 1 / D^2,   D = |p - eye'| = |p - R| + |R - eye|
+    //  i.e. connect()'s own 1/dist^2 measured along the folded-out path. The vertex
+    //  term and the pixel solid angle are shared with every other connector, so the
+    //  estimator is connect() with a longer, bent distance and one reflectance factor.
+    //
+    //  A curved (spherical) mirror keeps the unfolding idea but loses the closed form,
+    //  so it reuses the sphere machinery: the reflection point is a 1-D root in
+    //  plane(eye, p, centre) and G comes from ray differentials, exactly as for glass.
+    //
+    //  Limits: ONE specular vertex per connection (a mirror seen in a mirror is still
+    //  missing), pinhole only, and flat mirrors must be authored as triangles (an
+    //  instanced/BLAS mirror is not collected — see Scene::buildMirrorPlanes).
+    // ===================================================================
+
+    // Reflect a ray off sphere S at its first intersection ahead of `o`. Works from
+    // either side (a convex mirror ball seen from outside, a mirrored room seen from
+    // within), since the reflecting normal is taken against the ray.
+    struct SphereRefl { Vec3 P1, exitDir; };
+    static bool reflectOffSphere(const Vec3& o, const Vec3& d, const Sphere& S,
+                                 SphereRefl& out) {
+        Vec3 oc = o - S.c;
+        double b = dot(oc, d), c = dot(oc, oc) - S.r * S.r;
+        double disc = b * b - c;
+        if (disc <= 0.0) return false;
+        double sq = std::sqrt(disc);
+        double t = -b - sq;                             // near root (exterior origin)
+        if (t < 1e-7) t = -b + sq;                      // interior origin: the far one
+        if (t < 1e-7) return false;
+        Vec3 P1 = o + d * t;
+        Vec3 N = (P1 - S.c) * (1.0 / S.r);              // outward normal
+        double cn = dot(d, N);
+        if (std::fabs(cn) <= 1e-6) return false;        // grazing: reflection is degenerate
+        out.P1 = P1;
+        out.exitDir = normalize(d - N * (2.0 * cn));    // reflect(d, N); sign of N is moot
+        return true;
+    }
+
+    // Is the surface the eye actually sees at `hitPoint` (found by a closest-hit along
+    // the connection's eye-side leg) the mirror we solved the geometry for? One BVH
+    // query settles BOTH questions the connection needs — "is there really mirror
+    // material at that spot" (containment within the authored panel) and "is the leg
+    // from the eye clear" — and hands back the Hit, so the reflectance can be read at
+    // the exact texel/pattern value the surface has there.
+    static bool mirrorSeenAt(const Scene& scene, const Vec3& eye, const Vec3& wE,
+                             double dE, Hit& hm) {
+        hm = scene.closestHit(Ray{eye, wE});
+        if (!hm.valid) return false;
+        if (std::fabs(hm.t - dE) > 1e-4 * (1.0 + dE)) return false;   // something in front
+        if (hm.matId < 0 || hm.matId >= (int)scene.mats.size()) return false;
+        return isPlanarMirrorMat(scene.mats[hm.matId]);
+    }
+
+    // Splat the `nUp` live wavelengths of a photon vertex through one connection whose
+    // geometry has already been solved: the vertex is at p, the light leaves it toward
+    // wP over a distance dP to the mirror point R, the mirror hands it to the eye over
+    // dE, and the whole unfolded path is D long. Shared by the planar and spherical
+    // mirror connectors — everything below this point is wavelength-dependent only
+    // through the mirror's reflectance and the fog.
+    void splatMirrorLegs(const Scene& scene, Film& film, const Material& mm, const Hit& hm,
+                         int px, int py, double omega, const Vec3& p, const Vec3& wP,
+                         double dP, const Vec3& R, const Vec3& wRE, double dE, double D,
+                         double shape, const double* lam, const double* beta,
+                         const double* w, int nUp, Pcg32& rng) const {
+        const double invD2Omega = 1.0 / (D * D * omega);
+        for (int i = 0; i < nUp; ++i) {
+            double refl = clamp01(reflectSlot(scene, mm, hm, lam[i]));
+            double contrib = beta[i] * (w[i] * shape) * refl * invD2Omega;
+            if (contrib <= 0.0) continue;
+            if (!scene.media.empty()) {
+                contrib *= mediaTransmittance(scene, p, wP,  dP, lam[i], rng);
+                contrib *= mediaTransmittance(scene, R, wRE, dE, lam[i], rng);
+            }
+            film.add(px, py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
+        }
+    }
+
+    // Connect vertex p to the pinhole `cam` by reflection in one PLANAR mirror.
+    void connectSpecularPlane(const Scene& scene, const Camera& cam, Film& film,
+                              const Scene::MirrorPlane& mp, const Vec3& p, const SpecVtx& vt,
+                              const double* lam, const double* beta, const double* w,
+                              int nUp, Pcg32& rng) const {
+        const Vec3 eye = cam.eye;
+        const double se = dot(mp.n, eye) - mp.d;
+        const double sp = dot(mp.n, p)   - mp.d;
+        // A mirror reflects whichever face you look at, but the eye and the vertex must
+        // be on the SAME face — otherwise the "reflection" is through the mirror's back.
+        if (!(se * sp > 0.0)) return;
+        const Vec3 eyeM = eye - mp.n * (2.0 * se);        // the eye's mirror image
+        Vec3 wP = eyeM - p;
+        const double D = length(wP);                      // unfolded path length
+        if (D < 1e-9) return;
+        wP = wP * (1.0 / D);
+        const double shape = vt.shape(wP);
+        if (shape < 0.0) return;                          // camera side behind the surface
+        const double denom = dot(mp.n, wP);
+        if (std::fabs(denom) < 1e-12) return;
+        const double dP = (mp.d - dot(mp.n, p)) / denom;  // p + wP*dP lands on the plane
+        if (dP <= 1e-7 || dP >= D - 1e-7) return;
+        const Vec3 R = p + wP * dP;
+        // Cheap extent reject before paying for the BVH query that confirms the mirror.
+        if (R.x < mp.lo.x || R.x > mp.hi.x || R.y < mp.lo.y || R.y > mp.hi.y ||
+            R.z < mp.lo.z || R.z > mp.hi.z) return;
+
+        int px, py; double cosCam, dist2e;
+        if (!cam.project(R, px, py, cosCam, dist2e)) return;
+        const double omega = cam.pixelSolidAngle(cosCam);
+        if (omega <= 0.0) return;
+
+        const double dE = D - dP;                         // |R - eye| (R lies on the plane)
+        Vec3 wRE = (eye - R) * (1.0 / dE);                // mirror -> eye
+        Hit hm;
+        if (!mirrorSeenAt(scene, eye, -wRE, dE, hm)) return;
+        // Light-side leg, stopping just short of the mirror's own surface.
+        if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) return;
+
+        splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
+                        p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng);
+    }
+
+    // Connect vertex p to the pinhole `cam` by reflection in one SPHERICAL mirror.
+    // Same 1-D root solve + ray-differential Jacobian as the glass sphere, with a
+    // single reflection in place of the two refractions.
+    void connectSpecularSphereMirror(const Scene& scene, const Camera& cam, Film& film,
+                                     const Sphere& S, const Vec3& p, const SpecVtx& vt,
+                                     const double* lam, const double* beta, const double* w,
+                                     int nUp, Pcg32& rng) const {
+        const Vec3 O = S.c; const double r = S.r; const Vec3 eye = cam.eye;
+        const double dEyeO = length(eye - O);
+        const double dPO   = length(p - O);
+        if (std::fabs(dEyeO - r) < 1e-4 * r) return;      // eye ~on the surface: degenerate
+        const bool outside = dEyeO > r;
+        // The vertex has to be on the same side of the silvering as the eye, or there is
+        // no reflection joining them (a mirror is opaque).
+        if (outside ? (dPO <= r * 1.0001) : (dPO >= r * 0.9999)) return;
+
+        // Plane(eye, p, O) — the reflection path off a sphere is planar by symmetry.
+        Vec3 ex, ey;
+        if (dEyeO < 1e-9) { Vec3 tb; onb(normalize(p - O), ex, tb); }
+        else              ex = (eye - O) * (1.0 / dEyeO);
+        const Vec3 ap = p - O;
+        const Vec3 perp = ap - ex * dot(ap, ex);
+        const double perpLen = length(perp);
+        if (perpLen < 1e-9) { Vec3 tb; onb(ex, ey, tb); }
+        else                ey = perp * (1.0 / perpLen);
+        const double ex_e = dot(eye - O, ex), ey_e = dot(eye - O, ey);
+        const double px2 = dot(ap, ex), py2 = dot(ap, ey);
+
+        // Signed perpendicular distance of p from the ray reflected at surface angle phi.
+        auto trace2D = [&](double c1, double s1, bool& valid) -> double {
+            valid = false;
+            const double P1x = r * c1, P1y = r * s1;
+            double dinx = P1x - ex_e, diny = P1y - ey_e;
+            const double dl = std::sqrt(dinx * dinx + diny * diny);
+            if (dl < 1e-12) return 0.0;
+            dinx /= dl; diny /= dl;
+            const double cn = dinx * c1 + diny * s1;      // dot(din, outward normal)
+            if (std::fabs(cn) <= 1e-6) return 0.0;
+            // Reachability: from OUTSIDE only the front face is hit first (cn < 0);
+            // from inside the ray always leaves through the far face (cn > 0).
+            if (outside != (cn < 0.0)) return 0.0;
+            const double doutx = dinx - 2.0 * cn * c1, douty = diny - 2.0 * cn * s1;
+            const double fw = (px2 - P1x) * doutx + (py2 - P1y) * douty;
+            if (fw <= 0.0) return 0.0;                    // p must be on the forward side
+            valid = true;
+            return doutx * (py2 - P1y) - douty * (px2 - P1x);
+        };
+
+        // Scan the circle; bisect sign changes into chief reflection angles.
+        const int NS = kSphScanN; double roots[4]; int nroot = 0;
+        const SphScanTab& T = sphScanTab();
+        double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
+        for (int i = 0; i <= NS && nroot < 4; ++i) {
+            const double phi = -PI + (2.0 * PI) * i / NS;
+            bool v; const double mss = trace2D(T.c[i], T.s[i], v);
+            if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
+                double a = prevPhi, b = phi, fa = prevMiss;
+                for (int k = 0; k < 40; ++k) {
+                    const double mid = 0.5 * (a + b);
+                    bool vm; const double fm = trace2D(std::cos(mid), std::sin(mid), vm);
+                    if (!vm) break;
+                    if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
+                }
+                roots[nroot++] = 0.5 * (a + b);
+            }
+            prevMiss = mss; prevValid = v; prevPhi = phi;
+        }
+
+        for (int ri = 0; ri < nroot; ++ri) {
+            const double phi = roots[ri];
+            const Vec3 P1chief = O + ex * (r * std::cos(phi)) + ey * (r * std::sin(phi));
+            const Vec3 d0 = normalize(P1chief - eye);
+            SphereRefl ch;
+            if (!reflectOffSphere(eye, d0, S, ch)) continue;
+
+            // Ray-differential geometry factor G = dOmega_eye / dA_perp at p.
+            Vec3 a1, a2; onb(d0, a1, a2);
+            const double eps = 2e-4;
+            SphereRefl rA, rB;
+            if (!reflectOffSphere(eye, normalize(d0 + a1 * eps), S, rA)) continue;
+            if (!reflectOffSphere(eye, normalize(d0 + a2 * eps), S, rB)) continue;
+            Vec3 e1, e2; onb(ch.exitDir, e1, e2);
+            auto planeOff = [&](const SphereRefl& Rf, double& ox, double& oy) {
+                double den = dot(Rf.exitDir, ch.exitDir);
+                if (std::fabs(den) < 1e-9) den = (den < 0 ? -1e-9 : 1e-9);
+                const double s = dot(p - Rf.P1, ch.exitDir) / den;
+                const Vec3 off = (Rf.P1 + Rf.exitDir * s) - p;
+                ox = dot(off, e1); oy = dot(off, e2);
+            };
+            double ax, ay, bx, by;
+            planeOff(rA, ax, ay); planeOff(rB, bx, by);
+            const double jac = std::fabs(ax * by - ay * bx);
+            if (jac < 1e-24) continue;                    // caustic singularity guard
+            // The same G the flat mirror gets in closed form as 1/D^2; expressed here as
+            // an equivalent unfolded distance so both connectors share one splat.
+            const double G = (eps * eps) / jac;
+            const double D = 1.0 / std::sqrt(G);
+
+            int px, py; double cosCam, dist2e;
+            if (!cam.project(P1chief, px, py, cosCam, dist2e)) continue;
+            const double omega = cam.pixelSolidAngle(cosCam);
+            if (omega <= 0.0) continue;
+
+            Vec3 wP = ch.P1 - p; const double dP = length(wP);
+            if (dP < 1e-9) continue;
+            wP = wP * (1.0 / dP);
+            const double shape = vt.shape(wP);
+            if (shape < 0.0) continue;
+
+            Vec3 toEye = eye - ch.P1; const double dE = length(toEye);
+            if (dE < 1e-9) continue;
+            const Vec3 wRE = toEye * (1.0 / dE);
+            Hit hm;
+            if (!mirrorSeenAt(scene, eye, -wRE, dE, hm)) continue;
+            if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) continue;
+
+            splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
+                            p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, rng);
+        }
+    }
+
     // Splat vertex p to every camera through every smooth dielectric sphere (the
-    // refracted image of p). Mode B (pinhole) only; draws no aperture RNG.
+    // refracted image of p) and off every perfect mirror (the reflected image of p).
+    // Mode B (pinhole) only; draws no aperture RNG.
+    //
+    // `w[i]` is the vertex's per-λ weight (Lambertian rho / single-scatter albedo);
+    // vt.weight is ignored, and vt is copied per λ for the dielectric path. The loop
+    // nesting of the dielectric-sphere connection (λ, then sphere, then camera) is the
+    // one the scalar and hero wrappers used before this was factored, so its film
+    // accumulation order — and therefore its images — are unchanged bit for bit.
+    void camSpecularSplatAllVtxN(const Scene& scene, const CamTarget* cams, int nCam,
+                                 const Vec3& p, const SpecVtx& vt, const double* lam,
+                                 const double* beta, const double* w, int nUp,
+                                 Pcg32& rng) const {
+        if (lensMode || forwardCatch) return;               // finite-lens/catch not supported
+        for (int i = 0; i < nUp; ++i) {
+            SpecVtx vi = vt; vi.weight = w[i];
+            for (const Sphere& S : scene.spheres) {
+                const Material& gm = scene.mats[S.matId];
+                if (gm.type != MatType::Dielectric) continue;
+                const double ng = gm.ior(lam[i]);
+                for (int c = 0; c < nCam; ++c)
+                    if (cams[c].cam && cams[c].film)
+                        connectSpecularSphere(scene, *cams[c].cam, *cams[c].film, S, gm, ng,
+                                              p, vi, lam[i], beta[i], rng);
+            }
+        }
+        // Mirrors. Achromatic geometry, so one solve serves the whole hero bundle.
+        for (const Sphere& S : scene.spheres) {
+            if (!isPlanarMirrorMat(scene.mats[S.matId])) continue;
+            for (int c = 0; c < nCam; ++c)
+                if (cams[c].cam && cams[c].film)
+                    connectSpecularSphereMirror(scene, *cams[c].cam, *cams[c].film, S,
+                                                p, vt, lam, beta, w, nUp, rng);
+        }
+        for (const Scene::MirrorPlane& mp : scene.mirrorPlanes)
+            for (int c = 0; c < nCam; ++c)
+                if (cams[c].cam && cams[c].film)
+                    connectSpecularPlane(scene, *cams[c].cam, *cams[c].film, mp,
+                                         p, vt, lam, beta, w, nUp, rng);
+    }
     void camSpecularSplatAllVtx(const Scene& scene, const CamTarget* cams, int nCam,
                                 const Vec3& p, const SpecVtx& vt, double lambda,
                                 double beta, Pcg32& rng) const {
-        if (lensMode || forwardCatch) return;               // finite-lens/catch not supported
-        for (const Sphere& S : scene.spheres) {
-            const Material& gm = scene.mats[S.matId];
-            if (gm.type != MatType::Dielectric) continue;
-            double ng = gm.ior(lambda);
-            for (int c = 0; c < nCam; ++c)
-                if (cams[c].cam && cams[c].film)
-                    connectSpecularSphere(scene, *cams[c].cam, *cams[c].film, S, gm, ng,
-                                          p, vt, lambda, beta, rng);
-        }
+        const double w = vt.weight;
+        camSpecularSplatAllVtxN(scene, cams, nCam, p, vt, &lambda, &beta, &w, 1, rng);
     }
-    // Surface vertex: refract the Lambertian reflection of p through every glass sphere.
+    // Surface vertex: refract the Lambertian reflection of p through every glass sphere,
+    // and reflect it in every mirror.
     void camSpecularSplatAll(const Scene& scene, const CamTarget* cams, int nCam,
                              const Vec3& p, const Vec3& n, double lambda, double beta,
                              double rho, Pcg32& rng) const {
         SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho;
         camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lambda, beta, rng);
     }
-    // Hero variant: the sphere refraction is DISPERSIVE (glass IOR varies per λ), so it
+    // Hero variant. The sphere REFRACTION is dispersive (glass IOR varies per λ), so it
     // cannot share one geometry — each wavelength traces its own refracted image, which
-    // is exactly what makes the glass-sphere caustic-image chromatically dispersed. Draws
-    // no RNG (mode B), so looping λ leaves the stream untouched.
+    // is exactly what makes the glass-sphere caustic-image chromatically dispersed. A
+    // mirror is achromatic, so its geometry IS shared and only the reflectance varies.
+    // Draws no RNG (mode B), so the bundle leaves the stream untouched.
     void camSpecularSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam,
                                  const Vec3& p, const Vec3& n, const double* lam,
                                  const double* beta, const double* rho, int nUp,
                                  Pcg32& rng) const {
-        for (int i = 0; i < nUp; ++i) {
-            SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho[i];
-            camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lam[i], beta[i], rng);
-        }
+        SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho[0];
+        camSpecularSplatAllVtxN(scene, cams, nCam, p, vt, lam, beta, rho, nUp, rng);
     }
     // Volume vertex: refract the fog in-scatter at p through every glass sphere, so the
-    // glowing haze itself bends through the glass the camera flies through.
+    // glowing haze itself bends through the glass the camera flies through — and shows
+    // in the mirrors.
     void camSpecularSplatVolumeAll(const Scene& scene, const Medium& med, const CamTarget* cams,
                                    int nCam, const Vec3& p, const Vec3& wIn, double lambda,
                                    double beta, Pcg32& rng) const {
