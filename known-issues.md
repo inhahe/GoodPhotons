@@ -5,6 +5,54 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED-BY-GUARD (2026-08-16, v0.187.0): building with the VS 2026 BuildTools preview as nvcc's host compiler silently miscompiles the device code — every GPU render comes out BLACK, with no CUDA error
+
+Found while building a baseline binary in a `git worktree` for an A/B regression: the
+worktree's fresh `cmake -S . -B build_cuda2` (no `-G`) picked **Visual Studio 18 2026
+BuildTools / MSVC 14.51** instead of the VS 2022 / MSVC 14.44 the main build dir was
+configured with years-of-commits ago. The resulting `ftrace.exe` built and ran, reported
+a *successful* render, and produced a black image:
+
+```
+mode B: tracing 2000000 photons ... on GPU
+wrote png/c_base.png (256x256), auto-exposure=1
+[live] 0.5s, 2000000 / 2000000 photons, ~0.0% noise (done)
+[energy] absorbed=1.0000 sensor=0.0000 escaped=0.0000 residual=0.0000 (sum/emitted=1.000000)
+```
+
+Every photon is absorbed at its first interaction; nothing escapes, nothing reaches the
+sensor. The same binary on `-device cpu` is **correct** (absorbed=0.6701), so it is the
+device pass specifically.
+
+**Isolated, not guessed.** Rebuilding the *same commit* in the *same worktree* with
+`-G "Visual Studio 17 2022" -A x64`:
+
+| host compiler | CUDA arch | result |
+|---|---|---|
+| MSVC 14.51 (VS 2026 BuildTools) | 75 (CMake's fallback) | **black**, absorbed=1.0000 |
+| MSVC 14.44 (VS 2022) | 75 | correct, absorbed=0.6702 (slow: PTX JIT) |
+| MSVC 14.44 (VS 2022) | 89 (native) | correct, absorbed=0.6702, 4.2 s |
+
+So the device architecture is a red herring — it is the **host compiler**. nvcc 13.3
+accepts MSVC 14.51 with at most a warning, every kernel launches and runs, and
+`cudaGetLastError`/`cudaDeviceSynchronize` report success (`cudaCheckKernel` is already
+called on the forward launch, `src/render_cuda.cu:13339`, and never fires). There is
+therefore **no runtime signal to check** — the fix has to be at configure time.
+
+**Guarded, 2026-08-16:**
+- `build.bat` now pins `-G "Visual Studio 17 2022" -A x64` on first configure, falling
+  back to CMake's default generator only if VS 2022 is absent.
+- `CMakeLists.txt` emits a `message(WARNING ...)` when `MSVC_VERSION >= 1950` and CUDA is
+  enabled, naming the symptom.
+
+**Still open**, hence the entry: an existing `build_cuda2/` configured the bad way is
+NOT repaired by either guard (CMake never re-picks a generator for an existing cache) —
+delete the build dir to re-configure. And the underlying miscompilation is unfixed and
+unlocalised; if a future CUDA toolkit officially supports MSVC 14.5x, raise the warning
+threshold rather than assuming it went away. A cheap runtime net would be a GPU
+self-test at init (trace one known photon, compare against the CPU) — worth doing if
+this class of failure recurs.
+
 ### OPEN (2026-08-15, v0.186.0): a mesh area light is sampled UNIFORMLY BY AREA, so every occluded or backfacing part of the emitter still costs samples
 
 `EmitterShape::Mesh` (added for mesh area lights, C5) picks a triangle from a
@@ -99,6 +147,44 @@ largest known avoidable cost in mode R and it is what a light tree actually buys
 splitting) importance-weighted emitters, cost O(log N). The `selectEmitter` power-CDF
 binary search already in the CUDA scene is the hook the tree should replace, and the
 backward NEE should start using it.
+
+**DONE (2026-08-16, v0.187.0) for the emitter level — the Conty–Kulla light BVH is in,
+on both devices.** `src/lighttree.h` (traversal, shared verbatim by the CPU and the
+`.cu`) + `src/lighttree_build.h` (build) + `Scene::buildLightTree`;
+`BackwardRenderer::pickEmitters` (`src/backward.h`) and `dPickEmitters`
+(`src/render_cuda.cu`) replace the `for (e = 0; e < nEm; ++e)` loop bound with a set of
+(emitter, 1/pdf) draws, so `sum_e w_e` becomes `sum_selected w_e / p(e)` — same
+expectation, bounded cost. Flags: `-no-lighttree`, `-light-split <v>`,
+`-light-samples <n>`. Same benchmark, same 256 spp, same 6.25 % noise:
+
+| N lights | before | after | image mean before/after |
+|---:|---:|---:|---:|
+| 1 | 0.4 s | 0.4 s | — (no tree is built for one light) |
+| 4 | 0.7 s | 0.5 s | |
+| 16 | 3.3 s | 1.0 s | |
+| 64 | 15.1 s | 1.8 s | |
+| 256 | **75.9 s** | **2.7 s** | 37.745 / 37.749 (ratio 1.00012) |
+
+The 190× blow-up is now 6.75×. Unbiasedness was checked where a biased tree would
+show, not just where it is easy: a 40 m corridor with 256 panels spanning orders of
+magnitude of per-light importance (`scraps/gen_corridor.py`) renders 6.1 s → 0.6 s with
+means within 0.07 % of the no-tree reference. Variance is unchanged (16 spp vs a
+4096-spp reference: RMSE 6.616 no-tree, 6.665 with the default 8 samples).
+
+**The CPU had a second, non-obvious O(N) term** that only became visible once the shadow
+rays were gone: the per-sample emitter-SPD table, which evaluated every emitter's
+spectrum at every sampled wavelength (1024 Planck evaluations per sample at N=256, C=4)
+and then summed over emitters again to derive `invPdfLambda`. Fixed by factoring every
+emitter SPD as `base_g(lambda) * scale_e` (`SharedSpectrum`/`ScaledSpectrum` in
+`src/spectrum.h`, memoised in the FTSL loader, collected by `Scene::buildSpdBases`) so
+the table is over DISTINCT curves, and by folding `sum_e geomWeight_e*SPD_e` into
+`sum_g spdBase[g] * spdBaseGeom[g]`. CPU ml256 at 64 spp: **524.7 s → 7.0 s (75×)**,
+against 2.6 s for the same room with one light. Exactness: `-no-lighttree` on the new
+build reproduces the old binary **bit-for-bit** on a 10-scene corpus (both devices).
+
+Still open at this level: the forward/BDPT/VCM `selectEmitter` power CDF does not yet
+use the tree, and a mesh emitter's own triangles are still sampled by area (the top of
+this entry).
 
 ### FIXED (2026-08-12, v0.183.2): `-prebake` announced a too-small cap only after hitting it, so playback fell off a cliff mid-loop with no warning
 

@@ -17,6 +17,11 @@ rationale, prior art and scoping live in that entry, not here.
 > The one piece of *new* work identified since is not a TODO.md item at all but a
 > `known-issues.md` entry: **many-lights importance sampling** (a light BVH / Conty–Kulla
 > tree, optionally ReSTIR DI on top), logged when mesh area lights shipped in v0.186.0.
+>
+> **Update 2026-08-16 (v0.187.0):** the emitter-level light tree has landed on both
+> devices (75.9 s → 2.7 s GPU / 524.7 s → 7.0 s CPU on the 256-light benchmark, unbiased).
+> What remains of that entry is the *mesh-triangle* level, using the tree for
+> forward/BDPT/VCM emitter selection, and ReSTIR DI — see section 1.
 
 Keep the two in sync: when an item below lands, mark it DONE in **both** files (or delete it
 here and record the DONE in `TODO.md`). When a new open item appears in `TODO.md`, add it here.
@@ -31,6 +36,23 @@ without asking.
 ### Many-lights importance sampling — a light BVH, then optionally ReSTIR DI  *(ftrace)*
 *Not a TODO.md item — logged in `known-issues.md` (first Open entry) when mesh area lights
 shipped in v0.186.0. The only genuinely open, unblocked engineering work as of 2026-08-15.*
+
+> **PARTLY DONE 2026-08-16 (v0.187.0): the emitter-level tree shipped, on both devices.**
+> `src/lighttree.h` + `src/lighttree_build.h` + `Scene::buildLightTree`, consumed by
+> `BackwardRenderer::pickEmitters` and `dPickEmitters`. The 256-panel benchmark below went
+> **75.9 s → 2.7 s** on the GPU and **524.7 s → 7.0 s** on the CPU (which needed a second
+> fix: the per-sample emitter-SPD table, now factored over distinct spectra — see the
+> `lighttree.h` module entry in `design.md`). Unbiased: `-no-lighttree` reproduces the old
+> binary bit-for-bit on a 10-scene corpus, and the deliberately hard 40 m-corridor case
+> lands within 0.07 % of its reference. Flags: `-no-lighttree` / `-lighttree` /
+> `-light-split` / `-light-samples`.
+>
+> **Still open, which is why this entry stays in section 1:** (a) forward/BDPT/VCM still
+> select an emitter from the power CDF (`selectEmitter`, `render_cuda.cu`) — the tree is
+> already built and uploaded, so this is a small change; (b) a **mesh** emitter's own
+> triangles are still sampled uniformly by area, which is the occlusion problem the
+> paragraph below measures, and is the phase the tree was designed to extend into (descend
+> from an emitter leaf into that emitter's triangle tree); (c) ReSTIR DI, unstarted.
 
 Emitter selection is a **power CDF** and, within an emitter, the draw is **uniform** (by area
 for `Mesh`, by surface for quad/cylinder). Neither consults the shading point, so any part of

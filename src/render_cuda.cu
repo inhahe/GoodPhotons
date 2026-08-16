@@ -85,6 +85,8 @@
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
 #include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
+#include "lighttree.h"    // Conty-Kulla light BVH: the SAME traversal the CPU runs, not a copy
+                          // (the header is dependency-free and __host__ __device__ for this)
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
 // every kernel launch/sync return code MUST be checked: under GPU contention (a second
@@ -968,6 +970,18 @@ struct DScene {
     const DEmitter*  emitters; int nEmitters;
     const double*    emitCdf;       // size nEmitters, cumulative power, normalised
     double           totalPower;
+    // Conty-Kulla light BVH over the emitters (lighttree.h), uploaded VERBATIM from
+    // Scene::lightTree — LightTreeNode is POD holding only doubles and child INDICES, and
+    // `dems` is built 1:1 with scene.emitters, so a leaf's `emitter` field indexes this
+    // DEmitter array directly with no remap. lightTreeRoot < 0 => no tree (fewer than two
+    // tree-eligible emitters, or the host build declined), and the device then falls back
+    // to the exact all-emitters loop. `lightTreeAlways` lists emitters with no usable
+    // spatial bound (distant suns) that are connected unconditionally.
+    const LightTreeNode* lightTree; int lightTreeRoot;
+    const int*       lightTreeAlways; int nLightTreeAlways;
+    int              bkLightTree;    // 0 = -no-lighttree: exact all-emitters splitting
+    double           bkLightSplit;   // -light-split
+    int              bkLightSamples; // -light-samples
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
     const DTexture*  textures; int nTex;   // reflectance textures (mat.reflectTex)
     // N-D data tables (§grids), reached from a pattern as `grid:<name>(c0, …)` (regular
@@ -7402,6 +7416,56 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     return true;
 }
 
+// ---- many-lights selection on the device (device twin of BackwardRenderer::pickEmitters)
+//
+// Every NEE routine below used to loop `k = 0 .. nEmitters`, connecting a shadow ray to
+// every light at every non-specular vertex. Unbiased, but O(N) per bounce for nothing once
+// the lights are redundant — measured on THIS backend: same room, same total flux split
+// across N ceiling panels, mode R 256 spp 256^2, 1 light 0.4 s vs 256 lights 75.9 s at an
+// identical 6.25 % noise. The draw below replaces the loop bound: it returns the emitters
+// to connect to plus 1/p(e) for each, turning `sum_e w_e` into `sum_selected w_e / p(e)`.
+//
+// kDMaxLightPick is deliberately half the CPU's 32: the LtSample array and ltSample's
+// traversal stack are per-thread local-memory frames in a megakernel that is already
+// register-starved, so every slot is paid by every thread. 16 connections per vertex is
+// far past the point where more splitting improves the image.
+#define kDMaxLightPick 16
+
+struct DEmitterDraw {
+    int  n;             // number of connections to make
+    bool all;           // true: entries are emitters 0..n-1, each with weight 1 (the old loop)
+    LtSample s[kDMaxLightPick];
+    __device__ int emitter(int i) const { return all ? i : s[i].emitter; }
+    __device__ double weight(int i) const {
+        return all ? 1.0 : (s[i].pdf > 0.0 ? 1.0 / s[i].pdf : 0.0);
+    }
+};
+
+// `nrm` is the receiver normal, or null at a volume vertex (which has none to bound with).
+// Mode W keeps the exact path: its deterministic G x G lattice has no variance to trade.
+__device__ static void dPickEmitters(const DScene& sc, const DVec3& p, const DVec3* nrm,
+                                     DRng& rng, DEmitterDraw& d) {
+    d.n = 0; d.all = false;
+    if (!sc.bkLightTree || sc.bkWhitted || sc.lightTreeRoot < 0 || !sc.lightTree) {
+        d.all = true; d.n = sc.nEmitters; return;
+    }
+    for (int i = 0; i < sc.nLightTreeAlways && d.n < kDMaxLightPick; ++i) {
+        d.s[d.n].emitter = sc.lightTreeAlways[i];
+        d.s[d.n].pdf = 1.0;
+        ++d.n;
+    }
+    int budget = sc.bkLightSamples;
+    if (budget > kDMaxLightPick - d.n) budget = kDMaxLightPick - d.n;
+    if (budget > 0) {
+        const double pp[3] = {(double)p.x, (double)p.y, (double)p.z};
+        double nn[3] = {0.0, 0.0, 0.0};
+        if (nrm) { nn[0] = (double)nrm->x; nn[1] = (double)nrm->y; nn[2] = (double)nrm->z; }
+        d.n += ltSample<DRng, kDMaxLightPick + 2>(
+                   sc.lightTree, sc.lightTreeRoot, pp, nn, nrm != nullptr,
+                   sc.bkLightSplit, budget, d.s + d.n, rng);
+    }
+}
+
 // `giDepth` selects mode W's shadow-ray grid: 0 = a primary vertex (bkGrid), 1 = a gather
 // vertex (the coarser bkGiGrid — its soft-shadow detail is about to be averaged over giDirs
 // directions anyway, so paying bkGrid^2 there multiplies the gather's cost for no return).
@@ -7416,7 +7480,11 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
     Real f = rho / (Real)DPI;                         // Lambertian BRDF
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     const bool whitted = (sc.bkWhitted != 0);
-    for (int k = 0; k < sc.nEmitters; ++k) {
+    DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
+    for (int di = 0; di < draw.n; ++di) {
+        const int k = draw.emitter(di);
+        const double selW = draw.weight(di);            // 1/p(e); exactly 1 on the all path
+        if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnv)
         const bool uv = dEmitterNeedsUV(em);
@@ -7447,7 +7515,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                 contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, g.dist, lambda, rng);
             acc += contrib;
         }
-        total += (nS > 1) ? acc / (double)nS : acc;
+        total += ((nS > 1) ? acc / (double)nS : acc) * selW;
     }
     return total;
 }
@@ -7463,13 +7531,19 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
                                       int giDepth = 0) {
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     const bool whitted = (sc.bkWhitted != 0);
-    for (int k = 0; k < sc.nEmitters; ++k) {
+    DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
+    for (int di = 0; di < draw.n; ++di) {
+        const int k = draw.emitter(di);
+        const double selW = draw.weight(di);            // 1/p(e); exactly 1 on the all path
+        if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;
         const bool uv = dEmitterNeedsUV(em);
         const int G = (whitted && uv) ? (giDepth ? sc.bkGiGrid : sc.bkGrid) : 1;
         const int nS = G * G;
-        const double invS = 1.0 / (double)nS;
+        // Folding the selection weight into the per-sample scale keeps the all-emitters
+        // path bit-identical (selW is exactly 1.0 there, and x*1.0 == x).
+        const double invS = ((nS > 1) ? 1.0 / (double)nS : 1.0) * selW;
         for (int s = 0; s < nS; ++s) {
             Real su1 = (Real)0, su2 = (Real)0;
             if (whitted) { if (uv) dGridUV(s, G, su1, su2); }
@@ -7484,7 +7558,7 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
                     : g.spot
                     ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
                     : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
-                L[i] += (nS > 1) ? thr[i] * contrib * invS : thr[i] * contrib;
+                L[i] += thr[i] * contrib * invS;
             }
         }
     }
@@ -7503,7 +7577,12 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
     double total = 0.0;
     Real alb = medAlbedo(med, lambda);
     if (alb <= (Real)0) return 0.0;
-    for (int k = 0; k < sc.nEmitters; ++k) {
+    // No shading normal at a fog vertex, so the tree bounds on the receiver side only.
+    DEmitterDraw draw; dPickEmitters(sc, p, nullptr, rng, draw);
+    for (int di = 0; di < draw.n; ++di) {
+        const int k = draw.emitter(di);
+        const double selW = draw.weight(di);            // 1/p(e); exactly 1 on the all path
+        if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnvVolume)
         if (em.shape == 2) {
@@ -7520,7 +7599,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
             double contrib = (double)(alb * phase * fall / dist2) * emitW;
             contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
-            total += contrib;
+            total += contrib * selW;
             continue;
         }
         if (em.shape == 6) {
@@ -7535,7 +7614,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
             double contrib = (double)(alb * phase) * emitW * em.spotOmega;
             contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
-            total += contrib;
+            total += contrib * selW;
             continue;
         }
         Real u1 = rng.uniform(), u2 = rng.uniform();
@@ -7555,7 +7634,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         double contrib = (double)(alb * phase * G) * emitW * (double)em.area;
         if (epat != 1.0) contrib *= epat;                 // no-op without a pattern
         contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
-        total += contrib;
+        total += contrib * selW;
     }
     return total;
 }
@@ -8776,7 +8855,12 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
     DVec3 total(0, 0, 0);
     DVec3 f = rhoRGB / (Real)DPI;                     // Lambertian BRDF (per channel)
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
-    for (int k = 0; k < sc.nEmitters; ++k) {
+    DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
+    for (int di = 0; di < draw.n; ++di) {
+        const int k = draw.emitter(di);
+        const double selW = draw.weight(di);           // 1/p(e); exactly 1 on the all path
+        if (selW <= 0.0) continue;
+        const Real selWr = (Real)selW;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;  // collimated beams / env (env: bkNeeEnvRGB)
         if (em.shape == 2) {                           // point spot
@@ -8791,7 +8875,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
             if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
-            total = total + hadamard(f * (fall * cosSurf / dist2 * stG), em.rgbEmit);
+            total = total + hadamard(f * (fall * cosSurf / dist2 * stG * selWr), em.rgbEmit);
             continue;
         }
         if (em.shape == 6) {                           // distant sun: cone NEE, 1/pdfW = Omega
@@ -8803,7 +8887,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             if (stG <= (Real)0) continue;
             Real dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
             if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist)) continue;
-            total = total + hadamard(f * (Real)((double)(cosSurf * stG) * em.spotOmega), em.rgbEmit);
+            total = total + hadamard(f * (Real)((double)(cosSurf * stG) * em.spotOmega * selW), em.rgbEmit);
             continue;
         }
         Real u1 = rng.uniform(), u2 = rng.uniform();
@@ -8824,7 +8908,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
         Real G = cosSurf * cosLight / dist2;
         if (epat != 1.0) G = (Real)((double)G * epat);   // no-op without a pattern
-        total = total + hadamard(f * (G * em.area * stG), em.rgbEmit);
+        total = total + hadamard(f * (G * em.area * stG * selWr), em.rgbEmit);
     }
     return total;
 }
@@ -12884,6 +12968,18 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.recCoeff = d_recCoeff; sc.recDrivers = d_recDrv; sc.recScalarStops = d_recStops;
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
+    // Light BVH: POD nodes referring to each other by index, so a straight memcpy. The
+    // knobs come from lt:: (the same globals the CPU BackwardRenderer reads) so a scene
+    // rendered on either backend makes the same selection decisions.
+    sc.lightTree       = scene.lightTree.empty() ? nullptr
+                                                 : (const LightTreeNode*)keep(uploadVec(scene.lightTree));
+    sc.lightTreeRoot   = scene.lightTree.empty() ? -1 : scene.lightTreeRoot;
+    sc.lightTreeAlways = scene.lightTreeAlways.empty() ? nullptr
+                                                       : (const int*)keep(uploadVec(scene.lightTreeAlways));
+    sc.nLightTreeAlways = (int)scene.lightTreeAlways.size();
+    sc.bkLightTree     = lt::gEnabled ? 1 : 0;
+    sc.bkLightSplit    = lt::gSplit;
+    sc.bkLightSamples  = lt::gSamples;
     sc.lightCdfAll = d_cdfAll;
     sc.textures = d_tex; sc.nTex = (int)dtex.size();
     // N-D data tables upload VERBATIM — the host PatGrid / PatScatter headers refer to

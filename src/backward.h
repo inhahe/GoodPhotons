@@ -316,10 +316,27 @@ struct BackwardRenderer {
     // wavelengths no longer equal the cached ones. Cached values are the exact
     // doubles spdFn returned and the consumers keep the same iteration order and
     // arithmetic shape, so images stay bit-identical.
+    //
+    // FACTORED (v0.187.0): the table is over DISTINCT base curves, not emitters, and an
+    // emitter's value is base*scale (Scene::spdBase / spdBaseIdx / spdScale). Two reasons.
+    // The evaluation count drops from one per emitter to one per distinct spectrum, which
+    // for a room lit by N copies of one fixture is the whole many-lights cost once the
+    // light BVH has removed the shadow rays; and the table itself stops being O(N) MEMORY
+    // rewritten every sample — at 256 emitters x 4 wavelengths the old layout stored 8 KB
+    // per sample, which at 4 M samples is tens of GB of pure store traffic. The value is
+    // bit-identical either way: base*scale is literally how the emitter's own Spectrum
+    // computes itself (ScaledSpectrum::operator(), spectrum.h).
     struct SpdCache {
-        const double* lam = nullptr;  // wavelengths the table was built for
-        const double* spd = nullptr;  // emitter-major: spd[e*C + i] = emitters[e].spdFn(lam[i])
+        const double* lam = nullptr;   // wavelengths the table was built for
+        const double* base = nullptr;  // base-major: base[g*C + i] = spdBase[g](lam[i])
+        const int*    baseIdx = nullptr;  // emitter -> base index
+        const double* scale = nullptr;    // emitter -> constant factor
         int C = 0;
+        int iOff = 0;                  // wavelength-axis offset of this (possibly sliced) view
+        // emitters[e].spdFn(lam[i]) — exactly, not approximately.
+        double at(int e, int i) const {
+            return base[(size_t)baseIdx[e] * (size_t)C + (size_t)(iOff + i)] * scale[e];
+        }
         bool matches(const double* l, int nUp) const {
             for (int i = 0; i < nUp; ++i) if (l[i] != lam[i]) return false;
             return true;
@@ -687,6 +704,62 @@ struct BackwardRenderer {
         u2 = ((double)(g / G) + 0.5) / (double)G;
     }
 
+    // ---- many-lights selection (the Conty-Kulla light BVH, lighttree.h) ------------
+    //
+    // Historically every NEE vertex connected a shadow ray to EVERY emitter. That is an
+    // unbiased splitting estimator and it is fine for one lamp, but it costs O(N) per
+    // bounce and buys nothing once the lights are redundant: same room, same TOTAL flux
+    // split across N ceiling panels, mode R 256 spp — 1 light 0.4 s, 256 lights 75.9 s,
+    // at an IDENTICAL 6.25 % noise (scraps/gen_manylights.py). 190x for the same image.
+    //
+    // `pickEmitters` replaces the loop bound: it hands back the emitters to connect to
+    // at this vertex together with 1/pdf for each, so `sum_e w_e` becomes
+    // `sum_selected w_e / p(e)` — same expectation, bounded cost. When the tree is
+    // absent (one light, mode W's deterministic grid, -no-lighttree) it reports "all
+    // emitters, weight 1", i.e. literally the old loop, drawing the rng in the old
+    // order so those scenes stay bit-identical.
+    bool   lightTree = lt::gEnabled;   // -no-lighttree: force the exact all-emitters estimator
+    double lightSplit = lt::gSplit;    // adaptive-splitting threshold, (node radius / distance)^2
+    int    lightSamples = lt::gSamples;// cap on emitters connected per vertex
+    static constexpr int kMaxLightPick = 32;
+
+    struct EmitterDraw {
+        int n = 0;                       // number of connections to make
+        bool all = false;                // true: entries are emitters 0..n-1, each pdf 1
+        LtSample s[kMaxLightPick];
+        int emitter(int i) const { return all ? i : s[i].emitter; }
+        // 1/p(e) — the weight that makes selection unbiased against the old sum.
+        double weight(int i) const { return all ? 1.0 : (s[i].pdf > 0.0 ? 1.0 / s[i].pdf : 0.0); }
+    };
+
+    // `n` is the receiver normal, or null at a volume vertex (no normal to bound with).
+    EmitterDraw pickEmitters(const Scene& scene, const Vec3& p, const Vec3* nrm,
+                             Pcg32& rng) const {
+        EmitterDraw d;
+        const int nEm = (int)scene.emitters.size();
+        // Mode W wants its deterministic G x G grid on every light and has no variance to
+        // trade away, so it always takes the exact path.
+        if (!lightTree || whitted || scene.lightTreeRoot < 0 || scene.lightTree.empty()) {
+            d.all = true; d.n = nEm; return d;
+        }
+        // Emitters with no usable spatial bound (a distant sun) are outside the tree and
+        // are always connected, exactly as before.
+        for (int e : scene.lightTreeAlways) {
+            if (d.n >= kMaxLightPick) break;
+            d.s[d.n++] = LtSample{e, 1.0};
+        }
+        int budget = lightSamples;
+        if (budget > kMaxLightPick - d.n) budget = kMaxLightPick - d.n;
+        if (budget > 0) {
+            const double pp[3] = {p.x, p.y, p.z};
+            double nn[3] = {0, 0, 0};
+            if (nrm) { nn[0] = nrm->x; nn[1] = nrm->y; nn[2] = nrm->z; }
+            d.n += ltSample(scene.lightTree.data(), scene.lightTreeRoot, pp, nn,
+                            nrm != nullptr, lightSplit, budget, d.s + d.n, rng);
+        }
+        return d;
+    }
+
     // `hs` non-null routes the connection through the fiber BCSDF (see emitterGeom); the
     // caller then passes rho == 1, because the strand's colour is already inside the BCSDF
     // (its sigma_a) and the PI in emitterGeom's response cancels the rho/PI below.
@@ -706,8 +779,13 @@ struct BackwardRenderer {
         // path (post-de-hero interactMaterial) reuses the hero table's i==0 column;
         // a fluorescent λ-switch fails matches() and falls back to a live spdFn call.
         const bool cached = spdCache && spdCache->matches(&lambda, 1);
-        const int nEm = (int)scene.emitters.size();
-        for (int e = 0; e < nEm; ++e) {
+        // Which lights to connect to, and with what 1/pdf. `all` reproduces the old
+        // loop over every emitter (weight 1) bit-for-bit, including its rng order.
+        const EmitterDraw draw = pickEmitters(scene, h.p, &h.n, rng);
+        for (int di = 0; di < draw.n; ++di) {
+            const int e = draw.emitter(di);
+            const double selW = draw.weight(di);
+            if (selW <= 0.0) continue;
             const Emitter& em = scene.emitters[e];
             const bool uv = emitterNeedsUV(em);
             // Whitted: G x G deterministic shadow rays per area light, averaged. A
@@ -739,8 +817,7 @@ struct BackwardRenderer {
                 if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, hs,
                                  dctx ? &dc : nullptr)) continue;
                 if (!haveSpd) {   // evaluated at most once per emitter, as before
-                    spdV = cached ? spdCache->spd[(size_t)e * (size_t)spdCache->C]
-                                  : em.spdFn(lambda);
+                    spdV = cached ? spdCache->at(e, 0) : em.spdFn(lambda);
                     haveSpd = true;
                 }
                 double contrib = (rho / PI) * (spdV * invPdfLambda) * w;
@@ -748,7 +825,9 @@ struct BackwardRenderer {
                     contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 acc += contrib;
             }
-            total += (nS > 1) ? acc / (double)nS : acc;
+            // selW is 1 on the exact path, so this multiply is a no-op there (and the
+            // `nS > 1` branch keeps its original float ordering).
+            total += ((nS > 1) ? acc / (double)nS : acc) * selW;
         }
         return total;
     }
@@ -763,8 +842,11 @@ struct BackwardRenderer {
                       GiCtx gi = GiCtx{}) const {
         const Vec3 ngo = orientedGeoN(h);
         const bool cached = spdCache && spdCache->matches(lam, nUp);
-        const int nEm = (int)scene.emitters.size();
-        for (int e = 0; e < nEm; ++e) {
+        const EmitterDraw draw = pickEmitters(scene, h.p, &h.n, rng);
+        for (int di = 0; di < draw.n; ++di) {
+            const int e = draw.emitter(di);
+            const double selW = draw.weight(di);
+            if (selW <= 0.0) continue;
             const Emitter& em = scene.emitters[e];
             const bool uv = emitterNeedsUV(em);
             const int G = (whitted && uv) ? (gi.depth ? giGrid : lightGrid) : 1;
@@ -776,11 +858,11 @@ struct BackwardRenderer {
                 else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
                 double dist = 0.0, w = 0.0;
                 if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w)) continue;
-                const double ws = (nS > 1) ? w * invS : w;
+                double ws = (nS > 1) ? w * invS : w;
+                ws *= selW;                       // no-op (bit-exact) on the exact path
                 if (cached) {
-                    const double* spdE = spdCache->spd + (size_t)e * (size_t)spdCache->C;
                     for (int i = 0; i < nUp; ++i)
-                        L[i] += thr[i] * (rho[i] / PI) * (spdE[i] * invPdf[i]) * ws;
+                        L[i] += thr[i] * (rho[i] / PI) * (spdCache->at(e, i) * invPdf[i]) * ws;
                 } else {
                     for (int i = 0; i < nUp; ++i)
                         L[i] += thr[i] * (rho[i] / PI) * (em.spdFn(lam[i]) * invPdf[i]) * ws;
@@ -884,10 +966,14 @@ struct BackwardRenderer {
                      const SpdCache* spdCache = nullptr) const {
         double total = 0.0;
         const bool cached = spdCache && spdCache->matches(&lambda, 1);
-        const int nEmV = (int)scene.emitters.size();
-        for (int e = 0; e < nEmV; ++e) {
+        // A fog vertex has no normal, so the tree's receiver-cosine bound is skipped.
+        const EmitterDraw draw = pickEmitters(scene, p, nullptr, rng);
+        for (int di = 0; di < draw.n; ++di) {
+            const int e = draw.emitter(di);
+            const double selW = draw.weight(di);
+            if (selW <= 0.0) continue;
             const Emitter& em = scene.emitters[e];
-            const double spdV = cached ? spdCache->spd[(size_t)e * (size_t)spdCache->C]
+            const double spdV = cached ? spdCache->at(e, 0)
                                        : 0.0;   // live spdFn below when not cached
             if (em.collimated) continue;
             if (em.shape == EmitterShape::Spot) {
@@ -903,7 +989,7 @@ struct BackwardRenderer {
                 double albedo = scene.backwardMedium().albedo(lambda);
                 double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
-                total += albedo * phase * emitW * fall / dist2 * T;
+                total += albedo * phase * emitW * fall / dist2 * T * selW;
                 continue;
             }
             if (em.shape == EmitterShape::Sun) {
@@ -917,7 +1003,7 @@ struct BackwardRenderer {
                 double albedo = scene.backwardMedium().albedo(lambda);
                 double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
-                total += albedo * phase * emitW * em.spotOmega * T;
+                total += albedo * phase * emitW * em.spotOmega * T * selW;
                 continue;
             }
             double u1 = rng.uniform(), u2 = rng.uniform();
@@ -956,7 +1042,7 @@ struct BackwardRenderer {
                 if (epat != 1.0) contrib *= epat;
             }
             contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
-            total += contrib;
+            total += contrib * selW;           // selW == 1 on the exact all-emitters path
         }
         return total;
     }
@@ -1893,10 +1979,10 @@ struct BackwardRenderer {
                         double sLam = lam[i], sInv = invPdf[i], sThr = thr[i];
                         SpdCache sCache;                     // re-point at λ_i's COLUMN
                         const SpdCache* sCp = nullptr;
-                        if (spdCache && spdCache->lam && spdCache->spd && i < spdCache->C) {
-                            sCache.lam = spdCache->lam + i;
-                            sCache.spd = spdCache->spd + i;
-                            sCache.C   = spdCache->C;
+                        if (spdCache && spdCache->lam && spdCache->base && i < spdCache->C) {
+                            sCache = *spdCache;              // same table, one λ column
+                            sCache.lam  = spdCache->lam + i;
+                            sCache.iOff = spdCache->iOff + i;
                             sCp = &sCache;
                         }
                         double sub[hero::kHeroMax];
@@ -2083,17 +2169,17 @@ struct BackwardRenderer {
                             MediumStack sStk = stk;
                             Ray sRay = ray;
                             // Re-point the emitter-SPD cache at wavelength i's COLUMN. The
-                            // table is emitter-major with stride C (spd[e*C + i]), so offsetting
-                            // the base by i and KEEPING the stride makes the sub-path's
-                            // spd[e*C + 0] read exactly emitter e at λ_i -- zero-copy, and
-                            // matches(&sLam, 1) still validates against lam[i]. Without this the
-                            // cache would silently hand the sub-path the HERO's SPD values.
+                            // table is base-major with stride C, so bumping `iOff` by i makes
+                            // the sub-path's at(e, 0) read exactly emitter e at λ_i -- zero-
+                            // copy, and matches(&sLam, 1) still validates against lam[i].
+                            // Without this the cache would silently hand the sub-path the
+                            // HERO's SPD values.
                             SpdCache sCache;
                             const SpdCache* sCp = nullptr;
-                            if (spdCache && spdCache->lam && spdCache->spd && i < spdCache->C) {
-                                sCache.lam = spdCache->lam + i;
-                                sCache.spd = spdCache->spd + i;
-                                sCache.C   = spdCache->C;
+                            if (spdCache && spdCache->lam && spdCache->base && i < spdCache->C) {
+                                sCache = *spdCache;
+                                sCache.lam  = spdCache->lam + i;
+                                sCache.iOff = spdCache->iOff + i;
                                 sCp = &sCache;
                             }
                             if (interactMaterial(scene, m, h, mats, sRay, sLam, sInv, sThr, sL,
@@ -2177,11 +2263,37 @@ struct BackwardRenderer {
         const bool useHero = (C > 1) && !scene.backwardMedium().enabled &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         const uint64_t nPix = (uint64_t)film.resX * (uint64_t)film.resY;
-        // Per-sample emitter-SPD table (see SpdCache): nEm×C (nEm×1 on the scalar
-        // path), allocated once per renderRows call (i.e. per thread) and refilled
-        // for every sample.
+        // Per-sample SPD table (see SpdCache): nBase×C (nBase×1 on the scalar path),
+        // allocated once per renderRows call (i.e. per thread) and refilled for every
+        // sample. Shared-SPD factorisation (Scene::spdBase / spdBaseIdx / spdScale):
+        // each emitter is base_g(lambda) * scale_e, so the table is over DISTINCT curves
+        // — one evaluation per curve plus a multiply at READ time per emitter, instead of
+        // one evaluation AND one store per emitter. Exact: `base*scale` is how the
+        // emitter's own Spectrum computes itself (ScaledSpectrum, spectrum.h).
         const int nEm = (int)scene.emitters.size();
-        std::vector<double> spdBuf((size_t)nEm * (size_t)(useHero ? C : 1));
+        const bool haveBases = ((int)scene.spdBaseIdx.size() == nEm) &&
+                               ((int)scene.spdScale.size() == nEm) && !scene.spdBase.empty();
+        // Fallback for a scene whose bases were never built (finalizeEmitters not run):
+        // every emitter is its own base with scale 1, i.e. the pre-factorisation layout.
+        std::vector<int>    fbIdx;
+        std::vector<double> fbScale;
+        std::vector<double> fbGeom;
+        if (!haveBases) {
+            fbIdx.resize((size_t)nEm);
+            for (int e = 0; e < nEm; ++e) fbIdx[(size_t)e] = e;
+            fbScale.assign((size_t)nEm, 1.0);
+            fbGeom.resize((size_t)nEm);
+            for (int e = 0; e < nEm; ++e) fbGeom[(size_t)e] = scene.emitters[e].geomWeight();
+        }
+        const int     nBase    = haveBases ? (int)scene.spdBase.size() : nEm;
+        const int*    baseIdx  = haveBases ? scene.spdBaseIdx.data() : fbIdx.data();
+        const double* baseScl  = haveBases ? scene.spdScale.data()   : fbScale.data();
+        // Per-base geomWeight*scale sums (Scene::spdBaseGeom): lets the per-sample
+        // invPdfLambda = emitG / sum_e geomWeight_e*SPD_e(lambda) be evaluated over
+        // BASES instead of emitters, which is what removes the last O(N_lights) term
+        // from the backward CPU sample loop.
+        const double* baseGeom = haveBases ? scene.spdBaseGeom.data() : fbGeom.data();
+        std::vector<double> baseBuf((size_t)nBase * (size_t)(useHero ? C : 1));
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
@@ -2204,24 +2316,24 @@ struct BackwardRenderer {
                         double uLam = whitted ? whittedLambdaU(sIdx) : rng.uniform();
                         if (!hero::sampleBundle(scene.emitSampler, uLam, C,
                                                 lamA, pdfA)) continue;
-                        // Fill the per-sample SPD table, then derive invA from it by
-                        // replicating Scene::invPdfLambda on the cached values (same
-                        // emitter order, same zero guard — bit-identical). The NEE
-                        // connections down the path then reuse the table instead of
-                        // re-dispatching spdFn per emitter per bounce.
-                        for (int e = 0; e < nEm; ++e) {
-                            const Emitter& em = scene.emitters[e];
-                            for (int i = 0; i < C; ++i)
-                                spdBuf[(size_t)e * C + i] = em.spdFn(lamA[i]);
+                        // Fill the per-sample SPD table (one evaluation per DISTINCT
+                        // curve), then derive invA from it — Scene::invPdfLambda
+                        // regrouped over bases, same zero guard. The NEE connections
+                        // down the path then read the table through SpdCache::at()
+                        // instead of re-dispatching spdFn per emitter per bounce.
+                        for (int g = 0; g < nBase; ++g) {
+                            const Spectrum& bs = haveBases ? scene.spdBase[g]
+                                                           : scene.emitters[g].spdFn;
+                            for (int i = 0; i < C; ++i) baseBuf[(size_t)g * C + i] = bs(lamA[i]);
                         }
+                        SpdCache spdCache{lamA, baseBuf.data(), baseIdx, baseScl, C, 0};
                         for (int i = 0; i < C; ++i) {
                             if (i > 0 && pdfA[i] <= 0.0) { invA[i] = 0.0; continue; }
                             double g = 0.0;
-                            for (int e = 0; e < nEm; ++e)
-                                g += scene.emitters[e].geomWeight() * spdBuf[(size_t)e * C + i];
+                            for (int b = 0; b < nBase; ++b)
+                                g += baseGeom[(size_t)b] * baseBuf[(size_t)b * C + i];
                             invA[i] = (g > 0.0) ? scene.emitG / g : 0.0;
                         }
-                        SpdCache spdCache{lamA, spdBuf.data(), C};
                         double jx, jy;
                         if (whitted) whittedSample(sIdx, jx, jy);
                         else { jx = rng.uniform(); jy = rng.uniform(); }
@@ -2249,15 +2361,16 @@ struct BackwardRenderer {
                         : scene.emitSampler.sample(rng, pdf);
                     if (pdf <= 0) continue;
                     // Fill the per-sample SPD table (C=1) and derive invPdfLambda from
-                    // it, replicating Scene::invPdfLambda on the cached values (same
-                    // emitter order, same zero guard — bit-identical, = emitG/g(λ)).
-                    for (int e = 0; e < nEm; ++e)
-                        spdBuf[e] = scene.emitters[e].spdFn(lambda);
+                    // it — Scene::invPdfLambda regrouped over bases, same zero guard,
+                    // = emitG/g(λ).
+                    for (int g = 0; g < nBase; ++g)
+                        baseBuf[(size_t)g] = haveBases ? scene.spdBase[g](lambda)
+                                                       : scene.emitters[g].spdFn(lambda);
+                    SpdCache spdCache{&lambda, baseBuf.data(), baseIdx, baseScl, 1, 0};
                     double gSum = 0.0;
-                    for (int e = 0; e < nEm; ++e)
-                        gSum += scene.emitters[e].geomWeight() * spdBuf[e];
+                    for (int b = 0; b < nBase; ++b)
+                        gSum += baseGeom[(size_t)b] * baseBuf[(size_t)b];
                     double invPdfLambda = (gSum > 0.0) ? scene.emitG / gSum : 0.0;
-                    SpdCache spdCache{&lambda, spdBuf.data(), 1};
                     if (cam.hasLens()) {
                         // Physical multi-element lens: trace the camera ray from the
                         // film out through the real glass interfaces at this wavelength

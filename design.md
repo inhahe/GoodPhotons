@@ -1667,6 +1667,71 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   is the entire spectral quadrature, so narrowing it does not add noise that more samples
   would remove — it changes the answer. `warnWhittedHeroCollapse` guards the batch path
   (the viewer already guarded itself via `wNeedSpp`); see `known-issues.md`.
+- **`lighttree.h` / `lighttree_build.h`** (0.187.0) — the **Conty–Kulla adaptive light
+  BVH**, the many-lights selector. `lighttree.h` holds the node layout and `ltSample()`
+  and is deliberately **dependency-free** (`<cmath>`, `<cstdint>`; `LT_FN` =
+  `__host__ __device__ inline` under `__CUDACC__`) so the `.cu` includes the *same*
+  traversal source the CPU compiles — one implementation of the importance heuristic,
+  not two that can drift. Nodes carry spatial bounds, a bounding cone of emission
+  normals (axis, `cosθ_o`, `cosθ_e`) and subtree flux; importance is
+  `power · cos(θ − θ_o − θ_u) / d²` against a `θ_u`-widened `|cos|` at the receiver.
+  `lighttree_build.h` does the build; `Scene::buildLightTree()` calls it from
+  `finalizeEmitters()`, so every path that rebuilds the emitter list (`-ignoreenv`,
+  `applyIgnoreFlags`, the built-in scenes) gets a matching tree rather than a stale one.
+  The CLI knobs live in the header as `lt::gEnabled` / `lt::gSplit` / `lt::gSamples`
+  (the `hero::gSplit` pattern — `inline` variables, legal in the `.cu` because
+  `CMAKE_CUDA_STANDARD` is 17), which is what lets `render_cuda.cu` read the same policy
+  `main.cpp` set without a second copy of the flags.
+
+  **Why it exists, and what it replaced.** Backward NEE ran `for (e = 0; e < nEm; ++e)`
+  and cast a shadow ray to *every* emitter at *every* non-specular vertex — an unbiased
+  splitting estimator whose cost is O(N_lights) per bounce. Measured on the GPU (mode R,
+  256 spp, 256², same room, same total 20 000 lm): 1 light 0.4 s → 256 lights **75.9 s**,
+  at an identical 6.25 % noise. `BackwardRenderer::pickEmitters` and its device mirror
+  `dPickEmitters` now replace the loop *bound* only: they hand back a set of
+  (emitter, `1/pdf`) draws, so `sum_e w_e` becomes `sum_selected w_e / p(e)`. That
+  framing is what keeps the change surgical — the connection code below it is untouched,
+  and on the fallback path the weight is **exactly** `1.0`, so `x * 1.0 == x` leaves
+  legacy images bit-identical rather than merely close.
+
+  **The unbiasedness contract.** Every bound in the heuristic must be *conservative*
+  (hence `|cos|`, and `cosθ_o = −1` for spheres/cylinders): a bound that is too tight
+  gives a contributing emitter probability 0, and the image silently *darkens* instead
+  of getting noisier. **Adaptive splitting** visits both children at probability 1 while
+  `(radius/distance)² > gSplit`, and only chooses stochastically below that — which is
+  why small-N scenes are safe: full splitting degenerates *exactly* to the old
+  estimator. One light builds no tree at all (`lightTreeRoot < 0`), and mode `W` always
+  takes the exact path, since its deterministic shadow grid has no variance to trade.
+
+  **The second O(N) term, which only appeared once the shadow rays were gone.** The CPU
+  refilled a per-sample table of every emitter's SPD at every sampled wavelength (1024
+  Planck evaluations per sample at N=256, C=4) and then summed over emitters *again* to
+  derive `invPdfLambda`. Both are now over **distinct spectra**: `spectrum.h` gained
+  `SharedSpectrum`/`ScaledSpectrum` so an emitter's SPD is provably `base_g(λ) · scale_e`
+  (the FTSL loader memoises identical spectrum expressions, and `absPower` — where
+  `lumens`/`power` normalisation happens — returns a `ScaledSpectrum` instead of a fresh
+  closure, which is what made identity survive normalisation); `Scene::buildSpdBases`
+  collects the distinct bases plus `spdBaseGeom[g] = Σ geomWeight_e·scale_e`; and
+  `backward.h`'s `SpdCache` became an *accessor* (`at(e,i) = base[baseIdx[e]*C+i] *
+  scale[e]`) rather than a materialised emitter-major table, so nothing O(N) is even
+  stored per sample. The value is bit-identical because `base*scale` is literally how
+  `ScaledSpectrum::operator()` computes itself; the `Σ_g base_g·spdBaseGeom[g]`
+  regrouping is the one place the summation *order* changes, and it is exact whenever
+  there is one emitter per base (every single-light scene). CPU ml256 at 64 spp:
+  **524.7 s → 7.0 s**.
+
+  **Verified, not assumed.** `-no-lighttree` on the new binary reproduces the pre-tree
+  binary bit-for-bit across a 10-scene corpus on both devices (`scraps/regress_pair.py`,
+  against a `git worktree` build of the previous commit). With the tree: ml256 image
+  means 37.745 vs 37.749 (ratio 1.00012); variance is unchanged (16 spp against a
+  4096-spp reference — RMSE 6.616 no-tree, 6.665 at the default 8 samples); and the case
+  designed to break a biased tree — a 40 m corridor whose 256 panels span orders of
+  magnitude of per-light importance (`scraps/gen_corridor.py`) — lands within 0.07 % of
+  its no-tree reference while running 6.1 s → 0.6 s.
+
+  **Not yet using it:** the forward/BDPT/VCM `selectEmitter` power CDF
+  (`render_cuda.cu`), and a mesh emitter's own triangles (still area-sampled) — both
+  tracked in `known-issues.md`.
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
   Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,

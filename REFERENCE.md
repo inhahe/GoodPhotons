@@ -4124,6 +4124,27 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-fur-lod [d0[:d1]]` | Turn that far tier from a mode into a **LOD decision**: trace strands while one pixel is narrower than `d0` fiber diameters where the coat begins, the aggregate once it is wider than `d1`, and cross-fade stochastically between (one coin per path against a smoothstep, so the switch dissolves into the sampling instead of drawing a line across the image). Implies `-fur-volume`. One number sets `d0` and puts `d1` two octaves up; default `1:4`. The ruler is the **pixel** footprint and does not shrink with `-spp`. See [Choosing a tier](#choosing-a-tier--fur-lod). |
 | `-fur-keep-strands` | Opt out of `-fur-volume`'s deletion of the strands: the fibers stay loaded and in the BVH (still invisible to the far tier's rays, which free-flight against the grid either way). For A/B-ing the two tiers in one process, or if something in a scene still needs the curve geometry. Inert without `-fur-volume`. |
 
+**Many lights (the light tree)** — the backward tracers (`R`, `P`, `-rgb`, and the camera
+connections of `D`/`U`) used to cast a shadow ray to **every** emitter at every
+non-specular vertex. That is unbiased, but it costs O(N_lights) per bounce and buys
+nothing once the lights are redundant: the same room at the same total flux split across
+256 ceiling panels took **75.9 s** instead of 0.4 s for an identical image at identical
+noise. A **Conty–Kulla adaptive light BVH** now picks a handful of importance-weighted
+emitters per vertex, each carried with its `1/pdf`, so the estimator keeps the same
+expectation at bounded cost — that render is now **2.7 s** (and the CPU, which had a
+second O(N) term in its per-sample spectral table, went from 524.7 s to 7.0 s at 64 spp).
+It is **on by default and needs no flags**; these exist to turn it off or to trade noise
+against speed. A scene with one light never builds a tree and is bit-for-bit what it
+always was, as is mode `W`, whose deterministic shadow grid always connects to every
+light.
+
+| Flag | Meaning |
+|---|---|
+| `-no-lighttree` | Go back to the exact all-emitters splitting estimator. This is the reference for any "is the tree biased?" question, and the first thing to try if a many-light scene looks wrong. O(N) per bounce. |
+| `-lighttree` | Force it back on (it already is — useful for overriding an earlier `-no-lighttree` in a shared argument list). |
+| `-light-samples <n>` | Cap on how many emitters one vertex may connect to (default `8`). `1` is the cheapest, pure importance-sampled selection; raising it trades time for less selection noise. Emitters with no usable spatial bound (a distant sun, an environment light) sit outside the tree and are always connected, on top of this budget. |
+| `-light-split <v>` | Adaptive-splitting threshold, as `(node radius / distance)²` (default `1.0`). A node subtending more than this is traversed into **both** children instead of choosing one, which is what stops a nearby cluster of lights from being resolved by a single random pick. Raising it selects more aggressively (faster, noisier); `0` disables splitting; a very large value degenerates back to the all-emitters estimator. |
+
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
 the composite `P`, and the photon modes `M`/`S`/`U`), on both CPU and GPU. `-resume` /

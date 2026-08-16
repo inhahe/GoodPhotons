@@ -10634,6 +10634,21 @@ static int g_giBounce = 4;
 // See BackwardRenderer::giClamp for the full rationale.
 static double g_giClamp = 0.0;
 
+// ---- many-lights importance sampling (the Conty-Kulla light BVH) -------------------
+// `-no-lighttree` restores the historical estimator: connect a shadow ray to EVERY
+// emitter at every non-specular vertex. Correct, but O(N_lights) per bounce for no gain
+// once the lights are redundant (measured: same room, same total flux, mode R 256 spp —
+// 1 light 0.4 s vs 256 lights 75.9 s at an identical 6.25 % noise). Kept as an escape
+// hatch and as the reference the tree is validated against.
+// `-light-split` is the adaptive-splitting threshold, (node radius / distance)^2: a node
+// still subtending more than this at the shading point has BOTH children visited instead
+// of one being chosen, so near lights keep their structure. 0 = never split (cheapest,
+// noisiest); a huge value splits everything (= -no-lighttree).
+// `-light-samples` caps how many emitters one vertex may connect to.
+// The three values themselves live in `lt::` (src/lighttree.h) rather than in statics
+// here, because render_cuda.cu must read the identical settings when it fills DScene —
+// exactly the arrangement `hero::gSplit` uses. See lighttree.h.
+
 // -dual-scatter (P3 stage 4): replace the fur coat's multiple-scattering random walk with
 // Zinke et al. 2008's two analytic terms. Biased, one-bounce fur, orders of magnitude
 // cheaper on a pale coat. See BackwardRenderer::dualScatter.
@@ -11283,6 +11298,8 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         br.ambient = g_ambient * scene.ambientRef();
         br.giDirs = g_gi; br.giGrid = g_giGrid; br.giBounce = g_giBounce;
         br.giClamp = g_giClamp * scene.ambientRef();   // same scaling as -ambient above
+        br.lightTree = lt::gEnabled; br.lightSplit = lt::gSplit;
+        br.lightSamples = lt::gSamples;
         br.dualScatter = g_dualScatter; br.dualDensity = g_dualDensity;
         br.dualMaxCross = g_dualMaxCross;
         br.dualDb = g_dualDb; br.dualDf = g_dualDf;
@@ -14764,6 +14781,15 @@ static int run(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-gi-clamp") && i + 1 < argc) {
             g_giClamp = std::max(0.0, std::atof(argv[++i]));
+        }
+        // Many-lights importance sampling (light BVH). See the lt:: knobs above.
+        else if (!std::strcmp(argv[i], "-no-lighttree")) { lt::gEnabled = false; }
+        else if (!std::strcmp(argv[i], "-lighttree"))    { lt::gEnabled = true; }
+        else if (!std::strcmp(argv[i], "-light-split") && i + 1 < argc) {
+            lt::gSplit = std::max(0.0, std::atof(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-light-samples") && i + 1 < argc) {
+            lt::gSamples = std::max(1, std::atoi(argv[++i]));
         }
         // -dual-scatter / -dual-grid / -fur-volume / -fur-lod / -fur-keep-strands. Parsed by
         // the shared table so this loop and the pre-scan above cannot drift apart; see

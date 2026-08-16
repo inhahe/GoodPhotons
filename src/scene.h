@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <memory>
 #include <climits>
+#include <unordered_map>
 #include "geometry.h"
 #include "bvh.h"
 #include "implicit.h"
@@ -16,6 +17,7 @@
 #include "vdbgrid.h"
 #include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
 #include "record.h"      // parametric records (§records): named per-channel LUTs
+#include "lighttree_build.h"  // Conty-Kulla light BVH: node layout + host builder
 
 // NOTE: append new types at the END. render_cuda.cu's D_* tags are `(int)m.type` and must
 // stay 1:1 with this order, so inserting in the middle silently reinterprets every
@@ -1475,6 +1477,7 @@ struct Scene {
             emitterCdf[i] = totalPower;
         }
         if (totalPower > 0) for (auto& c : emitterCdf) c /= totalPower;
+        buildSpdBases();
         // Combined g(lambda) = sum_k geomWeight_k*SPD_k(lambda); by value capture.
         std::vector<std::pair<double, Spectrum>> parts;
         for (const auto& e : emitters) parts.push_back({e.geomWeight(), e.spdFn});
@@ -1497,6 +1500,190 @@ struct Scene {
             };
             mm.fluoInSampler.build(prod, stepNm);
         }
+        // Emitter powers are now final, so the light BVH can be built off them. Last,
+        // and inside finalizeEmitters, so every path that rebuilds the emitter list
+        // (-ignoreenv, applyIgnoreFlags, the built-in scenes) gets a matching tree
+        // rather than a stale one pointing at emitters that no longer exist.
+        buildLightTree();
+    }
+
+    // ---- shared-SPD factorisation -------------------------------------------
+    // Every emitter's SPD is written as base_g(lambda) * scale_e, with `spdBase` the
+    // list of DISTINCT base curves, spdBaseIdx[e] the one emitter e uses, and
+    // spdScale[e] its constant. The factorisation is exact, not approximate: it comes
+    // from spectrumBase() (spectrum.h), which only reports a base when the loader
+    // literally built the spectrum as a shared curve times a constant, and whose
+    // contract is that base(lambda)*scale reproduces spdFn(lambda) BIT-FOR-BIT. An
+    // emitter whose SPD is opaque simply becomes its own base with scale 1.
+    //
+    // What it buys: the backward renderer refills a table of SPD(lambda) over all
+    // emitters for every sample. Factored, it evaluates one Planck (or one file curve,
+    // or one measured table) per DISTINCT spectrum and multiplies out, so a room lit by
+    // 256 panels of the same fixture costs one evaluation instead of 256. Once the
+    // light BVH removed the O(N) shadow rays, THIS table was what remained of the
+    // many-lights cost on the CPU.
+    std::vector<Spectrum> spdBase;
+    std::vector<int>      spdBaseIdx;
+    std::vector<double>   spdScale;
+    // Sum over the emitters sharing base g of geomWeight_e * spdScale_e, so the combined
+    // emission g(lambda) = sum_e geomWeight_e*SPD_e(lambda) collapses to
+    // sum_g spdBase[g](lambda) * spdBaseGeom[g] — O(distinct spectra), not O(lights).
+    // That sum is exactly what invPdfLambda() is, and the backward reference needs it once
+    // per SAMPLE, so with 256 identical panels it was the last O(N) term left after the
+    // light BVH removed the shadow rays. Regrouping changes the summation ORDER, so the
+    // result can differ from the emitter-by-emitter sum in the last bit; it is identical
+    // whenever there is one emitter per base (i.e. every single-light scene), because the
+    // scale is then exactly 1.0 and a*(b*1) == b*a.
+    std::vector<double>   spdBaseGeom;
+
+    void buildSpdBases() {
+        const int n = (int)emitters.size();
+        spdBase.clear();
+        spdBaseIdx.assign((size_t)n, 0);
+        spdScale.assign((size_t)n, 1.0);
+        std::unordered_map<const void*, int> seen;
+        for (int e = 0; e < n; ++e) {
+            double k = 1.0;
+            const Spectrum* b = spectrumBase(emitters[e].spdFn, k);
+            if (!b) {                       // opaque: its own base, scale exactly 1
+                spdBaseIdx[e] = (int)spdBase.size();
+                spdBase.push_back(emitters[e].spdFn);
+                spdScale[e] = 1.0;
+                continue;
+            }
+            auto it = seen.find((const void*)b);
+            if (it == seen.end()) {
+                it = seen.emplace((const void*)b, (int)spdBase.size()).first;
+                spdBase.push_back(*b);
+            }
+            spdBaseIdx[e] = it->second;
+            spdScale[e] = k;
+        }
+        spdBaseGeom.assign(spdBase.size(), 0.0);
+        for (int e = 0; e < n; ++e)
+            spdBaseGeom[(size_t)spdBaseIdx[e]] += emitters[e].geomWeight() * spdScale[e];
+    }
+
+    // ---- light BVH (Conty & Kulla) ------------------------------------------
+    // Built by finalizeEmitters() from the finished emitter list. `lightTree` is the
+    // node array (root at lightTreeRoot); `lightTreeAlways` holds the emitters that
+    // are NOT in the tree because they have no meaningful position for the spatial
+    // bound — a distant sun, an env light, a collimated beam — and so are connected
+    // unconditionally, as before. Empty tree => every consumer falls back to the old
+    // loop-over-all-emitters, which is what keeps single-light scenes bit-identical.
+    std::vector<LightTreeNode> lightTree;
+    std::vector<int> lightTreeAlways;
+    int lightTreeRoot = -1;
+
+    // Describe one emitter to the builder: a box that contains its emitting surface,
+    // a cone that contains every normal it can emit along, and its flux.
+    //
+    // Every bound here must be CONSERVATIVE — the traversal is allowed to give an
+    // emitter probability zero exactly when these bounds prove it cannot contribute,
+    // so a bound that is too tight is not an inefficiency, it is a black image.
+    // Hence a sphere and a tube both declare a FULL cone of normals (cosThetaO = -1)
+    // rather than anything cleverer.
+    static bool lightTreeBoundOf(const Emitter& e, int index, LtEmitterBound& out) {
+        if (e.collimated) return false;
+        if (e.shape == EmitterShape::Env || e.shape == EmitterShape::Sun) return false;
+        if (!(e.power > 0.0)) return false;
+        auto setBox = [&](Vec3 lo, Vec3 hi) {
+            out.bmin[0] = lo.x; out.bmin[1] = lo.y; out.bmin[2] = lo.z;
+            out.bmax[0] = hi.x; out.bmax[1] = hi.y; out.bmax[2] = hi.z;
+        };
+        auto grow = [&](Vec3 p) {
+            out.bmin[0] = std::min(out.bmin[0], p.x); out.bmax[0] = std::max(out.bmax[0], p.x);
+            out.bmin[1] = std::min(out.bmin[1], p.y); out.bmax[1] = std::max(out.bmax[1], p.y);
+            out.bmin[2] = std::min(out.bmin[2], p.z); out.bmax[2] = std::max(out.bmax[2], p.z);
+        };
+        out.emitter = index;
+        out.power = e.power;
+        out.cosThetaO = 1.0;    // a single flat normal unless overridden below
+        out.cosThetaE = 0.0;    // Lambertian hemisphere
+        Vec3 ax = e.normal;
+        switch (e.shape) {
+            case EmitterShape::Quad: {
+                setBox(e.origin, e.origin);
+                grow(e.origin + e.u); grow(e.origin + e.v); grow(e.origin + e.u + e.v);
+                break;
+            }
+            case EmitterShape::Sphere: {
+                const double r = e.radius;
+                setBox(e.origin - Vec3{r, r, r}, e.origin + Vec3{r, r, r});
+                out.cosThetaO = -1.0;                 // normals cover the whole sphere
+                ax = Vec3{0, 0, 1};
+                break;
+            }
+            case EmitterShape::Cylinder: {
+                const double r = e.radius;
+                setBox(e.origin - Vec3{r, r, r}, e.origin + Vec3{r, r, r});
+                grow(e.origin + e.v - Vec3{r, r, r});
+                grow(e.origin + e.v + Vec3{r, r, r});
+                out.cosThetaO = -1.0;                 // lateral normals sweep a full circle
+                ax = Vec3{0, 0, 1};
+                break;
+            }
+            case EmitterShape::Spot: {
+                setBox(e.origin, e.origin);
+                ax = e.beamDir;
+                out.cosThetaO = 1.0;
+                // The spot's own penumbra IS its emission spread; nothing outside the
+                // outer cone receives anything, which is exactly what theta_e encodes.
+                out.cosThetaE = e.spotCosOuter;
+                break;
+            }
+            case EmitterShape::Mesh: {
+                if (e.meshTris.empty()) return false;
+                bool first = true;
+                Vec3 nSum{0, 0, 0};
+                double maxDev = 1.0;                  // running min of dot(mean, n_i)
+                for (const auto& t : e.meshTris) {
+                    if (first) { setBox(t.v0, t.v0); first = false; } else grow(t.v0);
+                    grow(t.v0 + t.e1); grow(t.v0 + t.e2);
+                    nSum = nSum + t.nrm;
+                }
+                const double L = length(nSum);
+                if (L > 1e-12) {
+                    ax = nSum / L;
+                    for (const auto& t : e.meshTris) maxDev = std::min(maxDev, dot(ax, t.nrm));
+                    out.cosThetaO = maxDev;
+                } else {                              // normals cancel: a closed shell
+                    ax = Vec3{0, 0, 1};
+                    out.cosThetaO = -1.0;
+                }
+                break;
+            }
+            default: return false;
+        }
+        const double al = length(ax);
+        if (!(al > 1e-12)) { ax = Vec3{0, 0, 1}; }
+        else ax = ax / al;
+        out.axis[0] = ax.x; out.axis[1] = ax.y; out.axis[2] = ax.z;
+        return true;
+    }
+
+    void buildLightTree() {
+        lightTree.clear();
+        lightTreeAlways.clear();
+        lightTreeRoot = -1;
+        std::vector<LtEmitterBound> items;
+        items.reserve(emitters.size());
+        for (size_t i = 0; i < emitters.size(); ++i) {
+            LtEmitterBound b{};
+            if (lightTreeBoundOf(emitters[i], (int)i, b)) items.push_back(b);
+            else if (emitters[i].shape != EmitterShape::Env)
+                lightTreeAlways.push_back((int)i);    // suns / beams: always connected
+        }
+        // One tree-eligible emitter is not worth a tree — the traversal would just
+        // return it with pdf 1 after burning a stack push, and keeping the old path
+        // there is what preserves bit-identical single-light images.
+        if (items.size() < 2) {
+            for (const auto& b : items) lightTreeAlways.push_back(b.emitter);
+            std::sort(lightTreeAlways.begin(), lightTreeAlways.end());
+            return;
+        }
+        lightTreeRoot = ltBuild(items, lightTree);
+        std::sort(lightTreeAlways.begin(), lightTreeAlways.end());
     }
 
     // Select an emitter index for the power-weighted CDF. For a single emitter

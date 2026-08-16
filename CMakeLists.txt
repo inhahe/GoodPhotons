@@ -155,6 +155,21 @@ if(CMAKE_CUDA_COMPILER)
     if(MSVC)
         target_link_options(ftrace PRIVATE /NODEFAULTLIB:LIBCMT)
     endif()
+    # A host compiler newer than the CUDA toolkit supports is NOT a benign warning here.
+    # Measured 2026-08-16 with CUDA 13.3 + MSVC 14.51 (the VS 2026 BuildTools preview):
+    # nvcc accepted it, every kernel launched and ran without a single CUDA error, and
+    # every GPU render came out BLACK (mode B: absorbed=1.0000, escaped=0.0000, "0.0%
+    # noise"). The same source built with MSVC 14.44 is correct at both sm_75 and sm_89,
+    # so it is the host pass, not the device arch. Nothing at runtime can catch that —
+    # so shout at configure time. (build.bat pins the VS 2022 generator for this reason.)
+    if(MSVC AND MSVC_VERSION GREATER_EQUAL 1950)
+        message(WARNING
+            "MSVC ${MSVC_VERSION} is newer than this CUDA toolkit "
+            "(${CMAKE_CUDA_COMPILER_VERSION}) officially supports. That combination has "
+            "been observed to MISCOMPILE the device code silently — GPU renders come out "
+            "black with no CUDA error. Configure with -G \"Visual Studio 17 2022\" (what "
+            "build.bat does) or another supported host compiler.")
+    endif()
     message(STATUS "CUDA backend enabled (FTRACE_CUDA_ARCH=${FTRACE_CUDA_ARCH}; "
                    "use -DFTRACE_CUDA_ARCH=all-major for a portable fat binary; "
                    "FTRACE_GPU_FP32=${FTRACE_GPU_FP32})")
