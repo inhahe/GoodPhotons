@@ -109,6 +109,16 @@ struct NavInput {
 
 class LiveWindow {
 public:
+    // Open every subsequent window MINIMIZED to the taskbar instead of on-screen
+    // (-window-min). The window is fully live -- it still receives and presents frames, and
+    // the user can restore it from the taskbar whenever they want to look -- it just never
+    // takes over the desktop or steals focus. This exists because a batch of renders each
+    // popping a window to the foreground makes the machine unusable for anything else; it
+    // is a display choice only and changes nothing about the render. Set before
+    // constructing; affects windows created afterwards.
+    static void setStartMinimized(bool on);
+    static bool startMinimized();
+
     // Create and show a window sized to (w,h) (clamped to the screen, aspect kept).
     LiveWindow(int w, int h, const char* title);
     ~LiveWindow();

@@ -10634,6 +10634,66 @@ static int g_giBounce = 4;
 // See BackwardRenderer::giClamp for the full rationale.
 static double g_giClamp = 0.0;
 
+// ---- -radcache: biased early path termination into a world-space irradiance cache -----
+// The opposite design choice from -gi above, and deliberately so. -gi has NO cache because
+// mode W is aimed at animation, where POV-Ray-style adaptive irradiance caches make
+// low-frequency blotches that POP between frames. -radcache accepts exactly that risk in
+// exchange for cutting the cost of deep GI: past `g_radMinBounce`, a mode-R path that lands
+// in a well-sampled cell stops tracing and reads E/pi out of the table instead of walking
+// the rest of its bounces. It is therefore OFF by default, never implied by another flag,
+// and NOT for a seamless loop -- use it for stills and for previewing, and turn it off for
+// the reference render. See src/radcache.h for the estimator and known-issues.md for the
+// documented limits.
+static bool   g_radCache      = false;
+static double g_radCacheCell  = 0.0;    // level-0 cell edge, world units; 0 = auto
+static double g_radTrainFrac  = 0.15;   // fraction of paths that ignore the cache
+static int    g_radMinBounce  = 2;      // no termination before this bounce index
+// Deposit policy (-radcache-deposit train|all). `all` lets every path write to the table,
+// including the ones that terminated on it, which is ~1/radTrainFrac more training data and
+// is usually the difference between the cache paying for itself and being pure overhead; the
+// cost is that the table then converges to a fixed point of itself rather than to the truth.
+// `train` keeps deposits to the cache-ignoring paths only, so every sample is exact. See the
+// long note on BackwardRenderer::radDepositAll.
+static bool   g_radDepositAll = true;
+static int    g_radMinSamples = kRadCacheMinSamples;   // deposits before a cell is trusted
+// Table capacity in cells (rounded up to a power of two). Each cell is 8 B of key plus
+// 128 B of per-bin sums/counts, so the default is ~34 MB. Sizing matters for SPEED as much
+// as for capacity: the probe is a random access, so a table that outgrows the last-level
+// cache turns every lookup into a memory stall. A Cornell box occupies ~13 k cells; raise
+// this for a scene whose visible surface area is orders of magnitude larger (the status line
+// warns when deposits start being dropped).
+static size_t g_radCacheCells = (size_t)1 << 18;
+static RadianceCache g_radianceCache;
+
+// End-of-render summary. `term%` is the share of cache consultations that actually shortened
+// a path -- the number that predicts the speedup -- and `evicted` should stay near zero: a
+// non-trivial eviction count means the table is too small for the scene at this cell size
+// (raise -radcache-cells, or coarsen with -radcache-cell).
+static void reportRadCache() {
+    if (!g_radCache || !g_radianceCache.ready()) return;
+    const long long look = g_radianceCache.nTerm + g_radianceCache.nMiss;
+    std::printf("[radcache] %lld deposits in %zu cells (%.1f%% full), "
+                "%lld/%lld consults terminated (%.1f%%)%s\n",
+                g_radianceCache.nDeposit, g_radianceCache.used,
+                100.0 * g_radianceCache.occupancy(),
+                g_radianceCache.nTerm, look,
+                look ? 100.0 * (double)g_radianceCache.nTerm / (double)look : 0.0,
+                g_radianceCache.nEvicted
+                    ? "  [!] table full - some deposits were dropped" : "");
+}
+
+// -raystats: print the total number of rays cast against the acceleration structure. This
+// is the deterministic measure of how much work a render did, which is what you want when
+// comparing two configurations on a machine whose wall-clock varies more than the effect
+// being measured (a 5 s render here spans 3.4-6.3 s run to run; the ray count does not
+// move at all). Currently wired into the mode-R backward workers.
+static bool g_rayStats = false;
+static void reportRayStats() {
+    if (!g_rayStats) return;
+    const unsigned long long n = raystats::total.load();
+    std::printf("[raystats] %llu ray queries (closest-hit + shadow)\n", n);
+}
+
 // ---- many-lights importance sampling (the Conty-Kulla light BVH) -------------------
 // `-no-lighttree` restores the historical estimator: connect a shadow ray to EVERY
 // emitter at every non-specular vertex. Correct, but O(N_lights) per bounce for no gain
@@ -11282,6 +11342,29 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
     const int bandN  = bandHi - bandLo;
     if (bandN <= 0) return out;
     if (bandN < nThreads) nThreads = bandN;   // don't hand a thread an empty row range
+    // -radcache: one shared, READ-ONLY table for the pass plus one deposit bank per thread.
+    // The table is only ever written between passes (the merge below), so a lookup on the hot
+    // path is a plain read -- no atomics, no false sharing, and the image a chunk produces
+    // does not depend on how the OS scheduled the threads. `into != nullptr` is the
+    // interactive viewer's band-at-a-time preview; it shares the same table, which is exactly
+    // what makes the preview get cheaper as you look around.
+    const bool rcOn = g_radCache && !(g_whitted || forceWhitted) && !g_directOnly;
+    std::vector<RadCacheBank> rcBanks(rcOn ? nThreads : 0);
+    if (rcOn) {
+        if (!g_radianceCache.ready()) g_radianceCache.init(g_radCacheCells);
+        // Auto cell size: 1/64 of the scene's bounding radius at the reference distance, so
+        // the default adapts to a millimetre-scale scene and a kilometre-scale one alike.
+        // Indirect irradiance is smooth, so this is a blur budget, not a detail budget.
+        const double R = std::max(1e-9, scene.sceneRadius);
+        g_radianceCache.baseCell   = g_radCacheCell > 0.0 ? g_radCacheCell : R / 64.0;
+        g_radianceCache.baseDist   = R;
+        g_radianceCache.minBounce  = g_radMinBounce;
+        g_radianceCache.minSamples = g_radMinSamples;
+        g_radianceCache.lambdaLo   = LAMBDA_MIN;
+        g_radianceCache.lambdaHi   = LAMBDA_MAX;
+        g_radianceCache.camera     = cam.eye;    // clipmap centre; re-read every pass
+        g_radianceCache.prepare();               // refresh the reciprocals the hot path uses
+    }
     auto worker = [&](int tid) {
         BackwardRenderer br; br.diffraction = diffraction; br.heroC = g_heroC;
         if (g_maxBounceOverride >= 1) br.maxBounce = g_maxBounceOverride;
@@ -11319,12 +11402,33 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
             br.furLodW0 = g_furLodD0 * dia;
             br.furLodW1 = g_furLodD1 * dia;
         }
+        if (rcOn) {
+            br.radCache = &g_radianceCache;
+            br.radBank  = &rcBanks[tid];
+            br.radMinBounce   = g_radMinBounce;
+            br.radDepositAll  = g_radDepositAll;
+            // Warm-up ramp. A cold cache cannot shorten a path anyway, so on the first pass a
+            // sub-1.0 training fraction buys nothing: the non-training paths trace to full
+            // length regardless, they just do not get to record what they saw. Train at 100%
+            // for the first pass -- same work, more data -- then drop to the configured
+            // fraction. (In `train` deposit mode that is a ~7x difference in how fast the
+            // table becomes usable; in `all` mode every path deposits either way, and this
+            // only stops the first pass wasting time on lookups that must all miss.)
+            br.radTrainFrac = (g_radianceCache.nDeposit == 0) ? 1.0 : g_radTrainFrac;
+        }
         int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
         br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
+        raystats::flushThread();   // -raystats: fold this worker's tally into the total
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
     for (auto& th : pool) th.join();
+    // Merge this pass's deposits. Single-threaded and after the join, which is what makes the
+    // table's state a pure function of the samples rendered so far rather than of the thread
+    // interleaving -- so a chunked render and a one-shot render of the same budget see the
+    // same cache. Bank order is thread order (deterministic), so even the float summation
+    // order inside a cell is reproducible.
+    if (rcOn) for (auto& b : rcBanks) g_radianceCache.merge(b);
     return out;
 }
 
@@ -11766,6 +11870,12 @@ static bool                        g_showWindow = false;
 // after run() returns until the user closes the window themselves, so a finished image
 // stays on screen to inspect.
 static bool                        g_keepWindow = false;
+// -window-min / -minimized: open the live preview MINIMIZED to the taskbar. It is still a
+// real, live window -- frames are presented to it and it can be restored at any moment --
+// it simply never grabs the desktop or the keyboard focus on the way up. This is the right
+// default when a series of renders is being launched in the background while the machine
+// is in use for something else: without it every render pops a window to the foreground.
+static bool                        g_minWindow = false;
 static std::unique_ptr<LiveWindow> g_liveWin;
 // Base window title identifying WHAT is being rendered — set in main() to
 // "ftrace - <scene> -> <output>" (see makeWindowTitle). The current render mode
@@ -12625,6 +12735,8 @@ static int runSppProgressive(
     if (wantCheckpoint)
         std::printf("[checkpoint] %s holds %lld spp — rerun with -resume to add more\n",
                     checkpointPath(outPath).c_str(), finalSpp);
+    reportRadCache();
+    reportRayStats();
     return writeOk ? 0 : 1;
 }
 
@@ -14218,6 +14330,8 @@ static void printHelp(const char* prog) {
 "  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
 "  -window               live OS preview window, refreshed as it converges\n"
 "  -keepwindow|-hold     like -window but hold the final image until you close it\n"
+"  -window-min|-minimized  implies -window, but opens it minimized to the taskbar\n"
+"                        (live, restorable any time; never steals focus)\n"
 "  -preview              live ANSI thumbnail in the terminal\n"
 "  -interval <sec>       periodic image-write / status / ANSI-preview cadence (default: 15)\n"
 "  -window-interval <s>  live-window repaint cadence, independent of -interval (default: 0.2)\n"
@@ -14782,6 +14896,32 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-gi-clamp") && i + 1 < argc) {
             g_giClamp = std::max(0.0, std::atof(argv[++i]));
         }
+        // -radcache and friends. Opt-in and biased; see the g_radCache block above.
+        else if (!std::strcmp(argv[i], "-radcache"))     { g_radCache = true; }
+        else if (!std::strcmp(argv[i], "-no-radcache"))  { g_radCache = false; }
+        else if (!std::strcmp(argv[i], "-radcache-cell") && i + 1 < argc) {
+            g_radCacheCell = std::max(0.0, std::atof(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-train") && i + 1 < argc) {
+            g_radTrainFrac = std::max(0.0, std::min(1.0, std::atof(argv[++i]))); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-bounce") && i + 1 < argc) {
+            g_radMinBounce = std::max(1, std::atoi(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-samples") && i + 1 < argc) {
+            g_radMinSamples = std::max(1, std::atoi(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-cells") && i + 1 < argc) {
+            g_radCacheCells = (size_t)std::max(1024LL, std::atoll(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-raystats")) { g_rayStats = true; }
+        else if (!std::strcmp(argv[i], "-radcache-deposit") && i + 1 < argc) {
+            const char* v = argv[++i];
+            if      (!std::strcmp(v, "all"))   g_radDepositAll = true;
+            else if (!std::strcmp(v, "train")) g_radDepositAll = false;
+            else { std::fprintf(stderr, "ftrace: -radcache-deposit expects 'train' or 'all'\n"); return 2; }
+            g_radCache = true;
+        }
         // Many-lights importance sampling (light BVH). See the lt:: knobs above.
         else if (!std::strcmp(argv[i], "-no-lighttree")) { lt::gEnabled = false; }
         else if (!std::strcmp(argv[i], "-lighttree"))    { lt::gEnabled = true; }
@@ -14961,6 +15101,9 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
         else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) g_beamGather = true;
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
+        else if (!std::strcmp(argv[i], "-window-min") || !std::strcmp(argv[i], "-minimized")) {
+            g_showWindow = true; g_minWindow = true;
+        }
         else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
         else if (!std::strcmp(argv[i], "-raster-gpu")) { doRaster = true; rasterGpu = true; }
@@ -15144,6 +15287,10 @@ static int run(int argc, char** argv) {
     if (checkArrayOnly)    return checkArray();    // ditto
     if (checkSunOnly)      return checkSun();      // deterministic, no scene needed
     if (checkLatticeOnly)  return checkLattice();  // N4a: host-vs-device, no scene needed
+
+    // -window-min: applied once here rather than at each of the four LiveWindow
+    // construction sites, so any future one inherits it automatically.
+    LiveWindow::setStartMinimized(g_minWindow);
 
     // --- every output directory must exist BEFORE a single photon is traced ----------
     // Otherwise a mistyped/not-yet-created output directory used to be discovered only

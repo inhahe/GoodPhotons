@@ -49,6 +49,7 @@
 #include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
 #include "fur_volume.h"   // -fur-volume: the aggregate far-tier fur medium
+#include "radcache.h" // -radcache: biased early termination into a world-space irradiance cache
 
 struct BackwardRenderer {
     int maxBounce = 32;
@@ -301,6 +302,61 @@ struct BackwardRenderer {
     // colour-correct on a dielectric at -spp 1. Hence `whitted` turns this on by default
     // (main.cpp); mode R is stochastic and averages the collapse away, so it stays opt-in.
     bool heroSplit = hero::gSplit;
+
+    // ---- radiance cache (-radcache; OFF by default, and biased) ---------------------
+    // A world-space cache of indirect irradiance at diffuse vertices. Once a path is at
+    // least `radMinBounce` bounces deep and lands in a cell that already holds enough
+    // samples at every live wavelength, it stops tracing and reads E/pi out of the cache
+    // instead of continuing. See radcache.h for the derivation (a Lambertian vertex
+    // multiplies throughput by rho alone, so a finished path measures its own incident
+    // radiance for free and the cache trains itself off the paths already being traced).
+    //
+    // Three invariants keep this honest, and all three are load-bearing:
+    //   * `radCache == nullptr` (no -radcache) must leave mode R BIT-IDENTICAL. Nothing
+    //     below may consume an rng draw, reorder one, or change a branch unless the cache
+    //     is actually on -- mode R is this renderer's unbiased reference.
+    //   * The table is READ-ONLY during a pass. Deposits go to this thread's `radBank`
+    //     and are merged between chunks, so a lookup is a plain read: no atomics, no false
+    //     sharing, and a chunk's image does not depend on thread scheduling.
+    //   * Whichever paths are allowed to deposit, the rule must not select on WHERE THE PATH
+    //     WENT. Both deposit modes below satisfy that; the tempting middle ground (every path
+    //     that did not happen to terminate on the cache) does not, and measures 1.8% dark.
+    const RadianceCache* radCache = nullptr;   // shared, immutable during a pass
+    RadCacheBank*        radBank  = nullptr;   // THIS thread's deposit bank (per-thread!)
+    int    radMinBounce = 2;     // no cache termination before this bounce index
+    // Fraction of camera paths that IGNORE the cache and run to full length anyway. Without
+    // it the cache freezes: once every cell is confident nothing traces deep again, so a
+    // moving light or a slow-converging corner would keep answering with its stale mean
+    // forever. These paths still deposit, so the cache keeps refining for the whole render.
+    double radTrainFrac = 0.15;
+    // Deposit policy. Two self-consistent choices, and the difference is bias-vs-data-rate:
+    //
+    //   false (TRAINING-ONLY) -- only the radTrainFrac paths that ignore the cache deposit.
+    //     Every deposit is then a plain, full-length, unbiased path-tracer sample, so cell
+    //     averaging is the only bias in the feature. The price is the data rate: at the
+    //     default 15% the table fills ~7x slower, and since a cell needs minSamples at each
+    //     of 16 bins before it answers, a scene with many cells can finish the whole render
+    //     without the cache ever becoming confident (measured on fur_creature: 0.4 samples
+    //     per bin, 0% termination -- pure overhead, no win).
+    //
+    //   true (BOOTSTRAP) -- every path deposits, whether or not it read the cache, INCLUDING
+    //     paths that terminated on it. That is the important part: it is depositing on the
+    //     non-terminated subset that selects directionally, not depositing on cache readers.
+    //     Depositing on ALL of them selects on nothing. What it costs instead is exactness:
+    //     a deposit made by a cache reader contains the cache's own estimate, so the table
+    //     converges to a fixed point of itself rather than to the truth. The fixed point is
+    //     stable (each feedback round trip is attenuated by the albedo rho < 1, so an error
+    //     eps decays as eps*rho^k) and it is the truth when the cache is right -- but a
+    //     systematic error, once in, is reinforced rather than washed out.
+    bool radDepositAll = false;
+
+    // Is the cache live for this render? Mode W (`whitted`) and -direct-only both terminate
+    // diffuse paths themselves, so a deposit from one would record a sub-path that never
+    // gathered its indirect light -- systematically too dark. Gate the feature off there
+    // rather than depositing garbage.
+    bool rcActive() const {
+        return radCache && radCache->ready() && !whitted && !directOnly;
+    }
 
     // Per-sample cache of emitter-SPD evaluations at the path's wavelengths. The
     // wavelengths are fixed for the whole camera path, but every NEE connection
@@ -1807,9 +1863,18 @@ struct BackwardRenderer {
         // double it. A specular bounce re-arms this, so gold-bounced light still lands.
         double thr[hero::kHeroMax];
         for (int i = 0; i < C; ++i) thr[i] = 1.0;
+        // -radcache: roll this path's training ticket. Drawn HERE and only when the cache
+        // is live, so a run without -radcache consumes the identical rng stream it always
+        // did (see the `radCache` note above -- bit-identity with the flag off is a
+        // requirement, not a nicety). A training path ignores the cache and traces to full
+        // length, which is what keeps the table refining instead of freezing on its own
+        // first estimate.
+        const bool rcTrain = rcActive() && radTrainFrac > 0.0
+                           && (rng.uniform() < radTrainFrac);
         radianceHeroLoop(scene, ray, MediumStack{}, lamIn, invPdfIn, thr, C,
                          /*secAlive=*/(C > 1), /*specularArrival=*/(gi.depth == 0),
-                         /*contBsdfPdf=*/0.0, /*bounce0=*/0, Lout, rng, spdCache, gi);
+                         /*contBsdfPdf=*/0.0, /*bounce0=*/0, Lout, rng, spdCache, gi,
+                         rcTrain);
     }
 
     // Bounce loop for a hero bundle already sitting at (`ray`, `stk`) with
@@ -1829,7 +1894,7 @@ struct BackwardRenderer {
                           const double* invPdfIn, const double* thrIn, int C, bool secAlive,
                           bool specularArrival, double contBsdfPdf, int bounce0,
                           double* Lout, Pcg32& rng, const SpdCache* spdCache,
-                          GiCtx gi) const {
+                          GiCtx gi, bool rcTrain = false) const {
         double lam[hero::kHeroMax], invPdf[hero::kHeroMax], thr[hero::kHeroMax], L[hero::kHeroMax];
         // Copy only the LIVE entries: a monochromatic sub-path spawned by the split fills
         // only slot 0 of its lamIn/invPdfIn/thrIn, so reading all C would read
@@ -1844,9 +1909,96 @@ struct BackwardRenderer {
         const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
         Renderer mats; mats.diffraction = diffraction;
 
-        auto finish = [&]() { for (int i = 0; i < C; ++i) Lout[i] = L[i]; };
+        // ---- -radcache bookkeeping (inert, and free, when the cache is off) -------------
+        // Each diffuse vertex this path leaves is remembered so that when the path FINISHES
+        // we can hand the cache a sample of the radiance that arrived along the direction we
+        // chose. The identity is exact rather than an approximation:
+        //
+        //     everything L gains after this vertex  ==  thrA[i] * L_i(omega)
+        //
+        // because a Lambertian continuation multiplies throughput by rho alone, so
+        // (L[i] - Lat[i]) / thrA[i] IS one unbiased sample of L_i(omega); its cosine-weighted
+        // mean over the hemisphere is E/pi, which is the number a terminating path wants.
+        // See radcache.h.
+        //
+        // The stack is a fixed 12 deep: beyond a dozen diffuse bounces the remaining energy
+        // is a fraction of a percent, and dropping those deposits costs nothing but keeps the
+        // frame free of a heap allocation on the hot path.
+        // Hero channel only (index 0) -- see the deposit note in finish().
+        struct RcPend {
+            Vec3   p, n;
+            double Lat[1];    // L[0] as it stood at the last re-base (see deHero)
+            double thrA[1];   // throughput AFTER the rho/q reweight, re-based at a de-hero
+            double part[1];   // value banked at earlier re-bases
+            double lam[1];
+        };
+        static constexpr int kRcMaxPend = 12;
+        RcPend rcPend[kRcMaxPend];
+        int  rcNPend = 0;
+        bool rcTerminated = false;   // this path read its tail out of the cache
+        const bool rcOn = rcActive() && radBank != nullptr;
+        // May THIS path record pending vertices at all? (Deposit policy: see radDepositAll.)
+        const bool rcDep = rcOn && (radDepositAll || rcTrain);
+
+        auto finish = [&]() {
+            // WHO DEPOSITS is not a detail -- it is what makes the cached number unbiased.
+            // The rule that must hold is that a vertex's chance to deposit cannot depend on
+            // WHERE THE PATH WENT AFTER IT. The tempting middle ground -- every path that did
+            // not happen to terminate on the cache -- breaks exactly that: a vertex only gets
+            // to deposit if the direction it sampled led somewhere the cache was NOT yet
+            // confident about, i.e. the sparsely-visited, typically darker half of its
+            // hemisphere. Measured on cornell.ftsl that biased the whole frame 1.8% dark
+            // (2.9% in the centre). Both supported policies avoid it: training-only paths
+            // ignore the cache from the outset (so their deposits are plain unbiased
+            // path-tracer samples), and radDepositAll deposits on every path including the
+            // terminated ones (so there is no subset to select). Never the middle.
+            // ONLY THE HERO DEPOSITS, and that is the second half of the same argument. A
+            // de-hero kills the secondaries mid-path, so L[i>0] is a TRUNCATED sub-path and
+            // cannot be deposited -- but whether a path de-heros depends on where it went
+            // (through the glass ball or past it), so skipping just those secondaries would
+            // train the table only on the directions that missed the specular geometry. That
+            // is the same directional selection the training-path rule above exists to avoid,
+            // and it is worth exactly as much: on cornell.ftsl, banking the hero correctly but
+            // still letting the surviving secondaries in left 1.3% of darkening on the table.
+            // The hero is never truncated and never dropped, so hero-only deposits are clean
+            // in every scene. The cost is 1/C of the sample rate, which is affordable: the
+            // hero lambda is stratified across the whole spectrum, so all 16 bins still fill.
+            if (rcDep && (radDepositAll || !rcTerminated)) {
+                for (int k = 0; k < rcNPend; ++k) {
+                    const RcPend& q = rcPend[k];
+                    if (!(q.thrA[0] > 0.0)) continue;
+                    const double v = q.part[0] + (L[0] - q.Lat[0]) / q.thrA[0];
+                    if (!(v >= 0.0) || !std::isfinite(v)) continue;
+                    radBank->push(q.p, q.n, q.lam[0], v);
+                }
+            }
+            for (int i = 0; i < C; ++i) Lout[i] = L[i];
+        };
         auto deHero = [&]() {            // terminate secondaries, boost hero ×C
             if (!secAlive) return;
+            // -radcache: a de-hero breaks the plain (L - Lat)/thrA identity in two different
+            // ways, and BOTH have to be handled or the cache comes out systematically dark.
+            // (Measured: dropping these deposits outright cost 1.9% on cornell.ftsl, whose
+            // glass sphere de-heros constantly, while the same box with a diffuse sphere --
+            // no de-hero at all -- came out to 0.02%. So this is the whole error term.)
+            //
+            //   * The HERO gets thr[0] *= C, an artificial boost that is there to keep the
+            //     BUNDLE's expectation right after the secondaries are killed. Everything
+            //     L[0] gains from here on is therefore C x too large to read as lambda_0's
+            //     own incident radiance. Fixed exactly, not approximately: bank the value
+            //     accrued so far, re-base Lat to the current L, and fold the C into thrA. The
+            //     sum of the two segments is then the correct single number.
+            //   * The SECONDARIES simply stop accumulating -- nothing more will ever be added
+            //     to L[i>0] -- so their (L - Lat) is a truncated path, not a finished one.
+            //     That is why finish() deposits the hero only; see the note there.
+            if (rcDep) {
+                for (int k = 0; k < rcNPend; ++k) {
+                    RcPend& q = rcPend[k];
+                    if (q.thrA[0] > 0.0) q.part[0] += (L[0] - q.Lat[0]) / q.thrA[0];
+                    q.Lat[0]   = L[0];
+                    q.thrA[0] *= (double)C;
+                }
+            }
             thr[0] *= (double)C;
             secAlive = false;
         };
@@ -1986,9 +2138,16 @@ struct BackwardRenderer {
                             sCp = &sCache;
                         }
                         double sub[hero::kHeroMax];
+                        // -radcache: a split sub-path is spawned as a TRAINING path
+                        // (rcTrain=true) whatever the parent is. Its radiance is added
+                        // into the parent's L[i], so if it could terminate on the cache the
+                        // parent's own deposits would be measuring the cache's output --
+                        // the feedback loop the design forbids. Splits are rare (dispersive
+                        // vertices only), so tracing them in full costs almost nothing.
                         radianceHeroLoop(scene, ray, stk, &sLam, &sInv, &sThr,
                                          /*C=*/1, /*secAlive=*/false, specularArrival,
-                                         contBsdfPdf, b, sub, rng, sCp, gi);
+                                         contBsdfPdf, b, sub, rng, sCp, gi,
+                                         /*rcTrain=*/true);
                         L[i] += sub[0];      // this wavelength's own estimate, own slot
                         thr[i] = 0.0;        // now that sub-path's business, not ours
                     }
@@ -2185,9 +2344,13 @@ struct BackwardRenderer {
                             if (interactMaterial(scene, m, h, mats, sRay, sLam, sInv, sThr, sL,
                                                  sSpec, sPdf, sStk, rng, sCp, gi)) {
                                 double sub[hero::kHeroMax];
+                                // rcTrain=true: see the sibling split above -- a sub-path
+                                // whose radiance lands in the parent's L[i] must never read
+                                // the cache, or the parent's deposits would train on it.
                                 radianceHeroLoop(scene, sRay, sStk, &sLam, &sInv, &sThr,
                                                  /*C=*/1, /*secAlive=*/false, sSpec, sPdf,
-                                                 b + 1, sub, rng, sCp, gi);
+                                                 b + 1, sub, rng, sCp, gi,
+                                                 /*rcTrain=*/true);
                                 sL += sub[0];
                             }
                             L[i] += sL;      // this wavelength's own estimate, own slot
@@ -2226,6 +2389,31 @@ struct BackwardRenderer {
                             for (int i = 0; i < nUp; ++i) L[i] += thr[i] * rho[i] * ambient;
                     }
                     if (directOnly) { finish(); return; }         // Whitted: no diffuse indirect
+                    // ---- -radcache: read the tail out of the cache and stop ---------------
+                    // Placed AFTER this vertex's own NEE and BEFORE the continuation RR, which
+                    // is what makes the partition exact: the cached number is the mean of the
+                    // radiance arriving along the direction the RR was about to sample, and
+                    // that estimator excludes the NEE done HERE (it is measured from what the
+                    // sub-path added, and the sub-path starts at the next vertex). So direct
+                    // light is counted once, by this vertex, and everything beyond it once, by
+                    // the cache -- no gap, no double count.
+                    //
+                    // ALL live wavelengths must be confident, not just the hero. Terminating
+                    // on a partially-confident cell would mean some lambda continued and some
+                    // did not, which turns a spectral bundle into a tinted one -- a colour
+                    // error, not noise, so no amount of spp would clean it up.
+                    if (rcOn && !rcTrain && b >= radMinBounce) {
+                        double e[hero::kHeroMax];
+                        if (radCache->lookupBundle(h.p, h.n, lam, nUp, e)) {
+                            // Exactly what continuing would have contributed in expectation:
+                            // surviving RR with probability q and reweighting by rho/q gives
+                            // thr*rho*E[L_i], and E[L_i] over the cosine hemisphere is E/pi.
+                            for (int i = 0; i < nUp; ++i) L[i] += thr[i] * rho[i] * e[i];
+                            ++radBank->nTerm;
+                            rcTerminated = true; finish(); return;
+                        }
+                        ++radBank->nMiss;
+                    }
                     // Continuation RR over the WHOLE bundle: the survival probability is
                     // max_i rho_i, not the hero's own albedo, and every live λ reweights by
                     // rho_i/q <= 1. Rolling the coin on the hero alone (thr[i] *= rho_i/rho_0)
@@ -2236,6 +2424,16 @@ struct BackwardRenderer {
                     const double q = hero::maxOf(rho, nUp);
                     if (rng.uniform() >= q) { finish(); return; }         // RR absorb
                     for (int i = 0; i < nUp; ++i) thr[i] *= rho[i] / q;   // bounded reweight
+                    // -radcache: remember this vertex so finish() can hand the cache a sample
+                    // of what came back along wOut. Recorded HERE, after the reweight, because
+                    // the identity needs thr_AFTER: everything L gains from now on is exactly
+                    // thr_after * L_i(omega).
+                    if (rcDep && rcNPend < kRcMaxPend) {
+                        RcPend& q2 = rcPend[rcNPend++];
+                        q2.p = h.p; q2.n = h.n;
+                        q2.Lat[0] = L[0]; q2.thrA[0] = thr[0]; q2.lam[0] = lam[0];
+                        q2.part[0] = 0.0;
+                    }
                     Vec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
                     ray = Ray{h.p + h.n * 1e-6, wOut};

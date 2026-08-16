@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <memory>
 #include <climits>
+#include <atomic>
 #include <unordered_map>
 #include "geometry.h"
 #include "bvh.h"
@@ -18,6 +19,22 @@
 #include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
 #include "record.h"      // parametric records (§records): named per-channel LUTs
 #include "lighttree_build.h"  // Conty-Kulla light BVH: node layout + host builder
+
+// ---- ray-query telemetry (-raystats) --------------------------------------------------
+// Counts every ray actually cast against the acceleration structure: closest-hit queries
+// plus shadow/occlusion queries. This is the renderer's unit of WORK, and unlike wall time
+// it is deterministic -- two runs of the same render cast exactly the same number of rays,
+// so it can measure whether an optimisation (e.g. -radcache terminating paths early) really
+// removed work on a machine too noisy to time a 5-second render on. The per-thread counter
+// is a plain thread_local increment next to a BVH traversal that costs hundreds of ns, so
+// it is unmeasurable in the render itself; each worker folds its tally into the atomic on
+// the way out, which is where the cross-thread cost lives.
+namespace raystats {
+inline thread_local unsigned long long tls = 0;
+inline std::atomic<unsigned long long> total{0};
+inline void flushThread() { total += tls; tls = 0; }
+inline void reset() { total = 0; }
+}
 
 // NOTE: append new types at the END. render_cuda.cu's D_* tags are `(int)m.type` and must
 // stay 1:1 with this order, so inserting in the middle silently reinterprets every
@@ -2158,6 +2175,7 @@ struct Scene {
     // `MatType::Hair` curves are skipped: grass and wire are curves too and stay solid.
     Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr,
                    bool skipHair = false) const {
+        ++raystats::tls;
         Hit h;
         double tMax = DBL_MAX;
         const size_t nT = tris.size();
@@ -2211,6 +2229,7 @@ struct Scene {
     // SDS limitation. Glass therefore appears dark in model B; caustics it casts
     // onto diffuse surfaces still render, since those diffuse vertices connect.
     bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
+        ++raystats::tls;
         Ray r{o, dir};
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
@@ -2242,6 +2261,7 @@ struct Scene {
     // question this way is also what makes the grid pay — unlike `walkFibers`, this one CAN
     // early-out on the first opaque hit, and in a coat's own shadow it almost always does.
     bool occludedSkipHair(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
+        ++raystats::tls;
         Ray r{o, dir};
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
