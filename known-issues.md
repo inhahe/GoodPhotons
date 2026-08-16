@@ -5,35 +5,45 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-08-16, v0.190.0): `-radcache` is opt-in because it is *approximate*, and its residual error concentrates on caustics/specular — plus three hard limits
+### OPEN (2026-08-16, v0.190.0–0.190.2): `-radcache` is opt-in because it is *approximate*, and its residual error concentrates on caustics/specular — plus its limits
 
 `-radcache` (`src/radcache.h`, read site in `BackwardRenderer::radianceHeroLoop`,
 `src/backward.h`) is a world-space diffuse radiance cache for mode `R` on the CPU. It is
 **off by default and must stay that way** — it trades a bounded, measured bias for fewer
-rays. This entry records what that bias is, and the three places the feature simply isn't
-present. None of it is a bug in the sense of "the code is doing the wrong thing"; it is the
-shape of the approximation, written down so it isn't rediscovered as a surprise.
+rays. This entry records what that bias is, the places the feature simply isn't present,
+and one thing that *was* a real bug and is now fixed (item 3). The rest is not a bug in the
+sense of "the code is doing the wrong thing" — it is the shape of the approximation, written
+down so it isn't rediscovered as a surprise.
 
 **1. Residual error concentrates on caustics and specular transport.** Measured at 200²,
 1024 spp, mode `R`, `-device cpu`, against the same render with the cache off:
 
 | scene | validate | terminated | rays | vs OFF | energy bias | rel-RMS @8× | max \|rel\| |
 |---|---|---|---|---|---|---|---|
-| `scenes/cornell.ftsl` (dispersive SF10 sphere) | 0 (off) | 55.9 % | 128.2 M | −12.3 % | −1.17 % | 3.20 % | 24.8 % |
-| " | **0.05** (default) | 38.4 % | 133.3 M | −8.9 % | −0.29 % | 1.26 % | 6.7 % |
-| " | 0.15 | 27.0 % | 136.8 M | −6.4 % | −0.15 % | 1.05 % | 7.7 % |
-| `scenes/_cornell_diffuse.ftsl` (all diffuse) | 0 (off) | 87.2 % | 111.0 M | −14.9 % | +0.10 % | 1.03 % | — |
-| " | **0.05** (default) | 75.0 % | 113.0 M | −13.4 % | −0.02 % | 0.65 % | — |
+| `scenes/cornell.ftsl` (dispersive SF10 sphere) | 0 (off) | 45.6 % | 130.9 M | −10.4 % | −1.04 % | 2.85 % | 22.5 % |
+| " | **0.05** (default) | 35.5 % | 135.0 M | −7.7 % | −0.27 % | 1.21 % | 7.4 % |
+| " | 0.15 | 32.1 % | 136.0 M | −7.0 % | −0.12 % | 1.14 % | 6.7 % |
+| `scenes/_cornell_diffuse.ftsl` (all diffuse) | 0 (off) | 87.7 % | 112.6 M | −13.7 % | +0.08 % | 0.99 % | 6.0 % |
+| " | **0.05** (default) | 76.6 % | 114.2 M | −12.5 % | −0.02 % | 0.65 % | 4.6 % |
+
+Cache-off baselines: 146,189,548 rays (glass) and 130,465,103 rays (diffuse). Every row is
+bit-reproducible as of v0.190.2 — see item 3.
 
 The all-diffuse control is essentially exact (−0.02 % energy, 0.65 % rel-RMS). The glass
-Cornell is not: `-radcache-audit` on the *raw, uncorrected* table scored 7.11 M reads and
-reported **−18.80 % systematic error per read (audit SE ±0.31 %)** — i.e. the cell mean is
+Cornell is not. `-radcache-audit` scores the *raw, uncorrected* table on both:
+
+| scene | reads scored | raw systematic error per read | audit SE |
+|---|---|---|---|
+| `scenes/cornell.ftsl` | 7.00 M | **−18.76 %** | ±0.31 % |
+| `scenes/_cornell_diffuse.ftsl` | 7.90 M | **+2.38 %** | ±0.07 % |
+
+Eight times the magnitude, and the opposite sign — the cell mean on the glass scene is
 genuinely, measurably darker than the tail it replaces, because a caustic's radiance varies
 enormously *within* one cell and across the 54 normal buckets, and cell averaging is a
 low-pass filter. Reader verification (`-radcache-validate`, default 0.05) is what pulls that
-back to −0.29 %: it corrects the cells it can pin down and retires the ones it can prove
-wrong but can't (22 corrected / 8 retired on that scene). **The residual 1.26 % rel-RMS and
-6.7 % worst pixel are still there**, and they sit on the caustic. Proper fixes, none done:
+back to −0.27 %: it corrects the cells it can pin down and retires the ones it can prove
+wrong but can't (19 corrected / 9 retired on that scene). **The residual 1.21 % rel-RMS and
+7.4 % worst pixel are still there**, and they sit on the caustic. Proper fixes, none done:
 a directional (SH / spherical-Gaussian) cell payload instead of a scalar mean per normal
 bucket; a caustic-aware refusal to cache cells whose sample variance stays high; or
 splitting cells adaptively on measured variance rather than on a fixed pixel footprint.
@@ -45,13 +55,41 @@ presents so much distinct surface that no reader ever revisits a cell often enou
 amortise filling it. `-radcache` is not a general speed switch and shouldn't be sold as one;
 it pays on architectural/interior scenes with large re-visited diffuse surfaces.
 
-**3. Unsuitable for animation or any seamless loop.** Cell contents depend on how many
-update samples a cell happened to receive, which depends on render order and chunk
-boundaries — so two adjacent frames of a flyby get *different* cells and the residual error
-flickers. This is the same objection `design.md`'s `backward.h` `-gi` note raises against
+**3. Determinism: FIXED within a frame (v0.190.2), still absent across frames.**
+
+*Fixed.* Cell contents depend on how many update samples a cell received, which depends on
+the chunk boundaries — and `cpuSppChunks` was choosing those **by wall clock**, retargeting
+each chunk toward ~0.4 s. Ordinarily that is invisible, because per-`(pixel, sample)` seeding
+makes the film independent of how the budget is split; the cache voids that invariant by
+advancing between chunks. Two identical invocations of the same binary on the same scene
+gave 40.1 % vs 41.4 % of consults terminated and images 0.45 % rel-RMS apart, while two runs
+with `FTRACE_CHUNK_SPP` pinned were bit-identical — which is what identified the cause. So
+`-device cpu is fully deterministic and is used for reference/validation baselines` was
+false whenever `-radcache` was on, i.e. exactly when someone would be diffing against a
+reference. `cpuSppChunks` now uses a schedule derived from `sppTarget` (1, 9, then an equal
+split into ~64 chunks) whenever `g_radCache` is set; repeat runs are now bit-identical, and
+renders without the flag keep the timed schedule and are unchanged.
+
+One caveat on the fixed half: the table is **not** part of the `.ftbuf` checkpoint (nothing
+in `radcache.h` serialises), so a `-resume`d render restarts with a cold table and will not
+match the same budget rendered in one go. Reproducibility means "the same command run
+twice", not "the same total spp however you got there".
+
+A second finding fell out of the same investigation, and it is a **performance trap** worth
+knowing: the chunk *count* is the number of update passes the table gets, and the cache is
+extremely sensitive to it — 65 chunks → 35.5 % terminated / 135.0 M rays; 16 chunks → 2.3 % /
+146.9 M; 5 chunks → 0 % / 146.8 M. The last two are **slower than not caching at all**, since
+the update pass is paid for and nothing is ever resolved. That is why the deterministic
+schedule targets a chunk count rather than a chunk size — a flat split, the obvious way to
+make it reproducible, is exactly the wrong shape.
+
+*Still open.* Different **frames** still get different cells: a flyby moves the camera, so a
+different set of cells is marked and resolved, and the residual error flickers between
+frames. This is the same objection `design.md`'s `backward.h` `-gi` note raises against
 irradiance caching generally, and `-radcache` does not escape it. Don't use it for
 `camera_curve` / `camera_path` sequences. Fixing this properly means a temporally-stable
-table (persist and re-use across frames, with cells aged rather than rebuilt).
+table (persist and re-use across frames, with cells aged rather than rebuilt) — the
+per-frame reproducibility above is a prerequisite for that, not a substitute.
 
 **4. Three code paths have no cache at all.** Since v0.190.1 `runRender` says so out loud —
 `[radcache] IGNORED: <reason>. The render is unaffected and correct; it is simply not using

@@ -1732,8 +1732,8 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   **Not yet using it:** the forward/BDPT/VCM `selectEmitter` power CDF
   (`render_cuda.cu`), and a mesh emitter's own triangles (still area-sampled) — both
   tracked in `known-issues.md`.
-- **`radcache.h`** (0.190.0) — the **world-space diffuse radiance cache** behind
-  `-radcache`, mode `R` on the CPU. A clipmapped hash of cells (54-bit quantised
+- **`radcache.h`** (0.190.0; device notice 0.190.1, deterministic chunking 0.190.2) — the
+  **world-space diffuse radiance cache** behind `-radcache`, mode `R` on the CPU. A clipmapped hash of cells (54-bit quantised
   position, clipmap level, 54 normal buckets) each holding a 16-bin spectral mean, its
   variance and a confidence flag; `backward.h`'s `radianceHeroLoop` reads it at a diffuse
   vertex *after* that vertex's own NEE and *before* the continuation roulette, adds
@@ -1778,14 +1778,32 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   resolution-invariant (4× the resolution gives 4× the cells *and* 4× the paths).
 
   Measured, and the limits, in `REFERENCE.md` → *Radiance cache*; the residual failure mode
-  (concentrated specular/caustic transport, −18.8 % ± 0.31 % per raw read on a dispersive
-  Cornell vs −0.3 % all-diffuse) and the fur-class scenes it does not help are in
+  (concentrated specular/caustic transport, −18.76 % ± 0.31 % per raw read on a dispersive
+  Cornell vs +2.38 % ± 0.07 % all-diffuse) and the fur-class scenes it does not help are in
   `known-issues.md`. **Not the same decision as mode `W`'s `-gi` gather**, which
   deliberately has no cache (see the three constraints under `backward.h`'s `-gi` note):
   that estimator must stay a pure function of `(index, sample index)` so an animated
   seamless loop cannot flicker, and `-radcache` fails exactly that test — its cells depend
   on render order and on what the update pass happened to sample, so it is opt-in and
   documented as unsuitable for animation.
+
+  **It made the chunk split observable, which cost `-device cpu` its determinism** until
+  0.190.2. Every CPU render is supposed to be a pure function of the scene and the sample
+  budget: `cpuSppChunks` may split the budget however it likes because per-`(pixel, sample)`
+  seeding means chunk `[base, base+c)` renders the same samples whatever `c` is. The cache
+  advances *between* chunks (the update pass runs at each boundary), so the boundaries
+  joined the realization — and they were being chosen by wall clock, retargeting toward
+  ~0.4 s per chunk. Two identical invocations measured 40.1 % vs 41.4 % of consults
+  terminated and images 0.45 % rel-RMS apart; pinning the split via the pre-existing
+  `FTRACE_CHUNK_SPP` triage hook made them bit-identical, which is what pinned the cause.
+  `cpuSppChunks` now switches to a schedule derived from `sppTarget` when `g_radCache` is
+  set (1, 9, then an equal split into ~64 chunks); flagless renders keep the timed rule and
+  are byte-unchanged. The non-obvious part is *why the deterministic schedule has that
+  shape*: the chunk count IS the update-pass count, and the cache is violently sensitive to
+  it — 65 chunks terminate 35.5 % of consults, 16 chunks 2.3 %, 5 chunks 0 %, with the last
+  two **slower than not caching** because the update pass is paid for and no cell ever
+  resolves. A flat split — the obvious way to make something reproducible — is precisely the
+  wrong answer here, so the rule targets a chunk *count*, not a chunk *size*.
 
   **It reaches exactly one code path, and 0.190.1 makes that audible.** The GPU backward
   megakernel (`bkRadianceHeroLoop`, `render_cuda.cu`) and the scalar `radiance()` fallback

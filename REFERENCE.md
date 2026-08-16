@@ -1003,17 +1003,36 @@ downsample, so Monte-Carlo noise averages out and what is left is structure):
 
 | Scene | validate | consults terminated | ray queries | vs. cache off | energy bias | rel-RMS |
 |---|---|---|---|---|---|---|
-| Cornell (dispersive SF10 sphere) | off | 55.9 % | 128.2 M | −12.3 % | −1.17 % | 3.20 % |
-| Cornell (dispersive SF10 sphere) | 0.05 | 38.4 % | 133.3 M | −8.9 % | −0.29 % | 1.26 % |
-| Cornell, all diffuse | off | 87.2 % | 111.0 M | −14.9 % | +0.10 % | 1.03 % |
-| Cornell, all diffuse | 0.05 | 75.0 % | 113.0 M | −13.4 % | −0.02 % | 0.65 % |
+| Cornell (dispersive SF10 sphere) | off | 45.6 % | 130.9 M | −10.4 % | −1.04 % | 2.85 % |
+| Cornell (dispersive SF10 sphere) | **0.05** | 35.5 % | 135.0 M | −7.7 % | −0.27 % | 1.21 % |
+| Cornell (dispersive SF10 sphere) | 0.15 | 32.1 % | 136.0 M | −7.0 % | −0.12 % | 1.14 % |
+| Cornell, all diffuse | off | 87.7 % | 112.6 M | −13.7 % | +0.08 % | 0.99 % |
+| Cornell, all diffuse | **0.05** | 76.6 % | 114.2 M | −12.5 % | −0.02 % | 0.65 % |
 
 Verification costs roughly a third of the speedup and buys back roughly three quarters of
 the error — which is why it is on by default. The residual is concentrated **specular and
 caustic** transport: `-radcache-audit` on the glass Cornell measures the *raw* cache at
-−18.8 % ± 0.31 % per read, against −0.3 % for the same scene with the sphere made diffuse.
+−18.76 % ± 0.31 % per read, against **+2.38 % ± 0.07 %** for the same scene with the sphere
+made diffuse — eight times the magnitude, and the opposite sign.
 A cell whose update rays never happen to find the caustic cannot know it is missing it,
 which is precisely the failure verification exists to catch.
+
+**Every number above is exactly reproducible**, and that took a fix (0.190.2). A CPU render
+is normally independent of how the progressive driver splits the sample budget into chunks,
+because each sample is seeded from its own `(pixel, sample index)` — so the split is
+invisible. The cache breaks that: it *advances* between chunks, so the boundaries become
+part of the result, and the driver was choosing them by wall clock. Two identical
+invocations therefore disagreed (40.1 % vs 41.4 % of consults terminated, 0.45 % rel-RMS
+apart), quietly voiding the `-device cpu` determinism guarantee for precisely the renders
+someone would check against a reference. With `-radcache` the chunk schedule is now derived
+from the sample target instead of the clock, and repeat runs are bit-identical. Renders
+*without* the flag are unaffected — same schedule, same images as before.
+
+The chunk count matters more than it looks, because it *is* the number of update passes the
+table receives: at 65 chunks the cache terminates ~36 % of consults, at 16 it manages 2.3 %,
+and at 5 it terminates nothing at all while still paying for the update pass — **slower than
+not caching**. `FTRACE_CHUNK_SPP=<n>` pins the split and `FTRACE_CHUNK_DEBUG=1` prints the
+sequence, if you want to see this for yourself.
 
 **When it does not help.** The cache pays only once its cells are resolved, and a cell is
 resolved by the update pass, not by the image. On a scene whose visible surface area dwarfs
@@ -1083,7 +1102,11 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   driven scalar/roughness slot uploads each stop's compiled expression + driver — both
   sampled on-device by exact twins of the CPU sampler; mode `D`'s connection BSDF
   reconstructs the per-hit point to sample the driver). The fallback is automatic. `cpu`
-  is fully deterministic and is used for reference/validation baselines.
+  is fully deterministic and is used for reference/validation baselines — including under
+  [`-radcache`](#radiance-cache--radcache--mode-r-cpu), which needed its own fix to keep
+  that promise (the cache advances between chunks, so the wall-clock-adaptive chunk split
+  became visible in the image; with the flag on, the split is derived from the sample target
+  instead).
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
   identical, exactly energy-conserving physics. The **megakernel** runs each
   photon's whole path in one thread and is usually fastest on **shallow, uniform

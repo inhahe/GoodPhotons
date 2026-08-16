@@ -12679,6 +12679,40 @@ static char applyUnsupportedPolicy(Scene& scene, char mode, int projection,
 // the historical single-shot render. Returns the accumulated SUM film (writeFilm divides
 // by the completed spp). Chunk size adapts toward ~0.4s so early frames appear quickly
 // and the per-chunk thread-spawn overhead stays negligible.
+//
+// ...EXCEPT under -radcache, where the split must not depend on the clock. Ordinarily the
+// chunk boundaries are invisible: per-(pixel,sample) seeding means chunk `c` starting at
+// absolute sample `base` renders exactly the samples [base, base+c) whatever the split, so
+// a slow machine and a fast one produce the same film. The radiance cache breaks that
+// invariant, because the cache ADVANCES between chunks -- the update pass runs at each
+// boundary -- so the boundaries themselves become part of the realization. Measured on
+// scenes/cornell.ftsl at 200^2 / 1024 spp: two identical wall-clock-adaptive invocations
+// gave 40.1 % vs 41.4 % of consults terminated and images differing by 0.45 % rel-RMS,
+// while two runs with the split pinned were bit-identical. That silently voided the
+// "-device cpu is fully deterministic and is used for reference/validation baselines"
+// guarantee for exactly the renders most likely to be checked against a reference.
+//
+// The fix has to preserve the schedule's SHAPE, not just remove the clock, because the
+// cache is far more sensitive to the split than one would guess. What actually matters is
+// the NUMBER of chunks, since that is the number of update passes the table gets. Measured
+// on the same scene (FTRACE_CHUNK_DEBUG=1 dumps the sequence):
+//
+//   65 chunks (timed: 1, 9, 26, then settling at ~24-27)  -> 40.1 % terminated, 133.7 M rays
+//   62 chunks (the fixed schedule below: 1, 9, then 17)   -> 35.5 %,           135.0 M rays
+//   16 chunks (FTRACE_CHUNK_SPP=64, flat)                 ->  2.3 %,           146.9 M rays
+//    5 chunks (geometric 1, 9, 73, 585, ...)              ->  0 %,             146.8 M rays
+//
+// (cache off, for scale: 146.2 M rays)
+//
+// Both of the coarse schedules are WORSE than not caching at all -- the table never gets
+// enough update rounds to resolve a cell, so every render pays the update pass and
+// terminates nothing. (Note the timed rule does not ramp geometrically; the `c*8+1` clamp
+// only governs the first two steps, after which it converges on whatever hits 0.4 s.)
+//
+// So the deterministic schedule targets a fixed chunk COUNT rather than a fixed chunk time:
+// 1, then 9, then an equal split of the remainder into kFixedChunks-2 pieces. That is a
+// pure function of sppTarget, keeps the fast first previews, and lands within a few chunks
+// of what the timed rule converges to here.
 static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX, int resY,
                          const std::function<Film(long long, unsigned long long)>& renderOne) {
     if (!prog || !prog->report) return renderOne(sppTarget, 0);
@@ -12697,6 +12731,21 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
     if (const char* e = std::getenv("FTRACE_CHUNK_SPP")) forcedChunk = std::atoll(e);
     if (forcedChunk > 0) chunk = forcedChunk;
     const bool chunkDebug = std::getenv("FTRACE_CHUNK_DEBUG") != nullptr;
+    // See the header comment: the radiance cache makes the split observable, so it gets a
+    // clock-free schedule. `g_radCache` (not `rcOn`) deliberately -- when the cache is set
+    // but inert (-whitted / -direct-only) the two schedules give the same film anyway, so
+    // the broader condition costs nothing and cannot drift out of sync with the read site.
+    const bool fixedSchedule = g_radCache;
+    // Chunk count to aim for under the fixed schedule. 64 is the measured-good neighbourhood
+    // (the timed rule settles on ~65 here); the cache wants many update rounds, and the
+    // per-chunk thread-spawn overhead is negligible next to a 200^2 x 16 spp chunk.
+    const long long kFixedChunks = 64;
+    long long settledChunk = 1;
+    if (fixedSchedule && sppTarget > 10) {
+        const long long pieces = kFixedChunks - 2;
+        settledChunk = (sppTarget - 10 + pieces - 1) / pieces;   // ceil, so the plan finishes
+        if (settledChunk < 1) settledChunk = 1;
+    }
     while (done < sppTarget) {
         long long c = chunk; if (c > sppTarget - done) c = sppTarget - done;
         auto t0 = clk::now();
@@ -12706,7 +12755,11 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
         if (chunkDebug) std::fprintf(stderr, "[chunk] c=%lld base=%llu dt=%.3f\n",
                                      c, seedBias + (unsigned long long)(done - c), dt);
-        if (forcedChunk <= 0 && dt > 1e-4) {   // retarget chunk toward ~0.4s of work
+        if (forcedChunk > 0) {
+            // pinned by FTRACE_CHUNK_SPP; leave `chunk` alone
+        } else if (fixedSchedule) {
+            chunk = (done < 10) ? 9 : settledChunk;   // 1, 9, then an equal split
+        } else if (dt > 1e-4) {                // retarget chunk toward ~0.4s of work
             long long next = (long long)((double)c * (0.4 / dt));
             if (next < 1) next = 1;
             if (next > c * 8 + 1) next = c * 8 + 1;   // ramp up gently
