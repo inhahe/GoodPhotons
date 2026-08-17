@@ -336,6 +336,18 @@ Both are places the current env quietly assumes z = 0 *is* the ground:
                             --terrain-level 1.0                          # the generalisation claim
       ```
 
+      **The control is measured** (2026-08-17): P1's flat-trained `runs/canis/best.pt`
+      (14.95M steps, command cap 0.8) scored on stairs it never saw. This is the number the
+      terrain run has to beat, and it says the measurement is sensitive rather than saturated
+      — the policy degrades gradually with difficulty rather than passing or failing outright.
+
+      | task | return | survived | r_speed | tilt° | alive |
+      |---|---|---|---|---|---|
+      | flat (the regression guard) | 1224.9 | 100% | 0.972 | 3.4 | 20.0 s |
+      | stairs 0.2 | 239.2 | 11% | 0.785 | 7.8 | 4.8 s |
+      | stairs 0.5 | 62.8 | 0% | 0.449 | 15.5 | 2.1 s |
+      | stairs 1.0 | 14.1 | 0% | 0.186 | 21.4 | 1.0 s |
+
 ---
 
 ## P2 — AMP imitation from public mocap  `[ ]`
