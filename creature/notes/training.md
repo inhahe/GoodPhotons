@@ -173,6 +173,10 @@ python tools/train.py --resume runs/canis_rough/latest.pt --out runs/canis_rough
 
 # score an existing checkpoint on terrain of a chosen difficulty
 python tools/train.py --eval runs/canis_rough/best.pt --terrain-level 1.0
+
+# hold a class out of training, then score on exactly that class -- this pair IS P1b's bar
+python tools/train.py --terrain-kinds flat,rolling,rubble,steps,slope --out runs/canis_rough
+python tools/train.py --eval runs/canis_rough/best.pt --terrain-kinds stairs --terrain-level 1.0
 ```
 
 `--terrain` swaps the infinite `<geom type="plane">` for a MuJoCo heightfield, regenerated
@@ -201,6 +205,16 @@ comparing eval returns across a run, and a score measured on ground that gets ro
 proceeds is not comparable with itself — the checkpoint selector would drift with the curriculum
 rather than with the policy. To measure the thing you actually trained, use the third command
 above: `--eval CKPT --terrain-level L` scores a checkpoint on terrain of a difficulty you name.
+Scoring on terrain without naming a difficulty is refused rather than defaulted, because
+difficulty 0 is a *flat heightfield* — it would pay terrain's cost and hand back a flat-ground
+table under a heading that says terrain.
+
+**`--terrain-kinds` is what makes the bar measurable.** P1b's claim is not "walks on rough
+ground" but "walks on rough ground *of a kind it never trained on*", and that needs a class
+held out of the training draw and then named at eval time — the last pair of commands above.
+The held-out set is printed once at the top of the run's log and travels in the checkpoint, so
+a `--resume` that forgets the flag cannot quietly show the policy the one class the run's whole
+number depends on it never having seen. A misspelled class is an error, not a smaller set.
 
 **It costs ~26% of throughput**, from MuJoCo's hfield collision geometry and not from anything in
 this repo (`known-issues.md` #8 has the attribution, and the two knobs that would buy it back
@@ -304,6 +318,7 @@ near a parameter's range edge, where most of its neighbourhood gets clipped.
 | `--device` | auto | see above — this is CPU-bound in MuJoCo |
 | `--terrain` | off | rough ground (P1b), with its own curriculum axis; costs ~26% throughput |
 | `--terrain-level` | — | the curriculum's starting difficulty 0..1 (and the difficulty `--eval` scores on); implies `--terrain`, and wins over a resumed value |
+| `--terrain-kinds` | all six | the classes to draw from, comma-separated; implies `--terrain`. Hold one out to train, name it to `--eval`: that pair is P1b's bar |
 
 The reward weights, the command ranges and the curriculum live in `EnvConfig`
 (`creaturelab/env.py`) and are **not** exposed as flags. That is deliberate: they are part of the

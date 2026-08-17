@@ -792,6 +792,20 @@ freeze at whatever the policy managed on the easiest terrain it ever saw. Flat i
 fixed for the whole run, it is directly comparable to P1's numbers, and it is exactly the bar
 P1b is held to ("flat-ground performance does not regress"). Scoring *on* terrain is a
 measurement rather than a selector, and has its own flag: `--eval CKPT --terrain-level L`.
+Scoring on terrain without a difficulty is refused rather than defaulted: difficulty 0 is a
+flat heightfield, so the run would pay terrain's cost and print a flat-ground table under a
+heading that says terrain.
+
+**The other half of P1b's bar needs a class held out, so the class set is task state too.**
+"Survives on terrain it never saw in training" is only measurable if training can be denied a
+class and evaluation can then be pointed at exactly that one — `--terrain-kinds`, which both
+halves share. Unlike the terrain flag the set *could* be restored after the env is built
+(`regenerate` reads it per reset), but it rides in the checkpoint and is applied in the same
+pre-build block anyway, so that one place holds everything a resume's argv could silently
+redefine: a five-class run that resumes onto six has been shown the very terrain its number is
+a claim about, and nothing in its output would say so. For the same reason the set is printed
+once at the top of the run with its complement named, and an unknown class name is an error —
+downstream, a typo cannot raise, it can only quietly shrink the distribution.
 
 **Observations are unchanged.** Nothing about terrain reaches the policy through a new
 channel; it arrives through the feet, the vestibular block and the joint angles, exactly as it

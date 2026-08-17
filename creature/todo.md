@@ -238,9 +238,10 @@ Smoke-test the entire loop end to end on a body whose dynamics we trust.
 ## P1b — Terrain: the ground stops being flat  `[~]`
 
 *(Stage 1 built 2026-08-16 — `creaturelab/terrain.py`, `tests/test_terrain.py`, `--terrain` /
-`--terrain-level` on `tools/train.py`, written up in design.md §"Terrain is a training
-distribution, not a solver" and notes/training.md §"Training on rough ground". The phase stays
-open on the **Bar**, which is a claim about a trained policy and needs a full run to answer.)*
+`--terrain-level` / `--terrain-kinds` on `tools/train.py`, written up in design.md §"Terrain is
+a training distribution, not a solver" and notes/training.md §"Training on rough ground". The
+phase stays open on the **Bar**, which is a claim about a trained policy and needs a full run
+to answer; everything needed to run and read that measurement is in place.)*
 
 P1 proved the RL loop on a plane. Every episode so far has reset onto `type="plane"` at
 z = 0, which means the policy has never seen a foot land lower than it expected. That is
@@ -321,6 +322,19 @@ Both are places the current env quietly assumes z = 0 *is* the ground:
       class it never saw in training — **and** flat-ground performance does not regress
       (the P1 command sweep re-run on the plane is the guard, since it is the only
       apples-to-apples number we have).
+      *The apparatus for measuring it exists as of 2026-08-17 — `--terrain-kinds` holds a
+      class out of the training draw and names it back at eval time, the held-out set rides
+      in the checkpoint so a resume cannot quietly reveal it, and scoring on terrain without
+      a stated difficulty is refused (difficulty 0 is a flat heightfield, which would answer
+      the terrain question with a flat-ground table). What is left is running it:*
+
+      ```bash
+      python tools/train.py --terrain-kinds flat,rolling,rubble,steps,slope \
+                            --steps 3e7 --out runs/canis_rough
+      python tools/train.py --eval runs/canis_rough/best.pt              # flat: the regression guard
+      python tools/train.py --eval runs/canis_rough/best.pt --terrain-kinds stairs \
+                            --terrain-level 1.0                          # the generalisation claim
+      ```
 
 ---
 

@@ -357,3 +357,83 @@ def test_resume_of_a_terrain_run_does_not_silently_continue_on_a_plane(tmp_path)
     assert "terrain on" in r.stdout, "the resume did not notice it was resuming a terrain run"
     levels = _levels(out / "log.jsonl")
     assert len(levels) >= 2 and set(levels) == {0.4}, f"the resume lost the terrain: {levels}"
+
+
+# ------------------------------------------------------------------- the held-out class
+# P1b's bar is "survives on terrain drawn from a class it never saw in training", which is
+# only measurable if a class can actually be held out of training and named at eval time.
+# That is one flag, `--terrain-kinds`, and these pin the three ways it can quietly not hold.
+def test_a_restricted_class_set_is_the_only_thing_drawn(body):
+    """The env must draw from the configured set and nothing else.
+
+    Worth pinning separately from the CLI: `regenerate` picks with `rng.integers(len(kinds))`,
+    and an off-by-one or a stale default here would show up as the held-out class appearing in
+    a run whose whole claim is that it never did.
+    """
+    v = VecCreatureEnv([body] * 4, cfg(terrain_kinds=("rolling", "slope")), seed=0)
+    v.terrain_level = 1.0
+    seen = set()
+    for s in range(12):
+        v.reset(seed=s)
+        seen |= {p.kind for p in v.patches}
+    assert seen <= {"rolling", "slope"}, f"drew a class it was not given: {seen}"
+    assert seen == {"rolling", "slope"}, f"never drew part of its own set in 48 rolls: {seen}"
+    v.close()
+
+
+def test_terrain_kinds_reports_what_it_held_out(tmp_path):
+    """The held-out class decides whether the run's eval number is a generalisation claim.
+
+    So it has to be legible from the log file alone, months later, without the shell history
+    that started the run -- a run trained on five classes and one trained on six are otherwise
+    indistinguishable from their output.
+    """
+    out = tmp_path / "run"
+    r = _train("--terrain-kinds", "flat,rolling,rubble,steps,slope", "--terrain-level", "0.6",
+               "--steps", "16", "--out", str(out))
+    assert r.returncode == 0, r.stderr
+    assert "held out: stairs" in r.stdout, r.stdout
+
+
+def test_a_resume_keeps_the_held_out_class_held_out(tmp_path):
+    """Unlike the terrain *flag*, the class set could be restored after the env is built --
+    but it is just as much a task, and it is the half a held-out run cannot afford to lose.
+
+    A run trained on five classes that resumes onto all six has been shown the very terrain
+    its bar is about generalising to, and nothing in its output would say so.
+    """
+    out = tmp_path / "run"
+    assert _train("--terrain-kinds", "flat,rolling", "--terrain-level", "0.6",
+                  "--steps", "16", "--out", str(out)).returncode == 0
+    r = _train("--resume", str(out / "latest.pt"), "--steps", "32", "--out", str(out))
+    assert r.returncode == 0, r.stderr
+    assert "held out: rubble, steps, slope, stairs" in r.stdout, r.stdout
+
+
+def test_a_misspelled_terrain_class_is_refused(tmp_path):
+    """Nothing downstream would object: `generate` is only ever asked for names that were
+    drawn from the set, so a typo silently shrinks the set instead of raising."""
+    r = _train("--terrain-kinds", "rolling,stiars", "--steps", "16",
+               "--out", str(tmp_path / "run"))
+    assert r.returncode != 0
+    assert "unknown terrain class stiars" in r.stderr, r.stderr
+
+
+def test_scoring_on_terrain_without_a_difficulty_is_refused(tmp_path):
+    """`--eval CKPT --terrain` is difficulty 0, which is a flat heightfield: the eval pays
+    terrain's cost and prints a flat-ground table under a heading that says terrain."""
+    out = tmp_path / "run"
+    assert _train("--steps", "16", "--out", str(out)).returncode == 0
+    r = _train("--eval", str(out / "latest.pt"), "--terrain")
+    assert r.returncode == 2
+    assert "explicit --terrain-level" in r.stderr, r.stderr
+
+
+def test_scoring_on_a_named_class_says_which(tmp_path):
+    """The measurement path for the bar: score a checkpoint on one class at one difficulty."""
+    out = tmp_path / "run"
+    assert _train("--steps", "16", "--out", str(out)).returncode == 0
+    r = _train("--eval", str(out / "latest.pt"), "--terrain-kinds", "stairs",
+               "--terrain-level", "1.0")
+    assert r.returncode == 0, r.stderr
+    assert "difficulty 1.00 (stairs)" in r.stdout, r.stdout
