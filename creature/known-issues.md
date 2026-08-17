@@ -253,6 +253,50 @@ cross-validation error per body part, once one is trained;
 `tests/test_keypoints.py::test_the_placeholder_sigma_is_flagged_as_a_placeholder` fails if
 the flag is flipped without the numbers changing.
 
+### 8. Terrain costs 26% of throughput, and it is MuJoCo's hfield collision, not our code
+
+*(found 2026-08-16, while building P1b.)* Turning `EnvConfig.terrain` on takes the default
+canis rig from **2210 to ~1630 env-steps/s**, a 26% loss, measured at 16 envs on the same
+machine, same seed, same everything else.
+
+Attributed, so that nobody re-optimises the wrong half:
+
+| configuration | env-steps/s | reading |
+|---|---|---|
+| `type="plane"` (P1) | 2210 | baseline |
+| hfield asset, data all zeros ("hfield-but-flat") | 1649 | **the whole cost is here** |
+| hfield with a full difficulty-1 terrain | 1633 | the terrain data itself costs ~1% |
+
+So it is not the per-episode `generate` (once per reset, ~0.5 ms), not the per-step
+`Patch.height_at` (3.28 µs against a ~10 ms control step at 16 envs, i.e. ~0.5%), and not
+the per-env `MjModel` deepcopy (once, at construction). It is that a `hfield` geom is a far
+more expensive collider than a `plane`, which has a closed-form contact.
+
+Two knobs move it, both by making the collider coarser:
+
+| change | env-steps/s | note |
+|---|---|---|
+| cell 0.196 m → 0.786 m (`terrain_cell` 0.25 → 1.0 withers) | 1633 → **2072** | fewer, larger triangles for the broadphase to sift |
+| elevation scale 46.9 m → 0.35 m (i.e. drop the `slope`/`stairs` classes) | 1633 → **1831** | a shorter hfield box is a smaller AABB |
+
+Neither is taken. A coarser cell makes the rubble bigger than the paw, which is the feature
+the class exists to produce; dropping the slope classes drops the terrain that most changes
+what a gait has to do.
+
+**The deferred alternative: "slope as tilted gravity."** The `slope` and `stairs` classes are
+the only reason `elevation` is tens of metres rather than tens of centimetres, and a slope
+could instead be expressed as a rotated gravity vector over a flat-ish hfield — recovering
+roughly the 12% the elevation range costs, with no change to the terrain the feet feel.
+**It was not done, and it should not be done casually**, because it silently changes what the
+fall test measures: `env.step` terminates on `arccos(R[2,2])`, the angle between the trunk's
+up-axis and *world* up, and the code comments there make a point of that agreeing with
+`validate.trunk_tilt_of`. Under tilted gravity a correctly-standing animal on a 25° slope has
+`R[2,2] = 1`, so the two measures stop being the same quantity and every tilt threshold in the
+project (`fall_tilt`, `stand_test`'s bar, `tune.brace`'s mode read) would have to be restated
+against the local gravity direction rather than world up. That is a project-wide change to a
+load-bearing definition in exchange for ~12% of one config's throughput — worth doing only
+deliberately, and with the tilt definition changed everywhere in the same commit.
+
 ---
 
 ## Done

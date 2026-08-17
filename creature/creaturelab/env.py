@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import sensing
+from . import sensing, terrain
 from .model import Creature
 
 
@@ -72,6 +72,29 @@ class EnvConfig:
     # commands are the harder task. `_standstill_score` computes the parked baseline in closed
     # form and the bar sits this far above it. 0.25 reproduces ~0.73 at the initial width.
     curriculum_margin: float = 0.25
+
+    # --- terrain (P1b) ----------------------------------------------------------------------
+    # Off by default: a flat plane is what P1's numbers were measured on, and the terrain bar
+    # is explicitly "flat-ground performance does not regress", which needs the flat task to
+    # stay reachable unchanged.
+    #
+    # Everything here is in the body's OWN units, for the same reason the command range is:
+    # `terrain_amp` and `terrain_cell` are withers heights, so the same config means the same
+    # terrain on a terrier and a wolfhound rather than the same absolute stones.
+    terrain: bool = False
+    terrain_kinds: tuple[str, ...] = ("flat", "rolling", "rubble", "steps", "slope", "stairs")
+    terrain_amp: float = 0.35          # peak-to-peak of the rough classes at difficulty 1
+    terrain_cell: float = 0.25         # target sample spacing
+    terrain_margin: float = 1.25       # patch covers this multiple of an episode's max travel
+    terrain_max_slope: float = 25.0    # deg; deliberately under fall_tilt/2, see TerrainSpec
+    terrain_max_cells: int = 513       # ceiling on the grid; cell size gives before this does
+
+    # The terrain curriculum shares the command curriculum's window, bar and measurement --
+    # see `_advance_curriculum`. It has its own start/step because difficulty is a different
+    # axis with a different natural granularity.
+    terrain_curriculum: bool = True
+    terrain_start: float = 0.0         # difficulty in [0, 1]; 0 is flat
+    terrain_step: float = 0.1
 
     # --- reward weights (all terms dimensionless) --------------------------------------
     w_speed: float = 1.0
@@ -111,6 +134,13 @@ class Body:
     spec: sensing.ObsSpec
     frame_skip: int
     withers: float
+    #: The MJCF this model was compiled from, kept so a vector env can clone the model per
+    #: env. That is only needed for terrain -- `hfield_data` lives in `MjModel`, so envs
+    #: sharing a `Body` would share one terrain and a reset in env 3 would move the ground
+    #: under envs 0-2 mid-episode. See `VecCreatureEnv.__init__`.
+    mjcf: str = ""
+    #: The hfield's shape, when this body was compiled with terrain. `None` means a plane.
+    terrain: object | None = None
 
 
 def build_body(cfg: EnvConfig, morph: dict[str, float] | None = None,
@@ -120,6 +150,13 @@ def build_body(cfg: EnvConfig, morph: dict[str, float] | None = None,
     `build_tuned`, not `load`: an untuned skeleton has no passive tone, folds up the
     instant gravity touches it, and would hand the policy the job of not collapsing --
     which costs training budget forever. The tone pass is part of what "this body" means.
+
+    With `cfg.terrain` the model is compiled twice, and that is not waste. The terrain patch
+    is sized in the body's own units -- amplitude and cell in withers heights, extent from
+    how far this animal can travel in an episode -- and the withers height is a *measurement*
+    off the compiled model (`spec.length`), so it does not exist until the first compile. The
+    tuning pass, which is what actually costs (~1.1 s), runs once either way; the second pass
+    is XML parsing.
     """
     import mujoco
 
@@ -127,18 +164,30 @@ def build_body(cfg: EnvConfig, morph: dict[str, float] | None = None,
     from .tune import build_tuned
 
     creature, _ = build_tuned(cfg.rig, morph)
-    model = mujoco.MjModel.from_xml_string(to_mjcf(creature))
-    data = mujoco.MjData(model)
 
-    skip = int(round(cfg.control_dt / model.opt.timestep))
-    if skip < 1:
-        raise ValueError(f"control_hz {cfg.control_hz} is faster than the physics "
-                         f"timestep {model.opt.timestep}")
-    actual = skip * model.opt.timestep
-    spec = sensing.build_spec(model, data, creature, control_dt=actual,
-                              foot_names=foot_names)
+    def compile_(tspec):
+        xml = to_mjcf(creature, terrain=tspec)
+        m = mujoco.MjModel.from_xml_string(xml)
+        d = mujoco.MjData(m)
+        skip = int(round(cfg.control_dt / m.opt.timestep))
+        if skip < 1:
+            raise ValueError(f"control_hz {cfg.control_hz} is faster than the physics "
+                             f"timestep {m.opt.timestep}")
+        s = sensing.build_spec(m, d, creature, control_dt=skip * m.opt.timestep,
+                               foot_names=foot_names)
+        return xml, m, skip, s
+
+    xml, model, skip, spec = compile_(None)
+    tspec = None
+    if cfg.terrain:
+        tspec = terrain.TerrainSpec.for_body(
+            spec.length, amp=cfg.terrain_amp, cell=cfg.terrain_cell,
+            margin=cfg.terrain_margin, max_speed=cfg.speed_range[1],
+            seconds=cfg.episode_seconds, max_slope_deg=cfg.terrain_max_slope,
+            max_cells=cfg.terrain_max_cells)
+        xml, model, skip, spec = compile_(tspec)
     return Body(creature=creature, model=model, spec=spec, frame_skip=skip,
-                withers=spec.length)
+                withers=spec.length, mjcf=xml, terrain=tspec)
 
 
 def _energy_chunks(frame_skip: int, requested: int) -> int:
@@ -193,7 +242,22 @@ class VecCreatureEnv:
         self.chunk_dt = self.chunk_steps * bodies[0].model.opt.timestep
         self.max_steps = int(round(cfg.episode_seconds * cfg.control_hz))
 
-        self.datas = [mujoco.MjData(b.model) for b in bodies]
+        # Per-env models, but only when terrain is on. `MjModel` is read-only during a step,
+        # so on flat ground every env can share one -- which is the whole reason `build_envs`
+        # compiles a single body for 64 envs. Terrain breaks that: elevation data lives in
+        # `MjModel.hfield_data`, so envs sharing a model share a terrain, and since episodes
+        # end at different steps a reset in one env would move the ground under the others
+        # mid-stride. Cloning is per env rather than per distinct body for the same reason.
+        self.models = [b.model for b in bodies]
+        self.patches: list[terrain.Patch] | None = None
+        if any(b.terrain is not None for b in bodies):
+            if not all(b.terrain is not None for b in bodies):
+                raise ValueError("some bodies were compiled with terrain and some without")
+            self.models = [self._clone_model(b) for b in bodies]
+            self.patches = [terrain.Patch(b.terrain, m)
+                            for b, m in zip(bodies, self.models)]
+
+        self.datas = [mujoco.MjData(m) for m in self.models]
         self.rng = np.random.default_rng(seed)
         self.prop = sensing.BatchProprioception(self.bspec, self.n, self.rng)
         self.raw = sensing.make_raw(self.spec, self.n, self.chunks)
@@ -229,6 +293,10 @@ class VecCreatureEnv:
         self._ep_track = np.zeros(self.n)
         self._speed_cap = (float(np.clip(cfg.curriculum_start, *cfg.speed_range))
                            if cfg.curriculum else cfg.speed_range[1])
+        # Terrain difficulty in [0, 1]. Zero without terrain, so `info["terrain_level"]` is a
+        # number in every run and a log parser never has to special-case the flat case.
+        self._terrain_level = 0.0 if self.patches is None else (
+            float(np.clip(cfg.terrain_start, 0.0, 1.0)) if cfg.terrain_curriculum else 1.0)
         self._cur_track = self._cur_steps = 0.0     # the promotion window, see `_advance_...`
         self._cur_eps = 0
         # The last completed window's score, and the standstill score it has to beat. Both are
@@ -241,6 +309,7 @@ class VecCreatureEnv:
         self.cur_score = float("nan")
         self.cur_bar = self._promotion_bar()
         self._tilt = np.zeros(self.n)
+        self._clear = np.zeros(self.n)      # root height above the ground under it
         self._speed = np.zeros(self.n)
         self._cot = np.zeros(self.n)
         self._r_speed = np.zeros(self.n)
@@ -253,6 +322,22 @@ class VecCreatureEnv:
         # stayed plausible (a valid command, `sane` True) so nothing ever raised.
         self._info_cmd = np.zeros((self.n, 3))
         self._sane = np.zeros(self.n, dtype=bool)
+
+    @staticmethod
+    def _clone_model(body: Body):
+        """An independent `MjModel` for one env. Deep copy where the bindings allow it.
+
+        `copy.deepcopy` is ~two orders of magnitude cheaper than re-parsing the XML, which
+        matters at 64 envs, but it is a binding feature rather than a guarantee -- so the
+        MJCF is kept on the `Body` and re-parsed if the copy is refused.
+        """
+        import copy
+
+        try:
+            return copy.deepcopy(body.model)
+        except Exception:                       # noqa: BLE001 -- any failure means re-parse
+            import mujoco
+            return mujoco.MjModel.from_xml_string(body.mjcf)
 
     # ------------------------------------------------------------------------- commands
     def sample_commands(self, k: int) -> np.ndarray:
@@ -279,6 +364,19 @@ class VecCreatureEnv:
         # simply promote against the wrong bar for the rest of its life.
         self._speed_cap = float(v)
         self.cur_bar = self._promotion_bar()
+
+    @property
+    def terrain_level(self) -> float:
+        """Current terrain difficulty in [0, 1]; see `_advance_curriculum`."""
+        return self._terrain_level
+
+    @terrain_level.setter
+    def terrain_level(self, v: float) -> None:
+        # Written from outside exactly where `speed_cap` is: a checkpoint restore. Resuming a
+        # terrain run at difficulty 0 would hand a competent policy the flat task it solved
+        # millions of steps ago, and the curve would step backwards for reasons entirely
+        # internal to the resume.
+        self._terrain_level = float(np.clip(v, 0.0, 1.0))
 
     def _standstill_score(self) -> float:
         """The tracking reward a *motionless* animal collects under the current cap.
@@ -354,10 +452,19 @@ class VecCreatureEnv:
 
         Accumulated per *step*, not per episode, so a policy that falls over after 20 well
         tracked steps does not count the same as one that held the command for 20 seconds.
+
+        **Terrain (P1b) rides on exactly this machinery, on a second axis.** Rough ground and
+        a faster command are both "the task got harder", both show up in the same tracking
+        reward, and both must only be widened once the policy has earned it -- so they share
+        the window, the measurement and the bar, and differ only in what a promotion spends
+        itself on. `_promote` gives each earned promotion to whichever axis has progressed
+        less, in fractions of its own range. Advancing both at once would double the step
+        change the policy has to absorb per promotion; advancing speed to its maximum first
+        would train a flat-ground gallop and then ask it to relearn on rubble.
         """
-        if not self.cfg.curriculum or self.speed_cap >= self.cfg.speed_range[1]:
-            return
         n = self._steps[idx]                    # zeroed by `_reset_one`, so this is the episode
+        if not (self._can_promote_speed() or self._can_promote_terrain()):
+            return
         self._cur_track += float(np.sum(self._ep_track[idx]))
         self._cur_steps += float(np.sum(n))
         self._cur_eps += int(idx.size)
@@ -367,8 +474,30 @@ class VecCreatureEnv:
         self._cur_track = self._cur_steps = 0.0
         self._cur_eps = 0
         if score >= self.cur_bar:
-            self.speed_cap = min(self.cfg.speed_range[1],       # the setter moves `cur_bar` too
-                                 self.speed_cap + self.cfg.curriculum_step)
+            self._promote()
+
+    def _can_promote_speed(self) -> bool:
+        return bool(self.cfg.curriculum and self.speed_cap < self.cfg.speed_range[1])
+
+    def _can_promote_terrain(self) -> bool:
+        return bool(self.patches is not None and self.cfg.terrain_curriculum
+                    and self._terrain_level < 1.0)
+
+    def _promote(self) -> None:
+        """Spend one earned promotion on the axis that is further behind."""
+        c = self.cfg
+        span = c.speed_range[1] - c.curriculum_start
+        speed_at = 1.0 if span <= 0 else (self.speed_cap - c.curriculum_start) / span
+        # An axis that cannot move counts as finished, so the comparison always picks the
+        # other one rather than stalling the curriculum on a maxed-out axis.
+        if not self._can_promote_speed():
+            speed_at = float("inf")
+        terrain_at = self._terrain_level if self._can_promote_terrain() else float("inf")
+        if speed_at <= terrain_at:
+            self.speed_cap = min(c.speed_range[1],        # the setter moves `cur_bar` too
+                                 self.speed_cap + c.curriculum_step)
+        else:
+            self.terrain_level = self._terrain_level + c.terrain_step
 
     # ---------------------------------------------------------------------------- reset
     def _reset_one(self, i: int) -> None:
@@ -376,9 +505,15 @@ class VecCreatureEnv:
 
         from .emit_mjcf import place_on_ground
 
-        m, d, s, c = self.bodies[i].model, self.datas[i], self.bodies[i].spec, self.cfg
+        m, d, s, c = self.models[i], self.datas[i], self.bodies[i].spec, self.cfg
         mujoco.mj_resetData(m, d)
-        place_on_ground(m, d)
+
+        # A fresh surface every episode, not one memorised terrain. Rolled before the body is
+        # placed, because where the ground is decides where the body starts.
+        patch = None if self.patches is None else self.patches[i]
+        if patch is not None:
+            patch.regenerate(self.rng, self._terrain_level, c.terrain_kinds)
+        place_on_ground(m, d, patch=patch)
 
         # Perturb the start pose. Every episode starting from the identical settled stance
         # lets a policy memorise one opening rather than learn to move from wherever it
@@ -389,12 +524,14 @@ class VecCreatureEnv:
         d.qvel[s.jnt_dofadr] += (self.rng.uniform(-0.5, 0.5, len(span))
                                  * (c.init_rate_noise / s.time))
         mujoco.mj_forward(m, d)
-        place_on_ground(m, d)
+        place_on_ground(m, d, patch=patch)
 
         # `mj_resetData` zeroed MuJoCo's warning counters too, so the baseline `gather_state`
         # compares against has to be zeroed with them or the fresh env reads as insane.
         self.raw.warn[i] = 0
         sensing.gather_state(m, d, s, self.raw, i)
+        if patch is not None:
+            self.raw.ground_z[i] = patch.height_at(d.qpos[0], d.qpos[1])
         self.raw.work_tau[i] = 0.0
         self.raw.work_vel[i] = 0.0
         self._steps[i] = 0
@@ -428,7 +565,7 @@ class VecCreatureEnv:
         """The only code that runs in the thread pool. Touches `MjData` and nothing else."""
         import mujoco
 
-        m, d, s = self.bodies[i].model, self.datas[i], self.bodies[i].spec
+        m, d, s = self.models[i], self.datas[i], self.bodies[i].spec
         d.ctrl[:] = self._ctrl[i]
         tau, vel, sel = self.raw.work_tau[i], self.raw.work_vel[i], s.dof_sel
         tau[0] = d.qfrc_actuator[sel]
@@ -438,6 +575,12 @@ class VecCreatureEnv:
             tau[c] = d.qfrc_actuator[sel]
             vel[c] = d.qvel[sel]
         sensing.gather_state(m, d, s, self.raw, i)
+        # The one terrain query in the hot loop. It lives here, in the pool, rather than in
+        # the batched pass outside it, because each env has its own elevation array -- there
+        # is nothing to batch, and N one-point numpy calls would cost more GIL time than N
+        # scalar interpolations. See `terrain.Patch.height_at`.
+        if self.patches is not None:
+            self.raw.ground_z[i] = self.patches[i].height_at(d.qpos[0], d.qpos[1])
 
     def _physics_span(self, span: tuple[int, int]) -> None:
         for i in range(span[0], span[1]):
@@ -501,9 +644,16 @@ class VecCreatureEnv:
         # Identical measure to `validate.trunk_tilt_of`, deliberately: a policy that can
         # satisfy the training termination and not P0's acceptance bar is a policy that
         # learned to game the difference between them.
+        #
+        # The height test is on clearance above the ground *under the root*, not on world z.
+        # On a plane `ground_z` is zero and this is the pre-terrain test unchanged; on terrain
+        # world z is wrong in both directions at once -- cresting a rise reads as unusually
+        # tall, standing healthily in a dip reads as fallen -- and the second of those ends
+        # episodes the policy was doing nothing wrong in, which is the more expensive error.
         self._tilt[:] = np.degrees(np.arccos(np.clip(R[:, 2, 2], -1.0, 1.0)))
+        self._clear[:] = self.raw.root_z - self.raw.ground_z
         self.term[:] = ((self._tilt > cfg.fall_tilt)
-                        | (self.raw.root_z < cfg.min_height * self.withers)
+                        | (self._clear < cfg.min_height * self.withers)
                         | ~sane)
         self.trunc[:] = (~self.term) & (self._steps >= self.max_steps)
         self._speed[:], self._cot[:], self._r_speed[:] = v_local[:, 0], c_energy, r_speed
@@ -513,7 +663,7 @@ class VecCreatureEnv:
         info = {"command": self._info_cmd, "tilt": self._tilt, "speed": self._speed,
                 "cot": self._cot, "r_speed": self._r_speed, "sane": self._sane,
                 "speed_cap": self.speed_cap, "cur_score": self.cur_score,
-                "cur_bar": self.cur_bar}
+                "cur_bar": self.cur_bar, "terrain_level": self.terrain_level}
         done = np.nonzero(self.term | self.trunc)[0]
         if done.size:
             info["episode_return"] = self._return[done].copy()
@@ -555,7 +705,10 @@ class CreatureEnv:
         self.body = body
         self.cfg = cfg
         self.spec = body.spec
-        self.model = body.model
+        # The vec env's model, not `body.model`: with terrain they are different objects, and
+        # the one that matters is the one `self.data` was allocated against and whose hfield
+        # the resets write into.
+        self.model = self.vec.models[0]
         self.data = self.vec.datas[0]
         self.obs_dim = self.vec.obs_dim
         self.act_dim = self.vec.act_dim

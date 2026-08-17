@@ -24,6 +24,7 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -165,6 +166,12 @@ def main() -> int:
                     help="randomise bodies this far about the centre (0 = one body)")
     ap.add_argument("--morph-bodies", type=int, default=8,
                     help="distinct bodies to compile, cycled over the envs")
+    ap.add_argument("--terrain", action="store_true",
+                    help="train on rough ground (P1b): a heightfield re-rolled every "
+                         "episode, with its own difficulty curriculum")
+    ap.add_argument("--terrain-level", type=float, default=None,
+                    help="with --eval, score on terrain of this difficulty (0-1) instead of "
+                         "on the flat plane; implies --terrain")
     args = ap.parse_args()
 
     from creaturelab.morph_io import morph_from_args, parse_sets
@@ -174,7 +181,8 @@ def main() -> int:
         from creaturelab.build import load
         center = morph_from_args(args.rig, args.morph, sets, load(args.rig).params)
 
-    ecfg = envmod.EnvConfig(rig=args.rig)
+    ecfg = envmod.EnvConfig(rig=args.rig,
+                            terrain=args.terrain or args.terrain_level is not None)
     pcfg = ppo.PPOConfig(num_envs=args.envs, horizon=args.horizon, lr=args.lr,
                          seed=args.seed, total_steps=int(args.steps),
                          device=ppo.pick_device(args.device))
@@ -194,8 +202,17 @@ def main() -> int:
     # The eval score has to be comparable across the whole run and between runs, and a
     # score averaged over 64 different animals moves when the zoo changes -- which would
     # make `best.pt` track "got a lucky draw of bodies" as readily as "got better".
-    eval_env = build_envs(ecfg, pcfg.num_envs, pcfg.seed + 1, auto_reset=False,
-                          center=center, quiet=True)
+    #
+    # For the same reason it runs on FLAT ground even when the training env has terrain
+    # (P1b). An evaluation whose task gets harder as the curriculum advances cannot select a
+    # checkpoint: the score drops at every promotion, so `best.pt` would freeze at whatever
+    # the policy managed on the easiest terrain it ever saw. Flat is the one task that stays
+    # fixed for the whole run, it is directly comparable to P1's numbers, and it is exactly
+    # the guard P1b is held to -- "flat-ground performance does not regress". To score a
+    # checkpoint ON terrain, use `--eval CKPT --terrain-level L`, which is a measurement
+    # rather than a selector.
+    eval_env = build_envs(replace(ecfg, terrain=False), pcfg.num_envs, pcfg.seed + 1,
+                          auto_reset=False, center=center, quiet=True)
     ac = ppo.ActorCritic(env.obs_dim, env.act_dim, pcfg)
     norm = ppo.RunningNorm(env.obs_dim)
 
@@ -207,14 +224,17 @@ def main() -> int:
         # task it solved 5M steps ago, and the learning curve takes a visible step backwards
         # for reasons entirely internal to the resume. Same class of bug as leaving the
         # observation normaliser out of the checkpoint.
-        return {"best": best, "speed_cap": float(env.speed_cap)}
+        return {"best": best, "speed_cap": float(env.speed_cap),
+                "terrain_level": float(env.terrain_level)}
 
     if args.resume:
         step, extra = ppo.load(args.resume, ac, norm)
         best = extra.get("best", -np.inf)
         env.speed_cap = extra.get("speed_cap", env.speed_cap)
+        env.terrain_level = extra.get("terrain_level", env.terrain_level)
         print(f"resumed {args.resume} at {step:,} steps (best eval {best:.2f}, "
-              f"command cap {env.speed_cap:.2f})", flush=True)
+              f"command cap {env.speed_cap:.2f}, terrain {env.terrain_level:.2f})",
+              flush=True)
 
     obs, _ = env.reset(seed=pcfg.seed)
     per_update = pcfg.horizon * pcfg.num_envs
@@ -240,7 +260,8 @@ def main() -> int:
         row = {"step": step, "update": upd,
                "sps": (step - step0) / max(1e-9, time.time() - t0),
                "speed_cap": float(env.speed_cap), "cur_score": float(env.cur_score),
-               "cur_bar": float(env.cur_bar), **ro.stats, **logs}
+               "cur_bar": float(env.cur_bar), "terrain_level": float(env.terrain_level),
+               **ro.stats, **logs}
         if upd % args.eval_every == 0:
             row.update(evaluate(eval_env, ac, norm, pcfg))
             if row["eval_return"] > best:
@@ -256,7 +277,9 @@ def main() -> int:
                 f"len {row.get('ep_len', float('nan')):6.1f}  "
                 f"rspd {row['r_speed']:.3f}  spd {row['speed']:+.3f}"
                 f"/{row['speed_cap']:.2f}  cur {row['cur_score']:.2f}"
-                f"/{row['cur_bar']:.2f}  tilt {row['tilt']:5.1f}  "
+                f"/{row['cur_bar']:.2f}"
+                + (f"  terr {row['terrain_level']:.1f}" if ecfg.terrain else "")
+                + f"  tilt {row['tilt']:5.1f}  "
                 f"kl {row['kl']:.4f}  sps {row['sps']:5.0f}{ev}")
 
         if time.time() - t_ck > args.checkpoint_minutes * 60:
@@ -281,6 +304,10 @@ def run_eval(args, ecfg, pcfg, center=None) -> int:
     # neighbourhood is free") in a form you can actually run.
     env = build_envs(ecfg, 1 if args.view else pcfg.num_envs, pcfg.seed,
                      auto_reset=args.view, center=center)
+    if args.terrain_level is not None:
+        # A fixed difficulty, not the curriculum's: this is a measurement of one policy on one
+        # stated task, and a level that moved during the rollout would make the table unreadable.
+        env.terrain_level = args.terrain_level
     ac = ppo.ActorCritic(env.obs_dim, env.act_dim, pcfg)
     norm = ppo.RunningNorm(env.obs_dim)
     step, extra = ppo.load(args.eval, ac, norm)
@@ -306,7 +333,9 @@ def run_eval(args, ecfg, pcfg, center=None) -> int:
     import mujoco.viewer
     obs, _ = env.reset(seed=0)
     env.command[:] = [0.5, 0.0, 0.0]
-    with mujoco.viewer.launch_passive(env.bodies[0].model, env.datas[0]) as v:
+    # `env.models[0]`, not `env.bodies[0].model`: with terrain the vec env clones a model per
+    # env, and the clone is the one holding the elevation data the resets write.
+    with mujoco.viewer.launch_passive(env.models[0], env.datas[0]) as v:
         dt = env.cfg.control_dt
         while v.is_running():
             t = time.time()
