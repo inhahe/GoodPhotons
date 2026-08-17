@@ -24,6 +24,7 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,9 +34,30 @@ import numpy as np                                        # noqa: E402
 
 from creaturelab import env as envmod                     # noqa: E402
 from creaturelab import ppo                               # noqa: E402
+from creaturelab import terrain                           # noqa: E402
 from creaturelab.console import use_utf8                  # noqa: E402
 
 use_utf8()   # before argparse: --help is the thing a cp1252 console cannot print
+
+
+def _parse_kinds(ap, s: str | None) -> tuple[str, ...] | None:
+    """`--terrain-kinds a,b,c` -> a validated tuple, or None if the flag was not given.
+
+    Validated rather than passed through because an unknown name is not an error anywhere
+    downstream: `terrain.generate` would simply never draw it, so `--terrain-kinds stiars`
+    trains on the five classes that *did* parse and reports nothing. A typo in the set of
+    terrain a run is trained on is precisely the kind of silent task change P1b already had
+    two of.
+    """
+    if s is None:
+        return None
+    kinds = tuple(k.strip() for k in s.split(",") if k.strip())
+    if not kinds:
+        ap.error("--terrain-kinds needs at least one class")
+    if bad := [k for k in kinds if k not in terrain.KINDS]:
+        ap.error(f"unknown terrain class {', '.join(bad)} "
+                 f"(choose from {', '.join(terrain.KINDS)})")
+    return kinds
 
 
 def build_envs(cfg: envmod.EnvConfig, n: int, seed: int, auto_reset: bool = True,
@@ -165,7 +187,21 @@ def main() -> int:
                     help="randomise bodies this far about the centre (0 = one body)")
     ap.add_argument("--morph-bodies", type=int, default=8,
                     help="distinct bodies to compile, cycled over the envs")
+    ap.add_argument("--terrain", action="store_true",
+                    help="train on rough ground (P1b): a heightfield re-rolled every "
+                         "episode, with its own difficulty curriculum")
+    ap.add_argument("--terrain-level", type=float, default=None,
+                    help="terrain difficulty 0-1: the curriculum's STARTING difficulty when "
+                         "training, and the difficulty to score on with --eval (which is "
+                         "otherwise flat). Implies --terrain")
+    ap.add_argument("--terrain-kinds", metavar="A,B,C", default=None,
+                    help="comma-separated terrain classes to draw from (" +
+                         ",".join(terrain.KINDS) + "). Implies --terrain. Training with a "
+                         "class held out and then scoring on it with --eval is how P1b's bar "
+                         "-- generalising to ground it never saw -- is measured")
     args = ap.parse_args()
+
+    kinds = _parse_kinds(ap, args.terrain_kinds)
 
     from creaturelab.morph_io import morph_from_args, parse_sets
     sets = parse_sets(args.set)
@@ -174,7 +210,32 @@ def main() -> int:
         from creaturelab.build import load
         center = morph_from_args(args.rig, args.morph, sets, load(args.rig).params)
 
-    ecfg = envmod.EnvConfig(rig=args.rig)
+    ecfg = envmod.EnvConfig(rig=args.rig,
+                            terrain=args.terrain or args.terrain_level is not None
+                            or kinds is not None)
+    if kinds is not None:
+        ecfg = replace(ecfg, terrain_kinds=kinds)
+
+    # Terrain is a property of the TASK, not resumable state, and it is compiled into the
+    # model -- so unlike `speed_cap` it cannot be restored after the env is built. Without
+    # this, `--resume ckpt` on a terrain run rebuilds a FLAT env (the flag lives in argv, not
+    # in the checkpoint), restores a terrain_level onto it, and trains happily on a plane: the
+    # task changes mid-run and the only trace is the `terr` column quietly disappearing.
+    # Same failure design.md names for the morph zoo, which is why it is an error and not a
+    # warning when the two disagree in the direction the user has actually asked for.
+    #
+    # The class *set* is task too, and it is the half a held-out-class run cannot afford to
+    # lose: a run trained on five classes that resumes onto all six has quietly been shown the
+    # very terrain its bar is about generalising to, and the resulting number means nothing.
+    # It is restorable after the build in a way the flag is not, but it is restored here
+    # anyway, so that one block holds everything argv would otherwise silently redefine.
+    if args.resume:
+        was = ppo.peek(args.resume)
+        if not ecfg.terrain and was.get("terrain"):
+            ecfg = replace(ecfg, terrain=True)
+            print(f"{args.resume} is a terrain run; continuing with terrain on", flush=True)
+        if kinds is None and ecfg.terrain and was.get("terrain_kinds"):
+            ecfg = replace(ecfg, terrain_kinds=tuple(was["terrain_kinds"]))
     pcfg = ppo.PPOConfig(num_envs=args.envs, horizon=args.horizon, lr=args.lr,
                          seed=args.seed, total_steps=int(args.steps),
                          device=ppo.pick_device(args.device))
@@ -194,8 +255,17 @@ def main() -> int:
     # The eval score has to be comparable across the whole run and between runs, and a
     # score averaged over 64 different animals moves when the zoo changes -- which would
     # make `best.pt` track "got a lucky draw of bodies" as readily as "got better".
-    eval_env = build_envs(ecfg, pcfg.num_envs, pcfg.seed + 1, auto_reset=False,
-                          center=center, quiet=True)
+    #
+    # For the same reason it runs on FLAT ground even when the training env has terrain
+    # (P1b). An evaluation whose task gets harder as the curriculum advances cannot select a
+    # checkpoint: the score drops at every promotion, so `best.pt` would freeze at whatever
+    # the policy managed on the easiest terrain it ever saw. Flat is the one task that stays
+    # fixed for the whole run, it is directly comparable to P1's numbers, and it is exactly
+    # the guard P1b is held to -- "flat-ground performance does not regress". To score a
+    # checkpoint ON terrain, use `--eval CKPT --terrain-level L`, which is a measurement
+    # rather than a selector.
+    eval_env = build_envs(replace(ecfg, terrain=False), pcfg.num_envs, pcfg.seed + 1,
+                          auto_reset=False, center=center, quiet=True)
     ac = ppo.ActorCritic(env.obs_dim, env.act_dim, pcfg)
     norm = ppo.RunningNorm(env.obs_dim)
 
@@ -207,14 +277,36 @@ def main() -> int:
         # task it solved 5M steps ago, and the learning curve takes a visible step backwards
         # for reasons entirely internal to the resume. Same class of bug as leaving the
         # observation normaliser out of the checkpoint.
-        return {"best": best, "speed_cap": float(env.speed_cap)}
+        # `terrain` is in here for a different reason from the rest: not to be restored into
+        # the env (it cannot be -- it is compiled into the model) but so a `--resume` can find
+        # out what task it is resuming BEFORE it builds one. See `ppo.peek` above.
+        return {"best": best, "speed_cap": float(env.speed_cap),
+                "terrain": bool(ecfg.terrain),
+                "terrain_kinds": list(ecfg.terrain_kinds),
+                "terrain_level": float(env.terrain_level)}
 
     if args.resume:
         step, extra = ppo.load(args.resume, ac, norm)
         best = extra.get("best", -np.inf)
         env.speed_cap = extra.get("speed_cap", env.speed_cap)
+        env.terrain_level = extra.get("terrain_level", env.terrain_level)
         print(f"resumed {args.resume} at {step:,} steps (best eval {best:.2f}, "
-              f"command cap {env.speed_cap:.2f})", flush=True)
+              f"command cap {env.speed_cap:.2f}, terrain {env.terrain_level:.2f})",
+              flush=True)
+
+    # After the resume on purpose: an explicit `--terrain-level` is the user overriding where
+    # the curriculum stands, which is the only reason to pass it on a resume at all.
+    if args.terrain_level is not None:
+        env.terrain_level = args.terrain_level
+        print(f"terrain difficulty set to {env.terrain_level:.2f}", flush=True)
+
+    # Said once, at the top of the log, rather than per row: a held-out class is the single
+    # fact that decides whether this run's eval number is a generalisation claim or not, and
+    # it must be readable from the log file alone months later.
+    if ecfg.terrain:
+        held = [k for k in terrain.KINDS if k not in ecfg.terrain_kinds]
+        print(f"terrain classes: {', '.join(ecfg.terrain_kinds)}"
+              + (f"  (held out: {', '.join(held)})" if held else ""), flush=True)
 
     obs, _ = env.reset(seed=pcfg.seed)
     per_update = pcfg.horizon * pcfg.num_envs
@@ -240,7 +332,8 @@ def main() -> int:
         row = {"step": step, "update": upd,
                "sps": (step - step0) / max(1e-9, time.time() - t0),
                "speed_cap": float(env.speed_cap), "cur_score": float(env.cur_score),
-               "cur_bar": float(env.cur_bar), **ro.stats, **logs}
+               "cur_bar": float(env.cur_bar), "terrain_level": float(env.terrain_level),
+               **ro.stats, **logs}
         if upd % args.eval_every == 0:
             row.update(evaluate(eval_env, ac, norm, pcfg))
             if row["eval_return"] > best:
@@ -256,7 +349,9 @@ def main() -> int:
                 f"len {row.get('ep_len', float('nan')):6.1f}  "
                 f"rspd {row['r_speed']:.3f}  spd {row['speed']:+.3f}"
                 f"/{row['speed_cap']:.2f}  cur {row['cur_score']:.2f}"
-                f"/{row['cur_bar']:.2f}  tilt {row['tilt']:5.1f}  "
+                f"/{row['cur_bar']:.2f}"
+                + (f"  terr {row['terrain_level']:.1f}" if ecfg.terrain else "")
+                + f"  tilt {row['tilt']:5.1f}  "
                 f"kl {row['kl']:.4f}  sps {row['sps']:5.0f}{ev}")
 
         if time.time() - t_ck > args.checkpoint_minutes * 60:
@@ -279,8 +374,23 @@ def run_eval(args, ecfg, pcfg, center=None) -> int:
     # per-command table readable. To see the policy on a *different* animal, pass that
     # animal as `--morph` -- which is the P4 claim ("every edit inside the trained
     # neighbourhood is free") in a form you can actually run.
+    # An eval is a measurement of one policy on one *stated* task, so the task has to be
+    # stated. Terrain without a difficulty is difficulty 0, which is a flat heightfield --
+    # the run pays terrain's cost, prints no warning, and hands back a flat-ground table
+    # under a heading that says terrain. Ask for the number instead of guessing it.
+    if ecfg.terrain and args.terrain_level is None:
+        print("--eval on terrain needs an explicit --terrain-level (0-1): without one the "
+              "difficulty is 0, which is flat ground wearing a heightfield.", file=sys.stderr)
+        return 2
+
     env = build_envs(ecfg, 1 if args.view else pcfg.num_envs, pcfg.seed,
                      auto_reset=args.view, center=center)
+    if args.terrain_level is not None:
+        # A fixed difficulty, not the curriculum's: a level that moved during the rollout
+        # would make the table unreadable.
+        env.terrain_level = args.terrain_level
+        print(f"scoring on terrain at difficulty {env.terrain_level:.2f} "
+              f"({', '.join(ecfg.terrain_kinds)})")
     ac = ppo.ActorCritic(env.obs_dim, env.act_dim, pcfg)
     norm = ppo.RunningNorm(env.obs_dim)
     step, extra = ppo.load(args.eval, ac, norm)
@@ -306,7 +416,9 @@ def run_eval(args, ecfg, pcfg, center=None) -> int:
     import mujoco.viewer
     obs, _ = env.reset(seed=0)
     env.command[:] = [0.5, 0.0, 0.0]
-    with mujoco.viewer.launch_passive(env.bodies[0].model, env.datas[0]) as v:
+    # `env.models[0]`, not `env.bodies[0].model`: with terrain the vec env clones a model per
+    # env, and the clone is the one holding the elevation data the resets write.
+    with mujoco.viewer.launch_passive(env.models[0], env.datas[0]) as v:
         dt = env.cfg.control_dt
         while v.is_running():
             t = time.time()

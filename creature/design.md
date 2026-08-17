@@ -718,6 +718,114 @@ command grid that a motionless animal reads perfectly at one end of will hide a 
 to locomote, which is the one thing P1 exists to detect, so `train.py --eval CKPT` prints the
 breakdown and says so underneath it.
 
+### Terrain is a training distribution, not a solver
+
+P1 trained every episode on an infinite plane at z = 0, which means the policy never once had
+a foot land lower than it expected. P1b replaces the plane with a MuJoCo heightfield
+(`creaturelab/terrain.py`), re-rolled every episode, with a difficulty a curriculum widens.
+
+**The mechanism is deliberately not procedural IK.** The obvious alternative — the one games
+use to walk spider-bots over rubble — is a full-body IK solver (Unreal FBIK, ADAPTIK) that
+raycasts for a foot target and solves the chain to reach it. It is rejected here for reasons
+written up at length under todo.md P10 → Terrain; the short form is that a solver is a way of
+*posing* a skeleton, not a source of motion, so it produces kinematics with no notion of the
+contact forces that make a slip a slip. What it is genuinely good for is downstream of this
+pipeline (retargeting baked output onto a different-limbed creature, LOD instances that never
+run physics), and IK is *already* used here for exactly that kind of job: `q₀` analytic IK in
+the rig and the damped Gauss–Newton pose fit in P5.
+
+Four decisions carry the design:
+
+- **The hfield's shape is a model constant; only its elevation data changes.** `nrow`, `ncol`
+  and `size` are compiled into the `MjModel`, so `TerrainSpec.for_body` picks them once, per
+  body. `hfield_data` is a plain buffer MuJoCo's collision routines read live, so a
+  per-episode terrain is a numpy assignment and costs no recompile. `terrain.Patch` holds a
+  *view* onto that buffer rather than a copy, so writing terrain and querying heights cannot
+  drift apart.
+- **Envs get their own `MjModel` when terrain is on.** Flat ground is why one compiled `Body`
+  can serve 64 envs: `MjModel` is read-only during a step. Elevation data breaks that — envs
+  sharing a model share a terrain, and since episodes end at different steps a reset in one
+  env would move the ground under the others mid-stride. `VecCreatureEnv` deep-copies the
+  model per env (falling back to re-parsing the retained MJCF), which is the only place the
+  "one body, many envs" sharing rule is suspended.
+- **The patch is sized so an episode cannot walk off it.** Half-extent comes from the fastest
+  command times the episode length — ~37 m for a dog at 0.8 Froude for 20 s, so ~90 m across.
+  The alternative, a small fine patch plus an out-of-bounds truncation, shortens episodes to a
+  few seconds at the top of the command range, which changes the task far more than a coarser
+  cell does. Cell size is what gives: the spec asks for `terrain_cell` withers heights and
+  accepts what `terrain_max_cells` allows (0.20 m on the default rig).
+- **Difficulty is applied in metres, per class.** The elevation scale has to cover the
+  steepest slope the curriculum can ask for, which over a 90 m patch is tens of metres; rubble
+  is twenty centimetres. So each generator declares the peak-to-peak height it wants *in
+  metres* at difficulty 1 and the data written is `u · d · span / elevation`. Scaling `u` by
+  difficulty directly would make a difficulty-1 rubble field a mountain range.
+
+**Two places quietly assumed z = 0 *was* the ground, and both are now wrong-on-terrain bugs
+that were fixed with it.** `place_on_ground` measured spawn clearance against z = 0; it now
+takes the highest ground under the body's whole horizontal footprint, not the ground under the
+root, because the root's own column buries whichever foot straddles a bump — reintroducing the
+exact spawn-intersection impulse that function exists to prevent. And termination tested world
+`root_z`; it now tests `root_z − ground_z`, clearance above the ground directly under the root.
+World z on terrain is wrong in both directions at once — cresting a rise reads as unusually
+tall, standing healthily in a dip reads as fallen — and the dip is the expensive one, because
+it ends episodes the policy was doing nothing wrong in. On a plane `ground_z` is zero and the
+test is the pre-terrain one unchanged, which is what keeps P1's numbers comparable.
+
+**The terrain curriculum rides on the command curriculum's machinery, on a second axis.**
+Rough ground and a faster command are both "the task got harder", both show up in the same
+tracking reward, and both may only widen once the policy has earned it — so they share the
+256-episode step-weighted window, the measurement and the relative bar, and differ only in
+what a promotion is spent on. `_promote` gives each earned promotion to whichever axis has
+progressed less as a fraction of its own range. Advancing both at once doubles the step change
+the policy must absorb per promotion; advancing speed to its maximum first trains a flat-ground
+gallop and then asks it to relearn on rubble. `terrain_level` is checkpointed beside
+`speed_cap`, for the reason `speed_cap` is — and so is the terrain *flag*, for a different
+reason: terrain is compiled into the model, so it is the one piece of a run's task that cannot
+be restored after the env exists. `tools/train.py` reads it out of the checkpoint (`ppo.peek`)
+*before* it builds anything, because a `--resume` that omitted `--terrain` otherwise rebuilt a
+flat env, restored a difficulty onto it and trained on a plane — the task changing mid-run,
+with no trace but a column vanishing from the progress line.
+
+**Evaluation stays flat even when training is not.** An evaluation whose task hardens with the
+curriculum cannot select a checkpoint — the score drops at every promotion, so `best.pt` would
+freeze at whatever the policy managed on the easiest terrain it ever saw. Flat is the one task
+fixed for the whole run, it is directly comparable to P1's numbers, and it is exactly the bar
+P1b is held to ("flat-ground performance does not regress"). Scoring *on* terrain is a
+measurement rather than a selector, and has its own flag: `--eval CKPT --terrain-level L`.
+Scoring on terrain without a difficulty is refused rather than defaulted: difficulty 0 is a
+flat heightfield, so the run would pay terrain's cost and print a flat-ground table under a
+heading that says terrain.
+
+**The other half of P1b's bar needs a class held out, so the class set is task state too.**
+"Survives on terrain it never saw in training" is only measurable if training can be denied a
+class and evaluation can then be pointed at exactly that one — `--terrain-kinds`, which both
+halves share. Unlike the terrain flag the set *could* be restored after the env is built
+(`regenerate` reads it per reset), but it rides in the checkpoint and is applied in the same
+pre-build block anyway, so that one place holds everything a resume's argv could silently
+redefine: a five-class run that resumes onto six has been shown the very terrain its number is
+a claim about, and nothing in its output would say so. For the same reason the set is printed
+once at the top of the run with its complement named, and an unknown class name is an error —
+downstream, a typo cannot raise, it can only quietly shrink the distribution.
+
+**Observations are unchanged.** Nothing about terrain reaches the policy through a new
+channel; it arrives through the feet, the vestibular block and the joint angles, exactly as it
+would for an animal. A body-frame height scan around the feet (the perceptive half of the
+ANYmal-class result) is Stage 2 and only if blind locomotion demonstrably cannot clear the
+terrain class we want — every added observation channel is one the video pipeline eventually
+has to supply or ablate, and `test_no_world_frame_channel_leaks_in` still bans world-frame
+names either way.
+
+**Cost.** Heightfield collision is inherently dearer than a plane primitive: measured on the
+default rig at 16 envs, 2210 → ~1630 env-steps/s (−26%). It is the terrain *geometry* that
+costs, not anything in this module — an hfield carrying an all-zero field measures 1649, i.e.
+the entire loss is present before a single hill exists, and `height_at` is 3.3 µs against a
+~10 ms control step for 16 envs. Coarsening the cell 4× would buy back 1633 → 2072 and
+shrinking the elevation range 1633 → 1831, and neither is taken: the first makes rubble bigger
+than the paw it exists to trip, the second means dropping the slope classes. Recorded in
+known-issues.md #8 with the one idea that would recover part of it (implementing slope as
+tilted gravity rather than as a ramp in the field), which is not free of semantics: it would
+change what the tilt-based fall test measures, project-wide.
+
 ### Textures: non-stationarity, not randomness
 
 Procedural noise (Perlin/Worley/fBm) is **stationary** — statistically identical

@@ -74,6 +74,7 @@ small. Don't buy a GPU for this.
 | `rspd` | the speed-tracking reward term, 0–1 | this is the one that has to rise; ~0.5 is roughly "parked" (see below) |
 | `spd` | actual mean forward speed (Froude) `/` the curriculum's current cap | **`spd` hovering at ±0.01 is the failure mode.** See the next section |
 | `cur` | curriculum score `/` the bar it must beat to widen the cap | `cur` stuck below `cur_bar` for a long stretch means the curriculum has stalled |
+| `terr` | terrain difficulty 0–1, **only present with `--terrain`** | the second curriculum axis; see below |
 | `tilt` | mean degrees off vertical | rises before a collapse |
 | `kl` | policy KL per update | a spike into the tenths is the run coming apart; the PPO loop early-stops on it |
 | `sps` | env steps/s, this process | |
@@ -154,6 +155,77 @@ That separation is load-bearing rather than tidy — with auto-reset the fixed g
 until the first animal falls, after which the "deterministic evaluation" is quietly scoring a
 random command set. The symptom was consecutive evals of a steadily improving policy reading
 20, 263, 22.
+
+---
+
+## Training on rough ground (P1b)
+
+```bash
+# terrain on, difficulty starting at 0 and widened by the curriculum
+python tools/train.py --terrain --out runs/canis_rough --steps 3e7
+
+# start the curriculum at a specific difficulty (implies --terrain); 0..1
+python tools/train.py --terrain-level 0.5 --out runs/canis_rough
+
+# a resume knows it was a terrain run -- you do not have to re-pass --terrain, and if you
+# forget it, it will not quietly put the animal back on a plane
+python tools/train.py --resume runs/canis_rough/latest.pt --out runs/canis_rough
+
+# score an existing checkpoint on terrain of a chosen difficulty
+python tools/train.py --eval runs/canis_rough/best.pt --terrain-level 1.0
+
+# hold a class out of training, then score on exactly that class -- this pair IS P1b's bar
+python tools/train.py --terrain-kinds flat,rolling,rubble,steps,slope --out runs/canis_rough
+python tools/train.py --eval runs/canis_rough/best.pt --terrain-kinds stairs --terrain-level 1.0
+```
+
+`--terrain` swaps the infinite `<geom type="plane">` for a MuJoCo heightfield, regenerated
+**every episode** from one of six classes (`flat`, `rolling`, `rubble`, `steps`, `slope`,
+`stairs`). Nothing about the observation changes: there is no height map input, no exteroception
+of any kind. The policy finds out about the ground through its feet, which is the point — see
+`design.md` §"Terrain is a training distribution, not a solver" for why this is a heightfield and
+not a foot-placement solver.
+
+The progress line grows a `terr` field, which is the difficulty in 0..1:
+
+```
+   573,440  ret  534.4  len  679.7  rspd 0.593  spd +0.012/0.30  cur 0.51/0.73  terr 0.3  ...
+```
+
+**Difficulty is a second curriculum axis, sharing the first one's machinery.** Rough ground and a
+faster command are both "the task got harder" and both show up in the same tracking reward, so
+they share the 256-episode window, the measurement and the bar — and every earned promotion is
+spent on whichever axis has progressed less as a fraction of its own range. Advancing speed to
+its maximum first would train a flat-ground gallop and then ask it to relearn on rubble.
+`terrain_level` is checkpointed alongside `speed_cap`, so a `--resume` does not hand a competent
+policy the flat task it solved millions of steps ago.
+
+**Evaluation stays flat even for a terrain run, deliberately.** `best.pt` is selected by
+comparing eval returns across a run, and a score measured on ground that gets rougher as the run
+proceeds is not comparable with itself — the checkpoint selector would drift with the curriculum
+rather than with the policy. To measure the thing you actually trained, use the third command
+above: `--eval CKPT --terrain-level L` scores a checkpoint on terrain of a difficulty you name.
+Scoring on terrain without naming a difficulty is refused rather than defaulted, because
+difficulty 0 is a *flat heightfield* — it would pay terrain's cost and hand back a flat-ground
+table under a heading that says terrain.
+
+**`--terrain-kinds` is what makes the bar measurable.** P1b's claim is not "walks on rough
+ground" but "walks on rough ground *of a kind it never trained on*", and that needs a class
+held out of the training draw and then named at eval time — the last pair of commands above.
+The held-out set is printed once at the top of the run's log and travels in the checkpoint, so
+a `--resume` that forgets the flag cannot quietly show the policy the one class the run's whole
+number depends on it never having seen. A misspelled class is an error, not a smaller set.
+
+**It costs ~26% of throughput**, from MuJoCo's hfield collision geometry and not from anything in
+this repo (`known-issues.md` #8 has the attribution, and the two knobs that would buy it back
+along with why neither is taken). Budget for it: a 3e7-step terrain run is about a third longer
+in wall-clock than the same run on a plane.
+
+The terrain's shape is quoted in **withers heights**, like everything else here — amplitude,
+feature size and the patch's own extent all scale with the animal, so the same config means the
+same terrain on a terrier and a wolfhound. The knobs are `EnvConfig.terrain_*` in
+`creaturelab/env.py` and, as with the reward weights, they are not flags: a run trained on
+different terrain is a different task, not a different run.
 
 ---
 
@@ -244,6 +316,9 @@ near a parameter's range edge, where most of its neighbourhood gets clipped.
 | `--eval-every` | 20 | evals cost a full 1000-step rollout on a second env set; raise it if it dominates |
 | `--checkpoint-minutes` | 5 | |
 | `--device` | auto | see above — this is CPU-bound in MuJoCo |
+| `--terrain` | off | rough ground (P1b), with its own curriculum axis; costs ~26% throughput |
+| `--terrain-level` | — | the curriculum's starting difficulty 0..1 (and the difficulty `--eval` scores on); implies `--terrain`, and wins over a resumed value |
+| `--terrain-kinds` | all six | the classes to draw from, comma-separated; implies `--terrain`. Hold one out to train, name it to `--eval`: that pair is P1b's bar |
 
 The reward weights, the command ranges and the curriculum live in `EnvConfig`
 (`creaturelab/env.py`) and are **not** exposed as flags. That is deliberate: they are part of the
@@ -282,3 +357,4 @@ python tools/train.py --steps 3e8 --out runs/rex \
 - **What the reward, curriculum and observation actually are** — `design.md`.
 - **Why training happens once and not per-animal** — `todo.md` P6.
 - **The QACC instability on randomised bodies** — `known-issues.md` #6.
+- **What terrain costs, and the alternative that was deferred** — `known-issues.md` #8.

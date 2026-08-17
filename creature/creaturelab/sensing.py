@@ -362,6 +362,12 @@ class RawState:
     xmat: np.ndarray               # (N, 3, 3) root body orientation
     qvel_free: np.ndarray          # (N, 6)    free-joint velocity: 0:3 world lin, 3:6 body ang
     root_z: np.ndarray             # (N,)      root height, m -- termination only, never sensed
+    #: (N,) world z of the ground directly under each root, m. Zero on a plane, which is why
+    #: `gather_state` does not touch it: the flat case needs no query and the terrain case
+    #: needs the env's `terrain.Patch`, which is env state rather than `MjData`. `VecCreatureEnv`
+    #: writes it in `_physics` when a patch exists. Termination reads `root_z - ground_z`, so a
+    #: flat run reproduces the pre-terrain test exactly.
+    ground_z: np.ndarray
     contact: np.ndarray            # (N, nfoot) normal force on each foot, N
     work_tau: np.ndarray           # (N, C+1, nu) actuator generalised force, per energy sample
     work_vel: np.ndarray           # (N, C+1, nu) matching joint rate
@@ -452,7 +458,7 @@ def make_raw(spec: ObsSpec, n: int, energy_samples: int) -> RawState:
     return RawState(
         qpos_j=np.zeros((n, nu)), qvel_j=np.zeros((n, nu)),
         xmat=np.zeros((n, 3, 3)), qvel_free=np.zeros((n, 6)), root_z=np.zeros(n),
-        contact=np.zeros((n, len(spec.foot_bodies))),
+        ground_z=np.zeros(n), contact=np.zeros((n, len(spec.foot_bodies))),
         work_tau=np.zeros((n, c, nu)), work_vel=np.zeros((n, c, nu)),
         sane=np.ones(n, dtype=bool), warn=np.zeros(n, dtype=np.int64))
 

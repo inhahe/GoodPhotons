@@ -24,6 +24,7 @@ import math
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
+from . import terrain as terrain_mod
 from .model import Bone, Creature, Geom
 
 
@@ -193,7 +194,15 @@ def apply_target_mass(creature: Creature) -> float:
     return k
 
 
-def to_mjcf(creature: Creature, include_ground: bool | None = None) -> str:
+def to_mjcf(creature: Creature, include_ground: bool | None = None, terrain=None) -> str:
+    """Emit MJCF for one creature.
+
+    `terrain` is an optional `terrain.TerrainSpec`. When given, the flat infinite `plane`
+    floor is replaced by a heightfield geom of that shape -- the *shape* only. The elevation
+    data stays zero here and is written per episode by `terrain.Patch`, because it belongs to
+    the environment (which re-rolls it every reset) rather than to the rig. Keeping the two
+    apart is what lets terrain be regenerated without recompiling a model.
+    """
     apply_target_mass(creature)
     root = ET.Element("mujoco", {"model": creature.name})
 
@@ -214,14 +223,20 @@ def to_mjcf(creature: Creature, include_ground: bool | None = None) -> str:
                                      "rgb1": ".18 .2 .22", "rgb2": ".24 .26 .28"})
     ET.SubElement(asset, "material", {"name": "grid", "texture": "grid",
                                       "texrepeat": "6 6", "reflectance": "0.1"})
+    if terrain is not None:
+        ET.SubElement(asset, "hfield", {"name": terrain_mod.HFIELD,
+                                        "nrow": str(terrain.n), "ncol": str(terrain.n),
+                                        "size": terrain.size_attr})
 
     world = ET.SubElement(root, "worldbody")
     ET.SubElement(world, "light", {"pos": "0 0 4", "dir": "0 0 -1", "directional": "true"})
     ground = creature.world.ground if include_ground is None else include_ground
     if ground:
-        ET.SubElement(world, "geom", {
-            "name": "floor", "type": "plane", "size": "0 0 .05", "material": "grid",
-            "friction": _v(creature.defaults.geom_friction)})
+        floor = {"name": terrain_mod.FLOOR, "material": "grid",
+                 "friction": _v(creature.defaults.geom_friction)}
+        floor.update({"type": "hfield", "hfield": terrain_mod.HFIELD} if terrain is not None
+                     else {"type": "plane", "size": "0 0 .05"})
+        ET.SubElement(world, "geom", floor)
 
     _body_el(world, creature.bone(creature.root), creature, True)
 
@@ -290,8 +305,8 @@ def geom_z_extent(model, data, gid: int) -> tuple[float, float]:
     return float(pos[2] - h), float(pos[2] + h)
 
 
-def place_on_ground(model, data, clearance: float = 0.01) -> float:
-    """Drop the free-base creature so its lowest geom sits `clearance` above z=0.
+def place_on_ground(model, data, clearance: float = 0.01, patch=None) -> float:
+    """Drop the free-base creature so its lowest geom sits `clearance` above the ground.
 
     Uses MuJoCo's own kinematics rather than re-deriving Euler conventions here. Returns
     the z that was applied. A creature spawned intersecting the floor gets an enormous
@@ -300,19 +315,38 @@ def place_on_ground(model, data, clearance: float = 0.01) -> float:
 
     Pass `clearance=0` (or slightly negative) when you want the feet actually *loaded* --
     inverse dynamics at a pose with no active contact measures a free-fall, not a stance.
+
+    `patch` is an optional `terrain.Patch`. Without it "the ground" is z = 0, which is what
+    the plane floor is. With it, the reference is the HIGHEST ground anywhere under the
+    body's horizontal footprint -- not the ground under the root. Using the root's own
+    column would bury whichever foot happens to straddle a bump, which is precisely the
+    spawn-intersection failure this function exists to prevent, reintroduced by terrain.
+    Feet over a dip start a few centimetres high instead, and fall the moment physics runs,
+    which is both harmless and what stepping onto uneven ground actually feels like.
     """
     import mujoco
     import numpy as np
 
     mujoco.mj_forward(model, data)
     lowest = np.inf
+    x0 = y0 = np.inf
+    x1 = y1 = -np.inf
     for gid in range(model.ngeom):
         if model.geom_bodyid[gid] == 0:          # skip world geoms (the floor)
             continue
         lowest = min(lowest, geom_z_extent(model, data, gid)[0])
+        if patch is not None:
+            # `geom_rbound` overestimates the vertical extent badly (see `geom_z_extent`),
+            # but horizontally it is a correct bound and a cheap one, and here an
+            # overestimate only widens the footprint we take a max over -- it can make the
+            # spawn a little high, never too low.
+            p, r = data.geom_xpos[gid], float(model.geom_rbound[gid])
+            x0, x1 = min(x0, p[0] - r), max(x1, p[0] + r)
+            y0, y1 = min(y0, p[1] - r), max(y1, p[1] + r)
     if not np.isfinite(lowest):
         return float(data.qpos[2])
-    dz = clearance - lowest
+    ground = 0.0 if patch is None else patch.max_height_in(x0, x1, y0, y1)
+    dz = ground + clearance - lowest
     data.qpos[2] += dz
     mujoco.mj_forward(model, data)
     return float(data.qpos[2])

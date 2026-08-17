@@ -34,6 +34,8 @@ The order is therefore:
 ```
 P0 grammar → MJCF          (cheapest end-to-end proof that the architecture holds)
 P1 torque quadruped + PPO  (smoke-test the whole RL loop on a body we trust)
+P1b terrain (rough ground)  (an env capability, not a control channel — beside P1
+                             because it needs P1's env and blocks nothing above it)
 P2 AMP from PUBLIC MOCAP   (derisk imitation with clean data — no cameras yet)
 P3 muscles replace torques  (the biomechanics that makes it ours)
 P4 morphology conditioning  (the thing that makes stylization free later)
@@ -230,6 +232,121 @@ Smoke-test the entire loop end to end on a body whose dynamics we trust.
         every env it resets, so the "fixed" grid survived only until the first animal fell over
         and consecutive evaluations of a steadily improving policy came back 20, 263, 22 —
         with `best.pt` being selected on that noise.
+
+---
+
+## P1b — Terrain: the ground stops being flat  `[~]`
+
+*(Stage 1 built 2026-08-16 — `creaturelab/terrain.py`, `tests/test_terrain.py`, `--terrain` /
+`--terrain-level` / `--terrain-kinds` on `tools/train.py`, written up in design.md §"Terrain is
+a training distribution, not a solver" and notes/training.md §"Training on rough ground". The
+phase stays open on the **Bar**, which is a claim about a trained policy and needs a full run
+to answer; everything needed to run and read that measurement is in place.)*
+
+P1 proved the RL loop on a plane. Every episode so far has reset onto `type="plane"` at
+z = 0, which means the policy has never seen a foot land lower than it expected. That is
+the single largest gap between "a gait emerged" and "an animal moves through a world",
+and it is an **environment** capability, not a control channel — nothing above it in the
+ordering is blocked on it, and it needs the env P1 just built. So it sits here, beside P1.
+
+**The mechanism is training distribution, not a solver.** A physics-based policy meets
+rough ground by having been trained on rough ground; that is how the ANYmal-class results
+work (blind locomotion over rubble and stairs from terrain curricula alone, perception
+added afterwards only where blind fails). We are not bolting a foot-placement solver onto
+a policy that doesn't know the ground moved — see P10's Terrain note for why procedural
+full-body IK was considered and rejected as the mechanism.
+
+**Not doing:** procedural IK foot placement / FBIK terrain adaptation. Rejected 2026-08-16;
+the argument is written up under P10 → Terrain.
+
+### Stage 1 — blind rough terrain
+
+- [x] **Heightfield in the emitter.** `to_mjcf(creature, terrain=spec)` emits an `<hfield>`
+      asset and makes `floor` a `type="hfield"` geom; without it the geom is the old
+      infinite plane, so every existing test resets onto exactly what it did before. The
+      elevation data is owned by the env, not the rig — `TerrainSpec` declares the asset's
+      shape (which is a compiled model constant) and the env writes `model.hfield_data`.
+- [x] **Per-episode terrain regeneration.** `terrain.Patch.regenerate` is called from
+      `_reset_one`, so every episode gets a fresh surface. Six classes: `flat`, `rolling`
+      (fBm), `rubble` (paw-sized plateaus on a long undulation), `steps`, `slope`, `stairs`.
+      `flat` stays in the mix on purpose — it is what stops a terrain-trained policy
+      forgetting the ground the evaluation guard is measured on.
+      **The one architectural consequence:** elevation lives in `MjModel`, so terrain forces
+      an `MjModel` **per env** (`VecCreatureEnv._clone_model`) rather than P1's one shared
+      read-only model. Envs sharing a model would share a terrain, and since episodes end at
+      different steps a reset in one env would move the ground under the others mid-stride.
+- [x] **Terrain-difficulty curriculum**, reusing P1's promotion machinery verbatim
+      (`_standstill_score` / `_promotion_bar` / `_advance_curriculum`, 256-episode
+      step-weighted window) as a **second axis**: `_promote` spends each earned promotion on
+      whichever of speed and difficulty has progressed less as a fraction of its own range.
+      `terrain_level` rides in the checkpoint exactly as `speed_cap` does.
+- [x] **Evaluation stays flat**, deliberately, so `best.pt` remains a valid selector — a
+      score measured on ground that roughens with the run is not comparable with itself.
+      `--eval CKPT --terrain-level L` is the measurement path.
+
+### The two correctness fixes terrain forces
+
+Both are places the current env quietly assumes z = 0 *is* the ground:
+
+- [x] **`place_on_ground` must query local terrain height.** It now takes `patch=` and
+      seats the body against `patch.max_height_in(...)` over the body's whole horizontal
+      footprint — the *maximum*, not the height under the root, because seating against the
+      root's own elevation buries any foot that straddles a bump, which is the enormous
+      first-step contact impulse `place_on_ground` existed to prevent, reintroduced.
+- [x] **Termination must use height above *local* ground.** `step` now terminates on
+      `raw.root_z - raw.ground_z < min_height * withers`, where `ground_z` is the terrain
+      directly under the root (bilinear, sampled in the physics thread, and identically zero
+      without terrain — so the flat path is the pre-P1b test bit for bit).
+- [x] **`fall_tilt` got the same scrutiny, and the answer was to bound the terrain instead.**
+      Tilt is `arccos(R[2,2])` against **world** up, and design.md makes a point of that
+      being the same quantity `validate.trunk_tilt_of` reports — so redefining it against a
+      local surface normal would have to be done in `stand_test` and `tune.brace` in the same
+      change. Instead `TerrainSpec.for_body(max_slope_deg=25)` is held below half of
+      `fall_tilt = 50°`, so a correctly-standing animal on the steepest slope the curriculum
+      can ask for is at 25° and never near the bar. Revisit only if slopes need to get
+      steeper than that; `known-issues.md` #8 records the related tilted-gravity idea and why
+      it is not a free win.
+
+### Stage 2 — perceptive, only if blind is insufficient
+
+- [ ] A body-frame height scan (a small grid of terrain clearances sampled around the
+      feet, expressed in the root frame) appended to the observation. **Only** if Stage 1's
+      blind policy demonstrably cannot clear the terrain class we want — the literature
+      says blind gets remarkably far, and every added observation channel is a channel the
+      video pipeline eventually has to supply or ablate.
+- Observations stay **body-relative** regardless of stage. `tests/test_env.py::
+  test_no_world_frame_channel_leaks_in` is the standing enforcement of that and must keep
+  passing: a height scan is a clearance field in the root frame, never a world position.
+
+- [ ] **Bar:** the policy tracks its speed command and survives on terrain drawn from a
+      class it never saw in training — **and** flat-ground performance does not regress
+      (the P1 command sweep re-run on the plane is the guard, since it is the only
+      apples-to-apples number we have).
+      *The apparatus for measuring it exists as of 2026-08-17 — `--terrain-kinds` holds a
+      class out of the training draw and names it back at eval time, the held-out set rides
+      in the checkpoint so a resume cannot quietly reveal it, and scoring on terrain without
+      a stated difficulty is refused (difficulty 0 is a flat heightfield, which would answer
+      the terrain question with a flat-ground table). What is left is running it:*
+
+      ```bash
+      python tools/train.py --terrain-kinds flat,rolling,rubble,steps,slope \
+                            --steps 3e7 --out runs/canis_rough
+      python tools/train.py --eval runs/canis_rough/best.pt              # flat: the regression guard
+      python tools/train.py --eval runs/canis_rough/best.pt --terrain-kinds stairs \
+                            --terrain-level 1.0                          # the generalisation claim
+      ```
+
+      **The control is measured** (2026-08-17): P1's flat-trained `runs/canis/best.pt`
+      (14.95M steps, command cap 0.8) scored on stairs it never saw. This is the number the
+      terrain run has to beat, and it says the measurement is sensitive rather than saturated
+      — the policy degrades gradually with difficulty rather than passing or failing outright.
+
+      | task | return | survived | r_speed | tilt° | alive |
+      |---|---|---|---|---|---|
+      | flat (the regression guard) | 1224.9 | 100% | 0.972 | 3.4 | 20.0 s |
+      | stairs 0.2 | 239.2 | 11% | 0.785 | 7.8 | 4.8 s |
+      | stairs 0.5 | 62.8 | 0% | 0.449 | 15.5 | 2.1 s |
+      | stairs 1.0 | 14.1 | 0% | 0.186 | 21.4 | 1.0 s |
 
 ---
 
@@ -910,6 +1027,35 @@ separate channels is how you get a 200-dimensional command space by accident.
 - [ ] **Postural transitions** — lie down, sit, get up, roll over. Genuinely hard (large body
       reorientation, whole-body ground contact) and constantly needed. Absent from the brainstorm.
 - [ ] **Terrain.** The brainstorm assumes flat ground. Slopes, uneven footing, stairs, slip-and-recover.
+      **Promoted to its own phase, P1b** *(2026-08-16)* — it is an env capability, not a control
+      channel, and nothing above it is blocked on it, so it sits beside P1 where the env lives.
+      **Considered and rejected as the mechanism: procedural full-body IK** (Unreal FBIK,
+      ADAPTIK, the Godot proposal — what games use to walk spider-bots over rubble). It is the
+      right tool in an engine whose animation is *kinematic playback*: a clip knows nothing
+      about the ground, so a solver bends the legs until the feet land where a raycast says the
+      ground is. Little of that argument survives here:
+      - **It is a solver, not a data source.** IK answers "what joint angles put this foot
+        *there*"; it cannot answer "where should the foot go, when, carrying what weight" —
+        which is the motion character P5's rig exists to measure and P2/P6 exist to preserve.
+        A rig plus an IK solver produces *a* quadruped, never *this* animal.
+      - **It is kinematics.** This controller is torque- (P3: muscle-) actuated against real
+        contacts. IK has no forces, so it cannot produce the one behaviour uneven ground is
+        actually about — **slip-and-recover** — which is a dynamics problem end to end.
+      - **It assumes the skeleton.** Much of what the cameras buy is the CMA-ES morph fit that
+        *identifies* proportions (P5); IK starts after that question is already answered.
+      - **And the workaround is unnecessary here.** A physics policy meets terrain by having
+        been trained on it — the standard robotics answer (ANYmal-class blind, then perceptive,
+        locomotion), and the one that yields recovery for free. Adopting IK would import a fix
+        for a limitation this architecture does not have.
+
+      **Where it is genuinely useful — and where it already is.** Downstream of us: this layer
+      is a *generator* (design.md), so an engine consuming baked output may well layer runtime
+      IK for micro-adaptation on top of learned motion, and for background/LOD creatures that
+      never get a policy it is the cheap answer. Note also that the technique is *already* in
+      this project twice, used where it belongs — as a solver against evidence rather than a
+      substitute for it: `q₀` is bone-length-aware analytic IK on the triangulated points, and
+      the per-frame pose fit is model-based IK (damped Gauss–Newton, "the same shape as
+      OpenSim IK / Anipose"; P5 → the implementation plan).
 - [ ] **Landing** — the counterpart to jumping; impact absorption is its own skill and is where bad
       physics is most visible.
 - [ ] **Idle behaviours** — shake off water, scratch, stretch, yawn. What makes a creature look alive
