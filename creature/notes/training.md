@@ -164,8 +164,12 @@ random command set. The symptom was consecutive evals of a steadily improving po
 # terrain on, difficulty starting at 0 and widened by the curriculum
 python tools/train.py --terrain --out runs/canis_rough --steps 3e7
 
-# start the difficulty somewhere specific (implies --terrain); 0..1
+# start the curriculum at a specific difficulty (implies --terrain); 0..1
 python tools/train.py --terrain-level 0.5 --out runs/canis_rough
+
+# a resume knows it was a terrain run -- you do not have to re-pass --terrain, and if you
+# forget it, it will not quietly put the animal back on a plane
+python tools/train.py --resume runs/canis_rough/latest.pt --out runs/canis_rough
 
 # score an existing checkpoint on terrain of a chosen difficulty
 python tools/train.py --eval runs/canis_rough/best.pt --terrain-level 1.0
@@ -299,7 +303,7 @@ near a parameter's range edge, where most of its neighbourhood gets clipped.
 | `--checkpoint-minutes` | 5 | |
 | `--device` | auto | see above — this is CPU-bound in MuJoCo |
 | `--terrain` | off | rough ground (P1b), with its own curriculum axis; costs ~26% throughput |
-| `--terrain-level` | — | fix the starting difficulty 0..1; implies `--terrain`, and sets the difficulty for `--eval` |
+| `--terrain-level` | — | the curriculum's starting difficulty 0..1 (and the difficulty `--eval` scores on); implies `--terrain`, and wins over a resumed value |
 
 The reward weights, the command ranges and the curriculum live in `EnvConfig`
 (`creaturelab/env.py`) and are **not** exposed as flags. That is deliberate: they are part of the

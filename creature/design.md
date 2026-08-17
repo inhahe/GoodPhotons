@@ -779,7 +779,12 @@ what a promotion is spent on. `_promote` gives each earned promotion to whicheve
 progressed less as a fraction of its own range. Advancing both at once doubles the step change
 the policy must absorb per promotion; advancing speed to its maximum first trains a flat-ground
 gallop and then asks it to relearn on rubble. `terrain_level` is checkpointed beside
-`speed_cap`, for the reason `speed_cap` is.
+`speed_cap`, for the reason `speed_cap` is — and so is the terrain *flag*, for a different
+reason: terrain is compiled into the model, so it is the one piece of a run's task that cannot
+be restored after the env exists. `tools/train.py` reads it out of the checkpoint (`ppo.peek`)
+*before* it builds anything, because a `--resume` that omitted `--terrain` otherwise rebuilt a
+flat env, restored a difficulty onto it and trained on a plane — the task changing mid-run,
+with no trace but a column vanishing from the progress line.
 
 **Evaluation stays flat even when training is not.** An evaluation whose task hardens with the
 curriculum cannot select a checkpoint — the score drops at every promotion, so `best.pt` would

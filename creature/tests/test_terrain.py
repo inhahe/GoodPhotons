@@ -10,8 +10,10 @@ so each of them is pinned here.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -306,3 +308,52 @@ def test_terrain_level_survives_a_round_trip(body):
     v.reset(seed=0)
     assert all(p.difficulty == 1.0 for p in v.patches)
     v.close()
+
+
+# --------------------------------------------------------------------------- the train CLI
+# Subprocesses, and worth the ~30 s they cost, because both bugs below were live in the tree
+# and neither is reachable in-process: they live in `tools/train.py`'s argument handling, and
+# both produce a run that trains perfectly happily on the wrong task.
+def _train(*args: str) -> subprocess.CompletedProcess:
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return subprocess.run(
+        [sys.executable, os.path.join(root, "tools", "train.py"),
+         "--envs", "2", "--horizon", "8", "--eval-every", "10000", *args],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=dict(os.environ, PYTHONPATH=root), cwd=root, timeout=900)
+
+
+def _levels(log: str) -> list[float]:
+    return [json.loads(line)["terrain_level"] for line in open(log) if line.strip()]
+
+
+def test_terrain_level_sets_the_starting_difficulty_of_a_TRAINING_run(tmp_path):
+    """`--terrain-level 0.5` used to be an eval-only flag that silently did nothing here.
+
+    It turned terrain *on* (so the run paid the 26%) and then trained at difficulty 0.0 --
+    a flat-ground run wearing a terrain run's costume, which the progress line reported
+    honestly as `terr 0.0` and nobody would think to disbelieve.
+    """
+    out = tmp_path / "run"
+    r = _train("--terrain-level", "0.5", "--steps", "32", "--out", str(out))
+    assert r.returncode == 0, r.stderr
+    levels = _levels(out / "log.jsonl")
+    assert levels and set(levels) == {0.5}, \
+        f"the run trained at a difficulty nobody asked for: {levels}"
+
+
+def test_resume_of_a_terrain_run_does_not_silently_continue_on_a_plane(tmp_path):
+    """Terrain is compiled into the model, so it cannot be restored after the env is built.
+
+    A `--resume` therefore has to learn it from the checkpoint *before* building anything.
+    Before this was wired, `--resume ckpt` without re-passing `--terrain` rebuilt a flat env,
+    restored the terrain_level onto it, and carried on -- the task changed mid-run and the
+    only trace was the `terr` column quietly vanishing from the progress line.
+    """
+    out = tmp_path / "run"
+    assert _train("--terrain-level", "0.4", "--steps", "16", "--out", str(out)).returncode == 0
+    r = _train("--resume", str(out / "latest.pt"), "--steps", "32", "--out", str(out))
+    assert r.returncode == 0, r.stderr
+    assert "terrain on" in r.stdout, "the resume did not notice it was resuming a terrain run"
+    levels = _levels(out / "log.jsonl")
+    assert len(levels) >= 2 and set(levels) == {0.4}, f"the resume lost the terrain: {levels}"

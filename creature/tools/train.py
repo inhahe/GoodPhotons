@@ -170,8 +170,9 @@ def main() -> int:
                     help="train on rough ground (P1b): a heightfield re-rolled every "
                          "episode, with its own difficulty curriculum")
     ap.add_argument("--terrain-level", type=float, default=None,
-                    help="with --eval, score on terrain of this difficulty (0-1) instead of "
-                         "on the flat plane; implies --terrain")
+                    help="terrain difficulty 0-1: the curriculum's STARTING difficulty when "
+                         "training, and the difficulty to score on with --eval (which is "
+                         "otherwise flat). Implies --terrain")
     args = ap.parse_args()
 
     from creaturelab.morph_io import morph_from_args, parse_sets
@@ -183,6 +184,17 @@ def main() -> int:
 
     ecfg = envmod.EnvConfig(rig=args.rig,
                             terrain=args.terrain or args.terrain_level is not None)
+
+    # Terrain is a property of the TASK, not resumable state, and it is compiled into the
+    # model -- so unlike `speed_cap` it cannot be restored after the env is built. Without
+    # this, `--resume ckpt` on a terrain run rebuilds a FLAT env (the flag lives in argv, not
+    # in the checkpoint), restores a terrain_level onto it, and trains happily on a plane: the
+    # task changes mid-run and the only trace is the `terr` column quietly disappearing.
+    # Same failure design.md names for the morph zoo, which is why it is an error and not a
+    # warning when the two disagree in the direction the user has actually asked for.
+    if args.resume and not ecfg.terrain and ppo.peek(args.resume).get("terrain"):
+        ecfg = replace(ecfg, terrain=True)
+        print(f"{args.resume} is a terrain run; continuing with terrain on", flush=True)
     pcfg = ppo.PPOConfig(num_envs=args.envs, horizon=args.horizon, lr=args.lr,
                          seed=args.seed, total_steps=int(args.steps),
                          device=ppo.pick_device(args.device))
@@ -224,7 +236,11 @@ def main() -> int:
         # task it solved 5M steps ago, and the learning curve takes a visible step backwards
         # for reasons entirely internal to the resume. Same class of bug as leaving the
         # observation normaliser out of the checkpoint.
+        # `terrain` is in here for a different reason from the rest: not to be restored into
+        # the env (it cannot be -- it is compiled into the model) but so a `--resume` can find
+        # out what task it is resuming BEFORE it builds one. See `ppo.peek` above.
         return {"best": best, "speed_cap": float(env.speed_cap),
+                "terrain": bool(ecfg.terrain),
                 "terrain_level": float(env.terrain_level)}
 
     if args.resume:
@@ -235,6 +251,12 @@ def main() -> int:
         print(f"resumed {args.resume} at {step:,} steps (best eval {best:.2f}, "
               f"command cap {env.speed_cap:.2f}, terrain {env.terrain_level:.2f})",
               flush=True)
+
+    # After the resume on purpose: an explicit `--terrain-level` is the user overriding where
+    # the curriculum stands, which is the only reason to pass it on a resume at all.
+    if args.terrain_level is not None:
+        env.terrain_level = args.terrain_level
+        print(f"terrain difficulty set to {env.terrain_level:.2f}", flush=True)
 
     obs, _ = env.reset(seed=pcfg.seed)
     per_update = pcfg.horizon * pcfg.num_envs

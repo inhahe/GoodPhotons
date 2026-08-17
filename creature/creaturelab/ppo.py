@@ -456,3 +456,17 @@ def load(path, ac: ActorCritic, norm: RunningNorm) -> tuple[int, dict]:
     ac.load_state_dict(d["ac"])
     norm.load_state_dict(d["norm"])
     return int(d["step"]), d.get("extra", {})
+
+
+def peek(path) -> dict:
+    """A checkpoint's `extra` dict, without building a network to read it.
+
+    Some of what `extra` carries is not resumable *state* but a property of the **task**, and
+    the task has to be known before the env is built -- `terrain` is compiled into the model,
+    so by the time `load` could tell you the run had terrain, the flat env already exists.
+    Reading it twice (here, and again in `load`) is much cheaper than the alternative, which
+    is a resume that silently continues a terrain run on a plane.
+    """
+    import torch
+
+    return torch.load(path, map_location="cpu", weights_only=False).get("extra", {})
