@@ -2359,8 +2359,9 @@ struct BackwardRenderer {
                         // needs filling) and on a training path (which is not reading, but its
                         // twin next chunk will). Marking is deduplicated per thread against a
                         // direct-mapped filter, so the millionth path across a cell is free.
-                        const uint64_t ck = radCache->cellKey(h.p, h.n);
-                        radBank->mark(ck, (size_t)RadianceCache::mix(ck), h.p, h.n);
+                        const uint64_t ck  = radCache->cellKey(h.p, h.n);
+                        const uint64_t ckm = RadianceCache::mix(ck);
+                        radBank->mark(ck, (size_t)ckm, h.p, h.n);
                         double e[hero::kHeroMax];
                         double j0 = 0.0, j1 = 0.0, j2 = 0.0;
                         // Only draw the dither when it is actually enabled: an unused draw
@@ -2376,9 +2377,16 @@ struct BackwardRenderer {
                         // Letting one of them terminate into the cache would score the cell
                         // against "direct light + somebody else's cached tail" -- the same
                         // self-feeding that rcTrain exists to prevent on the update side.
+                        // With jitter off (the default) the lookup key IS the mark key, so
+                        // hand it — and its mix — straight to the probe instead of letting
+                        // lookupBundle re-derive both. Jitter dithers the position, so only
+                        // that path still needs the full key derivation.
                         if (!rcTrain && !rcValidated &&
-                            radCache->lookupBundle(h.p, h.n, lam, nUp, e, &corr,
-                                                   &ckey, j0, j1, j2)) {
+                            (radCache->jitter > 0.0
+                                 ? radCache->lookupBundle(h.p, h.n, lam, nUp, e, &corr,
+                                                          &ckey, j0, j1, j2)
+                                 : radCache->lookupBundleAt(ck, ckm, lam, nUp, e, &corr,
+                                                            &ckey))) {
                             // Exactly what continuing would have contributed in expectation:
                             // surviving RR with probability q and reweighting by rho/q gives
                             // thr*rho*E[L_i], and E[L_i] over the cosine hemisphere is E/pi.

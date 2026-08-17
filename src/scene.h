@@ -1623,6 +1623,15 @@ struct Scene {
     };
     std::vector<MirrorPlane> mirrorPlanes;
 
+    // Index lists over `spheres` for the per-vertex specular camera connections
+    // (render.h camSpecularSplatAllVtxN): which spheres are smooth dielectrics (the
+    // refracted image of a vertex) and which are mirrors (the reflected image).
+    // Rebuilt together with the mirror planes, so they follow the same staleness
+    // policy. Ascending, so iterating them visits spheres in exactly the order the
+    // plain 0..nSph scans they replace did — film accumulation order is unchanged.
+    std::vector<int> dielSphereIdx;
+    std::vector<int> mirrorSphereIdx;
+
     // At most this many distinct mirror planes are tracked. A flat mirror is one or two
     // planes; a faceted "mirror" mesh (a disco ball, a tessellated chrome sphere) would
     // otherwise contribute thousands, and each one costs a BVH query per photon vertex.
@@ -1632,8 +1641,17 @@ struct Scene {
     static constexpr int kMaxMirrorPlanes = 64;
 
     // Group the mirror-material triangles by plane. Called from build(), after
-    // Tri::finalize() has filled in the geometric normals.
+    // Tri::finalize() has filled in the geometric normals. Also refreshes the
+    // dielectric/mirror sphere index lists (same machinery, same staleness policy).
     void buildMirrorPlanes() {
+        dielSphereIdx.clear();
+        mirrorSphereIdx.clear();
+        for (int i = 0; i < (int)spheres.size(); ++i) {
+            const int m = spheres[i].matId;
+            if (m < 0 || m >= (int)mats.size()) continue;
+            if (mats[m].type == MatType::Dielectric) dielSphereIdx.push_back(i);
+            if (isPlanarMirrorMat(mats[m]))          mirrorSphereIdx.push_back(i);
+        }
         mirrorPlanes.clear();
         // Quantised plane key, so the two tris of a quad (identical gn and offset) and
         // any coplanar neighbours land in one bucket. The tolerance is deliberately

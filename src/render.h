@@ -1364,10 +1364,13 @@ struct Renderer {
 
         const double dE = D - dP;                         // |R - eye| (R lies on the plane)
         Vec3 wRE = (eye - R) * (1.0 / dE);                // mirror -> eye
+        // Light-side leg first (stopping just short of the mirror's own surface): the
+        // any-hit occlusion walk is cheaper than the closest-hit that confirms the
+        // mirror, so a shadowed connection never pays for the expensive query. Both
+        // tests must pass and neither draws RNG, so the order is unobservable.
+        if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) return;
         Hit hm;
         if (!mirrorSeenAt(scene, eye, -wRE, dE, hm)) return;
-        // Light-side leg, stopping just short of the mirror's own surface.
-        if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) return;
 
         splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
                         p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng);
@@ -1444,9 +1447,29 @@ struct Renderer {
         for (int ri = 0; ri < nroot; ++ri) {
             const double phi = roots[ri];
             const Vec3 P1chief = O + ex * (r * std::cos(phi)) + ey * (r * std::sin(phi));
+            // Everything below is pure and RNG-free, so the tests are ordered cheapest
+            // first — an off-frame or backfacing connection rejects before paying for
+            // the two extra differential reflections, and the BVH queries come last,
+            // any-hit before closest-hit. Every value is computed by the same
+            // expression as before, so the accepted set and the splats are unchanged.
+            int px, py; double cosCam, dist2e;
+            if (!cam.project(P1chief, px, py, cosCam, dist2e)) continue;
+            const double omega = cam.pixelSolidAngle(cosCam);
+            if (omega <= 0.0) continue;
+
             const Vec3 d0 = normalize(P1chief - eye);
             SphereRefl ch;
             if (!reflectOffSphere(eye, d0, S, ch)) continue;
+
+            Vec3 wP = ch.P1 - p; const double dP = length(wP);
+            if (dP < 1e-9) continue;
+            wP = wP * (1.0 / dP);
+            const double shape = vt.shape(wP);
+            if (shape < 0.0) continue;
+
+            Vec3 toEye = eye - ch.P1; const double dE = length(toEye);
+            if (dE < 1e-9) continue;
+            const Vec3 wRE = toEye * (1.0 / dE);
 
             // Ray-differential geometry factor G = dOmega_eye / dA_perp at p.
             Vec3 a1, a2; onb(d0, a1, a2);
@@ -1471,23 +1494,9 @@ struct Renderer {
             const double G = (eps * eps) / jac;
             const double D = 1.0 / std::sqrt(G);
 
-            int px, py; double cosCam, dist2e;
-            if (!cam.project(P1chief, px, py, cosCam, dist2e)) continue;
-            const double omega = cam.pixelSolidAngle(cosCam);
-            if (omega <= 0.0) continue;
-
-            Vec3 wP = ch.P1 - p; const double dP = length(wP);
-            if (dP < 1e-9) continue;
-            wP = wP * (1.0 / dP);
-            const double shape = vt.shape(wP);
-            if (shape < 0.0) continue;
-
-            Vec3 toEye = eye - ch.P1; const double dE = length(toEye);
-            if (dE < 1e-9) continue;
-            const Vec3 wRE = toEye * (1.0 / dE);
+            if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) continue;
             Hit hm;
             if (!mirrorSeenAt(scene, eye, -wRE, dE, hm)) continue;
-            if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) continue;
 
             splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
                             p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, rng);
@@ -1508,21 +1517,26 @@ struct Renderer {
                                  const double* beta, const double* w, int nUp,
                                  Pcg32& rng) const {
         if (lensMode || forwardCatch) return;               // finite-lens/catch not supported
-        for (int i = 0; i < nUp; ++i) {
-            SpecVtx vi = vt; vi.weight = w[i];
-            for (const Sphere& S : scene.spheres) {
-                const Material& gm = scene.mats[S.matId];
-                if (gm.type != MatType::Dielectric) continue;
-                const double ng = gm.ior(lam[i]);
-                for (int c = 0; c < nCam; ++c)
-                    if (cams[c].cam && cams[c].film)
-                        connectSpecularSphere(scene, *cams[c].cam, *cams[c].film, S, gm, ng,
-                                              p, vi, lam[i], beta[i], rng);
+        // Scene::dielSphereIdx / mirrorSphereIdx replace the old scan of EVERY sphere's
+        // material per vertex (per λ, for the dielectrics). The lists are ascending, so
+        // the visit order — and the film accumulation order — is exactly the old scan's.
+        if (!scene.dielSphereIdx.empty()) {
+            for (int i = 0; i < nUp; ++i) {
+                SpecVtx vi = vt; vi.weight = w[i];
+                for (int si : scene.dielSphereIdx) {
+                    const Sphere& S = scene.spheres[(size_t)si];
+                    const Material& gm = scene.mats[S.matId];
+                    const double ng = gm.ior(lam[i]);
+                    for (int c = 0; c < nCam; ++c)
+                        if (cams[c].cam && cams[c].film)
+                            connectSpecularSphere(scene, *cams[c].cam, *cams[c].film, S, gm, ng,
+                                                  p, vi, lam[i], beta[i], rng);
+                }
             }
         }
         // Mirrors. Achromatic geometry, so one solve serves the whole hero bundle.
-        for (const Sphere& S : scene.spheres) {
-            if (!isPlanarMirrorMat(scene.mats[S.matId])) continue;
+        for (int si : scene.mirrorSphereIdx) {
+            const Sphere& S = scene.spheres[(size_t)si];
             for (int c = 0; c < nCam; ++c)
                 if (cams[c].cam && cams[c].film)
                     connectSpecularSphereMirror(scene, *cams[c].cam, *cams[c].film, S,

@@ -709,8 +709,12 @@ struct RadianceCache {
     // up after kProbe slots costs an occasional duplicate cell, never a hang.
     static constexpr int kProbe = 8;
 
-    int findSlot(uint64_t k) const {
-        size_t i = (size_t)mix(k) & mask;
+    int findSlot(uint64_t k) const { return findSlotMixed((size_t)mix(k), k); }
+
+    // Probe with the mix already in hand. The reader's call site computes mix(k) anyway for
+    // the mark filter's slot, so the hot path hands it in instead of paying splitmix twice.
+    int findSlotMixed(size_t h, uint64_t k) const {
+        size_t i = h & mask;
         for (int probe = 0; probe < kProbe; ++probe) {
             const uint64_t slot = key[i];
             if (slot == kEmpty) return -1;
@@ -768,7 +772,19 @@ struct RadianceCache {
             q = Vec3{p.x + (j0 - 0.5) * h, p.y + (j1 - 0.5) * h, p.z + (j2 - 0.5) * h};
         }
         const uint64_t k = cellKey(q, n);
-        const int s = findSlot(k);
+        return lookupBundleAt(k, mix(k), lambda, nLam, out, outCorr, outKey);
+    }
+
+    // The no-jitter fast path: key and mix precomputed by the caller, which already derived
+    // BOTH for the mark filter (backward.h marks first, then reads). With jitter off the
+    // lookup key is identical to the mark key, so recomputing levelOf + normalBucket + three
+    // floors + splitmix here was pure duplicate work. Same key, same probe, same answer —
+    // bit-identical to routing through lookupBundle.
+    bool lookupBundleAt(uint64_t k, uint64_t kmix, const double* lambda, int nLam,
+                        double* out, double* outCorr = nullptr,
+                        uint64_t* outKey = nullptr) const {
+        if (key.empty()) return false;
+        const int s = findSlotMixed((size_t)kmix, k);
         if (s < 0) return false;
         const RadCacheCell& c = cell[s];
         if (!c.ok) return false;

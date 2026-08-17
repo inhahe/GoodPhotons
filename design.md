@@ -1672,8 +1672,11 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   and is deliberately **dependency-free** (`<cmath>`, `<cstdint>`; `LT_FN` =
   `__host__ __device__ inline` under `__CUDACC__`) so the `.cu` includes the *same*
   traversal source the CPU compiles — one implementation of the importance heuristic,
-  not two that can drift. Nodes carry spatial bounds, a bounding cone of emission
-  normals (axis, `cosθ_o`, `cosθ_e`) and subtree flux; importance is
+  not two that can drift. Nodes carry the members' bounding **sphere** (`center`, `r2` —
+  baked by the builder from the AABB as `0.5·(bmin+bmax)` / `0.25·|bmax−bmin|²`, the exact
+  expressions the traversal used to derive per call before 0.190.4 stored them
+  pre-computed; `sinθ_o` is baked the same way), a bounding cone of emission
+  normals (axis, `cosθ_o`, `sinθ_o`, `cosθ_e`) and subtree flux; importance is
   `power · cos(θ − θ_o − θ_u) / d²` against a `θ_u`-widened `|cos|` at the receiver.
   `lighttree_build.h` does the build; `Scene::buildLightTree()` calls it from
   `finalizeEmitters()`, so every path that rebuilds the emitter list (`-ignoreenv`,
@@ -1740,6 +1743,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   vertex *after* that vertex's own NEE and *before* the continuation roulette, adds
   `thr·ρ·(E/π)·invPdf` and stops. That placement is what makes the partition exact: direct
   light is counted once by the reader, everything beyond the vertex once by the cache.
+  (The reader marks first and reads second; with `-radcache-jitter` off the two keys are
+  identical, so since 0.190.4 the call site derives key+mix once and probes via
+  `lookupBundleAt` instead of letting `lookupBundle` re-derive both.)
 
   **Camera paths never write it**, which is the design's load-bearing asymmetry and the
   reason a miss is free. A separate update pass between chunks (`main.cpp`
@@ -4515,7 +4521,17 @@ quantised `(n, d)` key — normal canonically oriented, since a mirror is two-si
 `Scene::mirrorPlanes`, each carrying the plane, the member AABB and the total area.
 That makes the per-photon-vertex cost **O(#mirror surfaces)**, not O(#mirror triangles),
 and it is capped at `kMaxMirrorPlanes = 64` (largest-area planes win). The list uploads
-verbatim to `DScene::mirrorPlanes` as `DMirrorPlane`.
+verbatim to `DScene::mirrorPlanes` as `DMirrorPlane`. The sphere connectors get the same
+treatment (0.190.4): `buildMirrorPlanes` also fills `Scene::dielSphereIdx` /
+`mirrorSphereIdx` — the ascending indices of the dielectric / planar-mirror spheres — and
+`camSpecularSplatAllVtxN` (both backends; the lists upload to `DScene::dielSph`/`mirrorSph`)
+iterates those instead of testing every sphere's material per vertex per λ, so a scene of
+many plain spheres pays nothing. Ascending order keeps the film accumulation order, and
+therefore the images, bit-identical. Within each connector the tests are ordered
+cheap-reject-first (0.190.4): pure projections and root solves before any BVH query, then
+the any-hit `occluded()` before the closest-hit `mirrorSeenAt` — legal because every
+reordered step is pure and RNG-free, so a vertex that fails either way computes the same
+splat or none.
 
 **One traversal does three jobs.** A plane does not know where its panel *ends*, so
 `mirrorSeenAt` / `dMirrorSeenAt` casts one `closestHit(eye → R)` and requires
