@@ -796,6 +796,16 @@ be restored after the env exists. `tools/train.py` reads it out of the checkpoin
 flat env, restored a difficulty onto it and trained on a plane — the task changing mid-run,
 with no trace but a column vanishing from the progress line.
 
+**A run's process must outlive the session that starts it.** Checkpoint cadence bounds what a
+death costs, but a trainer launched as a child of an agent/terminal session is killed *with*
+that session — silently, with nobody left to resume it (observed: a fresh run killed four
+minutes in, before its first `latest.pt`). `tools/detach.ps1` is the standing launcher for
+long runs: it creates the process via WMI so it is parented under the `wmiprvse.exe` service
+rather than the caller, logs stdout+stderr to a file, and records the deepest interpreter PID
+(the venv `python.exe` is a re-exec shim) in a pid file — which is the only process it is ever
+legitimate to stop, by exact PID. See notes/training.md → "Launching a long run so it
+survives the session".
+
 **Evaluation stays flat even when training is not.** An evaluation whose task hardens with the
 curriculum cannot select a checkpoint — the score drops at every promotion, so `best.pt` would
 freeze at whatever the policy managed on the easiest terrain it ever saw. Flat is the one task

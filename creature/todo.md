@@ -360,6 +360,12 @@ Both are places the current env quietly assumes z = 0 *is* the ground:
                             --terrain-level 1.0                                      # the claim
       ```
 
+      Launch the training half of that through `tools/detach.ps1` (notes/training.md →
+      "Launching a long run so it survives the session") — the first attempt at this exact
+      run was killed at step 335,872 by a session restart because it was a child of the
+      session's shell. **Re-run IN FLIGHT** (relaunched detached, PID in
+      `runs/canis_rough2/pid`); evals + table re-measurement pending its completion.
+
 ---
 
 ## P2 — AMP imitation from public mocap  `[ ]`

@@ -158,6 +158,32 @@ random command set. The symptom was consecutive evals of a steadily improving po
 
 ---
 
+## Launching a long run so it survives the session
+
+A trainer started as an ordinary child of an agent/terminal session **dies with that
+session** — checkpoints bound the loss to five minutes, but the run still stops silently and
+nobody restarts it. (Measured: a 2e7-step run killed at step 335,872, four minutes in, by a
+harness session restart — before the first `latest.pt` was ever written.)
+
+So launch anything longer than a few minutes with `tools/detach.ps1`, which creates the
+process via WMI (`Win32_Process.Create`). That parents it under the `wmiprvse.exe` service —
+outside the launching session's process tree and job objects — so its lifetime is its own:
+
+```powershell
+powershell -NoProfile -File tools\detach.ps1 `
+    -Log runs\myrun\train.log -PidFile runs\myrun\pid `
+    .venv\Scripts\python.exe tools\train.py --terrain --steps 2e7 --out runs/myrun
+```
+
+`-Log` captures stdout+stderr; `-PidFile` receives the PID of the **real** interpreter — the
+venv `python.exe` is a launcher shim that re-execs the base interpreter as a child, so the
+script walks to the deepest process in the chain, and that PID is the only correct target for
+monitoring (`Get-Process -Id`) or stopping. Stop it *only* by that exact PID, never by image
+name (`taskkill /IM python.exe` takes down every other Python on the machine). Killing the
+trainer loses at most `--checkpoint-minutes` of work; resume from `latest.pt`.
+
+---
+
 ## Training on rough ground (P1b)
 
 ```bash
