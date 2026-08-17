@@ -94,8 +94,11 @@
 //                  resume is bit-identical outright -- `-spp 3` then `-resume -spp 5` gives
 //                  exactly the pixels of a plain `-spp 8`, since the lattice is indexed by
 //                  absolute sample. R/D store a SUM-over-spp film + spp count; P stores a
-//                  dual forward+backward film (magic FTPCM02). M/S/U keep persistent per-pass
-//                  state that a film alone can't restore, so they are not disk-resumable.
+//                  dual forward+backward film (magic FTPCM02). Under -radcache both formats
+//                  carry the radiance-cache table as a sparse trailing section, so a resumed
+//                  render continues with a WARM cache rather than relearning it (see
+//                  writeRadCacheSection). M/S/U keep persistent per-pass state that a film
+//                  alone can't restore, so they are not disk-resumable.
 //   -savemap <f>   (mode M, GPU) after the forward deposit pass, write the view-independent
 //                  photon map to <f> (magic FTPMP01). The map is the expensive result of the
 //                  photon trace and is independent of camera and gather radius.
@@ -10634,6 +10637,169 @@ static int g_giBounce = 4;
 // See BackwardRenderer::giClamp for the full rationale.
 static double g_giClamp = 0.0;
 
+// ---- -radcache: biased early path termination into a world-space irradiance cache -----
+// The opposite design choice from -gi above, and deliberately so. -gi has NO cache because
+// mode W is aimed at animation, where POV-Ray-style adaptive irradiance caches make
+// low-frequency blotches that POP between frames. -radcache accepts exactly that risk in
+// exchange for cutting the cost of deep GI: past `g_radMinBounce`, a mode-R path that lands
+// in a well-sampled cell stops tracing and reads E/pi out of the table instead of walking
+// the rest of its bounces. It is therefore OFF by default, never implied by another flag,
+// and NOT for a seamless loop -- use it for stills and for previewing, and turn it off for
+// the reference render. See src/radcache.h for the estimator and known-issues.md for the
+// documented limits.
+static bool   g_radCache      = false;
+static double g_radCacheCell  = 0.0;    // level-0 cell edge, world units; 0 = auto
+static double g_radTrainFrac  = 0.0;    // fraction of paths that ignore the cache
+static int    g_radMinBounce  = 2;      // no termination before this bounce index
+static int    g_radRays       = kRadCacheRays;       // update rays per cell per round
+static int    g_radMinSamples = kRadCacheMinSamples; // per bin, before the gate is believed
+static int    g_radMaxSamples = kRadCacheMaxSamples; // per bin, before a cell is retired
+static double g_radTol        = kRadCacheTol;        // required relative standard error
+static double g_radBudget     = kRadCacheBudget;     // update samples per cache consult
+static int    g_radWarm       = kRadCacheWarm;       // first-chunk budget multiplier
+static double g_radJitter     = 0.0;    // lookup dither, in cell widths
+static bool   g_radAudit      = false;  // -radcache-audit: score reads, never terminate
+static double g_radValidate   = 0.05;   // fraction of reads that verify instead of terminating
+// Table capacity in cells (rounded up to a power of two). Each cell is 8 B of key plus ~210 B
+// of value/counters plus ~160 B of per-round scratch, so the default is ~98 MB. Sizing matters
+// for SPEED as much as for capacity: the probe is a random access, so a table that outgrows
+// the last-level cache turns every lookup into a memory stall. A Cornell box occupies ~13 k
+// cells; raise this for a scene whose visible surface area is orders of magnitude larger (the
+// status line warns when cells start being dropped).
+static size_t g_radCacheCells = (size_t)1 << 18;
+static RadianceCache g_radianceCache;
+
+// ---- resume: the table read out of a .ftbuf checkpoint, waiting to be adopted -------------
+//
+// A resumed render reloads the cache table so it continues WARM. This is not just a speed
+// nicety, it removes a correctness wart: without it a resumed film silently blends cold-table
+// samples (which never terminate, and are therefore unbiased) with warm-table samples (which
+// do, and are therefore biased) in a ratio decided by wherever the user happened to stop and
+// restart. The bias of the finished image then depends on the interruption history, which is
+// not a property an image should have.
+//
+// The load is DEFERRED rather than applied where the file is read, because the table's
+// configuration is not final at that point: renderBackward derives the auto cell size from the
+// camera and resolution and sets the clipmap centre from the eye, and those are exactly the
+// settings the saved cells' keys were computed under. So the reader parks the records here and
+// radCacheAdoptPending() consumes them at the top of the first pass, once every parameter the
+// guard covers is known.
+struct PendingRadCache {
+    bool      have  = false;
+    uint64_t  guard = 0;
+    uint32_t  pass  = 0;
+    long long nSample = 0, nEvicted = 0, nTerm = 0, nMiss = 0, nUpdated = 0;
+    std::vector<uint64_t>     keys;
+    std::vector<RadCacheCell> cells;
+    void clear() { *this = PendingRadCache{}; }
+};
+static PendingRadCache g_pendingRadCache;
+
+// Fold a checkpointed table into the freshly-initialised one. Called once, from the first
+// backward pass, after the cache's configuration has been finalised. A guard mismatch is NOT
+// fatal: the film still resumes correctly, the table simply starts cold, so this warns and
+// carries on rather than refusing the render.
+static void radCacheAdoptPending() {
+    if (!g_pendingRadCache.have) return;
+    PendingRadCache p;
+    p = std::move(g_pendingRadCache);
+    g_pendingRadCache.clear();          // one shot: later passes must not re-adopt
+    if (!g_radianceCache.ready()) return;
+    if (p.guard != g_radianceCache.configGuard()) {
+        std::fprintf(stderr, "[resume] the checkpoint's radiance-cache table was built with "
+                             "different cache settings (cell size, clipmap centre, spectral "
+                             "range or confidence gate); starting with a cold table. The image "
+                             "resume itself is unaffected.\n");
+        return;
+    }
+    size_t loaded = 0;
+    for (size_t i = 0; i < p.keys.size(); ++i)
+        if (g_radianceCache.loadCell(p.keys[i], p.cells[i])) ++loaded;
+    g_radianceCache.pass     = p.pass;
+    g_radianceCache.nSample  = p.nSample;
+    g_radianceCache.nEvicted = p.nEvicted;
+    g_radianceCache.nTerm    = p.nTerm;
+    g_radianceCache.nMiss    = p.nMiss;
+    g_radianceCache.nUpdated = p.nUpdated;
+    std::printf("[resume] radiance cache: %zu of %zu cells restored; continuing warm\n",
+                loaded, p.keys.size());
+}
+
+// End-of-render summary.
+//   term%    share of cache consultations that actually shortened a path -- the number that
+//            predicts the speedup.
+//   ok/dead  cells that passed the standard-error gate / were retired as too noisy to ever
+//            pass it. A table that is nearly all `dead` means this scene's indirect light is
+//            too high-variance to cache at this -radcache-tol; the render fell back to exact
+//            tracing and paid only the (bounded) update overhead.
+//   dropped  should stay near zero: a non-trivial count means the table is too small for the
+//            scene at this cell size (raise -radcache-cells, or coarsen with -radcache-cell).
+static void reportRadCache() {
+    if (!g_radCache || !g_radianceCache.ready()) return;
+    const RadianceCache& rc = g_radianceCache;
+    const long long look = rc.nTerm + rc.nMiss;
+    std::printf("[radcache] cell %.4g; %zu cells (%.1f%% full): %lld ready, %lld retired, "
+                "%zu pending; %lld update samples; %lld/%lld consults terminated (%.1f%%)%s\n",
+                rc.baseCell,
+                rc.used, 100.0 * rc.occupancy(), rc.nOk, rc.nDead, rc.work.size(),
+                rc.nSample, rc.nTerm, look,
+                look ? 100.0 * (double)rc.nTerm / (double)look : 0.0,
+                rc.nEvicted ? "  [!] table full - some cells were dropped" : "");
+    // Verification (-radcache-validate). `corrected` counts cells whose reader-measured ratio
+    // was well enough determined to adopt as a scale factor; `retired` counts cells the
+    // readers proved wrong but could not pin down, which stop answering entirely. Both being
+    // zero on a scene with plenty of consults means either verification is off or every cell
+    // agreed with its readers -- which is the good case, not a broken one.
+    if (g_radValidate > 0.0 && !g_radAudit && (rc.nCorrected || rc.nRejected))
+        std::printf("[radcache] verification: %lld cells corrected, %lld retired by readers "
+                    "(%.0f%% of reads verified)\n",
+                    rc.nCorrected, rc.nRejected, 100.0 * g_radValidate);
+    if (g_radAudit) {
+        // offer/trace - 1 is the cache's systematic error per read. Both sums are over the
+        // SAME set of vertices in the SAME run, so the pixel noise that dominates an
+        // image-space comparison cancels and what is left is the bias alone.
+        const double rel = rc.auditTrace != 0.0 ? rc.auditCache / rc.auditTrace - 1.0 : 0.0;
+        // ... and the audit's own standard error, so a noisy verdict cannot be mistaken for
+        // a real bias. The traced tail is heavy-tailed wherever specular transport is (a
+        // caustic sample can be thousands of times the mean), and an audit whose +-SE spans
+        // zero has measured nothing but its own variance.
+        const double N   = (double)std::max(1LL, rc.auditN);
+        const double m   = rc.auditTrace / N;
+        const double var = std::max(0.0, rc.auditTrace2 / N - m * m);
+        const double se  = (m != 0.0) ? std::sqrt(var / N) / std::fabs(m) : 0.0;
+        std::printf("[radcache] audit: %lld reads scored; cache offered %.6g, tail delivered "
+                    "%.6g -> %+.2f%% systematic error per read (audit's own SE +-%.2f%%)\n",
+                    rc.auditN, rc.auditCache, rc.auditTrace, 100.0 * rel, 100.0 * se);
+    }
+}
+
+// -raystats: print the total number of rays cast against the acceleration structure. This
+// is the deterministic measure of how much work a render did, which is what you want when
+// comparing two configurations on a machine whose wall-clock varies more than the effect
+// being measured (a 5 s render here spans 3.4-6.3 s run to run; the ray count does not
+// move at all). Currently wired into the mode-R backward workers.
+static bool g_rayStats = false;
+static void reportRayStats() {
+    if (!g_rayStats) return;
+    const unsigned long long n = raystats::total.load();
+    std::printf("[raystats] %llu ray queries (closest-hit + shadow)\n", n);
+}
+
+// ---- many-lights importance sampling (the Conty-Kulla light BVH) -------------------
+// `-no-lighttree` restores the historical estimator: connect a shadow ray to EVERY
+// emitter at every non-specular vertex. Correct, but O(N_lights) per bounce for no gain
+// once the lights are redundant (measured: same room, same total flux, mode R 256 spp —
+// 1 light 0.4 s vs 256 lights 75.9 s at an identical 6.25 % noise). Kept as an escape
+// hatch and as the reference the tree is validated against.
+// `-light-split` is the adaptive-splitting threshold, (node radius / distance)^2: a node
+// still subtending more than this at the shading point has BOTH children visited instead
+// of one being chosen, so near lights keep their structure. 0 = never split (cheapest,
+// noisiest); a huge value splits everything (= -no-lighttree).
+// `-light-samples` caps how many emitters one vertex may connect to.
+// The three values themselves live in `lt::` (src/lighttree.h) rather than in statics
+// here, because render_cuda.cu must read the identical settings when it fills DScene —
+// exactly the arrangement `hero::gSplit` uses. See lighttree.h.
+
 // -dual-scatter (P3 stage 4): replace the fur coat's multiple-scattering random walk with
 // Zinke et al. 2008's two analytic terms. Biased, one-bounce fur, orders of magnitude
 // cheaper on a pale coat. See BackwardRenderer::dualScatter.
@@ -11267,7 +11433,82 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
     const int bandN  = bandHi - bandLo;
     if (bandN <= 0) return out;
     if (bandN < nThreads) nThreads = bandN;   // don't hand a thread an empty row range
-    auto worker = [&](int tid) {
+    // -radcache: one shared, READ-ONLY table for the pass plus one deposit bank per thread.
+    // The table is only ever written between passes (the merge below), so a lookup on the hot
+    // path is a plain read -- no atomics, no false sharing, and the image a chunk produces
+    // does not depend on how the OS scheduled the threads. `into != nullptr` is the
+    // interactive viewer's band-at-a-time preview; it shares the same table, which is exactly
+    // what makes the preview get cheaper as you look around.
+    const bool rcOn = g_radCache && !(g_whitted || forceWhitted) && !g_directOnly;
+    std::vector<RadCacheBank> rcBanks(rcOn ? nThreads : 0);
+    if (rcOn) {
+        if (!g_radianceCache.ready()) g_radianceCache.init(g_radCacheCells);
+        // Auto cell size: the world size of a ~32-pixel square at the distance the camera is
+        // actually looking, NOT a fraction of the scene radius.
+        //
+        // Cell size is the single most important performance knob, and it works in the
+        // opposite direction from the intuition: halving the cell edge multiplies the cell
+        // count by up to four (they tile a SURFACE) while dividing the consults each cell
+        // serves by the same factor, so the samples a cell needs to become confident stay
+        // the same while the traffic that pays for them collapses. Measured on cornell.ftsl
+        // at 200x200x1024spp against an exact reference, holding everything else at the
+        // defaults:
+        //
+        //     cell   cells  term%   rays vs cache-off   rms
+        //     0.50      10  45.1%        -11.4%        1.49%
+        //     0.25      44  56.5%        -12.7%        2.18%
+        //     0.12     204  23.6%         +2.6%        1.80%
+        //     0.06     664   3.3%        +11.6%        1.48%
+        //
+        // -- i.e. the fine settings are a NET LOSS, and the earlier R/64 default (0.027 here)
+        // left 11 k cells for a 40 k-pixel image, a quarter of a cell per pixel, and no cell
+        // ever became confident at all.
+        //
+        // A fraction of the scene radius is the wrong scale to hang this on, because the
+        // thing that has to pay for a cell is the number of camera samples that read it, and
+        // that is set by the IMAGE, not by the scene's size. Pinning the cell to a fixed
+        // number of pixels makes the economics resolution-invariant: double the resolution
+        // and you get 4x the cells, but also 4x the paths to amortise them over, so
+        // consults-per-cell -- the quantity that decides whether the cache pays -- is
+        // unchanged. It also automatically coarsens for a distant camera and refines for a
+        // close one, which is what the clipmap does with distance anyway. 32 pixels is chosen
+        // to land on the measured optimum above (0.256 for this scene at 200 px tall) and is
+        // safe to blur over because the cache is only ever read at bounce >= 2, where two
+        // diffuse bounces have already smoothed the signal far below that scale.
+        //
+        // The scene radius still sets the CLAMP (and the fallback for a camera with no
+        // ordinary field of view -- fisheye, panoramic, a real multi-element lens), so a
+        // pathological camera cannot ask for a cell finer than R/256 or coarser than R/2.
+        const double R = std::max(1e-9, scene.sceneRadius);
+        double autoCell = R / 8.0;
+        if (cam.tanHalfY > 0.0 && resY > 0) {
+            const double d   = std::max(0.25 * R, length(scene.sceneCenter - cam.eye));
+            const double pix = 2.0 * d * cam.tanHalfY / (double)resY;
+            autoCell = std::clamp(32.0 * pix, R / 256.0, R * 0.5);
+        }
+        g_radianceCache.baseCell   = g_radCacheCell > 0.0 ? g_radCacheCell : autoCell;
+        g_radianceCache.baseDist   = R;
+        g_radianceCache.minBounce  = g_radMinBounce;
+        g_radianceCache.rays       = g_radRays;
+        g_radianceCache.minSamples = g_radMinSamples;
+        g_radianceCache.maxSamples = g_radMaxSamples;
+        g_radianceCache.tol        = g_radTol;
+        g_radianceCache.budget     = g_radBudget;
+        g_radianceCache.warm       = g_radWarm;
+        g_radianceCache.jitter     = g_radJitter;
+        g_radianceCache.lambdaLo   = LAMBDA_MIN;
+        g_radianceCache.lambdaHi   = LAMBDA_MAX;
+        g_radianceCache.camera     = cam.eye;    // clipmap centre; re-read every pass
+        g_radianceCache.prepare();               // refresh the reciprocals the hot path uses
+        // -resume: adopt the table saved in the .ftbuf sidecar, now that every setting its
+        // guard covers is final. No-op on a fresh render, and after the first pass.
+        radCacheAdoptPending();
+    }
+    // Factored out of the worker so the -radcache update pass (below) can trace with an
+    // IDENTICAL renderer configuration -- an update ray must see the same materials, the same
+    // light-tree settings and the same bounce limits as the camera path whose tail it stands
+    // in for, or the cached value would not be the number the reader wanted.
+    auto makeBr = [&]() {
         BackwardRenderer br; br.diffraction = diffraction; br.heroC = g_heroC;
         if (g_maxBounceOverride >= 1) br.maxBounce = g_maxBounceOverride;
         br.directOnly = g_directOnly || forceWhitted;   // mode W is direct-only by construction
@@ -11283,6 +11524,8 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         br.ambient = g_ambient * scene.ambientRef();
         br.giDirs = g_gi; br.giGrid = g_giGrid; br.giBounce = g_giBounce;
         br.giClamp = g_giClamp * scene.ambientRef();   // same scaling as -ambient above
+        br.lightTree = lt::gEnabled; br.lightSplit = lt::gSplit;
+        br.lightSamples = lt::gSamples;
         br.dualScatter = g_dualScatter; br.dualDensity = g_dualDensity;
         br.dualMaxCross = g_dualMaxCross;
         br.dualDb = g_dualDb; br.dualDf = g_dualDf;
@@ -11302,12 +11545,83 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
             br.furLodW0 = g_furLodD0 * dia;
             br.furLodW1 = g_furLodD1 * dia;
         }
+        if (rcOn) {
+            br.radCache       = &g_radianceCache;
+            br.radMinBounce   = g_radMinBounce;
+            br.radTrainFrac   = g_radTrainFrac;
+            br.radAudit       = g_radAudit;
+            br.radValidate    = g_radValidate;
+        }
+        return br;
+    };
+    auto worker = [&](int tid) {
+        BackwardRenderer br = makeBr();
+        if (rcOn) br.radBank = &rcBanks[tid];
         int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
         br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
+        raystats::flushThread();   // -raystats: fold this worker's tally into the total
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
     for (auto& th : pool) th.join();
+    // ---- -radcache: mark -> update -> apply, once per chunk ---------------------------
+    // All three steps run after the join and before the next chunk, so the table is immutable
+    // for the whole of any render pass. That is what makes the table's state a pure function
+    // of the chunks rendered so far rather than of the thread interleaving -- a chunked render
+    // and a one-shot render of the same budget see the same cache.
+    if (rcOn) {
+        // 1. MARKS create the cells (geometry, no radiance yet) and rebuild the work list --
+        //    the cells that are neither confident yet nor written off as hopeless. Update rays
+        //    mark too, and their marks ride here from the PREVIOUS chunk, which is how the
+        //    table grows into geometry no camera path ever reached.
+        g_radianceCache.mergeMarks(rcBanks);
+        // 2. UPDATE ROUNDS, under a budget. A round shoots rc.rays cosine rays per served
+        //    cell; the rays read the table, so every round propagates light one bounce
+        //    further. How many cells get served is set by the budget governor (radcache.h):
+        //    `-radcache-budget` update samples per cache consult the chunk actually made, with
+        //    a `-radcache-warm` multiplier on the cold first chunk. That is what stops the
+        //    update pass eating the render on a scene with hundreds of thousands of cells --
+        //    it simply serves fewer of them per chunk and rotates through the rest.
+        long long budget = g_radianceCache.chunkBudget();
+        const int nRays  = std::max(1, g_radianceCache.rays);
+        std::vector<uint32_t> served;
+        // Cap the rounds per chunk: past a handful the merge/apply bookkeeping starts to cost
+        // more than the propagation buys, and the budget is better spent next chunk.
+        for (int it = 0; it < 64 && budget >= nRays; ++it) {
+            if (!g_radianceCache.takeWork(served, (size_t)(budget / nRays))) break;
+            if (served.empty()) break;
+            // One thread per contiguous slice of the served list: each thread then owns those
+            // cells' scratch outright, so the round needs no atomics.
+            const size_t nServe = served.size();
+            int uThreads = (int)std::min((size_t)nThreads, nServe);
+            std::vector<long long> got((size_t)uThreads, 0);
+            std::vector<std::thread> up;
+            for (int t = 0; t < uThreads; ++t) {
+                up.emplace_back([&, t]() {
+                    BackwardRenderer br = makeBr();
+                    br.radBank      = &rcBanks[t];
+                    // Update rays never read the cache (updateRadCacheCells forces rcTrain),
+                    // so none of the reader-side knobs apply; zero them so a future change to
+                    // that forcing cannot silently let an update ray feed on the table.
+                    br.radTrainFrac = 0.0;
+                    br.radValidate  = 0.0;
+                    br.radAudit     = false;
+                    const size_t a = nServe * (size_t)t / (size_t)uThreads;
+                    const size_t b = nServe * (size_t)(t + 1) / (size_t)uThreads;
+                    br.updateRadCacheCells(scene, g_radianceCache, served.data(), a, b,
+                                           &got[(size_t)t]);
+                    raystats::flushThread();
+                });
+            }
+            for (auto& th : up) th.join();
+            for (long long g : got) { g_radianceCache.nSample += g; budget -= g; }
+            // 3. APPLY: fold the round's samples into each served cell's cumulative mean and
+            //    re-test its confidence gate. Cells that pass (or are retired) drop out of the
+            //    work list, so the next round's budget goes to cells that still need it.
+            if (g_radianceCache.apply(served)) g_radianceCache.rebuildWork();
+        }
+        g_radianceCache.clearBanks(rcBanks);
+    }
     return out;
 }
 
@@ -11749,6 +12063,12 @@ static bool                        g_showWindow = false;
 // after run() returns until the user closes the window themselves, so a finished image
 // stays on screen to inspect.
 static bool                        g_keepWindow = false;
+// -window-min / -minimized: open the live preview MINIMIZED to the taskbar. It is still a
+// real, live window -- frames are presented to it and it can be restored at any moment --
+// it simply never grabs the desktop or the keyboard focus on the way up. This is the right
+// default when a series of renders is being launched in the background while the machine
+// is in use for something else: without it every render pops a window to the foreground.
+static bool                        g_minWindow = false;
 static std::unique_ptr<LiveWindow> g_liveWin;
 // Base window title identifying WHAT is being rendered — set in main() to
 // "ftrace - <scene> -> <output>" (see makeWindowTitle). The current render mode
@@ -12008,6 +12328,92 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
 
 static std::string checkpointPath(const std::string& outPath) { return outPath + ".ftbuf"; }
 
+// ---- the radiance-cache section of a .ftbuf sidecar ---------------------------------------
+//
+// Appended AFTER the film blobs, under its own tag and its own guard. Appending works because
+// both readers above consume a fixed number of fixed-size records and never require the stream
+// to end there, so a sidecar carrying this section loads unchanged in a build that knows
+// nothing about it, and one written by such a build simply has no section to find. That is why
+// the file magic does NOT need a bump: the format is only extended, never reinterpreted.
+//
+// It is SPARSE -- only occupied slots -- and this is not an optimisation, it is what makes
+// checkpointing the table viable at all. The default table is 262144 cells; dumping it whole
+// would put ~82 MB into a file that is otherwise ~1 MB and rewrite it every `-interval`
+// (15 s by default), which would cost more than the cache saves. Occupancy in practice is a
+// tiny fraction of capacity -- 36 cells on a Cornell box (~11 KB), 8.7 k on fur_creature
+// (~2.7 MB) -- because cells tile the VISIBLE SURFACE, not the volume.
+//
+// `scratch` is not written: it holds one update round's partial sums, is folded into the cells
+// at the end of every round, and is empty at the chunk boundary where checkpoints are taken.
+//
+// The section's guard is separate from the film's on purpose. checkpointGuard() covers the
+// scene, mode and resolution, and nothing whatever about the cache -- so it would happily
+// accept a sidecar written under a different -radcache-cell, whose keys quantise space
+// differently. Two guards let the mismatch cases resolve independently and correctly: a
+// changed scene rejects both, a changed cache setting rejects only the table and still resumes
+// the image.
+static constexpr char kRadCacheTag[8] = {'F','T','R','C','A','C','H','1'};
+
+// Returns false only on a write error. Writes nothing at all (leaving the sidecar byte-for-byte
+// what it has always been) when there is no live table, so a render without -radcache is
+// unaffected in every respect, including the bytes on disk.
+static bool writeRadCacheSection(std::ostream& o) {
+    if (!g_radCache || !g_radianceCache.ready()) return true;
+    const RadianceCache& rc = g_radianceCache;
+    uint64_t n = 0;
+    for (size_t i = 0; i < rc.key.size(); ++i) if (rc.key[i] != RadianceCache::kEmpty) ++n;
+    const uint64_t guard = rc.configGuard();
+    const uint32_t pass  = rc.pass;
+    const long long ctr[5] = {rc.nSample, rc.nEvicted, rc.nTerm, rc.nMiss, rc.nUpdated};
+    o.write(kRadCacheTag, 8);
+    o.write((const char*)&guard, 8);
+    o.write((const char*)&pass, 4);
+    o.write((const char*)ctr, sizeof ctr);
+    o.write((const char*)&n, 8);
+    for (size_t i = 0; i < rc.key.size(); ++i) {
+        if (rc.key[i] == RadianceCache::kEmpty) continue;
+        o.write((const char*)&rc.key[i], 8);
+        o.write((const char*)&rc.cell[i], sizeof(RadCacheCell));
+    }
+    return (bool)o;
+}
+
+// Park a checkpointed table in g_pendingRadCache for radCacheAdoptPending() to consume. Any
+// shortfall -- no section, an unrecognised tag, a truncated record -- means "no saved table",
+// which is a completely ordinary state (every sidecar written before this existed, and every
+// one written without -radcache), so it is silent and the stream's failure bits are cleared
+// afterwards: the caller has already read everything it needs and must not see a stray EOF
+// from probing past the end as a truncated FILM.
+static void readRadCacheSection(std::istream& in) {
+    g_pendingRadCache.clear();
+    if (!g_radCache) { in.clear(); return; }
+    char tag[8] = {0};
+    in.read(tag, 8);
+    if (!in || std::memcmp(tag, kRadCacheTag, 8) != 0) { in.clear(); return; }
+    uint64_t guard = 0, n = 0; uint32_t pass = 0; long long ctr[5] = {0,0,0,0,0};
+    in.read((char*)&guard, 8);
+    in.read((char*)&pass, 4);
+    in.read((char*)ctr, sizeof ctr);
+    in.read((char*)&n, 8);
+    // Sanity bound before allocating from a file's word: a table can never hold more cells
+    // than the largest capacity the flag accepts, and the record count is otherwise attacker-
+    // or corruption-controlled.
+    if (!in || n > (uint64_t)1 << 28) { in.clear(); return; }
+    PendingRadCache p;
+    p.keys.resize((size_t)n);
+    p.cells.resize((size_t)n);
+    for (uint64_t i = 0; i < n; ++i) {
+        in.read((char*)&p.keys[(size_t)i], 8);
+        in.read((char*)&p.cells[(size_t)i], sizeof(RadCacheCell));
+    }
+    if (!in) { in.clear(); return; }
+    in.clear();
+    p.have = true; p.guard = guard; p.pass = pass;
+    p.nSample = ctr[0]; p.nEvicted = ctr[1]; p.nTerm = ctr[2];
+    p.nMiss = ctr[3]; p.nUpdated = ctr[4];
+    g_pendingRadCache = std::move(p);
+}
+
 // "png/foo.png" + "_forward" -> "png/foo_forward.png". Inserts a suffix before the
 // extension, keeping the directory (so a companion image lands next to -o rather than in
 // the CWD) and the format (writeImage dispatches on the extension). No extension, or a
@@ -12035,6 +12441,7 @@ static bool writeCheckpoint(const std::string& outPath, const Checkpoint& c,
     o.write((const char*)&guard, 8);
     o.write((const char*)c.film.xyz.data(), c.film.xyz.size() * sizeof(Vec3));
     o.write((const char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
+    if (!writeRadCacheSection(o)) return false;
     return (bool)o;
 }
 
@@ -12072,6 +12479,7 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
     in.read((char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
     if (!in) { std::fprintf(stderr, "[resume] checkpoint %s truncated; starting fresh\n",
                             checkpointPath(outPath).c_str()); return false; }
+    readRadCacheSection(in);          // optional trailing section; absent in older sidecars
     return true;
 }
 
@@ -12106,6 +12514,7 @@ static bool writeCompositeCheckpoint(const std::string& outPath, const Composite
     o.write((const char*)c.fwd.hits.data(), c.fwd.hits.size() * sizeof(double));
     o.write((const char*)c.ref.xyz.data(), c.ref.xyz.size() * sizeof(Vec3));
     o.write((const char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
+    if (!writeRadCacheSection(o)) return false;   // mode P's backward layer reads the cache too
     return (bool)o;
 }
 
@@ -12142,6 +12551,7 @@ static bool readCompositeCheckpoint(const std::string& outPath, int res, int res
     in.read((char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
     if (!in) { std::fprintf(stderr, "[resume] composite checkpoint %s truncated; starting fresh\n",
                             checkpointPath(outPath).c_str()); return false; }
+    readRadCacheSection(in);          // optional trailing section; absent in older sidecars
     return true;
 }
 
@@ -12421,6 +12831,40 @@ static char applyUnsupportedPolicy(Scene& scene, char mode, int projection,
 // the historical single-shot render. Returns the accumulated SUM film (writeFilm divides
 // by the completed spp). Chunk size adapts toward ~0.4s so early frames appear quickly
 // and the per-chunk thread-spawn overhead stays negligible.
+//
+// ...EXCEPT under -radcache, where the split must not depend on the clock. Ordinarily the
+// chunk boundaries are invisible: per-(pixel,sample) seeding means chunk `c` starting at
+// absolute sample `base` renders exactly the samples [base, base+c) whatever the split, so
+// a slow machine and a fast one produce the same film. The radiance cache breaks that
+// invariant, because the cache ADVANCES between chunks -- the update pass runs at each
+// boundary -- so the boundaries themselves become part of the realization. Measured on
+// scenes/cornell.ftsl at 200^2 / 1024 spp: two identical wall-clock-adaptive invocations
+// gave 40.1 % vs 41.4 % of consults terminated and images differing by 0.45 % rel-RMS,
+// while two runs with the split pinned were bit-identical. That silently voided the
+// "-device cpu is fully deterministic and is used for reference/validation baselines"
+// guarantee for exactly the renders most likely to be checked against a reference.
+//
+// The fix has to preserve the schedule's SHAPE, not just remove the clock, because the
+// cache is far more sensitive to the split than one would guess. What actually matters is
+// the NUMBER of chunks, since that is the number of update passes the table gets. Measured
+// on the same scene (FTRACE_CHUNK_DEBUG=1 dumps the sequence):
+//
+//   65 chunks (timed: 1, 9, 26, then settling at ~24-27)  -> 40.1 % terminated, 133.7 M rays
+//   62 chunks (the fixed schedule below: 1, 9, then 17)   -> 35.5 %,           135.0 M rays
+//   16 chunks (FTRACE_CHUNK_SPP=64, flat)                 ->  2.3 %,           146.9 M rays
+//    5 chunks (geometric 1, 9, 73, 585, ...)              ->  0 %,             146.8 M rays
+//
+// (cache off, for scale: 146.2 M rays)
+//
+// Both of the coarse schedules are WORSE than not caching at all -- the table never gets
+// enough update rounds to resolve a cell, so every render pays the update pass and
+// terminates nothing. (Note the timed rule does not ramp geometrically; the `c*8+1` clamp
+// only governs the first two steps, after which it converges on whatever hits 0.4 s.)
+//
+// So the deterministic schedule targets a fixed chunk COUNT rather than a fixed chunk time:
+// 1, then 9, then an equal split of the remainder into kFixedChunks-2 pieces. That is a
+// pure function of sppTarget, keeps the fast first previews, and lands within a few chunks
+// of what the timed rule converges to here.
 static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX, int resY,
                          const std::function<Film(long long, unsigned long long)>& renderOne) {
     if (!prog || !prog->report) return renderOne(sppTarget, 0);
@@ -12439,6 +12883,21 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
     if (const char* e = std::getenv("FTRACE_CHUNK_SPP")) forcedChunk = std::atoll(e);
     if (forcedChunk > 0) chunk = forcedChunk;
     const bool chunkDebug = std::getenv("FTRACE_CHUNK_DEBUG") != nullptr;
+    // See the header comment: the radiance cache makes the split observable, so it gets a
+    // clock-free schedule. `g_radCache` (not `rcOn`) deliberately -- when the cache is set
+    // but inert (-whitted / -direct-only) the two schedules give the same film anyway, so
+    // the broader condition costs nothing and cannot drift out of sync with the read site.
+    const bool fixedSchedule = g_radCache;
+    // Chunk count to aim for under the fixed schedule. 64 is the measured-good neighbourhood
+    // (the timed rule settles on ~65 here); the cache wants many update rounds, and the
+    // per-chunk thread-spawn overhead is negligible next to a 200^2 x 16 spp chunk.
+    const long long kFixedChunks = 64;
+    long long settledChunk = 1;
+    if (fixedSchedule && sppTarget > 10) {
+        const long long pieces = kFixedChunks - 2;
+        settledChunk = (sppTarget - 10 + pieces - 1) / pieces;   // ceil, so the plan finishes
+        if (settledChunk < 1) settledChunk = 1;
+    }
     while (done < sppTarget) {
         long long c = chunk; if (c > sppTarget - done) c = sppTarget - done;
         auto t0 = clk::now();
@@ -12448,7 +12907,11 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
         if (chunkDebug) std::fprintf(stderr, "[chunk] c=%lld base=%llu dt=%.3f\n",
                                      c, seedBias + (unsigned long long)(done - c), dt);
-        if (forcedChunk <= 0 && dt > 1e-4) {   // retarget chunk toward ~0.4s of work
+        if (forcedChunk > 0) {
+            // pinned by FTRACE_CHUNK_SPP; leave `chunk` alone
+        } else if (fixedSchedule) {
+            chunk = (done < 10) ? 9 : settledChunk;   // 1, 9, then an equal split
+        } else if (dt > 1e-4) {                // retarget chunk toward ~0.4s of work
             long long next = (long long)((double)c * (0.4 / dt));
             if (next < 1) next = 1;
             if (next > c * 8 + 1) next = c * 8 + 1;   // ramp up gently
@@ -12608,6 +13071,8 @@ static int runSppProgressive(
     if (wantCheckpoint)
         std::printf("[checkpoint] %s holds %lld spp — rerun with -resume to add more\n",
                     checkpointPath(outPath).c_str(), finalSpp);
+    reportRadCache();
+    reportRayStats();
     return writeOk ? 0 : 1;
 }
 
@@ -13114,6 +13579,32 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 "volumetric BDPT (mode D).\n",
                 layer, g_whitted ? 'W' : mode);
         }
+    }
+
+    // Same "the device is now resolved" moment, for -radcache. The cache is read from
+    // exactly ONE place -- BackwardRenderer::radianceHeroLoop, on the CPU -- so a
+    // -radcache run that lands anywhere else renders perfectly correctly and reports
+    // nothing at all. That is the worst kind of no-op: the flag was accepted, the image
+    // is right, and the only evidence it did nothing is a missing status line the user
+    // has no reason to be looking for. Say so out loud instead.
+    //
+    // The GPU case is the one that actually bites, because `-device auto` picks the GPU
+    // for mode R on any machine that has one -- so the natural spelling `ftrace scene
+    // -mode R -radcache` silently does nothing. Porting bkRadianceHeroLoop is open work
+    // (see open-work.md); until then this warning IS the feature's device story.
+    if (g_radCache) {
+        const char* why = nullptr;
+        if (g_whitted)
+            why = "-whitted traces no indirect bounces, so there is no tail to cache";
+        else if (g_directOnly)
+            why = "-direct-only traces no indirect bounces, so there is no tail to cache";
+        else if (mode != 'R' && mode != 'V' && mode != 'P')
+            why = "only the backward tracer reads the cache; use -mode R";
+        else if (mode == 'R' && useGpu)
+            why = "the GPU backward megakernel has no cache -- pass -device cpu";
+        if (why)
+            std::fprintf(stderr, "[radcache] IGNORED: %s. The render is unaffected and "
+                                 "correct; it is simply not using the cache.\n", why);
     }
 
     // The wavefront (streaming) backend only applies to a forward render on the GPU.
@@ -14119,6 +14610,58 @@ static void printHelp(const char* prog) {
 "                        escaping gather ray returns, so the gather's fill is effectively\n"
 "                        min(-ambient, x) and a smaller x just darkens the whole scene\n"
 "\n"
+"Radiance cache (mode R; OPT-IN and BIASED — never on by default):\n"
+"  -radcache             cache indirect irradiance in a world-space clipmap and let a\n"
+"                        path that is deep enough stop tracing and read E/pi out of it.\n"
+"                        The data comes from a dedicated update pass over the cells the\n"
+"                        image actually touched, not from the camera paths, so a cell the\n"
+"                        camera barely grazed is sampled as well as one it hammers — and\n"
+"                        a cell with no data yet just keeps tracing, exactly. Turn it OFF\n"
+"                        for a reference render and for a seamless animation loop\n"
+"  -radcache-cell <w>    level-0 cell edge in world units. 0 = auto: 32 pixel footprints at\n"
+"                        the scene center, clamped to [sceneRadius/256, sceneRadius/2], so\n"
+"                        the cost is resolution-invariant. Coarser is FASTER (cells tile a\n"
+"                        surface: halving the edge quadruples the cells and quarters the\n"
+"                        consults each one gets). This is the dominant lever.\n"
+"                        COARSER IS FASTER, and by a lot: a cell only becomes confident\n"
+"                        once enough paths have paid for it, so shrinking cells splits the\n"
+"                        same traffic over more of them and none of them ever get there\n"
+"  -radcache-cells <n>   table capacity in cells, rounded up to a power of two\n"
+"  -radcache-bounce <b>  earliest bounce a path may terminate on the cache (default 2)\n"
+"  -radcache-tol <f>     required relative standard error, per spectral bin, before a cell\n"
+"                        may answer (default 0.05). THE quality/speed knob: it is very\n"
+"                        nearly the systematic error the cached term carries, and halving\n"
+"                        it costs 4x the update samples. A cell that cannot reach it is\n"
+"                        retired and the render just traces those paths exactly\n"
+"  -radcache-budget <f>  update samples a chunk may spend per cache consult it made\n"
+"                        (default 0.25) — the overhead ceiling. Raise it to converge the\n"
+"                        table sooner at the cost of the image, lower it for the reverse\n"
+"  -radcache-warm <n>    multiplier on that budget for the FIRST chunk (default 8), where\n"
+"                        the multi-bounce propagation happens and every later chunk's\n"
+"                        saving comes from\n"
+"  -radcache-rays <n>    update rays per cell per round (default 16 = one per spectral\n"
+"                        bin, so every round sweeps the whole spectrum)\n"
+"  -radcache-samples <n> samples per bin before a cell's measured error is believed at all\n"
+"                        (default 8; old name -radcache-passes still works)\n"
+"  -radcache-max <n>     samples per bin a cell may be PROJECTED to need before it is\n"
+"                        written off as too noisy to cache (default 4096)\n"
+"  -radcache-jitter <f>  dither the lookup position by f cell widths (default 0), which\n"
+"                        turns cell boundaries into noise instead of a visible edge\n"
+"  -radcache-train <f>   fraction of camera paths that ignore the cache and trace fully\n"
+"                        (default 0). A quality/preview blend, not a correctness knob\n"
+"  -radcache-validate <f> fraction of cache reads that trace their tail to full length and\n"
+"                        report back what the cache SHOULD have said (default 0.05). This\n"
+"                        is what bounds the error: a cell the readers prove wrong is either\n"
+"                        rescaled or retired. 0 disables it and trusts the update pass\n"
+"  -radcache-audit       diagnostic: read the cache but never terminate on it, and report\n"
+"                        what it OFFERED against what the traced tail actually delivered.\n"
+"                        The image is a cache-off image; the extra line is the cache's\n"
+"                        systematic error per read, measured free of render noise\n"
+"  -no-radcache          turn it back off (undoes an earlier -radcache on the line)\n"
+"  -raystats             print the total ray-query count (closest-hit + shadow). The\n"
+"                        deterministic measure of how much work a render did, for\n"
+"                        comparing configurations without wall-clock noise\n"
+"\n"
 "Fur (mode R):\n"
 "  -dual-scatter         approximate a coat's MULTIPLE scattering analytically (Zinke\n"
 "                        et al. 2008) instead of path-tracing it. The shadow ray counts\n"
@@ -14201,10 +14744,13 @@ static void printHelp(const char* prog) {
 "  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
 "  -window               live OS preview window, refreshed as it converges\n"
 "  -keepwindow|-hold     like -window but hold the final image until you close it\n"
+"  -window-min|-minimized  implies -window, but opens it minimized to the taskbar\n"
+"                        (live, restorable any time; never steals focus)\n"
 "  -preview              live ANSI thumbnail in the terminal\n"
 "  -interval <sec>       periodic image-write / status / ANSI-preview cadence (default: 15)\n"
 "  -window-interval <s>  live-window repaint cadence, independent of -interval (default: 0.2)\n"
-"  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C)\n"
+"  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C, R/D, P;\n"
+"                        also carries the -radcache table, so a resume continues warm)\n"
 "  -resume               continue an accumulated render from its .ftbuf checkpoint\n"
 "  -parseonly            load the scene, print a contents summary, exit (no render)\n"
 "  -stop [<pid>|all]     ask a RUNNING ftrace to finish cleanly (image + checkpoint\n"
@@ -14765,6 +15311,59 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-gi-clamp") && i + 1 < argc) {
             g_giClamp = std::max(0.0, std::atof(argv[++i]));
         }
+        // -radcache and friends. Opt-in and biased; see the g_radCache block above.
+        else if (!std::strcmp(argv[i], "-radcache"))     { g_radCache = true; }
+        else if (!std::strcmp(argv[i], "-no-radcache"))  { g_radCache = false; }
+        else if (!std::strcmp(argv[i], "-radcache-cell") && i + 1 < argc) {
+            g_radCacheCell = std::max(0.0, std::atof(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-train") && i + 1 < argc) {
+            g_radTrainFrac = std::max(0.0, std::min(1.0, std::atof(argv[++i]))); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-bounce") && i + 1 < argc) {
+            g_radMinBounce = std::max(1, std::atoi(argv[++i])); g_radCache = true;
+        }
+        else if ((!std::strcmp(argv[i], "-radcache-samples") ||
+                  !std::strcmp(argv[i], "-radcache-passes")) && i + 1 < argc) {
+            g_radMinSamples = std::max(1, std::atoi(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-max") && i + 1 < argc) {
+            g_radMaxSamples = std::max(1, std::atoi(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-tol") && i + 1 < argc) {
+            g_radTol = std::max(1e-6, std::atof(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-budget") && i + 1 < argc) {
+            g_radBudget = std::max(0.0, std::atof(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-rays") && i + 1 < argc) {
+            g_radRays = std::max(1, std::atoi(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-warm") && i + 1 < argc) {
+            g_radWarm = std::max(1, std::atoi(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-jitter") && i + 1 < argc) {
+            g_radJitter = std::max(0.0, std::atof(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-audit")) {
+            g_radAudit = true; g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-validate") && i + 1 < argc) {
+            g_radValidate = std::max(0.0, std::min(1.0, std::atof(argv[++i]))); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-radcache-cells") && i + 1 < argc) {
+            g_radCacheCells = (size_t)std::max(1024LL, std::atoll(argv[++i])); g_radCache = true;
+        }
+        else if (!std::strcmp(argv[i], "-raystats")) { g_rayStats = true; }
+        // Many-lights importance sampling (light BVH). See the lt:: knobs above.
+        else if (!std::strcmp(argv[i], "-no-lighttree")) { lt::gEnabled = false; }
+        else if (!std::strcmp(argv[i], "-lighttree"))    { lt::gEnabled = true; }
+        else if (!std::strcmp(argv[i], "-light-split") && i + 1 < argc) {
+            lt::gSplit = std::max(0.0, std::atof(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-light-samples") && i + 1 < argc) {
+            lt::gSamples = std::max(1, std::atoi(argv[++i]));
+        }
         // -dual-scatter / -dual-grid / -fur-volume / -fur-lod / -fur-keep-strands. Parsed by
         // the shared table so this loop and the pre-scan above cannot drift apart; see
         // parseFurFlag for why they are pre-scanned at all.
@@ -14935,6 +15534,9 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
         else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) g_beamGather = true;
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
+        else if (!std::strcmp(argv[i], "-window-min") || !std::strcmp(argv[i], "-minimized")) {
+            g_showWindow = true; g_minWindow = true;
+        }
         else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
         else if (!std::strcmp(argv[i], "-raster-gpu")) { doRaster = true; rasterGpu = true; }
@@ -15118,6 +15720,10 @@ static int run(int argc, char** argv) {
     if (checkArrayOnly)    return checkArray();    // ditto
     if (checkSunOnly)      return checkSun();      // deterministic, no scene needed
     if (checkLatticeOnly)  return checkLattice();  // N4a: host-vs-device, no scene needed
+
+    // -window-min: applied once here rather than at each of the four LiveWindow
+    // construction sites, so any future one inherits it automatically.
+    LiveWindow::setStartMinimized(g_minWindow);
 
     // --- every output directory must exist BEFORE a single photon is traced ----------
     // Otherwise a mistyped/not-yet-created output directory used to be discovered only

@@ -20,6 +20,8 @@ Three neighbouring documents cover what this one only summarises:
 - [Render modes (`-mode`, or per-camera `mode`)](#render-modes--mode-or-per-camera-mode)
   - [Mode `W` — the deterministic (POV-Ray-style) preview](#mode-w--the-deterministic-pov-ray-style-preview)
   - [Speed / accuracy / ability tradeoffs](#speed--accuracy--ability-tradeoffs)
+  - [Analytic specular connections — what mode `B` can image directly](#analytic-specular-connections--what-mode-b-can-image-directly)
+  - [Radiance cache (`-radcache`) — mode `R`, CPU](#radiance-cache--radcache--mode-r-cpu)
   - [Backends & performance (`-device`, `-wavefront`)](#backends--performance--device--wavefront)
 - [Cameras](#cameras)
 - [Materials](#materials)
@@ -715,8 +717,8 @@ that converges to the same physical image.
 | Mode | Best for | Speed | Specular-first | Depth of field | Caustics | GPU | Main limitation |
 |---|---|---|---|---|---|---|---|
 | **`-raster`** *(preview)* | Composition & camera-motion preview | Instant | — *(flat ghost/tint)* | ✗ | ✗ | ✓ *(`-device gpu`; else threaded CPU)* | **No light transport at all** — no shadows, reflection, refraction or GI (`-see-through` fakes clear glass) |
-| `B` *(default)* | Diffuse & caustic-heavy scenes | **Fastest** | ✗ *(black)* | ✗ | ✓ | ✓ | Can't shade a directly-seen mirror/glass; no depth of field |
-| `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black |
+| `B` *(default)* | Diffuse & caustic-heavy scenes | **Fastest** | ~ *(mirrors + glass spheres)* | ✗ | ✓ | ✓ | Other specular-first pixels (mesh glass, rough specular, mirror-in-mirror) still black; no depth of field |
+| `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black (the analytic connections are pinhole-only) |
 | `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
 | `R` | Quiet reference; any first hit; **fluorescence** | Medium | ✓ | ✓ *(physical lens)* | ✗ *(noisy)* | ✓ | Noisy on caustics |
 | `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe; fully on the GPU |
@@ -730,9 +732,15 @@ that converges to the same physical image.
 - **`B` — pinhole splat (default, fastest).** Every photon that hits a
   camera-visible surface splats to the pinhole, so essentially no photons are
   wasted — **orders of magnitude faster** than physically catching photons through
-  an aperture. GPU-accelerated. *Cost:* a pinhole has no depth of field, and it
-  **cannot render specular-first pixels** (a mirror/glass surface seen directly
-  splats nothing and stays black — use `P`, `D`, or `R` for those). Best default
+  an aperture. GPU-accelerated. *Cost:* a pinhole has no depth of field, and a
+  specular surface has no ordinary connection to it (a delta reflection/refraction has
+  ~zero probability of aiming at a point), so **specular-first pixels are black unless
+  the connection can be solved in closed form**. Two families now are — see
+  **[Analytic specular connections](#analytic-specular-connections-what-mode-b-can-image-directly)**
+  below: a **smooth mirror** (flat panel or sphere, including `halfmirror` and
+  roughness-0 `glossy`) and a **smooth dielectric sphere**. Everything else specular —
+  a glass *mesh*, a rough specular surface, a mirror seen inside another mirror —
+  still renders black; use `P`, `D`, or `R` for those. Best default
   for diffuse and caustic-heavy scenes. In an *absolute-EV* scene an authored
   `fstop`/`lens` still sets exposure here — the pinhole has no depth of field, but it
   applies the camera-equation light-gathering term `(π/4)/N²`, so f/2 is exactly four
@@ -919,9 +927,158 @@ interval. **Disk `-resume`/`-checkpoint` now cover `A`/`B`/`C` (photon-count che
 continues the *absolute* sample sequence past whatever the checkpoint holds, so its added
 samples genuinely reduce variance; in the deterministic mode `W` the continuation is exact,
 and `-spp 3` followed by `-resume -spp 5` gives bit-for-bit the pixels of a plain `-spp 8`
-(note that `-spp` under `-resume` means *additional* samples, not a total). Only the
+(note that `-spp` under `-resume` means *additional* samples, not a total). Since 0.190.3 the
+sidecar also carries the `-radcache` table when there is one, as a sparse trailing section,
+so a resumed run continues with a warm cache instead of relearning it. Only the
 persistent-state photon modes `M`/`S`/`U` (whose per-pass state a film alone can't restore)
 stay non-resumable.
+
+### Analytic specular connections — what mode `B` can image directly
+
+Forward light tracing images a surface by *connecting* each photon vertex to the
+camera. A **specular** vertex has no such connection: a perfect mirror scatters into
+exactly one direction, so the probability that it aims at a pinhole is zero. That is why
+mode `B` (and `A`/`C`) historically rendered every directly-seen mirror or glass surface
+**pure black** while mode `R` drew it correctly — the classic SDS gap.
+
+Where the specular geometry is simple enough, the connection can be **solved in closed
+form** instead of sampled, and then it is drawn exactly. Mode `B` does this for:
+
+| Directly-seen surface | How the connection is solved | Since |
+|---|---|---|
+| **Flat mirror panel** — coplanar `mirror` / `halfmirror` / roughness-0 `glossy` triangles | *Unfolding*: the eye is mirrored across the plane, so the bent path `p → R → eye` becomes a straight segment and the specular Jacobian is exactly `1/D²` along it | 0.188.0 |
+| **Mirror sphere** — a `sphere` primitive with the same materials | 1-D root solve in the plane through (eye, vertex, centre) + ray-differential Jacobian | 0.188.0 |
+| **Smooth dielectric sphere** — a `sphere` with `type dielectric`, seen from outside *or* flown through | Same root solve, with two refractions (dispersive: each λ gets its own image, which is what makes the glass-orb caustic image chromatic) | 0.160.0 |
+
+So a mirrored wall, the room reflected in it, and lights that are only visible *in* the
+reflection now render in mode `B` — on both the CPU and the GPU, which agree.
+
+**Still black in `B`, by design:** a glass or mirror **mesh** (only world-space triangles
+grouped into planes, and analytic spheres, are collected — an instanced/BLAS mirror is
+not, and at most 64 distinct mirror planes are, largest-area first), a **rough** specular
+surface (it is no longer a delta, so it needs a real estimator), the **transmitted** side
+of a `halfmirror` (only its reflected leg is built, so whatever is behind a beamsplitter
+stays black), and **more than one specular vertex** in a row — a mirror seen *inside*
+another mirror, or glass in front of a mirror. Fog *inside* a dielectric shell is the
+same kind of gap. For any of those use `P`, `D`, `R`, or the photon-map family.
+
+The connections are **pinhole-only**: `A` (finite lens) and `C` (forward catch) return
+early, so their specular-first pixels stay black.
+
+### Radiance cache (`-radcache`) — mode `R`, CPU
+
+`-radcache` puts a **world-space cache of outgoing diffuse radiance** behind mode `R`.
+At a diffuse vertex the path does its own next-event estimate as usual and then asks the
+cache what the *rest* of the path is worth; if the cache can answer confidently, the path
+adds that value and stops instead of tracing another handful of bounces. It is off by
+default, CPU-only, and inert in mode `W` and under `-direct-only`, which terminate diffuse
+paths themselves and so have no tail for a cached value to stand in for.
+
+> **Pass `-device cpu`.** The GPU backward megakernel has no cache, and `-device auto`
+> prefers the GPU for mode `R` on any machine that has one — so the obvious spelling
+> `ftrace scene -mode R -radcache` uses no cache at all. The render is correct either way;
+> it is simply not accelerated. ftrace now says so when it happens:
+> `[radcache] IGNORED: the GPU backward megakernel has no cache -- pass -device cpu`,
+> printed once, next to the `[device]` line. The same notice covers the other inert
+> combinations (`-whitted`, `-direct-only`, a forward mode).
+
+Two properties make it different from a classical irradiance cache:
+
+- **Camera paths never write it.** A separate *update pass* between chunks shoots its own
+  rays from the cells that camera paths marked, under a budget expressed as update samples
+  *per cache consult the chunk actually made*. So a cache miss is free — the path just keeps
+  tracing exactly as it would have without the flag — and an unresolved corner renders
+  exactly rather than answering with noise.
+- **The readers check its work.** A random `-radcache-validate` fraction of readable
+  vertices do **not** terminate: they record what the cache offered, trace the tail to full
+  length anyway, and report the pair back to the cell. A cell whose measured ratio is well
+  determined is rescaled; one the readers prove wrong but cannot pin down is retired and
+  stops answering. This is the only measurement that sees the cache's error *as the image
+  actually uses it* — cell averaging, normal-cone spread and unsampled tails all included,
+  weighted exactly as readers weight them.
+
+Measured on `scenes/cornell.ftsl` and `scenes/_cornell_diffuse.ftsl` (the same box with the
+dispersive sphere swapped for a grey lambertian — the control that separates "the cache is
+wrong" from "the cache is being asked to average something that does not average"), 200²,
+1024 spp, against a cache-off render of the same budget (`rel-RMS` is after an 8×8 box
+downsample, so Monte-Carlo noise averages out and what is left is structure):
+
+| Scene | validate | consults terminated | ray queries | vs. cache off | energy bias | rel-RMS |
+|---|---|---|---|---|---|---|
+| Cornell (dispersive SF10 sphere) | off | 45.6 % | 130.9 M | −10.4 % | −1.04 % | 2.85 % |
+| Cornell (dispersive SF10 sphere) | **0.05** | 35.5 % | 135.0 M | −7.7 % | −0.27 % | 1.21 % |
+| Cornell (dispersive SF10 sphere) | 0.15 | 32.1 % | 136.0 M | −7.0 % | −0.12 % | 1.14 % |
+| Cornell, all diffuse | off | 87.7 % | 112.6 M | −13.7 % | +0.08 % | 0.99 % |
+| Cornell, all diffuse | **0.05** | 76.6 % | 114.2 M | −12.5 % | −0.02 % | 0.65 % |
+
+Verification costs roughly a third of the speedup and buys back roughly three quarters of
+the error — which is why it is on by default. The residual is concentrated **specular and
+caustic** transport: `-radcache-audit` on the glass Cornell measures the *raw* cache at
+−18.76 % ± 0.31 % per read, against **+2.38 % ± 0.07 %** for the same scene with the sphere
+made diffuse — eight times the magnitude, and the opposite sign.
+A cell whose update rays never happen to find the caustic cannot know it is missing it,
+which is precisely the failure verification exists to catch.
+
+**Every number above is exactly reproducible**, and that took a fix (0.190.2). A CPU render
+is normally independent of how the progressive driver splits the sample budget into chunks,
+because each sample is seeded from its own `(pixel, sample index)` — so the split is
+invisible. The cache breaks that: it *advances* between chunks, so the boundaries become
+part of the result, and the driver was choosing them by wall clock. Two identical
+invocations therefore disagreed (40.1 % vs 41.4 % of consults terminated, 0.45 % rel-RMS
+apart), quietly voiding the `-device cpu` determinism guarantee for precisely the renders
+someone would check against a reference. With `-radcache` the chunk schedule is now derived
+from the sample target instead of the clock, and repeat runs are bit-identical. Renders
+*without* the flag are unaffected — same schedule, same images as before.
+
+The chunk count matters more than it looks, because it *is* the number of update passes the
+table receives: at 65 chunks the cache terminates ~36 % of consults, at 16 it manages 2.3 %,
+and at 5 it terminates nothing at all while still paying for the update pass — **slower than
+not caching**. `FTRACE_CHUNK_SPP=<n>` pins the split and `FTRACE_CHUNK_DEBUG=1` prints the
+sequence, if you want to see this for yourself.
+
+**The table survives `-checkpoint` / `-resume`** (0.190.3). It is written into the `.ftbuf`
+sidecar as a sparse trailing section — occupied cells only, ~320 bytes each, so a Cornell box
+adds 11 KB to a 1.3 MB file rather than the 82 MB a whole 262 144-cell table would be — and a
+resumed render therefore continues **warm**. Measured at 200², resuming +512 spp on top of
+1024: **68.4 %** of consults terminated and 65.9 M ray queries, against **24.9 %** and 70.5 M
+resuming the identical film with the section stripped off. Beyond the speed, it removes a
+subtler wart: a cold resume blended never-terminating (unbiased) samples with terminating
+(biased) ones in a ratio decided by wherever you happened to stop, so the finished image's
+bias depended on its interruption history.
+
+The section carries its own guard covering everything a stored cell's contents depend on —
+cell size, clipmap centre, spectral range, and the confidence gate — separately from the
+film's scene/mode/resolution guard, so resuming with a different `-radcache-cell` discards
+the *table* (with a message) and still resumes the *image*. The table is rehomed by key on
+load, so growing `-radcache-cells` between runs keeps it. Older sidecars, and those written
+without `-radcache`, simply have no section and load exactly as before. What this does *not*
+buy is resume-equals-single-shot: the chunk schedule restarts, so the update passes still
+fall in different places.
+
+**When it does not help.** The cache pays only once its cells are resolved, and a cell is
+resolved by the update pass, not by the image. On a scene whose visible surface area dwarfs
+the table — `scenes/fur_creature.ftsl`, where 8.7 k cells try to cover a fur coat — 0.3 %
+of consults terminate and the cache is simply neutral (at a fixed 128 spp it costs 210 k
+extra ray queries out of 23.9 M, or 0.9 %). It is not a general speed switch; it is a win
+on well-behaved diffuse interiors at a coarse cell size.
+
+**Cell size is the dominant knob, and coarser is faster.** Cells tile a *surface*, so
+halving the edge multiplies the cell count ~4× while dividing the consults-per-cell — and
+so the rate at which a cell resolves — by the same factor. The default is automatic and is
+a **pixel footprint**, not a fraction of the scene: the world size of a ~32-pixel square at
+the distance the camera is actually looking. That makes the economics resolution-invariant
+(4× the resolution gives 4× the cells *and* 4× the paths to fill them). `-radcache-cell`
+overrides it.
+
+See the [command-line reference](#command-line-reference) for the full flag list, and
+`known-issues.md` for the limits worth knowing before you switch it on (it is CPU/mode-`R`
+only, it has no cache in the scalar `radiance()` path, and it is **not** safe for animation
+— cell contents depend on render order, so the residual error flickers between frames).
+To reproduce or extend the numbers above, `tools/rcrun.sh <outbase> <scene> [flags]` runs
+one measurement (minimised live window, clean `ftrace -stop` release, `[raystats]` echoed)
+and `tools/pfmcmp.py ref.pfm test.pfm` produces the last three columns. Compare ray
+queries rather than wall clock — repeat runs of an identical render on the development
+machine varied 18.5 s / 25.8 s / 27.2 s.
 
 ### Backends & performance (`-device`, `-wavefront`)
 
@@ -966,7 +1123,11 @@ stay non-resumable.
   driven scalar/roughness slot uploads each stop's compiled expression + driver — both
   sampled on-device by exact twins of the CPU sampler; mode `D`'s connection BSDF
   reconstructs the per-hit point to sample the driver). The fallback is automatic. `cpu`
-  is fully deterministic and is used for reference/validation baselines.
+  is fully deterministic and is used for reference/validation baselines — including under
+  [`-radcache`](#radiance-cache--radcache--mode-r-cpu), which needed its own fix to keep
+  that promise (the cache advances between chunks, so the wall-clock-adaptive chunk split
+  became visible in the image; with the flag on, the split is derived from the sample target
+  instead).
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
   identical, exactly energy-conserving physics. The **megakernel** runs each
   photon's whole path in one thread and is usually fastest on **shallow, uniform
@@ -2082,6 +2243,14 @@ volume with inward orientation, leaving flat/open sheets (which enclose no volum
 exactly as authored. Emissive meshes count as lights, so a scene lit *only* by one
 needs no separate `light` block. (Meshes that import their own materials — glTF/GLB —
 are not auto-lit; bind an FTSL `emit` material instead.)
+
+Because the sampling is uniform by area and takes no account of the shading point,
+keep an emissive mesh **spatially compact** — one fixture per `mesh` block rather than
+every sign in a building in one OBJ. Parts of an emitter that are shadowed from a given
+receiver still consume their share of its shadow rays and return nothing, so a single
+emitter spread across separate rooms is measurably noisier than the same panels split
+into separate `mesh` blocks. A compact shape (a ring, a ball, a panel) costs nothing:
+a tessellated emissive sphere is as clean as the analytic `light sphere`.
 
 **Emissive non-mesh geometry (glowing solids).** `emit` is a property of the
 *material*, not of the `mesh` block, so binding an emissive material to anything else —
@@ -4089,6 +4258,26 @@ add-on), this doubles as a Blender → FTSL path.
 | `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, and `V`; **number of passes** for SPPM (`S`) and VCM (`U`) |
 | `-n <photons>` (mode `S`) | Photons traced **per pass** (SPPM rebuilds a bounded map each pass). *(Mode `U` ignores `-n` — its light-path count follows the film resolution.)* |
 
+**Radiance cache** (mode `R`, CPU) — see [Radiance cache](#radiance-cache--radcache--mode-r-cpu)
+above for what it is and when it pays. Every `-radcache-*` flag implies `-radcache`, so the
+knob alone is enough to turn the feature on.
+
+| Flag | Meaning |
+|---|---|
+| `-radcache` / `-no-radcache` | Turn the world-space diffuse-radiance cache on / back off. Off by default. Mode `R` on the **CPU** only; ignored in mode `W` and under `-direct-only`, which have no path tail to cache |
+| `-radcache-cell <w>` | Level-0 cell edge in world units. Default: automatic — the world size of a ~32-pixel square at the camera's viewing distance, which keeps the economics resolution-invariant. **The dominant knob, and coarser is faster**: cells tile a surface, so halving the edge multiplies the cell count ~4× and quarters the consults each cell gets to resolve itself with |
+| `-radcache-validate <f>` | Fraction of cache reads that trace their tail to full length anyway and report back what the cache *should* have said (default `0.05`). This is what bounds the error — a cell the readers prove wrong is rescaled or retired. `0` disables it and trusts the update pass alone (measured: 4× the energy bias and 2.5× the structural error on a dispersive Cornell) |
+| `-radcache-tol <f>` | Required relative standard error per spectral bin before a cell may answer (default `0.2`). A cell that can't reach it within `-radcache-max` is retired and those paths just trace exactly |
+| `-radcache-budget <f>` | Update samples a chunk may spend **per cache consult it made** — the overhead ceiling, expressed against the work the cache is being asked to do rather than the size of the table (default `0.25`) |
+| `-radcache-warm <n>` | Multiplier on that budget for the **first** chunk (default `8`), where the multi-bounce propagation happens and every later chunk's saving comes from |
+| `-radcache-rays <n>` | Update rays per cell per round (default `16` = one per spectral bin, so a round sweeps the whole spectrum) |
+| `-radcache-samples <n>` | Samples per bin before a cell's measured error is believed at all (default `8`; old name `-radcache-passes` still works) |
+| `-radcache-max <n>` | Samples per bin a cell may be *projected* to need before it is written off as too noisy to cache (default `4096`) |
+| `-radcache-cells <n>` | Table capacity in cells, rounded up to a power of two (default `262144`, ~98 MB). The status line warns when cells start being dropped |
+| `-radcache-jitter <f>` | Dither the lookup position by `f` cell widths (default `0`), turning cell boundaries into noise instead of a visible edge. Off by default because dithering also widens the set of cells a pixel reads from — measured *worse* (1.5 % → 6.4 % RMS) on a Cornell box, since a neighbour cell's error is frozen and cross-surface cells get sampled |
+| `-radcache-train <f>` | Fraction of camera paths that ignore the cache entirely and trace fully (default `0`). A quality/preview blend, not a correctness knob — the table is fed by the update pass, so nothing depends on it |
+| `-radcache-audit` | **Diagnostic.** Read the cache but never terminate on it, and report what it *offered* against what the traced tail actually delivered, together with the audit's own standard error. The image is a cache-off image; the extra line is the cache's systematic error per read, measured free of render noise. Disables the verification feedback, so it measures the *raw* table |
+
 **Scene-ignore (speed knobs)** — rasterizer-style flags that strip or cap expensive
 scene features so a render (especially the backward camera modes `R`/`P`, and the fast
 `-rgb` path) runs faster. The three strip flags mutate the scene once at load and print an
@@ -4116,6 +4305,27 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-fur-lod [d0[:d1]]` | Turn that far tier from a mode into a **LOD decision**: trace strands while one pixel is narrower than `d0` fiber diameters where the coat begins, the aggregate once it is wider than `d1`, and cross-fade stochastically between (one coin per path against a smoothstep, so the switch dissolves into the sampling instead of drawing a line across the image). Implies `-fur-volume`. One number sets `d0` and puts `d1` two octaves up; default `1:4`. The ruler is the **pixel** footprint and does not shrink with `-spp`. See [Choosing a tier](#choosing-a-tier--fur-lod). |
 | `-fur-keep-strands` | Opt out of `-fur-volume`'s deletion of the strands: the fibers stay loaded and in the BVH (still invisible to the far tier's rays, which free-flight against the grid either way). For A/B-ing the two tiers in one process, or if something in a scene still needs the curve geometry. Inert without `-fur-volume`. |
 
+**Many lights (the light tree)** — the backward tracers (`R`, `P`, `-rgb`, and the camera
+connections of `D`/`U`) used to cast a shadow ray to **every** emitter at every
+non-specular vertex. That is unbiased, but it costs O(N_lights) per bounce and buys
+nothing once the lights are redundant: the same room at the same total flux split across
+256 ceiling panels took **75.9 s** instead of 0.4 s for an identical image at identical
+noise. A **Conty–Kulla adaptive light BVH** now picks a handful of importance-weighted
+emitters per vertex, each carried with its `1/pdf`, so the estimator keeps the same
+expectation at bounded cost — that render is now **2.7 s** (and the CPU, which had a
+second O(N) term in its per-sample spectral table, went from 524.7 s to 7.0 s at 64 spp).
+It is **on by default and needs no flags**; these exist to turn it off or to trade noise
+against speed. A scene with one light never builds a tree and is bit-for-bit what it
+always was, as is mode `W`, whose deterministic shadow grid always connects to every
+light.
+
+| Flag | Meaning |
+|---|---|
+| `-no-lighttree` | Go back to the exact all-emitters splitting estimator. This is the reference for any "is the tree biased?" question, and the first thing to try if a many-light scene looks wrong. O(N) per bounce. |
+| `-lighttree` | Force it back on (it already is — useful for overriding an earlier `-no-lighttree` in a shared argument list). |
+| `-light-samples <n>` | Cap on how many emitters one vertex may connect to (default `8`). `1` is the cheapest, pure importance-sampled selection; raising it trades time for less selection noise. Emitters with no usable spatial bound (a distant sun, an environment light) sit outside the tree and are always connected, on top of this budget. |
+| `-light-split <v>` | Adaptive-splitting threshold, as `(node radius / distance)²` (default `1.0`). A node subtending more than this is traversed into **both** children instead of choosing one, which is what stops a nearby cluster of lights from being resolved by a single random pick. Raising it selects more aggressively (faster, noisier); `0` disables splitting; a very large value degenerates back to the all-emitters estimator. |
+
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
 the composite `P`, and the photon modes `M`/`S`/`U`), on both CPU and GPU. `-resume` /
@@ -4130,6 +4340,7 @@ alone can't restore, so they are not disk-resumable.
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
 | `-window` | Open a real OS window (Win32; no-op off Windows) showing the actual tone-mapped pixels, refreshed every `-window-interval` (default 0.2 s, independent of the `-interval` disk-write cadence — so the image builds up on screen while it renders rather than appearing only when it's finished). The image is **presented by Direct3D 11** (a flip-model swap chain; the control strip below it stays GDI), which is what keeps a fast renderer fast: the previous CPU present — a per-pixel RGB→BGRA repack plus a `HALFTONE` `StretchDIBits` — cost **9 ms/frame** at 1920², more than the render it was displaying, and charged it to the render thread; it is now **~1.3 ms**. In the GPU-rasterized interactive explorer (`-raster -explore -device gpu`) the frame skips host memory **entirely**: CUDA is handed the window's own D3D11 texture and the tone-map kernel writes the finished pixels straight into it, so there is no device→host download, no re-upload, and no host touch of the image at all (measured at 3840²: **26.1 ms → 9.7 ms** per displayed frame). ftrace prints one line saying which way it's presenting; the copy path is used automatically whenever the fast one can't be (notably when D3D picks a different adapter than the CUDA device, as on hybrid iGPU/dGPU laptops, or when a flypath overlay has to be drawn into the pixels). `FTRACE_LIVE_GDI=1` forces the old GDI path (and ftrace falls back to it automatically if D3D can't start). The window is put on screen **before the render starts** — as soon as the scene has loaded and the frame size is known — showing a near-black placeholder with the current stage in the title bar (`preparing…`, `mode W — starting…`), then the first rendered chunk replaces it. Previously it was created lazily by the first repaint, so in the ray-traced modes no window existed until the render was already over and the finished image appeared to flash up for a split second as the process exited. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>`, then the transport mode driving that frame (`mode B (pinhole)`, `mode D (BDPT)`, `mode M (photon map)`, …; a per-camera flight shows the mode of the frame currently on screen), then the live status (`spp` / `% noise` or photon count) as it converges, and finally the **compute backend** actually in use — `GPU (NVIDIA GeForce RTX 4090)` (the real device name, so a multi-GPU box says *which* one) or `CPU (12 threads)` — so you can tell at a glance which scene/file the window is showing, how it's being rendered, how far along it is, and what's doing the work. The backend is reported from where the device is *resolved*, not from what `-device` asked for, so a `-device gpu` that fell back (no CUDA build, no free VRAM, an unsupported feature) reads `CPU` and says so; in the interactive explorer, where the raster preview and a `mode W` refinement run on the CPU while a path-trace refinement runs on the GPU, the label follows whichever pass produced the frame on screen. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is.<br><br>**When the render finishes the title says so**, leading with `✔ DONE — <why>` before everything else: `✔ DONE — noise target met  —  ftrace — scene.ftsl → png/out.png  —  mode R (backward ref)  —  [noise] target ~0.5%, 49.1s, 40133 spp, ~0.50% noise  —  GPU (NVIDIA GeForce RTX 4090)`. `<why>` names the budget that ended it — `noise target met`, `time budget reached`, `photon target reached`, `sample target reached`, `stopped early` (Ctrl-C or `-stop`), or `stopped by an error`. Without this the only signal that a render had finished was that the progress text *stopped changing*, which looks exactly like a render still grinding through a long chunk between repaints; it matters most under `-keepwindow`, where the window deliberately outlives the render. The marker is a prefix rather than a suffix so it survives the left-anchored truncation of the taskbar button and a narrow title bar. |
+| `-window-min` / `-minimized` | Like `-window`, but the window **opens minimized to the taskbar** instead of on the desktop. It is a fully live preview — frames are presented to it exactly as with `-window`, the title bar tracks progress, closing it still stops the render — you just restore it from the taskbar when you want to look, rather than having it put in front of whatever you were doing. It never takes keyboard focus even momentarily (`SW_SHOWMINNOACTIVE`, not `SW_MINIMIZE`, which activates the window first and would swallow a keystroke). The reason to want it: when several renders are launched in sequence — a parameter sweep, a flyby, a batch of validation stills — each one popping a window to the foreground makes the machine unusable for anything else, and the obvious workaround (drop `-window` entirely) throws the live preview away instead of just relocating it. Purely a display choice: the render, its output and its timings are unaffected. Combines with `-keepwindow`, which then holds the finished image in the still-minimized window. Implies `-window`. |
 | `-keepwindow` / `-hold` | Like `-window`, but **don't auto-close** the live window when the render finishes — normally the window is torn down at process exit the instant the last frame completes, so a finished image only flashes on screen. With this set, ftrace keeps the final image up and blocks until you close the window yourself (handy for inspecting a quick `-raster` preview or a completed still), and the title bar switches to `✔ DONE — <why>` (see `-window`) so a held window can't be mistaken for one that is still converging. Implies `-window`. |
 | `-interval <s>` | Periodic image write / status line / ANSI `-preview` refresh (default 15 s). This is the **crash-safety** cadence — how often the PNG and the `.ftbuf` checkpoint are rewritten — and is deliberately *not* what drives the live window (see `-window-interval`). |
 | `-window-interval <s>` | How often the `-window` live view repaints (default 0.2 s), independent of `-interval`. The two used to share one timer, which meant any render finishing inside one interval never showed a single live frame — a 5 s `-mode W` frame under `-interval 8` painted once, as the process was exiting, so the finished image just flashed and vanished. They are separate now because they want opposite cadences: rewriting a PNG and a multi-megabyte checkpoint five times a second is pointless disk churn, while repainting a window every 15 s defeats the point of having one. Repaint granularity is bounded below by the renderer's own chunk size (one chunk ≈ 0.15 s of GPU work, minimum 1 spp), so on a 480² `-mode W -spp 8` frame you get one repaint per spp — the first complete image lands after ~0.6 s instead of after 5 s. Measured cost of the extra repaints there: **+3.9 %** of render time (a repaint tone-maps and presents the whole frame, ~25 ms at 480²). The floor is adaptive — never less than the larger of this value and 12× what the last repaint actually cost — so a 4K film backs itself off instead of spending all its time painting. `0` means "every chunk, subject only to that budget". `FTRACE_WINDOW_DEBUG=1` logs each repaint and its cost. |
@@ -4148,7 +4359,7 @@ alone can't restore, so they are not disk-resumable.
 | `-play` | With `-viewer`: open with the clock **already playing**, so a loop can be watched — or its per-frame cost read off the `[play]` breakdown printed to stdout — without clicking into the window. Ignored (with a printed reason) when there is no live loom channel or the sidecar advertises `frames = 1`. |
 | `-prebake` | With `-viewer`: walk the clock **once** on open and keep every frame's adopted state in memory, then play out of that cache on a wall clock at the panel's `fps` rather than at loom's bake rate. Costs ~0.01 ms a frame to show, so the requested rate is actually delivered, and it makes scrubbing the frame slider instant too. The cache is dropped whenever a build parameter or `frames` changes — a cache built at other values is not a cache of what you are looking at. Same thing as the panel's **prebake** button; the flag exists so a played frame rate can be measured from a script. |
 | `-prebake-cap <MB>` | Memory budget for `-prebake` (default `1024`, also settable live as the panel's **cap MB**). A walk that reaches the cap stops there and says where: the **prefix** it did fill still plays from memory and the remaining frames fall back to bake-paced play, so a long clock degrades instead of failing. Because that degradation is otherwise invisible until you hit it — a loop that runs at the target rate for its first half and stutters through the rest — the walk projects the whole clock's cost after 4 frames and prints it **before** committing: either `~19.4 MB/frame x 96 frames = ~1863 MB, fits the 1024 MB cap` or the shortfall together with the exact `-prebake-cap` value that would cache everything. The same suggestion is repeated on the cap-reached line. |
-| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
+| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`). Under `-radcache` the sidecar also carries the radiance-cache table (sparse — occupied cells only), so a resumed render continues warm; see **The radiance cache** |
 | `-stop [<pid>\|all]` | **Stop a running render cleanly, from another shell.** `ftrace -stop <pid>` asks that render to do exactly what Ctrl-C does — finish the current chunk, write the final image **and** `.ftbuf` checkpoint, release the CUDA context through the graceful-shutdown path — then waits (up to 120 s) for it to actually exit, so it's safe to script a rebuild right after. `-stop all` targets every running render; a bare `-stop` just **lists** them (pid + scene → output). This exists because a render launched detached has no console to Ctrl-C into, and **force-killing ftrace mid-CUDA is a known way to wedge the NVIDIA driver into a TDR/bugcheck** — so never `taskkill /F` a render, use this. It also releases a window being held open by `-keepwindow`. Implemented as a sentinel file under `<temp>/ftrace/` (a `<pid>.run` entry per live render, a `<pid>.stop` to signal it), which — unlike a named kernel event — crosses the session / window-station boundary between a detached render and the shell signalling it. Stale channel files are reaped by the next `-stop`: both a `<pid>.run` left by a hard kill and a `<pid>.stop` nobody was left to consume, in each case only once the owning pid is gone. A stop that arrives while the process is still **loading the scene** aborts the load rather than being waited out: it prints `[stop] scene load stopped before rendering — nothing was rendered or written.` and exits **1** (no scene was built, so nothing could be rendered — the non-zero exit is the correct outcome, not an error in your `.ftsl`). Since **0.182.0** it covers every long-lived ftrace process, not just renders: a `-viewer` (loom native viewer) or `-explore` GUI is listed by a bare `-stop` and shuts down cleanly when targeted, its event loop polling the same flag a render polls and then leaving through its normal teardown (D3D11, the loom python child, the window). Also since 0.182.0 the **exit code is honest**: `0` only when every target is genuinely gone (a pid that was already dead counts, and reports `nothing to stop`), and `2` with `[stop] FAILED — still running after 120s: <pids>` when one outlives the wait — previously it printed `stopped cleanly` and exited 0 regardless, so a stop that did nothing looked like a success. Nothing is ever force-killed either way. |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`). **Process-local** — it can only share an anchor between frames rendered by *this* invocation; for a frame-per-invocation sequence use `-exposure-anchor` |
 | `-exposure-anchor <v\|file>` | **Share one auto-exposure anchor across separate `ftrace` invocations** — the missing piece for a sequence whose frames are each rendered by their own process (loom's `render_range`, a batch script, a re-render of one frame). Implies `-exposure-lock`. With a **number** the anchor is used directly (no metering). With a **path**: if the file exists and holds a number that anchor is loaded and reused; otherwise this run meters normally and **writes** its resolved anchor there, so every later frame pointed at the same file develops at the identical gain. Also accepted by **`-topng`**, which is how a *finished* sequence is repaired from its `.ftbuf` checkpoints with no re-render (see **Output**). Without it, per-frame metering can jump — the p99 anchor solves `area(L) = 1%` for a level, and on a scene with a bright compact highlight population the tail density is so thin (~0.25% of frame per octave) that the inversion is ill-conditioned, so a rotating highlight swings the anchor by a third of an octave (measured on `pastel_jack_ring`: 36% single-frame anchor step while every honest brightness measure moved ≤ 2.3%). This is not fixable in the statistic — see the `exposure_lock` notes and `known-issues.md` |

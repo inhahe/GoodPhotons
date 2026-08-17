@@ -49,6 +49,7 @@
 #include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
 #include "fur_volume.h"   // -fur-volume: the aggregate far-tier fur medium
+#include "radcache.h" // -radcache: biased early termination into a world-space irradiance cache
 
 struct BackwardRenderer {
     int maxBounce = 32;
@@ -302,6 +303,55 @@ struct BackwardRenderer {
     // (main.cpp); mode R is stochastic and averages the collapse away, so it stays opt-in.
     bool heroSplit = hero::gSplit;
 
+    // ---- radiance cache (-radcache; OFF by default, and biased) ---------------------
+    // A world-space cache of indirect irradiance at diffuse vertices. Once a path is at
+    // least `radMinBounce` bounces deep and lands in a cell the update pass has filled in,
+    // it stops tracing and reads E/pi out of the cache instead of continuing. See
+    // radcache.h for the estimator and for why the data comes from a dedicated update pass
+    // rather than from the camera paths themselves.
+    //
+    // Three invariants keep this honest, and all three are load-bearing:
+    //   * `radCache == nullptr` (no -radcache) must leave mode R BIT-IDENTICAL. Nothing
+    //     below may consume an rng draw, reorder one, or change a branch unless the cache
+    //     is actually on -- mode R is this renderer's unbiased reference.
+    //   * The table is READ-ONLY during a pass. Marks and samples go to this thread's
+    //     `radBank` and are merged between chunks, so a lookup is a plain read: no atomics,
+    //     no false sharing, and a chunk's image does not depend on thread scheduling.
+    //   * Camera paths MUST NOT be the training set. A path's chance to contribute cannot be
+    //     allowed to depend on where it went, and every rule that keys on a path's fate keys
+    //     on its direction too (measured: 1.8% dark on cornell.ftsl for the natural-looking
+    //     "deposit unless you terminated on the cache" rule). The update pass sidesteps the
+    //     whole question -- it samples per CELL, so there is no path population to select.
+    const RadianceCache* radCache = nullptr;   // shared, immutable during a pass
+    RadCacheBank*        radBank  = nullptr;   // THIS thread's mark/sample bank (per-thread!)
+    int    radMinBounce = 2;     // no cache termination before this bounce index
+    // Fraction of camera paths that IGNORE the cache and trace to full length anyway. Purely
+    // a QUALITY knob -- the table is fed by the update pass, not by camera paths, so nothing
+    // depends on it -- and it defaults to 0. Raise it to blend exact paths back into a
+    // preview, at proportional cost.
+    double radTrainFrac = 0.0;
+    // -radcache-audit: read the cache but do NOT terminate, recording both the value the
+    // cache offered and the value the traced tail actually delivered (see RadCacheBank's
+    // audit fields). A render with this on is a cache-OFF render numerically -- every path
+    // runs to full length -- so the audit measures the cache's per-read systematic error
+    // against an exact reference in the same run, with the pixel noise cancelling out.
+    bool   radAudit = false;
+    // -radcache-validate: fraction of readable vertices that trace their tail to full length
+    // instead of terminating, and report (offer, tail) back to the cell they would have read.
+    // This is the one measurement the update pass CANNOT make, because it is taken through the
+    // readers' own weighting: it sees cell averaging, normal-cone spread and unsampled tails
+    // exactly in the proportions the image is actually built from. Cheap (the coin is drawn
+    // once per path, and a validating path is just a cache-OFF path) and self-limiting: a cell
+    // that turns out to be right gets corr == 1 and costs nothing but the sampling.
+    double radValidate = 0.05;
+
+    // Is the cache live for this render? Mode W (`whitted`) and -direct-only both terminate
+    // diffuse paths themselves rather than gathering indirect light, so there is no path tail
+    // for a cached value to stand in for; gate the feature off there.
+    bool rcActive() const {
+        return radCache && radCache->ready() && !whitted && !directOnly;
+    }
+
     // Per-sample cache of emitter-SPD evaluations at the path's wavelengths. The
     // wavelengths are fixed for the whole camera path, but every NEE connection
     // used to re-evaluate em.spdFn(λ) — a std::function typically wrapping the
@@ -316,10 +366,27 @@ struct BackwardRenderer {
     // wavelengths no longer equal the cached ones. Cached values are the exact
     // doubles spdFn returned and the consumers keep the same iteration order and
     // arithmetic shape, so images stay bit-identical.
+    //
+    // FACTORED (v0.187.0): the table is over DISTINCT base curves, not emitters, and an
+    // emitter's value is base*scale (Scene::spdBase / spdBaseIdx / spdScale). Two reasons.
+    // The evaluation count drops from one per emitter to one per distinct spectrum, which
+    // for a room lit by N copies of one fixture is the whole many-lights cost once the
+    // light BVH has removed the shadow rays; and the table itself stops being O(N) MEMORY
+    // rewritten every sample — at 256 emitters x 4 wavelengths the old layout stored 8 KB
+    // per sample, which at 4 M samples is tens of GB of pure store traffic. The value is
+    // bit-identical either way: base*scale is literally how the emitter's own Spectrum
+    // computes itself (ScaledSpectrum::operator(), spectrum.h).
     struct SpdCache {
-        const double* lam = nullptr;  // wavelengths the table was built for
-        const double* spd = nullptr;  // emitter-major: spd[e*C + i] = emitters[e].spdFn(lam[i])
+        const double* lam = nullptr;   // wavelengths the table was built for
+        const double* base = nullptr;  // base-major: base[g*C + i] = spdBase[g](lam[i])
+        const int*    baseIdx = nullptr;  // emitter -> base index
+        const double* scale = nullptr;    // emitter -> constant factor
         int C = 0;
+        int iOff = 0;                  // wavelength-axis offset of this (possibly sliced) view
+        // emitters[e].spdFn(lam[i]) — exactly, not approximately.
+        double at(int e, int i) const {
+            return base[(size_t)baseIdx[e] * (size_t)C + (size_t)(iOff + i)] * scale[e];
+        }
         bool matches(const double* l, int nUp) const {
             for (int i = 0; i < nUp; ++i) if (l[i] != lam[i]) return false;
             return true;
@@ -687,6 +754,62 @@ struct BackwardRenderer {
         u2 = ((double)(g / G) + 0.5) / (double)G;
     }
 
+    // ---- many-lights selection (the Conty-Kulla light BVH, lighttree.h) ------------
+    //
+    // Historically every NEE vertex connected a shadow ray to EVERY emitter. That is an
+    // unbiased splitting estimator and it is fine for one lamp, but it costs O(N) per
+    // bounce and buys nothing once the lights are redundant: same room, same TOTAL flux
+    // split across N ceiling panels, mode R 256 spp — 1 light 0.4 s, 256 lights 75.9 s,
+    // at an IDENTICAL 6.25 % noise (scraps/gen_manylights.py). 190x for the same image.
+    //
+    // `pickEmitters` replaces the loop bound: it hands back the emitters to connect to
+    // at this vertex together with 1/pdf for each, so `sum_e w_e` becomes
+    // `sum_selected w_e / p(e)` — same expectation, bounded cost. When the tree is
+    // absent (one light, mode W's deterministic grid, -no-lighttree) it reports "all
+    // emitters, weight 1", i.e. literally the old loop, drawing the rng in the old
+    // order so those scenes stay bit-identical.
+    bool   lightTree = lt::gEnabled;   // -no-lighttree: force the exact all-emitters estimator
+    double lightSplit = lt::gSplit;    // adaptive-splitting threshold, (node radius / distance)^2
+    int    lightSamples = lt::gSamples;// cap on emitters connected per vertex
+    static constexpr int kMaxLightPick = 32;
+
+    struct EmitterDraw {
+        int n = 0;                       // number of connections to make
+        bool all = false;                // true: entries are emitters 0..n-1, each pdf 1
+        LtSample s[kMaxLightPick];
+        int emitter(int i) const { return all ? i : s[i].emitter; }
+        // 1/p(e) — the weight that makes selection unbiased against the old sum.
+        double weight(int i) const { return all ? 1.0 : (s[i].pdf > 0.0 ? 1.0 / s[i].pdf : 0.0); }
+    };
+
+    // `n` is the receiver normal, or null at a volume vertex (no normal to bound with).
+    EmitterDraw pickEmitters(const Scene& scene, const Vec3& p, const Vec3* nrm,
+                             Pcg32& rng) const {
+        EmitterDraw d;
+        const int nEm = (int)scene.emitters.size();
+        // Mode W wants its deterministic G x G grid on every light and has no variance to
+        // trade away, so it always takes the exact path.
+        if (!lightTree || whitted || scene.lightTreeRoot < 0 || scene.lightTree.empty()) {
+            d.all = true; d.n = nEm; return d;
+        }
+        // Emitters with no usable spatial bound (a distant sun) are outside the tree and
+        // are always connected, exactly as before.
+        for (int e : scene.lightTreeAlways) {
+            if (d.n >= kMaxLightPick) break;
+            d.s[d.n++] = LtSample{e, 1.0};
+        }
+        int budget = lightSamples;
+        if (budget > kMaxLightPick - d.n) budget = kMaxLightPick - d.n;
+        if (budget > 0) {
+            const double pp[3] = {p.x, p.y, p.z};
+            double nn[3] = {0, 0, 0};
+            if (nrm) { nn[0] = nrm->x; nn[1] = nrm->y; nn[2] = nrm->z; }
+            d.n += ltSample(scene.lightTree.data(), scene.lightTreeRoot, pp, nn,
+                            nrm != nullptr, lightSplit, budget, d.s + d.n, rng);
+        }
+        return d;
+    }
+
     // `hs` non-null routes the connection through the fiber BCSDF (see emitterGeom); the
     // caller then passes rho == 1, because the strand's colour is already inside the BCSDF
     // (its sigma_a) and the PI in emitterGeom's response cancels the rho/PI below.
@@ -706,8 +829,13 @@ struct BackwardRenderer {
         // path (post-de-hero interactMaterial) reuses the hero table's i==0 column;
         // a fluorescent λ-switch fails matches() and falls back to a live spdFn call.
         const bool cached = spdCache && spdCache->matches(&lambda, 1);
-        const int nEm = (int)scene.emitters.size();
-        for (int e = 0; e < nEm; ++e) {
+        // Which lights to connect to, and with what 1/pdf. `all` reproduces the old
+        // loop over every emitter (weight 1) bit-for-bit, including its rng order.
+        const EmitterDraw draw = pickEmitters(scene, h.p, &h.n, rng);
+        for (int di = 0; di < draw.n; ++di) {
+            const int e = draw.emitter(di);
+            const double selW = draw.weight(di);
+            if (selW <= 0.0) continue;
             const Emitter& em = scene.emitters[e];
             const bool uv = emitterNeedsUV(em);
             // Whitted: G x G deterministic shadow rays per area light, averaged. A
@@ -739,8 +867,7 @@ struct BackwardRenderer {
                 if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, hs,
                                  dctx ? &dc : nullptr)) continue;
                 if (!haveSpd) {   // evaluated at most once per emitter, as before
-                    spdV = cached ? spdCache->spd[(size_t)e * (size_t)spdCache->C]
-                                  : em.spdFn(lambda);
+                    spdV = cached ? spdCache->at(e, 0) : em.spdFn(lambda);
                     haveSpd = true;
                 }
                 double contrib = (rho / PI) * (spdV * invPdfLambda) * w;
@@ -748,7 +875,9 @@ struct BackwardRenderer {
                     contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 acc += contrib;
             }
-            total += (nS > 1) ? acc / (double)nS : acc;
+            // selW is 1 on the exact path, so this multiply is a no-op there (and the
+            // `nS > 1` branch keeps its original float ordering).
+            total += ((nS > 1) ? acc / (double)nS : acc) * selW;
         }
         return total;
     }
@@ -763,8 +892,11 @@ struct BackwardRenderer {
                       GiCtx gi = GiCtx{}) const {
         const Vec3 ngo = orientedGeoN(h);
         const bool cached = spdCache && spdCache->matches(lam, nUp);
-        const int nEm = (int)scene.emitters.size();
-        for (int e = 0; e < nEm; ++e) {
+        const EmitterDraw draw = pickEmitters(scene, h.p, &h.n, rng);
+        for (int di = 0; di < draw.n; ++di) {
+            const int e = draw.emitter(di);
+            const double selW = draw.weight(di);
+            if (selW <= 0.0) continue;
             const Emitter& em = scene.emitters[e];
             const bool uv = emitterNeedsUV(em);
             const int G = (whitted && uv) ? (gi.depth ? giGrid : lightGrid) : 1;
@@ -776,11 +908,11 @@ struct BackwardRenderer {
                 else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
                 double dist = 0.0, w = 0.0;
                 if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w)) continue;
-                const double ws = (nS > 1) ? w * invS : w;
+                double ws = (nS > 1) ? w * invS : w;
+                ws *= selW;                       // no-op (bit-exact) on the exact path
                 if (cached) {
-                    const double* spdE = spdCache->spd + (size_t)e * (size_t)spdCache->C;
                     for (int i = 0; i < nUp; ++i)
-                        L[i] += thr[i] * (rho[i] / PI) * (spdE[i] * invPdf[i]) * ws;
+                        L[i] += thr[i] * (rho[i] / PI) * (spdCache->at(e, i) * invPdf[i]) * ws;
                 } else {
                     for (int i = 0; i < nUp; ++i)
                         L[i] += thr[i] * (rho[i] / PI) * (em.spdFn(lam[i]) * invPdf[i]) * ws;
@@ -884,10 +1016,14 @@ struct BackwardRenderer {
                      const SpdCache* spdCache = nullptr) const {
         double total = 0.0;
         const bool cached = spdCache && spdCache->matches(&lambda, 1);
-        const int nEmV = (int)scene.emitters.size();
-        for (int e = 0; e < nEmV; ++e) {
+        // A fog vertex has no normal, so the tree's receiver-cosine bound is skipped.
+        const EmitterDraw draw = pickEmitters(scene, p, nullptr, rng);
+        for (int di = 0; di < draw.n; ++di) {
+            const int e = draw.emitter(di);
+            const double selW = draw.weight(di);
+            if (selW <= 0.0) continue;
             const Emitter& em = scene.emitters[e];
-            const double spdV = cached ? spdCache->spd[(size_t)e * (size_t)spdCache->C]
+            const double spdV = cached ? spdCache->at(e, 0)
                                        : 0.0;   // live spdFn below when not cached
             if (em.collimated) continue;
             if (em.shape == EmitterShape::Spot) {
@@ -903,7 +1039,7 @@ struct BackwardRenderer {
                 double albedo = scene.backwardMedium().albedo(lambda);
                 double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
-                total += albedo * phase * emitW * fall / dist2 * T;
+                total += albedo * phase * emitW * fall / dist2 * T * selW;
                 continue;
             }
             if (em.shape == EmitterShape::Sun) {
@@ -917,7 +1053,7 @@ struct BackwardRenderer {
                 double albedo = scene.backwardMedium().albedo(lambda);
                 double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
-                total += albedo * phase * emitW * em.spotOmega * T;
+                total += albedo * phase * emitW * em.spotOmega * T * selW;
                 continue;
             }
             double u1 = rng.uniform(), u2 = rng.uniform();
@@ -956,7 +1092,7 @@ struct BackwardRenderer {
                 if (epat != 1.0) contrib *= epat;
             }
             contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
-            total += contrib;
+            total += contrib * selW;           // selW == 1 on the exact all-emitters path
         }
         return total;
     }
@@ -1721,9 +1857,18 @@ struct BackwardRenderer {
         // double it. A specular bounce re-arms this, so gold-bounced light still lands.
         double thr[hero::kHeroMax];
         for (int i = 0; i < C; ++i) thr[i] = 1.0;
+        // -radcache: roll this path's training ticket. Drawn HERE and only when the cache
+        // is live, so a run without -radcache consumes the identical rng stream it always
+        // did (see the `radCache` note above -- bit-identity with the flag off is a
+        // requirement, not a nicety). A training path ignores the cache and traces to full
+        // length, which is what keeps the table refining instead of freezing on its own
+        // first estimate.
+        const bool rcTrain = rcActive() && radTrainFrac > 0.0
+                           && (rng.uniform() < radTrainFrac);
         radianceHeroLoop(scene, ray, MediumStack{}, lamIn, invPdfIn, thr, C,
                          /*secAlive=*/(C > 1), /*specularArrival=*/(gi.depth == 0),
-                         /*contBsdfPdf=*/0.0, /*bounce0=*/0, Lout, rng, spdCache, gi);
+                         /*contBsdfPdf=*/0.0, /*bounce0=*/0, Lout, rng, spdCache, gi,
+                         rcTrain);
     }
 
     // Bounce loop for a hero bundle already sitting at (`ray`, `stk`) with
@@ -1743,7 +1888,7 @@ struct BackwardRenderer {
                           const double* invPdfIn, const double* thrIn, int C, bool secAlive,
                           bool specularArrival, double contBsdfPdf, int bounce0,
                           double* Lout, Pcg32& rng, const SpdCache* spdCache,
-                          GiCtx gi) const {
+                          GiCtx gi, bool rcTrain = false) const {
         double lam[hero::kHeroMax], invPdf[hero::kHeroMax], thr[hero::kHeroMax], L[hero::kHeroMax];
         // Copy only the LIVE entries: a monochromatic sub-path spawned by the split fills
         // only slot 0 of its lamIn/invPdfIn/thrIn, so reading all C would read
@@ -1758,7 +1903,50 @@ struct BackwardRenderer {
         const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
         Renderer mats; mats.diffraction = diffraction;
 
-        auto finish = [&]() { for (int i = 0; i < C; ++i) Lout[i] = L[i]; };
+        // ---- -radcache bookkeeping (inert, and free, when the cache is off) -------------
+        // Camera paths do not train the table -- the update pass does (radcache.h) -- so all
+        // that is left here is: MARK the cells this path visits, and possibly READ one and
+        // stop. Both are gated on `rcOn`, so a run without -radcache is bit-identical.
+        const bool rcOn = rcActive() && radBank != nullptr;
+        // Verification state (-radcache-validate, and -radcache-audit). A small random
+        // fraction of readable vertices do NOT terminate: they record what the cache offered,
+        // snapshot the running L, and then trace the tail to full length anyway. The
+        // difference between the final L and that snapshot is exactly what the traced tail
+        // delivered, i.e. the quantity the cached number claims to equal, weighted exactly as
+        // a reader weights it (thr * rho * invPdf are already folded into both sides).
+        //
+        // Only the FIRST readable vertex of a path is scored, because a second one lies
+        // INSIDE the tail the first is being measured against -- scoring both would let a
+        // cell's error contaminate its own reference.
+        //
+        // The coin is flipped BEFORE the tail is known, so selection cannot depend on how the
+        // tail turns out; that is what makes Sum(tail)/Sum(offer) an unbiased estimate of the
+        // cell's systematic error as used. See the header prose in radcache.h.
+        bool     rcValidated = false;
+        uint64_t rcValKey    = 0;
+        double   rcValOffer  = 0.0;   // RAW cache mean, un-corrected: the val record's divisor
+        double   rcValCorr   = 1.0;   // correction in force, for the audit's "as delivered"
+        double   rcValSnap   = 0.0;
+
+        auto finish = [&]() {
+            for (int i = 0; i < C; ++i) Lout[i] = L[i];
+            if (rcValidated) {
+                double tail = 0.0;
+                for (int i = 0; i < C; ++i) tail += L[i];
+                const double got = tail - rcValSnap;
+                if (radAudit) {
+                    // Pure measurement mode: score the offer as actually delivered (raw*corr)
+                    // against the tail, and do NOT feed the result back into the table -- an
+                    // audit that corrects what it measures is measuring its own feedback.
+                    radBank->auditCache  += rcValOffer * rcValCorr;
+                    radBank->auditTrace  += got;
+                    radBank->auditTrace2 += got * got;
+                    ++radBank->auditN;
+                } else {
+                    radBank->vals.push_back(RadCacheVal{ rcValKey, rcValOffer, got });
+                }
+            }
+        };
         auto deHero = [&]() {            // terminate secondaries, boost hero ×C
             if (!secAlive) return;
             thr[0] *= (double)C;
@@ -1893,16 +2081,23 @@ struct BackwardRenderer {
                         double sLam = lam[i], sInv = invPdf[i], sThr = thr[i];
                         SpdCache sCache;                     // re-point at λ_i's COLUMN
                         const SpdCache* sCp = nullptr;
-                        if (spdCache && spdCache->lam && spdCache->spd && i < spdCache->C) {
-                            sCache.lam = spdCache->lam + i;
-                            sCache.spd = spdCache->spd + i;
-                            sCache.C   = spdCache->C;
+                        if (spdCache && spdCache->lam && spdCache->base && i < spdCache->C) {
+                            sCache = *spdCache;              // same table, one λ column
+                            sCache.lam  = spdCache->lam + i;
+                            sCache.iOff = spdCache->iOff + i;
                             sCp = &sCache;
                         }
                         double sub[hero::kHeroMax];
+                        // -radcache: a split sub-path is spawned as a TRAINING path
+                        // (rcTrain=true) whatever the parent is. Its radiance is added
+                        // into the parent's L[i], so if it could terminate on the cache the
+                        // parent's own deposits would be measuring the cache's output --
+                        // the feedback loop the design forbids. Splits are rare (dispersive
+                        // vertices only), so tracing them in full costs almost nothing.
                         radianceHeroLoop(scene, ray, stk, &sLam, &sInv, &sThr,
                                          /*C=*/1, /*secAlive=*/false, specularArrival,
-                                         contBsdfPdf, b, sub, rng, sCp, gi);
+                                         contBsdfPdf, b, sub, rng, sCp, gi,
+                                         /*rcTrain=*/true);
                         L[i] += sub[0];      // this wavelength's own estimate, own slot
                         thr[i] = 0.0;        // now that sub-path's business, not ours
                     }
@@ -2083,25 +2278,29 @@ struct BackwardRenderer {
                             MediumStack sStk = stk;
                             Ray sRay = ray;
                             // Re-point the emitter-SPD cache at wavelength i's COLUMN. The
-                            // table is emitter-major with stride C (spd[e*C + i]), so offsetting
-                            // the base by i and KEEPING the stride makes the sub-path's
-                            // spd[e*C + 0] read exactly emitter e at λ_i -- zero-copy, and
-                            // matches(&sLam, 1) still validates against lam[i]. Without this the
-                            // cache would silently hand the sub-path the HERO's SPD values.
+                            // table is base-major with stride C, so bumping `iOff` by i makes
+                            // the sub-path's at(e, 0) read exactly emitter e at λ_i -- zero-
+                            // copy, and matches(&sLam, 1) still validates against lam[i].
+                            // Without this the cache would silently hand the sub-path the
+                            // HERO's SPD values.
                             SpdCache sCache;
                             const SpdCache* sCp = nullptr;
-                            if (spdCache && spdCache->lam && spdCache->spd && i < spdCache->C) {
-                                sCache.lam = spdCache->lam + i;
-                                sCache.spd = spdCache->spd + i;
-                                sCache.C   = spdCache->C;
+                            if (spdCache && spdCache->lam && spdCache->base && i < spdCache->C) {
+                                sCache = *spdCache;
+                                sCache.lam  = spdCache->lam + i;
+                                sCache.iOff = spdCache->iOff + i;
                                 sCp = &sCache;
                             }
                             if (interactMaterial(scene, m, h, mats, sRay, sLam, sInv, sThr, sL,
                                                  sSpec, sPdf, sStk, rng, sCp, gi)) {
                                 double sub[hero::kHeroMax];
+                                // rcTrain=true: see the sibling split above -- a sub-path
+                                // whose radiance lands in the parent's L[i] must never read
+                                // the cache, or the parent's deposits would train on it.
                                 radianceHeroLoop(scene, sRay, sStk, &sLam, &sInv, &sThr,
                                                  /*C=*/1, /*secAlive=*/false, sSpec, sPdf,
-                                                 b + 1, sub, rng, sCp, gi);
+                                                 b + 1, sub, rng, sCp, gi,
+                                                 /*rcTrain=*/true);
                                 sL += sub[0];
                             }
                             L[i] += sL;      // this wavelength's own estimate, own slot
@@ -2140,6 +2339,79 @@ struct BackwardRenderer {
                             for (int i = 0; i < nUp; ++i) L[i] += thr[i] * rho[i] * ambient;
                     }
                     if (directOnly) { finish(); return; }         // Whitted: no diffuse indirect
+                    // ---- -radcache: read the tail out of the cache and stop ---------------
+                    // Placed AFTER this vertex's own NEE and BEFORE the continuation RR, which
+                    // is what makes the partition exact: the cached number is the mean of the
+                    // radiance arriving along the direction the RR was about to sample, and
+                    // that estimator excludes the NEE done HERE (it is measured from what the
+                    // sub-path added, and the sub-path starts at the next vertex). So direct
+                    // light is counted once, by this vertex, and everything beyond it once, by
+                    // the cache -- no gap, no double count.
+                    //
+                    // ALL live wavelengths must be confident, not just the hero. Terminating
+                    // on a partially-confident cell would mean some lambda continued and some
+                    // did not, which turns a spectral bundle into a tinted one -- a colour
+                    // error, not noise, so no amount of spp would clean it up.
+                    if (rcOn && b >= radMinBounce) {
+                        // MARK FIRST, unconditionally. A mark says "something will want to
+                        // read here", and it is what puts the cell on the update pass's work
+                        // list -- so it has to happen on the miss (that is the cell that most
+                        // needs filling) and on a training path (which is not reading, but its
+                        // twin next chunk will). Marking is deduplicated per thread against a
+                        // direct-mapped filter, so the millionth path across a cell is free.
+                        const uint64_t ck = radCache->cellKey(h.p, h.n);
+                        radBank->mark(ck, (size_t)RadianceCache::mix(ck), h.p, h.n);
+                        double e[hero::kHeroMax];
+                        double j0 = 0.0, j1 = 0.0, j2 = 0.0;
+                        // Only draw the dither when it is actually enabled: an unused draw
+                        // would still perturb the stream and make -radcache-jitter 0 differ
+                        // from the arrangement every measurement so far was taken on.
+                        if (radCache->jitter > 0.0) {
+                            j0 = rng.uniform(); j1 = rng.uniform(); j2 = rng.uniform();
+                        }
+                        double   corr = 1.0;
+                        uint64_t ckey = 0;
+                        // `!rcValidated`: once this path has been chosen to measure a cell,
+                        // every vertex from here on is INSIDE the tail that is the measurement.
+                        // Letting one of them terminate into the cache would score the cell
+                        // against "direct light + somebody else's cached tail" -- the same
+                        // self-feeding that rcTrain exists to prevent on the update side.
+                        if (!rcTrain && !rcValidated &&
+                            radCache->lookupBundle(h.p, h.n, lam, nUp, e, &corr,
+                                                   &ckey, j0, j1, j2)) {
+                            // Exactly what continuing would have contributed in expectation:
+                            // surviving RR with probability q and reweighting by rho/q gives
+                            // thr*rho*E[L_i], and E[L_i] over the cosine hemisphere is E/pi.
+                            // e[] is PHYSICAL radiance (update rays run with invPdf == 1, see
+                            // radcache.h), so the reader restores its OWN 1/pdf(λ) weight here.
+                            // `corr` is the correction the verification pass has learned for
+                            // this cell; it is 1 until enough validation paths have scored it.
+                            double raw = 0.0;
+                            for (int i = 0; i < nUp; ++i)
+                                raw += thr[i] * rho[i] * e[i] * invPdf[i];
+                            // VALIDATION COIN. Drawn here, before anything about the tail is
+                            // known, so the validation set cannot be selected by a path's
+                            // fate. A validating path takes NOTHING from the cache and traces
+                            // to full length: its pixel contribution stays exact, and what it
+                            // collects from here on is the measurement the cell is scored by.
+                            const bool validate =
+                                radAudit || (radValidate > 0.0 && rng.uniform() < radValidate);
+                            if (validate) {
+                                rcValidated = true;
+                                rcValKey    = ckey;
+                                rcValOffer  = raw;
+                                rcValCorr   = corr;
+                                rcValSnap   = 0.0;
+                                for (int i = 0; i < C; ++i) rcValSnap += L[i];
+                            } else {
+                                for (int i = 0; i < nUp; ++i)
+                                    L[i] += thr[i] * rho[i] * e[i] * invPdf[i] * corr;
+                                ++radBank->nTerm;
+                                finish(); return;
+                            }
+                        }
+                        ++radBank->nMiss;
+                    }
                     // Continuation RR over the WHOLE bundle: the survival probability is
                     // max_i rho_i, not the hero's own albedo, and every live λ reweights by
                     // rho_i/q <= 1. Rolling the coin on the hero alone (thr[i] *= rho_i/rho_0)
@@ -2160,6 +2432,113 @@ struct BackwardRenderer {
         finish();
     }
 
+    // ---- -radcache: one update round over cache cells [i0, i1) of `rc.live` ------------
+    //
+    // THIS is what fills the table. For each cell the round shoots `rc.rays` cosine-
+    // hemisphere rays from the cell's representative surface point and averages what comes
+    // back; `apply()` then folds the average into the cell's live value. A ray is just the
+    // ordinary path tracer re-launched with unit throughput -- it does NEE at every vertex it
+    // reaches and it may itself terminate on the cache, which is how light propagates one
+    // further bounce per round (a progressive radiosity solve riding along with the image).
+    //
+    // Why it starts at `bounce0 = 1` with `specularArrival = false` and
+    // `contBsdfPdf = cos/pi`: the cell is the vertex the READER is standing on, and the
+    // reader does its own NEE there. So the update ray must behave exactly like the
+    // continuation the reader would have traced -- one bounce already spent, arriving by a
+    // cosine-sampled BSDF direction, so an emitter hit on the very first segment carries the
+    // correct MIS weight against the reader's NEE instead of being counted twice.
+    //
+    // WAVELENGTHS ARE STRATIFIED ACROSS THE BINS, not drawn from the emission CDF: ray k of a
+    // cell's own round r takes bin (r*rays + k) mod kBins, jittered within it. Each ray is
+    // MONOCHROMATIC (C == 1), which is what makes a per-bin cache correct at all -- a hero
+    // bundle de-heros at a dispersive interface or a fur fiber, and a de-hero is only unbiased
+    // in the BUNDLE AVERAGE, not per channel (hero boosted x C, secondaries truncated). See
+    // radcache.h. `invPdf` is 1, so the returned L is physical radiance in exactly the units a
+    // cell stores; the reader restores its own 1/pdf(lambda) weight.
+    //
+    // Thread safety: caller partitions `slots` into disjoint ranges, so each thread owns its
+    // cells' scratch outright -- no atomics. The rays MARK through `radBank`, which is
+    // per-thread and merged next chunk, so the cache grows into the parts of the scene only
+    // update rays can see. Nothing here mutates the live values; `apply()` does that after
+    // the join.
+    void updateRadCacheCells(const Scene& scene, RadianceCache& rc, const uint32_t* slots,
+                             size_t i0, size_t i1, long long* outSamples) const {
+        if (!radCache || !slots || i1 <= i0) return;
+        const int nRays = std::max(1, rc.rays);
+        long long produced = 0;
+
+        // Per-ray SPD table for NEE, as renderRows builds it (one evaluation per DISTINCT
+        // emission curve rather than per emitter). C == 1 here, so it is nBase wide.
+        const int nEm = (int)scene.emitters.size();
+        const bool haveBases = ((int)scene.spdBaseIdx.size() == nEm) &&
+                               ((int)scene.spdScale.size() == nEm) && !scene.spdBase.empty();
+        std::vector<int>    fbIdx;
+        std::vector<double> fbScale;
+        if (!haveBases) {
+            fbIdx.resize((size_t)nEm);
+            for (int e = 0; e < nEm; ++e) fbIdx[(size_t)e] = e;
+            fbScale.assign((size_t)nEm, 1.0);
+        }
+        const int     nBase   = haveBases ? (int)scene.spdBase.size() : nEm;
+        const int*    baseIdx = haveBases ? scene.spdBaseIdx.data() : fbIdx.data();
+        const double* baseScl = haveBases ? scene.spdScale.data()   : fbScale.data();
+        std::vector<double> baseBuf((size_t)std::max(1, nBase));
+
+        for (size_t li = i0; li < i1; ++li) {
+            const uint32_t slot = slots[li];
+            const RadCacheCell& c = rc.cell[slot];
+            const Vec3 p = c.point();
+            Vec3 n = c.normal();
+            const double nl = std::sqrt(dot(n, n));
+            if (!(nl > 0.0)) continue;
+            n = n / nl;
+            const uint32_t round = c.upRound;   // the CELL's own round counter, not a global
+            // Seeded from the SLOT and that counter, never from a running index: the cell's
+            // sample sequence is then independent of how the work list was ordered or split
+            // across threads, so a 4-thread and a 32-thread render fill the table identically.
+            Pcg32 rng;
+            seedUnit(rng, RadianceCache::mix(((uint64_t)slot << 24) ^ (uint64_t)(round + 1)),
+                     0x9E3779B97F4A7C15ULL);
+            for (int k = 0; k < nRays; ++k) {
+                const int    b   = rc.scheduleBin(round, k);
+                double       lam = rc.lambdaOfBin(b, rng.uniform());
+                double       inv = 1.0, thr = 1.0, Lout = 0.0;
+                for (int g = 0; g < nBase; ++g)
+                    baseBuf[(size_t)g] = haveBases ? scene.spdBase[g](lam)
+                                                   : scene.emitters[g].spdFn(lam);
+                SpdCache spdCache{&lam, baseBuf.data(), baseIdx, baseScl, 1, 0};
+                const Vec3 wOut = cosineHemisphere(n, rng);
+                const double cosT = dot(wOut, n);
+                if (!(cosT > 0.0)) continue;
+                Ray ray{p + n * 1e-6, wOut};
+                // rcTrain=true: the update ray MARKS the cells it crosses (so the cache
+                // grows into geometry only update rays can see) but NEVER READS one. That
+                // distinction is the difference between an unbiased cache and a diverging
+                // one. If an update ray were allowed to terminate into the cache, the value
+                // it deposits would be `direct + <someone else's cached tail>` -- a fixed
+                // point of the cache's own error rather than an estimate of the truth. With
+                // a fraction f of an update ray's energy arriving through cache reads, any
+                // structural error e (cell averaging, normal-cone averaging) is amplified to
+                // e/(1-f); at the 59% termination rate cornell reaches that is a 2.4x
+                // multiplier, and it showed up as a measured 2.7% darkening of the image
+                // centre. It also corrupts the confidence gate: reading a MEAN instead of
+                // sampling the tail collapses the sample variance, so cells pass the
+                // standard-error test early while carrying inherited bias, which is exactly
+                // the wrong way round. Pure path-traced update rays cost more (they run to
+                // full length), but the budget governor already bounds that spend, and an
+                // unbiased number is the only kind worth storing.
+                radianceHeroLoop(scene, ray, MediumStack{}, &lam, &inv, &thr, /*C=*/1,
+                                 /*secAlive=*/false, /*specularArrival=*/false,
+                                 /*contBsdfPdf=*/cosT / PI, /*bounce0=*/1, &Lout, rng,
+                                 &spdCache, GiCtx{}, /*rcTrain=*/true);
+                if (!(Lout >= 0.0) || !std::isfinite(Lout)) continue;
+                rc.addSampleAt(slot, b, Lout);
+                ++produced;
+            }
+        }
+        if (outSamples) *outSamples += produced;
+    }
+
     // Render `spp` samples per pixel into `film` (accumulates cieXYZ * radiance,
     // exactly like the forward film, so writeFilm with N=spp displays it). Renders
     // the pixel rows [y0, y1) — the caller partitions rows across threads. On a
@@ -2177,11 +2556,37 @@ struct BackwardRenderer {
         const bool useHero = (C > 1) && !scene.backwardMedium().enabled &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         const uint64_t nPix = (uint64_t)film.resX * (uint64_t)film.resY;
-        // Per-sample emitter-SPD table (see SpdCache): nEm×C (nEm×1 on the scalar
-        // path), allocated once per renderRows call (i.e. per thread) and refilled
-        // for every sample.
+        // Per-sample SPD table (see SpdCache): nBase×C (nBase×1 on the scalar path),
+        // allocated once per renderRows call (i.e. per thread) and refilled for every
+        // sample. Shared-SPD factorisation (Scene::spdBase / spdBaseIdx / spdScale):
+        // each emitter is base_g(lambda) * scale_e, so the table is over DISTINCT curves
+        // — one evaluation per curve plus a multiply at READ time per emitter, instead of
+        // one evaluation AND one store per emitter. Exact: `base*scale` is how the
+        // emitter's own Spectrum computes itself (ScaledSpectrum, spectrum.h).
         const int nEm = (int)scene.emitters.size();
-        std::vector<double> spdBuf((size_t)nEm * (size_t)(useHero ? C : 1));
+        const bool haveBases = ((int)scene.spdBaseIdx.size() == nEm) &&
+                               ((int)scene.spdScale.size() == nEm) && !scene.spdBase.empty();
+        // Fallback for a scene whose bases were never built (finalizeEmitters not run):
+        // every emitter is its own base with scale 1, i.e. the pre-factorisation layout.
+        std::vector<int>    fbIdx;
+        std::vector<double> fbScale;
+        std::vector<double> fbGeom;
+        if (!haveBases) {
+            fbIdx.resize((size_t)nEm);
+            for (int e = 0; e < nEm; ++e) fbIdx[(size_t)e] = e;
+            fbScale.assign((size_t)nEm, 1.0);
+            fbGeom.resize((size_t)nEm);
+            for (int e = 0; e < nEm; ++e) fbGeom[(size_t)e] = scene.emitters[e].geomWeight();
+        }
+        const int     nBase    = haveBases ? (int)scene.spdBase.size() : nEm;
+        const int*    baseIdx  = haveBases ? scene.spdBaseIdx.data() : fbIdx.data();
+        const double* baseScl  = haveBases ? scene.spdScale.data()   : fbScale.data();
+        // Per-base geomWeight*scale sums (Scene::spdBaseGeom): lets the per-sample
+        // invPdfLambda = emitG / sum_e geomWeight_e*SPD_e(lambda) be evaluated over
+        // BASES instead of emitters, which is what removes the last O(N_lights) term
+        // from the backward CPU sample loop.
+        const double* baseGeom = haveBases ? scene.spdBaseGeom.data() : fbGeom.data();
+        std::vector<double> baseBuf((size_t)nBase * (size_t)(useHero ? C : 1));
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
@@ -2204,24 +2609,24 @@ struct BackwardRenderer {
                         double uLam = whitted ? whittedLambdaU(sIdx) : rng.uniform();
                         if (!hero::sampleBundle(scene.emitSampler, uLam, C,
                                                 lamA, pdfA)) continue;
-                        // Fill the per-sample SPD table, then derive invA from it by
-                        // replicating Scene::invPdfLambda on the cached values (same
-                        // emitter order, same zero guard — bit-identical). The NEE
-                        // connections down the path then reuse the table instead of
-                        // re-dispatching spdFn per emitter per bounce.
-                        for (int e = 0; e < nEm; ++e) {
-                            const Emitter& em = scene.emitters[e];
-                            for (int i = 0; i < C; ++i)
-                                spdBuf[(size_t)e * C + i] = em.spdFn(lamA[i]);
+                        // Fill the per-sample SPD table (one evaluation per DISTINCT
+                        // curve), then derive invA from it — Scene::invPdfLambda
+                        // regrouped over bases, same zero guard. The NEE connections
+                        // down the path then read the table through SpdCache::at()
+                        // instead of re-dispatching spdFn per emitter per bounce.
+                        for (int g = 0; g < nBase; ++g) {
+                            const Spectrum& bs = haveBases ? scene.spdBase[g]
+                                                           : scene.emitters[g].spdFn;
+                            for (int i = 0; i < C; ++i) baseBuf[(size_t)g * C + i] = bs(lamA[i]);
                         }
+                        SpdCache spdCache{lamA, baseBuf.data(), baseIdx, baseScl, C, 0};
                         for (int i = 0; i < C; ++i) {
                             if (i > 0 && pdfA[i] <= 0.0) { invA[i] = 0.0; continue; }
                             double g = 0.0;
-                            for (int e = 0; e < nEm; ++e)
-                                g += scene.emitters[e].geomWeight() * spdBuf[(size_t)e * C + i];
+                            for (int b = 0; b < nBase; ++b)
+                                g += baseGeom[(size_t)b] * baseBuf[(size_t)b * C + i];
                             invA[i] = (g > 0.0) ? scene.emitG / g : 0.0;
                         }
-                        SpdCache spdCache{lamA, spdBuf.data(), C};
                         double jx, jy;
                         if (whitted) whittedSample(sIdx, jx, jy);
                         else { jx = rng.uniform(); jy = rng.uniform(); }
@@ -2249,15 +2654,16 @@ struct BackwardRenderer {
                         : scene.emitSampler.sample(rng, pdf);
                     if (pdf <= 0) continue;
                     // Fill the per-sample SPD table (C=1) and derive invPdfLambda from
-                    // it, replicating Scene::invPdfLambda on the cached values (same
-                    // emitter order, same zero guard — bit-identical, = emitG/g(λ)).
-                    for (int e = 0; e < nEm; ++e)
-                        spdBuf[e] = scene.emitters[e].spdFn(lambda);
+                    // it — Scene::invPdfLambda regrouped over bases, same zero guard,
+                    // = emitG/g(λ).
+                    for (int g = 0; g < nBase; ++g)
+                        baseBuf[(size_t)g] = haveBases ? scene.spdBase[g](lambda)
+                                                       : scene.emitters[g].spdFn(lambda);
+                    SpdCache spdCache{&lambda, baseBuf.data(), baseIdx, baseScl, 1, 0};
                     double gSum = 0.0;
-                    for (int e = 0; e < nEm; ++e)
-                        gSum += scene.emitters[e].geomWeight() * spdBuf[e];
+                    for (int b = 0; b < nBase; ++b)
+                        gSum += baseGeom[(size_t)b] * baseBuf[(size_t)b];
                     double invPdfLambda = (gSum > 0.0) ? scene.emitG / gSum : 0.0;
-                    SpdCache spdCache{&lambda, spdBuf.data(), 1};
                     if (cam.hasLens()) {
                         // Physical multi-element lens: trace the camera ray from the
                         // film out through the real glass interfaces at this wavelength

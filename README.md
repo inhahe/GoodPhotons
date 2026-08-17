@@ -337,6 +337,7 @@ stays something you can actually read end to end.
 | Shading a strand as a fiber rather than a surface — R / TT / TRT, the scattering medulla, measured species | [Hair and fur fibers](REFERENCE.md#hair-and-fur-fibers-hair) |
 | Image textures, UV handling, and the math-driven procedural patterns | [Textures](REFERENCE.md#textures) · [Patterns](REFERENCE.md#procedural-patterns-math-driven-materials) |
 | Fog and volumes: homogeneous, bounded, heterogeneous density fields, OpenVDB / NanoVDB import | [Participating media](REFERENCE.md#participating-media--fog) |
+| Reusing computed indirect light across paths — the opt-in world-space radiance cache | [Radiance cache](REFERENCE.md#radiance-cache--radcache--mode-r-cpu) |
 | A tour of the scene language, and stereoscopic / animation workflows | [Scene language](REFERENCE.md#scene-language-ftsl) |
 | Every command-line flag | [Command-line reference](REFERENCE.md#command-line-reference) |
 | Output formats, `.ftbuf` checkpoints, resuming, tone mapping | [Output](REFERENCE.md#output) |

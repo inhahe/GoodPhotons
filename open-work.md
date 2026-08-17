@@ -5,10 +5,34 @@ long prose blocks whose opening paragraph reads like a plan but whose later
 `**STATUS (date) … DONE**` sub-paragraph says it landed. That makes "what's actually left?"
 expensive to answer.
 
-**This file is the actionable extract, as of 2026-08-08 (ftrace v0.159.0).** It carries only
+**This file is the actionable extract, as of 2026-08-15 (ftrace v0.186.0).** It carries only
 work that is genuinely undone *and* not explicitly ruled out. `TODO.md` remains the
 authoritative design text — every item below names its section/item ID there, and the full
 rationale, prior art and scoping live in that entry, not here.
+
+> **Status, 2026-08-15: section 1 is empty — nothing is both unblocked and undone.**
+> The O (procedural noise), P2/P3 (fur), C (mesh/VDB), E, K, F and B batches have all
+> landed; §J3b's only remaining item is the one the user excluded. What is left is
+> section 2 (waiting on *you*, not on code) and the standing exclusions at the bottom.
+> The one piece of *new* work identified since is not a TODO.md item at all but a
+> `known-issues.md` entry: **many-lights importance sampling** (a light BVH / Conty–Kulla
+> tree, optionally ReSTIR DI on top), logged when mesh area lights shipped in v0.186.0.
+>
+> **Update 2026-08-16 (v0.187.0):** the emitter-level light tree has landed on both
+> devices (75.9 s → 2.7 s GPU / 524.7 s → 7.0 s CPU on the 256-light benchmark, unbiased).
+> What remains of that entry is the *mesh-triangle* level, using the tree for
+> forward/BDPT/VCM emitter selection, and ReSTIR DI — see section 1.
+>
+> **Update 2026-08-16 (v0.188.0):** forward mode `B`'s black-mirror gap is now partly
+> closed — flat mirror panels and mirror spheres image via analytic specular camera
+> connections. Mirrored *meshes*, mirror-in-mirror, the 64-plane cap and the finite-lens
+> modes `A`/`C` remain; they are the second entry in section 1.
+>
+> **Update 2026-08-16 (v0.190.0):** the world-space diffuse radiance cache (`-radcache`,
+> `src/radcache.h`) shipped for mode `R` on the CPU. It is opt-in and approximate — see the
+> first `known-issues.md` entry for the measured bias. What it leaves open is the third
+> entry in section 1: the GPU kernel and the scalar `radiance()` path have no cache, and a
+> `-radcache` run on the GPU is a silent no-op that should at minimum become an error.
 
 Keep the two in sync: when an item below lands, mark it DONE in **both** files (or delete it
 here and record the DONE in `TODO.md`). When a new open item appears in `TODO.md`, add it here.
@@ -19,6 +43,122 @@ without asking.
 ---
 
 ## 1. Unblocked — nothing external is stopping these
+
+### Many-lights importance sampling — a light BVH, then optionally ReSTIR DI  *(ftrace)*
+*Not a TODO.md item — logged in `known-issues.md` (first Open entry) when mesh area lights
+shipped in v0.186.0. The only genuinely open, unblocked engineering work as of 2026-08-15.*
+
+> **PARTLY DONE 2026-08-16 (v0.187.0): the emitter-level tree shipped, on both devices.**
+> `src/lighttree.h` + `src/lighttree_build.h` + `Scene::buildLightTree`, consumed by
+> `BackwardRenderer::pickEmitters` and `dPickEmitters`. The 256-panel benchmark below went
+> **75.9 s → 2.7 s** on the GPU and **524.7 s → 7.0 s** on the CPU (which needed a second
+> fix: the per-sample emitter-SPD table, now factored over distinct spectra — see the
+> `lighttree.h` module entry in `design.md`). Unbiased: `-no-lighttree` reproduces the old
+> binary bit-for-bit on a 10-scene corpus, and the deliberately hard 40 m-corridor case
+> lands within 0.07 % of its reference. Flags: `-no-lighttree` / `-lighttree` /
+> `-light-split` / `-light-samples`.
+>
+> **Still open, which is why this entry stays in section 1:** (a) forward/BDPT/VCM still
+> select an emitter from the power CDF (`selectEmitter`, `render_cuda.cu`) — the tree is
+> already built and uploaded, so this is a small change; (b) a **mesh** emitter's own
+> triangles are still sampled uniformly by area, which is the occlusion problem the
+> paragraph below measures, and is the phase the tree was designed to extend into (descend
+> from an emitter leaf into that emitter's triangle tree); (c) ReSTIR DI, unstarted.
+
+Emitter selection is a **power CDF** and, within an emitter, the draw is **uniform** (by area
+for `Mesh`, by surface for quad/cylinder). Neither consults the shading point, so any part of
+a light that is backfacing or shadowed still spends its share of the NEE budget and returns
+zero. Measured in a controlled A/B (`scraps/occl_one.ftsl` vs `scraps/occl_two.ftsl`): an
+emitter half of which is permanently occluded costs **1.31× the noise at equal spp**, and the
+factor grows with the number of independently-visible patches. A compact convex emitter is
+fine — a 2304-tri emissive sphere matches the analytic cone-sampled `light sphere` exactly —
+so this is specifically about occlusion and orientation diversity.
+
+**Bigger, and separately measured (2026-08-15):** the backward renderer does not *select* an
+emitter at all — `BackwardRenderer::neeLight` (`src/backward.h:709`) and its CUDA mirrors
+(`src/render_cuda.cu:7419/7466/7506`) **split over every emitter at every non-specular
+vertex**. Same room, same total 20 000 lm, mode R 256 spp 256² (`scraps/gen_manylights.py`):
+1 light 0.4 s, 16 lights 3.3 s, 64 lights 15.1 s, 256 lights **75.9 s** — all at an identical
+6.25 % noise. 190× the cost for the same image. That is the largest known avoidable cost in
+mode R, and the same light tree fixes it (select one importance-weighted emitter, or a few
+via adaptive splitting, instead of all N).
+
+Fix: a Conty–Kulla adaptive light tree (Arnold / Cycles / PBRT-v4) built to serve **both**
+levels — a tree over emitters whose mesh-emitter leaves descend into that emitter's own
+triangle tree — returning a selection pdf so `emitterGeom`'s `pdf_area` becomes
+`pdfSelect / triArea`. Self-contained: `samplePoint` + the pdf in `emitterGeom`/BDPT, not the
+transport; needs a device mirror. ReSTIR DI is the larger follow-on. See the known-issues
+entry for the full write-up and the measurement scenes.
+
+### Analytic specular camera connections — the rest of the mirrors  *(ftrace)*
+*Not a TODO.md item — the remainder of the `known-issues.md` entry opened when the flat-panel
+and mirror-sphere connectors shipped in v0.188.0.*
+
+> **PARTLY DONE 2026-08-16 (v0.188.0).** Forward mode `B` used to render **every** mirror pure
+> black: a specular vertex has a delta BSDF, so its pinhole connection pdf is zero and
+> `tracePhoton` skipped the camera connect. Two analytic connectors now construct that vertex
+> deterministically — `connectSpecularPlane` (exact eye-unfolding across a plane) and
+> `connectSpecularSphereMirror` (Alhazen scan + bisection, ray-differential geometry factor),
+> both with CUDA twins. Mirror-box agreement with the mode-`R` reference went 0.00028 → 1.0078
+> against a 1.0060 outside-box control, GPU matching CPU. See `design.md`, *Analytic specular
+> camera connections*.
+
+**Still open, in rough order of value:**
+* **Mirrored meshes.** `Scene::buildMirrorPlanes()` collects only *coplanar* world-space mirror
+  triangles, so a curved or faceted mirrored mesh — `gallery_rain`'s chrome ring is the
+  standing example — is not collected and still renders black. Wants either a per-triangle
+  connector or a curved-mesh Alhazen solve generalising the sphere's. Instanced / BLAS mirrors
+  are likewise skipped.
+* **Lift the 64-plane cap.** `kMaxMirrorPlanes = 64` exists because the per-photon-vertex loop
+  is O(#mirror surfaces) with no spatial index. The planes already carry AABBs; indexing them
+  removes both the cap and the linear scan.
+* **Mirror-in-mirror.** One specular vertex per connection today; a chain of two unfoldings
+  would cover the common hall-of-mirrors case.
+* **A `halfmirror`'s transmitted side.** Only the reflected leg is built, so whatever is
+  behind a beamsplitter stays black — measured at a 19 % deficit on
+  `scenes/_mirror_mats_fwd.ftsl` before that scene grew its black backing. The fix is the
+  mirror-image of the plane connector: unfold *through* the plane rather than across it.
+* **Modes `A`/`C`.** Pinhole-only — `lensMode`/`forwardCatch` return early, so the finite-lens
+  physical camera still shows black mirrors. Needs the connection integrated over the aperture
+  rather than through a point.
+
+### `-radcache` reaches only one code path — the GPU kernel and the scalar `radiance()` have no cache  *(ftrace)*
+*Not a TODO.md item — logged when the radiance cache shipped in v0.190.0. See the first
+`known-issues.md` entry for the measured accuracy picture and the reasons it is opt-in.*
+
+The world-space diffuse radiance cache (`src/radcache.h`) is read from exactly one place:
+`BackwardRenderer::radianceHeroLoop` in `src/backward.h`, on the CPU, in mode `R`. Everything
+else silently ignores `-radcache`. Two of those gaps are worth closing; the third is a
+statement to make, not code to write.
+
+* **The GPU backward kernel.** `bkRadianceHeroLoop` (`src/render_cuda.cu`, ~8637 / 8661 /
+  8822) is the device twin of the loop that reads the cache, and it has no read site. This is
+  why `-device cpu` is currently mandatory (a `-radcache` run on the GPU renders correctly and
+  reports nothing, which is the worst kind of no-op — it looks like it worked). The table
+  itself ports cleanly: it is a flat open-addressed array of POD cells with a 64-bit key, so
+  the natural shape is upload-after-update / read-only-during-chunk, with the update pass
+  staying on the host between chunks. What does *not* port trivially is reader verification —
+  `radBank->vals.push_back` is a per-thread `std::vector`, and the device needs either a
+  bump-allocated append buffer or an atomic-counter slab, drained back to the host each chunk.
+  **The silence is fixed (v0.190.1); the port is not.** `runRender` now prints
+  `[radcache] IGNORED: the GPU backward megakernel has no cache -- pass -device cpu` at the
+  point the device is resolved, alongside the existing `[medium]` warning. This mattered more
+  than it sounds: `-device auto` picks the GPU for mode `R` on any machine that has one, so
+  the natural spelling `ftrace scene -mode R -radcache` was doing *nothing at all* on the
+  development machine, correctly and without complaint. The warning is the feature's device
+  story until the kernel gains a read site.
+* **The scalar `radiance()` path** in `src/backward.h`. Taken whenever `heroC == 1`, and
+  whenever a path enters participating media, a GRIN medium, or the finite-lens camera. The
+  read placement is the same (after this vertex's NEE, before the continuation roulette) and
+  the partition argument is identical, so this is mostly a transcription — but the media case
+  needs thought: a cell records radiance leaving a *surface*, and a path that terminates into
+  it from inside a medium must still carry the medium's transmittance along the tail it did
+  not trace, which the cell does not know about. Simplest correct answer is to keep the cache
+  read disabled while `inMedium` and enable it only on the surface-to-surface segments.
+* **Modes other than `R`.** Forward `A`/`B`/`C`, BDPT, VCM and SPPM have no cache and are not
+  obviously improved by one (their vertices are light-side, so the "what lies beyond this
+  vertex" quantity a cell stores is the wrong quantity). No work planned; recorded so the
+  absence reads as a decision rather than an oversight.
 
 ### ~~K1 remainder — user-supplied named RGB→spectral mapping~~  **DONE 2026-07-28 (v0.90.0)**
 *TODO.md §K, item K1 — now closed.*
@@ -117,33 +257,34 @@ materials attached to geometry, and calls a dielectric dispersive only if its `i
 actually varies over 400–700 nm, so a constant-IOR dielectric doesn't nag. Print-only; the mode-W
 image is byte-identical to 0.137.0.
 
-### O — procedural-texture / noise roadmap  *(ftrace; added to TODO.md 2026-08-07)*
-*TODO.md §O (the "third bullet point" batch, user-greenlit 2026-08-07).*
+### ~~O — procedural-texture / noise roadmap~~  **DONE 2026-08-10 (O1–O8 complete)**
+*TODO.md §O (the "third bullet point" batch, user-greenlit 2026-08-07) — now closed.*
 
-- ~~**O2** vector-valued noise (`DNoise`/`DTurbulence`) for domain warping~~ **DONE 2026-08-08
-  (v0.158.0)** — `dnoisex/y/z`, `dturbx/y/z`, `-checkvnoise`, `scenes/pattern_warp.ftsl`.
-- ~~**O1** cellular / Worley / Voronoi noise~~ **DONE 2026-08-08 (v0.159.0)** — `worley` /
-  `worley2` / `worleyd` / `worleyid` with a runtime Euclid/Manhattan/Chebyshev metric operand,
-  exact adaptive ring search, `-checkworley`, `scenes/pattern_worley.ftsl`.
-- **O3** non-stationary randomness (mostly idiom + docs; needs curvature/cavity primitives)
-- **O4** anisotropic / flow-aligned noise (needs a per-hit tangent frame + flow-field binding)
-- **O5** blue noise / Gabor noise / sparse convolution
-- **O6** reaction–diffusion (a *bake* step feeding the existing `tex:` path)
-- **O7** by-example synthesis / histogram-preserving tiling (composes with `PatOp::Tex`)
-- **O8** band-limiting / antialiasing the noise under minification (the quality gate for O1–O7
-  at distance)
+- **O2** vector noise for domain warping — v0.158.0 (`dnoisex/y/z`, `dturbx/y/z`).
+- **O1** cellular / Worley / Voronoi — v0.159.0 (`worley`/`worley2`/`worleyd`/`worleyid`).
+- **O3** non-stationary randomness — 2026-08-10, all four sub-items.
+- **O4** anisotropic / flow-aligned noise — v0.165.0 (`gabor(...)`).
+- **O5** blue noise / sparse-convolution placement — v0.166.0.
+- **O6** reaction–diffusion — v0.167.0 (`texture "n" { reaction { … } }`).
+- **O7** by-example synthesis / stochastic tiling — v0.170.0 (Heitz–Neyret).
+- **O8** band-limiting / antialiasing — v0.168.0 (stage 1) + v0.169.0 (stage 2).
 
-### P2 / P3 — fur follow-ons  *(ftrace)*
+### ~~P2 / P3 — fur follow-ons~~  **DONE (P3 v0.174.0, P2 v0.178.0)**
 *TODO.md §P (P1 shipped v0.150.0: the native `curve` primitive; the `fur` groom generator
-shipped v0.152.0).*
+shipped v0.152.0) — now closed.*
 
-- **P2** sub-pixel variance + aggregate-BSDF LOD (fibers thinner than a pixel).
-- **P3** fiber BCSDF: Marschner R/TT/TRT baseline, medulla lobes (Yan 2015/2017) for animal
-  fur, dual scattering (Zinke 2008) for light coats.
+- **P3** fiber BCSDF — v0.174.0, all four stages: Marschner R/TT/TRT core (v0.171.0), scene +
+  renderer wiring (v0.172.0), Yan's double-cylinder medulla (v0.173.0), Zinke dual
+  scattering (v0.174.0).
+- **P2** sub-pixel variance + aggregate-BSDF LOD — v0.178.0: the fiber density/orientation
+  grid (v0.175.0) then the aggregate volumetric far tier, incl. `-fur-volume`.
 
-### J3b — loom N-D / generalized-grammar superset  *(loom)*
-*TODO.md §J3b — four generalizations; item 4 (N-D record input domain) is excluded (user,
-2026-07-25), the rest are open.*
+### ~~J3b — loom N-D / generalized-grammar superset~~  **effectively closed**
+*TODO.md §J3b.* Items 1 (arbitrary channel arity), 2 (generalized stop grammar / delimiter
+ladder) and 3 (uniform named-input binding, parts a–d) all shipped, in ftrace as well as
+loom (v0.86.0 / v0.87.0 / v0.57.0). The checkbox stays open only because of **item 4**
+(N-D record *input* domain), which the user put out of scope on 2026-07-25 — see the
+exclusions table. Nothing here is actionable without reversing that decision.
 
 ---
 

@@ -2210,7 +2210,32 @@ private:
     }
 
     // ---- spectrum evaluation ----
+    //
+    // Memo over the expression TEXT, wrapping each result in sharedSpectrum() (see
+    // spectrum.h). Within one scene load a word-form spectrum expression is a pure
+    // function of its text — every branch below resolves either a literal, a builtin
+    // table, a file, or a `spectrum:` block, none of which depend on where the
+    // expression appears — so returning the same object is not merely an optimisation
+    // of the parse: it is what gives the RENDERER the right to know that 256 lights
+    // saying `spd preset:bb4000` are one curve, and to evaluate Planck once per
+    // wavelength instead of 256 times per sample. Block-form values (`table { … }`)
+    // are not memoised: their identity is the block, not a string, and there is never
+    // an army of them.
+    std::unordered_map<std::string, Spectrum> spdMemo_;
+
     Spectrum evalSpectrum(const Value& v, int depth = 0) {
+        if (v.block || v.words.empty()) return evalSpectrumRaw(v, depth);
+        std::string key;
+        for (const auto& w : v.words) { key += w; key += '\x1f'; }
+        auto it = spdMemo_.find(key);
+        if (it != spdMemo_.end()) return it->second;
+        const bool hadErr = !err.empty();
+        Spectrum s = sharedSpectrum(evalSpectrumRaw(v, depth));
+        if (hadErr || err.empty()) spdMemo_.emplace(std::move(key), s);  // don't cache a failed parse
+        return s;
+    }
+
+    Spectrum evalSpectrumRaw(const Value& v, int depth = 0) {
         if (depth > 16) { fail("spectrum reference cycle"); return constantSpectrum(0); }
         // table { λ:v … } — an inline piecewise curve. An optional `interp=cubic`
         // (monotone PCHIP, no overshoot) / `interp=linear` (default) flag among the
@@ -5273,6 +5298,13 @@ private:
                         std::swap(tr.v1, tr.v2);
                         std::swap(tr.uv1, tr.uv2);
                         std::swap(tr.n1, tr.n2);
+                        // Supplied per-vertex SHADING normals followed the old winding, so
+                        // they have to be reversed too — finalize() only substitutes gn for
+                        // normals that are absent (zero-length), it never re-derives supplied
+                        // ones, and leaving them inward would fight the new geometric normal.
+                        tr.n0 = tr.n0 * -1.0;
+                        tr.n1 = tr.n1 * -1.0;
+                        tr.n2 = tr.n2 * -1.0;
                         tr.finalize();
                     }
                 }
@@ -5905,7 +5937,11 @@ private:
             k = (denom > 0.0) ? lumens / denom : 0.0;
         }
         L.scene.absolute = true;
-        return [spd, k](double w) { return spd(w) * k; };
+        // scaledSpectrum, not a fresh `[spd,k]` closure: the shared base survives the
+        // normalisation, so a hundred `lumens`-rated copies of one fixture stay provably
+        // one curve and the renderer evaluates it once per wavelength (spectrum.h).
+        // Same arithmetic — ScaledSpectrum::operator() IS spd(w)*k.
+        return scaledSpectrum(spd, k);
     }
 
     // Each `light` block registers one Emitter. Multiple light blocks accumulate;

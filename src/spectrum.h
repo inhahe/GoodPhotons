@@ -8,10 +8,67 @@
 #include <algorithm>
 #include <utility>
 #include <string>
+#include <memory>
 #include "color.h"
 #include "rng.h"
 
 using Spectrum = std::function<double(double)>; // lambda (nm) -> value
+
+// --- Shared-callable spectra (spectrum IDENTITY) ------------------------------
+// A Spectrum is a std::function, so two spectra built from the same source text are
+// two independent closures with no way to tell they compute the same curve. That
+// matters for performance, not aesthetics: the backward renderer refills a per-sample
+// table of SPD(lambda) for EVERY emitter, so a room lit by 256 panels that all say
+// `spd preset:bb4000` pays 256 Planck evaluations per wavelength per sample to obtain
+// 256 copies of one number. (Measured: at 256 lights that table, not the shadow rays,
+// is what is left of the many-lights cost on the CPU once the light BVH is in.)
+//
+// `sharedSpectrum` wraps a curve in a reference-counted forwarder, so every Spectrum
+// copied from one call shares one underlying callable and `spectrumIdentity` returns
+// the same non-null pointer for all of them. Equal identity is then a PROOF that two
+// spectra are the same function — not a heuristic like comparing sampled tables — and
+// the renderer may evaluate one and copy the result to the others bit-for-bit.
+// Identity is null for any spectrum not built this way, and null is never assumed
+// equal to anything, so the fallback is simply the old per-emitter evaluation.
+struct SharedSpectrum {
+    std::shared_ptr<const Spectrum> fn;
+    double operator()(double w) const { return (*fn)(w); }
+};
+inline Spectrum sharedSpectrum(Spectrum s) {
+    if (s.target<SharedSpectrum>()) return s;          // already shared: don't nest
+    return SharedSpectrum{std::make_shared<const Spectrum>(std::move(s))};
+}
+
+// A shared curve times a constant. This exists because the constant is exactly what
+// makes N otherwise-identical lights different: `lumens 78` normalises each emitter's
+// SPD by its own factor (ftsl absPower), so without this the 256 panels of one fixture
+// would be 256 unrelated closures again. Keeping the factor OUTSIDE the shared base
+// means the renderer can evaluate the base once and recover every emitter's value as
+// base*k — and because that is literally how operator() computes it, the recovered
+// value is bit-identical, not merely equal to rounding.
+struct ScaledSpectrum {
+    std::shared_ptr<const Spectrum> fn;
+    double k;
+    double operator()(double w) const { return (*fn)(w) * k; }
+};
+inline Spectrum scaledSpectrum(const Spectrum& base, double k) {
+    if (const SharedSpectrum* s = base.target<SharedSpectrum>()) return ScaledSpectrum{s->fn, k};
+    if (const ScaledSpectrum* s = base.target<ScaledSpectrum>())
+        // Do NOT fold k into s->k: (v*k0)*k and v*(k0*k) can differ in the last bit,
+        // and this must reproduce the composed curve exactly. Share the composite whole.
+        return ScaledSpectrum{std::make_shared<const Spectrum>(base), k};
+    return ScaledSpectrum{std::make_shared<const Spectrum>(base), k};
+}
+
+// Decompose `s` into a shared base curve and a constant factor such that
+// s(w) == (*base)(w) * factor holds BIT-FOR-BIT. Returns null for a spectrum that was
+// not built through sharedSpectrum/scaledSpectrum — the caller must then treat it as
+// its own unique curve, which is always safe (it just shares nothing).
+inline const Spectrum* spectrumBase(const Spectrum& s, double& factor) {
+    if (const ScaledSpectrum* t = s.target<ScaledSpectrum>()) { factor = t->k;  return t->fn.get(); }
+    if (const SharedSpectrum* t = s.target<SharedSpectrum>()) { factor = 1.0;   return t->fn.get(); }
+    factor = 1.0; return nullptr;
+}
 
 // --- Builtins ---------------------------------------------------------------
 inline Spectrum constantSpectrum(double v) { return [v](double) { return v; }; }

@@ -45,8 +45,10 @@ you want the live preview to actually be visible (the default — see below), la
 ## Running renders — launch with the live preview so the user can watch
 
 **The one rule that matters: whenever you render, put the live preview window up
-(`-window`) so the user can see it.** That's the whole point — the user wants to be
+(`-window-min`) so the user can see it.** That's the whole point — the user wants to be
 able to glance over and watch any image you generate converge, without having to ask.
+**Start it minimized** (`-window-min`), so it's there in the taskbar to be restored the
+moment they want it, without interrupting whatever they're doing to get there.
 
 What this rule is **NOT**: it is *not* a reason to avoid rendering, to hold back work,
 or to wait for the user. A preview window harmlessly sitting on the desktop (even
@@ -58,17 +60,26 @@ fine and encouraged — the live window doesn't block any of that. Don't invent
 It's also **not absolute**: if you have a genuine reason to skip the live preview for a
 particular render, that's fine — just prefer showing it by default.
 
-So: default to launching every render with the live visual display (`-window`), which
+So: default to launching every render with the live visual display (`-window-min`), which
 gives both you and the user a real, watchable view of the image converging and confirms
-the render will actually finish. On top of `-window`, add periodic crash-safe output so
+the render will actually finish. On top of that, add periodic crash-safe output so
 progress survives a crash. Concretely, when you start a render:
 
-- **ALWAYS pass `-window`.** This opens the real OS live-preview (Win32 GDI)
-  showing the actual tone-mapped image refreshed as it converges — the best way to
-  watch. It also auto-chunks a plain fixed-`-n` render so periodic writes/status
-  happen (see the gotcha below). This is mandatory on every render invocation.
-- **ALWAYS pass `-keepwindow` (instead of plain `-window`) so the window does NOT
-  auto-close when the render finishes.** By default ftrace tears the live window
+- **ALWAYS pass `-window-min`, never bare `-window`.** `-window-min` (alias
+  `-minimized`) implies `-window` — same real OS live-preview (Win32 GDI) showing the
+  actual tone-mapped image refreshed as it converges, same auto-chunking of a plain
+  fixed-`-n` render (see the gotcha below) — but it opens **minimized to the taskbar**
+  instead of on the desktop. The window is fully live and the user restores it from the
+  taskbar whenever they want to watch; it just never pops up over what they're doing or
+  steals keyboard focus. **This is the point: you often launch renders in batches while
+  the user is working, and a window seizing the foreground every time makes the machine
+  unusable.** So `-window-min` is mandatory on every render invocation, and plain
+  `-window` is for when the user has explicitly asked to see the window come up.
+  (Implementation: `SW_SHOWMINNOACTIVE` in `livewindow.cpp` — minimizes *without*
+  activating, so it never takes focus even for an instant.)
+- **ALWAYS pass `-keepwindow` as well, so the window does NOT auto-close when the
+  render finishes.** (`-window-min -keepwindow` together: opens minimized, stays put
+  when done.) By default ftrace tears the live window
   down at process exit, so a finished image only flashes on screen and vanishes —
   the user never gets to look at the result. `-keepwindow` (alias `-hold`, implies
   `-window`) keeps the final image up and blocks until the user closes the window

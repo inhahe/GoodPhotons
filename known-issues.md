@@ -5,6 +5,393 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-16, v0.190.0–0.190.3): `-radcache` is opt-in because it is *approximate*, and its residual error concentrates on caustics/specular — plus its limits
+
+`-radcache` (`src/radcache.h`, read site in `BackwardRenderer::radianceHeroLoop`,
+`src/backward.h`) is a world-space diffuse radiance cache for mode `R` on the CPU. It is
+**off by default and must stay that way** — it trades a bounded, measured bias for fewer
+rays. This entry records what that bias is, the places the feature simply isn't present,
+and one thing that *was* a real bug and is now fixed (item 3). The rest is not a bug in the
+sense of "the code is doing the wrong thing" — it is the shape of the approximation, written
+down so it isn't rediscovered as a surprise.
+
+**1. Residual error concentrates on caustics and specular transport.** Measured at 200²,
+1024 spp, mode `R`, `-device cpu`, against the same render with the cache off:
+
+| scene | validate | terminated | rays | vs OFF | energy bias | rel-RMS @8× | max \|rel\| |
+|---|---|---|---|---|---|---|---|
+| `scenes/cornell.ftsl` (dispersive SF10 sphere) | 0 (off) | 45.6 % | 130.9 M | −10.4 % | −1.04 % | 2.85 % | 22.5 % |
+| " | **0.05** (default) | 35.5 % | 135.0 M | −7.7 % | −0.27 % | 1.21 % | 7.4 % |
+| " | 0.15 | 32.1 % | 136.0 M | −7.0 % | −0.12 % | 1.14 % | 6.7 % |
+| `scenes/_cornell_diffuse.ftsl` (all diffuse) | 0 (off) | 87.7 % | 112.6 M | −13.7 % | +0.08 % | 0.99 % | 6.0 % |
+| " | **0.05** (default) | 76.6 % | 114.2 M | −12.5 % | −0.02 % | 0.65 % | 4.6 % |
+
+Cache-off baselines: 146,189,548 rays (glass) and 130,465,103 rays (diffuse). Every row is
+bit-reproducible as of v0.190.2 — see item 3.
+
+The all-diffuse control is essentially exact (−0.02 % energy, 0.65 % rel-RMS). The glass
+Cornell is not. `-radcache-audit` scores the *raw, uncorrected* table on both:
+
+| scene | reads scored | raw systematic error per read | audit SE |
+|---|---|---|---|
+| `scenes/cornell.ftsl` | 7.00 M | **−18.76 %** | ±0.31 % |
+| `scenes/_cornell_diffuse.ftsl` | 7.90 M | **+2.38 %** | ±0.07 % |
+
+Eight times the magnitude, and the opposite sign — the cell mean on the glass scene is
+genuinely, measurably darker than the tail it replaces, because a caustic's radiance varies
+enormously *within* one cell and across the 54 normal buckets, and cell averaging is a
+low-pass filter. Reader verification (`-radcache-validate`, default 0.05) is what pulls that
+back to −0.27 %: it corrects the cells it can pin down and retires the ones it can prove
+wrong but can't (19 corrected / 9 retired on that scene). **The residual 1.21 % rel-RMS and
+7.4 % worst pixel are still there**, and they sit on the caustic. Proper fixes, none done:
+a directional (SH / spherical-Gaussian) cell payload instead of a scalar mean per normal
+bucket; a caustic-aware refusal to cache cells whose sample variance stays high; or
+splitting cells adaptively on measured variance rather than on a fixed pixel footprint.
+
+**2. No benefit on scenes whose surface area dwarfs the table.** On `fur_creature` the cache
+fills 8.7 k cells and terminates **0.3 %** of vertices; at a fixed 128 spp the update pass
+costs 210 k rays out of 23.86 M (0.9 %) and equal-time is a wash. Fur/hair-class geometry
+presents so much distinct surface that no reader ever revisits a cell often enough to
+amortise filling it. `-radcache` is not a general speed switch and shouldn't be sold as one;
+it pays on architectural/interior scenes with large re-visited diffuse surfaces.
+
+**3. Determinism: FIXED within a frame (v0.190.2), still absent across frames.**
+
+*Fixed.* Cell contents depend on how many update samples a cell received, which depends on
+the chunk boundaries — and `cpuSppChunks` was choosing those **by wall clock**, retargeting
+each chunk toward ~0.4 s. Ordinarily that is invisible, because per-`(pixel, sample)` seeding
+makes the film independent of how the budget is split; the cache voids that invariant by
+advancing between chunks. Two identical invocations of the same binary on the same scene
+gave 40.1 % vs 41.4 % of consults terminated and images 0.45 % rel-RMS apart, while two runs
+with `FTRACE_CHUNK_SPP` pinned were bit-identical — which is what identified the cause. So
+`-device cpu is fully deterministic and is used for reference/validation baselines` was
+false whenever `-radcache` was on, i.e. exactly when someone would be diffing against a
+reference. `cpuSppChunks` now uses a schedule derived from `sppTarget` (1, 9, then an equal
+split into ~64 chunks) whenever `g_radCache` is set; repeat runs are now bit-identical, and
+renders without the flag keep the timed schedule and are unchanged.
+
+One caveat on the fixed half, **narrowed in v0.190.3**: the table now *is* part of the
+`.ftbuf` checkpoint (a sparse trailing section, `writeRadCacheSection` in `main.cpp`), so a
+`-resume`d render continues warm instead of cold — measured on `scenes/cornell.ftsl` at
+200², resuming +512 spp on top of 1024: 68.4 % of consults terminated and 65.9 M rays warm,
+against 24.9 % and 70.5 M from the same checkpoint with the section stripped. That also
+removes a correctness wart, since a cold resume silently blended unbiased (never-terminating)
+samples with biased ones in a ratio set by wherever the user happened to stop.
+
+It does **not** make a resumed render identical to the same budget rendered in one go, and
+cannot on its own: the chunk schedule restarts from `done = 0`, so the boundaries — and
+therefore the number of update passes and where they fall — still differ. Reproducibility
+still means "the same command run twice" (which *is* bit-exact, checkpoint section included),
+not "the same total spp however you got there".
+
+A second finding fell out of the same investigation, and it is a **performance trap** worth
+knowing: the chunk *count* is the number of update passes the table gets, and the cache is
+extremely sensitive to it — 65 chunks → 35.5 % terminated / 135.0 M rays; 16 chunks → 2.3 % /
+146.9 M; 5 chunks → 0 % / 146.8 M. The last two are **slower than not caching at all**, since
+the update pass is paid for and nothing is ever resolved. That is why the deterministic
+schedule targets a chunk count rather than a chunk size — a flat split, the obvious way to
+make it reproducible, is exactly the wrong shape.
+
+*Still open.* Different **frames** still get different cells: a flyby moves the camera, so a
+different set of cells is marked and resolved, and the residual error flickers between
+frames. This is the same objection `design.md`'s `backward.h` `-gi` note raises against
+irradiance caching generally, and `-radcache` does not escape it. Don't use it for
+`camera_curve` / `camera_path` sequences. Fixing this properly means a temporally-stable
+table (persist and re-use across frames, with cells aged rather than rebuilt) — the
+per-frame reproducibility above is a prerequisite for that, not a substitute.
+
+**4. Three code paths have no cache at all.** Since v0.190.1 `runRender` says so out loud —
+`[radcache] IGNORED: <reason>. The render is unaffected and correct; it is simply not using
+the cache.` — at the point the device is resolved. Before that it was a *silent* no-op, and
+on any machine with a GPU it was the **default** one, because `-device auto` picks the GPU
+for mode `R`: `ftrace scene -mode R -radcache` accepted the flag, rendered correctly, and
+used no cache, with a missing status line as the only evidence.
+- **the GPU backward kernel** (`bkRadianceHeroLoop`, `src/render_cuda.cu` ~8637/8661/8822) —
+  hence the `-device cpu` requirement. Porting it is logged in `open-work.md`.
+- **the scalar `radiance()` path** in `src/backward.h`, taken when `heroC == 1`, or when the
+  path enters participating media, GRIN, or the finite-lens camera. Only the hero-wavelength
+  loop reads the cache.
+- **modes other than `R`** (forward `A`/`B`/`C`, BDPT, VCM, SPPM).
+
+**Repro.** `tools/rcrun.sh` is the serial driver (200², 1024 spp, mode `R`, `-device cpu`,
+minimised live window, clean `ftrace -stop` release); `tools/pfmcmp.py` is the HDR compare
+that produces the last three columns. `scenes/_cornell_diffuse.ftsl` is the all-diffuse
+control — same box, the SF10 sphere swapped for a grey lambertian.
+```
+sh tools/rcrun.sh png/rc_off scenes/cornell.ftsl
+sh tools/rcrun.sh png/rc_on  scenes/cornell.ftsl -radcache
+sh tools/rcrun.sh png/rc_v0  scenes/cornell.ftsl -radcache -radcache-validate 0
+python tools/pfmcmp.py png/rc_off.pfm png/rc_on.pfm
+python tools/pfmcmp.py png/rc_off.pfm png/rc_v0.pfm
+
+# the raw, uncorrected per-read bias (audit never terminates and never feeds back):
+./ftrace.exe scenes/cornell.ftsl -device cpu -mode R -r 200 200 -spp 1024 \
+    -radcache -radcache-audit -window-min -keepwindow -o png/rc_audit.png
+```
+Compare `[raystats]`, not wall clock — three repeats of one *identical* cache-off render on
+this machine came back 18.5 s / 25.8 s / 27.2 s, a spread wider than the effect being
+measured. That variance is also what once made a nonexistent 15 % "regression" look real
+enough to write a fix for; see the `chunkTerm` comment in `src/radcache.h`.
+
+### PARTLY FIXED (2026-08-16, v0.188.0): forward mode `B` rendered every mirror pure BLACK — flat panels and mirror spheres now image; mesh mirrors, mirror-in-mirror and rough specular still don't
+
+**The gap.** A forward light tracer connects each photon vertex to the pinhole and splats.
+A specular vertex has a *delta* BSDF, so the pdf of the connection direction being exactly
+the mirror direction is zero, and `tracePhoton` (`src/render.h`) skipped the camera connect
+for every `isSpecularType()` material. Net effect: a mirror seen directly by the camera in
+mode `B` rendered **pure black**, while mode `R` drew it correctly. `scenes/gallery_rain.ftsl`'s
+header noticed the symptom ("in mode B every piece of glass and the chrome ring go black")
+without naming the cause.
+
+**What 0.188.0 fixes.** Two new analytic connectors that construct the specular vertex
+deterministically instead of hoping to sample it (see `design.md`, *Analytic specular camera
+connections*, for the derivation):
+
+| surface | CPU / GPU connector | reflection point | geometry factor |
+|---|---|---|---|
+| flat mirror panel | `connectSpecularPlane` / `dConnectSpecularPlane` | exact — unfold the eye across the plane, intersect | exact, `G = 1/D²` with `D = \|p − eye′\|` |
+| mirror sphere | `connectSpecularSphereMirror` / `dConnectSpecularSphereMirror` | Alhazen, scan + bisection (≤ 4 roots) | ray differentials, `G = eps²/\|dA×dB\|`, re-expressed as `D = 1/sqrt(G)` |
+
+Qualifying materials (`isPlanarMirrorMat` / `dIsPlanarMirrorMat`): `Mirror`, `HalfMirror`
+(its reflect *probability* is its specular reflectance in expectation), and `Glossy` **only**
+when perfectly smooth (`roughness <= 0` and neither a roughness texture nor pattern).
+All three are pinned by `scenes/_mirror_mats_fwd.ftsl` — three coplanar panels, one per
+material, each backed by a black absorber so the comparison is reflection-only. Measured
+B/R per panel: `mirror` 1.01097, `halfmirror` 1.01390, `glossy roughness 0` 1.01105, against
+a mirror-free wall control of 1.00504.
+
+**Validated** on two scenes written for it — `scenes/_mirror_fwd.ftsl` (flat panel) and
+`scenes/_mirror_sphere_fwd.ftsl` (mirror ball). Both put a closed room around the mirror and
+two sphere lights *outside* the camera frustum, so the emitters are visible only by
+reflection. Mode `B` is metered against a mode-`R` reference over the mirror's pixel box,
+with a mirror-free region of the same frame as the control (`scraps/cmp_pfm.py` on `-hdr`
+PFMs — B/R carry a systematic ~0.6–0.9 % offset everywhere, so the control is what says
+whether the *mirror* is right):
+
+| scene | build | **mirror box** (B/R) | mirror-free control |
+|---|---|---|---|
+| flat panel | pre-feature GPU | **0.00028** (black) | 1.00599 |
+| flat panel | 0.188.0 GPU | **1.00779** | 1.00597 |
+| flat panel | 0.188.0 CPU | **1.00790** | 1.00617 |
+| mirror ball | pre-feature GPU | **0.00000** (black) | 1.00893 |
+| mirror ball | 0.188.0 GPU | **1.00449** | 1.00941 |
+| mirror ball | 0.188.0 CPU | **1.00430** | 1.00856 |
+
+i.e. the mirror lands on the same ratio as the rest of the frame — well inside the B/R
+offset — where it used to be *identically zero*, and GPU matches CPU.
+
+Bit-identity of everything else was checked against a baseline binary built from the
+previous commit (`git worktree` at HEAD~): **13 mirror-free scenes, PNG-md5 identical on
+GPU and 12 on CPU**, including `cornell`/`absolute`, whose dielectric spheres run the
+neighbouring `connectSpecularSphere` loop the refactor re-nested.
+
+**Still black by design — the remaining open part of this issue:**
+* **Mesh mirrors that aren't flat world-space triangles.** `Scene::buildMirrorPlanes()`
+  groups *coplanar* mirror triangles by a quantised `(n, d)` key, so a curved or faceted
+  mirrored mesh (`gallery_rain`'s chrome ring, a mirrored torus) is not collected and stays
+  black. Proper fix: a per-triangle connector, or a curved-mesh Alhazen solve like the
+  sphere's. Instanced / BLAS mirrors are likewise not collected — the planes are gathered
+  from world-space geometry only.
+* **Only 64 mirror planes.** `Scene::kMaxMirrorPlanes = 64`; the largest-area planes win and
+  the rest render black. The per-photon-vertex loop is O(#mirror surfaces) with no spatial
+  index, which is what the cap is really protecting against. Proper fix: index the planes
+  (they are already AABB-tagged) instead of capping them.
+* **One specular vertex per connection.** A mirror seen *in* another mirror needs a chain of
+  two unfoldings and is not built; those pixels stay black.
+* **A `halfmirror`'s transmitted image.** The connector builds only the *reflected* leg, so
+  whatever is behind a beamsplitter is still seen through a delta transmission and stays
+  black. Measured on `scenes/_mirror_mats_fwd.ftsl` before its black backing was added: the
+  panel read **0.811** of the mode-`R` reference, the whole 19 % deficit being the
+  transmitted wall behind it. (With the backing in place — reflection only — the same panel
+  reads 1.014.) The fix is the mirror-image of the existing plane connector: unfold *through*
+  the plane instead of across it.
+* **Rough specular is not a delta**, so a rough `Glossy` mirror is excluded — it is not
+  actually broken (it has a finite pdf and connects normally), just not accelerated here.
+* **Pinhole only.** `lensMode` / `forwardCatch` return early, so modes `A` and `C` — the
+  finite-lens physical camera — get no analytic specular connection and still show black
+  mirrors. Extending it needs the connection integrated over the aperture, not a point.
+
+### FIXED-BY-GUARD (2026-08-16, v0.187.0): building with the VS 2026 BuildTools preview as nvcc's host compiler silently miscompiles the device code — every GPU render comes out BLACK, with no CUDA error
+
+Found while building a baseline binary in a `git worktree` for an A/B regression: the
+worktree's fresh `cmake -S . -B build_cuda2` (no `-G`) picked **Visual Studio 18 2026
+BuildTools / MSVC 14.51** instead of the VS 2022 / MSVC 14.44 the main build dir was
+configured with years-of-commits ago. The resulting `ftrace.exe` built and ran, reported
+a *successful* render, and produced a black image:
+
+```
+mode B: tracing 2000000 photons ... on GPU
+wrote png/c_base.png (256x256), auto-exposure=1
+[live] 0.5s, 2000000 / 2000000 photons, ~0.0% noise (done)
+[energy] absorbed=1.0000 sensor=0.0000 escaped=0.0000 residual=0.0000 (sum/emitted=1.000000)
+```
+
+Every photon is absorbed at its first interaction; nothing escapes, nothing reaches the
+sensor. The same binary on `-device cpu` is **correct** (absorbed=0.6701), so it is the
+device pass specifically.
+
+**Isolated, not guessed.** Rebuilding the *same commit* in the *same worktree* with
+`-G "Visual Studio 17 2022" -A x64`:
+
+| host compiler | CUDA arch | result |
+|---|---|---|
+| MSVC 14.51 (VS 2026 BuildTools) | 75 (CMake's fallback) | **black**, absorbed=1.0000 |
+| MSVC 14.44 (VS 2022) | 75 | correct, absorbed=0.6702 (slow: PTX JIT) |
+| MSVC 14.44 (VS 2022) | 89 (native) | correct, absorbed=0.6702, 4.2 s |
+
+So the device architecture is a red herring — it is the **host compiler**. nvcc 13.3
+accepts MSVC 14.51 with at most a warning, every kernel launches and runs, and
+`cudaGetLastError`/`cudaDeviceSynchronize` report success (`cudaCheckKernel` is already
+called on the forward launch, `src/render_cuda.cu:13339`, and never fires). There is
+therefore **no runtime signal to check** — the fix has to be at configure time.
+
+**Guarded, 2026-08-16:**
+- `build.bat` now pins `-G "Visual Studio 17 2022" -A x64` on first configure, falling
+  back to CMake's default generator only if VS 2022 is absent.
+- `CMakeLists.txt` emits a `message(WARNING ...)` when `MSVC_VERSION >= 1950` and CUDA is
+  enabled, naming the symptom.
+
+**Still open**, hence the entry: an existing `build_cuda2/` configured the bad way is
+NOT repaired by either guard (CMake never re-picks a generator for an existing cache) —
+delete the build dir to re-configure. And the underlying miscompilation is unfixed and
+unlocalised; if a future CUDA toolkit officially supports MSVC 14.5x, raise the warning
+threshold rather than assuming it went away. A cheap runtime net would be a GPU
+self-test at init (trace one known photon, compare against the CPU) — worth doing if
+this class of failure recurs.
+
+### OPEN (2026-08-15, v0.186.0): a mesh area light is sampled UNIFORMLY BY AREA, so every occluded or backfacing part of the emitter still costs samples
+
+`EmitterShape::Mesh` (added for mesh area lights, C5) picks a triangle from a
+cumulative-area CDF and then samples it barycentrically — `Emitter::samplePoint`
+(`src/scene.h`) and its device mirror `emitterSamplePoint` (`src/render_cuda.cu`,
+`shape == 5`). That is **correct but blind**: the draw ignores where the shading point
+is, so any triangle that is backfacing (`cosLight <= 0`, rejected in `emitterGeom`,
+`src/backward.h`) or shadowed from the receiver still consumes its share of the NEE
+budget and returns zero.
+
+**Measured, in a controlled A/B** (`scraps/occl_one.ftsl` vs `scraps/occl_two.ftsl`,
+mode R, 32 spp, GPU). Both scenes light the same box with the same visible 0.3 × 0.3 m
+ceiling panel at the same 1200 lm; `occl_two` merely gives the *same* mesh emitter a
+second identical panel sealed inside an opaque crate 2.5 m away (`lumens 2400` over
+twice the area leaves the visible panel at exactly 1200 lm). The sealed panel
+contributes nothing, and indeed the converged images agree — patch mean 19.334 vs
+19.263 (0.4 %). But the high-frequency noise in that patch rises **2.488 → 3.251, a
+1.31× penalty** for a 50 % waste, i.e. ~1.7× the samples for the same quality. Scale
+that to a room whose signage is one mesh of dozens of scattered patches and only a few
+are visible from any given point, and the factor grows with the number of patches.
+
+Where it does **not** hurt, also measured, so the entry isn't overstated: a compact
+convex emitter is fine. A 2304-triangle emissive sphere (`scraps/sph_mesh.ftsl`) is
+indistinguishable from the analytic cone-sampled `light sphere`
+(`scraps/sph_ref.ftsl`) in both brightness and noise — mode R 32 spp: image mean
+15.3586 vs 15.3514, patch noise 3.013 vs 3.030; mode B: absorbed 0.5562 vs 0.5567.
+Enlarging it to r = 0.4 m in a 1 m box (`scraps/big_*.ftsl`) still shows no penalty
+(3.809 vs 3.891). The cost is specifically **occlusion and orientation diversity**
+within one emitter, not triangle count and not curvature.
+
+*(An earlier revision of this entry blamed a torus that "stalls at ~50 % noise and never
+converges". That was misdiagnosed: `scenes/torus.obj` is inward-wound (signed volume
+−0.107), so one-sided emission radiated into its own hollow. Fixed in v0.186.0 by the
+loader's closed-shell auto-orientation; that scene now reaches 0.4 % noise in 45 s.)*
+
+This is the "room lit only by emissive signs" case, i.e. exactly the workload mesh area
+lights exist for, so the weakness is squarely on the feature's main path.
+
+**Proper fix — importance-sample the emit-triangles, not the area.** Two options, in
+increasing order of payoff and effort:
+
+1. **Light BVH / adaptive light tree** (Conty & Kulla, *Importance Sampling of Many
+   Lights with Adaptive Tree Splitting*; the approach in Arnold / Cycles / PBRT-v4).
+   Build a BVH over `Emitter::meshTris` at `addMeshLight` time, storing per-node flux,
+   bounding cone of normals, and bounds; at a shading point descend it choosing children
+   by an estimated contribution (solid angle × cos bound × flux / dist²). Returns the
+   chosen triangle **and** its selection pdf, so `emitterGeom`'s `pdf_area` becomes
+   `pdfSelect / triArea` instead of `1/area`. Self-contained: touches `samplePoint` +
+   the pdf in `emitterGeom`/BDPT, not the transport. Needs a device mirror of the tree.
+2. **ReSTIR DI** (spatiotemporal reservoir resampling) on top of that. Strictly larger
+   win for many-emitter scenes and it is what real-time engines use for this exact case
+   (Unreal's new `LumenRef` cinematic mode, 2026-08-15, is lit entirely by emissive
+   meshes and is almost certainly ReSTIR-family). Not a licensing concern — the
+   technique is published; UE's own source is EULA-restricted and must not be copied.
+
+**Workaround until then:** keep an emissive mesh spatially compact — one fixture per
+`mesh` block rather than every sign in the building in a single OBJ — so that mutual
+occlusion inside one emitter stays low. Splitting into several `mesh` blocks does not by
+itself fix the problem (emitter selection is power-weighted, and is equally blind to the
+shading point), but it does stop one draw from having to choose among patches in
+different rooms.
+
+**Note the scope.** The underlying gap is that ftrace has **no many-lights importance
+sampling anywhere** — the forward/BDPT/VCM side selects an emitter from a power CDF
+(`selectEmitter`, `src/render_cuda.cu:4911`) and within an emitter the draw is uniform.
+Mesh lights merely make it easy to author the pathological case. Fix (1) should
+therefore be built to serve *both* levels: a tree over emitters whose mesh-emitter leaves
+descend into that emitter's own triangle tree.
+
+**The backward renderer is worse than "blind" — it does not select an emitter at all, it
+SPLITS over every one of them.** `BackwardRenderer::neeLight` (`src/backward.h:709-752`,
+device mirrors at `src/render_cuda.cu:7419/7466/7506`) runs `for (e = 0; e < nEm; ++e)`
+and casts a shadow ray to **every** emitter at **every** non-specular vertex. That is an
+unbiased splitting estimator, but its cost is O(N_lights) per bounce with no
+corresponding gain once the lights are redundant.
+
+Measured (`scraps/gen_manylights.py` → `scraps/ml{001,004,016,064,256}.ftsl`: the same
+4 × 2 × 4 m white room, the same **total** 20 000 lm, split across N ceiling panels;
+mode R, 256 spp, 256², RTX 4090):
+
+| N lights | time | reported noise | image mean |
+|---:|---:|---:|---:|
+| 1 | 0.4 s | 6.25 % | 38.7 |
+| 4 | 0.7 s | 6.25 % | 40.6 |
+| 16 | 3.3 s | 6.25 % | 39.6 |
+| 64 | 15.1 s | 6.25 % | 39.4 |
+| 256 | 75.9 s | 6.25 % | 37.7 |
+
+Linear in N, **190× the time for the same image at the same noise**. This is the single
+largest known avoidable cost in mode R and it is what a light tree actually buys: switch
+`neeLight` from splitting-over-all to selecting one (or a few, via adaptive tree
+splitting) importance-weighted emitters, cost O(log N). The `selectEmitter` power-CDF
+binary search already in the CUDA scene is the hook the tree should replace, and the
+backward NEE should start using it.
+
+**DONE (2026-08-16, v0.187.0) for the emitter level — the Conty–Kulla light BVH is in,
+on both devices.** `src/lighttree.h` (traversal, shared verbatim by the CPU and the
+`.cu`) + `src/lighttree_build.h` (build) + `Scene::buildLightTree`;
+`BackwardRenderer::pickEmitters` (`src/backward.h`) and `dPickEmitters`
+(`src/render_cuda.cu`) replace the `for (e = 0; e < nEm; ++e)` loop bound with a set of
+(emitter, 1/pdf) draws, so `sum_e w_e` becomes `sum_selected w_e / p(e)` — same
+expectation, bounded cost. Flags: `-no-lighttree`, `-light-split <v>`,
+`-light-samples <n>`. Same benchmark, same 256 spp, same 6.25 % noise:
+
+| N lights | before | after | image mean before/after |
+|---:|---:|---:|---:|
+| 1 | 0.4 s | 0.4 s | — (no tree is built for one light) |
+| 4 | 0.7 s | 0.5 s | |
+| 16 | 3.3 s | 1.0 s | |
+| 64 | 15.1 s | 1.8 s | |
+| 256 | **75.9 s** | **2.7 s** | 37.745 / 37.749 (ratio 1.00012) |
+
+The 190× blow-up is now 6.75×. Unbiasedness was checked where a biased tree would
+show, not just where it is easy: a 40 m corridor with 256 panels spanning orders of
+magnitude of per-light importance (`scraps/gen_corridor.py`) renders 6.1 s → 0.6 s with
+means within 0.07 % of the no-tree reference. Variance is unchanged (16 spp vs a
+4096-spp reference: RMSE 6.616 no-tree, 6.665 with the default 8 samples).
+
+**The CPU had a second, non-obvious O(N) term** that only became visible once the shadow
+rays were gone: the per-sample emitter-SPD table, which evaluated every emitter's
+spectrum at every sampled wavelength (1024 Planck evaluations per sample at N=256, C=4)
+and then summed over emitters again to derive `invPdfLambda`. Fixed by factoring every
+emitter SPD as `base_g(lambda) * scale_e` (`SharedSpectrum`/`ScaledSpectrum` in
+`src/spectrum.h`, memoised in the FTSL loader, collected by `Scene::buildSpdBases`) so
+the table is over DISTINCT curves, and by folding `sum_e geomWeight_e*SPD_e` into
+`sum_g spdBase[g] * spdBaseGeom[g]`. CPU ml256 at 64 spp: **524.7 s → 7.0 s (75×)**,
+against 2.6 s for the same room with one light. Exactness: `-no-lighttree` on the new
+build reproduces the old binary **bit-for-bit** on a 10-scene corpus (both devices).
+
+Still open at this level: the forward/BDPT/VCM `selectEmitter` power CDF does not yet
+use the tree, and a mesh emitter's own triangles are still sampled by area (the top of
+this entry).
+
 ### FIXED (2026-08-12, v0.183.2): `-prebake` announced a too-small cap only after hitting it, so playback fell off a cliff mid-loop with no warning
 
 *(NOT the "viewer died silently" report briefly logged here — that was the user closing the
@@ -7824,7 +8211,7 @@ follow-up, not a bug:
   dielectric. Proper fix: read `extensions.KHR_materials_transmission`/`_ior` → map to
   `MatType::Dielectric` with the given ior; other extensions as feasible.
 - **No `emissiveFactor` import.** Emissive glTF materials load unlit. The underlying
-  mechanism now exists — mesh-emitter area lights shipped in 0.41.0 (C5): an FTSL `emit`
+  mechanism now exists — mesh-emitter area lights shipped in 0.186.0 (C5): an FTSL `emit`
   material bound to a `mesh` registers an `EmitterShape::Mesh` sampled light. What's
   missing is wiring glTF's `emissiveFactor`/`KHR_materials_emissive_strength` into that
   path (set `Material::emit` from the factor and call `Scene::addMeshLight` for the
@@ -9797,7 +10184,7 @@ estimator, so it would return exactly the noise mode W exists to remove.
     ftrace's loader is OBJ-only (convert first); mesh `to_world` with
     rotation/shear only partly expressible (translate+scale + euler). (Mesh
     area-emitters *do* now have an FTSL equivalent — a `mesh` bound to an `emit`
-    material, since 0.41.0 — so the exporter could emit that instead of dropping the
+    material, since 0.186.0 — so the exporter could emit that instead of dropping the
     emission; not yet wired up.)
   - **Possible follow-ups:** map `.ply` via an auto OBJ conversion; emissive-mesh
     support (needs an emissive-triangle light primitive in the core); rough
@@ -10548,6 +10935,11 @@ Measured (v0.130.0, `-mode B -time 150` vs the 1180-spp mode-D still): the frame
 the chrome ring rendering solid black and heavy photon noise everywhere else. The scene header
 calls this "a real downgrade... in mode B every piece of glass and the chrome ring go black",
 which is true as far as it goes but understates how far from usable the result now is.
+
+*(Partly overtaken by 0.188.0's analytic specular connections — see the entry at the top of
+this file. The chrome ring is a mirrored **mesh**, not a flat panel or a sphere, so it is
+still not collected and still renders black. The two compounding causes below are unaffected
+and remain the substance of this issue.)*
 
 Two compounding causes, both created by removing the room:
 * **57% of every photon escapes to infinity** (`escaped=0.5662`) instead of bouncing off a wall

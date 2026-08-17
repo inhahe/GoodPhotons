@@ -85,6 +85,8 @@
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
 #include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
+#include "lighttree.h"    // Conty-Kulla light BVH: the SAME traversal the CPU runs, not a copy
+                          // (the header is dependency-free and __host__ __device__ for this)
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
 // every kernel launch/sync return code MUST be checked: under GPU contention (a second
@@ -507,6 +509,18 @@ struct DSphere { DVec3 c; double r; int matId; };
 struct DCurveSeg { DVec3 p0, p1; Real r0, r1; int matId; float u0, u1; };
 struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 
+// One flat mirror SURFACE (device twin of Scene::MirrorPlane), i.e. the set of coplanar
+// mirror-material triangles sharing a plane, collapsed to that plane plus the AABB of its
+// members. The forward camera connection reflects a photon vertex in this plane
+// analytically, so the geometry is solved in DOUBLE (like every other specular connector
+// here) regardless of the render Real — hence plain doubles rather than DVec3.
+struct DMirrorPlane {
+    double nx, ny, nz;      // unit plane normal (canonically oriented)
+    double d;               // plane equation: dot(n, x) == d
+    double lox, loy, loz;   // AABB of the member faces — a cheap reject before the
+    double hix, hiy, hiz;   // closestHit that confirms the mirror really is there
+};
+
 // Two-level BVH for instancing (device twin of scene.h Blas / MeshInstance). A DBlas
 // is a shared mesh asset held ONCE in local (authored) space as a slice of the flat
 // per-BLAS pools (blasNodes/blasTris/blasPrim); a DInstance places it into the world
@@ -920,6 +934,12 @@ struct DEmissiveVolume {
 struct DScene {
     const DTri*      tris;  int nTris;
     const DSphere*   sph;   int nSph;
+    // Flat mirror surfaces (Scene::mirrorPlanes, uploaded verbatim): one entry per
+    // coplanar group of mirror-material triangles, capped at Scene::kMaxMirrorPlanes.
+    // Read ONLY by the forward specular camera connection (dConnectSpecularPlane), which
+    // is what stops mode B rendering every mirror black. Null/0 in a mirror-free scene,
+    // so such scenes pay one integer compare per connected photon vertex.
+    const DMirrorPlane* mirrorPlanes; int nMirrorPlanes;
     const DMaterial* mats;
     const DNode*     nodes; const int* primIdx; int nNodes;
     // Implicit surfaces (isosurface/CSG/metaballs). BVH prims with index
@@ -968,6 +988,18 @@ struct DScene {
     const DEmitter*  emitters; int nEmitters;
     const double*    emitCdf;       // size nEmitters, cumulative power, normalised
     double           totalPower;
+    // Conty-Kulla light BVH over the emitters (lighttree.h), uploaded VERBATIM from
+    // Scene::lightTree — LightTreeNode is POD holding only doubles and child INDICES, and
+    // `dems` is built 1:1 with scene.emitters, so a leaf's `emitter` field indexes this
+    // DEmitter array directly with no remap. lightTreeRoot < 0 => no tree (fewer than two
+    // tree-eligible emitters, or the host build declined), and the device then falls back
+    // to the exact all-emitters loop. `lightTreeAlways` lists emitters with no usable
+    // spatial bound (distant suns) that are connected unconditionally.
+    const LightTreeNode* lightTree; int lightTreeRoot;
+    const int*       lightTreeAlways; int nLightTreeAlways;
+    int              bkLightTree;    // 0 = -no-lighttree: exact all-emitters splitting
+    double           bkLightSplit;   // -light-split
+    int              bkLightSamples; // -light-samples
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
     const DTexture*  textures; int nTex;   // reflectance textures (mat.reflectTex)
     // N-D data tables (§grids), reached from a pattern as `grid:<name>(c0, …)` (regular
@@ -4489,6 +4521,20 @@ struct DSpecVtx {
         double cosSurf = d3dot(np, wP);
         return cosSurf <= 0.0 ? -1.0 : (weight / DPI) * cosSurf;
     }
+    // The WAVELENGTH-INDEPENDENT half of term(): everything but `weight` (the per-λ
+    // albedo). The mirror connectors solve ONE shared geometry for a whole hero bundle —
+    // a flat/metallic reflection does not disperse — so they evaluate this once and
+    // multiply by each λ's weight. term() keeps its own arithmetic rather than being
+    // expressed through this, so the dielectric-sphere path's float ordering (and
+    // therefore its images) stay bit-identical to before this existed. Device twin of
+    // Renderer::SpecVtx::shape. (A volume vertex only ever reaches the mirrors through
+    // the scalar wrapper, where vt.lambda IS the single live λ, so a rainbow medium's
+    // λ-dependent phase is still evaluated at the right wavelength.)
+    __device__ double shape(const D3& wP) const {
+        if (volume) return (double)dMedPhase(*med, (Real)d3dot(wIn, wP), lambda);
+        double cosSurf = d3dot(np, wP);
+        return cosSurf <= 0.0 ? -1.0 : cosSurf / DPI;
+    }
 };
 
 struct DSphereRefr { D3 P1, P2, exitDir; double Tf, innerLen; };
@@ -4851,23 +4897,319 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
     }
 }
 
-// Splat vertex p to every camera through every smooth dielectric sphere (the
-// refracted image of p). Device twin of Renderer::camSpecularSplatAllVtx. Mode B only.
+// ================== analytic specular connection by REFLECTION ==================
+// Device twin of the mirror connectors in render.h (see the long rationale there).
+// A photon vertex that can only reach the pinhole by bouncing off a PERFECT MIRROR has
+// no connection under the plain estimator — a delta reflection has ~zero pdf toward a
+// point — so mode B used to draw every mirror surface pure BLACK while mode R drew it
+// correctly. The fix is to solve the reflection analytically instead of sampling it:
+//
+//   PLANE: unfold. Mirror the eye across the plane (eye' = eye - 2*(dot(n,eye)-d)*n) and
+//   the bent chain p -> R -> eye becomes the straight segment p -> eye'. The reflection
+//   point R is where that segment crosses the plane (no root solve), and the specular
+//   Jacobian is exactly G = 1/D^2 with D = |p - eye'| — connect()'s own inverse-square
+//   law measured along the folded-out path.
+//
+//   SPHERE: no closed form, so it reuses the glass-sphere machinery — a 1-D root scan in
+//   plane(eye, p, centre) and a ray-differential Jacobian, with ONE reflection in place
+//   of the two refractions.
+//
+// Same limits as the host: one specular vertex per connection, pinhole only, and flat
+// mirrors must be authored as world triangles (see Scene::buildMirrorPlanes).
+
+// Defined further down (it needs the pattern/record evaluators); declared here so the
+// mirror connectors can read a textured/driven mirror's reflectance at the exact hit.
+__device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda);
+
+// Materials whose reflection is a perfect delta the connection can solve for. Device twin
+// of isPlanarMirrorMat (scene.h): halfmirror's reflect slot IS its specular reflectance in
+// expectation, and glossy degenerates to a mirror only when nothing can roughen it.
+__device__ static inline bool dIsPlanarMirrorMat(const DMaterial& m) {
+    if (m.type == D_MIRROR || m.type == D_HALFMIRROR) return true;
+    return m.type == D_GLOSSY && m.roughness <= 0.0 &&
+           m.roughnessTex < 0 && m.roughnessPat < 0;
+}
+
+// Reflect a ray off sphere S at its first intersection ahead of `o`. Works from either
+// side (a convex mirror ball seen from outside, a mirrored room seen from within), since
+// the reflecting normal is taken against the ray. Twin of Renderer::reflectOffSphere.
+struct DSphereRefl { D3 P1, exitDir; };
+__device__ static bool dReflectOffSphere(const D3& o, const D3& d, const DSphere& S,
+                                         DSphereRefl& out) {
+    D3 O(S.c); double r = S.r;
+    D3 oc = o - O;
+    double b = d3dot(oc, d), c = d3dot(oc, oc) - r * r;
+    double disc = b * b - c;
+    if (disc <= 0.0) return false;
+    double sq = sqrt(disc);
+    double t = -b - sq;                              // near root (exterior origin)
+    if (t < 1e-7) t = -b + sq;                       // interior origin: the far one
+    if (t < 1e-7) return false;
+    D3 P1 = o + d * t;
+    D3 N = (P1 - O) * (1.0 / r);                     // outward normal
+    double cn = d3dot(d, N);
+    if (fabs(cn) <= 1e-6) return false;              // grazing: reflection is degenerate
+    out.P1 = P1;
+    out.exitDir = d3norm(d - N * (2.0 * cn));        // reflect(d, N); sign of N is moot
+    return true;
+}
+
+// Is the surface the eye actually sees along the connection's eye-side leg the mirror we
+// solved the geometry for? One traversal settles BOTH questions the connection needs —
+// "is there really mirror material at that spot" (containment inside the authored panel,
+// which the plane itself does not know) and "is the leg from the eye clear" — and hands
+// back the DHit, so the reflectance is read at the exact texel/pattern value there.
+// Twin of Renderer::mirrorSeenAt.
+__device__ static bool dMirrorSeenAt(const DScene& sc, const D3& eye, const D3& wE,
+                                     double dE, DHit& hm) {
+    hm = closestHit(sc, eye.toR(), wE.toR());
+    if (!hm.valid) return false;
+    if (fabs((double)hm.t - dE) > 1e-4 * (1.0 + dE)) return false;   // something in front
+    return dIsPlanarMirrorMat(sc.mats[hm.matId]);
+}
+
+// Splat the `nUp` live wavelengths of a photon vertex through one connection whose
+// geometry is already solved: the light leaves p toward wP over dP to the mirror point R,
+// the mirror hands it to the eye over dE, and the whole unfolded path is D long. Shared by
+// the planar and spherical mirror connectors — below this point the only λ-dependence is
+// the mirror's own reflectance and the fog. Twin of Renderer::splatMirrorLegs.
+__device__ static void dSplatMirrorLegs(const DScene& sc, const DCamera& cam, double* film,
+        double* hits, const DMaterial& mm, const DHit& hm, int px, int py, double omega,
+        const D3& p, const D3& wP, double dP, const D3& R, const D3& wRE, double dE,
+        double D, double shape, const Real* lam, const Real* beta, const Real* w,
+        int nUp, DRng& rng) {
+    const double invD2Omega = 1.0 / (D * D * omega);
+    const DVec3 wPR = wP.toR(), wRER = wRE.toR();
+    const DVec3 pR = p.toR(), RR = R.toR();
+    for (int i = 0; i < nUp; ++i) {
+        double refl = clamp01((double)dReflectSlot(sc, mm, hm, lam[i]));
+        double contrib = (double)beta[i] * ((double)w[i] * shape) * refl * invD2Omega;
+        if (contrib <= 0.0) continue;
+        if (sc.mediaN > 0) {
+            contrib *= (double)dMediaTransmittance(sc, pR, wPR,  (Real)dP, lam[i], rng);
+            contrib *= (double)dMediaTransmittance(sc, RR, wRER, (Real)dE, lam[i], rng);
+        }
+        filmAdd(film, hits, cam.resX, px, py, lam[i], (Real)contrib);
+    }
+}
+
+// Connect vertex p to the pinhole `cam` by reflection in one PLANAR mirror.
+// Twin of Renderer::connectSpecularPlane.
+__device__ static void dConnectSpecularPlane(const DScene& sc, const DCamera& cam,
+        double* film, double* hits, const DMirrorPlane& mp, const D3& p, const DSpecVtx& vt,
+        const Real* lam, const Real* beta, const Real* w, int nUp, DRng& rng) {
+    const D3 eye(cam.eye);
+    const D3 mn(mp.nx, mp.ny, mp.nz);
+    const double se = d3dot(mn, eye) - mp.d;
+    const double sp = d3dot(mn, p)   - mp.d;
+    // A mirror reflects whichever face you look at, but the eye and the vertex must be on
+    // the SAME face — otherwise the "reflection" is through the mirror's back.
+    if (!(se * sp > 0.0)) return;
+    const D3 eyeM = eye - mn * (2.0 * se);            // the eye's mirror image
+    D3 wP = eyeM - p;
+    const double D = d3len(wP);                       // unfolded path length
+    if (D < 1e-9) return;
+    wP = wP * (1.0 / D);
+    const double shape = vt.shape(wP);
+    if (shape < 0.0) return;                          // camera side behind the surface
+    const double denom = d3dot(mn, wP);
+    if (fabs(denom) < 1e-12) return;
+    const double dP = (mp.d - d3dot(mn, p)) / denom;  // p + wP*dP lands on the plane
+    if (dP <= 1e-7 || dP >= D - 1e-7) return;
+    const D3 R = p + wP * dP;
+    // Cheap extent reject before paying for the traversal that confirms the mirror.
+    if (R.x < mp.lox || R.x > mp.hix || R.y < mp.loy || R.y > mp.hiy ||
+        R.z < mp.loz || R.z > mp.hiz) return;
+
+    int px, py; Real cosCam, dist2e;
+    if (!cam.project(R.toR(), px, py, cosCam, dist2e)) return;
+    const double omega = cam.pixelSolidAngle(cosCam);
+    if (omega <= 0.0) return;
+
+    const double dE = D - dP;                         // |R - eye| (R lies on the plane)
+    const D3 wRE = (eye - R) * (1.0 / dE);            // mirror -> eye
+    DHit hm;
+    if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) return;
+    // Light-side leg, stopping just short of the mirror's own surface.
+    if (occluded(sc, (p + wP * 1e-6).toR(), wP.toR(), connMaxT(dP))) return;
+
+    dSplatMirrorLegs(sc, cam, film, hits, sc.mats[hm.matId], hm, px, py, omega,
+                     p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng);
+}
+
+// Connect vertex p to the pinhole `cam` by reflection in one SPHERICAL mirror. Same 1-D
+// root solve + ray-differential Jacobian as the glass sphere, with a single reflection in
+// place of the two refractions. Twin of Renderer::connectSpecularSphereMirror.
+__device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCamera& cam,
+        double* film, double* hits, const DSphere& S, const D3& p, const DSpecVtx& vt,
+        const Real* lam, const Real* beta, const Real* w, int nUp, DRng& rng) {
+    const D3 O(S.c); const double r = S.r; const D3 eye(cam.eye);
+    const double dEyeO = d3len(eye - O);
+    const double dPO   = d3len(p - O);
+    if (fabs(dEyeO - r) < 1e-4 * r) return;           // eye ~on the surface: degenerate
+    const bool outside = dEyeO > r;
+    // The vertex has to be on the same side of the silvering as the eye, or there is no
+    // reflection joining them (a mirror is opaque).
+    if (outside ? (dPO <= r * 1.0001) : (dPO >= r * 0.9999)) return;
+
+    // Plane(eye, p, O) — the reflection path off a sphere is planar by symmetry.
+    D3 ex, ey;
+    if (dEyeO < 1e-9) { D3 tb; d3onb(d3norm(p - O), ex, tb); }
+    else              ex = (eye - O) * (1.0 / dEyeO);
+    const D3 ap = p - O;
+    const D3 perp = ap - ex * d3dot(ap, ex);
+    const double perpLen = d3len(perp);
+    if (perpLen < 1e-9) { D3 tb; d3onb(ex, ey, tb); }
+    else                ey = perp * (1.0 / perpLen);
+    const double ex_e = d3dot(eye - O, ex), ey_e = d3dot(eye - O, ey);
+    const double px2 = d3dot(ap, ex), py2 = d3dot(ap, ey);
+
+    // Signed perpendicular distance of p from the ray reflected at surface angle phi.
+    // Macro rather than a lambda for the same reason the refraction traces are: no
+    // std::function on device, and this must inline into the scan loop.
+    #define D_TRACE2D_MIRROR(C1, S1, MISS, VALID) do {                               \
+        VALID = false; MISS = 0.0;                                                   \
+        double c1 = (C1), s1 = (S1);                                                 \
+        double P1x = r * c1, P1y = r * s1;                                           \
+        double dinx = P1x - ex_e, diny = P1y - ey_e;                                 \
+        double dl = sqrt(dinx*dinx + diny*diny);                                     \
+        if (dl >= 1e-12) {                                                           \
+            dinx /= dl; diny /= dl;                                                  \
+            double cn = dinx*c1 + diny*s1;          /* dot(din, outward normal) */   \
+            /* Reachability: from OUTSIDE only the front face is hit first (cn<0);   \
+               from inside the ray always leaves through the far face (cn>0). */     \
+            if (fabs(cn) > 1e-6 && (outside == (cn < 0.0))) {                        \
+                double doutx = dinx - 2.0*cn*c1, douty = diny - 2.0*cn*s1;           \
+                double fw = (px2-P1x)*doutx + (py2-P1y)*douty;                       \
+                if (fw > 0.0) {                     /* p on the forward side */      \
+                    VALID = true;                                                    \
+                    MISS = doutx*(py2-P1y) - douty*(px2-P1x);                        \
+                }                                                                    \
+            }                                                                        \
+        }                                                                            \
+    } while (0)
+
+    // Scan the circle; bisect sign changes into chief reflection angles.
+    const int NS = SPH_SCAN_N; double roots[4]; int nroot = 0;
+    double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
+    for (int i = 0; i <= NS && nroot < 4; ++i) {
+        double phi = -DPI + (2.0 * DPI) * i / NS;
+        bool v; double mss; D_TRACE2D_MIRROR(g_sphScanC[i], g_sphScanS[i], mss, v);
+        if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
+            double a = prevPhi, b = phi, fa = prevMiss;
+            for (int k = 0; k < 40; ++k) {
+                double mid = 0.5 * (a + b); bool vm; double fm;
+                D_TRACE2D_MIRROR(cos(mid), sin(mid), fm, vm);
+                if (!vm) break;
+                if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
+            }
+            roots[nroot++] = 0.5 * (a + b);
+        }
+        prevMiss = mss; prevValid = v; prevPhi = phi;
+    }
+    #undef D_TRACE2D_MIRROR
+
+    for (int ri = 0; ri < nroot; ++ri) {
+        const double phi = roots[ri];
+        const D3 P1chief = O + ex * (r * cos(phi)) + ey * (r * sin(phi));
+        const D3 d0 = d3norm(P1chief - eye);
+        DSphereRefl ch;
+        if (!dReflectOffSphere(eye, d0, S, ch)) continue;
+
+        // Ray-differential geometry factor G = dOmega_eye / dA_perp at p.
+        D3 a1, a2; d3onb(d0, a1, a2);
+        const double eps = 2e-4;
+        DSphereRefl rA, rB;
+        if (!dReflectOffSphere(eye, d3norm(d0 + a1 * eps), S, rA)) continue;
+        if (!dReflectOffSphere(eye, d3norm(d0 + a2 * eps), S, rB)) continue;
+        D3 e1, e2; d3onb(ch.exitDir, e1, e2);
+        double ax, ay, bx, by;
+        {   double den = d3dot(rA.exitDir, ch.exitDir);
+            if (fabs(den) < 1e-9) den = (den < 0 ? -1e-9 : 1e-9);
+            double s = d3dot(p - rA.P1, ch.exitDir) / den;
+            D3 off = (rA.P1 + rA.exitDir * s) - p;
+            ax = d3dot(off, e1); ay = d3dot(off, e2); }
+        {   double den = d3dot(rB.exitDir, ch.exitDir);
+            if (fabs(den) < 1e-9) den = (den < 0 ? -1e-9 : 1e-9);
+            double s = d3dot(p - rB.P1, ch.exitDir) / den;
+            D3 off = (rB.P1 + rB.exitDir * s) - p;
+            bx = d3dot(off, e1); by = d3dot(off, e2); }
+        const double jac = fabs(ax * by - ay * bx);
+        if (jac < 1e-24) continue;                    // caustic singularity guard
+        // The same G the flat mirror gets in closed form as 1/D^2; expressed here as an
+        // equivalent unfolded distance so both connectors share one splat.
+        const double G = (eps * eps) / jac;
+        const double D = 1.0 / sqrt(G);
+
+        int px, py; Real cosCam, dist2e;
+        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) continue;
+        const double omega = cam.pixelSolidAngle(cosCam);
+        if (omega <= 0.0) continue;
+
+        D3 wP = ch.P1 - p; const double dP = d3len(wP);
+        if (dP < 1e-9) continue;
+        wP = wP * (1.0 / dP);
+        const double shape = vt.shape(wP);
+        if (shape < 0.0) continue;
+
+        D3 toEye = eye - ch.P1; const double dE = d3len(toEye);
+        if (dE < 1e-9) continue;
+        const D3 wRE = toEye * (1.0 / dE);
+        DHit hm;
+        if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) continue;
+        if (occluded(sc, (p + wP * 1e-6).toR(), wP.toR(), connMaxT(dP))) continue;
+
+        dSplatMirrorLegs(sc, cam, film, hits, sc.mats[hm.matId], hm, px, py, omega,
+                         p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, rng);
+    }
+}
+
+// Splat vertex p to every camera through every smooth dielectric sphere (the refracted
+// image of p) and off every perfect mirror (the reflected image of p). Device twin of
+// Renderer::camSpecularSplatAllVtxN. Mode B only; draws no aperture RNG.
+//
+// `w[i]` is the vertex's per-λ weight (Lambertian rho / single-scatter albedo); vt.weight
+// is ignored, and vt is copied per λ for the dielectric path. The loop nesting of the
+// dielectric-sphere connection (λ, then sphere, then camera) is the one the scalar and
+// hero wrappers used before this was factored, so its film accumulation order — and
+// therefore its images — are unchanged bit for bit.
+__device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& cs, int camMode,
+        const D3& pd, const DSpecVtx& vt, const Real* lam, const Real* beta, const Real* w,
+        int nUp, DRng& rng) {
+    if (camMode != CAM_B) return;
+    for (int i = 0; i < nUp; ++i) {
+        DSpecVtx vi = vt; vi.weight = (double)w[i]; vi.lambda = lam[i];
+        for (int si = 0; si < sc.nSph; ++si) {
+            const DSphere& S = sc.sph[si];
+            const DMaterial& gm = sc.mats[S.matId];
+            if (gm.type != D_DIELECTRIC) continue;
+            double ng = (double)specLookup(gm.ior, lam[i]);
+            for (int c = 0; c < cs.nCam; ++c)
+                dConnectSpecularSphere(sc, cs.cams[c], cs.films[c], cs.hits[c], S, gm, ng,
+                                       pd, vi, lam[i], (double)beta[i], rng);
+        }
+    }
+    // Mirrors. Achromatic geometry, so one solve serves the whole hero bundle.
+    for (int si = 0; si < sc.nSph; ++si) {
+        const DSphere& S = sc.sph[si];
+        if (!dIsPlanarMirrorMat(sc.mats[S.matId])) continue;
+        for (int c = 0; c < cs.nCam; ++c)
+            dConnectSpecularSphereMirror(sc, cs.cams[c], cs.films[c], cs.hits[c], S,
+                                         pd, vt, lam, beta, w, nUp, rng);
+    }
+    for (int mi = 0; mi < sc.nMirrorPlanes; ++mi)
+        for (int c = 0; c < cs.nCam; ++c)
+            dConnectSpecularPlane(sc, cs.cams[c], cs.films[c], cs.hits[c],
+                                  sc.mirrorPlanes[mi], pd, vt, lam, beta, w, nUp, rng);
+}
 __device__ static void camSpecularSplatAllVtx(const DScene& sc, const DCamSet& cs, int camMode,
                                               const D3& pd, const DSpecVtx& vt, Real lambda,
                                               Real beta, DRng& rng) {
-    if (camMode != CAM_B) return;
-    for (int si = 0; si < sc.nSph; ++si) {
-        const DSphere& S = sc.sph[si];
-        const DMaterial& gm = sc.mats[S.matId];
-        if (gm.type != D_DIELECTRIC) continue;
-        double ng = (double)specLookup(gm.ior, lambda);
-        for (int c = 0; c < cs.nCam; ++c)
-            dConnectSpecularSphere(sc, cs.cams[c], cs.films[c], cs.hits[c], S, gm, ng,
-                                   pd, vt, lambda, (double)beta, rng);
-    }
+    const Real w = (Real)vt.weight;
+    camSpecularSplatAllVtxN(sc, cs, camMode, pd, vt, &lambda, &beta, &w, 1, rng);
 }
-// Surface vertex: refract the Lambertian reflection of p through every glass sphere.
+// Surface vertex: refract the Lambertian reflection of p through every glass sphere, and
+// reflect it in every mirror.
 __device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, int camMode,
                                            const DVec3& p, const DVec3& n, Real lambda,
                                            Real beta, Real rho, DRng& rng) {
@@ -6204,15 +6546,18 @@ __device__ static void splatSurfaceAllHero(const DScene& sc, const DCamSet& cs, 
         else if (camMode == CAM_A) connectLensHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
     }
 }
-// Refract each live wavelength's Lambertian reflection through every glass sphere. Unlike
-// the achromatic camera connection this CANNOT share geometry: the sphere IOR is dispersive
-// (per-λ), so each wavelength traces its own refracted image — exactly what makes a glass-
-// sphere caustic chromatically dispersed. Draws no RNG (mode B only inside).
+// Refract each live wavelength's Lambertian reflection through every glass sphere, and
+// reflect the bundle in every mirror. The sphere REFRACTION cannot share geometry: the
+// glass IOR is dispersive (per-λ), so each wavelength traces its own refracted image —
+// exactly what makes a glass-sphere caustic chromatically dispersed. A MIRROR is
+// achromatic, so its geometry IS shared across the bundle and only the reflectance varies
+// per λ. Draws no RNG (mode B only inside).
 __device__ static void camSpecularSplatAllHero(const DScene& sc, const DCamSet& cs, int camMode,
         const DVec3& p, const DVec3& n, const Real* lam, const Real* beta, const Real* rho,
         int nUp, DRng& rng) {
-    for (int i = 0; i < nUp; ++i)
-        camSpecularSplatAll(sc, cs, camMode, p, n, lam[i], beta[i], rho[i], rng);
+    DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.weight = (double)rho[0]; vt.g = 0;
+    vt.med = nullptr; vt.lambda = lam[0];
+    camSpecularSplatAllVtxN(sc, cs, camMode, D3(p), vt, lam, beta, rho, nUp, rng);
 }
 
 // Emit one hero photon: fills ro/rd and the per-λ lam[]/beta[] bundle, sets secAlive, does
@@ -7402,6 +7747,56 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     return true;
 }
 
+// ---- many-lights selection on the device (device twin of BackwardRenderer::pickEmitters)
+//
+// Every NEE routine below used to loop `k = 0 .. nEmitters`, connecting a shadow ray to
+// every light at every non-specular vertex. Unbiased, but O(N) per bounce for nothing once
+// the lights are redundant — measured on THIS backend: same room, same total flux split
+// across N ceiling panels, mode R 256 spp 256^2, 1 light 0.4 s vs 256 lights 75.9 s at an
+// identical 6.25 % noise. The draw below replaces the loop bound: it returns the emitters
+// to connect to plus 1/p(e) for each, turning `sum_e w_e` into `sum_selected w_e / p(e)`.
+//
+// kDMaxLightPick is deliberately half the CPU's 32: the LtSample array and ltSample's
+// traversal stack are per-thread local-memory frames in a megakernel that is already
+// register-starved, so every slot is paid by every thread. 16 connections per vertex is
+// far past the point where more splitting improves the image.
+#define kDMaxLightPick 16
+
+struct DEmitterDraw {
+    int  n;             // number of connections to make
+    bool all;           // true: entries are emitters 0..n-1, each with weight 1 (the old loop)
+    LtSample s[kDMaxLightPick];
+    __device__ int emitter(int i) const { return all ? i : s[i].emitter; }
+    __device__ double weight(int i) const {
+        return all ? 1.0 : (s[i].pdf > 0.0 ? 1.0 / s[i].pdf : 0.0);
+    }
+};
+
+// `nrm` is the receiver normal, or null at a volume vertex (which has none to bound with).
+// Mode W keeps the exact path: its deterministic G x G lattice has no variance to trade.
+__device__ static void dPickEmitters(const DScene& sc, const DVec3& p, const DVec3* nrm,
+                                     DRng& rng, DEmitterDraw& d) {
+    d.n = 0; d.all = false;
+    if (!sc.bkLightTree || sc.bkWhitted || sc.lightTreeRoot < 0 || !sc.lightTree) {
+        d.all = true; d.n = sc.nEmitters; return;
+    }
+    for (int i = 0; i < sc.nLightTreeAlways && d.n < kDMaxLightPick; ++i) {
+        d.s[d.n].emitter = sc.lightTreeAlways[i];
+        d.s[d.n].pdf = 1.0;
+        ++d.n;
+    }
+    int budget = sc.bkLightSamples;
+    if (budget > kDMaxLightPick - d.n) budget = kDMaxLightPick - d.n;
+    if (budget > 0) {
+        const double pp[3] = {(double)p.x, (double)p.y, (double)p.z};
+        double nn[3] = {0.0, 0.0, 0.0};
+        if (nrm) { nn[0] = (double)nrm->x; nn[1] = (double)nrm->y; nn[2] = (double)nrm->z; }
+        d.n += ltSample<DRng, kDMaxLightPick + 2>(
+                   sc.lightTree, sc.lightTreeRoot, pp, nn, nrm != nullptr,
+                   sc.bkLightSplit, budget, d.s + d.n, rng);
+    }
+}
+
 // `giDepth` selects mode W's shadow-ray grid: 0 = a primary vertex (bkGrid), 1 = a gather
 // vertex (the coarser bkGiGrid — its soft-shadow detail is about to be averaged over giDirs
 // directions anyway, so paying bkGrid^2 there multiplies the gather's cost for no return).
@@ -7416,7 +7811,11 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
     Real f = rho / (Real)DPI;                         // Lambertian BRDF
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     const bool whitted = (sc.bkWhitted != 0);
-    for (int k = 0; k < sc.nEmitters; ++k) {
+    DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
+    for (int di = 0; di < draw.n; ++di) {
+        const int k = draw.emitter(di);
+        const double selW = draw.weight(di);            // 1/p(e); exactly 1 on the all path
+        if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnv)
         const bool uv = dEmitterNeedsUV(em);
@@ -7447,7 +7846,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                 contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, g.dist, lambda, rng);
             acc += contrib;
         }
-        total += (nS > 1) ? acc / (double)nS : acc;
+        total += ((nS > 1) ? acc / (double)nS : acc) * selW;
     }
     return total;
 }
@@ -7463,13 +7862,19 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
                                       int giDepth = 0) {
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     const bool whitted = (sc.bkWhitted != 0);
-    for (int k = 0; k < sc.nEmitters; ++k) {
+    DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
+    for (int di = 0; di < draw.n; ++di) {
+        const int k = draw.emitter(di);
+        const double selW = draw.weight(di);            // 1/p(e); exactly 1 on the all path
+        if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;
         const bool uv = dEmitterNeedsUV(em);
         const int G = (whitted && uv) ? (giDepth ? sc.bkGiGrid : sc.bkGrid) : 1;
         const int nS = G * G;
-        const double invS = 1.0 / (double)nS;
+        // Folding the selection weight into the per-sample scale keeps the all-emitters
+        // path bit-identical (selW is exactly 1.0 there, and x*1.0 == x).
+        const double invS = ((nS > 1) ? 1.0 / (double)nS : 1.0) * selW;
         for (int s = 0; s < nS; ++s) {
             Real su1 = (Real)0, su2 = (Real)0;
             if (whitted) { if (uv) dGridUV(s, G, su1, su2); }
@@ -7484,7 +7889,7 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
                     : g.spot
                     ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
                     : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
-                L[i] += (nS > 1) ? thr[i] * contrib * invS : thr[i] * contrib;
+                L[i] += thr[i] * contrib * invS;
             }
         }
     }
@@ -7503,7 +7908,12 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
     double total = 0.0;
     Real alb = medAlbedo(med, lambda);
     if (alb <= (Real)0) return 0.0;
-    for (int k = 0; k < sc.nEmitters; ++k) {
+    // No shading normal at a fog vertex, so the tree bounds on the receiver side only.
+    DEmitterDraw draw; dPickEmitters(sc, p, nullptr, rng, draw);
+    for (int di = 0; di < draw.n; ++di) {
+        const int k = draw.emitter(di);
+        const double selW = draw.weight(di);            // 1/p(e); exactly 1 on the all path
+        if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnvVolume)
         if (em.shape == 2) {
@@ -7520,7 +7930,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
             double contrib = (double)(alb * phase * fall / dist2) * emitW;
             contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
-            total += contrib;
+            total += contrib * selW;
             continue;
         }
         if (em.shape == 6) {
@@ -7535,7 +7945,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
             double contrib = (double)(alb * phase) * emitW * em.spotOmega;
             contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
-            total += contrib;
+            total += contrib * selW;
             continue;
         }
         Real u1 = rng.uniform(), u2 = rng.uniform();
@@ -7555,7 +7965,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         double contrib = (double)(alb * phase * G) * emitW * (double)em.area;
         if (epat != 1.0) contrib *= epat;                 // no-op without a pattern
         contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
-        total += contrib;
+        total += contrib * selW;
     }
     return total;
 }
@@ -8776,7 +9186,12 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
     DVec3 total(0, 0, 0);
     DVec3 f = rhoRGB / (Real)DPI;                     // Lambertian BRDF (per channel)
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
-    for (int k = 0; k < sc.nEmitters; ++k) {
+    DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
+    for (int di = 0; di < draw.n; ++di) {
+        const int k = draw.emitter(di);
+        const double selW = draw.weight(di);           // 1/p(e); exactly 1 on the all path
+        if (selW <= 0.0) continue;
+        const Real selWr = (Real)selW;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;  // collimated beams / env (env: bkNeeEnvRGB)
         if (em.shape == 2) {                           // point spot
@@ -8791,7 +9206,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
             if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
-            total = total + hadamard(f * (fall * cosSurf / dist2 * stG), em.rgbEmit);
+            total = total + hadamard(f * (fall * cosSurf / dist2 * stG * selWr), em.rgbEmit);
             continue;
         }
         if (em.shape == 6) {                           // distant sun: cone NEE, 1/pdfW = Omega
@@ -8803,7 +9218,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             if (stG <= (Real)0) continue;
             Real dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
             if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist)) continue;
-            total = total + hadamard(f * (Real)((double)(cosSurf * stG) * em.spotOmega), em.rgbEmit);
+            total = total + hadamard(f * (Real)((double)(cosSurf * stG) * em.spotOmega * selW), em.rgbEmit);
             continue;
         }
         Real u1 = rng.uniform(), u2 = rng.uniform();
@@ -8824,7 +9239,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
         Real G = cosSurf * cosLight / dist2;
         if (epat != 1.0) G = (Real)((double)G * epat);   // no-op without a pattern
-        total = total + hadamard(f * (G * em.area * stG), em.rgbEmit);
+        total = total + hadamard(f * (G * em.area * stG * selWr), em.rgbEmit);
     }
     return total;
 }
@@ -12297,6 +12712,16 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         const Sphere& s = scene.spheres[i]; DSphere& d = sph[i];
         d.c = {s.c.x, s.c.y, s.c.z}; d.r = s.r; d.matId = s.matId;
     }
+    // Flat mirror surfaces, grouped per plane by Scene::buildMirrorPlanes (which the host
+    // already ran inside Scene::build). A straight field-for-field copy: the device solves
+    // the reflection in the same doubles the host does, so there is nothing to narrow.
+    std::vector<DMirrorPlane> mirrorPlanes(scene.mirrorPlanes.size());
+    for (size_t i = 0; i < scene.mirrorPlanes.size(); ++i) {
+        const Scene::MirrorPlane& m = scene.mirrorPlanes[i]; DMirrorPlane& d = mirrorPlanes[i];
+        d.nx = m.n.x; d.ny = m.n.y; d.nz = m.n.z; d.d = m.d;
+        d.lox = m.lo.x; d.loy = m.lo.y; d.loz = m.lo.z;
+        d.hix = m.hi.x; d.hiy = m.hi.y; d.hiz = m.hi.z;
+    }
     // Curve / fiber round cones. The host CurveSeg is already a flat POD in this exact
     // shape (curve.h says so, and this is what it was for), so the bake is a straight
     // narrowing copy — no flattening, no per-strand indirection. curveId is host-side
@@ -12640,6 +13065,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     // --- upload geometry/materials ---
     DTri*      d_tris  = tris.empty()    ? nullptr : (DTri*)keep(uploadVec(tris));
     DSphere*   d_sph   = sph.empty()     ? nullptr : (DSphere*)keep(uploadVec(sph));
+    DMirrorPlane* d_mirp = mirrorPlanes.empty() ? nullptr
+                                                : (DMirrorPlane*)keep(uploadVec(mirrorPlanes));
     DNode*     d_nodes = nodes.empty()   ? nullptr : (DNode*)keep(uploadVec(nodes));
     int*       d_prim  = primIdx.empty() ? nullptr : (int*)keep(uploadVec(primIdx));
     DMaterial* d_mats  = mats.empty()    ? nullptr : (DMaterial*)keep(uploadVec(mats));
@@ -12872,6 +13299,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     DScene& sc = up.sc;
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
+    sc.mirrorPlanes = d_mirp; sc.nMirrorPlanes = (int)mirrorPlanes.size();
     sc.mats = d_mats;
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
     sc.fieldNodes = d_fnodes; sc.fieldExprNodes = d_fexpr;
@@ -12884,6 +13312,18 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.recCoeff = d_recCoeff; sc.recDrivers = d_recDrv; sc.recScalarStops = d_recStops;
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
+    // Light BVH: POD nodes referring to each other by index, so a straight memcpy. The
+    // knobs come from lt:: (the same globals the CPU BackwardRenderer reads) so a scene
+    // rendered on either backend makes the same selection decisions.
+    sc.lightTree       = scene.lightTree.empty() ? nullptr
+                                                 : (const LightTreeNode*)keep(uploadVec(scene.lightTree));
+    sc.lightTreeRoot   = scene.lightTree.empty() ? -1 : scene.lightTreeRoot;
+    sc.lightTreeAlways = scene.lightTreeAlways.empty() ? nullptr
+                                                       : (const int*)keep(uploadVec(scene.lightTreeAlways));
+    sc.nLightTreeAlways = (int)scene.lightTreeAlways.size();
+    sc.bkLightTree     = lt::gEnabled ? 1 : 0;
+    sc.bkLightSplit    = lt::gSplit;
+    sc.bkLightSamples  = lt::gSamples;
     sc.lightCdfAll = d_cdfAll;
     sc.textures = d_tex; sc.nTex = (int)dtex.size();
     // N-D data tables upload VERBATIM — the host PatGrid / PatScatter headers refer to

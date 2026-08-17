@@ -150,7 +150,7 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   The Preetham sky's `sun_disk separate` option
   (`sky::SunDisk`) unbakes the solar disc from the env map and registers an
   energy-matched Sun instead — the same picture, converging ~20× faster in forward modes.
-  **Mesh area lights** (since 0.41.0): a
+  **Mesh area lights** (since 0.186.0): a
   material with an `emit` spectrum bound to a `mesh` registers an
   `EmitterShape::Mesh` emitter (`Scene::addMeshLight`) holding a per-triangle
   cumulative-area CDF (`Emitter::meshTris`, `EmitTri`); `samplePoint` binary-searches
@@ -1667,6 +1667,181 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   is the entire spectral quadrature, so narrowing it does not add noise that more samples
   would remove — it changes the answer. `warnWhittedHeroCollapse` guards the batch path
   (the viewer already guarded itself via `wNeedSpp`); see `known-issues.md`.
+- **`lighttree.h` / `lighttree_build.h`** (0.187.0) — the **Conty–Kulla adaptive light
+  BVH**, the many-lights selector. `lighttree.h` holds the node layout and `ltSample()`
+  and is deliberately **dependency-free** (`<cmath>`, `<cstdint>`; `LT_FN` =
+  `__host__ __device__ inline` under `__CUDACC__`) so the `.cu` includes the *same*
+  traversal source the CPU compiles — one implementation of the importance heuristic,
+  not two that can drift. Nodes carry spatial bounds, a bounding cone of emission
+  normals (axis, `cosθ_o`, `cosθ_e`) and subtree flux; importance is
+  `power · cos(θ − θ_o − θ_u) / d²` against a `θ_u`-widened `|cos|` at the receiver.
+  `lighttree_build.h` does the build; `Scene::buildLightTree()` calls it from
+  `finalizeEmitters()`, so every path that rebuilds the emitter list (`-ignoreenv`,
+  `applyIgnoreFlags`, the built-in scenes) gets a matching tree rather than a stale one.
+  The CLI knobs live in the header as `lt::gEnabled` / `lt::gSplit` / `lt::gSamples`
+  (the `hero::gSplit` pattern — `inline` variables, legal in the `.cu` because
+  `CMAKE_CUDA_STANDARD` is 17), which is what lets `render_cuda.cu` read the same policy
+  `main.cpp` set without a second copy of the flags.
+
+  **Why it exists, and what it replaced.** Backward NEE ran `for (e = 0; e < nEm; ++e)`
+  and cast a shadow ray to *every* emitter at *every* non-specular vertex — an unbiased
+  splitting estimator whose cost is O(N_lights) per bounce. Measured on the GPU (mode R,
+  256 spp, 256², same room, same total 20 000 lm): 1 light 0.4 s → 256 lights **75.9 s**,
+  at an identical 6.25 % noise. `BackwardRenderer::pickEmitters` and its device mirror
+  `dPickEmitters` now replace the loop *bound* only: they hand back a set of
+  (emitter, `1/pdf`) draws, so `sum_e w_e` becomes `sum_selected w_e / p(e)`. That
+  framing is what keeps the change surgical — the connection code below it is untouched,
+  and on the fallback path the weight is **exactly** `1.0`, so `x * 1.0 == x` leaves
+  legacy images bit-identical rather than merely close.
+
+  **The unbiasedness contract.** Every bound in the heuristic must be *conservative*
+  (hence `|cos|`, and `cosθ_o = −1` for spheres/cylinders): a bound that is too tight
+  gives a contributing emitter probability 0, and the image silently *darkens* instead
+  of getting noisier. **Adaptive splitting** visits both children at probability 1 while
+  `(radius/distance)² > gSplit`, and only chooses stochastically below that — which is
+  why small-N scenes are safe: full splitting degenerates *exactly* to the old
+  estimator. One light builds no tree at all (`lightTreeRoot < 0`), and mode `W` always
+  takes the exact path, since its deterministic shadow grid has no variance to trade.
+
+  **The second O(N) term, which only appeared once the shadow rays were gone.** The CPU
+  refilled a per-sample table of every emitter's SPD at every sampled wavelength (1024
+  Planck evaluations per sample at N=256, C=4) and then summed over emitters *again* to
+  derive `invPdfLambda`. Both are now over **distinct spectra**: `spectrum.h` gained
+  `SharedSpectrum`/`ScaledSpectrum` so an emitter's SPD is provably `base_g(λ) · scale_e`
+  (the FTSL loader memoises identical spectrum expressions, and `absPower` — where
+  `lumens`/`power` normalisation happens — returns a `ScaledSpectrum` instead of a fresh
+  closure, which is what made identity survive normalisation); `Scene::buildSpdBases`
+  collects the distinct bases plus `spdBaseGeom[g] = Σ geomWeight_e·scale_e`; and
+  `backward.h`'s `SpdCache` became an *accessor* (`at(e,i) = base[baseIdx[e]*C+i] *
+  scale[e]`) rather than a materialised emitter-major table, so nothing O(N) is even
+  stored per sample. The value is bit-identical because `base*scale` is literally how
+  `ScaledSpectrum::operator()` computes itself; the `Σ_g base_g·spdBaseGeom[g]`
+  regrouping is the one place the summation *order* changes, and it is exact whenever
+  there is one emitter per base (every single-light scene). CPU ml256 at 64 spp:
+  **524.7 s → 7.0 s**.
+
+  **Verified, not assumed.** `-no-lighttree` on the new binary reproduces the pre-tree
+  binary bit-for-bit across a 10-scene corpus on both devices (`scraps/regress_pair.py`,
+  against a `git worktree` build of the previous commit). With the tree: ml256 image
+  means 37.745 vs 37.749 (ratio 1.00012); variance is unchanged (16 spp against a
+  4096-spp reference — RMSE 6.616 no-tree, 6.665 at the default 8 samples); and the case
+  designed to break a biased tree — a 40 m corridor whose 256 panels span orders of
+  magnitude of per-light importance (`scraps/gen_corridor.py`) — lands within 0.07 % of
+  its no-tree reference while running 6.1 s → 0.6 s.
+
+  **Not yet using it:** the forward/BDPT/VCM `selectEmitter` power CDF
+  (`render_cuda.cu`), and a mesh emitter's own triangles (still area-sampled) — both
+  tracked in `known-issues.md`.
+- **`radcache.h`** (0.190.0; device notice 0.190.1, deterministic chunking 0.190.2,
+  checkpointed table 0.190.3) — the
+  **world-space diffuse radiance cache** behind `-radcache`, mode `R` on the CPU. A clipmapped hash of cells (54-bit quantised
+  position, clipmap level, 54 normal buckets) each holding a 16-bin spectral mean, its
+  variance and a confidence flag; `backward.h`'s `radianceHeroLoop` reads it at a diffuse
+  vertex *after* that vertex's own NEE and *before* the continuation roulette, adds
+  `thr·ρ·(E/π)·invPdf` and stops. That placement is what makes the partition exact: direct
+  light is counted once by the reader, everything beyond the vertex once by the cache.
+
+  **Camera paths never write it**, which is the design's load-bearing asymmetry and the
+  reason a miss is free. A separate update pass between chunks (`main.cpp`
+  `renderBackwardBand` → `mergeMarks` / `takeWork` /
+  `BackwardRenderer::updateRadCacheCells` / `apply`) shoots its own cosine rays from the
+  cells camera paths *marked*, under a budget of update samples **per cache consult the
+  chunk actually made** — proportional to the work the cache is being asked to do, not to
+  the size of the table. So an unresolved corner renders exactly rather than answering
+  with noise, and the table is immutable for the whole of any render pass (merge, update
+  and apply all run after the join), which makes its state a pure function of the chunks
+  rendered so far rather than of the thread interleaving.
+
+  **Update rays must not read the cache** (`rcTrain=true` on the update path). Otherwise a
+  cell stores `direct + somebody else's cached tail` — a fixed point of the cache's own
+  error, amplified by `1/(1−f)` — and the collapsed sample variance corrupts the very
+  confidence gate that is supposed to catch it.
+
+  **Verification against the readers** (`-radcache-validate`, default 0.05) is what
+  actually bounds the error. A random fraction of readable vertices decline to terminate,
+  trace the tail to full length, and report `(offer, tail)` back to the cell; `Σtail/Σoffer`
+  is an unbiased estimate of that cell's *total* systematic error **as used** — cell
+  averaging, normal-cone spread and unsampled tails, weighted exactly as readers weight
+  them. Well determined → adopt as `corr`; provably wrong but unpinnable → retire; not
+  enough data → 1. Two details are load-bearing: the coin is flipped **before** the tail is
+  known (an earlier fate-selected design measured 1.8 % dark), and `lookupBundle` returns
+  the **raw** mean with `corr` handed back separately, so a validation record is an
+  absolute measurement rather than one relative to a correction that is itself moving.
+
+  **Why 54 normal buckets** (6 faces × 3×3, not 6 × 1): a 90° face bucket folds a sphere's
+  normals into one average, a systematic error no spp removes. The 3×3 split keeps the face
+  *centre* in its own bucket, so an exactly axis-aligned normal cannot be shattered across
+  four buckets by ±1e-17 of rounding; a flat surface pays nothing either way.
+
+  **Auto cell size is a pixel footprint, not a scene fraction** (`main.cpp`,
+  `32 · 2·d·tanHalfY / resY`). What pays for a cell is the number of camera samples that
+  read it, which the image sets, not the scene — so this keeps the economics
+  resolution-invariant (4× the resolution gives 4× the cells *and* 4× the paths).
+
+  Measured, and the limits, in `REFERENCE.md` → *Radiance cache*; the residual failure mode
+  (concentrated specular/caustic transport, −18.76 % ± 0.31 % per raw read on a dispersive
+  Cornell vs +2.38 % ± 0.07 % all-diffuse) and the fur-class scenes it does not help are in
+  `known-issues.md`. **Not the same decision as mode `W`'s `-gi` gather**, which
+  deliberately has no cache (see the three constraints under `backward.h`'s `-gi` note):
+  that estimator must stay a pure function of `(index, sample index)` so an animated
+  seamless loop cannot flicker, and `-radcache` fails exactly that test — its cells depend
+  on render order and on what the update pass happened to sample, so it is opt-in and
+  documented as unsuitable for animation.
+
+  **It made the chunk split observable, which cost `-device cpu` its determinism** until
+  0.190.2. Every CPU render is supposed to be a pure function of the scene and the sample
+  budget: `cpuSppChunks` may split the budget however it likes because per-`(pixel, sample)`
+  seeding means chunk `[base, base+c)` renders the same samples whatever `c` is. The cache
+  advances *between* chunks (the update pass runs at each boundary), so the boundaries
+  joined the realization — and they were being chosen by wall clock, retargeting toward
+  ~0.4 s per chunk. Two identical invocations measured 40.1 % vs 41.4 % of consults
+  terminated and images 0.45 % rel-RMS apart; pinning the split via the pre-existing
+  `FTRACE_CHUNK_SPP` triage hook made them bit-identical, which is what pinned the cause.
+  `cpuSppChunks` now switches to a schedule derived from `sppTarget` when `g_radCache` is
+  set (1, 9, then an equal split into ~64 chunks); flagless renders keep the timed rule and
+  are byte-unchanged. The non-obvious part is *why the deterministic schedule has that
+  shape*: the chunk count IS the update-pass count, and the cache is violently sensitive to
+  it — 65 chunks terminate 35.5 % of consults, 16 chunks 2.3 %, 5 chunks 0 %, with the last
+  two **slower than not caching** because the update pass is paid for and no cell ever
+  resolves. A flat split — the obvious way to make something reproducible — is precisely the
+  wrong answer here, so the rule targets a chunk *count*, not a chunk *size*.
+
+  **The table is checkpointed (0.190.3), sparsely and under its own guard.** It rides in the
+  `.ftbuf` sidecar as a trailing section after the film blobs (`writeRadCacheSection` /
+  `readRadCacheSection`, `main.cpp`), which needs no magic bump because both film readers
+  consume a fixed number of fixed-size records and never demand the stream end there — the
+  format is extended, not reinterpreted. Three details carry the design. **Sparse**, because
+  the default table is 262 144 cells (~82 MB) and would otherwise be rewritten every
+  `-interval`; occupancy is a tiny fraction of that (36 cells on a Cornell box, 8.7 k on
+  `fur_creature`) since cells tile the visible *surface*. **Its own guard**
+  (`RadianceCache::configGuard`), because `checkpointGuard` covers scene/mode/resolution and
+  no cache parameter at all, so it would happily accept a sidecar whose cells were keyed
+  under a different `-radcache-cell` or a different clipmap centre — a value measured over
+  one volume of space filed under the key of another. Two guards let a changed cache setting
+  discard the table while the image still resumes. **Deferred adoption**
+  (`radCacheAdoptPending`), because the reader runs before the cache's configuration exists:
+  the auto cell size comes from the camera and resolution, so the records are parked and
+  folded in at the top of the first backward pass, through `loadCell`, which rehomes each
+  cell by key and therefore tolerates a changed table capacity. Measured effect on
+  `cornell.ftsl` at 200², resuming +512 spp on top of 1024: 68.4 % of consults terminated /
+  65.9 M rays warm, versus 24.9 % / 70.5 M from the same film with the section stripped. The
+  motivation is not only speed — a cold resume mixes unbiased (never-terminating) samples
+  with biased ones in a ratio set by the interruption history, which is not a property an
+  image should have. It does *not* make a resume equal a single shot, because the chunk
+  schedule restarts at `done = 0` and the update passes land elsewhere.
+
+  **It reaches exactly one code path, and 0.190.1 makes that audible.** The GPU backward
+  megakernel (`bkRadianceHeroLoop`, `render_cuda.cu`) and the scalar `radiance()` fallback
+  (`heroC == 1`, media, GRIN, finite lens) have no read site, so `-radcache` there was a
+  *silent* no-op — and, because `-device auto` prefers the GPU for mode `R`, it was the
+  **default** no-op on any machine with a GPU: flag accepted, image correct, cache unused,
+  a missing status line the only evidence. `runRender` now prints
+  `[radcache] IGNORED: <reason>` at the same "device is resolved" moment as the existing
+  `[medium]` warning, covering the GPU case, `-whitted`, `-direct-only` and the forward
+  modes. Porting the read site to the device is in `open-work.md`; the hard part there is
+  not the table (flat POD array, upload-after-update / read-only-during-chunk) but
+  verification's per-thread `std::vector` of records, which needs an atomic-counter slab
+  drained to the host each chunk.
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
   Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,
@@ -4307,6 +4482,82 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`render_progress.h`** — progress hook for chunked samples-per-pixel renderers (modes
   `R`, `D`): the live status line (`[live] … photons, ~N% noise`) and noise estimation for
   `-noise` budgets.
+
+## Analytic specular camera connections (forward mode `B`, 0.160.0 / 0.188.0)
+
+The forward tracer draws a surface by *connecting* each photon vertex to the camera. A
+**specular** vertex has no such connection — a delta lobe scatters into exactly one
+direction, so the density of "aims at the pinhole" is zero — and `tracePhoton` therefore
+skips the camera connect at every `isSpecularType()` material. That is the SDS gap: every
+directly-seen mirror/glass surface rendered **pure black** in `B` while `R` drew it.
+
+Where the specular geometry is simple, the connection is *solved* instead of sampled. Both
+CPU (`render.h`) and GPU (`render_cuda.cu`) implement the same three connectors, and the
+device versions do all the precision-critical math in `double` regardless of the render
+`Real`, so the two backends agree.
+
+| Connector (CPU / GPU) | Surface | Reflection point | Geometry factor `G` |
+|---|---|---|---|
+| `connectSpecularSphere`(`Inside`) / `dConnectSpecularSphere` | smooth `dielectric` sphere, eye outside or inside | 1-D root scan of a planar miss function + 40-step bisection (≤4 roots = multiple refracted images) | ray differentials, `eps²/\|dA×dB\|` |
+| `connectSpecularSphereMirror` / `dConnectSpecularSphereMirror` | `mirror`/`halfmirror`/roughness-0 `glossy` **sphere** | same scan, one reflection instead of two refractions | same, re-expressed as an equivalent unfolded distance `D = 1/√G` so it shares one splat with the plane |
+| `connectSpecularPlane` / `dConnectSpecularPlane` | coplanar **mirror triangles** (a flat panel) | **unfolding** — no root solve at all | exactly `1/D²`, `D = \|p − eye′\|` |
+
+**Unfolding** is what makes the flat case closed-form. Mirroring the eye across the plane,
+`eye′ = eye − 2·(dot(n,eye) − d)·n`, turns the bent chain `p → R → eye` into the straight
+segment `p → eye′`; `R` is where that segment crosses the plane, and the specular Jacobian
+is `dΩ_eye/dA_perp = 1/D²` with `D = |p − R| + |R − eye|` — i.e. `connect()`'s own
+inverse-square law measured along the folded-out path. So the mirror estimator *is*
+`connect()` with a longer, bent distance and one reflectance factor.
+
+**Per-plane, not per-triangle.** `Scene::buildMirrorPlanes` (`scene.h`, run at the tail of
+`Scene::build` because it needs finalized `Tri::gn`) groups mirror-material triangles by a
+quantised `(n, d)` key — normal canonically oriented, since a mirror is two-sided — into
+`Scene::mirrorPlanes`, each carrying the plane, the member AABB and the total area.
+That makes the per-photon-vertex cost **O(#mirror surfaces)**, not O(#mirror triangles),
+and it is capped at `kMaxMirrorPlanes = 64` (largest-area planes win). The list uploads
+verbatim to `DScene::mirrorPlanes` as `DMirrorPlane`.
+
+**One traversal does three jobs.** A plane does not know where its panel *ends*, so
+`mirrorSeenAt` / `dMirrorSeenAt` casts one `closestHit(eye → R)` and requires
+`|hit.t − dE| ≤ 1e-4·(1+dE)` **and** `isPlanarMirrorMat(mats[hit.matId])`. That
+simultaneously proves (a) the authored panel really contains `R`, (b) the eye-side leg is
+unoccluded, and (c) hands back a real `Hit`, so `reflectSlot` reads the mirror's
+texture/pattern reflectance at the exact point. The light-side leg is a separate
+`occluded()`, and `splatMirrorLegs` / `dSplatMirrorLegs` applies fog transmittance on both
+legs.
+
+**Which materials qualify** (`isPlanarMirrorMat`, `scene.h`; `dIsPlanarMirrorMat`):
+`mirror`; `halfmirror` (its reflect *probability* is its specular reflectance in
+expectation); `glossy` only when `roughness <= 0 && roughnessTex < 0 && roughnessPat < 0`.
+
+**Hero bundles.** A mirror is achromatic, so ONE geometry solve serves the whole live-λ
+bundle and only the reflectance varies per λ — hence `camSpecularSplatAllVtxN`
+(`…AllVtx` is now a 1-λ wrapper over it) and the split of `SpecVtx::term()` into a
+λ-independent `shape()` plus the per-λ weight. A dielectric sphere is dispersive and
+**cannot** share geometry: each λ traces its own refracted image, which is exactly what
+makes a glass-orb caustic image chromatic. Its loop nesting (λ → sphere → camera) was
+preserved verbatim through the refactor, and `term()` was left byte-identical rather than
+being expressed through `shape()` (`w*(cos/π) ≠ (w/π)*cos` in floating point), so every
+pre-existing image is bit-for-bit unchanged (verified against a baseline binary built from
+the previous commit, CPU and GPU).
+
+**Known limits** — all deliberate, all documented in `REFERENCE.md` and tracked in
+`known-issues.md`: ONE specular vertex per connection (a mirror inside a mirror is still
+black); **pinhole only** (`lensMode` / `forwardCatch` return early, so `A`/`C` are
+unchanged); flat mirrors must be authored as world-space triangles (an instanced/BLAS
+mirror is not collected, and beyond `kMaxMirrorPlanes` the surplus planes are dropped);
+only a `halfmirror`'s *reflected* leg is built, so what lies behind a beamsplitter is still
+a delta transmission and stays black; rough specular is not a delta and needs a real
+estimator. Use `P`/`D`/`R`/`M`/`S`/`U` for those.
+
+**Test scenes.** `scenes/_mirror_fwd.ftsl` (flat panel), `scenes/_mirror_sphere_fwd.ftsl`
+(mirror ball) and `scenes/_mirror_mats_fwd.ftsl` (one panel each of `mirror`, `halfmirror`
+and roughness-0 `glossy`, black-backed so the comparison is reflection-only). All three put
+the emitters *outside* the frustum, so the lit result exists only by reflection and a
+regressed connector shows up as black rather than as a subtle level shift. Meter them with
+`-hdr` + `scraps/cmp_pfm.py`, comparing each mirror's pixel box against a mirror-free patch
+of the same frame — mode `B` and mode `R` carry a systematic ~0.6–1 % offset everywhere, so
+the mirror-free patch, not 1.0, is the number the mirror box has to match.
 
 ## Watertight raster coverage (shared by both backends, 0.98.2)
 

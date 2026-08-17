@@ -1,5 +1,11 @@
 #include "livewindow.h"
 
+// Shared by both builds: on a headless build there is no window to minimize, but the
+// setter must still link so callers need no platform guard.
+static bool g_lwStartMinimized = false;
+void LiveWindow::setStartMinimized(bool on) { g_lwStartMinimized = on; }
+bool LiveWindow::startMinimized() { return g_lwStartMinimized; }
+
 #ifndef _WIN32
 // -------- Non-Windows stub: -window is a no-op (headless builds unaffected) --------
 struct LiveWindow::Impl {};
@@ -1263,7 +1269,11 @@ void LiveWindow::Impl::threadMain() {
     hwnd.store(hw);
     if (hw) {
         makeView(hw);                              // D3D child over the image area (may fail -> GDI)
-        ShowWindow(hw, SW_SHOWNORMAL);
+        // SW_SHOWMINNOACTIVE, not SW_MINIMIZE: the latter would still activate the window
+        // first (stealing focus for an instant, and dropping whatever the user was typing
+        // into). SHOWMINNOACTIVE goes straight to the taskbar without ever taking the
+        // foreground, which is the entire point of -window-min.
+        ShowWindow(hw, g_lwStartMinimized ? SW_SHOWMINNOACTIVE : SW_SHOWNORMAL);
         UpdateWindow(hw);
         SetTimer(hw, 1, 33, nullptr);              // ~30 fps repaint poll (GDI fallback path)
     }

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <memory>
 #include <climits>
+#include <atomic>
+#include <unordered_map>
 #include "geometry.h"
 #include "bvh.h"
 #include "implicit.h"
@@ -16,6 +18,23 @@
 #include "vdbgrid.h"
 #include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
 #include "record.h"      // parametric records (§records): named per-channel LUTs
+#include "lighttree_build.h"  // Conty-Kulla light BVH: node layout + host builder
+
+// ---- ray-query telemetry (-raystats) --------------------------------------------------
+// Counts every ray actually cast against the acceleration structure: closest-hit queries
+// plus shadow/occlusion queries. This is the renderer's unit of WORK, and unlike wall time
+// it is deterministic -- two runs of the same render cast exactly the same number of rays,
+// so it can measure whether an optimisation (e.g. -radcache terminating paths early) really
+// removed work on a machine too noisy to time a 5-second render on. The per-thread counter
+// is a plain thread_local increment next to a BVH traversal that costs hundreds of ns, so
+// it is unmeasurable in the render itself; each worker folds its tally into the atomic on
+// the way out, which is where the cross-thread cost lives.
+namespace raystats {
+inline thread_local unsigned long long tls = 0;
+inline std::atomic<unsigned long long> total{0};
+inline void flushThread() { total += tls; tls = 0; }
+inline void reset() { total = 0; }
+}
 
 // NOTE: append new types at the END. render_cuda.cu's D_* tags are `(int)m.type` and must
 // stay 1:1 with this order, so inserting in the middle silently reinterprets every
@@ -317,6 +336,28 @@ struct Material {
     // absorption). -1 => use the constant mixWeights above. Resolved via scalarAt.
     int mixWeightTex = -1;
 };
+
+// A PLANAR-SPECULAR (perfect-mirror) material: one whose reflection off a flat face is
+// an exact mirror image — a delta lobe with a plain reflectance and no bending — so the
+// forward light tracer can connect a photon vertex to the pinhole THROUGH it by
+// unfolding the eye across the plane (render.h connectSpecularPlane). This is what
+// fills the forward-mode SDS gap for mirrors; see Scene::mirrorPlanes.
+//
+//  - Mirror     — the case this exists for.
+//  - HalfMirror — a lossless reflect/transmit split whose reflect PROBABILITY is, in
+//                 expectation, exactly its specular reflectance, so the same estimator
+//                 applies with `reflect` read as a coefficient.
+//  - Glossy     — only when its lobe is a genuine delta: roughness pinned at 0 with
+//                 nothing spatially varying it (a texture or pattern could open the
+//                 lobe anywhere on the face, and the connection would then be wrong on
+//                 part of it). `mirror` and `glossy roughness 0` are the same surface.
+// Everything else either spreads the lobe, bends the path (dielectric, grating), or
+// switches wavelength — none of which unfold to a straight line.
+inline bool isPlanarMirrorMat(const Material& m) {
+    if (m.type == MatType::Mirror || m.type == MatType::HalfMirror) return true;
+    return m.type == MatType::Glossy && m.roughness <= 0.0 &&
+           m.roughnessTex < 0 && m.roughnessPat < 0;
+}
 
 // Resolve a Mix material to one of its child material indices using a single
 // uniform u in [0,1). Returns the chosen child index, or -1 if the photon falls
@@ -1475,6 +1516,7 @@ struct Scene {
             emitterCdf[i] = totalPower;
         }
         if (totalPower > 0) for (auto& c : emitterCdf) c /= totalPower;
+        buildSpdBases();
         // Combined g(lambda) = sum_k geomWeight_k*SPD_k(lambda); by value capture.
         std::vector<std::pair<double, Spectrum>> parts;
         for (const auto& e : emitters) parts.push_back({e.geomWeight(), e.spdFn});
@@ -1497,6 +1539,292 @@ struct Scene {
             };
             mm.fluoInSampler.build(prod, stepNm);
         }
+        // Emitter powers are now final, so the light BVH can be built off them. Last,
+        // and inside finalizeEmitters, so every path that rebuilds the emitter list
+        // (-ignoreenv, applyIgnoreFlags, the built-in scenes) gets a matching tree
+        // rather than a stale one pointing at emitters that no longer exist.
+        buildLightTree();
+    }
+
+    // ---- shared-SPD factorisation -------------------------------------------
+    // Every emitter's SPD is written as base_g(lambda) * scale_e, with `spdBase` the
+    // list of DISTINCT base curves, spdBaseIdx[e] the one emitter e uses, and
+    // spdScale[e] its constant. The factorisation is exact, not approximate: it comes
+    // from spectrumBase() (spectrum.h), which only reports a base when the loader
+    // literally built the spectrum as a shared curve times a constant, and whose
+    // contract is that base(lambda)*scale reproduces spdFn(lambda) BIT-FOR-BIT. An
+    // emitter whose SPD is opaque simply becomes its own base with scale 1.
+    //
+    // What it buys: the backward renderer refills a table of SPD(lambda) over all
+    // emitters for every sample. Factored, it evaluates one Planck (or one file curve,
+    // or one measured table) per DISTINCT spectrum and multiplies out, so a room lit by
+    // 256 panels of the same fixture costs one evaluation instead of 256. Once the
+    // light BVH removed the O(N) shadow rays, THIS table was what remained of the
+    // many-lights cost on the CPU.
+    std::vector<Spectrum> spdBase;
+    std::vector<int>      spdBaseIdx;
+    std::vector<double>   spdScale;
+    // Sum over the emitters sharing base g of geomWeight_e * spdScale_e, so the combined
+    // emission g(lambda) = sum_e geomWeight_e*SPD_e(lambda) collapses to
+    // sum_g spdBase[g](lambda) * spdBaseGeom[g] — O(distinct spectra), not O(lights).
+    // That sum is exactly what invPdfLambda() is, and the backward reference needs it once
+    // per SAMPLE, so with 256 identical panels it was the last O(N) term left after the
+    // light BVH removed the shadow rays. Regrouping changes the summation ORDER, so the
+    // result can differ from the emitter-by-emitter sum in the last bit; it is identical
+    // whenever there is one emitter per base (i.e. every single-light scene), because the
+    // scale is then exactly 1.0 and a*(b*1) == b*a.
+    std::vector<double>   spdBaseGeom;
+
+    void buildSpdBases() {
+        const int n = (int)emitters.size();
+        spdBase.clear();
+        spdBaseIdx.assign((size_t)n, 0);
+        spdScale.assign((size_t)n, 1.0);
+        std::unordered_map<const void*, int> seen;
+        for (int e = 0; e < n; ++e) {
+            double k = 1.0;
+            const Spectrum* b = spectrumBase(emitters[e].spdFn, k);
+            if (!b) {                       // opaque: its own base, scale exactly 1
+                spdBaseIdx[e] = (int)spdBase.size();
+                spdBase.push_back(emitters[e].spdFn);
+                spdScale[e] = 1.0;
+                continue;
+            }
+            auto it = seen.find((const void*)b);
+            if (it == seen.end()) {
+                it = seen.emplace((const void*)b, (int)spdBase.size()).first;
+                spdBase.push_back(*b);
+            }
+            spdBaseIdx[e] = it->second;
+            spdScale[e] = k;
+        }
+        spdBaseGeom.assign(spdBase.size(), 0.0);
+        for (int e = 0; e < n; ++e)
+            spdBaseGeom[(size_t)spdBaseIdx[e]] += emitters[e].geomWeight() * spdScale[e];
+    }
+
+    // ---- planar specular reflectors (the forward-mode mirror connection) -----
+    // Every set of COPLANAR mirror faces in `tris`, collapsed to the one thing the
+    // forward tracer's camera connection actually needs: the plane. Unfolding the eye
+    // across a plane turns the bent path  vertex -> mirror -> eye  into a straight
+    // segment, so the reflection point is an intersection rather than a root solve and
+    // the specular Jacobian is just 1/(unfolded distance)^2. That is per-PLANE work, not
+    // per-triangle — a mirror split into two quads' worth of tris costs one entry, and
+    // the per-photon-vertex loop stays O(#mirror surfaces) instead of O(#triangles).
+    //
+    // Empty for every scene without a flat mirror, and the connection code returns
+    // immediately when it is empty, so nothing existing pays for this.
+    struct MirrorPlane {
+        Vec3   n{0, 0, 1};      // unit plane normal (canonically oriented, see build)
+        double d = 0.0;         // plane equation: dot(n, x) == d
+        Vec3   lo{0, 0, 0};     // AABB of the member faces — a cheap reject before the
+        Vec3   hi{0, 0, 0};     // BVH query that confirms the mirror is really there
+        double area = 0.0;      // total face area (used to rank when capping the list)
+    };
+    std::vector<MirrorPlane> mirrorPlanes;
+
+    // At most this many distinct mirror planes are tracked. A flat mirror is one or two
+    // planes; a faceted "mirror" mesh (a disco ball, a tessellated chrome sphere) would
+    // otherwise contribute thousands, and each one costs a BVH query per photon vertex.
+    // Past the cap the largest-area planes win, which is exactly the set a viewer would
+    // notice — and the rest keep the old behaviour (black in mode B) rather than making
+    // the render unusably slow.
+    static constexpr int kMaxMirrorPlanes = 64;
+
+    // Group the mirror-material triangles by plane. Called from build(), after
+    // Tri::finalize() has filled in the geometric normals.
+    void buildMirrorPlanes() {
+        mirrorPlanes.clear();
+        // Quantised plane key, so the two tris of a quad (identical gn and offset) and
+        // any coplanar neighbours land in one bucket. The tolerance is deliberately
+        // coarse relative to double precision: faces meant to be coplanar are authored
+        // that way, and a tri that misses the bucket simply gets its own plane.
+        struct Key { long long a, b, c, d; };
+        struct KeyHash {
+            size_t operator()(const Key& k) const {
+                size_t h = 1469598103934665603ull;
+                for (long long v : {k.a, k.b, k.c, k.d})
+                    h = (h ^ (size_t)v) * 1099511628211ull;
+                return h;
+            }
+        };
+        struct KeyEq {
+            bool operator()(const Key& x, const Key& y) const {
+                return x.a == y.a && x.b == y.b && x.c == y.c && x.d == y.d;
+            }
+        };
+        std::unordered_map<Key, int, KeyHash, KeyEq> byPlane;
+        for (const Tri& t : tris) {
+            if (t.matId < 0 || t.matId >= (int)mats.size()) continue;
+            if (!isPlanarMirrorMat(mats[t.matId])) continue;
+            Vec3 n = t.gn;
+            double nl = length(n);
+            if (nl < 1e-12) continue;
+            n = n * (1.0 / nl);
+            // Canonical orientation: a mirror reflects from either face, so the two
+            // sides of one plane must not split into two entries. Flip so the first
+            // significant component is positive.
+            const double sx = std::fabs(n.x), sy = std::fabs(n.y), sz = std::fabs(n.z);
+            const double lead = (sx >= sy && sx >= sz) ? n.x : ((sy >= sz) ? n.y : n.z);
+            if (lead < 0.0) n = Vec3{-n.x, -n.y, -n.z};
+            double d = dot(n, t.v0);
+            const double qPos = 1e5, qDir = 1e6;   // 10 um in position, 1e-6 in direction
+            Key k{(long long)std::llround(n.x * qDir), (long long)std::llround(n.y * qDir),
+                  (long long)std::llround(n.z * qDir), (long long)std::llround(d * qPos)};
+            auto it = byPlane.find(k);
+            int idx;
+            if (it == byPlane.end()) {
+                idx = (int)mirrorPlanes.size();
+                byPlane.emplace(k, idx);
+                MirrorPlane mp;
+                mp.n = n; mp.d = d;
+                mp.lo = t.v0; mp.hi = t.v0;
+                mirrorPlanes.push_back(mp);
+            } else {
+                idx = it->second;
+            }
+            MirrorPlane& mp = mirrorPlanes[(size_t)idx];
+            for (const Vec3& v : {t.v0, t.v1, t.v2}) {
+                mp.lo.x = std::min(mp.lo.x, v.x); mp.hi.x = std::max(mp.hi.x, v.x);
+                mp.lo.y = std::min(mp.lo.y, v.y); mp.hi.y = std::max(mp.hi.y, v.y);
+                mp.lo.z = std::min(mp.lo.z, v.z); mp.hi.z = std::max(mp.hi.z, v.z);
+            }
+            mp.area += 0.5 * length(cross(t.v1 - t.v0, t.v2 - t.v0));
+        }
+        if ((int)mirrorPlanes.size() > kMaxMirrorPlanes) {
+            std::sort(mirrorPlanes.begin(), mirrorPlanes.end(),
+                      [](const MirrorPlane& a, const MirrorPlane& b) { return a.area > b.area; });
+            mirrorPlanes.resize(kMaxMirrorPlanes);
+        }
+        // Pad the reject box by a hair so a reflection point landing exactly on an edge
+        // is not thrown away by rounding (the BVH query is the authoritative test).
+        for (MirrorPlane& mp : mirrorPlanes) {
+            const double pad = 1e-6 * (1.0 + length(mp.hi - mp.lo));
+            mp.lo = mp.lo - Vec3{pad, pad, pad};
+            mp.hi = mp.hi + Vec3{pad, pad, pad};
+        }
+    }
+
+    // ---- light BVH (Conty & Kulla) ------------------------------------------
+    // Built by finalizeEmitters() from the finished emitter list. `lightTree` is the
+    // node array (root at lightTreeRoot); `lightTreeAlways` holds the emitters that
+    // are NOT in the tree because they have no meaningful position for the spatial
+    // bound — a distant sun, an env light, a collimated beam — and so are connected
+    // unconditionally, as before. Empty tree => every consumer falls back to the old
+    // loop-over-all-emitters, which is what keeps single-light scenes bit-identical.
+    std::vector<LightTreeNode> lightTree;
+    std::vector<int> lightTreeAlways;
+    int lightTreeRoot = -1;
+
+    // Describe one emitter to the builder: a box that contains its emitting surface,
+    // a cone that contains every normal it can emit along, and its flux.
+    //
+    // Every bound here must be CONSERVATIVE — the traversal is allowed to give an
+    // emitter probability zero exactly when these bounds prove it cannot contribute,
+    // so a bound that is too tight is not an inefficiency, it is a black image.
+    // Hence a sphere and a tube both declare a FULL cone of normals (cosThetaO = -1)
+    // rather than anything cleverer.
+    static bool lightTreeBoundOf(const Emitter& e, int index, LtEmitterBound& out) {
+        if (e.collimated) return false;
+        if (e.shape == EmitterShape::Env || e.shape == EmitterShape::Sun) return false;
+        if (!(e.power > 0.0)) return false;
+        auto setBox = [&](Vec3 lo, Vec3 hi) {
+            out.bmin[0] = lo.x; out.bmin[1] = lo.y; out.bmin[2] = lo.z;
+            out.bmax[0] = hi.x; out.bmax[1] = hi.y; out.bmax[2] = hi.z;
+        };
+        auto grow = [&](Vec3 p) {
+            out.bmin[0] = std::min(out.bmin[0], p.x); out.bmax[0] = std::max(out.bmax[0], p.x);
+            out.bmin[1] = std::min(out.bmin[1], p.y); out.bmax[1] = std::max(out.bmax[1], p.y);
+            out.bmin[2] = std::min(out.bmin[2], p.z); out.bmax[2] = std::max(out.bmax[2], p.z);
+        };
+        out.emitter = index;
+        out.power = e.power;
+        out.cosThetaO = 1.0;    // a single flat normal unless overridden below
+        out.cosThetaE = 0.0;    // Lambertian hemisphere
+        Vec3 ax = e.normal;
+        switch (e.shape) {
+            case EmitterShape::Quad: {
+                setBox(e.origin, e.origin);
+                grow(e.origin + e.u); grow(e.origin + e.v); grow(e.origin + e.u + e.v);
+                break;
+            }
+            case EmitterShape::Sphere: {
+                const double r = e.radius;
+                setBox(e.origin - Vec3{r, r, r}, e.origin + Vec3{r, r, r});
+                out.cosThetaO = -1.0;                 // normals cover the whole sphere
+                ax = Vec3{0, 0, 1};
+                break;
+            }
+            case EmitterShape::Cylinder: {
+                const double r = e.radius;
+                setBox(e.origin - Vec3{r, r, r}, e.origin + Vec3{r, r, r});
+                grow(e.origin + e.v - Vec3{r, r, r});
+                grow(e.origin + e.v + Vec3{r, r, r});
+                out.cosThetaO = -1.0;                 // lateral normals sweep a full circle
+                ax = Vec3{0, 0, 1};
+                break;
+            }
+            case EmitterShape::Spot: {
+                setBox(e.origin, e.origin);
+                ax = e.beamDir;
+                out.cosThetaO = 1.0;
+                // The spot's own penumbra IS its emission spread; nothing outside the
+                // outer cone receives anything, which is exactly what theta_e encodes.
+                out.cosThetaE = e.spotCosOuter;
+                break;
+            }
+            case EmitterShape::Mesh: {
+                if (e.meshTris.empty()) return false;
+                bool first = true;
+                Vec3 nSum{0, 0, 0};
+                double maxDev = 1.0;                  // running min of dot(mean, n_i)
+                for (const auto& t : e.meshTris) {
+                    if (first) { setBox(t.v0, t.v0); first = false; } else grow(t.v0);
+                    grow(t.v0 + t.e1); grow(t.v0 + t.e2);
+                    nSum = nSum + t.nrm;
+                }
+                const double L = length(nSum);
+                if (L > 1e-12) {
+                    ax = nSum / L;
+                    for (const auto& t : e.meshTris) maxDev = std::min(maxDev, dot(ax, t.nrm));
+                    out.cosThetaO = maxDev;
+                } else {                              // normals cancel: a closed shell
+                    ax = Vec3{0, 0, 1};
+                    out.cosThetaO = -1.0;
+                }
+                break;
+            }
+            default: return false;
+        }
+        const double al = length(ax);
+        if (!(al > 1e-12)) { ax = Vec3{0, 0, 1}; }
+        else ax = ax / al;
+        out.axis[0] = ax.x; out.axis[1] = ax.y; out.axis[2] = ax.z;
+        return true;
+    }
+
+    void buildLightTree() {
+        lightTree.clear();
+        lightTreeAlways.clear();
+        lightTreeRoot = -1;
+        std::vector<LtEmitterBound> items;
+        items.reserve(emitters.size());
+        for (size_t i = 0; i < emitters.size(); ++i) {
+            LtEmitterBound b{};
+            if (lightTreeBoundOf(emitters[i], (int)i, b)) items.push_back(b);
+            else if (emitters[i].shape != EmitterShape::Env)
+                lightTreeAlways.push_back((int)i);    // suns / beams: always connected
+        }
+        // One tree-eligible emitter is not worth a tree — the traversal would just
+        // return it with pdf 1 after burning a stack push, and keeping the old path
+        // there is what preserves bit-identical single-light images.
+        if (items.size() < 2) {
+            for (const auto& b : items) lightTreeAlways.push_back(b.emitter);
+            std::sort(lightTreeAlways.begin(), lightTreeAlways.end());
+            return;
+        }
+        lightTreeRoot = ltBuild(items, lightTree);
+        std::sort(lightTreeAlways.begin(), lightTreeAlways.end());
     }
 
     // Select an emitter index for the power-weighted CDF. For a single emitter
@@ -1562,6 +1890,7 @@ struct Scene {
         for (auto& t : tris) t.finalize();
         for (auto& bl : blasList) bl.build();   // shared instanced assets (local space)
         buildBvh();
+        buildMirrorPlanes();   // needs the finalized geometric normals
         // Scene bounding sphere from the BVH root AABB: center = box center, radius
         // = half the box diagonal (the box circumradius, guaranteed to enclose all
         // geometry). Sizes forward environment photon emission (disk radius) and
@@ -1846,6 +2175,7 @@ struct Scene {
     // `MatType::Hair` curves are skipped: grass and wire are curves too and stay solid.
     Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr,
                    bool skipHair = false) const {
+        ++raystats::tls;
         Hit h;
         double tMax = DBL_MAX;
         const size_t nT = tris.size();
@@ -1899,6 +2229,7 @@ struct Scene {
     // SDS limitation. Glass therefore appears dark in model B; caustics it casts
     // onto diffuse surfaces still render, since those diffuse vertices connect.
     bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
+        ++raystats::tls;
         Ray r{o, dir};
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
@@ -1930,6 +2261,7 @@ struct Scene {
     // question this way is also what makes the grid pay — unlike `walkFibers`, this one CAN
     // early-out on the first opaque hit, and in a coat's own shadow it almost always does.
     bool occludedSkipHair(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
+        ++raystats::tls;
         Ray r{o, dir};
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
