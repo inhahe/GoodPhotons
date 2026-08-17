@@ -63,11 +63,20 @@ inline int    gSamples = 8;      // cap on emitters connected per shading vertex
 // One node of the light BVH. Interior nodes carry two child indices; leaves carry
 // one emitter index. Kept as plain doubles/ints with no constructors so the whole
 // array can be memcpy'd to the device as-is.
+//
+// The node stores the DERIVED bounding-sphere form of its spatial bounds rather than
+// the box itself: the traversal below only ever used bmin/bmax to recompute the box
+// centre and the squared half-diagonal on every ltImportance/ltShouldSplit call —
+// per candidate node, per NEE vertex — so the builder now bakes them once.  Same for
+// sin(theta_o), which cost a sqrt per importance call.  The builder must fill these
+// with EXACTLY the expressions the traversal used (see lighttree_build.h) so the
+// selection pdfs — and therefore the images — stay bit-identical.
 struct LightTreeNode {
-    double bmin[3];      // spatial bounds of the subtree's emitters
-    double bmax[3];
+    double center[3];    // centre of the members' bounding box: 0.5*(bmin+bmax)
+    double r2;           // squared bounding-sphere radius: 0.25*|bmax-bmin|^2
     double axis[3];      // bounding cone of the subtree's emission axes
     double cosThetaO;    // cos of the half-angle containing every emitter normal
+    double sinThetaO;    // ltSafeSqrt(1 - cosThetaO^2), baked (the widening needs both)
     double cosThetaE;    // cos of the extra spread beyond the normal (0 = Lambertian hemisphere)
     double power;        // total emitted flux in the subtree (the selection weight)
     int left;            // interior: child node index; leaf: -1
@@ -96,16 +105,10 @@ LT_FN double ltSafeSqrt(double x) { return x <= 0.0 ? 0.0 : std::sqrt(x); }
 LT_FN double ltImportance(const LightTreeNode& nd, const double p[3],
                           const double n[3], bool hasN) {
     if (nd.power <= 0.0) return 0.0;
-    const double cx = 0.5 * (nd.bmin[0] + nd.bmax[0]);
-    const double cy = 0.5 * (nd.bmin[1] + nd.bmax[1]);
-    const double cz = 0.5 * (nd.bmin[2] + nd.bmax[2]);
-    const double dx = p[0] - cx, dy = p[1] - cy, dz = p[2] - cz;
-    double d2 = dx * dx + dy * dy + dz * dz;
-    // Bounding-sphere radius of the node (half the box diagonal).
-    const double ex = nd.bmax[0] - nd.bmin[0];
-    const double ey = nd.bmax[1] - nd.bmin[1];
-    const double ez = nd.bmax[2] - nd.bmin[2];
-    const double r2 = 0.25 * (ex * ex + ey * ey + ez * ez);
+    const double dx = p[0] - nd.center[0], dy = p[1] - nd.center[1], dz = p[2] - nd.center[2];
+    const double dist2 = dx * dx + dy * dy + dz * dz;   // raw; reused for invD below
+    double d2 = dist2;
+    const double r2 = nd.r2;                    // squared bounding-sphere radius (baked)
     // Half the node radius as the distance floor: inside-the-node scores stay
     // large (it IS the nearest light) but finite.
     const double floor2 = 0.25 * r2;
@@ -121,7 +124,7 @@ LT_FN double ltImportance(const LightTreeNode& nd, const double p[3],
         cosThetaU = ltSafeSqrt(1.0 - s2);
     }
 
-    const double invD = 1.0 / std::sqrt(dx * dx + dy * dy + dz * dz + 1e-300);
+    const double invD = 1.0 / std::sqrt(dist2 + 1e-300);
     const double wx = dx * invD, wy = dy * invD, wz = dz * invD;   // node -> p
 
     // theta = angle(axis, w). Widen by theta_o then by theta_u; both widenings are
@@ -129,7 +132,7 @@ LT_FN double ltImportance(const LightTreeNode& nd, const double p[3],
     double cosTheta = nd.axis[0] * wx + nd.axis[1] * wy + nd.axis[2] * wz;
     if (cosTheta > 1.0) cosTheta = 1.0; else if (cosTheta < -1.0) cosTheta = -1.0;
     const double sinTheta = ltSafeSqrt(1.0 - cosTheta * cosTheta);
-    const double sinThetaO = ltSafeSqrt(1.0 - nd.cosThetaO * nd.cosThetaO);
+    const double sinThetaO = nd.sinThetaO;      // baked by the builder
 
     double cosTP, sinTP;                                   // theta' = theta - theta_o
     if (cosTheta > nd.cosThetaO) { cosTP = 1.0; sinTP = 0.0; }   // already inside the cone
@@ -170,15 +173,9 @@ struct LtSample { int emitter; double pdf; };
 // a huge value splits the whole tree (= the old sum-over-all-emitters estimator).
 LT_FN bool ltShouldSplit(const LightTreeNode& nd, const double p[3], double thresh) {
     if (thresh <= 0.0) return false;
-    const double ex = nd.bmax[0] - nd.bmin[0];
-    const double ey = nd.bmax[1] - nd.bmin[1];
-    const double ez = nd.bmax[2] - nd.bmin[2];
-    const double r2 = 0.25 * (ex * ex + ey * ey + ez * ez);
+    const double r2 = nd.r2;
     if (r2 <= 0.0) return false;
-    const double cx = 0.5 * (nd.bmin[0] + nd.bmax[0]);
-    const double cy = 0.5 * (nd.bmin[1] + nd.bmax[1]);
-    const double cz = 0.5 * (nd.bmin[2] + nd.bmax[2]);
-    const double dx = p[0] - cx, dy = p[1] - cy, dz = p[2] - cz;
+    const double dx = p[0] - nd.center[0], dy = p[1] - nd.center[1], dz = p[2] - nd.center[2];
     const double d2 = dx * dx + dy * dy + dz * dz;
     if (d2 <= 0.0) return true;
     return r2 / d2 > thresh;

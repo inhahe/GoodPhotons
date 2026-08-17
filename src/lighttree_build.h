@@ -147,12 +147,23 @@ inline int ltBuild(const std::vector<LtEmitterBound>& items,
             const int self = (int)out.size();
             out.push_back(LightTreeNode{});
             LightTreeNode nd{};
+            // The node carries the DERIVED bounding-sphere form (centre, r^2) and the
+            // baked sin(theta_o) — see the struct comment in lighttree.h. These MUST be
+            // the exact expressions the traversal used to recompute them per call
+            // (0.5*(bmin+bmax); 0.25*(ex^2+ey^2+ez^2) summed x,y,z; ltSafeSqrt(1-c^2))
+            // so every importance value, selection pdf, and image stays bit-identical.
             for (int k = 0; k < 3; ++k) {
-                nd.bmin[k] = agg.bmin[k];
-                nd.bmax[k] = agg.bmax[k];
-                nd.axis[k] = agg.cone.w[k];
+                nd.center[k] = 0.5 * (agg.bmin[k] + agg.bmax[k]);
+                nd.axis[k]   = agg.cone.w[k];
+            }
+            {
+                const double ex = agg.bmax[0] - agg.bmin[0];
+                const double ey = agg.bmax[1] - agg.bmin[1];
+                const double ez = agg.bmax[2] - agg.bmin[2];
+                nd.r2 = 0.25 * (ex * ex + ey * ey + ez * ez);
             }
             nd.cosThetaO = agg.cone.cosTheta;
+            nd.sinThetaO = ltSafeSqrt(1.0 - nd.cosThetaO * nd.cosThetaO);
             nd.cosThetaE = agg.cosThetaE;
             nd.power = agg.power;
             nd.left = nd.right = nd.emitter = -1;

@@ -940,6 +940,13 @@ struct DScene {
     // is what stops mode B rendering every mirror black. Null/0 in a mirror-free scene,
     // so such scenes pay one integer compare per connected photon vertex.
     const DMirrorPlane* mirrorPlanes; int nMirrorPlanes;
+    // Sphere index lists (Scene::dielSphereIdx / mirrorSphereIdx, ascending): the spheres
+    // whose material is Dielectric / a planar-mirror metal. Read ONLY by the forward
+    // specular camera connection (dCamSpecularSplatAllVtxN) so it can skip the
+    // per-vertex-per-lambda scan of ALL spheres in scenes where few (or none) qualify.
+    // Null/0 when the scene has no such spheres.
+    const int* dielSph;   int nDielSph;
+    const int* mirrorSph; int nMirrorSph;
     const DMaterial* mats;
     const DNode*     nodes; const int* primIdx; int nNodes;
     // Implicit surfaces (isosurface/CSG/metaballs). BVH prims with index
@@ -5028,10 +5035,13 @@ __device__ static void dConnectSpecularPlane(const DScene& sc, const DCamera& ca
 
     const double dE = D - dP;                         // |R - eye| (R lies on the plane)
     const D3 wRE = (eye - R) * (1.0 / dE);            // mirror -> eye
+    // Light-side leg first (stopping just short of the mirror's own surface): the
+    // any-hit occlusion walk is cheaper than the closest-hit that confirms the mirror,
+    // so a shadowed connection never pays for the expensive query. Both tests must
+    // pass and neither draws RNG, so the order is unobservable.
+    if (occluded(sc, (p + wP * 1e-6).toR(), wP.toR(), connMaxT(dP))) return;
     DHit hm;
     if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) return;
-    // Light-side leg, stopping just short of the mirror's own surface.
-    if (occluded(sc, (p + wP * 1e-6).toR(), wP.toR(), connMaxT(dP))) return;
 
     dSplatMirrorLegs(sc, cam, film, hits, sc.mats[hm.matId], hm, px, py, omega,
                      p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng);
@@ -5112,9 +5122,29 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
     for (int ri = 0; ri < nroot; ++ri) {
         const double phi = roots[ri];
         const D3 P1chief = O + ex * (r * cos(phi)) + ey * (r * sin(phi));
+        // Everything below is pure and RNG-free, so the tests are ordered cheapest
+        // first — an off-frame or backfacing connection rejects before paying for the
+        // two extra differential reflections, and the traversals come last, any-hit
+        // before closest-hit. Every value is computed by the same expression as
+        // before, so the accepted set and the splats are unchanged.
+        int px, py; Real cosCam, dist2e;
+        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) continue;
+        const double omega = cam.pixelSolidAngle(cosCam);
+        if (omega <= 0.0) continue;
+
         const D3 d0 = d3norm(P1chief - eye);
         DSphereRefl ch;
         if (!dReflectOffSphere(eye, d0, S, ch)) continue;
+
+        D3 wP = ch.P1 - p; const double dP = d3len(wP);
+        if (dP < 1e-9) continue;
+        wP = wP * (1.0 / dP);
+        const double shape = vt.shape(wP);
+        if (shape < 0.0) continue;
+
+        D3 toEye = eye - ch.P1; const double dE = d3len(toEye);
+        if (dE < 1e-9) continue;
+        const D3 wRE = toEye * (1.0 / dE);
 
         // Ray-differential geometry factor G = dOmega_eye / dA_perp at p.
         D3 a1, a2; d3onb(d0, a1, a2);
@@ -5141,23 +5171,9 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
         const double G = (eps * eps) / jac;
         const double D = 1.0 / sqrt(G);
 
-        int px, py; Real cosCam, dist2e;
-        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) continue;
-        const double omega = cam.pixelSolidAngle(cosCam);
-        if (omega <= 0.0) continue;
-
-        D3 wP = ch.P1 - p; const double dP = d3len(wP);
-        if (dP < 1e-9) continue;
-        wP = wP * (1.0 / dP);
-        const double shape = vt.shape(wP);
-        if (shape < 0.0) continue;
-
-        D3 toEye = eye - ch.P1; const double dE = d3len(toEye);
-        if (dE < 1e-9) continue;
-        const D3 wRE = toEye * (1.0 / dE);
+        if (occluded(sc, (p + wP * 1e-6).toR(), wP.toR(), connMaxT(dP))) continue;
         DHit hm;
         if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) continue;
-        if (occluded(sc, (p + wP * 1e-6).toR(), wP.toR(), connMaxT(dP))) continue;
 
         dSplatMirrorLegs(sc, cam, film, hits, sc.mats[hm.matId], hm, px, py, omega,
                          p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, rng);
@@ -5177,22 +5193,26 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
         const D3& pd, const DSpecVtx& vt, const Real* lam, const Real* beta, const Real* w,
         int nUp, DRng& rng) {
     if (camMode != CAM_B) return;
-    for (int i = 0; i < nUp; ++i) {
-        DSpecVtx vi = vt; vi.weight = (double)w[i]; vi.lambda = lam[i];
-        for (int si = 0; si < sc.nSph; ++si) {
-            const DSphere& S = sc.sph[si];
-            const DMaterial& gm = sc.mats[S.matId];
-            if (gm.type != D_DIELECTRIC) continue;
-            double ng = (double)specLookup(gm.ior, lam[i]);
-            for (int c = 0; c < cs.nCam; ++c)
-                dConnectSpecularSphere(sc, cs.cams[c], cs.films[c], cs.hits[c], S, gm, ng,
-                                       pd, vi, lam[i], (double)beta[i], rng);
+    // sc.dielSph / sc.mirrorSph are the ascending indices of the qualifying spheres
+    // (host-precomputed with the same predicates the loops below used to test inline),
+    // so iteration — and therefore film accumulation — order is unchanged bit for bit,
+    // and a scene with many plain spheres no longer scans them all per vertex per λ.
+    if (sc.nDielSph > 0) {
+        for (int i = 0; i < nUp; ++i) {
+            DSpecVtx vi = vt; vi.weight = (double)w[i]; vi.lambda = lam[i];
+            for (int k = 0; k < sc.nDielSph; ++k) {
+                const DSphere& S = sc.sph[sc.dielSph[k]];
+                const DMaterial& gm = sc.mats[S.matId];
+                double ng = (double)specLookup(gm.ior, lam[i]);
+                for (int c = 0; c < cs.nCam; ++c)
+                    dConnectSpecularSphere(sc, cs.cams[c], cs.films[c], cs.hits[c], S, gm, ng,
+                                           pd, vi, lam[i], (double)beta[i], rng);
+            }
         }
     }
     // Mirrors. Achromatic geometry, so one solve serves the whole hero bundle.
-    for (int si = 0; si < sc.nSph; ++si) {
-        const DSphere& S = sc.sph[si];
-        if (!dIsPlanarMirrorMat(sc.mats[S.matId])) continue;
+    for (int k = 0; k < sc.nMirrorSph; ++k) {
+        const DSphere& S = sc.sph[sc.mirrorSph[k]];
         for (int c = 0; c < cs.nCam; ++c)
             dConnectSpecularSphereMirror(sc, cs.cams[c], cs.films[c], cs.hits[c], S,
                                          pd, vt, lam, beta, w, nUp, rng);
@@ -13067,6 +13087,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     DSphere*   d_sph   = sph.empty()     ? nullptr : (DSphere*)keep(uploadVec(sph));
     DMirrorPlane* d_mirp = mirrorPlanes.empty() ? nullptr
                                                 : (DMirrorPlane*)keep(uploadVec(mirrorPlanes));
+    int* d_dielSph   = scene.dielSphereIdx.empty()   ? nullptr
+                                                     : (int*)keep(uploadVec(scene.dielSphereIdx));
+    int* d_mirrorSph = scene.mirrorSphereIdx.empty() ? nullptr
+                                                     : (int*)keep(uploadVec(scene.mirrorSphereIdx));
     DNode*     d_nodes = nodes.empty()   ? nullptr : (DNode*)keep(uploadVec(nodes));
     int*       d_prim  = primIdx.empty() ? nullptr : (int*)keep(uploadVec(primIdx));
     DMaterial* d_mats  = mats.empty()    ? nullptr : (DMaterial*)keep(uploadVec(mats));
@@ -13300,6 +13324,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
     sc.mirrorPlanes = d_mirp; sc.nMirrorPlanes = (int)mirrorPlanes.size();
+    sc.dielSph   = d_dielSph;   sc.nDielSph   = (int)scene.dielSphereIdx.size();
+    sc.mirrorSph = d_mirrorSph; sc.nMirrorSph = (int)scene.mirrorSphereIdx.size();
     sc.mats = d_mats;
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
     sc.fieldNodes = d_fnodes; sc.fieldExprNodes = d_fexpr;
