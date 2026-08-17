@@ -1732,7 +1732,8 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   **Not yet using it:** the forward/BDPT/VCM `selectEmitter` power CDF
   (`render_cuda.cu`), and a mesh emitter's own triangles (still area-sampled) — both
   tracked in `known-issues.md`.
-- **`radcache.h`** (0.190.0; device notice 0.190.1, deterministic chunking 0.190.2) — the
+- **`radcache.h`** (0.190.0; device notice 0.190.1, deterministic chunking 0.190.2,
+  checkpointed table 0.190.3) — the
   **world-space diffuse radiance cache** behind `-radcache`, mode `R` on the CPU. A clipmapped hash of cells (54-bit quantised
   position, clipmap level, 54 normal buckets) each holding a 16-bin spectral mean, its
   variance and a confidence flag; `backward.h`'s `radianceHeroLoop` reads it at a diffuse
@@ -1804,6 +1805,30 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   two **slower than not caching** because the update pass is paid for and no cell ever
   resolves. A flat split — the obvious way to make something reproducible — is precisely the
   wrong answer here, so the rule targets a chunk *count*, not a chunk *size*.
+
+  **The table is checkpointed (0.190.3), sparsely and under its own guard.** It rides in the
+  `.ftbuf` sidecar as a trailing section after the film blobs (`writeRadCacheSection` /
+  `readRadCacheSection`, `main.cpp`), which needs no magic bump because both film readers
+  consume a fixed number of fixed-size records and never demand the stream end there — the
+  format is extended, not reinterpreted. Three details carry the design. **Sparse**, because
+  the default table is 262 144 cells (~82 MB) and would otherwise be rewritten every
+  `-interval`; occupancy is a tiny fraction of that (36 cells on a Cornell box, 8.7 k on
+  `fur_creature`) since cells tile the visible *surface*. **Its own guard**
+  (`RadianceCache::configGuard`), because `checkpointGuard` covers scene/mode/resolution and
+  no cache parameter at all, so it would happily accept a sidecar whose cells were keyed
+  under a different `-radcache-cell` or a different clipmap centre — a value measured over
+  one volume of space filed under the key of another. Two guards let a changed cache setting
+  discard the table while the image still resumes. **Deferred adoption**
+  (`radCacheAdoptPending`), because the reader runs before the cache's configuration exists:
+  the auto cell size comes from the camera and resolution, so the records are parked and
+  folded in at the top of the first backward pass, through `loadCell`, which rehomes each
+  cell by key and therefore tolerates a changed table capacity. Measured effect on
+  `cornell.ftsl` at 200², resuming +512 spp on top of 1024: 68.4 % of consults terminated /
+  65.9 M rays warm, versus 24.9 % / 70.5 M from the same film with the section stripped. The
+  motivation is not only speed — a cold resume mixes unbiased (never-terminating) samples
+  with biased ones in a ratio set by the interruption history, which is not a property an
+  image should have. It does *not* make a resume equal a single shot, because the chunk
+  schedule restarts at `done = 0` and the update passes land elsewhere.
 
   **It reaches exactly one code path, and 0.190.1 makes that audible.** The GPU backward
   megakernel (`bkRadianceHeroLoop`, `render_cuda.cu`) and the scalar `radiance()` fallback

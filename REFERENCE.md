@@ -927,7 +927,9 @@ interval. **Disk `-resume`/`-checkpoint` now cover `A`/`B`/`C` (photon-count che
 continues the *absolute* sample sequence past whatever the checkpoint holds, so its added
 samples genuinely reduce variance; in the deterministic mode `W` the continuation is exact,
 and `-spp 3` followed by `-resume -spp 5` gives bit-for-bit the pixels of a plain `-spp 8`
-(note that `-spp` under `-resume` means *additional* samples, not a total). Only the
+(note that `-spp` under `-resume` means *additional* samples, not a total). Since 0.190.3 the
+sidecar also carries the `-radcache` table when there is one, as a sparse trailing section,
+so a resumed run continues with a warm cache instead of relearning it. Only the
 persistent-state photon modes `M`/`S`/`U` (whose per-pass state a film alone can't restore)
 stay non-resumable.
 
@@ -1033,6 +1035,25 @@ table receives: at 65 chunks the cache terminates ~36 % of consults, at 16 it ma
 and at 5 it terminates nothing at all while still paying for the update pass — **slower than
 not caching**. `FTRACE_CHUNK_SPP=<n>` pins the split and `FTRACE_CHUNK_DEBUG=1` prints the
 sequence, if you want to see this for yourself.
+
+**The table survives `-checkpoint` / `-resume`** (0.190.3). It is written into the `.ftbuf`
+sidecar as a sparse trailing section — occupied cells only, ~320 bytes each, so a Cornell box
+adds 11 KB to a 1.3 MB file rather than the 82 MB a whole 262 144-cell table would be — and a
+resumed render therefore continues **warm**. Measured at 200², resuming +512 spp on top of
+1024: **68.4 %** of consults terminated and 65.9 M ray queries, against **24.9 %** and 70.5 M
+resuming the identical film with the section stripped off. Beyond the speed, it removes a
+subtler wart: a cold resume blended never-terminating (unbiased) samples with terminating
+(biased) ones in a ratio decided by wherever you happened to stop, so the finished image's
+bias depended on its interruption history.
+
+The section carries its own guard covering everything a stored cell's contents depend on —
+cell size, clipmap centre, spectral range, and the confidence gate — separately from the
+film's scene/mode/resolution guard, so resuming with a different `-radcache-cell` discards
+the *table* (with a message) and still resumes the *image*. The table is rehomed by key on
+load, so growing `-radcache-cells` between runs keeps it. Older sidecars, and those written
+without `-radcache`, simply have no section and load exactly as before. What this does *not*
+buy is resume-equals-single-shot: the chunk schedule restarts, so the update passes still
+fall in different places.
 
 **When it does not help.** The cache pays only once its cells are resolved, and a cell is
 resolved by the update pass, not by the image. On a scene whose visible surface area dwarfs
@@ -4338,7 +4359,7 @@ alone can't restore, so they are not disk-resumable.
 | `-play` | With `-viewer`: open with the clock **already playing**, so a loop can be watched — or its per-frame cost read off the `[play]` breakdown printed to stdout — without clicking into the window. Ignored (with a printed reason) when there is no live loom channel or the sidecar advertises `frames = 1`. |
 | `-prebake` | With `-viewer`: walk the clock **once** on open and keep every frame's adopted state in memory, then play out of that cache on a wall clock at the panel's `fps` rather than at loom's bake rate. Costs ~0.01 ms a frame to show, so the requested rate is actually delivered, and it makes scrubbing the frame slider instant too. The cache is dropped whenever a build parameter or `frames` changes — a cache built at other values is not a cache of what you are looking at. Same thing as the panel's **prebake** button; the flag exists so a played frame rate can be measured from a script. |
 | `-prebake-cap <MB>` | Memory budget for `-prebake` (default `1024`, also settable live as the panel's **cap MB**). A walk that reaches the cap stops there and says where: the **prefix** it did fill still plays from memory and the remaining frames fall back to bake-paced play, so a long clock degrades instead of failing. Because that degradation is otherwise invisible until you hit it — a loop that runs at the target rate for its first half and stutters through the rest — the walk projects the whole clock's cost after 4 frames and prints it **before** committing: either `~19.4 MB/frame x 96 frames = ~1863 MB, fits the 1024 MB cap` or the shortfall together with the exact `-prebake-cap` value that would cache everything. The same suggestion is repeated on the cap-reached line. |
-| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
+| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`). Under `-radcache` the sidecar also carries the radiance-cache table (sparse — occupied cells only), so a resumed render continues warm; see **The radiance cache** |
 | `-stop [<pid>\|all]` | **Stop a running render cleanly, from another shell.** `ftrace -stop <pid>` asks that render to do exactly what Ctrl-C does — finish the current chunk, write the final image **and** `.ftbuf` checkpoint, release the CUDA context through the graceful-shutdown path — then waits (up to 120 s) for it to actually exit, so it's safe to script a rebuild right after. `-stop all` targets every running render; a bare `-stop` just **lists** them (pid + scene → output). This exists because a render launched detached has no console to Ctrl-C into, and **force-killing ftrace mid-CUDA is a known way to wedge the NVIDIA driver into a TDR/bugcheck** — so never `taskkill /F` a render, use this. It also releases a window being held open by `-keepwindow`. Implemented as a sentinel file under `<temp>/ftrace/` (a `<pid>.run` entry per live render, a `<pid>.stop` to signal it), which — unlike a named kernel event — crosses the session / window-station boundary between a detached render and the shell signalling it. Stale channel files are reaped by the next `-stop`: both a `<pid>.run` left by a hard kill and a `<pid>.stop` nobody was left to consume, in each case only once the owning pid is gone. A stop that arrives while the process is still **loading the scene** aborts the load rather than being waited out: it prints `[stop] scene load stopped before rendering — nothing was rendered or written.` and exits **1** (no scene was built, so nothing could be rendered — the non-zero exit is the correct outcome, not an error in your `.ftsl`). Since **0.182.0** it covers every long-lived ftrace process, not just renders: a `-viewer` (loom native viewer) or `-explore` GUI is listed by a bare `-stop` and shuts down cleanly when targeted, its event loop polling the same flag a render polls and then leaving through its normal teardown (D3D11, the loom python child, the window). Also since 0.182.0 the **exit code is honest**: `0` only when every target is genuinely gone (a pid that was already dead counts, and reports `nothing to stop`), and `2` with `[stop] FAILED — still running after 120s: <pids>` when one outlives the wait — previously it printed `stopped cleanly` and exited 0 regardless, so a stop that did nothing looked like a success. Nothing is ever force-killed either way. |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`). **Process-local** — it can only share an anchor between frames rendered by *this* invocation; for a frame-per-invocation sequence use `-exposure-anchor` |
 | `-exposure-anchor <v\|file>` | **Share one auto-exposure anchor across separate `ftrace` invocations** — the missing piece for a sequence whose frames are each rendered by their own process (loom's `render_range`, a batch script, a re-render of one frame). Implies `-exposure-lock`. With a **number** the anchor is used directly (no metering). With a **path**: if the file exists and holds a number that anchor is loaded and reused; otherwise this run meters normally and **writes** its resolved anchor there, so every later frame pointed at the same file develops at the identical gain. Also accepted by **`-topng`**, which is how a *finished* sequence is repaired from its `.ftbuf` checkpoints with no re-render (see **Output**). Without it, per-frame metering can jump — the p99 anchor solves `area(L) = 1%` for a level, and on a scene with a bright compact highlight population the tail density is so thin (~0.25% of frame per octave) that the inversion is ill-conditioned, so a rotating highlight swings the anchor by a third of an octave (measured on `pastel_jack_ring`: 36% single-frame anchor step while every honest brightness measure moved ≤ 2.3%). This is not fixable in the statistic — see the `exposure_lock` notes and `known-issues.md` |

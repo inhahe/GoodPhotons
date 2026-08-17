@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-08-16, v0.190.0–0.190.2): `-radcache` is opt-in because it is *approximate*, and its residual error concentrates on caustics/specular — plus its limits
+### OPEN (2026-08-16, v0.190.0–0.190.3): `-radcache` is opt-in because it is *approximate*, and its residual error concentrates on caustics/specular — plus its limits
 
 `-radcache` (`src/radcache.h`, read site in `BackwardRenderer::radianceHeroLoop`,
 `src/backward.h`) is a world-space diffuse radiance cache for mode `R` on the CPU. It is
@@ -70,10 +70,19 @@ reference. `cpuSppChunks` now uses a schedule derived from `sppTarget` (1, 9, th
 split into ~64 chunks) whenever `g_radCache` is set; repeat runs are now bit-identical, and
 renders without the flag keep the timed schedule and are unchanged.
 
-One caveat on the fixed half: the table is **not** part of the `.ftbuf` checkpoint (nothing
-in `radcache.h` serialises), so a `-resume`d render restarts with a cold table and will not
-match the same budget rendered in one go. Reproducibility means "the same command run
-twice", not "the same total spp however you got there".
+One caveat on the fixed half, **narrowed in v0.190.3**: the table now *is* part of the
+`.ftbuf` checkpoint (a sparse trailing section, `writeRadCacheSection` in `main.cpp`), so a
+`-resume`d render continues warm instead of cold — measured on `scenes/cornell.ftsl` at
+200², resuming +512 spp on top of 1024: 68.4 % of consults terminated and 65.9 M rays warm,
+against 24.9 % and 70.5 M from the same checkpoint with the section stripped. That also
+removes a correctness wart, since a cold resume silently blended unbiased (never-terminating)
+samples with biased ones in a ratio set by wherever the user happened to stop.
+
+It does **not** make a resumed render identical to the same budget rendered in one go, and
+cannot on its own: the chunk schedule restarts from `done = 0`, so the boundaries — and
+therefore the number of update passes and where they fall — still differ. Reproducibility
+still means "the same command run twice" (which *is* bit-exact, checkpoint section included),
+not "the same total spp however you got there".
 
 A second finding fell out of the same investigation, and it is a **performance trap** worth
 knowing: the chunk *count* is the number of update passes the table gets, and the cache is

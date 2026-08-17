@@ -94,8 +94,11 @@
 //                  resume is bit-identical outright -- `-spp 3` then `-resume -spp 5` gives
 //                  exactly the pixels of a plain `-spp 8`, since the lattice is indexed by
 //                  absolute sample. R/D store a SUM-over-spp film + spp count; P stores a
-//                  dual forward+backward film (magic FTPCM02). M/S/U keep persistent per-pass
-//                  state that a film alone can't restore, so they are not disk-resumable.
+//                  dual forward+backward film (magic FTPCM02). Under -radcache both formats
+//                  carry the radiance-cache table as a sparse trailing section, so a resumed
+//                  render continues with a WARM cache rather than relearning it (see
+//                  writeRadCacheSection). M/S/U keep persistent per-pass state that a film
+//                  alone can't restore, so they are not disk-resumable.
 //   -savemap <f>   (mode M, GPU) after the forward deposit pass, write the view-independent
 //                  photon map to <f> (magic FTPMP01). The map is the expensive result of the
 //                  photon trace and is independent of camera and gather radius.
@@ -10666,6 +10669,62 @@ static double g_radValidate   = 0.05;   // fraction of reads that verify instead
 static size_t g_radCacheCells = (size_t)1 << 18;
 static RadianceCache g_radianceCache;
 
+// ---- resume: the table read out of a .ftbuf checkpoint, waiting to be adopted -------------
+//
+// A resumed render reloads the cache table so it continues WARM. This is not just a speed
+// nicety, it removes a correctness wart: without it a resumed film silently blends cold-table
+// samples (which never terminate, and are therefore unbiased) with warm-table samples (which
+// do, and are therefore biased) in a ratio decided by wherever the user happened to stop and
+// restart. The bias of the finished image then depends on the interruption history, which is
+// not a property an image should have.
+//
+// The load is DEFERRED rather than applied where the file is read, because the table's
+// configuration is not final at that point: renderBackward derives the auto cell size from the
+// camera and resolution and sets the clipmap centre from the eye, and those are exactly the
+// settings the saved cells' keys were computed under. So the reader parks the records here and
+// radCacheAdoptPending() consumes them at the top of the first pass, once every parameter the
+// guard covers is known.
+struct PendingRadCache {
+    bool      have  = false;
+    uint64_t  guard = 0;
+    uint32_t  pass  = 0;
+    long long nSample = 0, nEvicted = 0, nTerm = 0, nMiss = 0, nUpdated = 0;
+    std::vector<uint64_t>     keys;
+    std::vector<RadCacheCell> cells;
+    void clear() { *this = PendingRadCache{}; }
+};
+static PendingRadCache g_pendingRadCache;
+
+// Fold a checkpointed table into the freshly-initialised one. Called once, from the first
+// backward pass, after the cache's configuration has been finalised. A guard mismatch is NOT
+// fatal: the film still resumes correctly, the table simply starts cold, so this warns and
+// carries on rather than refusing the render.
+static void radCacheAdoptPending() {
+    if (!g_pendingRadCache.have) return;
+    PendingRadCache p;
+    p = std::move(g_pendingRadCache);
+    g_pendingRadCache.clear();          // one shot: later passes must not re-adopt
+    if (!g_radianceCache.ready()) return;
+    if (p.guard != g_radianceCache.configGuard()) {
+        std::fprintf(stderr, "[resume] the checkpoint's radiance-cache table was built with "
+                             "different cache settings (cell size, clipmap centre, spectral "
+                             "range or confidence gate); starting with a cold table. The image "
+                             "resume itself is unaffected.\n");
+        return;
+    }
+    size_t loaded = 0;
+    for (size_t i = 0; i < p.keys.size(); ++i)
+        if (g_radianceCache.loadCell(p.keys[i], p.cells[i])) ++loaded;
+    g_radianceCache.pass     = p.pass;
+    g_radianceCache.nSample  = p.nSample;
+    g_radianceCache.nEvicted = p.nEvicted;
+    g_radianceCache.nTerm    = p.nTerm;
+    g_radianceCache.nMiss    = p.nMiss;
+    g_radianceCache.nUpdated = p.nUpdated;
+    std::printf("[resume] radiance cache: %zu of %zu cells restored; continuing warm\n",
+                loaded, p.keys.size());
+}
+
 // End-of-render summary.
 //   term%    share of cache consultations that actually shortened a path -- the number that
 //            predicts the speedup.
@@ -11441,6 +11500,9 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         g_radianceCache.lambdaHi   = LAMBDA_MAX;
         g_radianceCache.camera     = cam.eye;    // clipmap centre; re-read every pass
         g_radianceCache.prepare();               // refresh the reciprocals the hot path uses
+        // -resume: adopt the table saved in the .ftbuf sidecar, now that every setting its
+        // guard covers is final. No-op on a fresh render, and after the first pass.
+        radCacheAdoptPending();
     }
     // Factored out of the worker so the -radcache update pass (below) can trace with an
     // IDENTICAL renderer configuration -- an update ray must see the same materials, the same
@@ -12266,6 +12328,92 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
 
 static std::string checkpointPath(const std::string& outPath) { return outPath + ".ftbuf"; }
 
+// ---- the radiance-cache section of a .ftbuf sidecar ---------------------------------------
+//
+// Appended AFTER the film blobs, under its own tag and its own guard. Appending works because
+// both readers above consume a fixed number of fixed-size records and never require the stream
+// to end there, so a sidecar carrying this section loads unchanged in a build that knows
+// nothing about it, and one written by such a build simply has no section to find. That is why
+// the file magic does NOT need a bump: the format is only extended, never reinterpreted.
+//
+// It is SPARSE -- only occupied slots -- and this is not an optimisation, it is what makes
+// checkpointing the table viable at all. The default table is 262144 cells; dumping it whole
+// would put ~82 MB into a file that is otherwise ~1 MB and rewrite it every `-interval`
+// (15 s by default), which would cost more than the cache saves. Occupancy in practice is a
+// tiny fraction of capacity -- 36 cells on a Cornell box (~11 KB), 8.7 k on fur_creature
+// (~2.7 MB) -- because cells tile the VISIBLE SURFACE, not the volume.
+//
+// `scratch` is not written: it holds one update round's partial sums, is folded into the cells
+// at the end of every round, and is empty at the chunk boundary where checkpoints are taken.
+//
+// The section's guard is separate from the film's on purpose. checkpointGuard() covers the
+// scene, mode and resolution, and nothing whatever about the cache -- so it would happily
+// accept a sidecar written under a different -radcache-cell, whose keys quantise space
+// differently. Two guards let the mismatch cases resolve independently and correctly: a
+// changed scene rejects both, a changed cache setting rejects only the table and still resumes
+// the image.
+static constexpr char kRadCacheTag[8] = {'F','T','R','C','A','C','H','1'};
+
+// Returns false only on a write error. Writes nothing at all (leaving the sidecar byte-for-byte
+// what it has always been) when there is no live table, so a render without -radcache is
+// unaffected in every respect, including the bytes on disk.
+static bool writeRadCacheSection(std::ostream& o) {
+    if (!g_radCache || !g_radianceCache.ready()) return true;
+    const RadianceCache& rc = g_radianceCache;
+    uint64_t n = 0;
+    for (size_t i = 0; i < rc.key.size(); ++i) if (rc.key[i] != RadianceCache::kEmpty) ++n;
+    const uint64_t guard = rc.configGuard();
+    const uint32_t pass  = rc.pass;
+    const long long ctr[5] = {rc.nSample, rc.nEvicted, rc.nTerm, rc.nMiss, rc.nUpdated};
+    o.write(kRadCacheTag, 8);
+    o.write((const char*)&guard, 8);
+    o.write((const char*)&pass, 4);
+    o.write((const char*)ctr, sizeof ctr);
+    o.write((const char*)&n, 8);
+    for (size_t i = 0; i < rc.key.size(); ++i) {
+        if (rc.key[i] == RadianceCache::kEmpty) continue;
+        o.write((const char*)&rc.key[i], 8);
+        o.write((const char*)&rc.cell[i], sizeof(RadCacheCell));
+    }
+    return (bool)o;
+}
+
+// Park a checkpointed table in g_pendingRadCache for radCacheAdoptPending() to consume. Any
+// shortfall -- no section, an unrecognised tag, a truncated record -- means "no saved table",
+// which is a completely ordinary state (every sidecar written before this existed, and every
+// one written without -radcache), so it is silent and the stream's failure bits are cleared
+// afterwards: the caller has already read everything it needs and must not see a stray EOF
+// from probing past the end as a truncated FILM.
+static void readRadCacheSection(std::istream& in) {
+    g_pendingRadCache.clear();
+    if (!g_radCache) { in.clear(); return; }
+    char tag[8] = {0};
+    in.read(tag, 8);
+    if (!in || std::memcmp(tag, kRadCacheTag, 8) != 0) { in.clear(); return; }
+    uint64_t guard = 0, n = 0; uint32_t pass = 0; long long ctr[5] = {0,0,0,0,0};
+    in.read((char*)&guard, 8);
+    in.read((char*)&pass, 4);
+    in.read((char*)ctr, sizeof ctr);
+    in.read((char*)&n, 8);
+    // Sanity bound before allocating from a file's word: a table can never hold more cells
+    // than the largest capacity the flag accepts, and the record count is otherwise attacker-
+    // or corruption-controlled.
+    if (!in || n > (uint64_t)1 << 28) { in.clear(); return; }
+    PendingRadCache p;
+    p.keys.resize((size_t)n);
+    p.cells.resize((size_t)n);
+    for (uint64_t i = 0; i < n; ++i) {
+        in.read((char*)&p.keys[(size_t)i], 8);
+        in.read((char*)&p.cells[(size_t)i], sizeof(RadCacheCell));
+    }
+    if (!in) { in.clear(); return; }
+    in.clear();
+    p.have = true; p.guard = guard; p.pass = pass;
+    p.nSample = ctr[0]; p.nEvicted = ctr[1]; p.nTerm = ctr[2];
+    p.nMiss = ctr[3]; p.nUpdated = ctr[4];
+    g_pendingRadCache = std::move(p);
+}
+
 // "png/foo.png" + "_forward" -> "png/foo_forward.png". Inserts a suffix before the
 // extension, keeping the directory (so a companion image lands next to -o rather than in
 // the CWD) and the format (writeImage dispatches on the extension). No extension, or a
@@ -12293,6 +12441,7 @@ static bool writeCheckpoint(const std::string& outPath, const Checkpoint& c,
     o.write((const char*)&guard, 8);
     o.write((const char*)c.film.xyz.data(), c.film.xyz.size() * sizeof(Vec3));
     o.write((const char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
+    if (!writeRadCacheSection(o)) return false;
     return (bool)o;
 }
 
@@ -12330,6 +12479,7 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
     in.read((char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
     if (!in) { std::fprintf(stderr, "[resume] checkpoint %s truncated; starting fresh\n",
                             checkpointPath(outPath).c_str()); return false; }
+    readRadCacheSection(in);          // optional trailing section; absent in older sidecars
     return true;
 }
 
@@ -12364,6 +12514,7 @@ static bool writeCompositeCheckpoint(const std::string& outPath, const Composite
     o.write((const char*)c.fwd.hits.data(), c.fwd.hits.size() * sizeof(double));
     o.write((const char*)c.ref.xyz.data(), c.ref.xyz.size() * sizeof(Vec3));
     o.write((const char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
+    if (!writeRadCacheSection(o)) return false;   // mode P's backward layer reads the cache too
     return (bool)o;
 }
 
@@ -12400,6 +12551,7 @@ static bool readCompositeCheckpoint(const std::string& outPath, int res, int res
     in.read((char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
     if (!in) { std::fprintf(stderr, "[resume] composite checkpoint %s truncated; starting fresh\n",
                             checkpointPath(outPath).c_str()); return false; }
+    readRadCacheSection(in);          // optional trailing section; absent in older sidecars
     return true;
 }
 
@@ -14597,7 +14749,8 @@ static void printHelp(const char* prog) {
 "  -preview              live ANSI thumbnail in the terminal\n"
 "  -interval <sec>       periodic image-write / status / ANSI-preview cadence (default: 15)\n"
 "  -window-interval <s>  live-window repaint cadence, independent of -interval (default: 0.2)\n"
-"  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C)\n"
+"  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C, R/D, P;\n"
+"                        also carries the -radcache table, so a resume continues warm)\n"
 "  -resume               continue an accumulated render from its .ftbuf checkpoint\n"
 "  -parseonly            load the scene, print a contents summary, exit (no render)\n"
 "  -stop [<pid>|all]     ask a RUNNING ftrace to finish cleanly (image + checkpoint\n"

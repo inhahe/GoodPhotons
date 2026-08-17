@@ -272,6 +272,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "linalg.h"
@@ -539,6 +540,41 @@ struct RadianceCache {
         if (maxSamples > 60000) maxSamples = 60000;   // cell.cnt is uint16
     }
 
+    // Identity hash of every setting a SAVED cell's contents depend on, so a checkpointed
+    // table is only ever reloaded into a render that would have produced the same cells.
+    // Split into two groups, because getting the split wrong in either direction is a real
+    // failure:
+    //
+    //   * KEY-DEFINING (baseCell, baseDist, maxLevel, camera): change any of these and the
+    //     same surface point hashes to a different cell. Reloading across such a change does
+    //     not merely misplace cells, it puts a value measured over one volume of space under
+    //     the key of another -- silent, systematic, and invisible in the output.
+    //   * VALUE-DEFINING (lambda range, minSamples/maxSamples/tol): these decide what a bin
+    //     MEANS and when a cell is allowed to answer. A cell that passed a loose `tol` is
+    //     frozen at `ok`, so reloading it into a run with a tighter tol would let the old
+    //     tolerance quietly govern the new render.
+    //
+    // Deliberately NOT included: `rays`, `budget`, `warm`, `jitter`, `minBounce`, `maxUnused`
+    // and the table CAPACITY. Those change how fast the table is fed, how it is read, or
+    // where a cell lives -- none of which makes an already-stored value wrong -- so resuming
+    // with a bigger update budget or a larger table is allowed, and is a thing one actually
+    // wants to do. (A changed capacity is handled by re-inserting through loadCell(), which
+    // rehomes every cell by key.) `kRadCacheBins` and the cell's own size are folded in so a
+    // rebuild that changes the record layout rejects the old file instead of misreading it.
+    uint64_t configGuard() const {
+        uint64_t h = 14695981039346656037ULL;                 // FNV-1a offset basis
+        auto mix64 = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
+        auto mixd  = [&](double d) { uint64_t b; std::memcpy(&b, &d, 8); mix64(b); };
+        mixd(baseCell); mixd(baseDist); mix64((uint64_t)(unsigned)maxLevel);
+        mixd(camera.x); mixd(camera.y); mixd(camera.z);
+        mixd(lambdaLo); mixd(lambdaHi);
+        mix64((uint64_t)(unsigned)minSamples); mix64((uint64_t)(unsigned)maxSamples);
+        mixd(tol);
+        mix64((uint64_t)kRadCacheBins);
+        mix64((uint64_t)sizeof(RadCacheCell));
+        return h;
+    }
+
     void init(size_t capacityPow2) {
         size_t cap = 1;
         while (cap < capacityPow2) cap <<= 1;
@@ -780,6 +816,33 @@ struct RadianceCache {
         c.nx = (float)m.n.x; c.ny = (float)m.n.y; c.nz = (float)m.n.z;
         c.lastMark = pass;
         scratch[i] = RadCacheScratch{};
+    }
+
+    // Re-insert a cell deserialized from a checkpoint (see the .ftbuf radiance-cache section
+    // in main.cpp). Probes exactly as insertMark does, which is what lets a resumed render use
+    // a DIFFERENT table capacity: every cell is rehomed by its key rather than by its old slot
+    // index, so growing `-radcache-cells` between runs keeps the table instead of scrambling
+    // it. A probe window with no free slot simply drops the cell -- it is a cache entry, and a
+    // dropped one costs one miss, which the update pass fills back in.
+    //
+    // `lastMark` is loaded verbatim, and the caller restores `pass` alongside, so cell AGES
+    // survive the round trip: a resumed flyby recycles the cells that had gone stale before
+    // the interruption rather than treating the whole table as freshly touched.
+    bool loadCell(uint64_t k, const RadCacheCell& c) {
+        if (key.empty() || k == kEmpty) return false;
+        size_t i = (size_t)mix(k) & mask;
+        for (int probe = 0; probe < kProbe; ++probe) {
+            if (key[i] == kEmpty || key[i] == k) {
+                if (key[i] == kEmpty) ++used;
+                key[i]     = k;
+                cell[i]    = c;
+                scratch[i] = RadCacheScratch{};   // a round's scratch is never checkpointed
+                return true;
+            }
+            i = (i + 1) & mask;
+        }
+        ++nEvicted;
+        return false;
     }
 
     // Add one radiance sample to a cell's scratch, addressed by slot. (The update pass owns
