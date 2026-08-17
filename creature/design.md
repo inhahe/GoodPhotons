@@ -759,6 +759,16 @@ Four decisions carry the design:
   is twenty centimetres. So each generator declares the peak-to-peak height it wants *in
   metres* at difficulty 1 and the data written is `u · d · span / elevation`. Scaling `u` by
   difficulty directly would make a difficulty-1 rubble field a mountain range.
+- **The top of the difficulty axis is bounded by what is learnable, not by what is legal.**
+  `terrain_max_slope` first took the only bound anyone had reasoned about — it must clear the
+  50° fall test with room, so 25°. That is true and not binding. The binding bound is that
+  `slope` and `stairs` apply their grade to the *whole* patch, so unlike the rough classes
+  there is no flat stretch to recover on and the climb lasts the entire episode; measured on
+  P1b's first full run, the policy scores 1123 at 5°, 831 at 11°, and 14 with zero survivors
+  at 25° — on a class it trained on. Past ~13° it abandons the speed command and braces. A
+  curriculum whose top third is a task nothing can perform spends promotions climbing into it
+  and then trains there, so the cost is not the wasted episodes but the behaviour they teach.
+  Now 12°, with the measurement recorded in `TerrainSpec.for_body` and pinned by a test.
 
 **Two places quietly assumed z = 0 *was* the ground, and both are now wrong-on-terrain bugs
 that were fixed with it.** `place_on_ground` measured spawn clearance against z = 0; it now

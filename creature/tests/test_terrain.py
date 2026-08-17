@@ -93,6 +93,26 @@ def test_generate_is_normalised(kind):
         assert span == pytest.approx(s.elevation)
 
 
+def test_the_steepest_slope_stays_under_the_measured_learnable_ceiling():
+    """The top of the difficulty axis has to be a task something can actually perform.
+
+    P1b's first 30M-step run set this at 25 degrees, reasoning only that it had to clear the
+    50-degree fall test with room to spare. It does -- and it is also unwalkable: the trained
+    policy scored 14 with 0 of 64 surviving on its OWN training class at that grade, against
+    1123 at 5 degrees. Slope and stairs apply their grade to the whole patch, so there is no
+    flat stretch to recover on; past the knee the policy abandons the speed command and just
+    braces, and that behaviour leaks to the classes that are walkable.
+
+    So this pins the ceiling against the measurement rather than against `fall_tilt`, which
+    is the looser of the two constraints and the one that silently permitted the mistake.
+    """
+    s = terrain.TerrainSpec.for_body(0.6)
+    grade = math.degrees(math.atan(s.elevation / (2.0 * s.extent)))
+    assert grade <= 13.0, f"the steepest slope is {grade:.1f} deg, past the measured knee"
+    assert grade >= 8.0, f"{grade:.1f} deg wastes the top of the difficulty axis"
+    assert grade < 0.5 * 50.0, "and it must still clear the fall test, which is why 25 looked fine"
+
+
 def test_difficulty_scales_amplitude_in_metres(body):
     m = body.model
     p = terrain.Patch(body.terrain, m)

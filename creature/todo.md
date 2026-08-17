@@ -322,31 +322,43 @@ Both are places the current env quietly assumes z = 0 *is* the ground:
       class it never saw in training — **and** flat-ground performance does not regress
       (the P1 command sweep re-run on the plane is the guard, since it is the only
       apples-to-apples number we have).
-      *The apparatus for measuring it exists as of 2026-08-17 — `--terrain-kinds` holds a
-      class out of the training draw and names it back at eval time, the held-out set rides
-      in the checkpoint so a resume cannot quietly reveal it, and scoring on terrain without
-      a stated difficulty is refused (difficulty 0 is a flat heightfield, which would answer
-      the terrain question with a flat-ground table). What is left is running it:*
+      **Run once, 2026-08-17** — `runs/canis_rough`, 30.0M steps in 389 min, `stairs` held
+      out of the training draw. Both curriculum axes maxed at 4.63M steps, alternating
+      cleanly the whole way (speed and difficulty never more than one promotion apart, which
+      is the first real evidence `_promote`'s split works outside a synthetic window).
+
+      **Generalisation: met, and not marginally.** `best.pt` (17.2M) against P1's flat-only
+      policy, on `stairs`, a class it was never shown:
+
+      | stairs | P1 return | P1 surv | rough return | rough surv |
+      |---|---|---|---|---|
+      | 0.2 | 239.2 | 11% | **1107.5** | **98%** |
+      | 0.5 | 62.8 | 0% | **321.5** | **17%** |
+      | 1.0 | 14.1 | 0% | 29.7 | 3% |
+
+      **Flat guard: a 4.6% regression at `best.pt`** (1168.8 vs P1's 1224.9, 100% survival
+      both), uniform across the command range — an ordinary capacity cost. `latest.pt` at
+      30M is 12% down and concentrated at the fast end, and is worse on terrain too; the run
+      converged at ~17M. Logged as known-issues #9.
+
+      **Why difficulty 1.0 reads so badly, and why the run must be repeated.** It is not a
+      generalisation failure. Per-class at difficulty 1.0: `rolling` 1061/98%, `steps`
+      493/30%, `rubble` 311/12%, `slope` **14/0%**, `stairs` **15/0%** — and `slope` was
+      *in* the training set. The two failures are exactly the two classes that apply their
+      grade to the whole patch, and `terrain_max_slope = 25°` turned out to be past the
+      measured learnable knee (~13°). So the curriculum spent promotions climbing into an
+      impossible task and then trained there for 25M steps. Fixed (known-issues #10,
+      now 12°); **the table above is from the 25° run and has to be re-measured, not
+      patched** — the held-out class was one of the two broken ones, so this understates
+      the generalisation claim rather than overstating it.
 
       ```bash
       python tools/train.py --terrain-kinds flat,rolling,rubble,steps,slope \
-                            --steps 3e7 --out runs/canis_rough
-      python tools/train.py --eval runs/canis_rough/best.pt              # flat: the regression guard
-      python tools/train.py --eval runs/canis_rough/best.pt --terrain-kinds stairs \
-                            --terrain-level 1.0                          # the generalisation claim
+                            --steps 2e7 --out runs/canis_rough2      # ~17M is where it converged
+      python tools/train.py --eval runs/canis_rough2/best.pt                         # flat guard
+      python tools/train.py --eval runs/canis_rough2/best.pt --terrain-kinds stairs \
+                            --terrain-level 1.0                                      # the claim
       ```
-
-      **The control is measured** (2026-08-17): P1's flat-trained `runs/canis/best.pt`
-      (14.95M steps, command cap 0.8) scored on stairs it never saw. This is the number the
-      terrain run has to beat, and it says the measurement is sensitive rather than saturated
-      — the policy degrades gradually with difficulty rather than passing or failing outright.
-
-      | task | return | survived | r_speed | tilt° | alive |
-      |---|---|---|---|---|---|
-      | flat (the regression guard) | 1224.9 | 100% | 0.972 | 3.4 | 20.0 s |
-      | stairs 0.2 | 239.2 | 11% | 0.785 | 7.8 | 4.8 s |
-      | stairs 0.5 | 62.8 | 0% | 0.449 | 15.5 | 2.1 s |
-      | stairs 1.0 | 14.1 | 0% | 0.186 | 21.4 | 1.0 s |
 
 ---
 

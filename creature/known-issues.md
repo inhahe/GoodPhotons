@@ -299,6 +299,73 @@ deliberately, and with the tilt definition changed everywhere in the same commit
 
 ---
 
+### 9. Training past ~17M steps erodes the top of the flat command range
+
+Found by P1b's first full run (30M steps, `runs/canis_rough`, 2026-08-17). The flat-ground
+guard is a *plateau*, not a curve still climbing — flat eval sat at 1090–1110 from 12M steps
+to the end — but the two checkpoints either side of it are not equally good, and the deficit
+against P1's flat-only policy has a shape:
+
+| flat `r_speed` vs P1 | bottom half of command range | top half |
+|---|---|---|
+| `best.pt` (17.2M) | −0.025 | −0.029 |
+| `latest.pt` (30.0M) | −0.051 | −0.115 |
+
+At 17.2M the deficit is **uniform** across the command range, which is the signature of an
+ordinary capacity cost: the same network now covers five terrain classes and a difficulty
+axis, and pays a flat ~3% for it. That is expected and cheap. By 30M it has become
+**concentrated at the top of the range** — the fast-gallop-on-flat regime specifically —
+which is the signature of *dilution*: a flat episode is one draw in five, and a fast gallop
+on flat is the one thing a rough-ground policy never gets to practise.
+
+`best.pt` also beats `latest.pt` on terrain (stairs 1.0: 29.7 vs 14.6; rolling 1.0: 1141 vs
+1061; equal on rubble and stairs 0.5), so the last 12.8M steps bought nothing anywhere and
+cost the flat guard 8%. The run converged at ~17M.
+
+**Do not fix this by weighting the class draw yet.** Issue #10 is a strong candidate for the
+actual cause — two of the five classes were an impossible task for the whole second half of
+the run, and "stop tracking the command" is exactly the behaviour that would leak into the
+fast end of the flat range. Re-measure this after #10's fix before adding a weighting; a
+weighting added now would be a second mechanism papering over the first.
+
+### 10. Slope and stairs at difficulty 1 were an unlearnable task, and the curriculum trained there  **FIXED, needs a re-run to confirm**
+
+`terrain_max_slope` was set to 25°, reasoned solely from the termination test: a standing
+animal on a slope *is* tilted by the grade, so the grade must clear `fall_tilt = 50` with
+room. It does. It is also unwalkable, which the same 30M-step run measured directly — the
+trained policy scored on `slope`, a class it trained on all run:
+
+| grade | 5° | 11° | 16° | 20° | 25° |
+|---|---|---|---|---|---|
+| return | 1123 | 831 | 199 | 32 | 14 |
+| survived | 100% | 84% | — | — | 0% |
+
+The knee is ~13°. Above it the policy stops tracking the command (`r_speed` 0.45 → 0.11) and
+just braces against gravity. Unlike the rough classes, `slope` and `stairs` apply their grade
+to the **whole patch**, so there is no flat stretch to recover on the way there is between
+stones — the climb lasts the entire episode.
+
+The cost is worse than wasted episodes. The curriculum promoted to difficulty 1.0 at 4.6M
+steps and then trained there for 25M more, with two of its five classes impossible, and the
+per-class profile at the end shows exactly that split: `rolling` 1061/98%, `steps` 493/30%,
+`rubble` 311/12%, `slope` **14/0%**, `stairs` **15/0%**. The two failures are the two
+whole-patch-grade classes, and the held-out class being one of them is why P1b's bar reads
+worse than the policy deserves.
+
+**Fixed** by setting `terrain_max_slope = 12.0` (`creaturelab/env.py`, with the measurement
+recorded in `TerrainSpec.for_body`) and pinned by
+`test_the_steepest_slope_stays_under_the_measured_learnable_ceiling`. It is **not confirmed**
+until a fresh 30M-step run reproduces the bar with a usable top-of-range; the numbers in
+todo.md's P1b bar table are from the 25° run and must be re-measured, not patched.
+
+The deeper design question this raises and does not answer: a monotone grade across a 90 m
+patch means difficulty buys *duration* of climb as much as steepness. A long undulation that
+climbs and descends would let difficulty buy steepness alone, which is probably what the class
+should mean — but it changes what `slope` *is*, so it wants its own decision rather than being
+smuggled in with a constant.
+
+---
+
 ## Done
 
 ### `--help` crashed on two tools, because the console could not encode `θ`  **DONE**

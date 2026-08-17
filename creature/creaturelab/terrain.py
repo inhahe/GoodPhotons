@@ -79,7 +79,7 @@ class TerrainSpec:
     @classmethod
     def for_body(cls, body_len: float, *, amp: float = 0.35, cell: float = 0.25,
                  margin: float = 1.25, max_speed: float = 0.8, seconds: float = 20.0,
-                 max_slope_deg: float = 25.0, max_cells: int = 513,
+                 max_slope_deg: float = 12.0, max_cells: int = 513,
                  gravity: float = 9.81) -> TerrainSpec:
         """Size a patch for one body, in that body's own units.
 
@@ -87,9 +87,29 @@ class TerrainSpec:
         on a terrier and a wolfhound -- the same dynamic-similarity argument the reward and
         the command range are built on.
 
-        `max_slope_deg` is deliberately kept below half of `EnvConfig.fall_tilt`: on a
-        genuine 25 degree slope a healthy standing animal *is* tilted 25 degrees, and a
-        termination test that fires at 50 would otherwise call a correct stance a fall.
+        `max_slope_deg` has two separate ceilings over it, and the binding one is not the
+        obvious one. The obvious one is the termination test: on a genuine slope a healthy
+        standing animal *is* tilted by the grade, and `fall_tilt = 50` would call a correct
+        stance a fall, so the grade must stay well under half of it. That argument set this
+        to 25 -- and 25 turned out to be unwalkable, which no amount of training fixed.
+
+        The binding ceiling is **learnability**, and it was measured rather than reasoned
+        (30M-step run, 2026-08-17, scoring the trained policy on slope alone):
+
+            grade   5deg    11deg   16deg   20deg   25deg
+            return  1123     831     199      32      14
+            survive  100%     84%      -       -       0%
+
+        Unlike the rough classes, `slope` and `stairs` apply their grade to the WHOLE patch,
+        so difficulty here buys a climb the animal cannot put down for the length of an
+        episode -- there is no flat stretch to recover on, the way there is between stones.
+        Past ~16 degrees the policy stops tracking the command altogether (`r_speed` 0.45 and
+        falling) and simply fights gravity. A curriculum whose top third of range is a task
+        nothing can perform does not merely waste those episodes: it spends promotions
+        climbing into them and then trains there, and "ignore the command" is a behaviour
+        that leaks back to the classes that *are* walkable. 12 sits just under the measured
+        knee, which keeps the whole difficulty axis useful, and is comfortably under
+        `fall_tilt / 2` for free.
         """
         # Froude number -> m/s is v = F * sqrt(g * L); the farthest an episode can travel is
         # that at the top of the command range for its whole length.
