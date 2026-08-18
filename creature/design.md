@@ -768,7 +768,9 @@ Four decisions carry the design:
   at 25° — on a class it trained on. Past ~13° it abandons the speed command and braces. A
   curriculum whose top third is a task nothing can perform spends promotions climbing into it
   and then trains there, so the cost is not the wasted episodes but the behaviour they teach.
-  Now 12°, with the measurement recorded in `TerrainSpec.for_body` and pinned by a test.
+  Now 12°, with the measurement recorded in `TerrainSpec.for_body` and pinned by a test — and
+  confirmed by the re-run: at 12°, `slope` at difficulty 1.0 went from 14/0% to 996/91%, and
+  the held-out-class bar (todo.md P1b) was met with the whole difficulty axis usable.
 
 **Two places quietly assumed z = 0 *was* the ground, and both are now wrong-on-terrain bugs
 that were fixed with it.** `place_on_ground` measured spawn clearance against z = 0; it now

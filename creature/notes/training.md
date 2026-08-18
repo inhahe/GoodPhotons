@@ -247,14 +247,17 @@ this repo (`known-issues.md` #8 has the attribution, and the two knobs that woul
 along with why neither is taken). Budget for it: a 3e7-step terrain run is about a third longer
 in wall-clock than the same run on a plane.
 
-**Measured, on the first full run** (30M steps, `stairs` held out, 2026-08-17). Against P1's
-flat-only policy on the held-out class: at difficulty 0.2, return 1107 and 98% survival versus
-239 and 11%; at 0.5, 322/17% versus 63/0%. Flat ground costs 4.6% of return at the checkpoint
-the run converged on (~17M steps), uniformly across the command range. Difficulty 1.0 is not a
-usable number from that run — `terrain_max_slope` was 25°, which measurement showed is past
-what any policy learned, so `slope` and `stairs` both scored ~0 there including the one that
-was trained on. It is 12° now; see `known-issues.md` #10, and re-measure rather than trusting
-the old table.
+**Measured** (the canonical run: `runs/canis_rough2`, 20M steps, `stairs` held out, 12°
+slope cap, 2026-08-17 — todo.md's P1b table has the full three-way comparison). Against P1's
+flat-only policy on the held-out class: at difficulty 0.2, return 1140 and 100% survival
+versus 239 and 11%; at 0.5, **1067/95%** versus 63/0%; at 1.0, 724/61% versus 14/0%. Flat
+ground costs ~5% of return at `best.pt` (13.2M steps), uniformly across the command range,
+at 100% survival. Per-class at difficulty 1.0: `flat` 1151/100%, `rolling` 1123/98%, `slope`
+996/91%, `steps` 591/33%, `rubble` 483/28% — the discrete-obstacle classes are the honest
+frontier, and the held-out class outscores both of them. (The first run, 30M steps at the
+old 25° cap, put `slope` and `stairs` at ~0 at difficulty 1.0 *including the trained one* —
+that was the unlearnable-ceiling defect, `known-issues.md` #10, fixed and confirmed by the
+re-run. Its numbers survive only in todo.md's table as the middle column.)
 
 The terrain's shape is quoted in **withers heights**, like everything else here — amplitude,
 feature size and the patch's own extent all scale with the animal, so the same config means the
