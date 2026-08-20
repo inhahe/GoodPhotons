@@ -158,6 +158,32 @@ random command set. The symptom was consecutive evals of a steadily improving po
 
 ---
 
+## Launching a long run so it survives the session
+
+A trainer started as an ordinary child of an agent/terminal session **dies with that
+session** — checkpoints bound the loss to five minutes, but the run still stops silently and
+nobody restarts it. (Measured: a 2e7-step run killed at step 335,872, four minutes in, by a
+harness session restart — before the first `latest.pt` was ever written.)
+
+So launch anything longer than a few minutes with `tools/detach.ps1`, which creates the
+process via WMI (`Win32_Process.Create`). That parents it under the `wmiprvse.exe` service —
+outside the launching session's process tree and job objects — so its lifetime is its own:
+
+```powershell
+powershell -NoProfile -File tools\detach.ps1 `
+    -Log runs\myrun\train.log -PidFile runs\myrun\pid `
+    .venv\Scripts\python.exe tools\train.py --terrain --steps 2e7 --out runs/myrun
+```
+
+`-Log` captures stdout+stderr; `-PidFile` receives the PID of the **real** interpreter — the
+venv `python.exe` is a launcher shim that re-execs the base interpreter as a child, so the
+script walks to the deepest process in the chain, and that PID is the only correct target for
+monitoring (`Get-Process -Id`) or stopping. Stop it *only* by that exact PID, never by image
+name (`taskkill /IM python.exe` takes down every other Python on the machine). Killing the
+trainer loses at most `--checkpoint-minutes` of work; resume from `latest.pt`.
+
+---
+
 ## Training on rough ground (P1b)
 
 ```bash
@@ -220,6 +246,18 @@ number depends on it never having seen. A misspelled class is an error, not a sm
 this repo (`known-issues.md` #8 has the attribution, and the two knobs that would buy it back
 along with why neither is taken). Budget for it: a 3e7-step terrain run is about a third longer
 in wall-clock than the same run on a plane.
+
+**Measured** (the canonical run: `runs/canis_rough2`, 20M steps, `stairs` held out, 12°
+slope cap, 2026-08-17 — todo.md's P1b table has the full three-way comparison). Against P1's
+flat-only policy on the held-out class: at difficulty 0.2, return 1140 and 100% survival
+versus 239 and 11%; at 0.5, **1067/95%** versus 63/0%; at 1.0, 724/61% versus 14/0%. Flat
+ground costs ~5% of return at `best.pt` (13.2M steps), uniformly across the command range,
+at 100% survival. Per-class at difficulty 1.0: `flat` 1151/100%, `rolling` 1123/98%, `slope`
+996/91%, `steps` 591/33%, `rubble` 483/28% — the discrete-obstacle classes are the honest
+frontier, and the held-out class outscores both of them. (The first run, 30M steps at the
+old 25° cap, put `slope` and `stairs` at ~0 at difficulty 1.0 *including the trained one* —
+that was the unlearnable-ceiling defect, `known-issues.md` #10, fixed and confirmed by the
+re-run. Its numbers survive only in todo.md's table as the middle column.)
 
 The terrain's shape is quoted in **withers heights**, like everything else here — amplitude,
 feature size and the patch's own extent all scale with the animal, so the same config means the

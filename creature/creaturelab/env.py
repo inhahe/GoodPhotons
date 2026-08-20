@@ -86,7 +86,7 @@ class EnvConfig:
     terrain_amp: float = 0.35          # peak-to-peak of the rough classes at difficulty 1
     terrain_cell: float = 0.25         # target sample spacing
     terrain_margin: float = 1.25       # patch covers this multiple of an episode's max travel
-    terrain_max_slope: float = 25.0    # deg; deliberately under fall_tilt/2, see TerrainSpec
+    terrain_max_slope: float = 12.0    # deg; the MEASURED learnable ceiling, see TerrainSpec
     terrain_max_cells: int = 513       # ceiling on the grid; cell size gives before this does
 
     # The terrain curriculum shares the command curriculum's window, bar and measurement --

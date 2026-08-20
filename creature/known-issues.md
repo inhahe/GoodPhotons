@@ -297,9 +297,96 @@ against the local gravity direction rather than world up. That is a project-wide
 load-bearing definition in exchange for ~12% of one config's throughput — worth doing only
 deliberately, and with the tilt definition changed everywhere in the same commit.
 
+**Most of that 12% arrived anyway, from #10's fix (measured 2026-08-17).** Dropping
+`terrain_max_slope` 25° → 12° — done for learnability, not throughput — shrank the hfield
+elevation range ~42 m → ~19 m, and the P1b re-run measured the prediction in production:
+20.0M steps at an average **1383 env-steps/s vs run 1's 1285** (+7.6% full-run at 64 envs),
+with the early flat-terrain phase running ~1500–1585 vs run 1's ~1300–1400. The remaining
+tilted-gravity headroom is correspondingly smaller, which makes that trade even less worth
+its definitional cost.
+
+---
+
+### 9. Training past ~17M steps erodes the top of the flat command range
+
+Found by P1b's first full run (30M steps, `runs/canis_rough`, 2026-08-17). The flat-ground
+guard is a *plateau*, not a curve still climbing — flat eval sat at 1090–1110 from 12M steps
+to the end — but the two checkpoints either side of it are not equally good, and the deficit
+against P1's flat-only policy has a shape:
+
+| flat `r_speed` vs P1 | bottom half of command range | top half |
+|---|---|---|
+| `best.pt` (17.2M) | −0.025 | −0.029 |
+| `latest.pt` (30.0M) | −0.051 | −0.115 |
+
+At 17.2M the deficit is **uniform** across the command range, which is the signature of an
+ordinary capacity cost: the same network now covers five terrain classes and a difficulty
+axis, and pays a flat ~3% for it. That is expected and cheap. By 30M it has become
+**concentrated at the top of the range** — the fast-gallop-on-flat regime specifically —
+which is the signature of *dilution*: a flat episode is one draw in five, and a fast gallop
+on flat is the one thing a rough-ground policy never gets to practise.
+
+`best.pt` also beats `latest.pt` on terrain (stairs 1.0: 29.7 vs 14.6; rolling 1.0: 1141 vs
+1061; equal on rubble and stairs 0.5), so the last 12.8M steps bought nothing anywhere and
+cost the flat guard 8%. The run converged at ~17M.
+
+**Re-measured after #10's fix (the 20M-step 12° re-run, `runs/canis_rough2`, 2026-08-17):
+the mechanism is real but the impossible classes were most of the magnitude.** With every
+class learnable, the signature persists — `latest.pt` (20M) vs `best.pt` (13.2M) on flat,
+`r_speed` by command band: −0.5% slow, −0.9% mid, **−3.4% fast** — but at roughly a third of
+run 1's strength (30M there read ≈ −2.8% bottom-half / −9.2% top-half by the same
+latest-vs-best comparison), and survival stays 98%. The late run also showed one transient
+eval collapse (~1120 → 712 around 18.9M) that fully recovered within 200k steps — noise, not
+the erosion.
+
+**Still not worth a class-draw weighting.** At this magnitude the existing guards already
+contain it: `best.pt` selection picks the pre-erosion checkpoint, and the budget lesson is
+simply not to train 10M+ steps past convergence (run 2's 20M budget left only a −3.4%
+fast-band mark; run 1's 30M turned it into −12% overall). Revisit only if a longer run is ever
+genuinely needed and the fast band decays past the eval noise floor early.
+
 ---
 
 ## Done
+
+### 10. Slope and stairs at difficulty 1 were an unlearnable task, and the curriculum trained there  **DONE**
+
+`terrain_max_slope` was set to 25°, reasoned solely from the termination test: a standing
+animal on a slope *is* tilted by the grade, so the grade must clear `fall_tilt = 50` with
+room. It does. It is also unwalkable, which the first 30M-step run measured directly — the
+trained policy scored on `slope`, a class it trained on all run:
+
+| grade | 5° | 11° | 16° | 20° | 25° |
+|---|---|---|---|---|---|
+| return | 1123 | 831 | 199 | 32 | 14 |
+| survived | 100% | 84% | — | — | 0% |
+
+The knee is ~13°. Above it the policy stops tracking the command (`r_speed` 0.45 → 0.11) and
+just braces against gravity. Unlike the rough classes, `slope` and `stairs` apply their grade
+to the **whole patch**, so there is no flat stretch to recover on the way there is between
+stones — the climb lasts the entire episode.
+
+The cost was worse than wasted episodes. The curriculum promoted to difficulty 1.0 at 4.6M
+steps and then trained there for 25M more, with two of its five classes impossible, and the
+per-class profile at the end showed exactly that split: `rolling` 1061/98%, `steps` 493/30%,
+`rubble` 311/12%, `slope` **14/0%**, `stairs` **15/0%**. The two failures are the two
+whole-patch-grade classes, and the held-out class being one of them is why run 1's bar read
+worse than the policy deserved.
+
+**Fixed** by setting `terrain_max_slope = 12.0` (`creaturelab/env.py`, with the measurement
+recorded in `TerrainSpec.for_body`) and pinned by
+`test_the_steepest_slope_stays_under_the_measured_learnable_ceiling`. **Confirmed** by the
+20M-step re-run (`runs/canis_rough2`, 2026-08-17): `slope` at difficulty 1.0 went **14/0% →
+995.6/91%**, every class is now learned or honestly hard rather than impossible (`rubble`
+483/28% and `steps` 591/33% are the remaining frontier), and the held-out `stairs` ladder
+that is P1b's bar reads 1140/100% at 0.2, 1067/95% at 0.5, 724/61% at 1.0 — see todo.md's
+canonical table.
+
+Still open as a *design question* (not a bug): a monotone grade across a 90 m patch means
+difficulty buys *duration* of climb as much as steepness. A long undulation that climbs and
+descends would let difficulty buy steepness alone, which is probably what the class should
+mean — but it changes what `slope` *is*, so it wants its own decision rather than being
+smuggled in with a constant.
 
 ### `--help` crashed on two tools, because the console could not encode `θ`  **DONE**
 

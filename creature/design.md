@@ -759,6 +759,18 @@ Four decisions carry the design:
   is twenty centimetres. So each generator declares the peak-to-peak height it wants *in
   metres* at difficulty 1 and the data written is `u · d · span / elevation`. Scaling `u` by
   difficulty directly would make a difficulty-1 rubble field a mountain range.
+- **The top of the difficulty axis is bounded by what is learnable, not by what is legal.**
+  `terrain_max_slope` first took the only bound anyone had reasoned about — it must clear the
+  50° fall test with room, so 25°. That is true and not binding. The binding bound is that
+  `slope` and `stairs` apply their grade to the *whole* patch, so unlike the rough classes
+  there is no flat stretch to recover on and the climb lasts the entire episode; measured on
+  P1b's first full run, the policy scores 1123 at 5°, 831 at 11°, and 14 with zero survivors
+  at 25° — on a class it trained on. Past ~13° it abandons the speed command and braces. A
+  curriculum whose top third is a task nothing can perform spends promotions climbing into it
+  and then trains there, so the cost is not the wasted episodes but the behaviour they teach.
+  Now 12°, with the measurement recorded in `TerrainSpec.for_body` and pinned by a test — and
+  confirmed by the re-run: at 12°, `slope` at difficulty 1.0 went from 14/0% to 996/91%, and
+  the held-out-class bar (todo.md P1b) was met with the whole difficulty axis usable.
 
 **Two places quietly assumed z = 0 *was* the ground, and both are now wrong-on-terrain bugs
 that were fixed with it.** `place_on_ground` measured spawn clearance against z = 0; it now
@@ -785,6 +797,16 @@ be restored after the env exists. `tools/train.py` reads it out of the checkpoin
 *before* it builds anything, because a `--resume` that omitted `--terrain` otherwise rebuilt a
 flat env, restored a difficulty onto it and trained on a plane — the task changing mid-run,
 with no trace but a column vanishing from the progress line.
+
+**A run's process must outlive the session that starts it.** Checkpoint cadence bounds what a
+death costs, but a trainer launched as a child of an agent/terminal session is killed *with*
+that session — silently, with nobody left to resume it (observed: a fresh run killed four
+minutes in, before its first `latest.pt`). `tools/detach.ps1` is the standing launcher for
+long runs: it creates the process via WMI so it is parented under the `wmiprvse.exe` service
+rather than the caller, logs stdout+stderr to a file, and records the deepest interpreter PID
+(the venv `python.exe` is a re-exec shim) in a pid file — which is the only process it is ever
+legitimate to stop, by exact PID. See notes/training.md → "Launching a long run so it
+survives the session".
 
 **Evaluation stays flat even when training is not.** An evaluation whose task hardens with the
 curriculum cannot select a checkpoint — the score drops at every promotion, so `best.pt` would

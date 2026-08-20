@@ -301,11 +301,13 @@ Both are places the current env quietly assumes z = 0 *is* the ground:
       Tilt is `arccos(R[2,2])` against **world** up, and design.md makes a point of that
       being the same quantity `validate.trunk_tilt_of` reports — so redefining it against a
       local surface normal would have to be done in `stand_test` and `tune.brace` in the same
-      change. Instead `TerrainSpec.for_body(max_slope_deg=25)` is held below half of
+      change. Instead `TerrainSpec.for_body(max_slope_deg=...)` is held below half of
       `fall_tilt = 50°`, so a correctly-standing animal on the steepest slope the curriculum
-      can ask for is at 25° and never near the bar. Revisit only if slopes need to get
-      steeper than that; `known-issues.md` #8 records the related tilted-gravity idea and why
-      it is not a free win.
+      can ask for is never near the bar. The fall test turned out not to be the binding
+      ceiling, though: 25° passed it and was still unlearnable (known-issues #10), and the
+      cap is now **12°**, set by the *measured* learnable knee (~13°). Revisit only if slopes
+      need to get steeper than that; `known-issues.md` #8 records the related tilted-gravity
+      idea and why it is not a free win.
 
 ### Stage 2 — perceptive, only if blind is insufficient
 
@@ -318,35 +320,66 @@ Both are places the current env quietly assumes z = 0 *is* the ground:
   test_no_world_frame_channel_leaks_in` is the standing enforcement of that and must keep
   passing: a height scan is a clearance field in the root frame, never a world position.
 
-- [ ] **Bar:** the policy tracks its speed command and survives on terrain drawn from a
+- [x] **Bar:** the policy tracks its speed command and survives on terrain drawn from a
       class it never saw in training — **and** flat-ground performance does not regress
       (the P1 command sweep re-run on the plane is the guard, since it is the only
       apples-to-apples number we have).
-      *The apparatus for measuring it exists as of 2026-08-17 — `--terrain-kinds` holds a
-      class out of the training draw and names it back at eval time, the held-out set rides
-      in the checkpoint so a resume cannot quietly reveal it, and scoring on terrain without
-      a stated difficulty is refused (difficulty 0 is a flat heightfield, which would answer
-      the terrain question with a flat-ground table). What is left is running it:*
+      **MET, 2026-08-17, by the re-run below** (`runs/canis_rough2`): held-out `stairs` at
+      difficulty 0.5 scores 1066.8 with **95% survival** against P1's 62.8/0%, the flat
+      guard holds a uniform ~5% capacity cost at 100% survival, and Stage 2 (perceptive) is
+      **not needed** — the blind policy cleared the bar.
+      **Run once, 2026-08-17** — `runs/canis_rough`, 30.0M steps in 389 min, `stairs` held
+      out of the training draw. Both curriculum axes maxed at 4.63M steps, alternating
+      cleanly the whole way (speed and difficulty never more than one promotion apart, which
+      is the first real evidence `_promote`'s split works outside a synthetic window).
 
-      ```bash
-      python tools/train.py --terrain-kinds flat,rolling,rubble,steps,slope \
-                            --steps 3e7 --out runs/canis_rough
-      python tools/train.py --eval runs/canis_rough/best.pt              # flat: the regression guard
-      python tools/train.py --eval runs/canis_rough/best.pt --terrain-kinds stairs \
-                            --terrain-level 1.0                          # the generalisation claim
-      ```
+      **Generalisation: met, and not marginally.** `best.pt` (17.2M) against P1's flat-only
+      policy, on `stairs`, a class it was never shown:
 
-      **The control is measured** (2026-08-17): P1's flat-trained `runs/canis/best.pt`
-      (14.95M steps, command cap 0.8) scored on stairs it never saw. This is the number the
-      terrain run has to beat, and it says the measurement is sensitive rather than saturated
-      — the policy degrades gradually with difficulty rather than passing or failing outright.
+      | stairs | P1 return | P1 surv | rough return | rough surv |
+      |---|---|---|---|---|
+      | 0.2 | 239.2 | 11% | **1107.5** | **98%** |
+      | 0.5 | 62.8 | 0% | **321.5** | **17%** |
+      | 1.0 | 14.1 | 0% | 29.7 | 3% |
 
-      | task | return | survived | r_speed | tilt° | alive |
-      |---|---|---|---|---|---|
-      | flat (the regression guard) | 1224.9 | 100% | 0.972 | 3.4 | 20.0 s |
-      | stairs 0.2 | 239.2 | 11% | 0.785 | 7.8 | 4.8 s |
-      | stairs 0.5 | 62.8 | 0% | 0.449 | 15.5 | 2.1 s |
-      | stairs 1.0 | 14.1 | 0% | 0.186 | 21.4 | 1.0 s |
+      **Flat guard: a 4.6% regression at `best.pt`** (1168.8 vs P1's 1224.9, 100% survival
+      both), uniform across the command range — an ordinary capacity cost. `latest.pt` at
+      30M is 12% down and concentrated at the fast end, and is worse on terrain too; the run
+      converged at ~17M. Logged as known-issues #9.
+
+      **Why run 1's difficulty 1.0 read so badly, and why it had to be repeated.** It was
+      not a generalisation failure. Per-class at difficulty 1.0: `rolling` 1061/98%, `steps`
+      493/30%, `rubble` 311/12%, `slope` **14/0%**, `stairs` **15/0%** — and `slope` was
+      *in* the training set. The two failures are exactly the two classes that apply their
+      grade to the whole patch, and `terrain_max_slope = 25°` turned out to be past the
+      measured learnable knee (~13°). So the curriculum spent promotions climbing into an
+      impossible task and then trained there for 25M steps. Fixed (known-issues #10, now
+      12°) and re-run.
+
+      **Re-run, 2026-08-17** — `runs/canis_rough2`, 20.0M steps in 241 min (avg 1383 sps vs
+      run 1's 1285: the smaller 12° elevation range at work, known-issues #8), launched
+      through `tools/detach.ps1` after the first attempt was killed at step 335,872 by a
+      session restart (notes/training.md → "Launching a long run so it survives the
+      session"). Both axes maxed by 5.6M; `best.pt` at 13.2M. **This is the canonical P1b
+      result:**
+
+      | eval (all at `best.pt`) | P1 flat-only | run 1 (25°) | run 2 (12°) |
+      |---|---|---|---|
+      | flat guard | 1224.9 / 100% | 1168.8 / 100% | 1157.8 / 100% |
+      | stairs 0.2 (held out) | 239.2 / 11% | 1107.5 / 98% | **1140.4 / 100%** |
+      | stairs 0.5 (held out) | 62.8 / 0% | 321.5 / 17% | **1066.8 / 95%** |
+      | stairs 1.0 (held out) | 14.1 / 0% | 29.7 / 3% | **723.8 / 61%** |
+
+      Per-class at difficulty 1.0: `flat` 1150.8/100%, `rolling` 1123.3/98%, `slope`
+      **995.6/91%** (was 14/0% — the #10 fix, confirmed), `steps` 591.0/33%, `rubble`
+      483.2/28%. The held-out class at full difficulty now sits *mid-pack among trained
+      classes* — stairs 61% vs trained steps 33% and rubble 28% — so what limits difficulty
+      1.0 is the discrete-obstacle classes themselves, not novelty. Flat guard: −5.5% vs P1
+      (−4.6% in run 1), uniform, 100% survival — the stable capacity price of the terrain
+      skills, not an erosion artifact. `latest.pt` at 20M: 1117.3/98%, with the deficit
+      banded −0.5%/−0.9%/−3.4% slow/mid/fast — known-issues #9's fast-end signature at a
+      quarter of run 1's magnitude, confirming both the mechanism and that stopping near
+      convergence bounds it.
 
 ---
 
