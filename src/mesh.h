@@ -441,6 +441,427 @@ inline int loadObj(Scene& s, const char* path, int matId,
 }
 
 // ===========================================================================
+// .ply — Stanford polygon format (0.183.0)
+// ===========================================================================
+//
+// WHY IT EXISTS NOW AND DID NOT BEFORE. `.ply` and `.stl` were already advertised
+// by `-help` and already accepted by the bare-mesh quick-viewer's extension list,
+// but no loader ever backed either one: the format dispatch in ftsl.h sent
+// everything that was not .gltf/.glb/.fbx/.ftmesh to the OBJ parser, which finds no
+// `v `/`f ` lines in a PLY and returns an EMPTY mesh — and the call site discarded
+// its return value, so nothing failed. The user-visible symptom was a render of
+// nothing at all: `ftrace foo.ply` auto-framed an empty scene and produced a
+// uniform grey field, with the only clue a `0 verts, 0 tris` line in the log.
+// Both formats are real loaders now, and an empty load is a hard error at the call
+// site rather than a silent grey image.
+//
+// COVERAGE. All three PLY encodings (`ascii`, `binary_little_endian`,
+// `binary_big_endian`, the last byte-swapped on read); arbitrary element and
+// property layouts, with unknown elements and properties consumed by their declared
+// type rather than assumed away — that is what lets a 60-property Gaussian-splat
+// PLY parse instead of derailing on the first `f_rest_*` field. Vertices come from
+// `x`/`y`/`z`, optional shading normals from `nx`/`ny`/`nz`, optional texture
+// coordinates from whichever of the four name pairs the exporter used. Faces come
+// from `vertex_indices` (or the singular `vertex_index` some writers emit) and are
+// fan-triangulated exactly like OBJ polygons, so a quad mesh loads identically
+// through either format. Semantics match loadObj's throughout: same world-space
+// transform, same authored-normals-win rule, same `meshFinishTris` finishing pass,
+// so swapping a mesh between .obj and .ply cannot change how it shades.
+namespace plydetail {
+
+enum class PT { I8, U8, I16, U16, I32, U32, F32, F64, None };
+
+inline PT ptOf(const std::string& t) {
+    if (t == "char"   || t == "int8")    return PT::I8;
+    if (t == "uchar"  || t == "uint8")   return PT::U8;
+    if (t == "short"  || t == "int16")   return PT::I16;
+    if (t == "ushort" || t == "uint16")  return PT::U16;
+    if (t == "int"    || t == "int32")   return PT::I32;
+    if (t == "uint"   || t == "uint32")  return PT::U32;
+    if (t == "float"  || t == "float32") return PT::F32;
+    if (t == "double" || t == "float64") return PT::F64;
+    return PT::None;
+}
+inline int ptSize(PT t) {
+    switch (t) {
+        case PT::I8:  case PT::U8:               return 1;
+        case PT::I16: case PT::U16:              return 2;
+        case PT::I32: case PT::U32: case PT::F32: return 4;
+        case PT::F64:                            return 8;
+        default:                                 return 0;
+    }
+}
+
+struct Prop { std::string name; PT type = PT::None; bool isList = false; PT countType = PT::None; };
+struct Elem { std::string name; long long count = 0; std::vector<Prop> props; };
+
+// Binary body cursor. Every value is read through `num`, including ones we intend to
+// throw away — reading-and-discarding an unknown property costs one byte-swap more
+// than seeking past it and removes a whole class of size-arithmetic bug, which is the
+// better trade for a loader whose job is to survive layouts we have never seen.
+struct Reader {
+    const unsigned char* p;
+    const unsigned char* end;
+    bool swap;
+    bool ok = true;
+    double num(PT t) {
+        const int n = ptSize(t);
+        if (n == 0 || (size_t)(end - p) < (size_t)n) { ok = false; return 0.0; }
+        unsigned char b[8];
+        for (int i = 0; i < n; ++i) b[i] = swap ? p[n - 1 - i] : p[i];
+        p += n;
+        switch (t) {
+            case PT::I8:  { signed char   v; std::memcpy(&v, b, 1); return (double)v; }
+            case PT::U8:                                            return (double)b[0];
+            case PT::I16: { short         v; std::memcpy(&v, b, 2); return (double)v; }
+            case PT::U16: { unsigned short v; std::memcpy(&v, b, 2); return (double)v; }
+            case PT::I32: { int           v; std::memcpy(&v, b, 4); return (double)v; }
+            case PT::U32: { unsigned      v; std::memcpy(&v, b, 4); return (double)v; }
+            case PT::F32: { float         v; std::memcpy(&v, b, 4); return (double)v; }
+            case PT::F64: { double        v; std::memcpy(&v, b, 8); return v; }
+            default:                                                return 0.0;
+        }
+    }
+};
+
+// ASCII body cursor. A PLY ascii body is nominally one element instance per line,
+// but list properties make the per-line token count variable and some writers wrap
+// long lists, so this reads a flat whitespace-delimited token stream instead of
+// binding to line structure. Newlines are whitespace here (unlike objIsWs, which
+// deliberately stops at one).
+struct AsciiReader {
+    const char* p;
+    const char* end;
+    bool ok = true;
+    double num(PT) {
+        while (p < end && (unsigned char)*p <= ' ') ++p;
+        if (p >= end) { ok = false; return 0.0; }
+        double v = 0.0;
+        bool good = true;
+        const char* q = objParseDouble(p, end, v, good);
+        if (!good) { ok = false; return 0.0; }
+        p = q;
+        return v;
+    }
+};
+
+// Header: ASCII lines up to and including `end_header`, whatever the body encoding.
+inline bool parseHeader(const std::string& buf, std::vector<Elem>& elems, int& fmt,
+                        size_t& bodyOff, std::string& err) {
+    fmt = -1;
+    size_t pos = 0;
+    bool sawMagic = false, sawEnd = false;
+    while (pos < buf.size()) {
+        const size_t nl = buf.find('\n', pos);
+        size_t lend = (nl == std::string::npos) ? buf.size() : nl;
+        if (lend > pos && buf[lend - 1] == '\r') --lend;
+        const std::string line = buf.substr(pos, lend - pos);
+        pos = (nl == std::string::npos) ? buf.size() : nl + 1;
+        std::vector<std::string> w;
+        for (size_t i = 0; i < line.size();) {
+            while (i < line.size() && (unsigned char)line[i] <= ' ') ++i;
+            const size_t b = i;
+            while (i < line.size() && (unsigned char)line[i] > ' ') ++i;
+            if (i > b) w.push_back(line.substr(b, i - b));
+        }
+        if (w.empty()) continue;
+        if (!sawMagic) {
+            if (w[0] != "ply") { err = "not a PLY file (no `ply` magic on the first line)"; return false; }
+            sawMagic = true;
+            continue;
+        }
+        if (w[0] == "comment" || w[0] == "obj_info") continue;
+        if (w[0] == "format") {
+            if (w.size() < 2) { err = "malformed `format` line"; return false; }
+            if      (w[1] == "ascii")                fmt = 0;
+            else if (w[1] == "binary_little_endian") fmt = 1;
+            else if (w[1] == "binary_big_endian")    fmt = 2;
+            else { err = "unsupported PLY encoding `" + w[1] + "`"; return false; }
+        } else if (w[0] == "element") {
+            if (w.size() < 3) { err = "malformed `element` line"; return false; }
+            Elem e;
+            e.name  = w[1];
+            e.count = std::strtoll(w[2].c_str(), nullptr, 10);
+            if (e.count < 0) { err = "negative element count on `element " + w[1] + "`"; return false; }
+            elems.push_back(std::move(e));
+        } else if (w[0] == "property") {
+            if (elems.empty()) { err = "`property` line before any `element`"; return false; }
+            Prop pr;
+            if (w.size() >= 5 && w[1] == "list") {
+                pr.isList    = true;
+                pr.countType = ptOf(w[2]);
+                pr.type      = ptOf(w[3]);
+                pr.name      = w[4];
+                if (pr.countType == PT::None || pr.type == PT::None) {
+                    err = "unsupported type on list property `" + pr.name + "`"; return false;
+                }
+            } else if (w.size() >= 3) {
+                pr.type = ptOf(w[1]);
+                pr.name = w[2];
+                if (pr.type == PT::None) {
+                    err = "unsupported property type `" + w[1] + "`"; return false;
+                }
+            } else { err = "malformed `property` line"; return false; }
+            elems.back().props.push_back(std::move(pr));
+        } else if (w[0] == "end_header") {
+            sawEnd  = true;
+            bodyOff = pos;
+            break;
+        }
+    }
+    if (!sawMagic) { err = "not a PLY file (empty)"; return false; }
+    if (!sawEnd)   { err = "PLY header is truncated (no `end_header`)"; return false; }
+    if (fmt < 0)   { err = "PLY header has no `format` line"; return false; }
+    return true;
+}
+
+// Body: walk every element in declaration order, keeping the vertex and face data
+// and consuming everything else. `R` is Reader or AsciiReader.
+template <class R>
+inline void readBody(R& rd, const std::vector<Elem>& elems, const Affine& xf, bool loadUV,
+                     std::vector<Vec3>& verts, std::vector<Vec3>& normals,
+                     std::vector<Vec3>& uvs, std::vector<std::array<int, 3>>& faces) {
+    for (const Elem& e : elems) {
+        const bool isVert = (e.name == "vertex");
+        const bool isFace = (e.name == "face");
+        int ix = -1, iy = -1, iz = -1, inx = -1, iny = -1, inz = -1, iu = -1, iv = -1, iIdx = -1;
+        for (size_t i = 0; i < e.props.size(); ++i) {
+            const std::string& n = e.props[i].name;
+            if (isVert) {
+                if      (n == "x")  ix  = (int)i;
+                else if (n == "y")  iy  = (int)i;
+                else if (n == "z")  iz  = (int)i;
+                else if (n == "nx") inx = (int)i;
+                else if (n == "ny") iny = (int)i;
+                else if (n == "nz") inz = (int)i;
+                else if (n == "u" || n == "s" || n == "texture_u" || n == "texture_s") iu = (int)i;
+                else if (n == "v" || n == "t" || n == "texture_v" || n == "texture_t") iv = (int)i;
+            } else if (isFace && e.props[i].isList &&
+                       (n == "vertex_indices" || n == "vertex_index")) {
+                iIdx = (int)i;
+            }
+        }
+        const bool wantVert = isVert && ix >= 0 && iy >= 0 && iz >= 0;
+        const bool wantFace = isFace && iIdx >= 0;
+        std::vector<double> vals(e.props.size(), 0.0);
+        std::vector<int> poly;
+        for (long long k = 0; k < e.count; ++k) {
+            if (!rd.ok) return;
+            poly.clear();
+            for (size_t i = 0; i < e.props.size(); ++i) {
+                const Prop& pr = e.props[i];
+                if (!pr.isList) { vals[i] = rd.num(pr.type); continue; }
+                const long long n = (long long)rd.num(pr.countType);
+                if (!rd.ok || n < 0) { rd.ok = false; return; }
+                if ((int)i == iIdx) {
+                    poly.resize((size_t)n);
+                    for (long long j = 0; j < n; ++j) poly[(size_t)j] = (int)rd.num(pr.type);
+                } else {
+                    for (long long j = 0; j < n; ++j) (void)rd.num(pr.type);
+                }
+                if (!rd.ok) return;
+            }
+            if (wantVert) {
+                verts.push_back(xf.apply(Vec3{vals[ix], vals[iy], vals[iz]}));
+                if (inx >= 0 && iny >= 0 && inz >= 0) {
+                    // Object->world by the inverse-transpose of the linear part, then
+                    // normalize — identical treatment to an OBJ `vn` (finalize()
+                    // renormalizes again).
+                    const Vec3 wn = xf.applyNormal(Vec3{vals[inx], vals[iny], vals[inz]});
+                    const double l = std::sqrt(dot(wn, wn));
+                    normals.push_back(l > 1e-18 ? wn * (1.0 / l) : Vec3{0, 0, 0});
+                }
+                if (loadUV && iu >= 0 && iv >= 0) uvs.push_back(Vec3{vals[iu], vals[iv], 0});
+            } else if (wantFace) {
+                for (size_t j = 1; j + 1 < poly.size(); ++j)
+                    faces.push_back({poly[0], poly[(int)j], poly[(int)j + 1]});
+            }
+        }
+    }
+}
+
+}  // namespace plydetail
+
+// Load a PLY from memory. Returns triangles added (0 on failure, with `err` set).
+inline int loadPlyBytes(Scene& s, const std::string& buf, const char* path, int matId,
+                        const Affine& xf, bool loadUV, std::string& err,
+                        UvProjection uvProj = UvProjection::None, int uvAxis = 1,
+                        double creaseAngleDeg = -1.0) {
+    std::vector<plydetail::Elem> elems;
+    int fmt = -1;
+    size_t bodyOff = 0;
+    if (!plydetail::parseHeader(buf, elems, fmt, bodyOff, err)) return 0;
+
+    std::vector<Vec3> verts, normals, uvs;
+    std::vector<std::array<int, 3>> faces;
+    bool truncated = false;
+    if (fmt == 0) {
+        plydetail::AsciiReader rd{buf.data() + bodyOff, buf.data() + buf.size()};
+        plydetail::readBody(rd, elems, xf, loadUV, verts, normals, uvs, faces);
+        truncated = !rd.ok;
+    } else {
+        const unsigned short one = 1;
+        const bool hostLE = (*(const unsigned char*)&one == 1);
+        const bool fileLE = (fmt == 1);
+        plydetail::Reader rd{(const unsigned char*)buf.data() + bodyOff,
+                             (const unsigned char*)buf.data() + buf.size(),
+                             hostLE != fileLE};
+        plydetail::readBody(rd, elems, xf, loadUV, verts, normals, uvs, faces);
+        truncated = !rd.ok;
+    }
+    if (verts.empty()) {
+        err = std::string("PLY has no vertex data (no `element vertex` with x/y/z)");
+        return 0;
+    }
+    if (faces.empty()) {
+        // The common and confusing case: a point cloud or a Gaussian-splat export.
+        // Say what the file *is*, because "0 triangles" alone reads like a parse bug.
+        char msg[256];
+        std::snprintf(msg, sizeof msg,
+                      "PLY holds %zu vertices but no faces — it is a point cloud, not a "
+                      "surface mesh, so there is nothing to render. Meshify it first "
+                      "(e.g. Poisson reconstruction) and load the result.", verts.size());
+        err = msg;
+        return 0;
+    }
+
+    const size_t triStart = s.tris.size();
+    const bool proceduralUV = (uvProj != UvProjection::None) && !loadUV;
+    const bool wantSmooth   = (creaseAngleDeg >= 0.0);
+    const bool haveN  = (normals.size() == verts.size());
+    const bool haveUV = loadUV && (uvs.size() == verts.size());
+    std::vector<std::array<int, 3>> triVI;
+    triVI.reserve(faces.size());
+    long long dropped = 0;
+    const int nv = (int)verts.size();
+    for (const std::array<int, 3>& f : faces) {
+        if (f[0] < 0 || f[1] < 0 || f[2] < 0 || f[0] >= nv || f[1] >= nv || f[2] >= nv) {
+            ++dropped;
+            continue;
+        }
+        Tri t{verts[f[0]], verts[f[1]], verts[f[2]], matId, -1, {}};
+        if (haveUV) { t.uv0 = uvs[f[0]];     t.uv1 = uvs[f[1]];     t.uv2 = uvs[f[2]]; }
+        if (haveN)  { t.n0  = normals[f[0]]; t.n1  = normals[f[1]]; t.n2  = normals[f[2]]; }
+        s.tris.push_back(t);
+        triVI.push_back(f);
+    }
+    const int added = (int)triVI.size();
+    const bool didSmooth = meshFinishTris(s, triStart, verts, triVI, proceduralUV, uvProj,
+                                          uvAxis, wantSmooth, haveN, creaseAngleDeg);
+    std::printf("loadPly: %s -> %d verts, %d tris (mat %d) [%s]%s%s%s%s\n",
+                path, nv, added, matId,
+                fmt == 0 ? "ascii" : (fmt == 1 ? "binary LE" : "binary BE"),
+                haveN ? " [normals]" : "", haveUV ? " [uv]" : "",
+                proceduralUV ? " [procedural UVs]" : "",
+                didSmooth ? " [crease-smoothed]" : "");
+    if (dropped)
+        std::fprintf(stderr, "loadPly: %s -> dropped %lld face(s) with out-of-range indices\n",
+                     path, dropped);
+    if (truncated)
+        std::fprintf(stderr, "loadPly: %s -> body ended early; the file is truncated and "
+                             "only %d triangle(s) were recovered\n", path, added);
+    return added;
+}
+
+// Read a `.ply` from disk and parse it.
+inline int loadPly(Scene& s, const char* path, int matId, const Affine& xf,
+                   bool loadUV, std::string& err,
+                   UvProjection uvProj = UvProjection::None, int uvAxis = 1,
+                   double creaseAngleDeg = -1.0) {
+    std::string buf;
+    if (!assetbytes::readFile(path, buf)) { err = std::string("cannot open ") + path; return 0; }
+    return loadPlyBytes(s, buf, path, matId, xf, loadUV, err, uvProj, uvAxis, creaseAngleDeg);
+}
+
+// ===========================================================================
+// .stl — stereolithography, binary and ascii (0.183.0)
+// ===========================================================================
+//
+// Same story as PLY above: advertised, accepted, never implemented. STL carries no
+// indices, no UVs and no shared vertices — every triangle repeats its three corners
+// — so the per-facet normal the format stores is exactly the geometric normal
+// `Tri::finalize` computes anyway. It is therefore read and discarded rather than
+// stored: keeping it would pin the mesh to flat shading, whereas leaving the shading
+// normals zero lets `smooth` work through the ordinary crease pass (which welds by
+// position first, and so recovers the vertex sharing the format threw away).
+inline int loadStlBytes(Scene& s, const std::string& buf, const char* path, int matId,
+                        const Affine& xf, std::string& err,
+                        UvProjection uvProj = UvProjection::None, int uvAxis = 1,
+                        double creaseAngleDeg = -1.0) {
+    std::vector<Vec3> verts;   // 3 per triangle, in order
+    bool binary = false;
+    // An ascii STL starts with "solid", but so do plenty of binary ones (the 80-byte
+    // header is arbitrary text). The reliable discriminator is the size the binary
+    // layout implies: 80-byte header + u32 count + 50 bytes per facet.
+    if (buf.size() >= 84) {
+        unsigned n = 0;
+        std::memcpy(&n, buf.data() + 80, 4);
+        if ((size_t)84 + (size_t)n * 50 == buf.size()) binary = true;
+    }
+    if (binary) {
+        unsigned n = 0;
+        std::memcpy(&n, buf.data() + 80, 4);
+        verts.reserve((size_t)n * 3);
+        const char* p = buf.data() + 84;
+        for (unsigned i = 0; i < n; ++i, p += 50) {
+            float f[12];
+            std::memcpy(f, p, 48);           // normal (discarded), then 3 vertices
+            for (int k = 0; k < 3; ++k)
+                verts.push_back(xf.apply(Vec3{f[3 + k * 3], f[4 + k * 3], f[5 + k * 3]}));
+        }
+    } else {
+        // ASCII: pull the three floats after each `vertex` keyword. Facet/loop
+        // structure carries no information a triangle list needs.
+        const char* p = buf.data();
+        const char* const e = p + buf.size();
+        while (p < e) {
+            const char* v = (const char*)std::memchr(p, 'v', (size_t)(e - p));
+            if (!v) break;
+            if ((size_t)(e - v) >= 6 && std::memcmp(v, "vertex", 6) == 0) {
+                double d[3] = {0, 0, 0};
+                objParseDoubles(v + 6, e, d, 3);
+                verts.push_back(xf.apply(Vec3{d[0], d[1], d[2]}));
+                p = v + 6;
+            } else {
+                p = v + 1;
+            }
+        }
+        if (verts.empty()) {
+            err = "STL has no `vertex` records (not an ascii STL, and its size does not "
+                  "match the binary layout either)";
+            return 0;
+        }
+    }
+    if (verts.size() < 3) { err = "STL has no complete triangles"; return 0; }
+    const size_t nTri = verts.size() / 3;
+    const size_t triStart = s.tris.size();
+    const bool proceduralUV = (uvProj != UvProjection::None);
+    const bool wantSmooth   = (creaseAngleDeg >= 0.0);
+    std::vector<std::array<int, 3>> triVI;
+    triVI.reserve(nTri);
+    for (size_t i = 0; i < nTri; ++i) {
+        s.tris.push_back(Tri{verts[i * 3], verts[i * 3 + 1], verts[i * 3 + 2], matId, -1, {}});
+        triVI.push_back({(int)(i * 3), (int)(i * 3 + 1), (int)(i * 3 + 2)});
+    }
+    const bool didSmooth = meshFinishTris(s, triStart, verts, triVI, proceduralUV, uvProj,
+                                          uvAxis, wantSmooth, false, creaseAngleDeg);
+    std::printf("loadStl: %s -> %zu verts, %zu tris (mat %d) [%s]%s%s\n",
+                path, verts.size(), nTri, matId, binary ? "binary" : "ascii",
+                proceduralUV ? " [procedural UVs]" : "",
+                didSmooth ? " [crease-smoothed]" : "");
+    return (int)nTri;
+}
+
+// Read a `.stl` from disk and parse it.
+inline int loadStl(Scene& s, const char* path, int matId, const Affine& xf, std::string& err,
+                   UvProjection uvProj = UvProjection::None, int uvAxis = 1,
+                   double creaseAngleDeg = -1.0) {
+    std::string buf;
+    if (!assetbytes::readFile(path, buf)) { err = std::string("cannot open ") + path; return 0; }
+    return loadStlBytes(s, buf, path, matId, xf, err, uvProj, uvAxis, creaseAngleDeg);
+}
+
+// ===========================================================================
 // .ftmesh — a binary indexed triangle mesh (0.147.0)
 // ===========================================================================
 //

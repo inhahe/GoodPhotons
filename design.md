@@ -1042,7 +1042,8 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     exactly 0 and 1 at the ends — a coat one-in-a-thousand aggregate at point-blank range is a
     coat with sparkling holes in it.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
-  single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
+  single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only,
+  PLY and STL (0.191.0).
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds
   vertices by quantized position, then gives each corner an angle-weighted average
   (Thürmer & Wüthrich) of the incident face normals, skipping any face across a
@@ -1084,6 +1085,29 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   outright by never writing the file (see `loomlink.h`/`viewer_gui.*`) and reduced it
   everywhere else by prefetching (see `assetbytes.h`) — `known-issues.md` records what
   the gate actually is, because most of what looked obvious about it was wrong.
+  **PLY and STL** (0.191.0, `loadPly`/`loadPlyBytes`, `loadStl`/`loadStlBytes`) close a
+  gap where the docs claimed both formats and the dispatch implemented neither, so a
+  `.ply` fell through to the OBJ parser, matched nothing, and rendered as an empty grey
+  scene — see `known-issues.md`. PLY parses its header into an element/property list and
+  then walks the body **generically**: unknown properties are consumed by their declared
+  type rather than skipped by a hardcoded stride, which is the only way a Gaussian-splat
+  export with sixty per-vertex scalars can be read at all. The same body walker is
+  templated over a binary `Reader` (with byte-swap for `binary_big_endian`) and an
+  `AsciiReader` (a token stream over the existing `objParseDouble`), so encoding is a
+  type parameter and not three copies of the format. STL discriminates binary from ascii
+  arithmetically — `84 + 50·count == filesize` — rather than by sniffing the word
+  `solid`, which binary exporters put in the header often enough to make that unreliable;
+  it deliberately **discards the per-facet normal**, because it is only the geometric
+  normal and storing it would pin every STL to flat shading, whereas dropping it lets
+  `smooth` weld by position and crease-smooth normally. Both call `meshFinishTris`, so
+  the same "format cannot change shading by construction" invariant that holds for
+  `.ftmesh` now holds across five formats, and **`-checkmesh`** is what asserts it: one
+  cube in six encodings must produce one triangle set.
+  **The structural fix, though, is the zero-triangle guard.** Both `.ftsl` dispatch
+  sites used to call the loader for effect and discard the count, which is what turned
+  "unsupported format" into "successfully loaded nothing" — an empty scene renders fine.
+  A load that yields no triangles is now a hard scene error, so the *next* unhandled
+  extension is a message rather than a grey image.
 - **`assetbytes.h`** (0.148.0) — the two things a scene's asset *bytes* may need that
   aren't parsing: an **overlay** and a **warmer**. `Overlay` is a map from `normKey`
   (lowercased, forward-slashed — so loom's `Path.as_posix()` names match ftrace's

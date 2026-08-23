@@ -7861,6 +7861,48 @@ disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.
 
 ## Recently fixed
 
+### `.ply` / `.stl` were advertised but never implemented — a `.ply` rendered as a silent grey image — FIXED 2026-08-23 (v0.191.0)
+
+**Report:** "how come I ran `ftrace <…>_cleaned.ply` and it just showed a grey display?"
+
+**Two separate defects, and the second is the one that made it undiagnosable.**
+
+1. **The format was never implemented.** `README.md` (quick mesh viewer), the geometry
+   summary table and `open-work.md` C9 all listed `.stl` / `.ply` among the supported mesh
+   formats, but `src/ftsl.h`'s extension dispatch only ever branched on `.gltf`/`.glb`,
+   `.fbx` and `.ftmesh` — **everything else fell through to the OBJ parser**. Fed a PLY,
+   the OBJ parser found no line starting `v `/`f ` and returned zero triangles.
+
+2. **The loader's return value was discarded.** Both the `mesh` and `mesh_asset` blocks
+   called `loadObj(...)` for effect and ignored the count, so "loaded nothing" was
+   indistinguishable from "loaded a mesh". The scene therefore built *successfully* with
+   no geometry in it, ftrace auto-framed on an empty bounding sphere, and the render
+   completed normally — producing exactly one thing, a flat grey environment. No warning,
+   no error, exit code 0. A user has no way to tell that apart from a badly-lit model.
+
+**Fix (v0.191.0):**
+- Real **PLY** and **STL** loaders in `src/mesh.h` — `loadPly`/`loadPlyBytes`,
+  `loadStl`/`loadStlBytes`. PLY covers ascii + binary LE + binary BE with arbitrary
+  element/property layouts (unknown properties consumed by declared type, so a
+  60-property Gaussian-splat export parses); STL covers binary and ascii. Both route
+  through the same `meshFinishTris` finishing pass as OBJ, so format cannot change
+  shading. Verified against the reporter's four real files, up to 3.42 M triangles.
+- Dispatch wired into **both** the `mesh` and `mesh_asset` blocks of `src/ftsl.h`.
+- **The zero-triangle guard is the durable half of the fix.** The OBJ fallthrough now
+  checks the count and fails the load with "loaded no triangles — the file is missing,
+  empty, or not the format its extension claims". Any *future* unsupported format is
+  now a loud error rather than a grey image.
+- A face-less PLY (a point cloud, which photogrammetry pipelines emit constantly) gets
+  its own message telling the user to meshify it rather than a generic parse failure.
+- **`ftrace -checkmesh`** is the regression guard: one cube in six encodings must yield
+  the same triangle set, plus authored-normal preservation and four must-fail-loudly
+  cases. Nothing caught this originally because nothing asserted that a format we
+  *claim* to read actually yields geometry.
+
+**Lesson worth keeping:** a discarded loader return value converts "unsupported" into
+"silently empty", and an empty scene still renders. Any load path whose failure mode is
+an *absence* needs an explicit non-empty assertion at the call site.
+
 ### `upsample::fitSigmoid` diverged for dark saturated colours — FIXED 2026-08-10 (v0.170.0)
 
 Found while building O7's Jakob–Hanika coefficient LUT, but it was **not** specific to

@@ -8120,6 +8120,231 @@ static int checkCavity() {
 //   §7 agreement with the ANALYTIC sphere. The mesh and intersectSphere are independent
 //      implementations of "which side did I hit"; on the same ray they must return the
 //      same side, the same sign of curv, and normals within the tessellation angle.
+// ---- -checkmesh: every format we claim to read means the same thing -------------
+//
+// WHY THIS TEST EXISTS. `.ply` and `.stl` were listed in `-help` and accepted by the
+// bare-mesh quick-viewer for a long time with no loader behind either: the format
+// dispatch sent everything that was not .gltf/.glb/.fbx/.ftmesh to the OBJ parser,
+// which finds no `v `/`f ` lines in a PLY, returns an empty mesh, and had its return
+// value discarded at the call site. `ftrace foo.ply` therefore rendered a flawless
+// picture of an empty scene — a uniform grey field — and confessed only in a
+// `0 verts, 0 tris` log line. Nothing caught it because nothing asserted that a
+// format we CLAIM to read yields geometry.
+//
+// The invariant under test is cross-format equivalence rather than per-parser
+// detail: one cube, written six ways, must arrive in the scene as the same
+// triangles. Endianness, list-property triangulation and STL's vertex duplication
+// are all covered by that single comparison. The negative cases get their own
+// section, because there the required behaviour is a LOUD failure — which is
+// precisely what was missing.
+static int checkMeshFormats() {
+    bool ok = true;
+    auto chkb = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkmesh] %-56s BAD\n", what); ok = false; }
+        return cond;
+    };
+
+    // A unit cube: 8 corners, 6 outward-wound quads (so the PLY/OBJ paths exercise
+    // polygon fan-triangulation and the STL path exercises raw triangle soup).
+    const double C[8][3] = {{0,0,0},{1,0,0},{1,1,0},{0,1,0},
+                            {0,0,1},{1,0,1},{1,1,1},{0,1,1}};
+    const int Q[6][4] = {{0,3,2,1},{4,5,6,7},{0,1,5,4},{2,3,7,6},{0,4,7,3},{1,2,6,5}};
+
+    auto putU32 = [](std::string& s, unsigned v, bool big) {
+        unsigned char b[4]; std::memcpy(b, &v, 4);
+        if (big) for (int i = 3; i >= 0; --i) s.push_back((char)b[i]);
+        else     for (int i = 0; i <  4; ++i) s.push_back((char)b[i]);
+    };
+    auto putF32 = [](std::string& s, float f, bool big) {
+        unsigned char b[4]; std::memcpy(b, &f, 4);
+        if (big) for (int i = 3; i >= 0; --i) s.push_back((char)b[i]);
+        else     for (int i = 0; i <  4; ++i) s.push_back((char)b[i]);
+    };
+
+    // --- the six encodings -------------------------------------------------------
+    std::string objSrc;
+    for (auto& c : C) objSrc += "v " + std::to_string(c[0]) + " " + std::to_string(c[1]) +
+                                " " + std::to_string(c[2]) + "\n";
+    for (auto& q : Q) objSrc += "f " + std::to_string(q[0]+1) + " " + std::to_string(q[1]+1) +
+                                " " + std::to_string(q[2]+1) + " " + std::to_string(q[3]+1) + "\n";
+
+    std::string plyAscii =
+        "ply\nformat ascii 1.0\ncomment written by -checkmesh\n"
+        "element vertex 8\nproperty float x\nproperty float y\nproperty float z\n"
+        "element face 6\nproperty list uchar int vertex_indices\nend_header\n";
+    for (auto& c : C) plyAscii += std::to_string(c[0]) + " " + std::to_string(c[1]) +
+                                  " " + std::to_string(c[2]) + "\n";
+    for (auto& q : Q) plyAscii += "4 " + std::to_string(q[0]) + " " + std::to_string(q[1]) +
+                                  " " + std::to_string(q[2]) + " " + std::to_string(q[3]) + "\n";
+
+    auto makePlyBinary = [&](bool big) {
+        std::string s = std::string("ply\nformat ") +
+            (big ? "binary_big_endian" : "binary_little_endian") + " 1.0\n"
+            "element vertex 8\nproperty float x\nproperty float y\nproperty float z\n"
+            "element face 6\nproperty list uchar int vertex_indices\nend_header\n";
+        for (auto& c : C) { putF32(s,(float)c[0],big); putF32(s,(float)c[1],big); putF32(s,(float)c[2],big); }
+        for (auto& q : Q) { s.push_back((char)4); for (int k=0;k<4;++k) putU32(s,(unsigned)q[k],big); }
+        return s;
+    };
+    // A splat-shaped PLY: the same cube buried in unknown scalar and list properties,
+    // interleaved before, between and after the ones we want. This is the layout that
+    // makes a naive fixed-stride reader walk off the rails.
+    std::string plyNoisy =
+        "ply\nformat binary_little_endian 1.0\n"
+        "element vertex 8\n"
+        "property double opacity\nproperty float x\nproperty uchar red\nproperty float y\n"
+        "property short junk\nproperty float z\nproperty float f_rest_0\n"
+        "element blob 2\nproperty float whatever\nproperty list uchar int lump\n"
+        "element face 6\nproperty list uchar int vertex_indices\nproperty uchar flags\n"
+        "end_header\n";
+    for (auto& c : C) {
+        double d = 0.5; unsigned char b8[8]; std::memcpy(b8,&d,8);
+        for (int i=0;i<8;++i) plyNoisy.push_back((char)b8[i]);          // opacity (f64)
+        putF32(plyNoisy,(float)c[0],false);                             // x
+        plyNoisy.push_back((char)200);                                  // red (u8)
+        putF32(plyNoisy,(float)c[1],false);                             // y
+        plyNoisy.push_back((char)1); plyNoisy.push_back((char)0);       // junk (i16)
+        putF32(plyNoisy,(float)c[2],false);                             // z
+        putF32(plyNoisy,0.25f,false);                                   // f_rest_0
+    }
+    for (int i = 0; i < 2; ++i) {                                        // the ignored element
+        putF32(plyNoisy,1.0f,false);
+        plyNoisy.push_back((char)3); for (int k=0;k<3;++k) putU32(plyNoisy,(unsigned)k,false);
+    }
+    for (auto& q : Q) {
+        plyNoisy.push_back((char)4); for (int k=0;k<4;++k) putU32(plyNoisy,(unsigned)q[k],false);
+        plyNoisy.push_back((char)7);                                     // trailing flags
+    }
+
+    // STL, both encodings. STL has no indices, so each quad becomes two explicit
+    // triangles with duplicated corners — the case position-welding has to undo.
+    std::string stlBin(80, ' ');
+    putU32(stlBin, 12u, false);
+    std::string stlAscii = "solid cube\n";
+    for (auto& q : Q) {
+        const int tri[2][3] = {{q[0],q[1],q[2]},{q[0],q[2],q[3]}};
+        for (auto& t : tri) {
+            for (int i = 0; i < 3; ++i) putF32(stlBin, 0.0f, false);      // facet normal
+            for (int k = 0; k < 3; ++k)
+                for (int a = 0; a < 3; ++a) putF32(stlBin, (float)C[t[k]][a], false);
+            stlBin.push_back((char)0); stlBin.push_back((char)0);         // attribute u16
+            stlAscii += "  facet normal 0 0 0\n    outer loop\n";
+            for (int k = 0; k < 3; ++k)
+                stlAscii += "      vertex " + std::to_string(C[t[k]][0]) + " " +
+                            std::to_string(C[t[k]][1]) + " " + std::to_string(C[t[k]][2]) + "\n";
+            stlAscii += "    endloop\n  endfacet\n";
+        }
+    }
+    stlAscii += "endsolid cube\n";
+
+    // --- load each, and reduce to a comparable fingerprint -----------------------
+    const Affine xf = MeshXform{}.toAffine();
+    auto fingerprint = [](const Scene& s) {
+        std::vector<std::array<double,3>> ctr;
+        for (const Tri& t : s.tris)
+            ctr.push_back({(t.v0.x+t.v1.x+t.v2.x)/3.0,
+                           (t.v0.y+t.v1.y+t.v2.y)/3.0,
+                           (t.v0.z+t.v1.z+t.v2.z)/3.0});
+        std::sort(ctr.begin(), ctr.end());
+        return ctr;
+    };
+    struct Case { const char* name; Scene s; };
+    std::vector<Case> cases;
+    {
+        Case c{"obj", {}};      loadObjBytes(c.s, objSrc, "cube.obj", 0, xf);
+        cases.push_back(std::move(c));
+    }
+    auto addPly = [&](const char* name, const std::string& src) {
+        Case c{name, {}};
+        std::string e;
+        int n = loadPlyBytes(c.s, src, name, 0, xf, false, e);
+        chkb((std::string("ply loads: ") + name).c_str(), n == 12);
+        cases.push_back(std::move(c));
+    };
+    addPly("ply-ascii",     plyAscii);
+    addPly("ply-binary-le", makePlyBinary(false));
+    addPly("ply-binary-be", makePlyBinary(true));
+    addPly("ply-noisy",     plyNoisy);
+    {
+        Case c{"stl-binary", {}}; std::string e;
+        int n = loadStlBytes(c.s, stlBin, "cube.stl", 0, xf, e);
+        chkb("stl loads: binary", n == 12);
+        cases.push_back(std::move(c));
+    }
+    {
+        Case c{"stl-ascii", {}}; std::string e;
+        int n = loadStlBytes(c.s, stlAscii, "cube.stl", 0, xf, e);
+        chkb("stl loads: ascii", n == 12);
+        cases.push_back(std::move(c));
+    }
+
+    chkb("baseline: OBJ cube is 12 triangles", cases[0].s.tris.size() == 12);
+    const auto ref = fingerprint(cases[0].s);
+    for (size_t i = 1; i < cases.size(); ++i) {
+        const auto got = fingerprint(cases[i].s);
+        bool same = (got.size() == ref.size());
+        for (size_t k = 0; same && k < got.size(); ++k)
+            for (int a = 0; a < 3; ++a)
+                if (std::fabs(got[k][a] - ref[k][a]) > 1e-6) same = false;
+        chkb((std::string("same geometry as OBJ: ") + cases[i].name).c_str(), same);
+    }
+
+    // --- authored shading normals survive the PLY path ---------------------------
+    {
+        std::string src =
+            "ply\nformat ascii 1.0\n"
+            "element vertex 3\nproperty float x\nproperty float y\nproperty float z\n"
+            "property float nx\nproperty float ny\nproperty float nz\n"
+            "element face 1\nproperty list uchar int vertex_indices\nend_header\n"
+            "0 0 0 0 1 0\n1 0 0 0 1 0\n0 0 1 0 1 0\n3 0 1 2\n";
+        Scene s; std::string e;
+        int n = loadPlyBytes(s, src, "n.ply", 0, xf, false, e);
+        chkb("ply: authored nx/ny/nz become shading normals",
+             n == 1 && !s.tris.empty() && std::fabs(s.tris[0].n0.y - 1.0) < 1e-9);
+    }
+
+    // --- the negative cases: these must FAIL, loudly -----------------------------
+    {   // A point cloud / Gaussian-splat export: vertices, no faces. This is the file
+        // that most deserves a real message, because "0 triangles" reads like our bug.
+        std::string src =
+            "ply\nformat ascii 1.0\nelement vertex 3\n"
+            "property float x\nproperty float y\nproperty float z\nend_header\n"
+            "0 0 0\n1 0 0\n0 1 0\n";
+        Scene s; std::string e;
+        int n = loadPlyBytes(s, src, "cloud.ply", 0, xf, false, e);
+        chkb("ply: a point cloud is refused, not silently empty",
+             n == 0 && e.find("point cloud") != std::string::npos);
+    }
+    {   // An extension that lies: OBJ text behind a .ply name.
+        Scene s; std::string e;
+        int n = loadPlyBytes(s, objSrc, "liar.ply", 0, xf, false, e);
+        chkb("ply: non-PLY content is refused", n == 0 && !e.empty());
+    }
+    {   // Truncated body: 6 faces promised, 2 delivered. Recover what is there and
+        // keep the count honest rather than reading past the buffer.
+        std::string src = makePlyBinary(false);
+        // 8 verts * 12 bytes, then 2 faces * (1 + 16) bytes after the header.
+        const size_t hdr = src.find("end_header\n") + 11;
+        src.resize(hdr + 8 * 12 + 2 * 17);
+        Scene s; std::string e;
+        int n = loadPlyBytes(s, src, "cut.ply", 0, xf, false, e);
+        chkb("ply: a truncated body recovers what it can", n == 4);
+    }
+    {   // Faces indexing past the vertex array are dropped, not dereferenced.
+        std::string src =
+            "ply\nformat ascii 1.0\nelement vertex 3\n"
+            "property float x\nproperty float y\nproperty float z\n"
+            "element face 2\nproperty list uchar int vertex_indices\nend_header\n"
+            "0 0 0\n1 0 0\n0 1 0\n3 0 1 2\n3 0 1 99\n";
+        Scene s; std::string e;
+        int n = loadPlyBytes(s, src, "oob.ply", 0, xf, false, e);
+        chkb("ply: out-of-range face indices are dropped", n == 1);
+    }
+
+    std::printf("[checkmesh] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 static int checkTriNormal() {
     bool ok = true;
     auto chkb = [&](const char* what, bool cond) {
@@ -14941,6 +15166,7 @@ static int run(int argc, char** argv) {
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
     bool checkTriNormalOnly = false;
+    bool checkMeshFormatsOnly = false;
     bool checkSdfOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
@@ -15513,6 +15739,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checktrinormal")) checkTriNormalOnly = true;
+        else if (!std::strcmp(argv[i], "-checkmesh")) checkMeshFormatsOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
@@ -15713,6 +15940,7 @@ static int run(int argc, char** argv) {
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkTriNormalOnly) return checkTriNormal(); // ditto (intersectTri's side/normal convention)
+    if (checkMeshFormatsOnly) return checkMeshFormats(); // ditto (OBJ/PLY/STL agree on the same cube)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed

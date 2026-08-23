@@ -2286,7 +2286,9 @@ first.
 
 `sphere`, `quad` (parallelogram), `triangle`, `curve` (a hair/fur/wire strand — see
 **Curves and fibers** below), and `mesh` (**OBJ, glTF 2.0 / GLB,
-Autodesk FBX, and `.ftmesh`** import — the loader dispatches on file extension). glTF brings
+Autodesk FBX, Stanford PLY, STL, and `.ftmesh`** import — the loader dispatches on file
+extension; an extension it does not recognise is parsed as OBJ, and a file that yields
+**zero triangles is a hard load error**, never a silently empty scene). glTF brings
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
 roughness → lobe width; `import_materials no` forces the FTSL `material` instead).
@@ -2299,7 +2301,32 @@ triangulated and baked through ufbx's world transform, with generated-if-missing
 per-vertex normals and the first UV set filling the same smooth-shading / texturing
 slots the OBJ/glTF paths use; the scene is normalized to right-handed Y-up metres at
 load. (FBX materials, skinning, blend shapes and animation are not yet consumed — see
-known-issues.) OBJ
+known-issues.)
+**PLY** (`.ply`, Stanford polygon format) reads all three encodings — `ascii`,
+`binary_little_endian` and `binary_big_endian` (byte-swapped on read) — with
+**arbitrary element and property layouts**: unknown elements and properties are
+consumed by their declared type rather than assumed away, which is what lets a
+photogrammetry or Gaussian-splat export carrying sixty-odd per-vertex scalars parse
+instead of derailing on the first `f_rest_*` field. Positions come from `x`/`y`/`z`,
+optional shading normals from `nx`/`ny`/`nz`, optional texture coordinates from
+whichever name pair the exporter used (`u`/`v`, `s`/`t`, `texture_u`/`texture_v`,
+`texture_s`/`texture_t`), and faces from `vertex_indices` (or the singular
+`vertex_index` some writers emit), fan-triangulated exactly like an OBJ polygon so a
+quad mesh loads identically through either format. A PLY holding **vertices but no
+faces is a point cloud**, and is refused with a message saying so — it has no surface
+to intersect, so meshify it first (e.g. Poisson reconstruction) and load the result.
+**STL** (`.stl`) reads both the binary form (auto-detected by checking that the
+80-byte header + `u32` count + 50 bytes/facet exactly accounts for the file size) and
+the ascii `solid`/`facet normal`/`outer loop` form. STL stores no indices, no UVs and
+no shared vertices, so every facet repeats its three corners; the per-facet normal is
+deliberately **not** kept as a shading normal (it is just the geometric normal, and
+keeping it would pin the mesh to flat shading) — which leaves `mesh { smooth [<deg>] }`
+free to weld coincident positions and crease-smooth an STL exactly as it does a
+low-poly OBJ. Both formats honour the same world transform, the same
+authored-normals-win rule and the same finishing pass as OBJ, so moving a mesh between
+`.obj`, `.ply` and `.stl` cannot change how it shades — `ftrace -checkmesh` asserts
+that, loading one cube in six encodings and comparing the resulting triangle sets.
+OBJ
 supports `usemtl use_names` for per-face materials and `uv use_mesh` for mesh UVs.
 OBJ **vertex normals (`vn`) are read as smooth shading normals** — a hit
 barycentric-interpolates them (CPU and GPU) for smooth-shaded curved meshes, with
@@ -4378,10 +4405,19 @@ alone can't restore, so they are not disk-resumable.
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
 `-checkbluenoise`, `-checkfnoise`, `-checkstochtile`, `-checkreaction`, `-checkcurv`,
-`-checkcavity`, `-checktrinormal`, `-checksdf`, `-checksun`,
+`-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checksdf`, `-checksun`,
 `-checkbind`, `-checkprop`, `-checkhair`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
-`PASS`/`FAIL`. `-checkcurve` guards the `curve` primitive: it cross-checks the
+`PASS`/`FAIL`. `-checkmesh` guards the **mesh importers**: it writes one unit cube in
+six encodings (OBJ quads, PLY ascii / binary-LE / binary-BE, a "noisy" splat-shaped PLY
+whose vertices carry unknown scalar and list properties around an entirely ignored
+extra element, and STL binary / ascii), loads each, and asserts the six produce an
+identical set of triangles — so a format can never quietly disagree with the others
+about what a file means. It also pins authored-normal preservation and the four ways a
+load is *supposed* to fail loudly: a face-less point-cloud PLY (refused, and told it is
+a point cloud), a file whose contents aren't the format its extension claims, a
+truncated body (the recoverable prefix is kept and reported), and out-of-range face
+indices (dropped and reported). `-checkcurve` guards the `curve` primitive: it cross-checks the
 round-cone intersector against the exact analytic SDF, the degenerate
 one-sphere-swallows-the-other case against the analytic ray–sphere test, `anyHit`
 against the full path (with half the origins *inside* the fiber), watertightness at
