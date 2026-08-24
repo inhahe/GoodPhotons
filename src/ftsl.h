@@ -5187,6 +5187,34 @@ private:
                     fail("mesh: " + ferr); return false;
                 }
             }
+        } else if (ext == ".ply" || ext == ".stl") {
+            // Stanford PLY / stereolithography STL (see the format notes in mesh.h).
+            // Both run the same finishing passes as the OBJ path, so `smooth` and the
+            // procedural `uv` projections behave identically; PLY additionally honours
+            // authored `nx/ny/nz` and texture coordinates when the file carries them.
+            double creaseAngleDeg = -1.0;
+            if (const Stmt* sm = find(b, "smooth")) {
+                creaseAngleDeg = 40.0;
+                if (!sm->val.words.empty() && isNumber(sm->val.words[0]))
+                    creaseAngleDeg = num(sm->val.words[0]);
+            }
+            std::string merr;
+            {
+                detail::AssetTimer _at;
+                const std::string* mb = assetBytes(file);
+                int n = 0;
+                if (ext == ".ply")
+                    n = mb ? loadPlyBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, merr,
+                                          uvProj, uvAxis, creaseAngleDeg)
+                           : loadPly(L.scene, file.c_str(), id, xf, loadUV, merr,
+                                     uvProj, uvAxis, creaseAngleDeg);
+                else
+                    n = mb ? loadStlBytes(L.scene, *mb, file.c_str(), id, xf, merr,
+                                          uvProj, uvAxis, creaseAngleDeg)
+                           : loadStl(L.scene, file.c_str(), id, xf, merr,
+                                     uvProj, uvAxis, creaseAngleDeg);
+                if (n == 0) { fail("mesh: " + (merr.empty() ? "no triangles loaded" : merr)); return false; }
+            }
         } else if (ext == ".ftmesh") {
             // Binary indexed mesh (see the format note in mesh.h). Accepts the same
             // `smooth` / `uv` statements as the OBJ path and runs the identical
@@ -5223,12 +5251,27 @@ private:
             {
                 detail::AssetTimer _at;
                 const MtlResolver* res = useNames ? &resolver : nullptr;
+                int n = 0;
                 if (const std::string* mb = assetBytes(file))
-                    loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
-                                 uvProj, uvAxis, creaseAngleDeg);
+                    n = loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
+                                     uvProj, uvAxis, creaseAngleDeg);
                 else
-                    loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
-                            uvProj, uvAxis, creaseAngleDeg);
+                    n = loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
+                                uvProj, uvAxis, creaseAngleDeg);
+                // A mesh that loaded nothing is an error, not an empty object. This
+                // return value used to be discarded, which is precisely how an
+                // unsupported format (.ply/.stl fell through to this OBJ branch)
+                // became a silent, fully-successful render of an empty scene.
+                if (n == 0) {
+                    // Say WHICH of the two it was. "loaded no triangles" on its own
+                    // sends the user hunting through a file that may not even exist.
+                    std::string why = assetBytes(file)
+                                          ? std::string("parsed as OBJ but held no faces — is it "
+                                                        "really the format its extension claims?")
+                                          : assetbytes::describeOpenFailure(file);
+                    fail("mesh: " + file + ": " + why);
+                    return false;
+                }
             }
         }
         // Record the object as a named mesh group (for -check-watertight): the range of
@@ -5394,6 +5437,30 @@ private:
                     fail("mesh_asset: " + ferr); return false;
                 }
             }
+        } else if (ext == ".ply" || ext == ".stl") {
+            double creaseAngleDeg = -1.0;                 // see the mesh block
+            if (const Stmt* sm = find(b, "smooth")) {
+                creaseAngleDeg = 40.0;
+                if (!sm->val.words.empty() && isNumber(sm->val.words[0]))
+                    creaseAngleDeg = num(sm->val.words[0]);
+            }
+            std::string merr;
+            {
+                detail::AssetTimer _at;
+                const std::string* mb = assetBytes(file);
+                int n = 0;
+                if (ext == ".ply")
+                    n = mb ? loadPlyBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, merr,
+                                          UvProjection::None, 1, creaseAngleDeg)
+                           : loadPly(L.scene, file.c_str(), id, xf, loadUV, merr,
+                                     UvProjection::None, 1, creaseAngleDeg);
+                else
+                    n = mb ? loadStlBytes(L.scene, *mb, file.c_str(), id, xf, merr,
+                                          UvProjection::None, 1, creaseAngleDeg)
+                           : loadStl(L.scene, file.c_str(), id, xf, merr,
+                                     UvProjection::None, 1, creaseAngleDeg);
+                if (n == 0) { fail("mesh_asset: " + (merr.empty() ? "no triangles loaded" : merr)); return false; }
+            }
         } else if (ext == ".ftmesh") {
             double creaseAngleDeg = -1.0;                 // see the mesh block
             if (const Stmt* sm = find(b, "smooth")) {
@@ -5421,12 +5488,24 @@ private:
             {
                 detail::AssetTimer _at;
                 const MtlResolver* res = useNames ? &resolver : nullptr;
+                int n = 0;
                 if (const std::string* mb = assetBytes(file))
-                    loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
-                                 UvProjection::None, 1, creaseAngleDeg);
+                    n = loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
+                                     UvProjection::None, 1, creaseAngleDeg);
                 else
-                    loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
-                            UvProjection::None, 1, creaseAngleDeg);
+                    n = loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
+                                UvProjection::None, 1, creaseAngleDeg);
+                // Same guard as the `mesh` block above — the empty-blas check below
+                // would catch this, but only after losing which FILE was at fault
+                // (a mesh_asset may name several).
+                if (n == 0) {
+                    std::string why = assetBytes(file)
+                                          ? std::string("parsed as OBJ but held no faces — is it "
+                                                        "really the format its extension claims?")
+                                          : assetbytes::describeOpenFailure(file);
+                    fail("mesh_asset '" + b.name + "': " + file + ": " + why);
+                    return false;
+                }
             }
         }
         Blas blas;
