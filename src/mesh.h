@@ -418,7 +418,8 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
                    double creaseAngleDeg = -1.0) {
     std::string buf;
     if (!assetbytes::readFile(path, buf)) {
-        std::fprintf(stderr, "loadObj: cannot open %s\n", path);
+        std::fprintf(stderr, "loadObj: %s: %s\n", path,
+                     assetbytes::describeOpenFailure(path).c_str());
         return 0;
     }
     return loadObjBytes(s, buf, path, matId, xf, loadUV, matResolver, uvProj, uvAxis,
@@ -769,7 +770,10 @@ inline int loadPly(Scene& s, const char* path, int matId, const Affine& xf,
                    UvProjection uvProj = UvProjection::None, int uvAxis = 1,
                    double creaseAngleDeg = -1.0) {
     std::string buf;
-    if (!assetbytes::readFile(path, buf)) { err = std::string("cannot open ") + path; return 0; }
+    if (!assetbytes::readFile(path, buf)) {
+        err = std::string(path) + ": " + assetbytes::describeOpenFailure(path);
+        return 0;
+    }
     return loadPlyBytes(s, buf, path, matId, xf, loadUV, err, uvProj, uvAxis, creaseAngleDeg);
 }
 
@@ -857,7 +861,10 @@ inline int loadStl(Scene& s, const char* path, int matId, const Affine& xf, std:
                    UvProjection uvProj = UvProjection::None, int uvAxis = 1,
                    double creaseAngleDeg = -1.0) {
     std::string buf;
-    if (!assetbytes::readFile(path, buf)) { err = std::string("cannot open ") + path; return 0; }
+    if (!assetbytes::readFile(path, buf)) {
+        err = std::string(path) + ": " + assetbytes::describeOpenFailure(path);
+        return 0;
+    }
     return loadStlBytes(s, buf, path, matId, xf, err, uvProj, uvAxis, creaseAngleDeg);
 }
 

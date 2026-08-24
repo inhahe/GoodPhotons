@@ -40,10 +40,13 @@
 // path the scene names, and warming is pure prefetch whose worst case is a wasted
 // read.
 #pragma once
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <filesystem>
 #include <map>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -59,6 +62,101 @@ inline bool readFile(const char* path, std::string& out) {
     while ((got = std::fread(tmp, 1, sizeof tmp, fp)) > 0) out.append(tmp, got);
     std::fclose(fp);
     return true;
+}
+
+// Why an open failure gets a whole function (0.191.1). "cannot open <path>" answers
+// the wrong question. The three ways it actually fails want three different reactions
+// from the user, and the message must say which one happened:
+//
+//   * the path names nothing        -> it's a typo or a stale path; look at the name
+//   * the path names a directory    -> you passed the folder, not the file in it
+//   * the path exists but won't open -> permissions, or something holds it open
+//
+// The typo case is worth more than a label, because a mistyped asset name is nearly
+// always ONE edit away from a file sitting in the same directory — and the user cannot
+// see that, since their eyes read the name they meant. So we list the directory and
+// offer the near misses by Levenshtein distance. This is not a nicety: the bug that
+// prompted it (see known-issues.md) had a dropped leading character in a 30-character
+// filename produce a completely silent grey render, and even after the load was made
+// to fail loudly, `cannot open` still didn't point at the one-character difference.
+//
+// Bounded on purpose: directories are read at most once per failure, capped at 4000
+// entries, and this runs only on a path that has ALREADY failed — so it is never on
+// any hot path and can afford to be thorough.
+inline int editDistance(const std::string& a, const std::string& b) {
+    const size_t n = a.size(), m = b.size();
+    std::vector<int> prev(m + 1), cur(m + 1);
+    for (size_t j = 0; j <= m; ++j) prev[j] = (int)j;
+    for (size_t i = 1; i <= n; ++i) {
+        cur[0] = (int)i;
+        for (size_t j = 1; j <= m; ++j) {
+            const char ca = (char)std::tolower((unsigned char)a[i - 1]);
+            const char cb = (char)std::tolower((unsigned char)b[j - 1]);
+            int del = prev[j] + 1, ins = cur[j - 1] + 1, sub = prev[j - 1] + (ca != cb ? 1 : 0);
+            cur[j] = del < ins ? (del < sub ? del : sub) : (ins < sub ? ins : sub);
+        }
+        prev.swap(cur);
+    }
+    return prev[m];
+}
+
+// Human-readable reason a path could not be read, with "did you mean" when the name
+// looks like a typo. Returns a phrase meant to follow the path in an error message.
+inline std::string describeOpenFailure(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path p = fs::u8path(path);
+
+    if (fs::is_directory(p, ec))
+        return "that is a directory, not a file";
+
+    if (fs::exists(p, ec)) {
+        // It's there and we still couldn't read it. Size is a useful tell: a
+        // zero-byte file is usually a half-finished write, not a permission problem.
+        const uintmax_t sz = fs::file_size(p, ec);
+        if (!ec && sz == 0) return "the file exists but is empty (0 bytes)";
+        return "the file exists but could not be opened for reading — check "
+               "permissions, or whether another program is holding it open";
+    }
+
+    std::string msg = "no such file";
+
+    const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+    if (!fs::is_directory(dir, ec)) {
+        msg += " (and its directory does not exist either: " +
+               dir.string() + ")";
+        return msg;
+    }
+
+    // Near misses in the same directory, ranked by edit distance on the filename.
+    const std::string want = p.filename().string();
+    std::vector<std::pair<int, std::string>> cand;
+    int scanned = 0;
+    for (fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
+         it != end && scanned < 4000; it.increment(ec), ++scanned) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+        const std::string have = it->path().filename().string();
+        const int d = editDistance(want, have);
+        // Accept a quarter of the name's length in edits, at least 1 and at most 6 —
+        // enough for a dropped char, a case slip or a wrong extension, not enough to
+        // "suggest" an unrelated file in a directory of similar names.
+        int budget = (int)want.size() / 4;
+        if (budget < 1) budget = 1;
+        if (budget > 6) budget = 6;
+        if (d <= budget) cand.emplace_back(d, have);
+    }
+    std::sort(cand.begin(), cand.end());
+    if (!cand.empty()) {
+        msg += " — did you mean ";
+        const size_t show = cand.size() < 3 ? cand.size() : 3;
+        for (size_t i = 0; i < show; ++i) {
+            if (i) msg += (i + 1 == show) ? " or " : ", ";
+            msg += "'" + cand[i].second + "'";
+        }
+        msg += "?";
+    }
+    return msg;
 }
 
 // Paths reach us from two directions — loom writes posix separators into the `.ftsl`

@@ -5263,8 +5263,13 @@ private:
                 // unsupported format (.ply/.stl fell through to this OBJ branch)
                 // became a silent, fully-successful render of an empty scene.
                 if (n == 0) {
-                    fail("mesh: " + file + " loaded no triangles — the file is missing, "
-                         "empty, or not the format its extension claims");
+                    // Say WHICH of the two it was. "loaded no triangles" on its own
+                    // sends the user hunting through a file that may not even exist.
+                    std::string why = assetBytes(file)
+                                          ? std::string("parsed as OBJ but held no faces — is it "
+                                                        "really the format its extension claims?")
+                                          : assetbytes::describeOpenFailure(file);
+                    fail("mesh: " + file + ": " + why);
                     return false;
                 }
             }
@@ -5483,12 +5488,24 @@ private:
             {
                 detail::AssetTimer _at;
                 const MtlResolver* res = useNames ? &resolver : nullptr;
+                int n = 0;
                 if (const std::string* mb = assetBytes(file))
-                    loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
-                                 UvProjection::None, 1, creaseAngleDeg);
+                    n = loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
+                                     UvProjection::None, 1, creaseAngleDeg);
                 else
-                    loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
-                            UvProjection::None, 1, creaseAngleDeg);
+                    n = loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
+                                UvProjection::None, 1, creaseAngleDeg);
+                // Same guard as the `mesh` block above — the empty-blas check below
+                // would catch this, but only after losing which FILE was at fault
+                // (a mesh_asset may name several).
+                if (n == 0) {
+                    std::string why = assetBytes(file)
+                                          ? std::string("parsed as OBJ but held no faces — is it "
+                                                        "really the format its extension claims?")
+                                          : assetbytes::describeOpenFailure(file);
+                    fail("mesh_asset '" + b.name + "': " + file + ": " + why);
+                    return false;
+                }
             }
         }
         Blas blas;

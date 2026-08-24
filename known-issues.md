@@ -7903,6 +7903,29 @@ disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.
 "silently empty", and an empty scene still renders. Any load path whose failure mode is
 an *absence* needs an explicit non-empty assertion at the call site.
 
+**Follow-up (v0.191.1): the message the guard produced was still not actionable.** The
+original report turned out to be a *mistyped filename* — `edcup…` for `redcup…`, one
+dropped leading character — which the discarded return value had been rendering as grey
+all along. Once the guard landed, the same command produced `mesh: cannot open <path>`:
+correct, and still not enough to see a one-character difference in a 30-character name.
+`assetbytes::describeOpenFailure()` now distinguishes the three real cases — the path
+names nothing / names a directory / exists but won't open (with 0-byte called out
+separately, since that is a half-finished write rather than a permission problem) — and
+for the missing case scans the containing directory and offers the nearest names by
+Levenshtein distance (budget = ¼ of the name length, clamped to 1–6, so it can't
+"suggest" an unrelated file). It also reports when the *directory* is the thing that
+doesn't exist. Wired into `loadPly`/`loadStl`/`loadObj` and both `.ftsl` dispatch sites;
+it runs only on an already-failed path, so it is never on a hot path. Result:
+
+```
+mesh: …/edcup_s2-15000011_cleaned.ply: no such file — did you mean 'redcup_s2-15000011_cleaned.ply'?
+```
+
+The `mesh_asset` OBJ branch was *still* discarding its loader return value after the
+first fix — the empty-blas check below it would eventually catch the failure, but only
+after losing which of several files was at fault. Now guarded like the `mesh` branch.
+Six more `-checkmesh` assertions cover the diagnostics against a real temp directory.
+
 ### `upsample::fitSigmoid` diverged for dark saturated colours — FIXED 2026-08-10 (v0.170.0)
 
 Found while building O7's Jakob–Hanika coefficient LUT, but it was **not** specific to

@@ -1107,7 +1107,17 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   sites used to call the loader for effect and discard the count, which is what turned
   "unsupported format" into "successfully loaded nothing" — an empty scene renders fine.
   A load that yields no triangles is now a hard scene error, so the *next* unhandled
-  extension is a message rather than a grey image.
+  extension is a message rather than a grey image. **`describeOpenFailure`**
+  (0.191.1, `assetbytes.h`) is the other half of that: an error is only useful if it
+  names the right *cause*, and "cannot open" conflates a typo, a directory passed in
+  place of a file, and a genuinely unreadable file. It separates those, calls out a
+  0-byte file (a half-finished write, not a permissions failure), reports when the
+  *directory* is what's missing, and for a missing file scans the containing directory
+  and suggests the nearest names by Levenshtein distance — because the report that
+  started all this was a single dropped character in a 30-character filename, which is
+  invisible to the person who typed it. Budgeted at ¼ of the name length (clamped 1–6)
+  so it cannot suggest an unrelated file, capped at 4000 directory entries, and reached
+  only on an already-failed path, so it is off every hot path by construction.
 - **`assetbytes.h`** (0.148.0) — the two things a scene's asset *bytes* may need that
   aren't parsing: an **overlay** and a **warmer**. `Overlay` is a map from `normKey`
   (lowercased, forward-slashed — so loom's `Path.as_posix()` names match ftrace's

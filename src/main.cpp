@@ -8341,6 +8341,61 @@ static int checkMeshFormats() {
         chkb("ply: out-of-range face indices are dropped", n == 1);
     }
 
+    // --- the diagnostic for a path that cannot be opened -------------------------
+    // The bug this guards is subtler than a crash: the ORIGINAL report was a mistyped
+    // filename (one dropped leading character) which, before the zero-triangle guard,
+    // rendered grey — and after it, still only said "cannot open". A message that does
+    // not distinguish "your name is wrong" from "the file is unreadable" leaves the
+    // user auditing a file that was never involved. So: real files, real directory.
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::path dir = fs::temp_directory_path(ec) / "ftrace_checkmesh";
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        if (!ec) {
+            const std::string real = (dir / "redcup_cleaned.ply").string();
+            { std::FILE* f = std::fopen(real.c_str(), "wb");
+              if (f) { std::fwrite(objSrc.data(), 1, objSrc.size(), f); std::fclose(f); } }
+            { std::FILE* f = std::fopen((dir / "empty.ply").string().c_str(), "wb");
+              if (f) std::fclose(f); }
+
+            // A one-character typo must name the file the user meant.
+            std::string d = assetbytes::describeOpenFailure((dir / "edcup_cleaned.ply").string());
+            chkb("open-fail: a typo suggests the real neighbouring file",
+                 d.find("no such file") != std::string::npos &&
+                 d.find("redcup_cleaned.ply") != std::string::npos);
+
+            // An unrelated name must NOT drag in a suggestion.
+            d = assetbytes::describeOpenFailure((dir / "totally_different_thing.ply").string());
+            chkb("open-fail: an unrelated name suggests nothing",
+                 d.find("did you mean") == std::string::npos);
+
+            // A directory is its own diagnosis, not "cannot open".
+            d = assetbytes::describeOpenFailure(dir.string());
+            chkb("open-fail: a directory says so",
+                 d.find("directory") != std::string::npos);
+
+            // Zero bytes is a distinct condition from absent.
+            d = assetbytes::describeOpenFailure((dir / "empty.ply").string());
+            chkb("open-fail: an empty file is reported as empty",
+                 d.find("empty") != std::string::npos);
+
+            // A path whose parent does not exist should say that, not offer names.
+            d = assetbytes::describeOpenFailure((dir / "no_such_dir" / "x.ply").string());
+            chkb("open-fail: a missing directory is named",
+                 d.find("directory does not exist") != std::string::npos);
+
+            // And the loader must actually surface it (not just the helper).
+            Scene s; std::string e;
+            int n = loadPly(s, (dir / "edcup_cleaned.ply").string().c_str(), 0, xf, false, e);
+            chkb("open-fail: loadPly surfaces the suggestion",
+                 n == 0 && e.find("redcup_cleaned.ply") != std::string::npos);
+
+            fs::remove_all(dir, ec);
+        }
+    }
+
     std::printf("[checkmesh] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
