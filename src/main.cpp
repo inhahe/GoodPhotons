@@ -8554,6 +8554,127 @@ static int checkPrefer() {
     return ok ? 0 : 1;
 }
 
+// Asset path resolution (assetbytes::resolve). Same bug, one link further up the
+// chain: before 0.192.0 every authored path went straight to fopen, so a scene was
+// loadable only from the directory its paths happened to be relative to — and the
+// failure that caused was not an error message but an empty scene and a GPU fault.
+//
+// The two properties that matter are in tension, so both are asserted here:
+//   * a path that already resolves must keep resolving to the SAME file (rule 1 is
+//     "as authored", precisely so this change cannot move an existing load), and
+//   * a path that resolves nowhere near the cwd must still be found beside the scene.
+// The tree below is built on disk rather than mocked, because the thing under test is
+// what the filesystem says, and every assertion goes through the real loader.
+static int checkPaths() {
+    namespace fs = std::filesystem;
+    bool ok = true;
+    auto chk = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkpaths] %-60s BAD\n", what); ok = false; }
+        return cond;
+    };
+
+    std::error_code ec;
+    const fs::path tmp = fs::temp_directory_path(ec) / "ftrace_checkpaths";
+    fs::remove_all(tmp, ec);
+    // proj/scenes/s.ftsl names "textures/t.ppm", which lives at proj/textures — the
+    // ordinary layout (scenes in one subdirectory, assets in a sibling) and the exact
+    // shape the old cwd-only rule could not express.
+    const fs::path proj = tmp / "proj";
+    fs::create_directories(proj / "scenes", ec);
+    fs::create_directories(proj / "textures", ec);
+    fs::create_directories(tmp / "elsewhere", ec);
+    if (!chk("temp tree could be created", !ec)) {
+        std::printf("[checkpaths] %s\n", "FAIL");
+        return 1;
+    }
+    auto writeFile = [](const fs::path& p, const std::string& bytes) {
+        std::FILE* f = std::fopen(p.string().c_str(), "wb");
+        if (!f) return false;
+        if (!bytes.empty()) std::fwrite(bytes.data(), 1, bytes.size(), f);
+        std::fclose(f);
+        return true;
+    };
+    // A 1x1 P6 PPM: the smallest thing texture.h's own loader will accept.
+    const std::string ppm = "P6\n1 1\n255\n\x7f\x7f\x7f";
+    chk("texture written", writeFile(proj / "textures" / "t.ppm", ppm));
+
+    const std::string scene =
+        "scene { units meters }\n"
+        "texture \"t\" { file \"textures/t.ppm\"  encoding srgb }\n"
+        "material \"m\" { type diffuse  reflect texture:t }\n"
+        "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material m }\n"
+        "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+        "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+    chk("scene written", writeFile(proj / "scenes" / "s.ftsl", scene));
+
+    // --- the headline: load it from a directory that knows nothing about the project.
+    {
+        const fs::path prev = fs::current_path(ec);
+        fs::current_path(tmp / "elsewhere", ec);
+        ftsl::Loaded L; std::string e;
+        const bool loaded = ftsl::load((proj / "scenes" / "s.ftsl").string(), L, e);
+        fs::current_path(prev, ec);
+        if (chk("a scene loads from an unrelated working directory", loaded))
+            chk("its sibling-directory texture was found", L.scene.textures.size() == 1);
+        else
+            std::printf("[checkpaths]   error was: %s\n", e.c_str());
+    }
+
+    // --- resolve() itself, under a scene directory ------------------------------
+    {
+        assetbytes::ScopedSceneDir sd((proj / "scenes").string());
+
+        // (1) Absolute paths are handed back untouched, found or not.
+        const std::string abs = (proj / "textures" / "t.ppm").string();
+        chk("an absolute path is returned unchanged", assetbytes::resolve(abs) == abs);
+
+        // (2) The ancestor walk: "textures/t.ppm" is not under scenes/, it is under
+        //     proj/. This is the case that stopping at the scene directory would miss.
+        const std::string got = assetbytes::resolve("textures/t.ppm");
+        chk("a sibling-directory asset resolves via the scene's parent",
+            fs::exists(assetbytes::toPath(got), ec) &&
+            fs::equivalent(assetbytes::toPath(got), proj / "textures" / "t.ppm", ec));
+
+        // (3) A name that matches nothing comes back as authored, so the error message
+        //     can quote what the author wrote rather than the last candidate tried.
+        chk("an unresolvable path is returned unchanged",
+            assetbytes::resolve("no/such/thing.ppm") == "no/such/thing.ppm");
+
+        // (4) cwd wins. A file that already resolves against the working directory must
+        //     keep resolving to THAT file even when the scene directory offers a
+        //     same-named one — this is what makes the search path purely additive.
+        const fs::path prev = fs::current_path(ec);
+        fs::current_path(tmp / "elsewhere", ec);
+        fs::create_directories(tmp / "elsewhere" / "textures", ec);
+        writeFile(tmp / "elsewhere" / "textures" / "t.ppm", ppm);
+        const std::string cwdWins = assetbytes::resolve("textures/t.ppm");
+        const bool tookCwd = fs::equivalent(assetbytes::toPath(cwdWins),
+                                            tmp / "elsewhere" / "textures" / "t.ppm", ec);
+        fs::current_path(prev, ec);
+        chk("the working directory still wins over the scene directory", tookCwd);
+    }
+
+    // (5) The scene directory is scoped, not global: leaving the load must restore it,
+    //     or one scene's assets would answer the next scene's names.
+    chk("the scene directory is empty again outside the scope",
+        assetbytes::sceneDirRef().empty());
+
+    // (6) Engine data resolves beside the executable, so `data/glass/*` works from any
+    //     cwd. Asserted through a real lookup rather than by inspecting the path.
+    {
+        const fs::path prev = fs::current_path(ec);
+        fs::current_path(tmp / "elsewhere", ec);
+        Spectrum s;
+        const bool found = speclib::loadGlass("bk7", s);
+        fs::current_path(prev, ec);
+        chk("engine data (data/glass) resolves from an unrelated cwd", found);
+    }
+
+    fs::remove_all(tmp, ec);
+    std::printf("[checkpaths] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 static int checkTriNormal() {
     bool ok = true;
     auto chkb = [&](const char* what, bool cond) {
@@ -15377,6 +15498,7 @@ static int run(int argc, char** argv) {
     bool checkTriNormalOnly = false;
     bool checkMeshFormatsOnly = false;
     bool checkPreferOnly = false;
+    bool checkPathsOnly = false;
     bool checkSdfOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
@@ -15951,6 +16073,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checktrinormal")) checkTriNormalOnly = true;
         else if (!std::strcmp(argv[i], "-checkmesh")) checkMeshFormatsOnly = true;
         else if (!std::strcmp(argv[i], "-checkprefer")) checkPreferOnly = true;
+        else if (!std::strcmp(argv[i], "-checkpaths")) checkPathsOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
@@ -16153,6 +16276,7 @@ static int run(int argc, char** argv) {
     if (checkTriNormalOnly) return checkTriNormal(); // ditto (intersectTri's side/normal convention)
     if (checkMeshFormatsOnly) return checkMeshFormats(); // ditto (OBJ/PLY/STL agree on the same cube)
     if (checkPreferOnly)   return checkPrefer();   // ditto (prefer{}/else{} resolution semantics)
+    if (checkPathsOnly)    return checkPaths();    // ditto (where a relative asset path is looked for)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
@@ -19942,6 +20066,22 @@ int main(int argc, char** argv) {
     // running-render list -- which contains an em dash -- and then returns without ever
     // reaching the render setup where this used to be called.
     enableAnsiTerminal();
+    // Where ftrace.exe itself lives — the last resort of the asset search path, and the
+    // fallback root for engine data (`data/glass/*` and friends ship beside the binary,
+    // so they must resolve from any working directory). Taken from the module path, not
+    // argv[0], which is whatever the launcher felt like passing. Set before anything can
+    // load a scene or touch the spectral library, since both consult it.
+    {
+        wchar_t exeBuf[MAX_PATH * 4];
+        const DWORD n = GetModuleFileNameW(nullptr, exeBuf,
+                                           (DWORD)(sizeof exeBuf / sizeof exeBuf[0]));
+        if (n > 0 && n < sizeof exeBuf / sizeof exeBuf[0]) {
+            std::error_code ec;
+            const std::filesystem::path dir = std::filesystem::path(exeBuf).parent_path();
+            if (!dir.empty() && std::filesystem::is_directory(dir, ec))
+                assetbytes::setExeDir(dir.string());
+        }
+    }
     // `-stop [<pid>|all]`: talk to ALREADY-RUNNING renders and exit. Handled before
     // anything else so it works from a bare command line -- it loads no scene, opens
     // no window and creates no CUDA context, so there is nothing here to tear down.

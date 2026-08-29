@@ -30,6 +30,7 @@
 #include <cmath>
 #include <system_error>
 #include <filesystem>
+#include "assetbytes.h"
 #include "third_party/json.h"
 
 namespace curvedrive {
@@ -192,9 +193,14 @@ inline bool validate(const Drive& d, std::string& err) {
 }
 
 // ---- disk ------------------------------------------------------------------------
-inline bool load(const std::string& path, Drive& out, std::string& err) {
+inline bool load(const std::string& authored, Drive& out, std::string& err) {
+    // Sidecars are named by a scene, so they follow the scene's search path too.
+    const std::string path = assetbytes::resolve(authored);
     std::ifstream f(path, std::ios::binary);
-    if (!f.good()) { err = "cannot open " + path; return false; }
+    if (!f.good()) {
+        err = "cannot open " + authored + ": " + assetbytes::describeOpenFailure(authored);
+        return false;
+    }
     std::ostringstream ss; ss << f.rdbuf();
     std::string text = ss.str();
 

@@ -24,12 +24,17 @@
 #include "scene.h"
 #include "linalg.h"
 #include "upsample.h"
+#include "assetbytes.h"
 #include "third_party/json.h"
 
 namespace gltfimpl {
 
 // Read an entire file into a byte vector. Returns false on open failure.
-inline bool readFileBytes(const std::string& path, std::vector<uint8_t>& out) {
+inline bool readFileBytes(const std::string& authored, std::vector<uint8_t>& out) {
+    // External buffer/image URIs are already resolved against the .gltf's own
+    // directory by the caller; `resolve` adds the scene search path on top, which
+    // matters when the .gltf itself was found somewhere other than the cwd.
+    const std::string path = assetbytes::resolve(authored);
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return false;
     std::streamsize n = f.tellg();
@@ -231,9 +236,16 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     bool importMaterials, std::string& err,
                     const std::vector<std::string>& skipMaterials = {}) {
     using namespace gltfimpl;
-    std::string spath(path);
+    // Resolve the document ONCE, up front: `dirOf(spath)` below becomes the base for
+    // every external buffer/image URI, so it has to be the directory the document was
+    // actually found in, not the one the scene happened to name it relative to.
+    const std::string authored(path);
+    std::string spath = assetbytes::resolve(authored);
     std::vector<uint8_t> file;
-    if (!readFileBytes(spath, file)) { err = "cannot open " + spath; return 0; }
+    if (!readFileBytes(spath, file)) {
+        err = "cannot open " + authored + ": " + assetbytes::describeOpenFailure(authored);
+        return 0;
+    }
 
     Doc doc;
     std::vector<uint8_t> glbBin;   // GLB BIN chunk (buffer 0 with no URI)

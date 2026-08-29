@@ -279,8 +279,12 @@ texture "wood" {
 }
 ```
 
-- `file` is required (unless `rgb` is given, below); the path resolves relative to
-  the working directory.
+- `file` is required (unless `rgb` is given, below). A relative path is looked for in
+  the working directory, then next to the `.ftsl` file, then in that file's parent
+  directories (up to 3 levels), then beside `ftrace.exe` — first hit wins, so a scene
+  loads from any working directory. Same rule for every other path a scene names
+  (meshes, SPD CSVs, camera curves, VDB grids). See *Where asset paths are looked for*
+  in [`REFERENCE.md`](REFERENCE.md#where-asset-paths-are-looked-for).
 - Reflectance coefficients (Jakob-Hanika) are precomputed at load.
 - `palette { <index> <spectrum-expr> … }` turns the texture's red channel into an
   indexed spectral lookup (nearest, no upsampling). Indices 0–255. (File textures only.)

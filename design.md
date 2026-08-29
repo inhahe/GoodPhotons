@@ -1112,14 +1112,21 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   names the right *cause*, and "cannot open" conflates a typo, a directory passed in
   place of a file, and a genuinely unreadable file. It separates those, calls out a
   0-byte file (a half-finished write, not a permissions failure), reports when the
-  *directory* is what's missing, and for a missing file scans the containing directory
-  and suggests the nearest names by Levenshtein distance — because the report that
-  started all this was a single dropped character in a 30-character filename, which is
-  invisible to the person who typed it. Budgeted at ¼ of the name length (clamped 1–6)
-  so it cannot suggest an unrelated file, capped at 4000 directory entries, and reached
-  only on an already-failed path, so it is off every hot path by construction.
-- **`assetbytes.h`** (0.148.0) — the two things a scene's asset *bytes* may need that
-  aren't parsing: an **overlay** and a **warmer**. `Overlay` is a map from `normKey`
+  *directory* is what's missing, and for a missing file scans **every directory the
+  search path would have looked in** (0.192.0 — see *Where a relative asset path is
+  looked for*) and suggests the nearest names by Levenshtein distance — because the
+  report that started all this was a single dropped character in a 30-character
+  filename, which is invisible to the person who typed it. When more than one directory
+  was consulted it also names them (`[searched: …]`), so a miss tells you *where* it
+  looked rather than leaving you to guess the base directory. Budgeted at ¼ of the name
+  length (clamped 1–6) so it cannot suggest an unrelated file, capped at 4000 directory
+  entries per root, and reached only on an already-failed path, so it is off every hot
+  path by construction.
+- **`assetbytes.h`** (0.148.0) — the three things a scene's asset *bytes* may need that
+  aren't parsing: an **overlay**, a **warmer**, and (0.192.0) the **search path** that
+  turns an authored relative path into a real one — `resolve` / `ScopedSceneDir` /
+  `setExeDir`, described in full under *Where a relative asset path is looked for*.
+  `Overlay` is a map from `normKey`
   (lowercased, forward-slashed — so loom's `Path.as_posix()` names match ftrace's
   lookups on Windows) to bytes; `ftsl::Builder` carries one and every mesh dispatch
   site consults it before touching the disk, which is what lets the live viewer hand
@@ -5025,6 +5032,59 @@ out-param. `main.cpp` reports it as `[stop] scene load stopped before rendering`
 outright on a stop — treating an interrupted branch as *rejected* would otherwise make it
 build the next branch and ignore the stop for another whole load.
 
+## Where a relative asset path is looked for (`assetbytes::resolve`, 0.192.0)
+
+Every file an FTSL scene names — meshes, textures, `.vdb` volumes, `file:` spectra, animation
+sidecars — passes through **one** function, `assetbytes::resolve()`, on its way to an `open`.
+Before 0.192.0 there was no such function and no notion of a base directory anywhere: the
+authored string went straight to `fopen`, so it resolved against the **process working
+directory** and a scene was loadable from exactly the one directory its paths had been written
+relative to. That is not a cosmetic limitation — it is the first link of the chain documented
+in the next section, where a wrong cwd became an unloadable scene, an unloadable scene became
+a silently *empty* one, and an empty scene faulted the display driver.
+
+`resolve()` tries these roots in order and returns the first that exists:
+
+| # | root | why |
+|---|---|---|
+| 1 | **the path as authored** (relative to the cwd) | first *on purpose*: every invocation that worked before resolves to the identical file, so the search path can only turn failures into successes, never move a load from one file to another. |
+| 2 | **the scene file's directory** | a scene's assets belong to the scene — the rule every format that references external files uses (glTF buffer URIs already worked this way). |
+| 3 | **the scene's ancestors, ≤ 3 levels** | the natural layout puts scenes in a subdirectory and assets in siblings: `proj/scenes/x.ftsl` naming `textures/y.png` means `proj/textures/y.png`. This repo is laid out that way, so stopping at row 2 would not have fixed the reported bug. Bounded so a stray name can't be answered from the root of a drive. |
+| 4 | **the directory of `ftrace.exe`** | engine data (`data/glass/*`, `data/metal/*`) ships beside the binary and has nothing to do with the scene. |
+
+Absolute paths pass through untouched. A path matching **nothing** comes back *unchanged*, so
+the error message quotes what the author wrote rather than the last candidate tried, and
+`describeOpenFailure` then runs its did-you-mean scan under every root and lists the
+directories it searched.
+
+Two deliberate scoping decisions:
+
+- **The scene directory is scoped, not global.** `ftsl::loadSource` (which already receives the
+  scene's path) holds an RAII `assetbytes::ScopedSceneDir` for the duration of the load. A
+  later load of a different scene must not inherit it, and every branch of a `prefer` block
+  must see the same one. A `nameForMsgs` that isn't a real path (the loom live channel passes a
+  placeholder) has no parent directory and simply leaves the search path alone.
+- **Engine data does not consult the scene directory** (`speclib::categoryDir`). `speclib::index()`
+  caches a name→path map per category for the process lifetime, so a scene-dependent answer
+  there would be frozen at whichever scene happened to load first. It tries cwd, then the
+  executable's directory, both of which are process-constant.
+
+`assetbytes::readFile` resolves internally, so every loader reading bytes through it
+(OBJ/PLY/STL/`.ftmesh`) inherits the policy without a call site. The loaders that open files
+themselves call `resolve()` explicitly: `texture.h`, `gltf.h` (resolving the document *before*
+deriving the `baseDir` its external URIs hang off), `fbx_load.cpp` (ufbx insists on a path),
+`curvedrive.h`, `vdbgrid.cpp`, `vdb_openvdb.cpp`, and the FTSL `file:` spectrum loader. The
+`Warmer` prefetch resolves on the *calling* thread, since the search path is scoped to the call
+and reading it from the warmer thread would race the scope's exit. `assetbytes::Overlay` is
+consulted **before** any of this and keys on the authored path, so the loom live channel is
+untouched by resolution.
+
+`-checkpaths` (`main.cpp`) is the regression guard: it builds a real `proj/scenes` +
+`proj/textures` tree on disk and asserts the end-to-end load from an unrelated cwd, the
+ancestor walk, absolute passthrough, unresolvable-returns-unchanged, that **the cwd still
+wins**, that the scene directory is restored on scope exit, and that `data/glass` resolves
+beside the executable.
+
 ## `prefer { } else { }` resolution (`ftsl.h loadSource`, hardened 0.191.2)
 
 A `prefer` node lets one scene file name several ways to render itself and let the loader
@@ -5042,7 +5102,8 @@ returns one of exactly **three** outcomes, which the rest of the algorithm must 
 **The fallback exists only for the middle row.** Through 0.191.1 the single-node fast path
 wrote `if (singleNode && (renderable || c == nb - 1)) accepted = trial;` — accepting the last
 branch *whether or not it built*. When every branch failed (the realistic trigger: a scene run
-from the wrong directory, so every cwd-relative asset missed), `loadSource` returned **true**
+from the wrong directory, so every cwd-relative asset missed — the path resolution described
+in the previous section is what stops that happening), `loadSource` returned **true**
 with a default-constructed `Loaded`: 0 cameras, 0 geometry, 0 emitters, announced as
 `[ftsl] loaded scene from …`. The empty scene then reached the CUDA forward kernel and faulted
 the driver. So the standing invariant is: **a `Loaded` that no build ever produced is never

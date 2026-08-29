@@ -30,6 +30,7 @@
 #include "upsample.h"
 #include "spectrum.h"
 #include "stochtile.h"
+#include "assetbytes.h"
 
 // stb_image API (implementation lives in src/stb_image_impl.cpp). Declared here so
 // this header stays light and CUDA never parses the full stb_image.h.
@@ -380,9 +381,17 @@ struct Texture {
     }
 
     // ---- loading ------------------------------------------------------------
-    bool load(const std::string& path, std::string& err) {
+    bool load(const std::string& authored, std::string& err) {
+        // Search the scene's directory as well as the cwd (assetbytes.h documents the
+        // order). The failure still names what the author WROTE, not the last
+        // candidate tried, and describeOpenFailure lists everywhere it looked.
+        const std::string path = assetbytes::resolve(authored);
         std::ifstream f(path, std::ios::binary);
-        if (!f) { err = "cannot open texture file: " + path; return false; }
+        if (!f) {
+            err = "cannot open texture file: " + authored + ": " +
+                  assetbytes::describeOpenFailure(authored);
+            return false;
+        }
         char m0 = 0, m1 = 0; f.get(m0); f.get(m1);
         // Our own PPM/PFM paths (also what the renderer writes); stb handles the rest.
         if (m0 == 'P' && (m1 == '6' || m1 == '3')) { f.seekg(0); return loadPPM(f, m1 == '6', err); }

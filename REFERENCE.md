@@ -45,6 +45,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Putting them together — non-stationary noise](#putting-them-together--non-stationary-noise)
 - [Participating media / fog](#participating-media--fog)
 - [Scene language (FTSL)](#scene-language-ftsl)
+  - [Where asset paths are looked for](#where-asset-paths-are-looked-for)
   - [Conditional blocks (`prefer { … } else { … }`)](#conditional-blocks-prefer----else---)
   - [Camera animation (`camera_path`, `camera_orbit`)](#camera-animation-camera_path-camera_orbit)
   - [Multi-camera shared photon pass (modes `A`, `B`, and `M`)](#multi-camera-shared-photon-pass-modes-a-b-and-m)
@@ -3816,6 +3817,40 @@ plug** — truncated paths, not a material bug. That scene therefore declares
 `render { max_bounce 32 }` and looks right without the operator having to know. When a scene
 sets it, the run prints `[scene] max bounce = N (from the scene's render block)`.
 
+### Where asset paths are looked for
+
+Every path a scene names — `mesh { file "…" }`, `texture { file "…" }`, an SPD CSV, a
+camera curve, a VDB grid, and the external buffers/images a `.gltf` refers to — is
+looked for in this order, and the **first place it exists wins**:
+
+| # | Directory | Why |
+|---|---|---|
+| 1 | the **current working directory** (i.e. the path exactly as authored) | so every scene that worked before 0.192.0 still resolves to the identical file |
+| 2 | the **directory holding the `.ftsl` file** | the intuitive base: a scene and its assets travel together |
+| 3 | that directory's **parents, up to 3 levels** | this repo's layout — `scenes/foo.ftsl` naming `textures/bar.png` means `<repo>/textures/bar.png`, a *sibling* of `scenes/`, not a child |
+| 4 | the directory containing **`ftrace.exe`** | engine data (`data/glass/…`, `data/metal/…`, `data/illuminants/…`) ships beside the binary |
+
+An **absolute** path is used as-is. A path that exists in none of the four is passed
+through unchanged, so the loader's own error message still quotes what you wrote.
+
+The upshot is that **a scene loads from any working directory**:
+`cd scenes && ..\ftrace gallery_rain.ftsl` works, and so does running it from the repo
+root. Before 0.192.0 only the latter did — assets silently missed from anywhere else,
+which (in a scene using `prefer`) could degrade into a successfully-loaded *empty*
+scene. `ftrace -checkpaths` is the self-test that guards this.
+
+When a file genuinely isn't found, the diagnostic names **every** directory that was
+searched and suggests near-miss filenames from each:
+
+```
+no such file (did you mean 'marble_gold.png'?) [searched: D:\…\scenes\textures, D:\…\textures]
+```
+
+Engine data (the `glass:` / `metal:` / `illuminant:` spectral library) deliberately
+uses only rows 1 and 4 — never the scene directory — because the library is indexed
+once per process, so a scene-dependent answer would be frozen at whichever scene
+happened to load first.
+
 ### Conditional blocks (`prefer { … } else { … }`)
 
 Some features aren't renderable in every mode — most notably **gradient-index (GRIN)
@@ -3848,9 +3883,10 @@ prefer {
   texture, a mistyped glass name) is not a fallback — it produced no scene at all. Such a
   branch is reported as `[prefer] branch N FAILED TO BUILD (<reason>)`, and if *no* branch
   builds the **load fails** with that error rather than quietly yielding an empty scene.
-  The commonest way to hit this is running a scene from the wrong directory, since asset
-  paths resolve against your current working directory — so run scenes from the directory
-  their paths are written relative to.
+  (Before 0.192.0 the commonest way to hit this was running a scene from another
+  directory, because asset paths resolved only against the current working directory;
+  they are now looked up relative to the scene file as well — see *Where asset paths are
+  looked for* below.)
 - Only **cameras** and **media** (the features with real mode gaps) participate in the
   support test; everything else always builds.
 
@@ -4413,10 +4449,17 @@ alone can't restore, so they are not disk-resumable.
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
 `-checkbluenoise`, `-checkfnoise`, `-checkstochtile`, `-checkreaction`, `-checkcurv`,
-`-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checkprefer`, `-checksdf`, `-checksun`,
-`-checkbind`, `-checkprop`, `-checkhair`,
+`-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checkprefer`, `-checkpaths`,
+`-checksdf`, `-checksun`, `-checkbind`, `-checkprop`, `-checkhair`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
-`PASS`/`FAIL`. `-checkprefer` guards **`prefer { … } else { … }` resolution**: it loads
+`PASS`/`FAIL`. `-checkpaths` guards **asset path resolution** (see *Where asset paths
+are looked for*): it builds a throwaway project tree in the temp directory, `cd`s
+somewhere unrelated, and asserts that a scene loads from there with its texture found
+via the scene's *parent* directory, that an absolute path is returned unchanged, that an
+unresolvable path is returned unchanged (so the loader's own error still quotes it),
+that the working directory still wins over the scene directory, that the scene-directory
+scope is popped on the way out, and that engine data (`data/glass`) resolves relative to
+the executable. `-checkprefer` guards **`prefer { … } else { … }` resolution**: it loads
 seven in-memory scenes covering the three outcomes a trial build can have (didn't build /
 built but unrenderable in this mode / renderable), and asserts the distinction that matters
 — a branch that failed to build is never a usable fallback, so a scene whose every branch

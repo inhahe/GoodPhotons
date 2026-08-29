@@ -22,6 +22,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "vdbgrid.h"
+#include "assetbytes.h"
 
 extern "C" {
 #include "third_party/lz4.h"
@@ -424,8 +425,15 @@ bool loadOpenVDBGrid(const std::string& path, VdbGrid& out, std::string& err,
         return true;
     };
     // Slurp the whole file (samples are a few MB; guarded against huge inputs).
-    FILE* fp = std::fopen(path.c_str(), "rb");
-    if (!fp) { err = "cannot open '" + path + "'"; return false; }
+    // Normally reached with an already-resolved path from loadVdbGrid; resolving
+    // again is a no-op (assetbytes::resolve returns an existing path untouched) and
+    // makes the entry point safe to call directly.
+    const std::string real = assetbytes::resolve(path);
+    FILE* fp = std::fopen(real.c_str(), "rb");
+    if (!fp) {
+        err = "cannot open '" + path + "': " + assetbytes::describeOpenFailure(path);
+        return false;
+    }
     std::fseek(fp, 0, SEEK_END);
     long len = std::ftell(fp);
     std::fseek(fp, 0, SEEK_SET);

@@ -2477,16 +2477,20 @@ private:
     // Load a measured SPD/reflectance from an external data file: `spd file:<path>`
     // (or `reflect file:<path>`). Reads the CSV/whitespace table mirrored under data/
     // into a tabulated `Spectrum` — piecewise-linear by default, or monotone-cubic
-    // (no overshoot) when `cubic` is set (`… interp=cubic`). Paths resolve relative to
-    // the current working directory (same convention as `texture`/`mesh` file refs),
-    // and repeated references to the same (path, interp) share one cached curve.
+    // (no overshoot) when `cubic` is set (`… interp=cubic`). Paths resolve through the
+    // shared asset search path — cwd, then the scene's own directory and its parents,
+    // then the ftrace directory (assetbytes.h), the same convention as `texture`/`mesh`
+    // file refs — and repeated references to the same (path, interp) share one cache
+    // entry, keyed on the AUTHORED path (resolution is deterministic within a load).
     Spectrum loadSpdFile(const std::string& path, bool cubic = false) {
         std::string key = cubic ? path + "\x01cubic" : path;
         auto it = spdFileCache_.find(key);
         if (it != spdFileCache_.end()) return it->second;
         std::vector<std::pair<double, double>> pairs;
         std::string ferr;
-        if (!speclib::loadSpdCsv(path, pairs, ferr)) { fail(ferr); return constantSpectrum(0); }
+        if (!speclib::loadSpdCsv(assetbytes::resolve(path), pairs, ferr)) {
+            fail(ferr); return constantSpectrum(0);
+        }
         // Coverage check: warn (once per key) if the file fails to cover the
         // perceptually significant band (~400..700 nm, where >99.9% of the CIE
         // observer's response lives), since sampling outside the file just holds the
@@ -8013,6 +8017,21 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
                        const SupportFn& supported = {},
                        LoadTiming* timing = nullptr,
                        const assetbytes::Overlay* assets = nullptr) {
+    // Assets this scene names are looked for beside the scene as well as in the cwd
+    // (assetbytes.h documents the whole order and why). `nameForMsgs` is the scene's
+    // path for a real file and a placeholder like "<live>" for the loom channel — a
+    // placeholder has no parent directory, which simply leaves the search path alone.
+    // Scoped rather than global: a later load of a different scene must not inherit
+    // this one's directory, and every `prefer` branch must see the same one.
+    assetbytes::ScopedSceneDir _sceneDir([&]() -> std::string {
+        std::error_code ec;
+        const std::filesystem::path p = assetbytes::toPath(nameForMsgs);
+        if (!p.has_parent_path()) return std::string();
+        const std::filesystem::path d = p.parent_path();
+        if (d.empty() || !std::filesystem::is_directory(d, ec)) return std::string();
+        return d.string();
+    }());
+
     // Report the keys nothing in the loader read. A warning rather than an error:
     // the check is new, and an old scene carrying a stale property should still
     // render — but it must SAY so, because the alternative (today's behaviour) is
@@ -8062,6 +8081,11 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     assetbytes::Warmer warmer;
     if (!assets || assets->empty()) {
         std::vector<std::string> paths = assetbytes::scanAssetPaths(src);
+        // Resolve here, on THIS thread: the search path is scoped to this call, and
+        // reading it from the warmer thread would race the scope's exit. A path that
+        // resolves to nothing comes back unchanged and simply fails to open, which is
+        // what prefetch already does with anything it can't read.
+        for (std::string& p : paths) p = assetbytes::resolve(p);
         if (!paths.empty()) warmer.start(std::move(paths));
     }
 
