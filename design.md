@@ -5025,6 +5025,48 @@ out-param. `main.cpp` reports it as `[stop] scene load stopped before rendering`
 outright on a stop — treating an interrupted branch as *rejected* would otherwise make it
 build the next branch and ignore the stop for another whole load.
 
+## `prefer { } else { }` resolution (`ftsl.h loadSource`, hardened 0.191.2)
+
+A `prefer` node lets one scene file name several ways to render itself and let the loader
+pick — the gallery wraps its camera so the scene asks for mode `D` and settles for mode `B`
+when `D` can't render something. Resolution **trial-builds** candidate scenes: `tryBuild`
+flattens the block list with one branch spliced in per node, runs a fresh `Builder`, and
+returns one of exactly **three** outcomes, which the rest of the algorithm must not conflate:
+
+| `Trial` | meaning |
+|---|---|
+| `built == false` (`buildErr` set) | a real authoring error. The branch produced **nothing**. |
+| `built`, `reason != nullptr` | a real scene that *this mode* cannot render (the caller's `SupportFn`, from main.cpp's per-mode gates). |
+| `built`, `reason == nullptr` | renderable. Take it and stop. |
+
+**The fallback exists only for the middle row.** Through 0.191.1 the single-node fast path
+wrote `if (singleNode && (renderable || c == nb - 1)) accepted = trial;` — accepting the last
+branch *whether or not it built*. When every branch failed (the realistic trigger: a scene run
+from the wrong directory, so every cwd-relative asset missed), `loadSource` returned **true**
+with a default-constructed `Loaded`: 0 cameras, 0 geometry, 0 emitters, announced as
+`[ftsl] loaded scene from …`. The empty scene then reached the CUDA forward kernel and faulted
+the driver. So the standing invariant is: **a `Loaded` that no build ever produced is never
+handed back.** The fallback is the last branch that actually *built*; when none did, control
+falls through to the final rebuild, whose failure carries the builder's own error up.
+
+**Resolution is order-dependent, so it sweeps to a fixed point.** Nodes resolve
+left-to-right, and while node *j* is being tried every *other* node sits at its current
+choice. A **later** node whose branch 1 doesn't build therefore makes **every** trial of an
+**earlier** node fail, for a reason belonging to neither. The old code hid that behind the
+unconditional fallback; making the fallback strict exposed it as a spurious whole-scene
+failure. The pass now repeats until a whole sweep changes no choice — at which point that
+sweep's trials are known to have used the final context — capped at *nodes+1* sweeps against
+oscillation. Per-branch diagnostics are **buffered** and only the converged sweep's are
+printed, so an unconverged sweep's artifacts never reach the console. A **single** node has no
+other node to be perturbed by, so it still resolves in one sweep; that is also the case the
+fast path serves, keeping the resolving trial as the final scene instead of re-loading every
+mesh a second time.
+
+A stop request (`ft::stopRequested`) aborts resolution outright rather than counting as a
+branch rejection — see above. `-checkprefer` (`main.cpp`) is the regression guard: seven
+cases covering all three `Trial` outcomes, the single-node fast path, the multi-node rebuild
+and the ordering artifact.
+
 ## GPU support gates fail safe, never coerce
 
 `cudaForwardSupported()` (`render_cuda.cu`) is the single gatekeeper — all eight GPU
@@ -5047,6 +5089,21 @@ device twin (`DCurveSeg` + `intersectCurveSeg`, and the fifth range in both `clo
 and `occluded`); what survives is the *screen*, which still checks curve **materials**
 exactly like every other primitive's. That is the intended lifecycle of one of these
 gates: ship it the moment the hole exists, delete it only by filling the hole.
+
+**A kernel prologue is the last of these gates, and each sampler needs its own.** The host
+uploads a *null* pointer for an empty array (`d_ems = dems.empty() ? nullptr : …`), so any
+device sampler that indexes `sc.emitters[…]` without first checking `sc.nEmitters` faults the
+driver rather than producing a black frame. The three forward/BDPT emitter samplers had drifted
+apart on this: `dGenLightSubpath` tested `sc.nEmitters == 0 || sc.totalPower <= 0.0`,
+`genPhoton` tested only `grandTotal <= 0` (which lets a scene with emissive volumes but no
+emitters through, since the volume-birth coin can miss on `uniform() == 1`), and `genPhotonHero`
+tested **nothing at all** — which is why an emitter-less scene faulted only in the hero kernel.
+0.191.2 gave both forward samplers the missing test, returning `false` ("skip this photon", the
+contract both call sites already honour). Such a guard must draw **no randomness**, or it
+perturbs the RNG stream and changes every image; both are pure reads, so scenes that do have
+emitters are bit-identical. The scene that exposed this could only arise from the `prefer` bug
+above, but the guard is the right place for the invariant regardless: a malformed scene should
+cost a black frame, never the display driver.
 
 ## Benchmarks & perf discipline
 

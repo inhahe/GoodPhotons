@@ -8400,6 +8400,160 @@ static int checkMeshFormats() {
     return ok ? 0 : 1;
 }
 
+// `prefer { } else { }` resolution semantics. This exists because of a bug that turned a
+// mistyped working directory into a CUDA "illegal memory access": every branch of the
+// gallery scene's prefer failed to BUILD (its cwd-relative asset paths all missed), and
+// the resolver accepted the last branch unconditionally — handing back an EMPTY scene
+// with `loaded == true`. 0 emitters, 0 cameras, 0 triangles, no error, and then the
+// forward kernel dereferenced a null emitter array. So the invariant under test is the
+// distinction the old code collapsed:
+//
+//   built == false            -> the branch produced NOTHING. Never a usable fallback.
+//   built, reason != nullptr  -> a real scene this mode can't render. THIS is what the
+//                                fallback is for, and what "keep the last branch" means.
+//   built, reason == nullptr  -> renderable; take it immediately.
+//
+// Every case below is a scene loaded through the real loader, so the assertions are about
+// what `loadSource` actually returns rather than about the resolver in isolation.
+static int checkPrefer() {
+    bool ok = true;
+    auto chk = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkprefer] %-58s BAD\n", what); ok = false; }
+        return cond;
+    };
+
+    // Shared scene tail: one lit quad + one camera, so a branch that builds is a scene the
+    // loader is willing to call complete. `%s` is the prefer block under test.
+    auto wrap = [](const std::string& preferBlock) {
+        return "scene { units meters }\n"
+               "material \"probe\" { type diffuse  reflect rgb 0.5 0.5 0.5 }\n"
+               "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+               "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+               + preferBlock;
+    };
+    // A camera branch. The camera's NAME tags the branch, so the resolved scene says which
+    // one won; no two branches below share a name.
+    auto cam = [](const char* tag) {
+        return "camera \"" + std::string(tag) + "\" { eye 0.5 0.5 2  look_at 0.5 0.5 0 "
+               " up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+    };
+    // Branch content that CANNOT build: it names a material that was never declared.
+    const std::string badQuad = "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material no_such_material }\n";
+    const std::string bad = badQuad + cam("bad");
+    // Which branch won, read back off the resolved camera's name ("" if there is none).
+    auto won = [](const ftsl::Loaded& L) {
+        return L.cameras.empty() ? std::string() : L.cameras[0].name;
+    };
+
+    // --- 1. Every branch fails to build => the load must FAIL, not succeed emptily. ------
+    // The exact regression. Before the fix this returned true with an empty Loaded.
+    {
+        ftsl::Loaded L; std::string e;
+        bool loaded = ftsl::loadSource(wrap("prefer {\n" + bad + "} else {\n" + bad + "}\n"),
+                                       "<checkprefer>", L, e);
+        chk("all branches fail to build -> load fails", !loaded);
+        chk("all-fail error names the cause",
+            e.find("every branch") != std::string::npos &&
+            e.find("no_such_material") != std::string::npos);
+    }
+
+    // --- 2. First branch renderable => taken, and the scene is COMPLETE. ----------------
+    // Guards the single-node fast path: the trial that resolves the node becomes the final
+    // scene without a rebuild, so a mistake there loses geometry rather than erroring.
+    {
+        ftsl::Loaded L; std::string e;
+        bool loaded = ftsl::loadSource(wrap("prefer {\n" + cam("one") + "} else {\n" + cam("two") + "}\n"),
+                                       "<checkprefer>", L, e);
+        if (chk("first renderable branch loads", loaded)) {
+            chk("first renderable branch is the one used", won(L) == "one");
+            chk("resolved scene keeps its geometry",  L.scene.tris.size() >= 2);
+            chk("resolved scene keeps its emitters", !L.scene.emitters.empty());
+        }
+    }
+
+    // --- 3. First branch fails to build, second is fine => second, fully built. ---------
+    {
+        ftsl::Loaded L; std::string e;
+        bool loaded = ftsl::loadSource(wrap("prefer {\n" + bad + "} else {\n" + cam("good") + "}\n"),
+                                       "<checkprefer>", L, e);
+        if (chk("failed first branch falls through to a good second", loaded)) {
+            chk("second branch is the one used", won(L) == "good");
+            chk("fallen-through scene keeps its geometry", L.scene.tris.size() >= 2);
+        }
+    }
+
+    // --- 4. Unrenderable-but-built branches: the fallback's actual purpose. -------------
+    // `supported` rejects the camera named "gated" and accepts everything else.
+    ftsl::SupportFn gate = [](const ftsl::Loaded& L) -> const char* {
+        return (!L.cameras.empty() && L.cameras[0].name == "gated") ? "pretend mode gate" : nullptr;
+    };
+    {
+        ftsl::Loaded L; std::string e;
+        bool loaded = ftsl::loadSource(wrap("prefer {\n" + cam("gated") + "} else {\n" + cam("plain") + "}\n"),
+                                       "<checkprefer>", L, e, gate);
+        if (chk("unrenderable first branch falls through", loaded))
+            chk("renderable second branch is used", won(L) == "plain");
+    }
+
+    // --- 5. Unrenderable first, UNBUILDABLE second => keep the first. -------------------
+    // The case that separates "last branch" from "last branch that built". Branch 1 is a
+    // real scene the mode can't render; branch 2 is not a scene at all. The old code took
+    // branch 2 (empty); the fix keeps branch 1, which is at least something to render.
+    {
+        ftsl::Loaded L; std::string e;
+        bool loaded = ftsl::loadSource(wrap("prefer {\n" + cam("gated") + "} else {\n" + bad + "}\n"),
+                                       "<checkprefer>", L, e, gate);
+        if (chk("unbuildable last branch is not preferred over a built one", loaded)) {
+            chk("the built (if unrenderable) branch is kept", won(L) == "gated");
+            chk("kept branch keeps its geometry", L.scene.tris.size() >= 2);
+        }
+    }
+
+    // --- 6. Multi-node: a doomed second node must sink the whole load. ------------------
+    // Exercises the non-fast path (>1 prefer => final rebuild) with the same invariant.
+    {
+        ftsl::Loaded L; std::string e;
+        std::string src =
+            "scene { units meters }\n"
+            "material \"probe\" { type diffuse  reflect rgb 0.5 0.5 0.5 }\n"
+            "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+            "prefer {\n"
+            "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+            "} else {\n"
+            "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+            "}\n"
+            "prefer {\n" + bad + "} else {\n" + bad + "}\n";
+        chk("multi-node: a node with no buildable branch fails the load",
+            !ftsl::loadSource(src, "<checkprefer>", L, e));
+    }
+
+    // --- 7. Multi-node ordering: a LATER node must not poison an EARLIER one. -----------
+    // Node 1 (two perfectly good camera branches) is resolved while node 2 still sits at
+    // its default branch 1 — which does not build. A single greedy pass therefore sees
+    // BOTH of node 1's branches "fail", mis-attributes the error to node 1 and, in the
+    // strict form of the fix, refuses the whole scene. Sweeping to a fixed point is what
+    // makes this load, choose node 1's FIRST (preferred) branch, and still reject node 2's
+    // first. Convergence here takes 3 sweeps, which is the nodes+1 cap.
+    {
+        ftsl::Loaded L; std::string e;
+        std::string src =
+            "scene { units meters }\n"
+            "material \"probe\" { type diffuse  reflect rgb 0.5 0.5 0.5 }\n"
+            "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+            "prefer {\n" + cam("n1a") + "} else {\n" + cam("n1b") + "}\n"
+            "prefer {\n" + badQuad +
+            "} else {\nquad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n}\n";
+        bool loaded = ftsl::loadSource(src, "<checkprefer>", L, e);
+        if (chk("multi-node: a doomed later branch does not sink an earlier node", loaded)) {
+            chk("earlier node still gets its PREFERRED branch", won(L) == "n1a");
+            chk("later node fell through to its buildable branch", L.scene.tris.size() >= 2);
+        }
+    }
+
+    std::printf("[checkprefer] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 static int checkTriNormal() {
     bool ok = true;
     auto chkb = [&](const char* what, bool cond) {
@@ -15222,6 +15376,7 @@ static int run(int argc, char** argv) {
     bool checkCavityOnly = false;
     bool checkTriNormalOnly = false;
     bool checkMeshFormatsOnly = false;
+    bool checkPreferOnly = false;
     bool checkSdfOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
@@ -15795,6 +15950,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checktrinormal")) checkTriNormalOnly = true;
         else if (!std::strcmp(argv[i], "-checkmesh")) checkMeshFormatsOnly = true;
+        else if (!std::strcmp(argv[i], "-checkprefer")) checkPreferOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
@@ -15996,6 +16152,7 @@ static int run(int argc, char** argv) {
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkTriNormalOnly) return checkTriNormal(); // ditto (intersectTri's side/normal convention)
     if (checkMeshFormatsOnly) return checkMeshFormats(); // ditto (OBJ/PLY/STL agree on the same cube)
+    if (checkPreferOnly)   return checkPrefer();   // ditto (prefer{}/else{} resolution semantics)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed

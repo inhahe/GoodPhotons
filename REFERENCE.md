@@ -3840,9 +3840,17 @@ prefer {
 - `else` chains **flat** — `prefer { A } else { B } else { C }` — and you may **not**
   nest a `prefer` inside a branch.
 - At load time the resolver **trial-builds each branch in order and picks the first one
-  that's renderable** under the active mode; if none qualify it falls back to the last
-  branch. It prints `[prefer] branch N rejected (<reason>); trying the next` and
-  `[prefer] using branch N of M` so you can see which won.
+  that's renderable** under the active mode. If a branch builds but the mode can't render
+  it, the resolver moves on and — if no branch qualifies — keeps the last branch that
+  *built*. It prints `[prefer] branch N cannot be rendered (<reason>); trying the next`
+  and `[prefer] using branch N of M` so you can see which won.
+- A branch that **fails to build** (an authoring error: an unknown material, a missing
+  texture, a mistyped glass name) is not a fallback — it produced no scene at all. Such a
+  branch is reported as `[prefer] branch N FAILED TO BUILD (<reason>)`, and if *no* branch
+  builds the **load fails** with that error rather than quietly yielding an empty scene.
+  The commonest way to hit this is running a scene from the wrong directory, since asset
+  paths resolve against your current working directory — so run scenes from the directory
+  their paths are written relative to.
 - Only **cameras** and **media** (the features with real mode gaps) participate in the
   support test; everything else always builds.
 
@@ -4405,10 +4413,17 @@ alone can't restore, so they are not disk-resumable.
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
 `-checkbluenoise`, `-checkfnoise`, `-checkstochtile`, `-checkreaction`, `-checkcurv`,
-`-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checksdf`, `-checksun`,
+`-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checkprefer`, `-checksdf`, `-checksun`,
 `-checkbind`, `-checkprop`, `-checkhair`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
-`PASS`/`FAIL`. `-checkmesh` guards the **mesh importers**: it writes one unit cube in
+`PASS`/`FAIL`. `-checkprefer` guards **`prefer { … } else { … }` resolution**: it loads
+seven in-memory scenes covering the three outcomes a trial build can have (didn't build /
+built but unrenderable in this mode / renderable), and asserts the distinction that matters
+— a branch that failed to build is never a usable fallback, so a scene whose every branch
+fails must fail to *load* rather than quietly resolve to an empty scene. It also pins the
+single-node fast path (which keeps the resolving trial as the final scene), the multi-node
+rebuild, and the ordering rule that a later node's unbuildable branch must not sink an
+earlier node. `-checkmesh` guards the **mesh importers**: it writes one unit cube in
 six encodings (OBJ quads, PLY ascii / binary-LE / binary-BE, a "noisy" splat-shaped PLY
 whose vertices carry unknown scalar and list properties around an entirely ignored
 extra element, and STL binary / ascii), loads each, and asserts the six produce an

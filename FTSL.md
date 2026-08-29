@@ -102,8 +102,15 @@ Rules:
   features rejected by the bidirectional modes (`D` BDPT, `U` VCM). The support test
   wraps `bdptUnsupportedFeature` / the fisheye/media checks; everything else always
   builds.
-- Resolution logs `[prefer] branch N rejected (<reason>); trying the next` and
-  `[prefer] using branch N of M`.
+- Resolution distinguishes a branch that **builds but can't be rendered** by the active
+  mode from one that **fails to build** (an authoring error — unknown material, missing
+  texture, mistyped glass). Only the former is a usable fallback: when no branch is
+  renderable the last branch that *built* is kept, and if **no** branch builds the load
+  **fails** with the builder's error instead of yielding an empty scene.
+- Resolution logs `[prefer] branch N cannot be rendered (<reason>); trying the next`,
+  `[prefer] branch N FAILED TO BUILD (<reason>)` and `[prefer] using branch N of M`.
+- With more than one `prefer` node, resolution repeats until the choices stop changing,
+  so a later node's unbuildable branch can't mis-attribute a failure to an earlier node.
 
 The CLI flag `-on-unsupported error|fallback|strip` is a separate, lower-priority
 safety net applied *after* prefer resolution, for when the finally-selected mode still
