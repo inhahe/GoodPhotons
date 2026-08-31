@@ -120,10 +120,16 @@
 # Render (still) — don't pass -mode, the scene's prefer{}/else{} picks it:
 #   ftrace -in scenes/gallery_rain.ftsl -camera cam -noise 2 \
 #          -window -keepwindow -interval 15 -checkpoint -o png/gallery_rain.png
-# Budget honestly: this is BDPT through three stacked media, so it is slow. Measured on an
-# RTX 4090, 1280x720: 310 spp in 600 s and still at 5.7% noise, and noise falls as 1/sqrt,
-# so `-noise 2` is ~2500 spp, i.e. well over an hour. `-time 600` already reads clearly (the
-# bow, the cloud and the shaft are all legible); -checkpoint + -resume adds to it later.
+# Budget honestly: this is BDPT through three stacked media, so it is slow. RE-MEASURED
+# 2026-08-31 on an RTX 4090 at v0.193.1, 1280x720: the cost is LINEAR in spp at 0.49 s/spp
+# with a fixed ~0.75 s of setup, so 600 s is ~1220 spp. The `~N% noise` the progress line
+# reports is not measured for R/D, it is exactly 100/sqrt(spp) (main.cpp ~19790), so 1220 spp
+# reads 2.9% and `-noise 2` is by definition 2500 spp = ~20 min.
+#   That is 3.9x faster than the number this comment used to carry (310 spp in 600 s, hence
+# "-noise 2 is well over an hour"). Nothing about the scene changed; the ENGINE did, and a
+# rate baked into a comment silently rots into bad advice. If you are budgeting off this,
+# re-measure with two short runs at different -spp and take the slope -- it is a two-minute
+# check (`-camera cam -spp 4` then `-spp 32`, -no-meter, subtract).
 #
 # Render (flyby) — the `fly` curve below, 600 frames at 960x540, ALSO mode D (it declares it):
 #   ftrace -in scenes/gallery_rain.ftsl -camera fly -time 45 \
@@ -142,9 +148,26 @@
 # sun discussion above). A photon map would buy back the frame cost by deleting the subject.
 # So this flyby is 600 INDEPENDENT BDPT renders -- D is camera-anchored, it shares nothing
 # across cameras (REFERENCE, "Other modes do NOT save time with multiple cameras"), and the
-# budget flag applies per frame. At 960x540 that is ~2x the still's sample rate, so -time 45
-# is ~50 spp/frame and 7.5 h for the loop; -time 20 is a rougher pass in 3.3 h. Check one
-# frame first (`-camera fly137 -time 45`) rather than discovering the exposure at frame 300.
+# budget flag applies PER FRAME. What IS shared is only the scene build and the exposure
+# anchor: the meter pre-pass meters the selector's frame alone, once, and all 600 reuse it.
+#
+# MEASURED per-frame rate (same run as above, 960x540), and note the 4x SPREAD -- a flat
+# -time gives very different quality at different points on the loop:
+#     fly000 (inside the gyroid channel)  0.63 s/spp   <- worst; glass on all sides
+#     fly137 (the creature coat pass)     0.33 s/spp
+#     fly500                              0.18 s/spp
+#     fly300 (open hall)                  0.16 s/spp   <- best, 4x cheaper than fly000
+# So -time 45 is ~7.5 h for the loop and buys ~70 spp inside the gyroid but ~280 in the open
+# (8.5% down to 6% noise -- the grain BREATHES across the loop, worst exactly where the
+# geometry is busiest). Matching the still's 2.9% would need ~1200 spp/frame = 65 h.
+# Check one frame first (`-camera fly000 -time 45`, the worst case, not a pretty one) rather
+# than discovering at frame 300 that the tunnel is a sparkling mess.
+#
+# There is also a fixed ~0.8 s per frame inside the render call itself: renderBdptCuda()
+# re-bakes and re-uploads the whole scene on EVERY call (render_cuda.cu ~14095), because mode
+# D has no resident multi-camera session like the forward and photon-map paths do. Over 600
+# frames that is ~8 min -- ~2% of a 7.5 h run, so it is logged in known-issues rather than
+# fixed, but it is the reason a very cheap per-frame budget stops scaling.
 
 scene { units meters  spectral 360 830 1 }
 

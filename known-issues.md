@@ -5,6 +5,45 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PERF — OPEN (2026-08-31, v0.193.1): mode `D` has no resident multi-camera session, so a flyby re-uploads the whole scene once per frame (~0.8 s × N)
+
+**What.** `renderBdptCuda()` (`src/render_cuda.cu:14082`) calls `buildUpload(scene, cam,
+…)` on **every invocation** (line ~14095), and a multi-camera mode-`D` render calls it once
+per camera. So a 600-frame flyby bakes and uploads the same static scene 600 times, plus
+600 × `cudaMalloc`/`cudaMemset` of the film pair and the kernel's local-memory reservation
+(8.19 GB on `gallery_rain`).
+
+**Measured** (RTX 4090, `scenes/gallery_rain.ftsl`, 960×540, `-no-meter`, cost fitted as a
+line through `-spp 4` and `-spp 16`):
+
+| frame | s/spp | fixed cost/frame |
+|---|---|---|
+| `fly000` | 0.63 | 0.87 s |
+| `fly137` | 0.33 | 0.77 s |
+| `fly300` | 0.16 | 0.67 s |
+| `fly500` | 0.18 | 0.90 s |
+
+The slope varies 4× with the view (glass on all sides vs open hall); the **intercept does
+not** — ~0.8 s regardless, which is what identifies it as per-call setup rather than render
+work.
+
+**Why it isn't fixed yet.** ~8 min over a 600-frame flyby, against ~7.5 h of actual
+sampling at `-time 45` — about **2 %**. It is real but it is not what makes a mode-`D`
+flyby slow, and it only starts to dominate if someone renders many frames at a very small
+per-frame budget (at `-time 2` it would be ~29 % of the run).
+
+**The fix, when it's worth doing.** The pattern already exists twice in the codebase: the
+shared forward group has `sharedForwardGpuBegin` / `sharedForwardGpuBatch` /
+`sharedForwardGpuDownload` (`main.cpp` ~19665), and the GPU mode-`M` path keeps the built
+map resident across its gathers. Mode `D` wants the same shape — a `BdptGpuSession` holding
+the uploaded `DUpload` and the device films, with the per-camera loop rebinding only the
+camera and the film pointers. Note this is *only* an upload amortisation, not a transport
+one: `D` is camera-anchored and genuinely must re-trace every frame (see REFERENCE, "Other
+modes do NOT save time with multiple cameras").
+
+**Related:** `scenes/gallery_rain.ftsl`'s header records this next to its flyby command,
+since that scene is the one that pays it.
+
 ### OPEN (2026-08-16, v0.190.0–0.190.3): `-radcache` is opt-in because it is *approximate*, and its residual error concentrates on caustics/specular — plus its limits
 
 `-radcache` (`src/radcache.h`, read site in `BackwardRenderer::radianceHeroLoop`,
