@@ -132,9 +132,18 @@
 # check (`-camera cam -spp 4` then `-spp 32`, -no-meter, subtract).
 #
 # Render (flyby) — the `fly` curve below, 600 frames at 960x540, ALSO mode D (it declares it):
-#   ftrace -in scenes/gallery_rain.ftsl -camera fly -time 45 \
+#   ftrace -in scenes/gallery_rain.ftsl -camera fly -spp 140 \
 #          -window-min -keepwindow -interval 15 -checkpoint \
 #          -o png/gallery_rain_fly/gallery_rain.png
+# BUDGET WITH -spp, NOT -time, and the reason is the 4x per-frame spread measured below. A
+# flat -time hands each frame a fixed number of SECONDS, so the cheap open-hall frames get 4x
+# the samples the expensive gyroid-channel frames do and the grain visibly BREATHES over the
+# loop -- worst precisely where the geometry is busiest and the eye is already working. A flat
+# -spp hands each frame the same number of SAMPLES: cheap frames simply finish sooner, the
+# grain is uniform, and the total is identical (140 spp x 600 frames x 0.325 s/spp mean =
+# ~7.6 h either way). -time is the right flag only when you need a wall-clock guarantee more
+# than a consistent image. Note -noise is NOT a third option here: for R/D the reported noise
+# is exactly 100/sqrt(spp), so `-noise 8.5` IS `-spp 140` with extra steps.
 # `-camera fly` is not optional: without it -o renders EVERY camera, so you get the still and
 # then roll straight into all 600 frames. Do NOT pass -no-meter (the curve is exposure_lock,
 # and the meter pre-pass is what makes every frame share one anchor instead of flickering).
@@ -157,11 +166,10 @@
 #     fly137 (the creature coat pass)     0.33 s/spp
 #     fly500                              0.18 s/spp
 #     fly300 (open hall)                  0.16 s/spp   <- best, 4x cheaper than fly000
-# So -time 45 is ~7.5 h for the loop and buys ~70 spp inside the gyroid but ~280 in the open
-# (8.5% down to 6% noise -- the grain BREATHES across the loop, worst exactly where the
-# geometry is busiest). Matching the still's 2.9% would need ~1200 spp/frame = 65 h.
-# Check one frame first (`-camera fly000 -time 45`, the worst case, not a pretty one) rather
-# than discovering at frame 300 that the tunnel is a sparkling mess.
+# Mean 0.325 s/spp, so `-spp 140` is ~7.6 h for the loop at a uniform 8.5% (= 100/sqrt(140)),
+# costing 88 s on fly000 and 22 s on fly300. Matching the still's 2.9% would need ~1200
+# spp/frame = 65 h. Check one frame first -- and check `-camera fly000`, the WORST frame, not
+# a pretty one, rather than discovering at frame 300 that the tunnel is a sparkling mess.
 #
 # There is also a fixed ~0.8 s per frame inside the render call itself: renderBdptCuda()
 # re-bakes and re-uploads the whole scene on EVERY call (render_cuda.cu ~14095), because mode
