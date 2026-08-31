@@ -19652,9 +19652,22 @@ static int run(int argc, char** argv) {
             }
         }
 #endif
+        // Put the live window up FOR THE METER, and name the frame it is on. The meter is a
+        // real (reduced) render, and on an exposure-locked flythrough it can meter dozens of
+        // frames — all of it BEFORE the `liveWindowPlaceholder("preparing…")` at the group
+        // dispatch below, which used to be the earliest window in the run. Measured on
+        // gallery_settled's 600-frame curve: `-window` produced NO window at all (hwnd 0) for
+        // over five minutes while the meter built its own photon+beam map and metered 64
+        // frames, so a correctly-progressing render was indistinguishable from a hung one.
+        // Titling per metered frame makes the phase legible, and costs one window creation
+        // the run was going to pay for anyway.
         if (!metered)
-            for (const auto& mc : cams) {
-                if (conv.add(meterAnchor(mc))) break;   // adaptive early-stop once converged
+            for (size_t mi = 0; mi < cams.size(); ++mi) {
+                if (g_stopRequested) break;
+                liveWindowPlaceholder(cams[mi].res, cams[mi].resY,
+                                      "metering exposure " + std::to_string(mi + 1) + "/" +
+                                      std::to_string(cams.size()) + "\xE2\x80\xA6");
+                if (conv.add(meterAnchor(cams[mi]))) break;   // adaptive early-stop once converged
             }
         if (conv.used() > 0) {
             expAnchors[g] = conv.anchor();
@@ -20162,9 +20175,18 @@ static int run(int argc, char** argv) {
                 std::printf("[camera] -loadmap failed — tracing photons instead.\n");
             }
         }
-        if (!mapLoaded)
+        // Name the stages in the title bar. Everything from here to the first gathered frame
+        // is one long silent phase — the photon flight, the grid build, and (with -beams) the
+        // beam BVH, which on a big scene is minutes — and until now the window sat on the
+        // "preparing…" placeholder for all of it, so there was no way to tell a working render
+        // from a wedged one. `liveWindowPlaceholder` re-titles an existing window and creates
+        // one only if the meter above did not.
+        const int titleW = toRender[idx[0]].res, titleH = toRender[idx[0]].resY;
+        if (!mapLoaded) {
+            liveWindowPlaceholder(titleW, titleH, "tracing photons\xE2\x80\xA6");
             tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
                             wantBeams ? &bmap : nullptr, g_beamTarget);
+        }
         // Written BEFORE the builds, so the file holds the raw trace and one cache can later
         // be re-gathered at any -pmradius / -beamk.
         if (!g_pmapSave.empty() && !mapLoaded) {
@@ -20172,8 +20194,12 @@ static int run(int argc, char** argv) {
                 std::printf("[camera] -savemap %s: %zu photons + %zu beams written.\n",
                             g_pmapSave.c_str(), pm.photons.size(), bmap.beams.size());
         }
+        liveWindowPlaceholder(titleW, titleH, "building photon map\xE2\x80\xA6");
         radius = buildPhotonMap(pm, radius, "[camera]");
-        if (wantBeams) buildBeamMap(bmap, "[camera]");
+        if (wantBeams) {
+            liveWindowPlaceholder(titleW, titleH, "building beam map\xE2\x80\xA6");
+            buildBeamMap(bmap, "[camera]");
+        }
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("[camera] photon map: %zu photons from %lld emitted in %.1fs, "
                     "grid %dx%dx%d — gathering %zu cameras ...\n",
@@ -20187,9 +20213,42 @@ static int run(int argc, char** argv) {
             // the whole flythrough or abruptly terminating a live render mid-gather.
             if (g_stopRequested) break;
             const RenderCam& rc = toRender[idx[k]];
-            Film f = renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, spp,
-                                        nThreads, diffraction, /*maxBounce*/32, 0,
-                                        g_pmFinalGather, wantBeams ? &bmap : nullptr);
+            // Drive the live window, exactly as the GPU branch above does with its own
+            // `liveProg`. This path had NO window feed at all: it wrote each frame to disk and
+            // never repainted, so a flythrough ran to completion behind the frozen
+            // "preparing…" placeholder. That was worst in the one configuration that FORCES
+            // this path — `-beams` is CPU-only, so the mode-M volumetric flyby, the slowest
+            // and most worth watching render in the engine, was precisely the one you could
+            // not watch. Verified before the fix on a 6-frame curve: frames landed on disk
+            // while the title never advanced past "preparing.".
+            //
+            // Routing through cpuSppChunks (what the single-camera mode-M path at ~14447
+            // already does) also makes a slow frame converge ON SCREEN rather than appearing
+            // all at once at the end — which matters at delivery resolution, where one frame's
+            // gather is far longer than a window repaint interval. It is bit-identical to the
+            // old single-shot call: renderPhotonCamera seeds per (pixel, ABSOLUTE sample), so
+            // the split into chunks cannot change the realization, and cpuSppChunks degrades
+            // to exactly `renderOne(spp, 0)` when no progress hook is armed (headless runs are
+            // untouched).
+            // `frameLabel` is declared in the SAME scope as liveProg, not inside the `if`:
+            // the lambda outlives that block (it runs inside cpuSppChunks below), so a buffer
+            // scoped to the `if` would be a dangling reference by the time it is read.
+            SppProgress liveProg;
+            char frameLabel[64];
+            std::snprintf(frameLabel, sizeof frameLabel, "frame %zu/%zu", k + 1, idx.size());
+            if (g_showWindow) {
+                const double liveExp = rc.exposure;
+                liveProg.report = [&, liveExp](const Film& pf, long long sppDone, bool) -> bool {
+                    liveWindowUpdate(pf, (double)sppDone, liveExp, scene.absolute, frameLabel);
+                    return g_stopRequested != 0;   // window closed / -stop -> stop after this chunk
+                };
+            }
+            Film f = cpuSppChunks(spp, g_showWindow ? &liveProg : nullptr, rc.res, rc.resY,
+                [&](long long c, unsigned long long off) {
+                    return renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, c, nThreads,
+                                              diffraction, /*maxBounce*/32, off,
+                                              g_pmFinalGather, wantBeams ? &bmap : nullptr);
+                });
             std::string op = outFor(rc.name);
             if (toRender.size() > 1)
                 std::printf("[camera] '%s' (mode M, %dx%d) -> %s\n",

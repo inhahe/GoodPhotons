@@ -2097,6 +2097,21 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   branch and the GPU mode-`M` exposure meter both carve out when `-beams` is on and print
   that they are falling back — better than the device silently dropping the volume, which is
   the exact bug `-beams` exists to fix. Logged in `known-issues.md`.
+  **…which is why the CPU branch had to learn the live window (0.195.1).** Being CPU-only
+  means `-beams` *forces* `runSharedPhotonMap`'s CPU branch, and that branch called
+  `renderPhotonCamera` with no progress hook — its GPU twin has passed a `SppProgress` since
+  the feature landed. So the slowest, longest render in the engine was the only one with no
+  live preview at all: frames were written to disk correctly while the window sat on the
+  `preparing…` placeholder from start to finish, making a working render look identical to a
+  hung one. The gather now routes through `cpuSppChunks` with a window-repainting
+  `SppProgress`, exactly as the single-camera mode-`M` path already did, so each frame also
+  *converges* on screen rather than appearing whole at the end. Bit-identical: seeding is per
+  (pixel, **absolute** sample), so the chunk split cannot move the realization, and with no
+  hook armed `cpuSppChunks` degenerates to the old single-shot call (verified 0 channel
+  difference across all frames of a 6-frame curve, windowed vs headless). The stage is named
+  throughout — `tracing photons…`, `building photon map…`, `building beam map…`,
+  `frame k/N` — and the `exposure_lock` meter pre-pass, which runs *before* the group dispatch
+  and so used to precede the existence of any window, now raises and titles one itself.
   **Validated on `scenes/_rainbow_test.ftsl`** against the pre-existing A/B splat estimator,
   which is the only independent implementation of the same single-scatter trade. Getting the
   comparison honest took two corrections worth recording. First, `-mode M` *without* `-beams`

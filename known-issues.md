@@ -105,6 +105,48 @@ to a worst case. A scene with **bounded** media (e.g. `gallery_rain`, whose clou
 volumes both carry `bounds`) clips every beam tightly and should traverse far better; the
 numbers above are the pessimistic end of the range, not the typical one.
 
+### FIXED (2026-08-31, v0.195.1): the CPU shared mode-`M` path never repainted the live window, so the one render you most want to watch was the one you couldn't
+
+**What.** `runSharedPhotonMap`'s CPU branch (`main.cpp`) called `renderPhotonCamera` directly
+and passed **no progress hook**. Its GPU twin has built a `SppProgress liveProg` and handed it
+to `renderPhotonMapSharedCuda` since the feature landed; the CPU branch simply never adopted
+it. So a shared mode-`M` render wrote every frame correctly to disk while the live window sat
+on the near-black `"preparing…"` placeholder from start to finish.
+
+**Why this was the worst possible path to lose the window on.** `-beams` is CPU-only (no device
+beam BVH — see the OPEN entry above), so it *forces* this branch. The mode-`M` volumetric
+flyby is therefore both the slowest render in the engine and, until now, the only one with no
+live preview at all — against a project rule that every render is launched watchable. It also
+made a working render indistinguishable from a hung one, which is how the "mode-M shared
+deposit hangs" issue got misdiagnosed once already.
+
+**A second, separate silent phase: the exposure meter.** The earliest window in the run was
+`liveWindowPlaceholder("preparing…")` at the group dispatch — but the exposure-lock meter
+pre-pass runs *before* that, and on a locked `camera_curve` it builds its own photon + beam map
+and meters dozens of frames first. Measured on `gallery_settled`'s 600-frame curve at v0.195.0:
+`-window` produced **no window at all** (`MainWindowHandle` = 0) for over five minutes.
+
+**Reproduce (pre-fix).** `ftrace -in scraps/_winprobe.ftsl -camera probe -mode M -beams
+-device cpu -n 3e6 -spp 24 -window -o png/_wintest/p.png`, then poll
+`Get-Process ftrace | Select MainWindowTitle`. Frame files appear under `png/_wintest/p_probe/`
+while the title stays `… - preparing.` forever.
+
+**Fix.** Three changes, all in `main.cpp`:
+
+1. The CPU shared gather now routes through `cpuSppChunks` with a `SppProgress` that calls
+   `liveWindowUpdate`, mirroring the GPU branch. Chunking (rather than a bare per-frame
+   repaint) means a *slow* frame converges on screen instead of appearing all at once — which
+   is what matters at delivery resolution, where one gather far exceeds a repaint interval.
+2. Stage titles — `tracing photons…` → `building photon map…` → `building beam map…` →
+   `frame k/N` — so the long silent build phase is legible rather than looking wedged.
+3. The meter pre-pass raises and titles the window itself (`metering exposure k/N`).
+
+**Bit-identical.** `renderPhotonCamera` seeds per `(pixel, ABSOLUTE sample)` via `seedUnit`, so
+splitting the spp cannot change the realization, and `cpuSppChunks` degrades to exactly
+`renderOne(spp, 0)` when no hook is armed — headless runs take the old code path untouched.
+This is the same chunk-under-window arrangement modes `R`/`D` and the single-camera mode-`M`
+path (`main.cpp` ~14447) have always used.
+
 ### FIXED (2026-08-31, v0.195.0): `-savemap` / `-loadmap` were GPU-only by accident of placement and stored surfaces only, so a `-beams` trace could never be banked — silently
 
 **What.** Mode `M`'s entire argument is "trace once, gather many", and `-savemap` / `-loadmap`
