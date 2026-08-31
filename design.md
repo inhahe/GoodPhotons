@@ -22,7 +22,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased; CPU + GPU since 0.110.0, fully on-device since 0.116.0) | `backward.h` (`whitted`), `render_cuda.cu` (`WhittedOpts`) |
 | `P` | composite: forward B + backward R passes merged | `main.cpp` orchestration |
 | `D` | bidirectional path tracer (BDPT, MIS) | `bdpt.h` |
-| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h` |
+| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
@@ -1984,7 +1984,7 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   0.9996 in absolute units, solar disc `1/16` on both — and `cornell.ftsl` mode U is
   **byte-identical** before and after the port, since every new density sits behind
   `dIsDeltaEmitter` and the area path keeps its RNG draw order.
-- **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`** — U/S/M.
+- **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`/`photonmap_io.h`** — U/S/M.
   PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.
   **`PhotonMap` is structure-of-arrays, and that is load-bearing.** Deposit positions
@@ -2113,6 +2113,23 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   and single scatter is exactly what both estimators drop. A third control confirmed no energy
   is lost on the surface path: with `sigma_t` cut to 0.0002 (near vacuum), mode `M` with and
   without `-beams` match to 0.1 sRGB in every region.
+  **The map persists** via `photonmap_io.h` (`-savemap` / `-loadmap`), which is new in 0.195.0
+  and is the piece that makes the amortisation argument complete rather than per-process: the
+  file carries surface photons *and* raw beam crossings, so a volumetric flyby can pay the
+  forward pass once, ever. Three decisions in that file are load-bearing. (1) It is a **header
+  shared by both mode-M paths**, because the old copy was file-static inside `render_cuda.cu` —
+  none of it is CUDA, so the flags were GPU-only by accident of placement, and therefore
+  missing from exactly the configuration that needs them most (`-beams` forces the CPU path, so
+  the slowest forward pass was the one that could not be banked; `-savemap -beams` exited 0 and
+  wrote nothing, silently). (2) It stores **no derived structure** — not the photon grid, not
+  the beam BVH, and specifically **not the post-`splitLong` sub-beams**: `buildAuto` picks the
+  split length from the radius it just solved, so persisting split beams would freeze the
+  radius into the file and silently ignore a later `-beamk`. Storing the raw crossings keeps
+  one file valid for any gather. (3) The magic went `FTPMP02` → `FTPMP03` with the beam block
+  **appended**, so old caches still load and simply report zero beams; asking for `-beams`
+  against such a file warns instead of rendering a volumeless image that looks like a beams
+  render. Verified: save-then-load is bit-identical, `-beamk 128` on a reloaded cache re-solves
+  the radius 4× larger, and the map phase drops 53.3 s → 2.6 s.
   **Beam noise reads as coloured streaks**, not grain — too few beams under a thin kernel are
   individually resolvable — so `-spp` is the wrong knob for it and `-beamcount` / `-beamk` are
   the right ones.

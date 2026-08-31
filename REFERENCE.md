@@ -877,8 +877,13 @@ that converges to the same physical image.
   `-pmcount <k>` sets the target population at 1 M stored photons (default `200`, calibrated
   so ordinary renders keep the look they already had — raise for smoother/blurrier, lower
   for sharper/grainier); `-nopmauto` restores the old fixed-radius behaviour exactly
-  (bit-identical), as does passing an explicit `-pmradius`. `-savemap`/`-loadmap` (currently
-  honoured only on `-device gpu`) still lets the deposit be paid just once.
+  (bit-identical), as does passing an explicit `-pmradius`. `-savemap`/`-loadmap` still lets
+  the deposit be paid just once, on **CPU and GPU**, and the file carries **both halves of the
+  trace** — surface photons *and* the `-beams` volume cache. (Before 0.195.0 the serialiser
+  lived in the CUDA translation unit, so the flags were GPU-only by accident of placement and
+  therefore unavailable in exactly the configuration that most wants them: `-beams` forces mode
+  `M` onto the CPU, so the render whose forward pass is most worth banking was the one that
+  could not bank it — silently, writing no file and printing nothing.)
 - **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
   (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
   photon passes** and **shrinks each pixel's gather radius** over iterations, so the
@@ -4165,6 +4170,14 @@ the failure this flag exists to remove.
 the CPU and prints that it has done so — preferable to the GPU silently dropping the volume,
 which is the bug `-beams` exists to fix.
 
+**The beam map persists.** `-savemap <f>` / `-loadmap <f>` store and reload the volume cache
+alongside the surface photons, so the forward pass can be paid once and re-gathered forever —
+which matters more here than for surfaces, since `-beams` runs on the CPU where that pass is
+slowest. A saved cache holds the **raw** crossings, not the split sub-beams, so a reload
+re-solves the kernel from scratch and a later `-beamk` / `-beamradius` still applies. Measured
+on `_rainbow_test` (1e7 photons): 53.3 s to trace and build, **2.6 s** to reload and build, for
+a bit-identical image.
+
 **Shared vs. independent randomness across cameras (matters for video and for
 side-by-side cameras).** This is the key per-mode difference in how randomness is
 distributed *between* cameras. Note that **a "frame" here is simply a camera in the same
@@ -4365,7 +4378,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-pmcount <k>` | Mode `M` density-adaptive gather radius: target number of photons a typical gather should see, at 1 M stored photons (default `200`; the target grows as the cube root of the stored count). Implies `-pmauto`. Higher = smoother/blurrier and slower, lower = sharper/grainier and faster |
 | `-pmauto` / `-nopmauto` | Turn the mode-`M` density-adaptive gather radius on (default) or off. `-nopmauto` reproduces the old fixed-radius output bit-for-bit |
 | `-pmfg <K>` | Mode `M` final gather: `K` cosine-weighted hemisphere sub-rays per sample, querying the map one bounce away for sharp contact shadows / fine detail (default `0` = off, direct density query). ~`K`× per-sample cost — pair with fewer `-spp` |
-| `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene. Like `-o`, a missing parent directory for `-savemap` is created up front rather than discovered after the deposit |
+| `-savemap <f>` / `-loadmap <f>` | Mode `M` view-independent photon-map cache, on **CPU and GPU**. `-savemap` writes the trace to `<f>`; `-loadmap` reloads it and **skips the forward pass entirely**, re-gathering any camera / radius for free. **Carries the `-beams` volume cache too**, so a rain / fog / rainbow scene can bank its volume as well as its surfaces — save with `-beams` and the beams go in the file. Only *derived* structures are left out (the photon grid, the beam BVH, the beam split), so **one file serves any later `-pmradius` / `-pmcount` / `-beamk` / `-beamradius`** — reload the same cache with `-beamk 128` and the kernel is re-solved from scratch. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene; a pre-0.195.0 (`FTPMP02`) file still loads and reports no beams, and asking for `-beams` against one warns rather than quietly rendering a volumeless image. Like `-o`, a missing parent directory for `-savemap` is created up front rather than discovered after the deposit |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R`, photon-map `M`/`S`, BDPT `D` and VCM `U`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, backward `R`, BDPT `D`, and VCM `U`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. In BDPT both subpaths carry the bundle and each connection is evaluated per-λ under one shared MIS weight — on **both** backends, which agree to 0.03%. VCM (`U`) does the same on **both** backends: one bundle per path index feeds both its light and camera subpath, so its *connections* are exact per-λ while its *merges* key off each stored light vertex's own wavelengths — **0.51× noise RMS** at equal passes on a gel + mirror box (CPU), **0.72–0.82× chroma noise** for 1.5–1.7× the time on the GPU, matching the single-λ estimator to 0.02 % and each other to 0.03 %. In modes `R` and `A`/`B`/`C` (and the `M`/`S` deposit) the bundle also rides through mirrors/gels/glossy lobes and every Russian roulette survives on the strongest live λ (no per-λ ratio amplification), worth ~0.42–0.52× noise RMS on coloured interiors in `R` and ~1.1× luma / 1.3–1.8× chroma at equal time in the forward modes. Default `4`; clamped to `1..8`. **Mode `W` defaults to `8` instead** — at 1 spp the bundle *is* the spectral quadrature, and it is nearly free there (measured 2.7 % of frame time versus a single wavelength, because mode `W` is traversal-bound; the same step costs 61 % in mode `R`). `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator) — fine in the sampled modes, but in mode `W` it renders dispersive surfaces flatly **wrong** rather than merely noisy, and a batch mode-`W` render now warns and names the offending material. Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`) and by any scene with participating media, a GRIN volume, or a finite-lens camera |

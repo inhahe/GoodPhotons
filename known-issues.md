@@ -105,6 +105,43 @@ to a worst case. A scene with **bounded** media (e.g. `gallery_rain`, whose clou
 volumes both carry `bounds`) clips every beam tightly and should traverse far better; the
 numbers above are the pessimistic end of the range, not the typical one.
 
+### FIXED (2026-08-31, v0.195.0): `-savemap` / `-loadmap` were GPU-only by accident of placement and stored surfaces only, so a `-beams` trace could never be banked — silently
+
+**What.** Mode `M`'s entire argument is "trace once, gather many", and `-savemap` / `-loadmap`
+are that promise made durable across processes. Two defects meant they did not apply to the
+volume at all:
+
+1. The serialiser was a pair of file-static helpers **inside `render_cuda.cu`**. None of it is
+   CUDA — it is ordinary host `fwrite`/`fread` — but living in that translation unit made the
+   flags reachable only from `renderPhotonMapSharedCuda`. The CPU mode-`M` path never saw them.
+2. The file stored **surface photons only**. Once `-beams` gave mode `M` a volume there was no
+   way to persist it.
+
+**Why the combination was worse than either half.** `-beams` forces mode `M` onto the CPU (no
+device beam BVH), so the flags were unavailable in precisely the configuration whose forward
+pass is slowest and most worth banking. And it failed *silently*: verified on 0.194.1 that
+`-mode M -beams -savemap f` **exited 0, wrote no file, and printed nothing**, while the same
+command without `-beams` wrote 59 MB. Same failure class as the `-beams`/`nCam` entry below —
+a flag that quietly does nothing.
+
+**Fix.** New `src/photonmap_io.h`, included by both `main.cpp` and `render_cuda.cu`, holding
+`photonMapGuard` / `savePhotonMap` / `loadPhotonMap`; the CPU mode-`M` path in `main.cpp` now
+honours both flags. Format `FTPMP02` → `FTPMP03`, with the beam block **appended** so old
+caches still load (they report zero beams, and asking for `-beams` against one warns instead of
+rendering a volumeless image). The file stores **raw** crossings, never the post-`splitLong`
+sub-beams: `buildAuto` derives the split length from the radius it just solved, so persisting
+split beams would freeze the radius into the file and make a later `-beamk` silently inert.
+
+**Verified.** Save-then-load on `_rainbow_test` at 1e7 photons is **bit-identical** (max channel
+diff 0) and drops the map phase **53.3 s → 2.6 s**; reloading the same cache with `-beamk 128`
+re-solves the kernel radius 4× larger (0.00134 → 0.00527), proving the gather parameters stayed
+free; a `FTPMP02` file written by 0.194.1 still loads and warns; the GPU save/load round trip is
+also still bit-identical. All 37 self-tests pass, all 126 scenes parse.
+
+**Still open:** `-savemap` from the *GPU* path writes an empty beam block, because the GPU has
+no beam gather to produce beams in the first place — folded into the "no GPU beam gather" entry
+above rather than tracked separately.
+
 ### FIXED (2026-08-31, v0.194.1): `-beams` was a SILENT no-op in modes `A`/`B` below two cameras, which made a "reference" render secretly the wrong thing
 
 **What.** The `A`/`B` form of `-beams` resamples one shared photon flight per camera, so both

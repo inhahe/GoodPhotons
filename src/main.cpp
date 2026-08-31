@@ -158,6 +158,7 @@
 #include "backward.h"
 #include "bdpt.h"
 #include "photonmap_render.h"   // mode M: photon-mapped final gather (ROADMAP item 1)
+#include "photonmap_io.h"       // -savemap / -loadmap (surface photons + beams), CPU and GPU
 #include "sppm_render.h"        // mode S: stochastic progressive photon mapping (item 2)
 #include "vcm.h"                // mode U: vertex connection and merging (VCM/UPS, item 3)
 #include "lights.h"
@@ -20133,8 +20134,44 @@ static int run(int argc, char** argv) {
         PhotonMap pm;
         BeamMap bmap;
         auto tp0 = std::chrono::steady_clock::now();
-        tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
-                        wantBeams ? &bmap : nullptr, g_beamTarget);
+        // -savemap / -loadmap on the CPU path. These used to be GPU-only purely because the
+        // serialiser lived in render_cuda.cu, which meant they were unavailable in exactly the
+        // configuration that most wants them: `-beams` forces mode M onto the CPU, so the one
+        // render whose forward pass is expensive enough to be worth banking was the one that
+        // could not bank it (and said nothing about it). Both halves of the trace — surface
+        // photons AND beams — go in the file; see photonmap_io.h for why the beams are stored
+        // raw, before buildAuto's radius-dependent split.
+        const uint64_t mapGuard = photonMapGuard(scene, diffraction);
+        EnergyReport pmE;
+        bool mapLoaded = false;
+        if (!g_pmapLoad.empty()) {
+            bool beamsMissing = false;
+            mapLoaded = loadPhotonMap(g_pmapLoad.c_str(), pm, pmE, mapGuard,
+                                      wantBeams ? &bmap : nullptr, &beamsMissing);
+            if (mapLoaded) {
+                std::printf("[camera] -loadmap %s: %zu photons, %zu beams — skipping the "
+                            "photon trace.\n", g_pmapLoad.c_str(), pm.photons.size(),
+                            bmap.beams.size());
+                if (wantBeams && beamsMissing)
+                    std::fprintf(stderr,
+                        "[loadmap] warning: %s has no beam data (saved without -beams, or its\n"
+                        "          trace crossed no medium), so -beams has nothing to gather and\n"
+                        "          the volume will render as NOTHING. Re-save with -beams.\n",
+                        g_pmapLoad.c_str());
+            } else {
+                std::printf("[camera] -loadmap failed — tracing photons instead.\n");
+            }
+        }
+        if (!mapLoaded)
+            tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
+                            wantBeams ? &bmap : nullptr, g_beamTarget);
+        // Written BEFORE the builds, so the file holds the raw trace and one cache can later
+        // be re-gathered at any -pmradius / -beamk.
+        if (!g_pmapSave.empty() && !mapLoaded) {
+            if (savePhotonMap(g_pmapSave.c_str(), pm, pmE, mapGuard, wantBeams ? &bmap : nullptr))
+                std::printf("[camera] -savemap %s: %zu photons + %zu beams written.\n",
+                            g_pmapSave.c_str(), pm.photons.size(), bmap.beams.size());
+        }
         radius = buildPhotonMap(pm, radius, "[camera]");
         if (wantBeams) buildBeamMap(bmap, "[camera]");
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();

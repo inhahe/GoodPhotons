@@ -84,6 +84,7 @@
 #include "stochtile.h"    // O7: the host/device-shared histogram-preserving tiling operator
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
+#include "photonmap_io.h" // -savemap / -loadmap, shared with the CPU mode-M path in main.cpp
 #include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
 #include "lighttree.h"    // Conty-Kulla light BVH: the SAME traversal the CPU runs, not a copy
                           // (the header is dependency-free and __host__ __device__ for this)
@@ -14693,92 +14694,10 @@ bool cudaPhotonMapSupported(const Scene& scene) {
 }
 
 // ---- mode-M photon-map cache file (-savemap / -loadmap) -----------------------
-// The deposited photon map is view-INDEPENDENT: it is the (expensive) result of the
-// forward photon trace, and any camera at any gather radius can be gathered from it. So
-// it is worth persisting. `-savemap <f>` writes the built map after the deposit pass;
-// `-loadmap <f>` reloads it and SKIPS the deposit entirely, re-gathering new camera
-// angles / a new radius for free without re-tracing a single photon. The file stores the
-// raw photon set + emitted count + energy tally; the grid is rebuilt on load via
-// PhotonMap::build(radius), so one file serves any gather radius. A scene-identity guard
-// (magic "FTPMP01\n") refuses to blend a stale map into a different scene.
-static uint64_t photonMapGuard(const Scene& scene, bool diffraction) {
-    uint64_t h = 14695981039346656037ULL;                 // FNV-1a offset basis
-    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
-    mix((uint64_t)scene.tris.size());
-    mix((uint64_t)scene.spheres.size());
-    mix((uint64_t)scene.emitters.size());
-    uint64_t tp; std::memcpy(&tp, &scene.totalPower, sizeof tp); mix(tp);
-    mix(diffraction ? 0x9E37ULL : 0x1234ULL);
-    return h;
-}
-
-static bool savePhotonMap(const char* path, const PhotonMap& pm,
-                          const EnergyReport& e, uint64_t guard) {
-    std::FILE* f = std::fopen(path, "wb");
-    if (!f) { std::fprintf(stderr, "[savemap] cannot open %s for writing\n", path); return false; }
-    // FTPMP02: positions and payloads are stored as two separate blocks, matching
-    // PhotonMap's split layout (FTPMP01 held one interleaved array that also carried a
-    // never-read incident direction). Bumping the magic makes an old cache fail the
-    // recognition check below rather than being misread as garbage.
-    const char magic[8] = {'F','T','P','M','P','0','2','\n'};
-    long long nPh = (long long)pm.photons.size();
-    double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
-    bool ok = true;
-    ok = ok && std::fwrite(magic, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&guard, sizeof guard, 1, f) == 1;
-    ok = ok && std::fwrite(&pm.nEmitted, sizeof pm.nEmitted, 1, f) == 1;
-    ok = ok && std::fwrite(en, sizeof en, 1, f) == 1;
-    ok = ok && std::fwrite(&nPh, sizeof nPh, 1, f) == 1;
-    if (ok && nPh > 0) {
-        ok = std::fwrite(pm.pos.data(), sizeof(Vec3), (size_t)nPh, f) == (size_t)nPh;
-        ok = ok && std::fwrite(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
-    }
-    std::fclose(f);
-    if (!ok) std::fprintf(stderr, "[savemap] write to %s failed\n", path);
-    return ok;
-}
-
-static bool loadPhotonMap(const char* path, PhotonMap& pm,
-                          EnergyReport& e, uint64_t guard) {
-    std::FILE* f = std::fopen(path, "rb");
-    if (!f) { std::fprintf(stderr, "[loadmap] cannot open %s\n", path); return false; }
-    char magic[8] = {0};
-    long long nEmitted = 0, nPh = 0; double en[5] = {0,0,0,0,0}; uint64_t g = 0;
-    bool ok = std::fread(magic, 1, 8, f) == 8;
-    if (!ok || std::memcmp(magic, "FTPMP02\n", 8) != 0) {
-        // Name the stale-version case explicitly: a user with a cache from before the
-        // split layout should be told to re-deposit, not left guessing.
-        if (ok && std::memcmp(magic, "FTPMP01\n", 8) == 0)
-            std::fprintf(stderr, "[loadmap] %s is an old FTPMP01 map (pre split-layout); "
-                                 "re-run with -savemap to rebuild it. Ignoring.\n", path);
-        else
-            std::fprintf(stderr, "[loadmap] %s is not a recognised photon-map file; ignoring\n", path);
-        std::fclose(f); return false;
-    }
-    ok = ok && std::fread(&g, sizeof g, 1, f) == 1;
-    ok = ok && std::fread(&nEmitted, sizeof nEmitted, 1, f) == 1;
-    ok = ok && std::fread(en, sizeof en, 1, f) == 1;
-    ok = ok && std::fread(&nPh, sizeof nPh, 1, f) == 1;
-    if (!ok) { std::fprintf(stderr, "[loadmap] %s truncated header; ignoring\n", path); std::fclose(f); return false; }
-    if (g != guard) {
-        std::fprintf(stderr, "[loadmap] %s was built for a different scene; ignoring\n", path);
-        std::fclose(f); return false;
-    }
-    if (nPh > 0) {
-        pm.pos.resize((size_t)nPh);
-        pm.photons.resize((size_t)nPh);
-        ok = std::fread(pm.pos.data(), sizeof(Vec3), (size_t)nPh, f) == (size_t)nPh;
-        ok = ok && std::fread(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
-    }
-    std::fclose(f);
-    if (!ok) {
-        std::fprintf(stderr, "[loadmap] %s truncated photon data; ignoring\n", path);
-        pm.photons.clear(); pm.pos.clear(); return false;
-    }
-    pm.nEmitted = nEmitted;
-    e.emitted += en[0]; e.absorbed += en[1]; e.sensor += en[2]; e.escaped += en[3]; e.residual += en[4];
-    return true;
-}
+// Moved to src/photonmap_io.h so the CPU mode-M path can use it too: none of it was
+// ever CUDA, and living here made -savemap / -loadmap GPU-only by accident of
+// placement rather than by design (and therefore silently unavailable exactly when
+// -beams forced mode M onto the CPU). The header also persists the beam map.
 
 // Build the view-independent photon map on the GPU (forward deposit pass) and gather every
 // camera from it — the flythrough win, on the device. The deposit runs the megakernel
