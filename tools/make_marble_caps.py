@@ -73,7 +73,20 @@ CAPS = [
     # #6 is the flattest AND most neutral sheet in the set (contrast 0.18, chroma 0.003), so
     # it goes under the one piece whose entire purpose is to put COLOUR on a cap.
     ('marble_axicon',  'marble texture 6.jpg',    'stand_axicon_cap',   None,           0.45, 0.30),
-    ('marble_orb',     'marble texture 7.jpg',    'stand_glass_cap',    None,           0.50, 0.35),
+    # #7 IS THE SECOND SHEET CUT INTO TWO SLABS, for the reason #2 was: the gallery grew a
+    # TWELFTH cap (the gem compote) and there are still only ten source drops. #7 is the one
+    # to quarry because it is by far the largest in the set at 4650x4650 -- the orb's cap spans
+    # 225x70 px in the still, so it was already throwing away 97% of the sheet, and half of it
+    # is still 2325x4650 against a MAXDIM of 1024. Orb takes the left half, the compote the
+    # right; the two crops share no pixel, so they are two slabs off one block rather than the
+    # same stone printed twice.
+    ('marble_orb',     'marble texture 7.jpg',    'stand_glass_cap',   (0, 0, 0.5, 1),  0.50, 0.35),
+    # The compote is caustic-critical and then some: a crystal bowl carrying twelve faceted
+    # dispersive gems, i.e. thirteen refracting solids over one tabletop. It is the only cap
+    # in the set that catches COLOURED caustics from more than one piece, so it gets the same
+    # calming as the axicon's slab rather than the orb's -- k/s at the bottom of the range, so
+    # thirteen overlapping coloured patches read as light and not as stone.
+    ('marble_compote', 'marble texture 7.jpg',    'stand_compote_cap', (0.5, 0, 1, 1),  0.45, 0.30),
     ('marble_gyroidx', 'marble texture 3.jpg',    'stand_diamond_cap',  None,           0.55, 0.40),
     # ---- mild: no measured caustic, but keep them quiet enough to read as a set ---------
     ('marble_klein',   'marble texture 4.jpg',    'stand_klein_cap',    None,           0.75, 0.70),

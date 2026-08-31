@@ -3884,6 +3884,32 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       (the closest this camera comes to solid geometry anywhere in the scene) while threading
       rump, barrel, chest, neck, head and tail brush for 1.16 m at 21 mm/frame. Its cap
       (1.10 × 0.90) was sized from the real footprint *including* the coat.
+    - **The gem compote is the twelfth exhibit, and it is the scene's worked example of
+      giving one GLB thirteen different materials.** The asset (`meshes/compote_with_gems.glb`)
+      is a crystal dish holding twelve faceted stones as thirteen nodes. It **must not** be
+      loaded with `import_materials yes`: ftrace's glTF reader implements no KHR material
+      extension (`src/gltf.h`), and this file keeps all of its colour in
+      `KHR_materials_volume`/`transmission`, so every one of the thirteen would arrive as
+      baseColor (1,1,1) / metallic 0 — thirteen identical **white diffuse** surfaces, i.e. the
+      asset destroyed. The only lever for per-node materials is **`skip_material`**, which
+      drops primitives whose glTF material *name* matches a substring and works independently
+      of `import_materials`; so the scene loads the file **thirteen times**, each load skipping
+      the other twelve names, and binds a hand-authored dielectric to each. Two consequences
+      worth knowing before copying the idiom: the patterns must be **comma-joined into one
+      token** (FTSL starts a new statement at the second bareword), and thirteen loads of a
+      4.5 MB GLB cost thirteen parses but only 250,744 triangles. The colours are carried
+      across exactly, by **σ = −ln(attenuationColor)/attenuationDistance** (glTF attenuates as
+      `color^(d/distance)`, ftrace's `absorb` is a Beer–Lambert σ_a in 1/m), then **divided by
+      the display scale 3.0** so that enlarging the piece holds its authored optical depth
+      instead of cubing the transmittance to near-black. All thirteen carry a **distinct**
+      `priority` (bowl 1, stones 2–13): the stones outrank the dish so a facet sunk in its wall
+      refracts as gem, and ranking the stones against *each other* is what silences the 22
+      overlapping-bounds ties a shared priority produced (a heap of stones in a dish has
+      thoroughly interleaved AABBs even though the solids are disjoint). Sited at (7.35, 6.20)
+      in the front-right court — the one court with no flyby control point in it — after two
+      measured rejections recorded in the scene: the middle-of-layout hole (57 × 74 px, and it
+      covered a third of the dumbbell behind it) and the front-left court (214 × 226 px over
+      the axicon, the one exhibit that exists to throw a coloured caustic).
     - **Mode `M` is not an option for this scene** even though it is the caustic-friendly mode
       on paper: `photonmap_render.h` has no participating-media code, so M renders the cloud,
       the rain and the bow away entirely — and, unlike mode `U`, does not refuse the scene or
