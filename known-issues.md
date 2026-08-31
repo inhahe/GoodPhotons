@@ -98,6 +98,82 @@ with a visually indistinguishable image and auto-exposure matching to 3 signific
 4. Only then revisit the per-hit transmittance work, which the table above shows is not
    currently worth touching.
 
+---
+
+### FIXED (2026-08-31, v0.196.0): the split rule now minimises AABB *area* at each beam's own optimum, and knows how much camera work will amortise the BVH build
+
+Closes items 1 and 2 above. Item 3 (uniform grid instead of a BVH) is **not** needed — the
+overlap it was meant to work around was an artifact of splitting at a scene-scale length, and
+tightening the boxes fixes the culling directly. Item 4 stands: per-hit work is still not the cost.
+
+**The right cost metric is total inflated-AABB surface area,** not beam count and not gathered
+count. By Cauchy's formula a random ray's probability of *entering* a convex box is proportional
+to that box's area, and entering is what costs — hence the measured insensitivity to `-beamk`.
+
+**The derivation** (`photonbeams.h::sahSplitLen`). A sub-segment of length `p` in unit direction
+`d`, inflated by radius `r`, is an AABB of extents `(|dx|p+2r, |dy|p+2r, |dz|p+2r)`. Summing
+`2(ab+bc+ca)` over the `L/p` pieces of a beam of length `L`:
+
+> `A(p) = 2L [ Q·p + 4rE + 12r²/p ]`,  `Q = |dx||dy|+|dy||dz|+|dz||dx|`,  `E = |dx|+|dy|+|dz|`
+
+`Q·p` is the empty space a long diagonal box encloses; `12r²/p` is the kernel inflation paid once
+per piece. Minimising gives **`p* = 2r·sqrt(3/Q)`** and `A(p*) = 8Lr[sqrt(3Q)+E]`.
+
+Three things the old rule got wrong fall straight out:
+* `p*` is **O(r)** with no scene-scale term, so it tightens as the radius shrinks. `max(diag/64,
+  S/3N)` was two scene-scale terms — hence 0.4999 / 0.5014 / 0.5012 across a 10× sweep.
+* `A(p*)` is linear in `r` and in total beam length `S`, and `buildAuto` picks `r = K·A_box/(2πS)`
+  to hold the gathered count — so `S·r` is **constant** and traversal cost stops depending on how
+  many beams are stored. "Cost linear in stored beams" was not a tuning failure; it was the direct
+  consequence of a split length that ignored `r`.
+* An axis-aligned beam has `Q = 0`, so `p* = ∞` — its AABB is already tight and splitting it is
+  pure loss. Any uniform length splits it anyway. The rule is now **per beam**.
+
+**But `p*` is the infinite-work limit, and the BVH build is not free** — it is linear in sub-beam
+count at ~1.6 µs each, which at the unconstrained optimum is minutes. That cost is paid once and
+amortised over every camera sharing the map, so the optimum depends on how much gathering is about
+to happen. Minimising `T(p) = c_build·(S/p) + W·k·A(p)` over `p` (with `W` = total pixel-samples
+across the sharing cameras) gives
+
+> `p_opt = sqrt(3/Q) · sqrt( 4r² + κ/W )`,  `κ = c_build/(6k) ≈ 72 m²`
+
+— the area optimum with a work-dependent floor. `W → ∞` recovers `p*` (a 600-frame flythrough
+splits as finely as memory allows); small `W` backs off (don't spend 3 min of BVH build to save
+1 min of gather on one still). **This is why the same rule can serve both a still and a flyby,
+and why any rule without a work term cannot.** `main.cpp::buildBeamMap` now takes `work` and the
+shared mode-`M` path sums it over the whole camera group.
+
+**Measurement** (`_fog_cornell`, 128×128, CPU, `-beamcount 1e6`, sweeping a pinned `-beamsplit`):
+
+| split | sub-beams | box area | BVH build | gather |
+|---|---|---|---|---|
+| **0.5** (what the old rule chose) | 3.46 M | 9.44e5 | 5.7 s | **47.9 s/spp** |
+| 0.2 | 8.05 M | 4.08e5 | 12.6 s | 18.4 s/spp |
+| 0.05 | 30.6 M | 1.26e5 | 53.2 s | 9.4 s/spp |
+| **0.012** | 126 M | 5.57e4 | 180.0 s | **4.5 s/spp** |
+
+Gather falls 10.6× as area falls 17× — area is the right metric. Build is linear in count, giving
+`c_build ≈ 1.6 µs` and `k ≈ 3.7e-9 s` per (pixel-sample·m²), hence `κ ≈ 72`. Substituting the
+single-camera `128×128×4spp` work `W = 65536` **predicts** `p_opt = 0.058`; the measured
+single-camera optimum of that sweep is between 0.05 (87 s) and 0.2 (96 s). The model is not fitted
+to the answer — it predicts it from two independently measured constants.
+
+**Result at the default settings**, same scene/config: total wall **156 s → 92 s**, box area
+1.009e7 → 3.99e5 (a 25× tightening), and the 8-bit output is **bit-identical** to the old rule
+(0 differing pixels of 16384; auto-exposure 7.42e-13 both ways). The split moves boxes, never the
+estimator. Work-term liveness verified by sweeping spp at a fixed scene: 1 → 256 spp drives the
+mean split 0.487 → 0.113, asymptoting to the pure-area optimum `2r√3 = 0.090`.
+
+**New knobs.** `-beamsplitmax <n>` (default 8 M) caps post-split sub-beams — a **memory** ceiling,
+not a quality one, because `p_opt` is O(r) while `buildAuto` shrinks `r` as ~1/S, so the optimal
+piece *count* grows as ~S² (126 M sub-beams is ~12 GB). Below the cap you get the optimum; above
+it, the finest split that fits, and the build says so rather than silently under-splitting.
+`-beamsplit <len>` pins a uniform length for measurement against a fixed baseline.
+
+**Still true, and now the next thing:** the remaining headroom is memory-bound, not rule-bound.
+At the default cap a long flyby is still leaving ~2× on the table (8 M → 30 M sub-beams halves the
+gather). Raising `-beamsplitmax` buys it at ~1 GB per 8 M sub-beams.
+
 **Scene-dependence caveat.** `_fog_cornell`'s medium is **unbounded** and its camera sits
 *outside* the box, so photons escaping the open front deposit beams up to
 `kBeamFarScale × sceneRadius` ≈ 7 m, which inflates the beam AABB to ~14 m across and is close

@@ -11129,14 +11129,39 @@ static double buildPhotonMap(PhotonMap& pm, double radius, const char* tag) {
 // The default is deliberately far below the surface-photon count: beams are split for BVH
 // quality (up to ~4x), and a beam carries a whole chord rather than a point, so a million
 // raw beams is already a dense volume cache.
+//
+// `g_beamSplitMax` budgets the POST-SPLIT sub-beam count, and `g_beamSplitLen` overrides the
+// split rule outright. These exist because the split length is what actually sets the gather's
+// cost, and until 0.196.0 it was chosen from scene scale (`max(diag/64, S/3N)`) and measurably
+// did not adapt at all. It is now each beam's own area-optimal length — see
+// `BeamMap::sahSplitLen`, which derives p* = 2r*sqrt(3/Q) by minimising total AABB area, the
+// quantity that a ray's box-entry count is proportional to.
+//
+//   `-beamsplitmax <n>`  ceiling on sub-beams. The optimum's piece count grows as ~S^2 (p* is
+//                        O(r) and buildAuto shrinks r as ~1/S), so the COST is bounded by the
+//                        rule but the MEMORY is not. This is that ceiling, and it is a memory
+//                        knob rather than a quality knob: below it you get the optimum, above
+//                        it the finest split that fits. Default 8 M sub-beams ~= 0.8 GB with
+//                        the BVH, which is also a size a device port can hold in VRAM.
+//   `-beamsplit <len>`   pin a uniform split length (expert). Only for measuring the rule
+//                        against a fixed baseline; the per-beam rule beats any single length,
+//                        because an axis-aligned beam wants no split at all and a diagonal one
+//                        wants many.
 static double    g_beamRadiusAbs = 0.0;
 static long long g_beamTarget    = 1000000;
 static double    g_beamK         = 32.0;
+static long long g_beamSplitMax  = 8000000;
+static double    g_beamSplitLen  = 0.0;
 
 // Bin the beam map and say what it settled on, mirroring buildPhotonMap's reporting: a
 // silently-different kernel radius would be baffling when comparing renders — and for beams
 // it is worse than baffling, because the radius sets the gather COST as well as the blur.
-static double buildBeamMap(BeamMap& bm, const char* tag) {
+// `work` is the total pixel-samples every camera that will share this map is going to gather
+// (Σ resX·resY·spp). It is not decoration: the split length that minimises total time depends
+// on it, because the BVH build is a one-time cost amortised over exactly that much gathering.
+// A 600-frame flythrough should split far finer than a single still of the same scene — see
+// BeamMap::sahSplitLen for the derivation and the measurements behind the constant.
+static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
     auto t0 = std::chrono::steady_clock::now();
     const size_t raw = bm.beams.size();
     double r;
@@ -11148,27 +11173,38 @@ static double buildBeamMap(BeamMap& bm, const char* tag) {
     if (bm.nDeposited > raw)
         std::printf("%s photon beams: %zu collected, trimmed to %zu by -beamcount "
                     "(survivors rescaled, unbiased)\n", tag, bm.nDeposited, raw);
+    const size_t splitBudget = g_beamSplitMax > 0 ? (size_t)g_beamSplitMax : 0;
     if (g_beamRadiusAbs > 0.0) {
-        // Explicit radius: still split for BVH quality, using the same rule buildAuto uses.
-        const Aabb bb = bm.bounds();
-        const Vec3 ext = bb.hi - bb.lo;
-        const double diag = std::sqrt(dot(ext, ext));
-        const double splitLen = raw ? std::max(diag / 64.0, bm.totalLength() / (3.0 * (double)raw))
-                                    : 0.0;
-        bm.build(g_beamRadiusAbs, splitLen);
+        // Explicit radius: still split, by the same area-optimal rule buildAuto uses. The rule
+        // keys off the radius, so an explicit one feeds it directly — nothing scene-scale here.
+        const double areaBefore = bm.totalBoxArea(g_beamRadiusAbs);
+        double meanSplit = 0.0;
+        bm.build(g_beamRadiusAbs, g_beamSplitLen, splitBudget, work, &meanSplit);
         r = g_beamRadiusAbs;
         std::printf("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g "
-                    "(-beamradius), BVH in %.1fs\n", tag, raw, bm.beams.size(), r,
+                    "(-beamradius), mean split %.4g, box area %.4g -> %.4g m^2 (%.2fx), "
+                    "BVH in %.1fs\n", tag, raw, bm.beams.size(), r, meanSplit,
+                    areaBefore, bm.totalBoxArea(r),
+                    areaBefore > 0 ? bm.totalBoxArea(r) / areaBefore : 1.0,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     } else {
-        const BeamMap::AutoInfo ai = bm.buildAuto(g_beamK);
+        const BeamMap::AutoInfo ai = bm.buildAuto(g_beamK, splitBudget, g_beamSplitLen, work);
         r = ai.rFinal;
+        // `box area` is the cost metric, not a curiosity: a camera ray's expected box-entry
+        // count — which measurement showed IS the gather's cost, far more than the number of
+        // beams it actually gathers — is proportional to it. Printing before/after is what
+        // makes a change to the split rule verifiable instead of asserted.
         std::printf("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g -> %.4g "
                     "(a probe ray gathered %.1f beams at the analytic radius; target %.0f), "
-                    "split at %.4g, BVH in %.1fs\n",
+                    "mean split %.4g, box area %.4g -> %.4g m^2 (%.3fx)%s, BVH in %.1fs\n",
                     tag, ai.rawBeams, ai.outBeams, ai.rAnalytic, ai.rFinal, ai.probeK,
-                    ai.targetK, ai.splitLen,
+                    ai.targetK, ai.splitLen, ai.areaBefore, ai.areaAfter,
+                    ai.areaBefore > 0 ? ai.areaAfter / ai.areaBefore : 1.0,
+                    ai.budgetBit ? " [split limited by -beamsplitmax, not by the rule]" : "",
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        if (ai.budgetBit)
+            std::printf("%s   raise -beamsplitmax for a tighter (faster) BVH at more memory, "
+                        "or lower -beamcount to get there for free.\n", tag);
     }
     if (bm.beams.empty())
         std::fprintf(stderr, "[beams] warning: 0 beams stored — no photon crossed a "
@@ -14435,7 +14471,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
                         wantBeams ? &bmap : nullptr, g_beamTarget);
         radius = buildPhotonMap(pm, radius, "mode M:");
-        if (wantBeams) buildBeamMap(bmap, "mode M:");
+        // One camera, so the BVH build is amortised over exactly this frame's samples. A
+        // progressive budget (-time/-noise/-forever) has no spp up front; assume a modest
+        // number rather than 0, since 0 would mean "build is free" and over-split for a frame
+        // that might stop after one pass.
+        if (wantBeams)
+            buildBeamMap(bmap, "mode M:",
+                         (double)res * (double)resY * (double)(spp > 0 ? spp : 16));
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("mode M: deposited %zu photons from %lld emitted in %.1fs; "
                     "grid %dx%dx%d. Gathering camera pass at %dx%d ...\n",
@@ -15236,6 +15278,11 @@ static void printHelp(const char* prog) {
 "                        (default: sized automatically; NOT the photon-map radius, which is\n"
 "                        larger by orders of magnitude and makes the gather never finish)\n"
 "  -beamcount <n>        mode-M budget on stored beams (default 1000000; 0 = keep all)\n"
+"  -beamsplitmax <n>     ceiling on sub-beams after the BVH split (default 8000000). Beams are\n"
+"                        split at their own area-optimal length; this bounds the MEMORY that\n"
+"                        costs, not the quality. Raising it buys a tighter, faster BVH\n"
+"  -beamsplit <len>      pin a uniform split length instead (expert; for measuring the rule\n"
+"                        against a fixed baseline — the per-beam rule beats any one length)\n"
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
 "  -rgb                  mode R fast RGB (non-spectral) backward preview on the GPU (much\n"
 "                        faster; drops dispersion/thin-film/fluorescence — Option B)\n"
@@ -16219,6 +16266,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-beamradius") && i + 1 < argc) g_beamRadiusAbs = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamcount") && i + 1 < argc) g_beamTarget = (long long)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamk") && i + 1 < argc) g_beamK = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamsplitmax") && i + 1 < argc) g_beamSplitMax = (long long)std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamsplit") && i + 1 < argc) g_beamSplitLen = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-window-min") || !std::strcmp(argv[i], "-minimized")) {
             g_showWindow = true; g_minWindow = true;
@@ -19554,7 +19603,14 @@ static int run(int argc, char** argv) {
                     tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap, g_heroC, 0,
                                     meterBeams ? &meterBmap : nullptr, meterBeamTarget);
                     buildPhotonMap(meterPmap, radius, "[meter]");
-                    if (meterBeams) buildBeamMap(meterBmap, "[meter]");
+                    // The meter map is thrown away after the anchor converges, so its work is
+                    // only the metered frames — at most `cams.size()` of them at meterSpp, and
+                    // the adaptive early-stop usually takes far fewer. Under-stating work makes
+                    // the split COARSER, which is the safe direction for a throwaway map: it
+                    // spends less on a BVH build that is about to be discarded.
+                    if (meterBeams)
+                        buildBeamMap(meterBmap, "[meter]",
+                                     (double)W * (double)H * (double)meterSpp);
                     meterPmapBuilt = true;
                 }
                 mf = renderPhotonCamera(scene, mc.cam, W, H, meterPmap, meterSpp, nThreads,
@@ -20198,7 +20254,15 @@ static int run(int argc, char** argv) {
         radius = buildPhotonMap(pm, radius, "[camera]");
         if (wantBeams) {
             liveWindowPlaceholder(titleW, titleH, "building beam map\xE2\x80\xA6");
-            buildBeamMap(bmap, "[camera]");
+            // THE work term, and the case it exists for: every camera in this group gathers off
+            // the one map, so the BVH build is amortised over all of them and a 600-frame
+            // flythrough should split far finer than a single still of the same scene would.
+            // Summed per camera because a group may mix resolutions.
+            double work = 0.0;
+            for (int i : idx)
+                work += (double)toRender[i].res * (double)toRender[i].resY
+                      * (double)(spp > 0 ? spp : 16);
+            buildBeamMap(bmap, "[camera]", work);
         }
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("[camera] photon map: %zu photons from %lld emitted in %.1fs, "

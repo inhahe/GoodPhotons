@@ -83,6 +83,15 @@
 // still evaluate transmittance from the true beam start (which is where the stored power
 // applies) without the splitter needing a Scene or an RNG to re-integrate it.
 //
+// WHERE to split is chosen by minimising surface area, NOT by scene scale — see sahSplitLen()
+// below for the derivation. The short version: cost is the number of AABBs a ray must enter,
+// that count is proportional to total box area (Cauchy), the area of a split beam is
+// 2L(Qp + 4rE + 12r²/p), and it bottoms out at p* = 2r√(3/Q). The consequence that matters is
+// that p* is O(r) with no scene-scale term at all, and the resulting total area is linear in
+// S·r — which buildAuto holds CONSTANT, so traversal cost stops growing with the stored beam
+// count. The rule this replaced, max(diag/64, S/3N), was two scene-scale terms that measurably
+// did not move across a 10× beam-count sweep, which is precisely why cost was linear in beams.
+//
 // MEMORY / BEAM SUBSAMPLING
 // -------------------------
 // A beam record is ~72 B (plus a 24 B CIE triple) and a dense photon pass emits tens of
@@ -267,9 +276,159 @@ struct BeamMap {
         beams.swap(out);
     }
 
+    // The area-optimal sub-segment length for ONE beam at kernel radius `r`. Returns 0 for
+    // "never split this beam".
+    //
+    // WHY AREA. Traversal cost is not "how many beams did the ray gather" — measured, a 16×
+    // change in the gathered count moved the time 3%. It is how many inflated AABBs the ray
+    // had to ENTER, and by Cauchy's formula the probability a random ray enters a convex box
+    // is proportional to that box's surface area. So the quantity to minimise over the choice
+    // of split is the TOTAL AREA of all sub-beam boxes — the same quantity a SAH BVH builder
+    // minimises, applied one level earlier, to the primitives themselves.
+    //
+    // THE DERIVATION. A sub-segment of length p travelling in unit direction d, inflated by
+    // the kernel radius r, is an AABB with extents (|dx|p + 2r, |dy|p + 2r, |dz|p + 2r).
+    // Summing 2(ab + bc + ca) over the L/p pieces of a beam of length L:
+    //
+    //     A_total(p) = 2L [ Q·p  +  4rE  +  12r²/p ]
+    //         Q = |dx||dy| + |dy||dz| + |dz||dx|        E = |dx| + |dy| + |dz|
+    //
+    // The two ends of that expression are the whole tradeoff: Q·p is the empty space a long
+    // diagonal box encloses (too few pieces), 12r²/p is the kernel inflation paid once per
+    // piece (too many). dA/dp = 0 gives
+    //
+    //     p* = 2r·sqrt(3/Q)        and        A_total(p*) = 8Lr [ sqrt(3Q) + E ]
+    //
+    // THREE CONSEQUENCES, each of which the old rule got wrong:
+    //   * p* is O(r) and contains NO scene-scale term. It tightens automatically as the radius
+    //     shrinks. `max(diag/64, S/3N)` was two scene-scale quantities with no dependence on
+    //     beam density, and returned 0.4999 / 0.5014 / 0.5012 across a 10× beam-count sweep —
+    //     i.e. it was not adapting at all.
+    //   * A_total(p*) is linear in r and in total beam length S. buildAuto chooses
+    //     r = K·A_box/(2πS) to hold the gathered count at K, so the product S·r = K·A_box/(2π)
+    //     is CONSTANT and the traversal cost stops depending on how many beams are stored.
+    //     Cost being linear in stored beams was the measured pathology; it is not a tuning
+    //     failure but a direct consequence of splitting at a length that ignored r.
+    //   * An axis-aligned beam has Q = 0, hence p* = infinity: its AABB is already tight and
+    //     splitting it is pure loss. A uniform rule splits it anyway.
+    //
+    // BUT p* IS THE INFINITE-WORK LIMIT, AND THE BUILD IS NOT FREE. Splitting also costs a BVH
+    // build that is LINEAR in the sub-beam count — measured at ~1.6 us per sub-beam, which at
+    // the unconstrained optimum for a small scene is minutes. That cost is paid ONCE and then
+    // amortised over every camera that shares the map, so the right split is not a property of
+    // the beams alone: it depends on how much gathering the map is about to do. Minimising
+    //
+    //     T(p) = c_build·(S/p)  +  W·k·A_total(p)
+    //
+    // over p (W = total pixel-samples across the sharing cameras, k = gather seconds per
+    // pixel-sample per unit area) gives, after the same differentiation,
+    //
+    //     p_opt = sqrt(3/Q) · sqrt( 4r² + kappa/W ),      kappa = c_build / (6k)
+    //
+    // i.e. EXACTLY the area optimum with 4r² lifted by a work-dependent floor. W -> infinity
+    // recovers p* (a 600-frame flyby should split as finely as memory allows, because the build
+    // is amortised to nothing); small W backs off (do not spend three minutes of BVH build to
+    // save one minute of gather on a single frame). This is why the same rule must serve both
+    // a one-off still and a flythrough, and why a rule with no work term cannot.
+    //
+    // MEASURED, on _fog_cornell at 128x128, sweeping a pinned uniform split (-beamsplit):
+    //
+    //     split   sub-beams   box area   BVH build   gather
+    //     0.5      3.46 M     9.44e5      5.7 s      47.9 s/spp   <- what the old rule chose
+    //     0.2      8.05 M     4.08e5     12.6 s      18.4 s/spp
+    //     0.05    30.6  M     1.26e5     53.2 s       9.4 s/spp
+    //     0.012  126     M    5.57e4    180.0 s       4.5 s/spp
+    //
+    // Gather tracks box area closely (it falls 10.6x as area falls 17x), which is the evidence
+    // that area is the right cost metric; build is linear in count, giving c_build ~ 1.6 us and
+    // k ~ 3.7e-9 s per (pixel-sample · m²), hence kappa ~ 72 m². Substituting the single-camera
+    // 128x128x4spp work W = 65536 predicts p_opt = 0.058 — and the measured single-camera
+    // optimum of that sweep is between 0.05 (87 s) and 0.2 (96 s). The model is not fitted to
+    // the answer; it predicts it from two independently measured constants.
+    static constexpr double kSplitKappa = 72.0;   // m², = c_build / (6k); see the table above
+
+    // `kappaOverW` is kappa/W — the work-dependent floor, 0 for "infinite work" (pure area
+    // optimum). Returns 0 for "never split this beam".
+    static double sahSplitLen(const PhotonBeam& b, double r, double kappaOverW) {
+        const double ax = std::fabs(b.d.x), ay = std::fabs(b.d.y), az = std::fabs(b.d.z);
+        const double Q  = ax * ay + ay * az + az * ax;
+        if (!(Q > 1e-12) || !(r > 0.0)) return 0.0;      // axis-aligned / no radius: no split
+        return std::sqrt((12.0 * r * r + 3.0 * std::max(0.0, kappaOverW)) / Q);
+    }
+
+    // Total inflated-AABB area of the current beam set at radius `r` — the cost metric the
+    // split minimises, reported so a change to the rule is measurable rather than asserted.
+    double totalBoxArea(double r) const {
+        double a = 0.0;
+        for (const PhotonBeam& b : beams) {
+            const double ex = std::fabs(b.d.x) * (double)b.len + 2.0 * r;
+            const double ey = std::fabs(b.d.y) * (double)b.len + 2.0 * r;
+            const double ez = std::fabs(b.d.z) * (double)b.len + 2.0 * r;
+            a += 2.0 * (ex * ey + ey * ez + ez * ex);
+        }
+        return a;
+    }
+
+    // Split every beam at its OWN area-optimal length (sahSplitLen), backing off uniformly if
+    // the unconstrained optimum would exceed `budget` sub-beams. Returns the mean sub-segment
+    // length actually used, for reporting.
+    //
+    // WHY A BUDGET AT ALL. p_opt is O(r) and buildAuto shrinks r as ~1/S, so the optimal piece
+    // COUNT grows as ~S² — the cost is bounded but the memory is not, and post-split records
+    // are what a GPU port has to fit in VRAM (~96 B per sub-beam plus its BVH node). Measured
+    // above: at 126 M sub-beams a 1 M-beam map is ~12 GB. So the budget is a memory ceiling,
+    // not a cost knob: below it we take the optimum, above it we take the finest split that
+    // fits, which is still strictly better than a scene-scale length because it is at least
+    // proportional to the optimum beam-by-beam.
+    double splitSah(double r, size_t budget, double kappaOverW) {
+        if (beams.empty() || !(r > 0.0)) return 0.0;
+        // Σ L/p scales as 1/f, so the closed-form factor lands close; ceil() and the
+        // never-split (axis-aligned) beams only make the true curve shallower, so tighten
+        // from below rather than trusting one step.
+        auto pieces = [&](double f) {
+            double n = 0.0;
+            for (const PhotonBeam& b : beams) {
+                const double p = sahSplitLen(b, r, kappaOverW) * f;
+                n += (p > 0.0 && (double)b.len > p) ? std::ceil((double)b.len / p) : 1.0;
+            }
+            return n;
+        };
+        double f = 1.0;
+        if (budget) {
+            double n = pieces(1.0);
+            for (int it = 0; it < 32 && n > (double)budget; ++it) {
+                f *= std::max(1.05, n / (double)budget);
+                n = pieces(f);
+            }
+        }
+        std::vector<PhotonBeam> out;
+        out.reserve(beams.size() * 2 + 16);
+        double lenSum = 0.0; size_t nSeg = 0;
+        for (const PhotonBeam& b : beams) {
+            const double len = (double)b.len;
+            const double p   = sahSplitLen(b, r, kappaOverW) * f;
+            if (!(p > 0.0) || len <= p) { out.push_back(b); lenSum += len; ++nSeg; continue; }
+            int k = (int)std::ceil(len / p);
+            if (k > 65536) k = 65536;                  // pathological guard
+            const double seg = len / (double)k;
+            for (int j = 0; j < k; ++j) {
+                PhotonBeam s = b;
+                s.s0  = (float)((double)b.s0 + (double)j * seg);
+                s.len = (float)seg;
+                out.push_back(s);
+            }
+            lenSum += len; nSeg += (size_t)k;
+        }
+        beams.swap(out);
+        return nSeg ? lenSum / (double)nSeg : 0.0;
+    }
+
     // Split beams longer than `maxLen` into equal sub-segments (see the header note on beam
     // splitting). Sub-segments share the parent's origin and power and only carry their own
     // [s0, s0+len] range, so nothing has to be re-integrated.
+    //
+    // Retained for the `-beamsplit <len>` expert override, which pins a uniform length so the
+    // rule above can be measured against a fixed baseline. splitSah() is the default path.
     void splitLong(double maxLen) {
         if (!(maxLen > 0.0)) return;
         size_t extra = 0;
@@ -294,13 +453,22 @@ struct BeamMap {
         beams.swap(out);
     }
 
-    // Bin the beams at an explicit kernel radius. Splits first (see splitLong), then builds
-    // the BVH over per-sub-beam AABBs inflated by the radius, then precomputes the CIE
-    // triples. `splitFrac`/`splitMean` shape the split length; see buildAuto for the values
-    // the driver uses and why.
-    void build(double r, double maxSplitLen = 0.0) {
+    // Bin the beams at an explicit kernel radius: split, then build the BVH over per-sub-beam
+    // AABBs inflated by the radius, then precompute the CIE triples.
+    //
+    // `explicitSplitLen > 0` pins a uniform split length (the `-beamsplit` expert override);
+    // otherwise every beam is split at its own cost-optimal length, bounded by `splitBudget`
+    // sub-beams (0 = unbounded). `work` is the total pixel-samples every camera sharing this
+    // map will gather — the term that decides how much BVH build is worth buying (0 = treat
+    // the build as free, i.e. the pure area optimum). `meanSplitOut` gets the mean length used.
+    void build(double r, double explicitSplitLen = 0.0, size_t splitBudget = 0,
+               double work = 0.0, double* meanSplitOut = nullptr) {
         radius = (r > 0.0) ? r : 1e-6;
-        if (maxSplitLen > 0.0) splitLong(maxSplitLen);
+        const double kappaOverW = (work > 0.0) ? kSplitKappa / work : 0.0;
+        double meanSplit;
+        if (explicitSplitLen > 0.0) { splitLong(explicitSplitLen); meanSplit = explicitSplitLen; }
+        else                        { meanSplit = splitSah(radius, splitBudget, kappaOverW); }
+        if (meanSplitOut) *meanSplitOut = meanSplit;
         cie.resize(beams.size());
         std::vector<Aabb> boxes(beams.size());
         for (size_t i = 0; i < beams.size(); ++i) {
@@ -324,9 +492,13 @@ struct BeamMap {
         double rFinal    = 0;   // after the probe correction
         double probeK    = 0;   // beams a probe ray actually gathered at rAnalytic
         double targetK   = 0;   // beams per gather we were aiming for
-        double splitLen  = 0;   // BVH split length
+        double splitLen  = 0;   // MEAN sub-segment length (the rule is per-beam, not uniform)
         size_t rawBeams  = 0;   // before splitting
         size_t outBeams  = 0;   // after splitting
+        double areaBefore = 0;  // total inflated-AABB area unsplit  — the cost metric, so a
+        double areaAfter  = 0;  // total inflated-AABB area after split   split is measurable
+        bool   budgetBit  = false;  // true if the sub-beam budget forced a coarser-than-optimal
+                                    // split (i.e. cost is memory-limited, not rule-limited)
     };
 
     // Choose the kernel radius for a target of `targetK` beams gathered per camera segment,
@@ -334,7 +506,8 @@ struct BeamMap {
     // uniformly filled bounding box, so we correct it with a cheap brute-force probe over a
     // strided subsample of the beams (no BVH needed, and the sample is large enough that the
     // ratio is far more stable than the absolute count).
-    AutoInfo buildAuto(double targetK) {
+    AutoInfo buildAuto(double targetK, size_t splitBudget = 0, double explicitSplitLen = 0.0,
+                       double work = 0.0) {
         AutoInfo info;
         info.targetK  = targetK;
         info.rawBeams = beams.size();
@@ -390,14 +563,30 @@ struct BeamMap {
             }
         }
 
-        // Split length: bound the post-split count at ~4x the raw count (each beam adds at
-        // most len/splitLen pieces, and splitLen >= S/(3N) caps the total added at 3N), with
-        // a floor at diag/64 so a scene of already-short beams is not split pointlessly.
-        const double splitLen = std::max(diag / 64.0, S / (3.0 * (double)beams.size()));
-        info.splitLen = splitLen;
-        build(r, splitLen);
+        // Split at each beam's own area-optimal length (sahSplitLen), bounded by the sub-beam
+        // budget. The radius is final at this point, which is the whole reason the rule can
+        // key off it — the old scene-scale rule could have been computed before the probe ran,
+        // and that is exactly what was wrong with it.
+        info.areaBefore = totalBoxArea(r);
+        // Did memory, rather than the cost model, pick the split? Answer it BEFORE building,
+        // by asking what the unconstrained rule would have produced — comparing the final count
+        // against the budget cannot tell you, because the back-off lands strictly under it.
+        if (splitBudget && explicitSplitLen <= 0.0) {
+            const double kOverW = (work > 0.0) ? kSplitKappa / work : 0.0;
+            double want = 0.0;
+            for (const PhotonBeam& b : beams) {
+                const double p = sahSplitLen(b, r, kOverW);
+                want += (p > 0.0 && (double)b.len > p) ? std::ceil((double)b.len / p) : 1.0;
+            }
+            info.budgetBit = want > (double)splitBudget;
+        }
+        double meanSplit = 0.0;
+        build(r, explicitSplitLen, splitBudget, work, &meanSplit);
+        info.splitLen = meanSplit;
         info.rFinal   = radius;
         info.outBeams = beams.size();
+        info.areaAfter = totalBoxArea(radius);
+        (void)diag;
         return info;
     }
 

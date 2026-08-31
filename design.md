@@ -2084,10 +2084,30 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   against time (`1e6 → 1e5` on `_fog_cornell`: 7m29s → 43s, indistinguishable image,
   auto-exposure agreeing to 3 s.f. — itself an unbiasedness check).
   **Beam splitting** keeps the BVH tight: a long diagonal beam is a mostly-empty AABB, so
-  `splitLong` cuts beams at `max(diag/64, S/3N)` — but a sub-segment keeps the parent's
+  beams are cut into sub-segments — but a sub-segment keeps the parent's
   **true** origin `o` and records only its own `[s0, s0+len]` range, so the gather still
   measures transmittance from where the stored power actually applies and the splitter needs
   neither a `Scene` nor an RNG to re-integrate anything.
+  **WHERE to cut is an area minimisation, and it has a work term (0.196.0).** The cost of the
+  gather is not how many beams it collects — measured, a 16× change in `-beamk` moves the time
+  3%. It is how many AABBs the ray must *enter*, which by Cauchy's formula is proportional to
+  their total surface area. Splitting a beam of length `L` into pieces of length `p` gives
+  `A(p) = 2L[Q·p + 4rE + 12r²/p]` (`Q = |dx||dy|+|dy||dz|+|dz||dx|`, `E = Σ|di|`), balancing the
+  empty space a long diagonal box encloses against the kernel inflation paid per piece, and
+  minimising gives `p* = 2r·sqrt(3/Q)`. That result is *per beam* and **O(r) with no scene-scale
+  term** — which is exactly what the rule it replaced, `max(diag/64, S/3N)`, could not be: two
+  scene-scale quantities that measurably did not move across a 10× beam-count sweep, making the
+  gather's cost linear in stored beams. It also never splits an axis-aligned beam (`Q = 0`),
+  whose box is already tight. But `p*` is the infinite-work limit and the BVH build is linear in
+  sub-beam count (~1.6 µs each), amortised over every camera sharing the map, so the rule
+  minimises `c_build·(S/p) + W·k·A(p)` instead and lands on
+  `p_opt = sqrt(3/Q)·sqrt(4r² + κ/W)` — the area optimum with a work-dependent floor, `W` being
+  the total pixel-samples the sharing cameras will gather. **A flythrough therefore splits far
+  finer than a still of the same scene**, which is why `buildBeamMap` takes a `work` argument
+  and the shared mode-`M` path sums it over the whole camera group. `κ ≈ 72 m²` is measured, not
+  fitted: it predicts the observed single-camera optimum from two independent constants. Bounded
+  by `-beamsplitmax` (memory, not quality — the optimal piece *count* grows as ~S²). Measured
+  156 s → 92 s on `_fog_cornell` with bit-identical output; table in `known-issues.md`.
   **Single scatter only, deliberately** — the depositing photon crosses straight (the analog
   free-flight redirect is skipped, `render.h`'s `doBeamStraight`) and is attenuated by the
   crossing, so surfaces beyond the fog are still correctly dimmed. Same trade `-beams` already
