@@ -17749,11 +17749,45 @@ static int run(int argc, char** argv) {
             // (heavy scene -> careful crawl, light scene -> quick) and you can never skip past
             // geometry between two frames you didn't see. `step` is the per-move distance,
             // adjustable live with Ctrl+wheel.
-            double       step   = sceneR * 0.02;     // held-key per-frame travel, world units
+            //
+            // `step` IS DERIVED PER FRAME FROM WHAT YOU ARE LOOKING AT, not from the scene
+            // bounds. It used to be a flat `sceneR * 0.02`, and that is wrong for any scene
+            // whose extent is set by a BACKDROP rather than by its subject -- which is most
+            // of them. `sceneRadius` is half the AABB diagonal of ALL geometry, so in
+            // `gallery_rain` (a 46 x 45 m ground plane carrying 0.5 m exhibits spaced 1.5 m
+            // apart) it is ~33 m: the old step was 0.65 m per frame and, at kWheelDolly,
+            // 5.2 m per wheel notch -- one click flew you past three exhibits. That scene is
+            // not big; its FLOOR is big, and you never navigate relative to the floor.
+            //
+            // So each frame probes the distance to the first surface along the view ray and
+            // travels a fixed FRACTION of it. That is self-correcting in the way a constant
+            // cannot be: closing on a small object the steps shorten as you arrive, so you
+            // decelerate into it instead of shooting past; out in the open they lengthen and
+            // you cruise. It costs one ray against the BVH the renderer already built, which
+            // is nothing beside rendering the frame it belongs to.
+            //
+            // Looking at NOTHING (sky, or off the edge of the world) has no distance to
+            // scale by, so it falls back to the old `sceneR * kStepFrac` -- the one case the
+            // scene-bounds guess was always right for, since open sky genuinely is the scale
+            // of the whole scene.
+            const double kStepFrac = 0.02;           // travel per frame as a fraction of the distance ahead
+            const double kStepMin  = 1e-4;           // ... clamped to a sane band, relative to sceneR
+            const double kStepMax  = 0.05;
+            double       stepScale = 1.0;            // Ctrl+wheel bias applied ON TOP of the automatic step
+            double       step      = sceneR * kStepFrac;   // recomputed every frame by autoStep()
+            // Probe ahead and set `step`. Called once per frame before the move is resolved.
+            auto autoStep = [&](const Vec3& from, const Vec3& dir) {
+                Hit h = scene.closestHit(Ray{from, dir}, 1e-6);
+                double ahead = (h.valid && h.t > 0.0) ? h.t : sceneR;
+                step = stepScale * std::clamp(ahead * kStepFrac, sceneR * kStepMin, sceneR * kStepMax);
+            };
             // The plain wheel is a quick DOLLY, so a notch moves several fly-steps (a held
-            // key is the fine cruise; the wheel repositions in a few flicks). Still tied to
-            // `step` so Ctrl+wheel scales both together, and still collision-feedback-locked
-            // (resolveMove stops at surfaces), so a coarse notch can't punch through geometry.
+            // key is the fine cruise; the wheel repositions in a few flicks). With an
+            // adaptive step a notch is ~16% of the distance to whatever you are aimed at,
+            // i.e. about six clicks to arrive FROM ANYWHERE -- which is the property that
+            // makes it feel the same in a jewellery box and across a hall. Still
+            // collision-feedback-locked (resolveMove stops at surfaces), so a coarse notch
+            // can't punch through geometry.
             const double kWheelDolly = 8.0;           // fly-steps travelled per plain-wheel notch
             // Hover-look turn RATES: the cursor's dead-zoned offset from the window centre
             // (nav.lookX/lookY, -1..+1) is multiplied by these AND the wall-clock frame time
@@ -17793,7 +17827,19 @@ static int run(int argc, char** argv) {
             // engine's own BVH (scene.closestHit); keeps a `skin` standoff so the near plane
             // never pokes through a surface. SLIDE iterates a few times so a corner (two walls)
             // doesn't leak. Returns the collision-safe new position.
-            const double kSkin = sceneR * 0.02;       // standoff kept between eye and any wall
+            // The standoff is NOT scene-scaled, for the same reason `step` is no longer: at
+            // `sceneR * 0.02` it was 0.65 m in gallery_rain, so collision held the eye two
+            // thirds of a metre off every surface -- in a hall whose exhibits are 0.5 m
+            // across. You could not get near enough to look at one, which is a strange
+            // property for a tool called `-explore`.
+            //
+            // It is sized by what it actually protects: the raster preview's near plane, a
+            // FIXED 1e-3 camera-forward (raster.h). Anything comfortably clear of that keeps
+            // the near plane out of the wall, and nothing about that requirement grows with
+            // the scene's bounding box. So the standoff tracks scene scale only weakly and is
+            // bounded at both ends -- millimetres in a small scene, never more than 5 cm in a
+            // huge one, and always >= the near plane by a wide margin.
+            const double kSkin = std::clamp(sceneR * 2e-4, 1e-3, 0.05);   // eye-to-wall standoff
             auto resolveMove = [&](Vec3 pos, Vec3 delta) -> Vec3 {
                 if (collide == COLLIDE_OFF) return pos + delta;
                 for (int iter = 0; iter < 4; ++iter) {
@@ -18335,12 +18381,13 @@ static int run(int argc, char** argv) {
             if (pathCount >= 2)
                 std::printf("[viewer] camera path: %d frames on the timeline"
                             " (Play/scrub/lock via the panel below the image)\n", pathCount);
+            autoStep(eye, fwd);   // so the banner quotes the real opening step, not the fallback
             std::printf(
               "[viewer] interactive fly-camera — fly around, then copy the printed camera block:\n"
               "         move:   Space or +  = fly forward     Shift or -  = fly backward   (you travel where you look)\n"
               "         dolly:  mouse wheel up/down = dolly forward/back one notch (each notch renders — no overshoot; Ctrl+wheel scales it)\n"
               "         look:   move the mouse off-centre to steer — offset from centre = turn rate (centre holds still); cursor stays visible; leave the window to stop\n"
-              "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
+              "         step:   travel auto-scales to the distance ahead (~%.3g u here; a notch is ~16%% of the way to what you aim at) — Ctrl + mouse wheel biases it\n"
               "         collide: C cycles wall collision (now: %s) — slide along walls / stop dead / noclip\n"
               "         trace:  T toggles a live PATH-TRACED preview (fast RGB backward) — holds still to converge, re-aims on move (GPU, if the scene is in RGB scope)\n"
               "         panel:  Clip / Reset buttons below the image%s\n"
@@ -18759,10 +18806,17 @@ static int run(int argc, char** argv) {
                     changed = true;
                 }
 
-                // Ctrl+wheel adjusts the STEP SIZE (up = bigger), clamped to a sane band.
+                // Ctrl+wheel BIASES the automatic step (up = bigger). It scales the multiplier
+                // rather than setting an absolute distance, because the step is re-derived from
+                // the view every frame — an absolute value set here would be overwritten by the
+                // next probe, so the only adjustment that can survive is a relative one. Both
+                // numbers are printed: the bias is what you set, the metres are what it means
+                // where you happen to be standing (and that second number moves as you fly).
                 if (nav.wheelSpeed != 0.0) {
-                    step = std::clamp(step * std::pow(1.15, nav.wheelSpeed), sceneR * 1e-3, sceneR * 2.0);
-                    std::printf("[viewer] step %.3g u\n", step); std::fflush(stdout);
+                    stepScale = std::clamp(stepScale * std::pow(1.15, nav.wheelSpeed), 0.02, 50.0);
+                    autoStep(eye, fwd);
+                    std::printf("[viewer] step x%.2f (%.3g u here)\n", stepScale, step);
+                    std::fflush(stdout);
                 }
                 // C cycles the collision response: slide -> stop -> off -> slide.
                 if (nav.cycleCollide) {
@@ -18886,8 +18940,15 @@ static int run(int argc, char** argv) {
                     // ---- FREE FLIGHT --------------------------------------------------
                     // Accumulate this frame's translation from all sources (plain-wheel dolly +
                     // held throttle), then resolve it ONCE against the scene so collision (and its
-                    // slide) sees the true combined motion. Plain wheel DOLLIES one `step` per notch
-                    // along the view ray (up = forward); held keys advance one `step`/frame.
+                    // slide) sees the true combined motion. Plain wheel DOLLIES kWheelDolly
+                    // `step`s per notch along the view ray (up = forward); held keys advance one
+                    // `step`/frame.
+                    //
+                    // `step` is re-probed HERE, every frame, from the eye we are about to move
+                    // from along the direction we are about to move in -- so a notch is always
+                    // sized to what is currently under the crosshair, and simply LOOKING at
+                    // something nearer shortens the step before you have moved at all.
+                    autoStep(eye, fwd);
                     Vec3 moveDelta{0, 0, 0};
                     if (nav.wheel != 0.0) moveDelta = moveDelta + fwd * (step * kWheelDolly * nav.wheel);
                     // Mouse-look STEERS at a RATE set by how far the cursor sits from the window

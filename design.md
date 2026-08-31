@@ -4939,6 +4939,33 @@ the timeline would "chunk" by several cameras per drag (0.22.0 regression, fixed
 drain, no busy spin). Gated on the discrete-GPU path (`gpuRaster != nullptr`); CPU
 raster unaffected.
 
+**Adaptive fly step (0.193.1).** The explorer's travel distance per frame used to be
+`sceneR * 0.02`, with `sceneR` = half the diagonal of the AABB of *all* geometry
+(`scene.h`'s `sceneRadius`). That is a bad proxy for navigation scale the moment a
+scene's extent is set by something other than its subject: `gallery_rain` is eleven
+~0.5 m exhibits spaced ~1.5 m apart standing on a 46×45 m floor, so `sceneR ≈ 32 m`
+and one wheel notch (`kWheelDolly` = 8 steps) moved **5.2 m** — past three exhibits,
+in a viewer whose job is to look at them. Fixed by sizing the step from what you are
+actually looking at rather than from the bounding box: before each move `autoStep()`
+casts **one ray** along the view direction and takes `2 %` of the distance to the
+first hit (falling back to `sceneR` when the ray escapes), clamped to
+`[sceneR*1e-4, sceneR*0.05]`. A notch is then ~16 % of the way to whatever is under
+the crosshair — about six clicks to arrive, identically when crossing a hall and when
+closing on a plinth. Verified at both ends of the scale: `gallery_rain` reports
+`~0.301 u` (= 0.02 × the 15.04 m along the view ray to the floor) and `cornell`
+`~0.0425 u` (= 0.02 × 2.13 m to its back wall) from the same code. The one-ray probe
+is free next to the raster frame it precedes.
+Consequence for `Ctrl`+wheel: it can no longer *set* an absolute step, because the
+next frame's probe would overwrite it — it now scales a persistent `stepScale` bias
+(×1.15/notch, clamped ×0.02…×50) that multiplies the probe result.
+The **collision standoff** had the identical defect and the identical cause:
+`kSkin = sceneR * 0.02` held the eye 0.65 m off every surface in `gallery_rain`, so a
+0.5 m exhibit could not be approached at all. It is now
+`clamp(sceneR * 2e-4, 1e-3, 0.05)` — sized against the raster's near plane, which is a
+**fixed absolute** `zn = 1e-3` (`raster.h`) and does not scale with the scene, so a
+scene-scaled standoff never had a justification. 6.5 mm in `gallery_rain` against a
+1 mm near plane.
+
 ## Threading model (CPU)
 
 Band/chunk parallelism via `std::thread` pools sized by `hardware_concurrency`;
