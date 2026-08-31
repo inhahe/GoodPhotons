@@ -5,38 +5,68 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-08-31, v0.194.0): mode-`M` photon beams (`-beams`) have no GPU gather, so a volumetric flyby is forced onto the CPU — the one path that most needs the GPU
+### FIXED (2026-08-31, v0.197.0): mode-`M` photon beams (`-beams`) now run entirely on the GPU — both the beam **deposit** and the beam **gather**
 
-**What.** `-beams` under mode `M` builds a `BeamMap` (`src/photonbeams.h`) and gathers it in
-`gatherPhotonBeams` / `photonGather` (`src/photonmap_render.h`) — **CPU only**. There is no
-device-side beam BVH, so `runSharedPhotonMap` (`main.cpp` ~20050) checks `beamsCpuOnly` and
-skips the whole `renderPhotonMapSharedCuda` branch, printing
+**What was wrong.** `-beams` under mode `M` built a `BeamMap` (`src/photonbeams.h`) and gathered
+it in `gatherPhotonBeams` / `photonGather` (`src/photonmap_render.h`) — **CPU only**. There was
+no device-side beam BVH, so `runSharedPhotonMap` (`main.cpp`) checked `beamsCpuOnly` and skipped
+the whole `renderPhotonMapSharedCuda` branch, printing `-beams: photon-beam volume gather is
+CPU-only — running mode M on the CPU.` The GPU mode-`M` exposure meter carved out for the same
+reason. The motivating case is a 600-frame `gallery_rain` flyby: mode `M` + `-beams` recovers the
+*amortisation* (one forward trace serves every frame) but landing it on the CPU threw away the
+*device*.
 
-```
-[camera] -beams: photon-beam volume gather is CPU-only — running mode M on the CPU.
-```
+**Why the port is bigger than "upload the BVH".** `-beams` changes the **transport**, not just
+the reconstruction: `doBeamStraight` makes the depositing photon cross the medium *straight*
+(analog redirect skipped, attenuated by `mediaTransmittance`, removed energy booked as absorbed).
+So the surface photon map and the beam map must come from the *same* forward pass — the device
+had to **deposit** beams too, not merely gather them. Both halves now live in `render_cuda.cu`:
 
-The GPU mode-`M` **exposure meter** carves out for the same reason (`main.cpp`, the
-`meterGpu && !(g_beamGather && !scene.media.empty())` guard) — otherwise the meter would
-measure a frame with no volume in it and pick an exposure for a different image than the one
-that gets rendered.
+* **Deposit** — `__device__ dEmitBeams` (device twin of `Renderer::emitBeams`) writes `DBeamDep`
+  records into a device buffer through an atomic counter, gated in `shadeStep` by
+  `doBeamDeposit = cs.beamCount && crng && sc.mediaN > 0 && !sc.hasGrin`.
+* **Gather** — `DBeamRec` / `DBeamMap` + `dGatherPhotonBeams`, called from `dPhotonGather`
+  *before* `thr` takes the segment's own attenuation, exactly as the host does, because each
+  gathered beam carries the transmittance to **its own** closest approach, not to the segment end.
+* **Host orchestration** — `struct BeamPass` (`render_cuda.h`) hands `renderPhotonMapSharedCuda`
+  the `BeamMap*`, the `-beamcount` target and the host `build` callback, and receives back the
+  downloaded crossings. The build runs **after** `-savemap`, deliberately: the `.pmap` must hold
+  RAW crossings so one cache serves any later `-beamradius` / `-beamk` (the split is
+  radius-dependent).
 
-**Why the carve-out is right even though it costs speed.** The alternative is the GPU path
-running *without* the beam map, i.e. silently dropping the volume — which is the exact bug
-`-beams` exists to fix, and it would fail invisibly (a plausible-looking image with the
-subject missing). A loud fallback is strictly better than a quiet wrong answer.
+**Three details that were not obvious.**
 
-**Why it matters.** The motivating case is a 600-frame `gallery_rain` flyby. Mode `D` costs
-~7.6 h because it is camera-anchored and re-traces per frame; the whole point of moving to
-mode `M` + `-beams` is that one forward trace serves every frame. Landing that on the CPU
-recovers the *amortisation* but not the *device*, so the win is smaller than it should be.
+1. **Fold-at-upload.** `DBeamRec.pX/pY/pZ = cie{X,Y,Z}(λ)·power/nEmitted`, mirroring
+   `DGatherPhoton`, so the inner loop does no CIE evaluation and no `invN` multiply.
+2. **Float cancellation in the estimator.** The host's `den = 1 - cosT²` with a `1e-9` rejection
+   is unusable in `float` (eps ≈ 1.2e-7). The device uses the algebraically identical but
+   cancellation-free `den = |cross(dc, d_b)|²`.
+3. **RNG discipline.** The device deposit's roulette and beam-side transmittance draw from the
+   per-photon **side** stream `crng`, never the transport stream, so the buffer-overflow rerun at
+   a reduced `beamKeep` reproduces the surface deposit photon-for-photon. (The host `emitBeams`
+   uses the transport `rng` — a deliberate divergence, and the reason the two raw crossing counts
+   differ while the images agree.) Overflow rescaling aims at **0.95×** the cap, not 1.0: the
+   survivor count is Binomial, and records past the cap are *dropped* (unlike the photon count,
+   which the atomic still reports exactly), which would bias the estimate.
 
-**The fix.** Port `BeamMap` to the device the way the photon map already is: upload a flat
-`DPhotonBeam` array plus the BVH nodes (the `Bvh` is already a POD node array, and
-`render_cuda.cu` uploads BVHs for geometry, so both halves exist), then add a beam-gather
-branch to the mode-`M` device gather that mirrors `gatherPhotonBeams`. The two per-beam
-`mediaTransmittance` marches are the dominant per-hit cost and should be looked at first —
-on the CPU they are already what makes the gather expensive (see the TECH DEBT entry below).
+**Validation (GPU vs CPU, ratios of linear-radiance means).**
+
+| Test | What it isolates | Ratio |
+|---|---|---|
+| `-savemap` on GPU, `-loadmap` on CPU, `_fog_cornell` | the **gather** alone (identical beam map) | 0.9996 median over 16×16 blocks (p5 0.985, p95 1.014) |
+| GPU deposit → CPU gather vs CPU deposit → CPU gather | the **deposit** alone | 0.9997 |
+| `-beamcount 100000` (forces the overflow rerun at `keep≈0.100`) | the roulette is unbiased | 0.9943 |
+| `scenes/_rainbow_test.ftsl`, 20 M photons | the spectral / phase-function path | 0.9945 (per-channel 1.013 / 0.987 / 0.983) |
+
+Both sides also agree exactly on the adaptive radii (0.0114 grid, 0.002219 beam kernel) and on
+the post-split sub-beam count (7,668,076) when handed the same map. `_fog_cornell` at 128²×8spp:
+**3m42s CPU → well under a minute on the GPU**, now dominated by the ~10–14 s *host* beam BVH
+build.
+
+**What is still CPU-only, and why.** **GRIN scenes.** A photon whose path bends has no straight
+chord to store, so there is nothing for a beam record to be. `beamsCpuOnly` survives as exactly
+that one carve-out, and still prints a loud fallback line rather than silently dropping the
+volume.
 
 ### PERF — OPEN (2026-08-31, v0.194.0): the mode-`M` beam gather's cost is BVH traversal over overlapping beam AABBs, and is ~independent of how many beams it actually gathers
 

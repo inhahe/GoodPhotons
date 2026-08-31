@@ -220,7 +220,9 @@ argument for standing a groom in a hall of polished objects.*
   those with a Beam × Ray estimator — so the phase function is evaluated at the true
   per-frame viewing angle and a *volumetric* flythrough gets the same "trace once, gather
   per frame" amortisation the surface map already had, instead of needing mode `D` to
-  re-trace every frame. (CPU only for now.) See
+  re-trace every frame. The mode-`M` beam deposit *and* gather run **on the GPU** as of
+  0.197.0 (only a GRIN scene falls back to the CPU — a bent photon has no straight chord
+  to store). See
   [Mode `M` and participating media](REFERENCE.md#mode-m-and-participating-media---beams).
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —

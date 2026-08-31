@@ -19652,6 +19652,9 @@ static int run(int argc, char** argv) {
         }
         return eAuto;
     };
+    // The RENDER's photon budget, named before the loop shadows `N` with the camera count —
+    // the GPU meter's beam budget scales against it (see meterBeamTarget below).
+    const long long renderPhotonN = N;
     for (const auto& [g, cams] : meterPlan) {
         if (cams.empty() || g_stopRequested) continue;
         const bool adaptive = meterAdaptive.count(g) != 0;
@@ -19668,10 +19671,11 @@ static int run(int argc, char** argv) {
         // + up to kMeterMax full-res CPU gathers) is the pre-pass that used to take tens
         // of minutes while the GPU idled. Gated exactly like runSharedPhotonMap's GPU
         // branch; any miss falls through to the per-frame loop below unchanged.
-        // ... including the -beams CPU-only carve-out: metering a volumetric scene on a
-        // device gather that cannot see the volume would anchor the exposure to an image
-        // missing its brightest subject.
-        if (meterGpu && !(g_beamGather && !scene.media.empty()) &&
+        // ... including its GRIN carve-out for -beams: a bent photon has no straight chord to
+        // deposit, so the device would meter a volumetric scene on an image missing its
+        // brightest subject and anchor the exposure to it.
+        const bool meterBeamsGpu = g_beamGather && !scene.media.empty();
+        if (meterGpu && !(meterBeamsGpu && grin::sceneHasGrin(scene)) &&
             cudaPhotonMapSupported(scene)) {
             bool allM = true, allPinhole = true;
             for (const auto& mc : cams) {
@@ -19700,10 +19704,29 @@ static int run(int argc, char** argv) {
                         filmToRgb8(f, (double)meterSpp, 1.0, false, nullptr, &eAuto);
                         return conv.add(eAuto) || g_stopRequested != 0;
                     };
+                // Same beam pass the real render gets, at a budget scaled down with the
+                // reduced photon count so the meter keeps the render's beams-per-photon
+                // density (a denser throwaway map would only be slower). Work is understated
+                // on purpose — a coarser split spends less on a BVH about to be discarded.
+                BeamMap  mBmapGpu;
+                BeamPass mBeamPass;
+                if (meterBeamsGpu) {
+                    mBeamPass.map = &mBmapGpu;
+                    mBeamPass.target = (g_beamTarget > 0)
+                        ? std::max(1LL, (long long)((double)g_beamTarget * (double)meterN
+                                                    / std::max(1.0, (double)renderPhotonN)))
+                        : 0;
+                    const double mWork = (double)cams[0].res * (double)cams[0].resY
+                                       * (double)meterSpp;
+                    mBeamPass.build = [mWork](BeamMap& bm) {
+                        buildBeamMap(bm, "[meter]", mWork);
+                    };
+                }
                 renderPhotonMapSharedCuda(scene, mcams, rxs, rys, meterN, radius, e,
                                           diffraction, meterSpp, nullptr, &onFrame,
                                           nullptr, nullptr, g_heroC, g_pmFinalGather,
-                                          g_pmAutoRadius ? g_pmAutoCount : 0.0);
+                                          g_pmAutoRadius ? g_pmAutoCount : 0.0,
+                                          meterBeamsGpu ? &mBeamPass : nullptr);
                 metered = true;   // a black meter falls into the no-anchor warning below
             }
         }
@@ -20134,14 +20157,15 @@ static int run(int argc, char** argv) {
             const bool wantAuto = !std::strcmp(device, "auto");
             bool allPinhole = true;
             for (int i : idx) if (toRender[i].cam.hasLens()) allPinhole = false;
-            // The photon-beam volume gather is CPU-only for now (the device gather has no
-            // beam BVH), so -beams on a media scene falls back to the CPU path below rather
-            // than silently rendering the volume as nothing — which is exactly the bug
-            // -beams exists to fix. See known-issues.md.
-            const bool beamsCpuOnly = wantBeams;
+            // -beams runs on the device now (deposit AND gather), with one exception: a GRIN
+            // scene. A gradient-index photon travels a CURVE, so it has no straight chord to
+            // store, and dEmitBeams therefore refuses to deposit one — sending such a scene to
+            // the device would silently render its volume as nothing, the exact bug -beams
+            // exists to fix. Those go to the CPU path below.
+            const bool beamsCpuOnly = wantBeams && grin::sceneHasGrin(scene);
             if (beamsCpuOnly && (wantGpu || wantAuto) && cudaAvailable())
-                std::printf("[camera] -beams: photon-beam volume gather is CPU-only — "
-                            "running mode M on the CPU.\n");
+                std::printf("[camera] -beams: photon beams have no straight chord in a GRIN "
+                            "scene — running mode M on the CPU.\n");
             if ((wantGpu || wantAuto) && allPinhole && !beamsCpuOnly &&
                 cudaAvailable() && cudaPhotonMapSupported(scene)) {
                 std::vector<Camera> cams; std::vector<int> rxs, rys;
@@ -20181,13 +20205,44 @@ static int run(int argc, char** argv) {
                             sharedWriteFail = true;
                         return g_stopRequested != 0;   // window closed / Ctrl-C -> stop after this frame
                     };
+                // The photon-beam volume pass. THE work term, and the case it exists for:
+                // every camera in this group gathers off the one map, so the BVH build is
+                // amortised over all of them and a 600-frame flythrough should split far finer
+                // than a single still of the same scene would. Summed per camera because a
+                // group may mix resolutions. (Identical to the CPU path's term below — the
+                // split rule must not depend on which device runs the gather.)
+                BeamMap  bmapGpu;
+                BeamPass beamPass;
+                if (wantBeams) {
+                    double work = 0.0;
+                    for (int i : idx)
+                        work += (double)toRender[i].res * (double)toRender[i].resY
+                              * (double)(spp > 0 ? spp : 16);
+                    const int tw = toRender[idx[0]].res, th = toRender[idx[0]].resY;
+                    beamPass.map    = &bmapGpu;
+                    beamPass.target = g_beamTarget;
+                    // Name the stage in the title bar: the beam BVH on a big scene is minutes
+                    // of silence between the deposit and the first gathered frame, and without
+                    // this the window sits on the previous caption looking wedged.
+                    beamPass.build  = [work, tw, th](BeamMap& bm) {
+                        liveWindowPlaceholder(tw, th, "building beam map\xE2\x80\xA6");
+                        buildBeamMap(bm, "[camera]", work);
+                    };
+                }
                 renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e,
                                           diffraction, spp,
                                           g_showWindow ? &liveProg : nullptr, &writeFrame,
                                           g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
                                           g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC,
                                           g_pmFinalGather,
-                                          g_pmAutoRadius ? g_pmAutoCount : 0.0);
+                                          g_pmAutoRadius ? g_pmAutoCount : 0.0,
+                                          wantBeams ? &beamPass : nullptr);
+                if (wantBeams && beamPass.loadedMissing)
+                    std::fprintf(stderr,
+                        "[loadmap] warning: %s has no beam data (saved without -beams, or its\n"
+                        "          trace crossed no medium), so -beams has nothing to gather and\n"
+                        "          the volume will render as NOTHING. Re-save with -beams.\n",
+                        g_pmapLoad.c_str());
                 if (e.emitted > 0.0)
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,
@@ -20281,9 +20336,10 @@ static int run(int argc, char** argv) {
             // `liveProg`. This path had NO window feed at all: it wrote each frame to disk and
             // never repainted, so a flythrough ran to completion behind the frozen
             // "preparing…" placeholder. That was worst in the one configuration that FORCES
-            // this path — `-beams` is CPU-only, so the mode-M volumetric flyby, the slowest
-            // and most worth watching render in the engine, was precisely the one you could
-            // not watch. Verified before the fix on a 6-frame curve: frames landed on disk
+            // this path — at the time `-beams` was CPU-only (it is on the GPU as of 0.197.0,
+            // except in GRIN scenes), so the mode-M volumetric flyby, the slowest and most
+            // worth watching render in the engine, was precisely the one you could not
+            // watch. Verified before the fix on a 6-frame curve: frames landed on disk
             // while the title never advanced past "preparing.".
             //
             // Routing through cpuSppChunks (what the single-camera mode-M path at ~14447

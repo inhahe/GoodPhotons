@@ -2113,12 +2113,40 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   crossing, so surfaces beyond the fog are still correctly dimmed. Same trade `-beams` already
   makes in A/B, and the right one here: the multiple-scatter term in a rain volume is a
   desaturating grey veil that washes out the bow we are there for.
-  **CPU only for now.** The device gather has no beam BVH, so `runSharedPhotonMap`'s GPU
-  branch and the GPU mode-`M` exposure meter both carve out when `-beams` is on and print
-  that they are falling back — better than the device silently dropping the volume, which is
-  the exact bug `-beams` exists to fix. Logged in `known-issues.md`.
-  **…which is why the CPU branch had to learn the live window (0.195.1).** Being CPU-only
-  means `-beams` *forces* `runSharedPhotonMap`'s CPU branch, and that branch called
+  **Ported to the device in 0.197.0 — deposit *and* gather.** The scope is larger than "upload
+  the BVH" because `-beams` changes the **transport**, not just the reconstruction: the
+  depositing photon crosses straight, so the surface photon map and the beam map have to come
+  from the *same* forward pass, and the device therefore had to learn to **deposit** beams as
+  well. Both halves live in `render_cuda.cu`. The deposit is `__device__ dEmitBeams` (twin of
+  `Renderer::emitBeams`) writing `DBeamDep` records through an atomic counter, gated in
+  `shadeStep` by `doBeamDeposit = cs.beamCount && crng && sc.mediaN > 0 && !sc.hasGrin`. The
+  gather is `DBeamRec` / `DBeamMap` / `dGatherPhotonBeams`, called from `dPhotonGather` **before**
+  `thr` takes the segment's own attenuation — the ordering matters, because each gathered beam
+  carries transmittance to *its own* closest approach, not to the segment end (the host does the
+  same, `photonmap_render.h::photonGather`). Host orchestration is `struct BeamPass`
+  (`render_cuda.h`), which hands `renderPhotonMapSharedCuda` the `BeamMap*`, the `-beamcount`
+  target and the host `build` callback; the build deliberately runs **after** `-savemap`, since
+  the file must hold raw crossings (see the persistence bullet below). Three non-obvious details:
+  (a) **fold at upload** — `DBeamRec.pXYZ = cie(λ)·power/nEmitted`, mirroring `DGatherPhoton`, so
+  the inner loop does no CIE evaluation and no `invN` multiply; (b) the host's `den = 1 - cosT²`
+  is **unusable in float** (eps ≈ 1.2e-7 vs its `1e-9` rejection), so the device uses the
+  algebraically identical, cancellation-free `den = |cross(dc, d_b)|²`; (c) the deposit's roulette
+  and beam-side transmittance draw from the per-photon **side** stream `crng`, never the transport
+  stream, so the device buffer-overflow rerun at a reduced `beamKeep` reproduces the surface
+  deposit photon-for-photon (the host `emitBeams` uses the transport `rng` — a deliberate
+  divergence, and why the two raw crossing counts differ ~12% while the images agree to 0.03%).
+  The overflow rescale aims at **0.95×** the cap, not 1.0: survivors are Binomial and records past
+  the cap are *dropped* (unlike photons, whose atomic still reports the true count), which would
+  bias the estimate. Validated GPU-vs-CPU as mean linear-radiance ratios — 0.9996 gather-only
+  (same map via `-savemap`/`-loadmap`), 0.9997 deposit-only, 0.9943 through a forced overflow
+  rerun at `keep≈0.100`, 0.9945 on `_rainbow_test`'s spectral phase path. `_fog_cornell`
+  128²×8spp: **3m42s → well under a minute**, now dominated by the *host* beam-BVH build.
+  **The one remaining CPU carve-out is GRIN**: a bent photon has no straight chord to store, so
+  `beamsCpuOnly = wantBeams && grin::sceneHasGrin(scene)` still forces the CPU branch (render and
+  exposure meter alike) and prints that it has — better than the device silently dropping the
+  volume, which is the exact bug `-beams` exists to fix.
+  **…which is why the CPU branch had to learn the live window (0.195.1).** Back when `-beams`
+  was CPU-only it *forced* `runSharedPhotonMap`'s CPU branch, and that branch called
   `renderPhotonCamera` with no progress hook — its GPU twin has passed a `SppProgress` since
   the feature landed. So the slowest, longest render in the engine was the only one with no
   live preview at all: frames were written to disk correctly while the window sat on the
@@ -2154,8 +2182,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   forward pass once, ever. Three decisions in that file are load-bearing. (1) It is a **header
   shared by both mode-M paths**, because the old copy was file-static inside `render_cuda.cu` —
   none of it is CUDA, so the flags were GPU-only by accident of placement, and therefore
-  missing from exactly the configuration that needs them most (`-beams` forces the CPU path, so
-  the slowest forward pass was the one that could not be banked; `-savemap -beams` exited 0 and
+  missing from exactly the configuration that needs them most (`-beams` forced the CPU path at
+  the time, so the slowest forward pass was the one that could not be banked; `-savemap -beams`
+  exited 0 and
   wrote nothing, silently). (2) It stores **no derived structure** — not the photon grid, not
   the beam BVH, and specifically **not the post-`splitLong` sub-beams**: `buildAuto` picks the
   split length from the radius it just solved, so persisting split beams would freeze the

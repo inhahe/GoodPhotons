@@ -188,6 +188,26 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // GPU too, not just the CPU: the shared-map path IS the high-photon-count path, which is
 // exactly where a count-independent radius collapses. The gather reads pm.radius (not this
 // argument) after the build, so the adapted value flows through with no further plumbing.
+//
+// `beams` (when non-null) turns on the photon-BEAM volume pass (`-beams`) — the
+// view-independent single-scatter gather that is the only thing making a participating medium
+// visible in mode M (the surface map stores no volume records). The beams MUST come from the
+// SAME forward trace as the surface map, because `-beams` changes the transport: a photon
+// crosses a medium straight instead of scattering (Renderer::doBeamStraight). So the device
+// deposits both in one pass and downloads the crossings into `beams->map`.
+//
+// Everything scene-scale about the beam map stays on the HOST: the exact unbiased trim to
+// `beams->target` (-beamcount), then `beams->build`, which owns the kernel radius, the
+// area-optimal split and the BVH (BeamMap::buildAuto). That reasoning has no place in a kernel
+// and is shared with the CPU path verbatim rather than reimplemented. After the callback
+// returns, the built map is uploaded once and every camera's gather sees it.
+struct BeamPass {
+    BeamMap*  map    = nullptr;   // receives the deposited (or -loadmap'd) beams, then built
+    long long target = 0;         // -beamcount: exact unbiased trim; <= 0 keeps every crossing
+    std::function<void(BeamMap&)> build;   // host build (radius + split + BVH); required
+    bool      loadedMissing = false;       // out: -loadmap succeeded but the file held no beams
+};
+
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
@@ -195,7 +215,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const SppProgress* prog = nullptr,
                                             const std::function<bool(int, const Film&)>* onFrame = nullptr,
                                             const char* mapLoad = nullptr, const char* mapSave = nullptr,
-                                            int heroC = 1, int fgRays = 0, double autoK = 0.0);
+                                            int heroC = 1, int fgRays = 0, double autoK = 0.0,
+                                            BeamPass* beams = nullptr);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

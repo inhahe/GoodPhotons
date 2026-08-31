@@ -4327,6 +4327,24 @@ struct DPhoton {
     float power, lambda;
 };
 
+// One DEPOSITED photon beam (device twin of PhotonBeam, photonbeams.h): the chord a photon
+// cut through one medium, stored so every camera of a flyby can gather single scatter from
+// it later. Written by dEmitBeams during the mode-M forward pass and downloaded into the
+// host BeamMap, which owns the split / radius / BVH build (all of it scene-scale reasoning
+// that belongs on the host — see BeamMap::sahSplitLen).
+//
+// No `s0` here, deliberately: a deposited beam is always a WHOLE crossing. Sub-segments are
+// a product of the host-side split, and the split rule needs the final kernel radius, which
+// is not known until after the deposit. (Same reason .pmap stores raw crossings.)
+struct DBeamDep {
+    DVec3 o, d;               // true segment start (world) and unit direction of travel
+    float len;                // crossing length in world units
+    float power;              // carried flux at `o`, after the deposit's Russian roulette
+    float lambda;             // wavelength (nm) — monochromatic, like a photon
+    float absorb;             // sigma_a of the enclosing dielectric (0 in air)
+    int   med;                // index into DScene::media
+};
+
 struct DCamSet {
     const DCamera* cams;      // nCam cameras
     double* const* films;     // nCam film buffers  (XYZ*3 doubles each)
@@ -4347,6 +4365,19 @@ struct DCamSet {
     // per-photon RNG stream, decoupling the deposit (shared flight) from the gather so a
     // volumetric flyby gets independent per-frame noise instead of one frozen speckle.
     bool beamGather = false;
+    // PHOTON-BEAM DEPOSIT (mode M with -beams). The view-independent twin of beamGather:
+    // instead of splatting the crossing to a camera list, store it. Same atomic-cursor /
+    // capacity protocol as the photon deposit above (beamOut may be null for a count-only
+    // pass; records past beamCap are counted and dropped), plus a Russian-roulette survival
+    // rate so a rerun can be made to FIT a buffer that the first pass overflowed —
+    // survivors' power is scaled by 1/beamKeep, so every rate is unbiased.
+    DBeamDep*           beamOut   = nullptr;
+    unsigned long long* beamCount = nullptr;
+    unsigned long long  beamCap   = 0;
+    double              beamKeep  = 1.0;
+    // Either beam path makes the photon cross media STRAIGHT (analog redirect skipped) and
+    // needs the per-photon side stream, so the two gates are asked together everywhere.
+    HD bool beamsOn() const { return beamGather || beamCount != nullptr; }
 };
 
 // Gather-tuned photon record: what the mode-M density-estimate kernel actually reads.
@@ -4378,6 +4409,121 @@ struct DPhotonMap {
     Real   radius;            // gather radius (world units)
     int    nx, ny, nz;
 };
+
+// ---------------------- photon BEAMS on the device (mode M volume) --------------------
+// Gather-tuned sub-beam record — what the device beam estimator actually reads. It is the
+// beam analogue of DGatherPhoton: the host BeamMap's per-beam constants (carried flux, the
+// 1/nEmitted pass normalisation, and the CIE triple at the beam's own wavelength) are all
+// per-record CONSTANTS of the estimate, so they are folded into one float3 at upload time
+// and the inner loop multiplies the folded triple by the geometry/medium terms alone.
+//
+// `s0`/`len` describe THIS sub-segment; `o`/`d` remain the parent beam's true origin and
+// direction, because the beam-side transmittance is measured from where the stored power
+// applies, not from where the split happened to cut (photonbeams.h, BEAM SPLITTING).
+struct DBeamRec {
+    DVec3 o, d;             // parent beam origin (world) and unit direction
+    float s0, len;          // this sub-segment's [s0, s0+len] range along the beam
+    float pX, pY, pZ;       // cie{X,Y,Z}(lambda) * power / nEmitted
+    float lambda;           // wavelength (nm) — sigma_s / phase / transmittance all need it
+    float absorb;           // sigma_a of the enclosing dielectric (0 in air)
+    int   med;              // index into DScene::media
+};
+
+// The uploaded BeamMap: the host's BVH over kernel-inflated per-sub-beam AABBs (photonbeams.h)
+// plus the records it indexes. `nNodes == 0` means "no volume gather" and every entry point
+// tests for it, so a media-less scene pays nothing.
+struct DBeamMap {
+    const DBeamRec* beams     = nullptr;
+    const DNode*    nodes     = nullptr;
+    const int*      primIdx   = nullptr;
+    Real            radius    = 0;   // 1D kernel half-width (world units)
+    Real            invRadius = 0;   // 1/radius, so the kernel costs no divide
+    int             nNodes    = 0;
+};
+
+// Beam x Ray 1D single-scatter estimate along the camera segment [oc, oc + dc*tMax] —
+// device twin of gatherPhotonBeams (photonmap_render.h). Accumulates XYZ directly (each beam
+// folded at ITS OWN wavelength), so a spectral rainbow comes out spectral with no
+// monochromatic reconstruction. `aGlassCam` is the absorption of the dielectric the camera
+// ray is currently inside, applied here only as far as each beam's own closest approach.
+//
+// TRAVERSAL. The host gather runs Bvh::traverseAny with a leaf callback that never reports
+// "blocked", i.e. an all-hits walk; the device twin is `occluded`'s stack loop with the same
+// callback discipline. tMax never shrinks (a density estimate has no nearest hit), so the
+// push-time slab test is sufficient and there is no pop-time retest — the same argument the
+// host traverseAny makes.
+//
+// PRECISION. The closest-approach solve runs in Real (float by default) like every other
+// device geometry query, with ONE deliberate change from the host formula: the denominator
+// is |cross(dc, d_b)|^2 rather than 1 - cos^2(theta). Those are equal in exact arithmetic,
+// but 1 - cos^2 catastrophically cancels for a near-parallel pair — precisely the
+// configuration the 1/sin(theta) Jacobian blows up on — and in float it would turn a
+// legitimate grazing beam into a random huge weight. The cross product has no cancellation
+// there, so the host's 1e-9 rejection threshold stays meaningful at float precision instead
+// of having to be loosened (which would have BIASED the estimate by dropping real samples).
+__device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
+                                          const DVec3& oc, const DVec3& dc, Real tMax,
+                                          double aGlassCam, DRng& rng,
+                                          double& oX, double& oY, double& oZ) {
+    oX = oY = oZ = 0.0;
+    if (bm.nNodes == 0) return;
+    const DVec3 invD{(Real)1 / dc.x, (Real)1 / dc.y, (Real)1 / dc.z};
+    Real tRoot;
+    if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) return;
+    const DPatEnv env = dPatEnvOf(sc);
+    int stack[64]; int sp = 0; stack[sp++] = 0;
+    while (sp) {
+        const DNode& n = bm.nodes[stack[--sp]];
+        if (n.count > 0) {
+            for (int i = 0; i < n.count; ++i) {
+                const DBeamRec& b = bm.beams[bm.primIdx[n.first + i]];
+                // --- closest approach between the camera ray and this sub-segment ---
+                const Real cosT = dot(dc, b.d);
+                const DVec3 cr  = cross(dc, b.d);
+                const Real den  = dot(cr, cr);              // == sin^2(theta), cancellation-free
+                if (den < (Real)1e-9) continue;             // parallel: 1/sin diverges, measure zero
+                const DVec3 w0 = oc - b.o;
+                const Real dd = dot(dc, w0), ee = dot(b.d, w0);
+                const Real t = (cosT * ee - dd) / den;
+                const Real s = (ee - cosT * dd) / den;
+                if (t < (Real)0 || t > tMax) continue;
+                if (s < b.s0 || s > b.s0 + b.len) continue;
+                const DVec3 diff = (oc + dc * t) - (b.o + b.d * s);
+                const Real d2 = dot(diff, diff);
+                if (d2 >= bm.radius * bm.radius) continue;
+                // --- the estimator (photonbeams.h, THE ESTIMATOR: BEAM x RAY) -------
+                if (b.med < 0 || b.med >= sc.mediaN) continue;
+                const DMedium& md = sc.media[b.med];
+                const Real lam = b.lambda;
+                const DVec3 xc = oc + dc * t;
+                // sigma_s AT the gather point — density field and all, so a heterogeneous
+                // cloud shapes the bow instead of a uniform slab of it.
+                const double ss = (double)specLookup(md.sigma_s, lam) * dMedDensityAt(md, xc, env);
+                if (!(ss > 0.0)) continue;
+                // connectVolume's convention: phase(dot(wIn, wToCamera)), wIn = b.d, wToCam = -dc.
+                const double phase = (double)dMedPhase(md, -cosT, lam);
+                if (!(phase > 0.0)) continue;
+                // 1D Epanechnikov kernel, normalised so its integral over [-r, r] is 1.
+                const double x  = (double)sqrt(d2) * (double)bm.invRadius;
+                const double kk = 1.0 - x * x;
+                if (!(kk > 0.0)) continue;
+                const double K1 = 0.75 * (double)bm.invRadius * kk;
+                double w = K1 / (double)sqrt((double)den) * ss * phase;
+                if (!(w > 0.0)) continue;
+                if (b.absorb > 0.f)  w *= exp(-(double)b.absorb * (double)s);   // glass, beam side
+                if (aGlassCam > 0.0) w *= exp(-aGlassCam * (double)t);          // glass, camera side
+                if (s > (Real)0) w *= (double)dMediaTransmittance(sc, b.o, b.d, s, lam, rng);
+                if (t > (Real)0) w *= (double)dMediaTransmittance(sc, oc, dc, t, lam, rng);
+                if (!(w > 0.0)) continue;
+                oX += (double)b.pX * w; oY += (double)b.pY * w; oZ += (double)b.pZ * w;
+            }
+        } else {
+            Real tc;
+            if (boxHit(bm.nodes[n.left],  oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.left;
+            if (boxHit(bm.nodes[n.right], oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.right;
+        }
+    }
+}
 
 // Splat a surface vertex to every camera (model B pinhole connect, or model A finite-
 // lens next-event splat). Device twin of Renderer::camSplatAll. Model C never shares
@@ -4420,6 +4566,54 @@ __device__ static void depositPhoton(const DCamSet& cs, const DVec3& p,
         ph.pos = p; ph.n = n;
         ph.power = (float)beta; ph.lambda = (float)lambda;
         cs.depPhotons[i] = ph;
+    }
+}
+
+// Append one photon beam per medium the segment [o, o + dir*dLen] crosses — device twin of
+// Renderer::emitBeams (render.h). Called from the beam branch of shadeStep, where the photon
+// has already been made to cross media STRAIGHT, so the whole chord is a legitimate beam.
+//
+// `rng` is the per-photon SIDE stream (crng), never the transport stream. On the host the
+// roulette and the transmittance march draw from the photon's own RNG, which is fine there
+// because the pass runs once; here the deposit may be RERUN at a lower beamKeep to fit the
+// device buffer, and a rate change that perturbed the transport stream would silently move
+// every surface photon too — so the two streams are kept disjoint and the surface map comes
+// out bit-identical whatever the beam rate turns out to be.
+__device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVec3& o,
+                                  const DVec3& dir, Real dLen, Real lambda, Real beta,
+                                  Real aGlass, DRng& rng) {
+    if (!cs.beamCount || !(beta > 0)) return;
+    // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
+    // 1e30-long box (host twin: Renderer::kBeamFarScale == 8).
+    const double farLimit = 8.0 * fmax(sc.sceneRadius, 1e-3);
+    const double dBeam = fmin((double)dLen, farLimit);
+    if (!(dBeam > 0.0)) return;
+    const double keep = cs.beamKeep;
+    for (int i = 0; i < sc.mediaN; ++i) {
+        const DMedium& md = sc.media[i];
+        if (specLookup(md.sigma_s, lambda) <= 0) continue;   // absorbing-only: nothing to gather
+        double ta, tb;
+        if (!dMedClip(md, o, dir, 0.0, dBeam, ta, tb)) continue;
+        if (!(tb > ta)) continue;
+        if (keep < 1.0 && (double)rng.uniform() >= keep) continue;
+        // Power at the beam's stored origin: the photon's throughput carried forward through
+        // the glass absorption and the media extinction it crossed to get there.
+        double p = (double)beta / ((keep < 1.0) ? keep : 1.0);
+        if (aGlass > 0 && ta > 0.0) p *= exp(-(double)aGlass * ta);
+        if (ta > 0.0) p *= (double)dMediaTransmittance(sc, o, dir, (Real)ta, lambda, rng);
+        if (!(p > 0.0)) continue;
+        unsigned long long k = atomicAdd(cs.beamCount, 1ULL);
+        if (cs.beamOut && k < cs.beamCap) {
+            DBeamDep bd;
+            bd.o = o + dir * (Real)ta;
+            bd.d = dir;
+            bd.len    = (float)(tb - ta);
+            bd.power  = (float)p;
+            bd.lambda = (float)lambda;
+            bd.absorb = (float)aGlass;
+            bd.med    = i;
+            cs.beamOut[k] = bd;
+        }
     }
 }
 // Volume (fog) analogue of splatSurfaceAll.
@@ -6341,11 +6535,20 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 DMediumStack& stk, DRng* crng = nullptr) {
     Real dSurf = h.valid ? h.t : BIG;
 
-    // PHOTON-BEAMS gather active for THIS step: shared multi-camera pass, a medium exists,
-    // and the caller handed us an independent RNG stream. When on, the photon does NOT
-    // redirect in the medium (it crosses straight) and each camera resamples its own
-    // in-scatter point below — so skip the analog medium-collision sampling here.
-    const bool doBeam = cs.beamGather && crng && cs.nCam > 1 && camMode != CAM_C && sc.mediaN > 0;
+    // PHOTON-BEAMS active for THIS step. Two consumers, one straight crossing:
+    //   * SPLAT (modes A/B): shared multi-camera pass — each camera resamples its own
+    //     in-scatter point below from the independent stream `crng`.
+    //   * DEPOSIT (mode M): the crossing is stored in the view-independent beam map, for
+    //     cameras that do not exist yet. The deposit pass runs with nCam == 0, so it cannot
+    //     share the splat's `nCam > 1` gate.
+    // Either way the photon does NOT redirect in the medium (it crosses straight), so the
+    // analog medium-collision sampling below is skipped and the crossing is attenuated by
+    // its transmittance instead. GRIN is excluded from the deposit: a bent photon has no
+    // straight segment to store, and the estimator's closest-approach geometry assumes one
+    // (host twin: Renderer::doBeamDeposit).
+    const bool doBeamSplat   = cs.beamGather && crng && cs.nCam > 1 && camMode != CAM_C && sc.mediaN > 0;
+    const bool doBeamDeposit = cs.beamCount && crng && sc.mediaN > 0 && !sc.hasGrin;
+    const bool doBeam = doBeamSplat || doBeamDeposit;
 
     // fog free-flight; dEvent is the nearer of surface hit / volume collision.
     bool mediumEvent = false; int scatterMed = -1; DVec3 mp; Real dEvent = dSurf;
@@ -6411,11 +6614,18 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
             DCamSet cs1 = cs; cs1.nCam = 1; cs1.cams = &cs.cams[c]; cs1.films = &cs.films[c]; cs1.hits = &cs.hits[c];
             camSpecularSplatVolumeAll(sc, smc, cs1, camMode, xc, rd, lambda, betaC, *crng);
         }
+        // Mode M: store the crossing itself, so every camera of a flyby can gather single
+        // scatter from it later without the photon knowing any camera exists.
+        if (doBeamDeposit) dEmitBeams(sc, cs, ro, rd, dSurf, lambda, betaPre, aC, *crng);
         // Attenuate the photon by the medium extinction over the whole crossing (single-
         // scatter transmission) so surfaces behind the fog are correctly dimmed; the removed
         // energy (out-scattered + absorbed) is booked as absorbed. Then continue STRAIGHT.
+        // The SPLAT path bills this draw to the side stream (the host does the same); the
+        // DEPOSIT path must bill it to the transport stream, because the side stream's
+        // position depends on beamKeep and the surface photon map has to come out identical
+        // whatever rate the beam buffer ends up needing.
         Real before = beta;
-        beta *= dMediaTransmittance(sc, ro, rd, dSurf, lambda, *crng);
+        beta *= dMediaTransmittance(sc, ro, rd, dSurf, lambda, doBeamSplat ? *crng : rng);
         eAbsorbed += (double)(before - beta);
     }
 
@@ -6915,17 +7125,19 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
         bool done = false;
         DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
-        // PHOTON-BEAMS: an INDEPENDENT per-photon stream used ONLY to resample each camera's
-        // in-scatter point (seeded from the main stream so it is unique per photon/thread).
-        // Only drawn from inside shadeStep's doBeam branch, so non-beam renders are unchanged.
+        // PHOTON-BEAMS: an INDEPENDENT per-photon stream used ONLY by the beam branch —
+        // to resample each camera's in-scatter point (splat) or to roll the deposit's
+        // Russian roulette and its beam-side transmittance (mode M). Seeded from the main
+        // stream so it is unique per photon/thread, and drawn from nowhere else, so non-beam
+        // renders are unchanged and the surface photon map is independent of the beam rate.
         DRng crng;
-        if (cs.beamGather) crng.seed(((unsigned long long)rng.next() << 32) ^ rng.next(),
-                                     ((unsigned long long)rng.next() << 32) ^ rng.next());
+        if (cs.beamsOn()) crng.seed(((unsigned long long)rng.next() << 32) ^ rng.next(),
+                                    ((unsigned long long)rng.next() << 32) ^ rng.next());
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // bend through any GRIN region first
             DHit h = closestHit(sc, ro, rd);
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
-                          eAbsorbed, eSensor, eEscaped, stk, cs.beamGather ? &crng : nullptr) == WF_TERMINATE) done = true;
+                          eAbsorbed, eSensor, eEscaped, stk, cs.beamsOn() ? &crng : nullptr) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -10809,9 +11021,16 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
 // bounce into the map (dPhotonGatherSub). Directly-viewed emitters and the environment (on
 // gather-ray escape) are added as a monochromatic estimate at the sampled lambda. Beer-Lambert
 // interior absorption is tracked exactly like bkRadiance. Keep in sync with photonGather.
+//
+// `bm` is the photon-BEAM map (mode M with -beams), or null when the scene has no media / the
+// beam pass was not run. When present, every segment of this walk — camera ray and each
+// specular leg alike — first collects single scatter from the beams it passes near, then takes
+// the medium's own attenuation. Beams are the only cache record carrying a photon DIRECTION,
+// so they are the only thing that can evaluate a phase function; see photonbeams.h.
 __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int diffraction,
                                      DVec3 ro, DVec3 rd, Real lambda, double invPdfL, DRng& rng,
-                                     int fgRays, double& oX, double& oY, double& oZ) {
+                                     int fgRays, const DBeamMap* bm,
+                                     double& oX, double& oY, double& oZ) {
     oX = oY = oZ = 0.0;
     double thr = 1.0;
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
@@ -10820,13 +11039,29 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
     // f2d convert issue at 1/64 rate, so keeping the test in FP32 matters.
     const Real r2 = (Real)((double)pm.radius * (double)pm.radius);
     const int maxBounce = 32;
+    const bool volOn = (bm != nullptr) && bm->nNodes > 0 && sc.mediaN > 0;
 
     for (int b = 0; b < maxBounce; ++b) {
         DHit h = closestHit(sc, ro, rd);
+        // Glass absorption for THIS segment, hoisted above the escape test because the beam
+        // gather below needs it: a beam seen through a dielectric is attenuated to its own
+        // closest-approach point, not to the segment end (host twin: photonmap_render.h).
+        const int  cmIdx  = stk.topMat();
+        const double aGlass = (cmIdx >= 0)
+                                  ? (double)specLookup(sc.mats[cmIdx].absorb, lambda) : 0.0;
+        // --- Participating media along this segment (mode M with -beams) ------------------
+        // Done BEFORE `thr` takes the segment's attenuation, for the same reason: each
+        // gathered beam carries the transmittance to ITS OWN closest approach.
+        if (volOn) {
+            const Real dSeg = h.valid ? h.t : (Real)1e30;
+            double bX, bY, bZ;
+            dGatherPhotonBeams(sc, *bm, ro, rd, dSeg, aGlass, rng, bX, bY, bZ);
+            oX += bX * thr; oY += bY * thr; oZ += bZ * thr;
+            thr *= (double)dMediaTransmittance(sc, ro, rd, dSeg, lambda, rng);
+            if (thr <= 0.0) return;
+        }
         if (h.valid) {                                   // Beer-Lambert in current medium
-            int cm = stk.topMat();
-            Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
-            if (a > 0) thr *= exp(-(double)a * (double)h.t);
+            if (aGlass > 0.0) thr *= exp(-aGlass * (double)h.t);
         }
         if (!h.valid) {                                  // escaped -> environment
             // Direct env term on gather-ray escape (mirrors photonGather, fgRays==0). The
@@ -10970,7 +11205,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
 // One thread per (pixel, sample); grid-strides over totalSamples. Mirrors kBackward's
 // seeding (global sample index) so a chunked gather is decorrelated across chunks. The
 // gather already returns XYZ, so (unlike kBackward) no cie(lambda) multiply is applied.
-__global__ void kGather(DScene sc, DPhotonMap pm, DCamera cam, double* film, double* hits,
+__global__ void kGather(DScene sc, DPhotonMap pm, DBeamMap bm, DCamera cam,
+                        double* film, double* hits,
                         long long totalSamples, long long chunkSpp, long long sppTotal,
                         long long sampleBase, int resX, int diffraction, int fgRays,
                         unsigned long long seedBase) {
@@ -10993,7 +11229,8 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DCamera cam, double* film, dou
         dGenRay(cam, px, py, jx, jy, ro, rd);            // pinhole only (lens cams gated to CPU)
 
         double oX, oY, oZ;
-        dPhotonGather(sc, pm, diffraction, ro, rd, lambda, invPdfL, rng, fgRays, oX, oY, oZ);
+        dPhotonGather(sc, pm, diffraction, ro, rd, lambda, invPdfL, rng, fgRays,
+                      bm.nNodes > 0 ? &bm : nullptr, oX, oY, oZ);
         size_t o = ((size_t)py * resX + px) * 3;
         atomicAdd(&film[o + 0], oX);
         atomicAdd(&film[o + 1], oY);
@@ -13708,7 +13945,7 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     if (heroC > 1 && up.sc.mediaN == 0 && !up.sc.hasGrin) {
         effHeroC = (heroC > hero::kHeroMax) ? hero::kHeroMax : heroC;
     }
-    if (wavefront && effHeroC == 1 && !cs.beamGather) {
+    if (wavefront && effHeroC == 1 && !cs.beamsOn()) {
         // Streaming backend: identical physics, path-regeneration scheduling. Same
         // maxBounce (32) and camera mode/set as the megakernel. (Hero AND photon-beams
         // force the megakernel — the wavefront pool carries no per-photon beam RNG stream.)
@@ -14705,6 +14942,12 @@ bool cudaPhotonMapSupported(const Scene& scene) {
 // (deterministic same-seed launch). The grid is built on the host (PhotonMap::build, the
 // tested counting sort) and re-uploaded, then each camera is gathered by kGather. Films are
 // SUMs over spp (writeFilm divides by spp), matching renderPhotonCamera / the backward path.
+//
+// With `beams` (the -beams volume pass) the SAME forward pass also deposits photon BEAMS —
+// the chords photons cut through each medium — because -beams changes the transport and the
+// two halves of the cache must therefore come from one trace. The crossings come back to the
+// host, which owns the trim / radius / split / BVH (BeamPass::build), and the built map is
+// uploaded once so every camera's gather picks up single scatter from it.
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
@@ -14712,7 +14955,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const SppProgress* prog,
                                             const std::function<bool(int, const Film&)>* onFrame,
                                             const char* mapLoad, const char* mapSave, int heroC,
-                                            int fgRays, double autoK) {
+                                            int fgRays, double autoK, BeamPass* beams) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -14748,15 +14991,28 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                     radius, r, nProbe, kTarget, pm.photons.size());
     };
 
+    // The photon-BEAM volume pass (-beams). Only live when the caller supplied a BeamPass AND
+    // the scene actually has a medium to store crossings of: with no media every beam gate is
+    // dead code, and switching it on would needlessly force the megakernel (the wavefront pool
+    // carries no per-photon side RNG stream — see launchForward).
+    BeamMap* bmap = (beams && beams->map && !scene.media.empty()) ? beams->map : nullptr;
+
     bool mapLoaded = false;
     if (mapLoad && *mapLoad) {
-        mapLoaded = loadPhotonMap(mapLoad, pm, eOut, photonMapGuard(scene, diffraction));
+        bool beamsMissing = false;
+        mapLoaded = loadPhotonMap(mapLoad, pm, eOut, photonMapGuard(scene, diffraction),
+                                  bmap, &beamsMissing);
         if (mapLoaded) {
-            std::printf("[loadmap] %s: %zu photons from %lld emitted -- deposit skipped\n",
-                        mapLoad, pm.photons.size(), (long long)pm.nEmitted);
+            std::printf("[loadmap] %s: %zu photons from %lld emitted", mapLoad,
+                        pm.photons.size(), (long long)pm.nEmitted);
+            if (bmap) std::printf(", %zu beams", bmap->beams.size());
+            std::printf(" -- deposit skipped\n");
+            if (bmap && beamsMissing && beams) beams->loadedMissing = true;
             buildMap();                         // (re)build the grid at the requested radius
+            if (bmap && beams->build) beams->build(*bmap);
         } else {
             std::fprintf(stderr, "[loadmap] falling back to a fresh deposit\n");
+            if (bmap) { bmap->beams.clear(); bmap->nDeposited = 0; bmap->nEmitted = 0; }
         }
     }
     if (!mapLoaded) {
@@ -14765,13 +15021,49 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     CUDA_CHECK(cudaMalloc(&d_depCount, sizeof(unsigned long long)));
     double* d_energy = nullptr; CUDA_CHECK(cudaMalloc(&d_energy, 5 * sizeof(double)));
 
-    auto depositLaunch = [&](DPhoton* buf, unsigned long long cap) {
+    // Beam staging buffer, sized like the CPU's per-thread banks: 2x the -beamcount target so
+    // the pass can overshoot before the one exact (unbiased) host-side trim to the target,
+    // which is what makes -beamcount mean what it says. Clamped to a quarter of free VRAM so
+    // it never competes with the photon buffer for the card.
+    unsigned long long beamCap = 0;
+    DBeamDep* d_beams = nullptr;
+    unsigned long long* d_beamCount = nullptr;
+    if (bmap) {
+        CUDA_CHECK(cudaMalloc(&d_beamCount, sizeof(unsigned long long)));
+        beamCap = (beams->target > 0) ? (unsigned long long)(2 * beams->target)
+                                      : ((unsigned long long)N * 2 + (1ull << 20));
+        { size_t freeB = 0, totalB = 0;
+          if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
+              unsigned long long fit = (unsigned long long)(freeB / 4 / sizeof(DBeamDep));
+              if (beamCap > fit) beamCap = fit; } }
+        if (beamCap < (1ull << 16)) beamCap = (1ull << 16);
+        while (beamCap >= (1ull << 14) &&
+               cudaMalloc(&d_beams, (size_t)beamCap * sizeof(DBeamDep)) != cudaSuccess) {
+            cudaGetLastError(); d_beams = nullptr; beamCap >>= 1;   // halve until it fits
+        }
+        if (!d_beams) { beamCap = 0; cudaFree(d_beamCount); d_beamCount = nullptr; bmap = nullptr;
+            std::fprintf(stderr, "[beams] could not allocate a device beam buffer; "
+                                 "the volume will be invisible.\n"); }
+    }
+
+    auto depositLaunch = [&](DPhoton* buf, unsigned long long cap, double beamKeep) {
         CUDA_CHECK(cudaMemset(d_depCount, 0, sizeof(unsigned long long)));
         CUDA_CHECK(cudaMemset(d_energy, 0, 5 * sizeof(double)));
         DCamSet cs{};                       // nCam == 0: every camera splat is a no-op
         cs.cams = nullptr; cs.films = nullptr; cs.hits = nullptr; cs.nCam = 0;
         cs.depPhotons = buf; cs.depCount = d_depCount; cs.depCap = cap;
+        if (d_beamCount) {
+            CUDA_CHECK(cudaMemset(d_beamCount, 0, sizeof(unsigned long long)));
+            cs.beamOut = d_beams; cs.beamCount = d_beamCount;
+            cs.beamCap = beamCap; cs.beamKeep = beamKeep;
+        }
         launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false, CAM_B, heroC);
+    };
+    auto readBeamCount = [&]() -> unsigned long long {
+        if (!d_beamCount) return 0;
+        unsigned long long n = 0;
+        CUDA_CHECK(cudaMemcpy(&n, d_beamCount, sizeof n, cudaMemcpyDeviceToHost));
+        return n;
     };
 
     // Single-pass deposit: the old flow ran the WHOLE forward trace twice (a count-only
@@ -14791,25 +15083,46 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
            cudaMalloc(&d_photons, (size_t)cap * sizeof(DPhoton)) != cudaSuccess) {
         cudaGetLastError(); d_photons = nullptr; cap >>= 1;   // halve until it fits
     }
-    unsigned long long nDep = 0;
+    unsigned long long nDep = 0, nBeam = 0;
     if (d_photons) {
-        depositLaunch(d_photons, cap);      // optimistic fill against the guess
+        depositLaunch(d_photons, cap, 1.0); // optimistic fill against the guess
         CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-        if (nDep > cap) {                   // undershot: rerun once at the exact size
-            cudaFree(d_photons); d_photons = nullptr;
-            CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
-            depositLaunch(d_photons, nDep);
+        nBeam = readBeamCount();
+        // ONE rerun settles both overflows, because the two are independent knobs on the same
+        // trace: the photon buffer is resized to the now-exact count, and the beams get a
+        // survival rate that fits them into theirs. Neither perturbs the transport RNG (the
+        // beam roulette draws from the per-photon SIDE stream, see dEmitBeams), so the rerun
+        // reproduces the surface deposit photon-for-photon whatever the beam rate is.
+        const bool phOver = (nDep > cap);
+        const bool bmOver = (d_beams && nBeam > beamCap);
+        if (phOver || bmOver) {
+            if (phOver) {
+                cudaFree(d_photons); d_photons = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
+                cap = nDep;
+            }
+            // 0.95, not 1.0: the survivor count is Binomial(nBeam, keep), so aiming exactly at
+            // the cap would overflow half the time — and an overflow past the cap is DROPPED
+            // (unlike the photon count, which the atomic still reports exactly), which would
+            // bias the estimate. 5% headroom is ~50 standard deviations at a 1 M cap.
+            const double keep = bmOver ? 0.95 * (double)beamCap / (double)nBeam : 1.0;
+            depositLaunch(d_photons, cap, keep);
             unsigned long long nFill = 0;
             CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
             if (nFill < nDep) nDep = nFill;
+            nBeam = readBeamCount();
         }
     } else {
         // Couldn't stage even a modest guess: fall back to the old two-pass flow.
-        depositLaunch(nullptr, 0);          // count-only sizing pass
+        depositLaunch(nullptr, 0, 1.0);     // count-only sizing pass
         CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        nBeam = readBeamCount();
         if (nDep > 0) {
             CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
-            depositLaunch(d_photons, nDep); // fill pass (same seed => same nDep deposits)
+            const double keep = (d_beams && nBeam > beamCap)
+                              ? 0.95 * (double)beamCap / (double)nBeam : 1.0;
+            depositLaunch(d_photons, nDep, keep);   // fill pass (same seed => same nDep deposits)
+            nBeam = readBeamCount();
         }
     }
     if (nDep > 0 && d_photons) {
@@ -14834,6 +15147,44 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         }
     }
     if (d_photons) cudaFree(d_photons);
+
+    // ---- download the deposited beams ----
+    // Straight widen into PhotonBeam: `s0` is 0 for every downloaded record because a DEPOSIT
+    // is always a WHOLE crossing — sub-segments are a product of the host-side split, which
+    // needs the final kernel radius and therefore cannot run until after this (same reason
+    // .pmap stores raw crossings; see photonbeams.h).
+    if (bmap) {
+        const unsigned long long stored = (nBeam < beamCap) ? nBeam : beamCap;
+        if (nBeam > beamCap)
+            std::fprintf(stderr, "[beams] warning: %llu crossings overflowed the %llu-record "
+                                 "device buffer even after rescaling; keeping %llu. Lower "
+                                 "-beamcount or free VRAM.\n",
+                         (unsigned long long)nBeam, (unsigned long long)beamCap,
+                         (unsigned long long)stored);
+        bmap->beams.clear();
+        bmap->beams.resize((size_t)stored);
+        std::vector<DBeamDep> bstage;
+        for (size_t off = 0; off < (size_t)stored; off += PM_CHUNK) {
+            size_t cnt = std::min(PM_CHUNK, (size_t)stored - off);
+            bstage.resize(cnt);
+            CUDA_CHECK(cudaMemcpy(bstage.data(), d_beams + off, cnt * sizeof(DBeamDep),
+                                  cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i < cnt; ++i) {
+                const DBeamDep& d = bstage[i];
+                bmap->beams[off + i] = PhotonBeam{Vec3(d.o.x, d.o.y, d.o.z),
+                                                  Vec3(d.d.x, d.d.y, d.d.z),
+                                                  0.0f, d.len, d.power, d.lambda, d.absorb, d.med};
+            }
+        }
+        bmap->nEmitted   = pm.nEmitted;      // same pass, same normalisation
+        bmap->nDeposited = bmap->beams.size();
+        // The one exact, unbiased trim that makes -beamcount mean what it says (host twin:
+        // tracePhotonPass). Set nDeposited FIRST so the overshoot stays reportable.
+        if (beams->target > 0) bmap->decimateTo((size_t)beams->target);
+    }
+    if (d_beams)     cudaFree(d_beams);
+    if (d_beamCount) cudaFree(d_beamCount);
+
     buildMap();                             // host counting sort -> cell-contiguous runs
 
     double energy[5] = {0,0,0,0,0};
@@ -14843,10 +15194,14 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     cudaFree(d_depCount); cudaFree(d_energy);
     if (mapSave && *mapSave) {
         EnergyReport passE{energy[0], energy[1], energy[2], energy[3], energy[4]};
-        if (savePhotonMap(mapSave, pm, passE, photonMapGuard(scene, diffraction)))
-            std::printf("[savemap] wrote %s: %zu photons (%lld emitted)\n",
-                        mapSave, pm.photons.size(), (long long)pm.nEmitted);
+        if (savePhotonMap(mapSave, pm, passE, photonMapGuard(scene, diffraction), bmap))
+            std::printf("[savemap] wrote %s: %zu photons + %zu beams (%lld emitted)\n",
+                        mapSave, pm.photons.size(), bmap ? bmap->beams.size() : (size_t)0,
+                        (long long)pm.nEmitted);
     }
+    // Built AFTER the save, deliberately: the file must hold the RAW crossings so one cache
+    // serves any later -beamradius / -beamk (the split is radius-dependent).
+    if (bmap && beams->build) beams->build(*bmap);
     }   // end if (!mapLoaded): deposit + build + optional save
 
     // ---- upload the built grid ----
@@ -14895,6 +15250,45 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // [begin,end) slice is empty so the gather loop simply never runs) — always upload it.
     dpm.cellStart = (const int*)up.keep(uploadVec(pm.cellStart));
 
+    // ---- upload the built beam map ----
+    // Same fold-at-upload trick as DGatherPhoton: the per-beam constants (carried flux, the
+    // 1/nEmitted pass normalisation, and the CIE triple at the beam's own wavelength — the
+    // host precomputed the last one in BeamMap::build for exactly this reason) collapse into
+    // one float3, so the inner loop multiplies geometry and medium terms alone. The BVH goes
+    // over verbatim; nNodes == 0 is the "no volume gather" sentinel every entry point tests.
+    DBeamMap dbm{};
+    if (bmap && !bmap->beams.empty() && !bmap->bvh.nodes.empty() && bmap->nEmitted > 0) {
+        const double invN = 1.0 / (double)bmap->nEmitted;
+        const size_t nb = bmap->beams.size();
+        std::vector<DBeamRec> recs(nb);
+        for (size_t i = 0; i < nb; ++i) {
+            const PhotonBeam& b = bmap->beams[i];
+            const Vec3&      ci = bmap->cie[i];
+            DBeamRec& r = recs[i];
+            r.o = DVec3(b.o.x, b.o.y, b.o.z);
+            r.d = DVec3(b.d.x, b.d.y, b.d.z);
+            r.s0 = b.s0; r.len = b.len;
+            const double w = (double)b.power * invN;
+            r.pX = (float)(ci.x * w); r.pY = (float)(ci.y * w); r.pZ = (float)(ci.z * w);
+            r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
+        }
+        std::vector<DNode> bnodes(bmap->bvh.nodes.size());
+        for (size_t i = 0; i < bnodes.size(); ++i) {
+            const BvhNode& s = bmap->bvh.nodes[i]; DNode& d = bnodes[i];
+            d.lo = {s.box.lo.x, s.box.lo.y, s.box.lo.z};
+            d.hi = {s.box.hi.x, s.box.hi.y, s.box.hi.z};
+            d.left = s.left; d.right = s.right; d.first = s.first; d.count = s.count;
+        }
+        dbm.beams     = (const DBeamRec*)up.keep(uploadVec(recs));
+        dbm.nodes     = (const DNode*)up.keep(uploadVec(bnodes));
+        dbm.primIdx   = (const int*)up.keep(uploadVec(bmap->bvh.primIdx));
+        dbm.radius    = (Real)bmap->radius;
+        dbm.invRadius = (Real)(1.0 / bmap->radius);
+        dbm.nNodes    = (int)bnodes.size();
+        std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %.4g "
+                    "uploaded for the volume gather\n", nb, bnodes.size(), bmap->radius);
+    }
+
     // ---- gather each camera ----
     // Pull the current device accumulation for camera c into out[c] (film + hit map).
     auto downloadFilm = [&](int c, const double* d_film, const double* d_hits, size_t npix) {
@@ -14921,7 +15315,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         for (long long base = 0; base < spp; base += chunk) {
             long long cs2 = (base + chunk <= spp) ? chunk : (spp - base);
             long long total = (long long)npix * cs2;
-            kGather<<<2048, 128>>>(up.sc, dpm, hc, d_film, d_hits, total, cs2, spp, base,
+            kGather<<<2048, 128>>>(up.sc, dpm, dbm, hc, d_film, d_hits, total, cs2, spp, base,
                                    resX[c], diffraction ? 1 : 0, fgRays, seed);
             cudaCheckKernel("photon-gather");
             // Live view: after a chunk, hand the host the frame-so-far so it can refresh the
