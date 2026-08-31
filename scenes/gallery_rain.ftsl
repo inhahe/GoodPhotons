@@ -124,7 +124,27 @@
 # RTX 4090, 1280x720: 310 spp in 600 s and still at 5.7% noise, and noise falls as 1/sqrt,
 # so `-noise 2` is ~2500 spp, i.e. well over an hour. `-time 600` already reads clearly (the
 # bow, the cloud and the shaft are all legible); -checkpoint + -resume adds to it later.
-# The flyby lives in gallery_settled.ftsl; this edition is a still, so it carries no curve.
+#
+# Render (flyby) — the `fly` curve below, 600 frames at 960x540, ALSO mode D (it declares it):
+#   ftrace -in scenes/gallery_rain.ftsl -camera fly -time 45 \
+#          -window-min -keepwindow -interval 15 -checkpoint \
+#          -o png/gallery_rain_fly/gallery_rain.png
+# `-camera fly` is not optional: without it -o renders EVERY camera, so you get the still and
+# then roll straight into all 600 frames. Do NOT pass -no-meter (the curve is exposure_lock,
+# and the meter pre-pass is what makes every frame share one anchor instead of flickering).
+#
+# NOT PHOTON MAPPING, and that is the one thing to get right here. gallery_settled's flyby is
+# mode M via render_gallery_flyby.bat, which is a big win there: mode M builds ONE
+# view-independent map and every frame is a cheap gather off it, so 600 frames cost about one
+# forward pass. That trade is unavailable in this edition. The rain volume and the cloud are
+# BOUNDED HETEROGENEOUS media and the bow is a view-dependent single-scatter signal off them;
+# mode D is the only mode that carries those AND the directly-seen glass and chrome (see the
+# sun discussion above). A photon map would buy back the frame cost by deleting the subject.
+# So this flyby is 600 INDEPENDENT BDPT renders -- D is camera-anchored, it shares nothing
+# across cameras (REFERENCE, "Other modes do NOT save time with multiple cameras"), and the
+# budget flag applies per frame. At 960x540 that is ~2x the still's sample rate, so -time 45
+# is ~50 spp/frame and 7.5 h for the loop; -time 20 is a rougher pass in 3.3 h. Check one
+# frame first (`-camera fly137 -time 45`) rather than discovering the exposure at frame 300.
 
 scene { units meters  spectral 360 830 1 }
 
