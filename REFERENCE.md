@@ -45,6 +45,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Putting them together — non-stationary noise](#putting-them-together--non-stationary-noise)
 - [Participating media / fog](#participating-media--fog)
 - [Scene language (FTSL)](#scene-language-ftsl)
+  - [Where asset paths are looked for](#where-asset-paths-are-looked-for)
   - [Conditional blocks (`prefer { … } else { … }`)](#conditional-blocks-prefer----else---)
   - [Camera animation (`camera_path`, `camera_orbit`)](#camera-animation-camera_path-camera_orbit)
   - [Multi-camera shared photon pass (modes `A`, `B`, and `M`)](#multi-camera-shared-photon-pass-modes-a-b-and-m)
@@ -523,19 +524,31 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > | **move the mouse over the window** | **steer** (joystick/rate look) — the cursor's offset from the window centre sets a **turn rate**: rest it near the centre (a neutral dead zone) and the view holds still so you can look at the scene; push it toward an edge and the view keeps turning that way (left/right = yaw, up/down = pitch, clamped just shy of straight up/down) for as long as you hold it there, so you can look a full circle. Where you look is where you fly. The pointer stays **visible** and free; steering only happens while the cursor is inside the window and stops the moment it leaves. |
 > | **`Space`** or **`+`** (held) | **fly forward** continuously along the view direction — one fixed **step per rendered frame** (see note below) |
 > | **`Shift`** or **`-`** (held) | **fly backward** — the exact opposite of where you're looking |
-> | **mouse wheel** | **dolly** forward (up) / back (down) — a discrete, fully-rendered move per notch (can't overshoot into geometry). Each notch travels several fly-steps, so it's a quick reposition; the held-key travel is the fine cruise |
-> | **`Ctrl` + mouse wheel** | change the **step size**: up = bigger steps, down = smaller (held-key step starts at 2 % of the scene radius, clamped to a sane band; the wheel dolly scales with it) |
+> | **mouse wheel** | **dolly** forward (up) / back (down) — a discrete, fully-rendered move per notch (can't overshoot into geometry). Each notch travels several fly-steps, so it's a quick reposition; the held-key travel is the fine cruise. The step **auto-scales to the distance ahead** (see note below), so a notch is about a sixth of the way to whatever is under the crosshair — roughly six clicks to arrive, from across a hall or from arm's length |
+> | **`Ctrl` + mouse wheel** | **bias** the automatic step: up = bigger, down = smaller (×1.15 per notch, clamped to ×0.02 … ×50). It multiplies the auto-scaled step rather than replacing it, and the multiplier persists; the current bias and the resulting distance are printed to the console |
 > | `C` | cycle **wall collision**: `slide` → `stop` → `noclip` (see note below) |
 > | `0` (or `Home`) | reset to the authored camera |
 > | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
 > | **resize the window** | change the preview resolution: the raster renders at the window's **actual pixel dimensions**, so the picture **fills the window (no letterbox bars)** and **shrinking it renders fewer pixels (faster on a heavy scene) while growing it renders more (crisper)**, up to the authored longest edge. The horizontal field of view widens/narrows with the window (like a game viewport — `fov_y` stays fixed, pixels stay square), so a wider window simply reveals more to the sides |
 >
 > **Motion is feedback-locked, not wall-clock-based.** Each held-key frame (and each
-> wheel notch) moves the eye exactly one fixed `step`, and *one frame is rendered per
+> wheel notch) moves the eye one `step`, and *one frame is rendered per
 > move* — so travel rate automatically scales with render speed: a heavy scene dollies
 > in a careful crawl, a light one moves briskly, and because every position you pass
 > through is actually drawn you can **never skip through a wall into the void between two
-> frames you didn't see**. Adjust the per-move distance live with `Ctrl`+wheel.
+> frames you didn't see**.
+>
+> **The step auto-scales to what you're looking at.** Before each move the viewer casts one
+> ray along the view direction and takes **2 % of the distance to the first surface** as the
+> step (clamped to a sane band relative to the scene radius); a wheel notch is several steps,
+> so it covers roughly a sixth of the gap to whatever is under the crosshair. That makes the
+> control behave the same when you're crossing a hall and when you're closing in on a small
+> object on a plinth — always about six clicks to arrive — instead of being tied to the size
+> of the scene's bounding box. *Why it isn't a fixed fraction of the scene radius:* the radius
+> is half the diagonal of **all** geometry, so a small subject standing on a large floor (or
+> inside a big backdrop) inherits the floor's scale and every notch overshoots the subject
+> entirely. Use `Ctrl`+wheel to bias the automatic step up or down if you want coarser or
+> finer travel than the default.
 >
 > **Wall collision keeps the camera out of solid geometry** (on by default). Each move is
 > cast against the scene (the engine's own BVH), so you can't fly through a wall. `C`
@@ -3816,6 +3829,40 @@ plug** — truncated paths, not a material bug. That scene therefore declares
 `render { max_bounce 32 }` and looks right without the operator having to know. When a scene
 sets it, the run prints `[scene] max bounce = N (from the scene's render block)`.
 
+### Where asset paths are looked for
+
+Every path a scene names — `mesh { file "…" }`, `texture { file "…" }`, an SPD CSV, a
+camera curve, a VDB grid, and the external buffers/images a `.gltf` refers to — is
+looked for in this order, and the **first place it exists wins**:
+
+| # | Directory | Why |
+|---|---|---|
+| 1 | the **current working directory** (i.e. the path exactly as authored) | so every scene that worked before 0.192.0 still resolves to the identical file |
+| 2 | the **directory holding the `.ftsl` file** | the intuitive base: a scene and its assets travel together |
+| 3 | that directory's **parents, up to 3 levels** | this repo's layout — `scenes/foo.ftsl` naming `textures/bar.png` means `<repo>/textures/bar.png`, a *sibling* of `scenes/`, not a child |
+| 4 | the directory containing **`ftrace.exe`** | engine data (`data/glass/…`, `data/metal/…`, `data/illuminants/…`) ships beside the binary |
+
+An **absolute** path is used as-is. A path that exists in none of the four is passed
+through unchanged, so the loader's own error message still quotes what you wrote.
+
+The upshot is that **a scene loads from any working directory**:
+`cd scenes && ..\ftrace gallery_rain.ftsl` works, and so does running it from the repo
+root. Before 0.192.0 only the latter did — assets silently missed from anywhere else,
+which (in a scene using `prefer`) could degrade into a successfully-loaded *empty*
+scene. `ftrace -checkpaths` is the self-test that guards this.
+
+When a file genuinely isn't found, the diagnostic names **every** directory that was
+searched and suggests near-miss filenames from each:
+
+```
+no such file (did you mean 'marble_gold.png'?) [searched: D:\…\scenes\textures, D:\…\textures]
+```
+
+Engine data (the `glass:` / `metal:` / `illuminant:` spectral library) deliberately
+uses only rows 1 and 4 — never the scene directory — because the library is indexed
+once per process, so a scene-dependent answer would be frozen at whichever scene
+happened to load first.
+
 ### Conditional blocks (`prefer { … } else { … }`)
 
 Some features aren't renderable in every mode — most notably **gradient-index (GRIN)
@@ -3840,9 +3887,18 @@ prefer {
 - `else` chains **flat** — `prefer { A } else { B } else { C }` — and you may **not**
   nest a `prefer` inside a branch.
 - At load time the resolver **trial-builds each branch in order and picks the first one
-  that's renderable** under the active mode; if none qualify it falls back to the last
-  branch. It prints `[prefer] branch N rejected (<reason>); trying the next` and
-  `[prefer] using branch N of M` so you can see which won.
+  that's renderable** under the active mode. If a branch builds but the mode can't render
+  it, the resolver moves on and — if no branch qualifies — keeps the last branch that
+  *built*. It prints `[prefer] branch N cannot be rendered (<reason>); trying the next`
+  and `[prefer] using branch N of M` so you can see which won.
+- A branch that **fails to build** (an authoring error: an unknown material, a missing
+  texture, a mistyped glass name) is not a fallback — it produced no scene at all. Such a
+  branch is reported as `[prefer] branch N FAILED TO BUILD (<reason>)`, and if *no* branch
+  builds the **load fails** with that error rather than quietly yielding an empty scene.
+  (Before 0.192.0 the commonest way to hit this was running a scene from another
+  directory, because asset paths resolved only against the current working directory;
+  they are now looked up relative to the scene file as well — see *Where asset paths are
+  looked for* below.)
 - Only **cameras** and **media** (the features with real mode gaps) participate in the
   support test; everything else always builds.
 
@@ -4371,13 +4427,13 @@ alone can't restore, so they are not disk-resumable.
 | `-keepwindow` / `-hold` | Like `-window`, but **don't auto-close** the live window when the render finishes — normally the window is torn down at process exit the instant the last frame completes, so a finished image only flashes on screen. With this set, ftrace keeps the final image up and blocks until you close the window yourself (handy for inspecting a quick `-raster` preview or a completed still), and the title bar switches to `✔ DONE — <why>` (see `-window`) so a held window can't be mistaken for one that is still converging. Implies `-window`. |
 | `-interval <s>` | Periodic image write / status line / ANSI `-preview` refresh (default 15 s). This is the **crash-safety** cadence — how often the PNG and the `.ftbuf` checkpoint are rewritten — and is deliberately *not* what drives the live window (see `-window-interval`). |
 | `-window-interval <s>` | How often the `-window` live view repaints (default 0.2 s), independent of `-interval`. The two used to share one timer, which meant any render finishing inside one interval never showed a single live frame — a 5 s `-mode W` frame under `-interval 8` painted once, as the process was exiting, so the finished image just flashed and vanished. They are separate now because they want opposite cadences: rewriting a PNG and a multi-megabyte checkpoint five times a second is pointless disk churn, while repainting a window every 15 s defeats the point of having one. Repaint granularity is bounded below by the renderer's own chunk size (one chunk ≈ 0.15 s of GPU work, minimum 1 spp), so on a 480² `-mode W -spp 8` frame you get one repaint per spp — the first complete image lands after ~0.6 s instead of after 5 s. Measured cost of the extra repaints there: **+3.9 %** of render time (a repaint tone-maps and presents the whole frame, ~25 ms at 480²). The floor is adaptive — never less than the larger of this value and 12× what the last repaint actually cost — so a 4K film backs itself off instead of spending all its time painting. `0` means "every chunk, subject only to that budget". `FTRACE_WINDOW_DEBUG=1` logs each repaint and its cost. |
-| `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets, `P` prints a paste-ready camera, plus **Clip/Reset buttons** in a panel below the image). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |
+| `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly (the step auto-scales to the distance ahead), Ctrl+wheel = bias that step, `C` = wall collision, `0` resets, `P` prints a paste-ready camera, plus **Clip/Reset buttons** in a panel below the image). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
 | `-raster-curve-budget <n>` | Cap on the preview triangles spent tessellating **curve / fur strands** (default `12000000`, ~3.8 GB of preview geometry). Past it the round-cone tubes coarsen (10-sided capped → 6/4/3-sided → capless → flat ribbon), and only if the cheapest tube still busts the budget are whole **strands** thinned out. A groomed pelt is millions of segments, so without this a `-raster`/`-explore` on one would allocate tens of GB and appear to hang. Preview-only — the ray-traced modes intersect the analytic strands and ignore it. |
 | `-raster-bench <n>` | Raster **frame-rate benchmark**: after the scene is built (and uploaded, on the GPU), re-render the first selected camera `n` times and report steady-state **ms/frame** (min/median/mean + fps) — the interactive explorer's per-move cost, measured independently of startup. With `-device gpu` also prints a per-pass breakdown (clearvis/project/raster/shade/clear/expose+encode/download, timed with CUDA events on the GPU timeline). Add `-window` and it also reports the **live-window present tail** — what handing each finished frame to the preview costs the render thread — because that tail used to be larger than the render itself and a backend speedup is only real if it stays small. With `-device gpu -window` it then runs a **second, zero-copy phase**: the same `n` frames rendered directly into the window's D3D11 texture, reported as one combined `render+present` figure (there is no separate tail to report — there is no handoff) plus its own per-pass breakdown, so the two presentation paths can be compared pass by pass on one run. Note that the zero-copy *median* pins at the display refresh (16.67 ms / 60.0 fps) because presenting blocks on vblank once both back buffers are queued — read **min** for the true pipeline cost. Writes the last frame to `-o` so backends/builds can be byte-compared. |
 | `-see-through` / `-seethrough` / `-glass` | In `-raster`, render **clear** materials (dielectric / thin-film / filter / diffuse-transmit) as actually see-through instead of solid ghosts: each clear surface between the camera and the opaque background **dims** and **milkily hazes** what's behind it, cumulative with the number of clear surfaces crossed (no refraction, no coloured absorption). Order-independent, so overlapping glass needs no sort. See the preview note under **Render modes**. |
 | `-glass-clarity <0..1>` | Per-surface transmittance for `-see-through` (default `0.85`; higher = clearer / less dimming). Passing it implies `-see-through`. |
-| `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`) and hands control to you: Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `T` = cycle the lit preview (see below), `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. The flyby's frames are kept as a **camera-path timeline** in the panel below the image: **scrub/play/pause** across them, **lock** the camera onto the path (travel forward/back along it at a **cams/update** or **cams/second** speed), or release to fly freely — see **Interactive camera** for the full panel. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. **`T` — cycle the lit preview:** the still view cycles **raster → mode `W` → path-traced → raster**. The flat raster (default) is instant and is what you navigate with; the other two render the pose you are actually standing at. Whichever is active, the instant you move the camera it drops back to the responsive raster and re-renders once you settle, so navigation stays fluid. The scene-ignore flags (`-no-media`/`-no-env`/`-no-fluoro`, `-max-bounce`, `-direct-only`) apply to both, so you can strip/cap the scene for a faster preview.<br><br>**mode `W`** is the deterministic Whitted preview (see **Render modes**) on the **CPU**, so unlike the path-traced stage it works on **any scene** and needs no GPU — full spectral walk, all materials, media, environment, and the `-gi` one-bounce gather if you asked for one. It is **noise-free**, so it does not need to converge: the pose renders **once**. Because a mode-`W` frame costs anywhere from ~0.4 s (a Cornell box) to ~26 s (a gyroid labyrinth at 960×600), it is delivered progressively — a **coarse full-frame pass lands immediately**, then full-resolution **row bands** sweep down over it, with the band height continuously retuned from the measured cost of the previous band to keep the viewer responsive on fast and slow scenes alike. The title bar shows the percentage complete. Moving the camera simply abandons the unfinished rows. If the scene contains a material that **de-heroes** the path onto one wavelength — a `layered` coat, participating media, a GRIN volume, or `-heroc 1` — the preview keeps adding passes up to 16 spp to resolve its colour; on any other scene 1 spp is already exact and it stops there. Dispersive materials (glass, thin film, multilayer, grating, half-mirror, fluorescence) used to be on that list and no longer are: mode `W` splits the bundle at a dispersive vertex, so they are colour-correct in the very first pass — see the glass note under **Render modes**. **`-explore -mode W` opens straight into this preview** instead of the raster.<br><br>**path-traced** progressively traces the pose with the fast **RGB backward** tracer (the Stage-2 `-rgb` walk) into a resident GPU session: while the camera holds still the image **converges in place** (the title shows accumulated `spp`), so it ends up more correct than mode `W` — real multi-bounce GI — but it starts noisy, needs a CUDA GPU, and only works when the scene+camera are inside the fast-RGB scope (same scope as `-rgb`). When it isn't available the cycle **skips it**, so `T` becomes a plain raster ↔ mode `W` toggle. |
+| `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`) and hands control to you: Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly (the step auto-scales to the distance ahead), Ctrl+wheel = bias that step, `C` = wall collision, `T` = cycle the lit preview (see below), `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. The flyby's frames are kept as a **camera-path timeline** in the panel below the image: **scrub/play/pause** across them, **lock** the camera onto the path (travel forward/back along it at a **cams/update** or **cams/second** speed), or release to fly freely — see **Interactive camera** for the full panel. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. **`T` — cycle the lit preview:** the still view cycles **raster → mode `W` → path-traced → raster**. The flat raster (default) is instant and is what you navigate with; the other two render the pose you are actually standing at. Whichever is active, the instant you move the camera it drops back to the responsive raster and re-renders once you settle, so navigation stays fluid. The scene-ignore flags (`-no-media`/`-no-env`/`-no-fluoro`, `-max-bounce`, `-direct-only`) apply to both, so you can strip/cap the scene for a faster preview.<br><br>**mode `W`** is the deterministic Whitted preview (see **Render modes**) on the **CPU**, so unlike the path-traced stage it works on **any scene** and needs no GPU — full spectral walk, all materials, media, environment, and the `-gi` one-bounce gather if you asked for one. It is **noise-free**, so it does not need to converge: the pose renders **once**. Because a mode-`W` frame costs anywhere from ~0.4 s (a Cornell box) to ~26 s (a gyroid labyrinth at 960×600), it is delivered progressively — a **coarse full-frame pass lands immediately**, then full-resolution **row bands** sweep down over it, with the band height continuously retuned from the measured cost of the previous band to keep the viewer responsive on fast and slow scenes alike. The title bar shows the percentage complete. Moving the camera simply abandons the unfinished rows. If the scene contains a material that **de-heroes** the path onto one wavelength — a `layered` coat, participating media, a GRIN volume, or `-heroc 1` — the preview keeps adding passes up to 16 spp to resolve its colour; on any other scene 1 spp is already exact and it stops there. Dispersive materials (glass, thin film, multilayer, grating, half-mirror, fluorescence) used to be on that list and no longer are: mode `W` splits the bundle at a dispersive vertex, so they are colour-correct in the very first pass — see the glass note under **Render modes**. **`-explore -mode W` opens straight into this preview** instead of the raster.<br><br>**path-traced** progressively traces the pose with the fast **RGB backward** tracer (the Stage-2 `-rgb` walk) into a resident GPU session: while the camera holds still the image **converges in place** (the title shows accumulated `spp`), so it ends up more correct than mode `W` — real multi-bounce GI — but it starts noisy, needs a CUDA GPU, and only works when the scene+camera are inside the fast-RGB scope (same scope as `-rgb`). When it isn't available the cycle **skips it**, so `T` becomes a plain raster ↔ mode `W` toggle. |
 | `-no-meter` / `-nometer` | Skip the **exposure-lock metering pre-pass**. Normally a locked `camera_curve`/`camera_path`/`camera_orbit` group meters (up to 64 of) its frames up front to compute one shared exposure anchor, so the flyby doesn't flicker. With this flag that pre-pass is skipped and each frame **auto-exposes on its own** — faster startup (no metering the whole path), at the cost of possible frame-to-frame brightness flicker on an animated flyby. Implied by `-explore` (the interactive viewer auto-exposes per frame, so metering a whole flyby just to fly one frame is wasted work). |
 | `-noclip` / `-nocollide` | Start the interactive fly-viewer with **wall collision off** (fly through geometry) — for placing a camera *outside* the room or *inside* glass. Collision is **on by default** (you can't fly through walls); press `C` in the viewer to cycle `slide` → `stop` → `noclip` live. See the fly-camera controls under **Interactive fly camera**. |
 | `-anim <file.json>` | Edit a **loom `CurveDrive` sidecar** in the interactive fly editor (implies `-explore`). The editor's control points become the drive's N-dimensional points: channels 0–2 are the point you see and move in 3-D, channels 3+ are non-spatial values carried along per point. **Save** writes the reshaped curve back to the sidecar atomically, preserving the drive's name/mode/dims and every channel → scene-variable **binding**. A sidecar that doesn't exist yet is created on the first Save (from whatever control points the scene seeded), so this is also how you start a drive. See **Editing a loom animation drive** under **Interactive fly camera**. |
@@ -4405,10 +4461,24 @@ alone can't restore, so they are not disk-resumable.
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
 `-checkbluenoise`, `-checkfnoise`, `-checkstochtile`, `-checkreaction`, `-checkcurv`,
-`-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checksdf`, `-checksun`,
-`-checkbind`, `-checkprop`, `-checkhair`,
+`-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checkprefer`, `-checkpaths`,
+`-checksdf`, `-checksun`, `-checkbind`, `-checkprop`, `-checkhair`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
-`PASS`/`FAIL`. `-checkmesh` guards the **mesh importers**: it writes one unit cube in
+`PASS`/`FAIL`. `-checkpaths` guards **asset path resolution** (see *Where asset paths
+are looked for*): it builds a throwaway project tree in the temp directory, `cd`s
+somewhere unrelated, and asserts that a scene loads from there with its texture found
+via the scene's *parent* directory, that an absolute path is returned unchanged, that an
+unresolvable path is returned unchanged (so the loader's own error still quotes it),
+that the working directory still wins over the scene directory, that the scene-directory
+scope is popped on the way out, and that engine data (`data/glass`) resolves relative to
+the executable. `-checkprefer` guards **`prefer { … } else { … }` resolution**: it loads
+seven in-memory scenes covering the three outcomes a trial build can have (didn't build /
+built but unrenderable in this mode / renderable), and asserts the distinction that matters
+— a branch that failed to build is never a usable fallback, so a scene whose every branch
+fails must fail to *load* rather than quietly resolve to an empty scene. It also pins the
+single-node fast path (which keeps the resolving trial as the final scene), the multi-node
+rebuild, and the ordering rule that a later node's unbuildable branch must not sink an
+earlier node. `-checkmesh` guards the **mesh importers**: it writes one unit cube in
 six encodings (OBJ quads, PLY ascii / binary-LE / binary-BE, a "noisy" splat-shaped PLY
 whose vertices carry unknown scalar and list properties around an entirely ignored
 extra element, and STL binary / ascii), loads each, and asserts the six produce an

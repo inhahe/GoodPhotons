@@ -6077,6 +6077,11 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         ro = origin + dir * RAY_EPS; rd = dir;
         return true;
     }
+    // The grandTotal test above lets a scene with emissive volumes but NO emitters through,
+    // and the volumeBirth draw can miss (uniform() == 1 exactly), which would index a null
+    // sc.emitters. Reject that here rather than faulting the device; the test draws no
+    // randomness, so scenes that do have emitters are bit-identical.
+    if (sc.nEmitters <= 0) return false;
     // Power-weighted emitter selection (single emitter draws no randomness).
     int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
     const DEmitter em = sc.emitters[ei];
@@ -6586,6 +6591,13 @@ __device__ static void camSpecularSplatAllHero(const DScene& sc, const DCamSet& 
 // byte-identical to genPhoton (λ-independent); only the wavelength/throughput bundle differs.
 __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int camMode, int C,
         DRng& rng, DVec3& ro, DVec3& rd, Real* lam, Real* beta, bool& secAlive, double& eEmitted) {
+    // A scene with no emitters arrives here with sc.emitters == nullptr (the host uploads a
+    // null pointer for an empty emitter list), so the indexing below would fault the device.
+    // genPhoton has the equivalent prologue (grandTotal <= 0) and dGenLightSubpath the
+    // equivalent nEmitters test; this kernel had neither, which is why an empty scene showed
+    // up as "an illegal memory access was encountered" instead of a black frame. The test
+    // draws no randomness, so every scene that does have emitters stays bit-identical.
+    if (sc.nEmitters <= 0 || sc.totalPower <= 0.0) return false;
     int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
     const DEmitter em = sc.emitters[ei];
     Real u1 = rng.uniform(), u2 = rng.uniform();

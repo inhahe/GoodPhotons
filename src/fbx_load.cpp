@@ -1,9 +1,11 @@
 // FBX mesh loader implementation — confines the vendored ufbx library to this one
 // translation unit (see src/fbx.h for the rationale and the public signature).
+#define _CRT_SECURE_NO_WARNINGS   // assetbytes.h reads files with plain C stdio
 #include "fbx.h"
 #include "scene.h"
 #include "geometry.h"
 #include "linalg.h"
+#include "assetbytes.h"
 
 #include <cmath>
 #include <cstdio>
@@ -44,11 +46,17 @@ int loadFbx(Scene& s, const char* path, int matId, const Affine& xf,
     opts.generate_missing_normals = true;
 
     ufbx_error uerr;
-    ufbx_scene* scene = ufbx_load_file(path, &opts, &uerr);
+    // ufbx insists on opening the file itself, so the search path (assetbytes.h) has
+    // to be applied to the name before it goes in — this is the one mesh format that
+    // does not come through assetbytes::readFile and so does not get it for free.
+    const std::string real = assetbytes::resolve(path ? path : "");
+    ufbx_scene* scene = ufbx_load_file(real.c_str(), &opts, &uerr);
     if (!scene) {
         char buf[512];
         ufbx_format_error(buf, sizeof(buf), &uerr);
         err = std::string("ufbx: ") + buf;
+        if (uerr.type == UFBX_ERROR_FILE_NOT_FOUND)
+            err += " — " + assetbytes::describeOpenFailure(path ? path : "");
         return 0;
     }
 

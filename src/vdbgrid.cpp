@@ -26,6 +26,7 @@
 #endif
 
 #include "vdbgrid.h"
+#include "assetbytes.h"
 
 #include <cstdio>
 #include <cstring>
@@ -74,10 +75,16 @@ bool invert3x3(const double m[9], double out[9]) {
 
 } // namespace
 
-bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err,
+bool loadVdbGrid(const std::string& authored, VdbGrid& out, std::string& err,
                  const std::string& wantName) {
+    // A volume is a scene asset like any other: resolve once here, and pass the
+    // RESOLVED path on to the OpenVDB reader below so it opens the same file.
+    const std::string path = assetbytes::resolve(authored);
     FILE* fp = std::fopen(path.c_str(), "rb");
-    if (!fp) { err = "cannot open '" + path + "'"; return false; }
+    if (!fp) {
+        err = "cannot open '" + authored + "': " + assetbytes::describeOpenFailure(authored);
+        return false;
+    }
 
     // Dispatch on magic: a native OpenVDB `.vdb` begins with the int64 magic
     // 0x56444220 ("VDB "). Delegate those to the hand-rolled OpenVDB reader (no

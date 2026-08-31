@@ -2477,16 +2477,20 @@ private:
     // Load a measured SPD/reflectance from an external data file: `spd file:<path>`
     // (or `reflect file:<path>`). Reads the CSV/whitespace table mirrored under data/
     // into a tabulated `Spectrum` — piecewise-linear by default, or monotone-cubic
-    // (no overshoot) when `cubic` is set (`… interp=cubic`). Paths resolve relative to
-    // the current working directory (same convention as `texture`/`mesh` file refs),
-    // and repeated references to the same (path, interp) share one cached curve.
+    // (no overshoot) when `cubic` is set (`… interp=cubic`). Paths resolve through the
+    // shared asset search path — cwd, then the scene's own directory and its parents,
+    // then the ftrace directory (assetbytes.h), the same convention as `texture`/`mesh`
+    // file refs — and repeated references to the same (path, interp) share one cache
+    // entry, keyed on the AUTHORED path (resolution is deterministic within a load).
     Spectrum loadSpdFile(const std::string& path, bool cubic = false) {
         std::string key = cubic ? path + "\x01cubic" : path;
         auto it = spdFileCache_.find(key);
         if (it != spdFileCache_.end()) return it->second;
         std::vector<std::pair<double, double>> pairs;
         std::string ferr;
-        if (!speclib::loadSpdCsv(path, pairs, ferr)) { fail(ferr); return constantSpectrum(0); }
+        if (!speclib::loadSpdCsv(assetbytes::resolve(path), pairs, ferr)) {
+            fail(ferr); return constantSpectrum(0);
+        }
         // Coverage check: warn (once per key) if the file fails to cover the
         // perceptually significant band (~400..700 nm, where >99.9% of the CIE
         // observer's response lives), since sampling outside the file just holds the
@@ -8013,6 +8017,21 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
                        const SupportFn& supported = {},
                        LoadTiming* timing = nullptr,
                        const assetbytes::Overlay* assets = nullptr) {
+    // Assets this scene names are looked for beside the scene as well as in the cwd
+    // (assetbytes.h documents the whole order and why). `nameForMsgs` is the scene's
+    // path for a real file and a placeholder like "<live>" for the loom channel — a
+    // placeholder has no parent directory, which simply leaves the search path alone.
+    // Scoped rather than global: a later load of a different scene must not inherit
+    // this one's directory, and every `prefer` branch must see the same one.
+    assetbytes::ScopedSceneDir _sceneDir([&]() -> std::string {
+        std::error_code ec;
+        const std::filesystem::path p = assetbytes::toPath(nameForMsgs);
+        if (!p.has_parent_path()) return std::string();
+        const std::filesystem::path d = p.parent_path();
+        if (d.empty() || !std::filesystem::is_directory(d, ec)) return std::string();
+        return d.string();
+    }());
+
     // Report the keys nothing in the loader read. A warning rather than an error:
     // the check is new, and an old scene carrying a stale property should still
     // render — but it must SAY so, because the alternative (today's behaviour) is
@@ -8062,6 +8081,11 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     assetbytes::Warmer warmer;
     if (!assets || assets->empty()) {
         std::vector<std::string> paths = assetbytes::scanAssetPaths(src);
+        // Resolve here, on THIS thread: the search path is scoped to this call, and
+        // reading it from the warmer thread would race the scope's exit. A path that
+        // resolves to nothing comes back unchanged and simply fails to open, which is
+        // what prefetch already does with anything it can't read.
+        for (std::string& p : paths) p = assetbytes::resolve(p);
         if (!paths.empty()) warmer.start(std::move(paths));
     }
 
@@ -8110,54 +8134,106 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
         return {true, {}, supported ? supported(out) : nullptr};
     };
 
-    // Greedy per-node resolution (nodes fixed left-to-right; the realistic case is a
-    // single node). For each node pick the first branch that yields a renderable scene,
-    // else keep the last branch.
+    // Per-node resolution: for each node take the FIRST branch that yields a renderable
+    // scene, else fall back. Two things this has to get right, both of which it once got
+    // wrong:
     //
-    // Single-node fast path: with exactly one `prefer`, the trial that resolves the
-    // node IS the final scene (its flattened block list == the resolved one), so we
-    // keep that trial's `Loaded` and skip a redundant final rebuild — which for a
-    // heavy scene would otherwise re-parse and RE-LOAD every mesh a second time.
+    // (1) FALLING BACK IS NOT THE SAME AS SUCCEEDING. The fallback exists for the third
+    //     Trial outcome — a branch that BUILDS but that this renderer cannot render — so
+    //     "keep the last branch" is only meaningful when that branch produced a scene. A
+    //     branch with `built == false` produced NOTHING, and accepting it (which is what
+    //     `c == nb - 1` used to do unconditionally, on the single-node fast path that
+    //     skips the final rebuild) hands the caller an empty `Loaded` and returns true:
+    //     0 cameras, 0 geometry, 0 emitters, reported as a successful load. That is how
+    //     `cd scenes && ftrace gallery.ftsl` — where every asset path, being cwd-relative,
+    //     misses — became an illegal memory access in the CUDA forward kernel instead of
+    //     "unknown glass 'fused-silica'". See known-issues.md. The invariant restored
+    //     here is simply: a `Loaded` that no build ever produced is never handed back.
+    //     The fallback is the last branch that actually BUILT, and when no branch built
+    //     the final rebuild below runs and reports the builder's own error.
+    //
+    // (2) RESOLUTION IS ORDER-DEPENDENT, so one sweep is not enough. While node j is being
+    //     resolved every OTHER node sits at its current choice — and a LATER node whose
+    //     branch 1 does not build makes EVERY trial of an EARLIER node fail for a reason
+    //     that has nothing to do with the earlier node. One greedy pass therefore both
+    //     mis-attributes the error and can pick a worse branch for the earlier node. So
+    //     sweep to a fixed point: repeat the pass until a whole sweep changes no choice
+    //     (a sweep's trials are then known to have used the final context), capped at
+    //     nodes+1 sweeps against pathological oscillation. A single node has no other
+    //     node to be perturbed by, so it still resolves in exactly one sweep — and the
+    //     realistic scene has exactly one.
+    //
+    // Single-node fast path: with exactly one `prefer`, the trial that resolves the node
+    // IS the final scene (its flattened block list == the resolved one), so keep that
+    // trial's `Loaded` and skip a redundant final rebuild — which for a heavy scene would
+    // otherwise re-parse and RE-LOAD every mesh a second time.
     const bool singleNode = (preferIdx.size() == 1);
     std::vector<int> choice(preferIdx.size(), 0);
     Loaded accepted;
     bool haveAccepted = false;
-    for (size_t j = 0; j < preferIdx.size(); ++j) {
-        int nb = (int)blocks[preferIdx[j]].branches.size();
-        int chosen = nb - 1;
-        for (int c = 0; c < nb; ++c) {
-            choice[j] = c;
-            Loaded trial;
-            Trial t = tryBuild(choice, trial);
-            // A clean stop is NOT a branch failure. Without this, an interrupted branch
-            // looks "rejected", `prefer` moves on to the next one, and the stop gets
-            // ignored while the loader builds an entire alternative scene.
-            if (ft::stopRequested()) { err = "scene load stopped by request"; return false; }
-            const bool renderable = (t.built && t.reason == nullptr);
-            // For a single node, whichever branch we end on (first renderable, or the
-            // last as fallback) is `chosen`, and `trial` currently holds its build.
-            if (singleNode && (renderable || c == nb - 1)) {
-                accepted = std::move(trial);
-                haveAccepted = true;
-            }
-            if (renderable) { chosen = c; break; }   // renderable -> take it
-            if (c < nb - 1) {
+    bool anyUnresolved = false;      // some node had no branch that built, in the last sweep
+    std::string lastBuildErr;        // the builder error behind that
+    std::vector<std::string> notes;  // per-branch messages of the CONVERGED sweep only
+    const int maxSweeps = singleNode ? 1 : (int)preferIdx.size() + 1;
+    for (int sweep = 0; sweep < maxSweeps; ++sweep) {
+        const std::vector<int> before = choice;
+        haveAccepted = false; anyUnresolved = false; lastBuildErr.clear(); notes.clear();
+        for (size_t j = 0; j < preferIdx.size(); ++j) {
+            int nb = (int)blocks[preferIdx[j]].branches.size();
+            int chosen = -1;             // last branch that built; -1 = none did
+            for (int c = 0; c < nb; ++c) {
+                choice[j] = c;
+                Loaded trial;
+                Trial t = tryBuild(choice, trial);
+                // A clean stop is NOT a branch failure. Without this, an interrupted branch
+                // looks "rejected", `prefer` moves on to the next one, and the stop gets
+                // ignored while the loader builds an entire alternative scene.
+                if (ft::stopRequested()) { err = "scene load stopped by request"; return false; }
+                const bool renderable = (t.built && t.reason == nullptr);
+                if (t.built) {
+                    // Standing fallback: the newest branch that produced a scene. For a
+                    // single node this trial IS that scene, so keep it and skip the rebuild.
+                    chosen = c;
+                    if (singleNode) { accepted = std::move(trial); haveAccepted = true; }
+                } else {
+                    lastBuildErr = t.buildErr;
+                }
+                if (renderable) break;   // renderable -> take it
+                // A build failure on the LAST branch used to be the one failure never
+                // printed (`if (c < nb - 1)`) — i.e. exactly the failure most likely to
+                // sink the whole load. Buffered, not printed, because an unconverged
+                // sweep's failures are artifacts of (2) that the next sweep may erase.
                 const char* why = t.built ? t.reason : t.buildErr.c_str();
-                std::fprintf(stderr, "[prefer] branch %d rejected (%s); trying the next\n",
-                             c + 1, why ? why : "unrenderable");
+                char buf[1024];
+                std::snprintf(buf, sizeof buf, "[prefer] branch %d %s (%s)%s\n", c + 1,
+                              t.built ? "cannot be rendered" : "FAILED TO BUILD",
+                              why ? why : "unrenderable",
+                              (c + 1 < nb) ? "; trying the next" : "");
+                notes.push_back(buf);
             }
+            if (chosen < 0) { anyUnresolved = true; chosen = nb - 1; }
+            choice[j] = chosen;
         }
-        choice[j] = chosen;
+        if (choice == before) break;     // fixed point: this sweep used the final context
     }
+    for (const std::string& s : notes) std::fputs(s.c_str(), stderr);
 
     if (singleNode && haveAccepted) {
         L = std::move(accepted);
     } else {
-        // Multi-node: rebuild once with the fully-resolved choices across all nodes.
+        // Rebuild once with the fully-resolved choices across all nodes. This is also the
+        // authority on failure: if no branch of some node ever built, the build fails here
+        // and its error — the real one, from the builder — is what the caller sees.
         std::vector<Block> flat = flattenPrefer(blocks, preferIdx, choice);
         Builder bld;
         bld.assets = assets;
-        if (!bld.build(flat, L)) { err = bld.err; return false; }
+        if (!bld.build(flat, L)) {
+            err = anyUnresolved
+                ? "every branch of a 'prefer' block failed to build — the scene cannot be "
+                  "loaded. Last error: " + (lastBuildErr.empty() ? bld.err : lastBuildErr)
+                : bld.err;
+            return false;
+        }
     }
     for (size_t j = 0; j < preferIdx.size(); ++j)
         std::printf("[prefer] using branch %d of %d\n",

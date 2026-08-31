@@ -285,6 +285,15 @@ texture "tex_marble_axicon"   { file textures/marble_axicon.png   encoding srgb 
 # TWO — chrome takes its top 52%, the creature its bottom 48%. The crops share no pixel, so
 # these are two slabs off one block rather than the same stone printed twice.
 texture "tex_marble_creature" { file textures/marble_creature.png encoding srgb  filter bilinear  wrap clamp }
+# The TWELFTH cap, and the second slab quarried out of one sheet rather than given its own.
+# The gem compote arrived after all ten drops were spoken for, so `marble texture 7.jpg` is
+# cut the way `2.jpg` was for chrome/creature: it is 4650x4650, by far the largest in the set,
+# and the orb cap it used to carry alone spans 225x70 px in the still — it was already
+# discarding 97% of the sheet. The orb keeps the LEFT half and this takes the RIGHT; the two
+# crops share no pixel, so they are two slabs off one block. Prepared to the axicon's numbers
+# (k=0.45, s=0.30) rather than the orb's, because this cap catches coloured caustics from
+# THIRTEEN refracting solids at once and the stone must not tint any of them.
+texture "tex_marble_compote"  { file textures/marble_compote.png  encoding srgb  filter bilinear  wrap clamp }
 
 # `wrap clamp` (not `repeat`) with `uv planar axis=y` on each cap isosurface maps ONE slab
 # across each tabletop, referenced to that primitive's own world bounds — a quarried slab cut
@@ -303,6 +312,7 @@ material "capmarble_brass"    { type diffuse  reflect texture:tex_marble_brass }
 material "capmarble_oil"      { type diffuse  reflect texture:tex_marble_oil }
 material "capmarble_axicon"   { type diffuse  reflect texture:tex_marble_axicon }
 material "capmarble_creature" { type diffuse  reflect texture:tex_marble_creature }
+material "capmarble_compote"  { type diffuse  reflect texture:tex_marble_compote }
 
 # --- Hero-object materials -----------------------------------------------------
 # `roughness` after `preset` overrides the preset's polished lobe. Gold needs a LOT here, and
@@ -366,6 +376,64 @@ material "flint"    { type dielectric ior glass:SF10 }
 material "diamond"  { preset diamond }
 material "morpho"   { preset morpho }       # iridescent multilayer Bragg (blue morpho)
 material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) — 2nd iridescent, different model
+
+# --- Gem-compote materials (the twelfth exhibit) -----------------------------------
+# Thirteen absorbing dielectrics: a crystal bowl and the twelve faceted stones in it. The
+# GLB carries its colours in `KHR_materials_volume` (an attenuation colour + distance per
+# material) and ftrace's glTF reader implements no KHR material extension — under
+# `import_materials` all thirteen arrive as baseColorFactor 1,1,1 / metallic 0, i.e. thirteen
+# identical WHITE DIFFUSE materials. Importing them would throw away the entire asset. So each
+# node is bound to a real material here instead, and the colours are carried across by hand.
+#
+# THE CONVERSION IS EXACT, not eyeballed. KHR_materials_volume attenuates as
+# attenuationColor^(d/attenuationDistance), and ftrace's `absorb` is a Beer-Lambert sigma_a in
+# 1/metre applied as exp(-sigma*d). Equating them gives sigma = -ln(attenuationColor)/
+# attenuationDistance, which is the only arithmetic below.
+#
+# ...THEN DIVIDED BY THE DISPLAY SCALE, which is the one place a judgement is made. The raw
+# mesh is 0.146 x 0.179 x 0.159 m — life-size for a compote dish, and 24 px tall in this
+# frame, which is less than the smallest existing exhibit by half. It is shown at scale 3.0
+# (0.44 x 0.54 x 0.48 m, in line with the Klein bottle's 0.60). Tripling the piece triples
+# every interior path length, so holding sigma would cube the transmittance and the stones
+# would go to near-black — a gem that passes no light throws no caustic, which is the whole
+# reason this piece earns a plinth. Dividing sigma by 3 holds the OPTICAL DEPTH the asset was
+# authored with, so each stone reads at the saturation its author chose, at the size this
+# scene needs. (The alternative — keep sigma, accept 2-5% transmittance — was rejected on
+# exactly that ground: it is physically the honest reading of "a 45 cm ruby", but this is a
+# gallery of caustics and a black gem is a hole in it.)
+#
+# IOR IS THIS SCENE'S CHOICE, NOT THE FILE'S. The GLB says 1.52 flat for all thirteen, which
+# has no dispersion at all and would make thirteen colourless-fire stones. The bowl takes
+# `glass:crystal`, the house glass whose comment above explains why a gallery's vessel is cut
+# lead crystal; the twelve STONES take `glass:SF10`, the densest flint here (Abbe 28.5, 3.2x
+# BK7's splay), for the reason the axicon was recut in it — a faceted stone is precisely where
+# fire belongs, and these twelve are the only pieces in the scene small enough that the whole
+# caustic lands on one cap.
+#
+# PRIORITY disambiguates the nesting, and EVERY ONE OF THE THIRTEEN IS DISTINCT. Two separate
+# ambiguities have to be resolved and only the first is obvious:
+#   * BOWL vs STONE. The stones rest in the bowl's cavity and several sink into its inner
+#     surface. The stones outrank it (2..13 over 1), so a facet buried in the bowl wall
+#     refracts as gem — which is what a stone sitting in a dish looks like.
+#   * STONE vs STONE. The twelve are disjoint solids, but they are twelve loads of one file
+#     and the overlap test is on BOUNDS: a heap of stones in a dish has thoroughly interleaved
+#     AABBs, so a shared `priority 2` made 22 pairs a TIE and the loader warned about every one
+#     of them. Ranking them 2..13 (in the file's own node order) costs nothing, silences all
+#     22, and is the better answer even where it never fires: if two facets ever do touch, a
+#     deterministic winner beats an arbitrary one.
+material "cp_bowl"       { type dielectric  ior glass:crystal  priority  1  absorb rgb  22.3 79.3 70.6 }
+material "cp_amethyst"   { type dielectric  ior glass:SF10     priority  2  absorb rgb  39.0 71.5 15.5 }
+material "cp_tanzanite"  { type dielectric  ior glass:SF10     priority  3  absorb rgb  63.8 57.7 13.1 }
+material "cp_sapphire"   { type dielectric  ior glass:SF10     priority  4  absorb rgb 102.1 54.3 14.1 }
+material "cp_aquamarine" { type dielectric  ior glass:SF10     priority  5  absorb rgb  71.5 18.1 14.1 }
+material "cp_tourmaline" { type dielectric  ior glass:SF10     priority  6  absorb rgb  84.8 22.3 32.6 }
+material "cp_emerald"    { type dielectric  ior glass:SF10     priority  7  absorb rgb 102.1 23.3 53.2 }
+material "cp_peridot"    { type dielectric  ior glass:SF10     priority  8  absorb rgb  30.8 15.5 71.5 }
+material "cp_citrine"    { type dielectric  ior glass:SF10     priority  9  absorb rgb   7.0 22.3 85.7 }
+material "cp_topaz"      { type dielectric  ior glass:SF10     priority 10  absorb rgb   7.0 39.0 85.7 }
+material "cp_garnet"     { type dielectric  ior glass:SF10     priority 11  absorb rgb  14.4 74.5 81.1 }
+material "cp_rhodolite"  { type dielectric  ior glass:SF10     priority 12  absorb rgb  15.2 79.4 44.2 }
+material "cp_morganite"  { type dielectric  ior glass:SF10     priority 13  absorb rgb   6.3 26.9 20.5 }
 
 # --- Fur-creature materials (the eleventh exhibit) ---------------------------------
 # Lifted unchanged from `scenes/fur_creature.ftsl`, prefixed `cr_` so nothing here can
@@ -951,6 +1019,81 @@ isosurface "stand_creature_cap" { material capmarble_creature
     # cap is therefore sized to the SUBJECT (see the footprint above) rather than to a
     # measured light patch, and centred under it.
     box { center 6.45 0.80 4.40  size 1.10 0.20 0.90  round 0.02 } }
+
+# --- exhibit: THE GEM COMPOTE (the twelfth stand) --------------------------------------
+# In world coordinates with no `group { translate }` wrapper, for the axicon's reason: it has
+# no pre-spread layout position to be displaced from, so a `translate 0 0 0` would be noise.
+#
+# WHY HERE: (7.35, 6.20), the front-right court -- x 6.30..8.00, z 5.20..7.20, bounded by the
+# gyroid plinth, the creature cap and the glass cap, and the only court in the hall with no
+# flyby control point anywhere in it. TWO earlier sitings were measured and thrown away, and
+# both failures are worth keeping because they are the two ways a "gap in the layout" lies:
+#   * THE MIDDLE OF THE LAYOUT (x 3.70..5.85, z 3.20..4.95) failed twice over. At 5.6 m out
+#     the piece read 57 x 74 px -- the smallest thing in the frame by a factor of three -- and,
+#     standing NEARER than the dumbbell behind it, it covered about a third of that exhibit.
+#     A hole in the middle of a layout is not free floor; it is the sight line of everything
+#     behind it. (The near row is HIGH z: the still camera is at z=9.35 looking toward -z.)
+#   * THE FRONT-LEFT court is the axicon's. Candidates at (3.55, 6.70) and (3.20, 7.10)
+#     overlapped its silhouette by 214 x 226 and 290 x 203 px. The axicon is the one exhibit
+#     in this hall that exists to throw a coloured caustic, so it is the last thing to cover.
+# The front-right court survives all four tests (`scraps/_compotesite.py`, `_compotegrid.py`,
+# which project candidates through the real still camera):
+#   * IN FRAME AND LARGE. At scale 3.0 the piece is 0.44 x 0.54 x 0.48 m and projects to
+#     x 1062..1242, y 527..686 -- 180 x 159 px, bigger than the glass orb (166 x 132) and a
+#     match for the fur creature (198 x 169), with 38 px still to the right edge. The frame's
+#     right margin was the last genuinely empty band in the still.
+#   * OCCLUDES NOTHING. Every other exhibit is either further left or nearer the camera; the
+#     glass orb is the only piece behind it from here and the two silhouettes do not touch.
+#   * CLEAR OF EVERY CAP. The 1.00 x 1.20 top spans x 6.96..7.96, z 5.40..6.60: 0.81 m from
+#     stand_gyroid_cap (ends x 6.15) and 0.55 m from stand_creature_cap (ends z 4.85), which
+#     are the two nearest; the glass cap is 1.05 m away in z.
+#   * OFF THE FLIGHT PATH by more than 2 m at the closest control point -- see FLYBY. This
+#     court is the one place the camera never goes, which is exactly what a thirteen-solid
+#     refracting pile wants: it is a piece to be looked AT, not flown through.
+isosurface "stand_compote" {   # cap top y=0.90
+    material wirecage  union {
+        difference {
+            box { center 7.35 0.10 6.20  size 0.76  0.20  0.76  }
+            box { center 7.35 0.10 6.20  size 0.78  0.178 0.738 }
+            box { center 7.35 0.10 6.20  size 0.738 0.22  0.738 }
+            box { center 7.35 0.10 6.20  size 0.738 0.178 0.78  }
+        }
+        difference {
+            box { center 7.35 0.50 6.20  size 0.34  0.60  0.34  }
+            box { center 7.35 0.50 6.20  size 0.36  0.578 0.318 }
+            box { center 7.35 0.50 6.20  size 0.318 0.62  0.318 }
+            box { center 7.35 0.50 6.20  size 0.318 0.578 0.36  }
+        }
+    }
+}
+isosurface "stand_compote_cap" { material capmarble_compote
+    uv planar axis=y
+    # THE FOURTH CANTILEVERED CAP, and the only one whose cantilever was measured off a
+    # RENDER instead of a sweep. `_gemsweep.py` (which renders one piece over a bare catcher
+    # and reads the patch out of the buffer) sized every other cap here and cannot size this
+    # one: the piece is thirteen refracting solids whose light overlaps, standing in a hall
+    # whose other exhibits throw onto the same slab. `scraps/_compotecaustic.py` measures it
+    # in the finished still instead, un-projecting the saturated non-grid pixels back onto
+    # this plane -- which works because a dispersed SF10 caustic is saturated and the marble
+    # under it is neutral by construction (every cap is rescaled to mean reflectance 0.15,
+    # and this one, like the axicon's, has s pulled to 0.30 so the stone cannot tint it).
+    #
+    # THE FIRST VERSION OF THIS SLAB WAS WRONG AND THE RENDER SAID SO. It was 1.00 x 1.00
+    # centred on the piece, on the argument that a bowl is a rotationally symmetric lens
+    # holding stones at twelve different azimuths and therefore throws a RING, and a ring has
+    # no downwind to cantilever toward. But the sun is ONE direction, so all thirteen solids
+    # bend the same way and the patch is a lobe: 99% of the coloured light falls in
+    # x 7.24..7.60, z 5.58..6.05, centroid (7.42, 5.81) -- 0.39 m downwind in -z of the
+    # piece's own axis. The centred slab left 1.2% of it hanging over the far edge.
+    #
+    # So: 1.00 x 1.20 centred (7.46, 6.00), i.e. +0.11 x / -0.20 z off the piece and 0.20 m
+    # longer in the one axis the light actually walks along. That holds the union of the
+    # piece's 0.44 x 0.48 footprint and the whole patch with 0.15-0.55 m to spare -- and the
+    # number that matters is the 0.15 m on the FAR edge, which the 1.10-deep intermediate
+    # version had at 0.05 m. 0.05 m is not a margin, it is the coincidence the axicon's cap
+    # comment above warns about. It costs nothing: the nearest thing in -z is
+    # stand_creature_cap, still 0.55 m away.
+    box { center 7.46 0.80 6.00  size 1.00 0.20 1.20  round 0.02 } }
 
 # ==============================  HERO PIECES  =================================
 # Each piece is wrapped in the SAME `group { translate }` as its stand — see THE SPREAD
@@ -1705,6 +1848,68 @@ fur "cr_coat_paw_br" {
     droop 0.1   jitter 0.25
     seed 25
 }
+
+# --- THE GEM COMPOTE (the twelfth exhibit): thirteen refracting solids on one tabletop ---
+# A crystal compote dish holding twelve faceted stones. In world coordinates, on
+# stand_compote_cap (top y=0.90), scaled 3.0 from the 0.146 x 0.179 x 0.159 m asset to
+# 0.44 x 0.54 x 0.48 m -- the size that makes it read at 180 x 159 px in the still, i.e.
+# comparable with the creature and the orb rather than a curio. The GLB's base is exactly at
+# y=0 and it is centred in x/z, so `translate 7.35 0.90 6.20` seats it on the slab with no
+# fudge factor.
+#
+# THIRTEEN LOADS OF ONE FILE, which is the part that needs explaining. The asset is one GLB
+# with thirteen nodes -- the bowl plus `gem_00_amethyst` .. `gem_11_morganite` -- and ftrace
+# has exactly one lever for giving separate materials to separate nodes of a GLB:
+# `skip_material`, which drops every primitive whose glTF material NAME contains one of the
+# listed substrings. So each load imports the whole file and skips the other twelve pieces.
+# That is 13 x 4.5 MB of parsing, but it is 250,744 triangles total (the bowl is 250,000 of
+# them; each stone is 62), and the alternative -- `import_materials yes` -- would DESTROY the
+# asset: every material in the file is baseColor (1,1,1) with metallic 0, because the colour
+# lives entirely in KHR_materials_volume/transmission, which ftrace's reader does not
+# implement. All thirteen would import as the same white DIFFUSE surface, i.e. a plaster
+# bowl of plaster pebbles in a gallery whose entire subject is dielectric caustics.
+#
+# The commas are not decoration: FTSL starts a new statement at the second bareword, so the
+# twelve patterns must be ONE comma-joined token.
+mesh "cp_ruby" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_bowl }
+mesh "cp_amethyst" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_amethyst }
+mesh "cp_tanzanite" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,amethyst,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_tanzanite }
+mesh "cp_sapphire" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,amethyst,tanzanite,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_sapphire }
+mesh "cp_aquamarine" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,amethyst,tanzanite,sapphire,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_aquamarine }
+mesh "cp_tourmaline" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_tourmaline }
+mesh "cp_emerald" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,peridot,citrine,topaz,garnet,rhodolite,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_emerald }
+mesh "cp_peridot" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,citrine,topaz,garnet,rhodolite,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_peridot }
+mesh "cp_citrine" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,topaz,garnet,rhodolite,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_citrine }
+mesh "cp_topaz" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,garnet,rhodolite,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_topaz }
+mesh "cp_garnet" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,rhodolite,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_garnet }
+mesh "cp_rhodolite" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,morganite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_rhodolite }
+mesh "cp_morganite" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite
+    translate 7.35 0.90 6.20   scale 3.0   material cp_morganite }
 
 # ==============================  LIGHTING  ====================================
 # TWO lights now that the roof is gone (the xenon short-arc lamp that used to hang here was

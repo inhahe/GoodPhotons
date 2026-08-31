@@ -33,9 +33,14 @@
 //     forward; Shift or '-' fly backward) — the render loop advances you ONE fixed step
 //     per RENDERED frame while one is held (feedback-locked: motion scales with render
 //     speed, so you never skip past geometry you didn't see).
-//   * `wheel` (plain-wheel notches, + = up) DOLLIES the camera: each notch is one bounded
-//     fly-step forward (+) / back (-), fully rendered — precise, overshoot-proof nudging.
-//   * `wheelSpeed` (Ctrl+wheel notches, + = up) adjusts the STEP SIZE (up = bigger steps).
+//   * `wheel` (plain-wheel notches, + = up) DOLLIES the camera forward (+) / back (-), fully
+//     rendered — precise, overshoot-proof nudging. A notch is several fly-steps, and the step
+//     itself is ADAPTIVE: the render loop probes the distance to whatever is under the crosshair
+//     and takes a fixed fraction of it, so one notch is roughly a sixth of the way to what you
+//     are aiming at whether that is a doorway across a hall or a gem on a plinth.
+//   * `wheelSpeed` (Ctrl+wheel notches, + = up) BIASES that adaptive step by a multiplier
+//     (up = bigger). It cannot set an absolute distance: the next frame's probe would overwrite
+//     it. The bias persists and multiplies whatever the probe returns.
 //   * `reset` / `print` / `cycleCollide` are one-shot edge flags ('0'/Home reset the
 //     camera; 'P' prints a paste-ready camera block; 'C' cycles the collision mode
 //     slide -> stop -> noclip). `looking` reports whether the cursor is currently inside the

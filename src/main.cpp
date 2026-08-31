@@ -8400,6 +8400,281 @@ static int checkMeshFormats() {
     return ok ? 0 : 1;
 }
 
+// `prefer { } else { }` resolution semantics. This exists because of a bug that turned a
+// mistyped working directory into a CUDA "illegal memory access": every branch of the
+// gallery scene's prefer failed to BUILD (its cwd-relative asset paths all missed), and
+// the resolver accepted the last branch unconditionally — handing back an EMPTY scene
+// with `loaded == true`. 0 emitters, 0 cameras, 0 triangles, no error, and then the
+// forward kernel dereferenced a null emitter array. So the invariant under test is the
+// distinction the old code collapsed:
+//
+//   built == false            -> the branch produced NOTHING. Never a usable fallback.
+//   built, reason != nullptr  -> a real scene this mode can't render. THIS is what the
+//                                fallback is for, and what "keep the last branch" means.
+//   built, reason == nullptr  -> renderable; take it immediately.
+//
+// Every case below is a scene loaded through the real loader, so the assertions are about
+// what `loadSource` actually returns rather than about the resolver in isolation.
+static int checkPrefer() {
+    bool ok = true;
+    auto chk = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkprefer] %-58s BAD\n", what); ok = false; }
+        return cond;
+    };
+
+    // Shared scene tail: one lit quad + one camera, so a branch that builds is a scene the
+    // loader is willing to call complete. `%s` is the prefer block under test.
+    auto wrap = [](const std::string& preferBlock) {
+        return "scene { units meters }\n"
+               "material \"probe\" { type diffuse  reflect rgb 0.5 0.5 0.5 }\n"
+               "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+               "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+               + preferBlock;
+    };
+    // A camera branch. The camera's NAME tags the branch, so the resolved scene says which
+    // one won; no two branches below share a name.
+    auto cam = [](const char* tag) {
+        return "camera \"" + std::string(tag) + "\" { eye 0.5 0.5 2  look_at 0.5 0.5 0 "
+               " up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+    };
+    // Branch content that CANNOT build: it names a material that was never declared.
+    const std::string badQuad = "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material no_such_material }\n";
+    const std::string bad = badQuad + cam("bad");
+    // Which branch won, read back off the resolved camera's name ("" if there is none).
+    auto won = [](const ftsl::Loaded& L) {
+        return L.cameras.empty() ? std::string() : L.cameras[0].name;
+    };
+
+    // --- 1. Every branch fails to build => the load must FAIL, not succeed emptily. ------
+    // The exact regression. Before the fix this returned true with an empty Loaded.
+    {
+        ftsl::Loaded L; std::string e;
+        bool loaded = ftsl::loadSource(wrap("prefer {\n" + bad + "} else {\n" + bad + "}\n"),
+                                       "<checkprefer>", L, e);
+        chk("all branches fail to build -> load fails", !loaded);
+        chk("all-fail error names the cause",
+            e.find("every branch") != std::string::npos &&
+            e.find("no_such_material") != std::string::npos);
+    }
+
+    // --- 2. First branch renderable => taken, and the scene is COMPLETE. ----------------
+    // Guards the single-node fast path: the trial that resolves the node becomes the final
+    // scene without a rebuild, so a mistake there loses geometry rather than erroring.
+    {
+        ftsl::Loaded L; std::string e;
+        bool loaded = ftsl::loadSource(wrap("prefer {\n" + cam("one") + "} else {\n" + cam("two") + "}\n"),
+                                       "<checkprefer>", L, e);
+        if (chk("first renderable branch loads", loaded)) {
+            chk("first renderable branch is the one used", won(L) == "one");
+            chk("resolved scene keeps its geometry",  L.scene.tris.size() >= 2);
+            chk("resolved scene keeps its emitters", !L.scene.emitters.empty());
+        }
+    }
+
+    // --- 3. First branch fails to build, second is fine => second, fully built. ---------
+    {
+        ftsl::Loaded L; std::string e;
+        bool loaded = ftsl::loadSource(wrap("prefer {\n" + bad + "} else {\n" + cam("good") + "}\n"),
+                                       "<checkprefer>", L, e);
+        if (chk("failed first branch falls through to a good second", loaded)) {
+            chk("second branch is the one used", won(L) == "good");
+            chk("fallen-through scene keeps its geometry", L.scene.tris.size() >= 2);
+        }
+    }
+
+    // --- 4. Unrenderable-but-built branches: the fallback's actual purpose. -------------
+    // `supported` rejects the camera named "gated" and accepts everything else.
+    ftsl::SupportFn gate = [](const ftsl::Loaded& L) -> const char* {
+        return (!L.cameras.empty() && L.cameras[0].name == "gated") ? "pretend mode gate" : nullptr;
+    };
+    {
+        ftsl::Loaded L; std::string e;
+        bool loaded = ftsl::loadSource(wrap("prefer {\n" + cam("gated") + "} else {\n" + cam("plain") + "}\n"),
+                                       "<checkprefer>", L, e, gate);
+        if (chk("unrenderable first branch falls through", loaded))
+            chk("renderable second branch is used", won(L) == "plain");
+    }
+
+    // --- 5. Unrenderable first, UNBUILDABLE second => keep the first. -------------------
+    // The case that separates "last branch" from "last branch that built". Branch 1 is a
+    // real scene the mode can't render; branch 2 is not a scene at all. The old code took
+    // branch 2 (empty); the fix keeps branch 1, which is at least something to render.
+    {
+        ftsl::Loaded L; std::string e;
+        bool loaded = ftsl::loadSource(wrap("prefer {\n" + cam("gated") + "} else {\n" + bad + "}\n"),
+                                       "<checkprefer>", L, e, gate);
+        if (chk("unbuildable last branch is not preferred over a built one", loaded)) {
+            chk("the built (if unrenderable) branch is kept", won(L) == "gated");
+            chk("kept branch keeps its geometry", L.scene.tris.size() >= 2);
+        }
+    }
+
+    // --- 6. Multi-node: a doomed second node must sink the whole load. ------------------
+    // Exercises the non-fast path (>1 prefer => final rebuild) with the same invariant.
+    {
+        ftsl::Loaded L; std::string e;
+        std::string src =
+            "scene { units meters }\n"
+            "material \"probe\" { type diffuse  reflect rgb 0.5 0.5 0.5 }\n"
+            "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+            "prefer {\n"
+            "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+            "} else {\n"
+            "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+            "}\n"
+            "prefer {\n" + bad + "} else {\n" + bad + "}\n";
+        chk("multi-node: a node with no buildable branch fails the load",
+            !ftsl::loadSource(src, "<checkprefer>", L, e));
+    }
+
+    // --- 7. Multi-node ordering: a LATER node must not poison an EARLIER one. -----------
+    // Node 1 (two perfectly good camera branches) is resolved while node 2 still sits at
+    // its default branch 1 — which does not build. A single greedy pass therefore sees
+    // BOTH of node 1's branches "fail", mis-attributes the error to node 1 and, in the
+    // strict form of the fix, refuses the whole scene. Sweeping to a fixed point is what
+    // makes this load, choose node 1's FIRST (preferred) branch, and still reject node 2's
+    // first. Convergence here takes 3 sweeps, which is the nodes+1 cap.
+    {
+        ftsl::Loaded L; std::string e;
+        std::string src =
+            "scene { units meters }\n"
+            "material \"probe\" { type diffuse  reflect rgb 0.5 0.5 0.5 }\n"
+            "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+            "prefer {\n" + cam("n1a") + "} else {\n" + cam("n1b") + "}\n"
+            "prefer {\n" + badQuad +
+            "} else {\nquad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n}\n";
+        bool loaded = ftsl::loadSource(src, "<checkprefer>", L, e);
+        if (chk("multi-node: a doomed later branch does not sink an earlier node", loaded)) {
+            chk("earlier node still gets its PREFERRED branch", won(L) == "n1a");
+            chk("later node fell through to its buildable branch", L.scene.tris.size() >= 2);
+        }
+    }
+
+    std::printf("[checkprefer] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Asset path resolution (assetbytes::resolve). Same bug, one link further up the
+// chain: before 0.192.0 every authored path went straight to fopen, so a scene was
+// loadable only from the directory its paths happened to be relative to — and the
+// failure that caused was not an error message but an empty scene and a GPU fault.
+//
+// The two properties that matter are in tension, so both are asserted here:
+//   * a path that already resolves must keep resolving to the SAME file (rule 1 is
+//     "as authored", precisely so this change cannot move an existing load), and
+//   * a path that resolves nowhere near the cwd must still be found beside the scene.
+// The tree below is built on disk rather than mocked, because the thing under test is
+// what the filesystem says, and every assertion goes through the real loader.
+static int checkPaths() {
+    namespace fs = std::filesystem;
+    bool ok = true;
+    auto chk = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkpaths] %-60s BAD\n", what); ok = false; }
+        return cond;
+    };
+
+    std::error_code ec;
+    const fs::path tmp = fs::temp_directory_path(ec) / "ftrace_checkpaths";
+    fs::remove_all(tmp, ec);
+    // proj/scenes/s.ftsl names "textures/t.ppm", which lives at proj/textures — the
+    // ordinary layout (scenes in one subdirectory, assets in a sibling) and the exact
+    // shape the old cwd-only rule could not express.
+    const fs::path proj = tmp / "proj";
+    fs::create_directories(proj / "scenes", ec);
+    fs::create_directories(proj / "textures", ec);
+    fs::create_directories(tmp / "elsewhere", ec);
+    if (!chk("temp tree could be created", !ec)) {
+        std::printf("[checkpaths] %s\n", "FAIL");
+        return 1;
+    }
+    auto writeFile = [](const fs::path& p, const std::string& bytes) {
+        std::FILE* f = std::fopen(p.string().c_str(), "wb");
+        if (!f) return false;
+        if (!bytes.empty()) std::fwrite(bytes.data(), 1, bytes.size(), f);
+        std::fclose(f);
+        return true;
+    };
+    // A 1x1 P6 PPM: the smallest thing texture.h's own loader will accept.
+    const std::string ppm = "P6\n1 1\n255\n\x7f\x7f\x7f";
+    chk("texture written", writeFile(proj / "textures" / "t.ppm", ppm));
+
+    const std::string scene =
+        "scene { units meters }\n"
+        "texture \"t\" { file \"textures/t.ppm\"  encoding srgb }\n"
+        "material \"m\" { type diffuse  reflect texture:t }\n"
+        "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material m }\n"
+        "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+        "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+    chk("scene written", writeFile(proj / "scenes" / "s.ftsl", scene));
+
+    // --- the headline: load it from a directory that knows nothing about the project.
+    {
+        const fs::path prev = fs::current_path(ec);
+        fs::current_path(tmp / "elsewhere", ec);
+        ftsl::Loaded L; std::string e;
+        const bool loaded = ftsl::load((proj / "scenes" / "s.ftsl").string(), L, e);
+        fs::current_path(prev, ec);
+        if (chk("a scene loads from an unrelated working directory", loaded))
+            chk("its sibling-directory texture was found", L.scene.textures.size() == 1);
+        else
+            std::printf("[checkpaths]   error was: %s\n", e.c_str());
+    }
+
+    // --- resolve() itself, under a scene directory ------------------------------
+    {
+        assetbytes::ScopedSceneDir sd((proj / "scenes").string());
+
+        // (1) Absolute paths are handed back untouched, found or not.
+        const std::string abs = (proj / "textures" / "t.ppm").string();
+        chk("an absolute path is returned unchanged", assetbytes::resolve(abs) == abs);
+
+        // (2) The ancestor walk: "textures/t.ppm" is not under scenes/, it is under
+        //     proj/. This is the case that stopping at the scene directory would miss.
+        const std::string got = assetbytes::resolve("textures/t.ppm");
+        chk("a sibling-directory asset resolves via the scene's parent",
+            fs::exists(assetbytes::toPath(got), ec) &&
+            fs::equivalent(assetbytes::toPath(got), proj / "textures" / "t.ppm", ec));
+
+        // (3) A name that matches nothing comes back as authored, so the error message
+        //     can quote what the author wrote rather than the last candidate tried.
+        chk("an unresolvable path is returned unchanged",
+            assetbytes::resolve("no/such/thing.ppm") == "no/such/thing.ppm");
+
+        // (4) cwd wins. A file that already resolves against the working directory must
+        //     keep resolving to THAT file even when the scene directory offers a
+        //     same-named one — this is what makes the search path purely additive.
+        const fs::path prev = fs::current_path(ec);
+        fs::current_path(tmp / "elsewhere", ec);
+        fs::create_directories(tmp / "elsewhere" / "textures", ec);
+        writeFile(tmp / "elsewhere" / "textures" / "t.ppm", ppm);
+        const std::string cwdWins = assetbytes::resolve("textures/t.ppm");
+        const bool tookCwd = fs::equivalent(assetbytes::toPath(cwdWins),
+                                            tmp / "elsewhere" / "textures" / "t.ppm", ec);
+        fs::current_path(prev, ec);
+        chk("the working directory still wins over the scene directory", tookCwd);
+    }
+
+    // (5) The scene directory is scoped, not global: leaving the load must restore it,
+    //     or one scene's assets would answer the next scene's names.
+    chk("the scene directory is empty again outside the scope",
+        assetbytes::sceneDirRef().empty());
+
+    // (6) Engine data resolves beside the executable, so `data/glass/*` works from any
+    //     cwd. Asserted through a real lookup rather than by inspecting the path.
+    {
+        const fs::path prev = fs::current_path(ec);
+        fs::current_path(tmp / "elsewhere", ec);
+        Spectrum s;
+        const bool found = speclib::loadGlass("bk7", s);
+        fs::current_path(prev, ec);
+        chk("engine data (data/glass) resolves from an unrelated cwd", found);
+    }
+
+    fs::remove_all(tmp, ec);
+    std::printf("[checkpaths] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 static int checkTriNormal() {
     bool ok = true;
     auto chkb = [&](const char* what, bool cond) {
@@ -15222,6 +15497,8 @@ static int run(int argc, char** argv) {
     bool checkCavityOnly = false;
     bool checkTriNormalOnly = false;
     bool checkMeshFormatsOnly = false;
+    bool checkPreferOnly = false;
+    bool checkPathsOnly = false;
     bool checkSdfOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
@@ -15795,6 +16072,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checktrinormal")) checkTriNormalOnly = true;
         else if (!std::strcmp(argv[i], "-checkmesh")) checkMeshFormatsOnly = true;
+        else if (!std::strcmp(argv[i], "-checkprefer")) checkPreferOnly = true;
+        else if (!std::strcmp(argv[i], "-checkpaths")) checkPathsOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
@@ -15996,6 +16275,8 @@ static int run(int argc, char** argv) {
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkTriNormalOnly) return checkTriNormal(); // ditto (intersectTri's side/normal convention)
     if (checkMeshFormatsOnly) return checkMeshFormats(); // ditto (OBJ/PLY/STL agree on the same cube)
+    if (checkPreferOnly)   return checkPrefer();   // ditto (prefer{}/else{} resolution semantics)
+    if (checkPathsOnly)    return checkPaths();    // ditto (where a relative asset path is looked for)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
@@ -17468,11 +17749,45 @@ static int run(int argc, char** argv) {
             // (heavy scene -> careful crawl, light scene -> quick) and you can never skip past
             // geometry between two frames you didn't see. `step` is the per-move distance,
             // adjustable live with Ctrl+wheel.
-            double       step   = sceneR * 0.02;     // held-key per-frame travel, world units
+            //
+            // `step` IS DERIVED PER FRAME FROM WHAT YOU ARE LOOKING AT, not from the scene
+            // bounds. It used to be a flat `sceneR * 0.02`, and that is wrong for any scene
+            // whose extent is set by a BACKDROP rather than by its subject -- which is most
+            // of them. `sceneRadius` is half the AABB diagonal of ALL geometry, so in
+            // `gallery_rain` (a 46 x 45 m ground plane carrying 0.5 m exhibits spaced 1.5 m
+            // apart) it is ~33 m: the old step was 0.65 m per frame and, at kWheelDolly,
+            // 5.2 m per wheel notch -- one click flew you past three exhibits. That scene is
+            // not big; its FLOOR is big, and you never navigate relative to the floor.
+            //
+            // So each frame probes the distance to the first surface along the view ray and
+            // travels a fixed FRACTION of it. That is self-correcting in the way a constant
+            // cannot be: closing on a small object the steps shorten as you arrive, so you
+            // decelerate into it instead of shooting past; out in the open they lengthen and
+            // you cruise. It costs one ray against the BVH the renderer already built, which
+            // is nothing beside rendering the frame it belongs to.
+            //
+            // Looking at NOTHING (sky, or off the edge of the world) has no distance to
+            // scale by, so it falls back to the old `sceneR * kStepFrac` -- the one case the
+            // scene-bounds guess was always right for, since open sky genuinely is the scale
+            // of the whole scene.
+            const double kStepFrac = 0.02;           // travel per frame as a fraction of the distance ahead
+            const double kStepMin  = 1e-4;           // ... clamped to a sane band, relative to sceneR
+            const double kStepMax  = 0.05;
+            double       stepScale = 1.0;            // Ctrl+wheel bias applied ON TOP of the automatic step
+            double       step      = sceneR * kStepFrac;   // recomputed every frame by autoStep()
+            // Probe ahead and set `step`. Called once per frame before the move is resolved.
+            auto autoStep = [&](const Vec3& from, const Vec3& dir) {
+                Hit h = scene.closestHit(Ray{from, dir}, 1e-6);
+                double ahead = (h.valid && h.t > 0.0) ? h.t : sceneR;
+                step = stepScale * std::clamp(ahead * kStepFrac, sceneR * kStepMin, sceneR * kStepMax);
+            };
             // The plain wheel is a quick DOLLY, so a notch moves several fly-steps (a held
-            // key is the fine cruise; the wheel repositions in a few flicks). Still tied to
-            // `step` so Ctrl+wheel scales both together, and still collision-feedback-locked
-            // (resolveMove stops at surfaces), so a coarse notch can't punch through geometry.
+            // key is the fine cruise; the wheel repositions in a few flicks). With an
+            // adaptive step a notch is ~16% of the distance to whatever you are aimed at,
+            // i.e. about six clicks to arrive FROM ANYWHERE -- which is the property that
+            // makes it feel the same in a jewellery box and across a hall. Still
+            // collision-feedback-locked (resolveMove stops at surfaces), so a coarse notch
+            // can't punch through geometry.
             const double kWheelDolly = 8.0;           // fly-steps travelled per plain-wheel notch
             // Hover-look turn RATES: the cursor's dead-zoned offset from the window centre
             // (nav.lookX/lookY, -1..+1) is multiplied by these AND the wall-clock frame time
@@ -17512,7 +17827,19 @@ static int run(int argc, char** argv) {
             // engine's own BVH (scene.closestHit); keeps a `skin` standoff so the near plane
             // never pokes through a surface. SLIDE iterates a few times so a corner (two walls)
             // doesn't leak. Returns the collision-safe new position.
-            const double kSkin = sceneR * 0.02;       // standoff kept between eye and any wall
+            // The standoff is NOT scene-scaled, for the same reason `step` is no longer: at
+            // `sceneR * 0.02` it was 0.65 m in gallery_rain, so collision held the eye two
+            // thirds of a metre off every surface -- in a hall whose exhibits are 0.5 m
+            // across. You could not get near enough to look at one, which is a strange
+            // property for a tool called `-explore`.
+            //
+            // It is sized by what it actually protects: the raster preview's near plane, a
+            // FIXED 1e-3 camera-forward (raster.h). Anything comfortably clear of that keeps
+            // the near plane out of the wall, and nothing about that requirement grows with
+            // the scene's bounding box. So the standoff tracks scene scale only weakly and is
+            // bounded at both ends -- millimetres in a small scene, never more than 5 cm in a
+            // huge one, and always >= the near plane by a wide margin.
+            const double kSkin = std::clamp(sceneR * 2e-4, 1e-3, 0.05);   // eye-to-wall standoff
             auto resolveMove = [&](Vec3 pos, Vec3 delta) -> Vec3 {
                 if (collide == COLLIDE_OFF) return pos + delta;
                 for (int iter = 0; iter < 4; ++iter) {
@@ -18054,12 +18381,13 @@ static int run(int argc, char** argv) {
             if (pathCount >= 2)
                 std::printf("[viewer] camera path: %d frames on the timeline"
                             " (Play/scrub/lock via the panel below the image)\n", pathCount);
+            autoStep(eye, fwd);   // so the banner quotes the real opening step, not the fallback
             std::printf(
               "[viewer] interactive fly-camera — fly around, then copy the printed camera block:\n"
               "         move:   Space or +  = fly forward     Shift or -  = fly backward   (you travel where you look)\n"
               "         dolly:  mouse wheel up/down = dolly forward/back one notch (each notch renders — no overshoot; Ctrl+wheel scales it)\n"
               "         look:   move the mouse off-centre to steer — offset from centre = turn rate (centre holds still); cursor stays visible; leave the window to stop\n"
-              "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
+              "         step:   travel auto-scales to the distance ahead (~%.3g u here; a notch is ~16%% of the way to what you aim at) — Ctrl + mouse wheel biases it\n"
               "         collide: C cycles wall collision (now: %s) — slide along walls / stop dead / noclip\n"
               "         trace:  T toggles a live PATH-TRACED preview (fast RGB backward) — holds still to converge, re-aims on move (GPU, if the scene is in RGB scope)\n"
               "         panel:  Clip / Reset buttons below the image%s\n"
@@ -18478,10 +18806,17 @@ static int run(int argc, char** argv) {
                     changed = true;
                 }
 
-                // Ctrl+wheel adjusts the STEP SIZE (up = bigger), clamped to a sane band.
+                // Ctrl+wheel BIASES the automatic step (up = bigger). It scales the multiplier
+                // rather than setting an absolute distance, because the step is re-derived from
+                // the view every frame — an absolute value set here would be overwritten by the
+                // next probe, so the only adjustment that can survive is a relative one. Both
+                // numbers are printed: the bias is what you set, the metres are what it means
+                // where you happen to be standing (and that second number moves as you fly).
                 if (nav.wheelSpeed != 0.0) {
-                    step = std::clamp(step * std::pow(1.15, nav.wheelSpeed), sceneR * 1e-3, sceneR * 2.0);
-                    std::printf("[viewer] step %.3g u\n", step); std::fflush(stdout);
+                    stepScale = std::clamp(stepScale * std::pow(1.15, nav.wheelSpeed), 0.02, 50.0);
+                    autoStep(eye, fwd);
+                    std::printf("[viewer] step x%.2f (%.3g u here)\n", stepScale, step);
+                    std::fflush(stdout);
                 }
                 // C cycles the collision response: slide -> stop -> off -> slide.
                 if (nav.cycleCollide) {
@@ -18605,8 +18940,15 @@ static int run(int argc, char** argv) {
                     // ---- FREE FLIGHT --------------------------------------------------
                     // Accumulate this frame's translation from all sources (plain-wheel dolly +
                     // held throttle), then resolve it ONCE against the scene so collision (and its
-                    // slide) sees the true combined motion. Plain wheel DOLLIES one `step` per notch
-                    // along the view ray (up = forward); held keys advance one `step`/frame.
+                    // slide) sees the true combined motion. Plain wheel DOLLIES kWheelDolly
+                    // `step`s per notch along the view ray (up = forward); held keys advance one
+                    // `step`/frame.
+                    //
+                    // `step` is re-probed HERE, every frame, from the eye we are about to move
+                    // from along the direction we are about to move in -- so a notch is always
+                    // sized to what is currently under the crosshair, and simply LOOKING at
+                    // something nearer shortens the step before you have moved at all.
+                    autoStep(eye, fwd);
                     Vec3 moveDelta{0, 0, 0};
                     if (nav.wheel != 0.0) moveDelta = moveDelta + fwd * (step * kWheelDolly * nav.wheel);
                     // Mouse-look STEERS at a RATE set by how far the cursor sits from the window
@@ -19785,6 +20127,22 @@ int main(int argc, char** argv) {
     // running-render list -- which contains an em dash -- and then returns without ever
     // reaching the render setup where this used to be called.
     enableAnsiTerminal();
+    // Where ftrace.exe itself lives — the last resort of the asset search path, and the
+    // fallback root for engine data (`data/glass/*` and friends ship beside the binary,
+    // so they must resolve from any working directory). Taken from the module path, not
+    // argv[0], which is whatever the launcher felt like passing. Set before anything can
+    // load a scene or touch the spectral library, since both consult it.
+    {
+        wchar_t exeBuf[MAX_PATH * 4];
+        const DWORD n = GetModuleFileNameW(nullptr, exeBuf,
+                                           (DWORD)(sizeof exeBuf / sizeof exeBuf[0]));
+        if (n > 0 && n < sizeof exeBuf / sizeof exeBuf[0]) {
+            std::error_code ec;
+            const std::filesystem::path dir = std::filesystem::path(exeBuf).parent_path();
+            if (!dir.empty() && std::filesystem::is_directory(dir, ec))
+                assetbytes::setExeDir(dir.string());
+        }
+    }
     // `-stop [<pid>|all]`: talk to ALREADY-RUNNING renders and exit. Handled before
     // anything else so it works from a bare command line -- it loads no scene, opens
     // no window and creates no CUDA context, so there is nothing here to tear down.

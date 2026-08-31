@@ -1112,14 +1112,21 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   names the right *cause*, and "cannot open" conflates a typo, a directory passed in
   place of a file, and a genuinely unreadable file. It separates those, calls out a
   0-byte file (a half-finished write, not a permissions failure), reports when the
-  *directory* is what's missing, and for a missing file scans the containing directory
-  and suggests the nearest names by Levenshtein distance — because the report that
-  started all this was a single dropped character in a 30-character filename, which is
-  invisible to the person who typed it. Budgeted at ¼ of the name length (clamped 1–6)
-  so it cannot suggest an unrelated file, capped at 4000 directory entries, and reached
-  only on an already-failed path, so it is off every hot path by construction.
-- **`assetbytes.h`** (0.148.0) — the two things a scene's asset *bytes* may need that
-  aren't parsing: an **overlay** and a **warmer**. `Overlay` is a map from `normKey`
+  *directory* is what's missing, and for a missing file scans **every directory the
+  search path would have looked in** (0.192.0 — see *Where a relative asset path is
+  looked for*) and suggests the nearest names by Levenshtein distance — because the
+  report that started all this was a single dropped character in a 30-character
+  filename, which is invisible to the person who typed it. When more than one directory
+  was consulted it also names them (`[searched: …]`), so a miss tells you *where* it
+  looked rather than leaving you to guess the base directory. Budgeted at ¼ of the name
+  length (clamped 1–6) so it cannot suggest an unrelated file, capped at 4000 directory
+  entries per root, and reached only on an already-failed path, so it is off every hot
+  path by construction.
+- **`assetbytes.h`** (0.148.0) — the three things a scene's asset *bytes* may need that
+  aren't parsing: an **overlay**, a **warmer**, and (0.192.0) the **search path** that
+  turns an authored relative path into a real one — `resolve` / `ScopedSceneDir` /
+  `setExeDir`, described in full under *Where a relative asset path is looked for*.
+  `Overlay` is a map from `normKey`
   (lowercased, forward-slashed — so loom's `Path.as_posix()` names match ftrace's
   lookups on Windows) to bytes; `ftsl::Builder` carries one and every mesh dispatch
   site consults it before touching the disk, which is what lets the live viewer hand
@@ -3877,6 +3884,32 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       (the closest this camera comes to solid geometry anywhere in the scene) while threading
       rump, barrel, chest, neck, head and tail brush for 1.16 m at 21 mm/frame. Its cap
       (1.10 × 0.90) was sized from the real footprint *including* the coat.
+    - **The gem compote is the twelfth exhibit, and it is the scene's worked example of
+      giving one GLB thirteen different materials.** The asset (`meshes/compote_with_gems.glb`)
+      is a crystal dish holding twelve faceted stones as thirteen nodes. It **must not** be
+      loaded with `import_materials yes`: ftrace's glTF reader implements no KHR material
+      extension (`src/gltf.h`), and this file keeps all of its colour in
+      `KHR_materials_volume`/`transmission`, so every one of the thirteen would arrive as
+      baseColor (1,1,1) / metallic 0 — thirteen identical **white diffuse** surfaces, i.e. the
+      asset destroyed. The only lever for per-node materials is **`skip_material`**, which
+      drops primitives whose glTF material *name* matches a substring and works independently
+      of `import_materials`; so the scene loads the file **thirteen times**, each load skipping
+      the other twelve names, and binds a hand-authored dielectric to each. Two consequences
+      worth knowing before copying the idiom: the patterns must be **comma-joined into one
+      token** (FTSL starts a new statement at the second bareword), and thirteen loads of a
+      4.5 MB GLB cost thirteen parses but only 250,744 triangles. The colours are carried
+      across exactly, by **σ = −ln(attenuationColor)/attenuationDistance** (glTF attenuates as
+      `color^(d/distance)`, ftrace's `absorb` is a Beer–Lambert σ_a in 1/m), then **divided by
+      the display scale 3.0** so that enlarging the piece holds its authored optical depth
+      instead of cubing the transmittance to near-black. All thirteen carry a **distinct**
+      `priority` (bowl 1, stones 2–13): the stones outrank the dish so a facet sunk in its wall
+      refracts as gem, and ranking the stones against *each other* is what silences the 22
+      overlapping-bounds ties a shared priority produced (a heap of stones in a dish has
+      thoroughly interleaved AABBs even though the solids are disjoint). Sited at (7.35, 6.20)
+      in the front-right court — the one court with no flyby control point in it — after two
+      measured rejections recorded in the scene: the middle-of-layout hole (57 × 74 px, and it
+      covered a third of the dumbbell behind it) and the front-left court (214 × 226 px over
+      the axicon, the one exhibit that exists to throw a coloured caustic).
     - **Mode `M` is not an option for this scene** even though it is the caustic-friendly mode
       on paper: `photonmap_render.h` has no participating-media code, so M renders the cloud,
       the rain and the bow away entirely — and, unlike mode `U`, does not refuse the scene or
@@ -4906,6 +4939,33 @@ the timeline would "chunk" by several cameras per drag (0.22.0 regression, fixed
 drain, no busy spin). Gated on the discrete-GPU path (`gpuRaster != nullptr`); CPU
 raster unaffected.
 
+**Adaptive fly step (0.193.1).** The explorer's travel distance per frame used to be
+`sceneR * 0.02`, with `sceneR` = half the diagonal of the AABB of *all* geometry
+(`scene.h`'s `sceneRadius`). That is a bad proxy for navigation scale the moment a
+scene's extent is set by something other than its subject: `gallery_rain` is eleven
+~0.5 m exhibits spaced ~1.5 m apart standing on a 46×45 m floor, so `sceneR ≈ 32 m`
+and one wheel notch (`kWheelDolly` = 8 steps) moved **5.2 m** — past three exhibits,
+in a viewer whose job is to look at them. Fixed by sizing the step from what you are
+actually looking at rather than from the bounding box: before each move `autoStep()`
+casts **one ray** along the view direction and takes `2 %` of the distance to the
+first hit (falling back to `sceneR` when the ray escapes), clamped to
+`[sceneR*1e-4, sceneR*0.05]`. A notch is then ~16 % of the way to whatever is under
+the crosshair — about six clicks to arrive, identically when crossing a hall and when
+closing on a plinth. Verified at both ends of the scale: `gallery_rain` reports
+`~0.301 u` (= 0.02 × the 15.04 m along the view ray to the floor) and `cornell`
+`~0.0425 u` (= 0.02 × 2.13 m to its back wall) from the same code. The one-ray probe
+is free next to the raster frame it precedes.
+Consequence for `Ctrl`+wheel: it can no longer *set* an absolute step, because the
+next frame's probe would overwrite it — it now scales a persistent `stepScale` bias
+(×1.15/notch, clamped ×0.02…×50) that multiplies the probe result.
+The **collision standoff** had the identical defect and the identical cause:
+`kSkin = sceneR * 0.02` held the eye 0.65 m off every surface in `gallery_rain`, so a
+0.5 m exhibit could not be approached at all. It is now
+`clamp(sceneR * 2e-4, 1e-3, 0.05)` — sized against the raster's near plane, which is a
+**fixed absolute** `zn = 1e-3` (`raster.h`) and does not scale with the scene, so a
+scene-scaled standoff never had a justification. 6.5 mm in `gallery_rain` against a
+1 mm near plane.
+
 ## Threading model (CPU)
 
 Band/chunk parallelism via `std::thread` pools sized by `hardware_concurrency`;
@@ -5025,6 +5085,102 @@ out-param. `main.cpp` reports it as `[stop] scene load stopped before rendering`
 outright on a stop — treating an interrupted branch as *rejected* would otherwise make it
 build the next branch and ignore the stop for another whole load.
 
+## Where a relative asset path is looked for (`assetbytes::resolve`, 0.192.0)
+
+Every file an FTSL scene names — meshes, textures, `.vdb` volumes, `file:` spectra, animation
+sidecars — passes through **one** function, `assetbytes::resolve()`, on its way to an `open`.
+Before 0.192.0 there was no such function and no notion of a base directory anywhere: the
+authored string went straight to `fopen`, so it resolved against the **process working
+directory** and a scene was loadable from exactly the one directory its paths had been written
+relative to. That is not a cosmetic limitation — it is the first link of the chain documented
+in the next section, where a wrong cwd became an unloadable scene, an unloadable scene became
+a silently *empty* one, and an empty scene faulted the display driver.
+
+`resolve()` tries these roots in order and returns the first that exists:
+
+| # | root | why |
+|---|---|---|
+| 1 | **the path as authored** (relative to the cwd) | first *on purpose*: every invocation that worked before resolves to the identical file, so the search path can only turn failures into successes, never move a load from one file to another. |
+| 2 | **the scene file's directory** | a scene's assets belong to the scene — the rule every format that references external files uses (glTF buffer URIs already worked this way). |
+| 3 | **the scene's ancestors, ≤ 3 levels** | the natural layout puts scenes in a subdirectory and assets in siblings: `proj/scenes/x.ftsl` naming `textures/y.png` means `proj/textures/y.png`. This repo is laid out that way, so stopping at row 2 would not have fixed the reported bug. Bounded so a stray name can't be answered from the root of a drive. |
+| 4 | **the directory of `ftrace.exe`** | engine data (`data/glass/*`, `data/metal/*`) ships beside the binary and has nothing to do with the scene. |
+
+Absolute paths pass through untouched. A path matching **nothing** comes back *unchanged*, so
+the error message quotes what the author wrote rather than the last candidate tried, and
+`describeOpenFailure` then runs its did-you-mean scan under every root and lists the
+directories it searched.
+
+Two deliberate scoping decisions:
+
+- **The scene directory is scoped, not global.** `ftsl::loadSource` (which already receives the
+  scene's path) holds an RAII `assetbytes::ScopedSceneDir` for the duration of the load. A
+  later load of a different scene must not inherit it, and every branch of a `prefer` block
+  must see the same one. A `nameForMsgs` that isn't a real path (the loom live channel passes a
+  placeholder) has no parent directory and simply leaves the search path alone.
+- **Engine data does not consult the scene directory** (`speclib::categoryDir`). `speclib::index()`
+  caches a name→path map per category for the process lifetime, so a scene-dependent answer
+  there would be frozen at whichever scene happened to load first. It tries cwd, then the
+  executable's directory, both of which are process-constant.
+
+`assetbytes::readFile` resolves internally, so every loader reading bytes through it
+(OBJ/PLY/STL/`.ftmesh`) inherits the policy without a call site. The loaders that open files
+themselves call `resolve()` explicitly: `texture.h`, `gltf.h` (resolving the document *before*
+deriving the `baseDir` its external URIs hang off), `fbx_load.cpp` (ufbx insists on a path),
+`curvedrive.h`, `vdbgrid.cpp`, `vdb_openvdb.cpp`, and the FTSL `file:` spectrum loader. The
+`Warmer` prefetch resolves on the *calling* thread, since the search path is scoped to the call
+and reading it from the warmer thread would race the scope's exit. `assetbytes::Overlay` is
+consulted **before** any of this and keys on the authored path, so the loom live channel is
+untouched by resolution.
+
+`-checkpaths` (`main.cpp`) is the regression guard: it builds a real `proj/scenes` +
+`proj/textures` tree on disk and asserts the end-to-end load from an unrelated cwd, the
+ancestor walk, absolute passthrough, unresolvable-returns-unchanged, that **the cwd still
+wins**, that the scene directory is restored on scope exit, and that `data/glass` resolves
+beside the executable.
+
+## `prefer { } else { }` resolution (`ftsl.h loadSource`, hardened 0.191.2)
+
+A `prefer` node lets one scene file name several ways to render itself and let the loader
+pick — the gallery wraps its camera so the scene asks for mode `D` and settles for mode `B`
+when `D` can't render something. Resolution **trial-builds** candidate scenes: `tryBuild`
+flattens the block list with one branch spliced in per node, runs a fresh `Builder`, and
+returns one of exactly **three** outcomes, which the rest of the algorithm must not conflate:
+
+| `Trial` | meaning |
+|---|---|
+| `built == false` (`buildErr` set) | a real authoring error. The branch produced **nothing**. |
+| `built`, `reason != nullptr` | a real scene that *this mode* cannot render (the caller's `SupportFn`, from main.cpp's per-mode gates). |
+| `built`, `reason == nullptr` | renderable. Take it and stop. |
+
+**The fallback exists only for the middle row.** Through 0.191.1 the single-node fast path
+wrote `if (singleNode && (renderable || c == nb - 1)) accepted = trial;` — accepting the last
+branch *whether or not it built*. When every branch failed (the realistic trigger: a scene run
+from the wrong directory, so every cwd-relative asset missed — the path resolution described
+in the previous section is what stops that happening), `loadSource` returned **true**
+with a default-constructed `Loaded`: 0 cameras, 0 geometry, 0 emitters, announced as
+`[ftsl] loaded scene from …`. The empty scene then reached the CUDA forward kernel and faulted
+the driver. So the standing invariant is: **a `Loaded` that no build ever produced is never
+handed back.** The fallback is the last branch that actually *built*; when none did, control
+falls through to the final rebuild, whose failure carries the builder's own error up.
+
+**Resolution is order-dependent, so it sweeps to a fixed point.** Nodes resolve
+left-to-right, and while node *j* is being tried every *other* node sits at its current
+choice. A **later** node whose branch 1 doesn't build therefore makes **every** trial of an
+**earlier** node fail, for a reason belonging to neither. The old code hid that behind the
+unconditional fallback; making the fallback strict exposed it as a spurious whole-scene
+failure. The pass now repeats until a whole sweep changes no choice — at which point that
+sweep's trials are known to have used the final context — capped at *nodes+1* sweeps against
+oscillation. Per-branch diagnostics are **buffered** and only the converged sweep's are
+printed, so an unconverged sweep's artifacts never reach the console. A **single** node has no
+other node to be perturbed by, so it still resolves in one sweep; that is also the case the
+fast path serves, keeping the resolving trial as the final scene instead of re-loading every
+mesh a second time.
+
+A stop request (`ft::stopRequested`) aborts resolution outright rather than counting as a
+branch rejection — see above. `-checkprefer` (`main.cpp`) is the regression guard: seven
+cases covering all three `Trial` outcomes, the single-node fast path, the multi-node rebuild
+and the ordering artifact.
+
 ## GPU support gates fail safe, never coerce
 
 `cudaForwardSupported()` (`render_cuda.cu`) is the single gatekeeper — all eight GPU
@@ -5047,6 +5203,21 @@ device twin (`DCurveSeg` + `intersectCurveSeg`, and the fifth range in both `clo
 and `occluded`); what survives is the *screen*, which still checks curve **materials**
 exactly like every other primitive's. That is the intended lifecycle of one of these
 gates: ship it the moment the hole exists, delete it only by filling the hole.
+
+**A kernel prologue is the last of these gates, and each sampler needs its own.** The host
+uploads a *null* pointer for an empty array (`d_ems = dems.empty() ? nullptr : …`), so any
+device sampler that indexes `sc.emitters[…]` without first checking `sc.nEmitters` faults the
+driver rather than producing a black frame. The three forward/BDPT emitter samplers had drifted
+apart on this: `dGenLightSubpath` tested `sc.nEmitters == 0 || sc.totalPower <= 0.0`,
+`genPhoton` tested only `grandTotal <= 0` (which lets a scene with emissive volumes but no
+emitters through, since the volume-birth coin can miss on `uniform() == 1`), and `genPhotonHero`
+tested **nothing at all** — which is why an emitter-less scene faulted only in the hero kernel.
+0.191.2 gave both forward samplers the missing test, returning `false` ("skip this photon", the
+contract both call sites already honour). Such a guard must draw **no randomness**, or it
+perturbs the RNG stream and changes every image; both are pure reads, so scenes that do have
+emitters are bit-identical. The scene that exposed this could only arise from the `prefer` bug
+above, but the guard is the right place for the invariant regardless: a malformed scene should
+cost a black frame, never the display driver.
 
 ## Benchmarks & perf discipline
 

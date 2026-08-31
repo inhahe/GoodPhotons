@@ -36,14 +36,33 @@
 #include <filesystem>
 #include <stdexcept>
 #include "spectrum.h"
+#include "assetbytes.h"
 
 namespace speclib {
 
 // Library root directory (holds glass/, metal/, reflectance/, illuminant/). Default
-// "data" resolves relative to the process working directory. Overridable if a future
-// CLI flag wants an alternate asset root.
+// "data", tried first relative to the process working directory and then relative to
+// ftrace.exe. Overridable if a future CLI flag wants an alternate asset root.
 inline std::string& root() { static std::string r = "data"; return r; }
 inline void setRoot(const std::string& r) { root() = r; }
+
+// The directory to read a category from. This is ENGINE data, not scene data: it
+// ships beside the binary, so it deliberately does NOT consult the scene search path
+// — `index()` caches its result for the process lifetime, and the scene directory
+// changes from load to load, so a scene-dependent answer here would be cached from
+// whichever scene happened to be loaded first. cwd first (so an explicit `-data`-style
+// root or a local `data/` still wins), then the executable's own directory.
+inline std::filesystem::path categoryDir(const std::string& category) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path dir = fs::path(root()) / category;
+    if (fs::is_directory(dir, ec)) return dir;
+    if (!fs::path(root()).is_absolute() && !assetbytes::exeDirRef().empty()) {
+        fs::path alt = assetbytes::toPath(assetbytes::exeDirRef()) / fs::path(root()) / category;
+        if (fs::is_directory(alt, ec)) return alt;
+    }
+    return dir;   // report the cwd-relative name in whatever comes next
+}
 
 inline std::string lower(std::string s) {
     for (char& c : s) c = (char)std::tolower((unsigned char)c);
@@ -86,7 +105,7 @@ inline const std::unordered_map<std::string, std::string>& index(const std::stri
     std::unordered_map<std::string, std::string> idx;
     namespace fs = std::filesystem;
     std::error_code ec;
-    fs::path dir = fs::path(root()) / category;
+    fs::path dir = categoryDir(category);
     if (fs::exists(dir, ec) && fs::is_directory(dir, ec)) {
         for (const auto& e : fs::directory_iterator(dir, ec)) {
             if (ec || !e.is_regular_file()) continue;
@@ -226,7 +245,9 @@ inline bool resolveSpectrumTokens(const std::vector<std::string>& w, Spectrum& o
     }
     if (h.rfind("file:", 0) == 0) {
         std::vector<std::pair<double, double>> p; std::string e;
-        require(loadSpdCsv(h.substr(5), p, e), e);  // e = "cannot open ..." / "no numeric rows ..."
+        // Through the scene search path: a `file:` token can come from a scene as
+        // easily as from a bundle manifest (assetbytes.h documents the order).
+        require(loadSpdCsv(assetbytes::resolve(h.substr(5)), p, e), e);
         out = tabulatedSpectrum(std::move(p)); return true;
     }
     return false;

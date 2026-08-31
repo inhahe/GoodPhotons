@@ -7861,6 +7861,155 @@ disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.
 
 ## Recently fixed
 
+### DONE (2026-08-29, v0.192.0): every asset path resolved against the CURRENT WORKING DIRECTORY, so a scene was loadable from only one directory
+
+**Was:** `cd scenes && ..\ftrace gallery_rain.ftsl` could not load the scene. Its
+`textures/marble_gold.png`, `assets/lamp/inner.obj` and `data/glass/…` were all resolved
+against the *process* cwd rather than against the scene, so every one of them missed — and
+the same file loaded perfectly from the repo root. This was link 1 of the v0.191.2 chain
+above: it is what made *every* branch of the gallery's `prefer` fail to build, which is what
+produced the empty scene, which is what faulted the GPU. It was the last link still open.
+
+**Why it was not a one-liner.** Nothing in the codebase had any notion of a base directory:
+`assetbytes::readFile` and every loader took the authored string straight to `fopen`, and
+`ftsl::load()` knew the scene's path but never passed it down. And two different kinds of
+path live in a scene — **engine data** (`data/glass/*`, shipped beside the binary) and
+**scene assets** (`textures/`, `meshes/`, `assets/`) — which want different bases. Worse,
+this repo's own layout puts scenes in `scenes/` and their assets in *sibling* directories at
+the project root, so "resolve relative to the scene file" alone would not have fixed the
+reported bug.
+
+**The fix** (`src/assetbytes.h`, and one call at every open site). One ordered search path,
+applied by `assetbytes::resolve()`:
+
+1. **the path as authored** (i.e. relative to the cwd) — first, deliberately, so the change
+   is *purely additive*: anything that resolved before resolves to the identical file now,
+   and only failures can turn into successes;
+2. **the scene file's own directory**;
+3. **its ancestors, up to three levels** — this is the rule that fixes the reported bug,
+   since `scenes/x.ftsl` naming `textures/y.png` means `<project>/textures/y.png`;
+4. **the directory of `ftrace.exe`** — so `data/glass/*` resolves from any cwd at all.
+
+Absolute paths pass through untouched, and a path that matches nothing comes back
+**unchanged**, so the error still quotes what the author wrote. The scene directory is held
+in an RAII `assetbytes::ScopedSceneDir` set by `ftsl::loadSource` (which already receives the
+scene path) — scoped rather than global, so one scene's directory can't answer the next
+scene's names, and every `prefer` branch sees the same one. Engine data deliberately does
+*not* consult the scene directory (`speclib::categoryDir`): `speclib::index()` caches per
+category for the process lifetime, so a scene-dependent answer there would be frozen at
+whichever scene happened to load first.
+
+`readFile` resolves internally, so every loader that reads bytes through it (OBJ/PLY/STL/
+`.ftmesh`) got the search path for free; the explicit call sites are `texture.h`, `gltf.h`
+(which resolves the document *before* deriving `baseDir` for its external URIs),
+`fbx_load.cpp` (ufbx insists on opening the file itself), `curvedrive.h`, `vdbgrid.cpp`,
+`vdb_openvdb.cpp`, and the FTSL `file:` spectrum loader.
+
+**Diagnostics.** `describeOpenFailure` now runs its did-you-mean scan under *every* root and
+names the directories it searched, so a path that resolves for one invocation and not another
+no longer looks like the renderer's whim:
+
+```
+cannot open texture file: textures/marble_glod.png: no such file — did you mean
+'D:\...\forward raytracer\textures\marble_gold.png'? [searched: C:\...\Temp\textures,
+D:\...\scraps\textures, D:\...\forward raytracer\textures, D:\visual studio projects\textures,
+D:\textures]
+```
+
+**Verified.** The acceptance test named in the original entry passes: all **126** scenes in
+`scenes/` produce byte-identical `-parseonly` output whether run from the repo root or from
+an unrelated temp directory (they previously differed on the asset-bearing ones). `-checkpaths`
+is the new permanent regression guard — it builds a real `proj/scenes` + `proj/textures` tree
+on disk and asserts the end-to-end load from an unrelated cwd, the ancestor walk, absolute
+passthrough, unresolvable-returns-unchanged, **cwd-still-wins**, that the scene directory is
+restored on scope exit, and that `data/glass` resolves beside the executable. The rest of the
+self-test suite is unaffected, and `cd scenes && ..\ftrace gallery_rain.ftsl` now takes
+`prefer` **branch 1** and renders.
+
+**Things checked because they could have been observably affected:** loom emits cwd-relative
+paths (unaffected — rule 1 is cwd); `assetbytes::Overlay` keys on the *authored* path and is
+consulted before any resolution, so the loom live channel is untouched; `-in`/`-resume`/`-o`
+are CLI paths and were deliberately left alone.
+
+### `prefer{}/else{}` accepted a branch that never built — an unloadable scene became a CUDA "illegal memory access" — FIXED 2026-08-29 (v0.191.2)
+
+**Report:** running the gallery from inside `scenes\`:
+
+```
+D:\...\forward raytracer\scenes>..\ftrace -preview gallery_rain.ftsl
+[prefer] branch 1 rejected (texture 'tex_marble_gold': cannot open texture file: textures/marble_gold.png); trying the next
+[prefer] using branch 2 of 2
+[ftsl] loaded scene from gallery_rain.ftsl
+mode B: tracing 2000000 photons at 256x256 on GPU (light=bb6500) ...
+[cuda] forward kernel failed: an illegal memory access was encountered
+```
+
+**A three-link chain, not one bug.** Each link is separately worth having fixed.
+
+1. **Asset paths resolve against the CWD, not the scene file** (fixed the next day in
+   v0.192.0 — see the entry below). Running from `scenes\` makes `textures/…`, `assets/…`
+   and `data/glass/…` all miss, so *every* branch of the scene's `prefer` failed to
+   **build**.
+
+2. **The resolver accepted the last branch unconditionally** (`src/ftsl.h`, single-node
+   fast path): `if (singleNode && (renderable || c == nb - 1)) { accepted = trial; }`.
+   `Trial` has three outcomes — *didn't build* / *built but this mode can't render it* /
+   *renderable* — and the fallback exists only for the middle one. A branch that did not
+   build produced **nothing**, and keeping it handed the caller an empty `Loaded` with
+   `loadSource` returning **true**: 0 emitters, 0 cameras, 0 triangles, reported as
+   `[ftsl] loaded scene from …`. `-parseonly` made it unmistakable — from the repo root
+   `25 materials, 1 emitters, 456750 tris, 601 cameras`; from `scenes/`
+   `13 materials, 0 emitters, 0 tris, 0 cameras`. The last branch's failure was also the
+   one failure never printed, because the message was guarded by `if (c < nb - 1)`.
+
+3. **`genPhotonHero` had no emitter guard.** `render_cuda.cu:6589` went straight to
+   `sc.emitters[ei]` with `sc.emitters == nullptr`. Its scalar twin `genPhoton` has a
+   `grandTotal <= 0` prologue and `dGenLightSubpath` an explicit `nEmitters == 0` test;
+   the hero kernel had neither, which is why only that kernel faulted. compute-sanitizer
+   pinned it exactly: `Invalid __global__ read of size 8 … at gpu::genPhotonHero+0xb20 in
+   render_cuda.cu:6590 … Access to 0x50 is out of bounds`.
+
+**And a fourth defect found while fixing (2):** multi-node `prefer` resolution is greedy
+left-to-right, so while node *j* is being resolved every other node sits at its current
+choice. A **later** node whose first branch doesn't build therefore makes **every** trial
+of an **earlier** node fail, for a reason that has nothing to do with that earlier node.
+The old code hid this behind the unconditional last-branch fallback; making (2) strict
+turned it into a spurious whole-scene load failure. Minimal repro: two `prefer` nodes,
+the first with two perfectly good camera branches, the second whose branch 1 names an
+undeclared material — one greedy pass reports *the first node's* branches as failing.
+Now covered by `-checkprefer` case 7.
+
+**The fixes:**
+
+- `src/ftsl.h` — the fallback is now the last branch that actually **built**; a branch
+  that failed to build is never accepted. Every branch failure is printed, including the
+  last one. When no branch built, the final rebuild runs and the builder's own error is
+  what the caller sees, framed as `every branch of a 'prefer' block failed to build …`.
+- `src/ftsl.h` — resolution now **sweeps to a fixed point** (capped at nodes+1 sweeps)
+  instead of a single greedy pass, so a later node can no longer poison an earlier one and
+  each node still gets its most-preferred workable branch. Per-branch messages are
+  buffered and only the converged sweep's are printed, so an unconverged sweep's artifacts
+  never reach the console. A single `prefer` — the realistic case, and what the gallery
+  uses — still resolves in exactly one sweep and still skips the redundant final rebuild.
+- `src/render_cuda.cu` — `genPhotonHero` gets `if (sc.nEmitters <= 0 || sc.totalPower <= 0.0)
+  return false;`, and `genPhoton` gets `if (sc.nEmitters <= 0) return false;` before its
+  emitter selection (its `grandTotal` prologue lets a scene with emissive volumes but no
+  emitters through, and the volume-birth draw can miss on `uniform() == 1`). Neither test
+  draws randomness, so every scene that does have emitters is bit-identical.
+- `src/main.cpp` — new `-checkprefer` self-test: seven cases covering all three `Trial`
+  outcomes, the single-node fast path, the multi-node rebuild, and the ordering artifact.
+
+**Verified:** from `scenes/` the same command now prints the texture error and exits 1;
+from the repo root both gallery scenes still resolve to branch 1 with their full contents;
+`-checkprefer` and the mesh/prop/array/bind/sdf/upsample/cavity self-tests all PASS; a
+mode-B GPU render is unchanged.
+
+**Lesson worth keeping — the same one as the PLY entry below.** A function that reports
+failure through a return value, whose caller discards or misreads it, converts "failed"
+into "succeeded with nothing" — and an empty result still renders. That is now the fourth
+instance in this codebase (`loadObj` in `mesh`, `loadObj` in `mesh_asset`, and both halves
+of this one). When a load can fail, the failure must reach the caller *as* a failure.
+
 ### `.ply` / `.stl` were advertised but never implemented — a `.ply` rendered as a silent grey image — FIXED 2026-08-23 (v0.191.0)
 
 **Report:** "how come I ran `ftrace <…>_cleaned.ply` and it just showed a grey display?"
