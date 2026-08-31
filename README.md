@@ -213,6 +213,15 @@ argument for standing a groom in a hall of polished objects.*
   ported to the CUDA forward tracer, and spectral-rainbow-phase media now run on the GPU
   too — the λ×µ Airy phase table is uploaded per-medium). Rainbows/fogbows/glories are
   single scatter, so this loses nothing that matters for them.
+  **`-beams` also gives mode `M` a volume at all.** The photon map stores *surface*
+  records only, so without it a fog / rain / cloud / rainbow scene renders its volume
+  as **nothing** under `M`. With it, each photon's straight crossing of each medium is
+  cached as a **view-independent beam** carrying its direction, and every camera gathers
+  those with a Beam × Ray estimator — so the phase function is evaluated at the true
+  per-frame viewing angle and a *volumetric* flythrough gets the same "trace once, gather
+  per frame" amortisation the surface map already had, instead of needing mode `D` to
+  re-trace every frame. (CPU only for now.) See
+  [Mode `M` and participating media](REFERENCE.md#mode-m-and-participating-media---beams).
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look

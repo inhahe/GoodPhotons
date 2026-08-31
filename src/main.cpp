@@ -11101,6 +11101,112 @@ static double buildPhotonMap(PhotonMap& pm, double radius, const char* tag) {
     return r;
 }
 
+// Mode-M PHOTON BEAMS (CLI -beams, shared with the mode-A/B splat gather of the same name).
+// The surface photon map holds no volume records at all, so mode M renders fog / rain /
+// cloud / rainbow as NOTHING. -beams switches the photon pass to straight medium crossings
+// stored as segments in a view-independent BeamMap (photonbeams.h), which the camera gathers
+// with the Beam x Ray 1D estimator — so a volumetric flythrough gets the mode-M "trace once,
+// gather per frame" amortisation instead of re-tracing every frame under mode D.
+//
+// `g_beamRadiusAbs` is the 1D kernel half-width in world units; 0 (the default) means "let
+// BeamMap::buildAuto size it", which is nearly always what you want:
+//
+//   DO NOT reach for the photon map's radius here. A beam is a 1D object blurred in 1D, so a
+//   camera ray gathers (pi/2) * r * L_ray * S / V beams — LINEAR in r and in the total stored
+//   beam length S. At the surface map's radius that is tens of thousands of beams per ray on
+//   an ordinary fog box, and the render never finishes. buildAuto solves the same expression
+//   for r at a target population instead (r = K*A/(2 pi S)) and then probes to correct it.
+//   This file used to pass `pmRadius` and that is exactly the bug. See photonbeams.h.
+//
+// `g_beamK` is that target population: beams gathered per camera segment. It plays the same
+// role for the volume estimate that `-pmcount` plays for the surface one — bigger is smoother
+// and slower, and the cost is strictly linear in it.
+//
+// `g_beamTarget` budgets the STORED beam count: a beam is ~72 B and lights a whole chord, so
+// keeping one per crossing on a 100 M-photon pass would cost gigabytes for variance nobody
+// needs. Beams above the budget are dropped by Russian roulette (unbiased). 0 = keep all.
+// The default is deliberately far below the surface-photon count: beams are split for BVH
+// quality (up to ~4x), and a beam carries a whole chord rather than a point, so a million
+// raw beams is already a dense volume cache.
+static double    g_beamRadiusAbs = 0.0;
+static long long g_beamTarget    = 1000000;
+static double    g_beamK         = 32.0;
+
+// Bin the beam map and say what it settled on, mirroring buildPhotonMap's reporting: a
+// silently-different kernel radius would be baffling when comparing renders — and for beams
+// it is worse than baffling, because the radius sets the gather COST as well as the blur.
+static double buildBeamMap(BeamMap& bm, const char* tag) {
+    auto t0 = std::chrono::steady_clock::now();
+    const size_t raw = bm.beams.size();
+    double r;
+    // Say when the budget actually bit. The per-thread banks keep everything until they hit
+    // their cap and then self-halve, so this reports the concatenated total before the one
+    // exact trim to -beamcount. Printing it turns "why did -beamcount 1e6 give me exactly
+    // 1e6?" into an observation, and makes a scene that never reaches its budget (small
+    // bounded media in a large scene) visibly different from one that blows through it.
+    if (bm.nDeposited > raw)
+        std::printf("%s photon beams: %zu collected, trimmed to %zu by -beamcount "
+                    "(survivors rescaled, unbiased)\n", tag, bm.nDeposited, raw);
+    if (g_beamRadiusAbs > 0.0) {
+        // Explicit radius: still split for BVH quality, using the same rule buildAuto uses.
+        const Aabb bb = bm.bounds();
+        const Vec3 ext = bb.hi - bb.lo;
+        const double diag = std::sqrt(dot(ext, ext));
+        const double splitLen = raw ? std::max(diag / 64.0, bm.totalLength() / (3.0 * (double)raw))
+                                    : 0.0;
+        bm.build(g_beamRadiusAbs, splitLen);
+        r = g_beamRadiusAbs;
+        std::printf("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g "
+                    "(-beamradius), BVH in %.1fs\n", tag, raw, bm.beams.size(), r,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    } else {
+        const BeamMap::AutoInfo ai = bm.buildAuto(g_beamK);
+        r = ai.rFinal;
+        std::printf("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g -> %.4g "
+                    "(a probe ray gathered %.1f beams at the analytic radius; target %.0f), "
+                    "split at %.4g, BVH in %.1fs\n",
+                    tag, ai.rawBeams, ai.outBeams, ai.rAnalytic, ai.rFinal, ai.probeK,
+                    ai.targetK, ai.splitLen,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+    if (bm.beams.empty())
+        std::fprintf(stderr, "[beams] warning: 0 beams stored — no photon crossed a "
+                             "scattering medium; the volume will be invisible.\n");
+    return r;
+}
+
+// Mode M is media-blind without -beams (the map has no volume records), so a media scene
+// rendered under plain mode M silently loses its fog/rain/cloud — the very subject of most
+// scenes that have one. Say so rather than quietly producing the wrong image.
+static void warnModeMMedia(const Scene& scene, bool beamsOn) {
+    if (beamsOn || scene.media.empty()) return;
+    std::fprintf(stderr,
+        "[mode M] warning: this scene has %zu participating medium/media, and the photon\n"
+        "         map stores SURFACE records only — the volume will render as nothing.\n"
+        "         Add -beams for the view-independent photon-beam volume gather.\n",
+        scene.media.size());
+}
+
+// The A/B/C form of -beams is a per-camera resample of ONE shared photon flight, so it is
+// gated on having several cameras to share (render.h's doBeamGather; render_cuda.cu ~13842
+// applies the identical `nc > 1` gate on the device). That gate is correct — with a single
+// camera the ordinary analog volumetric path is strictly better, since it keeps the multiple
+// scattering that -beams trades away — but until now it was SILENT, and a silent no-op on a
+// correctness-relevant flag is a trap: a single-camera `-mode B -beams` render is a full
+// multiple-scatter image that merely looks like a beams render, which is exactly the mistake
+// that made the mode-M beam gather look 20x too dark when it was in fact agreeing with its
+// reference. Say so instead.
+static void warnBeamsNeedsCameras(const Scene& scene, bool beamsOn, char mode, int nCam) {
+    if (!beamsOn || scene.media.empty() || nCam != 1) return;   // 0 = no camera of this mode
+    if (mode != 'A' && mode != 'B' && mode != 'C') return;
+    std::fprintf(stderr,
+        "[mode %c] warning: -beams needs at least 2 shared cameras in this mode (got %d), so it\n"
+        "         is being IGNORED — the render is ordinary analog volumetrics, WITH the\n"
+        "         multiple scattering -beams would have traded away. Add a second camera to\n"
+        "         compare like for like against a mode-M -beams render.\n",
+        mode, nCam);
+}
+
 // Mode-M final gather (CLI -pmfg <K>). 0 = off: read the density estimate directly at the
 // visible point (fast, but the estimate's blur softens contact shadows / fine detail right
 // at that surface). K > 0 = Jensen final gather: shoot K cosine-weighted hemisphere
@@ -14319,10 +14425,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if (g_pmFinalGather > 0)
             std::printf("mode M: final gather ON — %d hemisphere sub-rays/sample "
                         "(density query one bounce away)\n", g_pmFinalGather);
+        // Photon beams: the view-independent volume cache (see g_beamTarget above).
+        const bool wantBeams = g_beamGather && !scene.media.empty();
+        warnModeMMedia(scene, wantBeams);
         PhotonMap pm;
+        BeamMap bmap;
         auto tp0 = std::chrono::steady_clock::now();
-        tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC);
+        tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
+                        wantBeams ? &bmap : nullptr, g_beamTarget);
         radius = buildPhotonMap(pm, radius, "mode M:");
+        if (wantBeams) buildBeamMap(bmap, "mode M:");
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("mode M: deposited %zu photons from %lld emitted in %.1fs; "
                     "grid %dx%dx%d. Gathering camera pass at %dx%d ...\n",
@@ -14334,7 +14446,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
-                                              diffraction, /*maxBounce*/32, off, g_pmFinalGather);
+                                              diffraction, /*maxBounce*/32, off, g_pmFinalGather,
+                                              wantBeams ? &bmap : nullptr);
                 });
         };
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
@@ -15112,8 +15225,16 @@ static void printHelp(const char* prog) {
 "  -noise <pct>          stop at target graininess (progressive)\n"
 "  -forever              trace until Ctrl-C (progressive)\n"
 "  -spp <n>              samples/pixel for backward modes R/V\n"
-"  -beams|-photonbeams   decorrelated photon-beams gather for shared multi-camera flybys\n"
-"                        (single-scatter volumetrics; CPU or GPU; kills frozen speckle)\n"
+"  -beams|-photonbeams   photon beams (single-scatter volumetrics). Modes A/B: decorrelated\n"
+"                        per-camera gather for shared flybys (CPU or GPU; kills frozen\n"
+"                        speckle). Mode M: stores a view-independent BEAM MAP, which is the\n"
+"                        only way mode M sees media at all (CPU only)\n"
+"  -beamk <k>            mode-M beams gathered per camera segment (default 32) — the beam\n"
+"                        kernel radius is sized to hit this; smoother and slower as it grows\n"
+"  -beamradius <r>       mode-M beam kernel half-width in world units, overriding -beamk\n"
+"                        (default: sized automatically; NOT the photon-map radius, which is\n"
+"                        larger by orders of magnitude and makes the gather never finish)\n"
+"  -beamcount <n>        mode-M budget on stored beams (default 1000000; 0 = keep all)\n"
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
 "  -rgb                  mode R fast RGB (non-spectral) backward preview on the GPU (much\n"
 "                        faster; drops dispersion/thin-film/fluorescence — Option B)\n"
@@ -16094,6 +16215,9 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
         else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) g_beamGather = true;
+        else if (!std::strcmp(argv[i], "-beamradius") && i + 1 < argc) g_beamRadiusAbs = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamcount") && i + 1 < argc) g_beamTarget = (long long)std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamk") && i + 1 < argc) g_beamK = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-window-min") || !std::strcmp(argv[i], "-minimized")) {
             g_showWindow = true; g_minWindow = true;
@@ -19341,7 +19465,14 @@ static int run(int argc, char** argv) {
     // general forward mode-B light-trace for anything else (S/U/V/…, which still converge
     // to the same radiance). One reduced, view-independent photon map (built lazily once)
     // serves every mode-M meter.
+    // ... and, when -beams is on, ONE reduced beam map alongside it. Metering mode M on a
+    // media scene without the beam map would anchor the exposure to an image with the volume
+    // MISSING — i.e. to a different picture than the one about to be rendered, which for a
+    // fog / rain / cloud scene is usually its brightest subject. Same reasoning as the
+    // -beams carve-out on the GPU meter below; that one falls back to here, so here it must
+    // actually be right.
     PhotonMap meterPmap; bool meterPmapBuilt = false;
+    BeamMap   meterBmap;
 #ifdef HAVE_CUDA
     // Meter on the device the run asked for. The meter is a REAL reduced render, so when
     // a mode's GPU path supports this scene it must use it: metering on the CPU while the
@@ -19407,15 +19538,27 @@ static int run(int argc, char** argv) {
                 // CPU fallback only: mode-M groups that pass the GPU gates are metered in
                 // ONE batched renderPhotonMapSharedCuda call in the group loop below
                 // (shared device map + GPU gathers), never per-frame here.
+                const bool meterBeams = g_beamGather && !scene.media.empty();
                 if (!meterPmapBuilt) {
                     double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                                           : scene.sceneRadius * g_pmRadiusFactor;
-                    tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap, g_heroC);
+                    // Scale the beam budget down with the reduced photon count, so the meter
+                    // pass keeps the same beams-per-photon density as the real render rather
+                    // than an accidentally denser (and slower) one.
+                    const long long meterBeamTarget =
+                        (g_beamTarget > 0)
+                            ? std::max(1LL, (long long)((double)g_beamTarget * (double)meterN
+                                                        / std::max(1.0, (double)N)))
+                            : 0;
+                    tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap, g_heroC, 0,
+                                    meterBeams ? &meterBmap : nullptr, meterBeamTarget);
                     buildPhotonMap(meterPmap, radius, "[meter]");
+                    if (meterBeams) buildBeamMap(meterBmap, "[meter]");
                     meterPmapBuilt = true;
                 }
                 mf = renderPhotonCamera(scene, mc.cam, W, H, meterPmap, meterSpp, nThreads,
-                                        diffraction, /*maxBounce*/32, 0, g_pmFinalGather);
+                                        diffraction, /*maxBounce*/32, 0, g_pmFinalGather,
+                                        meterBeams ? &meterBmap : nullptr);
                 filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
                 break;
             }
@@ -19468,7 +19611,11 @@ static int run(int argc, char** argv) {
         // + up to kMeterMax full-res CPU gathers) is the pre-pass that used to take tens
         // of minutes while the GPU idled. Gated exactly like runSharedPhotonMap's GPU
         // branch; any miss falls through to the per-frame loop below unchanged.
-        if (meterGpu && cudaPhotonMapSupported(scene)) {
+        // ... including the -beams CPU-only carve-out: metering a volumetric scene on a
+        // device gather that cannot see the volume would anchor the exposure to an image
+        // missing its brightest subject.
+        if (meterGpu && !(g_beamGather && !scene.media.empty()) &&
+            cudaPhotonMapSupported(scene)) {
             bool allM = true, allPinhole = true;
             for (const auto& mc : cams) {
                 if (mc.mode != 'M')    allM = false;
@@ -19588,8 +19735,12 @@ static int run(int argc, char** argv) {
     }
     // A single-camera forward group has nothing to share — fold it back into the per-camera
     // path (models A/B still get the GPU there via renderForwardCuda).
-    if (groupB.size() < 2) { for (int i : groupB) restIdx.push_back(i); groupB.clear(); }
-    if (groupA.size() < 2) { for (int i : groupA) restIdx.push_back(i); groupA.clear(); }
+    // ... and that fold-back is exactly where -beams stops applying, so say so rather than
+    // no-op silently (see warnBeamsNeedsCameras).
+    if (groupB.size() < 2) { warnBeamsNeedsCameras(scene, g_beamGather, 'B', (int)groupB.size());
+                             for (int i : groupB) restIdx.push_back(i); groupB.clear(); }
+    if (groupA.size() < 2) { warnBeamsNeedsCameras(scene, g_beamGather, 'A', (int)groupA.size());
+                             for (int i : groupA) restIdx.push_back(i); groupA.clear(); }
     // Mode M is different: the per-camera fallback is CPU-only, so the shared photon-map path
     // is the ONLY GPU route for mode M and it handles a single camera fine. Keep even one
     // plain mode-M camera here so `-camera #N`/`near=`/name can aim the live window at one
@@ -19878,6 +20029,11 @@ static int run(int argc, char** argv) {
         g_windowMode = modeLabel('M');   // title bar shows the shared photon-map mode
         double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                               : scene.sceneRadius * g_pmRadiusFactor;
+        // Photon beams (the view-independent volume cache). Decided — and warned about —
+        // before the GPU branch below, since that branch has no beam gather and would
+        // otherwise drop a media scene's volume without a word.
+        const bool wantBeams = g_beamGather && !scene.media.empty();
+        warnModeMMedia(scene, wantBeams);
         // Trap Ctrl-C for the whole mode-M gather. Without this the default SIGINT action
         // terminates the process, which on a -window-less / backgrounded run would abruptly
         // kill a live CUDA context mid-gather — the exact scenario cudaGracefulShutdown()
@@ -19908,7 +20064,15 @@ static int run(int argc, char** argv) {
             const bool wantAuto = !std::strcmp(device, "auto");
             bool allPinhole = true;
             for (int i : idx) if (toRender[i].cam.hasLens()) allPinhole = false;
-            if ((wantGpu || wantAuto) && allPinhole &&
+            // The photon-beam volume gather is CPU-only for now (the device gather has no
+            // beam BVH), so -beams on a media scene falls back to the CPU path below rather
+            // than silently rendering the volume as nothing — which is exactly the bug
+            // -beams exists to fix. See known-issues.md.
+            const bool beamsCpuOnly = wantBeams;
+            if (beamsCpuOnly && (wantGpu || wantAuto) && cudaAvailable())
+                std::printf("[camera] -beams: photon-beam volume gather is CPU-only — "
+                            "running mode M on the CPU.\n");
+            if ((wantGpu || wantAuto) && allPinhole && !beamsCpuOnly &&
                 cudaAvailable() && cudaPhotonMapSupported(scene)) {
                 std::vector<Camera> cams; std::vector<int> rxs, rys;
                 for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
@@ -19967,9 +20131,12 @@ static int run(int argc, char** argv) {
                     idx.size(), N, radius, nThreads, lightLabel,
                     g_pmFinalGather > 0 ? " [final gather]" : "");
         PhotonMap pm;
+        BeamMap bmap;
         auto tp0 = std::chrono::steady_clock::now();
-        tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC);
-        buildPhotonMap(pm, radius, "[camera]");
+        tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
+                        wantBeams ? &bmap : nullptr, g_beamTarget);
+        radius = buildPhotonMap(pm, radius, "[camera]");
+        if (wantBeams) buildBeamMap(bmap, "[camera]");
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("[camera] photon map: %zu photons from %lld emitted in %.1fs, "
                     "grid %dx%dx%d — gathering %zu cameras ...\n",
@@ -19984,7 +20151,8 @@ static int run(int argc, char** argv) {
             if (g_stopRequested) break;
             const RenderCam& rc = toRender[idx[k]];
             Film f = renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, spp,
-                                        nThreads, diffraction, /*maxBounce*/32, 0, g_pmFinalGather);
+                                        nThreads, diffraction, /*maxBounce*/32, 0,
+                                        g_pmFinalGather, wantBeams ? &bmap : nullptr);
             std::string op = outFor(rc.name);
             if (toRender.size() > 1)
                 std::printf("[camera] '%s' (mode M, %dx%d) -> %s\n",

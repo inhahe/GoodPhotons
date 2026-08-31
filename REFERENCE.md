@@ -49,6 +49,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Conditional blocks (`prefer { … } else { … }`)](#conditional-blocks-prefer----else---)
   - [Camera animation (`camera_path`, `camera_orbit`)](#camera-animation-camera_path-camera_orbit)
   - [Multi-camera shared photon pass (modes `A`, `B`, and `M`)](#multi-camera-shared-photon-pass-modes-a-b-and-m)
+    - [Mode `M` and participating media — `-beams`](#mode-m-and-participating-media---beams)
   - [Stereoscopic 3-D (`-stereo`)](#stereoscopic-3-d--stereo)
   - [Animated geometry (OBJ sequences) → video](#animated-geometry-obj-sequences--video)
   - [The shared grammar](#the-shared-grammar)
@@ -77,7 +78,7 @@ paths they can capture at all**.
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
-| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras) | CPU + **GPU** (direct estimate) |
+| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras). The map is **surfaces only**: add `-beams` for the view-independent photon-beam volume cache, without which participating media render as nothing | CPU + **GPU** (direct estimate; `-beams` is CPU only) |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU + **GPU** |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU + **GPU** |
 
@@ -738,7 +739,7 @@ that converges to the same physical image.
 | `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
 | `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
 | `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / env / collimated lights |
-| `M` | Many cameras sharing one lighting solution (flythroughs); reusable/persistable map | Fast per frame *(after one shared pass)* | ✓ *(walks to diffuse)* | — | ✓ | ✓ *(direct query)* | Direct query blurs contact shadows (use `-pmfg`) |
+| `M` | Many cameras sharing one lighting solution (flythroughs); reusable/persistable map | Fast per frame *(after one shared pass)* | ✓ *(walks to diffuse)* | — | ✓ | ✓ *(direct query)* | Direct query blurs contact shadows (use `-pmfg`); media need `-beams` (single scatter, CPU) |
 | `S` | **Caustics / SDS**; progressive, bounded memory | Slow *(many passes)* | ✓ | ✓ | ✓✓ | ✓ *(resident session; pinhole only)* | Many passes to converge |
 | `U` | Robust "have it all" (diffuse GI + caustics), no per-scene mode picking | Heaviest / pass | ✓ | ✓ | ✓ | ✓ *(resident session; pinhole only, no media)* | Heaviest per-pass cost |
 
@@ -4109,6 +4110,61 @@ resumes together; a half-written or mismatched sidecar set falls back to a fresh
 (`-resume`/budget flags still render per camera for mode `M`, whose per-camera gather is
 independent anyway.)
 
+#### Mode `M` and participating media — `-beams`
+
+The photon map stores **surface** records only, so on its own mode `M` is blind to
+participating media: a `medium` renders as **nothing**, which for a fog / rain / cloud /
+rainbow scene silently deletes the subject. (ftrace warns when it sees a media scene under
+plain mode `M`.) The reason is structural rather than an oversight — a photon deposit is a
+point on a surface, and a photon *crossing* a fog bank interacts everywhere along its path.
+
+`-beams` adds the missing half: a **view-independent beam map**. Each photon's straight
+crossing of each medium is stored as a **segment** — origin, direction, length, power,
+wavelength — and the camera evaluates the Beam × Ray single-scatter estimator against a BVH
+over those segments. Two things follow that matter:
+
+- **The phase function is evaluated per frame at the true viewing angle.** A rainbow is
+  entirely a function of the angle between the photon direction and the eye direction, and a
+  beam is the only record in the engine that keeps a photon direction (`Photon` deliberately
+  does not — the surface estimate is Lambertian and does not need it). So a bow moves
+  correctly with the camera across a flyby, from one stored map.
+- **The forward trace amortizes across every frame**, exactly like the surface map. This is
+  the whole point: a volumetric flythrough that would otherwise need mode `D` (camera-anchored,
+  re-traced per frame) instead pays one photon pass and then a cheap gather per frame.
+
+Single scattering only, on purpose — the depositing photon crosses straight and is attenuated
+by the crossing, so surfaces *behind* the fog are still correctly dimmed, but the
+multiple-scatter term is omitted. That is the same trade the `A`/`B` form of `-beams` makes,
+and the right one here: multiple scattering in a rain volume is a desaturating grey veil that
+washes the bow out.
+
+Sizing: `-beamk <K>` (default 32) sets how many beams a camera segment should gather and the
+kernel radius is derived from it; `-beamcount <n>` (default 1e6) caps stored beams by unbiased
+adaptive thinning; `-beamradius <r>` overrides the radius outright. See the flag table for why
+the beam radius is **much** smaller than the photon-map gather radius.
+
+**Reading the noise.** Beam noise does not look like ordinary sample noise — it appears as
+**coloured streaks radiating through the volume**, because a thin kernel over too few stored
+beams lets individual beams be resolved. More `-spp` barely touches it. The knobs that do are
+`-beamcount` (more beams, but the cost climbs steeply because beam AABBs overlap heavily) and
+`-beamk` (a larger `K` widens the kernel, so the same beams blur together — cheaper, at the
+price of a softer bow). Note the consequence of the radius being derived from `K`: lowering
+`-beamcount` does **not** make the image noisier, it makes it *blurrier* and much faster — on
+`_fog_cornell`, `1e6 → 1e5` ran 10.5× quicker for a visually indistinguishable frame with
+auto-exposure agreeing to three significant figures.
+
+**Validated against the `A`/`B` estimator.** On `scenes/_rainbow_test.ftsl`, `-mode M -beams`
+and the established mode-`B` beam splat (forced on with a second camera, since the `A`/`B`
+form needs ≥2) agree across the frame to a few percent — lit backdrop 182 vs 186 sRGB, the bow
+arc 150 vs 155, the unlit floor and walls identically near-black — with the bow at the same
+angular radius and the same colour order, primary and secondary both present. Plain `-mode M`
+on the same scene renders the room correctly and the bow and the fog **not at all**, which is
+the failure this flag exists to remove.
+
+**CPU only.** The device gather has no beam BVH yet, so `-beams` under mode `M` falls back to
+the CPU and prints that it has done so — preferable to the GPU silently dropping the volume,
+which is the bug `-beams` exists to fix.
+
 **Shared vs. independent randomness across cameras (matters for video and for
 side-by-side cameras).** This is the key per-mode difference in how randomness is
 distributed *between* cameras. Note that **a "frame" here is simply a camera in the same
@@ -4314,7 +4370,10 @@ add-on), this doubles as a Blender → FTSL path.
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R`, photon-map `M`/`S`, BDPT `D` and VCM `U`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, backward `R`, BDPT `D`, and VCM `U`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. In BDPT both subpaths carry the bundle and each connection is evaluated per-λ under one shared MIS weight — on **both** backends, which agree to 0.03%. VCM (`U`) does the same on **both** backends: one bundle per path index feeds both its light and camera subpath, so its *connections* are exact per-λ while its *merges* key off each stored light vertex's own wavelengths — **0.51× noise RMS** at equal passes on a gel + mirror box (CPU), **0.72–0.82× chroma noise** for 1.5–1.7× the time on the GPU, matching the single-λ estimator to 0.02 % and each other to 0.03 %. In modes `R` and `A`/`B`/`C` (and the `M`/`S` deposit) the bundle also rides through mirrors/gels/glossy lobes and every Russian roulette survives on the strongest live λ (no per-λ ratio amplification), worth ~0.42–0.52× noise RMS on coloured interiors in `R` and ~1.1× luma / 1.3–1.8× chroma at equal time in the forward modes. Default `4`; clamped to `1..8`. **Mode `W` defaults to `8` instead** — at 1 spp the bundle *is* the spectral quadrature, and it is nearly free there (measured 2.7 % of frame time versus a single wavelength, because mode `W` is traversal-bound; the same step costs 61 % in mode `R`). `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator) — fine in the sampled modes, but in mode `W` it renders dispersive surfaces flatly **wrong** rather than merely noisy, and a batch mode-`W` render now warns and names the offending material. Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`) and by any scene with participating media, a GRIN volume, or a finite-lens camera |
 | `-herosplit` | **Split-at-dispersion** instead of the default de-hero policy. Normally a dispersive event (dielectric refraction, grating order, fluorescent Stokes shift) *terminates* the `N-1` secondary wavelengths and boosts the hero ×`N`, because they can no longer follow one shared direction. With `-herosplit` all `N` wavelengths **continue**, each running the same interaction with its own λ — refracting along its own Snell direction, diffracting into its own grating order — so the bundle fans out into `N` independent monochromatic sub-paths. Same mean (both estimators are unbiased; verified `sum/emitted = 1.000000` and converged luminance matching a 200 M-photon reference to 0.03 %), but the chromatic spread of a prism / rainbow / dispersive caustic is resolved **geometrically per photon** instead of stochastically across many. Measured on a dispersive `glass:SF10` flint-sphere Cornell box, **at equal wall clock**: **0.70× chroma / 0.89× luma noise RMS inside the caustic**, 0.80× / 0.92× over the whole frame. The extra traversal past the split is linear, not exponential (a monochromatic sub-path never re-splits) and is paid only by photons that actually reach the glass — **1.11×** per photon there — but that ratio is scene-dependent, which is why it stays opt-in. No-op with `-heroc 1`. **CPU forward modes `A`/`B`/`C` + the `M`/`S` photon deposit** only — ignored by the GPU backends, the backward tracer (`R`), BDPT (`D`) and VCM (`U`). |
-| `-beams` / `-photonbeams` | **Decorrelated single-scatter volumetrics** for the shared forward mode-`B` multi-camera / flyby pass. Normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Deliberately omits the multiple-scatter haze wash (crisper bow). Runs on **CPU and GPU** (ported to the CUDA forward tracer; spectral-rainbow-phase media stay CPU-tabulated and fall back to CPU); needs ≥2 shared cameras + a scattering `medium`. No effect otherwise. |
+| `-beams` / `-photonbeams` | **Single-scatter volumetrics** — two different mechanisms, picked by mode. **Modes `A`/`B` (shared multi-camera / flyby pass):** normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Runs on **CPU and GPU** (spectral-rainbow-phase media stay CPU-tabulated and fall back to CPU); **needs ≥2 shared cameras** + a scattering `medium` — with one camera the ordinary analog path is strictly better (it keeps the multiple scattering `-beams` trades away), so `-beams` is ignored and ftrace says so. Mind that when comparing against mode `M`: a single-camera `-mode B -beams` is *not* a beams render. **Mode `M` (photon map):** stores a **view-independent BEAM MAP**, which is the *only* way mode `M` sees media **at all** — the photon map holds surface records only, so without `-beams` a fog / rain / cloud / rainbow scene renders its volume as **nothing** under `M` (ftrace now warns when it sees that combination). Each photon's straight crossing of each medium is stored as a segment *with its direction*, and the camera gathers them with the Beam × Ray 1D estimator, so the phase function is evaluated at the true per-frame viewing angle and **one forward trace serves every frame of a flyby** instead of mode `D` re-tracing per frame. Tune with `-beamk` / `-beamradius` / `-beamcount`. **CPU only** — a `-beams` mode-`M` render falls back off the GPU and says so. Both forms deliberately omit the multiple-scatter haze wash (crisper bow). No effect without a scattering medium. |
+| `-beamk <K>` | Mode-`M` beam gather population: how many photon beams a camera segment should collect (default `32`). The beam kernel radius is *sized to hit this* — bigger is smoother and linearly slower. It is the volume analogue of `-pmcount`. |
+| `-beamradius <r>` | Mode-`M` beam kernel half-width in world units, overriding `-beamk`. Default is automatic. **Do not set this to the photon-map gather radius**: a beam is a 1-D object blurred in 1-D, so the gathered population grows *linearly* in `r` (and in total stored beam length) rather than as `r²` — at the surface map's radius an ordinary fog box collects tens of thousands of beams per ray and the render never finishes. The automatic size is smaller by orders of magnitude. |
+| `-beamcount <n>` | Mode-`M` **ceiling** on stored beams (default `1000000`; `0` = unlimited; accepts `2e6` form). A ceiling, not a quota: the pass keeps every beam it generates until it reaches this number, so a scene whose media are small and bounded (a rain box inside a large hall) legitimately stores far fewer, and that is not a fault. Beams past the ceiling are dropped by Russian roulette with the survivors' power rescaled, so the estimate is unbiased either way. A beam lights a whole chord rather than a point, so far fewer beams than photons are needed — and beams are additionally split for BVH quality, up to ~4× the raw count. Raising it buys **spatial sharpness, not lower noise** (the kernel radius shrinks to keep `-beamk` on target), and costs time roughly *linearly* — so this is the first knob to lower if a media render is slow. |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), a **path base name** (`fly` selects every frame of `camera_curve "fly"` — `fly000..fly143` — while excluding unrelated stills), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The path-base form renders one whole flyby from a scene that also declares one-off stills; the index / nearest forms aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
 | `-t <threads>` | CPU thread count |

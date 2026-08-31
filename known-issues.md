@@ -5,6 +5,220 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-31, v0.194.0): mode-`M` photon beams (`-beams`) have no GPU gather, so a volumetric flyby is forced onto the CPU — the one path that most needs the GPU
+
+**What.** `-beams` under mode `M` builds a `BeamMap` (`src/photonbeams.h`) and gathers it in
+`gatherPhotonBeams` / `photonGather` (`src/photonmap_render.h`) — **CPU only**. There is no
+device-side beam BVH, so `runSharedPhotonMap` (`main.cpp` ~20050) checks `beamsCpuOnly` and
+skips the whole `renderPhotonMapSharedCuda` branch, printing
+
+```
+[camera] -beams: photon-beam volume gather is CPU-only — running mode M on the CPU.
+```
+
+The GPU mode-`M` **exposure meter** carves out for the same reason (`main.cpp`, the
+`meterGpu && !(g_beamGather && !scene.media.empty())` guard) — otherwise the meter would
+measure a frame with no volume in it and pick an exposure for a different image than the one
+that gets rendered.
+
+**Why the carve-out is right even though it costs speed.** The alternative is the GPU path
+running *without* the beam map, i.e. silently dropping the volume — which is the exact bug
+`-beams` exists to fix, and it would fail invisibly (a plausible-looking image with the
+subject missing). A loud fallback is strictly better than a quiet wrong answer.
+
+**Why it matters.** The motivating case is a 600-frame `gallery_rain` flyby. Mode `D` costs
+~7.6 h because it is camera-anchored and re-traces per frame; the whole point of moving to
+mode `M` + `-beams` is that one forward trace serves every frame. Landing that on the CPU
+recovers the *amortisation* but not the *device*, so the win is smaller than it should be.
+
+**The fix.** Port `BeamMap` to the device the way the photon map already is: upload a flat
+`DPhotonBeam` array plus the BVH nodes (the `Bvh` is already a POD node array, and
+`render_cuda.cu` uploads BVHs for geometry, so both halves exist), then add a beam-gather
+branch to the mode-`M` device gather that mirrors `gatherPhotonBeams`. The two per-beam
+`mediaTransmittance` marches are the dominant per-hit cost and should be looked at first —
+on the CPU they are already what makes the gather expensive (see the TECH DEBT entry below).
+
+### PERF — OPEN (2026-08-31, v0.194.0): the mode-`M` beam gather's cost is BVH traversal over overlapping beam AABBs, and is ~independent of how many beams it actually gathers
+
+**Superseded a wrong diagnosis.** This entry originally claimed the two per-hit
+`mediaTransmittance` marches dominated. **Measurement says that is false**, and the wrong
+version is recorded here rather than deleted because the plausible-but-wrong theory is exactly
+what would otherwise get "fixed" first. Two reasons it was wrong: `mediumTransmittance` already
+has an analytic `exp(-sigma_t*d)` fast path for a homogeneous medium (`render.h:426`), so those
+calls are cheap in the common case; and the cost does not scale with the number of hits at all.
+
+**The measurement** (`scenes/_fog_cornell.ftsl`, 64×64×1spp, CPU, gather time only):
+
+| knob | value | gather |
+|---|---|---|
+| `-beamk 2` | ~2 beams/segment | 6.1 ms/sample |
+| `-beamk 32` | ~32 beams/segment | 6.3 ms/sample |
+
+A **16× change in gathered beams moves the time 3%** — the per-hit work (transmittance, phase,
+`sigma_s`, kernel) is not the cost. Sweeping the *stored* count instead, at fixed `-beamk 32`:
+
+| `-beamcount` | sub-beams after split | gather |
+|---|---|---|
+| `1e5` | 344 k | ~3.1 s |
+| `3e5` | 1.04 M | ~7.1 s |
+| `1e6` | 3.45 M | ~20 s |
+
+Cost is ~**linear in stored beams** while the gathered count is held constant — the signature of
+a traversal that touches a roughly fixed *fraction* of all primitives, i.e. the BVH is barely
+culling.
+
+**Why it can't cull.** A beam AABB is the box of a *diagonal* segment inflated by the kernel
+radius, so it is mostly empty. With ~1.7×10⁶ m of stored beam length packed into a ~10 m³
+region, every point in space falls inside on the order of **thousands** of beam AABBs. No BVH
+can separate boxes that genuinely overlap that deeply, so any ray must test them all.
+
+**The split rule is not adapting.** `splitLen = max(diag/64, S/(3N))` (`photonbeams.h::buildAuto`,
+mirrored in `main.cpp::buildBeamMap`) returned 0.4999 / 0.5014 / 0.5012 across the 10× beam-count
+sweep above — both terms are scene-scale quantities with no dependence on beam *density*, which
+is the thing that determines whether culling works. Worse, since cost is ~linear in primitive
+count and splitting multiplies that count by ~3.45× while leaving the cost-per-primitive roughly
+unchanged, **the split may currently be a net loss** rather than the BVH-quality win it was
+added as. Not yet proven either way — there is no flag to disable it, which is itself the gap.
+
+**Mitigations that already work.** Because the radius auto-adapts to hold `-beamk` at its
+target, the stored beam count is a *sharpness-vs-time* knob and **not** a noise knob: dropping
+`-beamcount` 1e6 → 1e5 on `_fog_cornell` (128×128×4spp) went **7m29s → 43s, a 10.5× speedup**,
+with a visually indistinguishable image and auto-exposure matching to 3 significant figures
+(7.43e-13 vs 7.42e-13 — incidentally a good unbiasedness check on `decimateTo`).
+
+**The fix, in order of expected value.**
+1. Add a `-beamsplit <len>` knob (expert, alongside `-beamradius`) so the split can be measured
+   and disabled — currently its value is unmeasurable, which is why this entry can't conclude.
+2. Replace the split rule with one driven by beam *density* (target total AABB volume as a
+   multiple of the region volume: total ≈ `S·L²/(3√3)`, so `L` is the free parameter) rather
+   than by scene diagonal and mean beam length.
+3. Consider abandoning the BVH for a uniform grid, which is what the *surface* photon map
+   already uses (`photonmap.h` — counting sort into cell-contiguous runs) and which degrades
+   far more gracefully under heavy primitive overlap than a SAH BVH does.
+4. Only then revisit the per-hit transmittance work, which the table above shows is not
+   currently worth touching.
+
+**Scene-dependence caveat.** `_fog_cornell`'s medium is **unbounded** and its camera sits
+*outside* the box, so photons escaping the open front deposit beams up to
+`kBeamFarScale × sceneRadius` ≈ 7 m, which inflates the beam AABB to ~14 m across and is close
+to a worst case. A scene with **bounded** media (e.g. `gallery_rain`, whose cloud and rain
+volumes both carry `bounds`) clips every beam tightly and should traverse far better; the
+numbers above are the pessimistic end of the range, not the typical one.
+
+### FIXED (2026-08-31, v0.194.1): `-beams` was a SILENT no-op in modes `A`/`B` below two cameras, which made a "reference" render secretly the wrong thing
+
+**What.** The `A`/`B` form of `-beams` resamples one shared photon flight per camera, so both
+tracers gate it on having several cameras to share: `render.h`'s `doBeamGather`, and
+`render_cuda.cu` ~13842 (`s->cs.beamGather = beamGather && nc > 1 && !scene.media.empty()`).
+`main.cpp` ~19738 folds a single-camera forward group back into the per-camera path, where the
+flag simply never applies. **The gate is correct** — with one camera the ordinary analog
+volumetric path is strictly better, because it keeps the multiple scattering `-beams` trades
+away — but it was completely silent.
+
+**Why silence was harmful, not merely untidy.** `-beams` changes what the render *means*, not
+just how fast it is: with it, a photon crosses a medium straight and the out-scattered energy
+is booked as absorbed (single scatter only); without it, the photon scatters and the multiply
+scattered light fills the room. So a single-camera `-mode B -beams` produces a full
+multiple-scatter image that *looks like* a beams render and is labelled like one.
+
+**How it surfaced.** Validating the new mode-`M` beam gather on `scenes/_rainbow_test.ftsl`
+against `-mode B -beams` as a reference. The mode-`M` render came out with a floor ~28× darker
+in linear terms (1.7 vs 35.3 sRGB) and near-black walls, which read exactly like an
+over-attenuation bug in the new code. It was not: mode `B` with and without `-beams` turned out
+to agree to **three significant figures in every sampled region** — i.e. the "reference" had
+never had beams on. Adding a second camera to the scene turned the gate on and the two
+estimators then agreed to a few percent everywhere (lit backdrop 182 vs 186 sRGB, bow arc 150
+vs 155, floor 1.7 vs 1.7). The darkness was real and correct: that scene's sun is *horizontal*,
+so only multiply-scattered fog light ever reaches the floor, and single scatter is precisely
+what both estimators drop.
+
+**Fix.** `warnBeamsNeedsCameras()` (`main.cpp`, beside the existing `warnModeMMedia`) prints,
+at the fold-back point, that `-beams` is being ignored, how many cameras of that mode it found,
+and that the render therefore *keeps* the multiple scattering. Symmetric with the mode-`M`
+"your media will render as nothing" warning; both exist because the failure mode of a silently
+ignored volumetric flag is an image that is wrong in a way you cannot see.
+
+### FIXED (2026-08-31, v0.194.0): `ftrace -stop` could not interrupt a mode-`M` camera gather at all — the one render that most needed stopping was the one that couldn't be
+
+**What.** `renderPhotonCamera()` (`src/photonmap_render.h`) never polled the stop flag. Its
+callers only test `g_stopRequested` *between whole frames*, so a **single-camera** mode-`M`
+render had no stop point anywhere: `ftrace -stop <pid>` printed `asked pid N to finish and exit
+cleanly`, waited its full 120 s, and then reported
+
+```
+[stop] FAILED — still running after 120s: <pid>
+```
+
+**How it surfaced.** Validating the new `-beams` mode-`M` gather with a deliberately oversized
+kernel radius (the pre-`buildAuto` sizing bug, ~44 000 beam hits per camera ray). The render
+was going to take days, and could not be stopped — it ran for 5.8 CPU-hours saturating the
+machine while the project rule correctly forbids `taskkill /F` on an ftrace process, because
+tearing down a live CUDA context that way can wedge the NVIDIA driver into a TDR/bugcheck. So
+the only two exits were "wait for a render that will not finish" or "do the forbidden thing."
+
+**Fix.** `photonmap_render.h` now includes `parallel.h` and the worker lambda polls
+`ft::stopRequested()` **once per pixel**, returning immediately on a stop. Per *pixel* rather
+than per scanline because the thing that makes a gather worth stopping is a slow gather — with
+an oversized beam radius one scanline is tens of seconds — and the poll is a single relaxed
+atomic load, free against even a fast one. A partially filled band is harmless: every caller
+discards the film when a stop is seen.
+
+**Note.** A process built *before* this fix still cannot be stopped; the fix only helps
+binaries from v0.194.0 on.
+
+### FIXED (2026-08-31, v0.194.0): the CPU mode-`M` exposure meter built no beam map, so `-beams` locked exposure to an image with the volume MISSING
+
+**What.** `main.cpp`'s CPU exposure-meter path traced a reduced photon pass and called
+`renderPhotonCamera` with a `PhotonMap` and **no** `BeamMap`. Under `-beams` on a media scene
+that meters a frame in which the participating medium does not exist — which for a fog / rain /
+cloud scene is usually the brightest thing in the picture — and then anchors the real render's
+exposure to it.
+
+**Why it was easy to miss.** The *GPU* meter already carved out for exactly this reason (the
+`meterGpu && !(g_beamGather && !scene.media.empty())` guard), and that carve-out **falls back
+to the CPU meter** — so the guard was routing the problem case into the path that had the same
+bug, which made the fix look complete when it wasn't.
+
+**Fix.** The CPU meter now builds a reduced `BeamMap` alongside its `PhotonMap` and passes it
+to `renderPhotonCamera`. The beam budget is scaled by `meterN / N` so the meter pass keeps the
+same beams-per-photon density as the real render rather than an accidentally denser (and
+slower) one.
+
+### FIXED (2026-08-31, v0.194.0): the beam budget was PREDICTED from the photon count, and was wrong by 100× in both directions — one scene starved of beams, another allocating gigabytes
+
+**What.** The deposit's Russian-roulette rate was computed once, up front, as
+`target / nPhotons` — i.e. assuming a photon deposits about one beam. That ratio is actually
+set by the media's **volume fraction** and the photons' **bounce depth**, neither of which is
+knowable before the pass, and measurement showed it failing in opposite directions:
+
+| scene | media | result at `-beamcount 1e6` | error |
+|---|---|---|---|
+| `_fog_cornell` | one **unbounded** medium | 2.25 M crossings deposited | **2.3× over** |
+| `gallery_rain` | two small **bounded** media in a large hall | 7 634 beams stored | **131× under** |
+
+The overshoot is a memory problem. **The undershoot was the serious one, because it was
+visible**: with 7.6 k beams the rain curtain rendered as a scatter of individual coloured
+streaks rather than as a volume — the estimator starved of exactly the samples that had been
+asked for, while silently reporting success.
+
+**Why the first fix wasn't enough.** `BeamMap::decimateTo` (a post-pass unbiased trim) was
+added first and does fix the overshoot, but it can only ever remove beams — it is powerless
+against the undershoot, which is a *deposit-side* failure.
+
+**Fix.** Don't predict the rate, **measure** it. `BeamBank` now keeps every beam it generates
+until it reaches a per-thread cap, then halves itself in place (each beam survives with
+p = ½, survivors' power doubled) and halves its own future deposit rate, which the depositor
+re-reads on each push. Standard adaptive-reservoir thinning, unbiased at every stage because
+each beam carries the reciprocal of its own inclusion probability. `decimateTo` is retained,
+demoted to the *exact trim* that makes the final total equal the number the user typed.
+
+**Result.** `gallery_rain` went from 7 634 → **751 419** beams stored (a 98× increase, and
+now everything it actually generates, since that is under the ceiling); the rain reads as a
+volume instead of streaks. `_fog_cornell` stays bounded at its ceiling as before.
+
+**Unbiasedness check.** Trimming 2.25 M deposits to 1 M on `_fog_cornell` moved the frame's
+auto-exposure from 7.43e-13 to 7.42e-13 — 3 significant figures unchanged.
+
 ### PERF — OPEN (2026-08-31, v0.193.1): mode `D` has no resident multi-camera session, so a flyby re-uploads the whole scene once per frame (~0.8 s × N)
 
 **What.** `renderBdptCuda()` (`src/render_cuda.cu:14082`) calls `buildUpload(scene, cam,

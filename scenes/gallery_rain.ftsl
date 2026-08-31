@@ -148,14 +148,28 @@
 # then roll straight into all 600 frames. Do NOT pass -no-meter (the curve is exposure_lock,
 # and the meter pre-pass is what makes every frame share one anchor instead of flickering).
 #
-# NOT PHOTON MAPPING, and that is the one thing to get right here. gallery_settled's flyby is
-# mode M via render_gallery_flyby.bat, which is a big win there: mode M builds ONE
-# view-independent map and every frame is a cheap gather off it, so 600 frames cost about one
-# forward pass. That trade is unavailable in this edition. The rain volume and the cloud are
-# BOUNDED HETEROGENEOUS media and the bow is a view-dependent single-scatter signal off them;
-# mode D is the only mode that carries those AND the directly-seen glass and chrome (see the
-# sun discussion above). A photon map would buy back the frame cost by deleting the subject.
-# So this flyby is 600 INDEPENDENT BDPT renders -- D is camera-anchored, it shares nothing
+# MODE D IS THE REFERENCE PATH, but as of 0.194.0 it is no longer the ONLY one -- read this
+# before you budget 7.6 h. gallery_settled's flyby is mode M via render_gallery_flyby.bat,
+# which is a big win there: mode M builds ONE view-independent map and every frame is a cheap
+# gather off it, so 600 frames cost about one forward pass. That trade used to be flatly
+# unavailable here, because the photon map is a SURFACE point cache with no volume records at
+# all -- it would have bought back the frame cost by deleting the subject, rendering the rain
+# column and the cloud as literally nothing and taking the bow with them.
+# `-beams` (photon beams in the photon map, src/photonbeams.h) fixes exactly that: the forward
+# pass now also stores each photon's straight crossing of each medium as a segment in a second
+# view-independent structure, and the camera gathers it with a Beam x Ray estimator, so the
+# angle between photon and eye -- which is the whole rainbow -- survives into a map that every
+# frame shares. `-mode M -beams` on this scene renders the rain as a coherent volume and the
+# bow with it. MEASURED: the 601-frame flyby runs at 2.35 s/frame, ~23.6 min for the loop, at
+# 160x90 / 2 spp -- i.e. the amortisation is real, and scaling to a delivery resolution is a
+# question about the per-frame gather, not about re-tracing 600 forward passes.
+# The caveats that keep D the reference: `-beams` in mode M is SINGLE SCATTER ONLY (the
+# depositing photon crosses straight), so the multiply-scattered veil inside the cloud is
+# missing; it is CPU-ONLY (no device beam BVH, so the GPU branch and the GPU meter both fall
+# back and say so); and mode M carries directly-seen glass and chrome differently from D (see
+# the sun discussion above). So: mode D for the finished piece, `-mode M -beams` when you want
+# the whole loop in half an hour instead of most of a day.
+# Under D this flyby is 600 INDEPENDENT BDPT renders -- D is camera-anchored, it shares nothing
 # across cameras (REFERENCE, "Other modes do NOT save time with multiple cameras"), and the
 # budget flag applies PER FRAME. What IS shared is only the scene build and the exposure
 # anchor: the meter pre-pass meters the selector's frame alone, once, and all 600 reuse it.

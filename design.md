@@ -22,7 +22,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased; CPU + GPU since 0.110.0, fully on-device since 0.116.0) | `backward.h` (`whitted`), `render_cuda.cu` (`WhittedOpts`) |
 | `P` | composite: forward B + backward R passes merged | `main.cpp` orchestration |
 | `D` | bidirectional path tracer (BDPT, MIS) | `bdpt.h` |
-| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather) | `photonmap.h`, `photonmap_render.h` |
+| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
@@ -2029,6 +2029,93 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   argument (0 = off) — it must, since that is the high-photon-count path where a
   count-independent radius collapses worst. The gather reads `pm.radius` after the build, so
   the adapted value needs no further plumbing.
+- **`photonbeams.h`** — the **view-independent volume cache** that makes mode `M` see
+  participating media at all (CLI `-beams`, since 0.20.7). The surface map above is a *point*
+  cache with no volume records whatsoever, so before this a fog / rain / cloud / rainbow scene
+  rendered its subject as **nothing** under mode `M`; and `render.h`'s existing `-beams` is a
+  camera **splat** (it needs the camera list at photon-trace time), which is structurally the
+  opposite of the view-independence mode `M` exists for. Note also that `Photon` deliberately
+  carries no incident direction (above) — and a rainbow is *entirely* a function of the angle
+  between photon and eye, so the record that would serve it is precisely the one the surface
+  map optimised away. Hence a **separate array with its own BVH**, not an extension of
+  `Photon`.
+  `PhotonBeam` stores a photon's straight crossing of one medium as a segment
+  (`o`, `d`, `s0`, `len`, `power`, `lambda`, `absorb`, `med`) — **one beam per (segment,
+  medium) pair**, clipped to that medium's bound. That decomposition is *correct*, not merely
+  tidy: `sampleMediaCollision` samples each medium independently and takes the minimum (a
+  union of Poisson processes), so in-scatter at a point is the **sum** over the media
+  containing it, and each beam must carry its own `sigma_s` and its own phase function.
+  The camera estimate is **Beam × Ray with a 1D blur** (Jarosz et al. 2011):
+  `L += K1(d_perp)/sin(theta) · Phi_b · Tr_beam(0→s_b) · sigma_s(x) · f_p(cos theta) ·
+  Tr_cam(0→t_c) / nEmitted` — dimensionally `[W]·[1/m]·[1/m]·[1/sr]` = radiance, with **no**
+  `1/(pi r²)` because the 1D Epanechnikov kernel carries its own normalisation. Parallel
+  pairs (`sin theta → 0`) are a measure-zero singularity and are rejected. The gather rides
+  `Bvh::traverseAny` with a leaf callback that always returns `false`, which turns the
+  occlusion traversal into an **all-hits** one for free — no second traversal to keep in sync.
+  **THE RADIUS IS NOT THE SURFACE MAP'S RADIUS — it is smaller by orders of magnitude**, and
+  this is the trap the first working version fell into. A beam is a 1D object blurred in 1D,
+  so `E[beams gathered] = (pi/2)·r·L_ray·S/V` (`S` = total stored beam length) — **linear** in
+  `r` and in `S`, where the surface estimate's population goes as `r²`. At the photon map's
+  radius that is ~44 000 beams per camera ray on a 1 m fog box and a 200×200 / 16 spp render
+  never finishes. `BeamMap::buildAuto` therefore solves the same expression for `r` at a
+  target population `K`, substituting the convex-body mean chord `L_ray = 4V/A`:
+  **`r = K·A/(2·pi·S)`** (`A` = beam-AABB surface area; `V` cancels). It then corrects the
+  closed form's two false assumptions — isotropic relative orientation, beams spread evenly
+  through the box, neither true in a sunlit rain volume where every beam is near-parallel to
+  the sun — with a 96-chord brute-force **probe** over a strided subsample (no BVH needed),
+  clamped to ×[1/64, 64]. `-beamk <K>` sets the target (default 32); `-beamradius <r>`
+  overrides absolutely.
+  **`-beamcount <n>` (default 1e6) is a ceiling reached by *adaptive* thinning, not by a
+  predicted survival rate** — and that distinction was learned the hard way. The first
+  version set a fixed `keepProb = n / nPhotons` up front, which silently assumes ~1 beam per
+  photon; the real yield is a property of the scene's geometry and was wrong by two orders of
+  magnitude *in both directions* (`_fog_cornell`, one unbounded medium: 2.25 M beams for a
+  1 M budget, 2.3× over; `gallery_rain`, small bounded media in a big hall: **7 634** beams
+  for the same budget, 131× under — visible as rain rendered in individual streaks rather
+  than a volume). `BeamBank` now self-thins: each thread fills to a cap of
+  `2·n/nThreads`, then **halves in place** (keep with p=½, double the survivor's power) and
+  halves its own future `keepProb`, which the depositor re-reads per call. Every beam
+  therefore carries the reciprocal of its own inclusion probability, so the estimator stays
+  unbiased at any thinning depth; `decimateTo` applies the same trick once more at the end
+  for the exact trim to `n`. The 2× headroom is what makes the banks still sum to ≥ `n`
+  after one halving each. Measured effect on `gallery_rain`: **7 634 → 751 419** beams.
+  Note what the knob actually buys: since the radius auto-adapts to hold `K`, fewer beams
+  means a *bigger* kernel, so `-beamcount` trades **sharpness** against time, not noise
+  against time (`1e6 → 1e5` on `_fog_cornell`: 7m29s → 43s, indistinguishable image,
+  auto-exposure agreeing to 3 s.f. — itself an unbiasedness check).
+  **Beam splitting** keeps the BVH tight: a long diagonal beam is a mostly-empty AABB, so
+  `splitLong` cuts beams at `max(diag/64, S/3N)` — but a sub-segment keeps the parent's
+  **true** origin `o` and records only its own `[s0, s0+len]` range, so the gather still
+  measures transmittance from where the stored power actually applies and the splitter needs
+  neither a `Scene` nor an RNG to re-integrate anything.
+  **Single scatter only, deliberately** — the depositing photon crosses straight (the analog
+  free-flight redirect is skipped, `render.h`'s `doBeamStraight`) and is attenuated by the
+  crossing, so surfaces beyond the fog are still correctly dimmed. Same trade `-beams` already
+  makes in A/B, and the right one here: the multiple-scatter term in a rain volume is a
+  desaturating grey veil that washes out the bow we are there for.
+  **CPU only for now.** The device gather has no beam BVH, so `runSharedPhotonMap`'s GPU
+  branch and the GPU mode-`M` exposure meter both carve out when `-beams` is on and print
+  that they are falling back — better than the device silently dropping the volume, which is
+  the exact bug `-beams` exists to fix. Logged in `known-issues.md`.
+  **Validated on `scenes/_rainbow_test.ftsl`** against the pre-existing A/B splat estimator,
+  which is the only independent implementation of the same single-scatter trade. Getting the
+  comparison honest took two corrections worth recording. First, `-mode M` *without* `-beams`
+  renders the room correctly and the bow and the fog as literally nothing — that render is the
+  before-picture for this whole bullet. Second, `-mode B -beams` at **one** camera is not a
+  beams render at all: both the CPU and CUDA forward tracers gate the splat form on `nCam > 1`
+  (`render_cuda.cu` ~13842), on purpose, since its entire reason to exist is amortising one
+  flight over many cameras — so B with and without `-beams` came out identical to 3 s.f. and
+  looked, misleadingly, like mode `M` was 20× too dark. Adding a second camera turns the gate
+  on, and then the two agree: lit backdrop 182 vs 186 sRGB, bow arc 150 vs 155, floor 1.7 vs
+  1.7, walls and sphere identically near-black, bow at the same angular radius with primary and
+  secondary in the same colour order. The apparent darkness was real and correct — in that
+  scene the sun is *horizontal*, so nothing but multiply-scattered fog light reaches the floor,
+  and single scatter is exactly what both estimators drop. A third control confirmed no energy
+  is lost on the surface path: with `sigma_t` cut to 0.0002 (near vacuum), mode `M` with and
+  without `-beams` match to 0.1 sRGB in every region.
+  **Beam noise reads as coloured streaks**, not grain — too few beams under a thin kernel are
+  individually resolvable — so `-spp` is the wrong knob for it and `-beamcount` / `-beamk` are
+  the right ones.
 - **`spectrum.h` / `spectral_library.h` / `upsample.h` / `color.h` / `hero.h`** —
   spectral core: measured SPDs/materials, RGB→spectrum upsampling, CIE tables,
   hero-wavelength sampling (`kHeroC=4`: hero λ + 3 stratified secondaries) used by

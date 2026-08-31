@@ -21,6 +21,7 @@
 #include "scene.h"
 #include "camera.h"
 #include "photonmap.h"
+#include "photonbeams.h"   // view-independent volume cache for mode M (photon beams)
 #include "medium_stack.h"
 #include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
@@ -349,6 +350,21 @@ struct Renderer {
         photonDeposit->push(p, n, (float)beta, (float)lambda);
     }
 
+    // Photon-BEAM deposit (mode M with -beams). The surface map above cannot represent a
+    // participating medium at all — no photon ever deposits inside one — so mode M renders
+    // fog / rain / cloud / rainbow as nothing. When this is non-null the photon crosses
+    // every medium in a STRAIGHT beam (the analog free-flight redirect is skipped, exactly
+    // as in the mode-A/B `-beams` path) and appends the whole crossed SEGMENT here, which
+    // any camera can later gather from. See photonbeams.h for the estimator and for why the
+    // segment — not a point — is the right record. Null in every other mode.
+    BeamBank* beamDeposit = nullptr;
+
+    // Longest beam we will store when the photon escapes to infinity through an UNBOUNDED
+    // medium, as a multiple of the scene radius. An unbounded medium clips to [0, 1e30], and
+    // a 1e30-long AABB would swallow the whole BVH; transmittance has long since killed the
+    // beam by a few scene radii anyway.
+    static constexpr double kBeamFarScale = 8.0;
+
     // Model A: map a contact-sensor hit to a pixel and deposit.
     void deposit(const Sensor& s, Film& film, const Vec3& p, double lambda, double beta) const {
         Vec3 rel = p - s.origin;
@@ -469,6 +485,49 @@ struct Renderer {
             if (Tr <= 0.0) break;
         }
         return Tr;
+    }
+
+    // Append the photon beams for one straight crossing of the media, from `o` along `dir`
+    // for `dLen` world units carrying power `beta` at the start (mode M, -beams).
+    //
+    // ONE BEAM PER MEDIUM, each clipped to that medium's own bound. Media superpose (see
+    // sampleMediaCollision: independent Poisson processes, minimum of their sampled
+    // collisions), so the in-scatter at a point is the SUM over the media containing it —
+    // which means a per-medium record is not just an optimisation but the correct
+    // decomposition: each beam then carries its own sigma_s and its own phase function, and
+    // a rain volume overlapping a haze contributes a bow and a glow independently. Clipping
+    // also keeps each beam's AABB tight, which is what makes the BVH worth having.
+    //
+    // `aGlass` is the absorption of the dielectric the photon is currently inside, carried
+    // on the beam so the gather can Beer-Lambert to its own closest-approach point.
+    void emitBeams(const Scene& scene, const Vec3& o, const Vec3& dir, double dLen,
+                   double lambda, double beta, double aGlass, Pcg32& rng) const {
+        if (!beamDeposit || !(beta > 0.0)) return;
+        // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
+        // 1e30-long box (see kBeamFarScale).
+        // (named `farLimit`, not `far`: `far` is a legacy Windows SDK keyword macro)
+        const double farLimit = kBeamFarScale * std::max(scene.sceneRadius, 1e-3);
+        const double dBeam = std::min(dLen, farLimit);
+        if (!(dBeam > 0.0)) return;
+        const double keep = beamDeposit->keepProb;
+        for (int i = 0; i < (int)scene.media.size(); ++i) {
+            const Medium& md = scene.media[i];
+            if (md.sigma_s(lambda) <= 0.0) continue;      // absorbing-only: nothing to gather
+            double ta, tb;
+            if (!md.clipToBounds(o, dir, 0.0, dBeam, ta, tb)) continue;
+            if (!(tb > ta)) continue;
+            // Russian roulette on the beam count (photonbeams.h): a beam lights a whole
+            // chord, so far fewer beams than photons are needed — and a beam is ~72 B, so
+            // one per crossing would run to gigabytes on a dense pass.
+            if (keep < 1.0) { if (rng.uniform() >= keep) continue; }
+            // Power at the beam's stored origin: the photon's throughput carried forward
+            // through the glass absorption and the media extinction it crossed to get there.
+            double p = beta / ((keep < 1.0) ? keep : 1.0);
+            if (aGlass > 0.0 && ta > 0.0) p *= std::exp(-aGlass * ta);
+            if (ta > 0.0) p *= mediaTransmittance(scene, o, dir, ta, lambda, rng);
+            if (!(p > 0.0)) continue;
+            beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i);
+        }
     }
 
     // Wavelength-INDEPENDENT part of the mode-B pinhole connection: project the surface
@@ -2010,6 +2069,15 @@ struct Renderer {
         // scenes stay bit-identical (the marcher is never entered).
         const bool grinAny = grin::sceneHasGrin(scene);
 
+        // PHOTON-BEAM deposit (mode M with -beams): store the crossed segment in the
+        // view-independent beam map instead of splatting it to a camera list. Refused under
+        // GRIN, where the photon does not travel in a straight line and so has no segment to
+        // store (the beam estimator's closest-approach geometry assumes straight beams).
+        const bool doBeamDeposit = (beamDeposit != nullptr) && !scene.media.empty() && !grinAny;
+        // Either beam path makes the photon cross media STRAIGHT: skip the analog free-flight
+        // redirect below and attenuate by the crossing's transmittance instead.
+        const bool doBeamStraight = doBeamGather || doBeamDeposit;
+
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
             // GRIN curved marching pre-pass (does not consume a bounce): advance the ray
             // through any gradient-index region before the straight-ray hit test.
@@ -2027,9 +2095,10 @@ struct Renderer {
             int scatterMed = -1;   // which medium scattered (index into scene.media)
             Vec3 mp;
             // In -beams (photon-beams single-scatter) mode the photon does NOT redirect in
-            // the medium — it crosses in a straight beam and each camera gathers single-
-            // scatter independently below — so skip the analog collision sampling here.
-            if (!scene.media.empty() && !doBeamGather) {
+            // the medium — it crosses in a straight beam, which each camera gathers from
+            // (modes A/B) or which is stored in the beam map (mode M) — so skip the analog
+            // collision sampling here.
+            if (!scene.media.empty() && !doBeamStraight) {
                 double tMed; int which;
                 if (sampleMediaCollision(scene, ray.o, ray.d, dSurf, lambda, rng, tMed, which)) {
                     dEvent = tMed; mediumEvent = true; scatterMed = which; mp = ray.o + ray.d * tMed;
@@ -2077,8 +2146,8 @@ struct Renderer {
             // exact single-scatter in-scatter integral, independent of the photon's own flight.
             // Multiple scattering (a desaturating wash) is intentionally omitted: the right
             // trade for a crisp view-dependent bow / fogbow / glory / crepuscular-ray flyby.
-            if (doBeamGather) {
-                if (nCam > 0 && !forwardCatch) {
+            if (doBeamStraight) {
+                if (doBeamGather && nCam > 0 && !forwardCatch) {
                     double aC = curAbsorb(lambda);
                     for (int c = 0; c < nCam; ++c) {
                         if (!(cams[c].cam && cams[c].film)) continue;
@@ -2093,12 +2162,17 @@ struct Renderer {
                         camSpecularSplatVolumeAll(scene, smc, &cams[c], 1, xc, ray.d, lambda, betaC, crng);
                     }
                 }
+                // Mode M: store the crossing itself, so every camera of a flyby can gather
+                // single scatter from it later without the photon knowing any camera exists.
+                if (doBeamDeposit)
+                    emitBeams(scene, ray.o, ray.d, dSurf, lambda, betaPre, curAbsorb(lambda), rng);
                 // Attenuate the photon by the medium extinction over the whole crossing
                 // (single-scatter transmission) so surfaces behind the fog get correctly
                 // dimmed direct light; the removed energy (out-scattered + absorbed) is booked
                 // as absorbed. The photon then continues STRAIGHT to the surface below.
                 double before = beta;
-                beta *= mediaTransmittance(scene, ray.o, ray.d, dSurf, lambda, crng);
+                beta *= mediaTransmittance(scene, ray.o, ray.d, dSurf,
+                                           lambda, doBeamGather ? crng : rng);
                 e.absorbed += (before - beta);
             }
 
