@@ -11839,11 +11839,55 @@ between 450 nm (138.76 deg) and 650 nm (137.65 deg) — is only ~1.2 deg wide. S
 broad achromatic ringing band with a thin coloured fringe on each side: "a white curve with
 thin bands of colour on top and bottom", which is exactly what the scene was reporting. Real
 rain is polydisperse and the supernumeraries average away; only the first lobe survives.
-`supernumerary off` already does the right thing, but it is opt-*out*, so the default look is
-the wrong one. Proper fix: make the phase function take a size *distribution* (a
+
+**3. `supernumerary off` is not the polydisperse average — it is worse than `supernumerary on`,
+and it flattens the bow's contrast to nothing.** (Measured 2026-08-31; this paragraph replaces
+an earlier claim here that `supernumerary off` "already does the right thing".) The
+implementation is a flat clamp:
+
+```cpp
+if (!p_.supernumerary && z < -1.02) {
+    double peak = airyAi(-1.01879); I = peak * peak;   // hold the principal-lobe PEAK
+}
+```
+
+Averaging `Ai(z)^2` over a droplet-size distribution smooths the oscillation toward its *local
+mean*, which decays as the Airy envelope `1 / (2*pi*sqrt|z|)`. The clamp instead holds the
+*peak* forever. And `z < -1.02` is everything more than ~0.28 deg inside `theta_rb` — at any
+droplet size, because the threshold is in `z` — so that is the entire ~40 deg interior of the
+primary bow, held at full arc brightness. Quantified in `scraps/_supernum_check.py` and
+`scraps/_supernum_row.py` (the latter rebuilds one real 2048-bin row, HG background included,
+using rainbow.h's own geometry: `n=1.3339`, `theta_rb=138.06 deg`, `h=2.532`, `K=210.1 rad^-1`,
+i.e. 3.67 z per degree). Ratio of the clamp to a scattering-cross-section-weighted
+Marshall-Palmer average (rel. width 58%, size-independent):
+
+| z | -5 | -12 | -30 | -80 |
+|---|---|---|---|---|
+| clamp / correct | 3.8x | 5.8x | 9.1x | 14.9x |
+
+After rainbow.h's per-lambda renormalisation (`droplet_um 300`, lambda 550 nm):
+
+| build | renorm divisor | arc peak | interior level | **arc / interior contrast** |
+|---|---|---|---|---|
+| polydisperse (correct) | 1.0588 | 0.25463 | 0.03978 | **6.40x** |
+| monodisperse (`supernumerary on`) | 1.0531 | 0.28933 | 0.03727 | **7.76x** |
+| flat clamp (`supernumerary off`) | 1.4619 | 0.20852 | 0.20745 | **1.01x** |
+
+So the clamp injects ~9x the correct interior mass; renormalisation then divides the whole row
+by 1.46 instead of 1.06, taking 18% off the arc's own peak *and* leaving the interior at
+essentially the arc's own brightness. `supernumerary off` does not render a bow — it renders a
+uniformly bright ~40 deg disc with a thin coloured rim, which is why the arc reads washed out.
+**`supernumerary on` is the closer of the two to the polydisperse truth on every metric above**,
+despite problem 2.
+
+Proper fix (unchanged, but now clearly the *only* correct option — the clamp should be deleted,
+not kept as a fallback): make the phase function take a size *distribution* (a
 gamma/Marshall-Palmer with a width parameter) and integrate over it when building the table,
 so `supernumerary on` means "narrow distribution, supernumeraries survive" rather than
-"physically-impossible single droplet size".
+"physically-impossible single droplet size". Integrating over the distribution also broadens the
+principal lobe (measured: +1% FWHM at 25% relative width, +15% at 50%, peak -9%), which slightly
+relieves problem 1. Until that lands, `scenes/gallery_rain.ftsl`'s `supernumerary off` is
+actively making its rainbow worse than the default would be.
 
 ## FIXED (2026-08-04, 0.129.0): GPU mode D dropped a *material's own* emission — every non-mesh glowing surface rendered black, while the CPU rendered it
 
