@@ -1669,7 +1669,34 @@ struct BackwardRenderer {
             // small steps so the path bends. Pure marching does NOT consume a bounce;
             // when the ray reaches a surface (within one step) or leaves all GRIN regions
             // it stops and we fall through to the straight-ray body.
-            if (grinAny) grin::march(scene, ray);
+            //
+            // The fog free flight is sampled ALONG THE CURVE, one straight sub-segment at
+            // a time (grin.h). Before 0.198.0 the marched span was invisible to the fog
+            // block below, which only ever saw the short straight remainder — so a medium
+            // that both scatters and carries `ior` lost nearly all of its scattering.
+            // `preMed >= 0` is a free flight drawn BEFORE the march and consumed by it: the
+            // marcher walks the curve accumulating arc length and stops the moment the
+            // accumulated length passes the drawn distance. One draw for the whole path
+            // (curve + remainder) rather than one per Eikonal step — identical in
+            // distribution for a homogeneous medium (the exponential is memoryless) and
+            // ~10^5x fewer RNG calls on a ray that spends a long time inside a lens.
+            // `preMed` is then handed to the fog block below as the residual flight over
+            // the straight remainder. -1 means "no medium / no GRIN": draw as before.
+            double preMed = -1.0;
+            bool   medInMarch = false;
+            if (grinAny) {
+                const double stG = scene.backwardMedium().enabled
+                                       ? scene.backwardMedium().sigmaT(lambda) : 0.0;
+                if (stG > 0.0) preMed = -std::log(1.0 - rng.uniformOpen()) / stG;
+                double sAcc = 0.0;
+                medInMarch = grin::marchSegments(scene, ray,
+                    [&](const Vec3&, const Vec3&, double slen, double& tStop) -> bool {
+                        if (preMed < 0.0) return false;
+                        if (sAcc + slen <= preMed) { sAcc += slen; return false; }
+                        tStop = preMed - sAcc; sAcc = preMed; return true;
+                    });
+                if (preMed >= 0.0) preMed = medInMarch ? 0.0 : (preMed - sAcc);
+            }
 
             // Which fur tier this path believes in — rolled once, on its first segment, and
             // then fixed for the rest of the path (GiCtx::furTier). Without -fur-lod this is
@@ -1705,8 +1732,11 @@ struct BackwardRenderer {
             if (scene.backwardMedium().enabled) {
                 double st = scene.backwardMedium().sigmaT(lambda);
                 if (st > 0.0) {
-                    double tMed = -std::log(1.0 - rng.uniform()) / st;
-                    if (tMed < dSurf) {
+                    // `preMed` is the residual of the flight already drawn for the marched
+                    // curve (0 = it collided during the march, at ray.o); otherwise draw.
+                    double tMed = (preMed >= 0.0) ? preMed
+                                                  : -std::log(1.0 - rng.uniformOpen()) / st;
+                    if (medInMarch || tMed < dSurf) {
                         Vec3 p = ray.o + ray.d * tMed;
                         // Beer-Lambert attenuation over the in-glass free-flight leg.
                         {

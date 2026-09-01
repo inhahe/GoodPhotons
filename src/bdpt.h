@@ -26,6 +26,7 @@
 #pragma once
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include "scene.h"
 #include "camera.h"
 #include "hero.h"     // kHeroC / kHeroMax — hero-wavelength bundle sizes
@@ -631,8 +632,10 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             if (++bounces >= maxDepth) return;
             if (rng.uniform() >= sm.albedo(lambda)) return;   // absorbed (vertex retained)
             Vertex& cur = path.back();
-            Vec3 wo = normalize(path[prevIdx].p - cur.p);     // toward the previous vertex
             double pdfW;
+            // phaseSample takes the INCOMING direction (ray.d) directly, so there is no
+            // need to reconstruct `wo` from the two vertex positions here — and doing so
+            // would be the one place in this walk that could produce a NaN direction.
             Vec3 wi = sm.phaseSample(ray.d, lambda, rng, pdfW); // scattered dir (HG or rainbow)
             double pdfRevW = pdfW;                             // phase symmetric in (wo,wi)
             path[prevIdx].pdfRev = convertDensity(pdfRevW, cur, path[prevIdx]);
@@ -681,7 +684,13 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // Sample a continuation direction wi, its forward solid-angle pdf pdfW, the
         // reverse pdf pdfRevW (wi<->wo swapped), the throughput factor, and whether
         // this vertex is a delta (specular) scatter.
-        Vec3 wo = normalize(path[prevSurfIdx].p - cur.p);   // toward the previous vertex
+        // Toward the previous vertex. Degeneracy guard: a hit at zero distance from the
+        // previous vertex would make this 0/0, and a NaN scatter frame poisons every
+        // vertex downstream of it. End the subpath instead — the vertices already stored
+        // stay valid and connectible.
+        Vec3 dwo = path[prevSurfIdx].p - cur.p;
+        if (dot(dwo, dwo) == 0.0) return;
+        Vec3 wo = normalize(dwo);
         Vec3 wi; double pdfW = 0.0, pdfRevW = 0.0, betaFactor = 0.0;
         // Hero bundle: per-secondary throughput factor, i.e. secF[i] = f_{i+1}·cos/pdf
         // for the lobe the hero actually sampled (pdf is always the hero's). This is the
@@ -894,7 +903,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // mxF == betaFactor, so this is exactly the old scalar test.
         double mxF = betaFactor;
         if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
-        if (terminate || mxF <= 0.0) return;
+        if (terminate || !(mxF > 0.0)) return;
 
         // Specular vertices carry a delta density: PBRT stores 0 for both the forward
         // and reverse area densities so MIS skips connections through them.
@@ -1071,7 +1080,7 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
         LeSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * fall;
         if (LeSec[i] > mxLe) mxLe = LeSec[i];
     }
-    if (mxLe <= 0.0) return 0;
+    if (!(mxLe > 0.0)) return 0;
 
     Vertex L0;
     L0.type = VType::Light; L0.p = org; L0.ns = dir; L0.ng = dir;
@@ -1303,7 +1312,9 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (t < 2) return 0.0;
         const Vertex& pt = eye[t - 1];
         if (!pt.isLightVertex()) return 0.0;
-        Vec3 wo = normalize(eye[t - 2].p - pt.p);
+        Vec3 dwo = eye[t - 2].p - pt.p;          // degeneracy guard: normalize(0) is NaN
+        if (dot(dwo, dwo) == 0.0) return 0.0;
+        Vec3 wo = normalize(dwo);
         double Le = pt.Le(wo, lambda, invPdfLambda);
         nUp = pt.nUp;
         // The hero may legitimately be black where a secondary is not, so the early-out
@@ -1313,7 +1324,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             LeSec[i] = pt.Le(wo, hb.lam[i + 1], hb.invPdf[i + 1]);
             if (LeSec[i] > mxLe) mxLe = LeSec[i];
         }
-        if (mxLe <= 0.0) return 0.0;
+        if (!(mxLe > 0.0)) return 0.0;
         L = pt.beta * Le;
         for (int i = 0; i + 1 < nUp; ++i) Lsec[i] = pt.betaSec[i] * LeSec[i];
     } else if (t == 1) {
@@ -1332,7 +1343,12 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (!cam.project(qs.p, px, py, cosCam, dist2)) return 0.0;
         double dist = std::sqrt(dist2);
         Vec3 wcam = (cam.eye - qs.p) / dist;
-        Vec3 wo = normalize(light[s - 2].p - qs.p);
+        // Degeneracy guard on the incoming edge, for the reason given at the interior
+        // connection below: coincident vertices make `normalize` 0/0 and the NaN then
+        // survives every `<= 0` test on its way to the film.
+        Vec3 dwo = light[s - 2].p - qs.p;
+        if (dot(dwo, dwo) == 0.0) return 0.0;
+        Vec3 wo = normalize(dwo);
         // Scattering value f and the endpoint cosine. A medium vertex has no surface:
         // its phase function replaces the BSDF and the geometry cosine is 1.
         double cosSurf, f, fSec[hero::kHeroMax - 1] = {0};
@@ -1368,7 +1384,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         {   // max over live wavelengths (identical to `f <= 0` when nUp==1)
             double mxF = f;
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
-            if (mxF <= 0.0) return 0.0;
+            if (!(mxF > 0.0)) return 0.0;
         }
         if (scene.occluded(connOrigin(qs, wcam), wcam, dist - connShorten(qs, wcam, 2e-6))) return 0.0;
         // Transmittance of the fog the connection ray crosses (1 in vacuum, no RNG).
@@ -1437,7 +1453,9 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             if (em.area <= 0.0) return 0.0;
             Wgeom = cosLight * em.area / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
         }
-        Vec3 wo = normalize(eye[t - 2].p - pt.p);
+        Vec3 dwo = eye[t - 2].p - pt.p;          // degeneracy guard: normalize(0) is NaN
+        if (dot(dwo, dwo) == 0.0) return 0.0;
+        Vec3 wo = normalize(dwo);
         // Scattering value f and endpoint cosine (phase / cos=1 at a medium vertex).
         double cosSurf, f, stG = 1.0, fSec[hero::kHeroMax - 1] = {0};
         nUp = pt.nUp;
@@ -1464,7 +1482,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         {   // max over live wavelengths (identical to `f <= 0` when nUp==1)
             double mxF = f;
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
-            if (mxF <= 0.0) return 0.0;
+            if (!(mxF > 0.0)) return 0.0;
         }
         // The emitter was CHOSEN at the hero wavelength; only its emitted radiance is
         // re-evaluated per-λ (the pdf stays hero-driven, as everywhere else).
@@ -1476,7 +1494,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                 LeSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
                 if (LeSec[i] > mxLe) mxLe = LeSec[i];
             }
-            if (mxLe <= 0.0) return 0.0;
+            if (!(mxLe > 0.0)) return 0.0;
         }
         if (scene.occluded(connOrigin(pt, wi), wi, dist - connShorten(pt, wi, occlEps))) return 0.0;
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
@@ -1502,8 +1520,19 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         Vec3 d = qs.p - pt.p; double dist2 = dot(d, d);
         if (dist2 <= 0.0) return 0.0;
         double dist = std::sqrt(dist2); Vec3 w = d / dist;   // pt -> qs
-        Vec3 woE = normalize(eye[t - 2].p - pt.p);
-        Vec3 woL = normalize(light[s - 2].p - qs.p);
+        // The two INCOMING edges need the same degeneracy guard the connection edge just
+        // got, because `normalize` of a zero vector is 0/0 = NaN — and a NaN scatter
+        // direction propagates straight through `mxE/mxL <= 0` (NaN compares false against
+        // everything) onto the film as an undefined pixel. Coincident vertices are exactly
+        // what a zero-length free flight produces (see Pcg32::uniformOpen, now fixed at the
+        // source), but a grazing hit or a degenerate emitter can do it too, so the guard
+        // stays. vertexPdf already rejects both edges the same way, so the pdf side and the
+        // throughput side now agree: this strategy contributes nothing, not something
+        // undefined.
+        Vec3 dwE = eye[t - 2].p - pt.p, dwL = light[s - 2].p - qs.p;
+        if (dot(dwE, dwE) == 0.0 || dot(dwL, dwL) == 0.0) return 0.0;
+        Vec3 woE = normalize(dwE);
+        Vec3 woL = normalize(dwL);
         // Each endpoint is a surface (BSDF, cosine) or a medium (phase, cos=1).
         double cosE, cosL, fE, fL, stGE = 1.0, stGL = 1.0;
         double fESec[hero::kHeroMax - 1] = {0}, fLSec[hero::kHeroMax - 1] = {0};
@@ -1561,7 +1590,10 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                 if (fESec[i] > mxE) mxE = fESec[i];
                 if (fLSec[i] > mxL) mxL = fLSec[i];
             }
-            if (mxE <= 0.0 || mxL <= 0.0) return 0.0;
+            // Negated form, NOT `mxE <= 0.0`: NaN compares false against every operand, so
+            // `<= 0.0` lets an undefined scatter value through while `!(mxE > 0.0)` rejects
+            // it. Identical for every finite value, so nothing else changes.
+            if (!(mxE > 0.0) || !(mxL > 0.0)) return 0.0;
         }
         // Both ENDS can be fibers here, and a connection arriving at a strand from its far
         // side would clip the tube just short of the vertex, so stop the shadow ray early at
@@ -1580,7 +1612,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
     // decided by the hero wavelength — so ONE weight serves the whole bundle.
     double mx = L;
     for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mx) mx = Lsec[i];
-    if (mx <= 0.0) return 0.0;
+    if (!(mx > 0.0)) return 0.0;        // negated: also rejects NaN (see the mxE/mxL note)
     const double mis = misWeight(scene, cam, light, eye, sampled, s, t, lambda);
     for (int i = 0; i + 1 < nUp; ++i) Lsec[i] *= mis;
     nUpConn = nUp;
@@ -1691,7 +1723,7 @@ struct BdptRenderer {
                             double mx = c;
                             for (int i = 0; i + 1 < nUpConn; ++i)
                                 if (Lsec[i] > mx) mx = Lsec[i];
-                            if (mx <= 0.0) continue;
+                            if (!(mx > 0.0)) continue;   // negated: also drops NaN (see connectBDPT)
                             // Average over the wavelengths this connection actually
                             // carries. Either subpath may have de-hero'd at a delta
                             // vertex, in which case nUpConn == 1 and this reduces

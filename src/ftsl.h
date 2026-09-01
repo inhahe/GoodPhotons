@@ -6712,9 +6712,20 @@ private:
         // and supernumeraries. Its physical features are ON BY DEFAULT; the block
         // knobs are overrides (turn a feature off, or retune it):
         //   droplet_um <r>       droplet radius in microns (default 500 = 0.5mm rain;
-        //                        ~10 -> a broad desaturated fogbow).
+        //                        ~10 -> a broad desaturated fogbow). With dispersion > 0 this
+        //                        is the SCATTERING-weighted MEAN radius.
+        //   dispersion <d>       relative width of the droplet size distribution (alias
+        //                        `spread`). 0 = monodisperse (full supernumerary train),
+        //                        0.577 = Marshall-Palmer rain (the DEFAULT), max 0.70.
+        //   rain_mm_h <R>        convenience: set droplet_um and dispersion from the
+        //                        Marshall-Palmer DSD at rain rate R mm/h. Either may still be
+        //                        overridden by naming it explicitly in the same block.
         //   secondary on|off     the p=3 secondary bow (default on).
-        //   supernumerary on|off the Airy side-maxima / supernumerary arcs (default on).
+        //   supernumerary on|off DEPRECATED (0.199.0). Was a flat clamp on the Airy profile
+        //                        standing in for polydispersity; measured far worse than the
+        //                        real size average that replaced it. Now mapped onto
+        //                        `dispersion`: `on` -> 0 (monodisperse), `off` -> the default
+        //                        0.577. Ignored if `dispersion` is also given.
         //   strength <s>         relative weight of the bows over the forward haze (default 1).
         //   forward_g <g>        HG anisotropy of the smooth forward-scatter background (default 0.55).
         //   secondary_ratio <v>  secondary brightness vs. primary (default 0.43).
@@ -6739,9 +6750,30 @@ private:
                 rainbow::Params prm;
                 const Block* pb = ph->val.block.get();
                 if (pb) {
+                    // `rain_mm_h` first, so it acts as a DEFAULT that explicit keys override.
+                    // Marshall-Palmer: N(D) ~ exp(-Lambda D), Lambda = 4.1 R^-0.21 per mm of
+                    // DIAMETER, so per mm of radius the rate is 2*Lambda and the scattering
+                    // (a^2) weighted mean radius is 3/(2*Lambda) mm. Shape k = 1 -> dispersion
+                    // 1/sqrt(3) = 0.577, independent of R (MP moves the size, not the width).
+                    if (const Stmt* s = find(*pb, "rain_mm_h")) {
+                        double R = s->val.words.empty() ? 0.0 : std::atof(s->val.words[0].c_str());
+                        if (!(R > 0.0)) { fail("medium `phase rainbow` needs a positive `rain_mm_h`"); return false; }
+                        prm.dropletRadius_m = 1.5e-3 / (4.1 * std::pow(R, -0.21));
+                        prm.dispersion = 1.0 / std::sqrt(3.0);
+                    }
                     double dropUm = dblOf(*pb, "droplet_um", prm.dropletRadius_m * 1e6);
                     if (dropUm <= 0.0) { fail("medium `phase rainbow` needs a positive `droplet_um`"); return false; }
                     prm.dropletRadius_m = dropUm * 1e-6;
+                    const bool hasDisp = find(*pb, "dispersion") || find(*pb, "spread");
+                    if (hasDisp) {
+                        double dsp = dblOf(*pb, "dispersion", dblOf(*pb, "spread", prm.dispersion));
+                        if (dsp < 0.0 || dsp > rainbow::kDispMax) {
+                            fail("medium `phase rainbow` `dispersion` must be in [0, 0.70] "
+                                 "(0 = monodisperse, 0.577 = Marshall-Palmer)");
+                            return false;
+                        }
+                        prm.dispersion = dsp;
+                    }
                     prm.rainbowStrength = dblOf(*pb, "strength", prm.rainbowStrength);
                     prm.gForward        = dblOf(*pb, "forward_g", prm.gForward);
                     prm.secondaryRatio  = dblOf(*pb, "secondary_ratio", prm.secondaryRatio);
@@ -6749,9 +6781,22 @@ private:
                         std::string v = s->val.words.empty() ? "on" : s->val.words[0];
                         if (falsy(v)) prm.secondary = false; else if (truthy(v)) prm.secondary = true;
                     }
+                    // DEPRECATED `supernumerary` — see the note above. Kept so old scenes load,
+                    // mapped onto the size distribution that actually models what it faked.
                     if (const Stmt* s = find(*pb, "supernumerary")) {
                         std::string v = s->val.words.empty() ? "on" : s->val.words[0];
-                        if (falsy(v)) prm.supernumerary = false; else if (truthy(v)) prm.supernumerary = true;
+                        static bool warned = false;
+                        if (!warned) {
+                            warned = true;
+                            std::fprintf(stderr, "[ftsl] note: `phase rainbow { supernumerary %s }` is "
+                                "deprecated since 0.199.0 — use `dispersion` (0 = monodisperse, "
+                                "0.577 = Marshall-Palmer rain, the default).%s\n", v.c_str(),
+                                hasDisp ? " Ignored here: `dispersion` is set explicitly." : "");
+                        }
+                        if (!hasDisp) {
+                            if (truthy(v))      prm.dispersion = 0.0;             // full Airy train
+                            else if (falsy(v))  prm.dispersion = 1.0 / std::sqrt(3.0);
+                        }
                     }
                 }
                 auto rp = std::make_shared<rainbow::RainbowPhase>();

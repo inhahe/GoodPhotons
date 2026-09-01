@@ -72,14 +72,68 @@ inline double airyAi(double x) {
                   x -= DX; y = yo; yp = ypo; v[i-1] = y; } }
         }
         double at(double x) const {
-            if (x <= X0) return 0.0;
             if (x >= X1) return 0.0;
+            if (x <= X0) {
+                // Below the table, use the exact large-|x| asymptotic rather than 0. Ai(-t) ~
+                // t^(-1/4)/sqrt(pi) * sin((2/3) t^(3/2) + pi/4), relative error < 1e-4 for t > 30.
+                // Returning 0 here used to clip the whole bow interior beyond z = -30 to nothing,
+                // which mattered because the Ai^2 envelope only decays as |z|^(-1/2).
+                double t = -x;
+                return std::sin((2.0 / 3.0) * t * std::sqrt(t) + 0.25 * PI)
+                     / (std::sqrt(std::sqrt(t)) * std::sqrt(PI));
+            }
             double f = (x - X0) / DX; int i = (int)f; double t = f - i;
             if (i < 0) return v[0]; if (i >= n - 1) return v[n - 1];
             return v[i] * (1.0 - t) + v[i + 1] * t;
         }
     } table;
     return table.at(x);
+}
+
+// --- Tail integral of Ai(x)^2 -----------------------------------------------
+// S(u) = integral from u to +inf of Ai(t)^2 dt. This is what makes the droplet-size
+// average below both exact and cheap: the mean of Ai^2 over an interval [a,b] is
+// (S(a) - S(b)) / (b - a), so a quadrature cell that straddles many Airy oscillations
+// gets their exact average instead of an aliased point sample. (Point-sampling
+// Ai(z*s)^2 at 64 sizes would alias badly: at z = -80 the phase sweeps ~1400 rad
+// across the distribution.)
+//
+// Tabulated by integrating the Ai table downward from X1; below X0 the oscillation
+// averages to the envelope 1/(2*pi*sqrt|t|), whose integral is sqrt|u|/pi.
+inline double airyAi2Tail(double u) {
+    static const struct Ai2Table {
+        const double X0 = -30.0, X1 = 12.0, DX = 0.002;
+        int n = 0;
+        std::vector<double> s;   // S at X0 + i*DX
+        Ai2Table() {
+            n = (int)std::lround((X1 - X0) / DX) + 1;
+            s.assign(n, 0.0);
+            double acc = 0.0;
+            double prev = airyAi(X1); prev *= prev;
+            for (int i = n - 2; i >= 0; --i) {
+                double x = X0 + i * DX;
+                double cur = airyAi(x); cur *= cur;
+                acc += 0.5 * (cur + prev) * DX;
+                s[i] = acc; prev = cur;
+            }
+        }
+        double at(double u) const {
+            if (u >= X1) return 0.0;
+            if (u <= X0) return s[0] + (std::sqrt(-u) - std::sqrt(-X0)) / PI;
+            double f = (u - X0) / DX; int i = (int)f; double t = f - i;
+            if (i < 0) return s[0]; if (i >= n - 1) return s[n - 1];
+            return s[i] * (1.0 - t) + s[i + 1] * t;
+        }
+    } table;
+    return table.at(u);
+}
+
+// Mean of Ai(t)^2 over t in [a, b] (any order). Exact, from the tail integral.
+inline double airyAi2Mean(double a, double b) {
+    if (b < a) std::swap(a, b);
+    double d = b - a;
+    if (d < 1e-9) { double v = airyAi(0.5 * (a + b)); return v * v; }
+    return (airyAi2Tail(a) - airyAi2Tail(b)) / d;
 }
 
 // --- Rainbow geometry for one wavelength / scattering order -----------------
@@ -128,13 +182,83 @@ inline BowGeom bowGeometry(double n, int p) {
     return g;
 }
 
+// --- Droplet SIZE DISTRIBUTION (polydispersity) ------------------------------
+//
+// Real rain is not one droplet size, and that single fact governs how a rainbow looks. The
+// bow's ANGLE is geometric — it does not depend on droplet size at all — but the Airy fold
+// scale does: K = (2/h)^(1/3) * (2*pi*a/lambda)^(2/3), so z = (theta - theta_rb) * K scales as
+// a^(2/3). Averaging Ai(z)^2 over a spread of a therefore smears the supernumerary train
+// toward its local mean while leaving theta_rb exactly where it is. That is why a shower shows
+// one clean bow and a fog (narrow distribution, tiny drops) shows supernumeraries.
+//
+// WHAT THIS REPLACED, AND WHY. Through 0.198.0 the stand-in for polydispersity was
+// `supernumerary off`, which held the principal-lobe PEAK flat for all z < -1.02:
+//
+//     if (!supernumerary && z < -1.02) { peak = Ai(-1.01879); I = peak*peak; }
+//
+// That is not a size average, it is a plateau. A real average decays with the Airy envelope
+// 1/(2*pi*sqrt|z|), and since `z < -1.02` is everything more than ~0.28 deg inside theta_rb AT
+// ANY DROPLET SIZE, the clamp held the entire ~40 deg interior of the bow at full arc
+// brightness. Measured (scraps/_supernum_row.py, one real 2048-bin row at droplet_um 300 /
+// 550 nm, HG background included): 3.8x too bright at z=-5 rising to 14.9x at z=-80, ~9x the
+// correct integrated interior mass, and — because each lambda row is renormalised to integrate
+// to 1 — an arc/interior contrast of 1.01x where the correct answer is 6.40x. It did not
+// render a bow at all; it rendered a uniformly bright disc with a thin coloured rim. See
+// known-issues.md, "phase rainbow", problem 3.
+//
+// THE MODEL. A gamma distribution over droplet radius, n(a) ~ a^(k-1) exp(-Lambda a), which is
+// the standard meteorological DSD; k = 1 is exactly Marshall-Palmer's exponential. Two
+// different moments of it matter and they are not the same distribution:
+//
+//   * how much each size SCATTERS: sigma_sca ~ 2*pi*a^2, so the size mix that a photon
+//     actually samples is weighted a^2 -> gamma of shape K2 = k + 2.
+//   * how bright each size's BOW is: the Airy rainbow's differential cross-section scales as
+//     a^(7/3) (van de Hulst), one power of a^(1/3) steeper than the total. So the mix that
+//     shapes the bow is weighted a^(7/3) -> gamma of shape Kb = K2 + 1/3. Big drops make
+//     disproportionately bright bows; that is not a fudge, it is the reason a heavy shower's
+//     bow is more vivid than drizzle's.
+//
+// USER PARAMETER. `dispersion` is the relative standard deviation of the SCATTERING-weighted
+// radius distribution, which is the one with the direct physical meaning ("how varied are the
+// drops that are doing the scattering"). rel.sd = 1/sqrt(K2), so K2 = 1/dispersion^2, and
+//
+//   dispersion = 0        monodisperse — one exact droplet size. A laboratory abstraction;
+//                         full supernumerary train, the pre-0.199.0 `supernumerary on` look.
+//   dispersion = 0.577    Marshall-Palmer (k = 1, exponential). THE DEFAULT. Note this comes
+//                         out INDEPENDENT of rain rate: MP's Lambda(R) moves the mean drop
+//                         size but not the shape, so the relative width is 58% in drizzle and
+//                         in a downpour alike. Verified in scraps/_supernum_mp.py at R = 1, 5
+//                         and 25 mm/h.
+//   dispersion -> 0.707   the ceiling (k -> 0). Beyond it the underlying n(a) has no mode.
+//
+// `droplet_um` remains the scattering-weighted MEAN radius, so it means the same thing at any
+// dispersion and the monodisperse limit is continuous.
+//
+// HOW IT IS COMPUTED. The average is separable: of everything in the Airy profile only the fold
+// scale K depends on a, so the size average of Ai(z)^2 is sum_i w_i * <Ai^2 over cell i>, with
+// the cell spanning [z*s_lo, z*s_hi] and s = (a/abar)^(2/3) — a fixed quadrature built once per
+// table build and reused for every (lambda, mu) cell.
+//
+// The cells are AVERAGED, not point-sampled, via airyAi2Mean(). That is not a refinement, it is
+// required: at z = -80 the Airy phase sweeps ~1400 rad across a Marshall-Palmer distribution, so
+// 64 point samples would alias into fixed-pattern ringing across the bow interior. Averaging each
+// cell exactly makes the quadrature converge on the cell count of the *density* (smooth, 64 is
+// plenty) instead of on the cell count of the *oscillation* (thousands). Cost is 2 table lookups
+// per node per cell at build time; the render cost is unchanged, since the render only ever sees
+// the finished (lambda x mu) table.
+inline constexpr int kSizeNodes = 64;      // quadrature cells across the distribution
+inline constexpr double kDispMax = 0.70;   // K2 = 1/d^2 > 2, i.e. k > 0 (n(a) still has a mode)
+
 // --- Parameters -------------------------------------------------------------
 struct Params {
     double dropletRadius_m = 0.5e-3;  // droplet radius (m). ~0.5mm rain; ~10um -> fogbow.
+                                      // The SCATTERING-WEIGHTED MEAN radius when dispersion>0.
+    double dispersion      = 0.577;   // relative sd of the scattering-weighted size
+                                      // distribution; 0 = monodisperse, 0.577 = Marshall-
+                                      // Palmer rain (the default). See the note above.
     double gForward       = 0.55;     // HG anisotropy of the smooth forward-scatter background.
     double rainbowStrength = 1.0;     // relative weight of the Airy bows vs the background.
     bool   secondary       = true;    // include the p=3 secondary bow.
-    bool   supernumerary   = true;    // keep the Airy side-maxima (else use only the main lobe).
     double secondaryRatio  = 0.43;    // secondary brightness relative to the primary.
     // n(lambda) of the droplet material (water by default). Callable Spectrum-like.
     std::function<double(double)> nOf = [](double lambdaNm) {
@@ -148,6 +272,7 @@ class RainbowPhase {
 public:
     void build(const Params& prm) {
         p_ = prm;
+        buildSizeQuadrature();
         lam0_ = LAMBDA_MIN; dLam_ = 5.0;
         nLam_ = (int)std::lround((LAMBDA_MAX - LAMBDA_MIN) / dLam_) + 1;
         nMu_  = 2048;
@@ -249,7 +374,56 @@ public:
     static void selfTest();
 
 private:
-    // Airy intensity of one bow at scattering angle theta (rad). Weight w scales it.
+    // Build the droplet-size quadrature from p_.dispersion. See the long note above.
+    // x = a / abar, abar = the SCATTERING-weighted (a^2-weighted) mean radius, so the
+    // a^2-weighted distribution is gamma(shape K2, scale 1/K2) and has mean exactly 1 —
+    // which is what makes `droplet_um` mean the same thing at every dispersion.
+    // The BOW-brightness weighting is one power of a^(1/3) steeper, gamma(Kb = K2 + 1/3),
+    // and that is the density the cells carry.
+    void buildSizeQuadrature() {
+        sLo_.clear(); sHi_.clear(); sW_.clear();
+        double d = p_.dispersion;
+        if (!(d > 0.0)) {                       // monodisperse: one degenerate cell
+            sLo_.push_back(1.0); sHi_.push_back(1.0); sW_.push_back(1.0);
+            return;
+        }
+        if (d > kDispMax) d = kDispMax;
+        const double K2 = 1.0 / (d * d);
+        const double Kb = K2 + 1.0 / 3.0;
+        const double mean = Kb / K2, sd = std::sqrt(Kb) / K2;
+        double x0 = mean - 8.0 * sd; if (x0 < 0.0) x0 = 0.0;
+        double x1 = mean + 8.0 * sd;
+        const double dx = (x1 - x0) / kSizeNodes;
+        // Unnormalised gamma(Kb, 1/K2) density, in log form so large Kb cannot overflow.
+        auto logDens = [&](double x) { return (Kb - 1.0) * std::log(x) - K2 * x; };
+        double peak = logDens(std::max(1e-12, (Kb - 1.0) / K2));   // mode, for scaling
+        double sum = 0.0;
+        std::vector<double> wRaw((size_t)kSizeNodes);
+        for (int i = 0; i < kSizeNodes; ++i) {
+            double xm = x0 + (i + 0.5) * dx;
+            double w = (xm > 1e-12) ? std::exp(logDens(xm) - peak) * dx : 0.0;
+            wRaw[(size_t)i] = w; sum += w;
+        }
+        if (!(sum > 0.0)) {                     // degenerate guard
+            sLo_.push_back(1.0); sHi_.push_back(1.0); sW_.push_back(1.0);
+            return;
+        }
+        sLo_.reserve(kSizeNodes); sHi_.reserve(kSizeNodes); sW_.reserve(kSizeNodes);
+        for (int i = 0; i < kSizeNodes; ++i) {
+            double w = wRaw[(size_t)i] / sum;
+            if (w < 1e-9) continue;             // skip cells that cannot matter
+            double xa = x0 + i * dx, xb = xa + dx;
+            sLo_.push_back(std::pow(std::max(0.0, xa), 2.0 / 3.0));
+            sHi_.push_back(std::pow(std::max(0.0, xb), 2.0 / 3.0));
+            sW_.push_back(w);
+        }
+        // Renormalise after the cull so the bow keeps exactly the monodisperse total.
+        double tot = 0.0; for (double w : sW_) tot += w;
+        if (tot > 0.0) for (double& w : sW_) w /= tot;
+    }
+
+    // Airy intensity of one bow at scattering angle theta (rad), averaged over the
+    // droplet-size distribution. Weight w scales it.
     double airyBow(double theta, const BowGeom& bow, double kSize, double w) const {
         if (!bow.valid) return 0.0;
         double h = bow.h < 1e-4 ? 1e-4 : bow.h;
@@ -258,11 +432,17 @@ private:
         // is dimensionless. This bakes in the physical (lambda/a)^(2/3) bow scaling.
         double K = std::pow(2.0 / h, 1.0 / 3.0) * kSize;
         double z = bow.sign * (theta - bow.thetaRb) * K;
-        double ai = airyAi(z);
-        double I = ai * ai;
-        if (!p_.supernumerary && z < -1.02) {
-            // Collapse the side-maxima: hold the principal-lobe peak for z below its max.
-            double peak = airyAi(-1.01879); I = peak * peak;
+        if (sW_.size() == 1 && sLo_[0] == sHi_[0]) {          // monodisperse fast path
+            double ai = airyAi(z * sLo_[0]);
+            return w * ai * ai;
+        }
+        // Size average. z scales as a^(2/3), so cell i covers z in [z*sLo, z*sHi] and
+        // contributes its exact mean of Ai^2 over that span (see airyAi2Mean).
+        double I = 0.0;
+        for (size_t i = 0; i < sW_.size(); ++i) {
+            double a = z * sLo_[i], b = z * sHi_[i];
+            if (a > 12.0 && b > 12.0) continue;               // deep in the dark side
+            I += sW_[i] * airyAi2Mean(a, b);
         }
         return w * I;
     }
@@ -272,6 +452,8 @@ private:
     double lam0_ = 360.0, dLam_ = 5.0;
     int nLam_ = 0, nMu_ = 0;
     std::vector<double> pdf_, cdf_;
+    // Droplet-size quadrature: cell edges in s = (a/abar)^(2/3), and the cell's mass.
+    std::vector<double> sLo_, sHi_, sW_;
 };
 
 inline void RainbowPhase::selfTest() {
@@ -286,6 +468,33 @@ inline void RainbowPhase::selfTest() {
         BowGeom b1 = bowGeometry(n, 2), b2 = bowGeometry(n, 3);
         std::printf("[rainbow selftest] lambda=%3.0fnm (%-6s) n=%.4f  primary=%.2f deg  secondary=%.2f deg\n",
                     c.lam, c.name, n, b1.thetaRb * 180.0 / PI, b2.thetaRb * 180.0 / PI);
+    }
+    // Airy tail integral: S(-inf..u) must match the envelope asymptote sqrt|u|/pi, and
+    // the local mean of Ai^2 over a wide window must match the envelope 1/(2 pi sqrt|z|).
+    // integral_0^inf Ai^2 = Ai'(0)^2 exactly, since d/dx[x Ai^2 - Ai'^2] = Ai^2.
+    std::printf("[rainbow selftest] Ai^2 tail S(0)=%.6f (exp %.6f = Ai'(0)^2)  "
+                "mean Ai^2 over [-52,-48]=%.6f (envelope %.6f)\n",
+                airyAi2Tail(0.0), 0.2588194037928068 * 0.2588194037928068,
+                airyAi2Mean(-52.0, -48.0), 1.0 / (2.0 * PI * std::sqrt(50.0)));
+    // Droplet size distribution: the default is Marshall-Palmer, whose scattering-weighted
+    // relative width is 0.577. Its size average must decay with the Airy envelope where the
+    // pre-0.199.0 flat clamp held the principal-lobe peak, Ai(-1.019)^2 = 0.2869, forever.
+    // Expect: within a lobe of the peak the average is near the monodisperse value; far inside
+    // the bow it tracks the Airy envelope 1/(2 pi sqrt|z|) (a touch above it, by Jensen on the
+    // convex s^(-1/2)), NOT the clamp, which is 3.9x too bright by z=-5 and 15x by z=-80.
+    std::printf("[rainbow selftest] dispersion=%.3f (0.577 = Marshall-Palmer)  "
+                "size-averaged Ai^2 (flat clamp would give 0.286928 at every z):\n",
+                prm.dispersion);
+    {
+        RainbowPhase probe; probe.p_ = prm; probe.buildSizeQuadrature();
+        BowGeom flat; flat.valid = true; flat.thetaRb = 0.0; flat.h = 2.0; flat.sign = 1.0;
+        double K = std::pow(2.0 / flat.h, 1.0 / 3.0);
+        for (double z : {-1.02, -5.0, -12.0, -30.0, -80.0}) {
+            double v = probe.airyBow(z / K, flat, 1.0, 1.0);
+            double mono = airyAi(z); mono *= mono;
+            std::printf("[rainbow selftest]   z=%6.1f  avg=%.6f  mono=%.6f  envelope=%.6f\n",
+                        z, v, mono, 1.0 / (2.0 * PI * std::sqrt(-z)));
+        }
     }
     // Normalisation check for a mid droplet: each per-lambda phase slice must integrate
     // to 1 over the sphere, i.e. 2*pi*integral p(mu) dmu == 1.

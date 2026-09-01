@@ -20,6 +20,24 @@ struct Pcg32 {
     }
     // Uniform double in [0,1).
     double uniform() { return (next() >> 8) * (1.0 / 16777216.0); }
+    // Uniform double in the OPEN interval (0,1) — for inverse-CDF draws whose transform
+    // has a pole at u == 0.
+    //
+    // `uniform()` samples the 24-bit grid {k/2^24}, so it returns EXACTLY 0 about once in
+    // 16.8 M draws. That is harmless for a discrete choice or a barycentric, but it is
+    // singular for an exponential free flight: `-log(1-u)/sigma` collapses to a
+    // ZERO-LENGTH flight, which places the new scattering vertex at exactly the previous
+    // one. Two coincident vertices then make every direction reconstructed between them
+    // 0/0 — the origin of the mode-D NaNs in thick, high-albedo media (a NaN phase-function
+    // argument in connectBDPT's `woL`), and of a small ratio-tracking bias where a
+    // zero-length step re-tests the same point and charges its (1 - sigma/sigma_max)
+    // factor twice.
+    //
+    // The nudge is unbiased and costs no extra randomness: grid point 0 stands for the bin
+    // [0, 2^-24), and this returns an interior point of that same bin instead of its lower
+    // edge. It consumes exactly one `next()`, and every one of the other 2^24-1 grid points
+    // is returned bit-for-bit unchanged — so existing renders do not move.
+    double uniformOpen() { double u = uniform(); return u > 0.0 ? u : 0.5 / 16777216.0; }
 };
 
 // SplitMix64 finalizer: bijective avalanche mix for turning structured indices

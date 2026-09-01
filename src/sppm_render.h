@@ -77,8 +77,20 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
 
     Renderer mats; mats.diffraction = diffraction;
     MediumStack stk;                                     // nested-dielectric medium stack
+    // GRADIENT-INDEX: the camera ray bends, exactly as mode M's gather does. Without this
+    // the SPPM deposit marched its photons through a GRIN lens while the view walked
+    // straight past it, and the lens rendered flat.
+    const bool grinAny = grin::sceneHasGrin(scene);
 
     for (int b = 0; b < maxBounce; ++b) {
+        if (grinAny) {
+            double arc = 0.0;
+            grin::marchSegments(scene, ray,
+                [&](const Vec3&, const Vec3&, double slen, double&) { arc += slen; return false; });
+            int cm = stk.topMat();                       // Beer-Lambert over the marched arc
+            double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
+            if (a > 0.0 && arc > 0.0) thr *= std::exp(-a * arc);
+        }
         Hit h = scene.closestHit(ray);
         if (h.valid) {
             int cm = stk.topMat();

@@ -22,7 +22,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased; CPU + GPU since 0.110.0, fully on-device since 0.116.0) | `backward.h` (`whitted`), `render_cuda.cu` (`WhittedOpts`) |
 | `P` | composite: forward B + backward R passes merged | `main.cpp` orchestration |
 | `D` | bidirectional path tracer (BDPT, MIS) | `bdpt.h` |
-| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather) | `photonmap.h`, `photonmap_render.h` |
+| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
@@ -30,6 +30,33 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 
 CPU is the default device; `-device gpu|auto` enables CUDA for forward A/B/C,
 M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
+
+### Which mode-`M` renders actually reach the GPU (0.197.2)
+
+Mode `M` has **two** dispatch routes, and only one of them has a device implementation — so
+what looks like a `-device` question is really a routing question:
+
+- **`groupM` → `runSharedPhotonMap`** builds one view-independent map and gathers every camera
+  from it (the flythrough win). This is the route with the GPU path,
+  `renderPhotonMapSharedCuda`. A *single* mode-`M` camera goes here too — the group of one is
+  still the fast route.
+- **anything else → `runRender`'s single-camera `mode == 'M'` branch** is unconditionally CPU.
+  It never even reads `device`.
+
+The gate is `rc.mode == 'M' && plainRender`. What legitimately belongs in `plainRender` is only
+a **progressive budget**: the shared path gathers a fixed spp per frame, so `-time` / `-noise` /
+`-forever` / `-preview` genuinely need the single-camera driver. Until 0.197.2 it also included
+`resume || wantCheckpointFlag`, which was a pure loss — mode `M` *discards* both flags 3000
+lines later (a photon map is persistent state a film-only `.ftbuf` cannot rebuild) and says so,
+yet passing `-checkpoint` moved the render off the RTX 4090 and onto 12 CPU threads. A flag the
+mode announces it is ignoring must not silently cost it the whole device backend, so those two
+terms are gone; the shared path re-emits the "ignoring for mode M" note itself, since the
+`runRender` copy is on the branch it no longer takes. The shared path needs no checkpoint
+regardless — it writes each frame the instant that frame's gather completes.
+
+**Still CPU-only underneath this:** a `-time` / `-noise` / `-forever` / `-preview` mode-`M`
+render. Closing that means teaching the shared device path to gather in spp chunks under
+`runSppProgressive`, the way the forward and mode-`R` GPU paths already do (`known-issues.md`).
 
 ## Module map (src/)
 
@@ -1900,6 +1927,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   secondaries. Delta vertices de-hero *except* Mirror and Filter, which pick their
   continuation without consulting λ and so set `keepBundle`.
 
+  **Degenerate-vertex guards (0.199.1).** Every direction BDPT reconstructs from two vertex
+  positions — the subpath walk's `wo`, and the incoming `wo`/`woE`/`woL` of all four
+  connection branches (`s==0`, `t==1`, `s==1`, interior) — now rejects a zero-length edge
+  before `normalize`, which `vertexPdf` had always done and the throughput side had not. Two
+  vertices land on the same point whenever a free flight is shorter than the position's ULP;
+  `Pcg32::uniformOpen` removes the exact-zero flight, but `render_cuda.cu` is `Real = float`,
+  so a *sub-ULP* flight still collapses there and the guard is what actually fixes it.
+  Relatedly, **every `max <= 0.0` reject in both BDPT ports is now written `!(max > 0.0)`**:
+  NaN compares false against everything, so the old form passed an undefined contribution
+  straight to the film. The CUDA film loop had no such reject at all and now mirrors the
+  CPU's. Together these closed the "mode D goes numerically undefined in thick, high-albedo
+  media" entry in known-issues.
+
   **Delta lights in BDPT** (since 0.124.0): mode `D` renders `light spot` and `light sun`.
   Both are Dirac emitters, so the strategies that would have to *sample* the delta are
   unavailable and must be dropped from the balance heuristic — otherwise the surviving
@@ -1984,7 +2024,7 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   0.9996 in absolute units, solar disc `1/16` on both — and `cornell.ftsl` mode U is
   **byte-identical** before and after the port, since every new density sits behind
   `dIsDeltaEmitter` and the area path keeps its RNG draw order.
-- **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`** — U/S/M.
+- **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`/`photonmap_io.h`** — U/S/M.
   PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.
   **`PhotonMap` is structure-of-arrays, and that is load-bearing.** Deposit positions
@@ -2029,6 +2069,338 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   argument (0 = off) — it must, since that is the high-photon-count path where a
   count-independent radius collapses worst. The gather reads `pm.radius` after the build, so
   the adapted value needs no further plumbing.
+- **`allocreport.h`** (0.199.1) — `ftalloc::resize` / `ftalloc::reserve`, which turn a
+  `std::bad_alloc` from a *command-line-sized* buffer into a message naming the buffer, the
+  element count and size, the total in binary units, and the flag that shrinks it. Wrapped:
+  the photon map positions/payloads (CPU pass, CUDA download, `-loadmap`), the photon-beam
+  map, the split beam array, the beam CIE table, the beam BVH boxes. `main()` carries a
+  `std::bad_alloc` backstop listing the four memory knobs for anything unwrapped. Motivation:
+  `std::bad_alloc::what()` is the bare string `bad allocation`, so a render that died between
+  two progress lines used to be diagnosable only by bisecting `-n` by hand.
+
+- **`photonbeams.h`** — the **view-independent volume cache** that makes mode `M` see
+  participating media at all (CLI `-beams`, since 0.20.7). The surface map above is a *point*
+  cache with no volume records whatsoever, so before this a fog / rain / cloud / rainbow scene
+  rendered its subject as **nothing** under mode `M`; and `render.h`'s existing `-beams` is a
+  camera **splat** (it needs the camera list at photon-trace time), which is structurally the
+  opposite of the view-independence mode `M` exists for. Note also that `Photon` deliberately
+  carries no incident direction (above) — and a rainbow is *entirely* a function of the angle
+  between photon and eye, so the record that would serve it is precisely the one the surface
+  map optimised away. Hence a **separate array with its own BVH**, not an extension of
+  `Photon`.
+  `PhotonBeam` stores a photon's straight crossing of one medium as a segment
+  (`o`, `d`, `s0`, `len`, `power`, `lambda`, `absorb`, `med`) — **one beam per (segment,
+  medium) pair**, clipped to that medium's bound. That decomposition is *correct*, not merely
+  tidy: `sampleMediaCollision` samples each medium independently and takes the minimum (a
+  union of Poisson processes), so in-scatter at a point is the **sum** over the media
+  containing it, and each beam must carry its own `sigma_s` and its own phase function.
+  The camera estimate is **Beam × Ray with a 1D blur** (Jarosz et al. 2011):
+  `L += K1(d_perp)/sin(theta) · Phi_b · Tr_beam(0→s_b) · sigma_s(x) · f_p(cos theta) ·
+  Tr_cam(0→t_c) / nEmitted` — dimensionally `[W]·[1/m]·[1/m]·[1/sr]` = radiance, with **no**
+  `1/(pi r²)` because the 1D Epanechnikov kernel carries its own normalisation. Parallel
+  pairs (`sin theta → 0`) are a measure-zero singularity and are rejected. The gather rides
+  `Bvh::traverseAny` with a leaf callback that always returns `false`, which turns the
+  occlusion traversal into an **all-hits** one for free — no second traversal to keep in sync.
+  **THE RADIUS IS NOT THE SURFACE MAP'S RADIUS — it is smaller by orders of magnitude**, and
+  this is the trap the first working version fell into. A beam is a 1D object blurred in 1D,
+  so `E[beams gathered] = (pi/2)·r·L_ray·S/V` (`S` = total stored beam length) — **linear** in
+  `r` and in `S`, where the surface estimate's population goes as `r²`. At the photon map's
+  radius that is ~44 000 beams per camera ray on a 1 m fog box and a 200×200 / 16 spp render
+  never finishes. `BeamMap::buildAuto` therefore solves the same expression for `r` at a
+  target population `K`, substituting the convex-body mean chord `L_ray = 4V/A`:
+  **`r = K·A/(2·pi·S)`** (`A` = beam-AABB surface area; `V` cancels). It then corrects the
+  closed form's two false assumptions — isotropic relative orientation, beams spread evenly
+  through the box, neither true in a sunlit rain volume where every beam is near-parallel to
+  the sun — with a 96-chord brute-force **probe** over a strided subsample (no BVH needed),
+  clamped to ×[1/64, 64]. `-beamk <K>` sets the target (default 32); `-beamradius <r>`
+  overrides absolutely.
+  **`-beamcount <n>` (default 1e6) is a ceiling reached by *adaptive* thinning, not by a
+  predicted survival rate** — and that distinction was learned the hard way. The first
+  version set a fixed `keepProb = n / nPhotons` up front, which silently assumes ~1 beam per
+  photon; the real yield is a property of the scene's geometry and was wrong by two orders of
+  magnitude *in both directions* (`_fog_cornell`, one unbounded medium: 2.25 M beams for a
+  1 M budget, 2.3× over; `gallery_rain`, small bounded media in a big hall: **7 634** beams
+  for the same budget, 131× under — visible as rain rendered in individual streaks rather
+  than a volume). `BeamBank` now self-thins: each thread fills to a cap of
+  `2·n/nThreads`, then **halves in place** (keep with p=½, double the survivor's power) and
+  halves its own future `keepProb`, which the depositor re-reads per call. Every beam
+  therefore carries the reciprocal of its own inclusion probability, so the estimator stays
+  unbiased at any thinning depth; `decimateTo` applies the same trick once more at the end
+  for the exact trim to `n`. The 2× headroom is what makes the banks still sum to ≥ `n`
+  after one halving each. Measured effect on `gallery_rain`: **7 634 → 751 419** beams.
+  Note what the knob actually buys: since the radius auto-adapts to hold `K`, fewer beams
+  means a *bigger* kernel, so `-beamcount` trades **sharpness** against time, not noise
+  against time (`1e6 → 1e5` on `_fog_cornell`: 7m29s → 43s, indistinguishable image,
+  auto-exposure agreeing to 3 s.f. — itself an unbiasedness check).
+  **Beam splitting** keeps the BVH tight: a long diagonal beam is a mostly-empty AABB, so
+  beams are cut into sub-segments — but a sub-segment keeps the parent's
+  **true** origin `o` and records only its own `[s0, s0+len]` range, so the gather still
+  measures transmittance from where the stored power actually applies and the splitter needs
+  neither a `Scene` nor an RNG to re-integrate anything.
+  **WHERE to cut is an area minimisation, and it has a work term (0.196.0).** The cost of the
+  gather is not how many beams it collects — measured, a 16× change in `-beamk` moves the time
+  3%. It is how many AABBs the ray must *enter*, which by Cauchy's formula is proportional to
+  their total surface area. Splitting a beam of length `L` into pieces of length `p` gives
+  `A(p) = 2L[Q·p + 4rE + 12r²/p]` (`Q = |dx||dy|+|dy||dz|+|dz||dx|`, `E = Σ|di|`), balancing the
+  empty space a long diagonal box encloses against the kernel inflation paid per piece, and
+  minimising gives `p* = 2r·sqrt(3/Q)`. That result is *per beam* and **O(r) with no scene-scale
+  term** — which is exactly what the rule it replaced, `max(diag/64, S/3N)`, could not be: two
+  scene-scale quantities that measurably did not move across a 10× beam-count sweep, making the
+  gather's cost linear in stored beams. It also never splits an axis-aligned beam (`Q = 0`),
+  whose box is already tight. But `p*` is the infinite-work limit and the BVH build is linear in
+  sub-beam count (~1.6 µs each), amortised over every camera sharing the map, so the rule
+  minimises `c_build·(S/p) + W·k·A(p)` instead and lands on
+  `p_opt = sqrt(3/Q)·sqrt(4r² + κ/W)` — the area optimum with a work-dependent floor, `W` being
+  the total pixel-samples the sharing cameras will gather. **A flythrough therefore splits far
+  finer than a still of the same scene**, which is why `buildBeamMap` takes a `work` argument
+  and the shared mode-`M` path sums it over the whole camera group. `κ ≈ 72 m²` is measured, not
+  fitted: it predicts the observed single-camera optimum from two independent constants. Bounded
+  by `-beamsplitmax` (memory, not quality — the optimal piece *count* grows as ~S²). Measured
+  156 s → 92 s on `_fog_cornell` with bit-identical output; table in `known-issues.md`.
+  **MULTIPLE SCATTERING (0.199.0).** Through 0.198.0 the beam map carried exactly one
+  scattering order: the depositing photon crossed every medium straight, the extinction it
+  suffered was booked as *absorbed*, and the stored beam paid back only the unscattered
+  in-scatter — anything that scattered twice was deleted. In an optically thick, high-albedo
+  medium that is most of the light. MEASURED on `scenes/_beams_ms.ftsl` (`sigma_t 6`,
+  `albedo 0.95`, `g 0` over a 0.3 m ball, against a 20000-spp mode-D reference): the fog ball
+  rendered at **0.330×** its correct brightness, i.e. two thirds of the volume was missing, and
+  the photon ledger reported `absorbed=0.7542` where the truth is `0.6797`.
+
+  The photon now runs plain **analog** transport under `-beams` and deposits **one long beam per
+  chord between scattering events**, chord *k+1* carrying *k*-times-scattered flux. The chords
+  tile the walk without overlap, so the gather estimates the *full* transport: the same ball
+  comes out at **1.085×**, the residual being the Beam×Ray kernel's finite-radius bias (the rest
+  of the frame sits at 1.019, which is the surface estimate's own radius bias).
+
+  Three things make this a small, local change rather than a rewrite, and each is a trap if
+  missed:
+  - ftrace's beams are **long** beams — the segment runs to the next *surface* and the gather
+    applies `Tr_beam(0→s_b)` analytically (`photonbeams.h:28`). Truncating a beam at the sampled
+    collision instead would be a *short*-beam estimator and would **double-charge**
+    transmittance. So the chord under MS is `dSurf`, not `dEvent`.
+  - the analog `mediumEvent` in-scatter splat must be **suppressed** for any medium a beam chord
+    already covered (`coveredByBeam`), or the same order is counted twice. GRIN collisions — on
+    the marched curve, covered by neither a beam nor a `MedStraight` resample — still splat.
+  - the beam's lead-in transmittance filter changes from `MedStraight` to `MedAll`: under single
+    scatter GRIN extinction was carried *stochastically* by clipping, and under MS nothing is
+    stochastic.
+
+  Order counting: the first chord is already order 1, hence
+  `beamMSAllowed(nDone) = (max == 0) || (nDone + 2) <= max`. The cap is CLI `-beams-order <n>`
+  (`0` = unlimited, the default), carried to the CUDA translation unit as the header-inline
+  global `pbeams::gOrderMax` for the same reason `hero::gSplit` is one — host renderer and
+  device TU do not share `main.cpp`'s statics. **`-beams-order 1` takes the pre-0.199.0 code path
+  verbatim and is bit-identical**, which keeps the crisper single-scatter bow available (dropping
+  the desaturating multiply-scattered veil genuinely sharpens a rainbow) and doubles as a free
+  regression lever. `kWfShade` (wavefront) and `traceHeroPhoton` pass no scatter counter, so they
+  degrade to single scatter — neither runs beams. Cost note: MS deposits several times more beams
+  per photon, so a `-n` that fit before may now exhaust the beam budget (see known-issues.md).
+  **Ported to the device in 0.197.0 — deposit *and* gather.** The scope is larger than "upload
+  the BVH" because `-beams` changes the **transport**, not just the reconstruction: the
+  depositing photon crosses straight, so the surface photon map and the beam map have to come
+  from the *same* forward pass, and the device therefore had to learn to **deposit** beams as
+  well. Both halves live in `render_cuda.cu`. The deposit is `__device__ dEmitBeams` (twin of
+  `Renderer::emitBeams`) writing `DBeamDep` records through an atomic counter, gated in
+  `shadeStep` by `doBeamDeposit = cs.beamCount && crng && sc.mediaN > 0`. (That gate carried a
+  scene-wide `&& !sc.hasGrin` until 0.197.1; GRIN media are now refused **per medium**, inside
+  `dEmitBeams` itself, because a photon bends only *inside* a gradient-index region — see the
+  per-medium block below.) The
+  gather is `DBeamRec` / `DBeamMap` / `dGatherPhotonBeams`, called from `dPhotonGather` **before**
+  `thr` takes the segment's own attenuation — the ordering matters, because each gathered beam
+  carries transmittance to *its own* closest approach, not to the segment end (the host does the
+  same, `photonmap_render.h::photonGather`). Host orchestration is `struct BeamPass`
+  (`render_cuda.h`), which hands `renderPhotonMapSharedCuda` the `BeamMap*`, the `-beamcount`
+  target and the host `build` callback; the build deliberately runs **after** `-savemap`, since
+  the file must hold raw crossings (see the persistence bullet below). Three non-obvious details:
+  (a) **fold at upload** — `DBeamRec.pXYZ = cie(λ)·power/nEmitted`, mirroring `DGatherPhoton`, so
+  the inner loop does no CIE evaluation and no `invN` multiply; (b) the host's `den = 1 - cosT²`
+  is **unusable in float** (eps ≈ 1.2e-7 vs its `1e-9` rejection), so the device uses the
+  algebraically identical, cancellation-free `den = |cross(dc, d_b)|²`; (c) the deposit's roulette
+  and beam-side transmittance draw from the per-photon **side** stream `crng`, never the transport
+  stream, so the device buffer-overflow rerun at a reduced `beamKeep` reproduces the surface
+  deposit photon-for-photon (the host `emitBeams` uses the transport `rng` — a deliberate
+  divergence, and why the two raw crossing counts differ ~12% while the images agree to 0.03%).
+  The overflow rescale aims at **0.95×** the cap, not 1.0: survivors are Binomial and records past
+  the cap are *dropped* (unlike photons, whose atomic still reports the true count), which would
+  bias the estimate. Validated GPU-vs-CPU as mean linear-radiance ratios — 0.9996 gather-only
+  (same map via `-savemap`/`-loadmap`), 0.9997 deposit-only, 0.9943 through a forced overflow
+  rerun at `keep≈0.100`, 0.9945 on `_rainbow_test`'s spectral phase path. `_fog_cornell`
+  128²×8spp: **3m42s → well under a minute**, now dominated by the *host* beam-BVH build.
+  **There is NO backend carve-out, and the GRIN limit is per-medium (0.197.1).** The port first
+  shipped with `beamsCpuOnly = wantBeams && grin::sceneHasGrin(scene)`, inherited by narrowing the
+  old blanket fallback rather than deleting it. That was wrong twice over. **First, the fallback
+  bought nothing**: the CPU refuses the GRIN deposit on *identical* terms (`render.h`'s
+  `doBeamDeposit` carried the same `!grinAny`), so the "safe" backend rendered the same volumeless
+  image, only far slower — a slower identical answer is a worse answer, not a safer one. The
+  inability to store a curved photon is a property of the beam *representation*, not of the
+  backend, so no backend can be the fallback for it. **Second, the gate was scene-wide.**
+  `grin::sceneHasGrin` is "any enabled medium carries an `ior` field", but a photon bends only
+  *inside* a GRIN region — `grin::march` jumps straight between them — so a photon's chord through
+  an ordinary fog is a perfectly good straight beam even when a GRIN lens sits elsewhere in the
+  room. The scene-wide gate therefore threw away every beam in the scene because of one unrelated
+  object. Both fixed: the refusal moved into `emitBeams` / `dEmitBeams` as a per-medium
+  `if (md.grin()) continue;` (device: `md.iorN > 0`), sitting right beside the existing
+  absorbing-only skip, and the host `doBeamDeposit` / device `doBeamDeposit` gates lost their GRIN
+  terms. `warnBeamsGrinMedia` replaces the fallback message: it fires only when a *scattering*
+  medium is GRIN, names how many, says their volume will not appear, and states outright that
+  `-device cpu` renders the same image. Regression scene `scenes/_grin_fog.ftsl` — a GRIN lens and
+  an unrelated scattering haze in one room — deposits 1.9 M crossings and images the haze; before
+  the fix it deposited zero.
+  **A GRIN medium keeps its analog transport instead of being deleted (0.198.0).** Refusing the
+  *deposit* is right; what 0.197.1 left behind was that refusing the deposit still let the photon
+  be crossed **straight** and charged the medium's extinction as absorption — so a scattering GRIN
+  medium was billed for out-scatter that nothing ever paid back, and behaved as a **pure
+  absorber**: its volume rendered as nothing *and* surfaces lit through it came out dark. The fix
+  splits the scene's media into two populations transported by different rules, and threads that
+  split through the free-flight sampler and the transmittance integrator on both backends as a
+  filter argument (`Renderer::MedFilter` = `MedAll`/`MedStraight`/`MedCurved`, device twin
+  `DMedFilter`, both defaulting to `All` so every pre-existing call site is bit-identical):
+  **non-GRIN media** (`MedStraight`) are crossed straight, deposited and gathered as beams exactly
+  as before; **GRIN media** (`MedCurved`) are excluded from the crossing and keep full analog
+  scattering — the same transport they get without `-beams` — sampled along the marched curve
+  (see the `grin.h` bullet below). The straight crossing is then clipped at the analog collision
+  (`dEvent`, not `dSurf`, in `tracePhoton` and `shadeStep`), which is also what makes the
+  bookkeeping exact rather than merely plausible: because the crossing stops there, the
+  probability that a stored beam covers depth *s* is already Tr_curved(0→s), so `emitBeams` /
+  `dEmitBeams` must apply only `MedStraight` transmittance to the power they store, or the curved
+  part would be counted twice. With no GRIN medium in the scene `MedCurved` matches nothing (no
+  RNG is drawn, `dEvent == dSurf`) and `MedStraight` matches everything, so ordinary beam renders
+  are unchanged draw-for-draw. Verified two ways: `scenes/_grin_scatfog.ftsl` (a GRIN lens plus a
+  scattering GRIN haze) rendered GPU mode `M` at 20 M photons **with and without `-beams`** agrees
+  to **energy bias −0.07 %, rel-RMS 1.09 % @8×8** (whole-frame ratio 0.9993, both halves within
+  0.0008 of 1) against a ~4 % per-pixel photon-map noise floor — through 0.197.x it did not; and a
+  sweep of **non-GRIN** media scenes against a 0.197.2 baseline binary came out **bit-identical**
+  on every path that is deterministic at all (`R` GPU/CPU, `B` megakernel/CPU, `M` CPU `-beams`,
+  and the `_g`/env variants). The four paths that differed — `B` GPU wavefront, `M` GPU `-beams`,
+  `M` GPU plain, `S` GPU — differ from *themselves* by the same margin when the **baseline binary
+  is run twice** (see the non-determinism entry in `known-issues.md`), so the sweep is clean.
+  `warnBeamsGrinMedia` is now a *note* rather than a warning, and
+  states the one thing that is still genuinely missing: a scattering GRIN medium has no volumetric
+  **in-scatter** in the beam map — there is no straight chord inside a bending region to store —
+  so the region's own glow is absent while everything it illuminates is correct.
+  **…which is why the CPU branch had to learn the live window (0.195.1).** Back when `-beams`
+  was CPU-only it *forced* `runSharedPhotonMap`'s CPU branch, and that branch called
+  `renderPhotonCamera` with no progress hook — its GPU twin has passed a `SppProgress` since
+  the feature landed. So the slowest, longest render in the engine was the only one with no
+  live preview at all: frames were written to disk correctly while the window sat on the
+  `preparing…` placeholder from start to finish, making a working render look identical to a
+  hung one. The gather now routes through `cpuSppChunks` with a window-repainting
+  `SppProgress`, exactly as the single-camera mode-`M` path already did, so each frame also
+  *converges* on screen rather than appearing whole at the end. Bit-identical: seeding is per
+  (pixel, **absolute** sample), so the chunk split cannot move the realization, and with no
+  hook armed `cpuSppChunks` degenerates to the old single-shot call (verified 0 channel
+  difference across all frames of a 6-frame curve, windowed vs headless). The stage is named
+  throughout — `tracing photons…`, `building photon map…`, `building beam map…`,
+  `frame k/N` — and the `exposure_lock` meter pre-pass, which runs *before* the group dispatch
+  and so used to precede the existence of any window, now raises and titles one itself.
+  **Validated on `scenes/_rainbow_test.ftsl`** against the pre-existing A/B splat estimator,
+  which is the only independent implementation of the same single-scatter trade. Getting the
+  comparison honest took two corrections worth recording. First, `-mode M` *without* `-beams`
+  renders the room correctly and the bow and the fog as literally nothing — that render is the
+  before-picture for this whole bullet. Second, `-mode B -beams` at **one** camera is not a
+  beams render at all: both the CPU and CUDA forward tracers gate the splat form on `nCam > 1`
+  (`render_cuda.cu` ~13842), on purpose, since its entire reason to exist is amortising one
+  flight over many cameras — so B with and without `-beams` came out identical to 3 s.f. and
+  looked, misleadingly, like mode `M` was 20× too dark. Adding a second camera turns the gate
+  on, and then the two agree: lit backdrop 182 vs 186 sRGB, bow arc 150 vs 155, floor 1.7 vs
+  1.7, walls and sphere identically near-black, bow at the same angular radius with primary and
+  secondary in the same colour order. The apparent darkness was real and correct — in that
+  scene the sun is *horizontal*, so nothing but multiply-scattered fog light reaches the floor,
+  and single scatter is exactly what both estimators drop. A third control confirmed no energy
+  is lost on the surface path: with `sigma_t` cut to 0.0002 (near vacuum), mode `M` with and
+  without `-beams` match to 0.1 sRGB in every region.
+  **The map persists** via `photonmap_io.h` (`-savemap` / `-loadmap`), which is new in 0.195.0
+  and is the piece that makes the amortisation argument complete rather than per-process: the
+  file carries surface photons *and* raw beam crossings, so a volumetric flyby can pay the
+  forward pass once, ever. Three decisions in that file are load-bearing. (1) It is a **header
+  shared by both mode-M paths**, because the old copy was file-static inside `render_cuda.cu` —
+  none of it is CUDA, so the flags were GPU-only by accident of placement, and therefore
+  missing from exactly the configuration that needs them most (`-beams` forced the CPU path at
+  the time, so the slowest forward pass was the one that could not be banked; `-savemap -beams`
+  exited 0 and
+  wrote nothing, silently). (2) It stores **no derived structure** — not the photon grid, not
+  the beam BVH, and specifically **not the post-`splitLong` sub-beams**: `buildAuto` picks the
+  split length from the radius it just solved, so persisting split beams would freeze the
+  radius into the file and silently ignore a later `-beamk`. Storing the raw crossings keeps
+  one file valid for any gather. (3) The magic went `FTPMP02` → `FTPMP03` with the beam block
+  **appended**, so old caches still load and simply report zero beams; asking for `-beams`
+  against such a file warns instead of rendering a volumeless image that looks like a beams
+  render. Verified: save-then-load is bit-identical, `-beamk 128` on a reloaded cache re-solves
+  the radius 4× larger, and the map phase drops 53.3 s → 2.6 s.
+  **Beam noise reads as coloured streaks**, not grain — too few beams under a thin kernel are
+  individually resolvable — so `-spp` is the wrong knob for it and `-beamcount` / `-beamk` are
+  the right ones.
+- **`grin.h` — gradient-index media, and what the marcher owes the rest of the engine.**
+  A `medium { ior "<expr>" }` is a region where rays integrate the Eikonal equation
+  `d/ds(n·dr/ds) = ∇n` rather than travelling straight, via a symplectic march of step
+  `ior_step`. One canonical CPU marcher (`grin.h`) and one device twin (`dGrinMarch`,
+  render_cuda.cu, carrying its running Eikonal state in **double** so the two backends bend
+  alike) serve every transport path; `grin::sceneHasGrin` / `DScene::hasGrin` gate the whole
+  thing, so an `ior`-free scene never enters it and stays bit-identical. Marching does **not**
+  consume a bounce: it is a pre-pass run before each bounce's `closestHit`, stopping when a
+  surface is within one step or the ray has left every GRIN region.
+  **Media along the curve are integrated by the caller, one straight sub-segment at a time
+  (0.198.0).** `grin::march` became a no-op-hook wrapper over `grin::marchSegments(scene, ray,
+  onSeg)`, which calls back for **every** straight piece of the walked polyline — the Eikonal
+  steps *and* the straight jumps between regions — handing over that piece's origin, travel
+  direction and true geometric length (`|(T/n)·ds|`, which equals `ds` only to first order).
+  Returning true terminates the march at a distance along that piece, which is how a caller says
+  "my medium scattered here". The device equivalent is a `DGrinMedia` struct parameter (no
+  `--extended-lambda`, so no device lambdas) plus a `maxSteps` driving parameter.
+  **This existed because the marched span was previously invisible to every media integrator.**
+  `march` advanced the ray geometrically over the whole curved span and each tracer then sampled
+  media only on the **short straight remainder** — so a medium that both scatters and carries
+  `ior` lost essentially all of its scattering, in every mode, on both backends. `grin.h`
+  documented that as an intentional approximation; measurement showed it was closer to deletion.
+  The control is a pair of scenes differing by **one line**, a *constant* `ior "1.0"`: a
+  constant index has zero gradient, so it bends nothing and only routes the medium through the
+  marcher. They are checked in as `scenes/_grin_constior_a.ftsl` (no `ior`) and
+  `scenes/_grin_constior_b.ftsl` (`ior "1.0"`); compare with
+  `ftrace -in scenes/_grin_constior_{a,b}.ftsl -mode R -spp 2000 -o png/ci_{a,b}.png -hdr` then
+  `python tools/pfmcmp.py png/ci_a.pfm png/ci_b.pfm`. At `-mode R -device gpu -spp 2000`
+  (2.24 % per-render noise floor) the haze came out to a **0.885** whole-image and **0.779**
+  centre-disc radiance ratio before the fix, auto-exposure moved 1.9×, and the haze visually
+  vanished; after it, **energy bias +0.00 %, rel-RMS 1.86 % @8×8**, ratios 1.0000 whole /
+  1.0007 centre / 1.0000 outside. "`ior "1.0"` must render identically to no `ior` at all" is
+  the reference-free invariant this feature is validated against.
+  **The decomposition is exact, not an approximation.** A spatial Poisson process with rate
+  σ_t(x) is Markov in arc length, so first-collision sampling along a polyline decomposes
+  exactly into "sample within segment 1; failing that, resample afresh in segment 2; …", and
+  transmittance along a polyline is exactly the product of the per-segment transmittances.
+  **Along the curve every medium goes analog, `-beams` or not.** That is not a shortcut, it is
+  the thing a beam cannot be: `-beams` trades analog scattering for a straight chord the gather
+  integrates, and there is no straight chord inside a bending region. Splitting the curve into
+  its 10⁴–10⁵ Eikonal steps and storing a micro-beam for each would explode both the beam map
+  and the gather cost to buy an answer analog sampling already gives exactly.
+  **Each tracer uses the hook for what it actually needs**, which is why the hook is a callback
+  rather than media code inside `grin.h` (whose only dependency is `scene.h`, while the media
+  samplers are `Renderer` members): the forward tracer (`render.h::tracePhoton`, device
+  `kTrace`/`kWfExtend` → `shadeStep`) samples a real collision and reports it as this bounce's
+  medium event at zero travelled distance; `backward.h` draws **one** exponential flight before
+  the march and lets accumulated arc length consume it (the exponential is memoryless, so this
+  is identical in distribution to a per-sub-segment draw and ~10⁵× fewer RNG calls); the
+  photon-map gather runs its **volume estimator per sub-segment**; the rest just accumulate arc
+  length for the dielectric Beer-Lambert. In the GPU **wavefront** backend the march happens in
+  `kWfExtend` but is consumed in `kWfShade`, so its outcome crosses the kernel boundary in two
+  new `WFState` arrays (`gmMed`, `gmArc`) the way `hit` already did, and `kWfExtend` writes the
+  advanced RNG back.
+  **Modes `M`/`S` bend the camera ray too (0.198.0).** Their forward deposit had marched since
+  GRIN landed, but `photonGather` / `dPhotonGather`, `photonGatherSub` / `dPhotonGatherSub` and
+  `sppmVisiblePoint` / `dSppmVisiblePoint` all called `closestHit` on a straight ray — so a
+  gradient lens bent the photons and not the view and **rendered dead flat**, while mode `R`
+  lensed the same scene into a radial disc, and nothing warned. The surface half was a drop-in.
+  The `-beams` **volume** half was not: Beam × Ray is a closest approach between two *straight*
+  lines, so a curved camera ray has to be fed to it one Eikonal step at a time — which is what
+  `maxSteps = 1` driving (loop until `!med->stepped`) is for on the device, and the per-sub-
+  segment hook on the host. Exact, because radiance along a path is additive over its pieces and
+  the running `thr` carries each piece's transmittance forward, which is precisely what
+  `gatherPhotonBeams`' own per-beam `Tr_cam(0 → tCam)` assumes (it measures from the sub-segment
+  start). One-step driving costs nothing extra — the marcher already redoes the
+  region-membership test and `closestHit` on every iteration — and it keeps the bending maths in
+  one function instead of a second copy of it. What is still missing is a scattering GRIN
+  medium's own volumetric **in-scatter** in mode `M`: there are no beams inside a bending region
+  to gather, and a curved beam primitive is a research problem, so the region's glow is absent
+  while everything it illuminates, attenuates and scatters is now correct.
 - **`spectrum.h` / `spectral_library.h` / `upsample.h` / `color.h` / `hero.h`** —
   spectral core: measured SPDs/materials, RGB→spectrum upsampling, CIE tables,
   hero-wavelength sampling (`kHeroC=4`: hero λ + 3 stratified secondaries) used by
@@ -3259,6 +3631,33 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   sampler (the trilinear stencil is clamped before lookup). The host keeps the dense lattice.
   A multi-grid `.vdb` selects a grid **by name** (`loadVdbGrid(..., wantName)`; the OpenVDB reader
   seeks each descriptor to the previous grid's `endPos`, since descriptors interleave with bodies).
+- **`rainbow.h` — droplet SIZE DISTRIBUTION (0.199.0).** The Airy bow's *angle* is geometric and
+  size-independent, but the fold scale `K = (2/h)^(1/3)·(2πa/λ)^(2/3)` is not, so `z` scales as
+  `a^(2/3)` and averaging `Ai(z)²` over a spread of sizes smears the supernumerary train into its
+  envelope while leaving `theta_rb` exactly in place. `Params::dispersion` (FTSL `dispersion` /
+  `spread` / `rain_mm_h`) is the relative sd of the **scattering-weighted** size distribution, a
+  gamma DSD with `K2 = 1/dispersion²`; `0.577` (`K2 = 3`, `k = 1`) is exactly Marshall-Palmer and
+  is the **default**, because that is what rain is. Note MP's relative width is *rain-rate
+  independent* — `Λ = 4.1·R^(-0.21)` moves the mean drop size but not the shape (verified at
+  R = 1, 5, 25 mm/h in `scraps/_supernum_mp.py`).
+  Two subtleties the implementation turns on:
+  - **two different moments of the DSD, not one.** Which sizes a photon *samples* is weighted by
+    `sigma_sca ~ a²` (shape `K2`); how bright each size's *bow* is goes as `a^(7/3)` (van de
+    Hulst), so the mix that shapes the bow is shape `Kb = K2 + 1/3`. `droplet_um` is defined on
+    the `a²`-weighted mean, which is why it means the same thing at every dispersion.
+  - **cells are averaged, not point-sampled.** At `z = -80` the Airy phase sweeps ~1400 rad across
+    a Marshall-Palmer distribution, so point-sampling 64 sizes would alias into fixed-pattern
+    ringing through the bow interior. `airyAi2Mean(a,b)` returns the *exact* mean of `Ai²` over
+    an interval from a tabulated tail integral `S(u) = ∫_u^∞ Ai²`, so the quadrature converges on
+    the cell count of the smooth density (64) rather than of the oscillation (thousands). Cost is
+    2 lookups per cell **at table-build time only** — the render sees only the finished λ×µ table,
+    so the GPU needs no change at all.
+  This replaced `Params::supernumerary`, a flat clamp holding the Airy *peak* across the whole bow
+  interior; measured 3.8×–14.9× too bright and collapsing arc/interior contrast from 6.40× to
+  1.01× (full table in `known-issues.md`). The FTSL key survives as a deprecated alias
+  (`on → dispersion 0`, `off → 0.577`) with a one-time note. Same change fixed `airyAi(x)`
+  returning **0** below `x = -30` (the RK4 table's floor), which hard-clipped the bow interior
+  where the `Ai²` envelope is still at 35% of peak; it now falls through to the exact asymptotic.
 - **`meshvoxel.h` — mesh containment for fog bounds.** `medium { bounds { object "<mesh>" } }`
   used to degrade to the mesh's AABB; `meshvox::voxelizeSolid` now **solid-voxelizes** the
   named mesh into an occupancy `VdbGrid` (`MediumBound::Mesh`, `Medium::boundGrid`,
@@ -3327,6 +3726,24 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       the one medium that must stay dark, since a rainbow is single-scatter and only survives
       against a dark backdrop. Verified by measuring the bow region's mean level before and
       after — it moved 0.3 %.
+    - **The cloud's medium is the DELTA-EDDINGTON REDUCTION of a real cloud, not eyeballed
+      (retuned 0.199.0).** A real cloud is `sigma_t ~ 10`, `albedo ~ 0.999`, `g ~ 0.85` (Mie,
+      ~10 µm droplets). Splitting the forward Mie spike `f = g²` off as unscattered light gives
+      `sigma_t* = (1-wf)sigma_t = 2.78`, `w* = w(1-f)/(1-wf) = 0.9964`, `g* = g/(1+g) = 0.46` —
+      which is the scene's *original* `3.0 / 0.5` to within rounding. So only the albedo was
+      ever wrong, and badly: `0.92` made a water cloud absorb 8 % per scattering event
+      (water's imaginary index at 550 nm is ~1e-9, so a droplet's albedo is 0.9999+), which is
+      `0.92^10 = 0.43` over a crossing. Clouds are white *because* they scatter conservatively;
+      a raincloud's dark base is optical **depth**, not absorption. Measured at 480×270 mode
+      `D`, 800 spp: the fix is **+29 %** on the cloud (+2.6 % on the frame, so it is a cloud
+      change, not an exposure shift). The **full** form was rendered too and rejected on
+      evidence — it flattens the crown/base contrast from 1.13 to 0.99 (destroying the dark
+      underside the bow is read against), is **2.5× noisier** at equal spp, and is the only one
+      of the three that emits monochromatic fireflies (8.4 % of cloud pixels over 3:1 channel
+      ratio, peaking at 5e29 — logged in `known-issues.md` with the mode-`D` NaNs, likely one
+      bug). Full table in the scene's own `medium` comment; measured by `tools/check_cloud.py`.
+      This mattered little before 0.199.0 and matters now: `-beams` was single-scatter through
+      0.198.0, so mode `M` had no scattering orders for a wrong albedo to compound over.
     - The sun spent the scene's early versions as a **distant sphere** because mode `D` refused
       a scene containing a `light sun` outright; 0.124.0/0.127.0 lifted that and it is now a
       real `light sun`. The old global haze is deleted: its `bounds` box was invisible only
@@ -3941,6 +4358,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.
+  `uniform()` is the ordinary `[0,1)` draw on the 24-bit grid `{k/2^24}`;
+  **`uniformOpen()` (0.199.1)** is the `(0,1)` variant that every *exponential* draw must
+  use. `uniform()` returns exactly 0 once in 2^24 draws, and the inverse-CDF free flight
+  `ta - log(1-u)/sigma_t` then lands exactly on `ta` — the ray origin — putting two path
+  vertices on the same point, which makes any direction reconstructed between them `0/0`.
+  `uniformOpen()` returns an interior point of that same bin instead of its lower edge:
+  one `next()`, unbiased, every other grid point bit-for-bit unchanged. Call sites:
+  `sampleMediumCollision` (free flight + delta tracking), `mediumTransmittance` (ratio
+  tracking, where a zero-length step also double-charged one point's null-collision
+  factor), `backward.h`'s GRIN free flights, and the three CUDA twins. `render_cuda.cu`'s
+  `DRng` carries the same pair — but note that with `using Real = float` there, ANY flight
+  shorter than the position's float ULP collapses the two vertices, so the sampler fix is
+  necessary and not sufficient and the consumers carry explicit guards (see `bdpt.h`).
 - **`render_cuda.cu`** (~7000) — the whole GPU backend: megakernel + wavefront
   forward paths, GPU R and BDPT, M deposit/gather, device twins of hero sampling.
   GPU backward (`bkRadiance`) supports **participating media** natively since
@@ -3965,7 +4395,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   **GRIN (gradient-index) media** run on the backward reference (mode `R`) on-device
   too since 0.38.0 (M11): `dGrinMarch` (render_cuda.cu) is the device twin of
   `grin::march`, carrying its running Eikonal state in double, and `bkRadiance` marches
-  each bounce's ray before `closestHit` (gated by `sc.hasGrin`); only mode-`D` BDPT and
+  each bounce's ray before `closestHit` (gated by `sc.hasGrin`) — and since 0.198.0 that march
+  also integrates the participating media along the curve, and the mode-`M`/`S` gathers march
+  their camera rays too (see the `grin.h` bullet); only mode-`D` BDPT and
   the RGB fast path still route GRIN scenes to the CPU. Since
   0.24.0 it also does **fluorescence** (bispectral Stokes-shift adjoint: elastic +
   excitation-wavelength NEE, `gOut = M(lambda)/Mint * invPdf`, stochastic
@@ -5084,6 +5516,26 @@ out-param. `main.cpp` reports it as `[stop] scene load stopped before rendering`
 1 rather than printing a scene-error diagnostic. `prefer { } else { }` resolution aborts
 outright on a stop — treating an interrupted branch as *rejected* would otherwise make it
 build the next branch and ignore the stop for another whole load.
+
+### Stopping during a PHOTON DEPOSIT (0.197.2)
+
+The same hole existed one stage later, and lasted longer. `tracePhotonPass`
+(`photonmap_render.h`) — the forward deposit that builds the map for modes `M` and `S` —
+looped `for (i = lo; i < hi; ++i) tracePhoton(...)` with **no poll of any kind**. 0.194.0 had
+taught the mode-`M` camera *gather* to stop, which made the omission easy to miss: a stop
+aimed at a mode-`M` render *was* honoured, just not until the entire `-n` had already been
+traced. On `-n 2000000000` that was ten minutes of a process ignoring every stop request
+while its photon map grew without bound (10 GB of private bytes and climbing) — the exact
+scenario that pushes someone toward the `taskkill /F` this whole channel exists to replace.
+An unresponsive `-stop` is a safety bug here, not an annoyance.
+
+The worker now polls `ft::stopRequested()` **every 4096 photons**. The granularity matters in
+both directions: a photon is microseconds, so a per-iteration atomic load would show up in the
+hottest loop of a mode-`M`/`S` build, while 4096 of them still lands the stop in well under a
+tenth of a second. On break the thread reports the count it **actually traced** rather than its
+assigned share — `pm.nEmitted` normalises the density estimate, so crediting untraced photons
+would darken a truncated pass rather than merely making it noisier. Measured: `-n 4000000000`
+stopped after 182,222,848 photons and exited 3.5 s after the `-stop`.
 
 ## Where a relative asset path is looked for (`assetbytes::resolve`, 0.192.0)
 

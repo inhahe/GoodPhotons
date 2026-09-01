@@ -2100,15 +2100,23 @@ medium {
     sigma_t 0.0012  albedo 0.99
     bounds { min -260 -260 12   max 260 260 190 }
     phase rainbow {
-        droplet_um    500      # water-drop RADIUS in microns (default 500 = 0.5 mm rain)
+        droplet_um    500      # scattering-weighted MEAN drop RADIUS in microns
+                               #   (default 500 = 0.5 mm rain)
+        dispersion    0.577    # relative width of the drop SIZE DISTRIBUTION; alias `spread`.
+                               #   0 = monodisperse, 0.577 = Marshall-Palmer (default), max 0.70
         secondary     on       # p=3 secondary bow            (default on)
-        supernumerary on       # Airy side-maxima / supernumerary arcs (default on)
         strength      1.0      # weight of the bows over the smooth forward haze (default 1)
         forward_g     0.55     # HG anisotropy of the smooth forward-scatter background
         secondary_ratio 0.43   # secondary brightness relative to primary
     }
 }
 ```
+
+`rain_mm_h <R>` is a convenience alternative to the first two: it sets `droplet_um` and
+`dispersion` from the Marshall-Palmer drop-size distribution at rain rate `R` mm/h
+(`Λ = 4.1·R^-0.21` per mm of diameter → scattering-weighted mean radius `1.5/Λ` mm, and
+`dispersion 0.577`). Either may still be overridden by naming it explicitly in the same
+block. `rain_mm_h 1` ≈ 366 µm (drizzle), `5` ≈ 514 µm, `25` ≈ 723 µm (downpour).
 
 - `phase hg` (or no `phase` statement) is the default Henyey-Greenstein lobe — nothing
   changes; a bare `phase hg` is only for making the choice explicit.
@@ -2121,6 +2129,19 @@ medium {
   **overrides `g`** for this medium.
 - Smaller drops broaden and desaturate the bow toward a white **fogbow** (try
   `droplet_um 10`); 0.5–1 mm rain drops give the crispest bows and supernumeraries.
+- **`dispersion` — real rain is not one drop size (0.199.0).** The bow's *angle* is
+  geometric and size-independent, but the Airy fold scale goes as `a^(2/3)`, so a spread of
+  sizes smears the supernumerary train toward its envelope while leaving the bow itself
+  exactly where it is. That is why a shower shows one clean bow and a fog shows rings.
+  `dispersion` is the relative standard deviation of the scattering-weighted size
+  distribution (a gamma DSD; `0.577` is exactly Marshall-Palmer's exponential, and is the
+  **default**, because that is what rain is). Set `dispersion 0` for the laboratory
+  monodisperse case and the full supernumerary train.
+- **`supernumerary on|off` is DEPRECATED (0.199.0)** and now maps onto `dispersion`
+  (`on` → `0`, `off` → `0.577`), with a one-time note. It was a flat clamp that held the
+  Airy *peak* for the whole bow interior rather than any kind of size average — measured at
+  3.8×–14.9× too bright, collapsing arc/interior contrast from 6.4× to 1.01×, i.e. it
+  rendered a bright disc with a coloured rim, not a bow. Use `dispersion` instead.
 - **Geometry that shows a bow:** the sun must be *behind the camera* and effectively far
   away (parallel rays → sharp bow); aim the camera at the **antisolar point** (the shadow
   of your head) and the bow appears as a ring at ~42° radius around it. Keep the fog

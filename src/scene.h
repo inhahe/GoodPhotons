@@ -472,9 +472,16 @@ struct Medium {
     // absorbing/scattering, but the classic use is a clear bending field
     // (sigma_a = sigma_s = 0). The one canonical marcher lives in grin.h and is
     // shared by the CPU backward tracer (mode R), the CPU forward light tracer
-    // (modes A/B/C) and the GPU forward megakernel/wavefront (dGrinMarch) — all
-    // bend rays identically. BDPT (mode D) REFUSES GRIN scenes (its straight-line
-    // connection geometry / MIS would be biased); use mode A/B/C or R instead.
+    // (modes A/B/C), the photon-map / SPPM gathers (modes M/S) and the GPU twins
+    // of all of them (dGrinMarch) — all bend rays identically. BDPT (mode D)
+    // REFUSES GRIN scenes (its straight-line connection geometry / MIS would be
+    // biased); use mode A/B/C, M/S or R instead.
+    //
+    // A GRIN region that ALSO scatters/absorbs has its medium integrated ALONG THE
+    // CURVE since 0.198.0 (grin.h's per-sub-segment hook). Before that the marcher
+    // advanced the ray over the whole bent span with no medium interaction and each
+    // tracer sampled media only on the short straight remainder, which deleted
+    // essentially all of such a medium's scattering.
     std::vector<PatNode> ior;   // compiled n(x,y,z) program; empty => not GRIN
     double iorStep = 0.0;       // Eikonal march step (world units); 0 => auto from bound
 

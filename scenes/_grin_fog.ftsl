@@ -1,0 +1,59 @@
+# GRIN lens + an UNRELATED scattering fog — regression scene for the per-medium GRIN gate
+# on photon beams (mode M, -beams).
+#
+# The point: this scene holds TWO media that have nothing to do with each other.
+#   * a bounded gradient-index sphere (`ior`, no scattering) that bends rays through it
+#   * a bounded, ordinary scattering haze slab elsewhere in the room
+#
+# A photon bends only INSIDE a GRIN region — grin::march jumps straight between regions —
+# so the photon's chord through the haze is a perfectly good STRAIGHT beam. The beam gate
+# used to be scene-wide (`!grin::sceneHasGrin(scene)`), so the mere presence of the lens
+# threw away every beam in the scene and the haze rendered as NOTHING. It is now per medium
+# (Renderer::emitBeams / dEmitBeams both skip only media with an `ior` field), so the haze
+# deposits and gathers normally while the lens is left alone.
+#
+# Expected: the haze is clearly visible as a lit volume, on BOTH backends and identically.
+#
+#   ftrace -in scenes/_grin_fog.ftsl -mode M -beams -device gpu -o png/grinfog_g.png
+#   ftrace -in scenes/_grin_fog.ftsl -mode M -beams -device cpu -o png/grinfog_c.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# (1) Gradient-index sphere, LEFT side. Pure index field: no sigma_t, so it scatters
+#     nothing and deposits no beam either way — it is here purely to turn the scene's
+#     GRIN flag on, which is what used to disable beams globally.
+medium {
+    bounds { center 0.28 0.35 0.45   radius 0.16 }
+    ior "1.6 - 0.6 * (sqrt((x-0.28)*(x-0.28) + (y-0.35)*(y-0.35) + (z-0.45)*(z-0.45)) / 0.16)"
+}
+
+# (2) An ordinary scattering haze, RIGHT side, bounded so its absence is obvious. Nothing
+#     about it is gradient-index, so its crossings are straight and beam-depositable.
+medium {
+    bounds { center 0.70 0.45 0.45   radius 0.26 }
+    sigma_t 3.0   albedo 0.9   g 0.0
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode M
+    film { res 192 192 }
+}

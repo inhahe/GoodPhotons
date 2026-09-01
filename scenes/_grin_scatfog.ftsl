@@ -1,0 +1,68 @@
+# A SCATTERING gradient-index medium — the case a photon beam cannot represent.
+#
+# Companion to scenes/_grin_fog.ftsl. There the GRIN lens does not scatter, so beams work
+# normally for the separate haze. Here the haze ITSELF carries an `ior` field, so photons
+# curve through the very medium we would need a straight chord for. Both backends refuse
+# that deposit per medium (Renderer::emitBeams / dEmitBeams), which is what this scene
+# exists to exercise:
+#
+#   * ftrace prints a note (warnBeamsGrinMedia) naming the medium
+#   * the beam map comes out empty ("0 beams stored"), on CPU and GPU alike
+#
+# THE INVARIANT THIS SCENE TESTS (since 0.198.0): a medium that cannot be beam-deposited
+# keeps its full ANALOG transport rather than being crossed straight, so the SURFACE
+# illumination here must match the same scene rendered WITHOUT -beams. Through 0.197.x it
+# did not — the medium was crossed straight with Beer-Lambert, which removed its scattered
+# light instead of redistributing it, and the image came out measurably darker. Measured at
+# 0.198.0, GPU mode M, 20M photons: whole-frame ratio 0.9993, both halves within 0.0008 of
+# 1, against a per-pixel photon-map noise floor of ~4%.
+#
+# What is still absent, and is a limit of the beam representation rather than a bug: the
+# GRIN haze's own volumetric IN-SCATTER (its visible glow). There is no straight chord
+# inside a bending region to store as a beam. Everything the haze ILLUMINATES is right.
+#
+#   ftrace -in scenes/_grin_scatfog.ftsl -mode M -beams -n 20000000 -o png/gs_beams.png -hdr
+#   ftrace -in scenes/_grin_scatfog.ftsl -mode M        -n 20000000 -o png/gs_plain.png -hdr
+#   python scraps/_cmp_pfm.py png/gs_plain.pfm png/gs_beams.pfm
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# (1) Gradient-index sphere, LEFT side. Pure index field: no sigma_t, so it scatters
+#     nothing and deposits no beam either way — it is here purely to turn the scene's
+#     GRIN flag on, which is what used to disable beams globally.
+medium {
+    bounds { center 0.28 0.35 0.45   radius 0.16 }
+    ior "1.6 - 0.6 * (sqrt((x-0.28)*(x-0.28) + (y-0.35)*(y-0.35) + (z-0.45)*(z-0.45)) / 0.16)"
+}
+
+# (2) An ordinary scattering haze, RIGHT side, bounded so its absence is obvious. Nothing
+#     about it is gradient-index, so its crossings are straight and beam-depositable.
+medium {
+    bounds { center 0.70 0.45 0.45   radius 0.26 }
+    sigma_t 3.0   albedo 0.9   g 0.0
+    ior "1.2 - 0.1 * (sqrt((x-0.70)*(x-0.70) + (y-0.45)*(y-0.45) + (z-0.45)*(z-0.45)) / 0.26)"
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode M
+    film { res 192 192 }
+}

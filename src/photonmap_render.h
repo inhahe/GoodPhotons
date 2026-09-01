@@ -29,11 +29,14 @@
 #include <cstdint>
 #include "render.h"
 #include "photonmap.h"
+#include "photonbeams.h"   // volume single-scatter cache (mode M with -beams)
+#include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 #include "backward.h"      // BackwardRenderer::neeLight / neeEnv for final-gather direct lighting
 #include "scene_film.h"
 #include "camera.h"
 #include "color.h"
 #include "geometry.h"
+#include "parallel.h"      // ft::stopRequested — cooperative `-stop` inside the pixel loop
 
 // ---- Forward photon pass: deposit into the map, no camera splat ---------------------
 // Traces N photons across nThreads, each depositing into a private bank, then
@@ -47,12 +50,40 @@
 // parameter existed every SPPM pass re-traced the identical photon set — a real
 // correctness bug: progressive photon mapping's convergence needs independent
 // passes, so mode S was re-averaging the same deposits at shrinking radii.)
+//
+// `bm` (optional) turns on the PHOTON-BEAM deposit: the same photons additionally store
+// every medium crossing as a segment, giving mode M a view-independent volume cache (see
+// photonbeams.h). Passing it changes how photons traverse media — straight, attenuated by
+// the crossing, instead of the analog scatter-or-absorb free flight — so the SURFACE map
+// changes too (it loses multiply-scattered volume light and gains correct single-scatter
+// transmission). That is the documented `-beams` trade, now available to mode M.
+// `beamTarget` is a budget on the stored beam count, applied as Russian roulette per beam;
+// <= 0 keeps every crossing.
 inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
                             bool diffraction, PhotonMap& pm, int heroC = hero::kHeroC,
-                            uint64_t seedBase = 0) {
+                            uint64_t seedBase = 0, BeamMap* bm = nullptr,
+                            long long beamTarget = 0) {
     if (nThreads < 1) nThreads = 1;
     std::vector<PhotonBank> banks(nThreads);
+    std::vector<BeamBank>   bbanks(nThreads);
     std::vector<long long> emitted(nThreads, 0);
+    // Beam budget: give each thread its share of the target as a self-thinning CAP and let
+    // it keep everything until it gets there (BeamBank halves itself past the cap). Do NOT
+    // precompute a survival rate from N — the beams-per-photon ratio is a property of the
+    // scene's media volume fraction, not of the photon count, and guessing it undershot by
+    // 131x on gallery_rain and overshot by 2.3x on _fog_cornell. See photonbeams.h.
+    //
+    // The 2x headroom lets a thread overshoot its exact share before halving, so the banks
+    // still sum to at least the target when the final decimateTo trims to it; without it,
+    // one halving per thread would land the total at ~half the budget.
+    for (int t = 0; t < nThreads; ++t) {
+        if (beamTarget > 0)
+            bbanks[t].cap = std::max<size_t>(1024, (size_t)(2 * beamTarget / nThreads));
+        // Private, per-thread stream for the self-thinning draws, so which beams get dropped
+        // never depends on — or perturbs — the photon tracer's own RNG sequence.
+        bbanks[t].rng.seed(seedBase + 0x9E3779B97F4A7C15ULL * (uint64_t)(t + 1),
+                           0xBF58476D1CE4E5B9ULL);
+    }
 
     // Hero-wavelength deposit (modes M/S): each traced path deposits its live wavelengths
     // as per-λ photon records via tracePhotonHero (render.h). nEmitted still counts PATHS
@@ -62,15 +93,33 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
 
     auto worker = [&](int tid) {
         Renderer r; r.diffraction = diffraction; r.photonDeposit = &banks[tid];
+        if (bm) r.beamDeposit = &bbanks[tid];
         r.useHero = heroOn; r.heroC = heroC;
         Pcg32 rng;
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         EnergyReport e;
+        long long done = 0;
         for (long long i = lo; i < hi; ++i) {
+            // Cooperative `-stop` / Ctrl-C. Until this poll existed the photon DEPOSIT was
+            // completely uninterruptible: v0.194.0 taught the mode-M camera *gather* to stop,
+            // but nothing polled here, so `ftrace -stop` on a deposit had to wait out the
+            // entire `-n` before the flag was even looked at. On a large `-n` that is many
+            // minutes of a process that ignores every stop request while its photon map keeps
+            // growing (a 2e9-photon CPU pass was sitting on 10 GB and climbing) — i.e. exactly
+            // the situation that tempts a `taskkill /F`, which is what `-stop` exists to
+            // prevent. Checked every 4096 photons rather than every photon: a photon is
+            // microseconds, so a per-iteration atomic load would be measurable in the hottest
+            // loop of a mode-M/S build, while 4096 of them still lands the stop in well under
+            // a tenth of a second.
+            if ((done & 0xFFF) == 0 && ft::stopRequested()) break;
             seedUnit(rng, seedBase + (uint64_t)i, 0xEB44ACCAB455D165ULL);
             r.tracePhoton(scene, (const Camera*)nullptr, (Film*)nullptr, (Film*)nullptr, rng, e);
+            ++done;
         }
-        emitted[tid] = hi - lo;
+        // Count what was ACTUALLY emitted, not what was asked for. pm.nEmitted normalises the
+        // density estimate, so reporting the full share after an early break would scale a
+        // truncated pass down by the fraction it never traced and darken the image.
+        emitted[tid] = done;
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -78,8 +127,8 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
 
     size_t total = 0;
     for (auto& b : banks) total += b.size();
-    pm.photons.clear();  pm.photons.reserve(total);
-    pm.pos.clear();      pm.pos.reserve(total);
+    pm.photons.clear();  ftalloc::reserve(pm.photons, total, "the photon map payloads", "-n");
+    pm.pos.clear();      ftalloc::reserve(pm.pos, total, "the photon map positions", "-n");
     pm.nEmitted = 0;
     for (int t = 0; t < nThreads; ++t) {
         // Append both halves in the same thread order, so pos[k] stays the position of
@@ -88,6 +137,73 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         pm.pos.insert(pm.pos.end(), banks[t].pos.begin(), banks[t].pos.end());
         pm.nEmitted += emitted[t];
     }
+    if (bm) {
+        size_t nb = 0;
+        for (auto& b : bbanks) nb += b.size();
+        bm->beams.clear();
+        ftalloc::reserve(bm->beams, nb, "the photon-beam map",
+                         "-beamcount (or -n, which feeds it)");
+        for (int t = 0; t < nThreads; ++t)
+            bm->beams.insert(bm->beams.end(), bbanks[t].beams.begin(), bbanks[t].beams.end());
+        bm->nEmitted   = pm.nEmitted;   // same pass, same normalisation
+        bm->nDeposited = bm->beams.size();
+        // Exact trim. The per-thread banks each self-thinned to their own cap, so the total
+        // lands somewhere in [target, 2*target] rather than on the number the user asked
+        // for; this is the one unbiased cut that makes -beamcount mean what it says.
+        if (beamTarget > 0) bm->decimateTo((size_t)beamTarget);
+    }
+}
+
+// ---- Volume gather: single-scatter radiance along one camera SEGMENT from the beam map ---
+// The Beam x Ray 1D estimator (photonbeams.h). For every stored beam whose kernel cylinder
+// the segment [oc, oc + dc*tMax] passes through, add
+//
+//   Phi_b * K1(d_perp)/sin(theta) * sigma_s(x) * f_p(cos theta)
+//         * Tr_beam(0 -> s_b) * Tr_cam(0 -> t_c) / nEmitted
+//
+// weighted by the CIE response at the BEAM's wavelength — the same "estimate built directly
+// in XYZ at the photon's own lambda" trick the surface density estimate uses, so a spectral
+// rainbow comes out spectral without any monochromatic reconstruction.
+//
+// `aGlassCam` is the absorption of the dielectric the CAMERA ray is currently inside; the
+// caller applies it over the whole segment afterwards, so here it is applied only as far as
+// each beam's own closest-approach point. `thr` is NOT applied here — the caller multiplies
+// the returned XYZ by its specular-chain throughput.
+//
+// Note the two transmittance marches per surviving beam (one along the beam, one back along
+// the camera ray). For a heterogeneous medium those are ratio-tracking walks, and they are
+// the dominant cost of this estimator; see known-issues.md.
+inline Vec3 gatherPhotonBeams(const Scene& scene, const Renderer& mats, const BeamMap& bm,
+                              const Vec3& oc, const Vec3& dc, double tMax,
+                              double aGlassCam, Pcg32& rng) {
+    Vec3 acc{0, 0, 0};
+    if (bm.empty() || bm.nEmitted <= 0) return acc;
+    const double invN = 1.0 / (double)bm.nEmitted;
+    const PatTables tabs = scene.patTables();
+    bm.gather(oc, dc, tMax, [&](const BeamHit& bh) {
+        const PhotonBeam& b = bm.beams[bh.idx];
+        if (b.med < 0 || b.med >= (int)scene.media.size()) return;
+        const double lam = (double)b.lambda;
+        const Medium& md = scene.media[b.med];
+        const Vec3 xc = oc + dc * bh.tCam;
+        // sigma_s AT the gather point — density field / imported volume included, so a
+        // heterogeneous cloud shapes the bow instead of a uniform slab of it.
+        const double ss = md.sigma_s(lam) * md.densityAt(xc, &tabs);
+        if (!(ss > 0.0)) return;
+        // Scattering angle. connectVolume's convention: phaseValue(dot(wIn, wToCamera)),
+        // wIn = the photon's propagation direction (b.d), wToCamera = -dc.
+        const double phase = md.phaseValue(-bh.cosT, lam);
+        if (!(phase > 0.0)) return;
+        double w = (double)b.power * bm.kernel1D(bh.dPerp) / bh.sinT * ss * phase * invN;
+        if (!(w > 0.0)) return;
+        if (b.absorb > 0.0f) w *= std::exp(-(double)b.absorb * bh.sBeam);   // glass, beam side
+        if (aGlassCam > 0.0) w *= std::exp(-aGlassCam * bh.tCam);           // glass, camera side
+        if (bh.sBeam > 0.0)  w *= mats.mediaTransmittance(scene, b.o, b.d, bh.sBeam, lam, rng);
+        if (bh.tCam  > 0.0)  w *= mats.mediaTransmittance(scene, oc, dc, bh.tCam, lam, rng);
+        if (!(w > 0.0)) return;
+        acc += bm.cie[bh.idx] * w;
+    });
+    return acc;
 }
 
 // ---- Final-gather sub-ray: one INDIRECT bounce from a visible point into the map -----
@@ -122,8 +238,17 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     bool specularSeen = false;                           // any specular bounce so far?
     Renderer mats; mats.diffraction = diffraction;
     MediumStack stk;                                     // nested-dielectric medium stack
+    const bool grinAny = grin::sceneHasGrin(scene);      // final-gather rays bend too
 
     for (int b = 0; b < maxBounce; ++b) {
+        if (grinAny) {
+            double arc = 0.0;
+            grin::marchSegments(scene, ray,
+                [&](const Vec3&, const Vec3&, double slen, double&) { arc += slen; return false; });
+            int cm = stk.topMat();                       // Beer-Lambert over the marched arc
+            double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
+            if (a > 0.0 && arc > 0.0) thr *= std::exp(-a * arc);
+        }
         Hit h = scene.closestHit(ray);
         if (h.valid) {                                   // Beer-Lambert in current medium
             int cm = stk.topMat();
@@ -282,8 +407,15 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
 // radiance is estimated by a radius query, with each photon reflected at ITS OWN
 // wavelength (density estimate built directly in XYZ). Directly-viewed emitters and the
 // environment are added as a monochromatic estimate at the sampled lambda.
+//
+// PARTICIPATING MEDIA: when `bm` is non-null the walk also (a) gathers volume single scatter
+// from the beam map along every segment it travels and (b) attenuates its throughput by the
+// media transmittance of that segment, so fog correctly dims the surfaces and sky behind it.
+// With `bm` null the walk is media-blind — which is what mode M has always been, and why a
+// fog / rain / cloud scene renders its volume as nothing without -beams.
 inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
-                         Pcg32& rng, bool diffraction, int maxBounce, int fgRays = 0) {
+                         Pcg32& rng, bool diffraction, int maxBounce, int fgRays = 0,
+                         const BeamMap* bm = nullptr) {
     Vec3 L{0, 0, 0};
     double thr = 1.0;
     double pdfL = 0.0;
@@ -297,12 +429,52 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     const double norm = (pm.nEmitted > 0 && area > 0.0)
                             ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
 
+    const bool volOn = (bm != nullptr) && !bm->empty() && !scene.media.empty();
+    // GRADIENT-INDEX: the CAMERA ray has to bend too. Mode M's forward deposit has marched
+    // since GRIN landed, but this gather called closestHit directly, so a GRIN lens bent the
+    // photons and not the view: the lens rendered dead flat while mode R lensed the same
+    // scene into a radial disc, and nothing warned. Marching here is what makes mode M see
+    // its own geometry.
+    const bool grinAny = grin::sceneHasGrin(scene);
+
     for (int b = 0; b < maxBounce; ++b) {
+        const int    cmIdx  = stk.topMat();
+        const double aGlass = (cmIdx >= 0) ? scene.mats[cmIdx].absorb(lambda) : 0.0;
+        // Curved pre-pass. The volume estimator runs PER STRAIGHT SUB-SEGMENT of the curve:
+        // Beam x Ray is a closest-approach between two straight lines, so a curved camera
+        // ray has to be fed to it one Eikonal step at a time. That is exact rather than an
+        // approximation — the radiance integral along a path is additive over its pieces,
+        // and `thr` carries each piece's transmittance forward, which is precisely what
+        // gatherPhotonBeams' own per-beam Tr_cam(0 -> tCam) expects (it measures from the
+        // sub-segment start; the accumulated `thr` supplies everything before it).
+        if (grinAny) {
+            grin::marchSegments(scene, ray,
+                [&](const Vec3& so, const Vec3& sd, double slen, double&) -> bool {
+                    if (volOn) {
+                        L += gatherPhotonBeams(scene, mats, *bm, so, sd, slen, aGlass, rng) * thr;
+                        thr *= mats.mediaTransmittance(scene, so, sd, slen, lambda, rng);
+                    }
+                    if (aGlass > 0.0) thr *= std::exp(-aGlass * slen);
+                    return false;   // a camera ray never terminates in the volume here:
+                                    // mode M's volume answer IS the beam gather above
+                });
+            if (thr <= 0.0) return L;
+        }
+
         Hit h = scene.closestHit(ray);
+        // --- Participating media along this segment (mode M with -beams) ---------------
+        // Done BEFORE `thr` takes the segment's attenuation, because each gathered beam
+        // needs the transmittance to ITS OWN closest-approach point, not to the segment end.
+        if (volOn) {
+            const double dSeg = h.valid ? h.t : 1e30;
+            L += gatherPhotonBeams(scene, mats, *bm, ray.o, ray.d, dSeg, aGlass, rng)
+                 * thr;
+            // Extinction along the camera segment: what is behind the fog gets dimmed.
+            thr *= mats.mediaTransmittance(scene, ray.o, ray.d, dSeg, lambda, rng);
+            if (thr <= 0.0) return L;
+        }
         if (h.valid) {                                   // Beer-Lambert in current medium
-            int cm = stk.topMat();
-            double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
-            if (a > 0.0) thr *= std::exp(-a * h.t);
+            if (aGlass > 0.0) thr *= std::exp(-aGlass * h.t);
         }
         if (!h.valid) {                                  // escaped -> environment
             if (scene.envIndex >= 0)
@@ -486,7 +658,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
 inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, int resY,
                                const PhotonMap& pm, long long spp, int nThreads,
                                bool diffraction, int maxBounce = 32,
-                               unsigned long long sampleBase = 0, int fgRays = 0) {
+                               unsigned long long sampleBase = 0, int fgRays = 0,
+                               const BeamMap* bm = nullptr) {
     if (nThreads < 1) nThreads = 1;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     std::vector<Film> bands(nThreads);
@@ -494,17 +667,30 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
     auto worker = [&](int tid) {
         Film& f = bands[tid]; f.resX = resX; f.resY = resY; f.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
-        for (int py = y0; py < y1; ++py)
+        for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < resX; ++px) {
+                // Cooperative `-stop`, polled once per PIXEL. Without this the gather is
+                // uninterruptible: the callers only test the stop flag between whole frames,
+                // so a single-camera mode-M render could not be stopped at all, and a
+                // pathologically slow gather had to be force-killed — precisely what this
+                // project forbids, because tearing down a live CUDA context that way can
+                // wedge the display driver. Per PIXEL rather than per scanline because the
+                // thing that makes a gather slow enough to want stopping is a slow gather:
+                // with an oversized `-beams` kernel radius one scanline can be half a minute,
+                // and the poll (one relaxed atomic load) is free against even a fast one.
+                // A partially filled band is fine — every caller discards the film on a stop.
+                if (ft::stopRequested()) return;
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)resX + (uint64_t)px;
                 for (long long s = 0; s < spp; ++s) {
                     Pcg32 rng;
                     seedUnit(rng, (sampleBase + (uint64_t)s) * nPix + pixIdx,
                              0xA24BAED4963EE407ULL);
                     Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
-                    f.add(px, py, photonGather(scene, pm, ray, rng, diffraction, maxBounce, fgRays));
+                    f.add(px, py, photonGather(scene, pm, ray, rng, diffraction, maxBounce,
+                                               fgRays, bm));
                 }
             }
+        }
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
