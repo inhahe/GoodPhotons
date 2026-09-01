@@ -415,7 +415,7 @@ struct Renderer {
         double ta, tb;
         if (!med.clipToBounds(o, dir, 0.0, dMax, ta, tb)) return false;
         if (!med.heterogeneous()) {                       // exact free-flight (one draw)
-            double t = ta - std::log(1.0 - rng.uniform()) / stBase;
+            double t = ta - std::log(1.0 - rng.uniformOpen()) / stBase;
             if (t < tb) { tHit = t; return true; }
             return false;
         }
@@ -423,7 +423,7 @@ struct Renderer {
         if (sigMax <= 0.0) return false;
         double t = ta;
         for (;;) {
-            t += -std::log(1.0 - rng.uniform()) / sigMax;
+            t += -std::log(1.0 - rng.uniformOpen()) / sigMax;
             if (t >= tb) return false;
             double sigT = stBase * med.densityAt(o + dir * t, tabs);
             if (rng.uniform() * sigMax < sigT) { tHit = t; return true; }  // real collision
@@ -446,7 +446,7 @@ struct Renderer {
         if (sigMax <= 0.0) return 1.0;
         double Tr = 1.0, t = ta;
         for (;;) {
-            t += -std::log(1.0 - rng.uniform()) / sigMax;
+            t += -std::log(1.0 - rng.uniformOpen()) / sigMax;
             if (t >= tb) break;
             double sigT = stBase * med.densityAt(o + dir * t, tabs);
             Tr *= 1.0 - sigT / sigMax;

@@ -9058,7 +9058,7 @@ negligible; the audit is just strict about it.
 
 _(former `light cylinder` entry moved to Resolved — it was a misdiagnosis.)_
 
-### Mode D goes numerically undefined in thick, high-albedo media — NaNs and 1e29 fireflies — 2026-09-01, OPEN
+### Mode D goes numerically undefined in thick, high-albedo media — NaNs and 1e29 fireflies — 2026-09-01, DONE 2026-09-01 (0.199.1)
 
 Two independent scenes, one likely bug. Both are mode `D`, both have a dense
 (`sigma_t` 6–10) near-conservative (`albedo` 0.95–0.999) scattering medium, and both produce
@@ -9093,15 +9093,62 @@ throughput and a very small pdf, and their ratio is where a `0/0` would live.
 Not caused by the 0.199.0 beam change (mode D does not use beams at all), and it does not
 affect the PNG, which clamps. It *does* silently poison any numeric comparison against the
 reference — `tools/check_beams_ms.py` had to grow an explicit NaN mask, and a plain `np.mean`
-over the reference returns `nan`. **Proper fix:** find the guard that is missing, rather
-than clamping NaN at the film — a NaN in a BDPT weight means one strategy's contribution is
-undefined, and clamping it hides which. Reproduce by rendering the scene above and counting
-`np.isnan` on the `.pfm`; a shorter `-spp 2000` run should show ~1/10 as many. Fixing (b) is
-the better entry point than (a): a NaN localises the guard exactly, whereas a 1e29 only says
-"small denominator somewhere". Check (a) again once (b) is fixed before assuming they are two
-bugs.
+over the reference returns `nan`.
 
-### `-beams` reports `error: bad allocation` instead of an OOM message — 2026-09-01, OPEN
+**FIXED in 0.199.1. It was not a vanishing pdf at all — it was `normalize(0)`.** Instrumenting
+`connectBDPT` printed `fL=nan` with `|dL| = 0` while the MIS weight was a perfectly ordinary
+`0.294`: two consecutive **medium vertices at exactly the same point**, so the phase function's
+incoming direction `woL = normalize(light[s-2].p - qs.p)` was `0/0`. Three defects, all fixed:
+
+1. **A free flight can be exactly zero long.** `Pcg32::uniform()` samples the 24-bit grid
+   `{k/2^24}`, so it returns exactly `0` about once in 16.8 M draws, and the inverse-CDF
+   free flight `ta - log(1-u)/sigma_t` then lands exactly on `ta` — the ray origin, i.e. the
+   previous vertex. New `Pcg32::uniformOpen()` (and its device twin `DRng::uniformOpen`)
+   returns the interior of that same bin instead of its lower edge: one `next()`, unbiased,
+   and every other grid point comes back bit-for-bit, so no existing render moves. Used at
+   every exponential draw — `sampleMediumCollision` (both the homogeneous free flight and the
+   delta-tracking loop), `mediumTransmittance`'s ratio tracking (where a zero-length step also
+   charged the same point's `1 - sigma/sigma_max` factor twice, a small bias), the GRIN
+   free flights in `backward.h`, and all three CUDA twins.
+2. **On the GPU that fix alone cannot be enough, and this is why the first attempt failed.**
+   `render_cuda.cu` is `using Real = float`, so any free flight shorter than the FLOAT ULP of
+   the position — not just an exactly-zero one — rounds the new vertex onto the previous one.
+   That is orders of magnitude commoner than `u == 0`, and it is unfixable at the sampler.
+   The guard is the fix.
+3. **`connectBDPT` normalised those edges without a zero-length guard** — even though
+   `vertexPdf` right beside it already guarded both, and the connection edge itself had
+   `if (dist2 <= 0.0) return 0.0`. The pdf side and the throughput side now agree in all four
+   branches (`s==0`, `t==1`, `s==1`, interior) and in the subpath walk, on both backends.
+4. **Every `max <= 0.0` reject let NaN through**, because NaN compares false against
+   everything — so a NaN produced anywhere upstream reached the film unfiltered. All of them
+   are now written `!(max > 0.0)`, which is identical for every finite value and rejects NaN.
+   The CUDA film loop had no such reject at all and now mirrors the CPU's.
+
+Verified, all measured rather than inferred:
+
+- `_beams_ms.ftsl` mode D, **27 NaN px -> 0 on GPU** at 500 spp and **7 -> 0 on CPU** at 300 spp.
+- The exact command in (b) above, re-run to completion (`20000 / 20000 spp, 184.9s`):
+  `png/ms_ref.pfm: 192x192  NaN px=0  Inf px=0  max=4.749e+13  mean=7.2019e+11`. **705 -> 0.**
+  A plain `np.mean` over the reference now returns a number, so `tools/check_beams_ms.py`'s
+  NaN mask is no longer load-bearing.
+- Sub-part (a) was the same bug seen through `-fireflies 3`, not a second one — the entry's own
+  "check (a) again once (b) is fixed" resolves in favour of one bug. Same scene, same flags,
+  same mask, before vs after (`tools/check_cloud.py`, which grew a permanent chroma-outlier
+  column for exactly this check):
+
+  | full-form cloud (`10.0 / 0.999 / 0.85`) | chroma>3 | >10 | peak max/min |
+  |---|---|---|---|
+  | pre-fix (`png/cloud_after.pfm`) | 341 | 40 | `inf` |
+  | post-fix | **0** | **0** | **1.76** |
+
+  Crown brightness moved only 1.3% (1.1608e-01 -> 1.1763e-01), which also settles the
+  suspicion recorded above that `-fireflies 3` clamping a NaN-poisoned estimate was what made
+  the full form read dimmer than the delta-Eddington-reduced form. It was not: the full form
+  really is dimmer here, and that is a tuning question, not a numerical one.
+- Regression smoke test, `scenes/_fog_cornell.ftsl` mode D CPU 200 spp: 0 NaN, 0 Inf, image
+  unchanged in appearance.
+
+### `-beams` reports `error: bad allocation` instead of an OOM message — 2026-09-01, DONE 2026-09-01 (0.199.1)
 
 `ftrace -in scenes/_beams_ms.ftsl -mode M -device gpu -beams -n 400000000` dies with the
 bare line `error: bad allocation` after the `[camera] shared photon map …` banner and before
@@ -9115,6 +9162,26 @@ ceiling of 1 M). **Proper fix:** catch `std::bad_alloc` around the map/beam allo
 report the requested byte count and the flag that controls it (`-n`, `-beamcount`,
 `-beamsplitmax`), the way the beam-split path already reports being limited by
 `-beamsplitmax`.
+
+**FIXED in 0.199.1.** New `src/allocreport.h` wraps every buffer whose size is set by the
+command line — the photon map (positions and payloads, CPU and CUDA paths and `-loadmap`), the
+photon-beam map, the split beam array, the beam CIE table and the beam BVH boxes — and turns a
+`std::bad_alloc` into a message naming the buffer, the element count, the element size, the
+total in binary units, and the flag that shrinks it. `main()` also grew a dedicated
+`std::bad_alloc` catch as a backstop for allocations nobody wrapped, which lists the four
+memory knobs with their per-element costs. The original repro now says:
+
+```
+error: out of memory allocating the photon map positions: 520212293 x 24 B = 11.63 GiB.
+       Lower -n and re-run. (Host RAM, not VRAM — this buffer lives on the CPU side
+       even when the trace ran on the GPU.)
+```
+
+Fixing this also removed a real inefficiency: `splitSah` used to `reserve(beams.size()*2 + 16)`
+and then let a multi-gigabyte vector regrow geometrically, even though `pieces(f)` already
+computes the exact post-split count. It now reserves that count exactly — one allocation
+instead of a doubling chain, and the one place the split can plausibly run out of memory is
+also the place that now names `-beamsplitmax`.
 
 ## Tech debt
 

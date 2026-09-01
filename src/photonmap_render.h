@@ -30,6 +30,7 @@
 #include "render.h"
 #include "photonmap.h"
 #include "photonbeams.h"   // volume single-scatter cache (mode M with -beams)
+#include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 #include "backward.h"      // BackwardRenderer::neeLight / neeEnv for final-gather direct lighting
 #include "scene_film.h"
 #include "camera.h"
@@ -126,8 +127,8 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
 
     size_t total = 0;
     for (auto& b : banks) total += b.size();
-    pm.photons.clear();  pm.photons.reserve(total);
-    pm.pos.clear();      pm.pos.reserve(total);
+    pm.photons.clear();  ftalloc::reserve(pm.photons, total, "the photon map payloads", "-n");
+    pm.pos.clear();      ftalloc::reserve(pm.pos, total, "the photon map positions", "-n");
     pm.nEmitted = 0;
     for (int t = 0; t < nThreads; ++t) {
         // Append both halves in the same thread order, so pos[k] stays the position of
@@ -139,7 +140,9 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     if (bm) {
         size_t nb = 0;
         for (auto& b : bbanks) nb += b.size();
-        bm->beams.clear(); bm->beams.reserve(nb);
+        bm->beams.clear();
+        ftalloc::reserve(bm->beams, nb, "the photon-beam map",
+                         "-beamcount (or -n, which feeds it)");
         for (int t = 0; t < nThreads; ++t)
             bm->beams.insert(bm->beams.end(), bbanks[t].beams.begin(), bbanks[t].beams.end());
         bm->nEmitted   = pm.nEmitted;   // same pass, same normalisation

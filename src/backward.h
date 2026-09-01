@@ -1687,7 +1687,7 @@ struct BackwardRenderer {
             if (grinAny) {
                 const double stG = scene.backwardMedium().enabled
                                        ? scene.backwardMedium().sigmaT(lambda) : 0.0;
-                if (stG > 0.0) preMed = -std::log(1.0 - rng.uniform()) / stG;
+                if (stG > 0.0) preMed = -std::log(1.0 - rng.uniformOpen()) / stG;
                 double sAcc = 0.0;
                 medInMarch = grin::marchSegments(scene, ray,
                     [&](const Vec3&, const Vec3&, double slen, double& tStop) -> bool {
@@ -1735,7 +1735,7 @@ struct BackwardRenderer {
                     // `preMed` is the residual of the flight already drawn for the marched
                     // curve (0 = it collided during the march, at ray.o); otherwise draw.
                     double tMed = (preMed >= 0.0) ? preMed
-                                                  : -std::log(1.0 - rng.uniform()) / st;
+                                                  : -std::log(1.0 - rng.uniformOpen()) / st;
                     if (medInMarch || tMed < dSurf) {
                         Vec3 p = ray.o + ray.d * tMed;
                         // Beer-Lambert attenuation over the in-glass free-flight leg.

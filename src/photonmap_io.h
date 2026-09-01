@@ -125,8 +125,10 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
         std::fclose(f); return false;
     }
     if (nPh > 0) {
-        pm.pos.resize((size_t)nPh);
-        pm.photons.resize((size_t)nPh);
+        ftalloc::resize(pm.pos, (size_t)nPh, "the photon map positions (-loadmap)",
+                        "the photon count the map was saved with");
+        ftalloc::resize(pm.photons, (size_t)nPh, "the photon map payloads (-loadmap)",
+                        "the photon count the map was saved with");
         ok = std::fread(pm.pos.data(), sizeof(Vec3), (size_t)nPh, f) == (size_t)nPh;
         ok = ok && std::fread(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
     }
@@ -145,7 +147,8 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
             pm.photons.clear(); pm.pos.clear(); std::fclose(f); return false;
         }
         if (bm && nBm > 0) {
-            bm->beams.resize((size_t)nBm);
+            ftalloc::resize(bm->beams, (size_t)nBm, "the photon-beam map (-loadmap)",
+                            "the beam count the map was saved with");
             if (std::fread(bm->beams.data(), sizeof(PhotonBeam), (size_t)nBm, f) != (size_t)nBm) {
                 std::fprintf(stderr, "[loadmap] %s truncated beam data; ignoring\n", path);
                 pm.photons.clear(); pm.pos.clear(); bm->beams.clear();

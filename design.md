@@ -1927,6 +1927,19 @@ render. Closing that means teaching the shared device path to gather in spp chun
   secondaries. Delta vertices de-hero *except* Mirror and Filter, which pick their
   continuation without consulting λ and so set `keepBundle`.
 
+  **Degenerate-vertex guards (0.199.1).** Every direction BDPT reconstructs from two vertex
+  positions — the subpath walk's `wo`, and the incoming `wo`/`woE`/`woL` of all four
+  connection branches (`s==0`, `t==1`, `s==1`, interior) — now rejects a zero-length edge
+  before `normalize`, which `vertexPdf` had always done and the throughput side had not. Two
+  vertices land on the same point whenever a free flight is shorter than the position's ULP;
+  `Pcg32::uniformOpen` removes the exact-zero flight, but `render_cuda.cu` is `Real = float`,
+  so a *sub-ULP* flight still collapses there and the guard is what actually fixes it.
+  Relatedly, **every `max <= 0.0` reject in both BDPT ports is now written `!(max > 0.0)`**:
+  NaN compares false against everything, so the old form passed an undefined contribution
+  straight to the film. The CUDA film loop had no such reject at all and now mirrors the
+  CPU's. Together these closed the "mode D goes numerically undefined in thick, high-albedo
+  media" entry in known-issues.
+
   **Delta lights in BDPT** (since 0.124.0): mode `D` renders `light spot` and `light sun`.
   Both are Dirac emitters, so the strategies that would have to *sample* the delta are
   unavailable and must be dropped from the balance heuristic — otherwise the surviving
@@ -2056,6 +2069,15 @@ render. Closing that means teaching the shared device path to gather in spp chun
   argument (0 = off) — it must, since that is the high-photon-count path where a
   count-independent radius collapses worst. The gather reads `pm.radius` after the build, so
   the adapted value needs no further plumbing.
+- **`allocreport.h`** (0.199.1) — `ftalloc::resize` / `ftalloc::reserve`, which turn a
+  `std::bad_alloc` from a *command-line-sized* buffer into a message naming the buffer, the
+  element count and size, the total in binary units, and the flag that shrinks it. Wrapped:
+  the photon map positions/payloads (CPU pass, CUDA download, `-loadmap`), the photon-beam
+  map, the split beam array, the beam CIE table, the beam BVH boxes. `main()` carries a
+  `std::bad_alloc` backstop listing the four memory knobs for anything unwrapped. Motivation:
+  `std::bad_alloc::what()` is the bare string `bad allocation`, so a render that died between
+  two progress lines used to be diagnosable only by bisecting `-n` by hand.
+
 - **`photonbeams.h`** — the **view-independent volume cache** that makes mode `M` see
   participating media at all (CLI `-beams`, since 0.20.7). The surface map above is a *point*
   cache with no volume records whatsoever, so before this a fog / rain / cloud / rainbow scene
@@ -4336,6 +4358,19 @@ render. Closing that means teaching the shared device path to gather in spp chun
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.
+  `uniform()` is the ordinary `[0,1)` draw on the 24-bit grid `{k/2^24}`;
+  **`uniformOpen()` (0.199.1)** is the `(0,1)` variant that every *exponential* draw must
+  use. `uniform()` returns exactly 0 once in 2^24 draws, and the inverse-CDF free flight
+  `ta - log(1-u)/sigma_t` then lands exactly on `ta` — the ray origin — putting two path
+  vertices on the same point, which makes any direction reconstructed between them `0/0`.
+  `uniformOpen()` returns an interior point of that same bin instead of its lower edge:
+  one `next()`, unbiased, every other grid point bit-for-bit unchanged. Call sites:
+  `sampleMediumCollision` (free flight + delta tracking), `mediumTransmittance` (ratio
+  tracking, where a zero-length step also double-charged one point's null-collision
+  factor), `backward.h`'s GRIN free flights, and the three CUDA twins. `render_cuda.cu`'s
+  `DRng` carries the same pair — but note that with `using Real = float` there, ANY flight
+  shorter than the position's float ULP collapses the two vertices, so the sampler fix is
+  necessary and not sufficient and the consumers carry explicit guards (see `bdpt.h`).
 - **`render_cuda.cu`** (~7000) — the whole GPU backend: megakernel + wavefront
   forward paths, GPU R and BDPT, M deposit/gather, device twins of hero sampling.
   GPU backward (`bkRadiance`) supports **participating media** natively since

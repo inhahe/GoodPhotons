@@ -20706,6 +20706,26 @@ int main(int argc, char** argv) {
                              (outPath ? outPath : "(default output)"));
         }
         rc = serve ? runServe(argc, argv, inValPos) : run(argc, argv);
+    } catch (const std::bad_alloc&) {
+        // std::bad_alloc::what() is the bare string "bad allocation", which names neither
+        // the buffer nor its size nor the flag that sized it — so a render that died here
+        // used to be diagnosable only by bisecting `-n` by hand. The buffers that actually
+        // scale with the command line now report themselves (see allocreport.h); this catch
+        // is the backstop for every allocation that does not, and at least points at the
+        // knobs instead of at nothing.
+        std::fprintf(stderr,
+            "error: out of HOST memory (in an allocation the renderer does not size itself).\n"
+            "       The buffers that grow with the command line are, in rough order of size:\n"
+            "         -n <photons>        the photon map: ~%zu bytes per DEPOSITED photon\n"
+            "         -beamcount <n>      the photon-beam map: ~%zu bytes per stored beam\n"
+            "         -beamsplitmax <n>   the SPLIT beam array — the beam map times the mean\n"
+            "                             split factor, usually the largest of the three\n"
+            "         -res / -spp         the film, and one film per selected camera\n"
+            "       Halving -n is the usual first move; -beamcount / -beamsplitmax bound the\n"
+            "       beam side independently of how many photons were traced.\n",
+            sizeof(Photon) + sizeof(Vec3), sizeof(PhotonBeam));
+        rc = 1;
+        noteFinishReason("stopped by an error");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         rc = 1;

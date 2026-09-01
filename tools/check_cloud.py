@@ -1,7 +1,7 @@
 # Measure the raincloud in a gallery_rain render: crown vs underside vs the rain shaft.
 #
 # Used to choose the 0.199.0 cloud retune (see the `medium` comment in gallery_rain.ftsl).
-# Usage:  python scraps/_cloud_cmp.py <ref.pfm> [<cmp.pfm> ...]   -- every row is ratioed
+# Usage:  python tools/check_cloud.py <ref.pfm> [<cmp.pfm> ...]   -- every row is ratioed
 # against the FIRST file, and every row shares one pixel mask taken from the first file, so
 # no image gets to define the cloud's silhouette differently from the others.
 #
@@ -65,15 +65,34 @@ for p, im in imgs:
 
 print(f"{w}x{h}   cloud px {lit.sum()} (crown {crown.sum()} / base {base.sum()})"
       f"   shaft px {shaft.sum()}")
+# Chroma outliers: a lit cloud pixel whose max/min channel ratio is huge is not a noisy
+# sample, it is a divide by a vanishing density -- a single-wavelength path that returned an
+# absurd value and painted one channel. A white cloud lit by a blackbody should sit near 1;
+# anything past 3:1 is suspect and anything past 10:1 is a firefly. This column is what
+# known-issues.md's "1e29 fireflies" entry is measured with, so it lives here rather than in
+# a throwaway script.
+def chroma(im, mask):
+    px = im[mask]
+    mx = px.max(axis=1)
+    mn = px.min(axis=1)
+    ok = mn > 0.0
+    r = np.full(mx.shape, 1.0)
+    r[ok] = mx[ok] / mn[ok]
+    r[~ok & (mx > 0.0)] = np.inf          # a channel at exactly 0 beside a lit one
+    return int((r > 3.0).sum()), int((r > 10.0).sum()), float(r.max())
+
+
 print(f"{'image':<26}{'crown':>12}{'base':>12}{'crown/base':>12}"
-      f"{'shaft':>12}{'frame':>12}")
+      f"{'shaft':>12}{'frame':>12}{'chroma>3':>10}{'>10':>7}{'peak':>12}")
 ref = None
 for p, im in imgs:
     L = lum(im)
     c, b = L[crown].mean(), L[base].mean()
     s = L[shaft].mean()
     fr = L[np.isfinite(L)].mean()
-    print(f"{p.split('/')[-1]:<26}{c:12.4e}{b:12.4e}{c / b:12.3f}{s:12.4e}{fr:12.4e}")
+    n3, n10, peak = chroma(im, lit)
+    print(f"{p.split('/')[-1]:<26}{c:12.4e}{b:12.4e}{c / b:12.3f}{s:12.4e}{fr:12.4e}"
+          f"{n3:10d}{n10:7d}{peak:12.3g}")
     if ref is None:
         ref = (c, b, s, fr)
     else:

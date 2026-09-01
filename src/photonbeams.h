@@ -113,6 +113,7 @@
 #include "rng.h"
 #include "color.h"
 #include "bvh.h"
+#include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 
 // MULTIPLE-SCATTERING ORDER CAP (CLI -beams-order), as a header-inline global for the same
 // reason `hero::gSplit` is one: it has to be visible to BOTH the host renderer (render.h) and
@@ -413,8 +414,18 @@ struct BeamMap {
                 n = pieces(f);
             }
         }
+        // Reserve the EXACT post-split count rather than a 2x guess. `pieces(f)` is the
+        // same sum the loop below is about to perform, so this is exact, and it turns the
+        // geometric regrowth of a buffer that can reach many gigabytes into ONE allocation
+        // — which is also the only place the split can plausibly run out of memory, and so
+        // the place to name `-beamsplitmax` when it does.
         std::vector<PhotonBeam> out;
-        out.reserve(beams.size() * 2 + 16);
+        {
+            const double nOut = pieces(f);
+            const size_t want = (nOut > 0.0 && nOut < 4.0e18) ? (size_t)nOut : beams.size();
+            ftalloc::reserve(out, want, "the split photon-beam array",
+                             "-beamsplitmax (or -beamcount, which feeds it)");
+        }
         double lenSum = 0.0; size_t nSeg = 0;
         for (const PhotonBeam& b : beams) {
             const double len = (double)b.len;
@@ -448,7 +459,8 @@ struct BeamMap {
             if ((double)b.len > maxLen) extra += (size_t)std::ceil((double)b.len / maxLen) - 1;
         if (extra == 0) return;
         std::vector<PhotonBeam> out;
-        out.reserve(beams.size() + extra);
+        ftalloc::reserve(out, beams.size() + extra, "the split photon-beam array",
+                         "-beamsplit (or -beamcount, which feeds it)");
         for (const PhotonBeam& b : beams) {
             const double len = (double)b.len;
             if (len <= maxLen) { out.push_back(b); continue; }
@@ -481,8 +493,10 @@ struct BeamMap {
         if (explicitSplitLen > 0.0) { splitLong(explicitSplitLen); meanSplit = explicitSplitLen; }
         else                        { meanSplit = splitSah(radius, splitBudget, kappaOverW); }
         if (meanSplitOut) *meanSplitOut = meanSplit;
-        cie.resize(beams.size());
-        std::vector<Aabb> boxes(beams.size());
+        ftalloc::resize(cie, beams.size(), "the beam CIE table", "-beamcount / -beamsplitmax");
+        std::vector<Aabb> boxes;
+        ftalloc::resize(boxes, beams.size(), "the beam BVH bounding boxes",
+                        "-beamcount / -beamsplitmax");
         for (size_t i = 0; i < beams.size(); ++i) {
             const PhotonBeam& b = beams[i];
             Aabb a;

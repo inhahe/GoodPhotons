@@ -27,6 +27,7 @@
 #include <thread>
 #include "linalg.h"
 #include "color.h"
+#include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 
 // One deposited photon's PAYLOAD — everything the gather reads *after* a candidate has
 // passed the distance test. The deposit POSITION deliberately lives in a separate
@@ -164,7 +165,7 @@ struct PhotonMap {
     // per photon, which would otherwise serialize ~1s+ onto the build.
     void fillCie() {
         const size_t nPh = photons.size();
-        cie.resize(nPh);
+        ftalloc::resize(cie, nPh, "the photon CIE table", "-n");
         auto fill = [&](size_t i0, size_t i1) {
             for (size_t i = i0; i < i1; ++i) {
                 const double l = photons[i].lambda;

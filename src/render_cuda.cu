@@ -84,6 +84,7 @@
 #include "stochtile.h"    // O7: the host/device-shared histogram-preserving tiling operator
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
+#include "allocreport.h"  // OOM that names the buffer, its size and the flag that sizes it
 #include "photonmap_io.h" // -savemap / -loadmap, shared with the CPU mode-M path in main.cpp
 #include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
 #include "lighttree.h"    // Conty-Kulla light BVH: the SAME traversal the CPU runs, not a copy
@@ -1317,6 +1318,14 @@ struct DRng {
         return (xorshifted >> rot) | (xorshifted << ((~rot + 1u) & 31));
     }
     __device__ Real uniform() { return (next() >> 8) * (Real)(1.0 / 16777216.0); }
+    // Uniform in the OPEN interval (0,1). Device twin of Pcg32::uniformOpen — see rng.h
+    // for why an exponential free flight must never be handed u == 0 (a zero-length
+    // flight puts two path vertices at exactly the same point). Same single `next()`, and
+    // every non-zero grid point comes back unchanged, so device renders do not move.
+    __device__ Real uniformOpen() {
+        Real u = uniform();
+        return u > (Real)0 ? u : (Real)(0.5 / 16777216.0);
+    }
 };
 
 __device__ static DVec3 cosineHemisphere(const DVec3& n, DRng& rng) {
@@ -1892,7 +1901,7 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
     double ta, tb;
     if (!dMedClip(m, o, dir, 0.0, (double)dMax, ta, tb)) return false;
     if (!m.heterogeneous) {
-        double t = ta - log(1.0 - (double)rng.uniform()) / stBase;
+        double t = ta - log(1.0 - (double)rng.uniformOpen()) / stBase;
         if (t < tb) { tHit = (Real)t; return true; }
         return false;
     }
@@ -1900,7 +1909,7 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
     if (sigMax <= 0.0) return false;
     double t = ta;
     for (;;) {
-        t += -log(1.0 - (double)rng.uniform()) / sigMax;
+        t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
         if (t >= tb) return false;
         DVec3 pp = o + dir * (Real)t;
         double sigT = stBase * dMedDensityAt(m, pp, env);
@@ -1923,7 +1932,7 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
     if (sigMax <= 0.0) return (Real)1;
     double Tr = 1.0, t = ta;
     for (;;) {
-        t += -log(1.0 - (double)rng.uniform()) / sigMax;
+        t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
         if (t >= tb) break;
         DVec3 pp = o + dir * (Real)t;
         double sigT = stBase * dMedDensityAt(m, pp, env);
@@ -10167,7 +10176,13 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             for (int i = 0; i + 1 < nUp; ++i) pathSec[cur * secStride + i] = betaSec[i];
             if (++bounces >= maxDepth) return;
             if (rng.uniform() >= (double)medAlbedo(sm, lambda)) return;   // absorbed (vertex retained)
-            DVec3 wo = normalize(path[prevIdx].p - path[cur].p);          // toward previous vertex
+            // Degeneracy guard (see the connection routines): a free flight shorter than
+            // the FLOAT ULP of the position puts this vertex on top of the previous one,
+            // and normalize(0) = NaN would then poison dPhasePdf and every density stored
+            // downstream. End the subpath; the vertices already stored stay valid.
+            DVec3 dwo = path[prevIdx].p - path[cur].p;
+            if (ddot(dwo, dwo) == 0.0) return;
+            DVec3 wo = normalize(dwo);                                    // toward previous vertex
             Real phPdf;
             DVec3 wi = dMedPhaseSample(sm, rd, lambda, rng, phPdf);       // scattered dir (HG or rainbow)
             double pdfW    = dPhasePdf(sc, path[cur], wo, wi, lambda);
@@ -10210,7 +10225,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         for (int i = 0; i + 1 < nUp; ++i) pathSec[cur * secStride + i] = betaSec[i];
         if (++bounces >= maxDepth) return;
 
-        DVec3 wo = normalize(path[cur - 1].p - path[cur].p);
+        DVec3 dwo = path[cur - 1].p - path[cur].p;   // degeneracy guard: normalize(0) is NaN
+        if (ddot(dwo, dwo) == 0.0) return;
+        DVec3 wo = normalize(dwo);
         DVec3 wi; double pdfW = 0, pdfRevW = 0, betaFactor = 0; int delta = 0; bool terminate = false;
         // Mirror / Filter are delta but choose their continuation WITHOUT consulting λ,
         // so the secondaries can ride through them; they set keepBundle to opt out of
@@ -10346,7 +10363,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // mxF == betaFactor, i.e. exactly the old scalar test.
         double mxF = betaFactor;
         if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
-        if (terminate || mxF <= 0.0) return;
+        if (terminate || !(mxF > 0.0)) return;
 
         path[cur].delta = delta;
         if (delta) { pdfW = 0.0; pdfRevW = 0.0; }
@@ -10653,7 +10670,9 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         if (t < 2) return 0.0;
         const DVertex& pt = eye[t - 1];
         if (!dIsLightVertex(sc, pt)) return 0.0;
-        DVec3 wo = normalize(eye[t - 2].p - pt.p);
+        DVec3 dwo = eye[t - 2].p - pt.p;             // degeneracy guard: normalize(0) is NaN
+        if (ddot(dwo, dwo) == 0.0) return 0.0;
+        DVec3 wo = normalize(dwo);
         nUp = pt.nUp;
         double Le = dVertexLe(sc, pt, wo, lambda, invPdfLambda);
         // The reject tests the max over the live wavelengths — identical to `Le <= 0` when
@@ -10663,7 +10682,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             LeSec[i] = dVertexLe(sc, pt, wo, hb.lam[i + 1], hb.invPdf[i + 1]);
             if (LeSec[i] > mxLe) mxLe = LeSec[i];
         }
-        if (mxLe <= 0.0) return 0.0;
+        if (!(mxLe > 0.0)) return 0.0;
         L = pt.beta * Le;
         for (int i = 0; i + 1 < nUp; ++i) Lsec[i] = eyeSec[(t - 1) * secStride + i] * LeSec[i];
     } else if (t == 1) {
@@ -10679,7 +10698,9 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         double dist2 = ddot(cam.eye - qs.p, cam.eye - qs.p);
         double dist = sqrt(dist2);
         DVec3 wcam = (cam.eye - qs.p) * (Real)(1.0 / dist);
-        DVec3 wo = normalize(light[s - 2].p - qs.p);
+        DVec3 dwo = light[s - 2].p - qs.p;           // degeneracy guard: normalize(0) is NaN
+        if (ddot(dwo, dwo) == 0.0) return 0.0;
+        DVec3 wo = normalize(dwo);
         // Medium endpoint: phase*albedo, cosine 1, occlusion from the exact point.
         nUp = qs.nUp;
         double fSec[BDPT_NSEC];
@@ -10717,7 +10738,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         {   // max over live wavelengths (identical to `f <= 0` when nUp == 1)
             double mxF = f;
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
-            if (mxF <= 0.0) return 0.0;
+            if (!(mxF > 0.0)) return 0.0;
         }
         if (occluded(sc, o, wcam, connMaxT(dist))) return 0.0;
         double cosCam = ddot(qs.p - cam.eye, cam.w) / dist;   // positive (point in front)
@@ -10730,7 +10751,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             Lsec[i] = lightSec[(s - 1) * secStride + i] * fSec[i] * G * dCameraWe(cam, cosCam) * Tr;
         {   double mxL = L;
             for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mxL) mxL = Lsec[i];
-            if (mxL <= 0.0) return 0.0;
+            if (!(mxL > 0.0)) return 0.0;
         }
         sampled.type = BV_CAMERA; sampled.p = cam.eye; sampled.ns = cam.w; sampled.ng = cam.w;
         sampled.beta = 1.0;
@@ -10798,9 +10819,11 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
                 LeSec[i] = (double)specLookup(em.emitSpd, hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
                 if (LeSec[i] > mxLe) mxLe = LeSec[i];
             }
-            if (mxLe <= 0.0) return 0.0;
+            if (!(mxLe > 0.0)) return 0.0;
         }
-        DVec3 wo = normalize(eye[t - 2].p - pt.p);
+        DVec3 dwo = eye[t - 2].p - pt.p;             // degeneracy guard: normalize(0) is NaN
+        if (ddot(dwo, dwo) == 0.0) return 0.0;
+        DVec3 wo = normalize(dwo);
         // Cheap sidedness/terminator rejects and the shadow ray run FIRST; the BSDF/phase
         // eval (texture fetches, lobe math) is deferred until the connection is known
         // unoccluded. occluded() consumes no RNG and the eval is deterministic, so the
@@ -10835,7 +10858,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         {   // max over live wavelengths (identical to `f <= 0` when nUp == 1)
             double mxF = f;
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
-            if (mxF <= 0.0) return 0.0;
+            if (!(mxF > 0.0)) return 0.0;
         }
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
         double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc, pt.p, wi, (Real)dist, lambda, rng) : 1.0;
@@ -10845,7 +10868,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             Lsec[i] = eyeSec[(t - 1) * secStride + i] * fSec[i] * LeSec[i] * G * Tr;
         {   double mxL = L;
             for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mxL) mxL = Lsec[i];
-            if (mxL <= 0.0) return 0.0;
+            if (!(mxL > 0.0)) return 0.0;
         }
         sampled.type = BV_LIGHT; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
         sampled.lightIdx = ei;
@@ -10865,8 +10888,15 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         DVec3 d = qs.p - pt.p; double dist2 = ddot(d, d);
         if (dist2 <= 0.0) return 0.0;
         double dist = sqrt(dist2); DVec3 w = d * (Real)(1.0 / dist);   // pt -> qs
-        DVec3 woE = normalize(eye[t - 2].p - pt.p);
-        DVec3 woL = normalize(light[s - 2].p - qs.p);
+        // Degeneracy guard, device twin of bdpt.h. `normalize` of a zero vector is 0/0 =
+        // NaN, and a NaN survives every `<= 0` reject on its way to the film (NaN compares
+        // false against everything). Two path vertices land on the same point whenever a
+        // free flight is shorter than the position's ULP — which on this backend is a FLOAT
+        // ULP (see `using Real = float`), so it is far commoner here than on the CPU.
+        DVec3 dwE = eye[t - 2].p - pt.p, dwL = light[s - 2].p - qs.p;
+        if (ddot(dwE, dwE) == 0.0 || ddot(dwL, dwL) == 0.0) return 0.0;
+        DVec3 woE = normalize(dwE);
+        DVec3 woL = normalize(dwL);
         // Each endpoint is a surface (BSDF, cosine) or a medium (phase*albedo, cos=1).
         // Cheap sidedness/terminator rejects and the shadow ray run FIRST; both endpoint
         // BSDF/phase evals (texture fetches, lobe math) are deferred until the connection
@@ -10941,7 +10971,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
                 if (fESec[i] > mxE) mxE = fESec[i];
                 if (fLSec[i] > mxL) mxL = fLSec[i];
             }
-            if (mxE <= 0.0 || mxL <= 0.0) return 0.0;
+            if (!(mxE > 0.0) || !(mxL > 0.0)) return 0.0;
         }
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
         double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc, pt.p, w, (Real)dist, lambda, rng) : 1.0;
@@ -10955,7 +10985,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     // decision was hero-driven, so the balance-heuristic ratios do not depend on λ.
     double mx = L;
     for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mx) mx = Lsec[i];
-    if (mx <= 0.0) return 0.0;
+    if (!(mx > 0.0)) return 0.0;
     const double mis = dMisWeight(sc, cam, light, eye, sampled, s, t, lambda);
     for (int i = 0; i + 1 < nUp; ++i) Lsec[i] *= mis;
     nUpConn = nUp;
@@ -11084,6 +11114,16 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 double c = dConnectBDPT(sc, cam, light, eye, lightSec, eyeSec, NS,
                                         s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn);
                 if (nUpConn <= 0) continue;
+                // Reject a non-positive — and, critically, a NON-FINITE — contribution before
+                // it reaches the film, exactly as BdptRenderer::renderRows does. Negated form
+                // on purpose: NaN compares false against everything, so `mx <= 0.0` would let
+                // an undefined connection through to atomicAdd and permanently poison the
+                // pixel. Bit-identical for every finite value (adding 0 is a no-op).
+                {
+                    double mx = c;
+                    for (int i = 0; i + 1 < nUpConn; ++i) if (Lsec[i] > mx) mx = Lsec[i];
+                    if (!(mx > 0.0)) continue;
+                }
                 // The ×C de-hero boost is applied ONCE here, as 1/min(nUp_light, nUp_eye):
                 // folding it into either subpath's throughput would square it whenever both
                 // sides stayed multi-λ. nUpConn == 1 reproduces the scalar accumulation exactly.
@@ -12085,7 +12125,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1] * emitScale;
             if (LeSec[k] > mxLe) mxLe = LeSec[k];
         }
-        if (mxLe <= 0.0) continue;
+        if (!(mxLe > 0.0)) continue;
         double pdfChoice = em.power / sc.totalPower;
         if (pdfPos <= 0.0 || pdfDirW <= 0.0 || pdfChoice <= 0.0) continue;
 
@@ -12254,7 +12294,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             // Kill the walk only when EVERY live λ is dead (nUp == 1 -> mxF == betaFactor).
             double mxF = betaFactor;
             if (secChromatic) for (int k = 0; k + 1 < nUp; ++k) if (secF[k] > mxF) mxF = secF[k];
-            if (terminate || mxF <= 0.0) break;
+            if (terminate || !(mxF > 0.0)) break;
             if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) break;
 
             // misScatter(delta, cosThetaOut, pdfW, pdfRevW)
@@ -12696,7 +12736,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                   fSec[q] = dBsdfF(sc, vt, wo, wMerge, (Real)row[q].lam);
                                   if (fSec[q] > mxF) mxF = fSec[q];
                               }
-                              if (mxF <= 0.0) continue;   // == the old `fCam <= 0` at lvUp == 1
+                              if (!(mxF > 0.0)) continue;   // == the old `fCam <= 0` at lvUp == 1
                               double denom = fabs(ddot(wMerge, ngoCam));
                               double gcorr = (denom <= 1e-8) ? 1.0 : fabs(ddot(wMerge, h.n)) / denom;
                               fCam *= gcorr;
@@ -12732,7 +12772,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                         lamAll, nUp, secF, &secChromatic, &keepBundle);
             double mxF = betaFactor;
             if (secChromatic) for (int k = 0; k + 1 < nUp; ++k) if (secF[k] > mxF) mxF = secF[k];
-            if (terminate || mxF <= 0.0) break;
+            if (terminate || !(mxF > 0.0)) break;
             if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) break;
 
             if (delta) { dVCM = 0.0; dVC *= cosThetaOut; dVM *= cosThetaOut; }
@@ -15402,8 +15442,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         // Download + convert in chunks (never a full host-side DPhoton copy). Positions
         // and payloads split into PhotonMap's two parallel arrays (see Photon in
         // photonmap.h); DPhoton has the same fields, so this is a pure widen + split.
-        pm.photons.resize((size_t)nDep);
-        pm.pos.resize((size_t)nDep);
+        ftalloc::resize(pm.photons, (size_t)nDep, "the photon map payloads", "-n");
+        ftalloc::resize(pm.pos, (size_t)nDep, "the photon map positions", "-n");
         std::vector<DPhoton> stage;
         for (size_t off = 0; off < (size_t)nDep; off += PM_CHUNK) {
             size_t cnt = std::min(PM_CHUNK, (size_t)nDep - off);
@@ -15435,7 +15475,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                          (unsigned long long)nBeam, (unsigned long long)beamCap,
                          (unsigned long long)stored);
         bmap->beams.clear();
-        bmap->beams.resize((size_t)stored);
+        ftalloc::resize(bmap->beams, (size_t)stored, "the photon-beam map",
+                        "-beamcount (or -n, which feeds it)");
         std::vector<DBeamDep> bstage;
         for (size_t off = 0; off < (size_t)stored; off += PM_CHUNK) {
             size_t cnt = std::min(PM_CHUNK, (size_t)stored - off);
