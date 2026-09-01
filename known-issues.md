@@ -302,7 +302,7 @@ mode-`D` reference render of the same camera.
 
 </details>
 
-### PARTLY FIXED (2026-09-01, v0.203.0): the caustic map had nowhere near enough photons, because emission was not aimed at the specular geometry — CPU done, **GPU still to do**
+### FIXED (2026-09-01, v0.203.0 CPU / v0.204.0 GPU): the caustic map had nowhere near enough photons, because emission was not aimed at the specular geometry
 
 **Found immediately after** the two-map split above started working. The split is the *storage*
 half of Jensen's scheme; this is the *sampling* half, and without it the sharp caustic map is
@@ -389,22 +389,63 @@ aim map is never bound ⇒ no RNG draw at all).
 CLI: **`-causticn <n>`** (aimed photons; default `auto` = `-n`/4, `0` = off) and
 **`-causticaimk <k>`** (target spheres, default 64). Both imply `-caustics`.
 
-**Still to do — the GPU twin (`src/render_cuda.cu`).** Until it lands, a GPU mode-`M` render gets
-the un-aimed (sparse) caustic map while the CPU gets the aimed one, so the two backends differ on
-any scene with caustics. The port needs: the target spheres uploaded; a device `applyCausticAim`
-inside `genPhoton` / `genPhotonHero`; the per-photon MIS weight carried to the deposit site (the
-natural carrier is the existing per-path `int pathBits`, widened to a small struct with `bits` +
-`w` — **not** bit-packed, per `DPhoton`'s own comment about implicit encodings in a buffer several
-kernels write and two host loops read — including the wavefront per-slot `st.pathBits` array); a
-caustic-only aimed `depositLaunch` with `beamStraightOnly`; and the `-causticn` accounting
-mirrored. One invariant found while surveying the device code that simplifies this: a deposit sets
-`PV_BIT_SCATTER` immediately after storing, so **at most one caustic deposit occurs per path** —
-the first diffuse deposit, and only if a focus vertex preceded it.
+**The GPU twin landed in v0.204.0** (`src/render_cuda.cu`), and it is a twin rather than a
+re-derivation: `DAimMap` / `DAimTarget` mirror `caim::AimMap` / `caim::Target` field for field, and
+`dApplyCausticAim` is `Renderer::applyCausticAim` line for line. Three things about the port are
+worth writing down because they were *not* obvious from the host code:
+
+* **The MIS weight is fixed at BIRTH, so it rides in the per-path state, not in the deposit
+  call.** `int pathBits` became `struct DPathCaustic { int bits; Real w; }` — deliberately *not*
+  bit-packed into the existing int, per `DPhoton`'s own comment about implicit encodings in a
+  buffer several kernels write and two host loops read — and it is carried identically by the
+  megakernel, the hero tracer and the wavefront's per-slot `st.pathC` array.
+* **At most ONE caustic deposit occurs per path**, because a deposit sets `PV_BIT_SCATTER`
+  immediately after storing. So the per-photon weight is consumed exactly once, or never, and no
+  accumulation is needed.
+* **The aimed launch needs no partition on download.** Device `depositPhoton` drops a *non*-caustic
+  deposit outright when `cs.aim.aimed`, so every record the aimed launch produces is caustic by
+  construction and is simply appended to `pmC`. Its energy goes to a scratch buffer that is thrown
+  away — the aimed photons are not additional emitted light, and folding their joules into `eOut`
+  would double-count the emission and break the energy audit.
+
+The aimed launch runs *after* the main pass's photon buffer is freed (so it gets the whole card),
+on a disjoint RNG stream, and is skipped entirely on `ft::stopRequested()` — leaving the un-aimed
+caustic map, which is still correct, just noisier. Its buffer is sized from the *observed*
+main-pass caustic rate (4× it, clamped) rather than the main pass's 2.5-deposits-per-photon guess,
+which would be wildly over.
+
+**Backend agreement, same binary, `scraps/caim_glass.ftsl` at `-r 160 -n 4M -causticn 16M`:**
+
+| | stored flux/emitted | caustic photons |
+|---|---|---|
+| CPU, `-causticn 0` | 6.17297e14 | 491 212 |
+| GPU, `-causticn 0` | 6.16697e14 | 490 735 |
+| CPU, `-causticn 16M` | 6.15876e14 | 5 287 803 |
+| GPU, `-causticn 16M` | 6.16008e14 | 5 289 307 |
+
+The two aimed numbers agree to **2e-4** relative and the photon counts to **0.03 %** — different
+RNG streams, same estimator. (`buildCaustic` in `render_cuda.cu` gained the same permanent
+`stored flux/emitted` line as the host's `buildCausticMap`, which is what makes the two directly
+comparable.) Whole-image `pfmcmp` on the same four renders:
+
+| comparison | energy bias | rel-RMS @8×8 |
+|---|---|---|
+| CPU aimed vs CPU un-aimed | **+0.00 %** | 0.53 % |
+| GPU aimed vs GPU un-aimed | **−0.00 %** | 0.85 % |
+| CPU vs GPU, both un-aimed | −0.26 % | 4.20 % |
+| CPU vs GPU, both aimed | −0.27 % | 3.96 % |
+
+The first two rows are the unbiasedness result on each backend; the last two say the aimed pass
+does not move the *pre-existing* CPU/GPU discrepancy (different RNG, different transport ordering)
+by so much as 0.01 % — and in fact lowers the residual noise, which is what it is for.
 
 **Files:** `src/causticaim.h` (new — targets, clustering, samplers), `src/render.h`
 (`Renderer::applyCausticAim` + the three emission call sites + `beamStraightOnly`),
-`src/photonmap_render.h` (`tracePhotonPass`'s second, aimed pass), `src/main.cpp` (`buildAimMap`,
-the two mode-`M` call sites, the two CLI flags, the flux diagnostic).
+`src/photonmap_render.h` (`tracePhotonPass`'s second, aimed pass), `src/render_cuda.cu` +
+`src/render_cuda.h` (`DAimMap`, the device samplers, `dApplyCausticAim`, `DPathCaustic`,
+`cs.beamStraightOnly`, the aimed `depositLaunch` and the target upload), `src/main.cpp`
+(`buildAimMap`, the two CPU mode-`M` call sites and the GPU one, the two CLI flags, the flux
+diagnostic).
 
 ### FIXED (2026-09-01, v0.199.6): the photon grid's memory guard silently overrode the requested gather radius on any large scene
 

@@ -20940,6 +20940,13 @@ static int run(int argc, char** argv) {
                         buildBeamMap(bm, "[camera]", work);
                     };
                 }
+                // Aimed caustic emission (-causticn), the exact twin of the CPU call below.
+                // Skipped when the map is being LOADED: -loadmap replays a stored deposit, so
+                // there is no emission pass for a second sampler to join.
+                long long nAimedGpu = 0;
+                const caim::AimMap aimMapGpu =
+                    g_pmapLoad.empty() ? buildAimMap(scene, N, nAimedGpu, "[camera]")
+                                       : caim::AimMap{};
                 renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e,
                                           diffraction, spp,
                                           g_showWindow ? &liveProg : nullptr, &writeFrame,
@@ -20948,7 +20955,8 @@ static int run(int argc, char** argv) {
                                           g_pmFinalGather,
                                           g_pmAutoRadius ? g_pmAutoCount : 0.0,
                                           wantBeams ? &beamPass : nullptr, &stageProg,
-                                          g_pmCaustics ? g_pmCausticCount : 0.0);
+                                          g_pmCaustics ? g_pmCausticCount : 0.0,
+                                          &aimMapGpu, nAimedGpu);
                 if (wantBeams && beamPass.loadedMissing)
                     std::fprintf(stderr,
                         "[loadmap] warning: %s has no beam data (saved without -beams, or its\n"

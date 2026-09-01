@@ -2171,7 +2171,7 @@ render. Closing that means teaching the shared device path to gather in spp chun
   That was the *storage* half of Jensen's scheme only, and on its own it leaves the caustic map
   sharp but nearly empty (0.12 % of `gallery_rain` deposits are L·S⁺·D). The *sampling* half is
   `causticaim.h`, next.
-- **`causticaim.h`** (0.203.0; `-causticn`, `-causticaimk`; **CPU only so far**) — the **aimed
+- **`causticaim.h`** (0.203.0 CPU, 0.204.0 GPU; `-causticn`, `-causticaimk`) — the **aimed
   caustic emission pass**, Jensen's projection-map half, built as a *continuous mixture
   importance sampler* rather than a discretised spherical grid. Every primitive whose material
   `materialMayFocus` (conservative — the undecidable "roughness driven by a texture/pattern/record"
@@ -2212,8 +2212,17 @@ render. Closing that means teaching the shared device path to gather in spp chun
   diagnostic — the one quantity aiming must leave alone — which is how the weighting was verified
   (see `known-issues.md` for the tables). Measured: 74× more caustic photons on `gallery_rain` for
   a 25 % larger budget, with the global map's deposit count bit-identical.
-  **Not yet on the GPU**, so a `-device gpu` mode-`M` render still gets the sparse un-aimed caustic
-  map; the port plan is in `known-issues.md`.
+  **The GPU twin (0.204.0)** is a field-for-field mirror, not a re-derivation: `DAimMap`/`DAimTarget`
+  mirror `caim::AimMap`/`caim::Target`, `dApplyCausticAim` mirrors `Renderer::applyCausticAim`, and
+  `renderPhotonMapSharedCuda` gained `aim` + `nAimed` and a second, caustic-only `depositLaunch`
+  with `cs.aim.aimed` / `cs.beamStraightOnly`. The MIS weight is fixed at *birth*, so it rides in
+  the per-path state — `int pathBits` became `DPathCaustic { int bits; Real w; }`, carried alike by
+  the megakernel, the hero tracer and the wavefront's per-slot `st.pathC`; and because a deposit
+  sets `PV_BIT_SCATTER` immediately after storing, at most **one** caustic deposit occurs per path,
+  so the weight is consumed exactly once or never. The aimed launch's energy goes to a scratch
+  buffer and is discarded (those photons are not additional emitted light), and `render_cuda.cu`'s
+  `buildCaustic` prints the same *stored flux / emitted* line as the host, which is what makes the
+  two backends directly comparable — they agree to 2e-4 on `scraps/caim_glass.ftsl`.
 - **`allocreport.h`** (0.199.1) — `ftalloc::resize` / `ftalloc::reserve`, which turn a
   `std::bad_alloc` from a *command-line-sized* buffer into a message naming the buffer, the
   element count and size, the total in binary units, and the flag that shrinks it. Wrapped:

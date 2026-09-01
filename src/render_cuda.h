@@ -219,6 +219,15 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // majority population, which is the broad ambient wash, and it convolves a caustic — a thin,
 // high-contrast concentration — into a flat smear. The two sets are disjoint and share
 // nEmitted, so the gather simply adds their density estimates. 0 = off (one map, as before).
+//
+// `aim` + `nAimed` add Jensen's PROJECTION-MAP half on top of that split (causticaim.h): a
+// SECOND deposit launch of `nAimed` photons whose emission is importance-sampled towards the
+// scene's focusing geometry, storing into the caustic map only. It is a pure variance
+// reduction and not a replacement — both launches' caustic deposits carry the same
+// balance-heuristic weight, computed at emission from the ratio nAimed/N, and the caustic
+// map's nEmitted stays at the MAIN launch's count — so an incomplete or over-eager target set
+// costs efficiency, never correctness, and `nAimed == 0` leaves every deposit bit-for-bit what
+// it was. Host twin: the aimed pass in tracePhotonPass (photonmap_render.h).
 struct BeamPass {
     BeamMap*  map    = nullptr;   // receives the deposited (or -loadmap'd) beams, then built
     long long target = 0;         // -beamcount: exact unbiased trim; <= 0 keeps every crossing
@@ -236,7 +245,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             int heroC = 1, int fgRays = 0, double autoK = 0.0,
                                             BeamPass* beams = nullptr,
                                             const StageProgress* stage = nullptr,
-                                            double causticK = 0.0);
+                                            double causticK = 0.0,
+                                            const caim::AimMap* aim = nullptr,
+                                            long long nAimed = 0);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

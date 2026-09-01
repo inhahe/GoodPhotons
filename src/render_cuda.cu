@@ -4582,6 +4582,32 @@ struct DBeamSpec {
     int  n = 0;
 };
 
+// ---- AIMED CAUSTIC EMISSION (device twin of caim::AimMap, causticaim.h) ------------------
+// One bounding sphere over a cluster of focusing primitives. Uploaded verbatim from the host
+// map — the clustering is a build-time host job over the whole scene, and the device only ever
+// needs to sample from and count against the finished set.
+struct DAimTarget {
+    DVec3 c;
+    Real  r;
+};
+
+// The aimed-emission configuration of ONE forward launch. Bound on BOTH deposit passes: the
+// main pass needs it to down-weight the caustic deposits the aimed pass is also making, and
+// binding it changes nothing else about the main pass (a photon that lands nowhere near
+// focusing geometry gets rho = 0 and weight exactly 1, and draws no extra randomness).
+struct DAimMap {
+    const DAimTarget* targets = nullptr;
+    int    n        = 0;
+    double sumR2    = 0.0;    // SUM_j r_j^2, cached host-side: the distant footprint measure
+    // True only in the dedicated caustic pass, where emission is RESAMPLED from this map
+    // instead of from the emitter's own distribution.
+    bool   aimed    = false;
+    // N_c / N_m — the caustic pass's photon count over the main pass's. The balance
+    // heuristic's only free parameter, and it is not free: it is the ratio actually run.
+    double misRatio = 0.0;
+    HD bool on() const { return targets != nullptr && n > 0; }
+};
+
 struct DCamSet {
     const DCamera* cams;      // nCam cameras
     double* const* films;     // nCam film buffers  (XYZ*3 doubles each)
@@ -4617,9 +4643,18 @@ struct DCamSet {
     // this only when the scene can honour it (achromatic extinction — beamSpectralOK in
     // photonmap_render.h), so the device never has to re-derive the gate.
     int                 beamSpecC = 1;
+    // AIMED CAUSTIC PASS (CLI -causticn, causticaim.h). See DAimMap above.
+    DAimMap aim;
+    // Cross media STRAIGHT without storing beams. The aimed caustic pass must transport by the
+    // same rules as the main pass it is MIS-combined with — under `-beams` the main pass
+    // crosses straight, and an analog collision here would set PV_BIT_SCATTER and destroy the
+    // L·S+·D classification the caustic map is defined by — but it must not STORE beams,
+    // because the beam map belongs to the main pass and is normalised by its nEmitted.
+    // (Host twin: Renderer::beamStraightOnly.)
+    bool beamStraightOnly = false;
     // Either beam path makes the photon cross media STRAIGHT (analog redirect skipped) and
     // needs the per-photon side stream, so the two gates are asked together everywhere.
-    HD bool beamsOn() const { return beamGather || beamCount != nullptr; }
+    HD bool beamsOn() const { return beamGather || beamCount != nullptr || beamStraightOnly; }
     // PHOTON-BEAM MULTIPLE SCATTERING (-beams-order). Host twin: Renderer::beamOrderMax /
     // beamMSAllowed. 1 = single scatter (pre-0.199.0, bit-identical); 0 = unlimited.
     int beamOrderMax = 0;
@@ -4886,10 +4921,20 @@ __device__ static void splatSurfaceAllHair(const DScene& sc, const DCamSet& cs, 
 // it (see DPhoton), so it isn't stored (matches Renderer::depositPhoton on the host).
 // `caustic` records the L·S+·D classification of the path that got here (see DPhoton); the
 // host reads it back to partition the download into the two maps.
+// `causticW` is the aimed pass's balance-heuristic weight (causticaim.h), which applies to a
+// CAUSTIC record and nothing else — 1 on every render without `-causticn`. The dedicated
+// aimed pass additionally drops non-caustic deposits outright: it exists only to feed the
+// caustic map, its global deposits would be normalised by the wrong nEmitted, and storing
+// them would cost a buffer the size of the whole aimed budget to then throw away on the host.
 __device__ static void depositPhoton(const DCamSet& cs, const DVec3& p,
                                      const DVec3& n, Real beta, Real lambda,
-                                     bool caustic = false) {
+                                     bool caustic = false, Real causticW = (Real)1) {
     if (!cs.depCount) return;
+    if (caustic && causticW != (Real)1) {
+        beta *= causticW;
+        if (!(beta > (Real)0)) return;
+    }
+    if (cs.aim.aimed && !caustic) return;
     unsigned long long i = atomicAdd(cs.depCount, 1ULL);
     if (cs.depPhotons && i < cs.depCap) {
         DPhoton ph;
@@ -6578,6 +6623,200 @@ __device__ static double dEnvPdf(const DEnvMap& e, const DVec3& d) {
 
 enum { WF_CONTINUE = 0, WF_TERMINATE = 1 };
 
+// ---- AIMED CAUSTIC EMISSION (device twin of causticaim.h + Renderer::applyCausticAim) -----
+// The host header holds the derivation; the device only needs the four primitives it reduces
+// to. The one structural difference from the host is that the target list is walked from
+// global memory rather than a std::vector, so every helper takes (targets, n) directly.
+//
+// The counting formula — p_a(x) = (number of footprints containing x) / T — is why these are
+// so small: there is no stored pdf, no normalisation table and no grid, just an overlap count
+// against at most `-causticaimk` spheres.
+
+// cos of the cone half-angle target j subtends from `o`; -1 when `o` is inside it (the whole
+// sphere of directions, which is the correct limit for an emitter embedded in a dielectric).
+__device__ static inline double dAimConeCos(const DAimTarget& tg, const DVec3& o) {
+    const DVec3 w = tg.c - o;
+    const double d2 = (double)dot(w, w), r2 = (double)tg.r * (double)tg.r;
+    if (d2 <= r2) return -1.0;
+    return sqrt(fmax(0.0, 1.0 - r2 / d2));
+}
+
+__device__ static inline double dAimSumOmega(const DAimMap& am, const DVec3& o) {
+    double s = 0.0;
+    for (int i = 0; i < am.n; ++i) s += 2.0 * DPI * (1.0 - dAimConeCos(am.targets[i], o));
+    return s;
+}
+
+__device__ static inline int dAimConeCount(const DAimMap& am, const DVec3& o, const DVec3& w) {
+    int n = 0;
+    for (int i = 0; i < am.n; ++i) {
+        const DVec3 v = am.targets[i].c - o;
+        const double d2 = (double)dot(v, v), r2 = (double)am.targets[i].r * (double)am.targets[i].r;
+        if (d2 <= r2) { ++n; continue; }
+        const double dl = sqrt(d2);
+        if ((double)dot(w, v) / dl >= sqrt(fmax(0.0, 1.0 - r2 / d2))) ++n;
+    }
+    return n;
+}
+
+// Draw a direction from the aimed cone mixture: `u0` picks a target proportional to its own
+// solid angle, `u1`/`u2` place the direction uniformly inside that cone.
+__device__ static bool dAimConeSample(const DAimMap& am, double sumOmega, const DVec3& o,
+                                      double u0, double u1, double u2, DVec3& w) {
+    if (am.n <= 0 || !(sumOmega > 0.0)) return false;
+    double pick = u0 * sumOmega, acc = 0.0;
+    int j = 0;
+    for (; j + 1 < am.n; ++j) {
+        acc += 2.0 * DPI * (1.0 - dAimConeCos(am.targets[j], o));
+        if (pick < acc) break;
+    }
+    const DAimTarget tg = am.targets[j];
+    const double cosMax = dAimConeCos(tg, o);
+    DVec3 axis = tg.c - o;
+    const double al = (double)length(axis);
+    axis = (al > 1e-12) ? axis / (Real)al : DVec3{(Real)0, (Real)0, (Real)1};
+    const double ct = 1.0 - u1 * (1.0 - cosMax);
+    const double st = sqrt(fmax(0.0, 1.0 - ct * ct));
+    const double ph = 2.0 * DPI * u2;
+    DVec3 tt, bb; onb(axis, tt, bb);
+    w = tt * (Real)(st * cos(ph)) + bb * (Real)(st * sin(ph)) + axis * (Real)ct;
+    return true;
+}
+
+// 2-D coordinates of target j's centre, projected onto the upstream plane a distant emitter
+// draws its entry point from (basis t/b, through sceneCenter, perpendicular to the travel
+// direction — exactly the plane `onb(dir, t, b)` builds in genPhoton).
+__device__ static inline void dAimDiscProject(const DAimTarget& tg, const DVec3& sceneCenter,
+                                              const DVec3& t, const DVec3& b,
+                                              double& x, double& y) {
+    const DVec3 w = tg.c - sceneCenter;
+    x = (double)dot(w, t);
+    y = (double)dot(w, b);
+}
+
+__device__ static inline int dAimDiscCount(const DAimMap& am, const DVec3& sceneCenter,
+                                           const DVec3& t, const DVec3& b, double x, double y) {
+    int n = 0;
+    for (int i = 0; i < am.n; ++i) {
+        double cx, cy; dAimDiscProject(am.targets[i], sceneCenter, t, b, cx, cy);
+        const double dx = x - cx, dy = y - cy;
+        const double r = (double)am.targets[i].r;
+        if (dx * dx + dy * dy < r * r) ++n;
+    }
+    return n;
+}
+
+__device__ static bool dAimDiscSample(const DAimMap& am, const DVec3& sceneCenter,
+                                      const DVec3& t, const DVec3& b,
+                                      double u0, double u1, double u2, double& x, double& y) {
+    if (am.n <= 0 || !(am.sumR2 > 0.0)) return false;
+    double pick = u0 * am.sumR2, acc = 0.0;
+    int j = 0;
+    for (; j + 1 < am.n; ++j) {
+        acc += (double)am.targets[j].r * (double)am.targets[j].r;
+        if (pick < acc) break;
+    }
+    const DAimTarget tg = am.targets[j];
+    double cx, cy; dAimDiscProject(tg, sceneCenter, t, b, cx, cy);
+    const double rr = (double)tg.r * sqrt(u1);
+    const double ph = 2.0 * DPI * u2;
+    x = cx + rr * cos(ph);
+    y = cy + rr * sin(ph);
+    return true;
+}
+
+// The whole scheme in one call, straight after the ordinary emission sample has been drawn.
+// Device twin of Renderer::applyCausticAim — see render.h for the full contract. In the MAIN
+// pass this only MEASURES the sample (no RNG draw at all, so every existing GPU render stays
+// bit-identical) and returns the balance-heuristic weight in `wOut`; in the AIMED pass it
+// additionally RESAMPLES whichever half of the emission the targets actually constrain.
+//
+// `em == nullptr` is a volumetric blackbody birth: isotropic from a point inside the fire,
+// which is the cone case with p_u = 1/(4*pi).
+//
+// Returns false when the sample carries no light (an aimed direction outside a spot's outer
+// cone, below an area emitter's horizon, or outside the upstream disc that IS a distant
+// emitter's entire phase space). Those are zero contributions, not rejections needing
+// compensation: p_u is genuinely zero there.
+__device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
+                                        const DEmitter* em, DVec3& origin, DVec3& dir,
+                                        const DVec3& emitN, Real& spotW, DRng& rng,
+                                        Real& wOut) {
+    wOut = (Real)1;
+    const DAimMap& am = cs.aim;
+    if (!am.on()) return true;
+    // rho = p_a/p_u. The default is 1, not 0: an emitter that CANNOT be aimed (a collimated
+    // one — its direction is a delta) is emitted by the caustic pass with the ordinary
+    // sampler, so there the two strategies are identical and rho is exactly 1. The balance
+    // heuristic then degenerates to splitting the deposit between two equal passes.
+    double rho = 1.0;
+    const bool distant   = em && (em->shape == 3 || em->shape == 6);   // env / sun
+    const bool collimated = em && em->collimated && !distant;
+    if (collimated) {
+        // nothing to aim: rho stays 1
+    } else if (distant) {
+        DVec3 t, b; onb(dir, t, b);
+        const DVec3 base = sc.sceneCenter - dir * (Real)sc.sceneRadius;
+        if (!(am.sumR2 > 0.0)) return true;
+        double x, y;
+        if (am.aimed) {
+            if (!dAimDiscSample(am, sc.sceneCenter, t, b,
+                                (double)rng.uniform(), (double)rng.uniform(),
+                                (double)rng.uniform(), x, y))
+                return true;
+            origin = base + t * (Real)x + b * (Real)y;
+        } else {
+            const DVec3 off = origin - base;
+            x = (double)dot(off, t); y = (double)dot(off, b);
+        }
+        const double R = sc.sceneRadius;
+        // Outside the disc the emitter delivers nothing at all, so p_u = 0 and the whole
+        // contribution is zero — not a lost sample, a zero one. (Reachable only from the aimed
+        // pass, and only when a target's bounding sphere pokes past the scene's own.)
+        if (x * x + y * y > R * R) return !am.aimed;
+        int n = dAimDiscCount(am, sc.sceneCenter, t, b, x, y);
+        if (am.aimed && n < 1) n = 1;      // we drew it from a disc, so it is in one
+        rho = (double)n * R * R / am.sumR2;
+    } else {
+        const double sumOmega = dAimSumOmega(am, origin);
+        if (!(sumOmega > 0.0)) return true;
+        if (am.aimed) {
+            DVec3 w;
+            if (!dAimConeSample(am, sumOmega, origin, (double)rng.uniform(),
+                                (double)rng.uniform(), (double)rng.uniform(), w))
+                return true;
+            dir = w;
+            if (em && em->shape == 2) {                       // spot
+                const double ct = (double)dot(dir, em->beamDir);
+                if (ct <= em->spotCosOuter) return false;      // outside the cone: p_u = 0
+                const double omegaOuter = 2.0 * DPI * (1.0 - em->spotCosOuter);
+                spotW = (Real)(spotFalloff(ct, em->spotCosInner, em->spotCosOuter)
+                               * omegaOuter / em->spotOmega);
+            } else if (em && (double)dot(dir, emitN) <= 0.0) {
+                return false;                                  // below the horizon: p_u = 0
+            }
+        }
+        double pu;
+        if (em && em->shape == 2) {
+            const double ct = (double)dot(dir, em->beamDir);
+            pu = (ct > em->spotCosOuter) ? 1.0 / (2.0 * DPI * (1.0 - em->spotCosOuter)) : 0.0;
+        } else if (em) {
+            const double c = (double)dot(dir, emitN);
+            pu = (c > 0.0) ? c / DPI : 0.0;                    // cosine hemisphere
+        } else {
+            pu = 1.0 / (4.0 * DPI);                            // isotropic volumetric birth
+        }
+        if (!(pu > 0.0)) return !am.aimed;
+        int n = dAimConeCount(am, origin, dir);
+        if (am.aimed && n < 1) n = 1;
+        rho = ((double)n / sumOmega) / pu;
+    }
+    // Balance heuristic: w = N_m p_u / (N_m p_u + N_c p_a). causticaim.h has why the SAME
+    // weight is right for a photon from either pass.
+    wOut = (Real)(1.0 / (1.0 + am.misRatio * rho));
+    return true;
+}
+
 // Sample one photon from the emitters: fills ro/rd/beta/lambda, accumulates the
 // emitted energy, and performs the direct emitter->camera connection (models A/B).
 // Returns false when the wavelength draw yields a zero pdf (skip this photon).
@@ -6587,8 +6826,9 @@ enum { WF_CONTINUE = 0, WF_TERMINATE = 1 };
 __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
                                  int camMode, DRng& rng,
                                  DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted,
-                                 DBeamSpec* spec = nullptr) {
+                                 DBeamSpec* spec = nullptr, Real* causticW = nullptr) {
     if (spec) spec->n = 0;
+    if (causticW) *causticW = (Real)1;
     // ROADMAP C3: split birth between surface/point/env emitters and volumetric "fire"
     // emission by power. grandTotal = totalPower + totalEmissionPower; the volumeBirth
     // test short-circuits (drawing NO extra RNG) when there are no emissive volumes, so
@@ -6625,6 +6865,16 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         double sr = sqrt(fmax(0.0, 1.0 - z * z));
         double phi = 2.0 * DPI * (double)rng.uniform();
         DVec3 dir = DVec3{ (Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z };
+        // Aimed caustic emission (causticaim.h). A fire birth POINT is already fixed, so it is
+        // the DIRECTION that gets aimed; p_u for an isotropic birth is 1/(4pi), which is the
+        // `em == nullptr` case. No-op — and no RNG draw — unless an aim map is bound.
+        {
+            DVec3 emitNv = dir; Real spotWv = (Real)1;   // unread when em == nullptr
+            Real wv = (Real)1;
+            if (!dApplyCausticAim(sc, cs, nullptr, origin, dir, emitNv, spotWv, rng, wv))
+                return false;
+            if (causticW) *causticW = wv;
+        }
         // Direct-visibility emission splat (the flame seen directly by the camera).
         camSplatEmissionAll(sc, cs, camMode, origin, lambda, beta, rng);
         ro = origin + dir * RAY_EPS; rd = dir;
@@ -6698,6 +6948,16 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         // `emit pattern:` factor — 1.0 (and a bit-identical draw) when unpatterned.
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+    }
+    // Aimed caustic emission (causticaim.h). Placed here, after the shape branch has produced
+    // an ordinary sample and BEFORE `beta *= spotW`, because the aimed pass resamples the
+    // direction and therefore recomputes spotW. In the main pass this only measures the
+    // sample — no RNG draw, so every existing render stays bit-for-bit — and returns the
+    // caustic MIS weight. Host twin: the same call in Renderer::tracePhoton.
+    {
+        Real wv = (Real)1;
+        if (!dApplyCausticAim(sc, cs, &em, origin, dir, emitN, spotW, rng, wv)) return false;
+        if (causticW) *causticW = wv;
     }
     Real pdfL = 0;
     // The variate is drawn explicitly rather than inside sampleLambda so the spectral bundle
@@ -6921,10 +7181,33 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
 // differently and disagree on the image.
 #define PV_BIT_FOCUS   1
 #define PV_BIT_SCATTER 2
-// L·S+·D: focused at least once, never scattered since. A null `bits` means the caller is not
+// The per-path caustic state, carried from emission to the deposit. `bits` is the pair above;
+// `w` is the balance-heuristic MIS weight the aimed caustic pass gives this photon at BIRTH
+// (causticaim.h; host twin Renderer::causticW), which scales the caustic deposit and nothing
+// else.
+//
+// A struct rather than the weight bit-packed into the int: this object is written by two
+// kernels and read by a third, and DPhoton's own comment already records why an implicit
+// encoding in a buffer several kernels touch is a trap. It is also cheap — the only *storage*
+// of it is the wavefront's per-slot array, one entry per in-flight photon.
+//
+// A path makes AT MOST ONE caustic deposit, because every deposit site sets PV_BIT_SCATTER
+// immediately after storing: the first diffuse vertex either is a caustic (a focus vertex
+// preceded it) or is not, and everything past it is diffuse indirect light. So `w` is
+// consumed exactly once, or never.
+struct DPathCaustic {
+    int  bits;
+    Real w;
+};
+// L·S+·D: focused at least once, never scattered since. A null `pc` means the caller is not
 // classifying at all (every mode but M), so nothing it deposits is a caustic.
-__device__ static inline bool dPathIsCaustic(const int* bits) {
-    return bits && (*bits & PV_BIT_FOCUS) && !(*bits & PV_BIT_SCATTER);
+__device__ static inline bool dPathIsCaustic(const DPathCaustic* pc) {
+    return pc && (pc->bits & PV_BIT_FOCUS) && !(pc->bits & PV_BIT_SCATTER);
+}
+// The caustic-deposit weight for this path — exactly 1 when nothing is aiming, which is every
+// render without `-causticn`.
+__device__ static inline Real dPathCausticW(const DPathCaustic* pc) {
+    return pc ? pc->w : (Real)1;
 }
 __device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h);
 __device__ static inline int dPhotonVertexBit(const DScene& sc, const DMaterial& m,
@@ -6953,9 +7236,10 @@ __device__ static inline int dPhotonVertexBit(const DScene& sc, const DMaterial&
 // marched (so the dielectric Beer-Lambert can cover it) and `grinMed >= 0` means a medium
 // collided during the march, at `ro`. Defaults (-1, 0) are "no GRIN in this scene".
 //
-// `pathBits` (optional) is the caustic classification carried down the path — the PV_BIT_*
-// pair above, host twin `sawFocus`/`sawScatter` in Renderer::tracePhoton. Null means "do not
-// classify", which is what every mode other than M passes.
+// `pathC` (optional) is the caustic state carried down the path — the PV_BIT_* pair above
+// plus the aimed pass's MIS weight (DPathCaustic), host twins `sawFocus`/`sawScatter` and
+// `causticW` in Renderer::tracePhoton. Null means "do not classify", which is what every mode
+// other than M passes.
 //
 // `spec` (optional) is the photon's live SPECTRAL BUNDLE (DBeamSpec). It is deposited with
 // this step's beam and then RETIRED, unconditionally, before returning: see the note at the
@@ -6966,7 +7250,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 double& eAbsorbed, double& eSensor, double& eEscaped,
                                 DMediumStack& stk, DRng* crng = nullptr,
                                 int grinMed = -1, Real grinArc = 0,
-                                int* beamScat = nullptr, int* pathBits = nullptr,
+                                int* beamScat = nullptr, DPathCaustic* pathC = nullptr,
                                 DBeamSpec* spec = nullptr) {
     Real dSurf = h.valid ? h.t : BIG;
 
@@ -6992,7 +7276,13 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     // ordinary fog somewhere else in a GRIN scene does (host twin: Renderer::emitBeams).
     const bool doBeamSplat   = cs.beamGather && crng && cs.nCam > 1 && camMode != CAM_C && sc.mediaN > 0;
     const bool doBeamDeposit = cs.beamCount && crng && sc.mediaN > 0;
-    const bool doBeam = doBeamSplat || doBeamDeposit;
+    // `beamStraightOnly` is the aimed caustic pass (causticaim.h): it must cross media by the
+    // SAME rule as the main pass it is MIS-combined with, but store nothing. Everything below
+    // then falls out on its own — the splat loop runs zero cameras (nCam == 0), dEmitBeams is
+    // gated on doBeamDeposit, and the transmittance draw already bills the transport stream
+    // whenever the splat path is off. Host twin: Renderer::doBeamStraight.
+    const bool doBeam = doBeamSplat || doBeamDeposit ||
+                        (cs.beamStraightOnly && crng && sc.mediaN > 0);
     // MULTIPLE SCATTERING in the beam media (0.199.0; -beams-order). Host twin: the `beamMS`
     // flag in Renderer::tracePhoton, where the full derivation lives. In short: the stored
     // beams are LONG (they run to the next surface and the gather applies Tr analytically), so
@@ -7165,7 +7455,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // An ANALOG collision is a wide redirect: the beam's focus does not survive it, so
         // anything deposited downstream is indirect light. A `-beams` STRAIGHT crossing never
         // reaches here and stays neutral — it does not deflect the photon at all. (render.h)
-        if (pathBits) *pathBits |= PV_BIT_SCATTER;
+        if (pathC) pathC->bits |= PV_BIT_SCATTER;
         return WF_CONTINUE;
     }
 
@@ -7194,7 +7484,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // Classify for the caustic split BEFORE the interaction, in the CALLER: this is the
         // one place that holds both `m` and `h`, and keeping it out of interactSpecular (which
         // the hero tracer also calls) leaves exactly one definition of the rule.
-        if (pathBits) *pathBits |= dPhotonVertexBit(sc, m, h);
+        if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
                                 ro, rd, beta, lambda, rng, eAbsorbed, stk);
     } else if (m.type == D_DIFFUSETRANSMIT) {
@@ -7211,8 +7501,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
-        depositPhoton(cs, h.p, h.n, beta, lambda, dPathIsCaustic(pathBits));
-        if (pathBits) *pathBits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
+        depositPhoton(cs, h.p, h.n, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+        if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         // Both lobes get the adjoint correction; |cos| in the factor makes it lobe-agnostic,
         // so h.n / ngo serve the transmit lobe too (nb = -h.n is used only for the splat side).
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rhoR, rng);
@@ -7231,8 +7521,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
-        depositPhoton(cs, h.p, h.n, beta, lambda, dPathIsCaustic(pathBits));
-        if (pathBits) *pathBits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
+        depositPhoton(cs, h.p, h.n, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+        if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -7338,7 +7628,9 @@ __device__ static void camSpecularSplatAllHero(const DScene& sc, const DCamSet& 
 // false when the hero wavelength draws a zero pdf (skip this photon). Emission geometry is
 // byte-identical to genPhoton (λ-independent); only the wavelength/throughput bundle differs.
 __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int camMode, int C,
-        DRng& rng, DVec3& ro, DVec3& rd, Real* lam, Real* beta, bool& secAlive, double& eEmitted) {
+        DRng& rng, DVec3& ro, DVec3& rd, Real* lam, Real* beta, bool& secAlive, double& eEmitted,
+        Real* causticW = nullptr) {
+    if (causticW) *causticW = (Real)1;
     // A scene with no emitters arrives here with sc.emitters == nullptr (the host uploads a
     // null pointer for an empty emitter list), so the indexing below would fault the device.
     // genPhoton has the equivalent prologue (grandTotal <= 0) and dGenLightSubpath the
@@ -7390,6 +7682,13 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
     } else {
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+    }
+    // Aimed caustic emission — see the scalar genPhoton. Before `base *= spotW` for the same
+    // reason (the aimed pass recomputes spotW).
+    {
+        Real wv = (Real)1;
+        if (!dApplyCausticAim(sc, cs, &em, origin, dir, emitN, spotW, rng, wv)) return false;
+        if (causticW) *causticW = wv;
     }
 
     // Hero + stratified secondaries from this emitter's SPD (one base draw, C-1 wrapped
@@ -7447,7 +7746,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
 __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int camMode,
         int diffraction, int C, const DHit& h, DVec3& ro, DVec3& rd, Real* lam, Real* beta,
         bool& secAlive, DRng& rng, double& eAbsorbed, double& eSensor, double& eEscaped,
-        DMediumStack& stk, int* pathBits = nullptr) {
+        DMediumStack& stk, DPathCaustic* pathC = nullptr) {
     const int nUp = C;
     Real dEvent = h.valid ? h.t : BIG;
 
@@ -7488,9 +7787,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
         DVec3 wiPrev = -rd;
-        { const bool caus = dPathIsCaustic(pathBits);
+        { const bool caus = dPathIsCaustic(pathC);
           for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i], caus);
-          if (pathBits) *pathBits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
+          if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
             splatSurfaceAllHero(sc, cs, camMode, h.p, nb, ngo * (Real)(-1), wiPrev, lam, beta, rhoT, nUp, rng);
@@ -7538,7 +7837,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     }
 
     if (m.type == D_MIRROR || m.type == D_FILTER || m.type == D_GLOSSY) {
-        if (pathBits) *pathBits |= dPhotonVertexBit(sc, m, h);   // caustic split
+        if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);   // caustic split
         // ACHROMATIC delta lobes (device twin of render.h's Mirror/Filter/Glossy hero case):
         // specular — so no camera connect, exactly like the scalar path — but the outgoing
         // DIRECTION does not depend on λ, so the bundle keeps riding and only the per-λ
@@ -7580,7 +7879,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         // here because its sigma_a (and the reflectance→absorption inversion) is per-λ, so
         // one fiber interaction cannot be shared across C wavelengths — matching the CPU
         // tracePhotonHero, which de-heroes onto the scalar MatType::Hair path.
-        if (pathBits) *pathBits |= dPhotonVertexBit(sc, m, h);   // caustic split
+        if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);   // caustic split
         beta[0] *= (Real)C; secAlive = false;
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
                                 ro, rd, beta[0], lam[0], rng, eAbsorbed, stk);
@@ -7591,9 +7890,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, m, h, lam[i]));
     DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     DVec3 wiPrev = -rd;
-    { const bool caus = dPathIsCaustic(pathBits);
+    { const bool caus = dPathIsCaustic(pathC);
       for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i], caus);
-      if (pathBits) *pathBits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
+      if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
     if (camMode == CAM_A || camMode == CAM_B) {
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
         camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rho, nUp, rng);
@@ -7626,24 +7925,28 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
     Real lam[hero::kHeroMax], beta[hero::kHeroMax];
     bool secAlive = false;
     DVec3 ro, rd;
-    if (!genPhotonHero(sc, cs, camMode, C, rng, ro, rd, lam, beta, secAlive, eEmitted)) return;
+    // `causticW` rides on the path state below: the aimed caustic pass fixes it at birth and
+    // it is spent at the ONE caustic deposit the path can make.
+    Real bornCausticW = (Real)1;
+    if (!genPhotonHero(sc, cs, camMode, C, rng, ro, rd, lam, beta, secAlive, eEmitted,
+                       &bornCausticW)) return;
     DMediumStack stk; stk.clear();
     bool done = false;
     // Caustic classification of the path so far (host twin: sawFocus/sawScatter in
     // Renderer::tracePhotonHero). It survives the de-hero handoff below because the two step
     // functions share it — a bundle that de-heros at a gem must carry that FOCUS onward, or
     // every dispersive caustic would be filed as ordinary indirect light.
-    int pathBits = 0;
+    DPathCaustic pathC{0, bornCausticW};
     for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
         if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // gate excludes GRIN; kept for symmetry
         DHit h = closestHit(sc, ro, rd);
         int r;
         if (secAlive)
             r = shadeStepHero(sc, cs, camMode, diffraction, C, h, ro, rd, lam, beta, secAlive, rng,
-                              eAbsorbed, eSensor, eEscaped, stk, &pathBits);
+                              eAbsorbed, eSensor, eEscaped, stk, &pathC);
         else
             r = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta[0], lam[0], rng,
-                          eAbsorbed, eSensor, eEscaped, stk, nullptr, -1, 0, nullptr, &pathBits);
+                          eAbsorbed, eSensor, eEscaped, stk, nullptr, -1, 0, nullptr, &pathC);
         if (r == WF_TERMINATE) done = true;
     }
     if (!done) {
@@ -7674,7 +7977,11 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         // first chord, retired by shadeStep. Empty for every scene that does not qualify, in
         // which case every beam is the classic monochromatic record.
         DBeamSpec spec;
-        if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted, &spec)) continue;
+        // The aimed caustic pass's per-photon MIS weight, fixed at birth and spent at the ONE
+        // caustic deposit a path can make (causticaim.h). Exactly 1 without `-causticn`.
+        Real bornCausticW = (Real)1;
+        if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted, &spec,
+                       &bornCausticW)) continue;
         bool done = false;
         DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
         // PHOTON-BEAMS: an INDEPENDENT per-photon stream used ONLY by the beam branch —
@@ -7689,8 +7996,9 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         // -beams-order cap can retire multiple scattering mid-path (host twin: `beamScatters`
         // in Renderer::tracePhoton).
         int beamScat = 0;
-        // Caustic classification of the path so far — see dPhotonVertexBit / dPathIsCaustic.
-        int pathBits = 0;
+        // Caustic state of the path so far — see dPhotonVertexBit / dPathIsCaustic, plus the
+        // aimed pass's MIS weight fixed at birth (causticaim.h).
+        DPathCaustic pathC{0, bornCausticW};
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             // Bend through any GRIN region first, INTEGRATING THE MEDIA ALONG THE CURVE
             // (see dGrinMarch): every medium is transported analog on the curved span,
@@ -7702,7 +8010,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                           eAbsorbed, eSensor, eEscaped, stk, cs.beamsOn() ? &crng : nullptr,
                           gm.hit ? gm.which : -1, gm.arc, &beamScat,
-                          &pathBits, &spec) == WF_TERMINATE) done = true;
+                          &pathC, &spec) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -7755,12 +8063,14 @@ struct WFState {
     // allocated always but only written/read in GRIN scenes.
     int*   gmMed;
     Real*  gmArc;
-    // Caustic-split path state: the per-slot twin of the megakernel's local `int pathBits`
+    // Caustic path state: the per-slot twin of the megakernel's local `DPathCaustic pathC`
     // in kTrace. A photon's FOCUS/SCATTER history decides which photon map its next diffuse
     // deposit lands in (see dPhotonVertexBit / dPathIsCaustic), and that history is built up
     // across bounces — so like the medium stack it has to live in the pool rather than in a
-    // shade-kernel local, which dies at the kernel boundary.
-    int*   pathBits;
+    // shade-kernel local, which dies at the kernel boundary. The aimed pass's MIS weight
+    // (causticaim.h) rides in the same record for the same reason: it is fixed at BIRTH, in
+    // wfSpawn, and spent bounces later at the deposit.
+    DPathCaustic* pathC;
 };
 
 // Claim photon budget and emit fresh photons into `slot` until one is successfully
@@ -7776,11 +8086,14 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
         unsigned long long idx = atomicAdd(dispatched, 1ULL);
         if (idx >= (unsigned long long)N) return false;
         DVec3 ro, rd; Real beta, lambda; double eEm = 0;
-        if (genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEm)) {
+        Real bornCausticW = (Real)1;
+        if (genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEm, nullptr, &bornCausticW)) {
             st.ro[slot] = ro; st.rd[slot] = rd;
             st.beta[slot] = beta; st.lambda[slot] = lambda;
             st.bounce[slot] = 0; st.alive[slot] = 1; st.stkN[slot] = 0;
-            st.pathBits[slot] = 0;   // fresh photon: no vertex seen yet, so neither bit is set
+            // Fresh photon: no vertex seen yet, so neither bit is set; the aimed pass's
+            // weight is whatever emission just assigned it (1 without `-causticn`).
+            st.pathC[slot] = DPathCaustic{0, bornCausticW};
             atomicAdd(&energy[0], eEm);
             return true;
         }
@@ -7840,11 +8153,11 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
         stk.pri[i]    = st.stkPri[slot * DMediumStack::CAP + i];
     }
     double eAbs = 0, eSen = 0, eEsc = 0;
-    int pathBits = st.pathBits[slot];   // caustic-split history carried from earlier bounces
+    DPathCaustic pathC = st.pathC[slot];   // caustic history + MIS weight, from earlier bounces
     int res = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                         eAbs, eSen, eEsc, stk, nullptr,
                         st.gmMed[slot], st.gmArc[slot],   // GRIN pre-pass, from kWfExtend
-                        nullptr, &pathBits);
+                        nullptr, &pathC);
     int bounce = st.bounce[slot] + 1;
     bool pathDone = (res == WF_TERMINATE);
     // Bounce cap: the photon survived maxBounce shadeStep calls without terminating —
@@ -7859,7 +8172,7 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
         st.lambda[slot] = lambda;   // fluorescence may Stokes-shift lambda mid-path
         // Store the medium stack back to SoA (carry to the next segment).
         st.stkN[slot] = stk.n;
-        st.pathBits[slot] = pathBits;   // carry the caustic-split history too
+        st.pathC[slot] = pathC;   // carry the caustic history + MIS weight too
         for (int i = 0; i < stk.n; ++i) {
             st.stkMat[slot * DMediumStack::CAP + i] = stk.matIdx[i];
             st.stkPri[slot * DMediumStack::CAP + i] = stk.pri[i];
@@ -14622,7 +14935,7 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     CUDA_CHECK(cudaMalloc(&st.hit,    (size_t)W * sizeof(DHit)));
     CUDA_CHECK(cudaMalloc(&st.gmMed,  (size_t)W * sizeof(int)));    // GRIN pre-pass results,
     CUDA_CHECK(cudaMalloc(&st.gmArc,  (size_t)W * sizeof(Real)));   // extend -> shade
-    CUDA_CHECK(cudaMalloc(&st.pathBits, (size_t)W * sizeof(int)));  // caustic-split history
+    CUDA_CHECK(cudaMalloc(&st.pathC, (size_t)W * sizeof(DPathCaustic)));  // caustic path state
     CUDA_CHECK(cudaMemset(st.alive, 0, (size_t)W * sizeof(int)));
 
     unsigned long long* d_dispatched = nullptr;
@@ -14657,7 +14970,7 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
     cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive);
     cudaFree(st.stkMat); cudaFree(st.stkPri); cudaFree(st.stkN); cudaFree(st.hit);
-    cudaFree(st.gmMed); cudaFree(st.gmArc); cudaFree(st.pathBits);
+    cudaFree(st.gmMed); cudaFree(st.gmArc); cudaFree(st.pathC);
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
@@ -15707,7 +16020,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const std::function<bool(int, const Film&)>* onFrame,
                                             const char* mapLoad, const char* mapSave, int heroC,
                                             int fgRays, double autoK, BeamPass* beams,
-                                            const StageProgress* stage, double causticK) {
+                                            const StageProgress* stage, double causticK,
+                                            const caim::AimMap* aim, long long nAimed) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -15767,6 +16081,14 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         const double r = pmC.buildAuto(r0, causticK, &nProbe, &kTarget, r0);
         std::printf("[gpu] caustic map: %zu photons, gather radius %.4g -> %.4g (probe saw "
                     "%.0f; target %.0f)\n", pmC.photons.size(), r0, r, nProbe, kTarget);
+        // Stored flux per emitted path — the invariant the aimed pass (`-causticn`) must leave
+        // alone while changing only the variance. Host twin: buildCausticMap in main.cpp, and
+        // the two numbers are directly comparable, which is how CPU/GPU agreement is checked.
+        long double flux = 0.0L;
+        for (const Photon& p : pmC.photons) flux += (long double)p.power;
+        if (pmC.nEmitted > 0)
+            std::printf("[gpu] caustic map: stored flux/emitted = %.6Lg (%zu photons)\n",
+                        flux / (long double)pmC.nEmitted, pmC.photons.size());
     };
 
     // The photon-BEAM volume pass (-beams). Only live when the caller supplied a BeamPass AND
@@ -15800,6 +16122,39 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     unsigned long long* d_depCount = nullptr;
     CUDA_CHECK(cudaMalloc(&d_depCount, sizeof(unsigned long long)));
     double* d_energy = nullptr; CUDA_CHECK(cudaMalloc(&d_energy, 5 * sizeof(double)));
+
+    // ---- aimed caustic emission (causticaim.h): upload the target spheres ----
+    // Same gate as the CPU pass (tracePhotonPass): the aimed pass needs somewhere caustic to
+    // deposit and something to aim at. Note the map is bound to the MAIN launch too — that is
+    // not an oversight but the balance heuristic: the main pass has to measure its own samples'
+    // aimed density to weight the caustic deposits the aimed pass is also making. Binding it
+    // draws no extra randomness, so a main pass with nAimed == 0 (misRatio 0 => weight 1) is
+    // bit-for-bit what it was before the aimed pass existed.
+    const bool doAimed = causticsOn && aim && !aim->empty() && nAimed > 0 && N > 0;
+    DAimTarget* d_aim = nullptr;
+    int         nAimT = 0;
+    if (doAimed) {
+        std::vector<DAimTarget> ht(aim->targets.size());
+        for (size_t i = 0; i < aim->targets.size(); ++i) {
+            const caim::Target& t = aim->targets[i];
+            ht[i].c = DVec3(t.c.x, t.c.y, t.c.z);
+            ht[i].r = (Real)t.r;
+        }
+        if (cudaMalloc(&d_aim, ht.size() * sizeof(DAimTarget)) == cudaSuccess) {
+            CUDA_CHECK(cudaMemcpy(d_aim, ht.data(), ht.size() * sizeof(DAimTarget),
+                                  cudaMemcpyHostToDevice));
+            nAimT = (int)ht.size();
+        } else {
+            cudaGetLastError(); d_aim = nullptr;
+            std::fprintf(stderr, "[caustic aim] could not upload %zu target spheres; "
+                                 "falling back to the un-aimed caustic map.\n", ht.size());
+        }
+    }
+    // One place decides whether the aimed pass happens, so the main launch's MIS ratio and the
+    // second launch can never disagree (a nonzero ratio with no second pass would darken the
+    // caustics by exactly the weight it applied).
+    const bool aimOn      = doAimed && (d_aim != nullptr);
+    const double aimRatio = aimOn ? (double)nAimed / (double)N : 0.0;
 
     // Beam staging buffer, sized like the CPU's per-thread banks: 2x the -beamcount target so
     // the pass can overshoot before the one exact (unbiased) host-side trim to the target,
@@ -15854,14 +16209,40 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // never traced and render a darkened image. (Exactly the accounting tracePhotonPass does
     // with its per-thread `emitted[tid] = done`.)
     long long depEmitted = N;
-    auto depositLaunch = [&](DPhoton* buf, unsigned long long cap, double beamKeep) {
+    // The aimed pass's own emitted count. It deliberately never reaches pm.nEmitted (it emits
+    // no light of its own — it re-estimates the main pass's caustic term with a different
+    // sampler), but a `-stop` mid-way still has to be visible to the accounting below.
+    long long aimEmitted = 0;
+    // Energy for the aimed pass, allocated only if one runs. Kept SEPARATE from d_energy and
+    // then thrown away: the aimed photons are not additional emitted light, so folding their
+    // joules into eOut would double-count the emission and break the energy audit.
+    double* d_energyAim = nullptr;
+    auto depositLaunch = [&](DPhoton* buf, unsigned long long cap, double beamKeep,
+                             bool aimedPass) {
+        const long long Nq = aimedPass ? nAimed : N;
+        double* const eBuf = aimedPass ? d_energyAim : d_energy;
+        // Disjoint RNG stream. The aimed pass must not replay the main pass's photons under a
+        // different sampler — that would correlate the two estimators the balance heuristic
+        // assumes are independent. (Host twin: the per-pass `salt` in tracePhotonPass.)
+        const unsigned long long seed0 = aimedPass ? 0x94D049BB13311000ULL : 0ULL;
+        const char* const label = aimedPass ? "tracing aimed photons" : "tracing photons";
         CUDA_CHECK(cudaMemset(d_depCount, 0, sizeof(unsigned long long)));
-        CUDA_CHECK(cudaMemset(d_energy, 0, 5 * sizeof(double)));
+        CUDA_CHECK(cudaMemset(eBuf, 0, 5 * sizeof(double)));
         DCamSet cs{};                       // nCam == 0: every camera splat is a no-op
         cs.cams = nullptr; cs.films = nullptr; cs.hits = nullptr; cs.nCam = 0;
         cs.depPhotons = buf; cs.depCount = d_depCount; cs.depCap = cap;
         cs.beamOrderMax = pbeams::gOrderMax;   // -beams-order (host twin: Renderer::beamOrderMax)
-        if (d_beamCount) {
+        // Bound on BOTH passes; only `aimed` differs. See the upload above for why the main
+        // pass needs it at all.
+        cs.aim.targets = d_aim; cs.aim.n = nAimT;
+        cs.aim.sumR2 = aim ? aim->sumR2 : 0.0;
+        cs.aim.aimed = aimedPass; cs.aim.misRatio = aimRatio;
+        if (aimedPass) {
+            // Caustic-only: no beam records (the beam map is the main pass's and is normalised
+            // by ITS nEmitted), but media must still be crossed straight or this pass would be
+            // transporting by different rules than the pass it is MIS-combined with.
+            cs.beamStraightOnly = (d_beamCount != nullptr);
+        } else if (d_beamCount) {
             CUDA_CHECK(cudaMemset(d_beamCount, 0, sizeof(unsigned long long)));
             cs.beamOut = d_beams; cs.beamCount = d_beamCount;
             cs.beamCap = beamCap; cs.beamKeep = beamKeep;
@@ -15870,29 +16251,29 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             cs.beamSpecC = (pbeams::gSpecC > 1 && beamSpectralOK(scene))
                                ? std::min(pbeams::gSpecC, kBeamSpecMax) : 1;
         }
-        depEmitted = N;
+        (aimedPass ? aimEmitted : depEmitted) = Nq;
         if (!splitDeposit) {
-            launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false,
+            launchForward(up, cs, eBuf, Nq, diffraction, seed0, /*wavefront*/false,
                           CAM_B, heroC);
             return;
         }
-        stage->report("tracing photons", 0, N);
+        stage->report(label, 0, Nq);
         // 1 M is small enough to be a sub-second probe on any card that can run this at all,
         // and large enough to keep ~262 k threads busy rather than measuring launch latency.
-        long long chunk = (N < (1ll << 20)) ? N : (1ll << 20);
-        for (long long off = 0; off < N; ) {
-            const long long cs2 = (off + chunk <= N) ? chunk : (N - off);
+        long long chunk = (Nq < (1ll << 20)) ? Nq : (1ll << 20);
+        for (long long off = 0; off < Nq; ) {
+            const long long cs2 = (off + chunk <= Nq) ? chunk : (Nq - off);
             const auto t0 = std::chrono::steady_clock::now();
-            launchForward(up, cs, d_energy, cs2, diffraction, (unsigned long long)off,
+            launchForward(up, cs, eBuf, cs2, diffraction, seed0 + (unsigned long long)off,
                           /*wavefront*/false, CAM_B, heroC);
             CUDA_CHECK(cudaDeviceSynchronize());   // the launch is async; time the WORK
             const double sec = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();
             off += cs2;
-            stage->report("tracing photons", off, N);
+            stage->report(label, off, Nq);
             // Cooperative stop: the deposit is the phase a `-stop` most often lands in, and
             // before the split there was no seam to honour it at.
-            if (ft::stopRequested()) { depEmitted = off; break; }
+            if (ft::stopRequested()) { (aimedPass ? aimEmitted : depEmitted) = off; break; }
             // Retarget ~1 s of work, but never shrink below the probe (a chunk that keeps
             // halving turns the deposit into launch overhead) and never grow more than 4x at
             // a step (one anomalously fast chunk must not produce a 10-minute next one).
@@ -15930,7 +16311,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     }
     unsigned long long nDep = 0, nBeam = 0;
     if (d_photons) {
-        depositLaunch(d_photons, cap, 1.0); // optimistic fill against the guess
+        depositLaunch(d_photons, cap, 1.0, /*aimed*/false); // optimistic fill against the guess
         CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
         nBeam = readBeamCount();
         // ONE rerun settles both overflows, because the two are independent knobs on the same
@@ -15951,7 +16332,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             // (unlike the photon count, which the atomic still reports exactly), which would
             // bias the estimate. 5% headroom is ~50 standard deviations at a 1 M cap.
             const double keep = bmOver ? 0.95 * (double)beamCap / (double)nBeam : 1.0;
-            depositLaunch(d_photons, cap, keep);
+            depositLaunch(d_photons, cap, keep, /*aimed*/false);
             unsigned long long nFill = 0;
             CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
             if (nFill < nDep) nDep = nFill;
@@ -15959,14 +16340,14 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         }
     } else {
         // Couldn't stage even a modest guess: fall back to the old two-pass flow.
-        depositLaunch(nullptr, 0, 1.0);     // count-only sizing pass
+        depositLaunch(nullptr, 0, 1.0, /*aimed*/false);   // count-only sizing pass
         CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
         nBeam = readBeamCount();
         if (nDep > 0) {
             CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
             const double keep = (d_beams && nBeam > beamCap)
                               ? 0.95 * (double)beamCap / (double)nBeam : 1.0;
-            depositLaunch(d_photons, nDep, keep);   // fill pass (same seed => same nDep deposits)
+            depositLaunch(d_photons, nDep, keep, /*aimed*/false); // fill pass (same seed => same nDep deposits)
             nBeam = readBeamCount();
         }
     }
@@ -16020,6 +16401,99 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         }
     }
     if (d_photons) cudaFree(d_photons);
+    d_photons = nullptr;
+
+    // ---- aimed caustic pass (Jensen's projection map; causticaim.h) --------------------
+    // A SECOND deposit launch whose emission is importance-sampled towards the focusing
+    // geometry, appended to the caustic map only. Deliberately AFTER the main pass and its
+    // download, for three reasons: the main pass's photon buffer is already freed so this one
+    // gets the whole card; the two RNG streams stay disjoint (see `seed0`); and an
+    // `ftrace -stop` during the main pass skips it entirely, leaving the un-aimed caustic map,
+    // which is still correct — just noisier.
+    //
+    // Every record it produces is caustic by construction: device depositPhoton drops a
+    // non-caustic deposit outright when cs.aim.aimed, so no partition is needed here.
+    // pm.nEmitted / pmC.nEmitted stay at the MAIN pass's count — the aimed photons carry no
+    // light of their own, they re-estimate the same caustic term with a different sampler, and
+    // the balance-heuristic weight applied at emission is what makes the sum unbiased.
+    if (aimOn && !ft::stopRequested()) {
+        CUDA_CHECK(cudaMalloc(&d_energyAim, 5 * sizeof(double)));
+        // Caustic deposits are a small fraction of all deposits, so the guess that sizes the
+        // main buffer (2.5/photon) would be wildly over here. Start at the observed main-pass
+        // caustic rate with generous slack, and let the same overflow rerun settle it exactly.
+        double perPhoton = 0.25;
+        if (depEmitted > 0 && pmC.photons.size() > 0)
+            perPhoton = 4.0 * (double)pmC.photons.size() / (double)depEmitted;
+        if (perPhoton < 0.05) perPhoton = 0.05;
+        if (perPhoton > 2.5)  perPhoton = 2.5;
+        unsigned long long acap =
+            (unsigned long long)((double)nAimed * perPhoton) + (1ull << 20);
+        { size_t freeB = 0, totalB = 0;
+          if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
+              unsigned long long fit = (unsigned long long)(freeB / 2 / sizeof(DPhoton));
+              if (acap > fit) acap = fit; } }
+        DPhoton* d_aphotons = nullptr;
+        while (acap >= (1ull << 20) &&
+               cudaMalloc(&d_aphotons, (size_t)acap * sizeof(DPhoton)) != cudaSuccess) {
+            cudaGetLastError(); d_aphotons = nullptr; acap >>= 1;
+        }
+        unsigned long long nAimDep = 0;
+        if (d_aphotons) {
+            depositLaunch(d_aphotons, acap, 1.0, /*aimed*/true);
+            CUDA_CHECK(cudaMemcpy(&nAimDep, d_depCount, sizeof nAimDep, cudaMemcpyDeviceToHost));
+            if (nAimDep > acap) {                       // overflow: resize to the exact count
+                cudaFree(d_aphotons); d_aphotons = nullptr;
+                if (cudaMalloc(&d_aphotons, (size_t)nAimDep * sizeof(DPhoton)) == cudaSuccess) {
+                    acap = nAimDep;
+                    depositLaunch(d_aphotons, acap, 1.0, /*aimed*/true);
+                    unsigned long long nFill = 0;
+                    CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof nFill,
+                                          cudaMemcpyDeviceToHost));
+                    if (nFill < nAimDep) nAimDep = nFill;
+                } else {
+                    // Couldn't hold them all: keep the prefix the first launch did store. That
+                    // is a biased subset (it is whichever deposits won the atomic race), so
+                    // say so rather than silently shipping it.
+                    cudaGetLastError(); d_aphotons = nullptr; nAimDep = 0;
+                    std::fprintf(stderr, "[caustic aim] the aimed pass overflowed its device "
+                                         "buffer and could not be resized; dropping it. Lower "
+                                         "-causticn.\n");
+                }
+            }
+        } else {
+            std::fprintf(stderr, "[caustic aim] could not allocate a device photon buffer for "
+                                 "the aimed pass; falling back to the un-aimed caustic map.\n");
+        }
+        if (d_aphotons && nAimDep > 0) {
+            const size_t base = pmC.photons.size();
+            ftalloc::resize(pmC.photons, base + (size_t)nAimDep, "the caustic map payloads",
+                            "-causticn");
+            ftalloc::resize(pmC.pos, base + (size_t)nAimDep, "the caustic map positions",
+                            "-causticn");
+            std::vector<DPhoton> astage;
+            size_t w = base;
+            for (size_t off = 0; off < (size_t)nAimDep; off += PM_CHUNK) {
+                size_t cnt = std::min(PM_CHUNK, (size_t)nAimDep - off);
+                astage.resize(cnt);
+                CUDA_CHECK(cudaMemcpy(astage.data(), d_aphotons + off, cnt * sizeof(DPhoton),
+                                      cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < cnt; ++i) {
+                    const DPhoton& d = astage[i];
+                    Photon& p = pmC.photons[w];
+                    pmC.pos[w] = Vec3(d.pos.x, d.pos.y, d.pos.z);
+                    p.n = Vec3(d.n.x, d.n.y, d.n.z);
+                    p.power = d.power; p.lambda = d.lambda;
+                    ++w;
+                }
+            }
+            std::printf("[gpu] aimed caustic pass: %lld photons -> %llu caustic deposits "
+                        "(main pass: %zu)\n",
+                        (long long)aimEmitted, (unsigned long long)nAimDep, base);
+        }
+        if (d_aphotons) cudaFree(d_aphotons);
+        cudaFree(d_energyAim); d_energyAim = nullptr;   // discarded: not additional emission
+    }
+    if (d_aim) { cudaFree(d_aim); d_aim = nullptr; }
 
     // ---- download the deposited beams ----
     // Straight widen into PhotonBeam: `s0` is 0 for every downloaded record because a DEPOSIT
