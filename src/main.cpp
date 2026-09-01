@@ -11324,18 +11324,62 @@ static double g_pmRadiusFactor = 0.02;
 static bool   g_pmAutoRadius = true;
 static double g_pmAutoCount  = 200.0;   // calibrated to today's look — see PhotonMap::buildAuto
 
+// CAUSTIC MAP (mode M; CLI -caustics / -nocaustics, -pmccount). Jensen's two-map scheme:
+// deposits whose path reads L·S⁺·D — focused by at least one specular/near-specular vertex
+// and never scattered since the light (see photonVertexKind in render.h) — go to a SECOND
+// map, gathered at its own radius, and the two estimates are summed.
+//
+// Why this is not optional polish. The adaptive radius above solves for one population, and a
+// scene with caustics has two that differ by orders of magnitude in density: a gem's focused
+// light lands as a thin bright filament, the ambient illumination as a broad wash. One radius
+// must serve both, and the answer it picks is set by the majority — the diffuse wash — so the
+// caustic gets convolved with a kernel far wider than the feature itself and disappears into
+// the background. Forcing that one radius down instead (`-pmcount 11`) does bring the caustic
+// back, and takes the entire rest of the image to grain with it. Two maps is the fix, and it
+// is exactly what Jensen's original scheme does.
+//
+// ON by default: it costs one extra map and strictly improves any scene that has caustics,
+// while a scene with none deposits an empty caustic map and gathers nothing extra.
+static bool   g_pmCaustics    = true;
+// Target gather population for the CAUSTIC map, the -pmcount analogue. Deliberately smaller
+// than the global 200: a caustic is a high-contrast feature where blur is far more
+// objectionable than noise (the reverse of ambient illumination), and its photons are much
+// denser per unit area, so a smaller k still lands a usable signal-to-noise ratio.
+static double g_pmCausticCount = 50.0;
+
 // Bin a freshly-deposited (or freshly-loaded) photon map, honouring the adaptive-radius
 // setting, and say out loud what radius it settled on — the radius printed before the
 // deposit is only the starting point, and a silently-different one would be baffling when
 // comparing renders. Returns the radius actually used.
-static double buildPhotonMap(PhotonMap& pm, double radius, const char* tag) {
-    if (!g_pmAutoRadius) { pm.build(radius); return radius; }
+//
+// `kAt1M` overrides the adaptive target; <= 0 means "use g_pmAutoCount" (the global map).
+// `rMax` caps the chosen radius; see PhotonMap::buildAuto (the caustic map passes the global
+// map's radius, because a blurrier caustic map is worse than no split at all).
+static double buildPhotonMap(PhotonMap& pm, double radius, const char* tag, double kAt1M = 0.0,
+                             double rMax = 0.0) {
+    if (!g_pmAutoRadius) { pm.build(rMax > 0.0 ? std::min(radius, rMax) : radius);
+                           return pm.radius; }
+    if (kAt1M <= 0.0) kAt1M = g_pmAutoCount;
     double nProbe = 0.0, kTarget = 0.0;
-    const double r = pm.buildAuto(radius, g_pmAutoCount, &nProbe, &kTarget);
+    const double r = pm.buildAuto(radius, kAt1M, &nProbe, &kTarget, rMax);
     std::printf("%s adaptive gather radius: %.4g -> %.4g (a typical gather saw %.0f photons "
                 "at the starting radius; target %.0f for %zu stored)\n",
                 tag, radius, r, nProbe, kTarget, pm.photons.size());
     return r;
+}
+
+// The caustic map's twin of buildPhotonMap. Separate because an EMPTY caustic map must not go
+// through buildAuto at all: with no photons the probe measures nothing, and the returned
+// radius would be meaningless noise printed as if it meant something.
+// `rGlobal` is the radius the GLOBAL map settled on, and caps this one (see buildAuto's rMax).
+static void buildCausticMap(PhotonMap& pmC, double radius, const char* tag, double rGlobal) {
+    if (pmC.photons.empty()) {
+        std::printf("%s caustic map: 0 photons (no L-S+-D path in this scene)\n", tag);
+        return;
+    }
+    char t2[96];
+    std::snprintf(t2, sizeof t2, "%s caustic map:", tag);
+    buildPhotonMap(pmC, radius, t2, g_pmCausticCount, rGlobal);
 }
 
 // Mode-M PHOTON BEAMS (CLI -beams, shared with the mode-A/B splat gather of the same name).
@@ -14913,7 +14957,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         const bool wantBeams = g_beamGather && !scene.media.empty();
         warnModeMMedia(scene, wantBeams);
         warnBeamsGrinMedia(scene, wantBeams);
-        PhotonMap pm;
+        PhotonMap pm, pmC;
         BeamMap bmap;
         auto tp0 = std::chrono::steady_clock::now();
         // The deposit and the builds run before a single pixel exists, so the sample-driven
@@ -14921,9 +14965,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         StageProgress stageProg = makeStageProgress(res, resY);
         liveWindowPlaceholder(res, resY, "tracing photons\xE2\x80\xA6");
         tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
-                        wantBeams ? &bmap : nullptr, g_beamTarget, &stageProg);
+                        wantBeams ? &bmap : nullptr, g_beamTarget, &stageProg,
+                        g_pmCaustics ? &pmC : nullptr);
         liveWindowPlaceholder(res, resY, "building photon map\xE2\x80\xA6");
         radius = buildPhotonMap(pm, radius, "mode M:");
+        if (g_pmCaustics) buildCausticMap(pmC, radius, "mode M:", pm.radius);
         // One camera, so the BVH build is amortised over exactly this frame's samples. A
         // progressive budget (-time/-noise/-forever) has no spp up front; assume a modest
         // number rather than 0, since 0 would mean "build is free" and over-split for a frame
@@ -14945,7 +14991,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
                                               diffraction, /*maxBounce*/32, off, g_pmFinalGather,
-                                              wantBeams ? &bmap : nullptr);
+                                              wantBeams ? &bmap : nullptr,
+                                              g_pmCaustics ? &pmC : nullptr);
                 });
         };
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
@@ -16603,6 +16650,9 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-pmauto")) g_pmAutoRadius = true;
         else if (!std::strcmp(argv[i], "-nopmauto")) g_pmAutoRadius = false;
         else if (!std::strcmp(argv[i], "-pmcount") && i + 1 < argc) { g_pmAutoCount = std::atof(argv[++i]); g_pmAutoRadius = true; }
+        else if (!std::strcmp(argv[i], "-caustics")) g_pmCaustics = true;
+        else if (!std::strcmp(argv[i], "-nocaustics")) g_pmCaustics = false;
+        else if (!std::strcmp(argv[i], "-pmccount") && i + 1 < argc) { g_pmCausticCount = std::atof(argv[++i]); g_pmCaustics = true; g_pmAutoRadius = true; }
         else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
         else if (!std::strcmp(argv[i], "-savemap") && i + 1 < argc) g_pmapSave = argv[++i];
         else if (!std::strcmp(argv[i], "-loadmap") && i + 1 < argc) g_pmapLoad = argv[++i];
@@ -20000,7 +20050,7 @@ static int run(int argc, char** argv) {
     // fog / rain / cloud scene is usually its brightest subject. Same reasoning as the
     // -beams carve-out on the GPU meter below; that one falls back to here, so here it must
     // actually be right.
-    PhotonMap meterPmap; bool meterPmapBuilt = false;
+    PhotonMap meterPmap, meterPmapC; bool meterPmapBuilt = false;
     BeamMap   meterBmap;
 #ifdef HAVE_CUDA
     // Meter on the device the run asked for. The meter is a REAL reduced render, so when
@@ -20080,8 +20130,14 @@ static int run(int argc, char** argv) {
                                                         / std::max(1.0, (double)N)))
                             : 0;
                     tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap, g_heroC, 0,
-                                    meterBeams ? &meterBmap : nullptr, meterBeamTarget);
+                                    meterBeams ? &meterBmap : nullptr, meterBeamTarget, nullptr,
+                                    g_pmCaustics ? &meterPmapC : nullptr);
                     buildPhotonMap(meterPmap, radius, "[meter]");
+                    // The meter exists to pick an exposure, so it has to gather what the real
+                    // render will gather — a caustic is bright, and metering without it would
+                    // anchor the exposure to a dimmer image than the one finally produced.
+                    if (g_pmCaustics)
+                        buildCausticMap(meterPmapC, meterPmap.radius, "[meter]", meterPmap.radius);
                     // The meter map is thrown away after the anchor converges, so its work is
                     // only the metered frames — at most `cams.size()` of them at meterSpp, and
                     // the adaptive early-stop usually takes far fewer. Under-stating work makes
@@ -20094,7 +20150,8 @@ static int run(int argc, char** argv) {
                 }
                 mf = renderPhotonCamera(scene, mc.cam, W, H, meterPmap, meterSpp, nThreads,
                                         diffraction, /*maxBounce*/32, 0, g_pmFinalGather,
-                                        meterBeams ? &meterBmap : nullptr);
+                                        meterBeams ? &meterBmap : nullptr,
+                                        g_pmCaustics ? &meterPmapC : nullptr);
                 filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
                 break;
             }
@@ -20205,7 +20262,12 @@ static int run(int argc, char** argv) {
                                           diffraction, meterSpp, nullptr, &onFrame,
                                           nullptr, nullptr, g_heroC, g_pmFinalGather,
                                           g_pmAutoRadius ? g_pmAutoCount : 0.0,
-                                          meterBeamsGpu ? &mBeamPass : nullptr);
+                                          meterBeamsGpu ? &mBeamPass : nullptr, nullptr,
+                                          // The meter must gather exactly what the render
+                                          // gathers: metering with the caustic map OFF anchors
+                                          // the exposure to a dimmer image than the one that
+                                          // gets written, and every render comes out hot.
+                                          g_pmCaustics ? g_pmCausticCount : 0.0);
                 metered = true;   // a black meter falls into the no-anchor warning below
             }
         }
@@ -20760,7 +20822,8 @@ static int run(int argc, char** argv) {
                                           g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC,
                                           g_pmFinalGather,
                                           g_pmAutoRadius ? g_pmAutoCount : 0.0,
-                                          wantBeams ? &beamPass : nullptr, &stageProg);
+                                          wantBeams ? &beamPass : nullptr, &stageProg,
+                                          g_pmCaustics ? g_pmCausticCount : 0.0);
                 if (wantBeams && beamPass.loadedMissing)
                     std::fprintf(stderr,
                         "[loadmap] warning: %s has no beam data (saved without -beams, or its\n"
@@ -20784,7 +20847,7 @@ static int run(int argc, char** argv) {
                     "radius %.4g on %d CPU threads (light=%s)%s ...\n",
                     idx.size(), N, radius, nThreads, lightLabel,
                     g_pmFinalGather > 0 ? " [final gather]" : "");
-        PhotonMap pm;
+        PhotonMap pm, pmC;
         BeamMap bmap;
         auto tp0 = std::chrono::steady_clock::now();
         // -savemap / -loadmap on the CPU path. These used to be GPU-only purely because the
@@ -20800,11 +20863,12 @@ static int run(int argc, char** argv) {
         if (!g_pmapLoad.empty()) {
             bool beamsMissing = false;
             mapLoaded = loadPhotonMap(g_pmapLoad.c_str(), pm, pmE, mapGuard,
-                                      wantBeams ? &bmap : nullptr, &beamsMissing);
+                                      wantBeams ? &bmap : nullptr, &beamsMissing,
+                                      g_pmCaustics ? &pmC : nullptr);
             if (mapLoaded) {
-                std::printf("[camera] -loadmap %s: %zu photons, %zu beams — skipping the "
-                            "photon trace.\n", g_pmapLoad.c_str(), pm.photons.size(),
-                            bmap.beams.size());
+                std::printf("[camera] -loadmap %s: %zu photons (+%zu caustic), %zu beams — "
+                            "skipping the photon trace.\n", g_pmapLoad.c_str(),
+                            pm.photons.size(), pmC.photons.size(), bmap.beams.size());
                 if (wantBeams && beamsMissing)
                     std::fprintf(stderr,
                         "[loadmap] warning: %s has no beam data (saved without -beams, or its\n"
@@ -20828,17 +20892,21 @@ static int run(int argc, char** argv) {
             // ... and, since 0.199.4, with a photon COUNT and an ETA in it rather than a
             // caption that names the phase and then never moves again.
             tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
-                            wantBeams ? &bmap : nullptr, g_beamTarget, &stageProg);
+                            wantBeams ? &bmap : nullptr, g_beamTarget, &stageProg,
+                            g_pmCaustics ? &pmC : nullptr);
         }
         // Written BEFORE the builds, so the file holds the raw trace and one cache can later
         // be re-gathered at any -pmradius / -beamk.
         if (!g_pmapSave.empty() && !mapLoaded) {
-            if (savePhotonMap(g_pmapSave.c_str(), pm, pmE, mapGuard, wantBeams ? &bmap : nullptr))
-                std::printf("[camera] -savemap %s: %zu photons + %zu beams written.\n",
-                            g_pmapSave.c_str(), pm.photons.size(), bmap.beams.size());
+            if (savePhotonMap(g_pmapSave.c_str(), pm, pmE, mapGuard, wantBeams ? &bmap : nullptr,
+                              g_pmCaustics ? &pmC : nullptr))
+                std::printf("[camera] -savemap %s: %zu photons + %zu caustic + %zu beams written.\n",
+                            g_pmapSave.c_str(), pm.photons.size(), pmC.photons.size(),
+                            bmap.beams.size());
         }
         liveWindowPlaceholder(titleW, titleH, "building photon map\xE2\x80\xA6");
         radius = buildPhotonMap(pm, radius, "[camera]");
+        if (g_pmCaustics) buildCausticMap(pmC, radius, "[camera]", pm.radius);
         if (wantBeams) {
             liveWindowPlaceholder(titleW, titleH, "building beam map\xE2\x80\xA6");
             // THE work term, and the case it exists for: every camera in this group gathers off
@@ -20852,9 +20920,10 @@ static int run(int argc, char** argv) {
             buildBeamMap(bmap, "[camera]", work);
         }
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
-        std::printf("[camera] photon map: %zu photons from %lld emitted in %.1fs, "
-                    "grid %dx%dx%d — gathering %zu cameras ...\n",
-                    pm.photons.size(), pm.nEmitted, buildSec, pm.nx, pm.ny, pm.nz, idx.size());
+        std::printf("[camera] photon map: %zu photons (+%zu caustic) from %lld emitted in %.1fs, "
+                    "radius %.4g (caustic %.4g) — gathering %zu cameras ...\n",
+                    pm.photons.size(), pmC.photons.size(), pm.nEmitted, buildSec,
+                    pm.radius, pmC.radius, idx.size());
         if (pm.photons.empty())
             std::fprintf(stderr, "[mode M] warning: 0 photons deposited — images "
                                  "will be black.\n");
@@ -20898,7 +20967,8 @@ static int run(int argc, char** argv) {
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, c, nThreads,
                                               diffraction, /*maxBounce*/32, off,
-                                              g_pmFinalGather, wantBeams ? &bmap : nullptr);
+                                              g_pmFinalGather, wantBeams ? &bmap : nullptr,
+                                              g_pmCaustics ? &pmC : nullptr);
                 });
             std::string op = outFor(rc.name);
             if (toRender.size() > 1)

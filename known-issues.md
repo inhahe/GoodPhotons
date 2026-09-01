@@ -5,10 +5,38 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN: mode `M` has no caustic map, so caustics are gathered at the diffuse radius and wash out
+### FIXED (2026-09-01, v0.199.7): mode `M` had no caustic map, so caustics were gathered at the diffuse radius and washed out
 
 **Reported as** the sixth of six defects in the `gallery_rain` mode-`M` beams render: *"i don't
 see any colorful caustics anywhere, the scene is meant to showcase good caustics."*
+
+**Done as described below**, on both backends, with two additions the plan did not anticipate:
+
+* **The caustic radius is capped at the global map's** (`PhotonMap::buildAuto`'s new `rMax`).
+  `buildAuto`'s target population scales as `cbrt(M/1e6)`, so a *sparse* caustic population asks
+  it to **grow** the radius — on `gallery_rain` at `-n 40M` the 21 808 caustic photons drove
+  0.655 m → 1.094 m, smearing the very feature the split exists to keep sharp. Capped, the worst
+  case degenerates to the unsplit answer instead of something worse.
+* **The GPU partitions on the host at download time**, via an explicit `DPhoton::caustic` field
+  (record 32 → 36 B) plus a `kCountCaustic` device reduction that sizes both host vectors exactly
+  before the copy. A second device atomic cursor would have needed its own capacity, overflow
+  detection and rerun-at-a-lower-rate path, all kept in agreement with the first one's.
+
+CLI: `-caustics` / `-nocaustics` (on by default) and `-pmccount <k>` (default 50, against the
+global map's 200 — a caustic is a high-contrast feature where blur hurts more than noise).
+`-savemap` format bumped to `FTPMP04`; `FTPMP03` files still load (their photons all land in the
+global map, i.e. the pre-split behaviour).
+
+**Still open — the split is necessary but not sufficient.** Separating the populations does
+nothing if the caustic population is empty. On `gallery_rain` only **0.12 %** of deposits
+(21 808 of 17.6 M at `-n 40M`) are L·S⁺·D, because the gems subtend a tiny solid angle of a
+sky-lit scene and photons are emitted uniformly. Jensen's scheme pairs the caustic map with a
+**dedicated caustic emission pass** driven by a *projection map* — photons emitted only into the
+directions that can reach specular geometry, with the pass's own `nEmitted` and a power scaled by
+the fraction of the emitter's solid angle the projection covers. Without it the caustic map is
+correct and sharp and still nearly empty. See the separate entry below.
+
+<details><summary>Original report and plan</summary>
 
 The 0.199.6 hashed-grid fix below removed the *artificial* floor on the gather radius, but it did
 not remove the real one: mode `M` deposits every photon into **one** map and gathers everything at
@@ -32,6 +60,35 @@ second `PhotonBank` in the deposit path), `src/photonmap_render.h` (`tracePhoton
 kernels), `src/photonmap_io.h` (format bump so `-savemap`/`-loadmap` carry both populations),
 `src/main.cpp` (driver plumbing and a CLI knob for the caustic photon budget). Verify against the
 mode-`D` reference render of the same camera.
+
+</details>
+
+### OPEN: the caustic map has nowhere near enough photons, because emission is not aimed at the specular geometry
+
+**Found immediately after** the two-map split above started working. The split is the *storage*
+half of Jensen's scheme; this is the *sampling* half, and without it the sharp caustic map is
+sharp and empty.
+
+Measured on `gallery_rain` (`-mode M -beams -device gpu -n 40000000`): **17 573 528** global
+deposits against **21 808** caustic ones — 0.12 %. The gallery's twelve gems, the gyroid, the
+Klein bottle and the axicon together subtend a tiny solid angle of a sky-lit 65 m scene, and the
+forward pass emits photons uniformly over the emitter, so almost none of them ever reach a
+dielectric. Raising `-n` fixes it only linearly and at ruinous cost — the caustic budget is 1/800
+of the trace.
+
+**Fix (Jensen projection map / dedicated caustic pass):** build a coarse spherical projection map
+per emitter marking the cells whose directions can reach specular or near-specular geometry
+(`photonVertexKind == PV_FOCUS`; the bounding spheres of those primitives are enough). Run a
+second, dedicated emission pass that samples **only** those cells, deposits **only** into the
+caustic map, and carries its own `nEmitted` plus a power scaled by the covered fraction of the
+emitter's solid angle — so the estimate stays unbiased while the photon density on the caustics
+goes up by whatever the coverage ratio is (three orders of magnitude on this scene). The two
+maps' normalisations are already independent, which is exactly what makes a separate pass
+droppable in.
+
+**Files it will touch:** `src/photonmap_render.h` (a second `tracePhotonPass` targeting only the
+caustic bank), `src/render.h` (emission from a projection map), `src/render_cuda.cu` (the device
+twin, plus the projection map as an upload), `src/main.cpp` (a `-causticn` budget knob).
 
 ### FIXED (2026-09-01, v0.199.6): the photon grid's memory guard silently overrode the requested gather radius on any large scene
 

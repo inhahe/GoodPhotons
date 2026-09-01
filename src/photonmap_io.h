@@ -18,8 +18,11 @@
 //      path, the two flags were silently mutually exclusive — `-savemap -beams` exited 0 and
 //      wrote nothing at all.
 //
-// Format. `FTPMP03\n` = header, surface block, then an OPTIONAL beam block. `FTPMP02\n`
-// (surface-only) still loads, so existing caches keep working and simply report no beams.
+// Format. `FTPMP04\n` = header, surface block, beam block, CAUSTIC block. `FTPMP03\n`
+// (header + surface + beam) and `FTPMP02\n` (surface only) still load: a v3 file simply has
+// every deposit in the global map, which is exactly the pre-0.199.7 single-map behaviour, and
+// a v2 file additionally reports no beams. So no existing cache is invalidated by the caustic
+// split — it just re-gathers as the one-map render it was saved from.
 //
 // What is NOT stored, deliberately: every derived structure. The photon grid is rebuilt by
 // `PhotonMap::build(radius)` and the beam BVH by `BeamMap::buildAuto(K)`, so ONE file serves
@@ -52,12 +55,15 @@ inline uint64_t photonMapGuard(const Scene& scene, bool diffraction) {
 // `bm` may be null (no -beams) or empty (no photon crossed a medium); either writes a beam
 // block with count 0, so a reader can always tell "this trace had no volume" apart from
 // "this file predates volume support".
+// `pmCaustic` may be null (the caustic split was off) — a count-0 caustic block is written,
+// which reloads as "no caustic photons", the same thing a v3 file means.
 inline bool savePhotonMap(const char* path, const PhotonMap& pm,
                           const EnergyReport& e, uint64_t guard,
-                          const BeamMap* bm = nullptr) {
+                          const BeamMap* bm = nullptr,
+                          const PhotonMap* pmCaustic = nullptr) {
     std::FILE* f = std::fopen(path, "wb");
     if (!f) { std::fprintf(stderr, "[savemap] cannot open %s for writing\n", path); return false; }
-    const char magic[8] = {'F','T','P','M','P','0','3','\n'};
+    const char magic[8] = {'F','T','P','M','P','0','4','\n'};
     long long nPh = (long long)pm.photons.size();
     double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
     bool ok = true;
@@ -82,6 +88,20 @@ inline bool savePhotonMap(const char* path, const PhotonMap& pm,
     ok = ok && std::fwrite(&bDep, sizeof bDep, 1, f) == 1;
     if (ok && nBm > 0)
         ok = std::fwrite(bm->beams.data(), sizeof(PhotonBeam), (size_t)nBm, f) == (size_t)nBm;
+    // --- caustic block (FTPMP04) ----------------------------------------------------------
+    // Its own nEmitted for the same reason the beam block has one: the normalisation belongs
+    // to the estimator, not to the file. Today it equals the surface map's (one pass fills
+    // both), and a future dedicated caustic emission pass would make it differ — at which
+    // point a file that had tied them would be silently wrong.
+    long long nCa = (pmCaustic ? (long long)pmCaustic->photons.size() : 0);
+    long long cEm = (pmCaustic ? pmCaustic->nEmitted : 0);
+    ok = ok && std::fwrite(&nCa, sizeof nCa, 1, f) == 1;
+    ok = ok && std::fwrite(&cEm, sizeof cEm, 1, f) == 1;
+    if (ok && nCa > 0) {
+        ok = std::fwrite(pmCaustic->pos.data(), sizeof(Vec3), (size_t)nCa, f) == (size_t)nCa;
+        ok = ok && std::fwrite(pmCaustic->photons.data(), sizeof(Photon), (size_t)nCa, f)
+                   == (size_t)nCa;
+    }
     std::fclose(f);
     if (!ok) std::fprintf(stderr, "[savemap] write to %s failed\n", path);
     return ok;
@@ -94,16 +114,23 @@ inline bool savePhotonMap(const char* path, const PhotonMap& pm,
 // `bm` may be null when the caller did not ask for -beams; the beam block is then skipped.
 // `beamsMissing` (optional out) reports "the caller wanted beams and this file has none", so
 // the caller can say so rather than rendering a volumeless image that looks like a beams one.
+//
+// `pmCaustic` may be null (the caller does not want the split). A v2/v3 file, or a v4 one
+// whose caustic block is empty, leaves it cleared — which gathers as the single-map render
+// the file was saved from.
 inline bool loadPhotonMap(const char* path, PhotonMap& pm,
                           EnergyReport& e, uint64_t guard,
-                          BeamMap* bm = nullptr, bool* beamsMissing = nullptr) {
+                          BeamMap* bm = nullptr, bool* beamsMissing = nullptr,
+                          PhotonMap* pmCaustic = nullptr) {
     if (beamsMissing) *beamsMissing = false;
+    if (pmCaustic) { pmCaustic->photons.clear(); pmCaustic->pos.clear(); pmCaustic->nEmitted = 0; }
     std::FILE* f = std::fopen(path, "rb");
     if (!f) { std::fprintf(stderr, "[loadmap] cannot open %s\n", path); return false; }
     char magic[8] = {0};
     long long nEmitted = 0, nPh = 0; double en[5] = {0,0,0,0,0}; uint64_t g = 0;
     bool ok = std::fread(magic, 1, 8, f) == 8;
-    const bool v3 = ok && std::memcmp(magic, "FTPMP03\n", 8) == 0;
+    const bool v4 = ok && std::memcmp(magic, "FTPMP04\n", 8) == 0;
+    const bool v3 = v4 || (ok && std::memcmp(magic, "FTPMP03\n", 8) == 0);   // v4 ⊃ v3 layout
     const bool v2 = ok && std::memcmp(magic, "FTPMP02\n", 8) == 0;
     if (!v3 && !v2) {
         // Name the stale-version case explicitly: a user with a cache from before the
@@ -161,6 +188,37 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
         }
     } else if (bm && beamsMissing) {
         *beamsMissing = true;                     // v2: predates volume support entirely
+    }
+    // --- caustic block (FTPMP04 only) -----------------------------------------------------
+    if (v4) {
+        long long nCa = 0, cEm = 0;
+        bool cok = std::fread(&nCa, sizeof nCa, 1, f) == 1
+                && std::fread(&cEm, sizeof cEm, 1, f) == 1;
+        if (!cok) {
+            std::fprintf(stderr, "[loadmap] %s truncated caustic header; ignoring\n", path);
+            pm.photons.clear(); pm.pos.clear(); std::fclose(f); return false;
+        }
+        if (nCa > 0) {
+            // Read it even when the caller passed no map: skipping would need a seek past a
+            // variable-size block, and the block is the last thing in the file anyway. With
+            // pmCaustic null the photons are simply dropped, which is the caller's request.
+            if (pmCaustic) {
+                ftalloc::resize(pmCaustic->pos, (size_t)nCa, "the caustic map positions (-loadmap)",
+                                "the photon count the map was saved with");
+                ftalloc::resize(pmCaustic->photons, (size_t)nCa, "the caustic map payloads (-loadmap)",
+                                "the photon count the map was saved with");
+                cok = std::fread(pmCaustic->pos.data(), sizeof(Vec3), (size_t)nCa, f) == (size_t)nCa;
+                cok = cok && std::fread(pmCaustic->photons.data(), sizeof(Photon), (size_t)nCa, f)
+                             == (size_t)nCa;
+                if (!cok) {
+                    std::fprintf(stderr, "[loadmap] %s truncated caustic data; ignoring\n", path);
+                    pm.photons.clear(); pm.pos.clear();
+                    pmCaustic->photons.clear(); pmCaustic->pos.clear();
+                    std::fclose(f); return false;
+                }
+                pmCaustic->nEmitted = cEm;
+            }
+        }
     }
     std::fclose(f);
     pm.nEmitted = nEmitted;

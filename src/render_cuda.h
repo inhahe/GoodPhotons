@@ -211,6 +211,14 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // chunking is safe (photon power is absolute, so the normalisation does not depend on the
 // split; the atomic deposit cursor accumulates across launches; and each chunk draws its own
 // seed, with chunk 0 reproducing the single-shot stream exactly).
+//
+// `causticK` > 0 turns on the Jensen two-map CAUSTIC SPLIT: every deposit reached by an
+// L.S+.D path (at least one focusing vertex, no scattering one — see dPhotonVertexBit) is
+// partitioned into a SECOND photon map, built at its own adaptive radius targeting `causticK`
+// photons per gather. That is the whole point of the split: a single radius is sized by the
+// majority population, which is the broad ambient wash, and it convolves a caustic — a thin,
+// high-contrast concentration — into a flat smear. The two sets are disjoint and share
+// nEmitted, so the gather simply adds their density estimates. 0 = off (one map, as before).
 struct BeamPass {
     BeamMap*  map    = nullptr;   // receives the deposited (or -loadmap'd) beams, then built
     long long target = 0;         // -beamcount: exact unbiased trim; <= 0 keeps every crossing
@@ -227,7 +235,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const char* mapLoad = nullptr, const char* mapSave = nullptr,
                                             int heroC = 1, int fgRays = 0, double autoK = 0.0,
                                             BeamPass* beams = nullptr,
-                                            const StageProgress* stage = nullptr);
+                                            const StageProgress* stage = nullptr,
+                                            double causticK = 0.0);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

@@ -4411,9 +4411,21 @@ __device__ static void connectLensHair(const DScene& sc, const DCamera& cam, dou
 // sized from FREE VRAM), so every byte per record is photons the GPU can't hold: dropping
 // it shrinks the record from 44 to 32 bytes, ~27% more photons in the same VRAM. Don't add
 // a field here without a reader.
+//
+// `caustic` is the one field here that the density estimate never reads, and it is here anyway:
+// it is the L·S⁺·D classification of the path that deposited this photon (host twin: the
+// `caustic` argument of Renderer::depositPhoton), and its reader is the HOST, which uses it to
+// split the download into the global map and the caustic map. It could have been packed into a
+// sign bit to keep the record at 32 bytes; it is a separate field because an implicit encoding
+// in a buffer that several kernels write and two host loops read is a trap, and the cost is
+// 12.5% fewer photons per VRAM chunk on a deposit that already chunks. Partitioning on the HOST
+// also avoids a SECOND device cursor with its own capacity, overflow detection and
+// rerun-at-a-lower-rate path — all of which would have to stay in agreement with the first
+// one's, for no gain.
 struct DPhoton {
     DVec3 pos, n;
     float power, lambda;
+    int   caustic;            // 1 = L·S+·D path (-> the caustic map); 0 = everything else
 };
 
 // One DEPOSITED photon beam (device twin of PhotonBeam, photonbeams.h): the chord a photon
@@ -4675,14 +4687,18 @@ __device__ static void splatSurfaceAllHair(const DScene& sc, const DCamSet& cs, 
 // deposit total); stores only when a buffer is bound and the slot is within capacity.
 // The photon's travel/incident direction is deliberately not a parameter: no gather reads
 // it (see DPhoton), so it isn't stored (matches Renderer::depositPhoton on the host).
+// `caustic` records the L·S+·D classification of the path that got here (see DPhoton); the
+// host reads it back to partition the download into the two maps.
 __device__ static void depositPhoton(const DCamSet& cs, const DVec3& p,
-                                     const DVec3& n, Real beta, Real lambda) {
+                                     const DVec3& n, Real beta, Real lambda,
+                                     bool caustic = false) {
     if (!cs.depCount) return;
     unsigned long long i = atomicAdd(cs.depCount, 1ULL);
     if (cs.depPhotons && i < cs.depCap) {
         DPhoton ph;
         ph.pos = p; ph.n = n;
         ph.power = (float)beta; ph.lambda = (float)lambda;
+        ph.caustic = caustic ? 1 : 0;
         cs.depPhotons[i] = ph;
     }
 }
@@ -6657,6 +6673,37 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
     return WF_CONTINUE;   // unreachable: caller dispatches only the specular types
 }
 
+// ---- caustic classification (device twin of photonVertexKind, render.h) ----------------
+// The bit pair a photon carries down its path for Jensen's two-map split. Bit 0 = "a FOCUSING
+// vertex has been seen"; bit 1 = "a SCATTERING vertex has been seen". A deposit is a caustic
+// iff FOCUS && !SCATTER, i.e. the path reads L·S⁺·D. See render.h for what makes a vertex
+// focusing rather than scattering, and why the glossy threshold sits where it does — the two
+// definitions MUST agree, or a CPU and a GPU render of the same scene split their photons
+// differently and disagree on the image.
+#define PV_BIT_FOCUS   1
+#define PV_BIT_SCATTER 2
+// L·S+·D: focused at least once, never scattered since. A null `bits` means the caller is not
+// classifying at all (every mode but M), so nothing it deposits is a caustic.
+__device__ static inline bool dPathIsCaustic(const int* bits) {
+    return bits && (*bits & PV_BIT_FOCUS) && !(*bits & PV_BIT_SCATTER);
+}
+__device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h);
+__device__ static inline int dPhotonVertexBit(const DScene& sc, const DMaterial& m,
+                                              const DHit& h) {
+    switch (m.type) {
+        case D_DIELECTRIC: case D_MIRROR: case D_THINFILM:
+        case D_MULTILAYER: case D_GRATING: case D_HALFMIRROR:
+            return PV_BIT_FOCUS;
+        case D_GLOSSY:
+            return (dMatRoughness(sc, m, h) <= (Real)kCausticGlossRoughness) ? PV_BIT_FOCUS
+                                                                             : PV_BIT_SCATTER;
+        case D_FILTER:
+            return 0;                       // straight through: direction untouched
+        default:
+            return PV_BIT_SCATTER;          // Fluorescent, Hair, and the diffuse family
+    }
+}
+
 // Advance a photon by one bounce given its precomputed intersection `h`. Mutates
 // ro/rd/beta and accumulates absorbed/sensor/escaped energy. Returns WF_TERMINATE
 // when the path ends (absorbed / escaped / landed on the sensor), else WF_CONTINUE
@@ -6666,13 +6713,17 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
 // span it just walked, which this step never sees otherwise: `grinArc` is the arc length
 // marched (so the dielectric Beer-Lambert can cover it) and `grinMed >= 0` means a medium
 // collided during the march, at `ro`. Defaults (-1, 0) are "no GRIN in this scene".
+//
+// `pathBits` (optional) is the caustic classification carried down the path — the PV_BIT_*
+// pair above, host twin `sawFocus`/`sawScatter` in Renderer::tracePhoton. Null means "do not
+// classify", which is what every mode other than M passes.
 __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 int camMode, int diffraction, const DHit& h,
                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
                                 double& eAbsorbed, double& eSensor, double& eEscaped,
                                 DMediumStack& stk, DRng* crng = nullptr,
                                 int grinMed = -1, Real grinArc = 0,
-                                int* beamScat = nullptr) {
+                                int* beamScat = nullptr, int* pathBits = nullptr) {
     Real dSurf = h.valid ? h.t : BIG;
 
     // Dielectric Beer-Lambert over the marched arc (the block further down only covers the
@@ -6852,6 +6903,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real phPdf;   // scatter dir from HG or the rainbow droplet phase (pdf unused: p/pdf==1)
         DVec3 nd = dMedPhaseSample(sm, rd, lambda, rng, phPdf);
         ro = mp; rd = nd;
+        // An ANALOG collision is a wide redirect: the beam's focus does not survive it, so
+        // anything deposited downstream is indirect light. A `-beams` STRAIGHT crossing never
+        // reaches here and stays neutral — it does not deflect the photon at all. (render.h)
+        if (pathBits) *pathBits |= PV_BIT_SCATTER;
         return WF_CONTINUE;
     }
 
@@ -6877,6 +6932,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         m.type == D_HAIR) {
         // The specular / wavelength-switching lobes (+ the fiber BCSDF, which is
         // wavelength-coupled like them) — shared with the hero tracer.
+        // Classify for the caustic split BEFORE the interaction, in the CALLER: this is the
+        // one place that holds both `m` and `h`, and keeping it out of interactSpecular (which
+        // the hero tracer also calls) leaves exactly one definition of the rule.
+        if (pathBits) *pathBits |= dPhotonVertexBit(sc, m, h);
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
                                 ro, rd, beta, lambda, rng, eAbsorbed, stk);
     } else if (m.type == D_DIFFUSETRANSMIT) {
@@ -6892,7 +6951,9 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
-        depositPhoton(cs, h.p, h.n, beta, lambda);   // photon-map deposit (mode M)
+        // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
+        depositPhoton(cs, h.p, h.n, beta, lambda, dPathIsCaustic(pathBits));
+        if (pathBits) *pathBits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         // Both lobes get the adjoint correction; |cos| in the factor makes it lobe-agnostic,
         // so h.n / ngo serve the transmit lobe too (nb = -h.n is used only for the splat side).
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rhoR, rng);
@@ -6910,7 +6971,9 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real rho = dDiffuseRho(sc, m, h, lambda);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
-        depositPhoton(cs, h.p, h.n, beta, lambda);   // photon-map deposit (mode M)
+        // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
+        depositPhoton(cs, h.p, h.n, beta, lambda, dPathIsCaustic(pathBits));
+        if (pathBits) *pathBits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -7125,7 +7188,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
 __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int camMode,
         int diffraction, int C, const DHit& h, DVec3& ro, DVec3& rd, Real* lam, Real* beta,
         bool& secAlive, DRng& rng, double& eAbsorbed, double& eSensor, double& eEscaped,
-        DMediumStack& stk) {
+        DMediumStack& stk, int* pathBits = nullptr) {
     const int nUp = C;
     Real dEvent = h.valid ? h.t : BIG;
 
@@ -7166,7 +7229,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
         DVec3 wiPrev = -rd;
-        for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i]);
+        { const bool caus = dPathIsCaustic(pathBits);
+          for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i], caus);
+          if (pathBits) *pathBits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
             splatSurfaceAllHero(sc, cs, camMode, h.p, nb, ngo * (Real)(-1), wiPrev, lam, beta, rhoT, nUp, rng);
@@ -7214,6 +7279,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     }
 
     if (m.type == D_MIRROR || m.type == D_FILTER || m.type == D_GLOSSY) {
+        if (pathBits) *pathBits |= dPhotonVertexBit(sc, m, h);   // caustic split
         // ACHROMATIC delta lobes (device twin of render.h's Mirror/Filter/Glossy hero case):
         // specular — so no camera connect, exactly like the scalar path — but the outgoing
         // DIRECTION does not depend on λ, so the bundle keeps riding and only the per-λ
@@ -7255,6 +7321,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         // here because its sigma_a (and the reflectance→absorption inversion) is per-λ, so
         // one fiber interaction cannot be shared across C wavelengths — matching the CPU
         // tracePhotonHero, which de-heroes onto the scalar MatType::Hair path.
+        if (pathBits) *pathBits |= dPhotonVertexBit(sc, m, h);   // caustic split
         beta[0] *= (Real)C; secAlive = false;
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
                                 ro, rd, beta[0], lam[0], rng, eAbsorbed, stk);
@@ -7265,7 +7332,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, m, h, lam[i]));
     DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     DVec3 wiPrev = -rd;
-    for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i]);
+    { const bool caus = dPathIsCaustic(pathBits);
+      for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i], caus);
+      if (pathBits) *pathBits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
     if (camMode == CAM_A || camMode == CAM_B) {
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
         camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rho, nUp, rng);
@@ -7301,16 +7370,21 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
     if (!genPhotonHero(sc, cs, camMode, C, rng, ro, rd, lam, beta, secAlive, eEmitted)) return;
     DMediumStack stk; stk.clear();
     bool done = false;
+    // Caustic classification of the path so far (host twin: sawFocus/sawScatter in
+    // Renderer::tracePhotonHero). It survives the de-hero handoff below because the two step
+    // functions share it — a bundle that de-heros at a gem must carry that FOCUS onward, or
+    // every dispersive caustic would be filed as ordinary indirect light.
+    int pathBits = 0;
     for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
         if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // gate excludes GRIN; kept for symmetry
         DHit h = closestHit(sc, ro, rd);
         int r;
         if (secAlive)
             r = shadeStepHero(sc, cs, camMode, diffraction, C, h, ro, rd, lam, beta, secAlive, rng,
-                              eAbsorbed, eSensor, eEscaped, stk);
+                              eAbsorbed, eSensor, eEscaped, stk, &pathBits);
         else
             r = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta[0], lam[0], rng,
-                          eAbsorbed, eSensor, eEscaped, stk);
+                          eAbsorbed, eSensor, eEscaped, stk, nullptr, -1, 0, nullptr, &pathBits);
         if (r == WF_TERMINATE) done = true;
     }
     if (!done) {
@@ -7352,6 +7426,8 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         // -beams-order cap can retire multiple scattering mid-path (host twin: `beamScatters`
         // in Renderer::tracePhoton).
         int beamScat = 0;
+        // Caustic classification of the path so far — see dPhotonVertexBit / dPathIsCaustic.
+        int pathBits = 0;
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             // Bend through any GRIN region first, INTEGRATING THE MEDIA ALONG THE CURVE
             // (see dGrinMarch): every medium is transported analog on the curved span,
@@ -7362,7 +7438,8 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             DHit h = closestHit(sc, ro, rd);
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                           eAbsorbed, eSensor, eEscaped, stk, cs.beamsOn() ? &crng : nullptr,
-                          gm.hit ? gm.which : -1, gm.arc, &beamScat) == WF_TERMINATE) done = true;
+                          gm.hit ? gm.which : -1, gm.arc, &beamScat,
+                          &pathBits) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -7415,6 +7492,12 @@ struct WFState {
     // allocated always but only written/read in GRIN scenes.
     int*   gmMed;
     Real*  gmArc;
+    // Caustic-split path state: the per-slot twin of the megakernel's local `int pathBits`
+    // in kTrace. A photon's FOCUS/SCATTER history decides which photon map its next diffuse
+    // deposit lands in (see dPhotonVertexBit / dPathIsCaustic), and that history is built up
+    // across bounces — so like the medium stack it has to live in the pool rather than in a
+    // shade-kernel local, which dies at the kernel boundary.
+    int*   pathBits;
 };
 
 // Claim photon budget and emit fresh photons into `slot` until one is successfully
@@ -7434,6 +7517,7 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
             st.ro[slot] = ro; st.rd[slot] = rd;
             st.beta[slot] = beta; st.lambda[slot] = lambda;
             st.bounce[slot] = 0; st.alive[slot] = 1; st.stkN[slot] = 0;
+            st.pathBits[slot] = 0;   // fresh photon: no vertex seen yet, so neither bit is set
             atomicAdd(&energy[0], eEm);
             return true;
         }
@@ -7493,9 +7577,11 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
         stk.pri[i]    = st.stkPri[slot * DMediumStack::CAP + i];
     }
     double eAbs = 0, eSen = 0, eEsc = 0;
+    int pathBits = st.pathBits[slot];   // caustic-split history carried from earlier bounces
     int res = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                         eAbs, eSen, eEsc, stk, nullptr,
-                        st.gmMed[slot], st.gmArc[slot]);   // GRIN pre-pass, from kWfExtend
+                        st.gmMed[slot], st.gmArc[slot],   // GRIN pre-pass, from kWfExtend
+                        nullptr, &pathBits);
     int bounce = st.bounce[slot] + 1;
     bool pathDone = (res == WF_TERMINATE);
     // Bounce cap: the photon survived maxBounce shadeStep calls without terminating —
@@ -7510,6 +7596,7 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
         st.lambda[slot] = lambda;   // fluorescence may Stokes-shift lambda mid-path
         // Store the medium stack back to SoA (carry to the next segment).
         st.stkN[slot] = stk.n;
+        st.pathBits[slot] = pathBits;   // carry the caustic-split history too
         for (int i = 0; i < stk.n; ++i) {
             st.stkMat[slot * DMediumStack::CAP + i] = stk.matIdx[i];
             st.stkPri[slot * DMediumStack::CAP + i] = stk.pri[i];
@@ -11194,7 +11281,13 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
 // sampled direction (the caller averages K). Because the sub-ray is cosine-weighted and the
 // visible BRDF is Lambertian, the cosine and 1/pi cancel to rho(vis), folded per photon
 // (diffuse hit) or applied once (specular-arrival emitter/env). Keep in sync with photonGatherSub.
-__device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, int diffraction,
+//
+// `pmC` is the CAUSTIC map (the L.S+.D partition of the same deposit); its photons are a
+// disjoint set from `pm`'s and it carries its own, much smaller, radius — so the two density
+// estimates are simply summed. `pmC.photons == nullptr` when the split is off or the scene
+// produced no caustic path, and then this costs one predictable branch per gather.
+__device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
+                                        const DPhotonMap& pmC, int diffraction,
                                         DVec3 ro, DVec3 rd, Real lambda, double invPdfL,
                                         const DHit& visHit, const DMaterial& visMat, DRng& rng,
                                         double& oX, double& oY, double& oZ) {
@@ -11203,6 +11296,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
     bool specularSeen = false;                           // any specular bounce so far?
     DMediumStack stk; stk.clear();
     const Real r2 = (Real)((double)pm.radius * (double)pm.radius);
+    const bool causOn = (pmC.photons != nullptr);
+    const Real r2C = (Real)((double)pmC.radius * (double)pmC.radius);
     const int maxBounce = 32;
     for (int b = 0; b < maxBounce; ++b) {
         if (sc.hasGrin) {                                // final-gather rays bend too
@@ -11270,6 +11365,16 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
                 float w = rhoY * rhoV;
                 gx += w * ph.pX; gy += w * ph.pY; gz += w * ph.pZ;
             });
+            if (causOn) dPmNeighborhood(pmC, h.p, [&](int k) {
+                const DGatherPhoton& ph = pmC.photons[k];
+                DVec3 d = h.p - ph.pos;
+                if (dot(d, d) > r2C) return;
+                if (dot(ph.n, h.n) < (Real)0.5) return;
+                float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
+                float w = rhoY * rhoV;
+                gx += w * ph.pX; gy += w * ph.pY; gz += w * ph.pZ;
+            });
             oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
         }
@@ -11325,7 +11430,14 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
 // specular leg alike — first collects single scatter from the beams it passes near, then takes
 // the medium's own attenuation. Beams are the only cache record carrying a photon DIRECTION,
 // so they are the only thing that can evaluate a phase function; see photonbeams.h.
-__device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int diffraction,
+//
+// `pmC` is the CAUSTIC map: the L.S+.D subset of the same deposit, held apart precisely so it
+// can carry its OWN (much smaller) gather radius. One radius cannot serve both populations —
+// buildAuto sizes it for the majority, which is the broad ambient wash, and a caustic is a thin
+// high-contrast concentration that such a radius convolves flat. The two sets are disjoint and
+// share nEmitted, so the estimates just add: nothing is double-counted and nothing is dropped.
+__device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
+                                     const DPhotonMap& pmC, int diffraction,
                                      DVec3 ro, DVec3 rd, Real lambda, double invPdfL, DRng& rng,
                                      int fgRays, const DBeamMap* bm,
                                      double& oX, double& oY, double& oZ) {
@@ -11336,6 +11448,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
     // VISITED photon (~85% of visits fail it), and on GeForce parts a double compare +
     // f2d convert issue at 1/64 rate, so keeping the test in FP32 matters.
     const Real r2 = (Real)((double)pm.radius * (double)pm.radius);
+    const bool causOn = (pmC.photons != nullptr);
+    const Real r2C = (Real)((double)pmC.radius * (double)pmC.radius);
     const int maxBounce = 32;
     const bool volOn = (bm != nullptr) && bm->nNodes > 0 && sc.mediaN > 0;
 
@@ -11469,7 +11583,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                     DVec3 gro = h.p + h.n * RAY_EPS;
                     DVec3 grd = cosineHemisphere(h.n, rng);
                     double sx, sy, sz;
-                    dPhotonGatherSub(sc, pm, diffraction, gro, grd, lambda, invPdfL, h, m, rng, sx, sy, sz);
+                    dPhotonGatherSub(sc, pm, pmC, diffraction, gro, grd, lambda, invPdfL, h, m, rng, sx, sy, sz);
                     fx += sx; fy += sy; fz += sz;
                 }
                 double inv = thr / (double)fgRays;
@@ -11489,6 +11603,17 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 DVec3 d = h.p - ph.pos;
                 if (dot(d, d) > r2) return;
                 if (dot(ph.n, h.n) < (Real)0.5) return;   // reject cross-surface leakage
+                float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                gx += rho * ph.pX;
+                gy += rho * ph.pY;
+                gz += rho * ph.pZ;
+            });
+            // Caustic map: same estimator, its own radius, summed in (see the header comment).
+            if (causOn) dPmNeighborhood(pmC, h.p, [&](int k) {
+                const DGatherPhoton& ph = pmC.photons[k];
+                DVec3 d = h.p - ph.pos;
+                if (dot(d, d) > r2C) return;
+                if (dot(ph.n, h.n) < (Real)0.5) return;
                 float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
                 gx += rho * ph.pX;
                 gy += rho * ph.pY;
@@ -11535,7 +11660,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
 // One thread per (pixel, sample); grid-strides over totalSamples. Mirrors kBackward's
 // seeding (global sample index) so a chunked gather is decorrelated across chunks. The
 // gather already returns XYZ, so (unlike kBackward) no cie(lambda) multiply is applied.
-__global__ void kGather(DScene sc, DPhotonMap pm, DBeamMap bm, DCamera cam,
+__global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, DCamera cam,
                         double* film, double* hits,
                         long long totalSamples, long long chunkSpp, long long sppTotal,
                         long long sampleBase, int resX, int diffraction, int fgRays,
@@ -11559,7 +11684,7 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DBeamMap bm, DCamera cam,
         dGenRay(cam, px, py, jx, jy, ro, rd);            // pinhole only (lens cams gated to CPU)
 
         double oX, oY, oZ;
-        dPhotonGather(sc, pm, diffraction, ro, rd, lambda, invPdfL, rng, fgRays,
+        dPhotonGather(sc, pm, pmC, diffraction, ro, rd, lambda, invPdfL, rng, fgRays,
                       bm.nNodes > 0 ? &bm : nullptr, oX, oY, oZ);
         size_t o = ((size_t)py * resX + px) * 3;
         atomicAdd(&film[o + 0], oX);
@@ -14216,6 +14341,7 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     CUDA_CHECK(cudaMalloc(&st.hit,    (size_t)W * sizeof(DHit)));
     CUDA_CHECK(cudaMalloc(&st.gmMed,  (size_t)W * sizeof(int)));    // GRIN pre-pass results,
     CUDA_CHECK(cudaMalloc(&st.gmArc,  (size_t)W * sizeof(Real)));   // extend -> shade
+    CUDA_CHECK(cudaMalloc(&st.pathBits, (size_t)W * sizeof(int)));  // caustic-split history
     CUDA_CHECK(cudaMemset(st.alive, 0, (size_t)W * sizeof(int)));
 
     unsigned long long* d_dispatched = nullptr;
@@ -14250,7 +14376,7 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
     cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive);
     cudaFree(st.stkMat); cudaFree(st.stkPri); cudaFree(st.stkN); cudaFree(st.hit);
-    cudaFree(st.gmMed); cudaFree(st.gmArc);
+    cudaFree(st.gmMed); cudaFree(st.gmArc); cudaFree(st.pathBits);
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
@@ -15276,6 +15402,22 @@ bool cudaPhotonMapSupported(const Scene& scene) {
 // two halves of the cache must therefore come from one trace. The crossings come back to the
 // host, which owns the trim / radius / split / BVH (BeamPass::build), and the built map is
 // uploaded once so every camera's gather picks up single scatter from it.
+
+// How many of the staged deposits are CAUSTIC (an L.S+.D path; the kernel set DPhoton::caustic
+// at deposit time). Counted on the DEVICE, in one cheap pass over a buffer that is already
+// there, purely so the host can size its two output vectors EXACTLY before the download. The
+// alternatives are both bad: sizing both to nDep doubles the host map's peak footprint at
+// exactly the photon counts where it is already the binding constraint, and growing them
+// chunk-by-chunk makes std::vector::resize recopy the whole (multi-GB) array once per chunk.
+__global__ void kCountCaustic(const gpu::DPhoton* p, unsigned long long n,
+                              unsigned long long* out) {
+    unsigned long long g = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long G = (unsigned long long)gridDim.x * blockDim.x;
+    unsigned long long c = 0;
+    for (unsigned long long i = g; i < n; i += G) if (p[i].caustic) ++c;
+    if (c) atomicAdd(out, c);
+}
+
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
@@ -15284,7 +15426,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const std::function<bool(int, const Film&)>* onFrame,
                                             const char* mapLoad, const char* mapSave, int heroC,
                                             int fgRays, double autoK, BeamPass* beams,
-                                            const StageProgress* stage) {
+                                            const StageProgress* stage, double causticK) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -15306,6 +15448,11 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // trace and optionally persist it (-savemap). The map is view-independent, so a loaded
     // one is re-gathered for any camera/radius without re-tracing a photon.
     PhotonMap pm;
+    // The caustic half of the split (empty, and never uploaded, when causticK <= 0). Its
+    // photons are a DISJOINT subset of the same deposit, so it shares pm's nEmitted and gets
+    // its own — much smaller — adaptive radius. See the header comment on `causticK`.
+    PhotonMap pmC;
+    const bool causticsOn = (causticK > 0.0);
 
     // Bin the map, honouring the density-adaptive radius (autoK > 0). Say out loud what
     // radius it settled on: the one printed before the deposit is only a starting point and
@@ -15319,6 +15466,27 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                     "photons at the starting radius; target %.0f for %zu stored)\n",
                     radius, r, nProbe, kTarget, pm.photons.size());
     };
+    // Host twin: buildCausticMap in main.cpp. Always adaptive — a caustic map built at the
+    // GLOBAL radius is the very thing the split exists to avoid — and short-circuited on an
+    // empty map, because buildAuto's density probe on zero photons returns a meaningless
+    // radius rather than an error.
+    auto buildCaustic = [&]() {
+        if (!causticsOn) return;
+        pmC.nEmitted = pm.nEmitted;          // counts PATHS EMITTED, not photons stored
+        if (pmC.photons.empty()) {
+            std::printf("[gpu] caustic map: 0 photons (no L-S+-D path in this scene)\n");
+            pmC.build(pm.radius);            // still bin it, so the empty gather is well-formed
+            return;
+        }
+        // Probe from the radius the GLOBAL map settled on, not the command-line starting
+        // point: buildAuto's answer is scale-free but its two-octave clamp is not, and the
+        // caustic radius is only ever interesting BELOW the global one anyway.
+        double nProbe = 0.0, kTarget = 0.0;
+        const double r0 = pm.radius;
+        const double r = pmC.buildAuto(r0, causticK, &nProbe, &kTarget, r0);
+        std::printf("[gpu] caustic map: %zu photons, gather radius %.4g -> %.4g (probe saw "
+                    "%.0f; target %.0f)\n", pmC.photons.size(), r0, r, nProbe, kTarget);
+    };
 
     // The photon-BEAM volume pass (-beams). Only live when the caller supplied a BeamPass AND
     // the scene actually has a medium to store crossings of: with no media every beam gate is
@@ -15330,14 +15498,16 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     if (mapLoad && *mapLoad) {
         bool beamsMissing = false;
         mapLoaded = loadPhotonMap(mapLoad, pm, eOut, photonMapGuard(scene, diffraction),
-                                  bmap, &beamsMissing);
+                                  bmap, &beamsMissing, causticsOn ? &pmC : nullptr);
         if (mapLoaded) {
             std::printf("[loadmap] %s: %zu photons from %lld emitted", mapLoad,
                         pm.photons.size(), (long long)pm.nEmitted);
+            if (causticsOn) std::printf(" (+%zu caustic)", pmC.photons.size());
             if (bmap) std::printf(", %zu beams", bmap->beams.size());
             std::printf(" -- deposit skipped\n");
             if (bmap && beamsMissing && beams) beams->loadedMissing = true;
             buildMap();                         // (re)build the grid at the requested radius
+            buildCaustic();
             if (bmap && beams->build) beams->build(*bmap);
         } else {
             std::fprintf(stderr, "[loadmap] falling back to a fresh deposit\n");
@@ -15520,11 +15690,30 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // for the paths that never reach here), because the density estimate divides by it.
     pm.nEmitted = depEmitted;
     if (nDep > 0 && d_photons) {
+        // Caustic count first, on the device, so both host vectors can be sized exactly (see
+        // kCountCaustic). Zero when the split is off, which collapses the loop below to the
+        // historical single-destination copy.
+        unsigned long long nCau = 0;
+        if (causticsOn) {
+            unsigned long long* d_cc = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_cc, sizeof(unsigned long long)));
+            CUDA_CHECK(cudaMemset(d_cc, 0, sizeof(unsigned long long)));
+            kCountCaustic<<<1024, 256>>>(d_photons, nDep, d_cc);
+            cudaCheckKernel("caustic-count");
+            CUDA_CHECK(cudaMemcpy(&nCau, d_cc, sizeof nCau, cudaMemcpyDeviceToHost));
+            cudaFree(d_cc);
+            if (nCau > nDep) nCau = nDep;
+        }
         // Download + convert in chunks (never a full host-side DPhoton copy). Positions
         // and payloads split into PhotonMap's two parallel arrays (see Photon in
         // photonmap.h); DPhoton has the same fields, so this is a pure widen + split.
-        ftalloc::resize(pm.photons, (size_t)nDep, "the photon map payloads", "-n");
-        ftalloc::resize(pm.pos, (size_t)nDep, "the photon map positions", "-n");
+        // The caustic flag additionally routes each record to one of TWO destination maps —
+        // a strict partition, so the two counts sum to nDep and no photon is duplicated.
+        ftalloc::resize(pm.photons, (size_t)(nDep - nCau), "the photon map payloads", "-n");
+        ftalloc::resize(pm.pos, (size_t)(nDep - nCau), "the photon map positions", "-n");
+        ftalloc::resize(pmC.photons, (size_t)nCau, "the caustic map payloads", "-n");
+        ftalloc::resize(pmC.pos, (size_t)nCau, "the caustic map positions", "-n");
+        size_t wg = 0, wc = 0;                  // independent write cursors
         std::vector<DPhoton> stage;
         for (size_t off = 0; off < (size_t)nDep; off += PM_CHUNK) {
             size_t cnt = std::min(PM_CHUNK, (size_t)nDep - off);
@@ -15533,10 +15722,15 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                   cudaMemcpyDeviceToHost));
             for (size_t i = 0; i < cnt; ++i) {
                 const DPhoton& d = stage[i];
-                Photon& p = pm.photons[off + i];
-                pm.pos[off + i] = Vec3(d.pos.x, d.pos.y, d.pos.z);
+                const bool caus = (nCau > 0) && d.caustic;
+                PhotonMap& M = caus ? pmC : pm;
+                size_t&    w = caus ? wc  : wg;
+                if (w >= M.photons.size()) continue;   // can't happen; never write past the end
+                Photon& p = M.photons[w];
+                M.pos[w] = Vec3(d.pos.x, d.pos.y, d.pos.z);
                 p.n   = Vec3(d.n.x,   d.n.y,   d.n.z);
                 p.power = d.power; p.lambda = d.lambda;
+                ++w;
             }
         }
     }
@@ -15585,6 +15779,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // and the first gathered pixel, so it names itself too.
     if (stage && stage->report) stage->report("building photon map", 0, 0);
     buildMap();                             // host counting sort -> cell-contiguous runs
+    buildCaustic();                         // ... and again for the caustic partition
 
     double energy[5] = {0,0,0,0,0};
     CUDA_CHECK(cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));
@@ -15593,10 +15788,12 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     cudaFree(d_depCount); cudaFree(d_energy);
     if (mapSave && *mapSave) {
         EnergyReport passE{energy[0], energy[1], energy[2], energy[3], energy[4]};
-        if (savePhotonMap(mapSave, pm, passE, photonMapGuard(scene, diffraction), bmap))
-            std::printf("[savemap] wrote %s: %zu photons + %zu beams (%lld emitted)\n",
-                        mapSave, pm.photons.size(), bmap ? bmap->beams.size() : (size_t)0,
-                        (long long)pm.nEmitted);
+        if (savePhotonMap(mapSave, pm, passE, photonMapGuard(scene, diffraction), bmap,
+                          causticsOn ? &pmC : nullptr))
+            std::printf("[savemap] wrote %s: %zu photons (+%zu caustic) + %zu beams "
+                        "(%lld emitted)\n",
+                        mapSave, pm.photons.size(), pmC.photons.size(),
+                        bmap ? bmap->beams.size() : (size_t)0, (long long)pm.nEmitted);
     }
     // Built AFTER the save, deliberately: the file must hold the RAW crossings so one cache
     // serves any later -beamradius / -beamk (the split is radius-dependent).
@@ -15604,50 +15801,61 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     }   // end if (!mapLoaded): deposit + build + optional save
 
     // ---- upload the built grid ----
-    DPhotonMap dpm{};
-    dpm.lo = DVec3(pm.lo.x, pm.lo.y, pm.lo.z);
-    dpm.cellSize = (Real)pm.cellSize; dpm.radius = (Real)pm.radius;
-    dpm.tableMask = pm.tableMask;
-    dpm.photons = nullptr;
-    if (!pm.photons.empty()) {
-        // Upload the sorted map host->device in chunks (no full mirror), folding each
-        // photon's constant gather weight into the record (see DGatherPhoton):
-        // p? = cie?(lambda) * power * norm / pi, with the CIE triple taken from
-        // PhotonMap::cie (precomputed in double by build(), index-aligned with the
-        // sorted photons). The radius is cast through Real first so the folded
-        // normalization equals the old in-kernel double((Real)radius)^2 exactly.
-        const double rr   = (double)(Real)pm.radius;
-        const double area = DPI * rr * rr;
-        const double fold = (pm.nEmitted > 0 && area > 0.0)
-                          ? 1.0 / (area * (double)pm.nEmitted * DPI) : 0.0;
-        size_t n = pm.photons.size();
-        DGatherPhoton* d_sorted = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DGatherPhoton)));
-        std::vector<DGatherPhoton> stage;
-        for (size_t off = 0; off < n; off += PM_CHUNK) {
-            size_t cnt = std::min(PM_CHUNK, n - off);
-            stage.resize(cnt);
-            for (size_t i = 0; i < cnt; ++i) {
-                const Photon& p = pm.photons[off + i];
-                const Vec3&  pp = pm.pos[off + i];
-                const Vec3&  ci = pm.cie[off + i];
-                DGatherPhoton& d = stage[i];
-                d.pos = DVec3(pp.x, pp.y, pp.z);
-                d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
-                const double w = (double)p.power * fold;
-                d.pX = (float)(ci.x * w);
-                d.pY = (float)(ci.y * w);
-                d.pZ = (float)(ci.z * w);
-                d.lambda = p.lambda;
+    // Shared by the global map and the caustic map: identical layout, identical fold, and the
+    // per-map constants (radius, nEmitted) are read from the map itself — which is exactly what
+    // makes the caustic map's smaller radius normalise correctly with no second code path.
+    auto uploadPhotonMap = [&](const PhotonMap& M, DPhotonMap& D) {
+        D = DPhotonMap{};
+        D.lo = DVec3(M.lo.x, M.lo.y, M.lo.z);
+        D.cellSize = (Real)M.cellSize; D.radius = (Real)M.radius;
+        D.tableMask = M.tableMask;
+        D.photons = nullptr;
+        if (!M.photons.empty()) {
+            // Upload the sorted map host->device in chunks (no full mirror), folding each
+            // photon's constant gather weight into the record (see DGatherPhoton):
+            // p? = cie?(lambda) * power * norm / pi, with the CIE triple taken from
+            // PhotonMap::cie (precomputed in double by build(), index-aligned with the
+            // sorted photons). The radius is cast through Real first so the folded
+            // normalization equals the old in-kernel double((Real)radius)^2 exactly.
+            const double rr   = (double)(Real)M.radius;
+            const double area = DPI * rr * rr;
+            const double fold = (M.nEmitted > 0 && area > 0.0)
+                              ? 1.0 / (area * (double)M.nEmitted * DPI) : 0.0;
+            size_t n = M.photons.size();
+            DGatherPhoton* d_sorted = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DGatherPhoton)));
+            std::vector<DGatherPhoton> stg;
+            for (size_t off = 0; off < n; off += PM_CHUNK) {
+                size_t cnt = std::min(PM_CHUNK, n - off);
+                stg.resize(cnt);
+                for (size_t i = 0; i < cnt; ++i) {
+                    const Photon& p = M.photons[off + i];
+                    const Vec3&  pp = M.pos[off + i];
+                    const Vec3&  ci = M.cie[off + i];
+                    DGatherPhoton& d = stg[i];
+                    d.pos = DVec3(pp.x, pp.y, pp.z);
+                    d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
+                    const double w = (double)p.power * fold;
+                    d.pX = (float)(ci.x * w);
+                    d.pY = (float)(ci.y * w);
+                    d.pZ = (float)(ci.z * w);
+                    d.lambda = p.lambda;
+                }
+                CUDA_CHECK(cudaMemcpy(d_sorted + off, stg.data(), cnt * sizeof(DGatherPhoton),
+                                      cudaMemcpyHostToDevice));
             }
-            CUDA_CHECK(cudaMemcpy(d_sorted + off, stage.data(), cnt * sizeof(DGatherPhoton),
-                                  cudaMemcpyHostToDevice));
+            D.photons = (const DGatherPhoton*)up.keep(d_sorted);
         }
-        dpm.photons = (const DGatherPhoton*)up.keep(d_sorted);
-    }
-    // cellStart always has >= 2 entries after build() (even for an empty map, where every
-    // [begin,end) slice is empty so the gather loop simply never runs) — always upload it.
-    dpm.cellStart = (const int*)up.keep(uploadVec(pm.cellStart));
+        // cellStart always has >= 2 entries after build() (even for an empty map, where every
+        // [begin,end) slice is empty so the gather loop simply never runs) — always upload it.
+        D.cellStart = (const int*)up.keep(uploadVec(M.cellStart));
+    };
+    DPhotonMap dpm{}, dpmC{};
+    uploadPhotonMap(pm, dpm);
+    // dpmC.photons stays null when the split is off or produced nothing — which is the very
+    // flag the two device gathers test to skip their second estimate entirely.
+    if (causticsOn && !pmC.photons.empty()) uploadPhotonMap(pmC, dpmC);
+    else                                    dpmC.cellStart = dpm.cellStart;  // never dereferenced
 
     // ---- upload the built beam map ----
     // Same fold-at-upload trick as DGatherPhoton: the per-beam constants (carried flux, the
@@ -15714,7 +15922,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         for (long long base = 0; base < spp; base += chunk) {
             long long cs2 = (base + chunk <= spp) ? chunk : (spp - base);
             long long total = (long long)npix * cs2;
-            kGather<<<2048, 128>>>(up.sc, dpm, dbm, hc, d_film, d_hits, total, cs2, spp, base,
+            kGather<<<2048, 128>>>(up.sc, dpm, dpmC, dbm, hc, d_film, d_hits, total, cs2, spp, base,
                                    resX[c], diffraction ? 1 : 0, fgRays, seed);
             cudaCheckKernel("photon-gather");
             // Live view: after a chunk, hand the host the frame-so-far so it can refresh the

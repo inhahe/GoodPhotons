@@ -64,6 +64,55 @@ inline Vec3 sampleGlossy(const Vec3& mdir, double roughness, Pcg32& rng) {
     return glossyDirUV(mdir, roughness, u1, u2);
 }
 
+// --- Caustic classification: what a photon vertex does to a beam of light -------------
+//
+// Mode M splits its deposit into a GLOBAL map and a CAUSTIC map (Jensen's two-map scheme),
+// because the two populations want completely different gather radii: diffuse illumination
+// is smooth and low-density and wants a wide kernel; a caustic is a thin, high-contrast
+// concentration and a kernel sized for the former erases it. Which map a deposit lands in
+// is decided by the path that reached it — the classic L·S⁺·D regular expression, i.e. "at
+// least one FOCUSING vertex and no SCATTERING one since the light".
+//
+// So every non-diffuse interaction is classified into three kinds:
+//
+//   FOCUS    — a deterministic (or near-deterministic) deflection that PRESERVES the beam's
+//              coherence and can therefore concentrate it: refraction through a gem,
+//              a mirror, a thin-film/multilayer interface, a grating order, a beam
+//              splitter, and a glossy lobe tight enough to still focus.
+//   SCATTER  — a wide, memory-destroying redirect. Any focus the beam had is gone, so a
+//              subsequent deposit is ordinary indirect light, not a caustic: a rough glossy
+//              lobe, a fluorescent re-emission (cosine-distributed, and wavelength-shifted
+//              on top), a hair BCSDF, an analog medium collision, and of course any diffuse
+//              vertex.
+//   NEUTRAL  — no deflection at all, so the classification is unchanged either way: a
+//              `filter` gel is a coloured absorber the photon passes straight through.
+//
+// The glossy threshold is the one judgement call; it is kCausticGlossRoughness, and it lives
+// in photonmap.h (with the argument for its value) so that the CUDA translation unit — which
+// does not include this header — reads the SAME number. Two threshold constants would mean a
+// CPU and a GPU render of one scene classify glossy vertices differently and disagree on the
+// image, with no symptom beyond "the GPU looks wrong".
+enum PhotonVertexKind { PV_NEUTRAL = 0, PV_FOCUS = 1, PV_SCATTER = 2 };
+
+inline int photonVertexKind(const Scene& scene, const Material& m, const Hit& h) {
+    switch (m.type) {
+        case MatType::Dielectric:
+        case MatType::Mirror:
+        case MatType::ThinFilm:
+        case MatType::Multilayer:
+        case MatType::Grating:
+        case MatType::HalfMirror:
+            return PV_FOCUS;
+        case MatType::Glossy:
+            return (materialRoughness(scene, m, h) <= kCausticGlossRoughness) ? PV_FOCUS
+                                                                              : PV_SCATTER;
+        case MatType::Filter:
+            return PV_NEUTRAL;                  // straight through: direction untouched
+        default:
+            return PV_SCATTER;                  // Fluorescent, Hair, and the diffuse family
+    }
+}
+
 // --- Fluorescence interaction (shared by the forward tracer and -checkfluoro) --
 // A fluorescent surface has two competing channels: elastic diffuse reflection
 // (albedo rho, wavelength preserved) and dye excitation (prob aEff = min(eps,
@@ -359,12 +408,24 @@ struct Renderer {
     // A/B/C, so their splat behaviour is byte-for-byte unchanged.
     PhotonBank* photonDeposit = nullptr;
 
+    // CAUSTIC map deposit (mode M, Jensen's two-map scheme). When non-null, a deposit whose
+    // path matches L·S⁺·D — at least one PV_FOCUS vertex and no PV_SCATTER vertex since the
+    // light, see photonVertexKind above — goes HERE INSTEAD OF `photonDeposit`. The split is
+    // strict, so the two maps partition the deposits and the gather is their plain sum: no
+    // photon is counted twice and none is dropped. Null (the pre-0.199.7 behaviour) puts
+    // everything in the global map, which is what mode S and any caller that does not want
+    // the split get.
+    PhotonBank* causticDeposit = nullptr;
+
     // Append a photon record at a diffuse/translucent vertex (no-op when the map is off).
     // The photon's incident direction is deliberately NOT stored: the density estimate is
     // Lambertian, so no gather has ever read it (see Photon in photonmap.h).
-    void depositPhoton(const Vec3& p, const Vec3& n, double lambda, double beta) const {
-        if (!photonDeposit) return;
-        photonDeposit->push(p, n, (float)beta, (float)lambda);
+    // `caustic` routes the record to the caustic bank when one is bound (see above).
+    void depositPhoton(const Vec3& p, const Vec3& n, double lambda, double beta,
+                       bool caustic = false) const {
+        PhotonBank* bank = (caustic && causticDeposit) ? causticDeposit : photonDeposit;
+        if (!bank) return;
+        bank->push(p, n, (float)beta, (float)lambda);
     }
 
     // Photon-BEAM deposit (mode M with -beams). The surface map above cannot represent a
@@ -2144,6 +2205,14 @@ struct Renderer {
         // cap can send it back to the single-scatter rule once it is spent.
         int beamScatters = 0;
 
+        // CAUSTIC classification state (mode M's two-map split; see photonVertexKind above).
+        // A deposit is a caustic iff the path so far reads L·S⁺·D — at least one FOCUS vertex
+        // and no SCATTER vertex since the light. Both flags are monotone along the path: once
+        // a wide scatter has destroyed the beam's coherence nothing downstream restores it, so
+        // `sawScatter` is never cleared — and a diffuse deposit sets it itself, because the
+        // bounce that continues past a diffuse vertex is indirect light by definition.
+        bool sawFocus = false, sawScatter = false;
+
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
             double dEvent;
             bool mediumEvent = false;
@@ -2368,6 +2437,13 @@ struct Renderer {
                 if (rng.uniform() >= sm.albedo(lambda)) { e.absorbed += beta; return; }
                 double phPdf;   // sample the scatter direction from HG or the rainbow droplet phase
                 ray = Ray{mp, sm.phaseSample(ray.d, lambda, rng, phPdf)};
+                // An ANALOG collision redirects the photon by the phase function, which is wide
+                // enough (even for a forward-peaked HG) that whatever focus the beam had is not
+                // recoverable — so anything deposited downstream is ordinary indirect light.
+                // A `-beams` STRAIGHT crossing never reaches here and correctly stays neutral:
+                // it does not deflect the photon at all, so a gem seen through fog still writes
+                // its caustic to the caustic map.
+                sawScatter = true;
                 continue;
             }
 
@@ -2389,9 +2465,13 @@ struct Renderer {
                 const Material& cm = *matp;
                 double R = layeredCoatReflectance(scene, cm, h, ray.d, lambda);
                 if (rng.uniform() < R) {                    // coat reflection
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
+                    double cr = materialRoughness(scene, cm, h);
+                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; }
                     ray = Ray{h.p + h.n * 1e-6, o};
+                    // A clearcoat reflection is a mirror lobe: it focuses when tight (the
+                    // highlight a polished coat throws IS a caustic), scatters when rough.
+                    (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;
                     continue;                               // lossless; beta unchanged
                 }
                 int child = mixPickChild(cm, rng.uniform());  // body lobe (leftover absorbs)
@@ -2426,6 +2506,18 @@ struct Renderer {
                     // rather than with Diffuse because it does its own camera splat (its
                     // projection factor is the strand's longitudinal cosine, not dot(n,w))
                     // and its own Russian roulette on the exact lobe attenuation.
+                    //
+                    // Classify the vertex for the caustic split HERE rather than inside the
+                    // helper: the caller is the one that holds `m`/`h`, and the helper is
+                    // shared with tracePhotonHero (which does its own bookkeeping over C
+                    // wavelengths), so keeping the classification out of it leaves exactly one
+                    // definition of the rule (photonVertexKind) and no hidden state in the
+                    // helper's signature.
+                    switch (photonVertexKind(scene, m, h)) {
+                        case PV_FOCUS:   sawFocus   = true; break;
+                        case PV_SCATTER: sawScatter = true; break;
+                        default: break;                       // PV_NEUTRAL: `filter` passes through
+                    }
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e))
                         return;
                     continue;
@@ -2445,7 +2537,8 @@ struct Renderer {
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Photon-map deposit: incident flux at this translucent vertex.
-                    depositPhoton(h.p, h.n, lambda, beta);
+                    depositPhoton(h.p, h.n, lambda, beta, sawFocus && !sawScatter);
+                    sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng);
                         camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, wi, lambda, beta, rhoT, rng);
@@ -2476,7 +2569,8 @@ struct Renderer {
                     // Photon-map deposit: incident flux at this diffuse vertex. Stored
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
                     // the arriving power (direct on the first hit, indirect thereafter).
-                    depositPhoton(h.p, h.n, lambda, beta);
+                    depositPhoton(h.p, h.n, lambda, beta, sawFocus && !sawScatter);
+                    sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
@@ -2605,10 +2699,16 @@ struct Renderer {
     // `secAlive == false`, and the split branch is guarded on `secAlive`, so a sub-path
     // can never split again — recursion is at most one level deep and the per-frame
     // footprint (a MediumStack plus two kHeroMax double arrays) is bounded.
+    // `sawFocus`/`sawScatter` carry the caustic classification of the path that REACHED
+    // (ray, stk) — see the same pair in tracePhoton. They are parameters rather than locals
+    // precisely because a -herosplit sub-path resumes mid-path: it is spawned at a dispersive
+    // interface, so it must inherit that vertex's FOCUS (and any earlier scatter), or every
+    // split caustic would land in the wrong map.
     void tracePhotonHeroLoop(const Scene& scene, const CamTarget* cams, int nCam,
                              Film* sensorFilm, Ray ray, MediumStack stk,
                              const double* lamIn, const double* betaIn, bool secAlive,
-                             int bounce0, Pcg32& rng, EnergyReport& e) const {
+                             int bounce0, Pcg32& rng, EnergyReport& e,
+                             bool sawFocus = false, bool sawScatter = false) const {
         const int C = heroC;
         double lam[hero::kHeroMax], beta[hero::kHeroMax];
         // Copy only the LIVE entries: a monochromatic sub-path spawned by -herosplit only
@@ -2686,9 +2786,11 @@ struct Renderer {
                 for (int i = 1; i < nUp; ++i)
                     if ((uCoat < Rl[i]) != refl0) { deHero(); nUp = 1; break; }
                 if (refl0) {
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
+                    double cr = materialRoughness(scene, cm, h);
+                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
                     ray = Ray{h.p + h.n * 1e-6, o};
+                    (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;  // see scalar twin
                     continue;
                 }
                 int child = mixPickChild(cm, rng.uniform());
@@ -2720,8 +2822,12 @@ struct Renderer {
                     // photon record (the gather keys off each photon's own λ). C records
                     // of base/C sum to base, and nEmitted counts PATHS, so the estimator
                     // stays energy-consistent with the scalar single-λ deposit.
-                    for (int i = 0; i < nUp; ++i)
-                        depositPhoton(h.p, h.n, lam[i], beta[i]);
+                    {
+                        const bool caus = sawFocus && !sawScatter;
+                        for (int i = 0; i < nUp; ++i)
+                            depositPhoton(h.p, h.n, lam[i], beta[i], caus);
+                        sawScatter = true;   // past a diffuse vertex it is indirect light
+                    }
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, wi, lam, beta, rhoR, nUp, rng);
                         camSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, wi, lam, beta, rhoT, nUp, rng);
@@ -2765,6 +2871,11 @@ struct Renderer {
                 case MatType::Mirror:
                 case MatType::Filter:
                 case MatType::Glossy: {
+                    switch (photonVertexKind(scene, m, h)) {      // caustic split; see tracePhoton
+                        case PV_FOCUS:   sawFocus   = true; break;
+                        case PV_SCATTER: sawScatter = true; break;
+                        default: break;
+                    }
                     // ACHROMATIC delta lobes (mirrors the backward tracer's radianceHero):
                     // specular — so no camera connect, exactly like the scalar path — but the
                     // outgoing DIRECTION does not depend on λ, so the bundle keeps riding and
@@ -2802,6 +2913,11 @@ struct Renderer {
                 case MatType::HalfMirror:
                 case MatType::Hair:
                 case MatType::Fluorescent: {
+                    switch (photonVertexKind(scene, m, h)) {      // caustic split; see tracePhoton
+                        case PV_FOCUS:   sawFocus   = true; break;
+                        case PV_SCATTER: sawScatter = true; break;
+                        default: break;
+                    }
                     // Dispersive / wavelength-switching: the outgoing direction (and, for a
                     // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
                     // cannot keep riding one shared direction past this interface. A fiber
@@ -2829,7 +2945,7 @@ struct Renderer {
                                                        cl[0], cstk, rng, e))
                                 tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, cray, cstk,
                                                     cl, cb, /*secAlive=*/false, bounce + 1,
-                                                    rng, e);
+                                                    rng, e, sawFocus, sawScatter);
                             beta[i] = 0.0;                  // its energy is now that sub-path's
                         }
                         secAlive = false;                   // hero carries on alone, UNBOOSTED
@@ -2856,8 +2972,12 @@ struct Renderer {
                     // photon record (the gather keys off each photon's own λ). C records
                     // of base/C sum to base, and nEmitted counts PATHS, so the estimator
                     // stays energy-consistent with the scalar single-λ deposit.
-                    for (int i = 0; i < nUp; ++i)
-                        depositPhoton(h.p, h.n, lam[i], beta[i]);
+                    {
+                        const bool caus = sawFocus && !sawScatter;
+                        for (int i = 0; i < nUp; ++i)
+                            depositPhoton(h.p, h.n, lam[i], beta[i], caus);
+                        sawScatter = true;   // past a diffuse vertex it is indirect light
+                    }
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, wi, lam, beta, rho, nUp, rng);
                         camSpecularSplatAllHero(scene, cams, nCam, h.p, h.n, lam, beta, rho, nUp, rng);

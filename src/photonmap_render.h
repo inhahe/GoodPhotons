@@ -65,13 +65,26 @@
 // `stage` (optional) reports deposit progress — how many of the N photons have been
 // traced — so the caller can keep the live window's title bar moving through what is
 // otherwise the longest silent phase of a mode-M render. Purely informational.
+//
+// `pmCaustic` (optional) turns on Jensen's TWO-MAP split: a deposit whose path reads
+// L·S⁺·D — at least one focusing vertex, no scattering one (see photonVertexKind in
+// render.h) — goes to *pmCaustic INSTEAD OF pm. The split is strict, so the two maps
+// partition the same deposits: nothing is duplicated, nothing is lost, and a gather that
+// sums the two estimates is exactly the one-map estimate would have been IF one radius
+// suited both. It does not, which is the whole point — a caustic is a thin high-contrast
+// concentration whose photons are orders of magnitude denser than the diffuse background,
+// so buildAuto picks each map its own radius and the caustic stops being smeared away by
+// a kernel sized for the ambient illumination. Null keeps every deposit in `pm` (mode S
+// and every pre-0.199.7 caller).
 inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
                             bool diffraction, PhotonMap& pm, int heroC = hero::kHeroC,
                             uint64_t seedBase = 0, BeamMap* bm = nullptr,
                             long long beamTarget = 0,
-                            const StageProgress* stage = nullptr) {
+                            const StageProgress* stage = nullptr,
+                            PhotonMap* pmCaustic = nullptr) {
     if (nThreads < 1) nThreads = 1;
     std::vector<PhotonBank> banks(nThreads);
+    std::vector<PhotonBank> cbanks(pmCaustic ? nThreads : 0);
     std::vector<BeamBank>   bbanks(nThreads);
     std::vector<long long> emitted(nThreads, 0);
     // Beam budget: give each thread its share of the target as a self-thinning CAP and let
@@ -106,6 +119,7 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
 
     auto worker = [&](int tid) {
         Renderer r; r.diffraction = diffraction; r.photonDeposit = &banks[tid];
+        if (pmCaustic) r.causticDeposit = &cbanks[tid];
         if (bm) r.beamDeposit = &bbanks[tid];
         r.useHero = heroOn; r.heroC = heroC;
         Pcg32 rng;
@@ -169,6 +183,25 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         pm.photons.insert(pm.photons.end(), banks[t].payload.begin(), banks[t].payload.end());
         pm.pos.insert(pm.pos.end(), banks[t].pos.begin(), banks[t].pos.end());
         pm.nEmitted += emitted[t];
+    }
+    if (pmCaustic) {
+        size_t ctotal = 0;
+        for (auto& b : cbanks) ctotal += b.size();
+        pmCaustic->photons.clear();
+        ftalloc::reserve(pmCaustic->photons, ctotal, "the caustic map payloads", "-n");
+        pmCaustic->pos.clear();
+        ftalloc::reserve(pmCaustic->pos, ctotal, "the caustic map positions", "-n");
+        for (int t = 0; t < nThreads; ++t) {
+            pmCaustic->photons.insert(pmCaustic->photons.end(),
+                                      cbanks[t].payload.begin(), cbanks[t].payload.end());
+            pmCaustic->pos.insert(pmCaustic->pos.end(),
+                                  cbanks[t].pos.begin(), cbanks[t].pos.end());
+        }
+        // SAME normalisation as the global map: nEmitted counts PATHS EMITTED, not photons
+        // stored, and both maps were filled by the one pass. Using the caustic map's own
+        // stored count here would be the classic two-map bug — it would rescale a rare
+        // caustic up to the brightness of the whole light source.
+        pmCaustic->nEmitted = pm.nEmitted;
     }
     if (bm) {
         size_t nb = 0;
@@ -263,9 +296,15 @@ inline Vec3 gatherPhotonBeams(const Scene& scene, const Renderer& mats, const Be
 // cosine and 1/pi cancel: the visible-point weight reduces to rho(vis), folded per photon
 // (diffuse hit) or applied once (specular-arrival emitter/env). `norm` = 1/(pi r^2
 // nEmitted) as in the caller. Mirrors photonGather's specular walk; keep the two in sync.
+//
+// `pmC`/`normC` are the optional CAUSTIC map and its own normalisation (see tracePhotonPass).
+// When present the density estimate is the SUM of the two maps' estimates — the maps hold
+// disjoint deposits, so this is the same estimator with each population read at the radius
+// that suits it.
 inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pcg32& rng,
                             bool diffraction, int maxBounce, double lambda, double invPdfL,
-                            double norm, const Hit& visHit, const Material& visMat) {
+                            double norm, const Hit& visHit, const Material& visMat,
+                            const PhotonMap* pmC = nullptr, double normC = 0.0) {
     Vec3 L{0, 0, 0};
     double thr = 1.0;
     bool specularSeen = false;                           // any specular bounce so far?
@@ -330,15 +369,19 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             case MatType::Fluorescent: {
                 // Density estimate at y, folding the visible-point reflectance per photon
                 // wavelength: L_o(vis) += rho(vis,l_p) * [rho(y,l_p)/pi] * Phi_p / (pi r^2 N).
-                Vec3 g{0, 0, 0};
-                pm.query(h.p, [&](const Photon& ph, double, int k) {
-                    if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
-                    double rhoY = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
-                    double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
-                    double f = rhoY * (1.0 / PI);
-                    g += pm.cie[k] * (f * rhoV * (double)ph.power);   // == cie(lambda_p), precomputed
-                });
-                L += g * (norm * thr);
+                auto est = [&](const PhotonMap& M) {
+                    Vec3 g{0, 0, 0};
+                    M.query(h.p, [&](const Photon& ph, double, int k) {
+                        if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
+                        double rhoY = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
+                        double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
+                        double f = rhoY * (1.0 / PI);
+                        g += M.cie[k] * (f * rhoV * (double)ph.power);  // == cie(lambda_p), precomputed
+                    });
+                    return g;
+                };
+                L += est(pm) * (norm * thr);
+                if (pmC && !pmC->photons.empty()) L += est(*pmC) * (normC * thr);
                 return L;
             }
             case MatType::Mirror: {
@@ -450,9 +493,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
 // media transmittance of that segment, so fog correctly dims the surfaces and sky behind it.
 // With `bm` null the walk is media-blind — which is what mode M has always been, and why a
 // fog / rain / cloud scene renders its volume as nothing without -beams.
+//
+// `pmC` (optional) is the CAUSTIC map (see tracePhotonPass): a disjoint half of the same
+// deposits, gathered at its own much finer radius and simply added.
 inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                          Pcg32& rng, bool diffraction, int maxBounce, int fgRays = 0,
-                         const BeamMap* bm = nullptr) {
+                         const BeamMap* bm = nullptr, const PhotonMap* pmC = nullptr) {
     Vec3 L{0, 0, 0};
     double thr = 1.0;
     double pdfL = 0.0;
@@ -465,6 +511,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     const double area = PI * pm.radius * pm.radius;
     const double norm = (pm.nEmitted > 0 && area > 0.0)
                             ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
+    // The caustic map carries its OWN radius (chosen by its own buildAuto over its own,
+    // far denser, population) and therefore its own 1/(pi r^2 N).
+    const bool causOn = (pmC != nullptr) && !pmC->photons.empty();
+    const double areaC = causOn ? PI * pmC->radius * pmC->radius : 0.0;
+    const double normC = (causOn && pmC->nEmitted > 0 && areaC > 0.0)
+                            ? 1.0 / (areaC * (double)pmC->nEmitted) : 0.0;
 
     const bool volOn = (bm != nullptr) && !bm->empty() && !scene.media.empty();
     // GRADIENT-INDEX: the CAMERA ray has to bend too. Mode M's forward deposit has marched
@@ -578,7 +630,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     for (int k = 0; k < fgRays; ++k) {
                         Ray gr{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
                         fg += photonGatherSub(scene, pm, gr, rng, diffraction, maxBounce,
-                                              lambda, invPdfL, norm, h, m);
+                                              lambda, invPdfL, norm, h, m,
+                                              causOn ? pmC : nullptr, normC);
                     }
                     L += fg * (thr * (1.0 / (double)fgRays));
                     return L;
@@ -587,14 +640,18 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 // visible points, which fall back here rather than final-gathering):
                 //   L_r(x) = (1/N) sum_p f_r * Phi_p / (pi r^2), f_r = rho/pi (Lambertian),
                 // accumulated in XYZ per photon wavelength.
-                Vec3 g{0, 0, 0};
-                pm.query(h.p, [&](const Photon& ph, double, int k) {
-                    if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
-                    double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
-                    double f = rho * (1.0 / PI);
-                    g += pm.cie[k] * (f * (double)ph.power);          // == cie(lambda_p), precomputed
-                });
-                L += g * (norm * thr);
+                auto est = [&](const PhotonMap& M) {
+                    Vec3 g{0, 0, 0};
+                    M.query(h.p, [&](const Photon& ph, double, int k) {
+                        if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
+                        double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
+                        double f = rho * (1.0 / PI);
+                        g += M.cie[k] * (f * (double)ph.power);       // == cie(lambda_p), precomputed
+                    });
+                    return g;
+                };
+                L += est(pm) * (norm * thr);
+                if (causOn) L += est(*pmC) * (normC * thr);
                 return L;
             }
             case MatType::Mirror: {
@@ -706,7 +763,8 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                                const PhotonMap& pm, long long spp, int nThreads,
                                bool diffraction, int maxBounce = 32,
                                unsigned long long sampleBase = 0, int fgRays = 0,
-                               const BeamMap* bm = nullptr) {
+                               const BeamMap* bm = nullptr,
+                               const PhotonMap* pmC = nullptr) {
     if (nThreads < 1) nThreads = 1;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     std::vector<Film> bands(nThreads);
@@ -734,7 +792,7 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                              0xA24BAED4963EE407ULL);
                     Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
                     f.add(px, py, photonGather(scene, pm, ray, rng, diffraction, maxBounce,
-                                               fgRays, bm));
+                                               fgRays, bm, pmC));
                 }
             }
         }

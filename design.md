@@ -2068,9 +2068,11 @@ render. Closing that means teaching the shared device path to gather in spp chun
   because its buffer is sized from *free VRAM*, so fewer bytes per record is directly more
   photons the GPU can hold (44 → 32 B). The GPU's gather record `DGatherPhoton`
   (render_cuda.cu) is the same idea, and additionally folds
-  `cie*power*norm/pi` into three floats. The `-savemap` cache format is `FTPMP02`
-  (two blocks: positions, then payloads); `FTPMP01` files are rejected with a message
-  telling the user to re-deposit.
+  `cie*power*norm/pi` into three floats. The `-savemap` cache format is `FTPMP04`
+  (header, surface photons, beams, then the caustic map — each version a strict superset of the
+  last, so `FTPMP03` and `FTPMP02` files still load, the former with an empty caustic map and the
+  latter with no beams either); `FTPMP01` files are rejected with a message telling the user to
+  re-deposit.
   **The mode-M gather radius is density-adaptive** (`PhotonMap::buildAuto`, default on;
   `-nopmauto` or an explicit `-pmradius` opts out bit-identically). `build(r)` sizes the grid
   at `cellSize == r`, so a radius chosen from scene size alone freezes the grid and makes
@@ -2118,6 +2120,52 @@ render. Closing that means teaching the shared device path to gather in spp chun
   argument (0 = off) — it must, since that is the high-photon-count path where a
   count-independent radius collapses worst. The gather reads `pm.radius` after the build, so
   the adapted value needs no further plumbing.
+  **TWO MAPS: the Jensen caustic split** (0.199.7; `-caustics`/`-nocaustics`, `-pmccount`, on by
+  default). All of the above solves for **one** population, and a scene with caustics has two
+  that differ by orders of magnitude in density — a gem's focused light lands as a thin bright
+  filament, the ambient illumination as a broad wash. `buildAuto`'s answer is set by the
+  majority, i.e. the wash, so the caustic is convolved with a kernel far wider than the feature
+  and vanishes; forcing the single radius down instead (`-pmcount 11`) brings the caustic back
+  and takes the whole image to grain with it. Mode `M` therefore **partitions its deposits**:
+  a photon arriving at a diffuse vertex after ≥1 **focusing** vertex and **no scattering** one
+  (the classic L·S⁺·D regular expression) goes to a second `PhotonMap`, the caustic map, built at
+  its own radius; every other deposit goes to the global map. The gather is the plain **sum** of
+  the two density estimates. The partition is *strict* (each deposit lands in exactly one map)
+  and both maps divide by the **same `nEmitted`** — which counts paths EMITTED, not photons
+  stored, and is the classic two-map bug if you use the caustic map's own count instead: a rare
+  caustic would be rescaled to full light-source brightness.
+  The classifier is `photonVertexKind` (`render.h`) with device twin `dPhotonVertexBit`
+  (`render_cuda.cu`), three-way: **FOCUS** (dielectric, mirror, thin-film, multilayer, grating,
+  half-mirror, and glossy at roughness ≤ `kCausticGlossRoughness`), **SCATTER** (rough glossy,
+  fluorescent, hair, an *analog* medium collision, and any diffuse vertex — which sets the flag
+  for itself, since what leaves a diffuse vertex is indirect light by definition), and
+  **NEUTRAL** (`filter`, a coloured absorber the photon passes straight through undeflected —
+  and, for the same reason, a `-beams` straight medium crossing, so a gem's caustic seen through
+  fog still counts). `kCausticGlossRoughness = 0.15` (a ~12° Phong lobe) lives in `photonmap.h`
+  rather than `render.h` because `render_cuda.cu` does not include the latter, and two threshold
+  constants would let a CPU and a GPU render of one scene classify differently — a discrepancy
+  whose only symptom would be "the GPU looks wrong".
+  On the **GPU** the classification runs in the kernel (a per-path `int pathBits`, threaded
+  through `shadeStep`/`shadeStepHero`/`kTrace` and, in the wavefront backend, held per-slot in
+  `WFState::pathBits` exactly like the medium stack), but the **partition happens on the host at
+  download time** off an explicit `DPhoton::caustic` field (record 32 → 36 B). A second device
+  atomic cursor would have needed its own capacity, overflow detection and rerun-at-a-lower-rate
+  path, all kept in agreement with the first one's; a packed sign bit would have saved 12.5 % of
+  a buffer several kernels write and two host loops read. `kCountCaustic` is a one-pass device
+  reduction whose only job is to let the host size **both** output vectors exactly before the
+  copy — sizing both to `nDep` would double the host map's peak footprint at exactly the photon
+  counts where it is already the binding constraint, and growing them chunk-by-chunk would make
+  `std::vector::resize` recopy a multi-GB array once per chunk.
+  `buildAuto` gained an `rMax` cap whose one caller is the caustic map, passing the global map's
+  radius: `k(M) = kAt1M·cbrt(M/1e6)` shrinks with the count, so a **sparse** caustic population
+  makes `sqrt(k/n)` ask to *grow* the radius — on `gallery_rain` at `-n 40M`, 21 808 caustic
+  photons drove 0.655 m → 1.094 m, smearing the one thing the split exists to keep sharp. Capped,
+  the worst case degenerates to the unsplit answer. Mode `S` (SPPM) is deliberately untouched —
+  its progressive radius already handles caustics, and its `causticDeposit` stays null.
+  **Known gap:** this is the *storage* half of Jensen's scheme only. Emission is still uniform,
+  so on `gallery_rain` just 0.12 % of deposits are L·S⁺·D and the caustic map is sharp but nearly
+  empty; the dedicated **projection-map emission pass** that fixes that is tracked in
+  `known-issues.md`.
 - **`allocreport.h`** (0.199.1) — `ftalloc::resize` / `ftalloc::reserve`, which turn a
   `std::bad_alloc` from a *command-line-sized* buffer into a message naming the buffer, the
   element count and size, the total in binary units, and the flag that shrinks it. Wrapped:

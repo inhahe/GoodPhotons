@@ -29,6 +29,22 @@
 #include "color.h"
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 
+// ---- Caustic split: the one tunable of the FOCUS/SCATTER classification ---------------
+// Mode M partitions its deposits into a global map and a caustic map by the classic L·S⁺·D
+// rule; the classifier itself is photonVertexKind (render.h) and its device twin
+// dPhotonVertexBit (render_cuda.cu). This threshold is the only judgement call in it, and it
+// lives HERE, in the one header both of them include, because a CPU and a GPU render that
+// disagreed about which glossy surfaces can focus would produce two different images from one
+// scene — a discrepancy with no symptom other than "the GPU looks wrong".
+//
+// `roughness` is the Phong-lobe width used by glossyDirUV (0 = perfect mirror). 0.15 is about
+// where the lobe stops being able to hold a caustic together over a scene-scale throw: the
+// exponent is 2/r^2 - 2 ~= 87, i.e. a ~12 degree lobe. Anything broader produces a diffuse
+// glow that the global map already represents perfectly well — and folding that broad
+// population into the caustic map would drag ITS density estimate back up, which is exactly
+// what the split exists to prevent.
+inline constexpr double kCausticGlossRoughness = 0.15;
+
 // One deposited photon's PAYLOAD — everything the gather reads *after* a candidate has
 // passed the distance test. The deposit POSITION deliberately lives in a separate
 // `PhotonMap::pos` array (see below); this struct is what `pos[k]` indexes into.
@@ -362,9 +378,20 @@ struct PhotonMap {
     // The win is in the growth: those same four points become ~237 / 377 / 598 / 949, so the
     // population is roughly preserved where people actually render and only the runaway tail
     // is cut. Equal-time quality is strictly better even at the small end (see README).
+    //
+    // `rMax` > 0 caps the chosen radius. Its one caller is the CAUSTIC map of the two-map
+    // split, which passes the GLOBAL map's radius — because a caustic map that ends up
+    // blurrier than the map it was separated from is strictly worse than not splitting at
+    // all. That happens whenever the caustic population is very sparse (a scene where only a
+    // thousandth of the flux reaches a diffuse surface through glass): k(M) shrinks with the
+    // count, the probe sees almost nothing, and sqrt(k/n) asks to GROW the radius — smearing
+    // the one thing the split exists to keep sharp. Capped, the worst case degenerates to
+    // "same radius as before, just estimated from two disjoint sets", which is exactly the
+    // unsplit answer.
     double buildAuto(double r0, double kAt1M = 200.0, double* nProbeOut = nullptr,
-                     double* kTargetOut = nullptr) {
-        if (photons.empty()) { build(r0); return radius; }
+                     double* kTargetOut = nullptr, double rMax = 0.0) {
+        if (photons.empty()) { build(r0 > 0.0 && rMax > 0.0 ? std::min(r0, rMax) : r0);
+                               return radius; }
         buildGrid(r0);
         const double n0 = medianNeighborCount();
         const double k  = kAt1M * std::cbrt((double)photons.size() / 1.0e6);
@@ -377,6 +404,7 @@ struct PhotonMap {
         // a median over a sample, and a pathological scene (all photons in one caustic, or
         // a single lit texel) shouldn't be allowed to pick an absurd grid.
         r1 = std::min(std::max(r1, r0 / 64.0), r0 * 4.0);
+        if (rMax > 0.0 && r1 > rMax) r1 = rMax;   // see the rMax note above
         // NO MEMORY GUARD ANY MORE (removed 0.199.6). While the lattice was dense, cellStart
         // held one int per CELL, so a fine radius over a large scene asked for an array that
         // grew as (L/r)^3 and had to be defended by growing r1 back until the grid fit. That
