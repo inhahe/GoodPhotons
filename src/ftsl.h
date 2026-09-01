@@ -6815,6 +6815,43 @@ private:
             }
         }
 
+        // ---- Local majorant grid (control + residual) ----------------------------
+        // The single global `densityMax` is a legal majorant but a terrible one: plain
+        // ratio tracking against it has a relative standard deviation that grows like
+        // e^(tau/2), which is what made gallery_rain's cloud render as saturated RGB
+        // speckle (majorant.h documents the measurement). Refine it into a per-cell
+        // control/residual split so transmittance can integrate the bulk analytically and
+        // only track the small residual stochastically. Bounded media only — an unbounded
+        // density field has no finite region to grid, and keeps the global majorant.
+        if (med.heterogeneous() && med.bounded && med.densityMax > 0.0) {
+            const PatTables tabs = L.scene.patTables();
+            auto grid = std::make_shared<MajorantGrid>();
+            // densityAt (not densityFieldAt): unlike the global peak estimate, this grid
+            // WANTS the membership carve — a cell outside an implicit/mesh bound really is
+            // vacuum, and the dilation in buildMajorantGrid is what makes reading it as
+            // vacuum safe.
+            if (!buildMajorantGrid(*grid, med.bmin, med.bmax,
+                                   [&](const Vec3& p) { return med.densityAt(p, &tabs); })) {
+                fail("stopped while building the medium majorant grid");
+                return false;
+            }
+            if (grid->valid()) {
+                double sumC = 0.0, sumR = 0.0, maxR = 0.0; size_t empty = 0;
+                for (size_t k = 0; k < grid->cells(); ++k) {
+                    sumC += grid->ctrl[k]; sumR += grid->res[k];
+                    maxR = std::max(maxR, (double)grid->res[k]);
+                    if (grid->ctrl[k] + grid->res[k] <= 0.0f) ++empty;
+                }
+                const double inv = 1.0 / (double)grid->cells();
+                std::fprintf(stderr,
+                    "[medium] majorant grid: %dx%dx%d cells (%.3g m), %.1f%% vacuum, "
+                    "mean control %.3f, mean residual %.4f (peak %.3f) vs global majorant %.3f\n",
+                    grid->nx, grid->ny, grid->nz, grid->cell.x,
+                    100.0 * (double)empty * inv, sumC * inv, sumR * inv, maxR, med.densityMax);
+                med.majorant = grid;
+            }
+        }
+
         L.scene.media.push_back(std::move(med));
         return true;
     }

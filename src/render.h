@@ -457,14 +457,73 @@ struct Renderer {
     // These cover the homogeneous, bounded-homogeneous, and heterogeneous (density-
     // field) media in one place. A homogeneous medium keeps the exact analytic
     // behaviour and draws exactly the same RNG as before (bit-identical to the
-    // pre-heterogeneous engine); a density field switches to delta / ratio tracking
-    // with the majorant sigma_max = sigmaT(lambda) * densityMax.
+    // pre-heterogeneous engine); a density field switches to delta / residual-ratio
+    // tracking against the per-cell majorant grid (majorant.h) when the medium has one,
+    // and to the single global majorant sigma_max = sigmaT(lambda) * densityMax when it
+    // does not (an unbounded density field).
+    //
+    // WALKING THE MAJORANT GRID. Both estimators below step the ray cell by cell with a
+    // 3D DDA and run their per-cell tracking loop over [tEnter, tExit] with THAT cell's
+    // coefficients. The two share `majorantWalk`, which calls `body(cellIndex, t0, t1)`
+    // for each cell the segment crosses and stops early when the body returns false. The
+    // walk is in the grid's own AABB, which is the medium bound's AABB, so `clipToBounds`
+    // has already trimmed the segment to it — but a ray can still start on/outside a face
+    // by an epsilon, so the entry cell is clamped rather than assumed in range.
+    template <class Body>
+    static void majorantWalk(const MajorantGrid& g, const Vec3& o, const Vec3& dir,
+                             double ta, double tb, Body&& body) {
+        auto cellOf = [&](double t, int a[3]) {
+            Vec3 p = o + dir * t;
+            double f[3] = {(p.x - g.wmin.x) * g.invCell.x,
+                           (p.y - g.wmin.y) * g.invCell.y,
+                           (p.z - g.wmin.z) * g.invCell.z};
+            int n[3] = {g.nx, g.ny, g.nz};
+            for (int k = 0; k < 3; ++k) {
+                int i = (int)std::floor(f[k]);
+                a[k] = i < 0 ? 0 : (i >= n[k] ? n[k] - 1 : i);
+            }
+        };
+        int c[3]; cellOf(ta, c);
+        const double d[3] = {dir.x, dir.y, dir.z};
+        const double cs[3] = {g.cell.x, g.cell.y, g.cell.z};
+        const double lo[3] = {g.wmin.x, g.wmin.y, g.wmin.z};
+        const int    nn[3] = {g.nx, g.ny, g.nz};
+        int step[3]; double tNext[3], tDelta[3];
+        for (int k = 0; k < 3; ++k) {
+            if (d[k] > 1e-12) {
+                step[k] = 1;
+                tNext[k] = (lo[k] + (c[k] + 1) * cs[k] - (k == 0 ? o.x : k == 1 ? o.y : o.z)) / d[k];
+                tDelta[k] = cs[k] / d[k];
+            } else if (d[k] < -1e-12) {
+                step[k] = -1;
+                tNext[k] = (lo[k] + c[k] * cs[k] - (k == 0 ? o.x : k == 1 ? o.y : o.z)) / d[k];
+                tDelta[k] = -cs[k] / d[k];
+            } else {
+                step[k] = 0; tNext[k] = 1e300; tDelta[k] = 1e300;
+            }
+        }
+        double t0 = ta;
+        for (;;) {
+            int axis = (tNext[0] < tNext[1]) ? ((tNext[0] < tNext[2]) ? 0 : 2)
+                                             : ((tNext[1] < tNext[2]) ? 1 : 2);
+            double t1 = std::min(tNext[axis], tb);
+            if (t1 > t0 && !body(g.idx(c[0], c[1], c[2]), t0, t1)) return;
+            if (t1 >= tb) return;
+            t0 = t1;
+            c[axis] += step[axis];
+            if (c[axis] < 0 || c[axis] >= nn[axis]) return;   // left the grid
+            tNext[axis] += tDelta[axis];
+        }
+    }
 
     // Sample the next real collision along (o,dir) within [0,dMax]. Returns true and
     // sets tHit at a real scattering/absorption event; false if the photon reaches
     // dMax first. Delta (Woodcock) tracking for a heterogeneous medium: candidate
     // collisions at rate sigma_max, accepted as real with prob sigmaT(x)/sigma_max
     // (a rejected "null collision" just continues) — unbiased, throughput unchanged.
+    // The majorant may be ANY upper bound on the local extinction, so the per-cell sup
+    // (ctrl + res) is used where a grid exists: same answer, far fewer null collisions,
+    // and a vacuum cell is skipped outright with no RNG draw at all.
     // `tabs` are the scene's grid:/scatter: tables, required (not defaulted) so a
     // density program that samples a measured volume can never be silently evaluated
     // without them — the two wrappers below are the only callers and both have a Scene.
@@ -480,6 +539,22 @@ struct Renderer {
             if (t < tb) { tHit = t; return true; }
             return false;
         }
+        if (med.majorant && med.majorant->valid()) {
+            const MajorantGrid& g = *med.majorant;
+            bool hit = false;
+            majorantWalk(g, o, dir, ta, tb, [&](size_t ci, double t0, double t1) {
+                double sigMax = stBase * ((double)g.ctrl[ci] + (double)g.res[ci]);
+                if (sigMax <= 0.0) return true;           // vacuum cell: skip, no RNG draw
+                double t = t0;
+                for (;;) {
+                    t += -std::log(1.0 - rng.uniformOpen()) / sigMax;
+                    if (t >= t1) return true;
+                    double sigT = stBase * med.densityAt(o + dir * t, tabs);
+                    if (rng.uniform() * sigMax < sigT) { tHit = t; hit = true; return false; }
+                }
+            });
+            return hit;
+        }
         double sigMax = stBase * med.densityMax;
         if (sigMax <= 0.0) return false;
         double t = ta;
@@ -492,8 +567,18 @@ struct Renderer {
     }
 
     // Unbiased transmittance along [o, o+dir*dist] through the medium. Exact exp for a
-    // homogeneous medium (clipped to its bound); ratio tracking otherwise (candidate
-    // collisions at rate sigma_max, each scaling the estimate by 1 - sigmaT(x)/sigma_max).
+    // homogeneous medium (clipped to its bound); RESIDUAL ratio tracking against the
+    // per-cell majorant grid otherwise, falling back to plain ratio tracking against the
+    // global majorant when the medium has no grid.
+    //
+    // Residual ratio tracking (Novak et al. 2014) splits each cell's extinction into a
+    // constant CONTROL term integrated analytically and a residual tracked stochastically:
+    //     Tr_cell = exp(-sigma_c * L) * PROD (1 - (sigma(x_i) - sigma_c)/sigma_r)
+    // with candidates at rate sigma_r >= sup|sigma - sigma_c| over the cell. The residual
+    // factors sit near 1 instead of near 0, which is the whole difference between an
+    // optically thick volume converging and not — see majorant.h for the measured
+    // variance reduction (~1100x at tau = 8). Note the factors may exceed 1 (the residual
+    // is signed); that is correct and is what keeps the estimator unbiased.
     double mediumTransmittance(const Medium& med, const Vec3& o, const Vec3& dir,
                                double dist, double lambda, Pcg32& rng,
                                const PatTables* tabs) const {
@@ -503,6 +588,25 @@ struct Renderer {
         if (!med.clipToBounds(o, dir, 0.0, dist, ta, tb)) return 1.0;   // ray never enters fog
         if (!med.heterogeneous())
             return std::exp(-stBase * (tb - ta));
+        if (med.majorant && med.majorant->valid()) {
+            const MajorantGrid& g = *med.majorant;
+            double Tr = 1.0;
+            majorantWalk(g, o, dir, ta, tb, [&](size_t ci, double t0, double t1) {
+                const double sigC = stBase * (double)g.ctrl[ci];
+                const double sigR = stBase * (double)g.res[ci];
+                if (sigC > 0.0) Tr *= std::exp(-sigC * (t1 - t0));       // control, analytic
+                if (sigR <= 0.0) return Tr > 0.0;                        // uniform cell: exact
+                double t = t0;
+                for (;;) {
+                    t += -std::log(1.0 - rng.uniformOpen()) / sigR;
+                    if (t >= t1) return true;
+                    double sigT = stBase * med.densityAt(o + dir * t, tabs);
+                    Tr *= 1.0 - (sigT - sigC) / sigR;
+                    if (Tr == 0.0) return false;
+                }
+            });
+            return Tr > 0.0 ? Tr : 0.0;
+        }
         double sigMax = stBase * med.densityMax;
         if (sigMax <= 0.0) return 1.0;
         double Tr = 1.0, t = ta;

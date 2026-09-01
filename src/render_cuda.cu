@@ -639,6 +639,76 @@ struct DVdbGrid {
     DVec3            imin;          // integer min-corner of the baked lattice
 };
 
+// Device twin of MajorantGrid (majorant.h): the per-cell control + residual majorant that
+// makes transmittance through a thick heterogeneous medium converge. `ctrl == nullptr`
+// means "no grid" and every entry point falls back to the single global `densityMax`, so an
+// unbounded density field (which has no finite region to grid) behaves exactly as before.
+struct DMajorant {
+    const float* ctrl;         // per-cell control density (null => no grid)
+    const float* res;          // per-cell residual majorant, sup|density - ctrl| over the cell
+    DVec3        wmin, cell, invCell;
+    int          nx, ny, nz;
+};
+
+// 3D DDA over a DMajorant, handing back one [t0,t1] span and cell index at a time. Device
+// twin of Renderer::majorantWalk; the two must step identically or CPU and GPU renders of
+// the same heterogeneous medium would disagree by more than noise. Doubles throughout,
+// matching the host walk (the tracking loops are double on the device already).
+struct DMajWalk {
+    int    c[3], step[3], nn[3];
+    double tNext[3], tDelta[3];
+    double t0, tEnd;
+    double ox[3], dx[3];
+
+    __device__ void init(const DMajorant& g, const DVec3& o, const DVec3& d,
+                         double ta, double tb) {
+        ox[0] = o.x; ox[1] = o.y; ox[2] = o.z;
+        dx[0] = d.x; dx[1] = d.y; dx[2] = d.z;
+        const double lo[3] = {g.wmin.x, g.wmin.y, g.wmin.z};
+        const double cs[3] = {g.cell.x, g.cell.y, g.cell.z};
+        const double ic[3] = {g.invCell.x, g.invCell.y, g.invCell.z};
+        nn[0] = g.nx; nn[1] = g.ny; nn[2] = g.nz;
+        for (int k = 0; k < 3; ++k) {
+            double p = ox[k] + dx[k] * ta;
+            int i = (int)floor((p - lo[k]) * ic[k]);
+            c[k] = i < 0 ? 0 : (i >= nn[k] ? nn[k] - 1 : i);
+            if (dx[k] > 1e-12) {
+                step[k] = 1;
+                tNext[k] = (lo[k] + (c[k] + 1) * cs[k] - ox[k]) / dx[k];
+                tDelta[k] = cs[k] / dx[k];
+            } else if (dx[k] < -1e-12) {
+                step[k] = -1;
+                tNext[k] = (lo[k] + c[k] * cs[k] - ox[k]) / dx[k];
+                tDelta[k] = -cs[k] / dx[k];
+            } else {
+                step[k] = 0; tNext[k] = 1e300; tDelta[k] = 1e300;
+            }
+        }
+        t0 = ta; tEnd = tb;
+    }
+    // Advance to the next non-empty span. Returns false when the segment (or the grid) is
+    // exhausted; `ci` is the flat cell index, [a,b] the span within it.
+    __device__ bool next(const DMajorant& g, size_t& ci, double& a, double& b) {
+        for (;;) {
+            if (t0 >= tEnd) return false;
+            int axis = (tNext[0] < tNext[1]) ? ((tNext[0] < tNext[2]) ? 0 : 2)
+                                             : ((tNext[1] < tNext[2]) ? 1 : 2);
+            double t1 = tNext[axis] < tEnd ? tNext[axis] : tEnd;
+            size_t cell = ((size_t)c[2] * g.ny + c[1]) * g.nx + c[0];
+            double s0 = t0;
+            if (t1 >= tEnd) { t0 = tEnd; }
+            else {
+                t0 = t1;
+                c[axis] += step[axis];
+                if (c[axis] < 0 || c[axis] >= nn[axis]) t0 = tEnd;   // left the grid
+                else tNext[axis] += tDelta[axis];
+            }
+            if (t1 > s0) { ci = cell; a = s0; b = t1; return true; }
+            if (t0 >= tEnd) return false;
+        }
+    }
+};
+
 struct DMedium {
     int    enabled;
     double sigma_a[SPEC_N];
@@ -655,6 +725,7 @@ struct DMedium {
     const PatNode*   density;         // device pool for the density formula (or null)
     int              densityN;        // node count of the density program
     double           densityMax;      // majorant (sup of density over the bound)
+    DMajorant        majorant;        // per-cell control/residual grid (ctrl null => none)
     // --- Optional imported .nvdb/.vdb volume, uploaded as a NATIVE SPARSE brick grid ---
     // When `densGrid.brickData` is non-null the density multiplier is TRILINEARLY
     // sampled from the sparse lattice (ROADMAP C2) instead of the pattern VM; takes
@@ -1906,6 +1977,26 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
         if (t < tb) { tHit = (Real)t; return true; }
         return false;
     }
+    // Per-cell majorant grid (majorant.h): delta tracking is unbiased for ANY upper bound,
+    // so use the tight local sup (ctrl + res) — far fewer null collisions, and a vacuum
+    // cell is skipped with no RNG draw at all. Host twin: Renderer::sampleMediumCollision.
+    if (m.majorant.ctrl) {
+        DMajWalk w; w.init(m.majorant, o, dir, ta, tb);
+        size_t ci; double a, b;
+        while (w.next(m.majorant, ci, a, b)) {
+            double sigMax = stBase * ((double)m.majorant.ctrl[ci] + (double)m.majorant.res[ci]);
+            if (sigMax <= 0.0) continue;              // vacuum cell
+            double t = a;
+            for (;;) {
+                t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
+                if (t >= b) break;
+                DVec3 pp = o + dir * (Real)t;
+                double sigT = stBase * dMedDensityAt(m, pp, env);
+                if ((double)rng.uniform() * sigMax < sigT) { tHit = (Real)t; return true; }
+            }
+        }
+        return false;
+    }
     double sigMax = stBase * m.densityMax;
     if (sigMax <= 0.0) return false;
     double t = ta;
@@ -1920,7 +2011,11 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
 
 // Unbiased transmittance along [o, o+dir*dist]. Device twin of
 // Renderer::mediumTransmittance: exact exp for a homogeneous medium (no RNG draw), else
-// ratio tracking. Homogeneous scenes therefore keep the exact analytic transmittance.
+// RESIDUAL ratio tracking against the per-cell majorant grid, falling back to plain ratio
+// tracking against the global majorant when the medium has no grid. Homogeneous scenes
+// therefore keep the exact analytic transmittance. See majorant.h for why the residual
+// split is what makes an optically thick volume converge (~1100x variance reduction at
+// tau = 8) and why merely TIGHTENING the majorant would have done nothing.
 __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const DVec3& dir,
                                          Real dist, Real lambda, DRng& rng,
                                          const DPatEnv& env) {
@@ -1929,6 +2024,27 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
     double ta, tb;
     if (!dMedClip(m, o, dir, 0.0, (double)dist, ta, tb)) return (Real)1;
     if (!m.heterogeneous) return (Real)exp(-stBase * (tb - ta));
+    if (m.majorant.ctrl) {
+        DMajWalk w; w.init(m.majorant, o, dir, ta, tb);
+        size_t ci; double a, b; double Tr = 1.0;
+        while (w.next(m.majorant, ci, a, b)) {
+            const double sigC = stBase * (double)m.majorant.ctrl[ci];
+            const double sigR = stBase * (double)m.majorant.res[ci];
+            if (sigC > 0.0) Tr *= exp(-sigC * (b - a));      // control term, analytic
+            if (sigR <= 0.0) { if (Tr <= 0.0) break; continue; }
+            double t = a;
+            for (;;) {
+                t += -log(1.0 - (double)rng.uniformOpen()) / sigR;
+                if (t >= b) break;
+                DVec3 pp = o + dir * (Real)t;
+                double sigT = stBase * dMedDensityAt(m, pp, env);
+                Tr *= 1.0 - (sigT - sigC) / sigR;
+                if (Tr == 0.0) break;
+            }
+            if (Tr == 0.0) break;
+        }
+        return (Real)(Tr > 0.0 ? Tr : 0.0);
+    }
     double sigMax = stBase * m.densityMax;
     if (sigMax <= 0.0) return (Real)1;
     double Tr = 1.0, t = ta;
@@ -14124,6 +14240,24 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.density  = m.density.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.density));
             dm.densityN = (int)m.density.size();
             dm.densityMax = m.densityMax;
+            // Per-cell control/residual majorant grid (majorant.h). Two dense float arrays
+            // — a 128^3 grid is 16 MB, and unlike the density field it is read once per
+            // tracking cell rather than per sample, so a sparse brick layout would buy
+            // little. Absent (unbounded density field) => ctrl null, global majorant.
+            if (m.majorant && m.majorant->valid()) {
+                const MajorantGrid& mg = *m.majorant;
+                dm.majorant.ctrl = (const float*)keep(uploadVec(mg.ctrl));
+                dm.majorant.res  = (const float*)keep(uploadVec(mg.res));
+                dm.majorant.wmin    = {mg.wmin.x, mg.wmin.y, mg.wmin.z};
+                dm.majorant.cell    = {mg.cell.x, mg.cell.y, mg.cell.z};
+                dm.majorant.invCell = {mg.invCell.x, mg.invCell.y, mg.invCell.z};
+                dm.majorant.nx = mg.nx; dm.majorant.ny = mg.ny; dm.majorant.nz = mg.nz;
+            } else {
+                dm.majorant.ctrl = nullptr; dm.majorant.res = nullptr;
+                dm.majorant.wmin = {0,0,0}; dm.majorant.cell = {0,0,0};
+                dm.majorant.invCell = {0,0,0};
+                dm.majorant.nx = dm.majorant.ny = dm.majorant.nz = 0;
+            }
             // Imported .nvdb/.vdb volume: upload a NATIVE SPARSE brick grid (ROADMAP C2).
             if (m.vdb && !m.vdb->empty()) uploadVdbGrid(*m.vdb, dm.densGrid, "density");
             else                          clearVdbGrid(dm.densGrid);

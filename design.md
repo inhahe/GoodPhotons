@@ -3749,6 +3749,47 @@ render. Closing that means teaching the shared device path to gather in spp chun
   sampler (the trilinear stencil is clamped before lookup). The host keeps the dense lattice.
   A multi-grid `.vdb` selects a grid **by name** (`loadVdbGrid(..., wantName)`; the OpenVDB reader
   seeks each descriptor to the previous grid's `endPos`, since descriptors interleave with bodies).
+- **`majorant.h` — the per-cell control/residual majorant grid, and RESIDUAL RATIO TRACKING
+  (0.200.0).** Every heterogeneous, *bounded* medium with a positive `density_max` gets a
+  `MajorantGrid` baked at load (`ftsl.h`, immediately before the `Medium` is pushed): a regular
+  lattice (long axis 128, capped at 4 M cells) storing two floats per cell — `ctrl`, a
+  piecewise-constant **control** density, and `res`, a majorant of `|density − ctrl|` over the
+  cell. `Medium::majorant` is a `shared_ptr`, uploaded to the device as `DMajorant` (two float
+  arrays + the lattice transform) and walked by a 3-D DDA (`Renderer::majorantWalk` on the host,
+  `DMajWalk` on the device) that hands each traversed cell's `[t0,t1]` to the estimator.
+  - **What it fixes, and the counterintuitive reason a plain local majorant does NOT.** The
+    obvious use of a majorant grid is to tighten `σ_max` for ratio tracking. Measured (a Python
+    sim of `gallery_rain`'s cloud), that buys **exactly nothing**: ratio tracking's
+    `Tr *= 1 − σ(x)/σ_max` converges *deterministically* to `exp(−τ)` as `σ_max → ∞`, and
+    degenerates to a binary hit/miss as `σ_max → σ`. A tight majorant is the **bad** end of that
+    range. Ratio tracking wants a LOOSE bound; its relative sd grows like `e^(τ/2)` regardless.
+  - **Residual ratio tracking (Novák et al. 2014) is the actual win**, and it needs exactly the
+    two numbers the grid stores: integrate the control analytically and track only the residual,
+    `Tr_cell = exp(−σ_c·L) · Π(1 − (σ(x_i) − σ_c)/σ_r)` with candidates drawn at rate `σ_r`. The
+    factors now sit near **1** instead of near 0, and the residual is *signed*, so a factor above
+    1 is correct and is what keeps the estimator unbiased. Same sim: relative sd 13.11 → 0.385 at
+    τ=8 (**1160×** variance reduction) and 41 → 0.55 at τ=16 (**5700×**) — and it is also
+    *faster*, because `σ_r` is far below the global majorant so there are far fewer candidates.
+  - **Collision sampling takes the opposite half.** Delta (Woodcock) tracking is unbiased for any
+    upper bound, so `sampleMediumCollision` uses the per-cell **sup** `ctrl + res` — fewer null
+    collisions — and skips a vacuum cell with no RNG draw at all.
+  - **Conservativeness is bought three ways**, because a sampled grid that under-estimates a peak
+    silently biases the render: each cell is probed on an (S+1)³ corner lattice (S=2, so
+    neighbouring cells share probe planes); each cell's `[min,max]` is then **dilated over its
+    3×3×3 neighbourhood**, so a feature that fell between probe points is still covered and
+    "vacuum" means a three-cell-wide margin of zero; and the residual half-range carries a ×1.15
+    safety factor. The probe uses `densityAt` (**with** the membership carve) — unlike the global
+    `densityMax` estimate, which must use `densityFieldAt` (see `meshvoxel.h` below) because a
+    coarse probe of a thin shape would otherwise majorise to ~0. That difference is safe here
+    precisely because the grid is local: a cell outside the carve really is vacuum, and the
+    3×3×3 dilation is what makes reading it as vacuum safe.
+  - **It is a pure speed/variance change, with no new knob and no scene-file syntax.** The only
+    observable is the load-time line, e.g. `gallery_rain`'s cloud:
+    `[medium] majorant grid: 128x80x125 cells (0.0213 m), 72.0% vacuum, mean control 0.204, mean
+    residual 0.0739 (peak 0.575) vs global majorant 1.150` — i.e. the tracking rate through that
+    medium fell **15×**. Both estimators keep the global-majorant loop as a fallback for media
+    with no grid (unbounded, homogeneous, or a build that was `-stop`ped), so nothing regresses.
+    Energy conservation on `gallery_rain` is unchanged (`sum/emitted = 0.999964`).
 - **`rainbow.h` — droplet SIZE DISTRIBUTION (0.199.0).** The Airy bow's *angle* is geometric and
   size-independent, but the fold scale `K = (2/h)^(1/3)·(2πa/λ)^(2/3)` is not, so `z` scales as
   `a^(2/3)` and averaging `Ai(z)²` over a spread of sizes smears the supernumerary train into its

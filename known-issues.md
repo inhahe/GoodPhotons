@@ -5,6 +5,49 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-09-01, v0.200.0): the `gallery_rain` cloud renders as full-saturation RGB speckle ("iridescent"), and residual ratio tracking was NOT the cause
+
+**Reported as** the fourth of six defects in the `gallery_rain` mode-`M` `-beams` render: *"the
+cloud appears iridescent, it shouldn't."* The cloud medium is fully achromatic (`sigma_t 2.78,
+albedo 0.9964, g 0.46`, a scalar noise density), so every colour in it is noise, not a feature.
+
+**What was ruled out.** Ratio-tracking variance in the transmittance estimator was the leading
+hypothesis, and v0.200.0 (`majorant.h`, residual ratio tracking — see `design.md`) fixed that
+properly: the estimator's relative sd through this cloud falls by ~1000× in a standalone
+simulation. On the actual render it moved the cloud's chroma sd by only ~11 % (r sd
+0.196 → 0.173, measured over the crop `(410,30)-(580,150)` of a 640×360 `-spp 16` frame), so
+transmittance variance is a minor contributor and the dominant term is elsewhere. The v0.200.0
+work is still worth having on its own merits (it is also several times cheaper per sample), but
+it is not the fix for this issue.
+
+**Where the variance actually is.** The chroma sd measured in the cloud is very close to the
+spectral spread of a *single* wavelength, i.e. the effective number of independent spectral
+samples per pixel is ~1–2 despite 16 spp × ~42 gathered beams ≈ 670 nominal samples. Each stored
+`PhotonBeam` is **monochromatic** (`PhotonBeam::lambda`) and accumulates into XYZ at its own
+wavelength; a single monochromatic sample sits far outside the sRGB gamut, so too few effective
+samples per pixel clamp to maximum saturation — which is exactly what "iridescent" looks like.
+
+**Candidate causes, in order of plausibility, none yet confirmed:**
+1. **Monochromatic beam deposit.** The structural fix is a hero-wavelength / multi-λ beam
+   deposit: each beam carries the XYZ of several wavelengths. The medium is achromatic, so this
+   cuts chroma noise at no extra beam cost. `hero::gSplit` and `tracePhotonHeroLoop` already
+   exist; whether the beam-deposit path participates has not been checked.
+2. **Beam-sample starvation inside the cloud.** `buildAuto`'s single global radius must serve
+   both the compact thick cloud and the optically thin rain shaft, and `-beamk` (default 32)
+   targets 32 beams per probe chord of the whole beam AABB, not per cloud crossing. This is the
+   same "one radius cannot serve two populations" problem the caustic-map split solved. The
+   decisive A/B is a `-beamk` sweep at low resolution (a full-resolution `-beamk 512` run is
+   ~1.9 G beam tests and does not complete in useful time).
+3. **The `1/sinθ` factor in the Beam × Ray 1-D estimator** is heavy-tailed (logarithmically
+   divergent second moment). With albedo 0.9964 and unlimited `-beams-order`, most beams are
+   high-order and randomly oriented, so the tail is fully active.
+4. **Wide spread of beam powers across scattering orders**, plus the Russian-roulette `1/p`
+   rescaling in `BeamBank::halve`.
+
+**Reproduce:** `ftrace -in scenes/gallery_rain.ftsl -camera cam -mode M -beams -device gpu
+-r 640 360 -n 40000000 -spp 16 -window-min -keepwindow -interval 15 -o png/caus/c.png`, then
+crop `(410,30)-(580,150)` and measure the sd of the chromaticity `r = R/(R+G+B)`.
+
 ### FIXED (2026-09-01, v0.199.7): mode `M` had no caustic map, so caustics were gathered at the diffuse radius and washed out
 
 **Reported as** the sixth of six defects in the `gallery_rain` mode-`M` beams render: *"i don't

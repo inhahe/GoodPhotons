@@ -18,6 +18,7 @@
 #include "vdbgrid.h"
 #include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
 #include "record.h"      // parametric records (§records): named per-channel LUTs
+#include "majorant.h"    // per-cell control/residual majorant grid (Medium::majorant)
 #include "lighttree_build.h"  // Conty-Kulla light BVH: node layout + host builder
 
 // ---- ray-query telemetry (-raystats) --------------------------------------------------
@@ -459,6 +460,16 @@ struct Medium {
     // is 1 everywhere (the classic homogeneous medium; unchanged behaviour).
     std::vector<PatNode> density;
     double densityMax = 1.0;   // majorant: sup of density over `bmin..bmax` (delta/ratio tracking)
+
+    // Per-cell control + residual majorant over the bound AABB (majorant.h). Present for
+    // any BOUNDED heterogeneous medium; null falls back to the single global `densityMax`,
+    // which is what an unbounded density field still uses. Transmittance runs RESIDUAL
+    // ratio tracking against it (the deterministic exp(-control) carries the bulk of the
+    // attenuation, which is what makes an optically thick cloud converge at all — see the
+    // header comment in majorant.h for the measured numbers), and collision sampling uses
+    // the tight per-cell sup `ctrl + res` instead of the global majorant. Shared so Medium
+    // copies stay cheap, like `vdb` / `boundGrid`.
+    std::shared_ptr<MajorantGrid> majorant;
 
     // --- Optional gradient-index (GRIN) refractive field n(x,y,z) ------------
     // When `ior` is non-empty, this region is a GRADIENT-INDEX medium: light
