@@ -5,6 +5,55 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-09-01, v0.199.2): mode `W`'s live window "fluctuates in hue" and a low-`-spp` mode-`W` frame comes out with a global colour cast — the wavelength lattice is SHARED by every pixel, so a de-hero'd path renders the whole image at `spp` wavelengths
+
+**Reported as** "why do the ftrace windows now show the scene with a fluctuating off hue?"
+It is not a regression from 0.199.0/0.199.1 — it is a pre-existing structural property of
+mode `W` that nothing in the batch path told you about, and that the interactive viewer
+under-compensated for.
+
+**Mechanism.** Mode `W` is noise-free at 1 spp only while the path stays in the hero
+*bundle* (`g_heroC` wavelengths through one BVH walk). Three things drop it onto the
+**scalar** path, which carries exactly ONE wavelength per sample: participating media, a
+GRIN volume, and `-heroc 1`. That alone would only be *noise* if each pixel drew its own
+wavelength — but it doesn't. `dWhittedLambdaU(sIdx)` (and `BackwardRenderer`'s host twin)
+is a scrambled radical inverse of the **absolute sample index and nothing else**, so every
+pixel uses the SAME wavelength on the same pass. That sharing is precisely what makes the
+mode noise-free on a bundle scene, and precisely what makes a de-hero'd one come out
+**uniformly mistinted**: an N-spp frame is the whole image rendered at N shared
+wavelengths. The error is global, so it does not average down per pixel.
+
+**Measured** (`scenes/gallery_rain.ftsl -camera cam -mode W -r 256 256`, rain volume ⇒
+scalar path), frame-mean channel ratios vs. the converged 512-spp answer:
+
+| spp | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 512 |
+|---|---|---|---|---|---|---|---|---|
+| R/G | 1.069 | 1.120 | 0.922 | **1.721** | 1.061 | 0.994 | 0.886 | 0.896 |
+| B/G | **0.000** | 0.085 | 0.483 | **1.243** | 0.691 | 0.787 | 0.694 | 0.705 |
+
+1 spp has **no blue at all** (one wavelength, and it wasn't a blue one); 8 spp overshoots
+into magenta. Within ~2% of converged from 64 on. A media-free control
+(`scenes/_cornell_diffuse.ftsl -mode W -spp 8`) is pixel-perfect, confirming the medium is
+what de-heroes.
+
+**Why the window "fluctuates":** `-window` repaints per chunk (≥1 spp), so a progressive
+mode-`W` render is *displayed* while walking up that table — every repaint is a different,
+still-incomplete set of shared wavelengths, so the whole frame changes tint each time.
+
+**Ruled out as the cause:** the 0.199.1 medium changes are three `uniform()` →
+`uniformOpen()` swaps on free flights (2 lines in `backward.h`, 3 in `render_cuda.cu`),
+which differ for 1 draw in 16 777 216 — they cannot tint every pixel of every frame.
+`src/hero.h` and `src/color.h` have not been touched in the whole 0.19x series.
+
+**Fixed by** (a) hoisting the viewer's private predicate + cap into shared
+`whittedDeHeroes(scene)` / `kWhittedDeHeroSpp` in `main.cpp` — two copies of the rule is
+how the viewer and the batch path drifted apart; (b) raising the `-explore` preview's
+`kWSppCap` **16 → 64** (16 was still ~18% off in R/G; the extra passes cost nothing in
+responsiveness because any camera movement abandons the refinement outright); and (c)
+`warnWhittedDeHeroSpp`, a `[mode W] WARNING` on a **batch** render below the floor that
+names the mechanism, quotes the measurement, and suggests `-spp 64` or `-no-media`.
+Documented in `REFERENCE.md` (mode `W` row + the `-explore` paragraph) and `design.md`.
+
 ### FIXED (2026-08-31, v0.198.0): a medium that both SCATTERS and carries `ior` lost its scattering almost entirely — the Eikonal marcher integrated no medium along the span it marched, in every mode and on both backends
 
 **Fixed by** `grin::marchSegments` / `dGrinMarch`'s per-sub-segment hook — see "How it was

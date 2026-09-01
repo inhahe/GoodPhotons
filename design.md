@@ -4595,7 +4595,23 @@ render. Closing that means teaching the shared device path to gather in spp chun
   accumulates, so it is cleared per pose. When a pass completes the viewer stops — a
   bundle-only scene is exact at 1 spp — *unless* `wNeedSpp`, which is set when the scalar path
   is in use at all (`heroC <= 1`, media, GRIN, lens); then it keeps adding passes to
-  `kWSppCap` (16) to resolve the wavelength collapse that case still causes. The *dispersive*
+  `kWSppCap` to resolve the wavelength collapse that case still causes. **(0.199.2)** That
+  predicate and that cap are now the *shared* `whittedDeHeroes(scene)` / `kWhittedDeHeroSpp`
+  in `main.cpp`, and the cap moved 16 → **64**. Two copies of the rule is how the viewer and
+  the batch path drifted apart: mode W's wavelength lattice is a function of the ABSOLUTE
+  SAMPLE INDEX alone, shared by every pixel — which is what makes the mode noise-free on a
+  bundle scene, and what makes a de-hero'd one come out **uniformly mistinted** instead of
+  grainy, since an N-spp frame is the whole image rendered at N *shared* wavelengths. It is a
+  global error, so it does not average down per pixel. Measured on `gallery_rain` (rain
+  volume), frame-mean B/G against the converged 512-spp answer 0.705: `1 → 0.000` (literally
+  no blue in the picture), `2 → 0.085`, `4 → 0.483`, `8 → 1.243` (magenta), `16 → 0.691`,
+  `32 → 0.787`, `64 → 0.694`. 16 was still ~18% off in R/G; 64 lands within ~2%, and costs
+  the viewer nothing in responsiveness because any camera movement abandons the unfinished
+  refinement outright. The **batch** path has no such escape — it obeys `-spp` literally —
+  so `warnWhittedDeHeroSpp` prints a `[mode W] WARNING` naming the mechanism whenever a
+  de-heroing scene is rendered below the floor. This is also the explanation for a live
+  `-window` on such a render appearing to *fluctuate in hue*: each repaint is a different,
+  still-incomplete set of shared wavelengths. The *dispersive*
   materials (Dielectric/ThinFilm/Multilayer/Grating/HalfMirror/Fluorescent) used to be on that
   list and no longer are, because `heroSplit` resolves them geometrically at 1 spp; `Layered`
   came off it in v0.115.1, once its coat reflectance became a per-λ weight instead of an

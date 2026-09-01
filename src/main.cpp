@@ -11843,6 +11843,72 @@ static void warnWhittedHeroCollapse(const Scene& scene) {
                 "traversal-bound, not spectral.\n", what, hero::kHeroMax);
 }
 
+// ---- the mode-W low-spp MISTINT --------------------------------------------------------
+//
+// Mode W is "noise-free at 1 spp" only while the path stays in the hero BUNDLE, which
+// carries g_heroC wavelengths through one BVH walk. Three things drop it onto the SCALAR
+// path, which carries exactly ONE wavelength per sample: participating media, a GRIN
+// volume, and an explicit `-heroc 1`. (Dispersive glass and clearcoats used to be on that
+// list and no longer are -- mode W splits the bundle at those vertices instead.)
+//
+// One wavelength per sample would merely be NOISY if each pixel drew its own. It doesn't:
+// mode W's wavelength lattice is `dWhittedLambdaU(sIdx)` (and BackwardRenderer's host twin)
+// -- a scrambled radical inverse of the ABSOLUTE SAMPLE INDEX and nothing else -- so every
+// pixel in the frame uses the SAME wavelength on the same pass. That sharing is exactly
+// what makes the mode noise-free on a bundle scene, and it is exactly what makes a de-hero'd
+// one come out UNIFORMLY MISTINTED rather than grainy: an N-spp frame is the whole image
+// rendered at N wavelengths, shared. The error is a global colour cast, so it does not
+// average down per pixel -- it only goes away once N covers the spectrum.
+//
+// Measured on scenes/gallery_rain.ftsl (rain volume => scalar path), frame-mean B/G against
+// the converged 512-spp answer (0.705):
+//
+//     spp    1     2     4     8    16    32    64   512
+//     B/G  0.000 0.085 0.483 1.243 0.691 0.787 0.694 0.705
+//
+// 1 spp has NO BLUE AT ALL (one wavelength, and it was not a blue one); 8 spp overshoots
+// into magenta. It is within a couple of percent from 64 on -- hence kWhittedDeHeroSpp.
+// This is also why the live `-window` view of such a render CHANGES HUE between repaints
+// while it climbs through the first few dozen spp: each repaint is a different (still
+// incomplete) set of shared wavelengths. Expected, not a bug.
+static const int kWhittedDeHeroSpp = 64;
+
+// Which of the three, or nullptr if the bundle survives (so 1 spp really is exact).
+// `-heroc 1` is checked first because it is the one the user typed, and it makes the other
+// two moot. Kept as ONE predicate so the batch warning below and the viewer's pass floor
+// (kWSppCap, in the -explore loop) cannot drift apart.
+static const char* whittedDeHeroes(const Scene& scene) {
+    if (g_heroC <= 1)                   return "-heroc 1 (the hero bundle is off)";
+    if (scene.backwardMedium().enabled) return "participating media";
+    if (grin::sceneHasGrin(scene))      return "a GRIN volume";
+    return nullptr;
+}
+
+// Batch mode W only. The interactive viewer handles this by ACCUMULATING passes up to
+// kWSppCap while the camera holds still (see -explore), so it converges on its own and a
+// nag there would fire on every run; a batch render obeys -spp literally and has no such
+// escape, so the one thing it can do is say why the image is the wrong colour.
+static void warnWhittedDeHeroSpp(const Scene& scene, long long spp) {
+    const char* why = whittedDeHeroes(scene);
+    if (!why || spp >= kWhittedDeHeroSpp) return;
+    std::printf("[mode W] WARNING: -spp %lld with %s -- the path DE-HEROES onto ONE "
+                "wavelength\n"
+                "[mode W]   per sample, and mode W's wavelength lattice is a function of the "
+                "sample index\n"
+                "[mode W]   ALONE (shared by every pixel), so this frame is the whole image "
+                "rendered at\n"
+                "[mode W]   %lld wavelength%s. Expect a UNIFORM COLOUR CAST, not noise -- at "
+                "1 spp there is\n"
+                "[mode W]   literally one wavelength in the picture. It is a global error, so "
+                "it does not\n"
+                "[mode W]   average down per pixel; only more spp fixes it.\n"
+                "[mode W]   Raise -spp to >= %d (measured: within ~2%% of the converged hue "
+                "from there),\n"
+                "[mode W]   or drop the medium with -no-media if you only want the geometry "
+                "preview.\n",
+                spp, why, spp, spp == 1 ? "" : "s", kWhittedDeHeroSpp);
+}
+
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
 // segment, so a volumetric FLYBY (rainbow/fogbow/fog) gets independent per-frame noise
@@ -16672,6 +16738,10 @@ static int run(int argc, char** argv) {
     // (wNeedSpp), so its C=1 image converges rather than staying wrong, and nagging there
     // would fire on every explore run.
     if (g_whitted && !wPreview && g_heroC <= 1) warnWhittedHeroCollapse(scene);
+    // Same "only a real batch render" gate, for the OTHER way mode W stops being exact at
+    // low spp: a de-hero'd path plus a pixel-shared wavelength lattice = a global colour
+    // cast. See warnWhittedDeHeroSpp for the measurement this threshold comes from.
+    if (g_whitted && !wPreview) warnWhittedDeHeroSpp(scene, spp);
     // Kept out of the chain above: rejecting -gi is independent of whether the run is
     // also direct-only, and folding it in would swallow that notice when both are given.
     // Mode R already carries real multi-bounce GI; the gather is mode W's substitute for
@@ -18724,9 +18794,16 @@ static int run(int argc, char** argv) {
             // Dielectric -- see thinFilmInterface's whittedWeight.)
             // (No hasLens() term: the viewer builds its camera fresh from the pose each frame,
             // so the preview camera is always a plain one even if the scene authored a lens.)
-            const int kWSppCap = 16;
-            bool wNeedSpp = (g_heroC <= 1) || scene.backwardMedium().enabled ||
-                            grin::sceneHasGrin(scene);
+            // The floor is the SAME constant the batch warning quotes (kWhittedDeHeroSpp),
+            // and the same predicate (whittedDeHeroes) decides whether it applies -- two
+            // copies of this rule is how the viewer and the batch path came to disagree.
+            // It was 16 here, which the gallery_rain measurement in warnWhittedDeHeroSpp
+            // shows is still ~18% off in R/G; 64 lands within ~2%. The extra passes cost
+            // nothing in responsiveness because ANY camera movement abandons the unfinished
+            // refinement outright -- they only run while you are holding still, and every
+            // one of them is displayed as it lands.
+            const int kWSppCap = kWhittedDeHeroSpp;
+            bool wNeedSpp = whittedDeHeroes(scene) != nullptr;
             // Rough GLOSSY is deliberately NOT on that list, even though its lobe is likewise
             // resolved across samples (whittedGlossyDir) rather than within one. The difference
             // is what a single pass looks like: a de-hero'd dielectric is flatly WRONG (a green
