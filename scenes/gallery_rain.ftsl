@@ -165,10 +165,27 @@
 # question about the per-frame gather, not about re-tracing 600 forward passes.
 # The caveats that keep D the reference: `-beams` in mode M is SINGLE SCATTER ONLY (the
 # depositing photon crosses straight), so the multiply-scattered veil inside the cloud is
-# missing; it is CPU-ONLY (no device beam BVH, so the GPU branch and the GPU meter both fall
-# back and say so); and mode M carries directly-seen glass and chrome differently from D (see
-# the sun discussion above). So: mode D for the finished piece, `-mode M -beams` when you want
-# the whole loop in half an hour instead of most of a day.
+# missing; and mode M carries directly-seen glass and chrome differently from D (see the sun
+# discussion above). So: mode D for the finished piece, `-mode M -beams` when you want the
+# whole loop in under an hour instead of most of a day.
+#
+# GPU. `-beams` WAS CPU-only and this header said so, until 0.197.0 ported BOTH halves (the
+# beam deposit and the beam gather) to CUDA -- there is a device beam BVH now and the GPU
+# mode-M meter no longer carves out, so `-device gpu` is correct here and is what you want.
+# MEASURED at 0.198.0 on an RTX 4090 with the exact command below (960x540, -spp 6,
+# -n 20000000): 15224 beams stored -> 367540 sub-beams after split, 236293 BVH nodes uploaded
+# for the volume gather, then a steady 5.0 s/frame -- ~50 min for the 600-frame loop, against
+# ~7.6 h under D. The GPU flyby command, verified end to end:
+#   ftrace -in scenes/gallery_rain.ftsl -camera fly -mode M -device gpu -beams \
+#          -n 20000000 -spp 6 -window -keepwindow -interval 15 \
+#          -o png/gallery_rain.png
+# NOTE the -o: ftrace derives the flyby subdirectory from the output stem plus the curve name,
+# so `-o png/gallery_rain.png` writes png/gallery_rain_fly/gallery_rain_flyNNN.png. Passing
+# `-o png/gallery_rain_fly/gallery_rain.png` nests it a second time.
+# Do NOT add -time/-noise/-forever/-preview: each of those drops mode M off the shared GPU
+# path (main.cpp `plainRender`) onto a per-frame fallback that has no GPU implementation at
+# all and rebuilds the map every frame. -checkpoint/-resume stopped breaking it in 0.197.2,
+# but mode M discards them anyway, so just leave them off.
 # Under D this flyby is 600 INDEPENDENT BDPT renders -- D is camera-anchored, it shares nothing
 # across cameras (REFERENCE, "Other modes do NOT save time with multiple cameras"), and the
 # budget flag applies PER FRAME. What IS shared is only the scene build and the exposure
