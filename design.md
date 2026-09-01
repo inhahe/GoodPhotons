@@ -4743,6 +4743,50 @@ render. Closing that means teaching the shared device path to gather in spp chun
   finish is the *render's* finish. The catch block records `"stopped by an error"`, and
   `setLiveTitle()` caches the last mode/progress text (`g_windowRest`) so adding the
   prefix keeps the final `…40133 spp, ~0.50% noise` line rather than blanking it.
+- **Mode `M` used to be the one mode with no progress in the title at all** (fixed 0.199.4).
+  Two independent gaps, and a showcase `gallery_rain -beams` flight hit both. (a) The shared
+  multi-camera GPU branch called `liveWindowUpdate(f, sppDone, exp, absolute)` with the
+  optional `status` argument **omitted**, so its `SppProgress` repainted the image but left
+  the caption frozen — and the branch never called `noteFinishReason()`, so the `✔ DONE`
+  prefix never appeared either. Both are now supplied: `pmGatherStatus()` (next to the
+  checkpoint helpers in `main.cpp`) formats the same shape every other mode reports —
+  `frame k/N — [gather] 107 / 160 spp (67%), 80.0M photons, 1017.1s, ~9.67% noise` — where
+  the noise term is the mode-`M` estimator `100/sqrt(mean per-pixel hits over LIT pixels)`,
+  the same formula the forward driver uses, with unlit pixels excluded so a black border
+  cannot read as perfect convergence. (b) More importantly, **a mode-`M` render spends most
+  of its wall clock before a film exists at all** — the photon deposit and the map/beam
+  builds — and `SppProgress` cannot report there because it hands back a `Film`. That phase
+  is now covered by **`StageProgress`** (`render_progress.h`): a `report(text, done, total)`
+  with no return value, since a stage is stopped through the ordinary `ft::stopRequested()`
+  flag rather than by its reporter. `makeStageProgress()` renders it as
+  `tracing photons — 1.0M / 80.0M (1%), 7s, 150.5k/s, ~525s left` on a 0.25 s window cadence
+  and a 30 s stdout cadence, and `total == 0` degrades to `building photon map… 12s` for a
+  phase with no meaningful measure.
+  - On the **CPU**, `tracePhotonPass` is a join-and-wait, so the count has to be sampled from
+    outside it: the workers publish into a relaxed `std::atomic<long long>` on the *same*
+    4096-photon cadence as their existing stop poll (one `fetch_add` per 4096 path traces is
+    unmeasurable), and a monitor thread — started only when a reporter was actually passed —
+    polls it while the main thread blocks on the joins.
+  - On the **GPU** there is no such seam, because the deposit is a single `launchForward`. So
+    when a reporter is present the deposit is **split into chunks**, sized adaptively to ~1 s
+    of work (1 M-photon probe, never shrinking below it, never growing more than 4× a step).
+    This is safe because `kTrace`'s `N` is only a grid-stride bound, `genPhoton` gives each
+    photon an absolute beta, and the estimate normalises by `pm.nEmitted` — so K launches of
+    N/K emit exactly the energy one launch of N does, and `launchForward`'s
+    `kseed = C + seedBase*C` makes chunk 0 reproduce the single-shot stream. Two traps this
+    walked into and back out of: the split is armed **unconditionally**, *not* gated on
+    `g_showWindow`, because gating it would make the same command produce a different image
+    depending on whether anyone was watching; and the loop now tracks `depEmitted` and assigns
+    `pm.nEmitted = depEmitted` **after** the deposit, because a `-stop` between chunks would
+    otherwise leave `nEmitted = N` while having emitted fewer and darken the whole map by the
+    untraced fraction. The chunk seam is also the first place a `-stop` can land during a GPU
+    deposit — before this there was none.
+  - The monitor thread is why `setLiveTitle()` now takes a **mutex**: it re-titles from a
+    non-main thread while the main thread is inside the joins, and `g_windowRest` is a
+    `std::string` that would otherwise be written from two threads at once. `SetWindowTextW`
+    itself is already cross-thread safe (it marshals a `WM_SETTEXT`), but *creating* the
+    window is not, so `liveWindowPlaceholder` compares against a recorded `g_mainThreadId` and
+    off-thread callers only re-title.
 - Repaint granularity is bounded below by the renderer's chunk size, not by this timer:
   `gpuSppChunks` / `cpuSppChunks` retarget ~0.15 s per chunk with a 1 spp floor, so a 480²
   `-mode W -spp 8` frame gets one repaint per spp and the first complete image lands after

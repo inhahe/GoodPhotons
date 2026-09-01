@@ -5,6 +5,54 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-09-01, v0.199.4): mode `M` was the one mode whose live window never showed progress or a DONE marker
+
+**Reported as** the first of six defects in the `gallery_rain` mode-`M` beams render: *"the
+window isn't showing all the info in its titlebar that it shows in other modes, such as its
+progress (in time, photons or clarity) and whether it's done."*
+
+Two independent gaps, both of which a showcase mode-`M` flight hits:
+
+1. **The shared multi-camera GPU branch omitted the `status` argument.** `liveWindowUpdate`'s
+   last parameter is what puts text on the title; the branch called it as
+   `liveWindowUpdate(f, sppDone, liveExp, scene.absolute)` and got a repainting image under a
+   frozen caption. It also never called `noteFinishReason()`, so the `✔ DONE — <why>` prefix
+   never appeared when the flight ended. (The CPU twin passed only `"frame k/n"`, so it was
+   half-broken in the same way.) Both branches now report through a shared
+   `pmGatherStatus()`: `frame 7/601 — [gather] 107 / 160 spp (67%), 80.0M photons, 1017.1s,
+   ~9.67% noise`.
+2. **Most of a mode-`M` render happens before a film exists**, so `SppProgress` — which hands
+   back a `Film` — structurally cannot cover it. The photon deposit and the map/beam builds
+   were one long silence: on `gallery_rain` at 80 M photons that is ~9 minutes on a frozen
+   `tracing photons…` placeholder, which is indistinguishable from a wedged render, with
+   nothing on stdout either. Fixed with a new **`StageProgress`** hook
+   (`src/render_progress.h`) reported by `tracePhotonPass` (CPU) and
+   `renderPhotonMapSharedCuda` (GPU), rendered as
+   `tracing photons — 1.0M / 80.0M (1%), 7s, 150.5k/s, ~525s left`.
+
+**Three design traps this walked into and back out of**, recorded because each would have been
+a silent correctness bug rather than a cosmetic one:
+
+- The GPU deposit is a single `launchForward` with no seam to report at, so `StageProgress`
+  **splits it into ~1 s chunks**. The first instinct was to arm that only when `g_showWindow` —
+  which would have made the same command produce a *different image* depending on whether
+  anyone was watching. It is armed unconditionally instead. (The split is energy-exact: `N` is
+  only a grid-stride bound, `genPhoton` gives absolute betas, and the estimate normalises by
+  `pm.nEmitted`.)
+- A `-stop` landing between deposit chunks would have left `pm.nEmitted = N` while fewer
+  photons were actually emitted, **darkening the whole map** by the untraced fraction. The loop
+  now tracks `depEmitted` and assigns `pm.nEmitted = depEmitted` after the deposit — the same
+  accounting `tracePhotonPass` already did per-thread. (Silver lining: the chunk seam is the
+  first place a `-stop` can be honoured during a GPU deposit at all.)
+- The CPU deposit's monitor thread re-titles from a **non-main thread** while the main thread
+  is blocked in the worker joins, and `g_windowRest` is a `std::string`. `setLiveTitle()` now
+  takes a mutex, and `liveWindowPlaceholder` refuses to *create* the window off-thread
+  (compares against a recorded `g_mainThreadId`) and only re-titles.
+
+The noise term uses the mode-`M` estimator `100/sqrt(mean per-pixel hits over LIT pixels)` —
+the same formula the forward driver uses — with unlit pixels excluded, because a black border
+counted in would read as perfect convergence.
+
 ### FIXED (2026-09-01, v0.199.3): an EMISSIVE surface was shaded wrong in three different ways in three different renderers — mode D deleted its direct lighting, mode M (CPU) deleted its reflection, mode M (GPU) deleted its emission
 
 **Reported as** three of six defects in the `gallery_rain` mode-`M` beams render: *"the floor

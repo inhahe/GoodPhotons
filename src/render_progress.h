@@ -33,3 +33,20 @@ struct SppProgress {
     // so the continued samples are decorrelated from the loaded ones. 0 = fresh render.
     long long sampleBase = 0;
 };
+
+// Progress through a phase that has NO pixels yet.
+//
+// SppProgress can only exist once there is a film to hand back, which in mode M is the
+// GATHER — but a showcase mode-M render spends most of its wall clock BEFORE that, in the
+// photon deposit and the map/beam builds. Those phases used to be one long silence: the
+// live window sat on a frozen "tracing photons…" caption for however many minutes the
+// deposit took, which is indistinguishable from a wedged render, and the console said
+// nothing either. StageProgress is the hook that makes them legible.
+//
+// `text` names the phase; `done`/`total` measure progress within it and are both 0 when
+// the phase has no meaningful measure (a BVH build). Reporting is best-effort and purely
+// informational — unlike SppProgress::report there is no return value, because a stage is
+// stopped through the ordinary ft::stopRequested() flag, not by the reporter.
+struct StageProgress {
+    std::function<void(const char* text, long long done, long long total)> report;
+};

@@ -201,6 +201,16 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // area-optimal split and the BVH (BeamMap::buildAuto). That reasoning has no place in a kernel
 // and is shared with the CPU path verbatim rather than reimplemented. After the callback
 // returns, the built map is uploaded once and every camera's gather sees it.
+//
+// `stage` (when non-null) reports the phases that precede the first pixel — chiefly the
+// photon deposit, with a running photon count — so the live window's title bar keeps moving
+// through them instead of freezing on one caption for minutes. It is also what makes the
+// deposit CHUNKED: with no reporter the whole `-n` goes out as a single kernel launch (the
+// historical, bit-identical path), while a reporter splits it into adaptively-sized launches
+// so a count can be read between them. See the deposit loop in render_cuda.cu for why
+// chunking is safe (photon power is absolute, so the normalisation does not depend on the
+// split; the atomic deposit cursor accumulates across launches; and each chunk draws its own
+// seed, with chunk 0 reproducing the single-shot stream exactly).
 struct BeamPass {
     BeamMap*  map    = nullptr;   // receives the deposited (or -loadmap'd) beams, then built
     long long target = 0;         // -beamcount: exact unbiased trim; <= 0 keeps every crossing
@@ -216,7 +226,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const std::function<bool(int, const Film&)>* onFrame = nullptr,
                                             const char* mapLoad = nullptr, const char* mapSave = nullptr,
                                             int heroC = 1, int fgRays = 0, double autoK = 0.0,
-                                            BeamPass* beams = nullptr);
+                                            BeamPass* beams = nullptr,
+                                            const StageProgress* stage = nullptr);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

@@ -88,6 +88,7 @@
 #include "photonmap_io.h" // -savemap / -loadmap, shared with the CPU mode-M path in main.cpp
 #include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
 #include "lighttree.h"    // Conty-Kulla light BVH: the SAME traversal the CPU runs, not a copy
+#include "parallel.h"     // ft::stopRequested — cooperative `-stop` between deposit chunks
                           // (the header is dependency-free and __host__ __device__ for this)
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
@@ -15294,7 +15295,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const SppProgress* prog,
                                             const std::function<bool(int, const Film&)>* onFrame,
                                             const char* mapLoad, const char* mapSave, int heroC,
-                                            int fgRays, double autoK, BeamPass* beams) {
+                                            int fgRays, double autoK, BeamPass* beams,
+                                            const StageProgress* stage) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -15385,6 +15387,34 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                  "the volume will be invisible.\n"); }
     }
 
+    // The deposit trace. Split into launches when — and only when — someone is listening.
+    //
+    // Why splitting is safe. (a) Photon power is ABSOLUTE: genPhoton hands each photon its
+    // own beta and the density estimate normalises by pm.nEmitted, so the kernel's `N`
+    // argument is a loop bound, not a divisor, and 8 launches of N/8 emit exactly the energy
+    // one launch of N does. (b) The deposit cursor is an ATOMIC on the device that we zero
+    // once, here, outside the loop — so successive launches append rather than overwrite.
+    // (c) Each launch takes `seedBase` = the cumulative photon offset, which is 0 for the
+    // first one, so an unsplit deposit is bit-identical to the historical single launch and a
+    // split one merely draws a different (equally valid) realization per chunk. (d) The split
+    // is a pure function of N, so the count/fill rerun above reproduces it deposit for
+    // deposit — which is the invariant the rerun depends on.
+    //
+    // Why splitting at all. A showcase `-n` is billions of photons, i.e. one kernel launch
+    // running for many minutes: nothing can be read back from it, so the window title froze
+    // on "tracing photons…" for most of the render and the console said nothing at all. A
+    // monolithic launch of that length is also exactly what the Windows TDR watchdog exists
+    // to shoot at. Chunks are sized ADAPTIVELY from the measured rate of the previous one
+    // (target ~1 s), because photons-per-second spans orders of magnitude across scenes and
+    // any fixed chunk count would be far too coarse on one and pure launch overhead on
+    // another. The first chunk is a deliberately small probe for the same reason.
+    const bool splitDeposit = (stage && stage->report);
+    // How many photons the last depositLaunch actually EMITTED. Normally N, but a `-stop`
+    // between chunks ends the trace early, and pm.nEmitted normalises the density estimate —
+    // so reporting the full N after a truncated pass would scale the map down by the fraction
+    // never traced and render a darkened image. (Exactly the accounting tracePhotonPass does
+    // with its per-thread `emitted[tid] = done`.)
+    long long depEmitted = N;
     auto depositLaunch = [&](DPhoton* buf, unsigned long long cap, double beamKeep) {
         CUDA_CHECK(cudaMemset(d_depCount, 0, sizeof(unsigned long long)));
         CUDA_CHECK(cudaMemset(d_energy, 0, 5 * sizeof(double)));
@@ -15397,7 +15427,39 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             cs.beamOut = d_beams; cs.beamCount = d_beamCount;
             cs.beamCap = beamCap; cs.beamKeep = beamKeep;
         }
-        launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false, CAM_B, heroC);
+        depEmitted = N;
+        if (!splitDeposit) {
+            launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false,
+                          CAM_B, heroC);
+            return;
+        }
+        stage->report("tracing photons", 0, N);
+        // 1 M is small enough to be a sub-second probe on any card that can run this at all,
+        // and large enough to keep ~262 k threads busy rather than measuring launch latency.
+        long long chunk = (N < (1ll << 20)) ? N : (1ll << 20);
+        for (long long off = 0; off < N; ) {
+            const long long cs2 = (off + chunk <= N) ? chunk : (N - off);
+            const auto t0 = std::chrono::steady_clock::now();
+            launchForward(up, cs, d_energy, cs2, diffraction, (unsigned long long)off,
+                          /*wavefront*/false, CAM_B, heroC);
+            CUDA_CHECK(cudaDeviceSynchronize());   // the launch is async; time the WORK
+            const double sec = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            off += cs2;
+            stage->report("tracing photons", off, N);
+            // Cooperative stop: the deposit is the phase a `-stop` most often lands in, and
+            // before the split there was no seam to honour it at.
+            if (ft::stopRequested()) { depEmitted = off; break; }
+            // Retarget ~1 s of work, but never shrink below the probe (a chunk that keeps
+            // halving turns the deposit into launch overhead) and never grow more than 4x at
+            // a step (one anomalously fast chunk must not produce a 10-minute next one).
+            if (sec > 1e-4) {
+                double want = (double)cs2 / sec;              // photons/s -> photons per 1 s
+                if (want > 4.0 * (double)chunk) want = 4.0 * (double)chunk;
+                chunk = (long long)want;
+                if (chunk < (1ll << 20)) chunk = (1ll << 20);
+            }
+        }
     };
     auto readBeamCount = [&]() -> unsigned long long {
         if (!d_beamCount) return 0;
@@ -15465,6 +15527,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             nBeam = readBeamCount();
         }
     }
+    // What the trace actually emitted, which is N unless a `-stop` cut a chunked deposit
+    // short. Set AFTER the deposit (the optimistic `pm.nEmitted = N` above only pre-fills it
+    // for the paths that never reach here), because the density estimate divides by it.
+    pm.nEmitted = depEmitted;
     if (nDep > 0 && d_photons) {
         // Download + convert in chunks (never a full host-side DPhoton copy). Positions
         // and payloads split into PhotonMap's two parallel arrays (see Photon in
@@ -15526,6 +15592,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     if (d_beams)     cudaFree(d_beams);
     if (d_beamCount) cudaFree(d_beamCount);
 
+    // Downloading tens of millions of deposits and counting-sorting them into cells is tens
+    // of seconds on a showcase `-n` — another silent phase between the deposit's last chunk
+    // and the first gathered pixel, so it names itself too.
+    if (stage && stage->report) stage->report("building photon map", 0, 0);
     buildMap();                             // host counting sort -> cell-contiguous runs
 
     double energy[5] = {0,0,0,0,0};

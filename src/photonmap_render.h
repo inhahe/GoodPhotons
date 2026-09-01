@@ -37,6 +37,9 @@
 #include "color.h"
 #include "geometry.h"
 #include "parallel.h"      // ft::stopRequested — cooperative `-stop` inside the pixel loop
+#include "render_progress.h"   // StageProgress — deposit progress for the live window/title
+#include <atomic>
+#include <chrono>
 
 // ---- Forward photon pass: deposit into the map, no camera splat ---------------------
 // Traces N photons across nThreads, each depositing into a private bank, then
@@ -59,10 +62,14 @@
 // transmission). That is the documented `-beams` trade, now available to mode M.
 // `beamTarget` is a budget on the stored beam count, applied as Russian roulette per beam;
 // <= 0 keeps every crossing.
+// `stage` (optional) reports deposit progress — how many of the N photons have been
+// traced — so the caller can keep the live window's title bar moving through what is
+// otherwise the longest silent phase of a mode-M render. Purely informational.
 inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
                             bool diffraction, PhotonMap& pm, int heroC = hero::kHeroC,
                             uint64_t seedBase = 0, BeamMap* bm = nullptr,
-                            long long beamTarget = 0) {
+                            long long beamTarget = 0,
+                            const StageProgress* stage = nullptr) {
     if (nThreads < 1) nThreads = 1;
     std::vector<PhotonBank> banks(nThreads);
     std::vector<BeamBank>   bbanks(nThreads);
@@ -91,6 +98,12 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     // chroma noise. Same gate as the forward tracers: no media / no GRIN (those stay C=1).
     const bool heroOn = (heroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
 
+    // Published photon count for `stage`. Written by the workers on the SAME 4096-photon
+    // cadence as the stop poll (one relaxed fetch_add per 4096 photons is unmeasurable next
+    // to 4096 path traces) and read by the monitor thread below. Relaxed ordering is right:
+    // nothing is synchronised through it, it only feeds a title bar.
+    std::atomic<long long> tracedTotal{0};
+
     auto worker = [&](int tid) {
         Renderer r; r.diffraction = diffraction; r.photonDeposit = &banks[tid];
         if (bm) r.beamDeposit = &bbanks[tid];
@@ -111,11 +124,15 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
             // microseconds, so a per-iteration atomic load would be measurable in the hottest
             // loop of a mode-M/S build, while 4096 of them still lands the stop in well under
             // a tenth of a second.
-            if ((done & 0xFFF) == 0 && ft::stopRequested()) break;
+            if ((done & 0xFFF) == 0) {
+                if (done) tracedTotal.fetch_add(0x1000, std::memory_order_relaxed);
+                if (ft::stopRequested()) break;
+            }
             seedUnit(rng, seedBase + (uint64_t)i, 0xEB44ACCAB455D165ULL);
             r.tracePhoton(scene, (const Camera*)nullptr, (Film*)nullptr, (Film*)nullptr, rng, e);
             ++done;
         }
+        tracedTotal.fetch_add(done & 0xFFF, std::memory_order_relaxed);   // the tail
         // Count what was ACTUALLY emitted, not what was asked for. pm.nEmitted normalises the
         // density estimate, so reporting the full share after an early break would scale a
         // truncated pass down by the fraction it never traced and darken the image.
@@ -123,7 +140,23 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
+    // The deposit is a join-and-wait, so progress has to be sampled from OUTSIDE it: a
+    // monitor thread polls the published count while the workers run. It is only started
+    // when someone asked for progress, so a headless render spawns nothing extra.
+    std::atomic<bool> monitorStop{false};
+    std::thread monitor;
+    if (stage && stage->report) {
+        monitor = std::thread([&] {
+            while (!monitorStop.load(std::memory_order_relaxed)) {
+                stage->report("tracing photons",
+                              tracedTotal.load(std::memory_order_relaxed), N);
+                for (int i = 0; i < 20 && !monitorStop.load(std::memory_order_relaxed); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
+    }
     for (auto& th : pool) th.join();
+    if (monitor.joinable()) { monitorStop.store(true, std::memory_order_relaxed); monitor.join(); }
 
     size_t total = 0;
     for (auto& b : banks) total += b.size();

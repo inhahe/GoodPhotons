@@ -136,6 +136,7 @@
 #include <set>
 #include <memory>
 #include <atomic>              // -stop: cross-thread flags for the external stop channel
+#include <mutex>               // guards the live-window title (the deposit monitor re-titles)
 #include <filesystem>          // -review: scan a directory of rendered frames
 
 // Baked in by CMake from the repo-root VERSION file (see CMakeLists.txt). The
@@ -12934,10 +12935,21 @@ static std::string liveTitle(const std::string& rest) {
     if (!g_windowBackend.empty()) t += "  \xE2\x80\x94  " + g_windowBackend;
     return t;
 }
+// Serialises the title state. Almost every caller is the main thread, but tracePhotonPass's
+// deposit monitor is NOT — the whole point of that thread is to report progress while the
+// main thread is blocked joining the photon workers — and g_windowRest is a std::string that
+// would otherwise be written from two threads at once. SetWindowTextW itself is already
+// cross-thread safe (it marshals a WM_SETTEXT to the window's own thread).
+static std::mutex g_titleMu;
 static void setLiveTitle(const std::string& rest) {
+    std::lock_guard<std::mutex> lk(g_titleMu);
     g_windowRest = rest;
     if (g_liveWin && !g_liveWin->closed()) g_liveWin->setTitle(liveTitle(rest));
 }
+// The thread that owns g_liveWin's lifetime. Re-titling from another thread is fine (above);
+// CREATING or destroying the unique_ptr from one is not, so liveWindowPlaceholder refuses to
+// do that off-thread and just re-titles instead.
+static const std::thread::id g_mainThreadId = std::this_thread::get_id();
 // Flip the title over to "finished". `why` is the stop cause in the user's own terms
 // ("noise target met", "time budget reached", ...) — the point of the feature is that the
 // window says *which* budget ended the render, not merely that something ended it.
@@ -13036,7 +13048,7 @@ static bool g_windowPainted = false;
 // frame should land the instant it exists rather than waiting out a window interval.
 static void liveWindowPlaceholder(int w, int h, const std::string& stage) {
     if (!g_showWindow || w <= 0 || h <= 0) return;
-    if (!g_liveWin) {
+    if (!g_liveWin && std::this_thread::get_id() == g_mainThreadId) {
         // Near-black rather than pure black so an empty window is visibly a window that is
         // waiting, not a dead rectangle or a hole punched in the desktop.
         std::vector<uint8_t> placeholder((size_t)w * h * 3);
@@ -13094,6 +13106,104 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
                      ++nPaint, N, cost * 1e3, firstPaint ? ", cold — not budgeted" : "");
         std::fflush(stderr);
     }
+}
+
+// --- mode M progress: the phases before the first pixel, and the gather ---------
+//
+// Every other driver assembles a progress line ("[time] 58.3s / 60s, 4096 spp, ~1.56%
+// noise") and puts it on the title bar via liveWindowUpdate's `status` argument. Mode M's
+// shared photon-map driver was the one that did not: the GPU branch passed NO status at
+// all, so the title read "ftrace live preview — mode M (photon map) — <device>" and never
+// changed, and the CPU branch passed only "frame k/n". So the one mode whose renders run
+// longest was also the one whose window could not answer "how far along is it?" or "is it
+// still going?". These two helpers close that.
+
+// Compact count: 4000000000 -> "4.00G". Photon counts in mode M are routinely billions, and
+// a 10-digit run of zeros in a title bar is unreadable at a glance.
+static std::string humanCount(double n) {
+    char b[32];
+    if (n >= 1e9)      std::snprintf(b, sizeof b, "%.2fG", n / 1e9);
+    else if (n >= 1e6) std::snprintf(b, sizeof b, "%.1fM", n / 1e6);
+    else if (n >= 1e3) std::snprintf(b, sizeof b, "%.1fk", n / 1e3);
+    else               std::snprintf(b, sizeof b, "%.0f",  n);
+    return b;
+}
+
+// The graininess estimate mode M reports everywhere else (the forward driver at ~14899):
+// Monte-Carlo relative error at an illuminated pixel falls as 1/sqrt(samples), and the
+// per-pixel hit count IS that sample count, so 100/sqrt(mean hits over LIT pixels) is an
+// honest ballpark. Unlit pixels are excluded — averaging them in would report a black
+// border as perfect convergence.
+static double filmNoisePct(const Film& f) {
+    double sum = 0.0; long long lit = 0;
+    for (double h : f.hits) if (h > 0.0) { sum += h; ++lit; }
+    if (!lit) return 0.0;
+    const double mean = sum / (double)lit;
+    return mean > 0.0 ? 100.0 / std::sqrt(mean) : 0.0;
+}
+
+// Progress text for one camera's mode-M gather. Mode M has no time or noise BUDGET to
+// count down against (the work is fixed: trace N photons, then gather `spp` samples), so
+// the line reports position rather than remaining budget — but it carries all three of the
+// quantities the user asked for: photons, elapsed time, and clarity.
+static std::string pmGatherStatus(const Film& f, long long sppDone, long long sppTotal,
+                                  size_t frame, size_t nFrames, long long photons,
+                                  double elapsed) {
+    std::string s;
+    if (nFrames > 1) {
+        char fb[48];
+        std::snprintf(fb, sizeof fb, "frame %zu/%zu  \xE2\x80\x94  ", frame, nFrames);
+        s = fb;
+    }
+    char b[220];
+    std::snprintf(b, sizeof b, "[gather] %lld / %lld spp (%.0f%%), %s photons, %.1fs, ~%.2f%% noise",
+                  sppDone, sppTotal,
+                  sppTotal > 0 ? 100.0 * (double)sppDone / (double)sppTotal : 0.0,
+                  humanCount((double)photons).c_str(), elapsed, filmNoisePct(f));
+    return s + b;
+}
+
+// Wire a renderer's StageProgress (render_progress.h) to the title bar. These are the
+// phases BEFORE any pixel exists — the photon deposit and the map builds — which on a
+// showcase mode-M render are most of the wall clock and used to be a single frozen caption.
+//
+// Two cadences, for the same reason liveWindowUpdate and the -interval save have two: the
+// title is cheap and wants to look alive (window cadence), while stdout is as often a piped
+// log as a terminal and a 5 Hz progress line would be thousands of junk lines in a build
+// log (30 s).
+static StageProgress makeStageProgress(int w, int h) {
+    using clk = std::chrono::steady_clock;
+    struct Ticker { clk::time_point t0 = clk::now(), lastWin{}, lastLog{}; };
+    auto tk = std::make_shared<Ticker>();
+    StageProgress sp;
+    sp.report = [tk, w, h](const char* text, long long done, long long total) {
+        const auto now = clk::now();
+        const double elapsed = std::chrono::duration<double>(now - tk->t0).count();
+        const bool wantWin = tk->lastWin.time_since_epoch().count() == 0 ||
+                             std::chrono::duration<double>(now - tk->lastWin).count() >= 0.25;
+        const bool wantLog = total > 0 && done > 0 &&
+                             (tk->lastLog.time_since_epoch().count() == 0 ||
+                              std::chrono::duration<double>(now - tk->lastLog).count() >= 30.0);
+        if (!wantWin && !wantLog) return;
+        char b[220];
+        if (total > 0) {
+            // Rate and ETA are the whole point of a progress line on a phase that can run
+            // for many minutes: "1.20G / 4.00G" alone still cannot answer "how long more?".
+            const double rate = elapsed > 1e-3 ? (double)done / elapsed : 0.0;
+            const double eta  = rate > 0.0 ? (double)(total - done) / rate : 0.0;
+            std::snprintf(b, sizeof b,
+                          "%s \xE2\x80\x94 %s / %s (%.0f%%), %.0fs, %s/s, ~%.0fs left",
+                          text, humanCount((double)done).c_str(),
+                          humanCount((double)total).c_str(),
+                          100.0 * (double)done / (double)total, elapsed,
+                          humanCount(rate).c_str(), eta);
+        } else {
+            std::snprintf(b, sizeof b, "%s\xE2\x80\xA6 %.0fs", text, elapsed);
+        }
+        if (wantWin) { liveWindowPlaceholder(w, h, b); tk->lastWin = now; }
+        if (wantLog) { std::printf("[camera] %s\n", b); std::fflush(stdout); tk->lastLog = now; }
+    };
+    return sp;
 }
 
 // --- Resumable-render checkpoint (.ftbuf sidecar) -----------------------------
@@ -14571,16 +14681,23 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         PhotonMap pm;
         BeamMap bmap;
         auto tp0 = std::chrono::steady_clock::now();
+        // The deposit and the builds run before a single pixel exists, so the sample-driven
+        // progress the gather reports below cannot cover them. StageProgress does.
+        StageProgress stageProg = makeStageProgress(res, resY);
+        liveWindowPlaceholder(res, resY, "tracing photons\xE2\x80\xA6");
         tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
-                        wantBeams ? &bmap : nullptr, g_beamTarget);
+                        wantBeams ? &bmap : nullptr, g_beamTarget, &stageProg);
+        liveWindowPlaceholder(res, resY, "building photon map\xE2\x80\xA6");
         radius = buildPhotonMap(pm, radius, "mode M:");
         // One camera, so the BVH build is amortised over exactly this frame's samples. A
         // progressive budget (-time/-noise/-forever) has no spp up front; assume a modest
         // number rather than 0, since 0 would mean "build is free" and over-split for a frame
         // that might stop after one pass.
-        if (wantBeams)
+        if (wantBeams) {
+            liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
             buildBeamMap(bmap, "mode M:",
                          (double)res * (double)resY * (double)(spp > 0 ? spp : 16));
+        }
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("mode M: deposited %zu photons from %lld emitted in %.1fs; "
                     "grid %dx%dx%d. Gathering camera pass at %dx%d ...\n",
@@ -20322,18 +20439,39 @@ static int run(int argc, char** argv) {
                             cudaDeviceName(), cams.size(), N, radius, lightLabel,
                             g_pmFinalGather > 0 ? " [final gather]" : "");
                 EnergyReport e;
+                const int titleWg = toRender[idx[0]].res, titleHg = toRender[idx[0]].resY;
                 // Drive the live window (per the always-`-window` rule): the shared gather
                 // reports each frame's converging film here so the window shows it build up
                 // and, on a flythrough, flips through the frames as they complete. Only armed
                 // when a window is open so a headless batch pays no extra device->host copies.
+                //
+                // The status text used to be omitted here, which is why mode M's title bar
+                // alone showed no progress: liveWindowUpdate falls back to the bare mode name
+                // when `status` is null, so the caption never changed for the whole render.
+                // `gatherFrame` counts completed frames (the device gather reports a film and
+                // an spp, not which camera they belong to) and writeFrame below advances it.
                 SppProgress liveProg;
+                auto gStart = std::chrono::steady_clock::now();
+                size_t gatherFrame = 0;
                 if (g_showWindow) {
                     const double liveExp = toRender[idx[0]].exposure;
                     liveProg.report = [&, liveExp](const Film& f, long long sppDone, bool) -> bool {
-                        liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute);
+                        const double el = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - gStart).count();
+                        liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute,
+                            pmGatherStatus(f, sppDone, spp, gatherFrame + 1, cams.size(),
+                                           N, el).c_str());
                         return g_stopRequested != 0;   // window closed -> stop after this chunk
                     };
                 }
+                // The phases before the first pixel — the photon deposit and the map build.
+                // Passed UNCONDITIONALLY, not only when a window is open, for two reasons:
+                // its periodic stdout line is worth as much to a headless batch as to a
+                // watched render (liveWindowPlaceholder inside it is already a no-op with no
+                // window), and passing it is also what CHUNKS the device deposit — which
+                // changes the RNG realization, so gating it on `-window` would make the same
+                // command produce a different image depending on whether anyone was looking.
+                StageProgress stageProg = makeStageProgress(titleWg, titleHg);
                 // Write each frame to disk the instant its gather completes (crash-safe
                 // incremental output, same as the CPU mode-M path below): a flythrough of
                 // hundreds of frames can run for many minutes, and batching every write to
@@ -20350,6 +20488,7 @@ static int run(int argc, char** argv) {
                         double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
                         if (!writeFilm(op.c_str(), f, (double)spp, rc.exposure, false, anchor, scene.absolute))
                             sharedWriteFail = true;
+                        gatherFrame = (size_t)k + 1;   // advances the title's "frame k/n"
                         return g_stopRequested != 0;   // window closed / Ctrl-C -> stop after this frame
                     };
                 // The photon-beam volume pass. THE work term, and the case it exists for:
@@ -20383,7 +20522,7 @@ static int run(int argc, char** argv) {
                                           g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC,
                                           g_pmFinalGather,
                                           g_pmAutoRadius ? g_pmAutoCount : 0.0,
-                                          wantBeams ? &beamPass : nullptr);
+                                          wantBeams ? &beamPass : nullptr, &stageProg);
                 if (wantBeams && beamPass.loadedMissing)
                     std::fprintf(stderr,
                         "[loadmap] warning: %s has no beam data (saved without -beams, or its\n"
@@ -20394,6 +20533,11 @@ static int run(int argc, char** argv) {
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,
                                 (e.absorbed + e.sensor + e.escaped + e.residual) / e.emitted);
+                // Mode M's budget is fixed work, so there is no time/noise target to name —
+                // but the title bar still has to say WHY it stopped, and without this the
+                // shared path fell through to main()'s generic "render complete" even after a
+                // window close or a `-stop`.
+                noteFinishReason(g_stopRequested ? "stopped early" : "all frames gathered");
                 return;
             }
         }
@@ -20440,10 +20584,13 @@ static int run(int argc, char** argv) {
         // from a wedged one. `liveWindowPlaceholder` re-titles an existing window and creates
         // one only if the meter above did not.
         const int titleW = toRender[idx[0]].res, titleH = toRender[idx[0]].resY;
+        StageProgress stageProg = makeStageProgress(titleW, titleH);
         if (!mapLoaded) {
             liveWindowPlaceholder(titleW, titleH, "tracing photons\xE2\x80\xA6");
+            // ... and, since 0.199.4, with a photon COUNT and an ETA in it rather than a
+            // caption that names the phase and then never moves again.
             tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
-                            wantBeams ? &bmap : nullptr, g_beamTarget);
+                            wantBeams ? &bmap : nullptr, g_beamTarget, &stageProg);
         }
         // Written BEFORE the builds, so the file holds the raw trace and one cache can later
         // be re-gathered at any -pmradius / -beamk.
@@ -20497,16 +20644,15 @@ static int run(int argc, char** argv) {
             // the split into chunks cannot change the realization, and cpuSppChunks degrades
             // to exactly `renderOne(spp, 0)` when no progress hook is armed (headless runs are
             // untouched).
-            // `frameLabel` is declared in the SAME scope as liveProg, not inside the `if`:
-            // the lambda outlives that block (it runs inside cpuSppChunks below), so a buffer
-            // scoped to the `if` would be a dangling reference by the time it is read.
             SppProgress liveProg;
-            char frameLabel[64];
-            std::snprintf(frameLabel, sizeof frameLabel, "frame %zu/%zu", k + 1, idx.size());
+            const auto gStart = std::chrono::steady_clock::now();
             if (g_showWindow) {
                 const double liveExp = rc.exposure;
                 liveProg.report = [&, liveExp](const Film& pf, long long sppDone, bool) -> bool {
-                    liveWindowUpdate(pf, (double)sppDone, liveExp, scene.absolute, frameLabel);
+                    const double el = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - gStart).count();
+                    liveWindowUpdate(pf, (double)sppDone, liveExp, scene.absolute,
+                        pmGatherStatus(pf, sppDone, spp, k + 1, idx.size(), N, el).c_str());
                     return g_stopRequested != 0;   // window closed / -stop -> stop after this chunk
                 };
             }
@@ -20524,6 +20670,7 @@ static int run(int argc, char** argv) {
             if (!writeFilm(op.c_str(), f, (double)spp, rc.exposure, false, anchor, scene.absolute))
                 sharedWriteFail = true;
         }
+        noteFinishReason(g_stopRequested ? "stopped early" : "all frames gathered");
     };
     runSharedPhotonMap(groupM);
 
