@@ -219,13 +219,23 @@
 #     -n 200M -spp 24 -beamk 256 -denoise     speckle 3.61
 #
 # Read that as three separate knobs, because they fix different artifacts:
-#   * `-n` fixes the STREAKS. A gather point sees ~`-beamk` beams; with too few beams stored
-#     the same long chords are re-gathered by whole runs of neighbouring pixels, so the
-#     variance is spatially CORRELATED and shows as lines rather than grain. More photons =
-#     more, shorter, independent chords. It is one-time cost (the forward pass is shared by
-#     every frame), which makes it by far the best value here.
-#   * `-beamk` fixes the volumetric GRAIN (32 -> 256 nearly halves it). This one is per-frame
-#     and LINEAR, so it is also the main thing you are paying for.
+#   * `-n` fixes the STREAKS. A gather point sees a number of beams set by the kernel radius;
+#     with too few beams stored the same long chords are re-gathered by whole runs of
+#     neighbouring pixels, so the variance is spatially CORRELATED and shows as lines rather
+#     than grain. More photons = more, shorter, independent chords. It is one-time cost (the
+#     forward pass is shared by every frame), which makes it by far the best value here.
+#   * `-beamk` USED to fix the volumetric GRAIN, and the 32 -> 256 row above is why the
+#     showcase command still carries it. SINCE 0.201.0 IT NO LONGER DOES ANYTHING HERE, and
+#     that is an improvement, not a loss. The old rule solved the kernel radius for a target
+#     gathered count, which made the radius shrink as `-n` grew -- so grain had to be bought
+#     per-frame, linearly, with `-beamk`. The radius now comes from each medium's MEASURED
+#     mean free path (`-beamblur`, default 0.01), and on this scene that is 1.29 m for the
+#     cloud and 1.73 m for the rain, at which the probe already gathers ~1730 beams. A
+#     `-beamk` FLOOR of 256 is far below that and never binds. The grain the flag used to buy
+#     is now free, and `-n` reduces it for real (-21% for 4x the photons, against -6.8% under
+#     the old rule). Leaving `-beamk 256` in the command is harmless; dropping it changes
+#     nothing. See known-issues.md, "the gallery_rain cloud rendered as full-saturation RGB
+#     speckle".
 #   * `-denoise` fixes the residual chroma speckle for ~1% of frame time -- it is the single
 #     best quality-per-second flag in the list. `-fireflies 3` measured the same (4.48 vs
 #     4.46) and additionally clamps, so prefer plain -denoise unless you see fireflies.
@@ -235,7 +245,11 @@
 #     frame (floor crop 6.56 vs 6.41 speckle -- i.e. that is texture, not noise).
 #
 # The showcase command, verified running:
-#   ftrace -in scenes/gallery_rain.ftsl -camera fly -mode M -device gpu -beams #          -n 200000000 -pmcount 45 -spp 24 -beamk 256 #          -beamcount 8000000 -beamsplitmax 24000000 -denoise #          -r 960 540 -window-min -keepwindow -interval 15 #          -o png/gallery_rain_showcase.png
+#   ftrace -in scenes/gallery_rain.ftsl -camera fly -mode M -device gpu -beams \
+#          -n 200000000 -pmcount 45 -spp 24 \
+#          -beamcount 8000000 -beamsplitmax 24000000 -denoise \
+#          -r 960 540 -window-min -keepwindow -interval 15 \
+#          -o png/gallery_rain_showcase.png
 # MEASURED: 153 s/frame => ~25.5 h for the 600-frame loop (against ~50 min for the preview
 # budget above, and ~7.6 h for mode D at -spp 140 -- D is still the reference, this is the
 # "M can look finished too" budget). Scale it by hand: per-frame cost is LINEAR in -spp, in
@@ -2353,11 +2367,48 @@ medium {
     bounds { min 6.5 0 0.6   max 9.5 3.2 3.4 }
     phase rainbow { droplet_um 300   dispersion 0.577 }
     # A soft elliptical shaft, densest at the top where it leaves the cloud and thinning as it
-    # falls, streaked by noise that is stretched ~6x in y so the structure reads as FALLING
+    # falls, streaked by noise that is stretched ~5x in y so the structure reads as FALLING
     # rather than as isotropic lumps. The radial term keeps the box's side faces from showing;
     # the trailing smoothstep does the same job for the top face.
+    #
+    # THE STRETCH IS A RATIO, AND A RATIO IS NOT ENOUGH — THE ABSOLUTE SCALE HAS TO FIT THE
+    # SHAFT. Through 0.201.0 this read `noise(1.2*x, 0.20*y, 1.2*z)`, whose 6:1 ratio was the
+    # right idea at the wrong size, and it made the rain render as VERTICAL STRIPES. `noise` is
+    # unit-lattice value noise (src/pattern.h, patValueNoise), so a frequency of f means a cell
+    # 1/f metres across. y at 0.20 is a cell FIVE METRES tall — and the shaft is 3.2 m. The
+    # field therefore could not complete even one lobe vertically: scraps/rainfield.py evaluates
+    # this expression outside the renderer and counts the lobes (sign changes of the derivative)
+    # along each axis over the shaft:
+    #
+    #     old  1.2 / 0.20 / 1.2      vertical lobes 0.00      lateral lobes  2.54
+    #     new  see below             vertical lobes 4.08      lateral lobes 20.44
+    #
+    # ZERO vertical lobes is not "very stretched", it is EXTRUDED: the lateral pattern is a
+    # fixed 2-D image swept the full height of the shaft, with no top and no bottom anywhere
+    # inside it, and at 0.83 m laterally that is about two-and-a-half metre-wide bands. That is
+    # the reported "rain appears vertically striated", and it is in the scene's density field
+    # rather than in the beam estimator — the measurement above never runs the renderer.
+    #
+    # The replacement picks both frequencies from a length, not from a ratio:
+    #   * GUSTS, 0.50 m across x 2.00 m tall (freq 2.0 / 0.50): the large-scale clumping, at a
+    #     size that still fits 1.6 lobes into the 3.2 m shaft, so gusts have a bottom edge.
+    #   * STREAKS, 0.111 m across x 0.556 m tall (freq 9.0 / 1.80): the visible fall texture.
+    #     0.111 m is ~19 px at the still camera's 8.8 mm/px, so it resolves without aliasing,
+    #     and the majorant grid's cells here are 3.2/128 = 25 mm, four to a streak cell, so
+    #     src/majorant.h still brackets it tightly and ratio tracking does not get slower.
+    # Both octaves are ~5:1 vertically elongated, which is the anisotropy the old expression was
+    # reaching for; the weights sum to 1 so the mean of the noise term is unchanged by
+    # construction and the optical depth this medium was tuned for is preserved.
+    #
+    # One real change comes with it. Over so few cells the OLD field's realised mean was an
+    # accident of the lattice, not 0.5: measured over the shaft box it is 0.5727, 14.5% high,
+    # because barely seven independent hash values covered the whole medium. The new field
+    # measures 0.5004. So the streak factor falls 0.9795 -> 0.9253 and tau drops ~5.5% — the
+    # rain is very slightly thinner than before, and the ~0.7 the sigma_t above is argued from
+    # is now the number this expression actually delivers rather than one it overshot.
     density "saturate( (1 - smoothstep(0.45, 1.05, sqrt( ((x-8.0)/1.30)^2 + ((z-2.0)/1.20)^2 )))
-                     * (0.55 + 0.75*noise(1.2*x, 0.20*y, 1.2*z))
+                     * (0.55 + 0.75*( 0.6*noise(2.0*x, 0.50*y, 2.0*z)
+                                    + 0.4*noise(9.0*x, 1.80*y, 9.0*z) ))
                      * mix(0.55, 1.0, saturate(y/2.4))
                      * (1 - smoothstep(2.55, 3.15, y)) )"
     density_max 1.30

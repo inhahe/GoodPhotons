@@ -93,6 +93,81 @@ would cut chroma noise further at no extra beam cost, since these media are achr
 `hero::gSplit` and `tracePhotonHeroLoop` exist but the beam-deposit path does not participate.
 Logged as tech debt below rather than as a bug — the reported defect is fixed.
 
+### PARTLY FIXED (2026-09-01, v0.201.1): "the rain appears vertically striated" — TWO separate causes, one in the scene and one in the beam estimator
+
+**Reported as** the fifth of six defects in the `gallery_rain` mode-`M` beams render: *"the rain
+appears vertically striated."*
+
+The two causes both produce near-vertical lines **in the still camera**, which is why they read as
+one defect. They separate completely in a camera chosen to tell them apart, and only one of them
+is the scene's fault.
+
+**How they were separated.** `scraps/make_rain_iso.py` generates a minimal scene — one sun, the
+rain medium verbatim, a black ground plane, nothing else — viewed along **+x**. In that camera:
+
+* world **+y** (the axis the density bug extrudes along) projects to **90°**, exactly vertical;
+* the **sun's direction of travel** (`dir -0.1470 0.7071 0.6916`, so travel `(0.147, -0.707,
+  -0.692)`), which is the axis every single-scattered beam chord lies on, projects to **~45°**.
+
+In the scene's own still camera those two are 90° and ~75° — 15° apart, indistinguishable by eye.
+At 45° apart they are unmistakable. (The isolated scene needs the ground plane: `light sun`'s
+power is `irradiance · π · R_scene²`, so with no geometry at all `R_scene ≈ 0`, the sun delivers
+nothing and the frame renders pure black even at +16 EV. That cost a confusing half hour.)
+
+**Cause 1 — the density field was EXTRUDED, not stretched (scene bug, FIXED).** The shaft's
+density read `noise(1.2*x, 0.20*y, 1.2*z)`, described in the scene as "stretched ~6x in y so the
+structure reads as FALLING". The 6:1 ratio is right; the absolute scale is not. `noise` is
+unit-lattice value noise (`patValueNoise`, `src/pattern.h`), so frequency `f` means a cell `1/f`
+metres across — and `0.20` is a cell **five metres tall**, against a shaft that is **3.2 m** tall.
+The field cannot complete even one lobe vertically. `scraps/rainfield.py` evaluates the
+expression outside the renderer and counts lobes (sign changes of the derivative) along each axis:
+
+| density expression | vertical lobes | lateral lobes | realised noise mean |
+|---|---|---|---|
+| old `1.2 / 0.20 / 1.2` | **0.00** | 2.54 | 0.5727 |
+| new (two octaves, below) | 4.08 | 20.44 | 0.5004 |
+
+Zero vertical lobes is not "very stretched", it is extruded: a fixed 2-D pattern swept the full
+height, ~2.5 metre-wide bands with no top and no bottom anywhere inside the medium. Replaced with
+two octaves picked from lengths rather than from a ratio — gusts 0.50 × 2.00 m (`2.0 / 0.50`) and
+streaks 0.111 × 0.556 m (`9.0 / 1.80`), weights 0.6/0.4 summing to 1 so the mean is unchanged by
+construction. Both are ~5:1 vertically elongated, which is the anisotropy the old line wanted.
+Note the old field's *realised* mean was 0.5727 rather than 0.5 — with barely seven independent
+hash values covering the medium, its optical depth was an accident of the lattice; the new field
+measures 0.5004 and tau drops ~5.5%, visible as the isolated render's auto-exposure moving
+14.6 → 15.9.
+
+**Cause 2 — beam-chord streaks along the sun direction (estimator, MITIGATED not fixed).** With a
+delta light every single-scattered beam is *exactly* parallel to the sun, so a beam is a long
+straight line and whole runs of neighbouring pixels re-gather the same chords: the variance is
+spatially correlated and prints as lines rather than as grain. The scene header already documented
+this as an `-n`-bound artifact. Measured in the isolation camera, high-passed, rms normalised by
+mean luminance, with signed opponent chroma (a chroma *magnitude* sits near 0.5 relative spread no
+matter how many samples you take, so it cannot show convergence):
+
+| run | luma | red-green | yellow-blue | dominant direction |
+|---|---|---|---|---|
+| pre-0.201.0 radius (`-beamradius 0.0002825`) | 0.126 | 0.343 | 0.255 | 132° |
+| v0.201.0 mfp radius (0.01893 m, 423 gathered) | 0.057 | 0.142 | 0.112 | 121–138° |
+| + the new density field | 0.055 | 0.137 | 0.109 | unchanged |
+| + 27x the beams (1245 gathered) | 0.037 | 0.090 | 0.069 | 135° |
+
+Three things fall out of that table. **The direction is ~130–138°, i.e. the ~45° sun-chord
+diagonal, never 90°** — so what dominates the *appearance* is cause 2, not cause 1; in the still
+camera the same chords project to ~75°, which is what "vertically striated" was describing.
+**v0.201.0's per-medium mfp radius already cut it 2.2x in luma and 2.4x in chroma** for free.
+**The density fix moves the streaks by ~3%**, confirming the two causes are orthogonal — cause 1
+is still a real bug worth fixing, it just was not the thing being looked at.
+
+**What is left.** Chroma streaks measure ~2.5x luma streaks in every row, and that ratio does not
+improve with beams or radius. That is the monochromatic-beam-deposit tech debt logged immediately
+below — each beam carries one wavelength, so it lays a *saturated* line down its whole length.
+That entry is the remaining fix for cause 2.
+
+Repro: `python scraps/make_rain_iso.py`, then render `scraps/_rain_iso_{old,new}.ftsl` with
+`-camera iso -mode M -device gpu -beams`; `python scraps/rainfield.py old|new` for the field
+measurement, which needs no renderer at all.
+
 ### TECH DEBT (2026-09-01, v0.201.0): a stored photon beam is MONOCHROMATIC, so `-beams` pays full chroma variance even in an achromatic medium
 
 **Where.** `src/photonbeams.h` — `PhotonBeam::lambda` is one wavelength, and `BeamMap::cie[i]`
@@ -123,9 +198,26 @@ medium they cannot, and the deposit would have to fall back to the hero waveleng
 implementation needs that branch, keyed off whatever the medium reports for wavelength
 dependence.
 
-**Not urgent.** The reported defect is fixed and the invariant (`tools/check_beams_ms.py`) is
-unmoved. This is the next factor of noise reduction available in `-beams`, not a correctness
-problem.
+**Measured cost, added 2026-09-01 while diagnosing the rain striation above.** In the isolated
+rain scene, high-passed and normalised by mean luminance, **chroma streaking is consistently
+~2.5x luminance streaking, and that ratio does not move** — not with a 67x larger kernel radius,
+not with 27x the beams:
+
+| run | luma | red-green | ratio |
+|---|---|---|---|
+| pre-0.201.0 radius | 0.126 | 0.343 | 2.7 |
+| v0.201.0 mfp radius | 0.057 | 0.142 | 2.5 |
+| + 27x the beams | 0.037 | 0.090 | 2.4 |
+
+A ratio that is invariant under both knobs is the signature of a variance source neither knob
+addresses. Luma converges with the number of *beams*; chroma converges with the number of
+distinct *wavelengths*, and that is pinned at one per beam. So this is now the single largest
+remaining artifact in a `-beams` render of a scattering medium, and the last unfixed part of the
+`gallery_rain` "vertically striated" report.
+
+**Not urgent in the sense that it is not a correctness problem.** The reported defects are fixed
+and the invariant (`tools/check_beams_ms.py`) is unmoved. But it is the next real factor of noise
+reduction available in `-beams`.
 
 ### FIXED (2026-09-01, v0.199.7): mode `M` had no caustic map, so caustics were gathered at the diffuse radius and washed out
 
