@@ -4259,7 +4259,23 @@ render. Closing that means teaching the shared device path to gather in spp chun
       the **spline** (not the chord polyline, which cannot see the curve bow outside its own
       control points on a turn) at 2 cm against every cage, cap and hero piece. Until 0.155.0
       the loader was reading those stops as control-point-index fractions anyway, behind the
-      scene's back; see the `density_at` entry below.
+      scene's back; see the `density_at` entry below. (d) **Which waypoint is written first is
+      a free choice about the film, not about the path** — a `closed` centripetal Catmull-Rom
+      is invariant under a cyclic rotation of its control points, so rotating the list moves
+      only where frame 0 falls. gallery_rain's loop originally opened one metre off the gold
+      gyroid's clip sphere pitched 52° down into it — an extreme close-up of a lattice,
+      mid-dive, with nothing establishing where any of it was — so the two closure-arc points
+      were moved to the front (2026-09-01). Frame 0 now sits at the loop's furthest-back,
+      highest-looking-in point aimed down the centre line, within 5° of the still camera's own
+      framing, and the dive starts at frame 18. **The catch, and the reason this is worth
+      recording:** `density_at` stops name positions *on the curve*, so a phase rotation is
+      correct only if every stop shifts by the same arc-length delta (here +0.0555) — leaving
+      them put would slide each dwell 1.33 m off its beat and start the creature pass inside
+      the gyroid channel's exit. `tools/flyphase.py` does both halves and, unlike
+      `scraps/_flyplan.py`, parses the scene instead of keeping its own copy of the control
+      points, so it cannot drift out of step with an edited curve. Verified as a pure phase
+      change by sampling both curves at 4000 arc positions: **max deviation 7.3e-11 m**, with
+      identical spline length (23.872145 m) and identical `Cmax`.
     - **`density_at`'s `t` is normalized ARC LENGTH, and until 0.155.0 the loader read it as a
       normalized control-point INDEX** (`src/ftsl.h`, the camera-curve sampler). Every scene,
       every comment and both docs described it as a position along the curve; the code

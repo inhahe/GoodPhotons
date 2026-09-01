@@ -214,15 +214,18 @@
 # anchor: the meter pre-pass meters the selector's frame alone, once, and all 600 reuse it.
 #
 # MEASURED per-frame rate (same run as above, 960x540), and note the 4x SPREAD -- a flat
-# -time gives very different quality at different points on the loop:
-#     fly000 (inside the gyroid channel)  0.63 s/spp   <- worst; glass on all sides
-#     fly137 (the creature coat pass)     0.33 s/spp
-#     fly500                              0.18 s/spp
-#     fly300 (open hall)                  0.16 s/spp   <- best, 4x cheaper than fly000
+# -time gives very different quality at different points on the loop. Frame numbers are
+# POST-ROTATION (see WHERE THE LOOP STARTS); the measurements were taken before it, so each
+# is the old index + 18:
+#     fly018 (inside the gyroid channel)  0.63 s/spp   <- worst; glass on all sides
+#     fly155 (the creature coat pass)     0.33 s/spp
+#     fly518                              0.18 s/spp
+#     fly318 (open hall)                  0.16 s/spp   <- best, 4x cheaper than fly018
 # Mean 0.325 s/spp, so `-spp 140` is ~7.6 h for the loop at a uniform 8.5% (= 100/sqrt(140)),
-# costing 88 s on fly000 and 22 s on fly300. Matching the still's 2.9% would need ~1200
-# spp/frame = 65 h. Check one frame first -- and check `-camera fly000`, the WORST frame, not
-# a pretty one, rather than discovering at frame 300 that the tunnel is a sparkling mess.
+# costing 88 s on fly018 and 22 s on fly318. Matching the still's 2.9% would need ~1200
+# spp/frame = 65 h. Check one frame first -- and check `-camera fly018`, the WORST frame, not
+# a pretty one, rather than discovering at frame 318 that the tunnel is a sparkling mess.
+# fly000 is now the cheap establishing shot, so it is the one frame NOT worth checking.
 #
 # There is also a fixed ~0.8 s per frame inside the render call itself: renderBdptCuda()
 # re-bakes and re-uploads the whole scene on EVERY call (render_cuda.cu ~14095), because mode
@@ -2391,15 +2394,36 @@ prefer {
 # gallery_settled flies -- there is nothing left to clip a wing on, and the pieces are far
 # enough apart that the camera has to actually travel between them instead of pivoting.
 #
-# THE FIVE PASSES, and why each waypoint is the number it is:
+# WHERE THE LOOP STARTS, and why it is not where the passes start. A closed centripetal
+# Catmull-Rom is invariant under a CYCLIC ROTATION of its control points -- the curve is the
+# same curve, only the parameter origin moves -- so which waypoint is written first is a
+# free choice about the FILM, not about the path. It used to be (5.00, 2.10, 7.35), which
+# put frame 0 one metre off the gold gyroid's clip sphere and pitched 52 deg DOWNWARD into
+# it: the loop opened on an extreme close-up of a lattice, mid-dive, with no shot
+# establishing where any of it was. The two closure-arc points now lead instead, so frame 0
+# sits at (5.32, 2.28, 8.55) -- the furthest-back (z 8.55) and highest-looking-in point on
+# the whole loop -- aimed -z down the centre line at 7.5 deg of downward pitch, which is
+# within 5 deg of the still camera's own hero framing. The hall, both gyroids, the bottle,
+# the ring and the cloud are all in that first frame; the dive into the channel then starts
+# at frame 18 instead of frame 0.
 #
-# 1. GOLD GYROID (t 0.048..0.114). Points 4..10 are gallery_settled's OWN validated threaded
+# Nothing about the geometry moved: same 23.872 m of spline, same Cmax, same clearances,
+# same order of passes. What DID have to move is every `density_at` stop, by the same
+# +0.0555 of arc length -- see the stops themselves. `tools/flyphase.py` does the whole
+# rotation (it parses this block rather than keeping its own copy of the points) and
+# `--rotate <idx>` prints the shifted stop list. It lives in tools/, not scraps/,
+# because the scene now depends on it to stay self-describing.
+#
+# THE FIVE PASSES, and why each waypoint is the number it is. The `t` values are ARC-LENGTH
+# fractions in the CURRENT (post-rotation) parameterization:
+#
+# 1. GOLD GYROID (t 0.104..0.170). Points 6..12 are gallery_settled's OWN validated threaded
 #    channel points, shifted +1.25 in z and nothing else -- which is exactly the rigid
 #    translation this scene's gold gyroid got, so the empty-air tunnel through the
 #    k=10 / T=0.45 lattice still lines up to the millimetre. Do not "tidy" them: they were
 #    solved against the lattice, and 2 cm of drift puts the lens inside a strut.
 #
-# 2. FUR CREATURE (t 0.180..0.226), and this is the one pass that is not through a hole, a
+# 2. FUR CREATURE (t 0.236..0.282), and this is the one pass that is not through a hole, a
 #    bore or a transparent volume. The camera flies through actual FUR: 1.10 m of travel
 #    inside the coat, at 21 mm per frame, the slowest movement anywhere on the loop. Three
 #    things had to line up and all three are measured, not eyeballed.
@@ -2427,14 +2451,14 @@ prefer {
 #    the whole frame: the coat stops being a texture and becomes architecture, which is the
 #    entire argument for standing a groom in a gallery of polished objects.
 #
-# 3. GLASS ORB (t 0.264). World centre (7.70, 1.70, 3.95), r 0.50 -- the orb is levitated
+# 3. GLASS ORB (t 0.320). World centre (7.70, 1.70, 3.95), r 0.50 -- the orb is levitated
 #    0.45 m off its cap now, so the old curve's z=3.50 / y=1.40 pass would miss it by more
 #    than a radius in both axes. That is the reason this curve had to be rewritten at all.
 #    The approach now comes off the creature's tail and climbs from 1.308 to the orb's centre
 #    height, so the camera still crosses the sunlit upper hemisphere on the way in and comes
 #    out looking down its own caustic.
 #
-# 4. KLEIN BOTTLE (t 0.352). The tightest and best beat. scraps/_kleinslice.py walks the
+# 4. KLEIN BOTTLE (t 0.408). The tightest and best beat. scraps/_kleinslice.py walks the
 #    real mesh vertices through the mesh/settle/spread transform chain and reports the body
 #    in horizontal slabs: it is a circle of radius 0.151 about (6.4584, 2.5311) at y=1.12,
 #    and only above y~1.22 does the handle break out toward +x. So y=1.12 is the widest
@@ -2488,12 +2512,22 @@ prefer {
 # CLOSURE. gallery_settled's loop closes on a fold -- it runs forward past the start and
 # doubles back, which `look tangent` renders as a 180 deg swing at the front of the hall.
 # This one closes on an ARC instead: the return leg comes forward to z=8.15, swings across
-# the front and turns back in on the centre line already heading -z, so frame 600 hands off
-# to frame 0 with the HEADING continuous as well as the position. The whole loop is a lazy
+# the front and turns back in on the centre line already heading -z, so the seam has the
+# HEADING continuous as well as the position. The rotation put frame 0 in the MIDDLE of that
+# arc rather than after it, which is strictly better for the seam: the handoff now happens
+# on the arc's slow outside edge (density 6.89, the loop's second-slowest) instead of at the
+# top of the dive, so the one frame boundary a viewer could notice is the one where the
+# camera is moving least. The whole loop is a lazy
 # figure eight -- down the centre, right to the orb and the bottle, left and back behind the
 # ring, then forward again up the left-centre -- so it never retraces its own path either.
 camera_curve "fly" {
-    point 5.00   2.10  7.35     # START (front-high, centre line) — closure arc, LEVEL
+    # START — the ESTABLISHING SHOT. See WHERE THE LOOP STARTS above: these two points used
+    # to be the last two on the list, and the loop is a closed centripetal Catmull-Rom, so
+    # moving them to the front rotates the PHASE without moving the curve by a millimetre.
+    point 5.32   2.28  8.55     # START — apex of the closure arc: the loop's furthest-back
+                                # (z 8.55), highest-looking-in point, aimed -z down the hall
+    point 5.05   2.16  8.15     # turn onto the centre line, already heading -z
+    point 5.00   2.10  7.35     # front-high, centre line — LEVEL, then the dive begins
     point 4.98   1.85  7.10     # descend the centre line
     point 4.95   1.60  6.87     # approach the gold gyroid's +z face (clip sphere ends 6.83)
     point 4.882  1.437 6.855    # final approach — held just OUTSIDE the clip sphere
@@ -2535,26 +2569,38 @@ camera_curve "fly" {
     point 4.35   2.52  5.70     # rise onto the cruise
     point 4.95   2.62  6.55     # over the gold gyroid (its clip tops out at y=2.11)
     point 5.35   2.55  7.45
-    point 5.55   2.42  8.15     # out past the front of the hall
-    point 5.32   2.28  8.55     # swing across the front — the closure ARC, not a fold
-    point 5.05   2.16  8.15     # turn back onto the centre line, already heading -z
+    point 5.55   2.42  8.15     # out past the front of the hall — hands back to the START,
+                                # which is the same closure ARC it always was, not a fold
     up 0 1 0   fov_y 70   mode D   frames 600
     fps 30                         # 600 frames -> 20 s
     look tangent
     spline centripetal
     # Stops are ARC-LENGTH fractions straight off scraps/_flyplan.py, which is what
     # `density_at` has taken since 0.155.0 (before that the loader silently read them as
-    # control-point-INDEX fractions -- see CLEARANCE above). The beats it reports for these
-    # 45 points / 23.87 m are: gyroid channel 0.048..0.114, CREATURE COAT 0.180..0.226,
-    # orb 0.264, klein 0.352, ring 0.607, crystal gyroid 0.722, gold gyroid overflight 0.851.
-    # The creature gets the highest density on the loop (26) and holds it FLAT across the
-    # whole pass rather than peaking at the middle: 53 frames / 1.8 s at 21 mm per frame, so
-    # the coat crosses the lens slowly enough to be read as individual fibres.
-    density_at 0.000  8  density_at 0.050 20  density_at 0.112 20  density_at 0.150 10
-    density_at 0.180 26  density_at 0.226 26  density_at 0.245 12  density_at 0.264 22
-    density_at 0.300 14  density_at 0.352 24  density_at 0.400 10  density_at 0.500  6
-    density_at 0.607 20  density_at 0.680 10  density_at 0.722 14  density_at 0.800  8
-    density_at 0.900  6  density_at 1.000  8
+    # control-point-INDEX fractions -- see CLEARANCE above).
+    #
+    # EVERY STOP BELOW IS THE OLD ONE + 0.0555, because the phase rotation moved t=0 back to
+    # what used to be arc-t 0.9445. That shift is not cosmetic and it is not optional: these
+    # numbers name POSITIONS ON THE CURVE, so leaving them alone would have slid every dwell
+    # 5.6% of the loop (1.33 m) off its beat -- the creature pass would start inside the
+    # gyroid channel's exit. tools/flyphase.py --rotate computes the shifted list.
+    #
+    # The beats for these 45 points / 23.87 m are now: gyroid channel 0.104..0.170,
+    # CREATURE COAT 0.236..0.282, orb 0.320, klein 0.408, ring 0.663, crystal gyroid 0.778,
+    # gold gyroid overflight 0.907. The creature gets the highest density on the loop (26)
+    # and holds it FLAT across the whole pass rather than peaking at the middle: 53 frames /
+    # 1.8 s at 21 mm per frame, so the coat crosses the lens slowly enough to be read as
+    # individual fibres.
+    #
+    # 6.89 at the ends is the old track's value AT the new start (it interpolated 6 -> 8
+    # across old 0.900..1.000, and 0.9445 lands 44.5% along), so the wrap stays continuous:
+    # the loop's slowest, widest cruise runs straight through frame 0, which is what an
+    # establishing shot wants.
+    density_at 0.000 6.89  density_at 0.055  8  density_at 0.105 20  density_at 0.167 20
+    density_at 0.205 10    density_at 0.235 26  density_at 0.281 26  density_at 0.300 12
+    density_at 0.319 22    density_at 0.355 14  density_at 0.407 24  density_at 0.455 10
+    density_at 0.555  6    density_at 0.662 20  density_at 0.735 10  density_at 0.777 14
+    density_at 0.855  8    density_at 0.955  6  density_at 1.000 6.89
     closed
     exposure_lock
     film { res 960 540   exposure 0.25 }

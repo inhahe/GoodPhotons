@@ -9185,6 +9185,34 @@ also the place that now names `-beamsplitmax`.
 
 ## Tech debt
 
+### Checked-in scenes cite ~22 derivation scripts that live in gitignored `scraps/` — 2026-09-01
+
+`scenes/*.ftsl` comments name the script that solved each authored constant, which is the
+right instinct and is most of what makes `gallery_rain.ftsl` auditable rather than a wall of
+magic numbers. But 22 of those scripts are under `/scraps/` (`.gitignore:105`), so **every one
+of those citations is a dangling reference in a fresh clone** — the numbers stay, the argument
+for them does not:
+
+```
+_bakecreature.py  _capchroma.py  _cmp_pfm.py  _compotecaustic.py  _compotesite.py
+_flyplan.py  _focalsweep.py  _gemsweep.py  _kleinslice.py  _placecreature.py  _proj.py
+_standaudit.py  bowgeom.py  bowmap.py  bowplot.py  gen_graychecker.py  imgdiff.py
+newklein_stand.py  settle_scene.py  (+ _creature_block.ftsl, _grid_test.ftsl)
+```
+
+Noticed while rotating gallery_rain's flyby phase: the new `tools/flyphase.py` was written
+into `scraps/` out of habit and had to be moved, because the scene comment that explains the
+`density_at` shift is worthless without it. `_flyplan.py` is the worst of the rest — the
+scene's CLEARANCE paragraph quotes its margins to 3 dp, and it additionally keeps its **own
+hardcoded copy of the 45 control points**, so it is silently wrong the moment the curve is
+edited (it was not updated by the phase rotation; `tools/flyphase.py` parses the scene
+instead, which is why it can't drift).
+
+**Proper fix:** promote the scripts a checked-in scene actually cites to `tools/`, and make
+each one parse the scene rather than embed a copy of its numbers. Anything genuinely one-off
+should have its *result* written into the scene comment and the citation dropped, rather than
+pointing at a file that isn't there.
+
 ### `-savemap` / `-loadmap` are silently ignored on the CPU (GPU-only) — 2026-07-26
 The photon-map disk cache is wired into `renderPhotonMapSharedCuda` only. `main.cpp`
 passes `g_pmapSave`/`g_pmapLoad` at exactly one call site (~line 6638, inside the
