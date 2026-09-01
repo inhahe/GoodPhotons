@@ -223,6 +223,32 @@ render. Closing that means teaching the shared device path to gather in spp chun
   the difference between a glowing panel and a black one — while every *reflective* slot
   looks identical either way, because NEE flips the normal toward the light itself. Open
   in `known-issues.md`.
+  **0.199.3 finishes the job on the two paths 0.118.1/0.129.0 did not reach — mode `M`'s
+  photon gather — and fixes a separate, larger bug the same investigation turned up: a
+  surface that both REFLECTS and EMITS was shaded wrong by every renderer except mode R.**
+  Three independent defects, all on the same `type diffuse` + `emit` material:
+  * `bdpt.h::connectBDPT` / `dConnectBDPT` opened with PBRT's *"ignore invalid connections
+    related to infinite area lights"* guard transcribed as `eye[t-1].isLightVertex()`
+    instead of PBRT's `type == VertexType::Light`. PBRT rejects a fictitious infinite-light
+    endpoint; ours also rejected any ordinary Surface vertex carrying an `emit` slot, so
+    **every `s >= 1` strategy ending on a glowing surface was discarded — all NEE and every
+    light-subpath connection onto it.** Mode D therefore rendered a 5 %-albedo emissive
+    plane at the ~1 % its surviving indirect happened to look like. Now tests the type,
+    which for an eye vertex is never `Light` (env escape is carried by `Escape`, not by a
+    vertex), so the guard is correctly inert on the camera side.
+  * `photonGather` / `photonGatherSub` and their device twins added the emission and then
+    `return`ed, as if an emissive material had no BSDF. They now add it and **fall through**
+    to the density estimate.
+  * `dPhotonGather` / `dPhotonGatherSub` keyed emission off `dEmitterForMat() >= 0` with no
+    `matIsLight`/`matEmit` fallback, so on GPU a glowing quad/isosurface/CSG solid lost its
+    emission entirely — while the host twins tested `m.isLight` and lost the *body* instead.
+    The two mode-M paths disagreed with each other and both disagreed with R and D.
+  Mode-M emission-on-hit is now also one-sided (`dot(ray.d, h.ng) < 0`) like `Vertex::Le`
+  and `bkRadiance`; it used to be two-sided, so quad winding changed the image between M
+  and D. Regression evidence: `scraps/mini_grid.ftsl`'s four slot-variant tiles agree across
+  D/R/M-gpu/M-cpu, and `_cornell_diffuse.ftsl` holds D vs R at 1.2/255 mean abs difference
+  with matching auto-exposure. Scenes authored against the old darkening need their albedo
+  re-tuned — `gallery_rain`'s ground went 5 % → 1 % in the same commit.
 - **`geometry.h` / `bvh.h`** — primitives + SAH BVH (split plane by SAH, always
   recurse to LEAF_SIZE, median fallback; front-to-back traversal, ray-slab test
   unrolled; `tEnter` pruning). Triangles use the **Woop watertight** test (JCGT 2013):

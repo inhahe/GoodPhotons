@@ -1300,8 +1300,20 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
     const double lambda = hb.lam[0], invPdfLambda = hb.invPdf[0];
     isSplat = false;
     nUpConn = 0;                    // set to the real width only once a contribution exists
-    // Can't connect ONTO a vertex that already sits on a light (PBRT guard).
-    if (t > 1 && s != 0 && eye[t - 1].isLightVertex()) return 0.0;
+    // PBRT's "ignore invalid connections related to infinite area lights" guard. It tests
+    // the vertex TYPE, not `isLightVertex()`, and the difference is load-bearing: a
+    // VType::Light eye vertex is a fictitious endpoint standing in for an infinite light,
+    // which has no surface and nothing to connect to; an EMISSIVE SURFACE is an ordinary
+    // Surface vertex that happens to carry an `emit` slot, and it still has a BSDF.
+    //
+    // Testing isLightVertex() here (as this did) rejected every s>=1 strategy that ended on
+    // an emissive surface, i.e. deleted ALL DIRECT LIGHTING ON ANY SURFACE THAT ALSO GLOWS.
+    // Measured on scraps/mini_grid.ftsl: four 5%-albedo tiles differing only in their slots
+    // rendered 59 / 61 / (clipped) / 14 in mode D, where mode R — which has no such guard —
+    // gave 59 / 61 / 61 / 61. The 14 is the surviving indirect; the direct sun and sky were
+    // gone. gallery_rain's glowing floor grid is exactly this material, which is why its
+    // 5%-albedo body read near-black in D and mid-grey in every other mode.
+    if (t > 1 && s != 0 && eye[t - 1].type == VType::Light) return 0.0;
 
     double L = 0.0;
     int nUp = 1;                    // live wavelengths for THIS connection (set per branch)

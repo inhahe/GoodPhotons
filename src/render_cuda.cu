@@ -10656,7 +10656,11 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     const double invPdfLambda = hb.invPdf[0];
     isSplat = 0;
     nUpConn = 0;                    // set to the real width only once a contribution exists
-    if (t > 1 && s != 0 && dIsLightVertex(sc, eye[t - 1])) return 0.0;
+    // PBRT's infinite-area-light guard — the vertex TYPE, not dIsLightVertex(). See the host
+    // twin in bdpt.h connectBDPT for the measurement: testing dIsLightVertex() here deleted
+    // every s>=1 strategy ending on an emissive SURFACE, i.e. all direct lighting on any
+    // surface that also glows.
+    if (t > 1 && s != 0 && eye[t - 1].type == BV_LIGHT) return 0.0;
 
     double L = 0.0;
     int nUp = 1;                    // live wavelengths for THIS connection (set per branch)
@@ -11210,15 +11214,23 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
         }
         const DMaterial& m = *mp;
 
-        int li = dEmitterForMat(sc, matId);
-        if (li >= 0) {                                   // emitter
-            if (specularSeen) {                          // specular-direct: NEE can't reach it
+        // Self-emission on a SPECULAR arrival (a diffuse arrival's direct term comes from NEE
+        // at the visible point). Prefers the registered emitter's baked SPD and falls back to
+        // the material's own `emit` for geometry that registers none — a quad, isosurface or
+        // CSG solid — exactly as bkRadiance does; testing `li >= 0` alone made every such
+        // glowing surface invisible to mode M. Does NOT return: an emissive material still
+        // has a BSDF. Host twin: photonGatherSub.
+        {
+            const int li = dEmitterForMat(sc, matId);
+            const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
+                               : (m.matIsLight)   ? m.matEmit
+                                                  : nullptr;
+            if (eSpd && specularSeen && dot(rd, h.ng) < 0) {
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
-                double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * rhoV * invPdfL
+                double e = (double)specLookup(eSpd, lambda) * thr * rhoV * invPdfL
                          * dEmitPatMul(sc, m.emitPat, h);   // `emit pattern:` at this hit
                 oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
             }
-            return;                                       // else: direct handled by NEE at vis
         }
 
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
@@ -11399,14 +11411,29 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
         }
         const DMaterial& m = *mp;
 
-        int li = dEmitterForMat(sc, matId);
-        if (li >= 0) {                                   // directly-viewed / specular-seen emitter
-            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL
-                     * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
-            oX += (double)cieX(lambda) * e;
-            oY += (double)cieY(lambda) * e;
-            oZ += (double)cieZ(lambda) * e;
-            return;
+        // Self-emission of a directly-viewed / specularly-seen emitter, one-sided by the
+        // geometric normal to match bkRadiance. Prefers the registered emitter's baked SPD
+        // (it may carry a `power`/`lumens` flux normalisation the raw material spectrum does
+        // not) and falls back to the material's own `emit` when this geometry registered no
+        // emitter at all — only tessellated geometry does, so a glowing `quad`, isosurface or
+        // CSG solid has an emissive MATERIAL and no DEmitter. Testing `li >= 0` alone is what
+        // made gallery_rain's grid floor lose its green lines entirely under mode M on GPU.
+        //
+        // NOT a `return`: an emissive material still has a BSDF, so a glowing DIFFUSE surface
+        // both emits and reflects and the walk falls through to the density estimate. Host
+        // twin: photonGather — see its comment for the four-mode measurement.
+        {
+            const int li = dEmitterForMat(sc, matId);
+            const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
+                               : (m.matIsLight)   ? m.matEmit
+                                                  : nullptr;
+            if (eSpd && dot(rd, h.ng) < 0) {
+                double e = (double)specLookup(eSpd, lambda) * thr * invPdfL
+                         * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
+                oX += (double)cieX(lambda) * e;
+                oY += (double)cieY(lambda) * e;
+                oZ += (double)cieZ(lambda) * e;
+            }
         }
 
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {

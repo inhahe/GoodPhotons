@@ -5,6 +5,76 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-09-01, v0.199.3): an EMISSIVE surface was shaded wrong in three different ways in three different renderers — mode D deleted its direct lighting, mode M (CPU) deleted its reflection, mode M (GPU) deleted its emission
+
+**Reported as** three of six defects in the `gallery_rain` mode-`M` beams render: *"the floor
+is supposed to be black with a green grid, but it's off white with some lines still but in
+black, and with a large black square in the back area"*.
+
+**The scene material at the centre of it** is `gallery_rain`'s ground plane: a `type diffuse`
+material carrying BOTH a reflect slot (5 % albedo, scaled by `reflect_map pattern:ground_fade`)
+and an emit slot (`emit gaussian 528 34 0.55`, masked by `emit_map pattern:grid_ground` into a
+1 cm grid). A material that both reflects and emits turns out to have been mishandled by every
+renderer except mode R, and each one broke it differently.
+
+**Measured** with `scraps/mini_grid.ftsl` — four 2×2 tiles, all `reflect rgb 0.05 0.055 0.05`,
+differing only in which slots they carry (`t1` plain, `t2` + `reflect_map`, `t3` + `emit`,
+`t4` + `emit` + `emit_map` = the gallery's `gridground`). Tile-body sRGB value:
+
+| tile | mode D (BDPT) | mode R | mode M gpu | mode M cpu |
+|---|---|---|---|---|
+| t1 plain | 59 | 59 | 54 | 63 |
+| t2 + `reflect_map` | 61 | 61 | 64 | 68 |
+| t3 + `emit` | (green, body unknowable) | (green) | **grey, NO green** | (green) |
+| t4 body (`emit_map`-masked) | **14** | 61 | 58, **no grid lines** | **0** |
+
+Mode R is the only one that gets `t4` right: body *and* grid. The other three:
+
+1. **Mode D / BDPT lost all DIRECT lighting on an emissive surface** (`t4` body 14 vs 61 —
+   the 14 is the surviving indirect). `connectBDPT` opened with PBRT's "ignore invalid
+   connections related to infinite area lights" guard, but transcribed as
+   `eye[t-1].isLightVertex()` instead of PBRT's `type == VertexType::Light`. PBRT's version
+   rejects a *fictitious infinite-light endpoint vertex*; ours also rejected any ordinary
+   Surface vertex whose material happens to carry an `emit` slot — so every `s >= 1` strategy
+   ending on a glowing surface was thrown away, taking NEE and every light-subpath connection
+   with it. Fixed in `src/bdpt.h` `connectBDPT` and `src/render_cuda.cu` `dConnectBDPT`.
+2. **Mode M lost the surface's REFLECTION**: `photonGather` / `photonGatherSub` (and their
+   device twins) added the emission and then `return`ed, as if an emissive material had no
+   BSDF. They now add the emission and fall through to the density estimate.
+3. **Mode M on GPU lost the surface's EMISSION entirely**: `dPhotonGather` /
+   `dPhotonGatherSub` gated emission on `dEmitterForMat(sc, matId) >= 0`, but only
+   *tessellated* geometry registers a `DEmitter` — a glowing `quad`, isosurface or CSG solid
+   has an emissive material and no emitter at all. `bkRadiance` has carried a
+   `matIsLight`/`matEmit` fallback for exactly this since the mode-D version of the same bug;
+   the mode-M gather never got it. Now it does. (This is also why the host and device mode-M
+   paths disagreed *with each other*: the host tested `m.isLight`, so it took the emission
+   branch and lost the body; the device missed the branch and lost the grid.)
+
+Emission on hit is also now **one-sided by the geometric normal** in the mode-M gather
+(`dot(ray.d, h.ng) < 0`), matching `Vertex::Le` and `bkRadiance`. It used to be two-sided, so
+a quad whose winding put `cross(u, v)` away from the camera glowed in mode M and not in D.
+
+**Verified** after the fix: all four tiles agree across D / R / M-gpu / M-cpu (t4 body
+61 / 61 / 58 / 63), `_cornell_diffuse.ftsl` D vs R mean abs diff 1.2/255 at 800 spp with
+matching auto-exposure (3.18e-13 vs 3.17e-13), and mode M's frame mean 70.37 vs R's 70.50.
+
+**Consequence for scenes**: any scene authored against mode D's darkening of an emissive
+surface gets a brighter body now. `gallery_rain`'s ground was, and its albedo was dropped from
+5 % to 1 % in the same commit to restore the intended near-black plane.
+
+### KNOWN LIMITATION (not a regression): an emissive `quad` / isosurface / CSG solid GLOWS but does not ILLUMINATE
+
+Only tessellated geometry registers an `Emitter` (`Scene::addAreaLight` / `addMeshLight` are
+called from `light` blocks and mesh lights). A bare `quad {}` whose material carries an `emit`
+slot therefore has emissive *material* and no emitter, so NEE can never sample it and no light
+subpath ever starts on it. Every mode adds its self-emission on a camera/specular arrival (that
+is the `matIsLight`/`matEmit` fallback above) and every mode drops its contribution on a
+diffuse arrival — consistently, but the surface still lights nothing. `gallery_rain` relies on
+this deliberately (its grid lines "GLOW rather than being lit"), which is why it has not been
+fixed. The proper fix is to register an emitter for emissive analytic primitives at scene
+build; the cost is that a huge emissive quad's flux then enters the power CDF and starves the
+other lights unless the `emit_map` mask is integrated into the registered area.
+
 ### FIXED (2026-09-01, v0.199.2): mode `W`'s live window "fluctuates in hue" and a low-`-spp` mode-`W` frame comes out with a global colour cast — the wavelength lattice is SHARED by every pixel, so a de-hero'd path renders the whole image at `spp` wavelengths
 
 **Reported as** "why do the ftrace windows now show the scene with a fluctuating off hue?"

@@ -278,13 +278,17 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         }
         const Material& m = *mp;
 
-        if (m.isLight) {                                 // hit an emitter
-            if (specularSeen) {                          // specular-direct: NEE can't reach it
-                double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
-                L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                     * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL);
-            }
-            return L;                                     // else: direct handled by NEE at vis
+        // Self-emission on a SPECULAR arrival (a diffuse arrival's direct term comes from
+        // NEE at the visible point, so adding it here too would double-count). One-sided by
+        // the geometric normal, matching Vertex::Le / bkRadiance.
+        //
+        // This no longer RETURNS: an emissive material still has a BSDF, so a glowing
+        // diffuse surface both emits and reflects, and the walk has to go on to the density
+        // estimate below. See photonGather for the measurement.
+        if (m.isLight && specularSeen && dot(ray.d, h.ng) < 0.0) {
+            double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
+            L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                 * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL);
         }
 
         switch (m.type) {
@@ -501,10 +505,20 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         }
         const Material& m = *mp;
 
-        if (m.isLight) {                                 // directly-viewed emitter
+        // Self-emission of a directly-viewed (or specularly-seen) emitter, one-sided by the
+        // geometric normal to match Vertex::Le / bkRadiance — the surface glows only from
+        // the face cross(u,v) points out of.
+        //
+        // NOT a `return`. An emissive material still has a BSDF: a glowing DIFFUSE surface
+        // both emits and reflects, so the walk falls through to the density estimate below.
+        // Returning here is what made gallery_rain's grid floor render as GRID-ONLY on the
+        // CPU (host `m.isLight` hit, emission returned, body dropped) and as BODY-ONLY on the
+        // GPU (dEmitterForMat missed the unregistered quad, so the emitter branch was never
+        // taken and the grid vanished) — two mode-M paths disagreeing with each other and
+        // both disagreeing with modes R and D. Measured on scraps/mini_grid.ftsl.
+        if (m.isLight && dot(ray.d, h.ng) < 0.0) {
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * (thr * emitSlot(scene, m, h, lambda) * invPdfL);
-            return L;
         }
 
         switch (m.type) {

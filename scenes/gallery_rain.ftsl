@@ -318,9 +318,23 @@ pattern "grid_ground" {
 pattern "ground_fade" {
     expr "1 - smoothstep(10, 22, sqrt((x - 5)*(x - 5) + (z - 3.5)*(z - 3.5)))"
 }
-# ~5% albedo: dark enough that the sunlit plane sits well below the exhibits, bright enough
-# that it still reads as a surface and still catches caustics in the forward modes. The green
-# is a 528 nm Gaussian rather than an `rgb` triple because emission wants a real radiance
+# ~1% albedo — and the 1 is a MEASUREMENT, not a taste call, so do not "restore" the 5% this
+# used to carry. Until v0.199.3 a material that both reflected and emitted was mis-shaded by
+# every renderer but mode R, and this ground is exactly that material: mode D's BDPT threw
+# away every s>=1 strategy that ended on an emissive surface, i.e. ALL of the plane's direct
+# sunlight, and the 5% figure was tuned against the ~1% that the surviving indirect happened
+# to look like. With the bug fixed the plane is genuinely lit and 5% put its body at sRGB 64,
+# level with the white exhibit caps at 75 — the ground stopped being a void and became a
+# second bright plane competing with the pieces. 0.010 puts it back at ~25: unmistakably a
+# surface, unmistakably darker than everything standing on it. (See known-issues.md
+# "an EMISSIVE surface was shaded wrong in three different ways".)
+#
+# Losing 5x of albedo costs the ground's caustics 5x, and that is affordable HERE because the
+# ground was never the caustic catcher: the white stand caps are (that is the whole reason the
+# stands are a wireframe cage plus a solid cap — see MUSEUM STANDS). Check the caps, not the
+# plane, if a caustic ever looks weak.
+#
+# The green is a 528 nm Gaussian rather than an `rgb` triple because emission wants a real radiance
 # magnitude — amp is spectral radiance per nm, and 0.55 puts the line core just at the clip
 # point of the camera's -2 stop absolute exposure, so the lines have a blown core and a graded
 # edge, which is what a glowing wire looks like.
@@ -336,7 +350,7 @@ pattern "ground_fade" {
 # the glowing lines instead.
 material "gridground" {
     type diffuse
-    reflect rgb 0.05 0.055 0.05
+    reflect rgb 0.010 0.011 0.010
     reflect_map pattern:ground_fade
     emit gaussian 528 34 0.55
     emit_map pattern:grid_ground
