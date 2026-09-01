@@ -5,6 +5,50 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-09-01, v0.199.5): every RGB spectral value above 1 was silently clamped to white, so a saturated gem rendered as CLEAR GLASS
+
+**Reported as** the second of six defects in the `gallery_rain` mode-`M` beams render: *"the
+compote and its gems are showing up clear, they're supposed to have colors."*
+
+**Not a mode-M bug at all** — mode D showed the same colourless stones, which is what made it
+findable. The five reflectance upsamplers in `src/upsample.h` (`rgbToReflectanceJH` and its
+Smits / box / Meng siblings) each opened with `std::clamp(r, 0.0, 1.0)` on every component,
+because a reflectance is bounded by 1 by definition. But FTSL's `rgb` head is **not reserved
+for reflectances**: the same head fills spectral slots that are physically unbounded
+coefficients — a dielectric's `absorb` (Beer-Lambert σₐ in 1/m), a `medium`'s
+`sigma_a`/`sigma_s`, a `hair`'s `sigma_a`, a metal's `substrate_k`, an `ior`.
+
+So `absorb rgb 22.3 79.3 70.6` became `(1,1,1)` → a flat, achromatic **1 /m** absorption. Over
+a 5 cm stone that is 95 % transmittance with zero tint. Thirteen deeply saturated gems rendered
+as clear glass, which is precisely what was reported.
+
+**The scene's numbers were right and were verified against the asset.** `meshes/compote_with_gems.glb`
+carries its colours in `KHR_materials_volume`; `glass_ruby` is
+`attenuationColor (0.262251, 0.008568, 0.014444)`, `attenuationDistance 0.02`, and
+`-ln(c)/d / 3` (the /3 holding optical depth at the scene's `scale 3.0`) is
+`(22.31, 79.33, 70.62)` — the exact triple in the scene file. Same for the other twelve.
+
+**Fix:** `upsample::gamutSplit(r, g, b)` factors an over-unity triple into a scalar magnitude
+(`max(r, g, b, 1)`) and the in-gamut colour that remains; each upsampler solves its usual
+in-gamut fit and multiplies the resulting spectrum by the magnitude. Hue and the relative depth
+between channels survive. **The floor of 1.0 is load-bearing:** for a triple already inside
+`[0,1]` the magnitude is exactly `1.0`, and division and multiplication by `1.0` are exact in
+IEEE, so every existing scene upsamples bit for bit as before — only the previously-destroyed
+case changes.
+
+**Blast radius**, from a scan of every `rgb`/`rgbsmits`/`rgbbox`/`rgbmeng` triple in `scenes/`:
+exactly two scenes had an out-of-gamut value, and both were being silently corrupted —
+`gallery_rain`'s thirteen gems, and `hair_basics.ftsl`'s `sigma_a rgb 0.42 0.63 1.19` (the blue
+component flattened to 1.0). `ftsl.h`'s own documented example, `absorb rgb 3 0.5 0.3`, was
+mangled too.
+
+**Known remaining limit (not this bug, but adjacent):** the *device/texture* upsample path
+(`stochJhCoeff` in `stochtile.h`, a 64³ LUT over the unit cube) still clamps to `[0,1]`. That is
+harmless for its actual inputs — image texels are in `[0,1]` by construction — but it means a
+**pattern- or texture-driven** coefficient slot (e.g. an `absorb_map`) cannot express a
+magnitude above 1 the way a constant now can. Fixing it means carrying the magnitude alongside
+the three fitted coefficients through the texture sampler; nothing in the repo needs it yet.
+
 ### FIXED (2026-09-01, v0.199.4): mode `M` was the one mode whose live window never showed progress or a DONE marker
 
 **Reported as** the first of six defects in the `gallery_rain` mode-`M` beams render: *"the

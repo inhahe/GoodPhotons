@@ -2496,6 +2496,27 @@ render. Closing that means teaching the shared device path to gather in spp chun
   vertex by `bary_k / T_k` (`T_k = X+Y+Z` of its spectrum) rather than by `bary_k`
   alone, because a chromaticity is an `(X+Y+Z)`-weighted mean — that is what makes the
   interpolated chromaticity *exact* rather than merely close.
+  **A component above 1 is FACTORED, not clamped (`upsample::gamutSplit`, 0.199.5).** All
+  five model a reflectance, which is bounded by 1 by definition, so each of them used to open
+  by clamping its input to `[0,1]` — and that quietly made `rgb` unusable for the spectral
+  slots that are *not* reflectances. FTSL routes physically **unbounded coefficients** through
+  the very same head: a dielectric's `absorb` (Beer–Lambert σₐ in 1/m), a `medium`'s
+  `sigma_a`/`sigma_s`, a `hair`'s `sigma_a`, a metal's `substrate_k`, an `ior`. The clamp was
+  total data loss on those: `absorb rgb 22.3 79.3 70.6` became `(1,1,1)`, i.e. a flat,
+  colourless 1 /m absorption — 95 % transmittance across a 5 cm stone — so thirteen deeply
+  saturated gems in `gallery_rain` rendered as *clear glass*, in every mode. `gamutSplit`
+  divides the largest component out as a scalar magnitude, hands the remaining in-gamut colour
+  to whichever fit the head named, and multiplies that spectrum back by the magnitude.
+  Factoring rather than widening the fits is the right shape of fix because each fit is a
+  *shape* solver over a bounded family and a magnitude is not a shape — dividing leaves a legal
+  colour for the existing solver, and the multiply restores the level exactly, so hue and the
+  relative depth between channels (the entire content of the authored number) survive. The
+  magnitude is `max(r, g, b, 1)` and **the floor of 1 is load-bearing**: an in-gamut triple then
+  divides and multiplies by exactly `1.0`, which is exact in IEEE, so every pre-existing scene
+  upsamples bit for bit as before and only the destroyed case moves. The *device* twin
+  (`stochJhCoeff`'s 64³ LUT over the unit cube) still clamps, which is harmless for its only
+  inputs — image texels are in `[0,1]` by construction — but does mean a pattern-driven
+  coefficient slot cannot yet carry a magnitude; see `known-issues.md`.
 - **`upsample::fitMany` — the bulk path every image texture goes through (0.138.1).**
   A single Jakob–Hanika fit is ~40 Gauss–Newton iterations over the 95-sample basis:
   a few microseconds, negligible for a material, *seconds per megapixel* for a texture.

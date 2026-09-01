@@ -728,6 +728,41 @@ inline std::array<double, MENG_N> mengSamples(double r, double g, double b) {
     return out;
 }
 
+// --- Out-of-gamut ("brighter than white") triples --------------------------
+// Split a linear-sRGB triple into a non-negative MAGNITUDE and an in-gamut colour,
+// returning the magnitude and rewriting r/g/b in place so that the original triple is
+// exactly magnitude x (r,g,b).
+//
+// WHY THIS EXISTS. Every upsampler below models a REFLECTANCE, which is bounded by 1 by
+// definition, so each of them opened by clamping its input to [0,1]. But FTSL's `rgb` head
+// is not reserved for reflectances: the very same head fills spectral slots that are
+// physically UNBOUNDED coefficients — a dielectric's Beer-Lambert `absorb` (sigma_a in
+// 1/metre), a `medium`'s `sigma_a`/`sigma_s`, a `hair`'s `sigma_a`, a metal's `substrate_k`,
+// an `ior`. For those, clamping is silent, total data loss: `absorb rgb 22.3 79.3 70.6`
+// became (1,1,1), i.e. a FLAT, COLOURLESS 1/m absorption — over a 5 cm stone that is 95%
+// transmittance, so a deeply saturated gem rendered as clear glass. (Found 2026-09-01 as
+// "the compote and its gems are showing up clear"; ftsl.h's own documented example
+// `absorb rgb 3 0.5 0.3` was mangled the same way, as was `hair_basics.ftsl`'s
+// `sigma_a rgb 0.42 0.63 1.19`.)
+//
+// Factoring is the right answer rather than widening the fits, because the fits are
+// *shape* solvers over a bounded family and the magnitude is not a shape: dividing by the
+// largest component leaves a legal in-gamut colour for the existing solver, and
+// multiplying its spectrum back by that scalar restores the level exactly. The hue and the
+// relative depth between channels — the whole content of the authored number — survive.
+//
+// THE FLOOR OF 1.0 IS LOAD-BEARING. It makes this a strict no-op for every triple that was
+// already in gamut: m is then exactly 1.0, the divisions are by 1.0 (exact in IEEE), and
+// the final multiply is by 1.0 (also exact), so every existing scene upsamples bit for bit
+// as before and only the previously-destroyed case changes. Negative components are still
+// floored to 0, as the old clamp did.
+inline double gamutSplit(double& r, double& g, double& b) {
+    r = std::max(0.0, r); g = std::max(0.0, g); b = std::max(0.0, b);
+    const double m = std::max(std::max(r, g), std::max(b, 1.0));
+    r /= m; g /= m; b /= m;
+    return m;
+}
+
 } // namespace upsample
 
 // Build a near-monochromatic *emission* Spectrum from a linear-sRGB triple: a
@@ -752,9 +787,12 @@ inline Spectrum rgbToLineEmission(double r, double g, double b, double sigmaOver
 // Build a reflectance Spectrum from a linear-sRGB triple (Smits 1999). The 10
 // tabulated samples are combined additively then linearly interpolated in λ;
 // outside [380,720] nm the endpoint value is held.
+// An over-unity triple is factored by upsample::gamutSplit (see there) rather than
+// clamped, so this also serves the unbounded coefficient slots (`absorb`, `sigma_a`, …).
 inline Spectrum rgbToReflectanceSmits(double r, double g, double b) {
-    r = std::clamp(r, 0.0, 1.0); g = std::clamp(g, 0.0, 1.0); b = std::clamp(b, 0.0, 1.0);
+    const double mag = upsample::gamutSplit(r, g, b);
     auto vals = upsample::smitsCombine(r, g, b);
+    for (double& v : vals) v *= mag;
     const upsample::SmitsBasis& B = upsample::smitsBasis();
     std::array<double, upsample::SmitsBasis::N> lam;
     for (int i = 0; i < upsample::SmitsBasis::N; ++i) lam[i] = B.lam[i];
@@ -771,12 +809,15 @@ inline Spectrum rgbToReflectanceSmits(double r, double g, double b) {
 // Build a reflectance Spectrum from a linear-sRGB triple (plain calibrated 3-box).
 // Three rectangular bands whose heights are solved to reproduce the colour under
 // D65; heights clamped to [0,1]. Zero outside [400,700) nm.
+// An over-unity triple is factored by upsample::gamutSplit (see there) rather than
+// clamped, so this also serves the unbounded coefficient slots (`absorb`, `sigma_a`, …) —
+// the [0,1] clamp below therefore bounds the *chromaticity*'s bands, not the level.
 inline Spectrum rgbToReflectanceBox(double r, double g, double b) {
-    r = std::clamp(r, 0.0, 1.0); g = std::clamp(g, 0.0, 1.0); b = std::clamp(b, 0.0, 1.0);
+    const double mag = upsample::gamutSplit(r, g, b);
     const upsample::BoxBasis& BB = upsample::boxBasis();
     std::array<double, 3> h;
     for (int i = 0; i < 3; ++i)
-        h[i] = std::clamp(BB.Minv[i*3+0]*r + BB.Minv[i*3+1]*g + BB.Minv[i*3+2]*b, 0.0, 1.0);
+        h[i] = mag * std::clamp(BB.Minv[i*3+0]*r + BB.Minv[i*3+1]*g + BB.Minv[i*3+2]*b, 0.0, 1.0);
     return [h](double w) -> double {
         if (w >= 400.0 && w < 500.0) return h[0];   // blue band
         if (w >= 500.0 && w < 600.0) return h[1];   // green band
@@ -790,8 +831,14 @@ inline Spectrum rgbToReflectanceBox(double r, double g, double b) {
 // outside [380,780] nm the endpoint value is held — which is exactly the
 // convention tools/bake_meng.py folded into the weights it solved against, so
 // the round-trip through reflectanceToLinearSrgbD65 is exact (not approximate).
+// An over-unity triple is factored by upsample::gamutSplit (see there) rather than
+// clamped, so this also serves the unbounded coefficient slots (`absorb`, `sigma_a`, …).
+// The scale is applied HERE and not inside mengSamples, whose own [0,1] clamp is part of
+// the table's reflectance semantics and must keep seeing an in-gamut colour.
 inline Spectrum rgbToReflectanceMeng(double r, double g, double b) {
+    const double mag = upsample::gamutSplit(r, g, b);
     auto vals = upsample::mengSamples(r, g, b);
+    for (double& v : vals) v *= mag;
     return [vals](double w) -> double {
         constexpr int N = upsample::MENG_N;
         double t = (w - upsample::MENG_LAMBDA_MIN) / upsample::MENG_LAMBDA_STEP;
@@ -803,11 +850,16 @@ inline Spectrum rgbToReflectanceMeng(double r, double g, double b) {
     };
 }
 
-// Build a reflectance Spectrum from a linear-sRGB triple (Jakob-Hanika fit).
+// Build a reflectance Spectrum from a linear-sRGB triple (Jakob-Hanika fit). This is the
+// DEFAULT upsampler — the one a bare `rgb r g b` reaches — so it is the one that has to
+// carry FTSL's unbounded coefficient slots (`absorb`, `sigma_a`, `substrate_k`, `ior`) as
+// well as reflectances. An over-unity triple is factored by upsample::gamutSplit (see
+// there) rather than clamped: the sigmoid fit still solves an in-gamut chromaticity, and
+// the magnitude rides on top. Exactly a no-op for an in-gamut triple.
 inline Spectrum rgbToReflectanceJH(double r, double g, double b) {
-    r = std::clamp(r, 0.0, 1.0); g = std::clamp(g, 0.0, 1.0); b = std::clamp(b, 0.0, 1.0);
+    const double mag = upsample::gamutSplit(r, g, b);
     std::array<double, 3> c = upsample::fit(r, g, b);
-    return [c](double lambda) { return upsample::reflAt(c, lambda); };
+    return [c, mag](double lambda) { return mag * upsample::reflAt(c, lambda); };
 }
 
 // Build an *emission* Spectrum from a linear-sRGB triple (Jakob-Hanika illuminant

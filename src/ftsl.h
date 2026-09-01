@@ -4422,6 +4422,11 @@ private:
             // NOTE: the `rgb` tag is required — a bare triple (`absorb 3 0.5 0.3`) is NOT
             // a valid spectrum expression; only a scalar, a tagged colour (`rgb`/`xyz`/…),
             // or a named/ref spectrum parse. See evalSpectrum below.
+            // THIS SLOT IS UNBOUNDED — a strongly absorbing gem is tens or hundreds of
+            // inverse metres, and the example above already exceeds 1. That is why the
+            // reflectance upsamplers factor an over-unity triple into a magnitude and an
+            // in-gamut colour instead of clamping it (upsample::gamutSplit); through
+            // 0.199.4 they clamped, and every `absorb` above 1 came out flat and colourless.
             m.absorb = spectrumParam(b, "absorb", constantSpectrum(0.0));
         } else if (type == "mirror") {
             m.type = MatType::Mirror;

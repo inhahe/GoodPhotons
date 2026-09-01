@@ -206,9 +206,24 @@ turns and wraps, s/v/l in `[0,1]`).
 | `rgbline` | dominant-wavelength line | near-monochromatic emission, so glass will disperse it into a spectrum (`rgbline r g b [sigma]`) |
 | `rgb:<name>` | your own — see §3.6 | none of the above is what the scene means |
 
-The first five are reflectances (bounded in `[0,1]`); `rgbillum` and `rgbline` are
-emission forms. Every head is accepted everywhere a spectrum expression is, *and* as a
-record channel's inline-colour tag (§9.2) — one shared list, so the two can't drift.
+The first five are reflectances; `rgbillum` and `rgbline` are emission forms. Every head
+is accepted everywhere a spectrum expression is, *and* as a record channel's inline-colour
+tag (§9.2) — one shared list, so the two can't drift.
+
+**A component may exceed 1.** The five reflectance heads model a curve that is bounded by
+1 by definition, but the `rgb` head is not reserved for reflectances — the same head fills
+spectral slots that are physically **unbounded coefficients**: a dielectric's `absorb`
+(Beer-Lambert σₐ in 1/m), a `medium`'s `sigma_a`/`sigma_s`, a `hair`'s `sigma_a`, a metal's
+`substrate_k`, an `ior`. So an over-unity triple is **factored**, not clamped: the largest
+component is divided out as a scalar magnitude, the remaining in-gamut colour is upsampled
+by whichever method the head names, and the magnitude multiplies the result. Hue and the
+relative depth between channels — the whole content of the number — survive, and a triple
+already inside `[0,1]` is untouched (bit for bit). Negative components still floor to 0.
+
+> Through 0.199.4 these were **clamped to `[0,1]`**, silently. `absorb rgb 22.3 79.3 70.6`
+> became `(1,1,1)`, i.e. a flat, colourless 1/m absorption — 95% transmittance across a
+> 5 cm stone — so a deeply saturated gem rendered as *clear glass*. If a scene of yours
+> leaned on that clamp (wrote a value above 1 and expected white), divide it down.
 
 ### 3.6 `upsample` — supplying your own
 

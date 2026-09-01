@@ -3460,7 +3460,79 @@ static int checkUpsample() {
                     img.size(), bad, done ? "" : " (STOPPED early)");
     }
 
-    bool pass = passA && passB && passW && passC && passD && passE && passF && passG && passH && passI;
+    // (j) OVER-UNITY TRIPLES ARE FACTORED, NOT CLAMPED.
+    //
+    // The five upsamplers above all model a reflectance, so each of them used to clamp its
+    // input to [0,1] — and that silently destroyed every FTSL spectral slot that is a
+    // physically unbounded COEFFICIENT rather than a reflectance (`absorb`, a medium's
+    // `sigma_a`/`sigma_s`, a hair's `sigma_a`, `substrate_k`, `ior`). `absorb rgb 22.3 79.3
+    // 70.6` became (1,1,1): a flat, colourless 1/m absorption, i.e. clear glass where a
+    // saturated gem was authored. upsample::gamutSplit now factors the magnitude out instead.
+    //
+    // Two properties are asserted, and they are the two the fix has to keep together:
+    //   * SCALE EQUIVARIANCE ABOVE THE GAMUT — for a triple whose largest component is already
+    //     1, upsampling m*(r,g,b) gives exactly m times the spectrum of (r,g,b), for every
+    //     head and every m >= 1. That is the whole point: hue and the relative depth between
+    //     channels survive an arbitrary magnitude instead of collapsing to flat white.
+    //   * IN-GAMUT INPUT IS UNTOUCHED — gamutSplit's magnitude is max(r,g,b,1), so a triple
+    //     that was already legal divides and multiplies by exactly 1.0 and no existing scene
+    //     moves. Asserted on gamutSplit directly with an exact `!=` rather than a tolerance,
+    //     because "1.0 is exact in IEEE" IS the argument, and asserted at the source rather
+    //     than through a head so a future head can't quietly opt out of it.
+    //
+    // NOTE ON WHY THE REFERENCE IS NORMALISED. Equivariance is a property of the OVER-UNITY
+    // regime only, and deliberately so: below 1 the upsamplers are still exactly the bounded
+    // reflectance solvers they always were, and f(0.5,0.5,0.5) is NOT half of f(1,1,1) — the
+    // fits are non-linear in the colour. gamutSplit's floor of 1.0 is what draws that line. So
+    // the reference for each colour is scaled to peak at 1 first; testing against an in-gamut
+    // reference would be asserting a linearity the solver never claimed.
+    bool passJ = true;
+    {
+        Spectrum (*const heads[])(double, double, double) = {
+            &rgbToReflectanceJH,
+            &rgbToReflectanceSmits,
+            &rgbToReflectanceBox,
+            &rgbToReflectanceMeng,
+        };
+        Vec3 cols[] = {{0.28, 1.00, 0.89}, {0.55, 0.30, 0.12}, {1.00, 0.20, 0.20},
+                       {0.10, 0.70, 1.00}, {0.50, 0.50, 0.50}};
+        for (Vec3& c : cols) {                       // normalise each reference to peak at 1
+            const double mx = std::max(c.x, std::max(c.y, c.z));
+            c.x /= mx; c.y /= mx; c.z /= mx;
+        }
+        const double mags[] = {1.0, 3.0, 79.3, 250.0};
+        double worst = 0.0;
+        for (auto f : heads) {
+            for (const Vec3& c : cols) {
+                Spectrum base = f(c.x, c.y, c.z);
+                for (double m : mags) {
+                    Spectrum scaled = f(c.x * m, c.y * m, c.z * m);
+                    for (double w = 400.0; w <= 700.0; w += 10.0) {
+                        const double a = m * base(w), b = scaled(w);
+                        const double d = std::abs(a - b) / std::max(1e-12, std::abs(a));
+                        if (d > worst) worst = d;
+                    }
+                }
+            }
+        }
+        if (worst > 1e-12) passJ = false;
+
+        // The in-gamut no-op, at the source.
+        bool noop = true;
+        const Vec3 inGamut[] = {{0.0, 0.0, 0.0}, {0.5, 0.5, 0.5}, {1.0, 1.0, 1.0},
+                                {0.28, 1.00, 0.89}, {0.7, 0.45, 0.2}, {1.0, 0.0, 0.0}};
+        for (const Vec3& c : inGamut) {
+            double r = c.x, g = c.y, b = c.z;
+            if (upsample::gamutSplit(r, g, b) != 1.0 || r != c.x || g != c.y || b != c.z)
+                noop = false;
+        }
+        if (!noop) passJ = false;
+        std::printf("[checkupsample] over-unity factoring: max relative error %.3g; "
+                    "in-gamut no-op %s\n", worst, noop ? "exact" : "BROKEN");
+    }
+
+    bool pass = passA && passB && passW && passC && passD && passE && passF && passG && passH
+             && passI && passJ;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
