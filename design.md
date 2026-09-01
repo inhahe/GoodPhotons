@@ -2191,6 +2191,38 @@ render. Closing that means teaching the shared device path to gather in spp chun
   `-device cpu` renders the same image. Regression scene `scenes/_grin_fog.ftsl` — a GRIN lens and
   an unrelated scattering haze in one room — deposits 1.9 M crossings and images the haze; before
   the fix it deposited zero.
+  **A GRIN medium keeps its analog transport instead of being deleted (0.198.0).** Refusing the
+  *deposit* is right; what 0.197.1 left behind was that refusing the deposit still let the photon
+  be crossed **straight** and charged the medium's extinction as absorption — so a scattering GRIN
+  medium was billed for out-scatter that nothing ever paid back, and behaved as a **pure
+  absorber**: its volume rendered as nothing *and* surfaces lit through it came out dark. The fix
+  splits the scene's media into two populations transported by different rules, and threads that
+  split through the free-flight sampler and the transmittance integrator on both backends as a
+  filter argument (`Renderer::MedFilter` = `MedAll`/`MedStraight`/`MedCurved`, device twin
+  `DMedFilter`, both defaulting to `All` so every pre-existing call site is bit-identical):
+  **non-GRIN media** (`MedStraight`) are crossed straight, deposited and gathered as beams exactly
+  as before; **GRIN media** (`MedCurved`) are excluded from the crossing and keep full analog
+  scattering — the same transport they get without `-beams` — sampled along the marched curve
+  (see the `grin.h` bullet below). The straight crossing is then clipped at the analog collision
+  (`dEvent`, not `dSurf`, in `tracePhoton` and `shadeStep`), which is also what makes the
+  bookkeeping exact rather than merely plausible: because the crossing stops there, the
+  probability that a stored beam covers depth *s* is already Tr_curved(0→s), so `emitBeams` /
+  `dEmitBeams` must apply only `MedStraight` transmittance to the power they store, or the curved
+  part would be counted twice. With no GRIN medium in the scene `MedCurved` matches nothing (no
+  RNG is drawn, `dEvent == dSurf`) and `MedStraight` matches everything, so ordinary beam renders
+  are unchanged draw-for-draw. Verified two ways: `scenes/_grin_scatfog.ftsl` (a GRIN lens plus a
+  scattering GRIN haze) rendered GPU mode `M` at 20 M photons **with and without `-beams`** agrees
+  to **energy bias −0.07 %, rel-RMS 1.09 % @8×8** (whole-frame ratio 0.9993, both halves within
+  0.0008 of 1) against a ~4 % per-pixel photon-map noise floor — through 0.197.x it did not; and a
+  sweep of **non-GRIN** media scenes against a 0.197.2 baseline binary came out **bit-identical**
+  on every path that is deterministic at all (`R` GPU/CPU, `B` megakernel/CPU, `M` CPU `-beams`,
+  and the `_g`/env variants). The four paths that differed — `B` GPU wavefront, `M` GPU `-beams`,
+  `M` GPU plain, `S` GPU — differ from *themselves* by the same margin when the **baseline binary
+  is run twice** (see the non-determinism entry in `known-issues.md`), so the sweep is clean.
+  `warnBeamsGrinMedia` is now a *note* rather than a warning, and
+  states the one thing that is still genuinely missing: a scattering GRIN medium has no volumetric
+  **in-scatter** in the beam map — there is no straight chord inside a bending region to store —
+  so the region's own glow is absent while everything it illuminates is correct.
   **…which is why the CPU branch had to learn the live window (0.195.1).** Back when `-beams`
   was CPU-only it *forced* `runSharedPhotonMap`'s CPU branch, and that branch called
   `renderPhotonCamera` with no progress hook — its GPU twin has passed a `SppProgress` since
@@ -2243,6 +2275,77 @@ render. Closing that means teaching the shared device path to gather in spp chun
   **Beam noise reads as coloured streaks**, not grain — too few beams under a thin kernel are
   individually resolvable — so `-spp` is the wrong knob for it and `-beamcount` / `-beamk` are
   the right ones.
+- **`grin.h` — gradient-index media, and what the marcher owes the rest of the engine.**
+  A `medium { ior "<expr>" }` is a region where rays integrate the Eikonal equation
+  `d/ds(n·dr/ds) = ∇n` rather than travelling straight, via a symplectic march of step
+  `ior_step`. One canonical CPU marcher (`grin.h`) and one device twin (`dGrinMarch`,
+  render_cuda.cu, carrying its running Eikonal state in **double** so the two backends bend
+  alike) serve every transport path; `grin::sceneHasGrin` / `DScene::hasGrin` gate the whole
+  thing, so an `ior`-free scene never enters it and stays bit-identical. Marching does **not**
+  consume a bounce: it is a pre-pass run before each bounce's `closestHit`, stopping when a
+  surface is within one step or the ray has left every GRIN region.
+  **Media along the curve are integrated by the caller, one straight sub-segment at a time
+  (0.198.0).** `grin::march` became a no-op-hook wrapper over `grin::marchSegments(scene, ray,
+  onSeg)`, which calls back for **every** straight piece of the walked polyline — the Eikonal
+  steps *and* the straight jumps between regions — handing over that piece's origin, travel
+  direction and true geometric length (`|(T/n)·ds|`, which equals `ds` only to first order).
+  Returning true terminates the march at a distance along that piece, which is how a caller says
+  "my medium scattered here". The device equivalent is a `DGrinMedia` struct parameter (no
+  `--extended-lambda`, so no device lambdas) plus a `maxSteps` driving parameter.
+  **This existed because the marched span was previously invisible to every media integrator.**
+  `march` advanced the ray geometrically over the whole curved span and each tracer then sampled
+  media only on the **short straight remainder** — so a medium that both scatters and carries
+  `ior` lost essentially all of its scattering, in every mode, on both backends. `grin.h`
+  documented that as an intentional approximation; measurement showed it was closer to deletion.
+  The control is a pair of scenes differing by **one line**, a *constant* `ior "1.0"`: a
+  constant index has zero gradient, so it bends nothing and only routes the medium through the
+  marcher. They are checked in as `scenes/_grin_constior_a.ftsl` (no `ior`) and
+  `scenes/_grin_constior_b.ftsl` (`ior "1.0"`); compare with
+  `ftrace -in scenes/_grin_constior_{a,b}.ftsl -mode R -spp 2000 -o png/ci_{a,b}.png -hdr` then
+  `python tools/pfmcmp.py png/ci_a.pfm png/ci_b.pfm`. At `-mode R -device gpu -spp 2000`
+  (2.24 % per-render noise floor) the haze came out to a **0.885** whole-image and **0.779**
+  centre-disc radiance ratio before the fix, auto-exposure moved 1.9×, and the haze visually
+  vanished; after it, **energy bias +0.00 %, rel-RMS 1.86 % @8×8**, ratios 1.0000 whole /
+  1.0007 centre / 1.0000 outside. "`ior "1.0"` must render identically to no `ior` at all" is
+  the reference-free invariant this feature is validated against.
+  **The decomposition is exact, not an approximation.** A spatial Poisson process with rate
+  σ_t(x) is Markov in arc length, so first-collision sampling along a polyline decomposes
+  exactly into "sample within segment 1; failing that, resample afresh in segment 2; …", and
+  transmittance along a polyline is exactly the product of the per-segment transmittances.
+  **Along the curve every medium goes analog, `-beams` or not.** That is not a shortcut, it is
+  the thing a beam cannot be: `-beams` trades analog scattering for a straight chord the gather
+  integrates, and there is no straight chord inside a bending region. Splitting the curve into
+  its 10⁴–10⁵ Eikonal steps and storing a micro-beam for each would explode both the beam map
+  and the gather cost to buy an answer analog sampling already gives exactly.
+  **Each tracer uses the hook for what it actually needs**, which is why the hook is a callback
+  rather than media code inside `grin.h` (whose only dependency is `scene.h`, while the media
+  samplers are `Renderer` members): the forward tracer (`render.h::tracePhoton`, device
+  `kTrace`/`kWfExtend` → `shadeStep`) samples a real collision and reports it as this bounce's
+  medium event at zero travelled distance; `backward.h` draws **one** exponential flight before
+  the march and lets accumulated arc length consume it (the exponential is memoryless, so this
+  is identical in distribution to a per-sub-segment draw and ~10⁵× fewer RNG calls); the
+  photon-map gather runs its **volume estimator per sub-segment**; the rest just accumulate arc
+  length for the dielectric Beer-Lambert. In the GPU **wavefront** backend the march happens in
+  `kWfExtend` but is consumed in `kWfShade`, so its outcome crosses the kernel boundary in two
+  new `WFState` arrays (`gmMed`, `gmArc`) the way `hit` already did, and `kWfExtend` writes the
+  advanced RNG back.
+  **Modes `M`/`S` bend the camera ray too (0.198.0).** Their forward deposit had marched since
+  GRIN landed, but `photonGather` / `dPhotonGather`, `photonGatherSub` / `dPhotonGatherSub` and
+  `sppmVisiblePoint` / `dSppmVisiblePoint` all called `closestHit` on a straight ray — so a
+  gradient lens bent the photons and not the view and **rendered dead flat**, while mode `R`
+  lensed the same scene into a radial disc, and nothing warned. The surface half was a drop-in.
+  The `-beams` **volume** half was not: Beam × Ray is a closest approach between two *straight*
+  lines, so a curved camera ray has to be fed to it one Eikonal step at a time — which is what
+  `maxSteps = 1` driving (loop until `!med->stepped`) is for on the device, and the per-sub-
+  segment hook on the host. Exact, because radiance along a path is additive over its pieces and
+  the running `thr` carries each piece's transmittance forward, which is precisely what
+  `gatherPhotonBeams`' own per-beam `Tr_cam(0 → tCam)` assumes (it measures from the sub-segment
+  start). One-step driving costs nothing extra — the marcher already redoes the
+  region-membership test and `closestHit` on every iteration — and it keeps the bending maths in
+  one function instead of a second copy of it. What is still missing is a scattering GRIN
+  medium's own volumetric **in-scatter** in mode `M`: there are no beams inside a bending region
+  to gather, and a curved beam primitive is a research problem, so the region's glow is absent
+  while everything it illuminates, attenuates and scatters is now correct.
 - **`spectrum.h` / `spectral_library.h` / `upsample.h` / `color.h` / `hero.h`** —
   spectral core: measured SPDs/materials, RGB→spectrum upsampling, CIE tables,
   hero-wavelength sampling (`kHeroC=4`: hero λ + 3 stratified secondaries) used by
@@ -4179,7 +4282,9 @@ render. Closing that means teaching the shared device path to gather in spp chun
   **GRIN (gradient-index) media** run on the backward reference (mode `R`) on-device
   too since 0.38.0 (M11): `dGrinMarch` (render_cuda.cu) is the device twin of
   `grin::march`, carrying its running Eikonal state in double, and `bkRadiance` marches
-  each bounce's ray before `closestHit` (gated by `sc.hasGrin`); only mode-`D` BDPT and
+  each bounce's ray before `closestHit` (gated by `sc.hasGrin`) — and since 0.198.0 that march
+  also integrates the participating media along the curve, and the mode-`M`/`S` gathers march
+  their camera rays too (see the `grin.h` bullet); only mode-`D` BDPT and
   the RGB fast path still route GRIN scenes to the CPU. Since
   0.24.0 it also does **fluorescence** (bispectral Stokes-shift adjoint: elastic +
   excitation-wavelength NEE, `gOut = M(lambda)/Mint * invPdf`, stochastic

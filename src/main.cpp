@@ -11226,10 +11226,17 @@ static void warnModeMMedia(const Scene& scene, bool beamsOn) {
 
 // A beam is a STRAIGHT chord, so a scattering medium that also carries an `ior` field (GRIN)
 // cannot be deposited: the photon curves through it and there is no segment to store. Both
-// backends refuse it on identical per-medium terms (Renderer::emitBeams / dEmitBeams), so this
-// is a property of the beam REPRESENTATION and not of the backend — which is exactly why there
-// is no CPU fallback for it. Warn, because the alternative is a scattering GRIN region that
-// silently renders as nothing while every other medium in the scene appears normally.
+// backends refuse that deposit on identical per-medium terms (Renderer::emitBeams /
+// dEmitBeams), so this is a property of the beam REPRESENTATION and not of the backend —
+// which is exactly why there is no CPU fallback for it.
+//
+// Since 0.198.0 refusing the deposit no longer means refusing the TRANSPORT. A GRIN medium is
+// excluded from the straight crossing and keeps full analog scattering along the marched curve
+// (Renderer::MedCurved / DMedCurved), exactly as it behaves without -beams, so it no longer
+// acts as a pure absorber and no longer dims what is lit through it. What is still missing is
+// only its volumetric IN-SCATTER in the beam map — there are no beams inside a bending region
+// to gather — so its own glow is absent from the image while everything it lights is correct.
+// Say that, since it is a real and otherwise silent difference from plain -mode M.
 static void warnBeamsGrinMedia(const Scene& scene, bool beamsOn) {
     if (!beamsOn) return;
     size_t nGrinScat = 0, nOther = 0;
@@ -11242,14 +11249,14 @@ static void warnBeamsGrinMedia(const Scene& scene, bool beamsOn) {
     }
     if (nGrinScat == 0) return;
     std::fprintf(stderr,
-        "[beams] warning: %zu scattering medium/media in this scene are gradient-index\n"
-        "        (GRIN), and a photon CURVES through those — there is no straight chord to\n"
-        "        store as a beam, so under -beams each behaves as PURELY ABSORBING: its\n"
-        "        volume renders as nothing, and the light it would have scattered is removed\n"
-        "        rather than redistributed, so surfaces lit through it come out dimmer than\n"
-        "        under plain -mode M%s.\n"
-        "        This is a limit of the beam representation, not of the backend: the CPU\n"
-        "        refuses the same deposit, so -device cpu renders the same image.\n",
+        "[beams] note: %zu scattering medium/media in this scene are gradient-index (GRIN),\n"
+        "        and a photon CURVES through those — there is no straight chord to store as a\n"
+        "        beam. Each therefore keeps its full ANALOG transport (it scatters the photons\n"
+        "        passing through it and attenuates the camera ray correctly, exactly as without\n"
+        "        -beams), but its own volumetric IN-SCATTER is not in the beam map, so the\n"
+        "        region's glow is absent while everything it illuminates is right%s.\n"
+        "        This is a limit of the beam representation, not of the backend: the CPU does\n"
+        "        the same, so -device cpu renders the same image.\n",
         nGrinScat, nOther ? " (other media are unaffected)" : "");
 }
 

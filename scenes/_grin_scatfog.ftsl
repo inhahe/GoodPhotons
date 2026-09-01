@@ -6,17 +6,24 @@
 # that deposit per medium (Renderer::emitBeams / dEmitBeams), which is what this scene
 # exists to exercise:
 #
-#   * ftrace warns (warnBeamsGrinMedia) that the medium behaves as PURELY ABSORBING under
-#     -beams — no volume, and its scattered light removed rather than redistributed
+#   * ftrace prints a note (warnBeamsGrinMedia) naming the medium
 #   * the beam map comes out empty ("0 beams stored"), on CPU and GPU alike
 #
-# It is also the test case for the OPEN known-issues item proposing that a non-depositable
-# medium keep its ANALOG transport instead of being crossed straight: under that fix, the
-# SURFACE illumination here should closely match the same scene rendered without -beams,
-# whereas today it is measurably darker.
+# THE INVARIANT THIS SCENE TESTS (since 0.198.0): a medium that cannot be beam-deposited
+# keeps its full ANALOG transport rather than being crossed straight, so the SURFACE
+# illumination here must match the same scene rendered WITHOUT -beams. Through 0.197.x it
+# did not — the medium was crossed straight with Beer-Lambert, which removed its scattered
+# light instead of redistributing it, and the image came out measurably darker. Measured at
+# 0.198.0, GPU mode M, 20M photons: whole-frame ratio 0.9993, both halves within 0.0008 of
+# 1, against a per-pixel photon-map noise floor of ~4%.
 #
-#   ftrace -in scenes/_grin_scatfog.ftsl -mode M -beams -n 300000 -o png/gs_beams.png
-#   ftrace -in scenes/_grin_scatfog.ftsl -mode M        -n 300000 -o png/gs_plain.png
+# What is still absent, and is a limit of the beam representation rather than a bug: the
+# GRIN haze's own volumetric IN-SCATTER (its visible glow). There is no straight chord
+# inside a bending region to store as a beam. Everything the haze ILLUMINATES is right.
+#
+#   ftrace -in scenes/_grin_scatfog.ftsl -mode M -beams -n 20000000 -o png/gs_beams.png -hdr
+#   ftrace -in scenes/_grin_scatfog.ftsl -mode M        -n 20000000 -o png/gs_plain.png -hdr
+#   python scraps/_cmp_pfm.py png/gs_plain.pfm png/gs_beams.pfm
 
 scene {
     units    meters

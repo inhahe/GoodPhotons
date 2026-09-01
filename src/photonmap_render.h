@@ -235,8 +235,17 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     bool specularSeen = false;                           // any specular bounce so far?
     Renderer mats; mats.diffraction = diffraction;
     MediumStack stk;                                     // nested-dielectric medium stack
+    const bool grinAny = grin::sceneHasGrin(scene);      // final-gather rays bend too
 
     for (int b = 0; b < maxBounce; ++b) {
+        if (grinAny) {
+            double arc = 0.0;
+            grin::marchSegments(scene, ray,
+                [&](const Vec3&, const Vec3&, double slen, double&) { arc += slen; return false; });
+            int cm = stk.topMat();                       // Beer-Lambert over the marched arc
+            double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
+            if (a > 0.0 && arc > 0.0) thr *= std::exp(-a * arc);
+        }
         Hit h = scene.closestHit(ray);
         if (h.valid) {                                   // Beer-Lambert in current medium
             int cm = stk.topMat();
@@ -418,11 +427,38 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                             ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
 
     const bool volOn = (bm != nullptr) && !bm->empty() && !scene.media.empty();
+    // GRADIENT-INDEX: the CAMERA ray has to bend too. Mode M's forward deposit has marched
+    // since GRIN landed, but this gather called closestHit directly, so a GRIN lens bent the
+    // photons and not the view: the lens rendered dead flat while mode R lensed the same
+    // scene into a radial disc, and nothing warned. Marching here is what makes mode M see
+    // its own geometry.
+    const bool grinAny = grin::sceneHasGrin(scene);
 
     for (int b = 0; b < maxBounce; ++b) {
-        Hit h = scene.closestHit(ray);
         const int    cmIdx  = stk.topMat();
         const double aGlass = (cmIdx >= 0) ? scene.mats[cmIdx].absorb(lambda) : 0.0;
+        // Curved pre-pass. The volume estimator runs PER STRAIGHT SUB-SEGMENT of the curve:
+        // Beam x Ray is a closest-approach between two straight lines, so a curved camera
+        // ray has to be fed to it one Eikonal step at a time. That is exact rather than an
+        // approximation — the radiance integral along a path is additive over its pieces,
+        // and `thr` carries each piece's transmittance forward, which is precisely what
+        // gatherPhotonBeams' own per-beam Tr_cam(0 -> tCam) expects (it measures from the
+        // sub-segment start; the accumulated `thr` supplies everything before it).
+        if (grinAny) {
+            grin::marchSegments(scene, ray,
+                [&](const Vec3& so, const Vec3& sd, double slen, double&) -> bool {
+                    if (volOn) {
+                        L += gatherPhotonBeams(scene, mats, *bm, so, sd, slen, aGlass, rng) * thr;
+                        thr *= mats.mediaTransmittance(scene, so, sd, slen, lambda, rng);
+                    }
+                    if (aGlass > 0.0) thr *= std::exp(-aGlass * slen);
+                    return false;   // a camera ray never terminates in the volume here:
+                                    // mode M's volume answer IS the beam gather above
+                });
+            if (thr <= 0.0) return L;
+        }
+
+        Hit h = scene.closestHit(ray);
         // --- Participating media along this segment (mode M with -beams) ---------------
         // Done BEFORE `thr` takes the segment's attenuation, because each gathered beam
         // needs the transmittance to ITS OWN closest-approach point, not to the segment end.

@@ -1,0 +1,53 @@
+# CONTROL: a plainly scattering bounded haze, no `ior` field at all.
+#
+# Half of a controlled pair with _grin_constior_b.ftsl, which is byte-identical except that
+# the medium carries `ior "1.0"`. A CONSTANT index of 1.0 has zero gradient, so it bends
+# nothing — the ray geometry is identical. The only thing it changes is which code path
+# handles the medium: `Medium::grin()` is `!ior.empty()`, so variant B is routed through
+# the Eikonal marcher (grin::marchSegments / dGrinMarch) and variant A is not.
+#
+# Therefore the two images MUST match to noise. If they don't, the GRIN marcher is
+# skipping participating-media interaction along the span it marches. This is the
+# REFERENCE-FREE test: it needs no ground truth, because each variant IS the other's.
+#
+# Through 0.197.x it FAILED — the marcher advanced the ray over the whole bent span with no
+# medium interaction, so B lost nearly all of the haze's scattering: ratio 0.885 whole-image
+# and 0.779 through the centre of the haze, and the dome vanished visually (auto-exposure
+# absorbed 1.9x of the error, which is why "just look at it" was not enough). Fixed in
+# 0.198.0 by grin.h's per-sub-segment hook; measured after, at -mode R -device gpu
+# -spp 2000: energy bias +0.00%, rel-RMS 1.86% at 8x8 against a 2.24% per-render noise floor.
+#
+#   ftrace -in scenes/_grin_constior_a.ftsl -mode R -spp 2000 -o png/ci_a.png -hdr
+#   ftrace -in scenes/_grin_constior_b.ftsl -mode R -spp 2000 -o png/ci_b.png -hdr
+#   python tools/pfmcmp.py png/ci_a.pfm png/ci_b.pfm
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# A dense, obvious haze sitting square in front of the back wall.
+medium {
+    bounds { center 0.5 0.45 0.45   radius 0.30 }
+    sigma_t 4.0   albedo 0.9   g 0.0
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode R
+    film { res 160 160 }
+}

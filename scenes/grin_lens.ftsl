@@ -7,15 +7,19 @@
 # gradient lens and visibly warps the checker behind it into a circular lensed pattern.
 # Remove the `medium` block for the undistorted straight-ray control.
 #
-# Backends: GRIN runs on BOTH CPU and GPU in modes A/B/C and R — all four share the one
+# Backends: GRIN runs on BOTH CPU and GPU in modes A/B/C, R and M/S — all share the one
 # symplectic Eikonal marcher (`grin::march` / `dGrinMarch`), so `-device gpu` is correct
 # here and is what you want. (An older version of this header said `-device cpu`; that
-# has not been true since the marcher was ported.) The modes that do NOT lens this scene:
-#   * mode D (BDPT) refuses GRIN outright — its connection geometry, area-measure pdf
-#     conversion and MIS weights all assume straight segments. See `-on-unsupported`.
-#   * mode M (photon map) bends the PHOTONS but not the CAMERA rays: its forward deposit
-#     marches, its gather calls closestHit directly, so the checker comes out flat.
-#     See known-issues.md.
+# has not been true since the marcher was ported.) The one mode that does NOT lens this
+# scene is mode D (BDPT), which refuses GRIN outright — its connection geometry,
+# area-measure pdf conversion and MIS weights all assume straight segments. See
+# `-on-unsupported`.
+#
+# Modes M/S used to belong on that list: through 0.197.x the photon-map deposit marched but
+# the camera gather called closestHit on a straight ray, so the checker came out DEAD FLAT
+# and nothing warned. Fixed in 0.198.0 — the gather, the final-gather rays and the SPPM
+# visible-point walk all march now, so M/S lens this scene the way R does. If you are
+# comparing modes, that agreement is the check worth making.
 scene {
     units    meters
     spectral 360 830 1

@@ -3767,8 +3767,9 @@ small symplectic march step (`ior_step <v>`, default 1/64 of the smallest bound 
 This makes mirages, hot-air shimmer, and **gradient lenses that focus/warp with no glass
 surface at all**. E.g. `medium { bounds { center 0 0 2 radius 0.9 } ior "1.6 - 0.6*(sqrt(x*x+y*y+(z-2)*(z-2))/0.9)" }`
 is a radial index ball (n=1.6 core → 1.0 rim) that visibly lenses a checkerboard behind it
-(`scenes/grin_lens.ftsl`). GRIN bending runs on the **forward light tracer (modes `A`/`B`/`C`)
-and the backward reference (mode `R`), on both CPU and GPU** — all share one symplectic
+(`scenes/grin_lens.ftsl`). GRIN bending runs on the **forward light tracer (modes `A`/`B`/`C`),
+the backward reference (mode `R`) and the photon-map modes (`M`/`S`), on both CPU and GPU** —
+all share one symplectic
 marcher (the GPU carries its running Eikonal state in double to match the CPU; a small
 bent-region float-vs-double residual on the GPU is noted in `known-issues.md`). **GRIN is not
 a backend question** — `-device gpu` is correct for a GRIN scene and is what you want. It is a
@@ -3777,10 +3778,35 @@ question of which *mode*:
 | mode | GRIN |
 |---|---|
 | `A` / `B` / `C` (forward), `R` (backward reference) | **full** — photons and camera rays both bend, CPU and GPU alike |
+| `M` (photon map), `S` (SPPM) | **full** since 0.198.0 — the deposit bends the photons and the gather now bends the camera ray, including the final-gather rays and (for `M` with `-beams`) the volume estimator, which is fed the curve one Eikonal step at a time. Before 0.198.0 only the deposit marched, so a gradient lens rendered **dead flat** and nothing warned |
 | `D` (BDPT) | **refused** — its connection geometry, area-measure pdf conversion and MIS weights all assume straight segments, so a GRIN region would bias the estimator; `-on-unsupported error\|fallback\|strip` picks the policy |
-| `M` (photon map), and presumably `S` | **partial, and silently so** — the forward deposit bends the *photons*, but the camera gather calls `closestHit` on a straight ray, so a gradient lens does not appear at all and nothing warns. See `known-issues.md`. |
 
-So reach for `A`/`B`/`C` or `R` when the point of the scene is the bending.
+**Participating media inside a GRIN region are integrated along the curve** (0.198.0). The
+marcher hands each straight sub-segment of the bent path back to the tracer, which samples its
+free flight / transmittance on it exactly as it would on any straight segment — the
+decomposition is exact, because a spatial Poisson process is Markov in arc length. Before
+0.198.0 the marched span was invisible to the media code (each tracer sampled only the short
+straight remainder *after* the march), so **a medium that both scatters and carries `ior` lost
+essentially all of its scattering** — in every mode, on both backends. Measured on a pair of
+scenes differing by a single *constant* `ior "1.0"` (zero gradient: it bends nothing, it only
+routes the medium through the marcher), the haze came out 22 % dark through its own centre
+against a 2.2 % noise floor and visually vanished.
+
+That pair is checked in, and is the reference-free way to test this yourself — a constant index
+must render *identically* to no `ior` at all:
+
+```
+ftrace -in scenes/_grin_constior_a.ftsl -mode R -spp 2000 -o png/ci_a.png -hdr   # no ior
+ftrace -in scenes/_grin_constior_b.ftsl -mode R -spp 2000 -o png/ci_b.png -hdr   # ior "1.0"
+python tools/pfmcmp.py png/ci_a.pfm png/ci_b.pfm
+```
+
+At 0.198.0 that reports **energy bias +0.00 %, rel-RMS 1.86 % @8×8** — noise, against a 2.24 %
+per-render floor. (Use `-device gpu`, the default. Mode `R` on the **CPU** can't judge this
+scene: its backward tracer collapses all media to one global homogeneous haze and ignores
+`bounds{}` — a long-standing limitation it warns about at startup.)
+
+So reach for `A`/`B`/`C`, `R` or `M`/`S` when the point of the scene is the bending.
 
 **Authoring media procedurally (loom).** The [loom toolkit](tools/loom/README.md) emits
 these `medium {}` blocks from a `loom.Volume(...)`: `sigma_t` / `albedo` / `g` are
@@ -4188,12 +4214,39 @@ leaves no segment to store. Both backends refuse that deposit on identical terms
 — a photon curves only *inside* a GRIN region, so its crossing of an ordinary fog elsewhere in
 the same scene is still a perfectly good beam. (Through 0.197.0 this gate was scene-*wide*, so
 merely putting a GRIN lens in a foggy room silently threw away every beam in the scene; fixed in
-0.197.1.) When a *scattering* GRIN medium is present ftrace warns that, under `-beams`, it
-behaves as **purely absorbing** — its volume renders as nothing *and* the light it would have
-scattered is removed rather than redistributed, so surfaces lit through it come out dimmer
-than under plain `-mode M`. The warning says plainly that `-device cpu` renders the same
-image, because it does. (Giving such a medium back its analog transport is tracked in
-`known-issues.md`.)
+0.197.1.)
+
+**Since 0.198.0 a GRIN medium keeps its analog transport under `-beams`** instead of being
+crossed straight and booked as absorbed. The two halves of a scene's media are now transported
+by different rules and sampled separately: **non-GRIN media** are crossed straight and
+deposited/gathered as beams, exactly as before; **GRIN media** are excluded from that crossing
+and keep full analog scattering — the same transport they get without `-beams` — sampled along
+the marched curve one Eikonal step at a time. Nothing is double-counted: because the straight
+crossing is clipped at the analog collision, the probability that a beam covers depth *s* is
+already the GRIN transmittance to *s*, so the stored beam charges only the straight media.
+Through 0.197.x a scattering GRIN medium instead behaved as **purely absorbing** under `-beams`
+— its volume rendered as nothing *and* the light it would have scattered was removed rather
+than redistributed, so surfaces lit through it came out dimmer than under plain `-mode M`, and
+ftrace warned about it. That warning is gone with the behaviour. What remains is a real
+limitation, and it is the one a beam genuinely cannot express: a scattering GRIN medium has no
+volumetric **in-scatter** representation in the mode-`M` beam map (there is no straight chord
+inside a bending region to store), though it now correctly attenuates the camera ray and
+correctly scatters the photons that pass through it.
+
+The check that pins this down is that `-beams` must now change *only* the volumetric glow, not
+the surface illumination — so a scene whose media are all GRIN must render the **same** with and
+without it. `scenes/_grin_scatfog.ftsl` (a gradient lens plus a scattering GRIN haze) is that
+scene:
+
+```
+ftrace -in scenes/_grin_scatfog.ftsl -mode M -beams -n 20000000 -o png/gs_beams.png -hdr
+ftrace -in scenes/_grin_scatfog.ftsl -mode M        -n 20000000 -o png/gs_plain.png -hdr
+python tools/pfmcmp.py png/gs_plain.pfm png/gs_beams.pfm
+```
+
+At 0.198.0: **energy bias −0.07 %, rel-RMS 1.09 % @8×8**, against a ~4 % per-pixel photon-map
+noise floor. (`0 beams stored` in the `-beams` log is correct here — every medium in the scene
+is GRIN, so there is nothing to deposit.)
 
 **What actually costs time, and the split rule (0.196.0).** Not the number of beams gathered —
 a 16× change in `-beamk` moves the gather 3%. The cost is how many beam AABBs a camera ray has
