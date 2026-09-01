@@ -897,10 +897,15 @@ that converges to the same physical image.
   turns the split off and restores the single-map behaviour. The caustic radius is never allowed
   to exceed the global one: on a scene where caustic photons are very sparse the adaptation would
   otherwise ask to *grow* it, which is worse than not splitting at all.
-  *Caveat:* the split is the storage half of Jensen's scheme. Emission is still uniform, so on a
-  scene whose specular geometry subtends a small solid angle the caustic map ends up sharp but
-  sparsely populated; the dedicated projection-map emission pass that fixes that is not built yet
-  (see `known-issues.md`). `-savemap`/`-loadmap` still lets
+  The split is only the **storage** half of Jensen's scheme; the **sampling** half is
+  `-causticn` (0.203.0 CPU, 0.204.0 GPU), which emits extra photons aimed at the scene's
+  focusing geometry so that the sharp caustic map is also densely *populated*. It is on by
+  default (`auto` = `-n`/4). With it off, a scene whose specular geometry subtends a small
+  solid angle gets a caustic map that is sharp but nearly empty — and, because the caustic
+  radius may not grow past the global one, one that gathers a handful of photons per pixel and
+  reads as noise the denoiser then erases. If a caustic looks absent rather than merely noisy,
+  the number to raise is `-causticn`; the `probe saw N; target K` line printed when the caustic
+  map is built says how far short the population is. `-savemap`/`-loadmap` still lets
   the deposit be paid just once, on **CPU and GPU**, and the file carries **both halves of the
   trace** — surface photons *and* the `-beams` volume cache. (Before 0.195.0 the serialiser
   lived in the CUDA translation unit, so the flags were GPU-only by accident of placement and

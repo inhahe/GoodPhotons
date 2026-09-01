@@ -5,6 +5,89 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-09-01, v0.204.0): on `gallery_rain` the aimed caustic pass cannot concentrate — ~275 k of ~275 k prims are flagged "focusing", most of them the gyroid *diffuser*
+
+**Context.** `-causticn` (0.203.0 CPU, 0.204.0 GPU) emits extra photons aimed at focusing
+geometry so the caustic map is densely populated. It demonstrably *works* — on `gallery_rain`,
+`-causticn 5M` turned 11 050 caustic deposits into 805 458 (a ~73x population), and a 12x
+amplified difference against the un-aimed control is precisely a field of colourful caustics on
+the floor around the glass exhibits. It is also unbiased: `stored flux/emitted` = **1817.83** at
+`-causticn 5M` vs **1815.88** at `-causticn 80M` (0.1 % agreement across a 16x budget change),
+which is the balance-heuristic MIS weight doing its job.
+
+**The problem is that the caustics are real but far too dim to see, and more `-causticn` does
+not close the gap.**
+
+| run | caustic photons stored | probe saw / target | flux/emitted |
+|---|---|---|---|
+| `-causticn 0`, `-n 20M`  | 11 050     | -       | - |
+| `-causticn 5M`, `-n 20M` | 816 508    | 2 / 47  | 1817.83 |
+| `-causticn 80M`, `-n 10M`| 12 888 623 | 11 / 117| 1815.88 |
+
+Even at a 16x budget the probe is ~10x short of its own target population. The image is **not**
+clipping (0.14 % of pixels >= 250; the caps sit mid-grey by design), so this is not a tone-map
+artefact.
+
+**Root cause.** The log reads `[camera] caustic aim: 275283 focusing prims in 64 target spheres`
+against `[mesh] shape_only: ... 275280 remain` — i.e. **essentially every primitive in the scene
+is flagged focusing**, dominated by the gold gyroid's tessellation. `caim::materialMayFocus`
+(`src/causticaim.h:108`) is a conservative material test (Dielectric / Mirror / ThinFilm /
+Multilayer / Grating / HalfMirror -> true; Glossy -> true when roughness <= `kCausticGlossRoughness`;
+Mix/Layered recurse; depth > 8 -> true), and it is *correct* as a material test — but the scene's
+own notes describe the gyroid as **"not a dozen prisms, it is a diffuser"**. So the 64 clusters
+spread the aimed budget over a 46x45 m hall instead of concentrating on the handful of exhibits
+that actually throw caustics onto the floor.
+
+**The fix, and why it is available.** The sampler currently sets the per-target selection
+probability `P_j = m_j/T` (m_j = prims in cluster j, T = total), which with `q_j = 1/m_j` makes
+`p_a(x) = count(x)/T` — one overlap count and one divide. But `P_j` is **not required** to be
+`m_j/T`: with `q_j = 1/m_j`, *any* `P_j` still yields an evaluable
+`p_a(x) = sum_{j in x} P_j/m_j` — a weighted overlap sum instead of a plain count. That is the
+opening for an **adaptive aim**: run a short pilot pass, measure each target's observed caustic
+*yield* (deposits that survived to the caustic map per photon aimed at it), and set `P_j`
+proportional to that yield. A cluster that is really a diffuser earns a near-zero `P_j` and stops
+eating budget; the exhibits that throw caustics take it. MIS stays valid throughout because the
+weight only needs `p_a` to be evaluable, not uniform.
+
+**Secondary cost note.** The mode-`M` gather cost scales with caustic-map *density*: raising
+`-causticn` 16x took the probe from 2 to 11 photons per query and made the gather dramatically
+slower (GPU pinned at 100 %). So "just raise `-causticn`" is not a free workaround even ignoring
+the concentration problem — the adaptive aim is the right fix precisely because it buys
+population where it matters instead of everywhere.
+
+**Still to measure.** A mode-`D` reference render of `gallery_rain`'s `camera "cam"` (mode `D` is
+the camera's native mode, and the mode the scene's caustic measurements were originally taken in)
+to settle whether mode `M`'s caustic *magnitude* matches the design's documented "peak 6.6x its
+cap".
+
+### RESOLVED — environmental, not a bug (2026-09-01, v0.204.1): a `gallery_rain` render died with `bad allocation` on a **201 MiB** buffer, on a machine with 64 GB of RAM
+
+Chased as if it were a leak in the new aimed caustic pass. It was not. Windows fails an
+allocation against the **system commit limit** (RAM + pagefile), not physical RAM, and the limit
+here — 268 GB (64 GB RAM + 192 GB pagefile) — was **97 % consumed**, mostly by four `claude`
+Node processes holding 57.5 / 54.7 / 28.4 / 24.8 GB. With ~1.1 GB of commit free, ftrace — itself
+holding only 5.4 GB — failed a 201 MiB `pm.pos` resize. The identical command succeeded on retry
+once free commit recovered to 11.4 GB.
+
+Ruled out along the way: the photon-grid lattice (a hash table since 0.199.6), the aimed pass's
+own buffers (all freed), and any gather-phase allocation proportional to `pmC`.
+
+**What was actually wrong was the diagnosis, and that is fixed.** The old message named the
+buffer and said "Lower `-n`" — advice that is *actively misleading* when 201 MiB is not the
+problem. `src/allocreport.h` now carries `ftalloc::MemStat` and `memAdvice()`, fed by a function
+hook installed by `main()` (the only TU that may include `<windows.h>`/`<psapi.h>`), so the
+message prints this process's own commit charge (`PROCESS_MEMORY_COUNTERS_EX::PrivateUsage`)
+next to the system's free and total commit (`MEMORYSTATUSEX::ullAvailPageFile` /
+`ullTotalPageFile`) and states which of the two ran out. It calls the failure **ours** if either
+the failed request is >= 25 % of what we already hold, or we are >= 50 % of the system's committed
+memory; failing both it says the machine filled up around us and that shrinking flags is the
+wrong move. The `std::bad_alloc` backstop passes `failedBytes < 0` (it never learns the request
+size) so its verdict rests on the second test alone.
+
+**How to check this by hand** if it recurs: `FreeVirtualMemory` / `TotalVirtualMemorySize` from
+`Win32_OperatingSystem`, not `FreePhysicalMemory`; and per-process `PM` (private memory), not
+`WS` (working set) — under commit pressure the working set is trimmed and understates the load.
+
 ### FIXED (2026-09-01, v0.201.0): the `gallery_rain` cloud rendered as full-saturation RGB speckle ("iridescent") because the beam kernel radius was pinned to a sample count
 
 **Reported as** the fourth of six defects in the `gallery_rain` mode-`M` `-beams` render: *"the

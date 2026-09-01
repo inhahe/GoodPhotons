@@ -187,6 +187,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX               // keep std::min/std::max (windows.h else macro-clobbers them)
 #include <windows.h>          // -preview: enable ANSI VT processing in a plain console
+#include <psapi.h>            // ftalloc's memStat hook: this process's own commit charge
 #endif
 
 // stb_image_write encoders (implementation compiled once in stb_image_impl.cpp).
@@ -21248,6 +21249,30 @@ int main(int argc, char** argv) {
     // running-render list -- which contains an em dash -- and then returns without ever
     // reaching the render setup where this used to be called.
     enableAnsiTerminal();
+    // Teach allocreport.h how to read the machine's memory state, so an out-of-memory can
+    // say whether the buffer that failed was the problem or the machine was already full
+    // (see the header comment there). Installed here because main.cpp is the one TU that
+    // already owns <windows.h>; the four headers/TUs that *use* ftalloc must not pull it in.
+    ftalloc::memStat = []() -> ftalloc::MemStat {
+        ftalloc::MemStat m;
+#ifdef _WIN32
+        MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms;
+        if (!GlobalMemoryStatusEx(&ms)) return m;
+        m.availCommit = (double)ms.ullAvailPageFile;
+        m.totalCommit = (double)ms.ullTotalPageFile;
+        m.availPhys   = (double)ms.ullAvailPhys;
+        m.totalPhys   = (double)ms.ullTotalPhys;
+        // PrivateUsage is the process's COMMIT charge, which is what the limit above counts
+        // — not the working set, which can be a small fraction of it under memory pressure
+        // and would make a 6 GiB render look like a 1 GiB one.
+        PROCESS_MEMORY_COUNTERS_EX pmc{}; pmc.cb = sizeof pmc;
+        if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                 (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof pmc))
+            m.procBytes = (double)pmc.PrivateUsage;
+        m.ok = true;
+#endif
+        return m;
+    };
     // Where ftrace.exe itself lives — the last resort of the asset search path, and the
     // fallback root for engine data (`data/glass/*` and friends ship beside the binary,
     // so they must resolve from any working directory). Taken from the module path, not
@@ -21380,8 +21405,11 @@ int main(int argc, char** argv) {
         // scale with the command line now report themselves (see allocreport.h); this catch
         // is the backstop for every allocation that does not, and at least points at the
         // knobs instead of at nothing.
+        // -1: this catch never learns how big the failed request was, so the verdict rests
+        // on our share of the system's committed memory alone (see memAdvice).
+        const std::string memNote = ftalloc::memAdvice(-1.0);
         std::fprintf(stderr,
-            "error: out of HOST memory (in an allocation the renderer does not size itself).\n"
+            "error: out of HOST memory (in an allocation the renderer does not size itself).%s\n"
             "       The buffers that grow with the command line are, in rough order of size:\n"
             "         -n <photons>        the photon map: ~%zu bytes per DEPOSITED photon\n"
             "         -beamcount <n>      the photon-beam map: ~%zu bytes per stored beam\n"
@@ -21390,7 +21418,7 @@ int main(int argc, char** argv) {
             "         -res / -spp         the film, and one film per selected camera\n"
             "       Halving -n is the usual first move; -beamcount / -beamsplitmax bound the\n"
             "       beam side independently of how many photons were traced.\n",
-            sizeof(Photon) + sizeof(Vec3), sizeof(PhotonBeam));
+            memNote.c_str(), sizeof(Photon) + sizeof(Vec3), sizeof(PhotonBeam));
         rc = 1;
         noteFinishReason("stopped by an error");
     } catch (const std::exception& e) {

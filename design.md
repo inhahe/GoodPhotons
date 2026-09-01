@@ -2231,6 +2231,18 @@ render. Closing that means teaching the shared device path to gather in spp chun
   `std::bad_alloc` backstop listing the four memory knobs for anything unwrapped. Motivation:
   `std::bad_alloc::what()` is the bare string `bad allocation`, so a render that died between
   two progress lines used to be diagnosable only by bisecting `-n` by hand.
+  Since **0.204.1** the message also says *whose* fault it was, because naming the buffer alone
+  can mislead: a 201 MiB failure in a process holding 5 GiB means the **machine** filled up
+  (this actually happened — see `known-issues.md`), and "Lower `-n`" is then the wrong advice.
+  `ftalloc::MemStat` + the `ftalloc::memStat` function hook (installed by `main()`, which is the
+  only TU allowed to include `<windows.h>`/`<psapi.h>`) report the process's own **commit
+  charge** (`PROCESS_MEMORY_COUNTERS_EX::PrivateUsage`) and the system's commit limit and free
+  commit (`MEMORYSTATUSEX::ullTotalPageFile` / `ullAvailPageFile` — commit, not physical RAM, is
+  what an allocation actually fails against on Windows). `memAdvice()` prints those and calls it
+  **ours** if either the failed request is ≥25 % of what we already hold, or we are ≥50 % of the
+  system's committed memory; failing both it says the machine ran out and that shrinking flags
+  is the wrong move. The `bad_alloc` backstop passes `failedBytes < 0` (it never learns the
+  size), so its verdict rests on the second test alone.
 
 - **`photonbeams.h`** — the **view-independent volume cache** that makes mode `M` see
   participating media at all (CLI `-beams`, since 0.20.7). The surface map above is a *point*
