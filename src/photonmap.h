@@ -47,6 +47,57 @@ struct Photon {
 // A per-thread deposit bank: the split (position, payload) pair that a photon pass appends
 // to, mirroring PhotonMap's own split layout so the concatenation into the map is a plain
 // append of both arrays. The two vectors are always the same length.
+// Host/device annotation for the one function the CPU grid and the CUDA gather kernels MUST
+// agree on bit for bit — the cell hash. If the two ever disagreed, a GPU gather would look in
+// a different bucket than the host counting sort filled and silently return black.
+#ifdef __CUDACC__
+  #define PM_HD __host__ __device__
+#else
+  #define PM_HD
+#endif
+
+// Bucket index for an integer cell coordinate, in a table of (mask+1) buckets.
+//
+// WHY THE GRID IS HASHED AND NOT DENSE. A dense grid indexes cells as (iz*ny+iy)*nx+ix and
+// therefore has to ALLOCATE nx*ny*nz ints, which grows as (L/r)^3 in the scene size L over the
+// gather radius r — while the photons themselves live on surfaces, a 2-D sheet whose occupancy
+// only grows as (L/r)^2. So on any large scene the empty cells, not the photons, set the memory
+// bill, and the map had to defend itself with a guard that GREW r back until the cell array fit
+// (kMaxCells, removed in 0.199.6). That guard is what made small radii unreachable exactly where
+// they matter: on gallery_rain (scene radius 32.7 m) a requested r of 0.031 m was inflated to
+// 0.094 m, and a ~3 cm caustic under a ~10 cm kernel is smeared into a colourless grey veil —
+// the reported "no colourful caustics anywhere" (2026-09-01).
+//
+// Hashing removes the volume term completely: the table is sized from the PHOTON COUNT, so the
+// cost per photon is a constant ~8 B no matter how fine the cells are, and r is free to follow
+// the measured density wherever it leads. Cells that collide into one bucket are not a
+// correctness problem — the query already distance-tests every candidate it visits, so an
+// aliased photon is simply rejected. With the table at 2x the photon count the expected number
+// of aliased candidates is ~0.5 per bucket, i.e. ~13 extra distance tests across the whole
+// 3x3x3 neighbourhood, against the hundreds of genuine candidates a tuned gather visits.
+//
+// The mix is a 64-bit multiply-xorshift (SplitMix64's finaliser over three odd-constant
+// products), not the classic XOR-of-three-primes: the XOR form leaves neighbouring cells
+// correlated in the low bits, and a gather visits 27 NEIGHBOURING cells at once — precisely the
+// pattern that clusters them into the same few buckets.
+PM_HD inline unsigned int pmCellHash(int ix, int iy, int iz, unsigned int mask) {
+    unsigned long long h = (unsigned long long)(unsigned int)ix * 0x9E3779B97F4A7C15ull;
+    h ^= (unsigned long long)(unsigned int)iy * 0xC2B2AE3D27D4EB4Full;
+    h ^= (unsigned long long)(unsigned int)iz * 0x165667B19E3779F9ull;
+    h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 27; h *= 0x94D049BB133111EBull;
+    h ^= h >> 31;
+    return (unsigned int)h & mask;
+}
+
+// Smallest power of two >= n, at least 1024 (a floor so a tiny map still has slack).
+inline unsigned int pmTableSize(size_t n) {
+    unsigned long long want = 2ull * (unsigned long long)n;
+    unsigned int t = 1024;
+    while ((unsigned long long)t < want && t < (1u << 31)) t <<= 1;
+    return t;
+}
+
 struct PhotonBank {
     std::vector<Vec3>   pos;
     std::vector<Photon> payload;
@@ -87,24 +138,33 @@ struct PhotonMap {
     double    radius   = 0.02;     // gather radius (world units); == grid cell size
 
     // grid geometry
-    Vec3   lo{0, 0, 0};
+    Vec3   lo{0, 0, 0};            // cell-lattice origin (padded bbox min)
     double cellSize = 0.02;
+    // Padded bbox cell dims. PURELY DIAGNOSTIC since 0.199.6 — the lattice is hashed, so
+    // nothing indexes through these and their product is never formed (it overflows a long
+    // long on a fine grid over a large scene, which is the whole reason the dense grid went).
+    // buildAuto still reads them as the measured bbox EXTENT in cells, and the mode-M log
+    // prints them so "how fine is the lattice" stays visible.
     int    nx = 1, ny = 1, nz = 1;
-    std::vector<int> cellStart;    // size nCells+1; cell c occupies [cellStart[c], cellStart[c+1])
+    // Bucket runs: bucket b occupies [cellStart[b], cellStart[b+1]). Size tableMask+2.
+    std::vector<int> cellStart;
+    unsigned int tableMask = 0;    // tableSize - 1; tableSize is a power of two
 
-    long long cellCount() const { return (long long)nx * ny * nz; }
+    long long bucketCount() const { return (long long)tableMask + 1; }
 
-    int cellIndex(int ix, int iy, int iz) const {
-        return (iz * ny + iy) * nx + ix;
+    // Bucket for an integer cell coordinate.
+    unsigned int cellIndex(int ix, int iy, int iz) const {
+        return pmCellHash(ix, iy, iz, tableMask);
     }
-    // Clamp a world point to a valid grid cell coordinate.
+    // Integer cell coordinate of a world point. NOT clamped to the bbox: with a hashed
+    // lattice there is no "outside the array" to defend against, and clamping was actively
+    // slightly wrong — a query point just beyond the bbox got folded onto the edge cell, so
+    // its 3x3x3 neighbourhood lost the far row. Unclamped, the neighbourhood straddles the
+    // boundary correctly and the extra cells are simply empty.
     void cellCoord(const Vec3& p, int& ix, int& iy, int& iz) const {
         ix = (int)std::floor((p.x - lo.x) / cellSize);
         iy = (int)std::floor((p.y - lo.y) / cellSize);
         iz = (int)std::floor((p.z - lo.z) / cellSize);
-        ix = std::min(std::max(ix, 0), nx - 1);
-        iy = std::min(std::max(iy, 0), ny - 1);
-        iz = std::min(std::max(iz, 0), nz - 1);
     }
 
     // Bin the deposited photons into a uniform grid of cell size `r` (== gather radius,
@@ -119,32 +179,44 @@ struct PhotonMap {
     void buildGrid(double r) {
         radius = r;
         cellSize = (r > 0.0) ? r : 1e-6;
-        if (photons.empty()) { nx = ny = nz = 1; cellStart.assign(2, 0); cie.clear(); pos.clear(); return; }
+        if (photons.empty()) {
+            nx = ny = nz = 1; tableMask = 0; cellStart.assign(2, 0);
+            cie.clear(); pos.clear(); return;
+        }
 
         Vec3 mn = pos[0], mx = pos[0];
         for (const Vec3& p : pos) {
             mn.x = std::min(mn.x, p.x); mn.y = std::min(mn.y, p.y); mn.z = std::min(mn.z, p.z);
             mx.x = std::max(mx.x, p.x); mx.y = std::max(mx.y, p.y); mx.z = std::max(mx.z, p.z);
         }
-        // Pad by half a cell so floor() never underflows at the low edge.
+        // Pad by half a cell so the lattice origin sits strictly below every photon (the
+        // integer coords stay non-negative, which is not required by the hash but keeps the
+        // diagnostic dims below meaningful).
         lo = mn - Vec3{cellSize, cellSize, cellSize} * 0.5;
         Vec3 ext = (mx - lo) + Vec3{cellSize, cellSize, cellSize} * 0.5;
-        nx = std::max(1, (int)std::ceil(ext.x / cellSize));
-        ny = std::max(1, (int)std::ceil(ext.y / cellSize));
-        nz = std::max(1, (int)std::ceil(ext.z / cellSize));
-        const long long nCells = cellCount();
+        // Diagnostic only, and clamped into int: a fine lattice over a large scene can want
+        // billions of cells per axis, which is exactly the situation the hash exists to make
+        // affordable — it must not overflow the number we merely PRINT.
+        auto dim = [](double e, double c) {
+            const double d = std::ceil(e / c);
+            return (int)std::min(std::max(d, 1.0), 2.0e9);
+        };
+        nx = dim(ext.x, cellSize); ny = dim(ext.y, cellSize); nz = dim(ext.z, cellSize);
 
-        // Pass 1: count photons per cell.
+        // Pass 1: count photons per BUCKET.
+        const unsigned int tableSize = pmTableSize(photons.size());
+        tableMask = tableSize - 1;
         std::vector<int> cellOf(photons.size());
-        cellStart.assign((size_t)nCells + 1, 0);
+        ftalloc::resize(cellStart, (size_t)tableSize + 1, "the photon grid bucket table", "-n");
+        std::fill(cellStart.begin(), cellStart.end(), 0);
         for (size_t i = 0; i < photons.size(); ++i) {
             int ix, iy, iz; cellCoord(pos[i], ix, iy, iz);
-            int c = cellIndex(ix, iy, iz);
+            int c = (int)cellIndex(ix, iy, iz);
             cellOf[i] = c;
             ++cellStart[c + 1];
         }
-        // Prefix sum -> cellStart[c] = begin offset of cell c.
-        for (long long c = 0; c < nCells; ++c) cellStart[c + 1] += cellStart[c];
+        // Prefix sum -> cellStart[b] = begin offset of bucket b.
+        for (unsigned int c = 0; c < tableSize; ++c) cellStart[c + 1] += cellStart[c];
 
         // Pass 2: scatter into cell-contiguous order. pos[] and photons[] are permuted by
         // the SAME cursor walk, so index k keeps addressing one photon across both.
@@ -200,24 +272,30 @@ struct PhotonMap {
     // `-savemap` run that wrote the file. (Caught 2026-07-26: 1401 vs 1402 median, r
     // 0.008981 vs 0.008977, images differed.)
     //
-    // So sample by CELL — cells are fixed by the bbox and cell size, i.e. by geometry alone —
-    // striding over occupied cells, and inside each take the lexicographically smallest
-    // position as the representative. That is a set-minimum, so it names the same photon no
-    // matter how the array is ordered (coincident positions would tie, but then the neighbour
-    // count is identical anyway). Querying an actual photon rather than the cell centre
-    // matters: a cell the surface merely clips at a corner has its centre off the surface and
-    // would report a spuriously empty neighbourhood.
+    // So sample by BUCKET — bucket membership is a pure function of the bbox, the cell size and
+    // the hash, i.e. of geometry alone — striding over occupied buckets, and inside each take
+    // the lexicographically smallest position as the representative. That is a set-minimum, so
+    // it names the same photon no matter how the array is ordered (coincident positions would
+    // tie, but then the neighbour count is identical anyway). Querying an actual photon rather
+    // than the cell centre matters: a cell the surface merely clips at a corner has its centre
+    // off the surface and would report a spuriously empty neighbourhood.
+    //
+    // (Before 0.199.6 a bucket WAS a cell, one-to-one. Hashing lets a bucket hold photons from
+    // a few unrelated cells, which changes only which photons are sampled, not the
+    // order-independence the note above is about — and the statistic is a median over
+    // thousands of samples, so it is insensitive to that reshuffle.)
     //
     // Cell-striding also makes the statistic area-weighted rather than photon-weighted, which
     // is if anything the better match: camera gathers land on visible surface points, spread
     // over area, not in proportion to local photon density.
     double medianNeighborCount(int sampleTarget = 4096) const {
-        const long long nCells = cellCount();
+        const long long nCells = bucketCount();
         if (photons.empty() || nCells <= 0) return 0.0;
 
-        // How many cells actually hold photons — needed to pick a stride that lands near
-        // sampleTarget. O(nCells) over a flat int array (~20 ms at 22M cells, against a
-        // build that already costs seconds at that size).
+        // How many buckets actually hold photons — needed to pick a stride that lands near
+        // sampleTarget. O(tableSize) over a flat int array, and since 0.199.6 the table is
+        // sized from the photon count rather than the cell volume, so this walk no longer
+        // grows with how fine the lattice is.
         long long occupied = 0;
         for (long long c = 0; c < nCells; ++c)
             if (cellStart[c + 1] > cellStart[c]) ++occupied;
@@ -299,29 +377,15 @@ struct PhotonMap {
         // a median over a sample, and a pathological scene (all photons in one caustic, or
         // a single lit texel) shouldn't be allowed to pick an absurd grid.
         r1 = std::min(std::max(r1, r0 / 64.0), r0 * 4.0);
-        // Hard memory guard: cellStart is one int per cell and cellIndex() is int math, so
-        // the cell count has to stay well inside 2^31 regardless of what the probe wants.
-        // Grow r1 back until the predicted grid fits.
-        {
-            // The probe binning already measured the padded bbox: nx*cellSize etc. is it
-            // (rounded up), so no second pass over 10s of millions of positions is needed.
-            const double ex = nx * cellSize, ey = ny * cellSize, ez = nz * cellSize;
-            // Budget the cell array against the MAP, not against an absolute number: photons
-            // live on surfaces (a 2-D sheet through a 3-D grid), so most cells are empty and
-            // the count runs as (L/r)^3 while the useful occupancy runs as (L/r)^2 — an
-            // absolute cap therefore binds at exactly the large-map sizes this function
-            // exists to serve. 2 cells/photon is 8 B/photon of cellStart against 56 B/photon
-            // of map (~14% overhead), with a floor so small maps can still refine freely.
-            // At the calibrated default this guard never binds; it is here for -pmcount
-            // extremes and for pathological (near-planar, one-caustic) scenes.
-            const double kMaxCells = std::max(1.6e7, 2.0 * (double)photons.size());
-            for (int guard = 0; guard < 64; ++guard) {
-                const double cells = std::ceil(ex / r1) * std::ceil(ey / r1)
-                                   * std::ceil(ez / r1);
-                if (cells <= kMaxCells) break;
-                r1 *= 1.25;
-            }
-        }
+        // NO MEMORY GUARD ANY MORE (removed 0.199.6). While the lattice was dense, cellStart
+        // held one int per CELL, so a fine radius over a large scene asked for an array that
+        // grew as (L/r)^3 and had to be defended by growing r1 back until the grid fit. That
+        // guard was the binding constraint on every large scene — on gallery_rain it inflated
+        // a requested 0.031 m to 0.094 m, three times too coarse to resolve a caustic — and it
+        // bound hardest exactly where a fine radius was most wanted. The hashed lattice
+        // (pmCellHash) sizes the table from the PHOTON COUNT instead, so r is now free to be
+        // whatever the measured density asks for and the only limit left is the deliberate
+        // two-octave clamp above.
         if (std::abs(r1 / r0 - 1.0) > 0.05) buildGrid(r1);   // else keep the probe binning
         fillCie();
         return radius;
@@ -341,13 +405,16 @@ struct PhotonMap {
         if (photons.empty()) return;
         int ix, iy, iz; cellCoord(p, ix, iy, iz);
         const double r2 = r * r;
+        // No per-axis bounds tests: the lattice is hashed, so an out-of-bbox cell coordinate is
+        // a legal bucket lookup that simply finds no photon within r (or finds an aliased one
+        // and rejects it on distance, below).
         for (int dz = -1; dz <= 1; ++dz) {
-            int cz = iz + dz; if (cz < 0 || cz >= nz) continue;
+            int cz = iz + dz;
             for (int dy = -1; dy <= 1; ++dy) {
-                int cy = iy + dy; if (cy < 0 || cy >= ny) continue;
+                int cy = iy + dy;
                 for (int dx = -1; dx <= 1; ++dx) {
-                    int cx = ix + dx; if (cx < 0 || cx >= nx) continue;
-                    int c = cellIndex(cx, cy, cz);
+                    int cx = ix + dx;
+                    int c = (int)cellIndex(cx, cy, cz);
                     // The reject scan reads ONLY pos[] (see the layout note on PhotonMap):
                     // ~85% of the candidates in this 3x3x3 box fail the test, and for those
                     // the fat payload record is never touched at all.

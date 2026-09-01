@@ -5,6 +5,90 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN: mode `M` has no caustic map, so caustics are gathered at the diffuse radius and wash out
+
+**Reported as** the sixth of six defects in the `gallery_rain` mode-`M` beams render: *"i don't
+see any colorful caustics anywhere, the scene is meant to showcase good caustics."*
+
+The 0.199.6 hashed-grid fix below removed the *artificial* floor on the gather radius, but it did
+not remove the real one: mode `M` deposits every photon into **one** map and gathers everything at
+**one** radius, and that radius is chosen by density to keep the diffuse illumination smooth. A
+caustic is a thin, high-contrast concentration of L·S⁺·D photons; smoothing it with a radius sized
+for ambient bounce light is exactly the operation that erases it. Forcing a fine radius globally
+(`-pmcount 11`, `png/i3_hash11.png`) trades the caustic for whole-image noise — the caustic starts
+to appear, and everything else becomes grain. There is no single radius that is right for both
+populations, which is the entire reason Jensen's original scheme uses two maps.
+
+**Fix (Jensen two-map partition):** classify each photon path as it is traced and partition the
+deposit *strictly*, so nothing is counted twice — a photon arriving at a diffuse vertex after
+**≥1 specular vertex and no prior diffuse vertex** (L·S⁺·D) goes to a **caustic map**; every other
+deposit goes to the global map. Each map runs `buildAuto` independently, so the caustic map picks
+a radius from its own (much denser, much more localised) photon population. The gather is the sum
+of the two estimates.
+
+**Files it touches:** `src/render.h` (path-state flags — `sawSpecular`, `sawDiffuse` — plus a
+second `PhotonBank` in the deposit path), `src/photonmap_render.h` (`tracePhotonPass` routing,
+`photonGather` summing two estimates), `src/render_cuda.cu` (the device deposit and both gather
+kernels), `src/photonmap_io.h` (format bump so `-savemap`/`-loadmap` carry both populations),
+`src/main.cpp` (driver plumbing and a CLI knob for the caustic photon budget). Verify against the
+mode-`D` reference render of the same camera.
+
+### FIXED (2026-09-01, v0.199.6): the photon grid's memory guard silently overrode the requested gather radius on any large scene
+
+**Found while investigating** the sixth defect above. `PhotonMap::buildAuto` picked a
+density-correct radius and then handed it to a **dense** cell lattice — a `cellStart` array with
+one entry per `nx*ny*nz` cell. A guard, `kMaxCells = max(1.6e7, 2*photons.size())`, grew the
+radius by 1.25× in a loop until that array fit.
+
+**Why that guard could never be satisfied at caustic scale:** on a scene of extent `L`, dense
+cells grow as `(L/r)³` while photon *occupancy* grows only as `(L/r)²` — the photons live on
+surfaces. So it is the **empty** cells that set the memory bill, and the guard binds harder the
+finer you ask. On `gallery_rain` (65 m bbox) a requested **0.031 m** was inflated to **0.094 m**,
+three times too coarse to resolve a caustic. Worse, the guard binds *harder* at a smaller photon
+count, so the obvious fix — a separate, smaller caustic map — would have been inflated even more
+(≈2.5 M caustic photons ⇒ r ≥ 0.26 m). The dense lattice was the wall.
+
+**Fix:** the lattice is now **hashed** (`pmCellHash`, `pmTableSize` in `src/photonmap.h`). The
+bucket table is sized from the *photon count* (next power of two ≥ 2N, floor 1024 ⇒ ~8 B/photon,
+against 56 B/photon for the photons themselves), so it is bounded regardless of how fine `r` is,
+and the memory guard is **deleted outright**. Collisions are harmless: the query already
+distance-tests every candidate it visits, so a collision costs a handful of extra tests
+(~13 per 27-bucket neighbourhood at 2× occupancy) and never changes a result. The mix is
+SplitMix64's finaliser over three odd-constant products rather than an XOR of three primes,
+because XOR leaves *neighbouring* cells correlated in the low bits and a gather visits 27
+neighbouring cells at once. `nx/ny/nz` survive as pure diagnostics; `cellCoord` no longer clamps
+(a hashed lattice has no edges to clamp to).
+
+**A latent overflow went with it.** The SPPM device build sized its key space as
+`(int)(nCells + 1)` from a `long long` cell count — on a fine radius that **wrapped** rather than
+merely costing memory. The hashed table is sized by `pmTableSize(n)` and cannot.
+
+**Verification:** new `-checkpmgrid` self-test (120k photons, deliberately clustered) checks the
+grid against brute force on exact photon sets, checks that bucket runs tile `[0,N)` with every
+photon in its own bucket, checks `buildAuto`'s analytic radius at two very different `-pmcount`
+values, and checks `medianNeighborCount` is input-order independent (load-bearing for
+`-savemap`/`-loadmap` reproducibility — it samples by *bucket*, with the lexicographically
+smallest position as representative). It reports
+`a DENSE lattice would need 7.84e+08 ints (3.1 GB); hashed table holds 262144`. Re-gathering a
+saved `gallery_rain` map at default settings picks the **identical** radius as the dense build
+(`0.6547 -> 0.1307`), confirming no behaviour change where the guard wasn't binding; at
+`-pmcount 11` it now delivers `0.6547 -> 0.03065` where the dense build forced `0.09354`. Modes
+`M` and `S` verified on both CPU and GPU. The `.ftpmp` format is unchanged — it stores raw
+photons and all derived structures are rebuilt.
+
+**Still open:** removing the floor is necessary but not sufficient — see the caustic-map entry
+above.
+
+### TECH DEBT: mode `U` (VCM) still uses a dense cell grid with the same `(int)(nCells + 1)` overflow
+
+`DVcmGrid` / `kVcmCellKey` in `src/render_cuda.cu` compute `(long long)gnx*gny*gnz` and then cast
+`(int)(nCells + 1)`, which is exactly the wrap that the SPPM path had before 0.199.6, and the same
+dense-lattice memory behaviour that made a fine radius unreachable in mode `M`. Nothing in the
+repo currently drives mode `U` to a radius fine enough to hit it, so it was deliberately left
+alone rather than changed unverified in the same commit. **Fix:** port it to `pmCellHash` /
+`pmTableSize` from `src/photonmap.h` (both are `PM_HD`, so they are already device-callable), the
+same way `kSppmCellKey` was, and extend `-checkpmgrid` to cover it.
+
 ### FIXED (2026-09-01, v0.199.5): every RGB spectral value above 1 was silently clamped to white, so a saturated gem rendered as CLEAR GLASS
 
 **Reported as** the second of six defects in the `gallery_rain` mode-`M` beams render: *"the

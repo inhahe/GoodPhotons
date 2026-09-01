@@ -4497,13 +4497,36 @@ struct DGatherPhoton {
 // host (PhotonMap::build) from the deposited photons, then uploaded for the gather kernel.
 // (No nEmitted here: the normalization is folded into each record's pX/pY/pZ.)
 struct DPhotonMap {
-    const DGatherPhoton* photons; // reordered into cell-contiguous runs
-    const int*     cellStart; // size nCells+1; cell c occupies [cellStart[c], cellStart[c+1])
-    DVec3  lo;                // grid origin (world)
+    const DGatherPhoton* photons; // reordered into bucket-contiguous runs
+    const int*   cellStart;   // size tableMask+2; bucket b is [cellStart[b], cellStart[b+1])
+    DVec3  lo;                // lattice origin (world)
     Real   cellSize;          // == gather radius
     Real   radius;            // gather radius (world units)
-    int    nx, ny, nz;
+    unsigned int tableMask;   // bucket count - 1; see pmCellHash (photonmap.h)
 };
+
+// The 3x3x3 bucket walk, shared by all three device gathers (mode-M gather, its final-gather
+// sub-ray, and SPPM). Factored out when the lattice became hashed in 0.199.6: the three copies
+// previously each open-coded a dense (iz*ny+iy)*nx+ix index plus its own per-axis bounds tests,
+// and three hand-copied transcriptions of the host's binning is three chances to disagree with
+// it — a disagreement that does not crash, it just silently gathers nothing.
+//
+// `body(k)` is invoked for every photon index in the neighbourhood; the DISTANCE TEST IS THE
+// CALLER'S, because each of the three sites already had one fused with its own leak/normal
+// rejection and lifting it here would cost a second subtract-and-dot per candidate.
+template <class F>
+__device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3& p, F body) {
+    const int ix = (int)floor(((double)p.x - (double)pm.lo.x) / (double)pm.cellSize);
+    const int iy = (int)floor(((double)p.y - (double)pm.lo.y) / (double)pm.cellSize);
+    const int iz = (int)floor(((double)p.z - (double)pm.lo.z) / (double)pm.cellSize);
+    for (int dz = -1; dz <= 1; ++dz)
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const unsigned int c = pmCellHash(ix + dx, iy + dy, iz + dz, pm.tableMask);
+            const int e = pm.cellStart[c + 1];
+            for (int k = pm.cellStart[c]; k < e; ++k) body(k);
+        }
+}
 
 // ---------------------- photon BEAMS on the device (mode M volume) --------------------
 // Gather-tuned sub-beam record — what the device beam estimator actually reads. It is the
@@ -11237,27 +11260,16 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
             // Density estimate at y, folding the visible-point reflectance per photon wavelength.
             float gx = 0.f, gy = 0.f, gz = 0.f;
-            int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
-            int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
-            int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
-            ix = min(max(ix, 0), pm.nx - 1);
-            iy = min(max(iy, 0), pm.ny - 1);
-            iz = min(max(iz, 0), pm.nz - 1);
-            for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= pm.nz) continue;
-              for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= pm.ny) continue;
-                for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
-                  int c = (cz * pm.ny + cy) * pm.nx + cx;
-                  for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
-                      const DGatherPhoton& ph = pm.photons[k];
-                      DVec3 d = h.p - ph.pos;
-                      if (dot(d, d) > r2) continue;
-                      if (dot(ph.n, h.n) < (Real)0.5) continue;
-                      float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
-                      float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
-                      float w = rhoY * rhoV;
-                      gx += w * ph.pX; gy += w * ph.pY; gz += w * ph.pZ;
-                  }
-                }}}
+            dPmNeighborhood(pm, h.p, [&](int k) {
+                const DGatherPhoton& ph = pm.photons[k];
+                DVec3 d = h.p - ph.pos;
+                if (dot(d, d) > r2) return;
+                if (dot(ph.n, h.n) < (Real)0.5) return;
+                float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
+                float w = rhoY * rhoV;
+                gx += w * ph.pX; gy += w * ph.pY; gz += w * ph.pZ;
+            });
             oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
         }
@@ -11472,27 +11484,16 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
             // far below the 8-bit output quantum, and FP64 FMAs would issue at 1/64 rate. The
             // per-sample total is promoted to double once at the end (film math stays double).
             float gx = 0.f, gy = 0.f, gz = 0.f;
-            int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
-            int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
-            int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
-            ix = min(max(ix, 0), pm.nx - 1);
-            iy = min(max(iy, 0), pm.ny - 1);
-            iz = min(max(iz, 0), pm.nz - 1);
-            for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= pm.nz) continue;
-              for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= pm.ny) continue;
-                for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
-                  int c = (cz * pm.ny + cy) * pm.nx + cx;
-                  for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
-                      const DGatherPhoton& ph = pm.photons[k];
-                      DVec3 d = h.p - ph.pos;
-                      if (dot(d, d) > r2) continue;
-                      if (dot(ph.n, h.n) < (Real)0.5) continue;   // reject cross-surface leakage
-                      float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
-                      gx += rho * ph.pX;
-                      gy += rho * ph.pY;
-                      gz += rho * ph.pZ;
-                  }
-                }}}
+            dPmNeighborhood(pm, h.p, [&](int k) {
+                const DGatherPhoton& ph = pm.photons[k];
+                DVec3 d = h.p - ph.pos;
+                if (dot(d, d) > r2) return;
+                if (dot(ph.n, h.n) < (Real)0.5) return;   // reject cross-surface leakage
+                float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                gx += rho * ph.pX;
+                gy += rho * ph.pY;
+                gz += rho * ph.pZ;
+            });
             oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
         }
@@ -11741,28 +11742,17 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
         Real r2 = (Real)(R * R);
         float gx = 0.f, gy = 0.f, gz = 0.f;
         double M = 0.0;
-        int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
-        int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
-        int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
-        ix = min(max(ix, 0), pm.nx - 1);
-        iy = min(max(iy, 0), pm.ny - 1);
-        iz = min(max(iz, 0), pm.nz - 1);
-        for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= pm.nz) continue;
-          for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= pm.ny) continue;
-            for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
-              int c = (cz * pm.ny + cy) * pm.nx + cx;
-              for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
-                  const DGatherPhoton& ph = pm.photons[k];
-                  DVec3 d = h.p - ph.pos;
-                  if (dot(d, d) > r2) continue;
-                  if (dot(ph.n, h.n) < (Real)0.5) continue;   // reject cross-surface leakage
-                  float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
-                  gx += rho * ph.pX;
-                  gy += rho * ph.pY;
-                  gz += rho * ph.pZ;
-                  M += 1.0;
-              }
-            }}}
+        dPmNeighborhood(pm, h.p, [&](int k) {
+            const DGatherPhoton& ph = pm.photons[k];
+            DVec3 d = h.p - ph.pos;
+            if (dot(d, d) > r2) return;
+            if (dot(ph.n, h.n) < (Real)0.5) return;   // reject cross-surface leakage
+            float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+            gx += rho * ph.pX;
+            gy += rho * ph.pY;
+            gz += rho * ph.pZ;
+            M += 1.0;
+        });
         // Shared-statistics PPM update (Hachisuka 2008).
         double nAcc = st.nAcc[pix];
         double Nnew = nAcc + alpha * M;
@@ -12928,19 +12918,17 @@ __global__ void kVcmCellKey(const DVcmLV* lv, int n, DVec3 gLo, double cell,
     }
 }
 
-// Cell id per deposited photon (PhotonMap::cellCoord twin). The host converted DPhoton's
-// float position to a double Vec3 BEFORE the all-double cell math, so promote first.
+// BUCKET id per deposited photon (PhotonMap::cellCoord + cellIndex twin). The host converted
+// DPhoton's float position to a double Vec3 BEFORE the all-double cell math, so promote first.
+// Unclamped and hashed since 0.199.6, matching the host exactly — see pmCellHash.
 __global__ void kSppmCellKey(const DPhoton* ph, long long n, double lox, double loy, double loz,
-                             double cellSize, int gnx, int gny, int gnz, int* key) {
+                             double cellSize, unsigned int tableMask, int* key) {
     long long stride = (long long)gridDim.x * blockDim.x;
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += stride) {
         int ix = (int)floor(((double)ph[i].pos.x - lox) / cellSize);
         int iy = (int)floor(((double)ph[i].pos.y - loy) / cellSize);
         int iz = (int)floor(((double)ph[i].pos.z - loz) / cellSize);
-        ix = min(max(ix, 0), gnx - 1);
-        iy = min(max(iy, 0), gny - 1);
-        iz = min(max(iz, 0), gnz - 1);
-        key[i] = (iz * gny + iy) * gnx + ix;      // int math, as in PhotonMap::cellIndex
+        key[i] = (int)pmCellHash(ix, iy, iz, tableMask);
     }
 }
 
@@ -15619,7 +15607,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     DPhotonMap dpm{};
     dpm.lo = DVec3(pm.lo.x, pm.lo.y, pm.lo.z);
     dpm.cellSize = (Real)pm.cellSize; dpm.radius = (Real)pm.radius;
-    dpm.nx = pm.nx; dpm.ny = pm.ny; dpm.nz = pm.nz;
+    dpm.tableMask = pm.tableMask;
     dpm.photons = nullptr;
     if (!pm.photons.empty()) {
         // Upload the sorted map host->device in chunks (no full mirror), folding each
@@ -15969,7 +15957,7 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
     // the current per-pixel radius, applied at resolve). Then gather + progressive update.
     const double cellSize = (rMax > 0.0) ? rMax : 1e-6;
     double lox = 0.0, loy = 0.0, loz = 0.0;
-    int gnx = 1, gny = 1, gnz = 1;
+    unsigned int tableMask = 0;
     DPhotonMap dpm{};
     dpm.photons = nullptr;
     if (nDep > 0) {
@@ -15984,25 +15972,24 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
         lox = (double)bb.mnx - cellSize * 0.5;
         loy = (double)bb.mny - cellSize * 0.5;
         loz = (double)bb.mnz - cellSize * 0.5;
-        const double ex = ((double)bb.mxx - lox) + cellSize * 0.5;
-        const double ey = ((double)bb.mxy - loy) + cellSize * 0.5;
-        const double ez = ((double)bb.mxz - loz) + cellSize * 0.5;
-        gnx = std::max(1, (int)std::ceil(ex / cellSize));
-        gny = std::max(1, (int)std::ceil(ey / cellSize));
-        gnz = std::max(1, (int)std::ceil(ez / cellSize));
-        const long long nCells = (long long)gnx * gny * gnz;
+        // Bucket table sized from the PHOTON COUNT, exactly as the host does (pmTableSize).
+        // The former dense variant sized it from gnx*gny*gnz — a cell count that on a fine
+        // SPPM radius over a large scene overflows the `(int)(nCells + 1)` this lower_bound
+        // passed to counting_iterator, i.e. it did not merely cost memory, it wrapped.
+        const unsigned int tableSize = pmTableSize(n);
+        tableMask = tableSize - 1;
         ensureDevCap(s->d_cellKey, s->cellKeyCap, n);
         ensureDevCap(s->d_order,   s->orderCap,   n);
         kSppmCellKey<<<2048, 128>>>(s->d_photons, (long long)n, lox, loy, loz, cellSize,
-                                    gnx, gny, gnz, s->d_cellKey);
+                                    tableMask, s->d_cellKey);
         cudaCheckKernel("sppm-cellkey");
         thrust::device_ptr<int> tKey(s->d_cellKey), tOrd(s->d_order);
         thrust::sequence(pol, tOrd, tOrd + n);
         thrust::stable_sort_by_key(pol, tKey, tKey + n, tOrd);
-        ensureDevCap(s->d_cellStart, s->cellStartCap, (size_t)nCells + 1);
+        ensureDevCap(s->d_cellStart, s->cellStartCap, (size_t)tableSize + 1);
         thrust::lower_bound(pol, tKey, tKey + n,
                             thrust::counting_iterator<int>(0),
-                            thrust::counting_iterator<int>((int)(nCells + 1)),
+                            thrust::counting_iterator<int>((int)tableSize + 1),
                             thrust::device_pointer_cast(s->d_cellStart));
         ensureDevCap(s->d_gather, s->gatherCap, n);
         kSppmGatherConvert<<<2048, 128>>>(s->d_photons, s->d_order, (long long)n, s->d_gather);
@@ -16014,7 +16001,7 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
     }
     dpm.lo = DVec3(lox, loy, loz);
     dpm.cellSize = (Real)cellSize; dpm.radius = (Real)rMax;
-    dpm.nx = gnx; dpm.ny = gny; dpm.nz = gnz;
+    dpm.tableMask = tableMask;
     dpm.cellStart = s->d_cellStart;
 
     // (3) Gather + progressive update.

@@ -2083,13 +2083,36 @@ render. Closing that means teaching the shared device path to gather in spp chun
   noise `M^-1/6` and bias `M^-2/3` — both error terms → 0, with a mild cost curve.
   `build` is split into `buildGrid` + `fillCie` for this, since the probe needs a second
   counting sort but only one (expensive, threaded) CIE pass.
-  **`medianNeighborCount` samples by cell, not by array index** — cells are fixed by the
-  bbox and cell size, i.e. by geometry, whereas the counting sort is stable and so preserves
-  a within-cell order that differs between a fresh deposit and a `-loadmap` of the same map.
-  Sampling by array position therefore made `-loadmap` stop reproducing its `-savemap` run.
-  Within a sampled cell the representative is the lexicographically smallest position (a
-  set-minimum, hence order-free); the cell *centre* would not do, because a cell that the
-  surface merely clips has its centre off-surface and reports a spuriously empty
+  **The lattice is HASHED, not dense** (`pmCellHash`, 0.199.6). A dense grid indexes cells as
+  `(iz·ny+iy)·nx+ix` and must therefore *allocate* `nx·ny·nz` ints — a count that grows as
+  `(L/r)³` in scene size over gather radius, while the photons themselves live on surfaces and
+  only occupy `(L/r)²` of it. So on any large scene the *empty* cells set the memory bill, and
+  `buildAuto` had to defend itself with a guard (`kMaxCells`) that **grew `r` back** until the
+  array fit. That guard was the binding constraint on every large scene, and it bound hardest
+  exactly where a fine radius was most wanted: on `gallery_rain` (scene radius 32.7 m) a
+  requested 0.031 m was inflated to 0.094 m, three times too coarse to resolve a caustic —
+  which is what smeared the scene's caustics into a colourless grey veil. Hashing sizes the
+  bucket table from the **photon count** (`pmTableSize`, 2× rounded up to a power of two, i.e.
+  a flat ~8 B/photon against the map's 56), so the volume term disappears and `r` is free to
+  follow the measured density; the only limit left is the deliberate two-octave clamp. Cells
+  that collide into one bucket are not a correctness problem — the query already distance-tests
+  every candidate — and at 2× occupancy that costs ~13 extra tests across a 27-bucket
+  neighbourhood. The mix is SplitMix64's finaliser over three odd-constant products rather than
+  the classic XOR-of-three-primes, because the XOR form leaves *neighbouring* cells correlated
+  in the low bits and a gather visits 27 neighbouring cells at once. Host and device share the
+  one function (`PM_HD`), and the device's three traversals (mode-M gather, its final-gather
+  sub-ray, SPPM) now go through one `dPmNeighborhood` helper instead of three hand-copied
+  transcriptions of the host binning. `cellCoord` no longer clamps to the bbox: with no array
+  to run off, clamping was actively slightly wrong (a query just outside got folded onto the
+  edge cell and lost the far row of its neighbourhood). `-checkpmgrid` validates the query
+  against brute force on exactly the configuration the dense lattice could not represent.
+  **`medianNeighborCount` samples by bucket, not by array index** — bucket membership is fixed
+  by the bbox, cell size and hash, i.e. by geometry, whereas the counting sort is stable and so
+  preserves a within-cell order that differs between a fresh deposit and a `-loadmap` of the
+  same map. Sampling by array position therefore made `-loadmap` stop reproducing its
+  `-savemap` run. Within a sampled bucket the representative is the lexicographically smallest
+  position (a set-minimum, hence order-free); the cell *centre* would not do, because a cell
+  that the surface merely clips has its centre off-surface and reports a spuriously empty
   neighbourhood.
   The GPU shared path gets the same treatment via `renderPhotonMapSharedCuda`'s `autoK`
   argument (0 = off) — it must, since that is the high-photon-count path where a

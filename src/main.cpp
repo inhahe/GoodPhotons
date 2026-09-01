@@ -3111,6 +3111,169 @@ static int checkGrating() {
     return pass ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------------------
+// PHOTON-MAP GRID self-test  (-checkpmgrid; src/photonmap.h)
+//
+// The mode-M / SPPM gather is a radius query over a lattice, and a lattice bug does not
+// crash — it silently returns FEWER photons than it should, which reads as a dim or noisy
+// image, not as a failure. So the query is checked here against brute force, which is the
+// only reference that cannot share a bug with it.
+//
+// The configuration is chosen to be the one that used to be IMPOSSIBLE: a small radius over
+// a large, strongly anisotropic scene. Until 0.199.6 the lattice was dense — one int per
+// nx*ny*nz cell — so this case allocated an array in the tens of billions of entries and the
+// map defended itself by inflating the radius until the array fit. That inflation is exactly
+// what smeared caustics into grey veils. The test therefore also PRINTS the cell count the
+// dense lattice would have demanded, so the regression is visible as a number and not just as
+// a passing assertion.
+static int checkPmGrid() {
+    bool pass = true;
+    auto chk = [&](const char* what, bool ok) {
+        std::printf("[checkpmgrid] %-58s (%s)\n", what, ok ? "ok" : "BAD");
+        if (!ok) pass = false;
+    };
+
+    // A deliberately awkward scene: 60 m across in x/z, 3 m tall, photons concentrated on a
+    // warped sheet (as real photons are — they live on surfaces) plus a dense "caustic" blob
+    // that is 2000x tighter than the rest, so the density statistic has the bimodality the
+    // median-radius rule exists to cope with.
+    const int N = 120000;
+    PhotonMap pm;
+    pm.pos.resize(N); pm.photons.resize(N);
+    Pcg32 rng; rng.seed(0x9E3779B9u, 0x5BF03635u);
+    for (int i = 0; i < N; ++i) {
+        Vec3 p;
+        if (i % 10 == 0) {                                   // the tight caustic blob
+            p = Vec3{7.0 + (rng.uniform() - 0.5) * 0.06,
+                     1.0 + (rng.uniform() - 0.5) * 0.01,
+                     3.0 + (rng.uniform() - 0.5) * 0.06};
+        } else {                                             // the broad warped sheet
+            const double x = (rng.uniform() - 0.5) * 60.0, z = (rng.uniform() - 0.5) * 60.0;
+            p = Vec3{x, 0.4 * std::sin(0.3 * x) + 0.3 * std::cos(0.21 * z), z};
+        }
+        pm.pos[i] = p;
+        pm.photons[i] = Photon{Vec3{0, 1, 0}, (float)(0.5 + rng.uniform()),
+                               (float)(400.0 + 300.0 * rng.uniform())};
+    }
+    const std::vector<Vec3> posRef = pm.pos;   // brute force must not read the permuted array
+
+    // 1. EXACT AGREEMENT WITH BRUTE FORCE. Not "similar counts" — the same SET of photons.
+    // Identity is by position (the build permutes indices), and positions here are distinct
+    // draws, so a multiset of positions is a faithful stand-in for the set of photons.
+    const double r = 0.02;                    // 3 cm scene feature over a 60 m scene
+    pm.build(r);
+    std::printf("[checkpmgrid] %d photons, r=%g, bbox %dx%dx%d cells -> a DENSE lattice would "
+                "need %.3g ints (%.1f GB); hashed table holds %lld\n",
+                N, r, pm.nx, pm.ny, pm.nz,
+                (double)pm.nx * pm.ny * pm.nz, (double)pm.nx * pm.ny * pm.nz * 4.0 / 1e9,
+                pm.bucketCount());
+
+    // Vec3 has no operator==/< (it is a maths type, not a key), so canonicalise to a sorted
+    // vector of triples and compare that. Bit-exact on purpose: brute force and the grid read
+    // the same stored doubles, so anything but exact equality is a genuine disagreement.
+    auto sortedKeys = [](std::vector<Vec3> v) {
+        std::vector<std::array<double, 3>> k(v.size());
+        for (size_t i = 0; i < v.size(); ++i) k[i] = {v[i].x, v[i].y, v[i].z};
+        std::sort(k.begin(), k.end());
+        return k;
+    };
+    size_t mismatches = 0, totalFound = 0;
+    {
+        Pcg32 qr; qr.seed(0xC0FFEEu, 0x1234u);
+        for (int q = 0; q < 400; ++q) {
+            // Half the probes sit ON a photon (where a gather really lands), a quarter float
+            // freely in the box, and a quarter sit WELL OUTSIDE it — the outside case is the
+            // one the old clamped cellCoord got subtly wrong, folding the query onto the edge
+            // cell and dropping the far row of its neighbourhood.
+            Vec3 p;
+            if (q % 4 < 2)      p = posRef[(size_t)(qr.uniform() * (N - 1))];
+            else if (q % 4 == 2) p = Vec3{(qr.uniform() - 0.5) * 62.0, (qr.uniform() - 0.5) * 3.0,
+                                          (qr.uniform() - 0.5) * 62.0};
+            else                 p = Vec3{(qr.uniform() - 0.5) * 200.0, (qr.uniform() - 0.5) * 200.0,
+                                          (qr.uniform() - 0.5) * 200.0};
+            std::vector<Vec3> got, want;
+            pm.queryR(p, r, [&](const Photon&, double, int k) { got.push_back(pm.pos[k]); });
+            for (const Vec3& c : posRef) { Vec3 d = p - c; if (dot(d, d) <= r * r) want.push_back(c); }
+            totalFound += want.size();
+            if (sortedKeys(got) != sortedKeys(want)) ++mismatches;
+        }
+    }
+    chk("radius query == brute force (400 probes, exact photon sets)",
+        mismatches == 0 && totalFound > 0);
+    std::printf("[checkpmgrid] brute-force cross-check visited %zu photons across the probes\n",
+                totalFound);
+
+    // 2. THE PARTITION IS COMPLETE. Every photon lands in exactly one bucket run, and the
+    // runs tile [0, N) — a counting sort that drops or duplicates a photon would still pass
+    // most spot queries.
+    {
+        bool ok = (pm.cellStart.front() == 0) && (pm.cellStart.back() == N);
+        for (size_t b = 1; b < pm.cellStart.size() && ok; ++b)
+            if (pm.cellStart[b] < pm.cellStart[b - 1]) ok = false;
+        // and every photon is findable in the bucket its own coordinate hashes to
+        for (int i = 0; i < N && ok; ++i) {
+            int ix, iy, iz; pm.cellCoord(pm.pos[i], ix, iy, iz);
+            const unsigned c = pm.cellIndex(ix, iy, iz);
+            if (i < pm.cellStart[c] || i >= pm.cellStart[c + 1]) ok = false;
+        }
+        chk("bucket runs tile [0,N) and every photon sits in its own bucket", ok);
+    }
+
+    // 3. THE RADIUS THE DENSITY ASKS FOR IS THE RADIUS DELIVERED. This is the actual bug
+    // fix: buildAuto used to grow r1 back until a dense cell array fit, so on a scene this
+    // size the answer was set by the memory guard rather than by the photons. Ask for a very
+    // fine target and check we land on the analytic rescale (r0*sqrt(k/n0)) or on the
+    // deliberate two-octave clamp — never coarser.
+    {
+        const double r0 = 0.6547;                       // the gallery_rain starting radius
+        bool ok = true;
+        // Two targets: a mild one the old guard would also have allowed, and a fine one that
+        // lands on the deliberate r0/64 clamp — the second is the case the guard used to
+        // destroy, so the old lattice's answer is computed alongside for contrast.
+        for (double kAt1M : {4.0, 0.02}) {
+            double nProbe = 0, kTarget = 0;
+            PhotonMap pm2; pm2.pos = posRef; pm2.photons = pm.photons;
+            const double got = pm2.buildAuto(r0, kAt1M, &nProbe, &kTarget);
+            const double wanted = std::min(std::max(r0 * std::sqrt(kTarget / nProbe), r0 / 64.0),
+                                           r0 * 4.0);
+            // What the removed guard would have returned: grow by 1.25x until the dense cell
+            // array fits max(1.6e7, 2*N). The probe binning's padded bbox is the extent.
+            double old = wanted;
+            {
+                const double ex = 60.6, ey = 3.6, ez = 60.6;   // the generated scene's extent
+                const double cap = std::max(1.6e7, 2.0 * (double)N);
+                for (int g = 0; g < 64; ++g) {
+                    if (std::ceil(ex/old) * std::ceil(ey/old) * std::ceil(ez/old) <= cap) break;
+                    old *= 1.25;
+                }
+            }
+            std::printf("[checkpmgrid] buildAuto k@1M=%-5g: probe n0=%.0f target k=%.3g -> "
+                        "r=%.6g  (density asks %.6g; the removed guard would have forced "
+                        "%.6g, %.1fx too coarse)\n",
+                        kAt1M, nProbe, kTarget, got, wanted, old, old / wanted);
+            if (!(nProbe > 0 && std::abs(got / wanted - 1.0) < 1e-9)) ok = false;
+        }
+        chk("buildAuto delivers the density-chosen radius (no memory guard)", ok);
+    }
+
+    // 4. DETERMINISM. Same photons in, same lattice out — mode M's -savemap/-loadmap contract
+    // depends on a rebuild reproducing the original run, and the median probe is only
+    // order-independent if the binning is.
+    {
+        PhotonMap a, b;
+        a.pos = posRef; a.photons = pm.photons;
+        b.pos = posRef; b.photons = pm.photons;
+        std::reverse(b.pos.begin(), b.pos.end());       // feed the SAME set in a different order
+        std::reverse(b.photons.begin(), b.photons.end());
+        a.build(r); b.build(r);
+        chk("median neighbour count is independent of input order",
+            a.medianNeighborCount() == b.medianNeighborCount());
+    }
+
+    std::printf("[checkpmgrid] %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 // Deterministic RGB -> reflectance upsampling self-test (Jakob-Hanika sigmoid
 // fit, src/upsample.h). Each colour is fitted to sigmoid coefficients, the
 // resulting reflectance is integrated under D65 through the CIE observer, and
@@ -15916,6 +16079,7 @@ static int run(int argc, char** argv) {
     bool checkCurveOnly = false;
     bool checkFurOnly = false;
     bool checkFurGridOnly = false;
+    bool checkPmGridOnly = false;
     bool checkFurVolOnly = false;
     bool checkContainerOnly = false;
     bool bvhStatsOnly = false;
@@ -16483,6 +16647,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkcurve")) checkCurveOnly = true;
         else if (!std::strcmp(argv[i], "-checkfur")) checkFurOnly = true;
         else if (!std::strcmp(argv[i], "-checkfurgrid")) checkFurGridOnly = true;
+        else if (!std::strcmp(argv[i], "-checkpmgrid")) checkPmGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkfurvol")) checkFurVolOnly = true;
         else if (!std::strcmp(argv[i], "-checkcontainer")) checkContainerOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
@@ -16727,6 +16892,7 @@ static int run(int argc, char** argv) {
     if (checkCurveOnly)    return checkCurve(200'000) == 0 ? 0 : 1;    // deterministic, no scene needed
     if (checkFurOnly)      return checkFur(50'000) == 0 ? 0 : 1;      // deterministic, no scene needed
     if (checkFurGridOnly)  return checkFurGrid() == 0 ? 0 : 1;        // deterministic, no scene needed
+    if (checkPmGridOnly)   return checkPmGrid();   // deterministic, no scene needed
     if (checkFurVolOnly)   return checkFurVol() == 0 ? 0 : 1;         // deterministic, no scene needed
     if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed

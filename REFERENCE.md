@@ -877,7 +877,14 @@ that converges to the same physical image.
   `-pmcount <k>` sets the target population at 1 M stored photons (default `200`, calibrated
   so ordinary renders keep the look they already had — raise for smoother/blurrier, lower
   for sharper/grainier); `-nopmauto` restores the old fixed-radius behaviour exactly
-  (bit-identical), as does passing an explicit `-pmradius`. `-savemap`/`-loadmap` still lets
+  (bit-identical), as does passing an explicit `-pmradius`.
+  **A low `-pmcount` now actually takes effect on a large scene (0.199.6).** The photon grid
+  used to be a *dense* lattice — one int per cell — so a fine radius over a big scene asked for
+  an array that grew as (scene size / radius)³, and the map defended itself by growing the
+  radius back until the array fit. That guard silently overrode you: on `gallery_rain` (scene
+  radius 32.7 m) `-pmcount 11` asked for 0.031 m and got 0.094 m, three times coarser, which is
+  enough to smear a caustic into a colourless grey blur. The lattice is now hashed and sized
+  from the photon count instead, so the radius you ask for is the radius you get. `-savemap`/`-loadmap` still lets
   the deposit be paid just once, on **CPU and GPU**, and the file carries **both halves of the
   trace** — surface photons *and* the `-beams` volume cache. (Before 0.195.0 the serialiser
   lived in the CUDA translation unit, so the flags were GPU-only by accident of placement and
@@ -4653,7 +4660,7 @@ alone can't restore, so they are not disk-resumable.
 | `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checkimplicit`,
-`-checkcurve`, `-checkfur`, `-checkfurgrid`, `-checkfurvol`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
+`-checkcurve`, `-checkfur`, `-checkfurgrid`, `-checkfurvol`, `-checkpmgrid`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
