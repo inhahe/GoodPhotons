@@ -2135,11 +2135,44 @@ render. Closing that means teaching the shared device path to gather in spp chun
   fitted: it predicts the observed single-camera optimum from two independent constants. Bounded
   by `-beamsplitmax` (memory, not quality — the optimal piece *count* grows as ~S²). Measured
   156 s → 92 s on `_fog_cornell` with bit-identical output; table in `known-issues.md`.
-  **Single scatter only, deliberately** — the depositing photon crosses straight (the analog
-  free-flight redirect is skipped, `render.h`'s `doBeamStraight`) and is attenuated by the
-  crossing, so surfaces beyond the fog are still correctly dimmed. Same trade `-beams` already
-  makes in A/B, and the right one here: the multiple-scatter term in a rain volume is a
-  desaturating grey veil that washes out the bow we are there for.
+  **MULTIPLE SCATTERING (0.199.0).** Through 0.198.0 the beam map carried exactly one
+  scattering order: the depositing photon crossed every medium straight, the extinction it
+  suffered was booked as *absorbed*, and the stored beam paid back only the unscattered
+  in-scatter — anything that scattered twice was deleted. In an optically thick, high-albedo
+  medium that is most of the light. MEASURED on `scenes/_beams_ms.ftsl` (`sigma_t 6`,
+  `albedo 0.95`, `g 0` over a 0.3 m ball, against a 20000-spp mode-D reference): the fog ball
+  rendered at **0.330×** its correct brightness, i.e. two thirds of the volume was missing, and
+  the photon ledger reported `absorbed=0.7542` where the truth is `0.6797`.
+
+  The photon now runs plain **analog** transport under `-beams` and deposits **one long beam per
+  chord between scattering events**, chord *k+1* carrying *k*-times-scattered flux. The chords
+  tile the walk without overlap, so the gather estimates the *full* transport: the same ball
+  comes out at **1.085×**, the residual being the Beam×Ray kernel's finite-radius bias (the rest
+  of the frame sits at 1.019, which is the surface estimate's own radius bias).
+
+  Three things make this a small, local change rather than a rewrite, and each is a trap if
+  missed:
+  - ftrace's beams are **long** beams — the segment runs to the next *surface* and the gather
+    applies `Tr_beam(0→s_b)` analytically (`photonbeams.h:28`). Truncating a beam at the sampled
+    collision instead would be a *short*-beam estimator and would **double-charge**
+    transmittance. So the chord under MS is `dSurf`, not `dEvent`.
+  - the analog `mediumEvent` in-scatter splat must be **suppressed** for any medium a beam chord
+    already covered (`coveredByBeam`), or the same order is counted twice. GRIN collisions — on
+    the marched curve, covered by neither a beam nor a `MedStraight` resample — still splat.
+  - the beam's lead-in transmittance filter changes from `MedStraight` to `MedAll`: under single
+    scatter GRIN extinction was carried *stochastically* by clipping, and under MS nothing is
+    stochastic.
+
+  Order counting: the first chord is already order 1, hence
+  `beamMSAllowed(nDone) = (max == 0) || (nDone + 2) <= max`. The cap is CLI `-beams-order <n>`
+  (`0` = unlimited, the default), carried to the CUDA translation unit as the header-inline
+  global `pbeams::gOrderMax` for the same reason `hero::gSplit` is one — host renderer and
+  device TU do not share `main.cpp`'s statics. **`-beams-order 1` takes the pre-0.199.0 code path
+  verbatim and is bit-identical**, which keeps the crisper single-scatter bow available (dropping
+  the desaturating multiply-scattered veil genuinely sharpens a rainbow) and doubles as a free
+  regression lever. `kWfShade` (wavefront) and `traceHeroPhoton` pass no scatter counter, so they
+  degrade to single scatter — neither runs beams. Cost note: MS deposits several times more beams
+  per photon, so a `-n` that fit before may now exhaust the beam budget (see known-issues.md).
   **Ported to the device in 0.197.0 — deposit *and* gather.** The scope is larger than "upload
   the BVH" because `-beams` changes the **transport**, not just the reconstruction: the
   depositing photon crosses straight, so the surface photon map and the beam map have to come
@@ -3576,6 +3609,33 @@ render. Closing that means teaching the shared device path to gather in spp chun
   sampler (the trilinear stencil is clamped before lookup). The host keeps the dense lattice.
   A multi-grid `.vdb` selects a grid **by name** (`loadVdbGrid(..., wantName)`; the OpenVDB reader
   seeks each descriptor to the previous grid's `endPos`, since descriptors interleave with bodies).
+- **`rainbow.h` — droplet SIZE DISTRIBUTION (0.199.0).** The Airy bow's *angle* is geometric and
+  size-independent, but the fold scale `K = (2/h)^(1/3)·(2πa/λ)^(2/3)` is not, so `z` scales as
+  `a^(2/3)` and averaging `Ai(z)²` over a spread of sizes smears the supernumerary train into its
+  envelope while leaving `theta_rb` exactly in place. `Params::dispersion` (FTSL `dispersion` /
+  `spread` / `rain_mm_h`) is the relative sd of the **scattering-weighted** size distribution, a
+  gamma DSD with `K2 = 1/dispersion²`; `0.577` (`K2 = 3`, `k = 1`) is exactly Marshall-Palmer and
+  is the **default**, because that is what rain is. Note MP's relative width is *rain-rate
+  independent* — `Λ = 4.1·R^(-0.21)` moves the mean drop size but not the shape (verified at
+  R = 1, 5, 25 mm/h in `scraps/_supernum_mp.py`).
+  Two subtleties the implementation turns on:
+  - **two different moments of the DSD, not one.** Which sizes a photon *samples* is weighted by
+    `sigma_sca ~ a²` (shape `K2`); how bright each size's *bow* is goes as `a^(7/3)` (van de
+    Hulst), so the mix that shapes the bow is shape `Kb = K2 + 1/3`. `droplet_um` is defined on
+    the `a²`-weighted mean, which is why it means the same thing at every dispersion.
+  - **cells are averaged, not point-sampled.** At `z = -80` the Airy phase sweeps ~1400 rad across
+    a Marshall-Palmer distribution, so point-sampling 64 sizes would alias into fixed-pattern
+    ringing through the bow interior. `airyAi2Mean(a,b)` returns the *exact* mean of `Ai²` over
+    an interval from a tabulated tail integral `S(u) = ∫_u^∞ Ai²`, so the quadrature converges on
+    the cell count of the smooth density (64) rather than of the oscillation (thousands). Cost is
+    2 lookups per cell **at table-build time only** — the render sees only the finished λ×µ table,
+    so the GPU needs no change at all.
+  This replaced `Params::supernumerary`, a flat clamp holding the Airy *peak* across the whole bow
+  interior; measured 3.8×–14.9× too bright and collapsing arc/interior contrast from 6.40× to
+  1.01× (full table in `known-issues.md`). The FTSL key survives as a deprecated alias
+  (`on → dispersion 0`, `off → 0.577`) with a one-time note. Same change fixed `airyAi(x)`
+  returning **0** below `x = -30` (the RK4 table's floor), which hard-clipped the bow interior
+  where the `Ai²` envelope is still at 35% of peak; it now falls through to the exact asymptotic.
 - **`meshvoxel.h` — mesh containment for fog bounds.** `medium { bounds { object "<mesh>" } }`
   used to degrade to the mesh's AABB; `meshvox::voxelizeSolid` now **solid-voxelizes** the
   named mesh into an occupancy `VdbGrid` (`MediumBound::Mesh`, `Medium::boundGrid`,
@@ -3644,6 +3704,24 @@ render. Closing that means teaching the shared device path to gather in spp chun
       the one medium that must stay dark, since a rainbow is single-scatter and only survives
       against a dark backdrop. Verified by measuring the bow region's mean level before and
       after — it moved 0.3 %.
+    - **The cloud's medium is the DELTA-EDDINGTON REDUCTION of a real cloud, not eyeballed
+      (retuned 0.199.0).** A real cloud is `sigma_t ~ 10`, `albedo ~ 0.999`, `g ~ 0.85` (Mie,
+      ~10 µm droplets). Splitting the forward Mie spike `f = g²` off as unscattered light gives
+      `sigma_t* = (1-wf)sigma_t = 2.78`, `w* = w(1-f)/(1-wf) = 0.9964`, `g* = g/(1+g) = 0.46` —
+      which is the scene's *original* `3.0 / 0.5` to within rounding. So only the albedo was
+      ever wrong, and badly: `0.92` made a water cloud absorb 8 % per scattering event
+      (water's imaginary index at 550 nm is ~1e-9, so a droplet's albedo is 0.9999+), which is
+      `0.92^10 = 0.43` over a crossing. Clouds are white *because* they scatter conservatively;
+      a raincloud's dark base is optical **depth**, not absorption. Measured at 480×270 mode
+      `D`, 800 spp: the fix is **+29 %** on the cloud (+2.6 % on the frame, so it is a cloud
+      change, not an exposure shift). The **full** form was rendered too and rejected on
+      evidence — it flattens the crown/base contrast from 1.13 to 0.99 (destroying the dark
+      underside the bow is read against), is **2.5× noisier** at equal spp, and is the only one
+      of the three that emits monochromatic fireflies (8.4 % of cloud pixels over 3:1 channel
+      ratio, peaking at 5e29 — logged in `known-issues.md` with the mode-`D` NaNs, likely one
+      bug). Full table in the scene's own `medium` comment; measured by `tools/check_cloud.py`.
+      This mattered little before 0.199.0 and matters now: `-beams` was single-scatter through
+      0.198.0, so mode `M` had no scattering orders for a wrong albedo to compound over.
     - The sun spent the scene's early versions as a **distant sphere** because mode `D` refused
       a scene containing a `light sun` outright; 0.124.0/0.127.0 lifted that and it is now a
       real `light sun`. The old global haze is deleted: its `bounds` box was invisible only

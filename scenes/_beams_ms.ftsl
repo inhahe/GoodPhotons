@@ -1,0 +1,93 @@
+# MULTIPLE SCATTERING in the photon-beam deposit (0.199.0) — the invariant test.
+#
+# `-beams` used to carry exactly ONE scattering order: the photon crossed every medium
+# straight, the extinction was booked as absorbed, and the stored beam paid back only the
+# unscattered in-scatter. Anything that scattered twice was simply deleted. In an optically
+# thick, high-albedo medium that is most of the light, so the volume came out far too dark
+# and far too saturated (multiple scattering is what makes a cloud white).
+#
+# Since 0.199.0 the photon goes back to plain ANALOG transport under `-beams` and deposits
+# one LONG beam per chord between scattering events, chord k+1 carrying k-times-scattered
+# flux. That makes the beam gather an unbiased estimator of the FULL volumetric transport,
+# which gives this scene a reference-free invariant to test:
+#
+#   mode M + -beams   must converge to the same image as   mode D (BDPT ground truth)
+#
+# and under `-beams-order 1` (the pre-0.199.0 behaviour, kept for the crisp-bow look) it
+# must not — it should come out visibly darker inside the fog ball.
+#
+# The medium is deliberately thick and bright (sigma_t 6, albedo 0.95 over a 0.3 m ball =>
+# tau ~ 3.6 across a diameter) so the higher orders dominate: at albedo 0.95 the 2nd-and-up
+# orders carry roughly half the scattered energy, which single scatter throws away.
+#
+#   ftrace -in scenes/_beams_ms.ftsl -mode D -device gpu -spp 20000 -o png/ms_ref.png -hdr
+#   ftrace -in scenes/_beams_ms.ftsl -mode M -device gpu -beams -n 40000000 \
+#          -o png/ms_beams.png -hdr
+#   ftrace -in scenes/_beams_ms.ftsl -mode M -device gpu -beams -beams-order 1 \
+#          -n 40000000 -o png/ms_ss.png -hdr
+#   python tools/check_beams_ms.py png/ms_ref.pfm png/ms_beams.pfm png/ms_ss.pfm
+#
+# Compare with `check_beams_ms.py`, not `tools/pfmcmp.py`: the ball is a 36-px disc in a 192-px frame, so
+# a whole-frame mean dilutes the very thing under test by ~20x. (`check_beams_ms.py` also masks NaNs,
+# which mode D emits on this scene -- see known-issues.md, "Mode D emits NaN pixels".)
+#
+# MEASURED 2026-09-01 at 0.199.0 (RTX 4090; ref 20000 spp, beams 40 M photons), mean radiance
+# inside the ball's disc as a ratio to the mode-D reference:
+#
+#   -beams                (full MS)        1.085     <- the invariant
+#   -beams -beams-order 1 (single scatter) 0.330     <- deletes 67% of the light
+#
+# i.e. single scatter is not slightly dark, it is missing two thirds of the volume. The photon
+# energy ledger says the same thing from the other end: `absorbed=0.6797` under MS against
+# `absorbed=0.7542` under `-beams-order 1`, and that 7.5-point gap IS the extinction that the
+# old code booked as absorption instead of letting it scatter again.
+#
+# The residual +8.5% is beam-gather kernel bias, not a transport error, and the check that shows
+# it is a CONVERGENCE check rather than an argument. The Beam x Ray estimator blurs over a finite
+# kernel radius sized to collect `-beamk` beams, so shrinking the radius must walk the ratio
+# toward 1. It does:
+#
+#   -n 40 M, -beamcount 1 M (default)   kernel r 2.525e-05   ball 1.0846   frame 1.0188
+#   -n 80 M, -beamcount 4 M             kernel r 5.798e-06   ball 1.0569   frame 1.0173
+#
+# i.e. a 4.4x smaller kernel takes a third off the excess. The frame column is the mode-M
+# SURFACE estimate's own radius bias (~1.017), present with or without beams; divide it out and
+# the converged ball sits at 1.039. Reproduce the second row with:
+#   ftrace -in scenes/_beams_ms.ftsl -mode M -device gpu -beams -n 80000000 \
+#          -beamcount 4000000 -beamsplitmax 32000000 -o png/ms_beams_hi.png -hdr
+# (that one needs ~12 GB of VRAM; `-n 400000000` at the default beam count is an OOM — MS
+# deposits several times more beams per photon than single scatter did.)
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# The one thing under test: an optically thick, high-albedo, isotropic scattering ball.
+# Nothing gradient-index anywhere in the scene, so every crossing is a straight chord and
+# every medium is beam-depositable — this is the plain `-beams` path, not the GRIN carve-out.
+medium {
+    bounds { center 0.5 0.42 0.5   radius 0.30 }
+    sigma_t 6.0   albedo 0.95   g 0.0
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode M
+    film { res 192 192 }
+}

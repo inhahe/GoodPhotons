@@ -335,6 +335,23 @@ struct Renderer {
                                  // same expectation as the shared point splat (the free-
                                  // flight collision pdf's transmittance cancels either way).
 
+    // PHOTON-BEAM MULTIPLE SCATTERING (CLI -beams-order). Maximum scattering order the beam
+    // paths carry: 1 = single scatter (the pre-0.199.0 behaviour), 0 = unlimited (bounded only
+    // by -bounces). See the long note above the `-beams` block in tracePhoton for why LONG
+    // beams make this a small change, and why truncating the beam at the sampled collision
+    // instead would double-count transmittance.
+    //
+    // The counting: the photon's FIRST chord is already scattering order 1 (the gather point
+    // on that beam IS one scattering event), so a photon that has scattered `nDone` times in a
+    // beam medium is depositing order nDone+1. Allowing one more scatter buys order nDone+2,
+    // so the cap admits it only while nDone + 2 <= beamOrderMax. `beamOrderMax == 1` therefore
+    // permits no scatter at all and takes the pre-0.199.0 straight-crossing path verbatim —
+    // which is what makes `-beams-order 1` bit-identical to 0.198.0.
+    int beamOrderMax = pbeams::gOrderMax;   // 0 = unlimited (bounded only by -bounces)
+    bool beamMSAllowed(int nDone) const {
+        return beamOrderMax == 0 || (nDone + 2) <= beamOrderMax;
+    }
+
     // Photon-map deposit (ROADMAP item 1 / mode M). When non-null, every diffuse-family
     // surface vertex ALSO appends a Photon record here (view-independent radiance cache).
     // A photon pass runs with nCam==0 (no camera splat) + photonDeposit set: paths bounce
@@ -523,8 +540,16 @@ struct Renderer {
     //
     // `aGlass` is the absorption of the dielectric the photon is currently inside, carried
     // on the beam so the gather can Beer-Lambert to its own closest-approach point.
+    //
+    // `offFilt` is which media pre-attenuate the power over the lead-in `ta` (from the ray
+    // origin to this medium's bound). Under SINGLE scatter that is MedStraight — a GRIN
+    // medium's extinction is carried stochastically, by the caller clipping the crossing at
+    // the analog collision, so applying it again here would double-count. Under MULTIPLE
+    // scatter nothing is carried stochastically (the beam runs the whole chord to the surface
+    // and the gather integrates Tr analytically), so every medium must be charged: MedAll.
     void emitBeams(const Scene& scene, const Vec3& o, const Vec3& dir, double dLen,
-                   double lambda, double beta, double aGlass, Pcg32& rng) const {
+                   double lambda, double beta, double aGlass, Pcg32& rng,
+                   MedFilter offFilt = MedStraight) const {
         if (!beamDeposit || !(beta > 0.0)) return;
         // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
         // 1e30-long box (see kBeamFarScale).
@@ -558,7 +583,7 @@ struct Renderer {
             // already carried by the deposition probability — the caller clips this crossing
             // at the analog collision, so the chance a beam covers depth s is exactly the
             // GRIN transmittance to s. Applying it here as well would count it twice.
-            if (ta > 0.0) p *= mediaTransmittance(scene, o, dir, ta, lambda, rng, MedStraight);
+            if (ta > 0.0) p *= mediaTransmittance(scene, o, dir, ta, lambda, rng, offFilt);
             if (!(p > 0.0)) continue;
             beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i);
         }
@@ -2114,11 +2139,20 @@ struct Renderer {
         // redirect below and attenuate by the crossing's transmittance instead.
         const bool doBeamStraight = doBeamGather || doBeamDeposit;
 
+        // MULTIPLE SCATTERING in the beam media (0.199.0; -beams-order). How many times this
+        // photon has already scattered inside a beam-carried (non-GRIN) medium, so the order
+        // cap can send it back to the single-scatter rule once it is spent.
+        int beamScatters = 0;
+
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
             double dEvent;
             bool mediumEvent = false;
             int scatterMed = -1;   // which medium scattered (index into scene.media)
             Vec3 mp;
+            // Beam multiple scattering permitted on THIS step? Re-evaluated per bounce because
+            // the order cap retires it mid-path (after which the photon goes back to crossing
+            // straight and booking the extinction as absorbed).
+            const bool beamMS = doBeamStraight && beamMSAllowed(beamScatters);
 
             // GRIN curved marching pre-pass (does not consume a bounce): advance the ray
             // through any gradient-index region before the straight-ray hit test.
@@ -2166,6 +2200,7 @@ struct Renderer {
             // A collision found DURING the march already happened at ray.o, so nothing is
             // travelled on this iteration: zero distance for the aperture catch, the glass
             // Beer-Lambert (already charged per sub-segment above) and any beam crossing.
+            const bool marchHit = mediumEvent;
             dEvent = mediumEvent ? 0.0 : dSurf;
 
             // Homogeneous fog: sample a free-flight collision. If it precedes the
@@ -2173,18 +2208,25 @@ struct Renderer {
             // then scatter-or-absorb). Beer-Lambert transmittance is implicit in
             // the exponential free-flight, so beta is unchanged (analog MC).
             //
-            // Under `-beams` the photon does NOT redirect in a medium it can cross as a
-            // straight beam — that crossing is handled by the doBeamStraight block below.
-            // But a GRIN medium has no straight chord to store, so it is EXCLUDED from the
-            // straight crossing and keeps full analog transport here (MedCurved), exactly
-            // as it behaves without `-beams`. Before 0.198.0 the collision sampling was
+            // Under `-beams` with SINGLE scatter the photon does NOT redirect in a medium it
+            // can cross as a straight beam — that crossing is handled by the doBeamStraight
+            // block below. But a GRIN medium has no straight chord to store, so it is EXCLUDED
+            // from the straight crossing and keeps full analog transport here (MedCurved),
+            // exactly as it behaves without `-beams`. Before 0.198.0 the collision sampling was
             // skipped wholesale under `-beams`, so a scattering GRIN medium was charged
             // extinction by the straight crossing and never paid back: it acted purely
             // absorbing.
+            //
+            // Under `-beams` with MULTIPLE scattering (the 0.199.0 default) the filter goes
+            // back to MedAll: EVERY medium is transported analog again. The photon scatters
+            // where the free flight says it does, and the beam it deposited over this chord
+            // (below) carries only the UNSCATTERED flux — the two are different orders and do
+            // not overlap. See the long note on the beam block for why the beam must still run
+            // the full chord to the surface even though the photon stops early.
             if (!mediumEvent && !scene.media.empty()) {
                 double tMed; int which;
                 if (sampleMediaCollision(scene, ray.o, ray.d, dSurf, lambda, rng, tMed, which,
-                                         doBeamStraight ? MedCurved : MedAll)) {
+                                         (doBeamStraight && !beamMS) ? MedCurved : MedAll)) {
                     dEvent = tMed; mediumEvent = true; scatterMed = which; mp = ray.o + ray.d * tMed;
                 }
             }
@@ -2228,20 +2270,43 @@ struct Renderer {
             // free-flight collision (pdf σ_t·Tr) over the crossing, and connectVolume's
             // albedo·phase·T_cam·β has that Tr cancelled — so E[per-camera splat] equals the
             // exact single-scatter in-scatter integral, independent of the photon's own flight.
-            // Multiple scattering (a desaturating wash) is intentionally omitted: the right
-            // trade for a crisp view-dependent bow / fogbow / glory / crepuscular-ray flyby.
             //
-            // The crossing runs to `dEvent`, not to the surface: a GRIN medium is excluded
-            // from the straight rule (MedStraight below) and keeps analog transport, so it
-            // can scatter the photon partway and cut the crossing short. With no GRIN
-            // medium in the scene dEvent == dSurf and every draw is as it was.
-            if (doBeamStraight && dEvent > 0.0) {
+            // MULTIPLE SCATTERING (0.199.0, the default; `-beams-order 1` restores the old
+            // single-scatter behaviour bit-for-bit). It is NOT inherent to photon beams that
+            // they carry one order — the textbook formulation deposits a beam per straight
+            // chord between scattering events, and the k-th chord carries k-th-order power.
+            // Two things make that a small change here:
+            //
+            //  * These are LONG beams (photonbeams.h): the stored segment runs to the next
+            //    SURFACE and the gather applies Tr(beam origin -> gather point) analytically.
+            //    So the beam is a deterministic record of the UNSCATTERED flux along the whole
+            //    chord, and it stays valid no matter where the photon itself stops.
+            //  * The photon therefore goes back to plain ANALOG transport: it samples a free
+            //    flight, scatters there (albedo roulette + phase sample), and the next chord
+            //    deposits the next beam. E[power of chord k+1] is exactly the k-times-scattered
+            //    flux, so beam k+1 supplies scattering order k+2. No overlap with beam k, which
+            //    only ever carried unscattered flux.
+            //
+            // The one trap: do NOT truncate the beam at the sampled collision. That is the
+            // SHORT-beam estimator, in which the truncation *is* the transmittance — combined
+            // with a gather that also applies Tr analytically it would charge transmittance
+            // twice and render the medium far too dark. Hence `dChord` below runs to dSurf
+            // under MS even when the photon stopped at dEvent < dSurf.
+            //
+            // With SINGLE scatter the crossing instead runs to `dEvent`, not to the surface: a
+            // GRIN medium is excluded from the straight rule (MedStraight below) and keeps
+            // analog transport, so it can scatter the photon partway and cut the crossing
+            // short. With no GRIN medium in the scene dEvent == dSurf and every draw is as it
+            // was. A collision found during the GRIN march happened at ray.o itself, so there
+            // is no chord at all on this step either way.
+            const double dChord = marchHit ? 0.0 : (beamMS ? dSurf : dEvent);
+            if (doBeamStraight && dChord > 0.0) {
                 if (doBeamGather && nCam > 0 && !forwardCatch) {
                     double aC = curAbsorb(lambda);
                     for (int c = 0; c < nCam; ++c) {
                         if (!(cams[c].cam && cams[c].film)) continue;
                         double tC; int whichC;
-                        if (!sampleMediaCollision(scene, ray.o, ray.d, dEvent, lambda, crng, tC,
+                        if (!sampleMediaCollision(scene, ray.o, ray.d, dChord, lambda, crng, tC,
                                                   whichC, MedStraight))
                             continue;   // this camera saw no in-scatter along this beam
                         Vec3 xc = ray.o + ray.d * tC;
@@ -2253,29 +2318,52 @@ struct Renderer {
                     }
                 }
                 // Mode M: store the crossing itself, so every camera of a flyby can gather
-                // single scatter from it later without the photon knowing any camera exists.
+                // from it later without the photon knowing any camera exists.
                 if (doBeamDeposit)
-                    emitBeams(scene, ray.o, ray.d, dEvent, lambda, betaPre, curAbsorb(lambda), rng);
-                // Attenuate the photon by the medium extinction over the whole crossing
-                // (single-scatter transmission) so surfaces behind the fog get correctly
-                // dimmed direct light; the removed energy (out-scattered + absorbed) is booked
-                // as absorbed. The photon then continues STRAIGHT to the surface below.
-                // MedStraight: only the media that were actually crossed straight are charged
-                // here. A GRIN medium's extinction is NOT booked as absorption — it is carried
-                // by the analog free flight instead, which is what stops it from behaving as a
-                // pure absorber under `-beams`.
-                double before = beta;
-                beta *= mediaTransmittance(scene, ray.o, ray.d, dEvent,
-                                           lambda, doBeamGather ? crng : rng, MedStraight);
-                e.absorbed += (before - beta);
+                    emitBeams(scene, ray.o, ray.d, dChord, lambda, betaPre, curAbsorb(lambda), rng,
+                              beamMS ? MedAll : MedStraight);
+                if (!beamMS) {
+                    // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over
+                    // the whole crossing (single-scatter transmission) so surfaces behind the
+                    // fog get correctly dimmed direct light; the removed energy (out-scattered
+                    // + absorbed) is booked as absorbed. The photon then continues STRAIGHT to
+                    // the surface below.
+                    // MedStraight: only the media that were actually crossed straight are
+                    // charged here. A GRIN medium's extinction is NOT booked as absorption —
+                    // it is carried by the analog free flight instead, which is what stops it
+                    // from behaving as a pure absorber under `-beams`.
+                    //
+                    // Under MS there is deliberately nothing to do: the analog free flight
+                    // above already carries the transmittance (the photon either survives the
+                    // crossing with its throughput intact, or it collided and is about to
+                    // scatter or be absorbed by the albedo roulette). Multiplying by Tr here as
+                    // well would charge it twice.
+                    double before = beta;
+                    beta *= mediaTransmittance(scene, ray.o, ray.d, dChord,
+                                               lambda, doBeamGather ? crng : rng, MedStraight);
+                    e.absorbed += (before - beta);
+                }
             }
 
             if (mediumEvent) {
                 const Medium& sm = scene.media[scatterMed];
-                if (nCam > 0 && !forwardCatch) {
+                // Was this collision inside the chord the beam block just covered? If so the
+                // in-scatter here is ALREADY estimated — by the beam (mode M) or by each
+                // camera's own resample along the same chord (modes A/B) — and splatting the
+                // shared point as well would count the same scattering order twice. Only the
+                // photon's REDIRECT is wanted from this event; the light it carries onward is
+                // the next order, and that is delivered by the next chord's beam.
+                //
+                // A collision found during the GRIN march, or in a GRIN medium (which no beam
+                // and no MedStraight resample ever covers), is not double counted and must
+                // still splat — which is also exactly what happens with `-beams-order 1`,
+                // where a non-GRIN medium can never reach this block at all.
+                const bool coveredByBeam = beamMS && !marchHit && !sm.grin();
+                if (nCam > 0 && !forwardCatch && !coveredByBeam) {
                     camSplatVolumeAll(scene, sm, cams, nCam, mp, ray.d, lambda, beta, rng);
                     camSpecularSplatVolumeAll(scene, sm, cams, nCam, mp, ray.d, lambda, beta, rng);
                 }
+                if (coveredByBeam) ++beamScatters;   // this photon just bought one more order
                 // Scatter (prob albedo) or absorb; throughput unchanged on scatter.
                 if (rng.uniform() >= sm.albedo(lambda)) { e.absorbed += beta; return; }
                 double phPdf;   // sample the scatter direction from HG or the rainbow droplet phase

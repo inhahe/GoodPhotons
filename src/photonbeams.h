@@ -114,6 +114,18 @@
 #include "color.h"
 #include "bvh.h"
 
+// MULTIPLE-SCATTERING ORDER CAP (CLI -beams-order), as a header-inline global for the same
+// reason `hero::gSplit` is one: it has to be visible to BOTH the host renderer (render.h) and
+// the CUDA translation unit, which do not share main.cpp's statics.
+//
+//   0 = unlimited (the default; bounded only by -bounces)
+//   1 = single scatter, the pre-0.199.0 behaviour, bit-identical
+//   n = orders 1..n
+//
+// See the `beamMS` block in Renderer::tracePhoton for what the number means and why LONG beams
+// make multiple scattering a small change to the transport.
+namespace pbeams { inline int gOrderMax = 0; }
+
 // One stored photon beam: (a sub-segment of) the path a photon travelled through one medium.
 //
 // Unlike `Photon`, this record DOES carry a direction — it has a reader (the phase

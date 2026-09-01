@@ -44,19 +44,29 @@
 # Behind the bow is black sky and a ground plane whose lit component is ~5% albedo, which is
 # a darker backdrop than any shaded wall was, so the whole limb now reads.
 #
-# --- Why the rain is 300 um with supernumeraries OFF --------------------------------
-# The first version asked for `droplet_um 500  ` with the default supernumerary train and the
-# bow came out as a WIDE WHITE ARC with only a thin coloured fringe on its rim. That is the
-# model being right about the wrong thing. scraps/bowplot.py reproduces rainbow.h's table in
-# Python and measures it: at 500 um the coloured Airy band is genuinely only ~1.2 deg wide
-# (primary at 138.76 deg for 450 nm vs 137.65 deg for 650 nm), while the MONODISPERSE
-# supernumerary train rings on for another ~11 deg inside it, and eleven degrees of ringing
-# read as white glare. Real rain is polydisperse, so those higher-order maxima land at
-# different angles per drop size and average away; only the principal Airy lobe survives.
-# `supernumerary off` is that average, and 300 um widens the surviving lobe by 1.4x
-# (K scales as a^(2/3)), which also puts ~8 table bins across it instead of ~5 — the phase
-# table is 2048 bins UNIFORM IN MU, so a big drop is genuinely under-resolved (logged in
-# known-issues.md). Result: one clean coloured band, no white core.
+# --- Why the rain is 300 um at dispersion 0.577 -------------------------------------
+# The first version asked for `droplet_um 500` with the default supernumerary train and the bow
+# came out as a WIDE WHITE ARC with only a thin coloured fringe on its rim. That is the model
+# being right about the wrong thing. scraps/bowplot.py reproduces rainbow.h's table in Python
+# and measures it: at 500 um the coloured Airy band is genuinely only ~1.2 deg wide (primary at
+# 138.76 deg for 450 nm vs 137.65 deg for 650 nm), while the MONODISPERSE supernumerary train
+# rings on for another ~11 deg inside it, and eleven degrees of ringing read as white glare.
+# Real rain is polydisperse, so those higher-order maxima land at different angles per drop
+# size and average away; only the principal Airy lobe survives.
+#
+# The fix used to be `supernumerary off`, and that was NOT the polydisperse average — it was a
+# flat clamp that held the Airy PEAK for the whole ~40 deg interior of the bow, measured at
+# 3.8x-14.9x too bright and collapsing arc/interior contrast from 6.40x to 1.01x. It rendered a
+# bright disc with a coloured rim, not an arc (known-issues.md, "phase rainbow", problem 3).
+# 0.199.0 replaced it with a real gamma droplet-size distribution: `dispersion 0.577` IS
+# Marshall-Palmer rain (k = 1), and it is now the default — it is spelled out here only because
+# this comment is about it. The train genuinely averages into its envelope this time.
+#
+# 300 um stays, for the resolution reason rather than the supernumerary one: it widens the
+# surviving lobe by 1.4x over 500 um (K scales as a^(2/3)), which puts more of the 2048 phase-
+# table bins across it — the table is UNIFORM IN MU, so a big drop is genuinely under-resolved
+# (logged in known-issues.md). `rain_mm_h 3` would be the physically-argued way to say the same
+# thing once that aliasing is fixed.
 #
 # --- Why the sun is a real `light sun` (it used to be a distant sphere) ---------------
 # Mode D is the only mode that renders BOTH this scene's bounded heterogeneous media and
@@ -163,11 +173,23 @@
 # bow with it. MEASURED: the 601-frame flyby runs at 2.35 s/frame, ~23.6 min for the loop, at
 # 160x90 / 2 spp -- i.e. the amortisation is real, and scaling to a delivery resolution is a
 # question about the per-frame gather, not about re-tracing 600 forward passes.
-# The caveats that keep D the reference: `-beams` in mode M is SINGLE SCATTER ONLY (the
-# depositing photon crosses straight), so the multiply-scattered veil inside the cloud is
-# missing; and mode M carries directly-seen glass and chrome differently from D (see the sun
-# discussion above). So: mode D for the finished piece, `-mode M -beams` when you want the
-# whole loop in under an hour instead of most of a day.
+# That single-scatter caveat is GONE as of 0.199.0. Through 0.198.0 `-beams` carried exactly
+# ONE scattering order -- the depositing photon crossed every medium straight and everything
+# that scattered twice was booked as absorbed -- so the multiply-scattered veil inside this
+# cloud did not exist under mode M at all. Since 0.199.0 the photon runs plain ANALOG transport
+# under `-beams` and deposits one long beam per chord between scattering events, chord k+1
+# carrying k-times-scattered flux, which makes the gather an unbiased estimator of the FULL
+# volumetric transport. `scenes/_beams_ms.ftsl` measures it against mode D on a thick
+# high-albedo ball: full MS lands at 1.085x the BDPT reference (1.057x with the gather kernel
+# shrunk 4.4x, i.e. the residual is finite-kernel bias, not transport), while the old single-
+# scatter path came in at 0.330x -- it was deleting two thirds of the volume. That is also why
+# the cloud's albedo below could finally be fixed: an albedo error compounds over scattering
+# orders, and until 0.199.0 mode M had no orders to compound over. `-beams-order 1` restores
+# the old behaviour bit-for-bit if you want the crisper single-scatter bow.
+# The one caveat that still keeps D the reference here is that mode M carries directly-seen
+# glass and chrome differently from D (see the sun discussion above). So: mode D for the
+# finished piece, `-mode M -beams` when you want the whole loop in under an hour instead of
+# most of a day.
 #
 # GPU. `-beams` WAS CPU-only and this header said so, until 0.197.0 ported BOTH halves (the
 # beam deposit and the beam gather) to CUDA -- there is a device beam BVH now and the GPU
@@ -2167,8 +2189,63 @@ mesh "raincloud" {
 # exact Euclidean distance to the outside, so the occupancy climbs from 0 at the surface to 1
 # about 0.13 m (~7 voxels) in. A real cloud's edge is exactly this: not a boundary but a zone
 # where droplet concentration falls off over metres. See FTSL.md 12.1.
+#
+# --- Why sigma_t 2.78 / albedo 0.9964 / g 0.46, and what it replaced (0.199.0) --------
+# This block used to read `sigma_t 3.0  albedo 0.92  g 0.5`. Those numbers were eyeballed, and
+# ONE of the three was badly wrong: `albedo 0.92` made a WATER cloud absorb 8% of every
+# scattering event. Liquid water's imaginary index at 550 nm is ~1e-9, so a cloud droplet's
+# single-scattering albedo is 0.9999+; 0.92 is not a small error, it is 0.92^10 = 0.43 over the
+# ~10 scatters a photon makes crossing this cloud, i.e. more than half the cloud's brightness
+# was being deleted by an absorption that water does not have. Clouds are white BECAUSE they
+# scatter conservatively; the darkness of a raincloud's base is optical DEPTH, not absorption.
+#
+# The other two turned out to be RIGHT, for a reason nobody had written down. A real cloud is
+# sigma_t ~ 10 /m, albedo ~ 0.999, g ~ 0.85 (Mie, ~10 um droplets). Its DELTA-EDDINGTON
+# reduction — split the forward Mie spike f = g^2 off as unscattered light and rescale the rest:
+#
+#     f = g^2 = 0.7225
+#     sigma_t* = (1 - w*f) * sigma_t = 2.782      w* = w(1-f)/(1-w*f) = 0.99641
+#     g*       = (g - f)/(1 - f) = g/(1+g) = 0.4595
+#
+# — is sigma_t 2.78 / albedo 0.9964 / g 0.46, which is the scene's original 3.0 / 0.5 to within
+# rounding. So the block was already the standard cheap stand-in for a real cloud, and the fix
+# is to correct the albedo the reduction actually implies (0.9964, not 0.92) and to say so.
+#
+# MEASURED 2026-09-01, 480x270 mode D, -spp 800 (3.54% noise), mean radiance over the cloud's
+# lit pixels, upper half ("crown") and lower half ("base"), against the old 0.92 values:
+#
+#   sigma_t  albedo   g     crown   base   crown/base   local noise   chroma outliers
+#   3.0      0.92     0.5   1.000   1.000     1.118        9.33%          0 px
+#   10.0     0.999    0.85  1.026   1.156     0.992       21.51%        328 px (max 5e29)
+#   2.78     0.9964   0.46  1.291   1.279     1.129        8.59%          0 px   <- chosen
+#
+# Read that table carefully, because the middle row is the honest full-form cloud and it is the
+# one being rejected:
+#   * The FIX is real and it is the albedo: +28..29% on the cloud, which is the absorption that
+#     water does not have coming back. The frame as a whole only moves +2.6%, so this is a
+#     change to the cloud, not an exposure shift.
+#   * Delta-Eddington keeps the CROWN/BASE CONTRAST (1.129, against the original 1.118) that
+#     this scene needs — the bow is read against the cloud's dark underside. The full form
+#     flattens it to 0.992, i.e. the underside becomes as bright as the sunlit crown, because
+#     g 0.85 drives light straight down through the cloud instead of diffusing it.
+#   * The full form is 2.5x NOISIER at equal spp (21.5% vs 8.6% local) and is the only one of
+#     the three that produces monochromatic FIREFLIES: 8.4% of its cloud pixels have a
+#     max/min channel ratio above 3, and 39 of them are above 10, peaking at 5e29 — which is a
+#     divide-by-a-vanishing-pdf, not slow convergence. Logged in known-issues.md alongside the
+#     mode-D NaNs on _beams_ms.ftsl; both scenes are thick + high-albedo, so it is likely one
+#     bug. That is a renderer problem to fix, but it is not a reason to ship a noisy cloud, and
+#     delta-Eddington is the physically-derived form that avoids it.
+# Reproduce: render this scene three times at `-camera cam -r 480 270 -spp 800 -fireflies 3
+# -no-meter`, editing only the `medium` line below to each row's values, to
+# png/cloud_before.pfm (row 1) / png/cloud_after.pfm (row 2) / png/cloud_de.pfm (row 3), then
+# `python tools/check_cloud.py png/cloud_before.pfm png/cloud_after.pfm png/cloud_de.pfm`.
+#
+# The albedo matters more now than it did. `-mode M -beams` was single-scatter through 0.198.0,
+# so the multiply-scattered interior of this cloud did not exist there at all and a wrong albedo
+# could not even be seen; 0.199.0 made beams carry full multiple scattering, which is exactly
+# the term a wrong albedo compounds. See REFERENCE.md `-beams-order`.
 medium {
-    sigma_t 3.0   albedo 0.92   g 0.5
+    sigma_t 2.78   albedo 0.9964   g 0.46
     bounds { object "raincloud"   voxels 192   feather 0.13 }
     # The mesh already supplies the silhouette, so this only breaks up the INTERIOR — a
     # uniform fill inside a mesh reads as jelly rather than as cloud. It never reaches 0, so
@@ -2180,11 +2257,15 @@ medium {
 # (2) The RAIN falling out of it. This is the only medium in the scene with a wavelength-
 # dependent phase function: `phase rainbow` swaps the smooth HG lobe for the tabulated Airy
 # water-droplet phase, which is what actually produces the 42 deg primary, the 51 deg
-# secondary and Alexander's dark band between them. 300 um with `supernumerary off` is the
-# polydisperse-rain setting — see the header for the measurement that chose it; the short
-# version is that a single drop SIZE rings for ~11 deg inside the primary and that ringing
-# reads as a white arc, while real rain averages every drop size together and only the
-# principal Airy lobe survives. Drop the radius to ~10 um instead and the same scene gives a
+# secondary and Alexander's dark band between them. `dispersion 0.577` is the polydisperse-rain
+# setting — it is a gamma DROP-SIZE DISTRIBUTION with the Marshall-Palmer shape, and 300 um is
+# now the scattering-weighted MEAN radius rather than the one radius every drop has. See the
+# header for the measurement that chose it; the short version is that a single drop SIZE rings
+# for ~11 deg inside the primary and that ringing reads as a white arc, while real rain averages
+# every drop size together and only the principal Airy lobe survives. (Through 0.198.0 that
+# average was faked by `supernumerary off`, a flat clamp that froze the interior at one
+# constant; 0.199.0 replaced it with the actual size average — see known-issues.md.)
+# Drop the radius to ~10 um instead and the same scene gives a
 # broad white fogbow, which is also correct — for fog. Large drops scatter achromatically
 # outside the bow angles, which is why rain itself reads GREY.
 #
@@ -2208,7 +2289,7 @@ medium {
 medium {
     sigma_t 0.35   albedo 0.99
     bounds { min 6.5 0 0.6   max 9.5 3.2 3.4 }
-    phase rainbow { droplet_um 300   supernumerary off }
+    phase rainbow { droplet_um 300   dispersion 0.577 }
     # A soft elliptical shaft, densest at the top where it leaves the cloud and thinning as it
     # falls, streaked by noise that is stretched ~6x in y so the structure reads as FALLING
     # rather than as isotropic lumps. The radial term keeps the box's side faces from showing;

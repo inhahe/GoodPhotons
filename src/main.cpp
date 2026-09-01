@@ -16300,6 +16300,16 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
         else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) g_beamGather = true;
+        // Highest scattering order the beam paths carry. 0 = unlimited (the default), 1 =
+        // single scatter (the pre-0.199.0 behaviour, bit-identical). `-beams-single` is the
+        // spelling you reach for when you want the old crisp-bow look back.
+        else if ((!std::strcmp(argv[i], "-beams-order") || !std::strcmp(argv[i], "-beamorder"))
+                 && i + 1 < argc) {
+            int v = std::atoi(argv[++i]);
+            pbeams::gOrderMax = (v < 0) ? 0 : v;
+        }
+        else if (!std::strcmp(argv[i], "-beams-single") || !std::strcmp(argv[i], "-beams-ss"))
+            pbeams::gOrderMax = 1;
         else if (!std::strcmp(argv[i], "-beamradius") && i + 1 < argc) g_beamRadiusAbs = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamcount") && i + 1 < argc) g_beamTarget = (long long)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamk") && i + 1 < argc) g_beamK = std::atof(argv[++i]);

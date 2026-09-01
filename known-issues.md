@@ -9058,6 +9058,64 @@ negligible; the audit is just strict about it.
 
 _(former `light cylinder` entry moved to Resolved — it was a misdiagnosis.)_
 
+### Mode D goes numerically undefined in thick, high-albedo media — NaNs and 1e29 fireflies — 2026-09-01, OPEN
+
+Two independent scenes, one likely bug. Both are mode `D`, both have a dense
+(`sigma_t` 6–10) near-conservative (`albedo` 0.95–0.999) scattering medium, and both produce
+values that are not "noisy" but *undefined*.
+
+**(a) 5e29 monochromatic fireflies in `scenes/gallery_rain.ftsl`'s cloud.** Rendering that scene
+at `-r 480 270 -spp 800 -fireflies 3` with the cloud set to the physically full-form
+`sigma_t 10.0  albedo 0.999  g 0.85` puts **328 of 3904 lit cloud pixels (8.4%) above a 3:1
+max/min channel ratio, 39 of them above 10:1, peaking at a max/min of 4.98e+29**. A one-channel
+value 29 orders of magnitude above its neighbours in the same pixel is a divide by a vanishing
+pdf, not a sample that needs more spp. The same scene's *delta-Eddington-reduced* cloud
+(`2.78 / 0.9964 / 0.46`, the shipped values) has **zero** pixels above 3:1 and a maximum ratio of
+1.96, and the pre-0.199.0 `3.0 / 0.92 / 0.5` cloud likewise zero — so it is the combination of
+high `sigma_t` and near-unit albedo, i.e. paths with many scattering vertices, that triggers it.
+`-fireflies 3` clamps the display but also biases the estimate down, which is measurable: the
+full form reads *dimmer* (1.026x crown) than the reduced form (1.291x) even though it is the
+reduced form that should be the approximation. Reproduce with the table and script named in
+`gallery_rain.ftsl`'s cloud comment (`tools/check_cloud.py`).
+
+**(b) 705 NaN pixels on `scenes/_beams_ms.ftsl`.** Details below. Same signature at the limit:
+where (a) divides by something tiny, (b) divides by something zero.
+
+The BDPT ground-truth render used to validate 0.199.0's beam multiple scattering
+(`ftrace -in scenes/_beams_ms.ftsl -mode D -device gpu -spp 20000 -o png/ms_ref.png -hdr`)
+writes **705 NaN pixels** out of 36864 into the PFM — 1.9% of the frame, scattered, not
+clustered. The scene is a plain Cornell box whose only unusual feature is a thick
+(`sigma_t 6`), high-albedo (`0.95`) isotropic scattering ball, so the suspect is a
+divide-by-a-vanishing-pdf in the volumetric BDPT connection / MIS weight after many
+scattering vertices — a path that scatters ~20 times inside the ball has a very small
+throughput and a very small pdf, and their ratio is where a `0/0` would live.
+
+Not caused by the 0.199.0 beam change (mode D does not use beams at all), and it does not
+affect the PNG, which clamps. It *does* silently poison any numeric comparison against the
+reference — `tools/check_beams_ms.py` had to grow an explicit NaN mask, and a plain `np.mean`
+over the reference returns `nan`. **Proper fix:** find the guard that is missing, rather
+than clamping NaN at the film — a NaN in a BDPT weight means one strategy's contribution is
+undefined, and clamping it hides which. Reproduce by rendering the scene above and counting
+`np.isnan` on the `.pfm`; a shorter `-spp 2000` run should show ~1/10 as many. Fixing (b) is
+the better entry point than (a): a NaN localises the guard exactly, whereas a 1e29 only says
+"small denominator somewhere". Check (a) again once (b) is fixed before assuming they are two
+bugs.
+
+### `-beams` reports `error: bad allocation` instead of an OOM message — 2026-09-01, OPEN
+
+`ftrace -in scenes/_beams_ms.ftsl -mode M -device gpu -beams -n 400000000` dies with the
+bare line `error: bad allocation` after the `[camera] shared photon map …` banner and before
+any beam statistics. It is an out-of-memory in the photon/beam map (40 M photons is fine on
+the same machine; 400 M is not), but the message names neither the allocation that failed nor
+its size, so the only way to find out is to bisect `-n`. This got easier to hit in 0.199.0:
+multiple scattering deposits **one beam per chord** rather than one per medium crossing, so a
+thick high-albedo medium now generates several times as many beams per photon as it used to
+(measured on this scene: 1.899 M collected from 40 M photons, against a `-beamcount` default
+ceiling of 1 M). **Proper fix:** catch `std::bad_alloc` around the map/beam allocations and
+report the requested byte count and the flag that controls it (`-n`, `-beamcount`,
+`-beamsplitmax`), the way the beam-split path already reports being limited by
+`-beamsplitmax`.
+
 ## Tech debt
 
 ### `-savemap` / `-loadmap` are silently ignored on the CPU (GPU-only) — 2026-07-26
@@ -11833,17 +11891,24 @@ aliases too. Proper fix: tabulate uniform in theta rather than in mu (the bow is
 theta-domain feature and mu wastes almost all its resolution near the poles), or keep mu but
 add a locally-refined region around each bow's `theta_rb`.
 
-**2. Monodisperse supernumeraries.** With `supernumerary on` the Airy train `Ai(z)^2` rings for
+**2. Monodisperse supernumeraries.** FIXED in 0.199.0 by the size distribution described under
+problem 3 — `dispersion` now defaults to 0.577 (Marshall-Palmer), which averages the train away.
+The original report follows. With `supernumerary on` the Airy train `Ai(z)^2` rings for
 ~11 deg inside the primary, while the *coloured* part of the bow — the spread of `theta_rb`
 between 450 nm (138.76 deg) and 650 nm (137.65 deg) — is only ~1.2 deg wide. So the eye sees a
 broad achromatic ringing band with a thin coloured fringe on each side: "a white curve with
 thin bands of colour on top and bottom", which is exactly what the scene was reporting. Real
 rain is polydisperse and the supernumeraries average away; only the first lobe survives.
 
-**3. `supernumerary off` is not the polydisperse average — it is worse than `supernumerary on`,
-and it flattens the bow's contrast to nothing.** (Measured 2026-08-31; this paragraph replaces
-an earlier claim here that `supernumerary off` "already does the right thing".) The
-implementation is a flat clamp:
+**3. FIXED (0.199.0) — `supernumerary off` was not the polydisperse average; it was worse than
+`supernumerary on`, and it flattened the bow's contrast to nothing.** (Measured 2026-08-31; this
+paragraph replaces an earlier claim here that `supernumerary off` "already does the right
+thing".) **The fix is the `dispersion` parameter** — `rainbow::Params::dispersion`, a real gamma
+droplet-size distribution integrated into the table build, defaulting to `0.577` = exactly
+Marshall-Palmer. `supernumerary` is gone from `Params`; the FTSL key is kept as a deprecated
+alias mapping `on -> dispersion 0` and `off -> dispersion 0.577`, with a one-time note. The
+original report follows, because it is what justifies the shape of the fix. The
+implementation was a flat clamp:
 
 ```cpp
 if (!p_.supernumerary && z < -1.02) {
@@ -11880,14 +11945,34 @@ uniformly bright ~40 deg disc with a thin coloured rim, which is why the arc rea
 **`supernumerary on` is the closer of the two to the polydisperse truth on every metric above**,
 despite problem 2.
 
-Proper fix (unchanged, but now clearly the *only* correct option — the clamp should be deleted,
-not kept as a fallback): make the phase function take a size *distribution* (a
-gamma/Marshall-Palmer with a width parameter) and integrate over it when building the table,
-so `supernumerary on` means "narrow distribution, supernumeraries survive" rather than
-"physically-impossible single droplet size". Integrating over the distribution also broadens the
-principal lobe (measured: +1% FWHM at 25% relative width, +15% at 50%, peak -9%), which slightly
-relieves problem 1. Until that lands, `scenes/gallery_rain.ftsl`'s `supernumerary off` is
-actively making its rainbow worse than the default would be.
+**What 0.199.0 actually did.** The phase function now takes a size *distribution* and integrates
+over it when building the table, so `dispersion 0` means "monodisperse, supernumeraries survive"
+rather than the physically-impossible single droplet size being the default. Two details that
+were not obvious up front:
+
+- **Two different moments of the DSD matter and they are not the same distribution.** Which
+  sizes a photon *samples* is weighted by `sigma_sca ~ a^2`; how bright each size's *bow* is
+  scales as `a^(7/3)` (van de Hulst). So the mix that shapes the bow is gamma of shape
+  `Kb = K2 + 1/3` while `droplet_um` (the user's mean) is defined on the `a^2`-weighted one,
+  shape `K2 = 1/dispersion^2`. Big drops make disproportionately bright bows — which is why a
+  heavy shower's bow is more vivid than drizzle's.
+- **The cells must be AVERAGED, not point-sampled.** At `z = -80` the Airy phase sweeps ~1400 rad
+  across a Marshall-Palmer distribution, so 64 point samples alias into fixed-pattern ringing
+  across the bow interior. `airyAi2Mean()` returns the *exact* mean of `Ai^2` over an interval
+  from a tabulated tail integral `S(u) = integral_u^inf Ai^2`, so the quadrature converges on the
+  cell count of the smooth *density* (64 is plenty) instead of the cell count of the
+  *oscillation* (thousands). Verified by `-rainbow-selftest`: the average tracks the envelope
+  `1/(2 pi sqrt|z|)` to <4% from z=-5 to z=-80 while the monodisperse value oscillates between
+  0.0029 and 0.123 over the same range.
+
+Integrating over the distribution also broadens the principal lobe (measured: +1% FWHM at 25%
+relative width, +15% at 50%, peak -9%), which slightly relieves problem 1.
+
+**Side fix in the same change: `airyAi(x)` returned 0 for `x <= -30`**, the bottom of its RK4
+table, which hard-clipped the entire bow interior beyond `z = -30` to nothing — not a small
+error, because the `Ai^2` envelope only decays as `|z|^(-1/2)` and is still at 35% of the peak
+there. It now falls through to the exact large-`|x|` asymptotic
+`Ai(-t) ~ t^(-1/4) sin((2/3) t^(3/2) + pi/4) / sqrt(pi)` (relative error <1e-4 for `t > 30`).
 
 ## FIXED (2026-08-04, 0.129.0): GPU mode D dropped a *material's own* emission — every non-mesh glowing surface rendered black, while the CPU rendered it
 

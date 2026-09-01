@@ -203,16 +203,24 @@ argument for standing a groom in a hall of polished objects.*
   mode-`B` pass normally splats one photon realisation to every camera, so a rainbow /
   fogbow / glory (view-dependent **single** scattering) comes out with the *same*
   frozen speckle welded into every frame of a flyby. Adding **`-beams`** (alias
-  `-photonbeams`) switches to a single-scattering **long-beam** estimator: the photon
-  crosses the medium straight (deposited once), and **each camera independently draws
-  its own in-scatter point** toward its own eye. Result: the *same* mean bow with
-  **independent per-frame noise** — the "fast AND best" combination (≈1× photon cost
-  across the flyby, correct per-view angle, clean non-frozen grain). It deliberately
-  drops the multiple-scatter haze wash, so the bow is actually *crisper* than the
-  shared baseline. Runs on **both CPU and GPU** (the per-camera in-scatter resample is
-  ported to the CUDA forward tracer, and spectral-rainbow-phase media now run on the GPU
-  too — the λ×µ Airy phase table is uploaded per-medium). Rainbows/fogbows/glories are
-  single scatter, so this loses nothing that matters for them.
+  `-photonbeams`) switches to a **long-beam** estimator: the photon deposits its chord
+  through the medium once, and **each camera independently draws its own in-scatter
+  point** toward its own eye. Result: the *same* mean bow with **independent per-frame
+  noise** — the "fast AND best" combination (≈1× photon cost across the flyby, correct
+  per-view angle, clean non-frozen grain). Runs on **both CPU and GPU** (the per-camera
+  in-scatter resample is ported to the CUDA forward tracer, and spectral-rainbow-phase
+  media now run on the GPU too — the λ×µ Airy phase table is uploaded per-medium).
+  **Full multiple scattering since 0.199.0.** Through 0.198.0 the beam deposit carried
+  exactly one scattering order — the photon crossed every medium straight and anything
+  that scattered twice was booked as absorbed — which is fine for a thin bow but deletes
+  most of a thick, high-albedo volume (a cloud is white *because* of multiple scatter).
+  The photon now runs plain analog transport under `-beams` and deposits one long beam
+  per chord between scattering events, chord *k+1* carrying *k*-times-scattered flux, so
+  the gather is an unbiased estimator of the **full** volumetric transport. Measured
+  against a BDPT reference on a thick albedo-0.95 ball (`scenes/_beams_ms.ftsl`): full
+  MS **1.085×** the reference, the old single-scatter path **0.330×**. Pass
+  **`-beams-order 1`** to get the pre-0.199.0 behaviour back bit-for-bit when you want
+  the crisper single-scatter bow.
   **`-beams` also gives mode `M` a volume at all.** The photon map stores *surface*
   records only, so without it a fog / rain / cloud / rainbow scene renders its volume
   as **nothing** under `M`. With it, each photon's straight crossing of each medium is
