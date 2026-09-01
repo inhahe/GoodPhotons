@@ -268,14 +268,12 @@ global map's 200 — a caustic is a high-contrast feature where blur hurts more 
 `-savemap` format bumped to `FTPMP04`; `FTPMP03` files still load (their photons all land in the
 global map, i.e. the pre-split behaviour).
 
-**Still open — the split is necessary but not sufficient.** Separating the populations does
+**The split is necessary but not sufficient.** Separating the populations does
 nothing if the caustic population is empty. On `gallery_rain` only **0.12 %** of deposits
 (21 808 of 17.6 M at `-n 40M`) are L·S⁺·D, because the gems subtend a tiny solid angle of a
 sky-lit scene and photons are emitted uniformly. Jensen's scheme pairs the caustic map with a
-**dedicated caustic emission pass** driven by a *projection map* — photons emitted only into the
-directions that can reach specular geometry, with the pass's own `nEmitted` and a power scaled by
-the fraction of the emitter's solid angle the projection covers. Without it the caustic map is
-correct and sharp and still nearly empty. See the separate entry below.
+**dedicated caustic emission pass** aimed at the focusing geometry; that is `causticaim.h` /
+`-causticn`, in the entry immediately below (CPU done in v0.203.0, GPU still to come).
 
 <details><summary>Original report and plan</summary>
 
@@ -304,7 +302,7 @@ mode-`D` reference render of the same camera.
 
 </details>
 
-### OPEN: the caustic map has nowhere near enough photons, because emission is not aimed at the specular geometry
+### PARTLY FIXED (2026-09-01, v0.203.0): the caustic map had nowhere near enough photons, because emission was not aimed at the specular geometry — CPU done, **GPU still to do**
 
 **Found immediately after** the two-map split above started working. The split is the *storage*
 half of Jensen's scheme; this is the *sampling* half, and without it the sharp caustic map is
@@ -317,19 +315,96 @@ forward pass emits photons uniformly over the emitter, so almost none of them ev
 dielectric. Raising `-n` fixes it only linearly and at ruinous cost — the caustic budget is 1/800
 of the trace.
 
-**Fix (Jensen projection map / dedicated caustic pass):** build a coarse spherical projection map
-per emitter marking the cells whose directions can reach specular or near-specular geometry
-(`photonVertexKind == PV_FOCUS`; the bounding spheres of those primitives are enough). Run a
-second, dedicated emission pass that samples **only** those cells, deposits **only** into the
-caustic map, and carries its own `nEmitted` plus a power scaled by the covered fraction of the
-emitter's solid angle — so the estimate stays unbiased while the photon density on the caustics
-goes up by whatever the coverage ratio is (three orders of magnitude on this scene). The two
-maps' normalisations are already independent, which is exactly what makes a separate pass
-droppable in.
+**Fix as built (`src/causticaim.h`, new): a continuous mixture importance sampler, not a
+discretised projection grid.** Jensen's projection map is a coarse spherical grid per emitter,
+which needs a resolution choice, a per-emitter build, and an occupancy test that is only as good
+as the cell size. Instead the focusing geometry — every primitive whose material
+`materialMayFocus` (conservative: the undecidable "roughness comes from a texture/pattern/record"
+case is *called* focusing) — is clustered into `-causticaimk` bounding **spheres**, and the
+footprint of the sphere set is then closed form:
 
-**Files it will touch:** `src/photonmap_render.h` (a second `tracePhotonPass` targeting only the
-caustic bank), `src/render.h` (emission from a projection map), `src/render_cuda.cu` (the device
-twin, plus the projection map as an upload), `src/main.cpp` (a `-causticn` budget knob).
+* a **local** emitter (quad / sphere / cylinder / mesh / spot, and a volumetric `fire` birth)
+  has a fixed origin, so the **direction** is aimed: each target subtends a cone of measure
+  `Omega_j = 2*pi*(1 - cos theta_j)`;
+* a **distant** emitter (sun / env) has a direction fixed by the solar cone or the sky importance
+  map, so the **origin** is aimed instead: each target projects to a disc of measure `pi*r_j^2` on
+  the upstream plane the ordinary sampler draws from.
+
+**The collapse that makes the pdf free.** Pick target `j` with probability `P_j = m_j / T`
+(proportional to its *own* footprint measure, `T = sum_j m_j`) and sample uniformly inside that
+footprint (`q_j = 1/m_j`). Then for any direction/point `x`
+
+    p_a(x) = sum_j P_j q_j [x in j] = count(x) / T
+
+— one overlap count and one divide, whatever the geometry, with no normalisation integral and no
+grid. That is the whole sampler.
+
+**Why it is unbiased regardless of what the target set contains — balance-heuristic MIS.** The
+aimed pass does **not** replace the main pass. Both passes' caustic deposits are scaled by the
+*same* per-photon weight computed at emission,
+
+    w = 1 / (1 + (N_c/N_m) * rho),   rho = p_a / p_u,
+
+and the caustic map's `nEmitted` stays at the **main** pass's count `N_m`. A main-pass photon
+nowhere near a gem has `rho = 0` and `w = 1`, i.e. is untouched. So a target set that is
+incomplete, over-eager, or badly clustered costs **efficiency only, never correctness** — which is
+what makes a conservative `materialMayFocus` the right call. Two further consequences worth
+naming: a direction the aimed pass proposes where `p_u = 0` (outside a spot's outer cone, below an
+area emitter's horizon, outside the upstream disc) is a zero *contribution*, not a lost sample;
+and a non-aimable **collimated** emitter gets `rho = 1`, not 0 — the caustic pass emits it with
+the ordinary sampler, the two strategies are identical, and MIS degenerates to splitting the
+deposit between two equal passes.
+
+**The clustering objective is `sum_j r_j^2`, not SAH.** The aimed sampler spends its budget
+uniformly over each footprint and a footprint's measure is proportional to `r_j^2`, so `sum r^2`
+*is* the expected fraction of aimed photons that miss. It is minimised directly.
+
+**The aimed pass must transport by the same rules as the main pass**, or MIS is combining
+estimators of two different integrands. Under `-beams` the main pass crosses media **straight**
+(an analog collision would set `sawScatter` and destroy the L·S⁺·D classification the caustic map
+is *defined* by), so the aimed pass must too — but it must not *store* beams, because the beam map
+belongs to the main pass and is normalised by that pass's `nEmitted`. Hence `beamStraightOnly`.
+
+**Measured.** On `gallery_rain` at `-n 2M` (CPU), caustic deposits went **1 111 → 82 294** (74×)
+for a 25 % larger photon budget, while the global map stayed at *exactly* 879 326 — the main pass
+is bit-for-bit unchanged and only the caustic map moved. Unbiasedness was checked with a new
+permanent `buildCausticMap` diagnostic, **stored flux / emitted**, which is exactly the quantity
+the aimed pass must leave alone while changing only its variance, on `scraps/caim_glass.ftsl` (a
+Cornell box with one SF10 sphere):
+
+| `-n` | `-causticn 0` | `-causticn 100M` |
+|---|---|---|
+| 2 M | 6.18229e14 | 6.15877e14 |
+| 8 M | 6.17109e14 | 6.15898e14 |
+| 16 M | 6.16501e14 | (host OOM) |
+
+The *un-aimed* estimator drifts monotonically downwards as `n` grows (nested photon sets — photon
+`i` is seeded by `i`) towards ≈6.159e14; the aimed-dominated one sits on that value already, at
+two very different budgets, agreeing to 3e-5 relative. A `-causticn` sweep at fixed `-n 4M` shows
+the same monotone approach — 6.17297 / 6.17013 / 6.16572 / 6.15876 e14 for `cn` = 0 / 1M / 4M /
+16M, with 491 212 → 5 287 803 caustic photons. Whole-image `pfmcmp`: energy bias **+0.01 %**,
+rel-RMS @8×8 **0.23 %**. `-causticn 0` is bit-for-bit the pre-0.203.0 behaviour (aim ratio 0 ⇒ the
+aim map is never bound ⇒ no RNG draw at all).
+
+CLI: **`-causticn <n>`** (aimed photons; default `auto` = `-n`/4, `0` = off) and
+**`-causticaimk <k>`** (target spheres, default 64). Both imply `-caustics`.
+
+**Still to do — the GPU twin (`src/render_cuda.cu`).** Until it lands, a GPU mode-`M` render gets
+the un-aimed (sparse) caustic map while the CPU gets the aimed one, so the two backends differ on
+any scene with caustics. The port needs: the target spheres uploaded; a device `applyCausticAim`
+inside `genPhoton` / `genPhotonHero`; the per-photon MIS weight carried to the deposit site (the
+natural carrier is the existing per-path `int pathBits`, widened to a small struct with `bits` +
+`w` — **not** bit-packed, per `DPhoton`'s own comment about implicit encodings in a buffer several
+kernels write and two host loops read — including the wavefront per-slot `st.pathBits` array); a
+caustic-only aimed `depositLaunch` with `beamStraightOnly`; and the `-causticn` accounting
+mirrored. One invariant found while surveying the device code that simplifies this: a deposit sets
+`PV_BIT_SCATTER` immediately after storing, so **at most one caustic deposit occurs per path** —
+the first diffuse deposit, and only if a focus vertex preceded it.
+
+**Files:** `src/causticaim.h` (new — targets, clustering, samplers), `src/render.h`
+(`Renderer::applyCausticAim` + the three emission call sites + `beamStraightOnly`),
+`src/photonmap_render.h` (`tracePhotonPass`'s second, aimed pass), `src/main.cpp` (`buildAimMap`,
+the two mode-`M` call sites, the two CLI flags, the flux diagnostic).
 
 ### FIXED (2026-09-01, v0.199.6): the photon grid's memory guard silently overrode the requested gather radius on any large scene
 

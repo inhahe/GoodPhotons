@@ -22,7 +22,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased; CPU + GPU since 0.110.0, fully on-device since 0.116.0) | `backward.h` (`whitted`), `render_cuda.cu` (`WhittedOpts`) |
 | `P` | composite: forward B + backward R passes merged | `main.cpp` orchestration |
 | `D` | bidirectional path tracer (BDPT, MIS) | `bdpt.h` |
-| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `photonmap_io.h` |
+| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
@@ -2050,7 +2050,7 @@ render. Closing that means teaching the shared device path to gather in spp chun
   0.9996 in absolute units, solar disc `1/16` on both — and `cornell.ftsl` mode U is
   **byte-identical** before and after the port, since every new density sits behind
   `dIsDeltaEmitter` and the area path keeps its RNG draw order.
-- **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`/`photonmap_io.h`** — U/S/M.
+- **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`/`photonmap_io.h`/`causticaim.h`** — U/S/M.
   PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.
   **`PhotonMap` is structure-of-arrays, and that is load-bearing.** Deposit positions
@@ -2168,10 +2168,52 @@ render. Closing that means teaching the shared device path to gather in spp chun
   photons drove 0.655 m → 1.094 m, smearing the one thing the split exists to keep sharp. Capped,
   the worst case degenerates to the unsplit answer. Mode `S` (SPPM) is deliberately untouched —
   its progressive radius already handles caustics, and its `causticDeposit` stays null.
-  **Known gap:** this is the *storage* half of Jensen's scheme only. Emission is still uniform,
-  so on `gallery_rain` just 0.12 % of deposits are L·S⁺·D and the caustic map is sharp but nearly
-  empty; the dedicated **projection-map emission pass** that fixes that is tracked in
-  `known-issues.md`.
+  That was the *storage* half of Jensen's scheme only, and on its own it leaves the caustic map
+  sharp but nearly empty (0.12 % of `gallery_rain` deposits are L·S⁺·D). The *sampling* half is
+  `causticaim.h`, next.
+- **`causticaim.h`** (0.203.0; `-causticn`, `-causticaimk`; **CPU only so far**) — the **aimed
+  caustic emission pass**, Jensen's projection-map half, built as a *continuous mixture
+  importance sampler* rather than a discretised spherical grid. Every primitive whose material
+  `materialMayFocus` (conservative — the undecidable "roughness driven by a texture/pattern/record"
+  case is *called* focusing, because a false positive costs efficiency and a false negative costs
+  caustics) is clustered into `-causticaimk` bounding spheres. The union of their footprints is
+  then closed form: a **cone** per sphere when the emitter is local (quad/sphere/cylinder/mesh/spot
+  and a volumetric `fire` birth — the origin is fixed, so the *direction* is aimed), a **disc** per
+  sphere when it is distant (sun/env — the direction is fixed by the solar cone or the sky
+  importance map, so the *origin* on the upstream plane is aimed).
+  **The collapse that makes the pdf free:** choosing target `j` with probability `P_j = m_j/T`
+  (proportional to its own footprint measure) and sampling uniformly inside it (`q_j = 1/m_j`)
+  gives `p_a(x) = Σ_j P_j q_j [x∈j] = count(x)/T` — one overlap count and one divide, whatever the
+  geometry, with no normalisation integral and no grid.
+  **Unbiasedness is structural, via the balance heuristic.** The aimed pass does not *replace* the
+  main pass: `tracePhotonPass` runs it as a second pass of `nAimed` photons that deposit into
+  `pmCaustic` only, and **both** passes' caustic deposits are scaled by the same per-photon weight
+  `w = 1/(1 + (N_c/N_m)·rho)`, `rho = p_a/p_u`, computed at emission in `Renderer::applyCausticAim`
+  — while the caustic map's `nEmitted` stays at the **main** pass's count. A main-pass photon
+  nowhere near a gem has `rho = 0`, `w = 1`, and is untouched. So a target set that is incomplete,
+  over-eager or badly clustered is an *efficiency* question and never a correctness one, and
+  `-causticn 0` is bit-for-bit the pre-0.203.0 result (the aim map is never bound, so not even an
+  RNG draw differs). Corollaries: an aimed proposal where `p_u = 0` (outside a spot's outer cone,
+  below an area emitter's horizon, outside the upstream disc) is a zero *contribution*, not a lost
+  sample; and a **collimated** emitter, which has no free variable to aim, gets `rho = 1` — the
+  caustic pass emits it with the ordinary sampler and MIS degenerates to splitting the deposit
+  between two identical passes.
+  Two non-obvious constraints. The clustering objective is **Σr²**, not SAH: the sampler spends its
+  budget uniformly over each footprint and a footprint's measure ∝ r², so Σr² *is* the expected
+  fraction of aimed photons that miss. And the aimed pass must **transport by the same rules as the
+  main pass** or MIS combines estimators of two different integrands — under `-beams` the main pass
+  crosses media straight (an analog collision would set `sawScatter` and destroy the very
+  classification the caustic map is defined by), so `Renderer::beamStraightOnly` makes the aimed
+  pass cross straight too *without* storing beams, since the beam map belongs to the main pass and
+  is normalised by its `nEmitted`.
+  The aimed pass runs **after** the main pass rather than alongside it, so both use every core and
+  so an `ftrace -stop` mid-trace simply skips it (leaving the un-aimed caustic map, which is still
+  correct, just noisier). `buildCausticMap` prints a permanent **stored flux / emitted**
+  diagnostic — the one quantity aiming must leave alone — which is how the weighting was verified
+  (see `known-issues.md` for the tables). Measured: 74× more caustic photons on `gallery_rain` for
+  a 25 % larger budget, with the global map's deposit count bit-identical.
+  **Not yet on the GPU**, so a `-device gpu` mode-`M` render still gets the sparse un-aimed caustic
+  map; the port plan is in `known-issues.md`.
 - **`allocreport.h`** (0.199.1) — `ftalloc::resize` / `ftalloc::reserve`, which turn a
   `std::bad_alloc` from a *command-line-sized* buffer into a message naming the buffer, the
   element count and size, the total in binary units, and the flag that shrinks it. Wrapped:

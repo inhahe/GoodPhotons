@@ -22,6 +22,7 @@
 #include "camera.h"
 #include "photonmap.h"
 #include "photonbeams.h"   // view-independent volume cache for mode M (photon beams)
+#include "causticaim.h"    // Jensen projection map: aimed emission for the caustic pass
 #include "medium_stack.h"
 #include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
@@ -417,15 +418,144 @@ struct Renderer {
     // the split get.
     PhotonBank* causticDeposit = nullptr;
 
+    // ---- DEDICATED CAUSTIC PASS (Jensen's projection map; see causticaim.h) --------------
+    // Non-null enables aimed emission and the balance-heuristic weighting that pairs with it.
+    // Bound on BOTH passes: the main pass needs it to down-weight the caustic deposits the
+    // aimed pass is also making, and it changes nothing else about the main pass (a photon
+    // that lands nowhere near focusing geometry has rho = 0 and weight exactly 1).
+    const caim::AimMap* aimMap = nullptr;
+    // True only in the dedicated caustic pass: emission is drawn from the aim map instead of
+    // from the emitter's own distribution. Costs the main pass no RNG draws at all, so a
+    // render with the feature bound but the pass switched off stays bit-identical.
+    bool aimEmission = false;
+    // N_c / N_m — the caustic pass's photon count over the main pass's. The balance
+    // heuristic's only free parameter, and it is not free: it is exactly the ratio the two
+    // passes were actually run at.
+    double aimMisRatio = 0.0;
+    // Caustic-deposit weight for the photon currently being traced, w(x) in causticaim.h.
+    // Mutable because every tracer here is const and this is per-photon scratch, exactly
+    // like the RNG the callers thread through.
+    mutable double causticW = 1.0;
+    // Cross media STRAIGHT without storing beams. The caustic pass must transport photons by
+    // the same rules as the main pass or the two are not estimating the same integrand and
+    // the MIS combination is meaningless — and with `-beams` the main pass crosses media
+    // straight. It must not store beams though: the beam map is the main pass's, normalised
+    // by the main pass's nEmitted.
+    bool beamStraightOnly = false;
+
     // Append a photon record at a diffuse/translucent vertex (no-op when the map is off).
     // The photon's incident direction is deliberately NOT stored: the density estimate is
     // Lambertian, so no gather has ever read it (see Photon in photonmap.h).
-    // `caustic` routes the record to the caustic bank when one is bound (see above).
+    // `caustic` routes the record to the caustic bank when one is bound (see above), and
+    // applies this photon's caustic MIS weight — 1.0 unless a dedicated caustic pass is
+    // running alongside, in which case the two passes share the deposit between them.
     void depositPhoton(const Vec3& p, const Vec3& n, double lambda, double beta,
                        bool caustic = false) const {
         PhotonBank* bank = (caustic && causticDeposit) ? causticDeposit : photonDeposit;
         if (!bank) return;
+        if (bank == causticDeposit && causticW != 1.0) {
+            beta *= causticW;
+            if (!(beta > 0.0)) return;
+        }
         bank->push(p, n, (float)beta, (float)lambda);
+    }
+
+    // ---- Aimed emission + caustic MIS weight -------------------------------------------
+    // Called once per photon, straight after the ordinary emission sample has been drawn.
+    // In the MAIN pass it only *measures* that sample — computing rho = p_a/p_u and storing
+    // the balance-heuristic weight in `causticW` — and draws no randomness, so the main
+    // pass's photon set is untouched. In the AIMED pass it additionally RESAMPLES the half
+    // of the emission the target actually constrains (the upstream disc point for a distant
+    // emitter, the direction for a local one), overwriting `origin` / `dir` / `spotW`.
+    //
+    // `em == nullptr` means a volumetric blackbody birth: an isotropic direction from a point
+    // inside the fire, which is the cone case with p_u = 1/(4*pi).
+    //
+    // Returns false when the sample carries no light — an aimed direction outside a spot's
+    // outer cone, below an area emitter's horizon, or outside the upstream disc that IS a
+    // distant emitter's entire phase space. Those are not rejections that need compensating:
+    // p_u is genuinely zero there, so the contribution being discarded is zero.
+    bool applyCausticAim(const Scene& scene, const Emitter* em, Vec3& origin, Vec3& dir,
+                         const Vec3& emitN, double& spotW, Pcg32& rng) const {
+        causticW = 1.0;
+        if (!aimMap || aimMap->empty()) return true;
+        // rho = p_a/p_u. The default is 1, not 0: an emitter that CANNOT be aimed (a
+        // collimated one — its direction is a delta) is emitted by the caustic pass with the
+        // ordinary sampler, so there the two strategies are identical and rho is exactly 1.
+        // The balance heuristic then degenerates to splitting the deposit between two equal
+        // passes, which is still exact.
+        double rho = 1.0;
+        const bool distant = em && (em->shape == EmitterShape::Env ||
+                                    em->shape == EmitterShape::Sun);
+        const bool collimated = em && em->collimated && !distant;
+        if (collimated) {
+            // nothing to aim: rho stays 1
+        } else if (distant) {
+            // --- upstream origin disc -------------------------------------------------
+            Vec3 t, b; onb(dir, t, b);
+            const Vec3 base = scene.sceneCenter - dir * scene.sceneRadius;
+            const caim::DiscAim da = caim::discAim(*aimMap);
+            if (!(da.sumR2 > 0.0)) return true;
+            double x, y;
+            if (aimEmission) {
+                if (!caim::discSample(*aimMap, da, scene.sceneCenter, t, b,
+                                      rng.uniform(), rng.uniform(), rng.uniform(), x, y))
+                    return true;
+                origin = base + t * x + b * y;
+            } else {
+                const Vec3 off = origin - base;
+                x = dot(off, t); y = dot(off, b);
+            }
+            const double R = scene.sceneRadius;
+            if (x * x + y * y > R * R) {
+                // Outside the disc the emitter delivers nothing at all, so p_u = 0 and the
+                // whole contribution is zero — not a lost sample, a zero one. (Reachable
+                // only from the aimed pass, and only when a target's bounding sphere pokes
+                // marginally past the scene's own.)
+                return !aimEmission;
+            }
+            int n = caim::discCount(*aimMap, scene.sceneCenter, t, b, x, y);
+            if (aimEmission && n < 1) n = 1;   // we drew it from a disc, so it is in one
+            rho = (double)n * R * R / da.sumR2;
+        } else {
+            // --- direction cone -------------------------------------------------------
+            const caim::ConeAim ca = caim::coneAim(*aimMap, origin);
+            if (!(ca.sumOmega > 0.0)) return true;
+            if (aimEmission) {
+                Vec3 w;
+                if (!caim::coneSample(*aimMap, ca, origin,
+                                      rng.uniform(), rng.uniform(), rng.uniform(), w))
+                    return true;
+                dir = w;
+                if (em && em->shape == EmitterShape::Spot) {
+                    const double ct = dot(dir, em->beamDir);
+                    if (ct <= em->spotCosOuter) return false;     // outside the cone: p_u = 0
+                    const double omegaOuter = 2.0 * PI * (1.0 - em->spotCosOuter);
+                    spotW = spotFalloff(ct, em->spotCosInner, em->spotCosOuter)
+                          * omegaOuter / em->spotOmega;
+                } else if (em && dot(dir, emitN) <= 0.0) {
+                    return false;                                 // below the horizon: p_u = 0
+                }
+            }
+            double pu;
+            if (em && em->shape == EmitterShape::Spot) {
+                const double ct = dot(dir, em->beamDir);
+                pu = (ct > em->spotCosOuter) ? 1.0 / (2.0 * PI * (1.0 - em->spotCosOuter)) : 0.0;
+            } else if (em) {
+                const double c = dot(dir, emitN);
+                pu = (c > 0.0) ? c / PI : 0.0;                    // cosine hemisphere
+            } else {
+                pu = 1.0 / (4.0 * PI);                            // isotropic volumetric birth
+            }
+            if (!(pu > 0.0)) return !aimEmission;
+            int n = caim::coneCount(*aimMap, origin, dir);
+            if (aimEmission && n < 1) n = 1;
+            rho = ((double)n / ca.sumOmega) / pu;
+        }
+        // Balance heuristic: w = N_m p_u / (N_m p_u + N_c p_a). See causticaim.h for why the
+        // SAME weight is right for a photon from either pass.
+        causticW = 1.0 / (1.0 + aimMisRatio * rho);
+        return true;
     }
 
     // Photon-BEAM deposit (mode M with -beams). The surface map above cannot represent a
@@ -2169,6 +2299,14 @@ struct Renderer {
             double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
             double phi = 2.0 * PI * rng.uniform();
             dir = Vec3{ sr * std::cos(phi), sr * std::sin(phi), z };
+            // Aimed caustic emission (causticaim.h). A fire birth point is already fixed, so
+            // it is the DIRECTION that gets aimed; p_u for an isotropic birth is 1/(4pi),
+            // which is the `em == nullptr` case. No-op (and no RNG draw) unless an aim map
+            // is bound.
+            {
+                Vec3 emitNv = dir; double spotWv = 1.0;   // unread when em == nullptr
+                if (!applyCausticAim(scene, nullptr, origin, dir, emitNv, spotWv, rng)) return;
+            }
             // Direct-visibility emission splat (the flame seen directly by the camera).
             if (nCam > 0 && !forwardCatch)
                 camSplatEmissionAll(scene, cams, nCam, origin, lambda, beta, rng);
@@ -2247,6 +2385,12 @@ struct Renderer {
             emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         }
+        // Aimed caustic emission (causticaim.h). Placed here, after the shape branch has
+        // produced an ordinary sample and BEFORE `beta *= spotW`, because the aimed pass
+        // resamples the direction and therefore recomputes spotW. In the main pass this
+        // only measures the sample (no RNG draw, so every existing render stays
+        // bit-for-bit) and stores the caustic MIS weight.
+        if (!applyCausticAim(scene, &em, origin, dir, emitN, spotW, rng)) return;
         double pdfL = 0.0;
         // Drawn through sampleAt rather than sample() so the SAME uniform variate can seed the
         // stratified secondaries below. `sample()` is literally `sampleAt(rng.uniform(), pdf)`,
@@ -2368,7 +2512,13 @@ struct Renderer {
         const bool doBeamDeposit = (beamDeposit != nullptr) && !scene.media.empty();
         // Either beam path makes the photon cross media STRAIGHT: skip the analog free-flight
         // redirect below and attenuate by the crossing's transmittance instead.
-        const bool doBeamStraight = doBeamGather || doBeamDeposit;
+        // `beamStraightOnly` is the aimed caustic pass, which must cross media by the SAME
+        // rule as the main pass it is being MIS-combined with (an analog collision would set
+        // sawScatter and destroy the L.S+.D classification the caustic map is defined by) —
+        // but must NOT store beams, because the beam map belongs to the main pass and is
+        // normalised by the main pass's nEmitted.
+        const bool doBeamStraight = doBeamGather || doBeamDeposit ||
+                                    (beamStraightOnly && !scene.media.empty());
 
         // MULTIPLE SCATTERING in the beam media (0.199.0; -beams-order). How many times this
         // photon has already scattered inside a beam-carried (non-GRIN) medium, so the order
@@ -2839,6 +2989,9 @@ struct Renderer {
             emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         }
+        // Aimed caustic emission — see the scalar tracer. Before `base *= spotW` for the
+        // same reason (the aimed pass recomputes spotW).
+        if (!applyCausticAim(scene, &em, origin, dir, emitN, spotW, rng)) return;
 
         // Hero + stratified secondary wavelengths from this emitter's SPD (hero.h policy 1:
         // one base draw, C-1 wrapped strata). The hero must have a valid pdf; a dead

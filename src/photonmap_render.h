@@ -30,6 +30,7 @@
 #include "render.h"
 #include "photonmap.h"
 #include "photonbeams.h"   // volume single-scatter cache (mode M with -beams)
+#include "causticaim.h"    // Jensen projection map: aimed emission for the caustic pass
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 #include "backward.h"      // BackwardRenderer::neeLight / neeEnv for final-gather direct lighting
 #include "scene_film.h"
@@ -76,13 +77,30 @@
 // so buildAuto picks each map its own radius and the caustic stops being smeared away by
 // a kernel sized for the ambient illumination. Null keeps every deposit in `pm` (mode S
 // and every pre-0.199.7 caller).
+//
+// `aim` + `nAimed` (optional) add Jensen's PROJECTION-MAP half of the two-map scheme: a
+// SECOND pass of nAimed photons whose emission is importance-sampled towards the scene's
+// focusing geometry (causticaim.h), depositing into *pmCaustic only. Without it the caustic
+// map is sharp and nearly empty — 0.12 % of deposits on gallery_rain — because a uniformly
+// emitting sky almost never happens to hit a gem. The two passes are combined with the
+// balance heuristic: both passes' caustic deposits are scaled by the SAME per-photon weight
+// w = 1/(1 + (N_c/N_m)·rho) computed at emission (Renderer::applyCausticAim), and the caustic
+// map's nEmitted stays at the main pass's count. So the aimed pass is a pure variance
+// reduction — an incomplete or over-eager target set costs efficiency, never correctness —
+// and nAimed = 0 leaves every deposit bit-for-bit what it was.
 inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
                             bool diffraction, PhotonMap& pm, int heroC = hero::kHeroC,
                             uint64_t seedBase = 0, BeamMap* bm = nullptr,
                             long long beamTarget = 0,
                             const StageProgress* stage = nullptr,
-                            PhotonMap* pmCaustic = nullptr) {
+                            PhotonMap* pmCaustic = nullptr,
+                            const caim::AimMap* aim = nullptr,
+                            long long nAimed = 0) {
     if (nThreads < 1) nThreads = 1;
+    // The aimed pass needs somewhere caustic to deposit and something to aim at.
+    const bool doAimed = pmCaustic && aim && !aim->empty() && nAimed > 0 && N > 0;
+    if (!doAimed) { aim = nullptr; nAimed = 0; }
+    const double aimRatio = doAimed ? (double)nAimed / (double)N : 0.0;
     std::vector<PhotonBank> banks(nThreads);
     std::vector<PhotonBank> cbanks(pmCaustic ? nThreads : 0);
     std::vector<BeamBank>   bbanks(nThreads);
@@ -125,14 +143,31 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     // nothing is synchronised through it, it only feeds a title bar.
     std::atomic<long long> tracedTotal{0};
 
-    auto worker = [&](int tid) {
-        Renderer r; r.diffraction = diffraction; r.photonDeposit = &banks[tid];
-        if (pmCaustic) r.causticDeposit = &cbanks[tid];
-        if (bm) r.beamDeposit = &bbanks[tid];
+    auto worker = [&](int tid, bool aimed) {
+        Renderer r; r.diffraction = diffraction;
+        if (aimed) {
+            // Caustic-only pass: no global deposits (the global map is the main pass's and
+            // is normalised by ITS nEmitted), and no beam deposits for the same reason — but
+            // media must still be crossed straight, or this pass would be transporting by
+            // different rules than the pass it is being combined with.
+            r.causticDeposit  = &cbanks[tid];
+            r.aimEmission     = true;
+            r.beamStraightOnly = (bm != nullptr);
+        } else {
+            r.photonDeposit = &banks[tid];
+            if (pmCaustic) r.causticDeposit = &cbanks[tid];
+            if (bm) r.beamDeposit = &bbanks[tid];
+        }
+        // Bound on BOTH passes: the main pass does not aim, but it still has to MEASURE its
+        // own samples' aimed density to weight its caustic deposits. That measurement draws
+        // no randomness, so the main pass's photon set is untouched.
+        r.aimMap = aim; r.aimMisRatio = aimRatio;
         r.useHero = heroOn; r.heroC = heroC;
-        r.beamSpecC = beamSpecC;
+        r.beamSpecC = aimed ? 1 : beamSpecC;
         Pcg32 rng;
-        long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
+        const long long Np = aimed ? nAimed : N;
+        const uint64_t salt = aimed ? 0x94D049BB133111EBULL : 0xEB44ACCAB455D165ULL;
+        long long lo = Np * tid / nThreads, hi = Np * (tid + 1) / nThreads;
         EnergyReport e;
         long long done = 0;
         for (long long i = lo; i < hi; ++i) {
@@ -151,7 +186,7 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
                 if (done) tracedTotal.fetch_add(0x1000, std::memory_order_relaxed);
                 if (ft::stopRequested()) break;
             }
-            seedUnit(rng, seedBase + (uint64_t)i, 0xEB44ACCAB455D165ULL);
+            seedUnit(rng, seedBase + (uint64_t)i, salt);
             r.tracePhoton(scene, (const Camera*)nullptr, (Film*)nullptr, (Film*)nullptr, rng, e);
             ++done;
         }
@@ -159,26 +194,38 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         // Count what was ACTUALLY emitted, not what was asked for. pm.nEmitted normalises the
         // density estimate, so reporting the full share after an early break would scale a
         // truncated pass down by the fraction it never traced and darken the image.
-        emitted[tid] = done;
+        // The aimed pass deliberately does NOT count: it emits no light of its own, it
+        // re-estimates the main pass's caustic term with a different sampler.
+        if (!aimed) emitted[tid] = done;
     };
     std::vector<std::thread> pool;
-    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
+    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t, false);
     // The deposit is a join-and-wait, so progress has to be sampled from OUTSIDE it: a
     // monitor thread polls the published count while the workers run. It is only started
     // when someone asked for progress, so a headless render spawns nothing extra.
     std::atomic<bool> monitorStop{false};
     std::thread monitor;
     if (stage && stage->report) {
-        monitor = std::thread([&] {
+        const long long nTotal = N + nAimed;
+        monitor = std::thread([&, nTotal] {
             while (!monitorStop.load(std::memory_order_relaxed)) {
                 stage->report("tracing photons",
-                              tracedTotal.load(std::memory_order_relaxed), N);
+                              tracedTotal.load(std::memory_order_relaxed), nTotal);
                 for (int i = 0; i < 20 && !monitorStop.load(std::memory_order_relaxed); ++i)
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         });
     }
     for (auto& th : pool) th.join();
+    // --- Aimed caustic pass (causticaim.h) --------------------------------------------
+    // Runs after the main pass rather than alongside it so both can use every core, and so
+    // an `ftrace -stop` during the main pass skips it entirely (the caustic map is then
+    // simply the un-aimed one, which is still correct — just noisier).
+    if (doAimed && !ft::stopRequested()) {
+        std::vector<std::thread> apool;
+        for (int t = 0; t < nThreads; ++t) apool.emplace_back(worker, t, true);
+        for (auto& th : apool) th.join();
+    }
     if (monitor.joinable()) { monitorStop.store(true, std::memory_order_relaxed); monitor.join(); }
 
     size_t total = 0;

@@ -11347,6 +11347,44 @@ static bool   g_pmCaustics    = true;
 // denser per unit area, so a smaller k still lands a usable signal-to-noise ratio.
 static double g_pmCausticCount = 50.0;
 
+// ---- Aimed caustic emission (Jensen's projection map; src/causticaim.h) -------------------
+// The storage half of the two-map split above gives caustics their own radius; it does
+// nothing about the fact that hardly any photon ever reaches a dielectric in the first place
+// (0.12 % of deposits on gallery_rain). `-causticn` runs a SECOND photon pass whose emission
+// is importance-sampled towards the scene's focusing geometry, MIS-combined with the main
+// pass by the balance heuristic so it is a pure variance reduction, never a bias.
+//
+// -1 means "auto": a quarter of `-n`, spent where essentially all of the caustic signal is.
+// 0 turns it off, which is bit-for-bit the pre-0.203.0 render.
+static long long g_causticAimN = -1;
+// How many bounding spheres the focusing geometry is clustered into. More targets track the
+// geometry more tightly (fewer aimed photons land on empty space) at a linear cost in the
+// per-photon pdf evaluation, which is a handful of dot products over a cache-hot array.
+static int    g_causticAimK   = 64;
+
+// Build the aim map for this scene, or leave it empty when aiming is off / there is nothing
+// focusing to aim at. Says out loud what it found, because "the caustic pass did nothing" and
+// "the caustic pass found no dielectrics" look identical in the output otherwise.
+static caim::AimMap buildAimMap(const Scene& scene, long long N, long long& nAimedOut,
+                                const char* tag) {
+    caim::AimMap am;
+    nAimedOut = 0;
+    if (!g_pmCaustics || g_causticAimN == 0 || N <= 0) return am;
+    am = caim::build(scene, g_causticAimK);
+    if (am.empty()) {
+        std::printf("%s caustic aim: no focusing geometry — aimed pass skipped.\n", tag);
+        return am;
+    }
+    nAimedOut = (g_causticAimN > 0) ? g_causticAimN : N / 4;
+    if (nAimedOut <= 0) { am.targets.clear(); return am; }
+    std::printf("%s caustic aim: %lld focusing prim%s in %zu target sphere%s "
+                "(sum r^2 = %.4g), %lld aimed photons (%.0f%% of -n).\n",
+                tag, am.nPrims, am.nPrims == 1 ? "" : "s",
+                am.targets.size(), am.targets.size() == 1 ? "" : "s",
+                am.sumR2, nAimedOut, 100.0 * (double)nAimedOut / (double)N);
+    return am;
+}
+
 // Bin a freshly-deposited (or freshly-loaded) photon map, honouring the adaptive-radius
 // setting, and say out loud what radius it settled on — the radius printed before the
 // deposit is only the starting point, and a silently-different one would be baffling when
@@ -11380,6 +11418,16 @@ static void buildCausticMap(PhotonMap& pmC, double radius, const char* tag, doub
     char t2[96];
     std::snprintf(t2, sizeof t2, "%s caustic map:", tag);
     buildPhotonMap(pmC, radius, t2, g_pmCausticCount, rGlobal);
+    // Stored flux per emitted path. This is the quantity the aimed pass (`-causticn`) is
+    // supposed to leave ALONE while changing only its variance, so printing it is the one
+    // cheap check that the MIS weighting is right: aim harder and this number must not move,
+    // only the photon count and the noise. Long double because a caustic map can hold a
+    // hundred million records whose powers span many orders of magnitude.
+    long double flux = 0.0L;
+    for (const Photon& p : pmC.photons) flux += (long double)p.power;
+    if (pmC.nEmitted > 0)
+        std::printf("%s caustic map: stored flux/emitted = %.6Lg (%zu photons)\n",
+                    tag, flux / (long double)pmC.nEmitted, pmC.photons.size());
 }
 
 // Mode-M PHOTON BEAMS (CLI -beams, shared with the mode-A/B splat gather of the same name).
@@ -14997,9 +15045,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // progress the gather reports below cannot cover them. StageProgress does.
         StageProgress stageProg = makeStageProgress(res, resY);
         liveWindowPlaceholder(res, resY, "tracing photons\xE2\x80\xA6");
+        long long nAimed = 0;
+        const caim::AimMap aimMap = buildAimMap(scene, N, nAimed, "mode M:");
         tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
                         wantBeams ? &bmap : nullptr, g_beamTarget, &stageProg,
-                        g_pmCaustics ? &pmC : nullptr);
+                        g_pmCaustics ? &pmC : nullptr, &aimMap, nAimed);
         liveWindowPlaceholder(res, resY, "building photon map\xE2\x80\xA6");
         radius = buildPhotonMap(pm, radius, "mode M:");
         if (g_pmCaustics) buildCausticMap(pmC, radius, "mode M:", pm.radius);
@@ -16701,6 +16751,24 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-caustics")) g_pmCaustics = true;
         else if (!std::strcmp(argv[i], "-nocaustics")) g_pmCaustics = false;
         else if (!std::strcmp(argv[i], "-pmccount") && i + 1 < argc) { g_pmCausticCount = std::atof(argv[++i]); g_pmCaustics = true; g_pmAutoRadius = true; }
+        else if (!std::strcmp(argv[i], "-causticn") && i + 1 < argc) {
+            // `auto` and `off` are spelled out because `atof("auto")` is 0, which is the
+            // OFF sentinel — so without this the documented spelling would silently mean
+            // the opposite of what it says. `-caustics` is implied: asking for an aimed
+            // caustic pass with the caustic map switched off is never what was meant.
+            const char* v = argv[++i];
+            if (!std::strcmp(v, "auto"))     g_causticAimN = -1;
+            else if (!std::strcmp(v, "off")) g_causticAimN = 0;
+            else {
+                g_causticAimN = (long long)std::atof(v);
+                if (g_causticAimN < 0) g_causticAimN = -1;   // any negative reads as "auto"
+            }
+            if (g_causticAimN != 0) g_pmCaustics = true;
+        }
+        else if (!std::strcmp(argv[i], "-causticaimk") && i + 1 < argc) {
+            g_causticAimK = std::atoi(argv[++i]);
+            if (g_causticAimK < 1) g_causticAimK = 1;
+        }
         else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
         else if (!std::strcmp(argv[i], "-savemap") && i + 1 < argc) g_pmapSave = argv[++i];
         else if (!std::strcmp(argv[i], "-loadmap") && i + 1 < argc) g_pmapLoad = argv[++i];
@@ -20948,9 +21016,11 @@ static int run(int argc, char** argv) {
             liveWindowPlaceholder(titleW, titleH, "tracing photons\xE2\x80\xA6");
             // ... and, since 0.199.4, with a photon COUNT and an ETA in it rather than a
             // caption that names the phase and then never moves again.
+            long long nAimed = 0;
+            const caim::AimMap aimMap = buildAimMap(scene, N, nAimed, "[camera]");
             tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
                             wantBeams ? &bmap : nullptr, g_beamTarget, &stageProg,
-                            g_pmCaustics ? &pmC : nullptr);
+                            g_pmCaustics ? &pmC : nullptr, &aimMap, nAimed);
         }
         // Written BEFORE the builds, so the file holds the raw trace and one cache can later
         // be re-gathered at any -pmradius / -beamk.
