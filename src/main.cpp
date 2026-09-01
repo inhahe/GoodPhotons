@@ -11224,6 +11224,35 @@ static void warnModeMMedia(const Scene& scene, bool beamsOn) {
         scene.media.size());
 }
 
+// A beam is a STRAIGHT chord, so a scattering medium that also carries an `ior` field (GRIN)
+// cannot be deposited: the photon curves through it and there is no segment to store. Both
+// backends refuse it on identical per-medium terms (Renderer::emitBeams / dEmitBeams), so this
+// is a property of the beam REPRESENTATION and not of the backend — which is exactly why there
+// is no CPU fallback for it. Warn, because the alternative is a scattering GRIN region that
+// silently renders as nothing while every other medium in the scene appears normally.
+static void warnBeamsGrinMedia(const Scene& scene, bool beamsOn) {
+    if (!beamsOn) return;
+    size_t nGrinScat = 0, nOther = 0;
+    for (const auto& md : scene.media) {
+        if (!md.enabled) continue;
+        // sigma_s is spectral; probe mid-visible, which is what "does it scatter" means here.
+        const bool scatters = md.sigma_s(550.0) > 0.0;
+        if (!scatters) continue;
+        if (md.grin()) ++nGrinScat; else ++nOther;
+    }
+    if (nGrinScat == 0) return;
+    std::fprintf(stderr,
+        "[beams] warning: %zu scattering medium/media in this scene are gradient-index\n"
+        "        (GRIN), and a photon CURVES through those — there is no straight chord to\n"
+        "        store as a beam, so under -beams each behaves as PURELY ABSORBING: its\n"
+        "        volume renders as nothing, and the light it would have scattered is removed\n"
+        "        rather than redistributed, so surfaces lit through it come out dimmer than\n"
+        "        under plain -mode M%s.\n"
+        "        This is a limit of the beam representation, not of the backend: the CPU\n"
+        "        refuses the same deposit, so -device cpu renders the same image.\n",
+        nGrinScat, nOther ? " (other media are unaffected)" : "");
+}
+
 // The A/B/C form of -beams is a per-camera resample of ONE shared photon flight, so it is
 // gated on having several cameras to share (render.h's doBeamGather; render_cuda.cu ~13842
 // applies the identical `nc > 1` gate on the device). That gate is correct — with a single
@@ -14465,6 +14494,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // Photon beams: the view-independent volume cache (see g_beamTarget above).
         const bool wantBeams = g_beamGather && !scene.media.empty();
         warnModeMMedia(scene, wantBeams);
+        warnBeamsGrinMedia(scene, wantBeams);
         PhotonMap pm;
         BeamMap bmap;
         auto tp0 = std::chrono::steady_clock::now();
@@ -19671,12 +19701,12 @@ static int run(int argc, char** argv) {
         // + up to kMeterMax full-res CPU gathers) is the pre-pass that used to take tens
         // of minutes while the GPU idled. Gated exactly like runSharedPhotonMap's GPU
         // branch; any miss falls through to the per-frame loop below unchanged.
-        // ... including its GRIN carve-out for -beams: a bent photon has no straight chord to
-        // deposit, so the device would meter a volumetric scene on an image missing its
-        // brightest subject and anchor the exposure to it.
+        // No GRIN carve-out, for the same reason the render branch has none: the CPU deposits
+        // exactly the same beams the device does (both skip GRIN media, per medium), so a
+        // fallback here would meter the identical image far more slowly. What the meter must
+        // match is the RENDER, and it does.
         const bool meterBeamsGpu = g_beamGather && !scene.media.empty();
-        if (meterGpu && !(meterBeamsGpu && grin::sceneHasGrin(scene)) &&
-            cudaPhotonMapSupported(scene)) {
+        if (meterGpu && cudaPhotonMapSupported(scene)) {
             bool allM = true, allPinhole = true;
             for (const auto& mc : cams) {
                 if (mc.mode != 'M')    allM = false;
@@ -19803,8 +19833,20 @@ static int run(int argc, char** argv) {
     }
 #endif
     (void)useGpuForward;   // only read under HAVE_CUDA; keep CPU-only builds warning-clean
-    const bool plainRender = !(timeBudgetSec > 0.0 || noiseTarget > 0.0 || resume ||
-                               wantCheckpointFlag || runForever || preview);
+    // What actually disqualifies a mode-M camera from the SHARED photon-map path: that path
+    // gathers a fixed spp per frame, so a wall-clock / noise / indefinite budget and the ANSI
+    // terminal preview all need the single-camera progressive driver instead.
+    //
+    // -resume / -checkpoint are deliberately NOT on this list. runRender discards both for
+    // mode M anyway (see the "-resume/-checkpoint apply only to modes A/B/C ..." warning
+    // above: a photon map is persistent state a film-only sidecar cannot reconstruct), so
+    // they change nothing about the render — yet while they WERE on this list, passing
+    // `-checkpoint` pushed the camera out of groupM and into runRender's single-camera mode-M
+    // branch, which has no GPU path at all. A flag the mode announces it is ignoring must not
+    // silently cost it the entire device backend and run 50x slower. (The shared path needs no
+    // checkpoint of its own: it writes each frame's image the instant that frame's gather
+    // completes, which is the crash-safety a sidecar would have bought.)
+    const bool plainRender = !(timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever || preview);
     std::vector<int> groupB, groupA, groupM, restIdx;
     for (int i = 0; i < (int)toRender.size(); ++i) {
         const RenderCam& rc = toRender[i];
@@ -20127,6 +20169,19 @@ static int run(int argc, char** argv) {
         // otherwise drop a media scene's volume without a word.
         const bool wantBeams = g_beamGather && !scene.media.empty();
         warnModeMMedia(scene, wantBeams);
+        warnBeamsGrinMedia(scene, wantBeams);
+        // -resume / -checkpoint no longer disqualify a mode-M camera from this shared path
+        // (they used to, which silently cost the render the entire GPU backend — see
+        // known-issues.md). They are still INERT for mode M, so say so here: runRender's
+        // matching warning is on the branch we no longer take, and a flag that quietly does
+        // nothing is worse than one that says it does nothing.
+        if (resume || wantCheckpointFlag)
+            std::fprintf(stderr,
+                "[render] -resume/-checkpoint apply only to modes A/B/C (forward), R/D "
+                "(reference), and P (composite); ignoring for mode M.\n"
+                "         (A photon map is persistent state a film-only sidecar cannot "
+                "rebuild. The shared\n         mode-M path is crash-safe anyway: it writes "
+                "each frame the instant that frame's gather ends.)\n");
         // Trap Ctrl-C for the whole mode-M gather. Without this the default SIGINT action
         // terminates the process, which on a -window-less / backgrounded run would abruptly
         // kill a live CUDA context mid-gather — the exact scenario cudaGracefulShutdown()
@@ -20157,16 +20212,14 @@ static int run(int argc, char** argv) {
             const bool wantAuto = !std::strcmp(device, "auto");
             bool allPinhole = true;
             for (int i : idx) if (toRender[i].cam.hasLens()) allPinhole = false;
-            // -beams runs on the device now (deposit AND gather), with one exception: a GRIN
-            // scene. A gradient-index photon travels a CURVE, so it has no straight chord to
-            // store, and dEmitBeams therefore refuses to deposit one — sending such a scene to
-            // the device would silently render its volume as nothing, the exact bug -beams
-            // exists to fix. Those go to the CPU path below.
-            const bool beamsCpuOnly = wantBeams && grin::sceneHasGrin(scene);
-            if (beamsCpuOnly && (wantGpu || wantAuto) && cudaAvailable())
-                std::printf("[camera] -beams: photon beams have no straight chord in a GRIN "
-                            "scene — running mode M on the CPU.\n");
-            if ((wantGpu || wantAuto) && allPinhole && !beamsCpuOnly &&
+            // -beams runs on the device now, deposit AND gather, with NO backend carve-out.
+            // There deliberately is no GRIN fallback here: a gradient-index photon travels a
+            // curve and so has no straight chord to store, but the CPU refuses that deposit on
+            // exactly the same terms the device does (Renderer::emitBeams and dEmitBeams share
+            // the per-medium `grin()` skip). Falling back would therefore buy a much slower
+            // render of the *identical* image, which is a worse answer, not a safer one. The
+            // user is told what is actually happening by warnBeamsGrinMedia() instead.
+            if ((wantGpu || wantAuto) && allPinhole &&
                 cudaAvailable() && cudaPhotonMapSupported(scene)) {
                 std::vector<Camera> cams; std::vector<int> rxs, rys;
                 for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }

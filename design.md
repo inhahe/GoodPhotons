@@ -31,6 +31,33 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 CPU is the default device; `-device gpu|auto` enables CUDA for forward A/B/C,
 M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 
+### Which mode-`M` renders actually reach the GPU (0.197.2)
+
+Mode `M` has **two** dispatch routes, and only one of them has a device implementation — so
+what looks like a `-device` question is really a routing question:
+
+- **`groupM` → `runSharedPhotonMap`** builds one view-independent map and gathers every camera
+  from it (the flythrough win). This is the route with the GPU path,
+  `renderPhotonMapSharedCuda`. A *single* mode-`M` camera goes here too — the group of one is
+  still the fast route.
+- **anything else → `runRender`'s single-camera `mode == 'M'` branch** is unconditionally CPU.
+  It never even reads `device`.
+
+The gate is `rc.mode == 'M' && plainRender`. What legitimately belongs in `plainRender` is only
+a **progressive budget**: the shared path gathers a fixed spp per frame, so `-time` / `-noise` /
+`-forever` / `-preview` genuinely need the single-camera driver. Until 0.197.2 it also included
+`resume || wantCheckpointFlag`, which was a pure loss — mode `M` *discards* both flags 3000
+lines later (a photon map is persistent state a film-only `.ftbuf` cannot rebuild) and says so,
+yet passing `-checkpoint` moved the render off the RTX 4090 and onto 12 CPU threads. A flag the
+mode announces it is ignoring must not silently cost it the whole device backend, so those two
+terms are gone; the shared path re-emits the "ignoring for mode M" note itself, since the
+`runRender` copy is on the branch it no longer takes. The shared path needs no checkpoint
+regardless — it writes each frame the instant that frame's gather completes.
+
+**Still CPU-only underneath this:** a `-time` / `-noise` / `-forever` / `-preview` mode-`M`
+render. Closing that means teaching the shared device path to gather in spp chunks under
+`runSppProgressive`, the way the forward and mode-`R` GPU paths already do (`known-issues.md`).
+
 ## Module map (src/)
 
 - **`main.cpp`** (~6200) — CLI parsing (the option table is a chain of `else if`s split
@@ -2119,7 +2146,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   from the *same* forward pass, and the device therefore had to learn to **deposit** beams as
   well. Both halves live in `render_cuda.cu`. The deposit is `__device__ dEmitBeams` (twin of
   `Renderer::emitBeams`) writing `DBeamDep` records through an atomic counter, gated in
-  `shadeStep` by `doBeamDeposit = cs.beamCount && crng && sc.mediaN > 0 && !sc.hasGrin`. The
+  `shadeStep` by `doBeamDeposit = cs.beamCount && crng && sc.mediaN > 0`. (That gate carried a
+  scene-wide `&& !sc.hasGrin` until 0.197.1; GRIN media are now refused **per medium**, inside
+  `dEmitBeams` itself, because a photon bends only *inside* a gradient-index region — see the
+  per-medium block below.) The
   gather is `DBeamRec` / `DBeamMap` / `dGatherPhotonBeams`, called from `dPhotonGather` **before**
   `thr` takes the segment's own attenuation — the ordering matters, because each gathered beam
   carries transmittance to *its own* closest approach, not to the segment end (the host does the
@@ -2141,10 +2171,26 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (same map via `-savemap`/`-loadmap`), 0.9997 deposit-only, 0.9943 through a forced overflow
   rerun at `keep≈0.100`, 0.9945 on `_rainbow_test`'s spectral phase path. `_fog_cornell`
   128²×8spp: **3m42s → well under a minute**, now dominated by the *host* beam-BVH build.
-  **The one remaining CPU carve-out is GRIN**: a bent photon has no straight chord to store, so
-  `beamsCpuOnly = wantBeams && grin::sceneHasGrin(scene)` still forces the CPU branch (render and
-  exposure meter alike) and prints that it has — better than the device silently dropping the
-  volume, which is the exact bug `-beams` exists to fix.
+  **There is NO backend carve-out, and the GRIN limit is per-medium (0.197.1).** The port first
+  shipped with `beamsCpuOnly = wantBeams && grin::sceneHasGrin(scene)`, inherited by narrowing the
+  old blanket fallback rather than deleting it. That was wrong twice over. **First, the fallback
+  bought nothing**: the CPU refuses the GRIN deposit on *identical* terms (`render.h`'s
+  `doBeamDeposit` carried the same `!grinAny`), so the "safe" backend rendered the same volumeless
+  image, only far slower — a slower identical answer is a worse answer, not a safer one. The
+  inability to store a curved photon is a property of the beam *representation*, not of the
+  backend, so no backend can be the fallback for it. **Second, the gate was scene-wide.**
+  `grin::sceneHasGrin` is "any enabled medium carries an `ior` field", but a photon bends only
+  *inside* a GRIN region — `grin::march` jumps straight between them — so a photon's chord through
+  an ordinary fog is a perfectly good straight beam even when a GRIN lens sits elsewhere in the
+  room. The scene-wide gate therefore threw away every beam in the scene because of one unrelated
+  object. Both fixed: the refusal moved into `emitBeams` / `dEmitBeams` as a per-medium
+  `if (md.grin()) continue;` (device: `md.iorN > 0`), sitting right beside the existing
+  absorbing-only skip, and the host `doBeamDeposit` / device `doBeamDeposit` gates lost their GRIN
+  terms. `warnBeamsGrinMedia` replaces the fallback message: it fires only when a *scattering*
+  medium is GRIN, names how many, says their volume will not appear, and states outright that
+  `-device cpu` renders the same image. Regression scene `scenes/_grin_fog.ftsl` — a GRIN lens and
+  an unrelated scattering haze in one room — deposits 1.9 M crossings and images the haze; before
+  the fix it deposited zero.
   **…which is why the CPU branch had to learn the live window (0.195.1).** Back when `-beams`
   was CPU-only it *forced* `runSharedPhotonMap`'s CPU branch, and that branch called
   `renderPhotonCamera` with no progress hook — its GPU twin has passed a `SppProgress` since
@@ -5252,6 +5298,26 @@ out-param. `main.cpp` reports it as `[stop] scene load stopped before rendering`
 1 rather than printing a scene-error diagnostic. `prefer { } else { }` resolution aborts
 outright on a stop — treating an interrupted branch as *rejected* would otherwise make it
 build the next branch and ignore the stop for another whole load.
+
+### Stopping during a PHOTON DEPOSIT (0.197.2)
+
+The same hole existed one stage later, and lasted longer. `tracePhotonPass`
+(`photonmap_render.h`) — the forward deposit that builds the map for modes `M` and `S` —
+looped `for (i = lo; i < hi; ++i) tracePhoton(...)` with **no poll of any kind**. 0.194.0 had
+taught the mode-`M` camera *gather* to stop, which made the omission easy to miss: a stop
+aimed at a mode-`M` render *was* honoured, just not until the entire `-n` had already been
+traced. On `-n 2000000000` that was ten minutes of a process ignoring every stop request
+while its photon map grew without bound (10 GB of private bytes and climbing) — the exact
+scenario that pushes someone toward the `taskkill /F` this whole channel exists to replace.
+An unresponsive `-stop` is a safety bug here, not an annoyance.
+
+The worker now polls `ft::stopRequested()` **every 4096 photons**. The granularity matters in
+both directions: a photon is microseconds, so a per-iteration atomic load would show up in the
+hottest loop of a mode-`M`/`S` build, while 4096 of them still lands the stop in well under a
+tenth of a second. On break the thread reports the count it **actually traced** rather than its
+assigned share — `pm.nEmitted` normalises the density estimate, so crediting untraced photons
+would darken a truncated pass rather than merely making it noisier. Measured: `-n 4000000000`
+stopped after 182,222,848 photons and exited 3.5 s after the `-stop`.
 
 ## Where a relative asset path is looked for (`assetbytes::resolve`, 0.192.0)
 

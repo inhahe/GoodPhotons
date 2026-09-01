@@ -97,11 +97,28 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         Pcg32 rng;
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         EnergyReport e;
+        long long done = 0;
         for (long long i = lo; i < hi; ++i) {
+            // Cooperative `-stop` / Ctrl-C. Until this poll existed the photon DEPOSIT was
+            // completely uninterruptible: v0.194.0 taught the mode-M camera *gather* to stop,
+            // but nothing polled here, so `ftrace -stop` on a deposit had to wait out the
+            // entire `-n` before the flag was even looked at. On a large `-n` that is many
+            // minutes of a process that ignores every stop request while its photon map keeps
+            // growing (a 2e9-photon CPU pass was sitting on 10 GB and climbing) — i.e. exactly
+            // the situation that tempts a `taskkill /F`, which is what `-stop` exists to
+            // prevent. Checked every 4096 photons rather than every photon: a photon is
+            // microseconds, so a per-iteration atomic load would be measurable in the hottest
+            // loop of a mode-M/S build, while 4096 of them still lands the stop in well under
+            // a tenth of a second.
+            if ((done & 0xFFF) == 0 && ft::stopRequested()) break;
             seedUnit(rng, seedBase + (uint64_t)i, 0xEB44ACCAB455D165ULL);
             r.tracePhoton(scene, (const Camera*)nullptr, (Film*)nullptr, (Film*)nullptr, rng, e);
+            ++done;
         }
-        emitted[tid] = hi - lo;
+        // Count what was ACTUALLY emitted, not what was asked for. pm.nEmitted normalises the
+        // density estimate, so reporting the full share after an early break would scale a
+        // truncated pass down by the fraction it never traced and darken the image.
+        emitted[tid] = done;
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);

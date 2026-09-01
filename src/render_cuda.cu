@@ -4592,6 +4592,12 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
     for (int i = 0; i < sc.mediaN; ++i) {
         const DMedium& md = sc.media[i];
         if (specLookup(md.sigma_s, lambda) <= 0) continue;   // absorbing-only: nothing to gather
+        // GRIN refusal, PER MEDIUM (host twin: Renderer::emitBeams). A photon bends only
+        // INSIDE a gradient-index region — dGrinMarch jumps straight between them — so its
+        // chord through an ordinary fog is a valid straight beam even when the scene also
+        // holds a GRIN lens. Only a medium that itself bends the photon has no segment to
+        // store. `iorN > 0` is the device's Medium::grin().
+        if (md.iorN > 0) continue;
         double ta, tb;
         if (!dMedClip(md, o, dir, 0.0, dBeam, ta, tb)) continue;
         if (!(tb > ta)) continue;
@@ -6543,11 +6549,11 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     //     share the splat's `nCam > 1` gate.
     // Either way the photon does NOT redirect in the medium (it crosses straight), so the
     // analog medium-collision sampling below is skipped and the crossing is attenuated by
-    // its transmittance instead. GRIN is excluded from the deposit: a bent photon has no
-    // straight segment to store, and the estimator's closest-approach geometry assumes one
-    // (host twin: Renderer::doBeamDeposit).
+    // its transmittance instead. GRIN media are excluded from the deposit PER MEDIUM, inside
+    // dEmitBeams — a bent photon has no straight segment to store, but a photon crossing an
+    // ordinary fog somewhere else in a GRIN scene does (host twin: Renderer::emitBeams).
     const bool doBeamSplat   = cs.beamGather && crng && cs.nCam > 1 && camMode != CAM_C && sc.mediaN > 0;
-    const bool doBeamDeposit = cs.beamCount && crng && sc.mediaN > 0 && !sc.hasGrin;
+    const bool doBeamDeposit = cs.beamCount && crng && sc.mediaN > 0;
     const bool doBeam = doBeamSplat || doBeamDeposit;
 
     // fog free-flight; dEvent is the nearer of surface hit / volume collision.

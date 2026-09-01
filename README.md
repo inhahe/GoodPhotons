@@ -221,8 +221,10 @@ argument for standing a groom in a hall of polished objects.*
   per-frame viewing angle and a *volumetric* flythrough gets the same "trace once, gather
   per frame" amortisation the surface map already had, instead of needing mode `D` to
   re-trace every frame. The mode-`M` beam deposit *and* gather run **on the GPU** as of
-  0.197.0 (only a GRIN scene falls back to the CPU — a bent photon has no straight chord
-  to store). See
+  0.197.0, with no backend carve-out. (A beam is a *straight chord*, so a medium that is
+  itself gradient-index — one a photon curves through — can't be stored as one; that is a
+  limit of the representation, refused identically on both backends and per medium, so an
+  ordinary fog elsewhere in a GRIN scene still works.) See
   [Mode `M` and participating media](REFERENCE.md#mode-m-and-participating-media---beams).
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —

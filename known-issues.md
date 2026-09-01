@@ -5,6 +5,210 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-31, v0.197.2): mode `M` bends PHOTONS through a GRIN medium but not CAMERA rays, so a gradient-index lens is invisible in a photon-mapped render — on both backends
+
+**What.** In a scene with a gradient-index `medium { ior … }`, mode `M`'s forward deposit
+runs the Eikonal marcher (`render.h:2084` on the CPU; `kTrace` / `kWfExtend` call
+`dGrinMarch` on the device), so the *photons* correctly curve. Its camera gather does not:
+`photonGather` (`photonmap_render.h:406`) and `dPhotonGather` (`render_cuda.cu:11036`) both
+call `closestHit` on a straight ray, with no marcher anywhere in the loop —
+`photonmap_render.h` mentions GRIN only once, in the hero-wavelength gate at line 91. Mode
+`R`'s `bkRadiance` does march (`render_cuda.cu:8736`), which is why it lenses and `M` does
+not. This is a *gather-side* gap, not a backend one: CPU and GPU mode `M` agree with each
+other and are both wrong.
+
+**Evidence.** `scenes/grin_lens.ftsl` (a converging GRIN sphere in front of a checkerboard):
+
+| render | result |
+|---|---|
+| `-mode R -device gpu -r 256 -spp 4096` | the checker is warped into the expected radial lensed disc |
+| `-mode M -device gpu -r 256 -n 400000000 -spp 256` | the checker is **flat** — no lens ring at all |
+
+(Kept as `png/_grintest/r2.png` / `m3.png` while this is open; delete them when it is fixed.)
+
+**Why it matters.** It is silent. Nothing warns, the image is plausible, and the photons
+having bent means the *illumination* is subtly right while the *geometry* is plainly wrong —
+the worst combination for spotting it. Mode `S` (SPPM) shares the camera-side visible-point
+walk and is very likely affected identically; that has not been checked.
+
+**Fix.** March before each `closestHit` in the gather loops, exactly as mode `R` does —
+`grin::march(scene, ro, rd)` in `photonGather` / `photonGatherSub`, `dGrinMarch(sc, ro, rd)`
+in `dPhotonGather` / `dPhotonGatherSub`, gated on `grin::sceneHasGrin` / `sc.hasGrin` so a
+non-GRIN scene pays nothing. Two wrinkles to think through rather than assume away:
+  * **The density estimate is a distance query in world space.** A photon deposited at a
+    surface point is found by radius search around the gather point; both live on the same
+    surface, so bending the *path used to reach* that surface does not change the estimate —
+    this part should be a clean drop-in.
+  * **The `-beams` volume gather is not.** `DBeamMap`'s beam×ray estimator computes a
+    closest approach between two **straight** lines (`den = |cross(dc,db)|²`). A curved
+    camera ray has no single such line, so the beam gather would have to be evaluated
+    per marcher step (each step *is* straight) rather than once per segment. Since GRIN
+    media are already refused as beam sources per-medium (v0.197.1), the case is "curved
+    camera ray through a GRIN region, gathering beams deposited in an ordinary fog
+    elsewhere" — real, but narrow. Doing the surface half first and leaving the beam half
+    marching-per-step is a legitimate split.
+
+Also update `REFERENCE.md`'s GRIN backend list (line ~3770), which currently names `A`/`B`/`C`
+and `R` and says nothing about `M` either way.
+
+---
+
+### FIXED (2026-08-31, v0.197.2): `ftrace -stop` could not interrupt a CPU photon DEPOSIT at all — the flag was not polled until the whole `-n` had been traced
+
+**What.** `tracePhotonPass` (`photonmap_render.h:93`) — the photon deposit shared by modes `M`
+and `S` — ran `for (i = lo; i < hi; ++i) r.tracePhoton(...)` with **no stop poll anywhere in
+the loop**. The v0.194.0 fix taught the mode-`M` camera *gather* to stop; nothing was ever done
+for the deposit that precedes it. So `-stop` (and Ctrl-C, and closing the preview window) had
+to wait out the entire requested photon count before the flag was so much as read.
+
+**Observed.** `-mode M -device cpu -n 2000000000` on `scenes/grin_lens.ftsl`, stopped ~30 s in:
+
+```
+mode M: photon map — tracing 2000000000 photons on 12 CPU threads ...
+[stop] external stop requested — stopping cleanly ...          <- ignored for the next 10 minutes
+mode M: deposited 165245603 photons from 2000000000 emitted in 616.8s
+[stop] interrupted at 1 spp — image saved.                     <- only NOW does it honour it
+```
+
+Ten minutes of an unstoppable process, meanwhile growing an unbounded photon map (10 GB of
+private bytes and climbing, on a machine with 19 GB free). That is precisely the situation
+that tempts the `taskkill /F` this project forbids — the one command that can wedge the
+NVIDIA driver — so an unresponsive `-stop` is a safety bug, not just an annoyance.
+
+**Fix.** Poll `ft::stopRequested()` in the worker loop, every 4096 photons (a photon is
+microseconds, so a per-iteration atomic load would be measurable in mode `M`/`S`'s hottest
+loop; 4096 still lands the stop in well under 0.1 s). On break, `emitted[tid]` reports the
+count **actually traced** rather than the thread's full share — `pm.nEmitted` normalises the
+density estimate, so crediting untraced photons would darken a truncated pass.
+
+**Verified.** `-n 4000000000` stopped after 182,222,848 emitted (4.5%) and the process exited
+3.5 s after the `-stop`; the log reports the truncated count, not the requested one.
+
+---
+
+### FIXED (2026-08-31, v0.197.2): `-checkpoint` silently forced mode `M` onto the CPU — a flag mode `M` explicitly announces it is IGNORING cost it the entire GPU backend
+
+**What.** Camera dispatch (`main.cpp` ~19836) computed
+
+```cpp
+const bool plainRender = !(timeBudgetSec > 0.0 || noiseTarget > 0.0 || resume ||
+                           wantCheckpointFlag || runForever || preview);
+…
+else if (rc.mode == 'M' && plainRender)   groupM.push_back(i);
+```
+
+`groupM` is the **shared photon-map path**, and it is the *only* mode-`M` route with a GPU
+implementation (`renderPhotonMapSharedCuda`). Anything not in `groupM` falls through to
+`runRender`'s single-camera mode-`M` branch (`main.cpp:14485`), which is unconditionally CPU
+— it never even tests `device`. So `-checkpoint` or `-resume` on a mode-`M` render moved it
+from the RTX 4090 to 12 CPU threads.
+
+The sting is that mode `M` **discards those two flags anyway**, three thousand lines later
+(`main.cpp:14020`, `resume = false; wantCheckpointFlag = false;`), and says so out loud:
+`[render] -resume/-checkpoint apply only to modes A/B/C (forward), R/D (reference), and P
+(composite); ignoring for mode M`. So the user was told the flag did nothing, in the same run
+in which it quietly cost them the device.
+
+**How it surfaced.** Rendering `scenes/grin_lens.ftsl` with `-mode M -device gpu … -checkpoint`
+printed `mode M: photon map — tracing 2000000000 photons on 12 CPU threads`. Dropping
+`-checkpoint` from the identical command line printed `[camera] shared photon map (mode M) on
+NVIDIA GeForce RTX 4090` and finished in seconds. Note this is exactly the flag combination
+`CLAUDE.md` tells you to use on every render, so the fast path was the one nobody was taking.
+
+**Fix.** `resume` / `wantCheckpointFlag` dropped from `plainRender`. What genuinely
+disqualifies a mode-`M` camera from the shared path is only a *progressive* budget: the shared
+path gathers a fixed spp per frame, so `-time` / `-noise` / `-forever` / `-preview` still need
+the single-camera driver. The shared path needs no checkpoint of its own — it writes each
+frame's image the instant that frame's gather completes, which is the crash-safety a `.ftbuf`
+sidecar would have bought.
+
+**Still open, and bigger, underneath this:** `runRender`'s single-camera mode-`M` branch has
+no GPU path *at all*, so a `-time` / `-noise` / `-forever` mode-`M` render is still CPU-only.
+Fixing that means teaching `renderPhotonMapSharedCuda` (or a single-camera sibling) to gather
+in spp chunks under `runSppProgressive`, the way the forward and mode-`R` GPU paths already do.
+The same hole applies to `-preview`.
+
+---
+
+### OPEN (2026-08-31, v0.197.1): under `-beams`, a medium that cannot be beam-deposited is crossed straight anyway, so it acts purely ABSORBING instead of keeping its analog transport
+
+**What.** `doBeamStraight` is decided once per segment, for all media at once: if *any* beam
+deposit is happening, the photon crosses **every** medium straight and the whole crossing's
+extinction is booked as absorbed. The single scatter is then reconstructed by the gather, from
+the beams. That is the intended `-beams` trade — but it only works for media that actually
+*got* a beam. A scattering **GRIN** medium gets none (a curved photon has no chord to store), so
+its removed energy is never given back: it behaves as a pure absorber, and surfaces lit through
+it come out dimmer than under plain `-mode M`.
+
+**This is a behaviour change introduced by the v0.197.1 fix below**, and it is recorded honestly
+rather than buried: before that fix, the presence of any GRIN medium disabled `-beams` entirely,
+so such a scene fell through to full analog transport. Now the ordinary media in that scene are
+correctly beam-deposited — the actual bug that was fixed — and the GRIN one is left absorbing.
+`warnBeamsGrinMedia` states this outcome explicitly at startup.
+
+**The proper fix (Option B): make the straight-crossing decision per medium, not per segment.**
+The rule should be *"media that can be beam-deposited are crossed straight and reconstructed
+from beams; every other medium behaves exactly as it does without `-beams`."* Concretely:
+restrict the analog free-flight sampler to the non-depositable media (`sampleMediaCollision`
+already loops per medium — it needs a subset predicate), apply `mediaTransmittance` for the
+depositable subset only, and let a collision inside a GRIN medium scatter the photon normally.
+A photon that analog-scatters in the GRIN fog and then crosses an ordinary fog still deposits a
+perfectly valid beam for the latter, so the two mechanisms compose. Both tracers must change
+together (`render.h`'s media block and `render_cuda.cu`'s `shadeStep`), since CPU/GPU parity is
+a hard requirement here.
+
+**Guard the whole thing on "a non-depositable scattering medium exists,"** which is false for
+every scene in the repo today — that keeps the common path bit-identical and confines the risk
+to the configuration being fixed.
+
+**How to validate it** (there is no analytic reference for GRIN + scattering — `grin.h` itself
+notes that combination is already approximated): under Option B the *surface* illumination of a
+GRIN-scattering scene under `-beams` should closely match the same scene under plain `-mode M`,
+because the GRIN medium keeps its analog transport in both. Under today's behaviour it is
+measurably darker. `scenes/_grin_scatfog.ftsl` (the `_grin_fog` regression scene with an `ior`
+field added to the haze) is the test case.
+
+**Why it is not done yet.** It is a real restructuring of the hottest loop in both tracers, for
+a combination that is experimental on both sides (GRIN is marked experimental; a scattering GRIN
+region is explicitly "approximated"), and the semantics are a genuine design choice — uniform
+`-beams` treatment is *defensible*, just lossier — rather than an outright bug. Worth deciding
+deliberately instead of by accident.
+
+### FIXED (2026-08-31, v0.197.1): the GRIN→CPU fallback for `-beams` was pointless *and* the GRIN gate was scene-wide, so one lens disabled every beam in the room
+
+Two bugs, found by asking the obvious question about the entry below: *if neither backend can
+handle a curved photon, why would GRIN fall back to the CPU?*
+
+**Bug 1 — the fallback bought nothing.** The GPU port shipped with
+`beamsCpuOnly = wantBeams && grin::sceneHasGrin(scene)`, which came from *narrowing* the old
+blanket "beams are CPU-only" fallback instead of deleting it. But `render.h`'s `doBeamDeposit`
+carried the very same `!grinAny` term, so the CPU refused the deposit on identical terms: the
+fallback sent the user to a backend that produced the **same volumeless image, far more slowly**.
+A slower identical answer is a worse answer, not a safer one. The root confusion is worth naming:
+the inability to store a curved photon is a property of the beam **representation**, not of the
+backend — so no backend can be a fallback for it.
+
+**Bug 2 — the gate was scene-wide, and shouldn't have been.** `grin::sceneHasGrin` means "any
+enabled medium carries an `ior` field". But a photon bends only *inside* a GRIN region —
+`grin::march` jumps straight between them — so a photon's chord through an ordinary fog is a
+perfectly good straight beam even when a GRIN lens sits elsewhere in the same room. The
+scene-wide gate threw away **every beam in the scene** because of one unrelated object, silently
+rendering the fog as nothing. This bug predates the GPU port: the CPU had it too, since v0.194.0.
+
+**The fix.** The refusal moved into `Renderer::emitBeams` / `dEmitBeams` as a per-medium
+`if (md.grin()) continue;` (device: `md.iorN > 0`), right beside the existing absorbing-only
+skip, and both `doBeamDeposit` gates lost their GRIN terms. `beamsCpuOnly` is gone, as is the
+meter's copy of it. `warnBeamsGrinMedia` replaces the fallback message: it fires only when a
+**scattering** medium is GRIN, names how many, says their volume will not appear, and states
+outright that `-device cpu` renders the same image — because it does.
+
+**Regression scene: `scenes/_grin_fog.ftsl`** — a gradient-index lens and an unrelated scattering
+haze in one Cornell box. Before: 0 beams, haze invisible. After: 1.9 M crossings deposited, haze
+imaged, GPU and CPU agreeing. The warning path is covered too: making the haze *itself*
+gradient-index correctly produces the warning and a `0 beams stored` volume.
+
+---
+
 ### FIXED (2026-08-31, v0.197.0): mode-`M` photon beams (`-beams`) now run entirely on the GPU — both the beam **deposit** and the beam **gather**
 
 **What was wrong.** `-beams` under mode `M` built a `BeamMap` (`src/photonbeams.h`) and gathered
@@ -63,10 +267,8 @@ the post-split sub-beam count (7,668,076) when handed the same map. `_fog_cornel
 **3m42s CPU → well under a minute on the GPU**, now dominated by the ~10–14 s *host* beam BVH
 build.
 
-**What is still CPU-only, and why.** **GRIN scenes.** A photon whose path bends has no straight
-chord to store, so there is nothing for a beam record to be. `beamsCpuOnly` survives as exactly
-that one carve-out, and still prints a loud fallback line rather than silently dropping the
-volume.
+**Nothing is CPU-only any more** — see the follow-up entry below, which removed the GRIN
+fallback this port originally shipped with.
 
 ### PERF — OPEN (2026-08-31, v0.194.0): the mode-`M` beam gather's cost is BVH traversal over overlapping beam AABBs, and is ~independent of how many beams it actually gathers
 

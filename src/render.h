@@ -513,6 +513,12 @@ struct Renderer {
         for (int i = 0; i < (int)scene.media.size(); ++i) {
             const Medium& md = scene.media[i];
             if (md.sigma_s(lambda) <= 0.0) continue;      // absorbing-only: nothing to gather
+            // GRIN media are refused HERE, per medium, rather than scene-wide: a photon bends
+            // only INSIDE a gradient-index region (grin::march jumps straight between them), so
+            // its chord through an ordinary fog is a perfectly good straight beam even when some
+            // other object in the scene is a GRIN lens. Only a medium that itself bends the
+            // photon has no segment to store.
+            if (md.grin()) continue;
             double ta, tb;
             if (!md.clipToBounds(o, dir, 0.0, dBeam, ta, tb)) continue;
             if (!(tb > ta)) continue;
@@ -2070,10 +2076,12 @@ struct Renderer {
         const bool grinAny = grin::sceneHasGrin(scene);
 
         // PHOTON-BEAM deposit (mode M with -beams): store the crossed segment in the
-        // view-independent beam map instead of splatting it to a camera list. Refused under
-        // GRIN, where the photon does not travel in a straight line and so has no segment to
-        // store (the beam estimator's closest-approach geometry assumes straight beams).
-        const bool doBeamDeposit = (beamDeposit != nullptr) && !scene.media.empty() && !grinAny;
+        // view-independent beam map instead of splatting it to a camera list. GRIN media are
+        // refused inside emitBeams, PER MEDIUM — a photon bends only within a gradient-index
+        // region, so a fog crossing elsewhere in the same scene is still a straight chord and
+        // still depositable. (This gate used to be the scene-wide `!grinAny`, which threw away
+        // the beams for every ordinary medium in a scene that merely contained a GRIN lens.)
+        const bool doBeamDeposit = (beamDeposit != nullptr) && !scene.media.empty();
         // Either beam path makes the photon cross media STRAIGHT: skip the analog free-flight
         // redirect below and attenuate by the crossing's transmittance instead.
         const bool doBeamStraight = doBeamGather || doBeamDeposit;
