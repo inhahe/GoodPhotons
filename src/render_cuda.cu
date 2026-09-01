@@ -4666,12 +4666,22 @@ __device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3&
 // `s0`/`len` describe THIS sub-segment; `o`/`d` remain the parent beam's true origin and
 // direction, because the beam-side transmittance is measured from where the stored power
 // applies, not from where the split happened to cut (photonbeams.h, BEAM SPLITTING).
+// `invRad` is 1 / (this beam's medium's kernel half-width). The half-width is PER MEDIUM since
+// 0.201.0 (photonbeams.h: it is a fixed fraction of the medium's own measured mean free path),
+// and it is carried per RECORD rather than looked up from a per-medium array by `med` because
+// that would be a dependent load in the innermost loop of the volume gather. One float per
+// sub-beam is 32 MB at the 8 M default ceiling, against a DBeamRec that was already 56 B — and
+// the reciprocal form makes the kernel evaluation strictly CHEAPER than the old shared-radius
+// one, because the reject test becomes d2*invRad^2 >= 1, which is the same quantity (d/r)^2
+// the Epanechnikov kernel needs anyway. The old code took a sqrt to get d and then squared
+// x = d*invRadius straight back.
 struct DBeamRec {
     DVec3 o, d;             // parent beam origin (world) and unit direction
     float s0, len;          // this sub-segment's [s0, s0+len] range along the beam
     float pX, pY, pZ;       // cie{X,Y,Z}(lambda) * power / nEmitted
     float lambda;           // wavelength (nm) — sigma_s / phase / transmittance all need it
     float absorb;           // sigma_a of the enclosing dielectric (0 in air)
+    float invRad;           // 1 / kernel half-width of THIS beam's medium
     int   med;              // index into DScene::media
 };
 
@@ -4682,8 +4692,8 @@ struct DBeamMap {
     const DBeamRec* beams     = nullptr;
     const DNode*    nodes     = nullptr;
     const int*      primIdx   = nullptr;
-    Real            radius    = 0;   // 1D kernel half-width (world units)
-    Real            invRadius = 0;   // 1/radius, so the kernel costs no divide
+    Real            radiusMax = 0;   // largest per-medium half-width — reporting only; the
+                                     // gather reads each record's own invRad
     int             nNodes    = 0;
 };
 
@@ -4736,7 +4746,9 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 if (s < b.s0 || s > b.s0 + b.len) continue;
                 const DVec3 diff = (oc + dc * t) - (b.o + b.d * s);
                 const Real d2 = dot(diff, diff);
-                if (d2 >= bm.radius * bm.radius) continue;
+                // (d_perp / r_med)^2, with r_med this beam's own medium's half-width.
+                const double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
+                if (!(x2 < 1.0)) continue;
                 // --- the estimator (photonbeams.h, THE ESTIMATOR: BEAM x RAY) -------
                 if (b.med < 0 || b.med >= sc.mediaN) continue;
                 const DMedium& md = sc.media[b.med];
@@ -4750,10 +4762,8 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 const double phase = (double)dMedPhase(md, -cosT, lam);
                 if (!(phase > 0.0)) continue;
                 // 1D Epanechnikov kernel, normalised so its integral over [-r, r] is 1.
-                const double x  = (double)sqrt(d2) * (double)bm.invRadius;
-                const double kk = 1.0 - x * x;
-                if (!(kk > 0.0)) continue;
-                const double K1 = 0.75 * (double)bm.invRadius * kk;
+                const double kk = 1.0 - x2;
+                const double K1 = 0.75 * (double)b.invRad * kk;
                 double w = K1 / (double)sqrt((double)den) * ss * phase;
                 if (!(w > 0.0)) continue;
                 if (b.absorb > 0.f)  w *= exp(-(double)b.absorb * (double)s);   // glass, beam side
@@ -16012,6 +16022,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             const double w = (double)b.power * invN;
             r.pX = (float)(ci.x * w); r.pY = (float)(ci.y * w); r.pZ = (float)(ci.z * w);
             r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
+            const double rm = bmap->radOf(b.med);
+            r.invRad = (float)(rm > 0.0 ? 1.0 / rm : 0.0);
         }
         std::vector<DNode> bnodes(bmap->bvh.nodes.size());
         for (size_t i = 0; i < bnodes.size(); ++i) {
@@ -16023,11 +16035,15 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         dbm.beams     = (const DBeamRec*)up.keep(uploadVec(recs));
         dbm.nodes     = (const DNode*)up.keep(uploadVec(bnodes));
         dbm.primIdx   = (const int*)up.keep(uploadVec(bmap->bvh.primIdx));
-        dbm.radius    = (Real)bmap->radius;
-        dbm.invRadius = (Real)(1.0 / bmap->radius);
+        dbm.radiusMax = (Real)bmap->radius;
         dbm.nNodes    = (int)bnodes.size();
-        std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %.4g "
-                    "uploaded for the volume gather\n", nb, bnodes.size(), bmap->radius);
+        double rlo = bmap->radius;
+        for (float rm : bmap->radMed) if (rm > 0.f) rlo = std::min(rlo, (double)rm);
+        char rtxt[64];
+        if (rlo < bmap->radius) std::snprintf(rtxt, sizeof rtxt, "%.4g .. %.4g", rlo, bmap->radius);
+        else                    std::snprintf(rtxt, sizeof rtxt, "%.4g", bmap->radius);
+        std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %s "
+                    "uploaded for the volume gather\n", nb, bnodes.size(), rtxt);
     }
 
     // ---- gather each camera ----

@@ -2203,14 +2203,64 @@ render. Closing that means teaching the shared device path to gather in spp chun
   so `E[beams gathered] = (pi/2)·r·L_ray·S/V` (`S` = total stored beam length) — **linear** in
   `r` and in `S`, where the surface estimate's population goes as `r²`. At the photon map's
   radius that is ~44 000 beams per camera ray on a 1 m fog box and a 200×200 / 16 spp render
-  never finishes. `BeamMap::buildAuto` therefore solves the same expression for `r` at a
-  target population `K`, substituting the convex-body mean chord `L_ray = 4V/A`:
-  **`r = K·A/(2·pi·S)`** (`A` = beam-AABB surface area; `V` cancels). It then corrects the
-  closed form's two false assumptions — isotropic relative orientation, beams spread evenly
-  through the box, neither true in a sunlit rain volume where every beam is near-parallel to
-  the sun — with a 96-chord brute-force **probe** over a strided subsample (no BVH needed),
-  clamped to ×[1/64, 64]. `-beamk <K>` sets the target (default 32); `-beamradius <r>`
-  overrides absolutely.
+  never finishes. Solving the same expression for `r` at a target population `K`, substituting
+  the convex-body mean chord `L_ray = 4V/A`, gives **`r = K·A/(2·pi·S)`** (`A` = beam-AABB
+  surface area; `V` cancels).
+  **BUT THAT EXPRESSION MUST NOT BE THE RULE — it was until 0.201.0, and it is a trap (0.201.0).**
+  `S` grows with the photon count, so pinning `K` pins `r ∝ 1/n`: every extra photon the user
+  pays for is spent **shrinking the kernel**, and the gather still averages the same `K` beams
+  whatever the budget. Each beam is monochromatic (`PhotonBeam::lambda`) and one monochromatic
+  sample is far outside sRGB, so averaging ~32 of them leaves full-saturation colour speckle —
+  a hard variance floor **neither `-n` nor `-spp` can move**. That is exactly the reported
+  "iridescent" `gallery_rain` cloud: measured, `-spp 16→64` moved the cloud's luminance sd
+  0.1733→0.1674 and `-n 40M→160M` moved its chroma saturation 0.1157→0.1078 (both ≈ nothing,
+  the log showing the radius shrinking 2.83e-4→1.65e-4 to hold `K`), while `-beamk 32→2048`
+  moved saturation 0.1157→**0.0487**. And the bias the trade was buying **does not exist**: on
+  the `_beams_ms` invariant (mode M + `-beams` must converge to the mode D reference), the
+  ball/reference ratio is 1.0563 / 1.0816 / 1.0831 / 1.0884 / 1.0841 / 1.0876 for `-beamk`
+  8 / 32 / 128 / 512 / 2048 / 8192 — under one point across a **1000× radius sweep**, i.e. the
+  residual few percent is a constant offset, not kernel bias.
+  **The radius is now PER MEDIUM and set by the medium's own measured mean free path.** Each
+  stored beam *is* a sampled free-flight chord clipped to the medium's bound, so
+  `mfp_m = S_m / N_m` (`BeamMap::mediumStats`, over the raw pre-split beams) measures it
+  directly — no scene access, no wavelength choice, heterogeneity handled exactly, and bounded
+  above by the medium's own extent. Then **`r_m = beamBlur · mfp_m`** (`-beamblur`, default
+  `0.01`): a fixed fraction of the distance over which the medium's radiance field varies, so
+  the blur is bounded by physics and **independent of `n`** — which is the point, because the
+  gathered count now grows linearly in `n` and `-n` finally buys noise reduction. Per *medium*
+  because a scene can hold a dense cloud and a thin rain curtain at once and one global radius
+  is simultaneously too blurry for one and too noisy for the other. The constant is not fitted:
+  `0.01` lands `gallery_rain`'s two media on 12.9 mm / 17.3 mm, just under the 18.6 mm that its
+  `-beamk 2048` saturation sweep found good, and `_beams_ms` on 2.81 mm, between its bias-flat
+  `-beamk 2048` (1.61 mm) and `-beamk 8192` (6.5 mm). The measured mfp is **stable to four
+  digits across a 4× photon change** (1.292 m / 1.727 m at both `-n 40M` and `-n 160M`), which
+  is the check that it is a property of the medium and not of the sampling. Measured result on
+  the cloud: saturation **0.1157 → 0.0533** at unchanged mean luminance, i.e. the old default's
+  noise was 2.2× the new one's *for the same photons* — and `-n 160M` now takes it to **0.0419**
+  (−21 %, against −6.8 % under the old rule), with the residual gap to `1/sqrt(n)` being
+  `-beamcount 1e6` capping the stored beams at 1.87× rather than 4×. The `_beams_ms` invariant is
+  unmoved at ball/ref **1.0899** against 1.0816..1.0884 across the whole `-beamk` sweep, i.e. the
+  much wider kernel introduces no new bias.
+  `-beamk <K>` survives as a **floor**, not a target — `buildAuto` probes the gathered count at
+  the mfp radii and scales them **up only** if a camera segment would gather fewer than `K`,
+  which is what stops a very sparse map rendering as individual streaks (iterated up to 3
+  rounds × 16×, because a single ratio against a probe that measured 0 is meaningless).
+  `-beamareaslack <f>` (default `1.0`) is the matching **ceiling**: `areaSlackScale` solves the
+  exact quadratic `A(s) = A0 + B·s + C·s²` for the largest uniform scale on the radii whose
+  kernel inflation grows the total sub-beam AABB area — the gather's cost metric — by at most
+  `f` over the tight `r=0` area. Bias bounded by physics, cost bounded by area, nothing pinned
+  to a sample count. `-beamradius <r>` still overrides everything with one value for all media.
+  The closed form survives only inside the **probe**, which brute-forces the gathered count over
+  96 random chords of the beam bbox on a strided subsample (no BVH needed — none exists yet),
+  because the closed form's two assumptions — isotropic relative orientation, beams spread
+  evenly through the box — are both false in a sunlit rain volume where every beam is
+  near-parallel to the sun, by more than an order of magnitude.
+  On the **device** the per-medium radius rides in `DBeamRec::invRad` (one float per sub-beam,
+  32 MB at the 8 M ceiling) rather than in a per-medium array indexed by `med`, which would be a
+  dependent load in the volume gather's innermost loop. The reciprocal form also makes the
+  kernel *cheaper* than the old shared-radius one: the reject test becomes `d2·invRad² >= 1`,
+  which is the same `(d/r)²` the Epanechnikov kernel needs, where the old code took a `sqrt` to
+  get `d` and squared it straight back.
   **`-beamcount <n>` (default 1e6) is a ceiling reached by *adaptive* thinning, not by a
   predicted survival rate** — and that distinction was learned the hard way. The first
   version set a fixed `keepProb = n / nPhotons` up front, which silently assumes ~1 beam per
@@ -2225,10 +2275,13 @@ render. Closing that means teaching the shared device path to gather in spp chun
   unbiased at any thinning depth; `decimateTo` applies the same trick once more at the end
   for the exact trim to `n`. The 2× headroom is what makes the banks still sum to ≥ `n`
   after one halving each. Measured effect on `gallery_rain`: **7 634 → 751 419** beams.
-  Note what the knob actually buys: since the radius auto-adapts to hold `K`, fewer beams
-  means a *bigger* kernel, so `-beamcount` trades **sharpness** against time, not noise
-  against time (`1e6 → 1e5` on `_fog_cornell`: 7m29s → 43s, indistinguishable image,
-  auto-exposure agreeing to 3 s.f. — itself an unbiasedness check).
+  What the knob buys **changed in 0.201.0** along with the radius rule. While the radius was
+  sized to hold `K`, fewer beams meant a *bigger* kernel, so `-beamcount` traded **sharpness**
+  against time and not noise (`1e6 → 1e5` on `_fog_cornell`: 7m29s → 43s, indistinguishable
+  image, auto-exposure agreeing to 3 s.f. — itself an unbiasedness check). Now the radius is a
+  physical scale that does not move with the stored count, so `-beamcount` trades **noise**
+  against time and leaves sharpness alone — which is the sane meaning, and the one that makes
+  it the volume analogue of `-pmcount` that it was always documented to be.
   **Beam splitting** keeps the BVH tight: a long diagonal beam is a mostly-empty AABB, so
   beams are cut into sub-segments — but a sub-segment keeps the parent's
   **true** origin `o` and records only its own `[s0, s0+len]` range, so the gather still

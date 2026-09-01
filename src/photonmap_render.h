@@ -260,7 +260,7 @@ inline Vec3 gatherPhotonBeams(const Scene& scene, const Renderer& mats, const Be
         // wIn = the photon's propagation direction (b.d), wToCamera = -dc.
         const double phase = md.phaseValue(-bh.cosT, lam);
         if (!(phase > 0.0)) return;
-        double w = (double)b.power * bm.kernel1D(bh.dPerp) / bh.sinT * ss * phase * invN;
+        double w = (double)b.power * bm.kernel1D(bh.dPerp, b.med) / bh.sinT * ss * phase * invN;
         if (!(w > 0.0)) return;
         if (b.absorb > 0.0f) w *= std::exp(-(double)b.absorb * bh.sBeam);   // glass, beam side
         if (aGlassCam > 0.0) w *= std::exp(-aGlassCam * bh.tCam);           // glass, camera side

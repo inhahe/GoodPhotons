@@ -11395,13 +11395,29 @@ static void buildCausticMap(PhotonMap& pmC, double radius, const char* tag, doub
 //   DO NOT reach for the photon map's radius here. A beam is a 1D object blurred in 1D, so a
 //   camera ray gathers (pi/2) * r * L_ray * S / V beams — LINEAR in r and in the total stored
 //   beam length S. At the surface map's radius that is tens of thousands of beams per ray on
-//   an ordinary fog box, and the render never finishes. buildAuto solves the same expression
-//   for r at a target population instead (r = K*A/(2 pi S)) and then probes to correct it.
-//   This file used to pass `pmRadius` and that is exactly the bug. See photonbeams.h.
+//   an ordinary fog box, and the render never finishes. This file used to pass `pmRadius` and
+//   that is exactly the bug. See photonbeams.h.
 //
-// `g_beamK` is that target population: beams gathered per camera segment. It plays the same
-// role for the volume estimate that `-pmcount` plays for the surface one — bigger is smoother
-// and slower, and the cost is strictly linear in it.
+// `g_beamBlur` sizes it instead, as a fraction of each MEDIUM'S OWN measured mean free path
+// (mfp_m = total stored chord length / chord count for that medium, which is exactly what the
+// beam records are). Per medium, because a dense cloud and a sparse rain curtain in one scene
+// have transport scales orders of magnitude apart and a single radius is simultaneously too
+// blurry for one and too noisy for the other.
+//
+//   THE RADIUS MUST NOT BE CHOSEN TO HIT A SAMPLE COUNT — that was the pre-0.201.0 rule
+//   (solve r = K*A/(2 pi S) for a fixed `-beamk` target) and it is a trap. S grows with the
+//   photon count, so r ~ 1/n and the gather averages the SAME K beams however much the user
+//   spends. Since each beam is monochromatic, that is a hard colour-noise floor no `-n` and no
+//   `-spp` can move — measured, 4x the samples and 4x the photons each moved the gallery_rain
+//   cloud's noise by nothing, while raising `-beamk` was the only thing that worked. And the
+//   bias it was buying does not exist: the `_beams_ms` invariant moves under one point across
+//   a 1000x radius sweep. See the long note in photonbeams.h for the numbers.
+//
+// `g_beamK` is now a FLOOR on that population rather than a target: buildAuto probes the
+// gathered count at the mfp radii and scales them UP only if a camera segment would gather
+// fewer than this, which is what stops a very sparse map rendering as individual streaks.
+// `g_beamAreaSlack` is the matching ceiling — the fraction by which the kernel is allowed to
+// inflate the total sub-beam AABB area (the gather's cost metric) over the tight r=0 area.
 //
 // `g_beamTarget` budgets the STORED beam count: a beam is ~72 B and lights a whole chord, so
 // keeping one per crossing on a 100 M-photon pass would cost gigabytes for variance nobody
@@ -11429,7 +11445,9 @@ static void buildCausticMap(PhotonMap& pmC, double radius, const char* tag, doub
 //                        wants many.
 static double    g_beamRadiusAbs = 0.0;
 static long long g_beamTarget    = 1000000;
-static double    g_beamK         = 32.0;
+static double    g_beamBlur      = 0.01;   // kernel half-width as a fraction of the mfp
+static double    g_beamK         = 32.0;   // FLOOR on the gathered count, not a target
+static double    g_beamAreaSlack = 1.0;    // ceiling: allowed box-area growth from the kernel
 static long long g_beamSplitMax  = 8000000;
 static double    g_beamSplitLen  = 0.0;
 
@@ -11455,30 +11473,45 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
                     "(survivors rescaled, unbiased)\n", tag, bm.nDeposited, raw);
     const size_t splitBudget = g_beamSplitMax > 0 ? (size_t)g_beamSplitMax : 0;
     if (g_beamRadiusAbs > 0.0) {
-        // Explicit radius: still split, by the same area-optimal rule buildAuto uses. The rule
-        // keys off the radius, so an explicit one feeds it directly — nothing scene-scale here.
-        const double areaBefore = bm.totalBoxArea(g_beamRadiusAbs);
+        // Explicit radius: one value for every medium, but still split by the same
+        // area-optimal rule buildAuto uses. The rule keys off the radius, so an explicit one
+        // feeds it directly — nothing scene-scale here.
+        bm.setUniformRadius(g_beamRadiusAbs);
+        const double areaBefore = bm.totalBoxArea();
         double meanSplit = 0.0;
-        bm.build(g_beamRadiusAbs, g_beamSplitLen, splitBudget, work, &meanSplit);
+        bm.build(g_beamSplitLen, splitBudget, work, &meanSplit);
         r = g_beamRadiusAbs;
         std::printf("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g "
                     "(-beamradius), mean split %.4g, box area %.4g -> %.4g m^2 (%.2fx), "
                     "BVH in %.1fs\n", tag, raw, bm.beams.size(), r, meanSplit,
-                    areaBefore, bm.totalBoxArea(r),
-                    areaBefore > 0 ? bm.totalBoxArea(r) / areaBefore : 1.0,
+                    areaBefore, bm.totalBoxArea(),
+                    areaBefore > 0 ? bm.totalBoxArea() / areaBefore : 1.0,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     } else {
-        const BeamMap::AutoInfo ai = bm.buildAuto(g_beamK, splitBudget, g_beamSplitLen, work);
-        r = ai.rFinal;
+        const BeamMap::AutoInfo ai =
+            bm.buildAuto(g_beamBlur, g_beamK, g_beamAreaSlack, splitBudget, g_beamSplitLen, work);
+        r = bm.radius;
+        // One line PER MEDIUM: the radius is per medium now, so a single number would hide
+        // exactly the thing that makes a two-medium scene work. mfp is the measured mean stored
+        // chord length, which is what the radius is a fraction of.
+        for (size_t m = 0; m < ai.med.size(); ++m) {
+            const BeamMap::MedStat& s = ai.med[m];
+            if (!s.n) continue;
+            std::printf("%s photon beams: medium %zu: %zu chords, mean free path %.4g m "
+                        "-> kernel radius %.4g m (%.3g x mfp)\n",
+                        tag, m, s.n, s.mfp, s.r, s.mfp > 0 ? s.r / s.mfp : 0.0);
+        }
         // `box area` is the cost metric, not a curiosity: a camera ray's expected box-entry
         // count — which measurement showed IS the gather's cost, far more than the number of
         // beams it actually gathers — is proportional to it. Printing before/after is what
         // makes a change to the split rule verifiable instead of asserted.
-        std::printf("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g -> %.4g "
-                    "(a probe ray gathered %.1f beams at the analytic radius; target %.0f), "
-                    "mean split %.4g, box area %.4g -> %.4g m^2 (%.3fx)%s, BVH in %.1fs\n",
-                    tag, ai.rawBeams, ai.outBeams, ai.rAnalytic, ai.rFinal, ai.probeK,
-                    ai.targetK, ai.splitLen, ai.areaBefore, ai.areaAfter,
+        std::printf("%s photon beams: %zu stored -> %zu after split, a probe ray gathers %.1f "
+                    "beams (%.1f at the raw mfp radii; -beamk floor %.0f)%s%s, mean split %.4g, "
+                    "box area %.4g -> %.4g m^2 (%.3fx)%s, BVH in %.1fs\n",
+                    tag, ai.rawBeams, ai.outBeams, ai.probeK, ai.probeK0, ai.targetK,
+                    ai.floorScale > 1.0001 ? " [floor raised the radii]" : "",
+                    ai.slackScale < 0.9999 ? " [-beamareaslack capped them]" : "",
+                    ai.splitLen, ai.areaBefore, ai.areaAfter,
                     ai.areaBefore > 0 ? ai.areaAfter / ai.areaBefore : 1.0,
                     ai.budgetBit ? " [split limited by -beamsplitmax, not by the rule]" : "",
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -15774,11 +15807,20 @@ static void printHelp(const char* prog) {
 "                        per-camera gather for shared flybys (CPU or GPU; kills frozen\n"
 "                        speckle). Mode M: stores a view-independent BEAM MAP, which is the\n"
 "                        only way mode M sees media at all (CPU only)\n"
-"  -beamk <k>            mode-M beams gathered per camera segment (default 32) — the beam\n"
-"                        kernel radius is sized to hit this; smoother and slower as it grows\n"
-"  -beamradius <r>       mode-M beam kernel half-width in world units, overriding -beamk\n"
-"                        (default: sized automatically; NOT the photon-map radius, which is\n"
-"                        larger by orders of magnitude and makes the gather never finish)\n"
+"  -beamblur <frac>      mode-M beam kernel half-width, as a fraction of each MEDIUM'S OWN\n"
+"                        measured mean free path (default 0.01). This is the quality knob:\n"
+"                        the blur is a physical scale independent of the photon count, so\n"
+"                        -n and -spp genuinely reduce volume noise (before 0.201.0 the radius\n"
+"                        was sized to a fixed gathered count, i.e. r ~ 1/n, and they did not)\n"
+"  -beamk <k>            FLOOR on mode-M beams gathered per camera segment (default 32).\n"
+"                        Scales the radii up only if a sparse map would gather fewer, which\n"
+"                        is what stops a thin volume rendering as individual streaks\n"
+"  -beamareaslack <f>    ceiling: fraction by which the kernel may inflate the total sub-beam\n"
+"                        AABB area, the gather's cost metric (default 1.0 = allow doubling)\n"
+"  -beamradius <r>       mode-M beam kernel half-width in world units, one value for every\n"
+"                        medium, overriding -beamblur / -beamk (default: sized automatically;\n"
+"                        NOT the photon-map radius, which is larger by orders of magnitude\n"
+"                        and makes the gather never finish)\n"
 "  -beamcount <n>        mode-M budget on stored beams (default 1000000; 0 = keep all)\n"
 "  -beamsplitmax <n>     ceiling on sub-beams after the BVH split (default 8000000). Beams are\n"
 "                        split at their own area-optimal length; this bounds the MEMORY that\n"
@@ -16783,6 +16825,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-beamradius") && i + 1 < argc) g_beamRadiusAbs = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamcount") && i + 1 < argc) g_beamTarget = (long long)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamk") && i + 1 < argc) g_beamK = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamblur") && i + 1 < argc) g_beamBlur = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamareaslack") && i + 1 < argc) g_beamAreaSlack = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamsplitmax") && i + 1 < argc) g_beamSplitMax = (long long)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamsplit") && i + 1 < argc) g_beamSplitLen = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;

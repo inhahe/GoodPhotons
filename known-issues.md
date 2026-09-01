@@ -5,48 +5,127 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-09-01, v0.200.0): the `gallery_rain` cloud renders as full-saturation RGB speckle ("iridescent"), and residual ratio tracking was NOT the cause
+### FIXED (2026-09-01, v0.201.0): the `gallery_rain` cloud rendered as full-saturation RGB speckle ("iridescent") because the beam kernel radius was pinned to a sample count
 
 **Reported as** the fourth of six defects in the `gallery_rain` mode-`M` `-beams` render: *"the
 cloud appears iridescent, it shouldn't."* The cloud medium is fully achromatic (`sigma_t 2.78,
 albedo 0.9964, g 0.46`, a scalar noise density), so every colour in it is noise, not a feature.
 
-**What was ruled out.** Ratio-tracking variance in the transmittance estimator was the leading
-hypothesis, and v0.200.0 (`majorant.h`, residual ratio tracking — see `design.md`) fixed that
-properly: the estimator's relative sd through this cloud falls by ~1000× in a standalone
-simulation. On the actual render it moved the cloud's chroma sd by only ~11 % (r sd
-0.196 → 0.173, measured over the crop `(410,30)-(580,150)` of a 640×360 `-spp 16` frame), so
-transmittance variance is a minor contributor and the dominant term is elsewhere. The v0.200.0
-work is still worth having on its own merits (it is also several times cheaper per sample), but
-it is not the fix for this issue.
+**Root cause.** `BeamMap::buildAuto` chose the 1-D kernel half-width by solving
+`r = K*A/(2*pi*S)` for a *fixed* gathered-beam target `K` (`-beamk`, default 32). Total stored
+beam length `S` is proportional to the photon count, so that rule pins **`r` proportional to
+`1/n`**: every extra photon the user paid for was spent shrinking the kernel, and a camera
+segment kept averaging the same ~32 beams whatever the budget. Each stored beam is
+**monochromatic** (`PhotonBeam::lambda`) and a single monochromatic sample sits far outside
+sRGB, so ~32 of them per pixel is a hard colour-noise floor — and it is a floor **neither `-n`
+nor `-spp` can move**, which is exactly what "iridescent" looks like and exactly why nothing the
+user could type fixed it.
 
-**Where the variance actually is.** The chroma sd measured in the cloud is very close to the
-spectral spread of a *single* wavelength, i.e. the effective number of independent spectral
-samples per pixel is ~1–2 despite 16 spp × ~42 gathered beams ≈ 670 nominal samples. Each stored
-`PhotonBeam` is **monochromatic** (`PhotonBeam::lambda`) and accumulates into XYZ at its own
-wavelength; a single monochromatic sample sits far outside the sRGB gamut, so too few effective
-samples per pixel clamp to maximum saturation — which is exactly what "iridescent" looks like.
+**The measurements that pinned it** (`scraps/cloudstat.py`, crop `(410,30)-(580,150)` scaled to
+a 320x180 `-spp 16` frame; "saturation" = mean distance of the chromaticity `(r,g)` from the
+equal-energy white point):
 
-**Candidate causes, in order of plausibility, none yet confirmed:**
-1. **Monochromatic beam deposit.** The structural fix is a hero-wavelength / multi-λ beam
-   deposit: each beam carries the XYZ of several wavelengths. The medium is achromatic, so this
-   cuts chroma noise at no extra beam cost. `hero::gSplit` and `tracePhotonHeroLoop` already
-   exist; whether the beam-deposit path participates has not been checked.
-2. **Beam-sample starvation inside the cloud.** `buildAuto`'s single global radius must serve
-   both the compact thick cloud and the optically thin rain shaft, and `-beamk` (default 32)
-   targets 32 beams per probe chord of the whole beam AABB, not per cloud crossing. This is the
-   same "one radius cannot serve two populations" problem the caustic-map split solved. The
-   decisive A/B is a `-beamk` sweep at low resolution (a full-resolution `-beamk 512` run is
-   ~1.9 G beam tests and does not complete in useful time).
-3. **The `1/sinθ` factor in the Beam × Ray 1-D estimator** is heavy-tailed (logarithmically
-   divergent second moment). With albedo 0.9964 and unlimited `-beams-order`, most beams are
-   high-order and randomly oriented, so the tail is fully active.
-4. **Wide spread of beam powers across scattering orders**, plus the Russian-roulette `1/p`
-   rescaling in `BeamBank::halve`.
+| change | effect |
+|---|---|
+| residual ratio tracking (v0.200.0) | chroma sd -11 %. **Not** the cause. |
+| clamp the `1/sin(theta)` Jacobian to <= 5 | zero statistical change (4181 pixels moved, both directions, unchanged mean = a different noise realisation, not variance reduction). **Not** the cause. |
+| `-spp` 16 -> 64 | luminance sd 0.1733 -> 0.1674 (nothing) |
+| `-n` 40M -> 160M | saturation 0.1157 -> 0.1078 (nothing), with the log showing the radius shrinking 2.83e-4 -> 1.65e-4 to hold `K` |
+| `-beamk` 32 / 128 / 512 / 2048 | saturation 0.1157 / 0.0777 / 0.0610 / 0.0487 — **the only thing that worked** |
 
-**Reproduce:** `ftrace -in scenes/gallery_rain.ftsl -camera cam -mode M -beams -device gpu
--r 640 360 -n 40000000 -spp 16 -window-min -keepwindow -interval 15 -o png/caus/c.png`, then
-crop `(410,30)-(580,150)` and measure the sd of the chromaticity `r = R/(R+G+B)`.
+**And the bias the trade was buying does not exist.** On `scenes/_beams_ms.ftsl` (the invariant
+that mode `M` + `-beams` must converge to the mode `D` reference), at a fixed `-n 40000000`:
+
+| `-beamk` | 8 | 32 | 128 | 512 | 2048 | 8192 |
+|---|---|---|---|---|---|---|
+| radius | 6.2e-6 | 2.7e-5 | 1.0e-4 | 4.0e-4 | 1.6e-3 | 6.5e-3 |
+| ball / ref | 1.0563 | 1.0816 | 1.0831 | 1.0884 | 1.0841 | 1.0876 |
+
+A **1000x** radius sweep moves the invariant by under one point, so the residual few percent is a
+constant offset (tracked separately), not kernel bias. The engine was spending its entire photon
+budget on a bias reduction that does not happen, and getting no variance reduction in exchange.
+
+**The fix (v0.201.0): the radius is per medium, and it is set by that medium's own measured mean
+free path.** Every stored beam *is* a sampled free-flight chord clipped to the medium's bound, so
+`BeamMap::mediumStats()` reads the mean free path straight off the raw pre-split map —
+`mfp_m = S_m / N_m` — with no scene access, no wavelength choice, exact handling of a
+heterogeneous cloud, and an automatic upper bound at the medium's own extent. Then
+
+    r_m = beamBlur * mfp_m          (`-beamblur`, default 0.01)
+
+a fixed fraction of the distance over which the medium's radiance field varies: bounded by
+physics and **independent of `n`**, so the gathered count grows linearly in `n` and `-n` finally
+buys noise reduction. Per *medium* because `gallery_rain` holds a dense cloud and a thin rain
+curtain whose transport scales differ, and one global radius is simultaneously too blurry for one
+and too noisy for the other — the same "one radius cannot serve two populations" problem the
+caustic-map split solved for surfaces.
+
+`-beamk` survives as a **floor** (probe the gathered count at the mfp radii, scale **up only** if
+a segment would gather fewer, so a very sparse map does not render as individual streaks), and
+`-beamareaslack` (default 1.0) is the matching **ceiling** — the closed-form largest uniform
+scale whose kernel inflation grows the total sub-beam AABB area, the gather's cost metric, by at
+most that fraction over the tight `r=0` area.
+
+**Verified.** Same scene, same photons, same spp:
+
+| | radius | probe gathers | cloud saturation | Y mean |
+|---|---|---|---|---|
+| old rule, `-beamk 32`, `-n 40M` | 2.825e-4 | 42 | 0.1157 | 0.4066 |
+| old rule, `-beamk 32`, `-n 160M` | 1.65e-4 | 42 | 0.1078 | 0.4095 |
+| **new rule, `-n 40M`** | **0.0129 / 0.0173** | **1732** | **0.0533** | 0.4189 |
+| **new rule, `-n 160M`** | 0.0129 / 0.0173 | 3218 | **0.0419** | 0.4239 |
+
+i.e. **2.2x less chroma noise for the same photons**, and `-n` now reduces it (-21 % for 4x the
+photons, against -6.8 % under the old rule; the residual gap to the ideal `1/sqrt(n)` is
+`-beamcount 1e6` capping the stored beams at 1.87x rather than 4x, which is the documented
+meaning of that knob). The measured mean free paths are **stable to four digits** across the 4x
+photon change (1.292 m / 1.727 m), confirming they are a property of the medium and not a
+sampling artifact. The constant `0.01` is fitted to neither scene: on `gallery_rain` it lands just under the
+18.6 mm that the `-beamk 2048` sweep row found good, and on `_beams_ms` it independently lands
+on 2.81 mm, between that scene's bias-flat `-beamk 2048` (1.61 mm) and `-beamk 8192` (6.5 mm).
+The `_beams_ms` invariant after the change reads **ball/ref 1.0899, rest-of-frame 1.0199**,
+against 1.0816..1.0884 / 1.0194..1.0197 across the whole old sweep — a ~100x wider kernel with
+**no new bias**, which is the point.
+
+**Not the whole story for `-beams` colour noise.** The estimator is still monochromatic per beam.
+A hero-wavelength / multi-lambda beam deposit (each beam carrying the XYZ of several wavelengths)
+would cut chroma noise further at no extra beam cost, since these media are achromatic;
+`hero::gSplit` and `tracePhotonHeroLoop` exist but the beam-deposit path does not participate.
+Logged as tech debt below rather than as a bug — the reported defect is fixed.
+
+### TECH DEBT (2026-09-01, v0.201.0): a stored photon beam is MONOCHROMATIC, so `-beams` pays full chroma variance even in an achromatic medium
+
+**Where.** `src/photonbeams.h` — `PhotonBeam::lambda` is one wavelength, and `BeamMap::cie[i]`
+precomputes that single wavelength's XYZ once at build time. The gather (`gatherPhotonBeams` in
+`src/photonmap_render.h`, `dGatherPhotonBeams` in `src/render_cuda.cu`) multiplies the beam's
+scalar power by that one XYZ. So every beam deposit is a single spectral sample, and a single
+monochromatic sample is far outside the sRGB gamut in every direction.
+
+**Why it costs.** Chroma converges only through the *number of distinct wavelengths* that land in
+a pixel, not through the number of beams. With too few effective samples the mean is still a
+long way from white and the tone map clamps it to maximum saturation — which is exactly the
+"iridescent cloud" mechanism fixed above, only now bounded by wavelength count rather than by
+kernel radius. It is why the remaining cloud saturation is 0.0419 rather than ~0.
+
+**What the proper fix is.** A hero-wavelength beam deposit. `hero::gSplit` and
+`tracePhotonHeroLoop` already exist and already carry N correlated wavelengths through a path;
+the beam-deposit path simply does not participate — it takes the hero wavelength and drops the
+rest. Widening `PhotonBeam` to carry the deposit's full XYZ (accumulated over the hero set,
+weighted by the per-wavelength MIS balance the loop already computes) makes each beam an N-sample
+spectral estimate at no extra beam count, no extra BVH node, and no extra gather cost — the only
+growth is the beam record, from one `float lambda` to three `float xyz` (`BeamMap::cie` then
+disappears, so the net is +2 floats per beam, ~8 MB at the current `-beamcount` default).
+
+**Why it is safe here specifically.** Both test media are achromatic — `sigma_s` and the phase
+function do not vary with wavelength across a cloud or rain droplet field — so the N wavelengths
+of a hero set travel identical paths and can share one chord with no bias. In a *dispersive*
+medium they cannot, and the deposit would have to fall back to the hero wavelength alone; the
+implementation needs that branch, keyed off whatever the medium reports for wavelength
+dependence.
+
+**Not urgent.** The reported defect is fixed and the invariant (`tools/check_beams_ms.py`) is
+unmoved. This is the next factor of noise reduction available in `-beams`, not a correctness
+problem.
 
 ### FIXED (2026-09-01, v0.199.7): mode `M` had no caustic map, so caustics were gathered at the diffuse radius and washed out
 
