@@ -87,11 +87,11 @@ The `_beams_ms` invariant after the change reads **ball/ref 1.0899, rest-of-fram
 against 1.0816..1.0884 / 1.0194..1.0197 across the whole old sweep — a ~100x wider kernel with
 **no new bias**, which is the point.
 
-**Not the whole story for `-beams` colour noise.** The estimator is still monochromatic per beam.
-A hero-wavelength / multi-lambda beam deposit (each beam carrying the XYZ of several wavelengths)
-would cut chroma noise further at no extra beam cost, since these media are achromatic;
-`hero::gSplit` and `tracePhotonHeroLoop` exist but the beam-deposit path does not participate.
-Logged as tech debt below rather than as a bug — the reported defect is fixed.
+**Not the whole story for `-beams` colour noise.** The estimator was still monochromatic per beam
+after this fix — each beam carried one wavelength, so it laid a *saturated* line down its whole
+length. Fixed separately in **v0.202.0** by the spectral beam bundle (`-beamspec`, entry below):
+a stored beam now carries up to four wavelengths and the gather folds all of them into XYZ from
+the same chord, for -8.5 % chroma texture at ~1.1x gather cost.
 
 ### PARTLY FIXED (2026-09-01, v0.201.1): "the rain appears vertically striated" — TWO separate causes, one in the scene and one in the beam estimator
 
@@ -159,65 +159,92 @@ camera the same chords project to ~75°, which is what "vertically striated" was
 **The density fix moves the streaks by ~3%**, confirming the two causes are orthogonal — cause 1
 is still a real bug worth fixing, it just was not the thing being looked at.
 
-**What is left.** Chroma streaks measure ~2.5x luma streaks in every row, and that ratio does not
-improve with beams or radius. That is the monochromatic-beam-deposit tech debt logged immediately
-below — each beam carries one wavelength, so it lays a *saturated* line down its whole length.
-That entry is the remaining fix for cause 2.
+**What was left, and how it ended (v0.202.0).** The table above reported chroma streaks at ~2.5x
+luma streaks, invariant under both knobs, and named the monochromatic beam deposit as the
+remaining fix. The deposit *was* fixed (spectral bundle, `-beamspec`, entry immediately below) and
+it did cut chroma texture 8.5 % — but the 2.5x ratio itself **did not reproduce** when re-measured
+with a script that survives on disk (`scraps/rainchroma.py`): on the current binary the isolation
+frame reads a chroma:luma streak ratio of 0.13, and `scraps/rainstat.py` classifies its striation
+as *horizontal*, not vertical. So cause 2 is, on the evidence available now, resolved by
+v0.201.0's mfp radius rule; the 2.5x figure should be treated as an artifact of the ad-hoc
+measurement that produced it. Cause 2 is closed unless it is seen again in the full scene.
 
 Repro: `python scraps/make_rain_iso.py`, then render `scraps/_rain_iso_{old,new}.ftsl` with
 `-camera iso -mode M -device gpu -beams`; `python scraps/rainfield.py old|new` for the field
 measurement, which needs no renderer at all.
 
-### TECH DEBT (2026-09-01, v0.201.0): a stored photon beam is MONOCHROMATIC, so `-beams` pays full chroma variance even in an achromatic medium
+### FIXED (2026-09-01, v0.202.0): a stored photon beam was MONOCHROMATIC, so `-beams` paid full chroma variance even in an achromatic medium
 
-**Where.** `src/photonbeams.h` — `PhotonBeam::lambda` is one wavelength, and `BeamMap::cie[i]`
-precomputes that single wavelength's XYZ once at build time. The gather (`gatherPhotonBeams` in
-`src/photonmap_render.h`, `dGatherPhotonBeams` in `src/render_cuda.cu`) multiplies the beam's
-scalar power by that one XYZ. So every beam deposit is a single spectral sample, and a single
-monochromatic sample is far outside the sRGB gamut in every direction.
+**Was.** `src/photonbeams.h` — `PhotonBeam::lambda` was one wavelength, and `BeamMap::cie[i]`
+precomputed that single wavelength's XYZ once at build time. The gather (`gatherPhotonBeams` in
+`src/photonmap_render.h`, `dGatherPhotonBeams` in `src/render_cuda.cu`) multiplied the beam's
+scalar power by that one XYZ. So every beam deposit was a single spectral sample, and a single
+monochromatic sample sits far outside the sRGB gamut in every direction. That matters more for a
+beam than for a surface photon: a photon is a *point* and lays grain, a beam is a *line* and lays
+a saturated streak, which the eye reads as structure rather than as noise.
 
-**Why it costs.** Chroma converges only through the *number of distinct wavelengths* that land in
-a pixel, not through the number of beams. With too few effective samples the mean is still a
-long way from white and the tone map clamps it to maximum saturation — which is exactly the
-"iridescent cloud" mechanism fixed above, only now bounded by wavelength count rather than by
-kernel radius. It is why the remaining cloud saturation is 0.0419 rather than ~0.
+**The fix: a spectral bundle carried on ONE beam (`-beamspec <n>`, default 4).** A stored beam now
+holds up to `kBeamSpecMax = 4` wavelengths — the hero in `lambda` plus `nSec` secondaries in
+`lamS[]` — and the gather folds all of them into XYZ from the *same* chord.
 
-**What the proper fix is.** A hero-wavelength beam deposit. `hero::gSplit` and
-`tracePhotonHeroLoop` already exist and already carry N correlated wavelengths through a path;
-the beam-deposit path simply does not participate — it takes the hero wavelength and drops the
-rest. Widening `PhotonBeam` to carry the deposit's full XYZ (accumulated over the hero set,
-weighted by the per-wavelength MIS balance the loop already computes) makes each beam an N-sample
-spectral estimate at no extra beam count, no extra BVH node, and no extra gather cost — the only
-growth is the beam record, from one `float lambda` to three `float xyz` (`BeamMap::cie` then
-disappears, so the net is +2 floats per beam, ~8 MB at the current `-beamcount` default).
+Three facts make this nearly free, and they are the reason the design is what it is:
 
-**Why it is safe here specifically.** Both test media are achromatic — `sigma_s` and the phase
-function do not vary with wavelength across a cloud or rain droplet field — so the N wavelengths
-of a hero set travel identical paths and can share one chord with no bias. In a *dispersive*
-medium they cannot, and the deposit would have to fall back to the hero wavelength alone; the
-implementation needs that branch, keyed off whatever the medium reports for wavelength
-dependence.
+* **No per-wavelength weight is needed.** `EmissionSampler` samples with `p(lambda) =
+  SPD(lambda)/integral`, so `spd(lambda)/pdf(lambda) = integral` — *independent of lambda*. Every
+  wavelength in a bundle therefore carries exactly the same power `power/nLam()`. The record stores
+  wavelengths only.
+* **The gather's cost is almost entirely wavelength-independent.** Geometry, `densityAt`, and the
+  two ratio-tracking `mediaTransmittance` marches (by far the dominant cost) are shared by the
+  whole bundle. The per-lambda tail is just `sigma_s(lambda)`, `phaseValue(cosTheta, lambda)` and
+  the three CIE lookups — measured at **~1.1x** gather time for 4 wavelengths.
+* **The existing hero machinery could not be reused**, contrary to the earlier plan recorded here.
+  `photonmap_render.h` gates it off in exactly the scenes that have beams:
+  `heroOn = (heroC > 1) && scene.media.empty() && ...`. The hero loop has never seen a medium. So
+  the bundle is a separate, self-contained carry on the scalar tracer, stratified from one variate
+  the same way hero is (`u + i/C` wrapped into `[0,1)`, through the same CDF).
 
-**Measured cost, added 2026-09-01 while diagnosing the rain striation above.** In the isolated
-rain scene, high-passed and normalised by mean luminance, **chroma streaking is consistently
-~2.5x luminance streaking, and that ratio does not move** — not with a 67x larger kernel radius,
-not with 27x the beams:
+**Liveness rule (this is what makes it unbiased).** The bundle survives exactly **one** transport
+iteration — from birth on a plain SPD-sampled emitter, through empty space and achromatic media,
+to the first deposited chord — and then collapses to `nSec = 0`, which is bit-for-bit the old
+monochromatic beam. It is retired at: GRIN scenes, glass Beer-Lambert absorption, image-env
+emitters, volumetric (fire) births, and **unconditionally at the end of every loop iteration**,
+outside the beam block, so a skipped deposit cannot leave a stale bundle alive across a
+wavelength-dependent surface event. Scene-wide, `beamSpectralOK()` (in `src/scene.h`, next to the
+`Medium` it interrogates — `render_cuda.cu` cannot include `photonmap_render.h`) samples every
+medium's `sigmaT` at 33 wavelengths and disables the bundle if any medium is chromatic, because
+the shared transmittance march would otherwise give a secondary the hero's attenuation — a bias,
+not noise.
 
-| run | luma | red-green | ratio |
-|---|---|---|---|
-| pre-0.201.0 radius | 0.126 | 0.343 | 2.7 |
-| v0.201.0 mfp radius | 0.057 | 0.142 | 2.5 |
-| + 27x the beams | 0.037 | 0.090 | 2.4 |
+**Storage.** On the host, `+4 floats` per `PhotonBeam`. On the device, `DBeamRec` quantises the
+secondaries to `u16` as `(lambda - 360) * 100` over 360–830 nm — 0.01 nm resolution, two orders
+finer than the 1 nm spectral tables — because every byte of that record is 8 MB of VRAM *and* 8 MB
+of inner-loop traffic at the 8 M sub-beam ceiling. `-savemap` format bumped to `FTPMP05`;
+`FTPMP04` files still load through a chunked widening path (`PhotonBeamV4`, frozen in
+`photonmap_io.h`) that sets `nSec = 0`.
 
-A ratio that is invariant under both knobs is the signature of a variance source neither knob
-addresses. Luma converges with the number of *beams*; chroma converges with the number of
-distinct *wavelengths*, and that is pinned at one per beam. So this is now the single largest
-remaining artifact in a `-beams` render of a scattering medium, and the last unfixed part of the
-`gallery_rain` "vertically striated" report.
+**Measured.** Isolated rain scene, GPU, `-n 60000000 -spp 16`, both runs producing byte-identical
+beam maps (300 146 chords, 7 257 009 sub-beams) so the bundle is provably the only difference —
+`scraps/rainchroma.py`, scene-linear `.pfm`, 15-px high-pass, luma-normalised opponent chroma:
 
-**Not urgent in the sense that it is not a correctness problem.** The reported defects are fixed
-and the invariant (`tools/check_beams_ms.py`) is unmoved. But it is the next real factor of noise
-reduction available in `-beams`.
+| | luma texture rms | chroma texture rms |
+|---|---|---|
+| `-beamspec 1` | 0.08828 | 0.17615 |
+| `-beamspec 4` | **0.08468** (-4.1 %) | **0.16111** (-8.5 %) |
+
+and the MS-bias invariant is unmoved — `tools/check_beams_ms.py`: ball/ref **1.0865** at
+`-beamspec 1` vs **1.0916** at `-beamspec 4`, rest-of-frame **1.0200** for both, against the
+documented 1.0816–1.0884 plateau. Unbiased, and free.
+
+**Honest framing: this is a variance reduction, not "the fix for striation."** The earlier note
+below claiming chroma streaks were pinned at 2.4–2.7x luma streaks was measured by an ad-hoc
+script that no longer exists, and it did **not** reproduce: on the current binary
+`scraps/rainchroma.py` reads a chroma:luma streak ratio of 0.132 (`-beamspec 1`) / 0.107
+(`-beamspec 4`), and `scraps/rainstat.py` classifies the isolation frame's striation index as
+**horizontal** (-0.108 / -0.128) — i.e. after v0.201.0's mfp radius rule that frame is not
+vertically striated at all. The reason the marginal gain from 4 wavelengths per beam is modest
+*here* is that the gather already averages ~1243 beams per probe ray, so the pixel is already
+integrating ~1243 distinct wavelengths; the bundle helps most where the gathered count is low.
+Kept because it is unbiased, costs ~nothing, and is a strict improvement in every configuration.
 
 ### FIXED (2026-09-01, v0.199.7): mode `M` had no caustic map, so caustics were gathered at the diffuse radius and washed out
 

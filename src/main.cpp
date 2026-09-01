@@ -15827,6 +15827,12 @@ static void printHelp(const char* prog) {
 "                        costs, not the quality. Raising it buys a tighter, faster BVH\n"
 "  -beamsplit <len>      pin a uniform split length instead (expert; for measuring the rule\n"
 "                        against a fixed baseline — the per-beam rule beats any one length)\n"
+"  -beamspec <n>         wavelengths carried by ONE stored beam, 1..4 (default 4; 1 = the\n"
+"                        classic monochromatic beam). A beam is a LINE, so a single wavelength\n"
+"                        paints a saturated coloured streak the eye reads as structure; the\n"
+"                        bundle shares the beam's geometry and both transmittance marches, so\n"
+"                        4 wavelengths cost ~1.1x the gather instead of 4x. Ignored in a scene\n"
+"                        whose media have chromatic extinction (the shared march would bias it)\n"
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
 "  -rgb                  mode R fast RGB (non-spectral) backward preview on the GPU (much\n"
 "                        faster; drops dispersion/thin-film/fluorescence — Option B)\n"
@@ -16829,6 +16835,13 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-beamareaslack") && i + 1 < argc) g_beamAreaSlack = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamsplitmax") && i + 1 < argc) g_beamSplitMax = (long long)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamsplit") && i + 1 < argc) g_beamSplitLen = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamspec") && i + 1 < argc) {
+            // Clamped rather than rejected: the record's secondary array is a fixed
+            // kBeamSecMax, so a larger request cannot be honoured, and silently giving the
+            // most the format can carry is the useful reading of "as spectral as possible".
+            int c = std::atoi(argv[++i]);
+            pbeams::gSpecC = (c < 1) ? 1 : (c > kBeamSpecMax ? kBeamSpecMax : c);
+        }
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-window-min") || !std::strcmp(argv[i], "-minimized")) {
             g_showWindow = true; g_minWindow = true;

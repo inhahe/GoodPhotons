@@ -4557,9 +4557,29 @@ struct DBeamDep {
     DVec3 o, d;               // true segment start (world) and unit direction of travel
     float len;                // crossing length in world units
     float power;              // carried flux at `o`, after the deposit's Russian roulette
-    float lambda;             // wavelength (nm) — monochromatic, like a photon
+    float lambda;             // HERO wavelength (nm)
     float absorb;             // sigma_a of the enclosing dielectric (0 in air)
     int   med;                // index into DScene::media
+    // SPECTRAL BUNDLE (photonbeams.h). The stratified SECONDARY wavelengths this same chord
+    // also carries; every wavelength in the bundle carries power/(nSec+1). Plain floats here,
+    // unlike the packed form in the gather-side DBeamRec, because this buffer is at most
+    // `-beamcount` records and its only job is to be copied to the host PhotonBeam, which
+    // stores floats — a packed encode here would have to be undone immediately.
+    float lamS[3];
+    int   nSec;               // 0 = classic monochromatic beam
+};
+
+// The photon's LIVE spectral bundle, carried down the path by the forward tracer and handed
+// to dEmitBeams (host twin: the `specLam`/`specSec` locals of Renderer::tracePhoton). It is
+// born with the photon on a plain SPD-sampled emitter and retired — `n = 0`, which is exactly
+// the pre-0.202.0 monochromatic beam — after ONE transport iteration, because everything the
+// photon does from there on (a surface scatter, a medium scatter, glass absorption) is
+// wavelength-dependent and the record carries no per-wavelength weight to track the
+// divergence with. A null pointer anywhere in the chain means "this caller has no bundle",
+// which is what every mode other than M-with-beams passes.
+struct DBeamSpec {
+    Real lam[3];
+    int  n = 0;
 };
 
 struct DCamSet {
@@ -4592,6 +4612,11 @@ struct DCamSet {
     unsigned long long* beamCount = nullptr;
     unsigned long long  beamCap   = 0;
     double              beamKeep  = 1.0;
+    // SPECTRAL BEAMS (CLI -beamspec, photonbeams.h). How many stratified wavelengths one
+    // deposited beam carries; 1 = the classic monochromatic beam, bit-for-bit. The host sets
+    // this only when the scene can honour it (achromatic extinction — beamSpectralOK in
+    // photonmap_render.h), so the device never has to re-derive the gate.
+    int                 beamSpecC = 1;
     // Either beam path makes the photon cross media STRAIGHT (analog redirect skipped) and
     // needs the per-photon side stream, so the two gates are asked together everywhere.
     HD bool beamsOn() const { return beamGather || beamCount != nullptr; }
@@ -4678,11 +4703,32 @@ __device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3&
 struct DBeamRec {
     DVec3 o, d;             // parent beam origin (world) and unit direction
     float s0, len;          // this sub-segment's [s0, s0+len] range along the beam
-    float pX, pY, pZ;       // cie{X,Y,Z}(lambda) * power / nEmitted
-    float lambda;           // wavelength (nm) — sigma_s / phase / transmittance all need it
+    float pX, pY, pZ;       // cie{X,Y,Z}(lambda) * power / (nEmitted * nLam)
+    float lambda;           // HERO wavelength (nm) — sigma_s / phase / Tr all need it
     float absorb;           // sigma_a of the enclosing dielectric (0 in air)
     float invRad;           // 1 / kernel half-width of THIS beam's medium
     int   med;              // index into DScene::media
+    // --- SPECTRAL BUNDLE (photonbeams.h) ------------------------------------------------
+    // The secondary wavelengths this chord also carries. QUANTISED to 0.01 nm as an offset
+    // from 360 nm: three floats would have grown the record by 12 bytes on top of pwSec's 4,
+    // and at the 8 M sub-beam ceiling every byte here is 8 MB of VRAM *and* 8 MB of traffic
+    // through the innermost loop of the volume gather. 0.01 nm is two orders finer than the
+    // 1 nm grid every spectral table in the engine is sampled on, so the quantisation is
+    // exact for every consumer; the visible band 360..830 nm maps to 0..47000, inside u16.
+    unsigned short lamS[3];
+    unsigned char  nSec;     // 0 = classic monochromatic beam; <= kBeamSecMax
+    unsigned char  pad;
+    // power / (nEmitted * nLam) WITHOUT the CIE fold — the shared per-record constant a
+    // secondary needs, since it supplies its own CIE triple. Unused when nSec == 0.
+    float pwSec;
+
+    __host__ __device__ float lamSec(int i) const { return 360.0f + (float)lamS[i] * 0.01f; }
+    static unsigned short packLam(double lam) {
+        double q = (lam - 360.0) * 100.0;
+        if (q < 0.0) q = 0.0;
+        if (q > 65535.0) q = 65535.0;
+        return (unsigned short)(q + 0.5);
+    }
 };
 
 // The uploaded BeamMap: the host's BVH over kernel-inflated per-sub-beam AABBs (photonbeams.h)
@@ -4755,8 +4801,12 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 const Real lam = b.lambda;
                 const DVec3 xc = oc + dc * t;
                 // sigma_s AT the gather point — density field and all, so a heterogeneous
-                // cloud shapes the bow instead of a uniform slab of it.
-                const double ss = (double)specLookup(md.sigma_s, lam) * dMedDensityAt(md, xc, env);
+                // cloud shapes the bow instead of a uniform slab of it. The DENSITY is
+                // wavelength-independent (it is a scalar field), so this one evaluation — the
+                // expensive half, since it runs a compiled pattern program — serves the whole
+                // spectral bundle below.
+                const double dens = dMedDensityAt(md, xc, env);
+                const double ss = (double)specLookup(md.sigma_s, lam) * dens;
                 if (!(ss > 0.0)) continue;
                 // connectVolume's convention: phase(dot(wIn, wToCamera)), wIn = b.d, wToCam = -dc.
                 const double phase = (double)dMedPhase(md, -cosT, lam);
@@ -4772,6 +4822,27 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 if (t > (Real)0) w *= (double)dMediaTransmittance(sc, oc, dc, t, lam, rng);
                 if (!(w > 0.0)) continue;
                 oX += (double)b.pX * w; oY += (double)b.pY * w; oZ += (double)b.pZ * w;
+                // SECONDARY wavelengths of the spectral bundle (host twin: gatherPhotonBeams).
+                // They share this beam's geometry, its kernel weight and — decisively — BOTH
+                // transmittance marches, which are the whole cost of the loop above and are
+                // wavelength-independent whenever the bundle is allowed at all (the extinction
+                // is achromatic; see beamSpectralOK). So all that differs per wavelength is
+                // sigma_s * phase * CIE. `w / (ss * phase)` recovers the shared factor with one
+                // division instead of rebuilding the chain; both terms are known positive here.
+                if (b.nSec) {
+                    const double wShared = w / (ss * phase) * (double)b.pwSec;
+                    for (int k = 0; k < (int)b.nSec; ++k) {
+                        const Real li = b.lamSec(k);
+                        const double ssi = (double)specLookup(md.sigma_s, li) * dens;
+                        if (!(ssi > 0.0)) continue;
+                        const double phi = (double)dMedPhase(md, -cosT, li);
+                        if (!(phi > 0.0)) continue;
+                        const double wi = wShared * ssi * phi;
+                        oX += (double)cieX(li) * wi;
+                        oY += (double)cieY(li) * wi;
+                        oZ += (double)cieZ(li) * wi;
+                    }
+                }
             }
         } else {
             Real tc;
@@ -4839,9 +4910,14 @@ __device__ static void depositPhoton(const DCamSet& cs, const DVec3& p,
 // device buffer, and a rate change that perturbed the transport stream would silently move
 // every surface photon too — so the two streams are kept disjoint and the surface map comes
 // out bit-identical whatever the beam rate turns out to be.
+//
+// `spec` (optional) is the photon's live spectral bundle; it rides along untouched — the
+// chord a photon cuts through a fog does not depend on its wavelength, so the same segment
+// legitimately carries every wavelength in the bundle (photonbeams.h).
 __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVec3& o,
                                   const DVec3& dir, Real dLen, Real lambda, Real beta,
-                                  Real aGlass, DRng& rng, int offFilt = DMedStraight) {
+                                  Real aGlass, DRng& rng, int offFilt = DMedStraight,
+                                  const DBeamSpec* spec = nullptr) {
     if (!cs.beamCount || !(beta > 0)) return;
     // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
     // 1e30-long box (host twin: Renderer::kBeamFarScale == 8).
@@ -4887,6 +4963,8 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
             bd.lambda = (float)lambda;
             bd.absorb = (float)aGlass;
             bd.med    = i;
+            bd.nSec   = spec ? spec->n : 0;
+            for (int j = 0; j < 3; ++j) bd.lamS[j] = (spec && j < spec->n) ? (float)spec->lam[j] : 0.f;
             cs.beamOut[k] = bd;
         }
     }
@@ -6503,9 +6581,14 @@ enum { WF_CONTINUE = 0, WF_TERMINATE = 1 };
 // Sample one photon from the emitters: fills ro/rd/beta/lambda, accumulates the
 // emitted energy, and performs the direct emitter->camera connection (models A/B).
 // Returns false when the wavelength draw yields a zero pdf (skip this photon).
+// `spec` (optional out) is the photon's SPECTRAL BUNDLE at birth (DBeamSpec): the extra
+// stratified wavelengths its beams may also carry. It is left empty unless the scene and the
+// emitter both qualify — see the fill site below.
 __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
                                  int camMode, DRng& rng,
-                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted) {
+                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted,
+                                 DBeamSpec* spec = nullptr) {
+    if (spec) spec->n = 0;
     // ROADMAP C3: split birth between surface/point/env emitters and volumetric "fire"
     // emission by power. grandTotal = totalPower + totalEmissionPower; the volumeBirth
     // test short-circuits (drawing NO extra RNG) when there are no emissive volumes, so
@@ -6617,7 +6700,11 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
     }
     Real pdfL = 0;
-    lambda = sampleLambda(sc, em, rng, pdfL);
+    // The variate is drawn explicitly rather than inside sampleLambda so the spectral bundle
+    // below can stratify from the SAME u (hero sampling, hero.h). Bit-identical: sampleLambda
+    // is exactly this call with its own rng.uniform().
+    const double uLam = (double)rng.uniform();
+    lambda = sampleLambdaU(sc, em, uLam, pdfL);
     if (pdfL <= 0) return false;
     // When emissive volumes exist the emitter-vs-fire split already consumed the
     // totalPower/grandTotal factor, so a chosen emitter photon carries the full
@@ -6642,6 +6729,32 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     // report matches what actually leaves the surface.
     if (emitPatW != 1.0) beta = (Real)((double)beta * emitPatW);
     eEmitted += beta;
+
+    // SPECTRAL BUNDLE at birth (host twin: Renderer::tracePhoton). C-1 more wavelengths,
+    // stratified from the same variate through the same emitter CDF, that this photon's beams
+    // will also carry. They all carry the SAME power — the emission pdf is proportional to the
+    // emitter's own SPD, so spd(lambda)/pdf(lambda) is the SPD's integral for every wavelength
+    // alike — which is why the record stores wavelengths and no weights.
+    //
+    // Excluded, because on these paths `beta` is NOT wavelength-independent and the
+    // equal-power argument fails outright: an IMAGE environment (beta is reweighted by the
+    // texel's own radiance at lambda) and a GRIN scene (the bend, and thus the whole geometry
+    // of the path, is a function of lambda). A volumetric "fire" birth returns far above and
+    // never reaches here, for the same reason: its beta carries ke(x, lambda)/pdf(lambda).
+    if (spec && cs.beamSpecC > 1 && cs.beamCount && !envImage && !sc.hasGrin) {
+        const int C = (cs.beamSpecC > 4) ? 4 : cs.beamSpecC;
+        for (int i = 1; i < C; ++i) {
+            double uu = uLam + (double)i / (double)C;
+            if (uu >= 1.0) uu -= 1.0;
+            Real pI = 0;
+            const Real lI = sampleLambdaU(sc, em, uu, pI);
+            // A zero-density secondary would have to be given weight 0 while the survivors
+            // kept 1/C, and the record stores no per-wavelength weight — so drop the WHOLE
+            // bundle rather than renormalise over the survivors, which would over-count them.
+            if (!(pI > 0)) { spec->n = 0; break; }
+            spec->lam[spec->n++] = lI;
+        }
+    }
 
     // Connect the emitter itself to the camera (makes the source visible): model
     // B splats to the pinhole, model A splats through the finite lens pupil. Model
@@ -6843,13 +6956,18 @@ __device__ static inline int dPhotonVertexBit(const DScene& sc, const DMaterial&
 // `pathBits` (optional) is the caustic classification carried down the path — the PV_BIT_*
 // pair above, host twin `sawFocus`/`sawScatter` in Renderer::tracePhoton. Null means "do not
 // classify", which is what every mode other than M passes.
+//
+// `spec` (optional) is the photon's live SPECTRAL BUNDLE (DBeamSpec). It is deposited with
+// this step's beam and then RETIRED, unconditionally, before returning: see the note at the
+// retirement site for why that is the conservative and provably-correct rule.
 __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 int camMode, int diffraction, const DHit& h,
                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
                                 double& eAbsorbed, double& eSensor, double& eEscaped,
                                 DMediumStack& stk, DRng* crng = nullptr,
                                 int grinMed = -1, Real grinArc = 0,
-                                int* beamScat = nullptr, int* pathBits = nullptr) {
+                                int* beamScat = nullptr, int* pathBits = nullptr,
+                                DBeamSpec* spec = nullptr) {
     Real dSurf = h.valid ? h.t : BIG;
 
     // Dielectric Beer-Lambert over the marched arc (the block further down only covers the
@@ -6940,7 +7058,15 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     {
         int cm = stk.topMat();
         Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
-        if (a > 0) beta *= exp(-a * dEvent);
+        if (a > 0) {
+            beta *= exp(-a * dEvent);
+            // Coloured glass: sigma_a is per-wavelength, and the beam record stores ONE
+            // `absorb` which the gather Beer-Lamberts every wavelength with. Handing the
+            // secondaries the hero's absorption would be a bias, not noise, so a beam that
+            // runs inside an absorbing dielectric goes back to monochromatic. (Host twin:
+            // the `specSec = 0` beside Renderer::tracePhoton's glass Beer-Lambert.)
+            if (spec) spec->n = 0;
+        }
     }
 
     // PHOTON-BEAMS gather (device twin of the CPU -beams block in render.h, where the full
@@ -6987,7 +7113,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // Mode M: store the crossing itself, so every camera of a flyby can gather from it
         // later without the photon knowing any camera exists.
         if (doBeamDeposit) dEmitBeams(sc, cs, ro, rd, dChord, lambda, betaPre, aC, *crng,
-                                      beamMS ? DMedAll : DMedStraight);
+                                      beamMS ? DMedAll : DMedStraight, spec);
         if (!beamMS) {
             // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over the
             // whole crossing (single-scatter transmission) so surfaces behind the fog are
@@ -7010,6 +7136,13 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
             eAbsorbed += (double)(before - beta);
         }
     }
+    // Retire the spectral bundle (host twin: the `specSec = 0` in Renderer::tracePhoton).
+    // OUTSIDE the beam block on purpose: if that block was skipped (a march hit, or a
+    // zero-length chord) nothing was deposited, but the photon still goes on to interact, so a
+    // bundle left live here would be picked up by a LATER chord's deposit — after a
+    // wavelength-dependent surface event, where the shared geometry argument no longer holds.
+    // One retirement per step, unconditionally, is what makes the rule airtight.
+    if (spec) spec->n = 0;
 
     if (mediumEvent) {
         const DMedium& sm = sc.media[scatterMed];
@@ -7537,7 +7670,11 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             continue;
         }
         DVec3 ro, rd; Real beta, lambda;
-        if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
+        // The photon's spectral bundle (`-beamspec`): filled at birth, deposited with the
+        // first chord, retired by shadeStep. Empty for every scene that does not qualify, in
+        // which case every beam is the classic monochromatic record.
+        DBeamSpec spec;
+        if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted, &spec)) continue;
         bool done = false;
         DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
         // PHOTON-BEAMS: an INDEPENDENT per-photon stream used ONLY by the beam branch —
@@ -7565,7 +7702,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                           eAbsorbed, eSensor, eEscaped, stk, cs.beamsOn() ? &crng : nullptr,
                           gm.hit ? gm.which : -1, gm.arc, &beamScat,
-                          &pathBits) == WF_TERMINATE) done = true;
+                          &pathBits, &spec) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -15728,6 +15865,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             CUDA_CHECK(cudaMemset(d_beamCount, 0, sizeof(unsigned long long)));
             cs.beamOut = d_beams; cs.beamCount = d_beamCount;
             cs.beamCap = beamCap; cs.beamKeep = beamKeep;
+            // SPECTRAL BEAMS. Same gate the CPU deposit uses (photonmap_render.h), asked here
+            // rather than on the device so the device never has to walk the media spectra.
+            cs.beamSpecC = (pbeams::gSpecC > 1 && beamSpectralOK(scene))
+                               ? std::min(pbeams::gSpecC, kBeamSpecMax) : 1;
         }
         depEmitted = N;
         if (!splitDeposit) {
@@ -15904,9 +16045,15 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                   cudaMemcpyDeviceToHost));
             for (size_t i = 0; i < cnt; ++i) {
                 const DBeamDep& d = bstage[i];
-                bmap->beams[off + i] = PhotonBeam{Vec3(d.o.x, d.o.y, d.o.z),
-                                                  Vec3(d.d.x, d.d.y, d.d.z),
-                                                  0.0f, d.len, d.power, d.lambda, d.absorb, d.med};
+                PhotonBeam& b = bmap->beams[off + i];
+                b.o = Vec3(d.o.x, d.o.y, d.o.z);
+                b.d = Vec3(d.d.x, d.d.y, d.d.z);
+                b.s0 = 0.0f; b.len = d.len; b.power = d.power;
+                b.lambda = d.lambda; b.absorb = d.absorb; b.med = d.med;
+                // Spectral bundle (`-beamspec`): 0 secondaries is the classic monochromatic
+                // beam, which is what every non-qualifying scene deposits.
+                b.nSec = (d.nSec < 0) ? 0 : (d.nSec > kBeamSecMax ? kBeamSecMax : d.nSec);
+                for (int k = 0; k < kBeamSecMax; ++k) b.lamS[k] = (k < b.nSec) ? d.lamS[k] : 0.0f;
             }
         }
         bmap->nEmitted   = pm.nEmitted;      // same pass, same normalisation
@@ -16019,9 +16166,17 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             r.o = DVec3(b.o.x, b.o.y, b.o.z);
             r.d = DVec3(b.d.x, b.d.y, b.d.z);
             r.s0 = b.s0; r.len = b.len;
-            const double w = (double)b.power * invN;
+            // `invC` splits the chord's flux evenly over its spectral bundle — every
+            // wavelength in it carries the same power (photonbeams.h) — and is exactly 1.0
+            // for a monochromatic beam, so a `-beamspec 1` render is bit-identical.
+            const double invC = 1.0 / (double)b.nLam();
+            const double w = (double)b.power * invN * invC;
             r.pX = (float)(ci.x * w); r.pY = (float)(ci.y * w); r.pZ = (float)(ci.z * w);
             r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
+            r.nSec = (unsigned char)b.nSec; r.pad = 0;
+            r.pwSec = (float)w;      // the same shared constant, minus the CIE fold
+            for (int k = 0; k < 3; ++k)
+                r.lamS[k] = (k < b.nSec) ? DBeamRec::packLam((double)b.lamS[k]) : (unsigned short)0;
             const double rm = bmap->radOf(b.med);
             r.invRad = (float)(rm > 0.0 ? 1.0 / rm : 0.0);
         }

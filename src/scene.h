@@ -2514,6 +2514,43 @@ struct Scene {
     }
 };
 
+// ---- Is a SPECTRAL BEAM BUNDLE valid in this scene? ---------------------------------------
+// A photon beam that carries several wavelengths (photonbeams.h, `-beamspec`) shares ONE
+// geometry and — decisively — ONE pair of transmittance marches between all of them, because
+// those marches are the dominant cost of the beam gather. That sharing is exact only when
+// every medium's EXTINCTION is wavelength-independent: Tr = exp(-integral sigma_t) is then the
+// same number for the hero and for every secondary, and all that differs per wavelength is the
+// cheap `sigma_s * phase * CIE` tail, which the gather does evaluate per wavelength.
+//
+// If some medium's sigma_t is chromatic — a coloured absorber, say — the shared march would
+// hand a secondary the HERO's attenuation, which is simply the wrong number: a wavelength-
+// dependent BIAS, not noise. There is no cheap repair (a per-wavelength march is exactly the
+// cost the bundle exists to avoid), so the honest answer is to refuse the bundle in such a
+// scene and deposit classic monochromatic beams, which are unbiased there and always were.
+//
+// The test SAMPLES sigma_t across the visible band rather than inspecting the spectra's
+// representation, because a Medium's sigma_a/sigma_s can each be any Spectrum — constant, RGB,
+// tabulated, blackbody — and only their SUM has to be flat; two chromatic halves that cancel
+// are a perfectly good achromatic extinction. The tolerance is relative and generous: a
+// rounding-level ripple in a tabulated grey spectrum must not disqualify a scene.
+//
+// Lives in scene.h, next to the Medium it interrogates, because BOTH deposit paths need it —
+// the CPU one in photonmap_render.h and the CUDA one in render_cuda.cu, which cannot include
+// the former.
+inline bool beamSpectralOK(const Scene& scene) {
+    for (const Medium& m : scene.media) {
+        double lo = 1e300, hi = -1e300;
+        for (int i = 0; i <= 32; ++i) {
+            const double lam = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * (double)i / 32.0;
+            const double st = m.sigmaT(lam);
+            lo = std::min(lo, st); hi = std::max(hi, st);
+        }
+        if (hi <= 0.0) continue;                  // a medium that never extinguishes is fine
+        if ((hi - lo) > 1e-4 * hi) return false;  // chromatic extinction: no bundle
+    }
+    return true;
+}
+
 // PatOp::Tex sampler: the LINEAR grayscale value of one of the Scene's image
 // textures (Texture::scalarAt — the same sampler roughness / film-thickness maps
 // use, and the exact twin of the device's dTexScalarAt). Installed into a PatCtx by

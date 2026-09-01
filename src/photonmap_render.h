@@ -111,6 +111,14 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     // chroma noise. Same gate as the forward tracers: no media / no GRIN (those stay C=1).
     const bool heroOn = (heroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
 
+    // SPECTRAL BEAMS. Where `heroOn` above is gated OFF by the presence of media, this one is
+    // gated on exactly the opposite thing — it is the media cache's own spectral widening, and
+    // it applies precisely when there ARE media. `-beamspec` (pbeams::gSpecC) asks for it; the
+    // scene has to be able to honour it (beamSpectralOK, above); and there must be a beam map
+    // to deposit into at all.
+    const int beamSpecC = (bm && pbeams::gSpecC > 1 && beamSpectralOK(scene))
+                              ? std::min(pbeams::gSpecC, kBeamSpecMax) : 1;
+
     // Published photon count for `stage`. Written by the workers on the SAME 4096-photon
     // cadence as the stop poll (one relaxed fetch_add per 4096 photons is unmeasurable next
     // to 4096 path traces) and read by the monitor thread below. Relaxed ordering is right:
@@ -122,6 +130,7 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         if (pmCaustic) r.causticDeposit = &cbanks[tid];
         if (bm) r.beamDeposit = &bbanks[tid];
         r.useHero = heroOn; r.heroC = heroC;
+        r.beamSpecC = beamSpecC;
         Pcg32 rng;
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         EnergyReport e;
@@ -231,6 +240,12 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
 // in XYZ at the photon's own lambda" trick the surface density estimate uses, so a spectral
 // rainbow comes out spectral without any monochromatic reconstruction.
 //
+// A beam may carry a stratified BUNDLE of wavelengths rather than one (`-beamspec`; see
+// PhotonBeam in photonbeams.h for why a monochromatic *line* is so much worse than a
+// monochromatic *point*). The bundle shares the chord, the kernel weight, the density
+// evaluation and both transmittance marches — i.e. everything this estimator actually spends
+// its time on — and differs only in sigma_s, the phase function and the CIE triple.
+//
 // `aGlassCam` is the absorption of the dielectric the CAMERA ray is currently inside; the
 // caller applies it over the whole segment afterwards, so here it is applied only as far as
 // each beam's own closest-approach point. `thr` is NOT applied here — the caller multiplies
@@ -253,14 +268,21 @@ inline Vec3 gatherPhotonBeams(const Scene& scene, const Renderer& mats, const Be
         const Medium& md = scene.media[b.med];
         const Vec3 xc = oc + dc * bh.tCam;
         // sigma_s AT the gather point — density field / imported volume included, so a
-        // heterogeneous cloud shapes the bow instead of a uniform slab of it.
-        const double ss = md.sigma_s(lam) * md.densityAt(xc, &tabs);
+        // heterogeneous cloud shapes the bow instead of a uniform slab of it. The density
+        // is wavelength-INDEPENDENT, so one evaluation serves the whole spectral bundle.
+        const double dens = md.densityAt(xc, &tabs);
+        const double ss = md.sigma_s(lam) * dens;
         if (!(ss > 0.0)) return;
         // Scattering angle. connectVolume's convention: phaseValue(dot(wIn, wToCamera)),
         // wIn = the photon's propagation direction (b.d), wToCamera = -dc.
         const double phase = md.phaseValue(-bh.cosT, lam);
         if (!(phase > 0.0)) return;
-        double w = (double)b.power * bm.kernel1D(bh.dPerp, b.med) / bh.sinT * ss * phase * invN;
+        // `invC` splits the chord's flux evenly over its spectral bundle (PhotonBeam: every
+        // wavelength in a bundle carries the same power). It is exactly 1.0 for a
+        // monochromatic beam, so the whole expression — and thus every pre-0.202.0 render —
+        // is bit-for-bit unchanged.
+        const double invC = 1.0 / (double)b.nLam();
+        double w = (double)b.power * bm.kernel1D(bh.dPerp, b.med) / bh.sinT * ss * phase * invN * invC;
         if (!(w > 0.0)) return;
         if (b.absorb > 0.0f) w *= std::exp(-(double)b.absorb * bh.sBeam);   // glass, beam side
         if (aGlassCam > 0.0) w *= std::exp(-aGlassCam * bh.tCam);           // glass, camera side
@@ -268,6 +290,23 @@ inline Vec3 gatherPhotonBeams(const Scene& scene, const Renderer& mats, const Be
         if (bh.tCam  > 0.0)  w *= mats.mediaTransmittance(scene, oc, dc, bh.tCam, lam, rng);
         if (!(w > 0.0)) return;
         acc += bm.cie[bh.idx] * w;
+        // SECONDARY wavelengths of the bundle. They share this beam's geometry, its kernel
+        // weight and BOTH transmittance marches — the bundle only exists on a path whose
+        // extinction is achromatic (Renderer::beamSpecC), which is precisely the condition
+        // that makes those marches wavelength-independent — so all that differs is
+        // sigma_s * phase * CIE. `w / (ss * phase)` recovers the shared factor with one
+        // division instead of rebuilding the chain, and both terms are known positive.
+        if (b.nSec > 0) {
+            const double wShared = w / (ss * phase);
+            for (int i = 0; i < b.nSec; ++i) {
+                const double li = (double)b.lamS[i];
+                const double ssi = md.sigma_s(li) * dens;
+                if (!(ssi > 0.0)) continue;
+                const double phi = md.phaseValue(-bh.cosT, li);
+                if (!(phi > 0.0)) continue;
+                acc += Vec3(cieX(li), cieY(li), cieZ(li)) * (wShared * ssi * phi);
+            }
+        }
     });
     return acc;
 }

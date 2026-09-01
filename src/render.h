@@ -437,6 +437,15 @@ struct Renderer {
     // segment — not a point — is the right record. Null in every other mode.
     BeamBank* beamDeposit = nullptr;
 
+    // SPECTRAL BEAMS (CLI -beamspec N). How many stratified wavelengths one deposited beam
+    // carries. 1 = the classic monochromatic beam, bit-for-bit. See the long note above
+    // PhotonBeam (photonbeams.h) for why a monochromatic LINE is so much worse than a
+    // monochromatic point, and Renderer::tracePhoton for the (deliberately conservative)
+    // rule that keeps a bundle alive only while the path is provably wavelength-independent.
+    // The driver sets this to 1 for any scene whose media have chromatic extinction, since a
+    // bundle's shared transmittance would then be wrong for its secondaries.
+    int beamSpecC = 1;
+
     // Longest beam we will store when the photon escapes to infinity through an UNBOUNDED
     // medium, as a multiple of the scene radius. An unbounded medium clips to [0, 1e30], and
     // a 1e30-long AABB would swallow the whole BVH; transmittance has long since killed the
@@ -712,9 +721,15 @@ struct Renderer {
     // the analog collision, so applying it again here would double-count. Under MULTIPLE
     // scatter nothing is carried stochastically (the beam runs the whole chord to the surface
     // and the gather integrates Tr analytically), so every medium must be charged: MedAll.
+    //
+    // `lamS`/`nSec` are the photon's live SPECTRAL BUNDLE — extra stratified wavelengths that
+    // this same chord also carries (photonbeams.h). They ride along untouched: the chord's
+    // geometry, its power and its transmittance are all wavelength-independent wherever the
+    // bundle is still alive, which is exactly the condition tracePhoton maintains.
     void emitBeams(const Scene& scene, const Vec3& o, const Vec3& dir, double dLen,
                    double lambda, double beta, double aGlass, Pcg32& rng,
-                   MedFilter offFilt = MedStraight) const {
+                   MedFilter offFilt = MedStraight,
+                   const double* lamS = nullptr, int nSec = 0) const {
         if (!beamDeposit || !(beta > 0.0)) return;
         // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
         // 1e30-long box (see kBeamFarScale).
@@ -750,7 +765,7 @@ struct Renderer {
             // GRIN transmittance to s. Applying it here as well would count it twice.
             if (ta > 0.0) p *= mediaTransmittance(scene, o, dir, ta, lambda, rng, offFilt);
             if (!(p > 0.0)) continue;
-            beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i);
+            beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i, lamS, nSec);
         }
     }
 
@@ -2111,6 +2126,13 @@ struct Renderer {
         if (grandTotal <= 0.0) return;
         Vec3 origin, dir;
         double lambda, beta;
+        // SPECTRAL BEAM BUNDLE (photonbeams.h). The extra stratified wavelengths this photon's
+        // beam deposits will carry alongside `lambda`, and how many are still live. Filled at
+        // birth for a plain SPD-sampled emitter, and dropped to zero — collapsing the beam back
+        // to the classic monochromatic record — the instant the path does anything the
+        // wavelengths would not agree on. Untouched (and therefore free) when beamSpecC == 1.
+        double specLam[kBeamSecMax];
+        int specSec = 0;
         const bool volumeBirth = !scene.emissiveVolumes.empty() &&
                                  (rng.uniform() * grandTotal < scene.totalEmissionPower);
         if (volumeBirth) {
@@ -2226,7 +2248,12 @@ struct Renderer {
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         }
         double pdfL = 0.0;
-        lambda = em.spd.sample(rng, pdfL);
+        // Drawn through sampleAt rather than sample() so the SAME uniform variate can seed the
+        // stratified secondaries below. `sample()` is literally `sampleAt(rng.uniform(), pdf)`,
+        // so this consumes the identical rng draw and returns the identical wavelength — every
+        // existing render stays bit-for-bit.
+        const double uLam = rng.uniform();
+        lambda = em.spd.sampleAt(uLam, pdfL);
         if (pdfL <= 0) return;
         // Single emitter (no fire): beta = its own power (== old lightEmitIntegral*
         // area*PI). Multiple emitters: beta = totalPower. When fire volumes coexist the
@@ -2250,6 +2277,39 @@ struct Renderer {
         // the energy report matches what actually leaves the surface.
         if (emitPatW != 1.0) beta *= emitPatW;
         e.emitted += beta;
+
+        // --- Spectral bundle for the beam deposit (photonbeams.h) --------------------------
+        // Hero policy (1): the C wavelengths come from ONE uniform variate, secondary i taking
+        // `u + i/C` wrapped into [0,1) through the same emission CDF, so the bundle is
+        // stratified over the emitter's own spectrum rather than clumped.
+        //
+        // Every wavelength carries the SAME power, which is why no per-wavelength weight is
+        // stored anywhere. The emission sampler's pdf is p(lam) = spd(lam)/integral, and the
+        // photon's beta is the emitter's total power — i.e. spd(lam)/p(lam) == integral, a
+        // constant. So the C-wavelength estimate is simply beta/C at each of the C
+        // wavelengths, and the beam record needs only the wavelengths themselves.
+        //
+        // An IMAGE environment is excluded because its beta carries the directional factor
+        // L(dir,lam)/(4*pi*pdfW*spd(lam)), which is genuinely per-wavelength; so is a
+        // volumetric blackbody birth, whose beta carries kappa_e(x,lam). Both keep C == 1
+        // rather than being reweighted, which costs those scenes nothing they had before.
+        if (beamSpecC > 1 && beamDeposit &&
+            !(em.shape == EmitterShape::Env && scene.envMap)) {
+            const int C = (beamSpecC > kBeamSpecMax) ? kBeamSpecMax : beamSpecC;
+            for (int i = 1; i < C; ++i) {
+                double uu = uLam + (double)i / (double)C;
+                if (uu >= 1.0) uu -= 1.0;
+                double pI = 0.0;
+                const double lI = em.spd.sampleAt(uu, pI);
+                // A zero-density secondary would have to be given weight 0 while the survivors
+                // kept 1/C, and the record stores no per-wavelength weight — so drop the WHOLE
+                // bundle instead of renormalising over the survivors, which would over-count
+                // them. (Inverting a CDF at a uniform variate cannot land in a zero-mass bin,
+                // so this is a guard, not a path.)
+                if (!(pI > 0.0)) { specSec = 0; break; }
+                specLam[specSec++] = lI;
+            }
+        }
 
         // Direct light -> camera: makes the source itself visible. The Lambertian
         // emitter term is 1/pi, i.e. connect() with rho=1 using the light normal.
@@ -2292,6 +2352,12 @@ struct Renderer {
         // the backward/BDPT tracers use, so all transport paths agree. Gated so ordinary
         // scenes stay bit-identical (the marcher is never entered).
         const bool grinAny = grin::sceneHasGrin(scene);
+        // A GRIN region bends the photon along a wavelength-dependent path and charges glass
+        // absorption over the arc, so nothing downstream of a march is a shared chord. Rather
+        // than reason about where the marcher was and was not entered, refuse the spectral
+        // bundle for the whole photon in any GRIN scene — those scenes cannot deposit beams
+        // inside the bending medium anyway (emitBeams skips it per medium).
+        if (grinAny) specSec = 0;
 
         // PHOTON-BEAM deposit (mode M with -beams): store the crossed segment in the
         // view-independent beam map instead of splatting it to a camera list. GRIN media are
@@ -2429,7 +2495,11 @@ struct Renderer {
             double betaPre = beta;
             {
                 double a = curAbsorb(lambda);
-                if (a > 0.0) beta *= std::exp(-a * dEvent);
+                // Glass absorption is spectral (that is what makes coloured glass coloured),
+                // and emitBeams re-applies it over the beam's own lead-in, so a bundle inside a
+                // dielectric would be attenuated at the wrong wavelengths. Collapse it here,
+                // BEFORE the deposit below reads it.
+                if (a > 0.0) { beta *= std::exp(-a * dEvent); specSec = 0; }
             }
 
             // PHOTON-BEAMS single-scatter gather (CLI -beams, shared multi-camera pass).
@@ -2494,7 +2564,7 @@ struct Renderer {
                 // from it later without the photon knowing any camera exists.
                 if (doBeamDeposit)
                     emitBeams(scene, ray.o, ray.d, dChord, lambda, betaPre, curAbsorb(lambda), rng,
-                              beamMS ? MedAll : MedStraight);
+                              beamMS ? MedAll : MedStraight, specLam, specSec);
                 if (!beamMS) {
                     // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over
                     // the whole crossing (single-scatter transmission) so surfaces behind the
@@ -2517,6 +2587,22 @@ struct Renderer {
                     e.absorbed += (before - beta);
                 }
             }
+            // The spectral bundle survives exactly ONE transport iteration. Everything the
+            // photon can do from here on — scatter off a surface, scatter in the medium, be
+            // attenuated by the single-scatter transmittance above — is wavelength-dependent,
+            // and the record carries no per-wavelength weight with which to track the
+            // divergence. Retiring it here is therefore the conservative, provably-correct
+            // rule: later chords deposit exactly the monochromatic beams they always did, so
+            // nothing regresses, and the chord that matters most (a light's DIRECT crossing of
+            // the medium, which is where a shaft's flux overwhelmingly comes from) is the one
+            // that gets the bundle. Relaxing this per event is a later refinement.
+            //
+            // This sits OUTSIDE the beam block on purpose. If that block is skipped (a march
+            // hit, or a zero-length chord) nothing was deposited, but the photon still goes on
+            // to interact — so a bundle left live here would be picked up by a LATER chord's
+            // deposit, after a wavelength-dependent surface event. One retirement per loop
+            // iteration, unconditionally, is what makes the rule airtight.
+            specSec = 0;
 
             if (mediumEvent) {
                 const Medium& sm = scene.media[scatterMed];

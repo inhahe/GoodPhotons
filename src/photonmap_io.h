@@ -18,11 +18,14 @@
 //      path, the two flags were silently mutually exclusive — `-savemap -beams` exited 0 and
 //      wrote nothing at all.
 //
-// Format. `FTPMP04\n` = header, surface block, beam block, CAUSTIC block. `FTPMP03\n`
-// (header + surface + beam) and `FTPMP02\n` (surface only) still load: a v3 file simply has
-// every deposit in the global map, which is exactly the pre-0.199.7 single-map behaviour, and
-// a v2 file additionally reports no beams. So no existing cache is invalidated by the caustic
-// split — it just re-gathers as the one-map render it was saved from.
+// Format. `FTPMP05\n` = header, surface block, beam block, CAUSTIC block. `FTPMP04\n` has the
+// same block layout but a NARROWER beam record (no spectral bundle — see PhotonBeamV4 below);
+// `FTPMP03\n` (header + surface + beam) and `FTPMP02\n` (surface only) are older still. Every
+// one of them loads: a v4 file's beams widen to nSec == 0, which is exactly the monochromatic
+// beam they were saved as; a v3 file simply has every deposit in the global map, which is the
+// pre-0.199.7 single-map behaviour; a v2 file additionally reports no beams. So no existing
+// cache is invalidated by any of these changes — each just re-gathers as the render it was
+// saved from.
 //
 // What is NOT stored, deliberately: every derived structure. The photon grid is rebuilt by
 // `PhotonMap::build(radius)` and the beam BVH by `BeamMap::buildAuto(K)`, so ONE file serves
@@ -35,9 +38,27 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <vector>
+#include <algorithm>
 #include "photonmap.h"
 #include "photonbeams.h"
 #include "scene.h"
+
+// The FTPMP04 beam record, frozen. The beam block is a raw fwrite of the live `PhotonBeam`,
+// so widening that struct for the spectral bundle (0.202.0) changed its size and would have
+// made every existing .pmap unreadable — silently and catastrophically, since a size mismatch
+// on a raw array read is not a parse error, it is garbage beams. Keeping the old layout here
+// verbatim, and reading a v4 file through IT, is what makes the widening free: the fields are
+// copied across by name and the bundle is set empty, which is precisely what a v4 beam meant.
+//
+// This struct must NEVER be edited again. It is not "the beam record"; it is "what a v4 file
+// contains", and that is now a historical fact. The next widening adds a PhotonBeamV5.
+struct PhotonBeamV4 {
+    Vec3  o;
+    Vec3  d;
+    float s0, len, power, lambda, absorb;
+    int   med;
+};
 
 // Scene-identity guard: refuses to blend a stale cache into a different scene. Cheap and
 // coarse on purpose — it catches "wrong file", not "same scene, one triangle moved".
@@ -63,7 +84,7 @@ inline bool savePhotonMap(const char* path, const PhotonMap& pm,
                           const PhotonMap* pmCaustic = nullptr) {
     std::FILE* f = std::fopen(path, "wb");
     if (!f) { std::fprintf(stderr, "[savemap] cannot open %s for writing\n", path); return false; }
-    const char magic[8] = {'F','T','P','M','P','0','4','\n'};
+    const char magic[8] = {'F','T','P','M','P','0','5','\n'};
     long long nPh = (long long)pm.photons.size();
     double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
     bool ok = true;
@@ -129,9 +150,13 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
     char magic[8] = {0};
     long long nEmitted = 0, nPh = 0; double en[5] = {0,0,0,0,0}; uint64_t g = 0;
     bool ok = std::fread(magic, 1, 8, f) == 8;
-    const bool v4 = ok && std::memcmp(magic, "FTPMP04\n", 8) == 0;
+    const bool v5 = ok && std::memcmp(magic, "FTPMP05\n", 8) == 0;
+    const bool v4 = v5 || (ok && std::memcmp(magic, "FTPMP04\n", 8) == 0);   // v5 ⊃ v4 blocks
     const bool v3 = v4 || (ok && std::memcmp(magic, "FTPMP03\n", 8) == 0);   // v4 ⊃ v3 layout
     const bool v2 = ok && std::memcmp(magic, "FTPMP02\n", 8) == 0;
+    // Only the BEAM RECORD differs between v4 and v5; the block structure is identical, which
+    // is why `v4` above stays true for a v5 file and only this flag distinguishes them.
+    const bool narrowBeams = v4 && !v5;
     if (!v3 && !v2) {
         // Name the stale-version case explicitly: a user with a cache from before the
         // split layout should be told to re-deposit, not left guessing.
@@ -176,7 +201,33 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
         if (bm && nBm > 0) {
             ftalloc::resize(bm->beams, (size_t)nBm, "the photon-beam map (-loadmap)",
                             "the beam count the map was saved with");
-            if (std::fread(bm->beams.data(), sizeof(PhotonBeam), (size_t)nBm, f) != (size_t)nBm) {
+            bool rok;
+            if (narrowBeams) {
+                // Widen an FTPMP04 file in place. Read into the frozen old layout a chunk at a
+                // time rather than allocating a second full array: the beam map is routinely
+                // the largest thing in the process, and doubling it to load a file would turn
+                // a working -loadmap into an OOM on exactly the caches big enough to be worth
+                // saving. 64 K records is 3 MB of scratch and one fread per 64 K beams.
+                std::vector<PhotonBeamV4> chunk;
+                rok = true;
+                for (long long done = 0; done < nBm && rok; ) {
+                    const size_t n = (size_t)std::min<long long>(65536, nBm - done);
+                    chunk.resize(n);
+                    rok = std::fread(chunk.data(), sizeof(PhotonBeamV4), n, f) == n;
+                    for (size_t i = 0; rok && i < n; ++i) {
+                        PhotonBeam& b = bm->beams[(size_t)done + i];
+                        const PhotonBeamV4& s = chunk[i];
+                        b.o = s.o; b.d = s.d; b.s0 = s.s0; b.len = s.len; b.power = s.power;
+                        b.lambda = s.lambda; b.absorb = s.absorb; b.med = s.med;
+                        b.nSec = 0;
+                        for (int k = 0; k < kBeamSecMax; ++k) b.lamS[k] = 0.0f;
+                    }
+                    done += (long long)n;
+                }
+            } else {
+                rok = std::fread(bm->beams.data(), sizeof(PhotonBeam), (size_t)nBm, f) == (size_t)nBm;
+            }
+            if (!rok) {
                 std::fprintf(stderr, "[loadmap] %s truncated beam data; ignoring\n", path);
                 pm.photons.clear(); pm.pos.clear(); bm->beams.clear();
                 std::fclose(f); return false;
@@ -185,6 +236,28 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
             bm->nDeposited = (size_t)bDep;
         } else if (bm && nBm == 0 && beamsMissing) {
             *beamsMissing = true;                 // file is v3 but its trace crossed no medium
+        } else if (!bm && nBm > 0) {
+            // The caller does not want beams, but the caustic block comes AFTER them, so the
+            // beam data still has to be stepped over. Without this seek the caustic header was
+            // read out of the middle of the beam array — a `-loadmap` without `-beams` on a
+            // file that HAS beams produced a nonsense caustic count and then either bailed on
+            // a truncation or allocated whatever those bytes happened to spell.
+            const long long recSize = narrowBeams ? (long long)sizeof(PhotonBeamV4)
+                                                  : (long long)sizeof(PhotonBeam);
+            // Stepped in 1 GB hops because `fseek`'s offset is a `long`, which is 32-bit on
+            // Windows: a beam block past 2 GB (entirely reachable with a raised -beamcount)
+            // would otherwise seek to a truncated, wrong offset.
+            long long rem = nBm * recSize;
+            bool sok = true;
+            while (rem > 0 && sok) {
+                const long hop = (long)std::min<long long>(rem, 1LL << 30);
+                sok = std::fseek(f, hop, SEEK_CUR) == 0;
+                rem -= hop;
+            }
+            if (!sok) {
+                std::fprintf(stderr, "[loadmap] %s: cannot skip the beam block; ignoring\n", path);
+                pm.photons.clear(); pm.pos.clear(); std::fclose(f); return false;
+            }
         }
     } else if (bm && beamsMissing) {
         *beamsMissing = true;                     // v2: predates volume support entirely

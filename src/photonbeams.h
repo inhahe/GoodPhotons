@@ -199,6 +199,43 @@
 // make multiple scattering a small change to the transport.
 namespace pbeams { inline int gOrderMax = 0; }
 
+// ------------------------------- SPECTRAL BEAMS ----------------------------------------
+// A deposited beam used to carry ONE wavelength, exactly like a photon. That is defensible
+// for a surface photon — it is a point, so its colour noise is grain, which the eye forgives
+// — and it is NOT defensible for a beam, because a beam is a LINE: one monochromatic deposit
+// lays a saturated streak down its whole length, and the eye reads a coloured line as
+// structure rather than as noise. Measured on the isolation scene (see known-issues.md,
+// "the rain appears vertically striated"), chroma streaking ran 2.4-2.7x luma streaking in
+// EVERY configuration — invariant under a 67x kernel-radius change and a 27x beam-count
+// change, which is the signature of a variance source that neither knob addresses: luma
+// converges with the number of BEAMS, chroma with the number of distinct WAVELENGTHS, and
+// the latter was pinned at one per beam.
+//
+// So a beam now carries a small stratified BUNDLE of wavelengths (hero sampling, hero.h)
+// that all share the one chord. Physically this is exact and not an approximation: the chord
+// a photon cuts through a fog does not depend on its wavelength at all — the geometry is a
+// straight line, the emitter's spectral pdf is proportional to its own SPD (so every
+// wavelength in the bundle carries the SAME power, `power / nLam()`), and everything that IS
+// wavelength-dependent (sigma_s, the phase function, the CIE response) is evaluated at gather
+// time, per wavelength, where it was always evaluated. The bundle therefore costs one extra
+// (lambda, sigma_s, phase, CIE) evaluation per secondary per gathered beam and NOTHING in
+// traversal, transmittance marching or density evaluation — which is where the gather's time
+// actually goes. Against 4x more beams, which buys the same 4x spectral sampling, this is
+// ~3x cheaper and uses ~1/3 the memory.
+//
+// The bundle is kept alive only while the path is provably wavelength-INDEPENDENT (see
+// Renderer::tracePhoton): from birth on a plain SPD-sampled emitter, through empty space and
+// through media whose sigma_t is achromatic. Any surface interaction, any medium scatter, any
+// glass absorption, any GRIN bend and any chromatic extinction collapses it back to the hero
+// wavelength alone (`nSec = 0`), which is bit-for-bit the pre-0.202.0 monochromatic beam. So
+// the feature is strictly additive: it improves the beams it can and changes nothing else.
+constexpr int kBeamSpecMax = 4;                 // wavelengths per beam, hero + secondaries
+constexpr int kBeamSecMax  = kBeamSpecMax - 1;  // secondaries stored in the record
+// Runtime bundle size (`-beamspec`); 1 = off, i.e. the classic monochromatic beam. Defaults
+// ON at the maximum because the deposit is free, the gather is ~1.1x, and the defect it fixes
+// is visible in the very first frame of any beam render.
+namespace pbeams { inline int gSpecC = kBeamSpecMax; }
+
 // One stored photon beam: (a sub-segment of) the path a photon travelled through one medium.
 //
 // Unlike `Photon`, this record DOES carry a direction — it has a reader (the phase
@@ -220,6 +257,16 @@ struct PhotonBeam {
                      // independent Poisson process; see Renderer::sampleMediaCollision), so
                      // each contributes its own sigma_s and its own phase function.
 
+    // SPECTRAL BUNDLE (see the note above). `lamS[0..nSec)` are the stratified SECONDARY
+    // wavelengths this chord also carries; `lambda` is the hero. Every wavelength in the
+    // bundle carries the same power `power / nLam()`, because the emission sampler's pdf is
+    // proportional to the emitter's own SPD, so spd(lambda)/pdf(lambda) is the SPD's integral
+    // for every wavelength alike — there is no per-wavelength weight to store. nSec == 0 is
+    // the classic monochromatic beam and every code path collapses to the old arithmetic.
+    float lamS[kBeamSecMax];
+    int   nSec;
+
+    int  nLam()  const { return nSec + 1; }
     Vec3 begin() const { return o + d * (double)s0; }
     Vec3 end()   const { return o + d * ((double)s0 + (double)len); }
 };
@@ -267,10 +314,19 @@ struct BeamBank {
 
     size_t size() const { return beams.size(); }
 
+    // `lamS`/`nSec` are the spectral bundle's secondaries (see PhotonBeam); pass nSec == 0
+    // for a classic monochromatic deposit, which is what every non-spectral caller does.
     void push(const Vec3& o, const Vec3& d, double len, double power,
-              double lambda, double absorb, int med) {
-        beams.push_back(PhotonBeam{o, d, 0.0f, (float)len, (float)power,
-                                   (float)lambda, (float)absorb, med});
+              double lambda, double absorb, int med,
+              const double* lamS = nullptr, int nSec = 0) {
+        PhotonBeam b;
+        b.o = o; b.d = d;
+        b.s0 = 0.0f; b.len = (float)len; b.power = (float)power;
+        b.lambda = (float)lambda; b.absorb = (float)absorb; b.med = med;
+        if (nSec > kBeamSecMax) nSec = kBeamSecMax;
+        b.nSec = (lamS && nSec > 0) ? nSec : 0;
+        for (int i = 0; i < kBeamSecMax; ++i) b.lamS[i] = (i < b.nSec) ? (float)lamS[i] : 0.0f;
+        beams.push_back(b);
         if (cap && beams.size() >= cap) halve();
     }
 

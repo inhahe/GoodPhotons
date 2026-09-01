@@ -2068,11 +2068,17 @@ render. Closing that means teaching the shared device path to gather in spp chun
   because its buffer is sized from *free VRAM*, so fewer bytes per record is directly more
   photons the GPU can hold (44 → 32 B). The GPU's gather record `DGatherPhoton`
   (render_cuda.cu) is the same idea, and additionally folds
-  `cie*power*norm/pi` into three floats. The `-savemap` cache format is `FTPMP04`
+  `cie*power*norm/pi` into three floats. The `-savemap` cache format is `FTPMP05`
   (header, surface photons, beams, then the caustic map — each version a strict superset of the
   last, so `FTPMP03` and `FTPMP02` files still load, the former with an empty caustic map and the
   latter with no beams either); `FTPMP01` files are rejected with a message telling the user to
-  re-deposit.
+  re-deposit. `FTPMP05` (0.202.0) differs from `FTPMP04` only in the *width* of the beam record —
+  it gained the spectral bundle (below) — so the reader keeps `PhotonBeamV4` frozen in
+  `photonmap_io.h` and widens a `FTPMP04` beam block in 65536-record chunks (chunked so peak
+  memory is not doubled), setting `nSec = 0`. The same pass fixed a latent reader bug: a file with
+  beams loaded by a caller that did not ask for them used to fall straight into reading the caustic
+  header out of the middle of the beam array, and now seeks past the block in 1 GB hops (`fseek`'s
+  offset is a 32-bit `long` on Windows).
   **The mode-M gather radius is density-adaptive** (`PhotonMap::buildAuto`, default on;
   `-nopmauto` or an explicit `-pmradius` opts out bit-identically). `build(r)` sizes the grid
   at `cellSize == r`, so a radius chosen from scene size alone freezes the grid and makes
@@ -2186,7 +2192,8 @@ render. Closing that means teaching the shared device path to gather in spp chun
   map optimised away. Hence a **separate array with its own BVH**, not an extension of
   `Photon`.
   `PhotonBeam` stores a photon's straight crossing of one medium as a segment
-  (`o`, `d`, `s0`, `len`, `power`, `lambda`, `absorb`, `med`) — **one beam per (segment,
+  (`o`, `d`, `s0`, `len`, `power`, `lambda`, `absorb`, `med`, plus the `lamS`/`nSec` spectral
+  bundle added in 0.202.0 — see below) — **one beam per (segment,
   medium) pair**, clipped to that medium's bound. That decomposition is *correct*, not merely
   tidy: `sampleMediaCollision` samples each medium independently and takes the minimum (a
   union of Poisson processes), so in-scatter at a point is the **sum** over the media
@@ -2261,6 +2268,48 @@ render. Closing that means teaching the shared device path to gather in spp chun
   kernel *cheaper* than the old shared-radius one: the reject test becomes `d2·invRad² >= 1`,
   which is the same `(d/r)²` the Epanechnikov kernel needs, where the old code took a `sqrt` to
   get `d` and squared it straight back.
+  **A stored beam is SPECTRAL, not monochromatic (`-beamspec <n>`, default 4, 0.202.0).** The
+  monochromatic record above is defensible for a surface photon and not for a beam: a photon is a
+  *point* and one spectral sample there lays grain, while a beam is a *line* and one spectral
+  sample lays a **saturated streak** down its whole length, which the eye reads as structure.
+  `PhotonBeam` therefore carries `float lamS[kBeamSecMax]` + `int nSec` (hero in `lambda`, up to 3
+  stratified secondaries), and `gatherPhotonBeams` / `dGatherPhotonBeams` fold all of them into XYZ
+  **from the same chord**. Three facts make that nearly free, and each one is load-bearing:
+  (1) **no per-wavelength weight is needed** — `EmissionSampler` samples `p(λ) = SPD(λ)/∫SPD`, so
+  `spd(λ)/pdf(λ) = ∫SPD` independent of λ, and every wavelength in the bundle carries exactly
+  `power/nLam()`; the record stores wavelengths only, and the gather multiplies `invC = 1/nLam()`
+  onto the *end* of the hero weight so the `nSec = 0` case stays bit-identical to pre-0.202.0.
+  (2) **the gather's cost is almost entirely λ-independent** — geometry, `densityAt` (hoisted to
+  one call shared by hero and secondaries) and the two ratio-tracking `mediaTransmittance` marches
+  dominate and are shared; the per-λ tail is `sigma_s(λ)`, `phaseValue(cosθ, λ)` and three CIE
+  lookups, measured at **~1.1×**. (3) **the existing hero machinery could not be reused**:
+  `photonmap_render.h` gates it off with `heroOn = (heroC > 1) && scene.media.empty() && !hasGrin`,
+  i.e. off in exactly the scenes that have beams. So the bundle is a separate, self-contained carry
+  on the scalar tracer, stratified from one variate the same way hero is (`u + i/C` wrapped into
+  `[0,1)` through the same CDF).
+  **Unbiasedness rests on a deliberately conservative liveness rule**: the bundle survives exactly
+  **one** transport iteration — birth on a plain SPD-sampled emitter, through empty space and
+  achromatic media, to the first deposited chord — then collapses to `nSec = 0`. It is retired at
+  GRIN scenes, glass Beer-Lambert absorption, image-env emitters and volumetric (fire) births, and
+  **unconditionally at the end of every loop iteration, outside the beam block** — that placement
+  is the subtle part: if the deposit is skipped (a march hit, a zero-length chord) the photon still
+  goes on to interact, so a bundle left live there would be picked up by a *later* chord after a
+  wavelength-dependent surface event. Scene-wide the feature is gated by `beamSpectralOK(scene)`,
+  which lives in **`scene.h`** (not `photonmap_render.h`, which `render_cuda.cu` cannot include)
+  next to the `Medium` it interrogates: it samples every medium's `sigmaT` at 33 wavelengths and
+  refuses the bundle if any is chromatic, because the *shared* transmittance march would otherwise
+  hand a secondary the hero's attenuation — a bias, not noise.
+  On the **device**, `DBeamRec` quantises secondaries to `u16` as `(λ − 360)·100` over 360–830 nm
+  (0.01 nm, two orders finer than the 1 nm spectral tables) because every byte of that record is
+  8 MB of VRAM *and* 8 MB of innermost-loop traffic at the 8 M sub-beam ceiling; `DBeamSpec` is the
+  in-flight carry threaded through `genPhoton` → `shadeStep` → `dEmitBeams`. Both splitters copy
+  the whole `PhotonBeam` struct, so the bundle propagates through splitting for free.
+  Measured on the isolated rain scene (`-n 60M -spp 16`, both runs producing byte-identical beam
+  maps so the bundle is provably the only difference): luma texture rms 0.08828 → 0.08468 (−4.1 %),
+  chroma 0.17615 → 0.16111 (−8.5 %), with the `_beams_ms` invariant unmoved (ball/ref 1.0865 vs
+  1.0916, rest-of-frame 1.0200 both). A free, unbiased variance reduction — not a large one *in
+  that configuration*, because its gather already averages ~1243 beams per probe ray and so already
+  integrates ~1243 distinct wavelengths; the bundle earns most where the gathered count is low.
   **`-beamcount <n>` (default 1e6) is a ceiling reached by *adaptive* thinning, not by a
   predicted survival rate** — and that distinction was learned the hard way. The first
   version set a fixed `keepProb = n / nPhotons` up front, which silently assumes ~1 beam per
