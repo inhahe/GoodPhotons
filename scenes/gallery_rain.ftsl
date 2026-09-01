@@ -208,6 +208,51 @@
 # path (main.cpp `plainRender`) onto a per-frame fallback that has no GPU implementation at
 # all and rebuilds the map every frame. -checkpoint/-resume stopped breaking it in 0.197.2,
 # but mode M discards them anyway, so just leave them off.
+# SHOWCASE QUALITY under `-mode M -beams`. The command above is a PREVIEW budget (-spp 6,
+# default -beamk 32) and it looks it: the cloud comes out as visible chromatic speckle laid
+# over long straight STREAKS. Measured 2026-09-01 on an RTX 4090 at 0.199.2, 960x540, still
+# camera `cam`, "speckle" = mean |pixel - 3x3 mean| over the cloud crop:
+#
+#     -n 50M  -spp 24 -beamk 256              speckle 7.14, long beam streaks visible
+#     -n 200M -spp 24 -beamk 256              speckle 5.60, streaks GONE
+#     -n 200M -spp 24 -beamk 32               speckle 7.08   <- the cloud is beamk-bound
+#     -n 200M -spp 24 -beamk 256 -denoise     speckle 3.61
+#
+# Read that as three separate knobs, because they fix different artifacts:
+#   * `-n` fixes the STREAKS. A gather point sees ~`-beamk` beams; with too few beams stored
+#     the same long chords are re-gathered by whole runs of neighbouring pixels, so the
+#     variance is spatially CORRELATED and shows as lines rather than grain. More photons =
+#     more, shorter, independent chords. It is one-time cost (the forward pass is shared by
+#     every frame), which makes it by far the best value here.
+#   * `-beamk` fixes the volumetric GRAIN (32 -> 256 nearly halves it). This one is per-frame
+#     and LINEAR, so it is also the main thing you are paying for.
+#   * `-denoise` fixes the residual chroma speckle for ~1% of frame time -- it is the single
+#     best quality-per-second flag in the list. `-fireflies 3` measured the same (4.48 vs
+#     4.46) and additionally clamps, so prefer plain -denoise unless you see fireflies.
+#   * `-pmcount 45` is a SPEEDUP, not a quality knob: the default target grows as the cube
+#     root of the stored count, so -n 200M silently raises it 200 -> 890 photons per surface
+#     gather. Pinning it back to a 200 target measured 3m14 vs 5m47 for a visually identical
+#     frame (floor crop 6.56 vs 6.41 speckle -- i.e. that is texture, not noise).
+#
+# The showcase command, verified running:
+#   ftrace -in scenes/gallery_rain.ftsl -camera fly -mode M -device gpu -beams #          -n 200000000 -pmcount 45 -spp 24 -beamk 256 #          -beamcount 8000000 -beamsplitmax 24000000 -denoise #          -r 960 540 -window-min -keepwindow -interval 15 #          -o png/gallery_rain_showcase.png
+# MEASURED: 153 s/frame => ~25.5 h for the 600-frame loop (against ~50 min for the preview
+# budget above, and ~7.6 h for mode D at -spp 140 -- D is still the reference, this is the
+# "M can look finished too" budget). Scale it by hand: per-frame cost is LINEAR in -spp, in
+# -beamk and in pixels, so halving -spp to 12 halves the loop to ~13 h.
+#
+# WHY 960x540 AND NOT 1080p -- this is a HOST RAM ceiling, not a taste call. The shared
+# mode-M pass holds ONE FILM PER SELECTED CAMERA in RAM for the whole run (600 of them), at
+# 24 B/pixel: 7.5 GB at 960x540, 13.3 GB at 1280x720, 29.9 GB at 1920x1080. Add the photon
+# map (~56 B per DEPOSITED photon: -n 200M deposits 88.2M = 4.9 GB), the beam map (~72 B per
+# beam) and the split array (~1 GB per 8M sub-beams) and 1280x720 with these settings already
+# died on a 64 GB machine -- correctly reported since 0.199.1 as `out of HOST memory ... the
+# buffers that grow with the command line are ...` rather than a bare `bad allocation`.
+# There is no frame-range flag to render the loop in halves, and splitting it across
+# invocations would re-trace the forward pass per chunk (which is the whole point of mode M),
+# so the honest trade at 1080p is a much smaller -n -- and -n is exactly the knob that was
+# buying the most. Hence: deliver at 960x540, or use mode D.
+#
 # Under D this flyby is 600 INDEPENDENT BDPT renders -- D is camera-anchored, it shares nothing
 # across cameras (REFERENCE, "Other modes do NOT save time with multiple cameras"), and the
 # budget flag applies PER FRAME. What IS shared is only the scene build and the exposure
