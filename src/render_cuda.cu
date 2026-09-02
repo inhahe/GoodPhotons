@@ -89,6 +89,7 @@
 #include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
 #include "lighttree.h"    // Conty-Kulla light BVH: the SAME traversal the CPU runs, not a copy
 #include "parallel.h"     // ft::stopRequested — cooperative `-stop` between deposit chunks
+#include "duration.h"     // humanDur: "[[[dd:]hh:]mm:]ss" for the stall watchdog's elapsed times
                           // (the header is dependency-free and __host__ __device__ for this)
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
@@ -15498,17 +15499,18 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
             if (el < nextWarn) continue;
             if (!warned) {
                 std::fprintf(stderr,
-                    "\n[gpu-stall] one %lld-spp chunk has been running on the GPU for %.0f s "
+                    "\n[gpu-stall] one %lld-spp chunk has been running on the GPU for %s "
                     "(target is 0.15 s).\n"
                     "[gpu-stall] The render is NOT hung, but until this chunk returns it "
                     "cannot write the -interval image, end on -time, or answer -stop.\n"
                     "[gpu-stall] The usual cause is another process saturating the GPU: check "
                     "`nvidia-smi` for a second CUDA program. Run with -device cpu to sidestep "
                     "it, or free the card.\n",
-                    launchSpp.load(std::memory_order_relaxed), el);
+                    launchSpp.load(std::memory_order_relaxed), humanDur(el).c_str());
                 warned = true;
             } else {
-                std::fprintf(stderr, "[gpu-stall] still in the same chunk after %.0f s.\n", el);
+                std::fprintf(stderr, "[gpu-stall] still in the same chunk after %s.\n",
+                             humanDur(el).c_str());
             }
             std::fflush(stderr);
             nextWarn = el + 60.0;               // then once a minute, so it stays visible

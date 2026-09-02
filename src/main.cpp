@@ -207,6 +207,8 @@ extern "C" {
     void           stbi_image_free(void* retval_from_stbi_load);
 }
 
+#include "duration.h"           // humanDur: "[[[dd:]hh:]mm:]ss" for every elapsed/ETA print
+
 // Case-insensitive test for a filename ending in `ext` (e.g. ".png").
 static bool endsWithCI(const std::string& s, const char* ext) {
     size_t n = std::strlen(ext);
@@ -11568,10 +11570,11 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
         r = g_beamRadiusAbs;
         std::printf("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g "
                     "(-beamradius), mean split %.4g, box area %.4g -> %.4g m^2 (%.2fx), "
-                    "BVH in %.1fs\n", tag, raw, bm.beams.size(), r, meanSplit,
+                    "BVH in %s\n", tag, raw, bm.beams.size(), r, meanSplit,
                     areaBefore, bm.totalBoxArea(),
                     areaBefore > 0 ? bm.totalBoxArea() / areaBefore : 1.0,
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                    humanDur(std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0).count()).c_str());
     } else {
         const BeamMap::AutoInfo ai =
             bm.buildAuto(g_beamBlur, g_beamK, g_beamAreaSlack, splitBudget, g_beamSplitLen, work);
@@ -11592,14 +11595,15 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
         // makes a change to the split rule verifiable instead of asserted.
         std::printf("%s photon beams: %zu stored -> %zu after split, a probe ray gathers %.1f "
                     "beams (%.1f at the raw mfp radii; -beamk floor %.0f)%s%s, mean split %.4g, "
-                    "box area %.4g -> %.4g m^2 (%.3fx)%s, BVH in %.1fs\n",
+                    "box area %.4g -> %.4g m^2 (%.3fx)%s, BVH in %s\n",
                     tag, ai.rawBeams, ai.outBeams, ai.probeK, ai.probeK0, ai.targetK,
                     ai.floorScale > 1.0001 ? " [floor raised the radii]" : "",
                     ai.slackScale < 0.9999 ? " [-beamareaslack capped them]" : "",
                     ai.splitLen, ai.areaBefore, ai.areaAfter,
                     ai.areaBefore > 0 ? ai.areaAfter / ai.areaBefore : 1.0,
                     ai.budgetBit ? " [split limited by -beamsplitmax, not by the rule]" : "",
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                    humanDur(std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0).count()).c_str());
         if (ai.budgetBit)
             std::printf("%s   raise -beamsplitmax for a tighter (faster) BVH at more memory, "
                         "or lower -beamcount to get there for free.\n", tag);
@@ -13633,10 +13637,11 @@ static std::string pmGatherStatus(const Film& f, long long sppDone, long long sp
         s = fb;
     }
     char b[220];
-    std::snprintf(b, sizeof b, "[gather] %lld / %lld spp (%.0f%%), %s photons, %.1fs, ~%.2f%% noise",
+    std::snprintf(b, sizeof b, "[gather] %lld / %lld spp (%.0f%%), %s photons, %s, ~%.2f%% noise",
                   sppDone, sppTotal,
                   sppTotal > 0 ? 100.0 * (double)sppDone / (double)sppTotal : 0.0,
-                  humanCount((double)photons).c_str(), elapsed, filmNoisePct(f));
+                  humanCount((double)photons).c_str(), humanDur(elapsed).c_str(),
+                  filmNoisePct(f));
     return s + b;
 }
 
@@ -13769,19 +13774,20 @@ static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
             // sample IS the sky probe, the 5.3k/s that was never true of anything.
             if (rate > 0.0)
                 std::snprintf(b, sizeof b,
-                              "%s \xE2\x80\x94 %s / %s (%.0f%%), %.0fs, %s/s, ~%.0fs left",
+                              "%s \xE2\x80\x94 %s / %s (%.0f%%), %s, %s/s, ~%s left",
                               text, humanCount((double)done).c_str(),
                               humanCount((double)total).c_str(),
-                              100.0 * (double)done / (double)total, elapsed,
-                              humanCount(rate).c_str(), (double)(total - done) / rate);
+                              100.0 * (double)done / (double)total,
+                              humanDur(elapsed).c_str(), humanCount(rate).c_str(),
+                              humanDur((double)(total - done) / rate).c_str());
             else
                 std::snprintf(b, sizeof b,
-                              "%s \xE2\x80\x94 %s / %s (%.0f%%), %.0fs, measuring\xE2\x80\xA6",
+                              "%s \xE2\x80\x94 %s / %s (%.0f%%), %s, measuring\xE2\x80\xA6",
                               text, humanCount((double)done).c_str(),
                               humanCount((double)total).c_str(),
-                              100.0 * (double)done / (double)total, elapsed);
+                              100.0 * (double)done / (double)total, humanDur(elapsed).c_str());
         } else {
-            std::snprintf(b, sizeof b, "%s\xE2\x80\xA6 %.0fs", text, elapsed);
+            std::snprintf(b, sizeof b, "%s\xE2\x80\xA6 %s", text, humanDur(elapsed).c_str());
         }
         if (wantWin) {
             // Draw the image-so-far when the phase has one. The placeholder stays the answer
@@ -14537,17 +14543,18 @@ static int runSppProgressive(
             const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
             char st[220];
             if (runForever)
-                std::snprintf(st, sizeof st, "[forever] %.1fs, %lld spp, %s%s",
-                              elapsed, totalSpp, nz, why);
+                std::snprintf(st, sizeof st, "[forever] %s, %lld spp, %s%s",
+                              humanDur(elapsed).c_str(), totalSpp, nz, why);
             else if (timeBudgetSec > 0.0)
-                std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld spp, %s%s",
-                              elapsed, timeBudgetSec, totalSpp, nz, why);
+                std::snprintf(st, sizeof st, "[time] %s / %s, %lld spp, %s%s",
+                              humanDur(elapsed).c_str(), humanDur(timeBudgetSec).c_str(),
+                              totalSpp, nz, why);
             else if (noiseTarget > 0.0)
-                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld spp, %s%s",
-                              noiseTarget, elapsed, totalSpp, nz, why);
+                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %s, %lld spp, %s%s",
+                              noiseTarget, humanDur(elapsed).c_str(), totalSpp, nz, why);
             else
-                std::snprintf(st, sizeof st, "[spp] %lld / %lld, %.1fs, %s",
-                              totalSpp, baseSpp + sppReq, elapsed, nz);
+                std::snprintf(st, sizeof st, "[spp] %lld / %lld, %s, %s",
+                              totalSpp, baseSpp + sppReq, humanDur(elapsed).c_str(), nz);
             if (wantSave) {
                 // The converged/stopping frame owns the exposure anchor; intermediate frames
                 // auto-expose independently (they only refine, never lock the anchor).
@@ -14733,17 +14740,18 @@ static int runCompositeProgressive(
             const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
             char st[220];
             if (runForever)
-                std::snprintf(st, sizeof st, "[forever] %.1fs, %lld photons / %lld spp, ~%.2f%% noise%s",
-                              elapsed, acc.N, acc.spp, noisePct, why);
+                std::snprintf(st, sizeof st, "[forever] %s, %lld photons / %lld spp, ~%.2f%% noise%s",
+                              humanDur(elapsed).c_str(), acc.N, acc.spp, noisePct, why);
             else if (timeBudgetSec > 0.0)
-                std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld photons / %lld spp, ~%.2f%% noise%s",
-                              elapsed, timeBudgetSec, acc.N, acc.spp, noisePct, why);
+                std::snprintf(st, sizeof st, "[time] %s / %s, %lld photons / %lld spp, ~%.2f%% noise%s",
+                              humanDur(elapsed).c_str(), humanDur(timeBudgetSec).c_str(),
+                              acc.N, acc.spp, noisePct, why);
             else if (noiseTarget > 0.0)
-                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld photons / %lld spp, ~%.2f%% noise%s",
-                              noiseTarget, elapsed, acc.N, acc.spp, noisePct, why);
+                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %s, %lld photons / %lld spp, ~%.2f%% noise%s",
+                              noiseTarget, humanDur(elapsed).c_str(), acc.N, acc.spp, noisePct, why);
             else
-                std::snprintf(st, sizeof st, "[spp] %lld / %lld spp (%lld / %lld photons), %.1fs, ~%.2f%% noise",
-                              acc.spp, sppReq, acc.N, Nreq, elapsed, noisePct);
+                std::snprintf(st, sizeof st, "[spp] %lld / %lld spp (%lld / %lld photons), %s, ~%.2f%% noise",
+                              acc.spp, sppReq, acc.N, Nreq, humanDur(elapsed).c_str(), noisePct);
             if (wantSave) {
                 persist(comp, done);
                 lastSave = clk::now();
@@ -15313,9 +15321,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                          (double)res * (double)resY * (double)(spp > 0 ? spp : 16));
         }
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
-        std::printf("mode M: deposited %zu photons from %lld emitted in %.1fs; "
+        std::printf("mode M: deposited %zu photons from %lld emitted in %s; "
                     "grid %dx%dx%d. Gathering camera pass at %dx%d ...\n",
-                    pm.photons.size(), pm.nEmitted, buildSec, pm.nx, pm.ny, pm.nz, res, resY);
+                    pm.photons.size(), pm.nEmitted, humanDur(buildSec).c_str(),
+                    pm.nx, pm.ny, pm.nz, res, resY);
         if (pm.photons.empty())
             std::fprintf(stderr, "[mode M] warning: 0 photons deposited — no diffuse "
                                  "surfaces reached? The image will be black.\n");
@@ -15655,17 +15664,18 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                 : totalDone ? " (done)" : "";
                 char st[220];
                 if (chunkFixed)
-                    std::snprintf(st, sizeof st, "[live] %.1fs, %lld / %lld photons, ~%.1f%% noise%s",
-                                  elapsed, acc.N, N, noisePct, why);
+                    std::snprintf(st, sizeof st, "[live] %s, %lld / %lld photons, ~%.1f%% noise%s",
+                                  humanDur(elapsed).c_str(), acc.N, N, noisePct, why);
                 else if (runForever)
-                    std::snprintf(st, sizeof st, "[forever] %.1fs elapsed, %lld batches, %lld photons, ~%.1f%% noise%s",
-                                  elapsed, batches, acc.N, noisePct, why);
+                    std::snprintf(st, sizeof st, "[forever] %s elapsed, %lld batches, %lld photons, ~%.1f%% noise%s",
+                                  humanDur(elapsed).c_str(), batches, acc.N, noisePct, why);
                 else if (timeBudgetSec > 0.0)
-                    std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld batches, %lld photons, ~%.1f%% noise%s",
-                                  elapsed, timeBudgetSec, batches, acc.N, noisePct, why);
+                    std::snprintf(st, sizeof st, "[time] %s / %s, %lld batches, %lld photons, ~%.1f%% noise%s",
+                                  humanDur(elapsed).c_str(), humanDur(timeBudgetSec).c_str(),
+                                  batches, acc.N, noisePct, why);
                 else
-                    std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld batches, %lld photons, ~%.1f%% noise%s",
-                                  noiseTarget, elapsed, batches, acc.N, noisePct, why);
+                    std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %s, %lld batches, %lld photons, ~%.1f%% noise%s",
+                                  noiseTarget, humanDur(elapsed).c_str(), batches, acc.N, noisePct, why);
                 if (preview || wantWin) {
                     auto tPrep = clk::now();
                     Film disp = acc.film;
@@ -18460,8 +18470,9 @@ static int run(int argc, char** argv) {
             };
             prims = raster::tessellate(scene, rasterIso, tessProgress, rasterCurveBudget);
             auto rt1 = std::chrono::steady_clock::now();
-            std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",
-                        prims.size(), std::chrono::duration<double>(rt1 - rt0).count(),
+            std::printf("[raster] %zu triangles in %s; rendering %zu camera(s) on %d threads%s\n",
+                        prims.size(),
+                        humanDur(std::chrono::duration<double>(rt1 - rt0).count()).c_str(),
                         toRender.size(), nThreads, g_showWindow ? " — live window" : "");
             std::fflush(stdout);
         };
@@ -18777,8 +18788,9 @@ static int run(int argc, char** argv) {
         }
         auto ft1 = std::chrono::steady_clock::now();
         double secs = std::chrono::duration<double>(ft1 - ft0).count();
-        std::printf("[raster] done: %d frame(s) in %.2fs (%.1f fps).\n",
-                    frame, secs, frame > 0 ? frame / std::max(secs, 1e-6) : 0.0);
+        std::printf("[raster] done: %d frame(s) in %s (%.1f fps).\n",
+                    frame, humanDur(secs).c_str(),
+                    frame > 0 ? frame / std::max(secs, 1e-6) : 0.0);
 
         // ---------------------------------------------------------------------------
         // Interactive raster viewer. For a single still camera shown in a live window,
@@ -20984,17 +20996,18 @@ static int run(int argc, char** argv) {
                                     : totalDone ? " (done)" : "";
                     char st[240];
                     if (chunkFixed)
-                        std::snprintf(st, sizeof st, "[live] %.1fs, %lld / %lld photons, %d cams, ~%.1f%% noise%s",
-                                      elapsed, accN, N, nc, noisePct, why);
+                        std::snprintf(st, sizeof st, "[live] %s, %lld / %lld photons, %d cams, ~%.1f%% noise%s",
+                                      humanDur(elapsed).c_str(), accN, N, nc, noisePct, why);
                     else if (runForever)
-                        std::snprintf(st, sizeof st, "[forever] %.1fs, %lld batches, %lld photons, %d cams, ~%.1f%% noise%s",
-                                      elapsed, batches, accN, nc, noisePct, why);
+                        std::snprintf(st, sizeof st, "[forever] %s, %lld batches, %lld photons, %d cams, ~%.1f%% noise%s",
+                                      humanDur(elapsed).c_str(), batches, accN, nc, noisePct, why);
                     else if (timeBudgetSec > 0.0)
-                        std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld photons, %d cams, ~%.1f%% noise%s",
-                                      elapsed, timeBudgetSec, accN, nc, noisePct, why);
+                        std::snprintf(st, sizeof st, "[time] %s / %s, %lld photons, %d cams, ~%.1f%% noise%s",
+                                      humanDur(elapsed).c_str(), humanDur(timeBudgetSec).c_str(),
+                                      accN, nc, noisePct, why);
                     else
-                        std::snprintf(st, sizeof st, "[noise] ~%.2g%% target, %.1fs, %lld photons, %d cams, ~%.1f%% noise%s",
-                                      noiseTarget, elapsed, accN, nc, noisePct, why);
+                        std::snprintf(st, sizeof st, "[noise] ~%.2g%% target, %s, %lld photons, %d cams, ~%.1f%% noise%s",
+                                      noiseTarget, humanDur(elapsed).c_str(), accN, nc, noisePct, why);
                     if (preview || wantWin) {
                         auto tPrep = clk::now();
                         Film disp = acc[0];
@@ -21346,10 +21359,10 @@ static int run(int argc, char** argv) {
             buildBeamMap(bmap, "[camera]", work);
         }
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
-        std::printf("[camera] photon map: %zu photons (+%zu caustic) from %lld emitted in %.1fs, "
+        std::printf("[camera] photon map: %zu photons (+%zu caustic) from %lld emitted in %s, "
                     "radius %.4g (caustic %.4g) — gathering %zu cameras ...\n",
-                    pm.photons.size(), pmC.photons.size(), pm.nEmitted, buildSec,
-                    pm.radius, pmC.radius, idx.size());
+                    pm.photons.size(), pmC.photons.size(), pm.nEmitted,
+                    humanDur(buildSec).c_str(), pm.radius, pmC.radius, idx.size());
         if (pm.photons.empty())
             std::fprintf(stderr, "[mode M] warning: 0 photons deposited — images "
                                  "will be black.\n");
