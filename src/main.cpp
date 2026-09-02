@@ -11558,6 +11558,45 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
     if (bm.nDeposited > raw)
         std::printf("%s photon beams: %zu collected, trimmed to %zu by -beamcount "
                     "(survivors rescaled, unbiased)\n", tag, bm.nDeposited, raw);
+    // ACHROMATIC-PATH FOLD COVERAGE (-beamachro, photonbeams.h). Reported BY POWER as well as
+    // by count, and the power figure is the one that matters: the fold removes the chromatic
+    // variance of the beams it covers and does nothing at all for the rest, so what is left in
+    // the image is set by how much ENERGY is still monochromatic, not by how many records are.
+    // A handful of bright unfolded beams is exactly what draws a saturated streak across an
+    // otherwise grey cloud, and a count-only figure would report that as a rounding error.
+    // Silent when the flag is off or when no beam qualified, so a scene the fold cannot help
+    // (a chromatic medium, an image environment) says nothing rather than printing two zeros.
+    //
+    // Collected PER MEDIUM, and printed on the per-medium line below, because the fold's third
+    // condition IS per medium: a scene holding an achromatic cloud and a `phase rainbow` rain
+    // curtain has one medium at ~90% and one at a structural 0%, and a single blended figure
+    // would read as "half broken" when both media are behaving exactly as designed. The split
+    // also localises the diagnosis — a cloud below ~90% means paths are arriving via surfaces
+    // or via the chromatic medium, which is a fact about the scene, not about the fold.
+    std::vector<size_t> foldN;
+    std::vector<double> foldP, foldPT;
+    if (pbeams::gAchro && raw) {
+        for (const PhotonBeam& b : bm.beams) {
+            const size_t m = (size_t)(b.med < 0 ? 0 : b.med);
+            if (m >= foldN.size()) { foldN.resize(m + 1, 0); foldP.resize(m + 1, 0.0); foldPT.resize(m + 1, 0.0); }
+            // Energy, not power: a long beam lays a long streak, so `power * len` is what the
+            // image actually sees and what a "% by power" figure has to weight by.
+            const double p = (double)b.power * (double)b.len;
+            foldPT[m] += p;
+            if (b.achro) { ++foldN[m]; foldP[m] += p; }
+        }
+    }
+    // "n/a" rather than "0.0%" for a medium the fold structurally cannot serve, so a rainbow
+    // curtain reads as out of scope instead of as a failure. `-beamachro off` prints nothing.
+    auto foldStr = [&](size_t m, size_t n) -> std::string {
+        if (!pbeams::gAchro || m >= foldN.size() || !n) return std::string();
+        if (!foldN[m]) return std::string(", achromatic fold n/a");
+        char buf[128];
+        std::snprintf(buf, sizeof buf, ", %.1f%% folded achromatically (%.1f%% by power)",
+                      100.0 * (double)foldN[m] / (double)n,
+                      foldPT[m] > 0 ? 100.0 * foldP[m] / foldPT[m] : 0.0);
+        return std::string(buf);
+    };
     const size_t splitBudget = g_beamSplitMax > 0 ? (size_t)g_beamSplitMax : 0;
     if (g_beamRadiusAbs > 0.0) {
         // Explicit radius: one value for every medium, but still split by the same
@@ -11575,6 +11614,17 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
                     areaBefore > 0 ? bm.totalBoxArea() / areaBefore : 1.0,
                     humanDur(std::chrono::duration<double>(
                                  std::chrono::steady_clock::now() - t0).count()).c_str());
+        // `-beamradius` has no per-medium line to hang the fold coverage on, so report it
+        // summed. The per-medium breakdown is the informative one (see foldStr above); this
+        // branch is the expert override, and losing the breakdown is part of overriding.
+        if (!foldN.empty()) {
+            size_t nA = 0; double pA = 0, pT = 0;
+            for (size_t m = 0; m < foldN.size(); ++m) { nA += foldN[m]; pA += foldP[m]; pT += foldPT[m]; }
+            if (nA)
+                std::printf("%s photon beams: %zu of %zu folded achromatically (%.1f%% by count,"
+                            " %.1f%% by power) — -beamachro\n", tag, nA, raw,
+                            100.0 * (double)nA / (double)raw, pT > 0 ? 100.0 * pA / pT : 0.0);
+        }
     } else {
         const BeamMap::AutoInfo ai =
             bm.buildAuto(g_beamBlur, g_beamK, g_beamAreaSlack, splitBudget, g_beamSplitLen, work);
@@ -11586,8 +11636,9 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
             const BeamMap::MedStat& s = ai.med[m];
             if (!s.n) continue;
             std::printf("%s photon beams: medium %zu: %zu chords, mean free path %.4g m "
-                        "-> kernel radius %.4g m (%.3g x mfp)\n",
-                        tag, m, s.n, s.mfp, s.r, s.mfp > 0 ? s.r / s.mfp : 0.0);
+                        "-> kernel radius %.4g m (%.3g x mfp)%s\n",
+                        tag, m, s.n, s.mfp, s.r, s.mfp > 0 ? s.r / s.mfp : 0.0,
+                        foldStr(m, s.n).c_str());
         }
         // `box area` is the cost metric, not a curiosity: a camera ray's expected box-entry
         // count — which measurement showed IS the gather's cost, far more than the number of
@@ -17172,6 +17223,15 @@ static int run(int argc, char** argv) {
             // most the format can carry is the useful reading of "as spectral as possible".
             int c = std::atoi(argv[++i]);
             pbeams::gSpecC = (c < 1) ? 1 : (c > kBeamSpecMax ? kBeamSpecMax : c);
+        }
+        // ACHROMATIC-PATH BEAMS (photonbeams.h). On by default; the argument is optional so
+        // both `-beamachro off` and a bare `-beamachro` read the way they look.
+        else if (!std::strcmp(argv[i], "-beamachro")) {
+            pbeams::gAchro = true;
+            if (i + 1 < argc && (!std::strcmp(argv[i + 1], "off") ||
+                                 !std::strcmp(argv[i + 1], "0"))) { pbeams::gAchro = false; ++i; }
+            else if (i + 1 < argc && (!std::strcmp(argv[i + 1], "on") ||
+                                      !std::strcmp(argv[i + 1], "1"))) ++i;
         }
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-window-min") || !std::strcmp(argv[i], "-minimized")) {

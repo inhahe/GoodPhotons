@@ -136,6 +136,10 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     // to deposit into at all.
     const int beamSpecC = (bm && pbeams::gSpecC > 1 && beamSpectralOK(scene))
                               ? std::min(pbeams::gSpecC, kBeamSpecMax) : 1;
+    // ACHROMATIC-PATH BEAMS. Same scene-wide extinction test, asked without the `-beamspec`
+    // condition — the mean-CIE fold stores no extra wavelengths, so `-beamspec 1` gets it too
+    // (photonbeams.h, ACHROMATIC-PATH BEAMS).
+    const bool beamAchroOK = bm && pbeams::gAchro && beamSpectralOK(scene);
 
     // Published photon count for `stage`. Written by the workers on the SAME 4096-photon
     // cadence as the stop poll (one relaxed fetch_add per 4096 photons is unmeasurable next
@@ -164,6 +168,7 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         r.aimMap = aim; r.aimMisRatio = aimRatio;
         r.useHero = heroOn; r.heroC = heroC;
         r.beamSpecC = aimed ? 1 : beamSpecC;
+        r.beamAchroOK = !aimed && beamAchroOK;
         Pcg32 rng;
         const long long Np = aimed ? nAimed : N;
         const uint64_t salt = aimed ? 0x94D049BB133111EBULL : 0xEB44ACCAB455D165ULL;

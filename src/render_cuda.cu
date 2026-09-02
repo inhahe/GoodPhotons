@@ -781,6 +781,11 @@ struct DMedium {
     const double*     rbCdf;          // per-lambda CDF over mu for importance sampling
     int               rbNLam, rbNMu;  // table dimensions
     double            rbLam0, rbDLam; // wavelength axis origin/step (nm)
+    // ACHROMATIC-PATH BEAMS (photonbeams.h / scene.h mediumAchromatic): 1 when this medium's
+    // gather-time spectral tail — sigma_s and the phase function — is flat in lambda, so a
+    // beam lying in it can be folded at the emitter's mean CIE with no chromatic variance.
+    // Baked host-side because it is a whole-band scan of two Spectrum objects.
+    int               achro;
 };
 
 // One triangle of a Mesh emitter (mirrors host EmitTri): v0 + two edge vectors, the
@@ -824,6 +829,9 @@ struct DEmitter {
     // wavelength-integrated radiance the spectral estimator converges to (the
     // p(lambda)*invPdfLambda cancellation), so NEE folds it in with no per-wavelength term.
     DVec3  rgbEmit;
+    // ACHROMATIC-PATH BEAMS (photonbeams.h): this emitter's SPD-weighted mean CIE, i.e. the
+    // expectation of CIE(lambda) under its own emission sampler. Host twin: Emitter::cieMean.
+    DVec3  cieMean;
 };
 
 // PBRT's IsDeltaLight (device twin of bdpt.h isDeltaEmitter): this emitter's emission
@@ -4621,6 +4629,11 @@ struct DBeamDep {
     // stores floats — a packed encode here would have to be undone immediately.
     float lamS[3];
     int   nSec;               // 0 = classic monochromatic beam
+    // ACHROMATIC-PATH FOLD (photonbeams.h). 1 => `cieA` is the emitter's mean CIE and the
+    // gather must fold this beam at it instead of at CIE(lambda). Mutually exclusive with
+    // the bundle above, which it supersedes exactly.
+    float cieA[3];
+    int   achro;
 };
 
 // The photon's LIVE spectral bundle, carried down the path by the forward tracer and handed
@@ -4634,6 +4647,21 @@ struct DBeamDep {
 struct DBeamSpec {
     Real lam[3];
     int  n = 0;
+    // ---- ACHROMATIC-PATH STATE (photonbeams.h, ACHROMATIC-PATH BEAMS) --------------------
+    // `achro` is the STRONGER of the two claims this struct carries, and it is why the
+    // retirement rule below is not simply "one step". The bundle (`n`) is retired after one
+    // transport iteration because the record has no per-wavelength weights to track a
+    // divergence with; `achro` instead asserts that NOTHING HAS DIVERGED — that the path from
+    // this emitter to here is provably wavelength-independent — and that claim survives every
+    // event which is itself wavelength-independent. In an achromatic HG medium a scatter is
+    // exactly that: the free flight uses an achromatic sigma_t, the direction comes from `g`
+    // alone, and the albedo weight is flat. So `achro` rides through hundreds of cloud
+    // scatters where the bundle cannot, which is the whole reason it exists — see the
+    // measurement in known-issues.md, where the bundle reached ~1 beam in 278.
+    //
+    // `cie` is the emitter's Emitter::cieMean, carried so the deposit needs no emitter index.
+    DVec3 cie{0, 0, 0};
+    int   achro = 0;
 };
 
 // ---- AIMED CAUSTIC EMISSION (device twin of caim::AimMap, causticaim.h) ------------------
@@ -4697,6 +4725,13 @@ struct DCamSet {
     // this only when the scene can honour it (achromatic extinction — beamSpectralOK in
     // photonmap_render.h), so the device never has to re-derive the gate.
     int                 beamSpecC = 1;
+    // ACHROMATIC-PATH BEAMS (photonbeams.h). Scene-wide permission for the mean-CIE fold:
+    // every medium's EXTINCTION is wavelength-independent, so a free flight anywhere in the
+    // scene samples the same distance for every wavelength and the photon's path — not merely
+    // its colour — is provably lambda-invariant. Same predicate as beamSpecC's (scene.h
+    // beamSpectralOK), asked separately because this fold does not need `-beamspec > 1`: it
+    // stores no extra wavelengths, so a `-beamspec 1` render still gets it.
+    bool                beamAchroOK = false;
     // AIMED CAUSTIC PASS (CLI -causticn, causticaim.h). See DAimMap above.
     DAimMap aim;
     // Cross media STRAIGHT without storing beams. The aimed caustic pass must transport by the
@@ -5112,8 +5147,21 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
             bd.lambda = (float)lambda;
             bd.absorb = (float)aGlass;
             bd.med    = i;
-            bd.nSec   = spec ? spec->n : 0;
-            for (int j = 0; j < 3; ++j) bd.lamS[j] = (spec && j < spec->n) ? (float)spec->lam[j] : 0.f;
+            // ACHROMATIC-PATH FOLD, decided per DEPOSITED BEAM rather than per photon,
+            // because the two conditions live in different places: the PATH being
+            // wavelength-independent is a property of the photon (spec->achro), while the
+            // gather-time tail being flat is a property of THIS medium (md.achro). A photon
+            // crossing gallery_rain's achromatic cloud and its chromatic rainbow rain in the
+            // same step deposits one beam of each kind, and only the cloud one may fold.
+            const int achro = (spec && spec->achro && sc.media[i].achro) ? 1 : 0;
+            bd.achro  = achro;
+            bd.cieA[0] = achro ? (float)spec->cie.x : 0.f;
+            bd.cieA[1] = achro ? (float)spec->cie.y : 0.f;
+            bd.cieA[2] = achro ? (float)spec->cie.z : 0.f;
+            // The bundle is redundant against the mean it was approximating: suppress it so
+            // the record's power is not also divided by nLam (photonbeams.h push()).
+            bd.nSec   = (spec && !achro) ? spec->n : 0;
+            for (int j = 0; j < 3; ++j) bd.lamS[j] = (j < bd.nSec) ? (float)spec->lam[j] : 0.f;
             cs.beamOut[k] = bd;
         }
     }
@@ -6934,7 +6982,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
                                  int camMode, DRng& rng,
                                  DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted,
                                  DBeamSpec* spec = nullptr, Real* causticW = nullptr) {
-    if (spec) spec->n = 0;
+    if (spec) { spec->n = 0; spec->achro = 0; spec->cie = DVec3{0, 0, 0}; }
     if (causticW) *causticW = (Real)1;
     // ROADMAP C3: split birth between surface/point/env emitters and volumetric "fire"
     // emission by power. grandTotal = totalPower + totalEmissionPower; the volumeBirth
@@ -7121,6 +7169,15 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
             if (!(pI > 0)) { spec->n = 0; break; }
             spec->lam[spec->n++] = lI;
         }
+    }
+    // ACHROMATIC-PATH STATE at birth. The gate is the SAME one the bundle uses — and for the
+    // same reason, since both rest on `beta` being wavelength-independent — but it does not
+    // need `-beamspec > 1`, because the mean-CIE fold is not a bundle and costs no record
+    // space. A photon born on an emitter with no visible-band energy has cieMean {0,0,0},
+    // which would fold every beam it lays down to black, so that case stays monochromatic.
+    if (spec && cs.beamAchroOK && cs.beamCount && !envImage && !sc.hasGrin) {
+        const DVec3 cm = em.cieMean;
+        if (cm.x > 0 || cm.y > 0 || cm.z > 0) { spec->cie = cm; spec->achro = 1; }
     }
 
     // Connect the emitter itself to the camera (makes the source visible): model
@@ -7462,7 +7519,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
             // secondaries the hero's absorption would be a bias, not noise, so a beam that
             // runs inside an absorbing dielectric goes back to monochromatic. (Host twin:
             // the `specSec = 0` beside Renderer::tracePhoton's glass Beer-Lambert.)
-            if (spec) spec->n = 0;
+            // The achromatic-path claim dies here for the same reason and a stronger one:
+            // `beta` itself has just been multiplied by a wavelength-dependent factor, so the
+            // photon no longer represents the whole band at equal power.
+            if (spec) { spec->n = 0; spec->achro = 0; }
         }
     }
 
@@ -7539,7 +7599,25 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     // bundle left live here would be picked up by a LATER chord's deposit — after a
     // wavelength-dependent surface event, where the shared geometry argument no longer holds.
     // One retirement per step, unconditionally, is what makes the rule airtight.
-    if (spec) spec->n = 0;
+    //
+    // THE ACHROMATIC-PATH FLAG IS RETIRED BY A WEAKER RULE, and that difference is the whole
+    // point of it. The bundle has to die every step because the record stores wavelengths with
+    // no weights, so it cannot represent a path where the wavelengths have started to diverge.
+    // `achro` claims instead that they have NOT diverged, and an event that is itself
+    // wavelength-independent leaves that claim true. A scatter in an achromatic medium is
+    // exactly such an event: the free flight that reached it used an achromatic sigma_t, the
+    // albedo roulette below reads a flat albedo, and dMedPhaseSample takes its direction from
+    // `g` alone. Everything else — any surface interaction, an escape, a rainbow or otherwise
+    // chromatic medium — does diverge, so the flag dies.
+    //
+    // This is what makes the mean-CIE fold reach a cloud at all. gallery_rain's cloud has
+    // albedo 0.9964, so a photon inside it scatters of the order of 278 times before it is
+    // absorbed; under the bundle's one-step rule only the FIRST of those ~278 chords was ever
+    // spectral, which is why `-beamspec 4` measured -8.5% chroma there and nothing more.
+    if (spec) {
+        spec->n = 0;
+        if (spec->achro && !(mediumEvent && sc.media[scatterMed].achro)) spec->achro = 0;
+    }
 
     if (mediumEvent) {
         const DMedium& sm = sc.media[scatterMed];
@@ -14660,6 +14738,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.emitPat = e.emitPat;             // `emit pattern:` profile over this emitter
         bakeSpec(e.spdFn, de.emitSpd);       // BDPT: baked emission SPD for Le(lambda)
         { Vec3 le = rgbbake::emitToRgb(e.spdFn); de.rgbEmit = {le.x, le.y, le.z}; }  // fast RGB backward
+        de.cieMean = {e.cieMean.x, e.cieMean.y, e.cieMean.z};   // achromatic-path beam fold
         cdfAll.insert(cdfAll.end(), e.spd.cdf.begin(), e.spd.cdf.end());
         dems.push_back(de);
     }
@@ -14954,6 +15033,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                 dm.rbPdf = nullptr; dm.rbCdf = nullptr;
                 dm.rbNLam = dm.rbNMu = 0; dm.rbLam0 = 0.0; dm.rbDLam = 1.0;
             }
+            dm.achro = mediumAchromatic(m) ? 1 : 0;   // achromatic-path beam fold (scene.h)
         }
         sc.media  = dmeds.empty() ? nullptr : (const DMedium*)keep(uploadVec(dmeds));
         sc.mediaN = (int)dmeds.size();
@@ -16451,6 +16531,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             // rather than on the device so the device never has to walk the media spectra.
             cs.beamSpecC = (pbeams::gSpecC > 1 && beamSpectralOK(scene))
                                ? std::min(pbeams::gSpecC, kBeamSpecMax) : 1;
+            // ACHROMATIC-PATH BEAMS: the same scene-wide extinction test, asked without the
+            // `-beamspec` condition (see DCamSet::beamAchroOK).
+            cs.beamAchroOK = pbeams::gAchro && beamSpectralOK(scene);
         }
         (aimedPass ? aimEmitted : depEmitted) = Nq;
         if (!splitDeposit) {
@@ -16729,6 +16812,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 // beam, which is what every non-qualifying scene deposits.
                 b.nSec = (d.nSec < 0) ? 0 : (d.nSec > kBeamSecMax ? kBeamSecMax : d.nSec);
                 for (int k = 0; k < kBeamSecMax; ++k) b.lamS[k] = (k < b.nSec) ? d.lamS[k] : 0.0f;
+                // Achromatic-path fold (`-beamachro`): the emitter's mean CIE, used by
+                // BeamMap::build in place of CIE(lambda). Mutually exclusive with the bundle.
+                b.achro = d.achro ? 1 : 0;
+                for (int k = 0; k < 3; ++k) b.cieA[k] = b.achro ? d.cieA[k] : 0.0f;
             }
         }
         bmap->nEmitted   = pm.nEmitted;      // same pass, same normalisation

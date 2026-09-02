@@ -5,6 +5,150 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-09-02, v0.210.0): the `gallery_rain` cloud was still "very iridescent, bars of colour running all through it" — every beam in an achromatic cloud was a single spectral sample, and **more `-spp` could never fix it**
+
+**Reported as** *"the clouds are still rendering very iridescent, there are bars of color running
+all through it in all directions. clouds don't look like that."* — after v0.201.0's per-medium mfp
+radius and v0.202.0's spectral bundle had both already been applied to this exact symptom.
+
+**The scene fact that makes this a bug and not a look.** `scenes/gallery_rain.ftsl:2424` declares
+the cloud as `sigma_t 2.78 albedo 0.9964 g 0.46` with a plain HG phase and a **scalar** noise
+density field. Nothing about it is wavelength-dependent. **So every colour in the cloud was
+noise** — there was no signal there to preserve, and any saturated pixel in it was pure estimator
+variance.
+
+**Why the two previous fixes could not close it.**
+
+* `-beamblur`/radius (v0.201.0) changes how many beams a probe averages. It moved mean chroma
+  saturation on the cloud crop 0.1157 → 0.0533 and then stalled, because the *per-beam* variance
+  was untouched.
+* `-beamspec 4` (v0.202.0) attacks the per-beam variance directly, and measured only **−8.5 %**
+  chroma on the rain. The reason is in `render_cuda.cu`'s retirement rule: `if (spec) spec->n = 0;`
+  fired unconditionally after **every** shade step, so a bundle lived exactly one chord. With
+  `albedo 0.9964` a photon scatters on the order of **278 times** inside this cloud, so about
+  **1 beam in 278** was ever spectral. The bundle was working exactly as designed and reaching
+  almost nothing.
+
+**And the reason it looked worse than a comparable amount of grain.** A beam is a **line**. One
+saturated monochromatic deposit lays a coloured *streak* down its whole length, which the eye
+reads as structure rather than as noise — hence "bars". Averaging does not cheaply rescue it
+either: the gather's weights (a 1D Epanechnikov kernel over `1/sin θ`, times two transmittances)
+are skewed enough that a few of the ~844 gathered beams carry nearly all the weight, so the
+*effective* sample count is an order of magnitude below the nominal one.
+
+**The trap that makes this worse than it sounds: in mode `M`, `-spp` does not touch it at all.**
+The beam map is traced **once** and is view-independent, so every additional spp re-gathers *the
+same beams*. More spp reduces camera-side (pixel / lens) noise and leaves the beam-side chromatic
+variance exactly where it was. Measured: the `off` arm's cloud saturation went 0.0740 at 4 spp →
+**0.0714 at 24 spp** — a 3.5 % improvement for 6x the render time. The colour was a **floor**, not
+grain, and no delivery-budget spp would ever have removed it.
+
+**The fix: achromatic-path beams (`-beamachro`, default on).** A photon born on an ordinary
+emitter draws λ from a pdf ∝ that emitter's SPD, so `spd(λ)/pdf(λ)` is the SPD's integral for
+every λ alike and the carried power is λ-independent. If **nothing on the path since birth
+depended on λ**, the estimator's expected colour is exactly
+
+```
+E[CIE(λ)] = ∫ CIE(λ)·SPD(λ) dλ / ∫ SPD(λ) dλ
+```
+
+— a **per-emitter constant** (`Emitter::cieMean`, baked in `finalizeEmitters()`). Folding the beam
+at that constant instead of at one sampled `CIE(λ)` has the same expectation, so it is unbiased,
+and it **removes** the chromatic variance term rather than reducing it. It costs the gather
+nothing: the colour folds into the beam's stored `pX/pY/pZ` in `BeamMap::build`, so there is no
+extra inner-loop work and no extra gather-side record byte.
+
+**Three conditions, checked in three different places, deliberately not combined into one test:**
+
+1. **Scene-wide** achromatic extinction (`beamSpectralOK`, once at launch) — free flights sample
+   the same distance for every λ, so the path's *geometry* is λ-invariant.
+2. **Per path** — no λ-dependent event since birth (`DBeamSpec::achro` on the device,
+   `achroPath` in `Renderer::tracePhoton`). Cleared by any surface interaction, glass absorption,
+   GRIN bend, image-env birth, or a scatter in a chromatic medium. **Not** cleared by a scatter in
+   an achromatic medium — that is the difference from the bundle's one-step rule and the whole
+   reason the fold reaches a 278-scatter cloud.
+3. **Per medium** — flat `sigma_s` and a non-rainbow phase (`Medium::achro`, baked once in
+   `Scene::build()`). This one *must* be per medium: `gallery_rain` holds the achromatic HG cloud
+   **and** a `phase rainbow` rain curtain at the same time, and the rain must keep per-wavelength
+   beams or there is no bow.
+
+`Medium::achro` is cached rather than computed on demand because the CPU tracer asks the question
+at **every** medium scatter — honestly evaluating it is a 33-sample scan of two `Spectrum`
+objects, i.e. ~278 whole-band scans per photon in this cloud.
+
+**Measured** (`gallery_rain`, `-camera cam`, GPU, `-n 20000000 -r 960 540 -beams`,
+`scraps/cloudstat.py` mean chroma saturation on the cloud crop):
+
+| | 4 spp | 24 spp |
+|---|---|---|
+| `-beamachro off` (= pre-0.210.0) | 0.0740 | 0.0714 |
+| `-beamachro on` (default) | **0.0365** | **0.0359** |
+
+The `off` arm reproduces `png/gbench2/sppfix4.png` to 4 decimal places, so the flag is provably
+inert when disabled. **Unbiasedness** was checked in scene-linear PFM (`-hdr`) on
+`scenes/_fog_cornell.ftsl`, GPU, `-n 40000000 -spp 128`: the `on` arm's mean luminance sits at
+−0.382 % of the `off` arm, against a **run-to-run control of two further `off` arms at −0.381 %
+and −0.197 %** — i.e. entirely inside the beam-split nondeterminism logged below, with no
+detectable bias. The CPU path was exercised separately (`-device cpu`, same scene, 50 % coverage).
+
+**Coverage is now reported per medium**, on the existing `[camera] photon beams: medium N:` line,
+by count *and* by power — power because a handful of bright unfolded beams is exactly what draws a
+streak, and a count-only figure would report that as a rounding error. On `gallery_rain`:
+
+```
+medium 0: 1182984 chords, ... 89.1% folded achromatically (90.3% by power)
+medium 1: 1474106 chords, ... achromatic fold n/a          <- phase rainbow, out of scope
+```
+
+**Why the cloud is 89 % and not 100 %, and what the residual streaks are.** The unfolded 11 % are
+photons that reached the cloud *after* a λ-dependent event. Substituting `phase hg 0.6` for the
+rain's `phase rainbow` (`scraps/_gr_norainbow.ftsl`) raises cloud coverage to **96.7 %** and drops
+crop saturation to **0.0176** — so ~7.5 of those 11 points are photons that scattered in the
+rainbow rain, and only ~3.3 are surface bounces. Both are *correct* exclusions: after a dispersive
+scatter the path geometry genuinely is λ-dependent. The residual streak level therefore tracks the
+unfolded fraction almost exactly (0.0740 → 0.0365 at 89 %, → 0.0176 at 97 %), which is the
+strongest available evidence that the remaining colour has the same single cause and not a second
+one. Since `-spp` cannot touch it, the only levers left on the real scene are `-n` (each beam then
+carries proportionally less power: at the showcase's `-n 200000000` the residual is ~3x fainter
+than in these 20 M-photon probes) and the follow-up logged immediately below.
+
+**Storage / cache.** `+4 floats` per host `PhotonBeam` (`cieA[3]` + `achro`), `+3 floats + 1 int`
+on `DBeamDep` — the *deposit* record only. `DBeamRec`, the record the gather actually streams, is
+unchanged, which is why the gather cost is unchanged. `-savemap` format bumped to `FTPMP06`;
+`FTPMP05` and `FTPMP04` files still load, through chunked widening paths reading the frozen
+`PhotonBeamV5` / `PhotonBeamV4` layouts. **A loaded pre-0.210.0 cache does not fold**, on purpose:
+a cached beam carries no record of its emitter, so the fold constant is unrecoverable, and
+inventing one would silently change the image a cache exists to reproduce. Re-trace to get the
+fold.
+
+### OPEN (2026-09-02, v0.210.0): the ~11 % of cloud beams that a dispersive event disqualifies have no variance reduction at all — a spectral bundle with per-wavelength WEIGHTS would give them ~4x
+
+**What is left after the entry above.** `-beamachro` folds a beam only when its whole path was
+wavelength-independent, and `-beamspec`'s bundle is retired at the first λ-dependent event. So a
+photon that scatters once in `gallery_rain`'s rainbow rain, or bounces once off a surface, and
+*then* lights the cloud, deposits a beam that is fully monochromatic and stays that way — it gets
+neither mechanism. Measured above: that is ~11 % of the cloud's beams, and they are exactly the
+sparse saturated streaks still visible on the fixed render.
+
+**Why the bundle cannot be made to cover them as it stands.** The record stores wavelengths and
+**no weights**, which is only valid while every wavelength in the bundle carries identical power.
+That holds from an SPD-proportional birth through achromatic transport, and stops holding the
+moment any λ-dependent factor is applied — hence the retirement. The bundle can never be *revived*
+either, for the same reason.
+
+**The fix, when it is worth doing: carry per-wavelength weights.** Store `w[nSec]` beside
+`lamS[nSec]` and multiply each wavelength's own weight by that wavelength's factor at every
+chromatic event (surface reflectance, glass absorption). The bundle then never has to die at an
+event that keeps the *geometry* shared — which is every non-dispersive interaction — and only
+genuinely diverging events (dispersive refraction, a rainbow-phase scatter, chromatic extinction)
+still collapse it. That would give the unfolded beams the ~4x variance reduction 4 wavelengths buy,
+in the one place where `-beamachro` provably cannot help.
+
+**Cost, so the trade is on the page:** +3 floats per host beam record and +3 quantised values per
+`DBeamRec` (this one *does* touch the gather's streamed record — ~+12 % of its bytes at the 8 M
+sub-beam ceiling), plus a per-secondary material evaluation at each surface along the photon path.
+Not free, unlike `-beamachro`, which is why it is logged rather than done in the same change.
+
 ### FIXED (2026-09-02, v0.209.0): the mode-`M` GPU gather starved its own launches — an adaptive slice controller drove the slice to 3 % occupancy and cost **11x** throughput
 
 **Context.** `renderPhotonMapSharedCuda` slices each spp into sub-chunk `kGather` launches so

@@ -236,6 +236,55 @@ constexpr int kBeamSecMax  = kBeamSpecMax - 1;  // secondaries stored in the rec
 // is visible in the very first frame of any beam render.
 namespace pbeams { inline int gSpecC = kBeamSpecMax; }
 
+// ------------------------- ACHROMATIC-PATH BEAMS (`-beamachro`) ----------------------------
+// The bundle above averages CIE over a HANDFUL of wavelengths. When the transport is
+// wavelength-independent you can do better than average it: you can evaluate the average
+// EXACTLY, in closed form, for free.
+//
+// A photon born on an ordinary emitter draws lambda from a pdf proportional to that emitter's
+// own SPD, so spd(lambda)/pdf(lambda) is the SPD's integral for every wavelength alike and the
+// carried power is the SAME number whatever lambda came out. If nothing on the path since then
+// has depended on lambda, the photon at this chord is a uniform sample of the emitter's whole
+// spectrum, and the beam's expected fold is
+//
+//     E[ CIE(lambda) ] = integral CIE(lam) SPD(lam) dlam / integral SPD(lam) dlam
+//
+// which is a per-emitter CONSTANT (Emitter::cieMean, baked in Scene::finalizeEmitters). Folding
+// at that constant instead of at the one sampled CIE(lambda) is not a variance reduction, it is
+// the removal of a variance term: the estimator's chromatic noise goes to ZERO, at no cost in
+// the gather, no extra record bytes, and no bias whatsoever — it is the same expectation.
+//
+// WHY THIS MATTERS SO MUCH FOR BEAMS SPECIFICALLY. The defect it kills is the one described
+// above the bundle: a beam is a LINE, so one saturated monochromatic deposit lays a coloured
+// STREAK down its whole length, which the eye reads as structure rather than as grain. On
+// gallery_rain the cloud is `sigma_t 2.78 albedo 0.9964 g 0.46` with a plain HG phase and a
+// scalar density field — fully achromatic — so every colour in it was noise and none of it was
+// a feature, and the render showed exactly that: full-saturation red/green/blue speckle with
+// visible diagonal bars. Averaging cannot fix it cheaply either, because the gather's weights
+// (a 1D Epanechnikov kernel over 1/sin(theta), times two transmittances) are so skewed that a
+// few of the ~844 gathered beams carry nearly all the weight — the EFFECTIVE sample count is
+// an order of magnitude below the nominal one.
+//
+// THREE CONDITIONS, CHECKED IN THREE DIFFERENT PLACES, because they are three different
+// questions and one combined test would be wrong for two of them:
+//
+//   1. The SCENE's extinction is achromatic (beamSpectralOK, checked once at launch). A free
+//      flight anywhere samples the same distance for every wavelength, so the path's GEOMETRY
+//      is lambda-invariant. Without this the photon would not even be at the same place.
+//   2. The PATH has hit no wavelength-dependent event since birth (DBeamSpec::achro, carried
+//      by the tracer). Any surface interaction, glass absorption, GRIN bend, image-environment
+//      birth or scatter in a chromatic medium clears it. A scatter in an ACHROMATIC medium
+//      does not — which is the difference from the bundle's one-step rule, and the reason the
+//      fold survives the hundreds of scatters a bright cloud puts a photon through.
+//   3. The BEAM's own medium has a flat sigma_s and a non-rainbow phase (mediumAchromatic,
+//      per medium at upload). This one must be per medium, not per scene: gallery_rain holds
+//      the achromatic cloud and a `phase rainbow` rain curtain at the same time, and the rain
+//      MUST keep its per-wavelength beams or there is no bow to see.
+//
+// The flag defaults ON. It is exact wherever it applies and inert everywhere else, so there is
+// nothing to trade off; `-beamachro off` exists to A/B it, not because there is a case for it.
+namespace pbeams { inline bool gAchro = true; }
+
 // One stored photon beam: (a sub-segment of) the path a photon travelled through one medium.
 //
 // Unlike `Photon`, this record DOES carry a direction — it has a reader (the phase
@@ -266,6 +315,19 @@ struct PhotonBeam {
     float lamS[kBeamSecMax];
     int   nSec;
 
+    // ACHROMATIC-PATH FOLD (see the note above the struct). When `achro` is set this beam's
+    // whole history — birth wavelength drawn from the emitter's own SPD, every event since —
+    // was wavelength-INDEPENDENT, and its medium's gather-time tail is too, so the beam is
+    // folded at `cieA` (the emitter's Emitter::cieMean) instead of at CIE(lambda). `lambda`
+    // is still stored and still used, by sigma_s / phase / the transmittance marches, all of
+    // which are flat in lambda whenever this flag is set — so it costs the gather nothing.
+    // A beam with `achro` never carries a bundle (nSec == 0): the bundle exists to average
+    // CIE over a few wavelengths, and this is that average exactly.
+    float cieA[3];
+    unsigned char achro;
+
+    // nSec is 0 for both a classic monochromatic beam and an achromatic-path one, so this is
+    // the plain nSec+1 it always was; the achromatic beam carries the full chord power.
     int  nLam()  const { return nSec + 1; }
     Vec3 begin() const { return o + d * (double)s0; }
     Vec3 end()   const { return o + d * ((double)s0 + (double)len); }
@@ -316,15 +378,19 @@ struct BeamBank {
 
     // `lamS`/`nSec` are the spectral bundle's secondaries (see PhotonBeam); pass nSec == 0
     // for a classic monochromatic deposit, which is what every non-spectral caller does.
+    // `cieA` (optional) is the emitter's mean CIE for an ACHROMATIC-PATH beam; passing it
+    // supersedes the bundle, since it is the exact limit the bundle was approximating.
     void push(const Vec3& o, const Vec3& d, double len, double power,
               double lambda, double absorb, int med,
-              const double* lamS = nullptr, int nSec = 0) {
+              const double* lamS = nullptr, int nSec = 0, const double* cieA = nullptr) {
         PhotonBeam b;
         b.o = o; b.d = d;
         b.s0 = 0.0f; b.len = (float)len; b.power = (float)power;
         b.lambda = (float)lambda; b.absorb = (float)absorb; b.med = med;
+        b.achro = cieA ? 1 : 0;
+        for (int i = 0; i < 3; ++i) b.cieA[i] = cieA ? (float)cieA[i] : 0.0f;
         if (nSec > kBeamSecMax) nSec = kBeamSecMax;
-        b.nSec = (lamS && nSec > 0) ? nSec : 0;
+        b.nSec = (lamS && nSec > 0 && !cieA) ? nSec : 0;
         for (int i = 0; i < kBeamSecMax; ++i) b.lamS[i] = (i < b.nSec) ? (float)lamS[i] : 0.0f;
         beams.push_back(b);
         if (cap && beams.size() >= cap) halve();
@@ -688,6 +754,11 @@ struct BeamMap {
             a.lo = a.lo - Vec3(r, r, r);
             a.hi = a.hi + Vec3(r, r, r);
             boxes[i] = a;
+            // ACHROMATIC-PATH BEAMS fold at the emitter's SPD-mean CIE instead of at one
+            // sampled wavelength — the exact expectation of the thing the monochromatic beam
+            // was sampling, so the chromatic variance is not reduced but REMOVED. Every other
+            // beam keeps the classic per-wavelength fold, bit-for-bit.
+            if (b.achro) { cie[i] = Vec3(b.cieA[0], b.cieA[1], b.cieA[2]); continue; }
             const double lam = (double)b.lambda;
             cie[i] = Vec3(cieX(lam), cieY(lam), cieZ(lam));
         }

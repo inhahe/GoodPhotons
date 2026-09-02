@@ -456,6 +456,37 @@ struct Medium {
     std::shared_ptr<rainbow::RainbowPhase> rainbowPhase;
     bool rainbow() const { return (bool)rainbowPhase; }
 
+    // ---- ACHROMATIC? (photonbeams.h, ACHROMATIC-PATH BEAMS) ------------------------------
+    // 1 when NOTHING about this medium depends on wavelength: flat sigma_s, flat sigma_t, and
+    // an HG rather than a rainbow phase. Two consumers, asking two different questions of the
+    // same fact:
+    //   * the beam GATHER — its per-wavelength tail is exactly sigma_s * phase * CIE, so a
+    //     flat medium contributes colour through CIE alone and a beam in it can be folded at
+    //     the emitter's mean CIE with zero chromatic variance;
+    //   * the forward TRACER — a scatter here is a wavelength-independent event (the free
+    //     flight that reached it, the albedo roulette and the HG direction are all flat), so
+    //     the achromatic-path claim survives it.
+    // Cached rather than computed on demand because the tracer asks it at EVERY medium
+    // scatter, and answering honestly means scanning two Spectrum objects across the band —
+    // which inside a cloud at albedo 0.9964 would be ~278 whole-band scans per photon.
+    // Scene::build() fills it via computeAchromatic(); the default of 0 is the safe answer
+    // (classic monochromatic beams) for any medium that somehow never reaches it.
+    int achro = 0;
+    bool computeAchromatic() const {
+        if (rainbow()) return false;
+        double sLo = 1e300, sHi = -1e300, tLo = 1e300, tHi = -1e300;
+        for (int i = 0; i <= 32; ++i) {
+            const double lam = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * (double)i / 32.0;
+            const double ss = sigma_s(lam), st = sigma_a(lam) + sigma_s(lam);
+            sLo = std::min(sLo, ss); sHi = std::max(sHi, ss);
+            tLo = std::min(tLo, st); tHi = std::max(tHi, st);
+        }
+        // A coefficient that is zero across the whole band has no colour to get wrong.
+        if (sHi > 0.0 && (sHi - sLo) > 1e-4 * sHi) return false;
+        if (tHi > 0.0 && (tHi - tLo) > 1e-4 * tHi) return false;
+        return true;
+    }
+
     // Phase value p(cos) at wavelength lambda (nm) — equals the solid-angle pdf when
     // the scatter direction is importance-sampled from the phase (both models below).
     double phaseValue(double cosTheta, double lambda) const {
@@ -817,6 +848,22 @@ struct Emitter {
     // Precomputed in build() because the direct-view path (a camera/specular ray that
     // escapes into the sun's cone) is evaluated per pixel and must not re-integrate.
     Vec3 viewXYZ{0, 0, 0};
+    // THE SPD-WEIGHTED MEAN CIE RESPONSE of this emitter:
+    //
+    //     cieMean = integral CIE(lam) * SPD(lam) dlam / integral SPD(lam) dlam
+    //
+    // i.e. the EXPECTED value of CIE(lambda) when lambda is drawn from this emitter's own
+    // emission sampler, whose pdf is proportional to SPD. That expectation is the exact
+    // colour a monochromatic estimator converges to along any path whose transport is
+    // wavelength-INDEPENDENT, because such a path leaves the photon's carried power equal
+    // for every wavelength in the band (spd(lam)/pdf(lam) is the SPD's integral for all of
+    // them alike) — so the only per-wavelength factor left in the fold is CIE itself.
+    //
+    // Photon beams use it to replace a single noisy CIE(lambda_hero) sample with its own
+    // mean, which is what removes the chromatic speckle from an achromatic medium outright
+    // rather than merely averaging it down (photonbeams.h, ACHROMATIC-PATH BEAMS). Set for
+    // EVERY emitter in finalizeEmitters(), unlike viewXYZ which only suns need.
+    Vec3 cieMean{0, 0, 0};
     std::vector<EmitTri> meshTris; // Mesh: per-triangle area CDF for uniform sampling
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
@@ -1548,6 +1595,21 @@ struct Scene {
         // rebuilds materials/emitters leaves the fast-path gate consistent with `mats`.
         camHiddenAny = false;
         for (const auto& m : mats) if (m.hideCamera) { camHiddenAny = true; break; }
+        // The SPD-weighted mean CIE of every emitter (see Emitter::cieMean). Both integrals
+        // run over the SAME 1 nm grid so the quadrature step cancels in the ratio and the
+        // result does not depend on `stepNm` or on how `spd` was built. An emitter with no
+        // energy in the visible band keeps {0,0,0}, which is the correct fold for it.
+        for (auto& e : emitters) {
+            Vec3 num{0, 0, 0};
+            double den = 0.0;
+            for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0) {
+                const double s = e.spdFn(lam);
+                if (!(s > 0.0)) continue;
+                num += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * s;
+                den += s;
+            }
+            e.cieMean = (den > 0.0) ? num * (1.0 / den) : Vec3{0, 0, 0};
+        }
         emitterCdf.assign(emitters.size(), 0.0);
         for (size_t i = 0; i < emitters.size(); ++i) {
             // Area/sphere keep the exact emitIntegral*area*PI expression so those
@@ -1988,6 +2050,12 @@ struct Scene {
                 envXYZ += Vec3(cieX(lam), cieY(lam), cieZ(lam))
                           * emitters[envIndex].spdFn(lam);
         }
+        // Bake each medium's achromaticity (Medium::achro) once, here, because the forward
+        // tracer reads it at every medium scatter and computing it honestly is a whole-band
+        // scan of two Spectrum objects. Done for DISABLED media too: `enabled` is a render
+        // flag that can be flipped by applyIgnoreFlags after build(), and a stale -1 would be
+        // worse than a computed answer nobody reads.
+        for (auto& m : media) m.achro = m.computeAchromatic() ? 1 : 0;
         finalizeEmitters();
         finalizeEmissiveVolumes();
     }
@@ -2612,6 +2680,31 @@ struct Scene {
 // Lives in scene.h, next to the Medium it interrogates, because BOTH deposit paths need it —
 // the CPU one in photonmap_render.h and the CUDA one in render_cuda.cu, which cannot include
 // the former.
+// ---- Is THIS MEDIUM's gather-time spectral tail wavelength-independent? -------------------
+// The beam gather's per-wavelength factors are exactly three: sigma_s at the gather point, the
+// phase function at the scattering angle, and CIE. A medium for which the first two are FLAT
+// across the band contributes nothing to the colour of a beam except through CIE — which means
+// a beam lying in it, on a wavelength-independent path, can be folded at the emitter's mean CIE
+// (Emitter::cieMean) instead of at one sampled wavelength, with NO chromatic variance at all.
+// See photonbeams.h, ACHROMATIC-PATH BEAMS.
+//
+// Two things disqualify a medium, and both are real cases in the same scene:
+//   * a RAINBOW phase table — the whole point of it is that the phase IS a function of
+//     wavelength, so the bow only exists if each beam keeps its own lambda;
+//   * a chromatic sigma_s — a medium that scatters blue more than red genuinely colours the
+//     light it scatters, and the mean CIE would erase that.
+// Extinction is NOT tested here: it enters through the two transmittance marches, which are
+// shared across the whole segment (all media, not just this one), so the scene-wide
+// beamSpectralOK below is what guards it.
+//
+// Per MEDIUM rather than per scene on purpose. gallery_rain holds an achromatic HG cloud and a
+// chromatic rainbow rain curtain at once; the cloud must get the noise-free fold and the rain
+// must not, and a scene-wide test would have to refuse both.
+// Reader for the flag Scene::build() baked (Medium::achro). A free function so the two beam
+// files can ask for it by the name the design talks about, without either of them having to
+// know that the answer is cached rather than computed.
+inline bool mediumAchromatic(const Medium& m) { return m.achro != 0; }
+
 inline bool beamSpectralOK(const Scene& scene) {
     for (const Medium& m : scene.media) {
         double lo = 1e300, hi = -1e300;

@@ -576,6 +576,15 @@ struct Renderer {
     // bundle's shared transmittance would then be wrong for its secondaries.
     int beamSpecC = 1;
 
+    // ACHROMATIC-PATH BEAMS (CLI -beamachro, photonbeams.h). Scene-wide permission for the
+    // mean-CIE fold: every medium's extinction is wavelength-independent, so a free flight
+    // samples the same distance for every wavelength and the path's GEOMETRY — not merely its
+    // colour — is lambda-invariant. Same predicate the driver applies to beamSpecC above, but
+    // kept separately because this fold needs no `-beamspec > 1`: it stores no extra
+    // wavelengths, so a `-beamspec 1` render gets it too. Set by the driver, not per photon
+    // (beamSpectralOK scans every medium's spectra and must not run inside the trace).
+    bool beamAchroOK = false;
+
     // Longest beam we will store when the photon escapes to infinity through an UNBOUNDED
     // medium, as a multiple of the scene radius. An unbounded medium clips to [0, 1e30], and
     // a 1e30-long AABB would swallow the whole BVH; transmittance has long since killed the
@@ -859,7 +868,8 @@ struct Renderer {
     void emitBeams(const Scene& scene, const Vec3& o, const Vec3& dir, double dLen,
                    double lambda, double beta, double aGlass, Pcg32& rng,
                    MedFilter offFilt = MedStraight,
-                   const double* lamS = nullptr, int nSec = 0) const {
+                   const double* lamS = nullptr, int nSec = 0,
+                   const Vec3* achroCie = nullptr) const {
         if (!beamDeposit || !(beta > 0.0)) return;
         // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
         // 1e30-long box (see kBeamFarScale).
@@ -895,7 +905,18 @@ struct Renderer {
             // GRIN transmittance to s. Applying it here as well would count it twice.
             if (ta > 0.0) p *= mediaTransmittance(scene, o, dir, ta, lambda, rng, offFilt);
             if (!(p > 0.0)) continue;
-            beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i, lamS, nSec);
+            // ACHROMATIC-PATH FOLD, decided per DEPOSITED BEAM, because its two halves live in
+            // different places: the PATH being wavelength-independent is a property of the
+            // photon (the caller's `achroPath`), while the gather-time tail being flat is a
+            // property of THIS medium. A photon crossing gallery_rain's achromatic cloud and
+            // its `phase rainbow` rain curtain in one step deposits one beam of each kind, and
+            // only the cloud's may fold. (Device twin: dEmitBeams in render_cuda.cu.)
+            const double ca[3] = {achroCie ? achroCie->x : 0.0,
+                                  achroCie ? achroCie->y : 0.0,
+                                  achroCie ? achroCie->z : 0.0};
+            const bool useAchro = achroCie && mediumAchromatic(md);
+            beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i,
+                              lamS, nSec, useAchro ? ca : nullptr);
         }
     }
 
@@ -2269,6 +2290,14 @@ struct Renderer {
         // wavelengths would not agree on. Untouched (and therefore free) when beamSpecC == 1.
         double specLam[kBeamSecMax];
         int specSec = 0;
+        // ACHROMATIC-PATH STATE (photonbeams.h, ACHROMATIC-PATH BEAMS; device twin:
+        // DBeamSpec::achro/cie). The stronger, longer-lived claim beside the bundle: that
+        // NOTHING on this path has depended on lambda, so the beam may be folded at the
+        // emitter's mean CIE and carry no chromatic noise at all. Unlike `specSec` it is not
+        // retired every step — only by an event that is itself wavelength-dependent, which a
+        // scatter in an achromatic medium is not.
+        Vec3 achroCie{0, 0, 0};
+        bool achroPath = false;
         const bool volumeBirth = !scene.emissiveVolumes.empty() &&
                                  (rng.uniform() * grandTotal < scene.totalEmissionPower);
         if (volumeBirth) {
@@ -2460,6 +2489,16 @@ struct Renderer {
                 specLam[specSec++] = lI;
             }
         }
+        // ACHROMATIC-PATH STATE at birth. The same exclusions as the bundle, for the same
+        // reason (both rest on beta being wavelength-independent), minus the `-beamspec`
+        // condition — this fold stores no extra wavelengths, so it applies at -beamspec 1.
+        // An emitter with no visible-band energy has cieMean {0,0,0} and stays monochromatic.
+        if (beamAchroOK && beamDeposit &&
+            !(em.shape == EmitterShape::Env && scene.envMap) &&
+            (em.cieMean.x > 0.0 || em.cieMean.y > 0.0 || em.cieMean.z > 0.0)) {
+            achroCie = em.cieMean;
+            achroPath = true;
+        }
 
         // Direct light -> camera: makes the source itself visible. The Lambertian
         // emitter term is 1/pi, i.e. connect() with rho=1 using the light normal.
@@ -2507,7 +2546,9 @@ struct Renderer {
         // than reason about where the marcher was and was not entered, refuse the spectral
         // bundle for the whole photon in any GRIN scene — those scenes cannot deposit beams
         // inside the bending medium anyway (emitBeams skips it per medium).
-        if (grinAny) specSec = 0;
+        // The achromatic-path claim dies for the same reason and more strongly: a GRIN arc IS
+        // a function of lambda, so the path's geometry differs per wavelength.
+        if (grinAny) { specSec = 0; achroPath = false; }
 
         // PHOTON-BEAM deposit (mode M with -beams): store the crossed segment in the
         // view-independent beam map instead of splatting it to a camera list. GRIN media are
@@ -2655,7 +2696,10 @@ struct Renderer {
                 // and emitBeams re-applies it over the beam's own lead-in, so a bundle inside a
                 // dielectric would be attenuated at the wrong wavelengths. Collapse it here,
                 // BEFORE the deposit below reads it.
-                if (a > 0.0) { beta *= std::exp(-a * dEvent); specSec = 0; }
+                // The achromatic-path claim dies here for the same reason and a stronger one:
+                // `beta` has just been multiplied by a wavelength-dependent factor, so the
+                // photon no longer represents the whole band at equal power.
+                if (a > 0.0) { beta *= std::exp(-a * dEvent); specSec = 0; achroPath = false; }
             }
 
             // PHOTON-BEAMS single-scatter gather (CLI -beams, shared multi-camera pass).
@@ -2720,7 +2764,8 @@ struct Renderer {
                 // from it later without the photon knowing any camera exists.
                 if (doBeamDeposit)
                     emitBeams(scene, ray.o, ray.d, dChord, lambda, betaPre, curAbsorb(lambda), rng,
-                              beamMS ? MedAll : MedStraight, specLam, specSec);
+                              beamMS ? MedAll : MedStraight, specLam, specSec,
+                              achroPath ? &achroCie : nullptr);
                 if (!beamMS) {
                     // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over
                     // the whole crossing (single-scatter transmission) so surfaces behind the
@@ -2759,6 +2804,23 @@ struct Renderer {
             // deposit, after a wavelength-dependent surface event. One retirement per loop
             // iteration, unconditionally, is what makes the rule airtight.
             specSec = 0;
+            // THE ACHROMATIC-PATH FLAG USES A WEAKER RULE, which is the whole reason it is a
+            // separate piece of state rather than a fourth wavelength in the bundle. The
+            // bundle must die every step because the record has no per-wavelength weights and
+            // so cannot represent wavelengths that have started to diverge; `achroPath` claims
+            // that they have NOT diverged, and an event that is itself wavelength-independent
+            // leaves that claim intact. A scatter in an achromatic medium is exactly such an
+            // event — achromatic sigma_t for the free flight that reached it, a flat albedo
+            // for the roulette just below, and an HG direction that depends only on `g`.
+            // Everything else clears it. (Device twin: render_cuda.cu, same position.)
+            //
+            // The paragraph above about "the chord that matters most is the DIRECT one" is
+            // true for a shaft and false for a CLOUD: at albedo 0.9964 a photon scatters of
+            // the order of 278 times inside gallery_rain's cloud, so the one-step rule reached
+            // ~1 chord in 278 there and `-beamspec 4` measured -8.5% chroma for it. This rule
+            // reaches all 278.
+            if (achroPath && !(mediumEvent && mediumAchromatic(scene.media[scatterMed])))
+                achroPath = false;
 
             if (mediumEvent) {
                 const Medium& sm = scene.media[scatterMed];
