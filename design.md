@@ -2171,6 +2171,39 @@ render. Closing that means teaching the shared device path to gather in spp chun
   That was the *storage* half of Jensen's scheme only, and on its own it leaves the caustic map
   sharp but nearly empty (0.12 % of `gallery_rain` deposits are L·S⁺·D). The *sampling* half is
   `causticaim.h`, next.
+  **One radius per MAP is still one radius (0.205.0, `-pmadaptive`).** The split assumed the
+  caustic map holds only caustics. It does not: L·S⁺·D is satisfied by *any* specular bounce, so
+  in a gallery full of glass and metal the caustic map also holds a broad, sparse, room-wide
+  specular wash — a second population inside the second map, and again the majority one, so
+  `buildAuto`'s median-density probe is decided by it. Measured on `gallery_rain`: the probe saw
+  1–6 photons against a target of 47 and therefore asked to *grow*, `rMax` pinned it, and the
+  caustic map's radius came out **exactly equal to the global map's** (0.1775 m) in every run —
+  `-pmccount` inert, the split a no-op. The visible consequence was issue 6 of the mode-M
+  showcase report ("I don't see any colourful caustics"): metered against a mode-D reference of
+  the same camera, the axicon cap's caustic peaked at **2.9×** its own median where mode D peaks
+  at **9.7×** — the energy and the hue were right, the feature was smeared flat. A `-loadmap`
+  radius sweep confirmed the radius was the whole story (peak 2.93 → 3.75 → 6.41 → **8.05×** as
+  the map-wide radius went 0.1775 → 0.0887 → 0.0435 → 0.0217 m) and also why shrinking it
+  map-wide is not the fix: at the small end every sparse-region gather catches one or two
+  *spectral* photons and paints a random saturated hue, so the wash turns to chromatic speckle.
+  The fix is to solve **per query**: `PhotonMap::adaptiveRadius` / `dPmAdaptiveRadius` return the
+  radius of the smallest disc around the gather point holding `kGather` same-facing photons,
+  capped at the map's radius and floored at `r/256`, and the caller renormalises by `1/(π r_q² N)`
+  for the radius it actually used. A filament shrinks its own kernel to its own scale; the wash
+  finds fewer than `k` in the whole disc, returns the map radius unchanged, and is bit-identical
+  to before. Only the caustic map sets `kGather` (to the same `k` `buildAuto` solved its radius
+  for); the global map and SPPM keep the fixed-radius path exactly.
+  It costs **one** extra neighbourhood walk, not a kNN heap (a per-thread heap is what a GPU
+  gather cannot afford) and not an iterated count-and-shrink (a full 3×3×3 walk per iteration).
+  The walk histograms each candidate's `d²/r²` into 16 geometric shells `(2^-(i+1), 2^-i]` via
+  `i = -ilogb(t)-1`, so the *suffix sum* of the histogram is a whole radius/population profile
+  from one pass; take the tightest shell still holding `k` and interpolate inside it under local
+  uniform density, `r_q² = r_i²·k/C_i`. The normal test is applied in the counting walk too, not
+  only in the caller's sum — counting a wall's photons while gathering the floor beside it would
+  shrink the radius for a population the sum then rejects, and since the estimate is divided by
+  `π r_q²` either way that mismatch would print a dark seam along every surface junction. On the
+  GPU the per-record fold already carries the map's fixed-radius normalisation, so the caustic
+  sum is rescaled by the area ratio `r²/r_q²` rather than re-folding every record.
 - **`causticaim.h`** (0.203.0 CPU, 0.204.0 GPU; `-causticn`, `-causticaimk`) — the **aimed
   caustic emission pass**, Jensen's projection-map half, built as a *continuous mixture
   importance sampler* rather than a discretised spherical grid. Every primitive whose material

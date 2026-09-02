@@ -4689,7 +4689,8 @@ struct DPhotonMap {
     const int*   cellStart;   // size tableMask+2; bucket b is [cellStart[b], cellStart[b+1])
     DVec3  lo;                // lattice origin (world)
     Real   cellSize;          // == gather radius
-    Real   radius;            // gather radius (world units)
+    Real   radius;            // gather radius (world units) — a MAXIMUM when kGather > 0
+    Real   kGather;           // per-query adaptive target population; 0 = fixed radius
     unsigned int tableMask;   // bucket count - 1; see pmCellHash (photonmap.h)
 };
 
@@ -4714,6 +4715,55 @@ __device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3&
             const int e = pm.cellStart[c + 1];
             for (int k = pm.cellStart[c]; k < e; ++k) body(k);
         }
+}
+
+// Per-query adaptive gather radius — device twin of PhotonMap::adaptiveRadius (photonmap.h),
+// where the full argument lives. In one word: a caustic map holds two populations whose
+// densities differ by orders of magnitude (the focused filament and the specular wash), one
+// radius per MAP cannot serve both, so each gather solves for its own. One 3x3x3 walk
+// histograms d^2/r^2 into geometric shells; the suffix sum of that histogram is the radius
+// profile, and the tightest shell still holding `kGather` photons — interpolated inside the
+// shell under local uniform density — is the answer.
+//
+// Returns pm.radius exactly when kGather <= 0 or the whole disc holds fewer than k photons,
+// so a fixed-radius map keeps the fixed-radius path. The normal test matches the caller's
+// (a mismatch would divide accepted photons by an area chosen for a rejected population and
+// print a dark seam along every surface junction).
+#define PM_ADAPT_BINS 16                     // covers r down to r * 2^-8 = r/256
+template <int NB = PM_ADAPT_BINS>
+__device__ static inline Real dPmAdaptiveRadius(const DPhotonMap& pm, const DVec3& p,
+                                                const DVec3& n) {
+    if (!(pm.kGather > (Real)0) || pm.photons == nullptr || !(pm.radius > (Real)0))
+        return pm.radius;
+    int hist[NB];
+#pragma unroll
+    for (int i = 0; i < NB; ++i) hist[i] = 0;
+    const Real r2    = pm.radius * pm.radius;
+    const Real invR2 = (Real)1 / r2;
+    dPmNeighborhood(pm, p, [&](int k) {
+        const DGatherPhoton& ph = pm.photons[k];
+        DVec3 d = p - ph.pos;
+        Real d2 = dot(d, d);
+        if (d2 > r2) return;
+        if (dot(ph.n, n) < (Real)0.5) return;
+        // Shell index: t in (2^-(i+1), 2^-i] -> i, i.e. i = -ilogb(t) - 1.
+        Real t = d2 * invR2;
+        int i = (t > (Real)0) ? (-ilogb((double)t) - 1) : (NB - 1);
+        i = min(max(i, 0), NB - 1);
+        ++hist[i];
+    });
+    long long C = 0;
+    for (int i = NB - 1; i >= 0; --i) {
+        C += hist[i];
+        if ((double)C >= (double)pm.kGather) {
+            double rq2 = (double)r2 * ldexp(1.0, -i) * ((double)pm.kGather / (double)C);
+            if (rq2 >= (double)r2) return pm.radius;
+            Real rq = (Real)sqrt(rq2);
+            Real rMin = pm.radius * (Real)(1.0 / 256.0);
+            return (rq < rMin) ? rMin : rq;
+        }
+    }
+    return pm.radius;                        // fewer than k in the disc — nothing to tighten
 }
 
 // ---------------------- photon BEAMS on the device (mode M volume) --------------------
@@ -11941,16 +11991,26 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 float w = rhoY * rhoV;
                 gx += w * ph.pX; gy += w * ph.pY; gz += w * ph.pZ;
             });
-            if (causOn) dPmNeighborhood(pmC, h.p, [&](int k) {
-                const DGatherPhoton& ph = pmC.photons[k];
-                DVec3 d = h.p - ph.pos;
-                if (dot(d, d) > r2C) return;
-                if (dot(ph.n, h.n) < (Real)0.5) return;
-                float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
-                float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
-                float w = rhoY * rhoV;
-                gx += w * ph.pX; gy += w * ph.pY; gz += w * ph.pZ;
-            });
+            if (causOn) {
+                // The caustic map gathers at its own PER-QUERY radius (dPmAdaptiveRadius).
+                // pX/pY/pZ carry the fold for the map's fixed radius, so rescale the sum by
+                // the area ratio r^2/r_q^2 rather than re-folding every record.
+                const Real rq  = dPmAdaptiveRadius(pmC, h.p, h.n);
+                const Real r2q = rq * rq;
+                float cx = 0.f, cy = 0.f, cz = 0.f;
+                dPmNeighborhood(pmC, h.p, [&](int k) {
+                    const DGatherPhoton& ph = pmC.photons[k];
+                    DVec3 d = h.p - ph.pos;
+                    if (dot(d, d) > r2q) return;
+                    if (dot(ph.n, h.n) < (Real)0.5) return;
+                    float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                    float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
+                    float w = rhoY * rhoV;
+                    cx += w * ph.pX; cy += w * ph.pY; cz += w * ph.pZ;
+                });
+                const float aw = (r2q > (Real)0) ? (float)((double)r2C / (double)r2q) : 0.f;
+                gx += cx * aw; gy += cy * aw; gz += cz * aw;
+            }
             oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
         }
@@ -12184,17 +12244,26 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 gy += rho * ph.pY;
                 gz += rho * ph.pZ;
             });
-            // Caustic map: same estimator, its own radius, summed in (see the header comment).
-            if (causOn) dPmNeighborhood(pmC, h.p, [&](int k) {
-                const DGatherPhoton& ph = pmC.photons[k];
-                DVec3 d = h.p - ph.pos;
-                if (dot(d, d) > r2C) return;
-                if (dot(ph.n, h.n) < (Real)0.5) return;
-                float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
-                gx += rho * ph.pX;
-                gy += rho * ph.pY;
-                gz += rho * ph.pZ;
-            });
+            // Caustic map: same estimator, its own PER-QUERY radius, summed in (see the
+            // header comment and dPmAdaptiveRadius). The area ratio r^2/r_q^2 corrects the
+            // fixed-radius normalisation already folded into pX/pY/pZ.
+            if (causOn) {
+                const Real rq  = dPmAdaptiveRadius(pmC, h.p, h.n);
+                const Real r2q = rq * rq;
+                float cx = 0.f, cy = 0.f, cz = 0.f;
+                dPmNeighborhood(pmC, h.p, [&](int k) {
+                    const DGatherPhoton& ph = pmC.photons[k];
+                    DVec3 d = h.p - ph.pos;
+                    if (dot(d, d) > r2q) return;
+                    if (dot(ph.n, h.n) < (Real)0.5) return;
+                    float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                    cx += rho * ph.pX;
+                    cy += rho * ph.pY;
+                    cz += rho * ph.pZ;
+                });
+                const float aw = (r2q > (Real)0) ? (float)((double)r2C / (double)r2q) : 0.f;
+                gx += cx * aw; gy += cy * aw; gz += cz * aw;
+            }
             oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
         }
@@ -16021,7 +16090,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const char* mapLoad, const char* mapSave, int heroC,
                                             int fgRays, double autoK, BeamPass* beams,
                                             const StageProgress* stage, double causticK,
-                                            const caim::AimMap* aim, long long nAimed) {
+                                            const caim::AimMap* aim, long long nAimed,
+                                            double causticAdaptK) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -16081,6 +16151,19 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         const double r = pmC.buildAuto(r0, causticK, &nProbe, &kTarget, r0);
         std::printf("[gpu] caustic map: %zu photons, gather radius %.4g -> %.4g (probe saw "
                     "%.0f; target %.0f)\n", pmC.photons.size(), r0, r, nProbe, kTarget);
+        // ...and then the radius just chosen becomes a MAXIMUM, with each gather tightening
+        // to whatever holds `k` photons locally. See dPmAdaptiveRadius for why one radius per
+        // map is not enough even after the split. Host twin: buildCausticMap in main.cpp.
+        pmC.kGather = 0.0;
+        if (causticAdaptK != 0.0) {
+            const double k = (causticAdaptK > 0.0) ? causticAdaptK : kTarget;
+            if (k > 0.0) {
+                pmC.kGather = k;
+                std::printf("[gpu] caustic map: per-query adaptive gather ON — target %.0f "
+                            "photons, radius %.4g down to %.4g as density allows\n",
+                            k, pmC.radius, pmC.radius / 256.0);
+            }
+        }
         // Stored flux per emitted path — the invariant the aimed pass (`-causticn`) must leave
         // alone while changing only the variance. Host twin: buildCausticMap in main.cpp, and
         // the two numbers are directly comparable, which is how CPU/GPU agreement is checked.
@@ -16573,6 +16656,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         D = DPhotonMap{};
         D.lo = DVec3(M.lo.x, M.lo.y, M.lo.z);
         D.cellSize = (Real)M.cellSize; D.radius = (Real)M.radius;
+        D.kGather = (Real)M.kGather;   // > 0 only on the caustic map (see -pmadaptive)
         D.tableMask = M.tableMask;
         D.photons = nullptr;
         if (!M.photons.empty()) {

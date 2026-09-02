@@ -55,10 +55,57 @@ slower (GPU pinned at 100 %). So "just raise `-causticn`" is not a free workarou
 the concentration problem — the adaptive aim is the right fix precisely because it buys
 population where it matters instead of everywhere.
 
-**Still to measure.** A mode-`D` reference render of `gallery_rain`'s `camera "cam"` (mode `D` is
-the camera's native mode, and the mode the scene's caustic measurements were originally taken in)
-to settle whether mode `M`'s caustic *magnitude* matches the design's documented "peak 6.6x its
-cap".
+**Measured (2026-09-01, v0.205.0).** The mode-`D` reference was rendered, and it settles the
+magnitude question: mode `M`'s caustic **energy and hue are right**, and the axicon cap's peak
+ratio came out 5.30x (mode M) vs 9.67x (mode D) purely because the *gather radius* was 5-10x too
+wide. That was a **separate** defect with its own root cause and its own fix (see the entry
+below, now FIXED in 0.205.0) — this aimed-pass concentration problem is unaffected by it and
+remains open. The two are independent: aiming buys caustic-map *population*, the adaptive radius
+buys caustic *sharpness*, and `gallery_rain` needed both.
+
+### FIXED (2026-09-01, v0.205.0): the two-map caustic split was a **no-op** on `gallery_rain` — the caustic map's radius always collapsed onto the global map's, so caustics rendered as a flat pastel wash
+
+**Symptom.** Issue 6 of the mode-`M` showcase report: "I don't see any colourful caustics
+anywhere, the scene is meant to showcase good caustics."
+
+**What it was not.** Not missing energy and not wrong colour. Metered per cap with
+`scraps/_capchroma.py` on `-hdr` `.pfm` output, mode `M`'s caustic ratios came out comparable to
+the mode-`D` ground truth (axicon 5.30x, diamond 5.47x, glass 4.64x), and the amplified difference
+against a no-caustic control is a field of correctly-coloured caustics. Not the aimed pass either:
+the balance heuristic **conserves** caustic energy (`flux/emitted` 1817.83 vs 1815.88 across a 16x
+budget change), so aiming can only reduce variance, never raise brightness.
+
+**Root cause.** L·S⁺·D is satisfied by *any* specular bounce, so in a gallery full of glass and
+metal the caustic map holds two populations, not one: the focused filaments, and a broad sparse
+room-wide specular wash — and the wash is the majority, so `buildAuto`'s median-density probe is
+decided by it. Every run's log read `caustic map: ... gather radius X -> X (probe saw 1..6;
+target 47)`: the probe wanted to *grow* the radius, `rMax` (= the global radius) pinned it, and
+the caustic map ended up at **exactly the global map's radius** (0.1775 m), 5-10x wider than the
+features it exists to preserve. `-pmccount` was inert on this scene; the split bought nothing.
+
+**Evidence.** Free `-loadmap` radius sweep on `scraps/gr_cam.pmap`, axicon cap peak as a multiple
+of its own median:
+
+| run | gather radius | peak | coverage |
+|---|---|---|---|
+| mode `D` reference | (path traced) | **9.67x** | 3.56 % |
+| `-pmcount 200` | 0.1775 m | 2.93x | 2.00 % |
+| `-pmcount 50`  | 0.08873 m | 3.75x | 3.17 % |
+| `-pmcount 12`  | 0.04347 m | 6.41x | 3.52 % |
+| `-pmcount 3`   | 0.02174 m | **8.05x** | 6.10 % |
+
+Monotonic convergence toward the reference as the radius shrinks — the radius was the whole
+story. Shrinking it map-wide is not the fix, though: the stacked crops in `png/caus6/cmp_radius.png`
+show the small-radius runs turning the sparse regions into **chromatic speckle**, because each
+gather there catches one or two *spectral* photons and paints a random saturated hue.
+
+**Fix.** A per-query adaptive gather radius on the caustic map (`-pmadaptive`, on by default):
+`PhotonMap::adaptiveRadius` (CPU) / `dPmAdaptiveRadius` (GPU) return the radius of the smallest
+disc holding `kGather` same-facing photons, capped at the map radius and floored at `r/256`, and
+the caller renormalises by `1/(π r_q² N)` for the radius actually used. Costs one extra
+neighbourhood walk — a 16-bin geometric histogram of `d²/r²` whose suffix sum is the whole
+radius/population profile — not a per-thread kNN heap and not an iterated count-and-shrink. The
+global map and SPPM keep the fixed-radius path. See `design.md` for the full derivation.
 
 ### RESOLVED — environmental, not a bug (2026-09-01, v0.204.1): a `gallery_rain` render died with `bad allocation` on a **201 MiB** buffer, on a machine with 64 GB of RAM
 

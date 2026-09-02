@@ -11348,6 +11348,23 @@ static bool   g_pmCaustics    = true;
 // denser per unit area, so a smaller k still lands a usable signal-to-noise ratio.
 static double g_pmCausticCount = 50.0;
 
+// PER-QUERY ADAPTIVE GATHER on the caustic map (CLI -pmadaptive / -nopmadaptive,
+// -pmadaptivek). ON by default. See PhotonMap::adaptiveRadius for the full argument; the
+// short version is that the two-map split above gives caustics their own radius but one
+// radius per MAP is still ONE radius, and a caustic map holds two populations — the focused
+// filament and the broad specular wash that any L·S⁺·D path deposits all over a gallery full
+// of glass and metal. buildAuto's median-density probe is decided by the wash, so on
+// gallery_rain the caustic radius pinned to the global map's 0.1775 m, 5-10x wider than the
+// caustics, and the axicon's caustic peaked at 2.9x its cap's median against the mode-D
+// reference's 9.7x — present, correctly coloured, and smeared flat. Shrinking the map-wide
+// radius instead recovers the peak (8.1x at r/8) and grains the rest of the frame into
+// chromatic speckle. Solving per query is what gets both.
+//
+// -pmadaptivek overrides the target population; <= 0 (default) means "the same k the map's
+// own radius was solved for", i.e. g_pmCausticCount * cbrt(stored/1e6).
+static bool   g_pmAdaptive  = true;
+static double g_pmAdaptiveK = 0.0;
+
 // ---- Aimed caustic emission (Jensen's projection map; src/causticaim.h) -------------------
 // The storage half of the two-map split above gives caustics their own radius; it does
 // nothing about the fact that hardly any photon ever reaches a dielectric in the first place
@@ -11419,6 +11436,23 @@ static void buildCausticMap(PhotonMap& pmC, double radius, const char* tag, doub
     char t2[96];
     std::snprintf(t2, sizeof t2, "%s caustic map:", tag);
     buildPhotonMap(pmC, radius, t2, g_pmCausticCount, rGlobal);
+    // Per-query adaptive gather (see g_pmAdaptive). The radius just chosen becomes a
+    // MAXIMUM: every gather tightens from it to whatever holds `k` photons locally, so a
+    // caustic filament is estimated at its own scale while the sparse wash around it keeps
+    // the wide kernel it needs to stay smooth. k matches buildAuto's own target so the two
+    // agree about what "a well-populated gather" means.
+    pmC.kGather = 0.0;
+    if (g_pmAdaptive) {
+        const double k = (g_pmAdaptiveK > 0.0)
+                             ? g_pmAdaptiveK
+                             : g_pmCausticCount * std::cbrt((double)pmC.photons.size() / 1.0e6);
+        if (k > 0.0) {
+            pmC.kGather = k;
+            std::printf("%s caustic map: per-query adaptive gather ON — target %.0f photons, "
+                        "radius %.4g down to %.4g as density allows\n",
+                        tag, k, pmC.radius, pmC.radius / 256.0);
+        }
+    }
     // Stored flux per emitted path. This is the quantity the aimed pass (`-causticn`) is
     // supposed to leave ALONE while changing only its variance, so printing it is the one
     // cheap check that the MIS weighting is right: aim harder and this number must not move,
@@ -16752,6 +16786,9 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-caustics")) g_pmCaustics = true;
         else if (!std::strcmp(argv[i], "-nocaustics")) g_pmCaustics = false;
         else if (!std::strcmp(argv[i], "-pmccount") && i + 1 < argc) { g_pmCausticCount = std::atof(argv[++i]); g_pmCaustics = true; g_pmAutoRadius = true; }
+        else if (!std::strcmp(argv[i], "-pmadaptive")) g_pmAdaptive = true;
+        else if (!std::strcmp(argv[i], "-nopmadaptive")) g_pmAdaptive = false;
+        else if (!std::strcmp(argv[i], "-pmadaptivek") && i + 1 < argc) { g_pmAdaptiveK = std::atof(argv[++i]); g_pmAdaptive = true; }
         else if (!std::strcmp(argv[i], "-causticn") && i + 1 < argc) {
             // `auto` and `off` are spelled out because `atof("auto")` is 0, which is the
             // OFF sentinel — so without this the documented spelling would silently mean
@@ -20393,7 +20430,10 @@ static int run(int argc, char** argv) {
                                           // gathers: metering with the caustic map OFF anchors
                                           // the exposure to a dimmer image than the one that
                                           // gets written, and every render comes out hot.
-                                          g_pmCaustics ? g_pmCausticCount : 0.0);
+                                          g_pmCaustics ? g_pmCausticCount : 0.0,
+                                          nullptr, 0,
+                                          g_pmAdaptive ? (g_pmAdaptiveK > 0.0 ? g_pmAdaptiveK
+                                                                              : -1.0) : 0.0);
                 metered = true;   // a black meter falls into the no-anchor warning below
             }
         }
@@ -20957,7 +20997,9 @@ static int run(int argc, char** argv) {
                                           g_pmAutoRadius ? g_pmAutoCount : 0.0,
                                           wantBeams ? &beamPass : nullptr, &stageProg,
                                           g_pmCaustics ? g_pmCausticCount : 0.0,
-                                          &aimMapGpu, nAimedGpu);
+                                          &aimMapGpu, nAimedGpu,
+                                          g_pmAdaptive ? (g_pmAdaptiveK > 0.0 ? g_pmAdaptiveK
+                                                                              : -1.0) : 0.0);
                 if (wantBeams && beamPass.loadedMissing)
                     std::fprintf(stderr,
                         "[loadmap] warning: %s has no beam data (saved without -beams, or its\n"

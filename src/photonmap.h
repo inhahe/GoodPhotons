@@ -153,6 +153,12 @@ struct PhotonMap {
     long long nEmitted = 0;        // total photons EMITTED in the pass (normalization)
     double    radius   = 0.02;     // gather radius (world units); == grid cell size
 
+    // PER-QUERY ADAPTIVE GATHER (0 = off; see adaptiveRadius below). When > 0 this is the
+    // number of photons a single gather wants to see, and `radius` becomes a MAXIMUM rather
+    // than the radius actually used. Set by buildAuto to the same k it solved the global
+    // radius for; only the CAUSTIC map turns it on (see main.cpp -pmadaptive).
+    double    kGather  = 0.0;
+
     // grid geometry
     Vec3   lo{0, 0, 0};            // cell-lattice origin (padded bbox min)
     double cellSize = 0.02;
@@ -455,5 +461,87 @@ struct PhotonMap {
                 }
             }
         }
+    }
+
+    // ------------------------- PER-QUERY ADAPTIVE GATHER RADIUS -------------------------
+    // Returns the radius this particular gather should use: the radius of the smallest disc
+    // around `p` that holds `kGather` photons facing the same way as `n`, capped at `radius`.
+    // `kGather <= 0` returns `radius` unchanged, so every caller is bit-identical when the
+    // feature is off.
+    //
+    // WHY. A single map-wide radius cannot serve a scene whose photon density spans orders of
+    // magnitude, and a CAUSTIC map is exactly that scene: a gem's focused light lands as a thin
+    // filament thousands of times denser than the specular wash covering the rest of the room.
+    // The two-map split (see main.cpp) was supposed to fix this by giving caustics their own
+    // radius — but one radius per MAP is still one radius, and buildAuto's median-density probe
+    // is dominated by the wash, so on gallery_rain the caustic map's chosen radius pinned to
+    // the global map's (0.1775 m) — 5-10x wider than the features it exists to preserve. The
+    // measured consequence: the axicon cap's caustic peaked at 2.9x its own median where the
+    // mode-D reference peaks at 9.7x, i.e. the caustic was still there, still the right colour,
+    // and smeared into a flat pastel wash. Forcing the map-wide radius down instead recovers
+    // the peak (8.1x at r/8) and turns the whole rest of the image into chromatic speckle,
+    // because each sparse-region gather then catches one or two SPECTRAL photons and paints a
+    // random saturated hue. Adapting PER QUERY is the only thing that gets both: the filament
+    // shrinks its own kernel to its own scale, the wash keeps the wide one it needs.
+    //
+    // HOW, in ONE neighbourhood walk. A kNN search would need a heap (and a heap per thread is
+    // exactly what a GPU gather cannot afford), and iterating "count, shrink, recount" costs a
+    // full 3x3x3 walk per iteration. Instead the single walk histograms each candidate's
+    // squared distance into geometric shells t = d^2/r^2 in (2^-(i+1), 2^-i], so the suffix sum
+    // C_i = sum_{j>=i} hist[j] is the population inside radius r*2^(-i/2) — a whole radius
+    // profile from one pass over the same candidates the gather was going to visit anyway.
+    // Take the tightest shell that still holds k, then interpolate inside it under the local
+    // uniform-density assumption (count grows as r^2): r_q^2 = r_i^2 * k / C_i.
+    //
+    // The normal test is applied HERE and not only in the caller's sum, deliberately. Counting
+    // a wall's photons while gathering the floor beside it would shrink the radius for a
+    // population the sum then rejects, and the estimate is divided by pi*r_q^2 either way — so
+    // the mismatch would print a dark seam along every surface junction.
+    static const int kAdaptBins = 16;   // covers r down to r * 2^-8 = r/256
+
+    double adaptiveRadius(const Vec3& p, const Vec3& n) const {
+        if (kGather <= 0.0 || photons.empty() || radius <= 0.0) return radius;
+        int hist[kAdaptBins] = {0};
+        const double r2 = radius * radius;
+        const double invR2 = 1.0 / r2;
+        int ix, iy, iz; cellCoord(p, ix, iy, iz);
+        for (int dz = -1; dz <= 1; ++dz) {
+            const int cz = iz + dz;
+            for (int dy = -1; dy <= 1; ++dy) {
+                const int cy = iy + dy;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int c = (int)cellIndex(ix + dx, cy, cz);
+                    const Vec3* __restrict pp = pos.data();
+                    for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
+                        Vec3 d = p - pp[k];
+                        const double d2 = dot(d, d);
+                        if (d2 > r2) continue;
+                        if (dot(photons[k].n, n) < 0.5) continue;
+                        // Shell index: t in (2^-(i+1), 2^-i] -> i. ilogb(t) is the exponent e
+                        // with t = m*2^e, m in [1,2), so i = -e-1. d2 == 0 lands in the
+                        // innermost shell (ilogb(0) is FP_ILOGB0, clamped below).
+                        const double t = d2 * invR2;
+                        int i = (t > 0.0) ? -std::ilogb(t) - 1 : (kAdaptBins - 1);
+                        if (i < 0) i = 0;
+                        if (i >= kAdaptBins) i = kAdaptBins - 1;
+                        ++hist[i];
+                    }
+                }
+            }
+        }
+        // Largest i (smallest shell) whose cumulative population still reaches k.
+        long long C = 0;
+        for (int i = kAdaptBins - 1; i >= 0; --i) {
+            C += hist[i];
+            if ((double)C >= kGather) {
+                // r_i^2 = r^2 * 2^-i; interpolate to exactly k photons inside it.
+                double rq2 = r2 * std::ldexp(1.0, -i) * (kGather / (double)C);
+                if (rq2 >= r2) return radius;
+                const double rMin = radius * (1.0 / 256.0);
+                double rq = std::sqrt(rq2);
+                return (rq < rMin) ? rMin : rq;
+            }
+        }
+        return radius;   // fewer than k photons in the whole disc — nothing to tighten
     }
 };

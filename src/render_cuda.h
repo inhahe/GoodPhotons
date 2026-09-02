@@ -228,6 +228,13 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // map's nEmitted stays at the MAIN launch's count — so an incomplete or over-eager target set
 // costs efficiency, never correctness, and `nAimed == 0` leaves every deposit bit-for-bit what
 // it was. Host twin: the aimed pass in tracePhotonPass (photonmap_render.h).
+//
+// `causticAdaptK` switches the caustic map's gather from one radius per MAP to one radius PER
+// QUERY (PhotonMap::adaptiveRadius / dPmAdaptiveRadius): 0 = off (fixed radius, as before),
+// < 0 = on with the same target `causticK` implies, > 0 = on with this explicit target. The
+// split alone is not enough on a scene whose caustic map ALSO holds a broad specular wash —
+// the map-wide probe is decided by the wash and the filament is smeared anyway. Host twin:
+// buildCausticMap in main.cpp.
 struct BeamPass {
     BeamMap*  map    = nullptr;   // receives the deposited (or -loadmap'd) beams, then built
     long long target = 0;         // -beamcount: exact unbiased trim; <= 0 keeps every crossing
@@ -247,7 +254,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const StageProgress* stage = nullptr,
                                             double causticK = 0.0,
                                             const caim::AimMap* aim = nullptr,
-                                            long long nAimed = 0);
+                                            long long nAimed = 0,
+                                            double causticAdaptK = 0.0);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

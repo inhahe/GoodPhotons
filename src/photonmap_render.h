@@ -455,9 +455,19 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             case MatType::Fluorescent: {
                 // Density estimate at y, folding the visible-point reflectance per photon
                 // wavelength: L_o(vis) += rho(vis,l_p) * [rho(y,l_p)/pi] * Phi_p / (pi r^2 N).
-                auto est = [&](const PhotonMap& M) {
+                // `nrmOut` comes back as the map's fixed normalisation unless the map gathers
+                // at a PER-QUERY radius (PhotonMap::adaptiveRadius — the caustic map does),
+                // in which case 1/(pi r_q^2 N) is recomputed for this query's own radius.
+                auto est = [&](const PhotonMap& M, double normFixed, double& nrmOut) {
+                    const double rq = M.adaptiveRadius(h.p, h.n);
+                    nrmOut = normFixed;
+                    if (rq != M.radius) {
+                        const double a = PI * rq * rq;
+                        nrmOut = (M.nEmitted > 0 && a > 0.0)
+                                     ? 1.0 / (a * (double)M.nEmitted) : 0.0;
+                    }
                     Vec3 g{0, 0, 0};
-                    M.query(h.p, [&](const Photon& ph, double, int k) {
+                    M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
                         if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
                         double rhoY = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                         double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
@@ -466,8 +476,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     });
                     return g;
                 };
-                L += est(pm) * (norm * thr);
-                if (pmC && !pmC->photons.empty()) L += est(*pmC) * (normC * thr);
+                double nA = norm;
+                L += est(pm, norm, nA) * (nA * thr);
+                if (pmC && !pmC->photons.empty()) {
+                    double nB = normC;
+                    L += est(*pmC, normC, nB) * (nB * thr);
+                }
                 return L;
             }
             case MatType::Mirror: {
@@ -598,7 +612,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     const double norm = (pm.nEmitted > 0 && area > 0.0)
                             ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
     // The caustic map carries its OWN radius (chosen by its own buildAuto over its own,
-    // far denser, population) and therefore its own 1/(pi r^2 N).
+    // far denser, population) and therefore its own 1/(pi r^2 N). When it also gathers
+    // PER QUERY (PhotonMap::kGather > 0) this is only the fallback: each gather recomputes
+    // the normalisation for the radius it actually used. See PhotonMap::adaptiveRadius.
     const bool causOn = (pmC != nullptr) && !pmC->photons.empty();
     const double areaC = causOn ? PI * pmC->radius * pmC->radius : 0.0;
     const double normC = (causOn && pmC->nEmitted > 0 && areaC > 0.0)
@@ -726,9 +742,18 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 // visible points, which fall back here rather than final-gathering):
                 //   L_r(x) = (1/N) sum_p f_r * Phi_p / (pi r^2), f_r = rho/pi (Lambertian),
                 // accumulated in XYZ per photon wavelength.
-                auto est = [&](const PhotonMap& M) {
+                // Per-query adaptive radius on any map that asks for one (the caustic map);
+                // see the twin in photonGatherSub and PhotonMap::adaptiveRadius.
+                auto est = [&](const PhotonMap& M, double normFixed, double& nrmOut) {
+                    const double rq = M.adaptiveRadius(h.p, h.n);
+                    nrmOut = normFixed;
+                    if (rq != M.radius) {
+                        const double a = PI * rq * rq;
+                        nrmOut = (M.nEmitted > 0 && a > 0.0)
+                                     ? 1.0 / (a * (double)M.nEmitted) : 0.0;
+                    }
                     Vec3 g{0, 0, 0};
-                    M.query(h.p, [&](const Photon& ph, double, int k) {
+                    M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
                         if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
                         double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                         double f = rho * (1.0 / PI);
@@ -736,8 +761,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     });
                     return g;
                 };
-                L += est(pm) * (norm * thr);
-                if (causOn) L += est(*pmC) * (normC * thr);
+                double nA = norm;
+                L += est(pm, norm, nA) * (nA * thr);
+                if (causOn) { double nB = normC; L += est(*pmC, normC, nB) * (nB * thr); }
                 return L;
             }
             case MatType::Mirror: {
