@@ -6293,6 +6293,20 @@ private:
         spd = absPower(b, spd, length(cross(us, vs)) * PI, L);
         Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
         lm.emitPat = spdPat;
+        // `hide_camera on` — primary visibility off. The emitter is untouched (it lights,
+        // it is sampled by NEE, its power keeps the same share of the selection CDF) and so
+        // is the geometry (it still occludes, still shadows, still shows up in a specular
+        // reflection); only the bounce-0 camera ray passes through it. That is what a studio
+        // fill flat wants: it is placed to be SEEN IN a rim, never to be seen directly, and
+        // it is otherwise a large solid rectangle that any later camera move can swing into
+        // frame. See Material::hideCamera and Scene::closestHit's `skipCamHidden`.
+        {
+            const std::string hc = strOf(b, "hide_camera", "off");
+            lm.hideCamera = (hc == "on" || hc == "true" || hc == "yes" || hc == "1");
+            // Set the scene-wide gate here as well as in finalizeEmitters(), so no load
+            // path can leave the fast-path bool disagreeing with the materials.
+            if (lm.hideCamera) L.scene.camHiddenAny = true;
+        }
         int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
         Vec3 a = os, bb = os + us, cc = os + us + vs, dd = os + vs;
         // UVs must equal the emitter's own (u,v) parameterisation — Emitter::samplePoint

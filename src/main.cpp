@@ -12464,7 +12464,10 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
     for (int py = 0; py < film.resY; ++py)
         for (int px = 0; px < film.resX; ++px) {
             Ray r = cam.genRay(px, py, 0.5, 0.5);
-            Hit h = scene.closestHit(r);
+            // A pixel-centre CAMERA ray, so a `hide_camera` flat must not stand between
+            // the lens and the sky it is meant to let through (Material::hideCamera).
+            Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
+                                     /*skipCamHidden=*/true);
             if (!h.valid) {
                 Vec3 bg{0, 0, 0};
                 if (haveEnv) bg += scene.envXYZForDir(r.d);
@@ -12904,7 +12907,10 @@ static CompositeClass classifyComposite(const Scene& scene, const Camera& cam,
         for (int px = 0; px < resX; ++px) {
             size_t i = (size_t)py * resX + px;
             Ray r = cam.genRay(px, py, 0.5, 0.5);
-            Hit h = scene.closestHit(r);
+            // Pixel-centre camera ray again: a hidden flat classifies as whatever is
+            // BEHIND it, which is what the composite will actually show there.
+            Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
+                                     /*skipCamHidden=*/true);
             if (!h.valid) {
                 if (scene.envIndex >= 0) {
                     cc.cls[i] = CompositeClass::SKY;

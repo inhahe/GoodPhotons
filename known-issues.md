@@ -9963,6 +9963,158 @@ host normalises by what actually landed rather than by a stale count.
 sum. This is below the noise of the `atomicAdd(double)` ordering that mode M's gather has always
 depended on, which is itself not reproducible run to run.
 
+### The three follow-ons to the above, all found by one 790 s `-stop` — FIXED 2026-09-02 (v0.205.2)
+
+Stopping the `gallery_rain` mode-M/GPU flyby (pid 42016) at 960x540 took **790 seconds** even
+with the v0.205.1 slicing in place, and the frame it wrote came out too dark. Three separate
+defects, each hidden behind the previous one.
+
+**1 — the first spp of a frame was un-stoppable (`src/render_cuda.cu`).** The guard was
+`if (i < total && base > 0 && ft::stopRequested())`. The `base > 0` half is the "never abandon
+the first chunk" rule quoted in the entry above, and *its premise was right while its conclusion
+was wrong*: abandoning the first chunk does leave a black frame, but the fix for that is to
+**not write the frame**, not to make the chunk uninterruptible. Because `chunk = 200000 / npix`
+clamps to **1 spp** at this resolution, "the first chunk" is "the entire first
+samples-per-pixel" — which on this scene, with `-beams` gathering ~8 500 beams per probe ray,
+runs well past 900 s. So the single seam v0.205.1 added was unreachable for the whole window
+that mattered. The `base > 0` clause is gone; the guard on the *write* side is now
+`if (onFrame && sppDone > 0)`, and a frame stopped before its first complete sample prints
+`frame k/n stopped before its first complete sample — nothing written for it` and leaves any
+previous good PNG at that path alone.
+
+**2 — an interrupted frame was written darkened by exactly the fraction it never gathered
+(`src/main.cpp`).** `writeFrame` normalised the film by the *requested* `spp`, but the film is a
+SUM over the samples that actually landed. A frame stopped at 7 of 24 spp was therefore
+developed 3.4x too dark. `onFrame` now carries `sppDone` (`std::function<bool(int, const Film&,
+long long)>`, declared in `render_cuda.h`) and both consumers use it: `writeFrame` normalises by
+`sppDone` and announces `stopped at N / M spp — writing what gathered`, and the exposure-meter
+`onFrame` does the same so a metering frame cut short can no longer anchor a whole exposure
+group too hot. This was the single most user-visible of the three: the last frame of a stopped
+flythrough is the one a viewer is most likely to open, and it was the one that was wrong.
+
+**3 — the live-window caption went stale for the entire first spp, which is what made the beam
+map look hung (`src/render_cuda.cu`, `src/main.cpp`, `src/render_progress.h`).** `SppProgress`
+cannot fire until a *complete chunk* exists, and per (1) that is one whole spp. Between
+`building beam map…` and the gather's first report the title never changed — 15+ minutes of a
+frozen caption on this scene, which is indistinguishable from a wedged render and is what led to
+a (wrong) report that the beam-map build was taking 25 minutes single-threaded. It takes
+**23.7 s** (`png/gbench/baseline.log`: `BVH in 23.7s`). Now the slice loop drives
+`StageProgress` with `gathering frame k/n` and a (pixel-sample done / total) measure *until the
+frame's first complete chunk exists*, after which `SppProgress` takes the caption back because
+it says strictly more (spp, photons, noise %). `StageProgress` also gained a **`reset`** hook:
+its rate and ETA are `done/elapsed` measured from construction, which is right for the first
+phase it covers and wrong for every one after it, so one `StageProgress` spanning deposit →
+map build → gather reported the gather's rate divided by the deposit's minutes. The gather calls
+`stage->reset()` on entry. Separately, `liveProg.report` now echoes the gather status line to
+**stdout every 30 s** — the gather previously wrote nothing to the log for its entire duration,
+so a backgrounded render was silent for exactly the phase that takes longest.
+
+**Related, still open.** The host-side beam-map build (`photonbeams.h` `splitSah` / the AABB+CIE
+loop / `bvh.h` `Bvh::buildRecursive`) is entirely serial — see the tech-debt entry below. At
+23.7 s it is not the bottleneck, so it was left alone.
+
+### OPEN (tech debt, 2026-09-02): the beam-map build is host-only and single-threaded
+
+Asked directly ("why is the beam-map build running on the CPU instead of the GPU, and why
+single-threaded?"), the answer is: by omission, not design.
+
+The GPU deposits chords into a `DBeamDep` staging buffer, but everything after the download is
+`std::vector` host code shared with the CPU renderer and never ported — the unbiased trim to
+`-beamcount`, `mediumStats()` (per-medium mfp), `probeGatherCount()` (96 probe rays, up to
+120 000 strided beam tests — the `-beamk` floor), `splitSah()` (per-beam area-optimal split),
+the AABB+CIE loop, and `Bvh::build`. Only then is it converted to `DBeamRec`/`DNode` and
+uploaded (`render_cuda.cu:16749-16780`).
+
+It is single-threaded because none of those uses `ft::parallelFor` — there is no such call
+anywhere in `photonbeams.h` or `bvh.h`. `Bvh::build` is a serial binned-SAH builder
+(`LEAF_SIZE = 4`, `NUM_BINS = 16`) shared by *every* BVH in the engine, so parallelising it
+would speed up mesh loads too.
+
+**Measured cost: 23.7 s** on `gallery_rain` (23 750 417 sub-beams, 15 297 819 nodes). That is
+why this is debt and not a bug — it is a rounding error against a gather that runs for minutes
+per frame. The per-beam stages (`splitSah`, the AABB+CIE loop) are embarrassingly parallel and
+would be a near-free `ft::parallelFor`; `buildRecursive` wants task-parallel subtree spawning
+with a serial cutoff, which is the larger of the two jobs.
+
+**Beware the diagnostic that motivated the question.** During a GPU gather ftrace shows exactly
+one host core pegged at ~100 % — that is **not** the beam build. ftrace never calls
+`cudaSetDeviceFlags`, so `cudaDeviceScheduleAuto` makes `cudaDeviceSynchronize()` a spin-wait.
+Combined with the stale caption of (3) above, that is what made a 23.7 s build look like a
+25-minute single-threaded one.
+
+### OPEN (minor, 2026-09-02): no CLI flag renders a single frame (or a range) of a `camera_curve`
+
+There is no `-frame N` / `-frames A B`. To render one frame of a 600-frame flyby — the normal
+thing to want when debugging what is *in* a flyby frame — the scene file must be edited to change
+`frames`, which means generating a scratch copy of the scene per experiment. This came up doing
+an A/B on `gallery_rain`'s left fill panel: the actual comparison was two `sed`-generated scenes
+(`scenes/_gr_fly0.ftsl`, `_gr_fly0_nopanel.ftsl`) differing only in one deleted `light area`
+block. A `-frames` range flag on the existing `camera_curve` evaluation would remove the whole
+dance, and would also let a stopped flyby be resumed at the frame it died on.
+
+### A `light area` was real, opaque, camera-visible geometry with no way to hide it — FIXED 2026-09-02 (v0.206.0)
+
+`ftsl.h` pushes two black-reflectance triangles into the BVH per `light area`, so an area light
+is a physical rectangle that occludes, shadows, and **renders as a visible solid slab** if it
+falls in frame. FTSL §11 has no camera-invisibility flag.
+
+This bit `gallery_rain`: the "large solid square to the left" seen in the flyby is the LEFT FILL
+PANEL (`gallery_rain.ftsl:2206`) — confirmed by A/B render, `png/flypanel/` (slab present) vs
+`png/flypanel_nb/` (that one `light area` block deleted, slab gone). The panel's out-of-frame
+clearance was derived in its own comment (line 2182) for the **still** camera: `fov_y 52`, so
+half-horizontal `atan(tan(26)·16/9) = 41 deg`, from a fixed eye looking down −z. The flyby is
+`fov_y 70` (half-horizontal 51.2 deg) and yaws left at frame 0 (eye `5.32 2.28 8.55`, tangent
+heading −x), which swings the panel's near edge from ~56 deg off-axis to ~42 deg — inside the
+frame. So the scene was correct for the camera it was authored against and silently wrong for
+every other camera, which is the shape of bug a per-camera clearance calculation will always have.
+
+**The proper fix is a flag** — something like `light area { … camera_invisible }` (or the more
+general `visibility camera off` seen in production renderers) that keeps the light emitting, and
+keeps it visible to *reflection* rays, while making it transparent to primary rays. A studio fill
+flat exists to be seen in a specular rim, never in frame; that is exactly what this panel's own
+comment says it is for ("exists only to be REFLECTED"). Re-siting the panel per-camera is the
+workaround, not the fix, and it breaks again on the next camera move.
+
+**FIXED in 0.206.0** by exactly that flag: `light area { … hide_camera on }` (FTSL §11.1,
+REFERENCE.md → Lights). Semantics are deliberately narrow — **primary visibility only**, the
+Cycles/Arnold/PBRT meaning: the bounce-0 camera ray passes through, and every other ray
+(reflection, refraction, shadow/NEE, photon, light subpath) sees the surface exactly as before,
+so the panel still emits at full power, keeps its share of the light-selection CDF, still
+occludes, still shadows, and still appears in the gold gyroid's specular rim — which is the one
+thing it was placed to do. Seen *through glass* it is visible, because a refracted ray is not a
+camera ray.
+
+Implementation:
+* `Material::hideCamera` + the scene-wide gate `Scene::camHiddenAny` (recounted by
+  `finalizeEmitters()` and set directly by the loader, so no load path can leave them
+  disagreeing), with device twins `DMaterial::hideCamera` / `DScene::camHiddenAny`.
+* `Scene::closestHit(…, skipCamHidden)` and `Scene::occluded(…, camLeg)` — and the device
+  `closestHit(…, camHide)` / `occluded(…, camLeg)` — reject the primitive **before** it is
+  intersected (every prim type carries `matId`), so a hidden primitive is strictly *cheaper*
+  than a visible one, and `camHiddenAny` collapses the whole thing to one uniform compare per
+  camera ray for the overwhelmingly common scene with no hidden material. Modelled on the
+  existing `skipHair` / `-fur-volume` ray-type visibility switch.
+* Threaded through the Eikonal GRIN marcher too (`grin::marchSegments(…, camHide)` /
+  `dGrinMarch(…, camHide)`): the marcher's internal `closestHit` bounds each step, so without
+  it a hidden flat inside/behind a GRIN region would freeze the bending at its own depth.
+* Every camera-ray / camera-leg site on both backends: `backward.h` (modes R/W), `bdpt.h`
+  (radiance subpath + the t=1 connection), `vcm.h` (camera subpath + t=1), `sppm_render.h`,
+  `photonmap_render.h` (`photonGather` only — **not** `photonGatherSub`, whose final-gather
+  sub-ray is indirect), `render.h` (`mirrorSeenAt` + the 9 vertex→camera/lens/pupil connection
+  legs; photon→mirror legs stay visible), `main.cpp` (`addEnvBackground`, `classifyComposite`),
+  and the CUDA twins of all of the above.
+* **Not** applied to: instanced meshes (materials live per-BLAS-triangle, below the decode, and
+  nothing that can carry the flag is instanced today — if a mesh-level `hide_camera` ever lands,
+  the test belongs in `Blas::intersectLocal`), forward photon paths, `kIsoPreview`, and the
+  raster preview, which deliberately keeps drawing hidden flats so you can still see where they
+  are (the usual production-viewport convention; raster is a preview, not an output mode).
+
+`gallery_rain` now carries `hide_camera on` on **all three** of its `light area` blocks — the
+left fill panel, the right fill panel (level with and behind the *still* camera only), and the
+50 kW sky panel, which is a 20×14 m black-reflectance lid that any upward pitch would have
+rendered as a roof over the sky. Each one's clearance arithmetic is kept as the record of why
+it sits where it does, but none of it is load-bearing for framing any more.
+
 ### Klein glass mesh had a non-manifold pinch vertex — FIXED 2026-07-14
 The Klein mesh (`scraps/klein_hunyuan_clean.obj` and its staged copy `klein_staged.obj`, used
 by `settle_test_settled.ftsl` / `klein_glass_ior152.ftsl` / `klein_glass_ior242.ftsl`) failed

@@ -2198,13 +2198,30 @@ per-path carrier is left unqualified here.
 
 | Subtype | Description | Key parameters |
 |---|---|---|
-| *(default)* area | Rectangular area light | `origin`, `u`, `v`, `normal`, `spd` |
+| *(default)* area | Rectangular area light | `origin`, `u`, `v`, `normal`, `spd`, `hide_camera` |
 | `sphere` | Spherical area light | `center`, `radius`, `spd` |
 | `cylinder` | Cylindrical tube light | `center`, `axis`, `length`, `radius`, `caps`, `spd` |
 | `spot` | Cone spotlight with penumbra | `origin`, `dir`, `inner_angle`, `outer_angle`, `spd` |
 | `collimated` | Parallel beam (3 cm pencil, ×enclosing group scale), centered on `origin` | `origin`, `dir`, `spd` |
 | `sun` | Distant directional sun (parallel beam over the whole scene, soft-edged disc) | `elevation` + `azimuth` (or `dir`), `angle`, `spd`, `intensity` |
 | `env` | Environment / IBL light | `file` (lat-long HDR) or `spd`, `rotate`, `intensity`, **or `sky`** (analytic sky, below) |
+
+**Invisible fill flats — `hide_camera`.** A rectangular `area` light is real,
+opaque geometry (two triangles in the BVH), so it renders as a visible slab whenever
+it falls in frame. `hide_camera on` inside an `area` block turns off **primary
+visibility only**, the same narrow meaning the flag has in Cycles / Arnold / PBRT: the
+bounce-0 camera ray passes straight through, and **every other ray sees the surface
+unchanged** — it still emits at full power, keeps its share of the light-selection CDF,
+is still sampled by NEE, still occludes, still casts shadows, and still shows up in a
+specular reflection (a mirror ray is traced at bounce 1). Seen *through* glass it is
+visible, since a refracted ray is not a camera ray. That is exactly what a studio fill
+panel wants: it exists to be *seen in* a highlight, never to be seen directly, and
+without the flag its out-of-frame-ness is a property of one particular camera that
+breaks the moment the camera moves or widens its field of view. Works in every render
+mode on both backends, and costs nothing when unused (a scene with no hidden material
+pays one uniform compare per camera ray, and a hidden primitive is rejected *before*
+it is intersected). The raster preview deliberately keeps drawing hidden flats, so you
+can still see where they are. See FTSL.md §11.1.
 
 **Distant sun.** `light sun { … }` is a first-class **directional** emitter: an
 infinitely-distant disc of angular diameter `angle` (degrees; default `0.53`, the real

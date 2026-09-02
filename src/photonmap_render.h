@@ -648,11 +648,18 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     if (aGlass > 0.0) thr *= std::exp(-aGlass * slen);
                     return false;   // a camera ray never terminates in the volume here:
                                     // mode M's volume answer IS the beam gather above
-                });
+                },
+                // b == 0 is the camera ray; see Material::hideCamera. (photonGatherSub's
+                // march above is a final-gather sub-ray and keeps the default `false`.)
+                /*camHide=*/(b == 0));
             if (thr <= 0.0) return L;
         }
 
-        Hit h = scene.closestHit(ray);
+        // b == 0 is the camera ray photonGather was handed (mode M's eye pass); see
+        // Material::hideCamera. photonGatherSub's walk is NOT given this: a final-gather
+        // sub-ray leaves a visible point, so it is an indirect ray and must see the flat.
+        Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
+                                 /*skipCamHidden=*/(b == 0));
         // --- Participating media along this segment (mode M with -beams) ---------------
         // Done BEFORE `thr` takes the segment's attenuation, because each gathered beam
         // needs the transmittance to ITS OWN closest-approach point, not to the segment end.

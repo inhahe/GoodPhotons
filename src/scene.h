@@ -111,6 +111,25 @@ struct Material {
     double roughness = 0.1;                    // glossy lobe width [0,1]; on a Dielectric it
                                                // roughens the reflected+refracted lobes (frosted)
     bool isLight = false;
+    // Invisible to CAMERA (primary) rays only — the standard "primary visibility off"
+    // of a production renderer, and the reason it exists here: an `light area` is not an
+    // abstract emitter, it is two real triangles in the BVH (ftsl.h), so a studio fill
+    // flat placed to be seen in a specular rim is also a large solid rectangle that will
+    // eventually swing into frame. `gallery_rain`'s left fill panel did exactly that the
+    // moment the flyby camera (fov_y 70, yawing) replaced the still one (fov_y 52, fixed)
+    // its out-of-frame clearance had been hand-derived for.
+    //
+    // Semantics, deliberately narrow: ONLY the bounce-0 ray leaving the camera passes
+    // through. Every other ray — reflection, refraction, shadow/NEE, photon, light
+    // subpath — sees the surface exactly as before, so the flat still lights the scene,
+    // still occludes, and still appears in the gold rim it was placed for. Seen THROUGH
+    // glass it is visible too, which matches PBRT/Cycles/Arnold: a refracted ray is not a
+    // camera ray. The one thing you lose is the direct view, which is the whole point.
+    //
+    // Enforced in Scene::closestHit(..., skipCamHidden) by rejecting the primitive BEFORE
+    // it is intersected — every prim type carries `matId`, so the test is a load and a
+    // compare, and a hidden surface costs strictly less than a visible one.
+    bool hideCamera = false;
     // Spatially-varying diffuse albedo: index into Scene::textures (-1 = use the
     // constant `reflect` spectrum). When set, the reflectance at a hit is the
     // texture's per-texel Jakob-Hanika reflectance sampled at the surface (u,v).
@@ -1278,6 +1297,12 @@ struct Scene {
     // sun-aware hot path (ray miss, background pass) tests this first so a scene
     // without a sun pays one integer compare.
     int sunCount = 0;
+    // Does ANY material carry `hideCamera`? Recounted by finalizeEmitters() (and set
+    // directly by the loader the moment the flag is authored, so it can never be missed
+    // by a scene path that skips finalisation). Exists purely so the overwhelmingly
+    // common scene — no hidden material anywhere — pays one bool test per camera ray
+    // instead of a per-primitive material lookup inside the BVH leaf.
+    bool camHiddenAny = false;
 
     // Environment radiance from direction `d` at wavelength lambda (0 if no env).
     // Constant env ignores `d`; an image env samples the lat-long map.
@@ -1519,6 +1544,10 @@ struct Scene {
         // path that rebuilds the emitter list, including applyIgnoreFlags' filtering.
         sunCount = 0;
         for (const auto& e : emitters) if (e.shape == EmitterShape::Sun) ++sunCount;
+        // Same reasoning for the camera-hidden flag: recount here so every path that
+        // rebuilds materials/emitters leaves the fast-path gate consistent with `mats`.
+        camHiddenAny = false;
+        for (const auto& m : mats) if (m.hideCamera) { camHiddenAny = true; break; }
         emitterCdf.assign(emitters.size(), 0.0);
         for (size_t i = 0; i < emitters.size(); ++i) {
             // Area/sphere keep the exact emitIntegral*area*PI expression so those
@@ -2209,8 +2238,17 @@ struct Scene {
     // the strands are summarised by the density grid, and hitting one as geometry would
     // count it twice — once as a surface and once as optical depth. As there, only
     // `MatType::Hair` curves are skipped: grass and wire are curves too and stay solid.
+    //
+    // `skipCamHidden` does the same for `Material::hideCamera` — see that field. Renderers
+    // pass it as `bounce == 0` on the CAMERA path only, which is what makes it mean
+    // "primary visibility off" rather than "invisible": a reflection or refraction spawned
+    // at bounce 0 is traced at bounce 1 and sees the surface normally. `occluded()` has the
+    // same switch under the name `camLeg`, for the forward/bidirectional modes whose camera
+    // ray is a connection segment rather than a traced ray — but it is off by default there,
+    // because an ordinary NEE shadow ray must still be blocked by a hidden flat or turning
+    // off primary visibility would silently change the lighting.
     Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr,
-                   bool skipHair = false) const {
+                   bool skipHair = false, bool skipCamHidden = false) const {
         ++raystats::tls;
         Hit h;
         double tMax = DBL_MAX;
@@ -2231,16 +2269,36 @@ struct Scene {
         // One leaf body, indexed by GLOBAL prim, so both trees decode the same way. The
         // leaf-level hair rejection stays as the fallback for when no no-hair tree was
         // built; when there is one, the fibers are simply not in it and the test never fires.
+        // Hoisted out of the leaf: a scene with no camera-hidden material (all but a
+        // handful) collapses this to a compile-time-constant false and the per-prim test
+        // below is never reached. `hidden()` is checked BEFORE the intersection, not after,
+        // so a hidden primitive costs a matId load and a bool test rather than a full
+        // ray-triangle test whose result is then thrown away.
+        const bool camHide = skipCamHidden && camHiddenAny;
+        const auto hidden = [&](int matId) {
+            return camHide && matId >= 0 && matId < (int)mats.size() && mats[matId].hideCamera;
+        };
         const auto leaf = [&](int prim, double& tm) {
-            if (prim < (int)nT)            { if (intersectTri(sh, r, tris[prim], tmin, h)) tm = h.t; }
-            else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
-            else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs)) tm = h.t; }
+            if (prim < (int)nT)            { const Tri& t = tris[prim];
+                                             if (hidden(t.matId)) return;
+                                             if (intersectTri(sh, r, t, tmin, h)) tm = h.t; }
+            else if (prim < (int)(nT + nS)){ const Sphere& s = spheres[prim - nT];
+                                             if (hidden(s.matId)) return;
+                                             if (intersectSphere(r, s, tmin, h)) tm = h.t; }
+            else if (prim < (int)(nT + nS + nI)) { const Implicit& im = implicits[prim - nT - nS];
+                                             if (hidden(im.matId)) return;
+                                             if (intersectImplicit(r, im, tmin, h, &tabs)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
                 if (skipHair && isHairCurve(cs)) return;
+                if (hidden(cs.matId)) return;
                 if (intersectCurveSeg(cray, r, cs, tmin, h)) tm = h.t;
             }
             else {
+                // Instanced meshes are NOT covered: their materials live per-BLAS-triangle,
+                // below this decode, and nothing that can carry `hideCamera` today (an
+                // `light area`'s two world tris) is ever instanced. If a future `hide_camera`
+                // on a mesh block needs it, the test belongs inside Blas::intersectLocal.
                 const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
                 Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
                 Hit lh; lh.t = h.t;                    // running world tMax == local tMax
@@ -2264,7 +2322,14 @@ struct Scene {
     // NOTE: dielectrics block connections (can't connect through specular) — the
     // SDS limitation. Glass therefore appears dark in model B; caustics it casts
     // onto diffuse surfaces still render, since those diffuse vertices connect.
-    bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
+    //
+    // `camLeg` says this segment IS the camera leg of a connection — a photon-to-pinhole
+    // or vertex-to-camera shadow ray in a forward / bidirectional mode. In those modes the
+    // camera leg plays the part `closestHit`'s primary ray plays in a backward mode, so it
+    // is where `Material::hideCamera` has to apply and the only place it may. Pass it false
+    // (the default) for an NEE / light-connection segment: a hidden flat still shadows.
+    bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6,
+                  bool camLeg = false) const {
         ++raystats::tls;
         Ray r{o, dir};
         const size_t nT = tris.size();
@@ -2275,13 +2340,23 @@ struct Scene {
         const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
         const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};   // see closestHit
         const PatTables tabs = patTables();      // see closestHit
+        const bool camHide = camLeg && camHiddenAny;      // see closestHit's `camHide`
+        const auto hidden = [&](int matId) {
+            return camHide && matId >= 0 && matId < (int)mats.size() && mats[matId].hideCamera;
+        };
         return bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
-            if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
-            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
-            if (prim < (int)(nT + nS + nI + nC))
-                return intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], tmin, h, /*anyHit=*/true);
+            if (prim < (int)nT)             { const Tri& t = tris[prim];
+                                              return !hidden(t.matId) && intersectTri(sh, r, t, tmin, h); }
+            if (prim < (int)(nT + nS))      { const Sphere& s = spheres[prim - nT];
+                                              return !hidden(s.matId) && intersectSphere(r, s, tmin, h); }
+            if (prim < (int)(nT + nS + nI)) { const Implicit& im = implicits[prim - nT - nS];
+                                              return !hidden(im.matId) &&
+                                                     intersectImplicit(r, im, tmin, h, &tabs, /*anyHit=*/true); }
+            if (prim < (int)(nT + nS + nI + nC)) {
+                const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
+                return !hidden(cs.matId) && intersectCurveSeg(cray, r, cs, tmin, h, /*anyHit=*/true);
+            }
             const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             return blasList[inst.blasId].occludedLocal(lr, tmin, seg);  // world seg == local seg

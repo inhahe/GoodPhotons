@@ -740,8 +740,11 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                             }
                             const bool isHairV = (mp->type == MatType::Hair);
                             if (mxF > 0.0 &&
+                                // Light-subpath vertex connected to the camera (VCM's t=1): a camera leg,
+                                // so `hide_camera` applies. See Scene::occluded.
                                 !scene.occluded(fiberOrigin(h, isHairV, wcam), wcam,
-                                                distc - fiberStep(h, isHairV, wcam) - 2e-6)) {
+                                                distc - fiberStep(h, isHairV, wcam) - 2e-6,
+                                                1e-6, /*camLeg=*/true)) {
                                 double bsdfRevPdfW = bsdfPdf(*mp, h.n, wcam, wo, lambda, scene, &h);
                                 double imgPtDist = ctx.imagePlaneDist / cosAtCamera;
                                 double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
@@ -848,7 +851,10 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     const bool hasSun = scene.sunCount > 0;
 
     for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
-        Hit h = scene.closestHit(ray);
+        // edges == 1 is the camera-to-first-vertex edge — the primary ray; see
+        // Material::hideCamera. (The light subpath walk above never gets this.)
+        Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
+                                 /*skipCamHidden=*/(edges == 1));
         if (!h.valid) {
             // The ray left the scene. No env map in VCM scope, but a `light sun` is a
             // delta-DIRECTION emitter with no geometry: the s=0 term never fires for it and

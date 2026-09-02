@@ -1694,7 +1694,10 @@ struct BackwardRenderer {
                         if (preMed < 0.0) return false;
                         if (sAcc + slen <= preMed) { sAcc += slen; return false; }
                         tStop = preMed - sAcc; sAcc = preMed; return true;
-                    });
+                    },
+                    // Camera segment: the marcher's own hit test must skip a `hide_camera`
+                    // surface too, or the bending would stop dead at an invisible flat.
+                    /*camHide=*/(b == 0 && gi.depth == 0));
                 if (preMed >= 0.0) preMed = medInMarch ? 0.0 : (preMed - sAcc);
             }
 
@@ -1707,7 +1710,11 @@ struct BackwardRenderer {
             // With the coat rendered as a medium the strands are NOT geometry any more: they
             // are the extinction the free flight below samples, so intersecting them too
             // would count every fiber twice.
-            Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/useVol);
+            // `b == 0 && gi.depth == 0` is precisely the camera segment (the same test the
+            // footprint below uses), so it is also precisely where a `hide_camera` surface
+            // must be transparent — and nowhere else on the path.
+            Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/useVol,
+                                     /*skipCamHidden=*/(b == 0 && gi.depth == 0));
             if (b == 0 && gi.depth == 0 && h.valid)         // camera segment only — see fwPerDist
                 h.fw = patShadingFootprint(fwPerDist, h.t, dot(ray.d, h.n));
             double dSurf = h.valid ? h.t : 1e30;
@@ -1990,7 +1997,10 @@ struct BackwardRenderer {
             // heroSplit re-entry (which resumes this loop mid-path) keep the parent's tier.
             if (!gi.furTier) gi.furTier = pickFurTier(ray, rng);
             const bool useVol = furVol && gi.furTier == 2;
-            Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/useVol);
+            // Camera segment only, exactly as the footprint test below (and `b == 0`, not
+            // `b == bounce0`, for the same heroSplit reason it gives).
+            Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/useVol,
+                                     /*skipCamHidden=*/(b == 0 && gi.depth == 0));
             // Camera segment only — see fwPerDist. `b == 0` and not `b == bounce0`: a
             // heroSplit re-entry resumes this loop at a DEEPER bounce, and that segment
             // has already been through an interface, so its footprint is not the camera's.

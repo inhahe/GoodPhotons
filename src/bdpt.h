@@ -571,7 +571,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
     };
     for (int bounces = 0;;) {
-        Hit h = scene.closestHit(ray);
+        // `hide_camera` is primary visibility only, so it applies to exactly one ray in
+        // this walk: the first edge of the RADIANCE (camera) subpath. An importance walk
+        // starts at a light and never has a camera ray at all.
+        Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
+                                 /*skipCamHidden=*/(mode == Mode::Radiance && bounces == 0));
         if (h.valid && h.sensorId >= 0) return;      // model-A sensor: not used in BDPT
         double dSurf = h.valid ? h.t : 1e30;
 
@@ -1398,7 +1402,10 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
             if (!(mxF > 0.0)) return 0.0;
         }
-        if (scene.occluded(connOrigin(qs, wcam), wcam, dist - connShorten(qs, wcam, 2e-6))) return 0.0;
+        // The t=1 strategy: this segment runs from a LIGHT-subpath vertex to the camera, so
+        // it is the camera leg and `hide_camera` applies to it (see Scene::occluded).
+        if (scene.occluded(connOrigin(qs, wcam), wcam, dist - connShorten(qs, wcam, 2e-6),
+                           1e-6, /*camLeg=*/true)) return 0.0;
         // Transmittance of the fog the connection ray crosses (1 in vacuum, no RNG).
         // Evaluated at the hero only: the hero gate disables bundling when the scene has
         // any medium, so Tr is exactly 1 whenever nUp > 1.

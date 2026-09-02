@@ -2164,10 +2164,17 @@ light sun { dir -0.1470 0.7071 0.6916   angle 0.53   spd blackbody 5800   intens
 # 50 kW over 280 m2 is ~180 W/m2 exitance, and at ~10 m above the pieces the view factor is
 # ~0.55, so they see ~100 W/m2 of skylight against 1000 W/m2 of sun — the ~10% split a real
 # clear-sky day has, and about 1.5% of the power CDF, which is enough that NEE finds it.
-# The panel is 36 deg above the top of frame, so it is never seen; and it is black anyway.
+# The panel is 36 deg above the top of frame, so it is never seen; and it is black anyway
+# - but "36 deg above the top of frame" is a fact about ONE camera, and a camera that pitches
+# up (the flyby does) would find a 20 x 14 m BLACK LID roofing the sky, since the panel's
+# reflectance is black. `hide_camera on` removes that failure mode outright: the bounce-0
+# camera ray passes through, so the camera sees the sky beyond, while the panel still emits
+# its full 50 kW, keeps its ~1.5% of the power CDF, is still NEE-sampled, and still shadows
+# exactly as the sun-clearance arithmetic above assumes. See FTSL.md 11.1.
 light area {
     origin -4 12.0 -6   u 20 0 0   v 0 0 14
     spd blackbody 11000   power 50000
+    hide_camera on
 }
 
 # --- (3) LEFT FILL PANEL (out of frame; exists only to be REFLECTED) ----------------
@@ -2193,6 +2200,20 @@ light area {
 #     z = 6.05, and the panel is still the same 3.5 m off its -x flank — it is now ALONGSIDE
 #     the ball instead of ahead of it, which is the same geometry the right fill panel already
 #     uses deliberately (see below). Re-derive both ends from the formula if the eye moves.
+#     ...WHICH IS NO LONGER SOMETHING YOU HAVE TO DO, because `hide_camera on` below now
+#     makes the whole clearance calculation moot for framing. It is kept as the record of
+#     WHY the panel sits where it does (the y ceiling, the sun clearance, and the distance
+#     from the rain are all still live constraints), but the panel can no longer appear in
+#     frame no matter where the camera goes. That mattered: the flyby camera_curve is
+#     fov_y 70 (half-horizontal 51.2 deg, not 41) and YAWS, and at frame 0 it swung this
+#     panel's near edge from ~56 deg off-axis to ~42 — inside frame, where it rendered as
+#     the large solid slab down the left. A clearance derived for one camera is wrong for
+#     every other camera by construction; the flag is the fix, the arithmetic was not.
+#   * `hide_camera on` costs the fill NOTHING. The panel still emits its full 2.5 kW, still
+#     keeps its share of the light-selection CDF, is still sampled by NEE, still occludes,
+#     still casts shadows — and still appears in the gold gyroid's rim, which is the only
+#     reason it exists (a specular ray is traced at bounce 1, so it sees the rectangle).
+#     Only the bounce-0 camera ray passes through it. See FTSL.md 11.1.
 #   * y stops at 2.60, below every cloud in the scene, so a panel whose whole purpose is to
 #     be seen in a metal cannot instead show up as a bright wash on the underside of fog.
 #   * it cannot eclipse the sun the way an early sky panel did. The sun is nearly overhead
@@ -2206,6 +2227,7 @@ light area {
 light area {
     origin 1.5 0.15 6.0   u 0 2.45 0   v 0 0 4.2
     spd blackbody 5500   power 2500
+    hide_camera on
 }
 
 # --- (4) RIGHT FILL PANEL (the shadow side) ----------------------------------------
@@ -2222,10 +2244,15 @@ light area {
 # 3.2 m instead of 0.67 at 1.6 m) while IMPROVING its angle on the gyroid (cos 0.95 at 3.8 m),
 # because the gyroid is nearly straight off its normal from there. Measure the bow region's
 # mean level before and after any change to this light; it should not move.
+# `hide_camera on` for the same reason as the left panel: this one sits LEVEL WITH AND BEHIND
+# the still camera, which is only a guarantee for THAT camera - a yawing flyby swings it into
+# frame as readily as it did the left one. It still fills the gyroid's +x flank exactly as
+# before (a bounce-1 ray is not a camera ray). See FTSL.md 11.1.
 # cross(u,v) = -x, so it faces the room.
 light area {
     origin 8.6 0.15 9.0   u 0 2.25 0   v 0 0 -3.0
     spd blackbody 5500   power 2000
+    hide_camera on
 }
 
 # ==============================  ATMOSPHERE  ==================================

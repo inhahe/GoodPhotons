@@ -86,12 +86,16 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
         if (grinAny) {
             double arc = 0.0;
             grin::marchSegments(scene, ray,
-                [&](const Vec3&, const Vec3&, double slen, double&) { arc += slen; return false; });
+                [&](const Vec3&, const Vec3&, double slen, double&) { arc += slen; return false; },
+                // b == 0 is the camera ray; see Material::hideCamera.
+                /*camHide=*/(b == 0));
             int cm = stk.topMat();                       // Beer-Lambert over the marched arc
             double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
             if (a > 0.0 && arc > 0.0) thr *= std::exp(-a * arc);
         }
-        Hit h = scene.closestHit(ray);
+        // b == 0 is the camera ray this function was handed; see Material::hideCamera.
+        Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
+                                 /*skipCamHidden=*/(b == 0));
         if (h.valid) {
             int cm = stk.topMat();
             double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;

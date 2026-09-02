@@ -64,8 +64,15 @@ inline bool sceneHasGrin(const Scene& scene) {
 //
 // A no-op when the ray is nowhere near a GRIN region. Callers gate on sceneHasGrin() so
 // this is never entered for ordinary scenes.
+//
+// `camHide` marks this march as a CAMERA (primary) ray, and is threaded straight into the
+// internal closestHit that bounds each step: a `hide_camera` surface must not truncate a
+// camera march any more than it may stop a straight camera ray, or a hidden flat sitting
+// inside/behind a GRIN region would freeze the bending at its own depth and the caller's
+// own skipCamHidden trace would then resume from the wrong point with the wrong direction.
+// See Material::hideCamera (scene.h).
 template <class SegFn>
-inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg) {
+inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg, bool camHide = false) {
     constexpr int GRIN_MAX_STEPS = 200000;   // safety cap on marching steps
     // Sampled tables, so an `ior` field (or the bounding field selecting the region) can
     // read a MEASURED index volume — `ior "grin:n(x, y, z)"` — not just a formula.
@@ -78,7 +85,7 @@ inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg) {
     };
     for (int gstep = 0; gstep < GRIN_MAX_STEPS; ++gstep) {
         const Medium* gm = grinAt(ray.o);
-        Hit hs = scene.closestHit(ray);
+        Hit hs = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/camHide);
         double dS = hs.valid ? hs.t : 1e30;
         if (!gm) {
             // Outside any GRIN region: jump straight to the nearest GRIN entry lying
@@ -129,9 +136,9 @@ inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg) {
 // wrapper exists to state. It has no in-tree caller at the moment (every current caller wants
 // at least the arc length back, so they pass a hook), but it is the honest spelling of "bend
 // only" and the device side keeps the same shape in `dGrinMarch`'s defaulted `med` parameter.
-inline void march(const Scene& scene, Ray& ray) {
+inline void march(const Scene& scene, Ray& ray, bool camHide = false) {
     marchSegments(scene, ray,
-                  [](const Vec3&, const Vec3&, double, double&) { return false; });
+                  [](const Vec3&, const Vec3&, double, double&) { return false; }, camHide);
 }
 
 }  // namespace grin

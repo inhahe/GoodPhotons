@@ -2069,7 +2069,7 @@ scene to fixed-exposure output (`power` wins if both given). Env lights reject
 
 | subtype | keys (defaults) |
 |---|---|
-| `area` (default) | `origin` `u` `v` `normal`(from u×v) `spd`, `spd_map` — a rectangle |
+| `area` (default) | `origin` `u` `v` `normal`(from u×v) `spd`, `spd_map`, `hide_camera`(off) — a rectangle |
 | `collimated` | `dir`(0,0,-1) `origin`(0.5,0.5,0.95) `spd` — a thin pencil beam |
 | `sphere` | `center` `radius`(0.1) `spd` — a glowing ball (also dropped into geometry) |
 | `cylinder` | `center` `axis`(0,1,0) `length`(0.5) `radius`(0.05) `segments`(48) `caps`(off) `spd` — a tube/fluorescent |
@@ -2091,6 +2091,42 @@ The default rectangular `area` light also accepts an **emission profile** over i
 surface — `spd pattern:<n>` (the pattern *is* the profile, greyscale) or
 `spd_map pattern:<n>` (modulate the authored SPD). Only this subtype and mesh emitters
 can carry one; see §7.2 for why, and for the `power`/`lumens` interaction.
+
+### 11.1 `hide_camera` — primary visibility off
+
+An `area` light is **real geometry**: the loader pushes two opaque, black-reflectance
+triangles into the BVH, so the rectangle occludes, casts shadows, and *renders as a
+visible slab* whenever it falls inside the frame. That is fine for a practical light
+you meant to see, and wrong for a studio fill flat — a panel placed off to one side to
+put a highlight on something, whose out-of-frame-ness is a property of one particular
+camera and silently breaks the moment the camera moves or widens.
+
+```
+light area {
+    origin -7 0 2   u 0 0 8   v 0 6 0   normal 1 0 0
+    spd preset:d65   power 900
+    hide_camera on           # emits and reflects; never seen directly
+}
+```
+
+`hide_camera on` (also `true` / `yes` / `1`) turns off **primary visibility only** —
+the deliberately narrow meaning it has in Cycles, Arnold and PBRT:
+
+- The **bounce-0 camera ray** passes straight through. The panel is not drawn.
+- **Everything else sees it unchanged.** It still emits at full power and keeps the
+  same share of the light-selection CDF; NEE still samples it; it still **occludes**
+  and still **casts shadows**; and it still appears in a **specular reflection**, which
+  is normally the whole reason a fill flat exists — a mirror or glossy rim ray is
+  traced at bounce 1, so it hits the rectangle and reflects it as before.
+- Seen **through glass** it is visible, because a refracted ray is not a camera ray.
+
+The flag costs nothing when unused: a scene with no `hide_camera` anywhere takes one
+uniform compare per camera ray, and a hidden primitive is rejected *before* it is
+intersected, so it is strictly cheaper than a visible one.
+
+Supported on every render mode and on both the CPU and CUDA backends. Not applied by
+the raster preview (`-raster` / the positional-scene viewport), which keeps showing
+hidden flats so you can still see where they are — the usual viewport convention.
 
 ---
 

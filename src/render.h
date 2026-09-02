@@ -936,7 +936,8 @@ struct Renderer {
             if (!cam.project(p, g.px, g.py, cosCamH, dist2H)) return false;
             const double off = hairExitOffset(*hs, n, g.wdir);
             if (off >= g.dist) return false;
-            if (scene.occluded(p + g.wdir * off, g.wdir, g.dist - off - 1e-6)) return false;
+            if (scene.occluded(p + g.wdir * off, g.wdir, g.dist - off - 1e-6, 1e-6,
+                               /*camLeg=*/true)) return false;
             g.denom = dist2H * cam.pixelSolidAngle(cosCamH);
             return true;
         }
@@ -952,7 +953,7 @@ struct Renderer {
         if (g.stG <= 0.0) return false;                 // camera behind true geometry: hard cutoff
         double cosCam, dist2;
         if (!cam.project(p, g.px, g.py, cosCam, dist2)) return false;
-        if (scene.occluded(p + ng * 1e-6, g.wdir, g.dist - 2e-6)) return false;
+        if (scene.occluded(p + ng * 1e-6, g.wdir, g.dist - 2e-6, 1e-6, /*camLeg=*/true)) return false;
         double omega = cam.pixelSolidAngle(cosCam);
         // Veach shading-normal adjoint correction for this particle connection
         // (wi = toward the previous/light-side vertex, wo = wdir toward the camera).
@@ -1017,7 +1018,7 @@ struct Renderer {
         Vec3 wdir = toCam / dist;
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
 
         double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
@@ -1072,7 +1073,8 @@ struct Renderer {
         if (!cam.lensImage(A, wdir, px, py)) return;
         const double off = hs ? hairExitOffset(*hs, n, wdir) : 1e-6;
         if (off >= dist) return;
-        if (scene.occluded(p + (hs ? wdir : ng) * off, wdir, dist - off - 1e-6)) return;
+        if (scene.occluded(p + (hs ? wdir : ng) * off, wdir, dist - off - 1e-6, 1e-6,
+                           /*camLeg=*/true)) return;
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
         // cosSurf carries the Veach shading-normal adjoint correction (see connect()).
@@ -1125,7 +1127,7 @@ struct Renderer {
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
         double corr = shadingAdjointCorr(wi, wdir, n, ng);
         double cellNorm = 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         for (int i = 0; i < nUp; ++i) {
@@ -1155,7 +1157,7 @@ struct Renderer {
         if (cosLens <= 1e-6) return;
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
 
         double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
@@ -1183,7 +1185,7 @@ struct Renderer {
         Vec3 wdir = toCam / dist;
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
         double omega = cam.pixelSolidAngle(cosCam);
         double contrib = beta * (1.0 / (4.0 * PI)) / (dist2 * omega);
         contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
@@ -1207,7 +1209,7 @@ struct Renderer {
         if (cosLens <= 1e-6) return;
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
         double contrib = beta * (1.0 / (4.0 * PI)) * cosLens * (PI * R * R) / (dist * dist);
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
@@ -1506,7 +1508,7 @@ struct Renderer {
             // surface is excluded by shortening maxDist just short of the endpoint).
             if (scene.occluded(p + wP * 1e-6, wP, dP2 - 2e-6)) continue;
             Vec3 wE = eye - ch.P1; double dE = length(wE); wE = wE * (1.0 / dE);
-            if (scene.occluded(ch.P1 + wE * 1e-6, wE, dE - 2e-6)) continue;
+            if (scene.occluded(ch.P1 + wE * 1e-6, wE, dE - 2e-6, 1e-6, /*camLeg=*/true)) continue;
 
             // Fog transmittance on the two outer (vacuum-side) segments only; the
             // interior segment is solid glass (its absorption is the Beer-Lambert above).
@@ -1727,7 +1729,11 @@ struct Renderer {
     // the exact texel/pattern value the surface has there.
     static bool mirrorSeenAt(const Scene& scene, const Vec3& eye, const Vec3& wE,
                              double dE, Hit& hm) {
-        hm = scene.closestHit(Ray{eye, wE});
+        // This leg starts AT THE EYE, so it is a camera ray and a `hide_camera` flat must
+        // not answer either of the two questions it asks — it is neither the mirror nor a
+        // legitimate blocker of the view. See Material::hideCamera.
+        hm = scene.closestHit(Ray{eye, wE}, 1e-6, nullptr, /*skipHair=*/false,
+                              /*skipCamHidden=*/true);
         if (!hm.valid) return false;
         if (std::fabs(hm.t - dE) > 1e-4 * (1.0 + dE)) return false;   // something in front
         if (hm.matId < 0 || hm.matId >= (int)scene.mats.size()) return false;

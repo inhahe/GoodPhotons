@@ -412,6 +412,11 @@ struct DMaterial {
     // the camera sees them. matEmit is that fallback, consulted only when
     // dEmitterForMat() < 0 so a mesh/quad light never double-counts.
     int    matIsLight;
+    // Device twin of Material::hideCamera — primary visibility off. Only the bounce-0
+    // camera ray of a gather/backward path skips this material; every other ray sees it.
+    // See Material::hideCamera (scene.h) for why the flag exists at all, and
+    // closestHit(..., camHide) below for how it is enforced.
+    int    hideCamera;
     double matEmit[SPEC_N];
     DVec3  rgbMatEmit;          // matEmit baked to linear sRGB, for the fast RGB backward
     // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
@@ -1022,6 +1027,11 @@ struct DScene {
     const int* dielSph;   int nDielSph;
     const int* mirrorSph; int nMirrorSph;
     const DMaterial* mats;
+    // Device twin of Scene::camHiddenAny — does ANY material carry hideCamera? Gates the
+    // per-primitive material lookup in closestHit's camera-ray mode, so a scene with no
+    // hidden flat (all but a handful) pays one uniform compare per camera ray instead of a
+    // global load per BVH leaf primitive. See DMaterial::hideCamera.
+    int              camHiddenAny;
     const DNode*     nodes; const int* primIdx; int nNodes;
     // Implicit surfaces (isosurface/CSG/metaballs). BVH prims with index
     // >= nTris+nSph map to implicits[prim - nTris - nSph]; fieldNodes is the flat
@@ -3140,10 +3150,21 @@ __device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& ro
 // texture samplers (which depend on dWrapIndex), but is called from closestHit's tail.
 __device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h);
 
+// `camHide` marks this as a CAMERA (primary) ray, which is the one and only ray type that
+// `DMaterial::hideCamera` applies to — device twin of Scene::closestHit's `skipCamHidden`.
+// Callers pass it as `bounce == 0` on a camera path and never on a photon / light-subpath
+// walk. `sc.camHiddenAny` collapses it to nothing for a scene with no hidden material.
 __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3& rd,
-                                   Real tmin = RAY_EPS, Real tCap = BIG) {
+                                   Real tmin = RAY_EPS, Real tCap = BIG,
+                                   bool camHide = false) {
     DHit h; h.t = tCap; h.valid = false; h.matId = 0; h.sensorId = -1;
     if (sc.nNodes == 0) return h;
+    // One uniform test, hoisted out of the leaf loop. `hidden()` is checked BEFORE the
+    // intersection, so a hidden primitive costs a matId load rather than a full ray test.
+    const bool camHideOn = camHide && sc.camHiddenAny;
+    auto hidden = [&](int matId) -> bool {
+        return camHideOn && sc.mats[matId].hideCamera != 0;
+    };
     DVec3 invD{(Real)1 / rd.x, (Real)1 / rd.y, (Real)1 / rd.z};
     const DTriShear sh = makeTriShear(rd);
     // Hoisted per ray, not per segment (a fur render tests thousands of segments per ray).
@@ -3163,11 +3184,18 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
-                if (prim < sc.nTris)              { if (intersectTri(sh, ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
-                else if (prim < sc.nTris + sc.nSph){ if (intersectSphere(ro, rd, sc.sph[prim - sc.nTris], tmin, h)) tMax = h.t; }
-                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { if (intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], ro, rd, tmin, h)) tMax = h.t; }
-                else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { if (intersectCurveSeg(cray, ro, rd, sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits], tmin, h)) tMax = h.t; }
+                if (prim < sc.nTris)              { const DTri& t = sc.tris[prim];
+                                                    if (!hidden(t.matId) && intersectTri(sh, ro, rd, t, tmin, h)) tMax = h.t; }
+                else if (prim < sc.nTris + sc.nSph){ const DSphere& s = sc.sph[prim - sc.nTris];
+                                                    if (!hidden(s.matId) && intersectSphere(ro, rd, s, tmin, h)) tMax = h.t; }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { const DImplicit& im = sc.implicits[prim - sc.nTris - sc.nSph];
+                                                    if (!hidden(im.matId) && intersectImplicit(sc, im, ro, rd, tmin, h)) tMax = h.t; }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
+                                                    if (!hidden(cs.matId) && intersectCurveSeg(cray, ro, rd, cs, tmin, h)) tMax = h.t; }
                 else {
+                    // Instanced meshes are not covered — see the host twin in scene.h for why
+                    // (per-BLAS-triangle materials live below this decode, and nothing that can
+                    // carry hideCamera today is ever instanced).
                     // Instance leaf: transform the ray into BLAS-local space, walk the
                     // shared sub-BVH, and map any closer hit back to world space.
                     const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits - sc.nCurveSegs];
@@ -3228,8 +3256,13 @@ struct DGrinMedia {
 // costs nothing extra — the marcher already redoes grinAt/closestHit on every iteration — and
 // it keeps the bending math in this one function instead of a second copy of it. On return
 // from a single step, (previous ro, the NEW rd, med->arc) is exactly the sub-segment walked.
+// `camHide` marks this march as a CAMERA (primary) ray and is threaded into the internal
+// closestHit calls that bound each step: a `hide_camera` surface must not truncate a camera
+// march any more than it may stop a straight camera ray, or a hidden flat inside/behind a
+// GRIN region would freeze the bending at its own depth. Host twin: grin.h marchSegments.
 __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
-                                  DGrinMedia* med = nullptr, int maxSteps = 200000) {
+                                  DGrinMedia* med = nullptr, int maxSteps = 200000,
+                                  bool camHide = false) {
     const int GRIN_MAX_STEPS = maxSteps;
     const bool doMedia = (med != nullptr) && (med->rng != nullptr) && sc.mediaN > 0;
     // Accumulate position/direction in DOUBLE (not Real=float) so the running Eikonal
@@ -3265,7 +3298,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
             // surface, else stop (straight-ray body takes over). This branch needs the
             // full-range closest hit (dS bounds the entry search) but runs only at
             // region entries, not per Eikonal step.
-            DHit hs = closestHit(sc, cro, crd);
+            DHit hs = closestHit(sc, cro, crd, RAY_EPS, BIG, camHide);
             double dS = hs.valid ? (double)hs.t : 1e30;
             double bestTa = 1e30; int bestM = -1;
             for (int mi = 0; mi < sc.mediaN; ++mi) {
@@ -3304,7 +3337,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
 #else
         tcap = nextafter(tcap, DBL_MAX);
 #endif
-        DHit hs = closestHit(sc, cro, crd, RAY_EPS, tcap);
+        DHit hs = closestHit(sc, cro, crd, RAY_EPS, tcap, camHide);
         if (hs.valid && (double)hs.t <= ds) break;   // surface within a step
         // Symplectic Eikonal step with optical direction T = n·d (|T| = n):
         //   T += ∇n·ds ;  x += (T/n)·ds ;  d = T/|T|.
@@ -3347,9 +3380,22 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
     rd = DVec3{dx, dy, dz};
 }
 
+// `camLeg` says this segment IS the camera leg of a connection — a photon-to-pinhole or
+// vertex-to-camera/lens shadow ray in a forward / bidirectional mode. In those modes the
+// camera leg plays the part closestHit's primary ray plays in a backward mode, so it is
+// where DMaterial::hideCamera has to apply and the only place it may. Pass it false (the
+// default) for an NEE / light-connection segment: a hidden flat still shadows, or turning
+// off primary visibility would silently change the lighting. Device twin of
+// Scene::occluded's `camLeg` (scene.h).
 __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& dir,
-                                 Real maxDist, Real tmin = RAY_EPS) {
+                                 Real maxDist, Real tmin = RAY_EPS, bool camLeg = false) {
     if (sc.nNodes == 0) return false;
+    // One uniform test, hoisted out of the leaf loop; `hidden()` is checked BEFORE the
+    // intersection, so a hidden primitive costs a matId load rather than a full ray test.
+    const bool camHideOn = camLeg && sc.camHiddenAny;
+    auto hidden = [&](int matId) -> bool {
+        return camHideOn && sc.mats[matId].hideCamera != 0;
+    };
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
     const DTriShear sh = makeTriShear(dir);
     const DCurveRay cray = sc.nCurveSegs ? makeCurveRay(dir) : DCurveRay{DVec3{(Real)0,(Real)0,(Real)1}, (Real)1};
@@ -3365,12 +3411,19 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                 int prim = sc.primIdx[n.first + i];
                 DHit h; h.t = tMax; h.valid = false;
                 bool blocked;
-                if (prim < sc.nTris)                              blocked = intersectTri(sh, o, dir, sc.tris[prim], tmin, h);
-                else if (prim < sc.nTris + sc.nSph)               blocked = intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h);
-                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) blocked = intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h, /*anyHit=*/true);
-                else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) blocked = intersectCurveSeg(cray, o, dir, sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits], tmin, h, /*anyHit=*/true);
+                if (prim < sc.nTris)                              { const DTri& t = sc.tris[prim];
+                                                                    blocked = !hidden(t.matId) && intersectTri(sh, o, dir, t, tmin, h); }
+                else if (prim < sc.nTris + sc.nSph)               { const DSphere& s = sc.sph[prim - sc.nTris];
+                                                                    blocked = !hidden(s.matId) && intersectSphere(o, dir, s, tmin, h); }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { const DImplicit& im = sc.implicits[prim - sc.nTris - sc.nSph];
+                                                                    blocked = !hidden(im.matId) && intersectImplicit(sc, im, o, dir, tmin, h, /*anyHit=*/true); }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
+                                                                    blocked = !hidden(cs.matId) && intersectCurveSeg(cray, o, dir, cs, tmin, h, /*anyHit=*/true); }
                 else {
-                    // Instance leaf: any-hit inside the shared BLAS in local space.
+                    // Instance leaf: any-hit inside the shared BLAS in local space. NOT covered by
+                    // `hidden()`: instanced materials live per-BLAS-triangle, below this decode, and
+                    // nothing that can carry hideCamera today (a `light area`'s two world tris) is
+                    // ever instanced. Same exclusion as closestHit and the host twin.
                     const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits - sc.nCurveSegs];
                     DVec3 lo = affPoint(inst.Lm, inst.Lt, o);
                     DVec3 ld = affDir(inst.Lm, dir);
@@ -3774,7 +3827,7 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     if (stG <= (Real)0) return;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real f = rho / (Real)DPI;
     // Projection-general splat: contrib = beta*f*cosSurf*corr / (dist^2 * pixelSolidAngle).
     // For a rectilinear lens pixelSolidAngle = pixelPlaneArea*cosCam^3, recovering the
@@ -3797,7 +3850,7 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
     DVec3 wdir = toCam / dist;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real ph = dMedPhase(med, dot(wIn, wdir), lambda);
     Real Lambda = medAlbedo(med, lambda);
     // Projection-general splat (no cosSurf for a volume vertex): the phase carries the
@@ -3834,7 +3887,7 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (cosLens <= (Real)1e-6) return;               // not heading toward the film
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
     Real contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
     // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification) — CPU twin: render.h connectLens.
@@ -3866,7 +3919,7 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real ph = dMedPhase(med, dot(wIn, wdir), lambda);
     Real Lambda = medAlbedo(med, lambda);
     Real contrib = beta * Lambda * ph * cosLens * (Real)DPI * (R * R) / (dist * dist);
@@ -4468,7 +4521,7 @@ __device__ static void connectHair(const DScene& sc, const DCamera& cam, double*
     if (!cam.project(p, px, py, cosCam, dist2)) return;
     const Real off = dHairExitOffset(hs, n, wdir);
     if (off >= dist) return;
-    if (occluded(sc, p + wdir * off, wdir, dist - off - RAY_EPS)) return;
+    if (occluded(sc, p + wdir * off, wdir, dist - off - RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real f = dHairFCos(hs, wdir);
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * f / (Real)((double)dist2 * solidAngle);
@@ -4495,7 +4548,7 @@ __device__ static void connectLensHair(const DScene& sc, const DCamera& cam, dou
     if (!cam.lensImage(A, wdir, px, py)) return;
     const Real off = dHairExitOffset(hs, n, wdir);
     if (off >= dist) return;
-    if (occluded(sc, p + wdir * off, wdir, dist - off - RAY_EPS)) return;
+    if (occluded(sc, p + wdir * off, wdir, dist - off - RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real fcos = (Real)DPI * dHairFCos(hs, wdir);
     Real contrib = beta * fcos * cosLens * (R * R) / (dist * dist);
     // Same flux -> film-irradiance normaliser as connectLens (see there).
@@ -5086,7 +5139,7 @@ __device__ static void connectEmissionVolume(const DScene& sc, const DCamera& ca
     DVec3 wdir = toCam / dist;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) / (Real)((double)dist2 * solidAngle);
     contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
@@ -5109,7 +5162,7 @@ __device__ static void connectEmissionLensVolume(const DScene& sc, const DCamera
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) * cosLens * (Real)DPI * (R * R) / (dist * dist);
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
@@ -5537,7 +5590,7 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         if (occluded(sc, (p + wP * 1e-6).toR(), wPR, connMaxT(dP2))) continue;
         D3 wE = eye - ch.P1; double dE = d3len(wE); wE = wE * (1.0 / dE);
         DVec3 wER = wE.toR();
-        if (occluded(sc, (ch.P1 + wE * 1e-6).toR(), wER, connMaxT(dE))) continue;
+        if (occluded(sc, (ch.P1 + wE * 1e-6).toR(), wER, connMaxT(dE), RAY_EPS, /*camLeg=*/true)) continue;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
 
         if (sc.mediaN > 0) {
             contrib *= (double)dMediaTransmittance(sc, p.toR(),   wPR, (Real)dP2, lambda, rng);
@@ -5612,7 +5665,10 @@ __device__ static bool dReflectOffSphere(const D3& o, const D3& d, const DSphere
 // Twin of Renderer::mirrorSeenAt.
 __device__ static bool dMirrorSeenAt(const DScene& sc, const D3& eye, const D3& wE,
                                      double dE, DHit& hm) {
-    hm = closestHit(sc, eye.toR(), wE.toR());
+    // This leg starts AT THE EYE, so it is a camera ray and a `hide_camera` flat must not
+    // answer either of the two questions above — it is neither the mirror nor a legitimate
+    // blocker of the view. Twin of Renderer::mirrorSeenAt. See DMaterial::hideCamera.
+    hm = closestHit(sc, eye.toR(), wE.toR(), RAY_EPS, BIG, /*camHide=*/true);
     if (!hm.valid) return false;
     if (fabs((double)hm.t - dE) > 1e-4 * (1.0 + dE)) return false;   // something in front
     return dIsPlanarMirrorMat(sc.mats[hm.matId]);
@@ -7606,7 +7662,7 @@ __device__ static void connectHero(const DScene& sc, const DCamera& cam, double*
     if (stG <= (Real)0) return;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real geo = cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
@@ -7639,7 +7695,7 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     Real cellNorm = (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     Real geo = cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG * cellNorm;
@@ -9691,8 +9747,15 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // only routes the medium through the marcher), the haze came out 22% dark through
         // its own centre against a 2.2% noise floor, and vanished visually.
         DGrinMedia gmed; gmed.rng = &rng; gmed.lambda = lambda;
-        if (sc.hasGrin) dGrinMarch(sc, ro, rd, &gmed);
-        DHit h = closestHit(sc, ro, rd);
+        // Camera segment: the marcher's own hit test must skip a `hide_camera` surface too,
+        // or the bending would stop dead at an invisible flat. See DMaterial::hideCamera.
+        if (sc.hasGrin) dGrinMarch(sc, ro, rd, &gmed, 200000,
+                                   /*camHide=*/(b == 0 && gi.depth == 0));
+        // `b == 0 && gi.depth == 0` is precisely the camera segment (the same test the O8
+        // footprint stamp below uses), so it is also precisely where a `hide_camera` surface
+        // must be transparent — and nowhere else on the path. See DMaterial::hideCamera.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG,
+                            /*camHide=*/(b == 0 && gi.depth == 0));
         // O8 stage 2: stamp the shading footprint on the CAMERA SEGMENT only (host twin:
         // backward.h radiance()). A secondary bounce would need ray differentials /
         // cones to know how much its own footprint spread, so it keeps fw = 0
@@ -9878,7 +9941,10 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
     for (int b = bounce0; b < maxBounce; ++b) {
         int nUp = secAlive ? C : 1;                    // wavelengths still being propagated
         gi.bounce = b;                                 // see the scalar twin: mode W's per-vertex lattice
-        DHit h = closestHit(sc, ro, rd);
+        // Camera segment only — same test as the footprint stamp below, and for the same
+        // reason a heroSplit re-entry (bounce0 > 0) is not one. See DMaterial::hideCamera.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG,
+                            /*camHide=*/(b == 0 && gi.depth == 0));
         // O8 stage 2 footprint, camera segment only — see the scalar twin. The test is
         // `b == 0`, NOT `b == bounce0`: a heroSplit re-entry resumes at a DEEPER bounce,
         // and that sub-path's first vertex is not a camera vertex.
@@ -10499,7 +10565,8 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
     const int maxBounce = sc.bkMaxBounce;
     const bool directOnly = (sc.bkDirectOnly != 0);
     for (int b = 0; b < maxBounce; ++b) {
-        DHit h = closestHit(sc, ro, rd);
+        // b == 0 is the camera ray this path was handed. See DMaterial::hideCamera.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(b == 0));
         if (!h.valid) {                                // escaped -> constant env
             if (sc.envIndex >= 0) {
                 if (specularArrival) {
@@ -10858,7 +10925,11 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
     for (int i = 0; i + 1 < nUp; ++i) betaSec[i] = betaSecIn[i];
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack for exterior-IOR resolution
     for (int bounces = 0;;) {
-        DHit h = closestHit(sc, ro, rd);
+        // `hide_camera` is primary visibility only, so it applies to exactly one ray in this
+        // walk: the first edge of the RADIANCE (camera) subpath. An importance walk starts at
+        // a light and never has a camera ray at all. See DMaterial::hideCamera.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG,
+                            /*camHide=*/(!importance && bounces == 0));
         if (h.valid && h.sensorId >= 0) return;
         double dSurf = h.valid ? (double)h.t : 1e30;
 
@@ -11481,7 +11552,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
             if (!(mxF > 0.0)) return 0.0;
         }
-        if (occluded(sc, o, wcam, connMaxT(dist))) return 0.0;
+        if (occluded(sc, o, wcam, connMaxT(dist), RAY_EPS, /*camLeg=*/true)) return 0.0;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
         double cosCam = ddot(qs.p - cam.eye, cam.w) / dist;   // positive (point in front)
         // Hero-only transmittance: the hero gate excludes any medium, so Tr is exactly 1
         // whenever nUp > 1.
@@ -12111,7 +12182,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             for (int gs = 0; gs < 200000; ++gs) {  // same safety cap the marcher applies
                 DVec3 pro = ro;
                 DGrinMedia gm;                     // rng == nullptr: bend only, no collisions
-                dGrinMarch(sc, ro, rd, &gm, 1);    // — a camera ray's volume answer IS the
+                dGrinMarch(sc, ro, rd, &gm, 1, /*camHide=*/(b == 0));  // — a camera ray's volume answer IS the
                 if (!gm.stepped) break;            //   beam gather below
                 const Real slen = (Real)gm.arc;
                 if (volOn && slen > 0) {
@@ -12124,7 +12195,10 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             }
             if (thr <= 0.0) return;
         }
-        DHit h = closestHit(sc, ro, rd);
+        // b == 0 is the camera ray dPhotonGather was handed (mode M's eye pass); see
+        // DMaterial::hideCamera. dPhotonGatherSub's walk is NOT given this: a final-gather
+        // sub-ray leaves a visible point, so it is an indirect ray and must see the flat.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(b == 0));
         // --- Participating media along this segment (mode M with -beams) ------------------
         // Done BEFORE `thr` takes the segment's attenuation, for the same reason: each
         // gathered beam carries the transmittance to ITS OWN closest approach.
@@ -12391,12 +12465,13 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
     for (int b = 0; b < maxBounce; ++b) {
         if (sc.hasGrin) {                                // GRADIENT-INDEX: the camera ray bends,
             DGrinMedia gm;                               // exactly as the deposit's photons do.
-            dGrinMarch(sc, ro, rd, &gm);                 // rng == nullptr: bend only
+            dGrinMarch(sc, ro, rd, &gm, 200000, /*camHide=*/(b == 0));  // rng == nullptr: bend only
             int cm = stk.topMat();                       // Beer-Lambert over the marched arc
             Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
             if (a > 0 && gm.arc > 0) thr *= exp(-(double)a * (double)gm.arc);
         }
-        DHit h = closestHit(sc, ro, rd);
+        // b == 0 is the camera ray this visible-point walk was handed; see DMaterial::hideCamera.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(b == 0));
         if (h.valid) {                                   // Beer-Lambert in current medium
             int cm = stk.topMat();
             Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
@@ -13057,7 +13132,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                 // in either; skips the eval for occluded splats).
                                 double sgn = ddot(h.ng, wcam) >= 0.0 ? 1.0 : -1.0;
                                 DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
-                                if (!occluded(sc, oo, wcam, connMaxT(distc))) {
+                                if (!occluded(sc, oo, wcam, connMaxT(distc), RAY_EPS, /*camLeg=*/true)) {  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
                                     DVertex vt = dVertFromHit(h, matId);
                                     // The adjoint correction and shadow-terminator G are purely
                                     // geometric, so they scale every λ the same way.
@@ -13212,7 +13287,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         const bool hasSun = sc.sunCount > 0;
 
         for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
-            DHit h = closestHit(sc, ro, rd);
+            // edges == 1 is the camera-to-first-vertex edge — the primary ray; see
+            // DMaterial::hideCamera. (The light subpath walk never gets this.)
+            DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(edges == 1));
             if (!h.valid) {
                 // The ray left the scene. No env map in VCM scope, but a `light sun` is a
                 // delta-DIRECTION emitter with no geometry: the s=0 term never fires for it
@@ -14361,6 +14438,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // CSG/quadric solids). bakeSpec of a null Spectrum yields all zeros, so a
         // non-emissive material costs nothing but the storage.
         d.matIsLight = m.isLight ? 1 : 0;
+        d.hideCamera = m.hideCamera ? 1 : 0;
         bakeSpec(m.emit, d.matEmit);
         { Vec3 le = m.emit ? rgbbake::emitToRgb(m.emit) : Vec3{0, 0, 0};
           d.rgbMatEmit = {le.x, le.y, le.z}; }
@@ -14701,6 +14779,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.dielSph   = d_dielSph;   sc.nDielSph   = (int)scene.dielSphereIdx.size();
     sc.mirrorSph = d_mirrorSph; sc.nMirrorSph = (int)scene.mirrorSphereIdx.size();
     sc.mats = d_mats;
+    sc.camHiddenAny = scene.camHiddenAny ? 1 : 0;   // see DScene::camHiddenAny
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
     sc.fieldNodes = d_fnodes; sc.fieldExprNodes = d_fexpr;
     sc.fieldNodesF = d_fnodesF; sc.fieldExprNodesF = d_fexprF;
