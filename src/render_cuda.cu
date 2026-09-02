@@ -16116,7 +16116,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             long long N, double radius, EnergyReport& eOut,
                                             bool diffraction, long long spp,
                                             const SppProgress* prog,
-                                            const std::function<bool(int, const Film&)>* onFrame,
+                                            const std::function<bool(int, const Film&, long long)>* onFrame,
                                             const char* mapLoad, const char* mapSave, int heroC,
                                             int fgRays, double autoK, BeamPass* beams,
                                             const StageProgress* stage, double causticK,
@@ -16833,6 +16833,23 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         if (slice < sliceLo) slice = ((long long)npix >> 4) + 1;          // first probe: 1/16 spp
         long long sppDone = 0;
         bool abandoned = false;
+        // Name the gather in the window title / log, with a measure.
+        //
+        // WHY THIS IS NOT REDUNDANT WITH `prog` BELOW. The live SppProgress report only fires
+        // after a COMPLETE chunk, and `chunk` has already clamped to one spp at any real
+        // resolution — so on a heavy scene the first title update is one whole spp away. On
+        // gallery_rain that is upwards of fifteen minutes during which the window still read
+        // `building beam map…`, the caption the previous phase left behind: the beam map had
+        // in fact finished in 23.7 s and the render was gathering the whole time, but nothing
+        // said so, and the only visible evidence — one CPU core pegged by the default
+        // spin-waiting cudaDeviceSynchronize, with the GPU at 100% — reads exactly like a
+        // single-threaded host build that will not end. A stage line fires every 0.25 s from
+        // inside the slice loop instead, so the gather names itself from its first quarter
+        // second, and (on the 30 s log cadence) a headless run's log says so too.
+        const long long sampTotal = (long long)npix * spp;   // pixel-samples in this frame
+        char stageText[96];
+        std::snprintf(stageText, sizeof stageText, "gathering frame %d/%d", c + 1, nc);
+        if (stage && stage->reset) stage->reset();   // rate/ETA measured from THIS phase
         for (long long base = 0; base < spp; base += chunk) {
             long long cs2 = (base + chunk <= spp) ? chunk : (spp - base);
             long long total = (long long)npix * cs2;
@@ -16850,10 +16867,24 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                     std::chrono::steady_clock::now() - t0).count();
                 const long long did = hi - i;
                 i = hi;
-                // Abandon the chunk in flight only if there is already a complete chunk in
-                // the film. Bailing out of the very first one would write a black frame,
-                // which is a worse answer to a stop than the one extra chunk it costs.
-                if (i < total && base > 0 && ft::stopRequested()) { chunkDone = false; break; }
+                // Only until the frame's first complete chunk exists: from there on `prog`
+                // below owns the caption and says strictly more (spp, photons, noise %).
+                if (sppDone == 0 && stage && stage->report)
+                    stage->report(stageText, base * (long long)npix + i, sampTotal);
+                // Abandon the chunk in flight, first chunk included.
+                //
+                // It used to require `base > 0`, so that a stop could never leave the film
+                // with zero complete samples in it — the frame would then have to be written
+                // black, which is a worse answer to a stop than the one extra chunk it costs.
+                // The premise is right and the conclusion was wrong: the cost is not "one
+                // extra chunk", it is one entire spp of a gather whose spp can run to a
+                // quarter of an hour, and measured on gallery_rain a `-stop` sat unanswered
+                // for the full 900 s wait and was reported FAILED on a render that was
+                // winding down correctly. The frame with nothing in it is not written at all
+                // instead (see the `sppDone > 0` guard on `onFrame` below), which is both
+                // honest and what every earlier frame of a flythrough — already safely on
+                // disk — makes harmless.
+                if (i < total && ft::stopRequested()) { chunkDone = false; break; }
                 // Never below 1/64 spp (a slice that keeps halving turns the gather into
                 // launch latency), never more than 4x up in one step (one anomalously fast
                 // slice must not produce a minutes-long next one). A slice too fast to time
@@ -16901,11 +16932,18 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         // all nc films to the end (mirrors the CPU mode-M path, which writes per frame). If
         // the host asks to stop (window closed / Ctrl-C), quit after this frame — everything
         // written so far is already safely on disk.
-        if (onFrame) {
-            bool stopReq = (*onFrame)(c, out[c]);
+        // A frame the stop caught before its first complete sample holds nothing but zeros;
+        // writing it would replace a good previous render of the same path with a black PNG.
+        // Say so and skip it — the frames before it are already on disk.
+        if (onFrame && sppDone > 0) {
+            bool stopReq = (*onFrame)(c, out[c], sppDone);
             Film empty; empty.resX = resX[c]; empty.resY = resY[c];   // shape kept, buffers freed
             out[c] = std::move(empty);
             if (stopReq) stopped = true;
+        } else if (onFrame) {
+            std::printf("\n[camera] frame %d/%d stopped before its first complete sample — "
+                        "nothing written for it.\n", c + 1, nc);
+            std::fflush(stdout);
         }
         if (nc > 1) {   // watchable per-frame progress on a multi-camera (flythrough) render
             std::printf("\r[camera] mode-M GPU gather %d/%d ...", c + 1, nc);

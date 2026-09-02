@@ -13672,6 +13672,9 @@ static StageProgress makeStageProgress(int w, int h) {
         if (wantWin) { liveWindowPlaceholder(w, h, b); tk->lastWin = now; }
         if (wantLog) { std::printf("[camera] %s\n", b); std::fflush(stdout); tk->lastLog = now; }
     };
+    // Re-base the clock AND clear both throttles, so the phase that just started gets its
+    // first window title and its first log line immediately rather than up to 30 s in.
+    sp.reset = [tk]() { *tk = Ticker{}; };
     return sp;
 }
 
@@ -20471,10 +20474,14 @@ static int run(int argc, char** argv) {
                             g, cudaDeviceName(), kmx);
                 std::fflush(stdout);
                 EnergyReport e;
-                std::function<bool(int, const Film&)> onFrame =
-                    [&](int, const Film& f) -> bool {
+                std::function<bool(int, const Film&, long long)> onFrame =
+                    [&](int, const Film& f, long long sppDone) -> bool {
                         double eAuto = 0.0;
-                        filmToRgb8(f, (double)meterSpp, 1.0, false, nullptr, &eAuto);
+                        // Normalise by what LANDED, not by what was asked for: a metering
+                        // frame cut short by a stop would otherwise read darker than it is
+                        // and anchor the whole group's exposure too hot.
+                        filmToRgb8(f, (double)(sppDone > 0 ? sppDone : meterSpp), 1.0, false,
+                                   nullptr, &eAuto);
                         return conv.add(eAuto) || g_stopRequested != 0;
                     };
                 // Same beam pass the real render gets, at a budget scaled down with the
@@ -20995,12 +21002,25 @@ static int run(int argc, char** argv) {
                 size_t gatherFrame = 0;
                 if (g_showWindow) {
                     const double liveExp = toRender[idx[0]].exposure;
-                    liveProg.report = [&, liveExp](const Film& f, long long sppDone, bool) -> bool {
-                        const double el = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - gStart).count();
-                        liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute,
-                            pmGatherStatus(f, sppDone, spp, gatherFrame + 1, cams.size(),
-                                           N, el).c_str());
+                    // Echo the same caption to stdout on a slow cadence. The window is the
+                    // only place this text went, so a backgrounded showcase render — the one
+                    // that runs for hours and is read from its log — had nothing at all in it
+                    // between the map build and the frame-written line, and a gather that
+                    // spends a quarter of an hour per spp is indistinguishable in a log from
+                    // one that has wedged. 30 s matches the StageProgress log cadence.
+                    auto lastEcho = std::make_shared<std::chrono::steady_clock::time_point>();
+                    liveProg.report = [&, liveExp, lastEcho](const Film& f, long long sppDone, bool) -> bool {
+                        const auto now = std::chrono::steady_clock::now();
+                        const double el = std::chrono::duration<double>(now - gStart).count();
+                        const std::string st = pmGatherStatus(f, sppDone, spp, gatherFrame + 1,
+                                                              cams.size(), N, el);
+                        liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute, st.c_str());
+                        if (lastEcho->time_since_epoch().count() == 0 ||
+                            std::chrono::duration<double>(now - *lastEcho).count() >= 30.0) {
+                            std::printf("[camera] %s\n", st.c_str());
+                            std::fflush(stdout);
+                            *lastEcho = now;
+                        }
                         return g_stopRequested != 0;   // window closed -> stop after this chunk
                     };
                 }
@@ -21018,15 +21038,23 @@ static int run(int argc, char** argv) {
                 // the very end means an interrupt / crash / power loss throws away ALL of it.
                 // Writing per frame also lets the device path free each film as it goes, so a
                 // long render stays near one-frame of host RAM instead of ~3 GB of films.
-                std::function<bool(int, const Film&)> writeFrame =
-                    [&](int k, const Film& f) -> bool {
+                std::function<bool(int, const Film&, long long)> writeFrame =
+                    [&](int k, const Film& f, long long sppDone) -> bool {
                         const RenderCam& rc = toRender[idx[k]];
                         std::string op = outFor(rc.name);
                         if (toRender.size() > 1)
                             std::printf("[camera] '%s' (mode M/GPU, %dx%d) -> %s\n",
                                         rc.name.c_str(), rc.res, rc.resY, op.c_str());
                         double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
-                        if (!writeFilm(op.c_str(), f, (double)spp, rc.exposure, false, anchor, scene.absolute))
+                        // The film is a SUM over the samples that actually landed. A frame an
+                        // `ftrace -stop` interrupted holds fewer than `spp` of them, so
+                        // normalising by `spp` here wrote it darkened by exactly the fraction
+                        // it never gathered — the one frame of a stopped flythrough that a
+                        // viewer is most likely to look at, and the one that used to be wrong.
+                        if (sppDone < spp)
+                            std::printf("[camera] '%s' stopped at %lld / %lld spp — writing "
+                                        "what gathered.\n", rc.name.c_str(), sppDone, spp);
+                        if (!writeFilm(op.c_str(), f, (double)sppDone, rc.exposure, false, anchor, scene.absolute))
                             sharedWriteFail = true;
                         gatherFrame = (size_t)k + 1;   // advances the title's "frame k/n"
                         return g_stopRequested != 0;   // window closed / Ctrl-C -> stop after this frame

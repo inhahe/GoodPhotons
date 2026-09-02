@@ -49,4 +49,14 @@ struct SppProgress {
 // stopped through the ordinary ft::stopRequested() flag, not by the reporter.
 struct StageProgress {
     std::function<void(const char* text, long long done, long long total)> report;
+
+    // Re-base the elapsed clock (and the log/window throttles) to NOW.
+    //
+    // `report`'s rate and ETA are done/elapsed and (total-done)/rate, measured from when the
+    // StageProgress was made — which is correct for the FIRST phase it covers and wrong for
+    // every one after it, because each later phase starts with `done` back at 0 while
+    // `elapsed` still carries all its predecessors. One StageProgress spans the deposit, the
+    // map builds and the gather, so without this the gather's first line would report a rate
+    // divided by the deposit's minutes and an ETA to match. Call it when a phase begins.
+    std::function<void()> reset;
 };

@@ -162,9 +162,15 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // chunk (e.g. the live window was closed). A null `prog` renders silently as before.
 //
 // `onFrame` (when non-null) is called ONCE per camera, right after that camera's gather
-// fully completes, with its local index and finished film — so the host can write that
-// frame to disk IMMEDIATELY (crash-safe incremental output, matching the CPU mode-M path
-// which writes each frame as it finishes) instead of holding all films to the end. When
+// completes, with its local index, its film, and the samples-per-pixel that ACTUALLY landed
+// in it — so the host can write that frame to disk IMMEDIATELY (crash-safe incremental
+// output, matching the CPU mode-M path which writes each frame as it finishes) instead of
+// holding all films to the end. `sppDone` is normally the requested spp, and is less on the
+// frame an `ftrace -stop` / a closed window interrupts; the film is a SUM over samples, so
+// the host must normalise by `sppDone` and not by the requested count or an interrupted
+// frame is written darkened by exactly the fraction it never gathered. `sppDone == 0` means
+// the stop landed before a single complete sample existed: there is nothing to write, and
+// the callback is NOT invoked at all in that case. When
 // `onFrame` is supplied the returned vector's films are RELEASED as they are handed off
 // (each returned Film[c] is left empty after the callback), so the whole render runs in
 // roughly one-frame of host memory rather than accumulating every frame — the caller must
@@ -247,7 +253,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             long long N, double radius, EnergyReport& eOut,
                                             bool diffraction, long long spp,
                                             const SppProgress* prog = nullptr,
-                                            const std::function<bool(int, const Film&)>* onFrame = nullptr,
+                                            const std::function<bool(int, const Film&, long long)>* onFrame = nullptr,
                                             const char* mapLoad = nullptr, const char* mapSave = nullptr,
                                             int heroC = 1, int fgRays = 0, double autoK = 0.0,
                                             BeamPass* beams = nullptr,
