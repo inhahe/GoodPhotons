@@ -16449,7 +16449,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                           CAM_B, heroC);
             return;
         }
-        stage->report(label, 0, Nq);
+        stage->report(label, 0, Nq, nullptr, 0.0);
         // 1 M is small enough to be a sub-second probe on any card that can run this at all,
         // and large enough to keep ~262 k threads busy rather than measuring launch latency.
         long long chunk = (Nq < (1ll << 20)) ? Nq : (1ll << 20);
@@ -16462,7 +16462,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             const double sec = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();
             off += cs2;
-            stage->report(label, off, Nq);
+            stage->report(label, off, Nq, nullptr, 0.0);
             // Cooperative stop: the deposit is the phase a `-stop` most often lands in, and
             // before the split there was no seam to honour it at.
             if (ft::stopRequested()) { (aimedPass ? aimEmitted : depEmitted) = off; break; }
@@ -16734,7 +16734,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // Downloading tens of millions of deposits and counting-sorting them into cells is tens
     // of seconds on a showcase `-n` — another silent phase between the deposit's last chunk
     // and the first gathered pixel, so it names itself too.
-    if (stage && stage->report) stage->report("building photon map", 0, 0);
+    if (stage && stage->report) stage->report("building photon map", 0, 0, nullptr, 0.0);
     buildMap();                             // host counting sort -> cell-contiguous runs
     buildCaustic();                         // ... and again for the caustic partition
 
@@ -16948,8 +16948,21 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 i = hi;
                 // Only until the frame's first complete chunk exists: from there on `prog`
                 // below owns the caption and says strictly more (spp, photons, noise %).
-                if (sppDone == 0 && stage && stage->report)
-                    stage->report(stageText, base * (long long)npix + i, sampTotal);
+                //
+                // The sub-chunk accumulator is also a perfectly good IMAGE while it fills.
+                // kGather maps sample index -> pixel as idx/chunkSpp, so a partial chunk is a
+                // scanline-order prefix: the covered pixels each hold exactly `cs2` samples
+                // and the rest are still zero, which draws as the frame arriving top to
+                // bottom. That is the difference between a dark placeholder for the whole
+                // first spp — half an hour on gallery_rain with -beams — and watching it
+                // land. Only assembled when the host says it would actually be drawn, since
+                // it costs a device->host copy of the film.
+                if (sppDone == 0 && stage && stage->report) {
+                    const bool wantImg = stage->wantFilm && stage->wantFilm();
+                    if (wantImg) downloadFilm(c, s_film, s_hits, npix);
+                    stage->report(stageText, base * (long long)npix + i, sampTotal,
+                                  wantImg ? &out[c] : nullptr, (double)cs2);
+                }
                 // Abandon the chunk in flight, first chunk included.
                 //
                 // It used to require `base > 0`, so that a stop could never leave the film

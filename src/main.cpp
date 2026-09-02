@@ -13646,12 +13646,29 @@ static std::string pmGatherStatus(const Film& f, long long sppDone, long long sp
 // title is cheap and wants to look alive (window cadence), while stdout is as often a piped
 // log as a terminal and a 5 Hz progress line would be thousands of junk lines in a build
 // log (30 s).
-static StageProgress makeStageProgress(int w, int h) {
+static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
+                                       bool absolute = false) {
     using clk = std::chrono::steady_clock;
-    struct Ticker { clk::time_point t0 = clk::now(), lastWin{}, lastLog{}; };
+    // markT/markDone and prevT/prevDone are a two-bucket TRAILING rate window: `mark` is
+    // rolled into `prev` once it is older than kRateWin, so the reported rate always covers
+    // the last kRateWin..2*kRateWin seconds rather than the whole phase.
+    struct Ticker {
+        clk::time_point t0 = clk::now(), lastWin{}, lastLog{};
+        clk::time_point markT = clk::now(), prevT = clk::now();
+        long long markDone = 0, prevDone = 0;
+    };
+    constexpr double kRateWin = 15.0;
     auto tk = std::make_shared<Ticker>();
     StageProgress sp;
-    sp.report = [tk, w, h](const char* text, long long done, long long total) {
+    // `g_showWindow` first: with no window there is nothing a partial film could be drawn
+    // ON, so a headless batch must never pay for the device->host copy assembling one costs.
+    sp.wantFilm = [tk]() {
+        return g_showWindow &&
+               (tk->lastWin.time_since_epoch().count() == 0 ||
+                std::chrono::duration<double>(clk::now() - tk->lastWin).count() >= 0.25);
+    };
+    sp.report = [tk, w, h, expComp, absolute](const char* text, long long done, long long total,
+                                              const Film* partial, double divisor) {
         const auto now = clk::now();
         const double elapsed = std::chrono::duration<double>(now - tk->t0).count();
         const bool wantWin = tk->lastWin.time_since_epoch().count() == 0 ||
@@ -13664,7 +13681,24 @@ static StageProgress makeStageProgress(int w, int h) {
         if (total > 0) {
             // Rate and ETA are the whole point of a progress line on a phase that can run
             // for many minutes: "1.20G / 4.00G" alone still cannot answer "how long more?".
-            const double rate = elapsed > 1e-3 ? (double)done / elapsed : 0.0;
+            //
+            // Measured over a TRAILING WINDOW, not since the phase began. A cumulative
+            // done/elapsed is only honest when the rate is constant, and the phase this
+            // matters most for is the one where it is furthest from constant: a mode-M
+            // gather opens on a 1/16-spp probe slice, and because samples are laid out in
+            // scanline order that probe covers the top of frame, which on gallery_rain is
+            // empty sky where a ray gathers almost no beams. It clocked 12.6k/s; the true
+            // rate once the gather reached the cloud (3205 beams per probe ray) was 280/s,
+            // 45x slower. The cumulative average was still reporting 677/s six minutes in
+            // and its ETA had climbed 986s -> 17974s without converging, every value of it
+            // wrong and wrong in the flattering direction. A trailing window reaches the
+            // real number in about a minute and then tracks it.
+            if (std::chrono::duration<double>(now - tk->markT).count() >= kRateWin) {
+                tk->prevT = tk->markT; tk->prevDone = tk->markDone;
+                tk->markT = now;       tk->markDone = done;
+            }
+            const double span = std::chrono::duration<double>(now - tk->prevT).count();
+            const double rate = span > 1e-3 ? (double)(done - tk->prevDone) / span : 0.0;
             const double eta  = rate > 0.0 ? (double)(total - done) / rate : 0.0;
             std::snprintf(b, sizeof b,
                           "%s \xE2\x80\x94 %s / %s (%.0f%%), %.0fs, %s/s, ~%.0fs left",
@@ -13675,7 +13709,13 @@ static StageProgress makeStageProgress(int w, int h) {
         } else {
             std::snprintf(b, sizeof b, "%s\xE2\x80\xA6 %.0fs", text, elapsed);
         }
-        if (wantWin) { liveWindowPlaceholder(w, h, b); tk->lastWin = now; }
+        if (wantWin) {
+            // Draw the image-so-far when the phase has one. The placeholder stays the answer
+            // for a deposit or a BVH build, which genuinely have no pixels to show.
+            if (partial && divisor > 0.0) liveWindowUpdate(*partial, divisor, expComp, absolute, b);
+            else                          liveWindowPlaceholder(w, h, b);
+            tk->lastWin = now;
+        }
         if (wantLog) { std::printf("[camera] %s\n", b); std::fflush(stdout); tk->lastLog = now; }
     };
     // Re-base the clock AND clear both throttles, so the phase that just started gets its
@@ -21006,8 +21046,10 @@ static int run(int argc, char** argv) {
                 SppProgress liveProg;
                 auto gStart = std::chrono::steady_clock::now();
                 size_t gatherFrame = 0;
+                // Hoisted out of the `if` below because the gather's StageProgress needs it
+                // too, to tone-map the partial-film preview exactly as the live view does.
+                const double liveExp = toRender[idx[0]].exposure;
                 if (g_showWindow) {
-                    const double liveExp = toRender[idx[0]].exposure;
                     // Echo the same caption to stdout on a slow cadence. The window is the
                     // only place this text went, so a backgrounded showcase render — the one
                     // that runs for hours and is read from its log — had nothing at all in it
@@ -21037,7 +21079,13 @@ static int run(int argc, char** argv) {
                 // window), and passing it is also what CHUNKS the device deposit — which
                 // changes the RNG realization, so gating it on `-window` would make the same
                 // command produce a different image depending on whether anyone was looking.
-                StageProgress stageProg = makeStageProgress(titleWg, titleHg);
+                // The exposure/absolute pair is what lets the GATHER phase hand back a
+                // partially-filled film to draw (see StageProgress::report's `partial`)
+                // rather than a placeholder — it has to tone-map it the same way the
+                // per-chunk live view above does, or the image would jump when the first
+                // complete chunk takes over.
+                StageProgress stageProg = makeStageProgress(titleWg, titleHg, liveExp,
+                                                            scene.absolute);
                 // Write each frame to disk the instant its gather completes (crash-safe
                 // incremental output, same as the CPU mode-M path below): a flythrough of
                 // hundreds of frames can run for many minutes, and batching every write to

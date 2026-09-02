@@ -48,7 +48,28 @@ struct SppProgress {
 // informational — unlike SppProgress::report there is no return value, because a stage is
 // stopped through the ordinary ft::stopRequested() flag, not by the reporter.
 struct StageProgress {
-    std::function<void(const char* text, long long done, long long total)> report;
+    // `partial`, when non-null, is a PARTIALLY-FILLED film the host should draw instead of
+    // the dark placeholder, normalised by `divisor` (the samples every COVERED pixel holds;
+    // the pixels the phase has not reached yet are still zero, so the image fills in as it
+    // goes). Pass nullptr from a phase that has no pixels at all — a deposit or a BVH build.
+    //
+    // This exists because "no pixels yet" was only ever true of the deposit and the map
+    // builds. A mode-M GATHER has a film from its first launch, but the SppProgress that
+    // would show it only fires on a COMPLETE chunk, and a chunk is one whole spp: measured
+    // on gallery_rain with -beams that is ~30 minutes, so the window sat on a dark
+    // placeholder for half an hour with a render in perfect health behind it. Naming the
+    // phase in the title fixed the "is it wedged?" question; it did not give back the thing
+    // the live window is FOR, which is watching the image arrive.
+    std::function<void(const char* text, long long done, long long total,
+                       const Film* partial, double divisor)> report;
+
+    // True when a `partial` would actually be DRAWN if one were supplied now.
+    //
+    // The renderer must ask before assembling one, because on the GPU that means a
+    // device->host copy of the whole film. The window refreshes at ~4 Hz and a slice can be
+    // far shorter than that, so without this gate the copy would run many times per frame
+    // painted. A host with no live window answers false forever and pays nothing.
+    std::function<bool()> wantFilm;
 
     // Re-base the elapsed clock (and the log/window throttles) to NOW.
     //

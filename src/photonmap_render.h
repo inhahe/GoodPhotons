@@ -210,7 +210,8 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         monitor = std::thread([&, nTotal] {
             while (!monitorStop.load(std::memory_order_relaxed)) {
                 stage->report("tracing photons",
-                              tracedTotal.load(std::memory_order_relaxed), nTotal);
+                              tracedTotal.load(std::memory_order_relaxed), nTotal,
+                              nullptr, 0.0);
                 for (int i = 0; i < 20 && !monitorStop.load(std::memory_order_relaxed); ++i)
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
