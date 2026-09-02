@@ -134,6 +134,8 @@
 #include <thread>
 #include <map>
 #include <set>
+#include <deque>               // makeStageProgress: trailing (time, done) rate window
+#include <utility>             // std::pair for the same
 #include <memory>
 #include <atomic>              // -stop: cross-thread flags for the external stop channel
 #include <mutex>               // guards the live-window title (the deposit monitor re-titles)
@@ -13649,33 +13651,87 @@ static std::string pmGatherStatus(const Film& f, long long sppDone, long long sp
 static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
                                        bool absolute = false) {
     using clk = std::chrono::steady_clock;
-    // markT/markDone and prevT/prevDone are a two-bucket TRAILING rate window: `mark` is
-    // rolled into `prev` once it is older than kRateWin, so the reported rate always covers
-    // the last kRateWin..2*kRateWin seconds rather than the whole phase.
+    // `hist` is a TRAILING rate window held as a ring of real (time, done) samples: the rate
+    // is the slope between the newest sample and the oldest one still inside the window.
+    //
+    // It replaces a two-bucket (mark/prev) scheme that rolled one bucket into the other every
+    // kRateWin seconds. That was not wrong arithmetically — both buckets always held genuine
+    // samples — but its window was only ever kRateWin..2*kRateWin wide, and `done` advances
+    // once per gather SLICE, which on gallery_rain is ~12 s. A 15 s window was therefore one
+    // to two updates wide, so it did not average anything: it reported the cost of whichever
+    // scanline band the gather happened to be crossing. Measured on the baseline arm it
+    // printed 5.3k/s, 1.0k/s, 280/s, 916/s across four log lines whose segment averages were
+    // 759, 589 and 675/s. The flapping was real signal, not noise — and useless, because the
+    // question a progress line answers is "how long for the REST of the frame", which no
+    // single band can predict.
     struct Ticker {
         clk::time_point t0 = clk::now(), lastWin{}, lastLog{};
-        clk::time_point markT = clk::now(), prevT = clk::now();
-        long long markDone = 0, prevDone = 0;
+        std::deque<std::pair<clk::time_point, long long>> hist;
+        long long lastDone = -1;
+        double rate = 0.0;      // last good trailing rate, held between advances
+        // Adaptive repaint gap — see kDuty below. Starts at the nominal 4 Hz and is widened
+        // to whatever keeps painting down to a fixed fraction of the work being reported on.
+        double winGap = 0.25;
+        clk::time_point probeT{};   // when wantFilm() last said yes; start of the draw's cost
     };
-    constexpr double kRateWin = 15.0;
+    // Wide enough to span several slices (and so several bands) even when a slice costs ~12 s,
+    // and still short enough to abandon the opening sky probe within a minute of leaving it.
+    constexpr double kRateWin = 60.0;
+    // Ceiling on the share of a phase's wall clock the live preview may consume.
+    //
+    // This exists because a progress display that changes what it displays is not a display,
+    // it is a tax. The mode-M gather calls report() once per SLICE and the slice loop is
+    // synchronous — kernel, sync, report, next kernel — so a repaint is not concurrent with
+    // the render, it is inserted into it. Drawing a partial film means a ~16 MB device->host
+    // copy of the film plus a full-frame tone-map, and at a fixed 4 Hz on a scene whose
+    // slices are shorter than that, essentially all of the loop's time went to painting:
+    // measured on gallery_rain at 960x540 with -pmcount 45, the first spp (the only one the
+    // partial preview runs during) took 129.5 s with -window-min against ~3 s headless, a 40x
+    // penalty on the phase, while the steady-state spp either side of it differed by 1.7x.
+    //
+    // So the cadence is set by COST, not by a constant: after each paint the next one is held
+    // off for kDuty times what that paint took. Cheap scenes still repaint at the full 4 Hz
+    // (the floor); expensive ones fall back automatically, and the preview can never cost
+    // more than 1/kDuty of the render whatever the resolution or the scene.
+    constexpr double kDuty    = 9.0;    // <= 10% of wall clock spent painting
+    constexpr double kGapMin  = 0.25;   // 4 Hz, the nominal cadence
+    constexpr double kGapMax  = 5.0;    // never leave the image untouched longer than this
     auto tk = std::make_shared<Ticker>();
     StageProgress sp;
     // `g_showWindow` first: with no window there is nothing a partial film could be drawn
     // ON, so a headless batch must never pay for the device->host copy assembling one costs.
     sp.wantFilm = [tk]() {
-        return g_showWindow &&
-               (tk->lastWin.time_since_epoch().count() == 0 ||
-                std::chrono::duration<double>(clk::now() - tk->lastWin).count() >= 0.25);
+        if (!g_showWindow) return false;
+        const auto now = clk::now();
+        if (tk->lastWin.time_since_epoch().count() != 0 &&
+            std::chrono::duration<double>(now - tk->lastWin).count() < tk->winGap) return false;
+        tk->probeT = now;      // the caller's download counts toward this paint's cost
+        return true;
     };
     sp.report = [tk, w, h, expComp, absolute](const char* text, long long done, long long total,
                                               const Film* partial, double divisor) {
         const auto now = clk::now();
         const double elapsed = std::chrono::duration<double>(now - tk->t0).count();
         const bool wantWin = tk->lastWin.time_since_epoch().count() == 0 ||
-                             std::chrono::duration<double>(now - tk->lastWin).count() >= 0.25;
+                             std::chrono::duration<double>(now - tk->lastWin).count() >= tk->winGap;
         const bool wantLog = total > 0 && done > 0 &&
                              (tk->lastLog.time_since_epoch().count() == 0 ||
                               std::chrono::duration<double>(now - tk->lastLog).count() >= 30.0);
+        // Sample the rate window BEFORE the throttles, not after. The window is a measurement
+        // and the throttles are a display cadence; letting a skipped repaint also skip a
+        // measurement would silently thin the history on any phase that reports faster than
+        // 4 Hz, for no benefit — recording one (time, done) pair costs nothing.
+        if (total > 0 && done != tk->lastDone) {
+            tk->lastDone = done;
+            tk->hist.emplace_back(now, done);
+            while (tk->hist.size() >= 2 &&
+                   std::chrono::duration<double>(now - tk->hist[1].first).count() >= kRateWin)
+                tk->hist.pop_front();
+            const double span = tk->hist.size() >= 2
+                ? std::chrono::duration<double>(now - tk->hist.front().first).count() : 0.0;
+            if (span > 1e-3 && done > tk->hist.front().second)
+                tk->rate = (double)(done - tk->hist.front().second) / span;
+        }
         if (!wantWin && !wantLog) return;
         char b[220];
         if (total > 0) {
@@ -13693,28 +13749,64 @@ static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
             // and its ETA had climbed 986s -> 17974s without converging, every value of it
             // wrong and wrong in the flattering direction. A trailing window reaches the
             // real number in about a minute and then tracks it.
-            if (std::chrono::duration<double>(now - tk->markT).count() >= kRateWin) {
-                tk->prevT = tk->markT; tk->prevDone = tk->markDone;
-                tk->markT = now;       tk->markDone = done;
-            }
-            const double span = std::chrono::duration<double>(now - tk->prevT).count();
-            const double rate = span > 1e-3 ? (double)(done - tk->prevDone) / span : 0.0;
-            const double eta  = rate > 0.0 ? (double)(total - done) / rate : 0.0;
-            std::snprintf(b, sizeof b,
-                          "%s \xE2\x80\x94 %s / %s (%.0f%%), %.0fs, %s/s, ~%.0fs left",
-                          text, humanCount((double)done).c_str(),
-                          humanCount((double)total).c_str(),
-                          100.0 * (double)done / (double)total, elapsed,
-                          humanCount(rate).c_str(), eta);
+            //
+            // The window advances on DATA, not on wall clock. report() is called at the
+            // window cadence, but `done` only moves when a unit of work lands, so sampling on
+            // time alone would keep capturing spans with no progress in them at all. Recording
+            // only on an advance makes the window self-scaling: it is always at least one
+            // update wide however coarse the updates are, and the rate is HELD between
+            // advances rather than decaying toward zero while a slice is in flight.
+            //
+            // Trimming keeps the OLDEST sample that is still at least kRateWin old, so the
+            // window settles at kRateWin..kRateWin+one-update and never collapses to a single
+            // update. The front is dropped only while the sample behind it is old enough to
+            // take over, which is what guarantees that. (Sampled above, before the throttles.)
+            const double rate = tk->rate;
+            // Until two samples exist there is no trailing rate, and the honest thing to
+            // print is that there isn't one. Printing `0/s, ~0s left` would read as a stalled
+            // render, and printing the one-sample cumulative average instead would reinstate
+            // exactly the bias this window exists to remove -- on a mode-M gather that first
+            // sample IS the sky probe, the 5.3k/s that was never true of anything.
+            if (rate > 0.0)
+                std::snprintf(b, sizeof b,
+                              "%s \xE2\x80\x94 %s / %s (%.0f%%), %.0fs, %s/s, ~%.0fs left",
+                              text, humanCount((double)done).c_str(),
+                              humanCount((double)total).c_str(),
+                              100.0 * (double)done / (double)total, elapsed,
+                              humanCount(rate).c_str(), (double)(total - done) / rate);
+            else
+                std::snprintf(b, sizeof b,
+                              "%s \xE2\x80\x94 %s / %s (%.0f%%), %.0fs, measuring\xE2\x80\xA6",
+                              text, humanCount((double)done).c_str(),
+                              humanCount((double)total).c_str(),
+                              100.0 * (double)done / (double)total, elapsed);
         } else {
             std::snprintf(b, sizeof b, "%s\xE2\x80\xA6 %.0fs", text, elapsed);
         }
         if (wantWin) {
             // Draw the image-so-far when the phase has one. The placeholder stays the answer
             // for a deposit or a BVH build, which genuinely have no pixels to show.
-            if (partial && divisor > 0.0) liveWindowUpdate(*partial, divisor, expComp, absolute, b);
-            else                          liveWindowPlaceholder(w, h, b);
-            tk->lastWin = now;
+            const bool drewFilm = (partial && divisor > 0.0);
+            if (drewFilm) liveWindowUpdate(*partial, divisor, expComp, absolute, b);
+            else          liveWindowPlaceholder(w, h, b);
+            const auto painted = clk::now();
+            // Cost this paint and set the next gap from it. A film draw is charged from
+            // wantFilm()'s yes, so the caller's device->host copy is included — it is part of
+            // what showing the image cost and excluding it would under-price the paint by most
+            // of its actual expense. A placeholder is charged from the draw alone.
+            const auto from = (drewFilm && tk->probeT.time_since_epoch().count() != 0)
+                              ? tk->probeT : now;
+            const double cost = std::chrono::duration<double>(painted - from).count();
+            double gap = kDuty * cost;
+            if (gap < kGapMin) gap = kGapMin;
+            if (gap > kGapMax) gap = kGapMax;
+            tk->winGap = gap;
+            // FTRACE_PAINT_DEBUG=1: dump what each repaint cost and the gap it bought. This
+            // is how the 40x first-spp regression above was found — the cost is invisible in
+            // any render timing, because it hides inside the phase it inflates.
+            if (getenv("FTRACE_PAINT_DEBUG"))
+                std::printf("[paint] film=%d cost=%.3fs gap=%.3fs\n", (int)drewFilm, cost, gap);
+            tk->lastWin = painted;   // measure the gap from when the screen was actually ready
         }
         if (wantLog) { std::printf("[camera] %s\n", b); std::fflush(stdout); tk->lastLog = now; }
     };
