@@ -235,7 +235,9 @@ argument for standing a groom in a hall of polished objects.*
   ordinary fog elsewhere in a GRIN scene still works.) See
   [Mode `M` and participating media](REFERENCE.md#mode-m-and-participating-media---beams).
 - **UPBP (mode `J`) — BDPT paths and photon beams under one MIS weight** *(in progress —
-  the mode exists and reduces exactly to mode `D`; the merge estimator lands next)*. Mode
+  both estimators now run, but the MIS weights that arbitrate between them do not exist yet,
+  so mode `J` currently **double-counts** the volume term and is brighter than it should be.
+  Use mode `D` or mode `M` for real images until this note goes away.)* Mode
   `D` and mode `M -beams` each solve half of a thick-medium scene and fail where the other
   succeeds: a BDPT connection needs the camera's free-flight distance sampling to *reach*
   the scattering point, which deep inside an optically thick medium it essentially never

@@ -186,6 +186,46 @@ plumbing:**
    *diffuse* hit through specular chains, whereas mode `J` gathers along every segment of a BDPT
    camera subpath, so the two agree only on the single-segment case unless the comparison is set
    up to isolate it.
+
+   **Phase 2 landed (2026-09-02, v0.215.0), and the substitute checks it could actually run all
+   pass.** The literal second half is still not runnable — mode `J` has no "connections off"
+   switch, and per the paragraph above it would not be a like-for-like comparison if it did — so
+   Phase 2 was gated on three things instead:
+
+   * The estimator moved to `beamgather.h` and mode `M` must not have noticed. Rendering
+     `_fog_cornell.ftsl -mode M -beams -n 20000 -spp 1 -device cpu` with the *preserved 0.214.0
+     binary* and with the 0.215.0 one gives `cmp`-identical PNGs. (Preserving the old binary
+     before rebuilding is the whole trick here; there is no other way to get the reference back.)
+   * `-mode J -nobeams` is still `cmp`-identical to `-mode D -device cpu`, i.e. gate 1 survived
+     the arrival of the merge code.
+   * The merges themselves land, and land **only additively**. This needs `-hdr`: a PNG is
+     auto-exposed, so a uniform brightness change is renormalised away and `cmp` tells you only
+     that *something* moved. On the scene-linear PFMs, with mode `J` sharing mode `D`'s stream so
+     that `J − D` is the merge output exactly (`scraps/mergediff.py`): mean ratio **2.0374**,
+     **65 536 / 65 536 pixels brighter, 0 dimmer**. Zero dimmer pixels is the load-bearing
+     number — a merge can only add, so one negative pixel would mean the streams had diverged and
+     the connection halves were no longer comparable. The ≈2× is the intended double count.
+
+   **Phase 2 cost, for Phase 3 to beat: 61 s/spp against mode `D`'s 0.55 s/spp** on that scene
+   (256², beams from `-n 20000`). A probe ray gathers ~100 beams, each surviving beam costs two
+   ratio-tracking transmittance marches, and mode `J` pays that per camera *segment per bounce*
+   where mode `M` pays it once per camera ray. The weight hook is applied before the `w > 0`
+   rejection precisely so a technique the weight kills costs no marches, so some of this should
+   come back in Phase 3 — but it is the number to watch.
+
+   **Two things Phase 3 must not forget, both found while reading `PhotonBeam` for where to put
+   the partials:**
+
+   * **The beam bank thins itself with Russian roulette** (`keepProb`, `photonbeams.h`), and
+     splits beams afterwards. RR is unbiased for the *contribution* because `power` is rescaled,
+     but the merge **density** in the balance heuristic is a different quantity: the probability
+     that this beam exists at all is `keepProb`, so `p_M` must carry it. Using `n_m = nEmitted`
+     unscaled would over-state the merge technique's density by `1/keepProb` and quietly bias the
+     weights — and because `keepProb` is derived from the *measured* crossing count rather than
+     from `-n`, it varies per scene, so the error would not even be a constant.
+   * **`achro` beams fold to `cieA`, not `CIE(lambda)`.** A weight that is a pure function of
+     path geometry (which the balance-heuristic weight is) is unaffected, but anything Phase 3
+     adds that reads a beam's spectrum must respect the fold.
 2. **MIS partition of unity.** Instrument the weights directly: for a sampled path, sum the
    weights of every technique that could have generated it and assert it equals 1. This tests
    the weights *independently of the image*, which is the only way to localise an energy bug

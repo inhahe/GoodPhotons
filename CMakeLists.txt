@@ -27,7 +27,17 @@ if(MSVC)
     # command line, so scope them to the CXX compile with a generator expression.
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4>
                         $<$<COMPILE_LANGUAGE:CXX>:/permissive->
-                        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>)
+                        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+                        $<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
+    # /bigobj: a COFF object file may hold only 65,279 sections, and main.cpp had reached
+    # that ceiling by 0.215.0 -- the mode-J template instantiation of gatherPhotonBeamsW was
+    # merely the straw that broke it (`error C1128: number of sections exceeded object file
+    # format limit`). Every COMDAT -- each inline function, each template instantiation, each
+    # string literal -- costs a section, and main.cpp transitively includes essentially the
+    # whole renderer, so the count only ever goes up. /bigobj raises the limit to 2^32 and
+    # costs nothing but a slightly larger .obj; it changes no generated code. Applied to all
+    # C++ TUs rather than just main.cpp because viewer_gui.cpp pulls in the same headers and
+    # is the next one that would hit the wall.
     # Fast math is NOT enabled: physical correctness matters more than speed for now.
 endif()
 

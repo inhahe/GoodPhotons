@@ -53,6 +53,7 @@
 #include "hero.h"     // kHeroC / kHeroMax — hero-wavelength bundle sizes
 #include "render.h"   // sampleGlossy, Renderer material primitives, clamp01, PI
 #include "photonbeams.h"  // BeamMap — mode J (UPBP) merges camera rays against photon beams
+#include "beamgather.h"   // gatherPhotonBeamsW — the Beam x Ray estimator, with a MIS hook
 
 namespace bdpt {
 
@@ -556,6 +557,37 @@ struct Escape {
     int nUp = 1;
 };
 
+// --- Camera-subpath ray segments, for the mode-J (UPBP) beam merge --------------------
+//
+// A BDPT *connection* joins two sampled vertices, so it only ever needs the vertices. A
+// beam *merge* is different in kind: it integrates along a whole camera ray, collecting
+// every photon beam whose kernel the ray passes through — so the thing it needs is the
+// SEGMENT, which the vertex list does not contain and randomWalk otherwise throws away.
+//
+// Note that a segment is not "the edge between eye[i] and eye[i+1]". It runs from eye[i]
+// to the SURFACE that ends the ray, which is strictly further whenever a medium collision
+// created eye[i+1] in between. That is the point: the merge is an *alternative* to the
+// camera's free-flight distance sample, so it must see the whole span that sample was
+// drawn from, not just the part up to the sample that happened to be drawn.
+//
+// For the same reason `beta` here is the throughput arriving at the segment's ORIGIN with
+// no free-flight factor in it, and the segment's own transmittance is left to the gather
+// (which computes Tr to each beam's own closest-approach point, not to a shared endpoint).
+// Both work out because ftrace's media transport is ANALOG — a homogeneous free flight
+// draws from the exact transmittance pdf, so beta is unchanged across the event and the
+// throughput at the segment origin is the throughput anywhere along it.
+struct CamSeg {
+    Vec3 o{0, 0, 0};      // segment origin
+    Vec3 d{0, 0, 0};      // unit direction
+    double tMax = 0.0;    // distance to the surface that ends the segment (large if it escapes)
+    double beta = 0.0;    // hero throughput arriving at `o` (see above: no free-flight factor)
+    double betaSec[hero::kHeroMax - 1] = {0};
+    int nUp = 1;
+    double aGlass = 0.0;  // absorption of the dielectric the ray is inside (exp(-a*t) per hit)
+    int camVert = 0;      // index in the camera subpath of the vertex the segment leaves
+};
+using CamSegs = std::vector<CamSeg>;
+
 // Continue a subpath whose endpoint is already path[0] (Camera or Light). `ray` is
 // the first ray leaving that endpoint; `beta` the throughput carried along it;
 // `pdfDir` the solid-angle density of that first direction; `mode` the transport
@@ -574,7 +606,8 @@ struct Escape {
 inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& mats,
                        Ray ray, double beta, double pdfDir, const HeroBundle& hb,
                        int maxDepth, Mode mode, Pcg32& rng, std::vector<Vertex>& path,
-                       const double* betaSecIn, int nUpIn, Escape* esc = nullptr) {
+                       const double* betaSecIn, int nUpIn, Escape* esc = nullptr,
+                       CamSegs* segs = nullptr) {
     (void)cam;   // cam reserved for future NEE-to-camera use; mode now drives adjoint corr
     const double lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
@@ -600,6 +633,21 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                                  /*skipCamHidden=*/(mode == Mode::Radiance && bounces == 0));
         if (h.valid && h.sensorId >= 0) return;      // model-A sensor: not used in BDPT
         double dSurf = h.valid ? h.t : 1e30;
+
+        // Record the segment for the mode-J beam merge, BEFORE the free-flight draw below
+        // consumes it (see CamSeg). Only the camera walk asks for this — a light walk has
+        // no merge to do, since the beam map *is* the light subpaths. `dSurf` is 1e30 on an
+        // escaping ray, which the BVH gather clips to the beams that actually exist, so no
+        // special case is needed for a ray that leaves the scene through a medium.
+        if (segs) {
+            CamSeg sg;
+            sg.o = ray.o; sg.d = ray.d; sg.tMax = dSurf;
+            sg.beta = beta; sg.nUp = nUp;
+            for (int i = 0; i + 1 < nUp; ++i) sg.betaSec[i] = betaSec[i];
+            sg.aGlass = curAbsorb(lambda);
+            sg.camVert = (int)path.size() - 1;
+            segs->push_back(sg);
+        }
 
         // Participating media: sample the earliest real collision along the ray up to
         // the surface (or 1e30 in open space). A homogeneous medium draws one exact
@@ -1005,7 +1053,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
 inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Renderer& mats,
                                  int px, int py, const HeroBundle& hb, int maxDepth,
                                  Pcg32& rng, std::vector<Vertex>& path,
-                                 Escape* esc = nullptr) {
+                                 Escape* esc = nullptr, CamSegs* segs = nullptr) {
     const double lambda = hb.lam[0];
     path.clear();
     // The camera vertex is wavelength-neutral: every λ in the bundle leaves it with
@@ -1037,7 +1085,7 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
         path.push_back(c);
         double pdfDir = cameraPdfDir(cam, dot(ray.d, cam.w));   // MIS-irrelevant placeholder
         randomWalk(scene, cam, mats, ray, wLens, pdfDir, hb, maxDepth - 1,
-                   Mode::Radiance, rng, path, betaSec0, 1, esc);
+                   Mode::Radiance, rng, path, betaSec0, 1, esc, segs);
         return (int)path.size();
     }
     c.p = cam.eye;
@@ -1046,7 +1094,7 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
     double cosCam = dot(ray.d, cam.w);
     double pdfDir = cameraPdfDir(cam, cosCam);
     randomWalk(scene, cam, mats, ray, /*beta*/1.0, pdfDir, hb, maxDepth - 1,
-               Mode::Radiance, rng, path, betaSec0, hb.C, esc);
+               Mode::Radiance, rng, path, betaSec0, hb.C, esc, segs);
     return (int)path.size();
 }
 
@@ -1684,6 +1732,9 @@ struct BdptRenderer {
                     int y0, int y1, long long spp, unsigned long long sampleBase) const {
         Renderer mats; mats.diffraction = diffraction;
         std::vector<Vertex> eye, light;
+        // Mode J (UPBP) only. Hoisted out of the pixel loop so its capacity is reached once
+        // per thread rather than reallocated per sample, exactly like `eye`/`light`.
+        CamSegs segs;
         const uint64_t nPix = (uint64_t)camFilm.resX * (uint64_t)camFilm.resY;
         // Hero gate, matching BackwardRenderer: bundling needs a wavelength-independent
         // ray path, so any participating medium (per-λ free flight), a GRIN field
@@ -1694,6 +1745,11 @@ struct BdptRenderer {
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         // Only pay for escape tracking when the scene actually has a distant sun.
         const bool hasSun = scene.sunCount > 0;
+        // Mode J. `beams` is null in mode D, and an empty map is passed as null by the
+        // dispatcher rather than as an empty map, so this single test is the whole gate:
+        // when it is false the camera walk is not even asked to record its segments and the
+        // render is mode D down to the RNG stream (validation gate 1).
+        const bool mergeOn = beams && !beams->empty() && beams->nEmitted > 0;
         for (int py = y0; py < y1; ++py)
             for (int px = 0; px < camFilm.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)camFilm.resX + (uint64_t)px;
@@ -1721,9 +1777,11 @@ struct BdptRenderer {
                         hb.C = 1;
                     }
                     Escape esc;
+                    if (mergeOn) segs.clear();
                     int nE = generateCameraSubpath(scene, cam, mats, px, py, hb,
                                                    maxDepth + 1, rng, eye,
-                                                   hasSun ? &esc : nullptr);
+                                                   hasSun ? &esc : nullptr,
+                                                   mergeOn ? &segs : nullptr);
                     int nL = generateLightSubpath(scene, cam, mats, hb,
                                                   maxDepth + 1, rng, light);
                     Vec3 cie[hero::kHeroMax];
@@ -1784,6 +1842,41 @@ struct BdptRenderer {
                             if (isSplat) splatFilm.add(spx, spy, contrib);
                             else         camFilm.add(px, py, contrib);
                         }
+
+                    // ---- MERGES (mode J / UPBP) ---------------------------------------
+                    // The other half of the estimator: every photon beam whose kernel this
+                    // camera subpath passed through. Unlike a connection this needs no
+                    // light subpath at all — the beam map IS a cache of light subpaths,
+                    // traced once for the whole frame — which is exactly why it reaches
+                    // where a connection cannot: deep inside a thick medium the camera's
+                    // own free-flight sampling essentially never lands on the scattering
+                    // point a connection would have to be made from, whereas a beam is a
+                    // whole LINE of deposited power and is hit by merely passing near it.
+                    //
+                    // The gather returns XYZ built at the BEAMS' wavelengths, not at this
+                    // sample's hero λ — the standard spectral-photon-mapping estimate, and
+                    // the same choice mode U makes for its merges (a merge gathers photons
+                    // from other paths, so there is no shared wavelength to be exact in).
+                    // `sg.beta` is this sample's own hero throughput to the segment origin,
+                    // which is a scalar and multiplies the XYZ triple directly.
+                    //
+                    // Placed after every connection deliberately. The gather draws from
+                    // `rng` (ratio-tracked transmittance in a heterogeneous medium), and
+                    // running it here means those draws cannot shift the connection half of
+                    // the SAME sample. They cannot shift the next sample either, because the
+                    // stream is re-seeded per (pixel, sample) at the top of this loop — so
+                    // "turn the merges off and mode J is mode D bit-for-bit" survives even
+                    // though the two halves share a generator.
+                    if (mergeOn) {
+                        for (const CamSeg& sg : segs) {
+                            if (!(sg.beta > 0.0)) continue;
+                            Vec3 m = gatherPhotonBeamsW(scene, mats, *beams, sg.o, sg.d,
+                                                        sg.tMax, sg.aGlass, rng,
+                                                        BeamWeightOne{});
+                            if (m.x != 0.0 || m.y != 0.0 || m.z != 0.0)
+                                camFilm.add(px, py, m * sg.beta);
+                        }
+                    }
                 }
             }
     }

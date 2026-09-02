@@ -25,7 +25,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
-| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). CPU only so far | `bdpt.h` + `photonbeams.h` |
+| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). CPU only so far; the merges are wired but **not yet MIS-weighted** (0.215.0), so they double-count | `bdpt.h` + `beamgather.h` + `photonbeams.h` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
 | `-raster` | z-buffer preview rasterizer + interactive fly viewer (`-explore`) | `raster.h`, `raster_cuda.cu` |
 
@@ -114,13 +114,94 @@ realisation, which is not a bug and not a comparison.
 The MIS derivation for the merge weights, the remaining gates, and what UPBP is and is not
 predicted to buy are in `known-issues.md` under the UPBP entry.
 
+### Mode `J` Phase 2 — the merges, still unweighted (0.215.0)
+
+Phase 2 adds the second estimator and **deliberately does not weight it**, so that the plumbing
+can be proved correct before the MIS arithmetic (Phase 3) is layered on top of it. A Phase-2
+render is therefore *wrong on purpose*: both techniques contribute at weight 1, so the volume
+term is counted about twice.
+
+**The estimator was extracted, not duplicated.** `gatherPhotonBeams` lived in
+`photonmap_render.h` while mode `M` was its only caller. Mode `J` lives in `bdpt.h`, which has no
+business including the photon-map renderer (that would drag in `causticaim.h`, `photonmap_io.h`
+and the whole deposit machinery to reach one function), and moving BDPT's merge the other way is
+worse still — a UPBP merge weight is built from the *BDPT subpath densities*, so it belongs with
+them. The primitive therefore moved **down** to the level both callers already share, as
+**`src/beamgather.h`**, which includes exactly `render.h` (for `Renderer::mediaTransmittance`)
+and `photonbeams.h` (for the map).
+
+It gained one thing: a **per-hit weight hook**, as a *template* parameter rather than a
+`std::function`. Mode `M` sums the estimator raw; mode `J` must scale each beam hit by its own
+MIS weight, because the balance-heuristic ratio depends on the merge geometry (`sinθ` above all)
+and so differs from hit to hit — a weight the caller cannot apply after the fact, because by then
+the hits have been summed. The default functor returns `1.0`, folds away, and leaves mode `M`'s
+generated code as it was; `gatherPhotonBeams` survives as that instantiation under its old name
+and signature, so every existing call site is untouched. The weight is applied *before* the
+`w > 0` rejection, so a technique the weight kills costs no transmittance marches.
+
+**Camera SEGMENTS, not camera vertices.** A merge is an alternative to the camera's free-flight
+*distance sample*, so it has to see the whole span that sample was drawn from — the segment from
+a vertex to the **surface** that ends it, not to the medium event that happened to be sampled
+inside it. `randomWalk` was throwing that span away, so it now records a `CamSeg` per bounce
+(origin, direction, distance-to-surface, throughput, glass absorption, and the index of the
+originating camera vertex, which Phase 3 needs for the MIS partials). `CamSeg::beta` carries
+**no** free-flight factor: ftrace's media transport is analog, so a homogeneous free flight draws
+from the exact transmittance pdf, `beta` is unchanged across the event, and the throughput at a
+segment origin is the throughput anywhere along it. The gather then applies each beam's own
+`Tr` to *its* closest-approach point.
+
+The merge loop runs **after every connection**, deliberately. The gather draws from `rng` (ratio
+tracking in a heterogeneous medium), and running it last means those draws cannot shift the
+connection half of the same sample; they cannot shift the next sample either, because the stream
+is re-seeded per (pixel, sample). That is what keeps gate 1 alive even though the two halves
+share a generator. The gather returns XYZ built at the **beams'** wavelengths (the standard
+spectral-photon-mapping estimate, and the same choice mode `U` makes for its merges);
+`sg.beta` is this sample's own hero throughput, a scalar, and multiplies that triple — matching
+mode `M`, whose `L += gather(...) * thr` likewise carries no camera-λ `invPdf`.
+
+**Validation, passed 0.215.0** (`_fog_cornell.ftsl`, `-device cpu`):
+
+| Test | What it proves | Result |
+|---|---|---|
+| mode `M -beams` on 0.214.0 vs 0.215.0 binaries, same seed | the extraction into `beamgather.h` changed nothing | `cmp` **identical** |
+| `-mode J -nobeams` vs `-mode D -device cpu` | gate 1 still holds now that merges exist | `cmp` **identical** |
+| `-mode J` vs `-mode D`, equal spp, `-hdr` | the merges land, and land *only* additively | see below |
+
+The third is the informative one, and it needs `-hdr`: a PNG is auto-exposed, which renormalises
+a global brightness change away entirely. On the scene-linear PFMs (`scraps/mergediff.py`), with
+mode `J` sharing mode `D`'s stream so that `J − D` *is* the merge output and nothing else:
+
+```
+J/D mean ratio  : 2.0374
+pixels touched  : 65536 / 65536 (100.0%)
+pixels brighter : 65536 / 65536 (100.0%)
+pixels dimmer   :     0 / 65536 (  0.0%)
+```
+
+Zero dimmer pixels is the load-bearing number: a merge can only add, so a single negative pixel
+would mean the two runs' RNG streams had diverged and the connection halves were no longer
+comparable. The ≈2× ratio is the expected double count.
+
+**Cost.** The merge is currently the dominant expense — 61 s/spp against mode `D`'s 0.55 s/spp on
+this scene, because a probe ray gathers ~100 beams and each surviving beam costs two
+transmittance marches, now paid per camera *segment* per bounce rather than once per camera ray
+as in mode `M`. Phase 3's weights will kill many hits before their marches (hence the ordering
+above), but this is the number to watch.
+
 ## Module map (src/)
 
 - **`main.cpp`** (~6200) — CLI parsing (the option table is a chain of `else if`s split
   into **segments** — each ends `else handled = false;` and the next is guarded by
   `if (!handled)`, because one unbroken chain hit MSVC's `C1061: blocks nested too deeply`
   at ~128 links and the build then fails on whatever flag was added last; append new flags
-  to a segment, and start another once one nears ~100 links), mode dispatch,
+  to a segment, and start another once one nears ~100 links). It is also the TU that forced
+  **`/bigobj`** on the whole C++ build in 0.215.0: a COFF object may hold only 65 279 sections
+  and every COMDAT — each inline function, each template instantiation, each string literal —
+  costs one, so a file that transitively includes essentially the whole renderer only ever
+  climbs. Mode `J`'s one extra template instantiation was the straw (`error C1128: number of
+  sections exceeded object file format limit`). `/bigobj` raises the ceiling to 2³² and changes
+  no generated code; it is set for all C++ TUs, not just this one, because `viewer_gui.cpp`
+  includes the same headers and is next in line. Also: mode dispatch,
   chunking/progressive loop
   (`cpuSppChunks`, `chunkFixed = !progressive && g_showWindow` — a bare fixed `-n`
   with no `-window`/budget flag runs monolithically with output only at the end),
@@ -2757,6 +2838,22 @@ predicted to buy are in `known-issues.md` under the UPBP entry.
   **Beam noise reads as coloured streaks**, not grain — too few beams under a thin kernel are
   individually resolvable — so `-spp` is the wrong knob for it and `-beamcount` / `-beamk` are
   the right ones.
+- **`beamgather.h`** — the Beam×Ray 1D estimator itself (Jarosz et al. 2011), split out of
+  `photonmap_render.h` in 0.215.0 once it acquired a second caller. Mode `M` gathers it as its
+  whole volume answer; mode `J` (UPBP, `bdpt.h`) gathers it as one of two competing techniques.
+  `bdpt.h` could not reach the old home without including the entire photon-map renderer, and
+  the reverse move — BDPT's merge into `photonmap_render.h` — is worse, since a UPBP merge
+  weight is built from the *BDPT subpath densities* and belongs beside them. So the primitive
+  sits at the level both callers already share, needing only `render.h` and `photonbeams.h`.
+  The one addition over the original is `gatherPhotonBeamsW`'s **per-hit weight hook**, a
+  template parameter (not a `std::function`: this is the innermost loop of the mode-`M` gather,
+  and an indirect call per hit would be paid on mode `M`'s behalf for a feature it does not
+  use). `BeamWeightOne` returns `1.0`, folds away, and `gatherPhotonBeams` is that
+  instantiation under the historical name and signature — verified `cmp`-identical against the
+  pre-split binary. Mode `J` needs a *per-hit* weight rather than a per-call one because the
+  balance-heuristic ratio between "merge this beam" and "connect this vertex" depends on the
+  merge geometry — `sinθ` above all — and so differs from hit to hit; by the time control
+  returns to the caller the hits have already been summed.
 - **`grin.h` — gradient-index media, and what the marcher owes the rest of the engine.**
   A `medium { ior "<expr>" }` is a region where rays integrate the Eikonal equation
   `d/ds(n·dr/ds) = ∇n` rather than travelling straight, via a symplectic march of step

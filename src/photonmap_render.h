@@ -30,6 +30,7 @@
 #include "render.h"
 #include "photonmap.h"
 #include "photonbeams.h"   // volume single-scatter cache (mode M with -beams)
+#include "beamgather.h"    // gatherPhotonBeams — the Beam x Ray estimator (shared with mode J)
 #include "causticaim.h"    // Jensen projection map: aimed emission for the caustic pass
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 #include "backward.h"      // BackwardRenderer::neeLight / neeEnv for final-gather direct lighting
@@ -290,87 +291,11 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     }
 }
 
-// ---- Volume gather: single-scatter radiance along one camera SEGMENT from the beam map ---
-// The Beam x Ray 1D estimator (photonbeams.h). For every stored beam whose kernel cylinder
-// the segment [oc, oc + dc*tMax] passes through, add
-//
-//   Phi_b * K1(d_perp)/sin(theta) * sigma_s(x) * f_p(cos theta)
-//         * Tr_beam(0 -> s_b) * Tr_cam(0 -> t_c) / nEmitted
-//
-// weighted by the CIE response at the BEAM's wavelength — the same "estimate built directly
-// in XYZ at the photon's own lambda" trick the surface density estimate uses, so a spectral
-// rainbow comes out spectral without any monochromatic reconstruction.
-//
-// A beam may carry a stratified BUNDLE of wavelengths rather than one (`-beamspec`; see
-// PhotonBeam in photonbeams.h for why a monochromatic *line* is so much worse than a
-// monochromatic *point*). The bundle shares the chord, the kernel weight, the density
-// evaluation and both transmittance marches — i.e. everything this estimator actually spends
-// its time on — and differs only in sigma_s, the phase function and the CIE triple.
-//
-// `aGlassCam` is the absorption of the dielectric the CAMERA ray is currently inside; the
-// caller applies it over the whole segment afterwards, so here it is applied only as far as
-// each beam's own closest-approach point. `thr` is NOT applied here — the caller multiplies
-// the returned XYZ by its specular-chain throughput.
-//
-// Note the two transmittance marches per surviving beam (one along the beam, one back along
-// the camera ray). For a heterogeneous medium those are ratio-tracking walks, and they are
-// the dominant cost of this estimator; see known-issues.md.
-inline Vec3 gatherPhotonBeams(const Scene& scene, const Renderer& mats, const BeamMap& bm,
-                              const Vec3& oc, const Vec3& dc, double tMax,
-                              double aGlassCam, Pcg32& rng) {
-    Vec3 acc{0, 0, 0};
-    if (bm.empty() || bm.nEmitted <= 0) return acc;
-    const double invN = 1.0 / (double)bm.nEmitted;
-    const PatTables tabs = scene.patTables();
-    bm.gather(oc, dc, tMax, [&](const BeamHit& bh) {
-        const PhotonBeam& b = bm.beams[bh.idx];
-        if (b.med < 0 || b.med >= (int)scene.media.size()) return;
-        const double lam = (double)b.lambda;
-        const Medium& md = scene.media[b.med];
-        const Vec3 xc = oc + dc * bh.tCam;
-        // sigma_s AT the gather point — density field / imported volume included, so a
-        // heterogeneous cloud shapes the bow instead of a uniform slab of it. The density
-        // is wavelength-INDEPENDENT, so one evaluation serves the whole spectral bundle.
-        const double dens = md.densityAt(xc, &tabs);
-        const double ss = md.sigma_s(lam) * dens;
-        if (!(ss > 0.0)) return;
-        // Scattering angle. connectVolume's convention: phaseValue(dot(wIn, wToCamera)),
-        // wIn = the photon's propagation direction (b.d), wToCamera = -dc.
-        const double phase = md.phaseValue(-bh.cosT, lam);
-        if (!(phase > 0.0)) return;
-        // `invC` splits the chord's flux evenly over its spectral bundle (PhotonBeam: every
-        // wavelength in a bundle carries the same power). It is exactly 1.0 for a
-        // monochromatic beam, so the whole expression — and thus every pre-0.202.0 render —
-        // is bit-for-bit unchanged.
-        const double invC = 1.0 / (double)b.nLam();
-        double w = (double)b.power * bm.kernel1D(bh.dPerp, b.med) / bh.sinT * ss * phase * invN * invC;
-        if (!(w > 0.0)) return;
-        if (b.absorb > 0.0f) w *= std::exp(-(double)b.absorb * bh.sBeam);   // glass, beam side
-        if (aGlassCam > 0.0) w *= std::exp(-aGlassCam * bh.tCam);           // glass, camera side
-        if (bh.sBeam > 0.0)  w *= mats.mediaTransmittance(scene, b.o, b.d, bh.sBeam, lam, rng);
-        if (bh.tCam  > 0.0)  w *= mats.mediaTransmittance(scene, oc, dc, bh.tCam, lam, rng);
-        if (!(w > 0.0)) return;
-        acc += bm.cie[bh.idx] * w;
-        // SECONDARY wavelengths of the bundle. They share this beam's geometry, its kernel
-        // weight and BOTH transmittance marches — the bundle only exists on a path whose
-        // extinction is achromatic (Renderer::beamSpecC), which is precisely the condition
-        // that makes those marches wavelength-independent — so all that differs is
-        // sigma_s * phase * CIE. `w / (ss * phase)` recovers the shared factor with one
-        // division instead of rebuilding the chain, and both terms are known positive.
-        if (b.nSec > 0) {
-            const double wShared = w / (ss * phase);
-            for (int i = 0; i < b.nSec; ++i) {
-                const double li = (double)b.lamS[i];
-                const double ssi = md.sigma_s(li) * dens;
-                if (!(ssi > 0.0)) continue;
-                const double phi = md.phaseValue(-bh.cosT, li);
-                if (!(phi > 0.0)) continue;
-                acc += Vec3(cieX(li), cieY(li), cieZ(li)) * (wShared * ssi * phi);
-            }
-        }
-    });
-    return acc;
-}
+// The Beam x Ray 1D volume gather (`gatherPhotonBeams`) used to be spelled out here. It moved
+// to **beamgather.h** in 0.215.0 so mode J (UPBP, bdpt.h) could call it too without bdpt.h
+// having to include this whole header to reach one function. Same name, same signature, same
+// output — the call sites below are untouched — and it gained a template hook for a per-hit
+// MIS weight that mode M instantiates as the constant 1.
 
 // ---- Final-gather sub-ray: one INDIRECT bounce from a visible point into the map -----
 // A gather ray shot from a diffuse visible point (visHit/visMat). It follows specular

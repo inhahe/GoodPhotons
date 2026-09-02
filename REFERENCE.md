@@ -84,7 +84,7 @@ paths they can capture at all**.
 | `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras). The map is **surfaces only**: add `-beams` for the view-independent photon-beam volume cache, without which participating media render as nothing | CPU + **GPU** (both the direct estimate and `-beams`) |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU + **GPU** |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU + **GPU** |
-| `J` | UPBP | Mode `D` **plus** the mode-`M` photon-beam volume cache, combined under one MIS weight — the volumetric counterpart of `U`. Connections carry the paths beams are blind to (multiple scattering, surfaces); beam merges carry the deep-in-a-thick-medium paths the camera's distance sampling never reaches. Beams are **on by default** here (`-nobeams` to disable, which reduces it exactly to mode `D`). See **Mode `J`** below | CPU |
+| `J` | UPBP | Mode `D` **plus** the mode-`M` photon-beam volume cache, combined under one MIS weight — the volumetric counterpart of `U`. Connections carry the paths beams are blind to (multiple scattering, surfaces); beam merges carry the deep-in-a-thick-medium paths the camera's distance sampling never reaches. Beams are **on by default** here (`-nobeams` to disable, which reduces it exactly to mode `D`). **Incomplete as of 0.215.0 — the MIS weights are not written yet, so both techniques contribute in full and the volume term is double-counted.** See **Mode `J`** below | CPU |
 
 ### Mode `W` — the deterministic (POV-Ray-style) preview
 
@@ -978,6 +978,14 @@ that converges to the same physical image.
   cost plus the merges, on top of one up-front beam pass — so on a media-free scene it is
   strictly mode `D` with extra words, and it only starts paying for itself where the medium
   is thick enough that `D` alone is starved.
+
+  > **Not finished as of 0.215.0.** Both estimators run, but the balance-heuristic weights
+  > described above are *not implemented yet* — every connection and every beam merge
+  > currently contributes at weight 1. The consequence is a real, visible error and not a
+  > subtlety: on `_fog_cornell.ftsl` the volume term comes out **≈2× too bright**, because
+  > the two techniques both account for it in full. `-mode J -nobeams` is still exactly mode
+  > `D` and is unaffected. Until this note is removed, use `D` or `M` for images you care
+  > about; `J` is a work in progress you are welcome to watch.
 
 The **image-forming modes are all progressive** — the forward camera models
 (`A`/`B`/`C`), the backward reference (`R`), the bidirectional tracer (`D`), UPBP (`J`),
