@@ -9885,6 +9885,84 @@ See `render_cuda.cu` ~line 555/577/624.
 
 ## Open bugs
 
+### `-stop` reported FAILED on a mode-M render that was in fact stopping correctly — FIXED 2026-09-01 (v0.205.1)
+
+**Observed** stopping the `gallery_rain` mode-M flyby (pid 35992) to swap the compote asset:
+
+```
+[stop] asked pid 35992 to finish and exit cleanly.
+[stop] FAILED -- still running after 120s: 35992
+[stop] it may be mid-write, or in a long non-chunked batch (a bare -n render with no
+       -window/-time/-noise budget writes only at the end), or it may not be an ftrace
+       process at all. Nothing was force-killed.
+exit=2
+```
+
+**Nothing was actually wrong.** The target's own log showed it had received and accepted the
+request — `[stop] external stop requested -- stopping cleanly` — and its window title showed it
+mid-`[gather] 1 / 24 spp` on frame 1/600. It exited cleanly on its own a few minutes later
+(exit code 0) once that frame's gather finished, writing its image as designed.
+
+**Cause (corrected after reading the code — the first diagnosis, "the frame boundary is the
+only seam", was incomplete).** `-stop` latency is bounded by the next seam at which
+`ft::stopRequested()` is polled, and on the mode-M **GPU** path the run of unseamed work
+between the deposit and the first frame write is a chain of three:
+
+1. the tail of the host-side beam-BVH build,
+2. the device upload (this scene: 23 759 625 sub-beams + 15 294 687 BVH nodes), and
+3. **one full spp of gather** — `chunk = 200000 / npix` (render_cuda.cu) clamps to **1** at
+   960x540 (518 400 px), and with `-beams` a probe ray gathers ~8 542 beams, so that single
+   `kGather` launch runs for minutes.
+
+Together they exceed the flat 120 s the old `-stop` waited before declaring failure. (The CPU
+mode-M path was never affected: it already polls between `cpuSppChunks`.)
+
+**Why it mattered.** The diagnostic actively misled: none of the three explanations it offered
+was the real one, and "it may not be an ftrace process at all" invites exactly the reflex the
+project forbids — reaching for `taskkill /F`, which is how the NVIDIA driver gets wedged into a
+TDR. A false FAILED on the one command that exists to prevent force-kills is the worst possible
+place for a false negative. Exit code 2 also breaks scripted `stop && rebuild` chains.
+
+**Fixed in two independent halves.**
+
+*A — the target now acknowledges, so `-stop` can tell "not listening" from "listening but
+busy" (`src/main.cpp`).* The stop channel gained a third file next to `<pid>.run` and
+`<pid>.stop`: **`<pid>.ack`**, written by the watcher thread the instant it consumes the
+sentinel — i.e. long before the render reaches a seam. `runStopCommand()`'s wait is now
+two-phase: **120 s to obtain an ack** (a target that never acks either is not an ftrace, is
+wedged, or predates this build — waiting longer is futile), then **900 s once acknowledged**,
+with a 30 s "still waiting" heartbeat that marks unacknowledged pids with `?`. The final
+message is split so an acknowledged straggler is told plainly that it *did* hear the request
+and will still exit on its own. `stopChannelStart()` clears a stale ack (which would otherwise
+make the first `-stop` of a new process look pre-acknowledged), `stopChannelEnd()` removes it,
+and the directory scan reaps `.ack` files belonging to dead owners. **Exit 0 still means
+genuinely gone, unconditionally** — `build.bat` chains a copy off it, so relabelling a
+still-running target as success was never an option.
+
+*B — the gather is sliceable, so the seam is a fraction of a second instead of a frame
+(`src/render_cuda.cu`).* `kGather` took an explicit `[idxBase, idxEnd)` window over the chunk's
+flat (pixel, sample) index space, and the host now cuts each chunk into sub-launches retargeted
+to ~0.25 s each (probe 1/16 spp, floor 1/64 spp, at most 4x growth per step; the learned slice
+carries **across** cameras so a 600-frame flyby does not re-probe 600 times), polling
+`ft::stopRequested()` between them. Every seed in `kGather` is a pure function of the *global*
+sample index `gidx`, never of the launch bounds, so slicing samples exactly the same paths.
+Slicing also cuts per-launch duration, which strictly improves TDR-watchdog headroom.
+
+*Why B needed a scratch buffer.* The film is normalised by a single global spp count, not per
+pixel, so committing half a chunk would leave the pixels that got their sample ~1/spp brighter
+than the ones that did not — a visible band across the last frame of every stopped render. So
+`kGather` now writes into a per-chunk scratch accumulator (~16 MB at 960x540) which the new
+`kFilmFold` folds into the film only once the whole chunk lands; an abandoned chunk is simply
+discarded, making a stop anywhere inside a chunk produce exactly the image a stop at the
+preceding chunk boundary would have. Two guards go with it: the *first* chunk of a frame is
+never abandoned (bailing out of it would write a black frame, a worse answer to a stop than the
+one chunk it costs), and the last completed spp count is always reported before breaking so the
+host normalises by what actually landed rather than by a stale count.
+
+**Not bit-identical, and never was.** `kFilmFold` changes the floating-point association of the
+sum. This is below the noise of the `atomicAdd(double)` ordering that mode M's gather has always
+depended on, which is itself not reproducible run to run.
+
 ### Klein glass mesh had a non-manifold pinch vertex — FIXED 2026-07-14
 The Klein mesh (`scraps/klein_hunyuan_clean.obj` and its staged copy `klein_staged.obj`, used
 by `settle_test_settled.ftsl` / `klein_glass_ior152.ftsl` / `klein_glass_ior242.ftsl`) failed

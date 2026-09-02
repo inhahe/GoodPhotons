@@ -12302,17 +12302,27 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
     }
 }
 
-// One thread per (pixel, sample); grid-strides over totalSamples. Mirrors kBackward's
-// seeding (global sample index) so a chunked gather is decorrelated across chunks. The
-// gather already returns XYZ, so (unlike kBackward) no cie(lambda) multiply is applied.
+// One thread per (pixel, sample); grid-strides over [idxBase, idxEnd) of this chunk's flat
+// (pixel, sample) index space. Mirrors kBackward's seeding (global sample index) so a
+// chunked gather is decorrelated across chunks. The gather already returns XYZ, so (unlike
+// kBackward) no cie(lambda) multiply is applied.
+//
+// The [idxBase, idxEnd) window exists so the host can cut ONE chunk into several launches
+// and poll the stop flag between them. At the resolutions this mode runs at, the chunk
+// size clamps to a single spp (200000/npix < 1), so without the window the finest seam an
+// external `ftrace -stop` could land on was a whole frame's worth of gathering — minutes,
+// with -beams — which is what made a perfectly healthy stop look like a failure. Every
+// seed here is a pure function of the GLOBAL index gidx, never of the launch bounds, so a
+// sliced chunk samples exactly the same paths as an unsliced one.
 __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, DCamera cam,
                         double* film, double* hits,
-                        long long totalSamples, long long chunkSpp, long long sppTotal,
+                        long long idxBase, long long idxEnd,
+                        long long chunkSpp, long long sppTotal,
                         long long sampleBase, int resX, int diffraction, int fgRays,
                         unsigned long long seedBase) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
-    for (long long idx = g; idx < totalSamples; idx += G) {
+    for (long long idx = idxBase + g; idx < idxEnd; idx += G) {
         long long pix  = idx / chunkSpp;
         long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
         DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
@@ -12336,6 +12346,26 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, D
         atomicAdd(&film[o + 1], oY);
         atomicAdd(&film[o + 2], oZ);
         if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
+    }
+}
+
+// Fold a completed chunk's scratch accumulation into the camera's film, then leave the
+// scratch for the host to clear. kGather writes into scratch rather than straight into the
+// film so that a chunk abandoned part-way (external `ftrace -stop`, closed window) can be
+// DISCARDED whole. That matters because the film is normalised by a single global spp
+// count, not per pixel: committing half a chunk would leave the pixels that got their
+// sample ~1/spp brighter than the ones that did not, i.e. a visible band across the last
+// frame of every stopped render. Dropping the partial chunk makes a stop anywhere inside a
+// chunk produce exactly the image a stop at the preceding chunk boundary would have.
+__global__ void kFilmFold(double* film, double* hits, const double* sfilm, const double* shits,
+                          long long npix) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long S = (long long)gridDim.x * blockDim.x;
+    for (; i < npix; i += S) {
+        film[i * 3 + 0] += sfilm[i * 3 + 0];
+        film[i * 3 + 1] += sfilm[i * 3 + 1];
+        film[i * 3 + 2] += sfilm[i * 3 + 2];
+        if (hits && shits) hits[i] += shits[i];
     }
 }
 
@@ -16771,6 +16801,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     const bool live = (prog && prog->report);
     auto lastReport = std::chrono::steady_clock::now();
     bool stopped = false;
+    // Learned sub-chunk slice (flat (pixel, sample) units), carried ACROSS cameras: on a
+    // flythrough consecutive frames cost almost the same, so re-probing 600 times would be
+    // 600 needlessly small launches for nothing. Re-clamped to the camera's own npix below.
+    long long slice = 0;
     for (int c = 0; c < nc && !stopped; ++c) {
         DCamera hc = bakeCamera(scene, cams[c], resX[c], resY[c], up);
         const size_t npix = (size_t)resX[c] * resY[c];
@@ -16778,33 +16812,90 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
         CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
         CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
+        // Scratch accumulator for the chunk in flight. kGather writes here, and kFilmFold
+        // folds it into d_film only once the WHOLE chunk has landed — see kFilmFold for why
+        // a half-committed chunk would band the image. ~16 MB at 960x540, i.e. nothing next
+        // to the photon map this mode is already holding.
+        double* s_film = nullptr; CUDA_CHECK(cudaMalloc(&s_film, npix * 3 * sizeof(double)));
+        double* s_hits = nullptr; CUDA_CHECK(cudaMalloc(&s_hits, npix * sizeof(double)));
         const unsigned long long seed = 0xA24BAED4963EE407ULL ^ (0x9E3779B97F4A7C15ULL * (unsigned long long)(c + 1));
         // Chunk spp so a single launch stays well under the Windows TDR watchdog even when a
         // caustic cell holds a dense photon cluster (heavy density query).
         long long chunk = 200000 / (long long)(npix ? npix : 1); if (chunk < 1) chunk = 1;
+        // Sub-chunk slicing, retargeted to ~0.25 s of work per launch. This is the ONLY seam
+        // an external `ftrace -stop` can land on inside a gather: at these resolutions
+        // `chunk` has already clamped to a single spp, so before slicing the shortest
+        // possible stop latency was one entire frame of gathering — minutes with -beams,
+        // well past the -stop wait, which is exactly how a healthy render came to be
+        // reported as a failed stop. Seeds depend only on the global sample index, so
+        // slicing changes no sample: the image is the one an unsliced gather produces.
+        const long long sliceLo = ((long long)npix >> 6) + 1;             // never finer than 1/64 spp
+        if (slice < sliceLo) slice = ((long long)npix >> 4) + 1;          // first probe: 1/16 spp
+        long long sppDone = 0;
+        bool abandoned = false;
         for (long long base = 0; base < spp; base += chunk) {
             long long cs2 = (base + chunk <= spp) ? chunk : (spp - base);
             long long total = (long long)npix * cs2;
-            kGather<<<2048, 128>>>(up.sc, dpm, dpmC, dbm, hc, d_film, d_hits, total, cs2, spp, base,
-                                   resX[c], diffraction ? 1 : 0, fgRays, seed);
-            cudaCheckKernel("photon-gather");
+            CUDA_CHECK(cudaMemset(s_film, 0, npix * 3 * sizeof(double)));
+            CUDA_CHECK(cudaMemset(s_hits, 0, npix * sizeof(double)));
+            bool chunkDone = true;
+            for (long long i = 0; i < total; ) {
+                const long long hi = (i + slice < total) ? (i + slice) : total;
+                const auto t0 = std::chrono::steady_clock::now();
+                kGather<<<2048, 128>>>(up.sc, dpm, dpmC, dbm, hc, s_film, s_hits, i, hi, cs2, spp,
+                                       base, resX[c], diffraction ? 1 : 0, fgRays, seed);
+                cudaCheckKernel("photon-gather");
+                CUDA_CHECK(cudaDeviceSynchronize());   // the launch is async; time the WORK
+                const double sec = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count();
+                const long long did = hi - i;
+                i = hi;
+                // Abandon the chunk in flight only if there is already a complete chunk in
+                // the film. Bailing out of the very first one would write a black frame,
+                // which is a worse answer to a stop than the one extra chunk it costs.
+                if (i < total && base > 0 && ft::stopRequested()) { chunkDone = false; break; }
+                // Never below 1/64 spp (a slice that keeps halving turns the gather into
+                // launch latency), never more than 4x up in one step (one anomalously fast
+                // slice must not produce a minutes-long next one). A slice too fast to time
+                // takes the 4x growth outright, so a cheap scene climbs back out of the
+                // probe in two or three launches instead of paying per-launch overhead for
+                // the whole frame.
+                double want = (sec > 1e-6) ? (double)did * (0.25 / sec) : 4.0 * (double)slice;
+                if (want > 4.0 * (double)slice) want = 4.0 * (double)slice;
+                slice = (long long)want;
+                if (slice < sliceLo) slice = sliceLo;
+            }
+            // Partial chunk discarded, not folded: the film still holds exactly `sppDone`
+            // complete samples per pixel, so it needs one last report to say so.
+            if (!chunkDone) { stopped = true; abandoned = true; break; }
+            kFilmFold<<<256, 128>>>(d_film, d_hits, s_film, s_hits, (long long)npix);
+            cudaCheckKernel("photon-gather-fold");
+            sppDone = base + cs2;
+            const bool frameDone = (sppDone >= spp);
+            const bool stopNow = ft::stopRequested();
             // Live view: after a chunk, hand the host the frame-so-far so it can refresh the
             // window/preview. Throttle to ~10 Hz (a high-res gather chunks one spp at a time,
-            // which is far finer than the eye needs) but always report the completed frame.
+            // which is far finer than the eye needs) but always report the completed frame —
+            // and always report the last one before a stop, so the host normalises by the spp
+            // that actually landed rather than by a stale count.
             if (live) {
-                long long done = base + cs2;
-                bool frameDone = (done >= spp);
                 auto now = std::chrono::steady_clock::now();
-                if (frameDone || std::chrono::duration<double>(now - lastReport).count() >= 0.1) {
+                if (frameDone || stopNow ||
+                    std::chrono::duration<double>(now - lastReport).count() >= 0.1) {
                     downloadFilm(c, d_film, d_hits, npix);
-                    if (prog->report(out[c], done, frameDone)) stopped = true;
+                    if (prog->report(out[c], sppDone, frameDone)) stopped = true;
                     lastReport = now;
-                    if (stopped) break;
                 }
             }
+            if (stopped || stopNow) { stopped = true; break; }
+        }
+        if (abandoned && live && sppDone > 0) {
+            downloadFilm(c, d_film, d_hits, npix);
+            prog->report(out[c], sppDone, false);
         }
         downloadFilm(c, d_film, d_hits, npix);   // ensure out[c] holds the final accumulation
         cudaFree(d_film); cudaFree(d_hits);
+        cudaFree(s_film); cudaFree(s_hits);
         // Hand the finished frame to the host for IMMEDIATE crash-safe write, then release
         // its buffers so a long flythrough runs in ~one frame of host RAM instead of holding
         // all nc films to the end (mirrors the CPU mode-M path, which writes per frame). If

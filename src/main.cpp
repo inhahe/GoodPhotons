@@ -13049,10 +13049,16 @@ static void onInterrupt(int sig) {
 //                              thread sees it within ~250 ms, deletes it, and raises
 //                              the very same g_stopRequested flag Ctrl-C raises.
 //                              Nothing is force-killed, ever.
+//   <temp>/ftrace/<pid>.ack    written by the target the moment it consumes the
+//                              sentinel: "I heard you, I am winding down". This is
+//                              what lets -stop tell "not listening" apart from "still
+//                              finishing a long chunk", which it previously could not
+//                              and so reported the second as a FAILURE. See the wait
+//                              loop in runStopCommand() for why that mattered.
 static std::atomic<bool>     g_extStopRequested{false};  // also breaks the -keepwindow hold
 static std::atomic<bool>     g_stopWatchQuit{false};
 static std::thread           g_stopWatchThread;
-static std::filesystem::path g_stopRunFile, g_stopSentinelFile;
+static std::filesystem::path g_stopRunFile, g_stopSentinelFile, g_stopAckFile;
 
 // <temp>/ftrace, created on demand. Empty path = no usable temp dir (channel disabled).
 static std::filesystem::path stopChannelDir() {
@@ -13093,10 +13099,13 @@ static void stopChannelStart(const std::string& what) {
     const long pid = ftraceCurrentPid();
     g_stopRunFile      = dir / (std::to_string(pid) + ".run");
     g_stopSentinelFile = dir / (std::to_string(pid) + ".stop");
+    g_stopAckFile      = dir / (std::to_string(pid) + ".ack");
     std::error_code ec;
     // A sentinel already sitting here belongs to a dead process whose pid we've been
-    // recycled into; clear it so we don't stop the instant we start.
+    // recycled into; clear it so we don't stop the instant we start. Same for a stale
+    // ack, which would otherwise make our first -stop look pre-acknowledged.
     std::filesystem::remove(g_stopSentinelFile, ec);
+    std::filesystem::remove(g_stopAckFile, ec);
     { std::ofstream f(g_stopRunFile); f << what << "\n"; }
     g_stopWatchQuit.store(false);
     g_stopWatchThread = std::thread([] {
@@ -13104,6 +13113,11 @@ static void stopChannelStart(const std::string& what) {
             std::error_code e;
             if (std::filesystem::exists(g_stopSentinelFile, e)) {
                 std::filesystem::remove(g_stopSentinelFile, e);
+                // Acknowledge BEFORE doing anything else. The waiting `-stop` reads this to
+                // learn that a real ftrace heard the request, which is what licenses it to
+                // keep waiting past its "is anything listening?" budget instead of declaring
+                // failure on a render that is merely mid-chunk.
+                { std::ofstream a(g_stopAckFile); a << "ack\n"; }
                 // Deliberately true whether a render is in flight (finish the chunk, write,
                 // exit) or the process is just holding a -keepwindow preview open.
                 std::printf("\n[stop] external stop requested — stopping cleanly "
@@ -13123,6 +13137,9 @@ static void stopChannelEnd() {
     if (g_stopWatchThread.joinable()) g_stopWatchThread.join();
     std::error_code ec;
     if (!g_stopRunFile.empty()) std::filesystem::remove(g_stopRunFile, ec);
+    // The ack has done its job once we are gone (the waiter keys off process liveness for
+    // the final verdict); leaving it would only be litter for the next -stop to reap.
+    if (!g_stopAckFile.empty()) std::filesystem::remove(g_stopAckFile, ec);
 }
 
 // Has a stop target actually gone? On Windows the process check is authoritative, so it
@@ -13163,11 +13180,11 @@ static int runStopCommand(const char* who) {
     std::error_code ec;
     for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
         const std::string ext = de.path().extension().string();
-        if (ext != ".run" && ext != ".stop") continue;
+        if (ext != ".run" && ext != ".stop" && ext != ".ack") continue;
         const long pid = std::strtol(de.path().stem().string().c_str(), nullptr, 10);
         if (pid <= 0) continue;
         if (!ftraceProcessAlive(pid)) { std::filesystem::remove(de.path(), ec); continue; }
-        if (ext != ".run") continue;                 // a live target's pending sentinel
+        if (ext != ".run") continue;                 // a live target's pending sentinel / ack
         std::string what;
         { std::ifstream f(de.path()); std::getline(f, what); }
         live.emplace_back(pid, what);
@@ -13221,28 +13238,85 @@ static int runStopCommand(const char* who) {
     }
     std::fflush(stdout);
 
-    // Wait for them to actually go. A render only notices at a chunk boundary and then
-    // still has to write its image + checkpoint, so this can legitimately take up to
-    // one -interval (default 15 s) plus the write; give it a generous ceiling and say
-    // so rather than leaving the caller guessing whether the stop took.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    // Wait for them to actually go — in two phases, because "not listening" and "listening
+    // but busy" need completely different budgets and used to be conflated.
+    //
+    //   Phase 1 (ACK_SECS): how long we are willing to wait for any sign of life. A target
+    //     that never writes its <pid>.ack either isn't an ftrace, or is wedged, or is in a
+    //     build old enough not to acknowledge — all cases where waiting longer is futile.
+    //   Phase 2 (BUSY_SECS): once a target HAS acknowledged, the sentinel is provably
+    //     consumed and the only thing left is the work between here and the next seam.
+    //     That can legitimately be minutes — a mode-M gather at high spp with -beams spends
+    //     a long time inside one launch — so the old flat 120 s ceiling reported a render
+    //     that was stopping perfectly correctly as a FAILURE, which is exactly the message
+    //     that talks somebody into a `taskkill /F` and a wedged display driver.
+    //
+    // Exit 0 still means *genuinely gone*, unconditionally: build.bat chains a copy off it,
+    // and a false 0 sends it at an exe that is still locked.
+    const auto ACK_SECS  = std::chrono::seconds(120);
+    const auto BUSY_SECS = std::chrono::seconds(900);
+    const auto t0 = std::chrono::steady_clock::now();
+
     std::vector<long> pending = targets;
+    std::set<long> acked;
+    auto deadline = t0 + ACK_SECS;
+    auto nextNote = t0 + std::chrono::seconds(30);
+
     while (!pending.empty() && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        std::error_code ec;
         std::vector<long> still;
-        for (long pid : pending)
-            if (!stopTargetGone(pid, dir)) still.push_back(pid);
+        for (long pid : pending) {
+            if (stopTargetGone(pid, dir)) continue;
+            still.push_back(pid);
+            // The ack appears the instant the watcher thread consumes the sentinel, well
+            // before the render reaches a seam — so it answers "did anyone hear me?"
+            // without waiting on "has it finished what it was doing?".
+            if (!acked.count(pid) &&
+                std::filesystem::exists(dir / (std::to_string(pid) + ".ack"), ec)) {
+                acked.insert(pid);
+                std::printf("[stop] pid %ld acknowledged — finishing its current chunk, then "
+                            "writing its image and checkpoint.\n", pid);
+                std::fflush(stdout);
+            }
+        }
         pending.swap(still);
+        // Any acknowledged target buys the whole wait the longer budget; an unacknowledged
+        // straggler alongside it is no reason to give up early on the one that answered.
+        if (!acked.empty()) deadline = t0 + BUSY_SECS;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!pending.empty() && now >= nextNote) {
+            const long long el =
+                std::chrono::duration_cast<std::chrono::seconds>(now - t0).count();
+            std::printf("[stop] still waiting (%llds) for:", el);
+            for (long pid : pending) std::printf(" %ld%s", pid, acked.count(pid) ? "" : "?");
+            std::printf("\n");
+            std::fflush(stdout);
+            nextNote = now + std::chrono::seconds(30);
+        }
     }
-    // Only claim a clean stop when every target is actually gone — this exit code is what
-    // build.bat and friends chain off, so a false 0 sends them at an exe that is still
-    // locked, which is precisely the dead end that tempts a `taskkill /F`.
+
     if (pending.empty()) { std::printf("[stop] done — stopped cleanly.\n"); return 0; }
-    std::printf("[stop] FAILED — still running after 120s:");
+
+    const long long waited = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::printf("[stop] FAILED — still running after %llds:", waited);
     for (long pid : pending) std::printf(" %ld", pid);
-    std::printf("\n[stop] it may be mid-write, or in a long non-chunked batch "
-                "(a bare -n render with no -window/-time/-noise budget writes only at the end),\n"
-                "       or it may not be an ftrace process at all. Nothing was force-killed.\n");
+    std::printf("\n");
+    bool anyAcked = false, anyMute = false;
+    for (long pid : pending) { if (acked.count(pid)) anyAcked = true; else anyMute = true; }
+    if (anyAcked)
+        std::printf("[stop] the acknowledged pid(s) above DID hear the request and are winding\n"
+                    "       down; they are just taking longer than %llds to reach a seam. They\n"
+                    "       will still exit on their own — re-run -stop to keep waiting.\n",
+                    (long long)BUSY_SECS.count());
+    if (anyMute)
+        std::printf("[stop] the pid(s) above never acknowledged: they may be mid-write, in a long\n"
+                    "       non-chunked batch (a bare -n render with no -window/-time/-noise\n"
+                    "       budget writes only at the end), running an older build that predates\n"
+                    "       acknowledgement, or not an ftrace process at all.\n");
+    std::printf("[stop] Nothing was force-killed.\n");
     return 2;
 }
 
