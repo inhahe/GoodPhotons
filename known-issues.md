@@ -18,13 +18,22 @@ which is the balance-heuristic MIS weight doing its job.
 **The problem is that the caustics are real but far too dim to see, and more `-causticn` does
 not close the gap.**
 
-| run | caustic photons stored | probe saw / target | flux/emitted |
-|---|---|---|---|
-| `-causticn 0`, `-n 20M`  | 11 050     | -       | - |
-| `-causticn 5M`, `-n 20M` | 816 508    | 2 / 47  | 1817.83 |
-| `-causticn 80M`, `-n 10M`| 12 888 623 | 11 / 117| 1815.88 |
+| run | log | caustic photons stored | probe saw / target | flux/emitted |
+|---|---|---|---|---|
+| `-causticn 0`, `-n 20M`  | `scraps/gr_noaim.log` | 11 118     | **0** / 11 | 1820.65 |
+| `-causticn 5M`, `-n 20M` | `scraps/gr_aim3.log`  | 816 508    | 2 / 47   | 1817.83 |
+| `-causticn 80M`, `-n 10M`| `scraps/gr_aim80.log` | 12 888 623 | 11 / 117 | 1815.88 |
 
-Even at a 16x budget the probe is ~10x short of its own target population. The image is **not**
+(The ~73x population figure quoted above compares the aimed run's own main-pass contribution,
+11 050, against its 805 458 aimed deposits — same run, so same seed and same map. The standalone
+un-aimed control stored 11 118, which is the row above; the two agree to 0.6 %.)
+
+Even at a 16x budget the probe is ~10x short of its own target population, **and the shortfall
+does not shrink as the budget grows** — 0/11, 2/47, 11/117 is a probe stuck at roughly a tenth of
+target no matter how many photons are thrown at it. That is the tell that the probe is being
+decided by the room-wide specular wash rather than by the filaments: the wash scales with the
+budget too, so buying more photons moves numerator and denominator together and never converges.
+It is the same observation that, followed up, produced the radius fix in the entry below. The image is **not**
 clipping (0.14 % of pixels >= 250; the caps sit mid-grey by design), so this is not a tone-map
 artefact.
 
