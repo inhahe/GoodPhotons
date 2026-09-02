@@ -5,7 +5,17 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-09-02, v0.210.0): mode `M`'s gather **degenerates to exactly one launch per spp at 960x540**, so the `-stop` seam its own comment promises does not exist there, and the caption stays stale for a whole spp — plus a second silent region upstream of it. Structural; the timings that exposed it are CONFOUNDED and must be re-measured on a quiet GPU
+### OPEN (2026-09-02, v0.210.0 → mostly fixed by v0.211.0): mode `M`'s gather **degenerates to exactly one launch per spp at 960x540**, so the `-stop` seam its own comment promises does not exist there, and the caption stays stale for a whole spp — plus a second silent region upstream of it
+
+**Status.** The degeneracy itself is structural and still true — there is still exactly one launch
+per spp at this resolution, and that is the *right* trade (see the occupancy note below). What has
+been fixed is everything that made it hurt: (a) loop-top stop polls and (b) a stage line printed
+before the first launch, both in **v0.210.1**; (c) device-side cooperative cancellation inside the
+launch, in **v0.211.0**, taking stop latency from 879 s to 2 s at no throughput cost. **Still open:**
+(d) the pre-gather silent region, and intra-launch *progress* (the caption is now correct about what
+is running but sits at 0% for the whole launch — that needs a device-side counter the host samples
+while blocked). Items (e)/(f) below are re-measurements, and the "contended GPU" confound that
+originally qualified them has since been **retracted** — see the `pmon` note.
 
 **Repro.** The `gallery_rain` showcase flags with `-n` raised 4x:
 
@@ -125,9 +135,27 @@ gone.
   | 960x540 | 518400 | 1 | 518400 | 1048576 | 1 per spp |
   | 320x180 | 57600 | 3 | 172800 | 1048576 | **1 for the whole 3-spp render** |
 
-  Measured on the v0.210.1 verification run at 320x180: a `-stop` issued ~1 min into the gather
-  had still not landed **8+ minutes** later, with the caption frozen at `0 / 172.8k (0%), 0.00s`
-  — no slice had completed because there is only one, spanning every sample in the render.
+  Measured end to end on the v0.210.1 verification run at 320x180, and the result is that the
+  stop accomplished **nothing**:
+
+  ```
+  [stop] still waiting (874s) for: 91476
+  [stop] done — stopped cleanly.            exit=0, elapsed 879s
+  [camera] gathering frame 1/1 — 172.8k / 172.8k (100%), 14:56, 193/s
+  [camera] [gather] 3 / 3 spp (100%), 20.0M photons, 33:16
+  wrote png/stopfix/t.png (320x180)
+  ```
+
+  The `-stop` was issued ~1 min into the gather and returned 879 s later reporting success — but
+  the render had simply **run to completion**, all 3 spp, and written its PNG. Nothing was
+  cancelled; the process merely happened to exit on its own inside the wait. `-stop`'s exit 0 is
+  still honest by its documented contract (the target is genuinely gone) but it is worth knowing
+  that "stopped cleanly" here means "finished naturally while we watched".
+
+  Note also that the caption, though now correct about *what* is running (v0.210.1), sat at
+  `0 / 172.8k (0%), 0.00s` for the whole 14:56 and jumped straight to 100%. Intra-launch
+  *progress* is a second thing the single launch costs, and the device flag below does not by
+  itself restore it — that would need a device-side counter the host samples while blocked.
 
   **Do not "fix" this by shrinking the slice.** The occupancy argument at 17018-17049 is
   measured and sound: a slice below `sliceOcc` leaves most of the persistent grid idle and cost
@@ -135,14 +163,41 @@ gone.
   single launch *bigger*.
 
   **The proper fix is device-side cooperative cancellation**, which removes the tension entirely
-  rather than trading one side of it away: allocate the stop flag in mapped pinned host memory
-  (`cudaHostAlloc(..., cudaHostAllocMapped)` + `cudaHostGetDevicePointer`), pass the device
-  pointer into `kGather`, and have its grid-stride loop test it every N samples and return
-  early. Any host thread can then raise the flag with a plain store — no CUDA call, so it works
-  while the launching thread is parked in `cudaDeviceSynchronize`. One poller thread for the
-  whole gather, polling `ft::stopRequested()`, is enough. The abandoned partial chunk is already
-  handled correctly by the existing `chunkDone = false` path, so nothing downstream changes, and
-  stop latency drops from "one whole launch" to microseconds at any slice size.
+  rather than trading one side of it away. **DONE in v0.211.0** — the flag lives in mapped pinned
+  host memory (`cudaHostAlloc(..., cudaHostAllocMapped)` + `cudaHostGetDevicePointer`), published
+  to a `__device__ int* g_dGatherStop` via `cudaMemcpyToSymbol` before any kernel is in flight, and
+  one poller thread (50 ms, RAII-joined) raises it with a plain store. A plain store is the whole
+  point: the launching thread is parked in `cudaDeviceSynchronize` for the entire launch and can
+  issue no CUDA call, so nothing else could set it.
+
+  **The first attempt at this changed nothing, and the reason is worth keeping.** Polling in
+  `kGather`'s own grid-stride loop measured **186 s** to stop against a ~194 s remaining launch —
+  i.e. it did not fire at all. `518400 samples / 262144 threads = 1`: each thread runs exactly ONE
+  iteration, so a poll at the top of that loop executes once, at the instant of launch, and never
+  again. **All of the time is inside a single sample.** The poll therefore has to go where the time
+  actually is, and it now sits in two places: `dGatherPhotonBeams`'s `while (sp)` beam-BVH walk
+  (every 64 nodes) and `dPhotonGather`'s bounce loop (a scene with no media never enters the
+  former). Measured stop latency across the three states: **879 s → 186 s → 2 s.**
+
+  **It is free.** Matched A/B on `gallery_rain -n 120M -r 960 540 -spp 2`, poll inert vs poll live:
+  per-spp gathers `3:17 / 3:24` against `3:26 / 3:16`, both reaching 2/2 spp at exactly **7:24**.
+  The within-run spread between two identical launches in the same process (7–10 s) is larger than
+  the between-arm difference (1 s), so the every-64-nodes mapped read is below the noise floor and
+  the interval was left at `& 63` rather than widened.
+
+  **One correctness change came with it, and it is not optional.** The post-launch poll used to
+  carry an `i < total` guard, which was merely useless before and is **wrong** now: a cancelled
+  launch returns having stopped part-way, leaving the scratch film holding a sample for some pixels
+  and not others, while host-side `i` still reaches `total` because the slice was *issued* whole.
+  Folding that partial chunk would lay exactly the ~1/spp brightness band across the frame that
+  `kFilmFold`'s comment warns about. Dropping the guard routes it to `chunkDone = false` and the
+  existing discard path, verified live: `frame 1/1 stopped before its first complete sample —
+  nothing written for it.`
+
+  **Consequence to be aware of:** the stage report still credits `i = hi` samples after a
+  cancellation, because the host advanced `i` when it issued the slice. A stop therefore prints an
+  overstated final rate (one cancelled-at-47 s launch reported `10.4k/s` against a true `2.6k/s`).
+  Harmless — the frame is discarded — but do not read a rate off a stopped run.
 - **(d) Give the pre-gather region (photon-map build, caustic map, beam split, BVH build/upload)
   the same treatment** — stop polls and a self-naming stage line — so the ~50 min of silence
   before the upload line is also observable and interruptible. This is the second, separate

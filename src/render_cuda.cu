@@ -4937,6 +4937,21 @@ struct DBeamMap {
 // legitimate grazing beam into a random huge weight. The cross product has no cancellation
 // there, so the host's 1e-9 rejection threshold stays meaningful at float precision instead
 // of having to be loosened (which would have BIASED the estimate by dropping real samples).
+// ---- device-side cancellation for the mode-M gather ----
+//
+// Holds a pointer to a flag in MAPPED PINNED host memory, published once (cudaMemcpyToSymbol)
+// before the gather starts. A __device__ global rather than a kernel parameter so the deep
+// callees that actually burn the time — this BVH walk and dPhotonGather's bounce loop — can
+// test it without threading a pointer through every signature between them and kGather.
+//
+// Mapped memory specifically: the host thread that launched the kernel is parked inside
+// cudaDeviceSynchronize for the whole launch and can issue no CUDA call, so the flag has to be
+// raisable by a plain store from a different thread.
+__device__ int* g_dGatherStop = nullptr;
+__device__ __forceinline__ bool dGatherStopped() {
+    return g_dGatherStop != nullptr && *(const volatile int*)g_dGatherStop != 0;
+}
+
 __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DVec3& oc, const DVec3& dc, Real tMax,
                                           double aGlassCam, DRng& rng,
@@ -4948,7 +4963,17 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
     if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) return;
     const DPatEnv env = dPatEnvOf(sc);
     int stack[64]; int sp = 0; stack[sp++] = 0;
+    // THIS is where a gather actually spends its time, so this is where cancellation has to
+    // live. A probe ray visits thousands of nodes here (G = 8534 gathered beams on
+    // gallery_rain's default), while kGather's own grid-stride loop runs ONE iteration per
+    // thread — 518400 samples over 262144 threads — so a poll up there fires once, at the
+    // instant of launch, and never again. That is why the first attempt at device-side
+    // cancellation changed nothing: measured 186 s to stop against a ~194 s remaining launch.
+    // Every 64th node keeps the mapped-memory read (a PCIe round trip, necessarily uncached)
+    // far off the hot path while still bounding stop latency to a few nodes' work.
+    int stopPoll = 0;
     while (sp) {
+        if ((++stopPoll & 63) == 0 && dGatherStopped()) return;
         const DNode& n = bm.nodes[stack[--sp]];
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
@@ -12240,6 +12265,9 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
     const bool volOn = (bm != nullptr) && bm->nNodes > 0 && sc.mediaN > 0;
 
     for (int b = 0; b < maxBounce; ++b) {
+        // Second cancellation point, covering the rays that spend their time BOUNCING rather
+        // than in one big beam walk (a scene with no media never enters dGatherPhotonBeams).
+        if (dGatherStopped()) return;
         // Glass absorption for THIS segment, hoisted above the escape test because the beam
         // gather below needs it: a beam seen through a dielectric is attenuated to its own
         // closest-approach point, not to the segment end (host twin: photonmap_render.h).
@@ -12482,7 +12510,31 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, D
                         unsigned long long seedBase) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
+    int poll = 0;
     for (long long idx = idxBase + g; idx < idxEnd; idx += G) {
+        // Cooperative cancellation, and the ONLY thing that makes a gather interruptible.
+        //
+        // The host can only poll BETWEEN launches, and at every ordinary resolution there is
+        // exactly one launch: `sliceOcc` (4 * kGatherGrid * kGatherBlock = 1048576) exceeds a
+        // frame's sample count (518400 at 960x540; 172800 for a whole 3-spp render at
+        // 320x180), so the slice loop never iterates and there is no "between". Measured
+        // before this existed: a `-stop` issued one minute into a 320x180 gather returned
+        // 879 s later having cancelled nothing — the render had simply run to completion. On
+        // gallery_rain at -n 800M the same single launch runs for hours.
+        //
+        // Shrinking the slice is NOT the alternative: tying it below the occupancy floor left
+        // most of this persistent grid idle and cost a measured 11x (see sliceLo). Polling
+        // here is independent of slice size, so the floor stays exactly as tuned.
+        //
+        // NOTE this poll is nearly worthless ON ITS OWN and is kept only as a cheap guard for
+        // the multi-sample-per-thread case: at 960x540 there are 518400 samples for 262144
+        // threads, i.e. ONE iteration each, so it fires at launch time and never again. The
+        // polls that actually make a stop land are the ones inside dGatherPhotonBeams' BVH
+        // walk and dPhotonGather's bounce loop, where the time is really spent.
+        //
+        // Returning early leaves the scratch film partially written, which is exactly what
+        // the host's `chunkDone = false` discard path already exists to throw away.
+        if ((poll++ & 3) == 0 && dGatherStopped()) return;
         long long pix  = idx / chunkSpp;
         long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
         DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
@@ -16986,6 +17038,38 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                 return (e && *e) ? std::atoi(e) : 0; }();
     auto lastReport = std::chrono::steady_clock::now();
     bool stopped = false;
+    // ---- the gather's cancellation flag (see kGather's poll for why it must exist) ----
+    //
+    // It lives in MAPPED PINNED host memory deliberately. The thread that launches kGather is
+    // parked inside cudaDeviceSynchronize for the whole launch and cannot issue any CUDA call,
+    // so a flag that needed a cudaMemcpy to raise would be unreachable at precisely the moment
+    // it is needed. A mapped allocation is raised by a plain store, from any thread.
+    int* h_gatherStop = nullptr;
+    int* d_gatherStop = nullptr;
+    CUDA_CHECK(cudaHostAlloc((void**)&h_gatherStop, sizeof(int), cudaHostAllocMapped));
+    *h_gatherStop = 0;
+    CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_gatherStop, h_gatherStop, 0));
+    // Publish it to the device global the deep callees read. Done here, with no kernel in
+    // flight, so it is an ordinary synchronous copy rather than something that would have to
+    // race a running gather.
+    CUDA_CHECK(cudaMemcpyToSymbol(g_dGatherStop, &d_gatherStop, sizeof(int*)));
+    std::atomic<bool> pollQuit{false};
+    std::thread pollThread([&pollQuit, h_gatherStop] {
+        while (!pollQuit.load(std::memory_order_relaxed)) {
+            if (ft::stopRequested()) { *(volatile int*)h_gatherStop = 1; return; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
+    // Joined and freed however this function leaves — including the CUDA_CHECK throw paths,
+    // which are numerous below and would otherwise leak a detached thread into a dead context.
+    struct GatherStopGuard {
+        std::atomic<bool>& quit; std::thread& th; int* mem;
+        ~GatherStopGuard() {
+            quit.store(true, std::memory_order_relaxed);
+            if (th.joinable()) th.join();
+            if (mem) cudaFreeHost(mem);
+        }
+    } gatherStopGuard{pollQuit, pollThread, h_gatherStop};
     // Learned sub-chunk slice (flat (pixel, sample) units), carried ACROSS cameras: on a
     // flythrough consecutive frames cost almost the same, so re-probing 600 times would be
     // 600 needlessly small launches for nothing. Re-clamped to the camera's own npix below.
@@ -17158,7 +17242,16 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 // instead (see the `sppDone > 0` guard on `onFrame` below), which is both
                 // honest and what every earlier frame of a flythrough — already safely on
                 // disk — makes harmless.
-                if (i < total && ft::stopRequested()) { chunkDone = false; break; }
+                // The `i < total` guard this used to carry is now not merely useless but
+                // WRONG. It meant "only abandon if slices remain", which assumed a launch
+                // that returned had run to completion. With device-side cancellation a launch
+                // can return having stopped half way, leaving the scratch film holding a
+                // sample for some pixels and not others — and `i` still reaches `total`,
+                // because the slice was issued whole. Folding that would put exactly the
+                // ~1/spp brightness band across the frame that kFilmFold's comment describes.
+                // So: if a stop is pending, the chunk in flight is partial by definition and
+                // must be discarded, wherever `i` happens to be.
+                if (ft::stopRequested()) { chunkDone = false; break; }
                 // Never below 1/64 spp (a slice that keeps halving turns the gather into
                 // launch latency), never more than 4x up in one step (one anomalously fast
                 // slice must not produce a minutes-long next one). A slice too fast to time
