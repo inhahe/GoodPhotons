@@ -2588,6 +2588,32 @@ render. Closing that means teaching the shared device path to gather in spp chun
   throughout — `tracing photons…`, `building photon map…`, `building beam map…`,
   `frame k/N` — and the `exposure_lock` meter pre-pass, which runs *before* the group dispatch
   and so used to precede the existence of any window, now raises and titles one itself.
+
+  **Every phase between the deposit and the first gathered pixel is now named and
+  interruptible (v0.212.0).** The list above covered the deposit and the map build; on a
+  `-beams` run in mode `M` the stretch after them was four further blocks that reported nothing
+  and honoured no `-stop`, measured at tens of seconds each on a showcase `-n` and far more at
+  flyby split budgets. They are now `building photon map`, `building caustic map` (split out —
+  a stall in the caustic sort used to look like a stall in the global one), `splitting photon
+  beams`, `uploading photon map`, `uploading caustic map`, `uploading photon beams`, and only
+  then `gathering frame k/N`. The three uploads report real progress and rate, since each has a
+  natural chunk loop to hang it on; the two builds report indeterminate, because a host counting
+  sort has no cheap cursor.
+
+  Each also carries a stop seam, and the seams are placed so an abandoned phase can never be
+  half-consumed. The photon-map upload breaks on its existing 4 M-photon chunk boundary and
+  still registers the partly-filled device buffer with `up.keep`, so it is freed on the way out.
+  The beam upload skips the PCIe transfer *and* the `uploaded for the volume gather` log line
+  when stopped, so the log never claims the device holds a beam BVH it does not; `dbm.nNodes ==
+  0` is already the "no volume gather" sentinel, so nothing downstream needs a new case. The BVH
+  build (`bvh.h`, shared by every BVH in the renderer) polls every 256 nodes and, when it bails,
+  **turns the current range into a leaf rather than abandoning the tree half-written** — the
+  result is a structurally valid BVH, merely a coarse one, so there is no window in which a
+  partial tree could be traversed and answer wrongly, and callers that discard on stop and
+  callers that do not are both safe. Verified on `gallery_rain` at `-beamsplitmax 80M`: a stop
+  issued ~6 s into a build that takes 25.7 s uninterrupted ended it at 5.42 s, skipped both
+  uploads, and wrote nothing.
+
   **Validated on `scenes/_rainbow_test.ftsl`** against the pre-existing A/B splat estimator,
   which is the only independent implementation of the same single-scatter trade. Getting the
   comparison honest took two corrections worth recording. First, `-mode M` *without* `-beams`

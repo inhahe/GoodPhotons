@@ -11,11 +11,13 @@ as practical; this file is the fallback for what can't be addressed immediately.
 per spp at this resolution, and that is the *right* trade (see the occupancy note below). What has
 been fixed is everything that made it hurt: (a) loop-top stop polls and (b) a stage line printed
 before the first launch, both in **v0.210.1**; (c) device-side cooperative cancellation inside the
-launch, in **v0.211.0**, taking stop latency from 879 s to 2 s at no throughput cost. **Still open:**
-(d) the pre-gather silent region, and intra-launch *progress* (the caption is now correct about what
-is running but sits at 0% for the whole launch — that needs a device-side counter the host samples
-while blocked). Items (e)/(f) below are re-measurements, and the "contended GPU" confound that
-originally qualified them has since been **retracted** — see the `pmon` note.
+launch, in **v0.211.0**, taking stop latency from 879 s to 2 s at no throughput cost; and (d) the
+whole pre-gather region — beam split, BVH build, and all three uploads — named and interruptible in
+**v0.212.0**. **Still open:** intra-launch *progress* only. The gather caption is now correct about
+what is running, and every phase before it reports, but the gather itself sits at 0% for its whole
+single launch — that needs a device-side counter the host samples while blocked in
+`cudaDeviceSynchronize`. Items (e)/(f) below are re-measurements, and the "contended GPU" confound
+that originally qualified them has since been **retracted** — see the `pmon` note.
 
 **Repro.** The `gallery_rain` showcase flags with `-n` raised 4x:
 
@@ -199,9 +201,43 @@ gone.
   overstated final rate (one cancelled-at-47 s launch reported `10.4k/s` against a true `2.6k/s`).
   Harmless — the frame is discarded — but do not read a rate off a stopped run.
 - **(d) Give the pre-gather region (photon-map build, caustic map, beam split, BVH build/upload)
-  the same treatment** — stop polls and a self-naming stage line — so the ~50 min of silence
-  before the upload line is also observable and interruptible. This is the second, separate
-  silent region and remains unfixed.
+  the same treatment** — stop polls and a self-naming stage line — so the silence before the
+  upload line is also observable and interruptible. **DONE in v0.212.0.** It was four blocks,
+  not one, and none of them said anything or honoured a stop: the beam split + BVH build, the
+  photon-map upload, the caustic-map upload, and the beam/BVH upload. Now
+  `building photon map` → `building caustic map` → `splitting photon beams` →
+  `uploading photon map` → `uploading caustic map` → `uploading photon beams` →
+  `gathering frame k/N`. The three uploads carry real progress and rate (each already had a
+  chunk loop to hang it on); the two builds report indeterminate, because a host counting sort
+  has no cheap cursor. Caustic build split out from global build on purpose — lumping them
+  made a stall in the second look like a stall in the first.
+
+  Two placement details that are load-bearing rather than cosmetic:
+
+  * **The beam upload skips the transfer AND the log line when stopped.** Printing
+    `[gpu] photon beams: N sub-beams, M BVH nodes ... uploaded for the volume gather` after a
+    cancelled conversion would be a plain lie in the log about what the device holds.
+    `dbm.nNodes == 0` is already the "no volume gather" sentinel, so nothing downstream needed
+    a new case.
+  * **The BVH build bails into a LEAF, not into a half-written tree** (`bvh.h`, polled every
+    256 nodes — `stopRequested` is an indirect call through a relaxed atomic slot and a 5M-node
+    build would otherwise make five million of them). Turning the current range into a leaf
+    yields a **structurally valid** BVH — every primitive still reachable, every node's bounds
+    still correct — merely a coarse one. That matters because `bvh.h` is shared by every BVH in
+    the renderer, so the bail has to be safe for callers that *don't* discard on stop, not just
+    for the beam upload that does.
+
+  Measured on `gallery_rain -loadmap -beamsplitmax 80M`: uninterrupted, the split+BVH takes
+  **25.7 s**; a stop issued ~6 s in ended it at **5.42 s**, skipped both uploads, printed no
+  `uploaded` line and wrote no image. Note the banked-map trick is what makes this testable —
+  `-savemap` writes the RAW crossings *before* the split, so every `-loadmap` run re-does the
+  split and BVH and you get a repeatable ~100 s dry run instead of a 90 s deposit first.
+
+  **Testing gotcha worth recording:** ftrace's stdout is block-buffered when redirected to a
+  file, so watching the log to decide *when* to issue a stop measures the buffer, not the
+  render. The first attempt at this measurement fired on a caustic-map line that had been
+  sitting in a 4 KB buffer and landed a whole phase late. Time the phases once against a fixed
+  `t0` and then stop at a wall-clock offset.
 
 **What to re-measure on a quiet GPU before believing it.** (e) Whether the ~50 min stretch at
 351351733 stored photons is real super-linear cost or contention. (f) What one spp of this

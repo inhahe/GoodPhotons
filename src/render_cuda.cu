@@ -16882,8 +16882,13 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // Downloading tens of millions of deposits and counting-sorting them into cells is tens
     // of seconds on a showcase `-n` — another silent phase between the deposit's last chunk
     // and the first gathered pixel, so it names itself too.
+    if (stage && stage->reset)  stage->reset();
     if (stage && stage->report) stage->report("building photon map", 0, 0, nullptr, 0.0);
     buildMap();                             // host counting sort -> cell-contiguous runs
+    // Named separately from the global map: on a caustics run this is a second full sort of its
+    // own partition, and lumping the two under one caption made a stall in the second look like
+    // a stall in the first.
+    if (stage && stage->report) stage->report("building caustic map", 0, 0, nullptr, 0.0);
     buildCaustic();                         // ... and again for the caustic partition
 
     double energy[5] = {0,0,0,0,0};
@@ -16902,14 +16907,27 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     }
     // Built AFTER the save, deliberately: the file must hold the RAW crossings so one cache
     // serves any later -beamradius / -beamk (the split is radius-dependent).
-    if (bmap && beams->build) beams->build(*bmap);
+    //
+    // This names itself for the same reason `buildMap` above does: the split subdivides every
+    // stored chord and then builds a BVH over the result — on a showcase `-n` that is millions
+    // of sub-beams and it reports nothing until it is finished, so an uninstrumented run sits
+    // on the previous caption for the whole of it. Measured 7.6 s at `-beamcount 6M` and far
+    // more at showcase counts.
+    if (bmap && beams->build) {
+        if (stage && stage->report) stage->report("splitting photon beams", 0, 0, nullptr, 0.0);
+        beams->build(*bmap);
+    }
     }   // end if (!mapLoaded): deposit + build + optional save
 
     // ---- upload the built grid ----
     // Shared by the global map and the caustic map: identical layout, identical fold, and the
     // per-map constants (radius, nEmitted) are read from the map itself — which is exactly what
     // makes the caustic map's smaller radius normalise correctly with no second code path.
-    auto uploadPhotonMap = [&](const PhotonMap& M, DPhotonMap& D) {
+    // `what` names the phase in the live window / status line. Tens of millions of photons get
+    // converted on the host and streamed over PCIe here, which is tens of seconds on a showcase
+    // `-n` and reported nothing at all before — the third silent stretch between the last deposit
+    // chunk and the first gathered pixel.
+    auto uploadPhotonMap = [&](const PhotonMap& M, DPhotonMap& D, const char* what) {
         D = DPhotonMap{};
         D.lo = DVec3(M.lo.x, M.lo.y, M.lo.z);
         D.cellSize = (Real)M.cellSize; D.radius = (Real)M.radius;
@@ -16931,7 +16949,14 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             DGatherPhoton* d_sorted = nullptr;
             CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DGatherPhoton)));
             std::vector<DGatherPhoton> stg;
+            if (stage && stage->reset)  stage->reset();   // rate/ETA measured from THIS phase
+            if (stage && stage->report) stage->report(what, 0, (long long)n, nullptr, 0.0);
             for (size_t off = 0; off < n; off += PM_CHUNK) {
+                // The chunk boundary is already here for host-RAM reasons, so it is also a free
+                // stop seam. Bailing leaves `d_sorted` partly filled, which is harmless: the
+                // camera loop below sees the same flag and gathers nothing, and the pointer is
+                // still handed to `up.keep` after the loop so it is freed on the way out.
+                if (ft::stopRequested()) break;
                 size_t cnt = std::min(PM_CHUNK, n - off);
                 stg.resize(cnt);
                 for (size_t i = 0; i < cnt; ++i) {
@@ -16949,6 +16974,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 }
                 CUDA_CHECK(cudaMemcpy(d_sorted + off, stg.data(), cnt * sizeof(DGatherPhoton),
                                       cudaMemcpyHostToDevice));
+                if (stage && stage->report)
+                    stage->report(what, (long long)(off + cnt), (long long)n, nullptr, 0.0);
             }
             D.photons = (const DGatherPhoton*)up.keep(d_sorted);
         }
@@ -16957,10 +16984,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         D.cellStart = (const int*)up.keep(uploadVec(M.cellStart));
     };
     DPhotonMap dpm{}, dpmC{};
-    uploadPhotonMap(pm, dpm);
+    uploadPhotonMap(pm, dpm, "uploading photon map");
     // dpmC.photons stays null when the split is off or produced nothing — which is the very
     // flag the two device gathers test to skip their second estimate entirely.
-    if (causticsOn && !pmC.photons.empty()) uploadPhotonMap(pmC, dpmC);
+    if (causticsOn && !pmC.photons.empty()) uploadPhotonMap(pmC, dpmC, "uploading caustic map");
     else                                    dpmC.cellStart = dpm.cellStart;  // never dereferenced
 
     // ---- upload the built beam map ----
@@ -16973,8 +17000,20 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     if (bmap && !bmap->beams.empty() && !bmap->bvh.nodes.empty() && bmap->nEmitted > 0) {
         const double invN = 1.0 / (double)bmap->nEmitted;
         const size_t nb = bmap->beams.size();
+        // The fourth and last silent stretch: converting millions of sub-beams and millions of
+        // BVH nodes into their device layouts, on one host thread, before the line at the bottom
+        // of this block finally says anything. Name it and make it interruptible.
+        if (stage && stage->reset)  stage->reset();
+        if (stage && stage->report) stage->report("uploading photon beams", 0, (long long)nb,
+                                                  nullptr, 0.0);
         std::vector<DBeamRec> recs(nb);
         for (size_t i = 0; i < nb; ++i) {
+            if ((i & 0xFFFFF) == 0) {
+                if (ft::stopRequested()) break;
+                if (stage && stage->report)
+                    stage->report("uploading photon beams", (long long)i, (long long)nb,
+                                  nullptr, 0.0);
+            }
             const PhotonBeam& b = bmap->beams[i];
             const Vec3&      ci = bmap->cie[i];
             DBeamRec& r = recs[i];
@@ -16997,23 +17036,30 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         }
         std::vector<DNode> bnodes(bmap->bvh.nodes.size());
         for (size_t i = 0; i < bnodes.size(); ++i) {
+            if ((i & 0xFFFFF) == 0 && ft::stopRequested()) break;
             const BvhNode& s = bmap->bvh.nodes[i]; DNode& d = bnodes[i];
             d.lo = {s.box.lo.x, s.box.lo.y, s.box.lo.z};
             d.hi = {s.box.hi.x, s.box.hi.y, s.box.hi.z};
             d.left = s.left; d.right = s.right; d.first = s.first; d.count = s.count;
         }
-        dbm.beams     = (const DBeamRec*)up.keep(uploadVec(recs));
-        dbm.nodes     = (const DNode*)up.keep(uploadVec(bnodes));
-        dbm.primIdx   = (const int*)up.keep(uploadVec(bmap->bvh.primIdx));
-        dbm.radiusMax = (Real)bmap->radius;
-        dbm.nNodes    = (int)bnodes.size();
-        double rlo = bmap->radius;
-        for (float rm : bmap->radMed) if (rm > 0.f) rlo = std::min(rlo, (double)rm);
-        char rtxt[64];
-        if (rlo < bmap->radius) std::snprintf(rtxt, sizeof rtxt, "%.4g .. %.4g", rlo, bmap->radius);
-        else                    std::snprintf(rtxt, sizeof rtxt, "%.4g", bmap->radius);
-        std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %s "
-                    "uploaded for the volume gather\n", nb, bnodes.size(), rtxt);
+        // A stop during either conversion leaves `recs`/`bnodes` half-built. Don't pay the PCIe
+        // transfer for data nothing will read, and above all don't print the "uploaded for the
+        // volume gather" line, which would be a plain lie in the log about what the device holds.
+        // `dbm` stays zeroed, and `nNodes == 0` is already the "no volume gather" sentinel.
+        if (!ft::stopRequested()) {
+            dbm.beams     = (const DBeamRec*)up.keep(uploadVec(recs));
+            dbm.nodes     = (const DNode*)up.keep(uploadVec(bnodes));
+            dbm.primIdx   = (const int*)up.keep(uploadVec(bmap->bvh.primIdx));
+            dbm.radiusMax = (Real)bmap->radius;
+            dbm.nNodes    = (int)bnodes.size();
+            double rlo = bmap->radius;
+            for (float rm : bmap->radMed) if (rm > 0.f) rlo = std::min(rlo, (double)rm);
+            char rtxt[64];
+            if (rlo < bmap->radius) std::snprintf(rtxt, sizeof rtxt, "%.4g .. %.4g", rlo, bmap->radius);
+            else                    std::snprintf(rtxt, sizeof rtxt, "%.4g", bmap->radius);
+            std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %s "
+                        "uploaded for the volume gather\n", nb, bnodes.size(), rtxt);
+        }
     }
 
     // ---- gather each camera ----
