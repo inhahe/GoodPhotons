@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-09-02, v0.210.0): mode `M` has a long region with **no progress output and no `-stop` seam** between the aimed caustic pass and the gather's first slice — structural; the timings that exposed it are CONFOUNDED and must be re-measured on a quiet GPU
+### OPEN (2026-09-02, v0.210.0): mode `M`'s gather **degenerates to exactly one launch per spp at 960x540**, so the `-stop` seam its own comment promises does not exist there, and the caption stays stale for a whole spp — plus a second silent region upstream of it. Structural; the timings that exposed it are CONFOUNDED and must be re-measured on a quiet GPU
 
 **Repro.** The `gallery_rain` showcase flags with `-n` raised 4x:
 
@@ -40,11 +40,56 @@ after the volume-gather upload — yet the request had still not LANDED 35+ min 
 full 900 s `-stop` windows. `render_cuda.cu`'s own comment (~line 17040) states that the sliced
 gather loop is "the ONLY seam an external `ftrace -stop` can land on inside a gather", and the
 stage line that would name the phase fires *from inside that loop*. So everything upstream of the
-first slice — the photon-map build, the caustic map, the beam split, the BVH build and upload,
-and the per-camera film allocations — is a single region with **neither a progress line nor a
-stop seam**. The window title stays on `building beam map…` throughout, which is precisely the
-symptom the comment at ~line 17063 describes and believed it had fixed; that fix covers the
-gather loop but not the region before it.
+first slice — the photon-map build, the caustic map, the beam split, and the BVH build and upload
+— is a region with **neither a progress line nor a stop seam**. The window title stays on
+`building beam map…` throughout, which is precisely the symptom the comment at ~line 17063
+describes and believed it had fixed; that fix covers the gather loop but not the region before
+it. *(And, per the next paragraph, at 960x540 it does not really cover the gather loop either.)*
+
+**THE POST-UPLOAD STALL IS NOW EXPLAINED, AND IT IS THE MAIN DEFECT — it is not allocation
+pressure and not the pre-gather region at all.** Read `render_cuda.cu` 17009-17054 with this
+scene's actual numbers substituted:
+
+| quantity | expression | value at 960x540 |
+|---|---|---|
+| `npix` | `resX*resY` | 518400 |
+| `chunk` (spp per chunk) | `200000/npix`, clamped to >= 1 | **1** |
+| `total` (samples in the chunk) | `npix * cs2` | **518400** |
+| `sliceOcc` (occupancy floor) | `4 * kGatherGrid * kGatherBlock` = `4*2048*128` | **1048576** |
+| `sliceFrac` | `(npix>>6)+1` | 8101 |
+| `sliceLo` = `max(sliceFrac, sliceOcc)` | | 1048576 |
+| first `slice` | grows to `sliceLo` | 1048576 |
+
+`slice` is **twice `total`**, so `hi = min(i+slice, total) = total` on the first iteration: the
+inner "sub-chunk slice" loop at 17081 runs **exactly once and covers the entire frame**. The
+seam that loop exists to provide is therefore *absent at this resolution* — the comment at
+17010 ("This is the ONLY seam an external `ftrace -stop` can land on inside a gather") is true,
+and at 960x540 that seam is one whole spp wide. Two consequences, both observed:
+
+1. **The stop cannot land for a full spp.** The poll at 17128 is guarded by `i < total`, which
+   is false after the only slice, so it is skipped entirely; the stop is honoured instead at
+   17156/17171, i.e. only after `kFilmFold`. And there is no poll at the *top* of either the
+   camera loop or the slice loop, so a stop that arrived **before** the gather even started —
+   exactly this run's case, the `[stop]` line sits immediately after the upload line — still
+   pays one entire spp of gathering before anything notices.
+2. **The caption stays stale for that whole spp.** The self-naming `stage->report` at 17109 is
+   *inside* the slice loop, after `cudaDeviceSynchronize`. With one slice per spp it fires for
+   the first time only when that spp is done. So the window reads `building beam map…` for the
+   entire first spp — which is verbatim the symptom the comment at 17062 describes and believed
+   the slicing had cured. It cured it only for resolutions where `npix*chunk > sliceOcc`.
+
+Measured against the live process: pid 111444 sat at `building beam map.` for **45+ minutes**
+after its upload line with CPU advancing ~29.7 s per 15 s wall (~2 cores — one of them the
+default spin-waiting `cudaDeviceSynchronize` at 17088), GPU at 100% with ~628 MiB free. That is
+one `kGather` launch, uninterruptible by construction. It was **not** suspended (the user had a
+second session pause and later resume it; CPU advanced steadily after the resume) and **not**
+stuck in teardown.
+
+**Corollary — `[stop] external stop requested` in a log proves nothing about the render.** It is
+printed by the watcher thread in `stopChannelStart` (`main.cpp` 13174-13195), which only polls
+for the sentinel file every 250 ms, writes the ack, prints, sets the flag, and returns. Its own
+comment says it is "deliberately true whether a render is in flight … or the process is just
+holding a `-keepwindow` preview open". Do not read it as evidence that a seam was reached.
 
 **`-stop` itself is NOT at fault and needs no change — an earlier draft of this entry said it
 was, wrongly.** Its two-phase wait (120 s to hear an ack, then 900 s for an acknowledged target
@@ -55,20 +100,37 @@ request and would still exit on its own, said `Nothing was force-killed`, and **
 was `tail`'s status, not ftrace's. The contract in `CLAUDE.md` holds: exit 0 means genuinely
 gone.
 
-**What to fix (the structural half — worth doing regardless of the timings).** (a) Add stop-flag
-polls to the region between the aimed pass and the first gather slice, the way the scene loader
-and the gather loop already do. (b) Give that region the same self-naming stage line the gather
-got, so the window and the log say which of map build / caustic map / beam split / BVH build is
-running instead of leaving the stale `building beam map…` caption up. Together these turn an
-opaque, uncancellable stretch into an observable, interruptible one — which is the whole
-complaint, independent of how long it *should* take.
+**What to fix (the structural half — worth doing regardless of the timings).**
 
-**What to re-measure on a quiet GPU before believing it.** (c) Whether the ~50 min stretch at
-351351733 stored photons is real super-linear cost or contention. (d) Whether the post-upload
-stall is ftrace at all — with 518 MiB free VRAM, the gather's four film allocations (~33 MB at
-960x540) were being requested against a nearly exhausted device, so allocation pressure is at
-least as likely an explanation as anything in ftrace. If it *is* real, a fail-fast VRAM headroom
-check before the gather would be far better than an unbounded stall.
+- **(a) Poll the stop flag at the TOP of the slice loop and the camera loop**, not only after a
+  completed slice behind `i < total`. A stop that arrives before or between launches should be
+  honoured without paying a launch. Cheap, and it alone would have made this run exit in
+  seconds.
+- **(b) Emit the stage line BEFORE the first launch, not after it.** `stage->report(stageText,
+  0, sampTotal, nullptr, …)` immediately after `stageText` is built at 17072 costs nothing (no
+  film download when the sample count is 0) and replaces the stale `building beam map…` caption
+  the instant the gather begins, instead of one spp later. This is the actual fix for the
+  symptom the 17059-17069 comment set out to solve.
+- **(c) Decide what the slice floor should do when `sliceOcc >= total`.** Right now the frame
+  silently becomes one uninterruptible launch. The occupancy argument in the 17018-17049 comment
+  is sound and must not be undone — a slice below `sliceOcc` genuinely starves the grid — so the
+  answer is probably *not* to shrink the slice, but to (i) raise `chunk` so `total` exceeds
+  `sliceOcc` and the loop gets real slices again (at 960x540, `chunk = 2` gives `total =
+  1036800`, just under two slices), or (ii) accept the single launch but make (a) and (b)
+  unconditional so it is at least captioned and promptly stoppable at its boundaries. Prefer
+  (i)+(a)+(b): it restores the seam *and* keeps the grid full.
+- **(d) Give the pre-gather region (photon-map build, caustic map, beam split, BVH build/upload)
+  the same treatment** — stop polls and a self-naming stage line — so the ~50 min of silence
+  before the upload line is also observable and interruptible. This is the second, separate
+  silent region and remains unfixed.
+
+**What to re-measure on a quiet GPU before believing it.** (e) Whether the ~50 min stretch at
+351351733 stored photons is real super-linear cost or contention. (f) What one spp of this
+configuration actually costs when ftrace owns the device — the 45 min observed here is a
+single `kGather` launch on a GPU with ~628 MiB free and 100% util from another session, against
+~6 min/spp measured for the `-n 200M` default on a quiet one. A fail-fast VRAM-headroom check
+before the gather is still worth considering, but note it would **not** have helped here: the
+allocations succeeded and the launch ran; it was slow, not starved.
 
 **Postscript — the run did eventually get through, and its numbers are in the entry below.** It
 reached the gather after ~50 min of silence and reported 351351733 stored photons, 10632728 beams
