@@ -63,6 +63,28 @@ struct StageProgress {
     std::function<void(const char* text, long long done, long long total,
                        const Film* partial, double divisor)> report;
 
+    // Progress from INSIDE a single unit of work, where no honest rate exists.
+    //
+    // Same caption and same throttles as `report`, but it prints no rate and no ETA, and — the
+    // reason it is a separate entry point rather than a flag — it does not feed the trailing
+    // rate window at all. Call it while a long operation is still running; call `report` when
+    // one completes.
+    //
+    // The mode-M gather is why. At 960x540 it is ONE kernel launch per spp, so `report` fired
+    // exactly once per spp and the caption sat at 0% for the whole launch. A device-side
+    // counter now exposes retired samples mid-launch — but that curve is steeply CONVEX,
+    // because the kernel is wildly divergent and most threads retire long before the handful
+    // of rays crossing the thickest cloud do. Measured on gallery_rain: 39% of the frame in
+    // the first minute, 10% in the second, 1% in the third. Fed to the trailing window that
+    // collapsed the reported rate to 145/s and put the ETA at ~59 min with about one minute
+    // actually left; fed to a cumulative average it under-reads instead, because extrapolating
+    // linearly from the fast opening cannot see the tail coming. NEITHER estimator survives a
+    // convex curve, and the same convexity would poison the rate for the per-launch reports
+    // that come after it. So the honest thing — the same judgement the `rate > 0` branch of
+    // `report` already makes — is to show the percentage and the clock and admit there is no
+    // usable ETA. The percentage is what answers "is it wedged?", which is the whole point.
+    std::function<void(const char* text, long long done, long long total)> reportLive;
+
     // True when a `partial` would actually be DRAWN if one were supplied now.
     //
     // The renderer must ask before assembling one, because on the GPU that means a

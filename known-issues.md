@@ -5,18 +5,16 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-09-02, v0.210.0 → mostly fixed by v0.211.0): mode `M`'s gather **degenerates to exactly one launch per spp at 960x540**, so the `-stop` seam its own comment promises does not exist there, and the caption stays stale for a whole spp — plus a second silent region upstream of it
+### FIXED (2026-09-02, v0.210.0 → v0.213.0): mode `M`'s gather **degenerates to exactly one launch per spp at 960x540**, so the `-stop` seam its own comment promises does not exist there, and the caption stays stale for a whole spp — plus a second silent region upstream of it
 
 **Status.** The degeneracy itself is structural and still true — there is still exactly one launch
 per spp at this resolution, and that is the *right* trade (see the occupancy note below). What has
 been fixed is everything that made it hurt: (a) loop-top stop polls and (b) a stage line printed
 before the first launch, both in **v0.210.1**; (c) device-side cooperative cancellation inside the
-launch, in **v0.211.0**, taking stop latency from 879 s to 2 s at no throughput cost; and (d) the
+launch, in **v0.211.0**, taking stop latency from 879 s to 2 s at no throughput cost; (d) the
 whole pre-gather region — beam split, BVH build, and all three uploads — named and interruptible in
-**v0.212.0**. **Still open:** intra-launch *progress* only. The gather caption is now correct about
-what is running, and every phase before it reports, but the gather itself sits at 0% for its whole
-single launch — that needs a device-side counter the host samples while blocked in
-`cudaDeviceSynchronize`. Items (e)/(f) below are re-measurements, and the "contended GPU" confound
+**v0.212.0**; and (e) intra-launch *progress*, in **v0.213.0**, running the same mapped-memory
+mechanism backwards. Items (f)/(g) below are re-measurements, and the "contended GPU" confound
 that originally qualified them has since been **retracted** — see the `pmon` note.
 
 **Repro.** The `gallery_rain` showcase flags with `-n` raised 4x:
@@ -157,7 +155,8 @@ gone.
   Note also that the caption, though now correct about *what* is running (v0.210.1), sat at
   `0 / 172.8k (0%), 0.00s` for the whole 14:56 and jumped straight to 100%. Intra-launch
   *progress* is a second thing the single launch costs, and the device flag below does not by
-  itself restore it — that would need a device-side counter the host samples while blocked.
+  itself restore it — that needs a device-side counter the host samples while blocked, which is
+  what **(e)** added in v0.213.0.
 
   **Do not "fix" this by shrinking the slice.** The occupancy argument at 17018-17049 is
   measured and sound: a slice below `sliceOcc` leaves most of the persistent grid idle and cost
@@ -238,9 +237,53 @@ gone.
   render. The first attempt at this measurement fired on a caustic-map line that had been
   sitting in a 4 KB buffer and landed a whole phase late. Time the phases once against a fixed
   `t0` and then stop at a wall-clock offset.
+- **(e) Give the gather intra-launch progress**, so the caption stops sitting at 0% for a whole
+  single launch. **DONE in v0.213.0** — it is (c)'s mapped-memory mechanism run **backwards**.
+  The same reason the stop flag had to be a plain store (the launching thread is parked in
+  `cudaDeviceSynchronize` and can issue no CUDA call) means a progress counter cannot be read
+  with `cudaMemcpy` either, so `kGather` `atomicAdd`s retired samples straight into mapped pinned
+  host memory (`__device__ unsigned long long* g_dGatherDone`) and the existing 50 ms poller
+  thread reads it. `atomicAdd_system` is `#if __CUDA_ARCH__ >= 600` guarded: system scope is what
+  makes it coherent with a concurrently-reading CPU thread, and it arrived with Pascal, while
+  `FTRACE_CUDA_ARCH=all-major` fat binaries still include sm_50/sm_52.
 
-**What to re-measure on a quiet GPU before believing it.** (e) Whether the ~50 min stretch at
-351351733 stored photons is real super-linear cost or contention. (f) What one spp of this
+  **Retire on the reject path too** (`pdf <= 0.0`). It is a rare sample, but an undercount leaves
+  the bar stalled just short of 100% at the end of a launch, which reads as exactly the wedged
+  render the counter exists to rule out. Verified: the run reaches `1.0M / 1.0M (100%)`.
+
+  **The first version of this shipped a lying ETA, and the fix is a new entry point rather than a
+  flag.** Feeding intra-launch samples to `StageProgress::report` produced
+  `~59:31 left` with about one minute actually remaining. The cause is that `kGather`'s
+  retirement curve is steeply **convex** — the kernel is wildly divergent, so most threads retire
+  long before the handful of rays crossing the thickest cloud do. Measured on `gallery_rain`:
+  **39% of the frame in the first minute, 10% in the second, 1% in the third.** A trailing rate
+  window collapses to 145/s and over-reads the remaining time by ~60x; a cumulative average
+  under-reads instead, because extrapolating linearly from the fast opening cannot see the tail
+  coming. *Neither* estimator survives a convex curve. So `StageProgress` gained
+  **`reportLive(text, done, total)`**: same caption, same repaint/log throttles, but it prints
+  percentage + elapsed + `in flight…` with no rate and no ETA — and, the reason it is a separate
+  function and not a `bool`, it **does not feed the trailing rate window at all**, so the same
+  convexity cannot poison the rate of the per-launch `report` calls that follow it. That is the
+  judgement `report`'s own `rate > 0` branch already makes; this just extends it to a case where
+  no honest rate exists.
+
+  Verified on `gallery_rain -n 120M -r 960 540 -spp 2`: the gather climbs
+  `2% → 20% → 37% → 47% → 49% → 50%` through the first launch and on to `100%` through the
+  second, each line reading `gathering frame 1/1 — 385.7k / 1.0M (37%), 1:00, in flight…`, while
+  the pre-gather phases keep uncorrupted rates (`uploading photon map — 4.2M / 52.7M (8%), 0.14s,
+  28.9M/s, ~1.68s left`). Two spp in **7:03** against the **7:24** baseline of the same config —
+  the per-sample `atomicAdd_system` is below the noise floor, as the every-64-nodes stop poll was.
+
+  **Arming is per launch and offset.** `*h_gatherDone` is zeroed and `progOffset` set to
+  `base * npix + i` immediately before each launch, then `progOffset` is set to `-1` **under the
+  same mutex the poller takes** immediately after `cudaDeviceSynchronize` — because the poller may
+  be inside `stage->report` at that instant and the main thread is about to call it itself a few
+  lines below, and a `StageProgress` mutates a shared Ticker (rate window, repaint throttles) that
+  is not reentrant. The caption is snapshotted into the poller's own `progText` while disarmed, so
+  it is never read while being written.
+
+**What to re-measure on a quiet GPU before believing it.** (f) Whether the ~50 min stretch at
+351351733 stored photons is real super-linear cost or contention. (g) What one spp of this
 configuration actually costs when ftrace owns the device — the 45 min observed here is a
 single `kGather` launch on a GPU with ~628 MiB free and 100% util from another session, against
 ~6 min/spp measured for the `-n 200M` default on a quiet one. A fail-fast VRAM-headroom check

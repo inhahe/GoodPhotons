@@ -13764,8 +13764,63 @@ static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
         tk->probeT = now;      // the caller's download counts toward this paint's cost
         return true;
     };
-    sp.report = [tk, w, h, expComp, absolute](const char* text, long long done, long long total,
-                                              const Film* partial, double divisor) {
+    // The shared tail of `report` and `reportLive`: paint the window and/or emit the log line,
+    // and re-price the repaint cadence from what this paint cost. Factored out so the two
+    // entry points can differ ONLY in the text they compose and in whether they feed the rate
+    // window — everything about throttling, film-vs-placeholder and duty-cycling is identical
+    // and must stay that way.
+    auto emit = [tk, w, h, expComp, absolute](const char* b, bool wantWin, bool wantLog,
+                                              const Film* partial, double divisor,
+                                              clk::time_point now) {
+        if (wantWin) {
+            // Draw the image-so-far when the phase has one. The placeholder stays the answer
+            // for a deposit or a BVH build, which genuinely have no pixels to show.
+            const bool drewFilm = (partial && divisor > 0.0);
+            if (drewFilm) liveWindowUpdate(*partial, divisor, expComp, absolute, b);
+            else          liveWindowPlaceholder(w, h, b);
+            const auto painted = clk::now();
+            // Cost this paint and set the next gap from it. A film draw is charged from
+            // wantFilm()'s yes, so the caller's device->host copy is included — it is part of
+            // what showing the image cost and excluding it would under-price the paint by most
+            // of its actual expense. A placeholder is charged from the draw alone.
+            const auto from = (drewFilm && tk->probeT.time_since_epoch().count() != 0)
+                              ? tk->probeT : now;
+            const double cost = std::chrono::duration<double>(painted - from).count();
+            double gap = kDuty * cost;
+            if (gap < kGapMin) gap = kGapMin;
+            if (gap > kGapMax) gap = kGapMax;
+            tk->winGap = gap;
+            // FTRACE_PAINT_DEBUG=1: dump what each repaint cost and the gap it bought. This
+            // is how the 40x first-spp regression above was found — the cost is invisible in
+            // any render timing, because it hides inside the phase it inflates.
+            if (getenv("FTRACE_PAINT_DEBUG"))
+                std::printf("[paint] film=%d cost=%.3fs gap=%.3fs\n", (int)drewFilm, cost, gap);
+            tk->lastWin = painted;   // measure the gap from when the screen was actually ready
+        }
+        if (wantLog) { std::printf("[camera] %s\n", b); std::fflush(stdout); tk->lastLog = now; }
+    };
+    // Progress from inside one still-running unit of work: percentage and clock, no rate and
+    // no ETA, and deliberately NOT fed to the trailing rate window. See StageProgress::
+    // reportLive in render_progress.h for the measurement that says why an estimator here
+    // would be worse than none.
+    sp.reportLive = [tk, emit](const char* text, long long done, long long total) {
+        const auto now = clk::now();
+        const double elapsed = std::chrono::duration<double>(now - tk->t0).count();
+        const bool wantWin = tk->lastWin.time_since_epoch().count() == 0 ||
+                             std::chrono::duration<double>(now - tk->lastWin).count() >= tk->winGap;
+        const bool wantLog = total > 0 && done > 0 &&
+                             (tk->lastLog.time_since_epoch().count() == 0 ||
+                              std::chrono::duration<double>(now - tk->lastLog).count() >= 30.0);
+        if (!wantWin && !wantLog) return;
+        char b[220];
+        std::snprintf(b, sizeof b, "%s \xE2\x80\x94 %s / %s (%.0f%%), %s, in flight\xE2\x80\xA6",
+                      text, humanCount((double)done).c_str(), humanCount((double)total).c_str(),
+                      total > 0 ? 100.0 * (double)done / (double)total : 0.0,
+                      humanDur(elapsed).c_str());
+        emit(b, wantWin, wantLog, nullptr, 0.0, now);
+    };
+    sp.report = [tk, emit](const char* text, long long done, long long total,
+                           const Film* partial, double divisor) {
         const auto now = clk::now();
         const double elapsed = std::chrono::duration<double>(now - tk->t0).count();
         const bool wantWin = tk->lastWin.time_since_epoch().count() == 0 ||
@@ -13840,32 +13895,7 @@ static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
         } else {
             std::snprintf(b, sizeof b, "%s\xE2\x80\xA6 %s", text, humanDur(elapsed).c_str());
         }
-        if (wantWin) {
-            // Draw the image-so-far when the phase has one. The placeholder stays the answer
-            // for a deposit or a BVH build, which genuinely have no pixels to show.
-            const bool drewFilm = (partial && divisor > 0.0);
-            if (drewFilm) liveWindowUpdate(*partial, divisor, expComp, absolute, b);
-            else          liveWindowPlaceholder(w, h, b);
-            const auto painted = clk::now();
-            // Cost this paint and set the next gap from it. A film draw is charged from
-            // wantFilm()'s yes, so the caller's device->host copy is included — it is part of
-            // what showing the image cost and excluding it would under-price the paint by most
-            // of its actual expense. A placeholder is charged from the draw alone.
-            const auto from = (drewFilm && tk->probeT.time_since_epoch().count() != 0)
-                              ? tk->probeT : now;
-            const double cost = std::chrono::duration<double>(painted - from).count();
-            double gap = kDuty * cost;
-            if (gap < kGapMin) gap = kGapMin;
-            if (gap > kGapMax) gap = kGapMax;
-            tk->winGap = gap;
-            // FTRACE_PAINT_DEBUG=1: dump what each repaint cost and the gap it bought. This
-            // is how the 40x first-spp regression above was found — the cost is invisible in
-            // any render timing, because it hides inside the phase it inflates.
-            if (getenv("FTRACE_PAINT_DEBUG"))
-                std::printf("[paint] film=%d cost=%.3fs gap=%.3fs\n", (int)drewFilm, cost, gap);
-            tk->lastWin = painted;   // measure the gap from when the screen was actually ready
-        }
-        if (wantLog) { std::printf("[camera] %s\n", b); std::fflush(stdout); tk->lastLog = now; }
+        emit(b, wantWin, wantLog, partial, divisor, now);
     };
     // Re-base the clock AND clear both throttles, so the phase that just started gets its
     // first window title and its first log line immediately rather than up to 30 s in.

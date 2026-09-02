@@ -4952,6 +4952,35 @@ __device__ __forceinline__ bool dGatherStopped() {
     return g_dGatherStop != nullptr && *(const volatile int*)g_dGatherStop != 0;
 }
 
+// ---- intra-launch PROGRESS for the mode-M gather ----
+//
+// The same mapped-pinned trick, running the other way: the kernel counts retired samples into
+// host memory and the poller thread reads them while the launching thread is blocked.
+//
+// This exists because cancellation alone left the other half of the problem standing. At
+// 960x540 the gather is ONE launch per spp (see kGather's note), so `done` moved 0 -> 100% with
+// nothing in between: the caption named the phase correctly and then sat at `0 / 172.8k (0%),
+// 0.00s` for 45 minutes. A render in perfect health was still indistinguishable from a wedged
+// one, which is the exact complaint naming the phase was supposed to answer.
+//
+// atomicAdd_system, not atomicAdd: the target is host memory shared with a CPU thread that is
+// reading it concurrently, and only the _system scope is coherent across that boundary. One
+// atomic per retired sample is 518400 of them spread over the whole launch — unmeasurable
+// against a gather that walks thousands of beams per sample.
+// Guarded because `all-major` fat binaries include sm_50/sm_52, where the _system scope does
+// not exist (it arrived with Pascal). The plain atomic still counts correctly there; it merely
+// loses the coherence guarantee, which for a progress bar means a reader may lag — the exact
+// failure mode a progress bar can absorb.
+__device__ unsigned long long* g_dGatherDone = nullptr;
+__device__ __forceinline__ void dGatherRetire() {
+    if (!g_dGatherDone) return;
+#if __CUDA_ARCH__ >= 600
+    atomicAdd_system(g_dGatherDone, 1ull);
+#else
+    atomicAdd(g_dGatherDone, 1ull);
+#endif
+}
+
 __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DVec3& oc, const DVec3& dc, Real tMax,
                                           double aGlassCam, DRng& rng,
@@ -12543,7 +12572,10 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, D
 
         double pdf = 0.0;
         Real lambda = dSampleSceneLambda(sc, rng, pdf);
-        if (pdf <= 0.0) continue;
+        // Retire on the reject path too. It is a rare sample, but an undercount here would
+        // leave the bar stalled just short of 100% at the end of a launch — which reads as
+        // exactly the wedged render this counter exists to rule out.
+        if (pdf <= 0.0) { dGatherRetire(); continue; }
         double invPdfL = dInvPdfLambda(sc, lambda);
 
         DVec3 ro, rd;
@@ -12558,6 +12590,7 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, D
         atomicAdd(&film[o + 1], oY);
         atomicAdd(&film[o + 2], oZ);
         if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
+        dGatherRetire();   // one retired sample — the host's only view inside this launch
     }
 }
 
@@ -17099,23 +17132,59 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // flight, so it is an ordinary synchronous copy rather than something that would have to
     // race a running gather.
     CUDA_CHECK(cudaMemcpyToSymbol(g_dGatherStop, &d_gatherStop, sizeof(int*)));
+    // ---- and the gather's PROGRESS counter, the same mechanism pointed the other way ----
+    //
+    // kGather counts retired samples into this; the poller below reads it while the launching
+    // thread is blocked. Without it the caption was correct but frozen at 0% for a whole spp,
+    // which at 960x540 is the ENTIRE launch (see g_dGatherDone).
+    unsigned long long* h_gatherDone = nullptr;
+    unsigned long long* d_gatherDone = nullptr;
+    CUDA_CHECK(cudaHostAlloc((void**)&h_gatherDone, sizeof(unsigned long long),
+                             cudaHostAllocMapped));
+    *h_gatherDone = 0;
+    CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_gatherDone, h_gatherDone, 0));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_dGatherDone, &d_gatherDone, sizeof(unsigned long long*)));
+    // Armed by the launch site for exactly the span of one launch. `progOffset < 0` means
+    // disarmed, which is the state in every phase that is NOT a gather launch — the poller must
+    // not paint over another phase's caption, and must not touch `stage` once the main thread is
+    // running again and reporting for itself.
+    std::atomic<long long> progOffset{-1};
+    std::atomic<long long> progTotal{0};
+    char progText[96] = {0};
+    // `stage->report` mutates a shared Ticker (rate window, repaint throttles) and is not
+    // reentrant. Disarming happens UNDER this lock, so the main thread's own reports after a
+    // launch cannot overlap a report the poller is still inside.
+    std::mutex reportMu;
     std::atomic<bool> pollQuit{false};
-    std::thread pollThread([&pollQuit, h_gatherStop] {
+    std::thread pollThread([&, h_gatherStop, h_gatherDone] {
         while (!pollQuit.load(std::memory_order_relaxed)) {
             if (ft::stopRequested()) { *(volatile int*)h_gatherStop = 1; return; }
+            // reportLive, not report: this is progress from INSIDE a launch that has not
+            // returned, where the retirement curve is convex and no honest rate exists — and
+            // feeding those samples to the trailing window would wreck the rate for the
+            // per-launch reports too. See StageProgress::reportLive.
+            if (stage && stage->reportLive && progOffset.load(std::memory_order_acquire) >= 0) {
+                const long long d = (long long)*(volatile unsigned long long*)h_gatherDone;
+                std::lock_guard<std::mutex> lk(reportMu);
+                const long long off = progOffset.load(std::memory_order_acquire);
+                if (off >= 0)
+                    stage->reportLive(progText, off + d,
+                                      progTotal.load(std::memory_order_relaxed));
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     });
     // Joined and freed however this function leaves — including the CUDA_CHECK throw paths,
     // which are numerous below and would otherwise leak a detached thread into a dead context.
     struct GatherStopGuard {
-        std::atomic<bool>& quit; std::thread& th; int* mem;
+        std::atomic<bool>& quit; std::thread& th; int* mem; unsigned long long* mem2;
         ~GatherStopGuard() {
             quit.store(true, std::memory_order_relaxed);
             if (th.joinable()) th.join();
-            if (mem) cudaFreeHost(mem);
+            if (mem)  cudaFreeHost(mem);
+            if (mem2) cudaFreeHost(mem2);
         }
-    } gatherStopGuard{pollQuit, pollThread, h_gatherStop};
+    } gatherStopGuard{pollQuit, pollThread, h_gatherStop, h_gatherDone};
     // Learned sub-chunk slice (flat (pixel, sample) units), carried ACROSS cameras: on a
     // flythrough consecutive frames cost almost the same, so re-probing 600 times would be
     // 600 needlessly small launches for nothing. Re-clamped to the camera's own npix below.
@@ -17210,6 +17279,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         const long long sampTotal = (long long)npix * spp;   // pixel-samples in this frame
         char stageText[96];
         std::snprintf(stageText, sizeof stageText, "gathering frame %d/%d", c + 1, nc);
+        // The poller's copy of the caption. Written here, with the poller disarmed, so it is
+        // never read while being written.
+        std::snprintf(progText, sizeof progText, "%s", stageText);
         if (stage && stage->reset) stage->reset();   // rate/ETA measured from THIS phase
         // Name the gather BEFORE the first launch, not after it.
         //
@@ -17244,11 +17316,23 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 if (ft::stopRequested()) { chunkDone = false; break; }
                 const long long hi = (i + slice < total) ? (i + slice) : total;
                 const auto t0 = std::chrono::steady_clock::now();
+                // Arm the intra-launch progress counter. Zeroed per launch and offset by the
+                // samples this frame has already retired, so the bar reads against the whole
+                // frame rather than restarting at each slice. Both stores are ordinary host
+                // writes to memory the device has not been told to touch yet — the kernel is
+                // launched on the next line, so there is no race to order against.
+                *(volatile unsigned long long*)h_gatherDone = 0;
+                progTotal.store(sampTotal, std::memory_order_relaxed);
+                progOffset.store(base * (long long)npix + i, std::memory_order_release);
                 kGather<<<kGatherGrid, kGatherBlock>>>(
                                        up.sc, dpm, dpmC, dbm, hc, s_film, s_hits, i, hi, cs2, spp,
                                        base, resX[c], diffraction ? 1 : 0, fgRays, seed);
                 cudaCheckKernel("photon-gather");
                 CUDA_CHECK(cudaDeviceSynchronize());   // the launch is async; time the WORK
+                // Disarm UNDER the lock: the poller may be inside stage->report right now, and
+                // the main thread is about to call it itself a few lines below.
+                { std::lock_guard<std::mutex> lk(reportMu);
+                  progOffset.store(-1, std::memory_order_release); }
                 const double sec = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t0).count();
                 const long long did = hi - i;

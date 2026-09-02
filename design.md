@@ -2614,6 +2614,56 @@ render. Closing that means teaching the shared device path to gather in spp chun
   issued ~6 s into a build that takes 25.7 s uninterrupted ended it at 5.42 s, skipped both
   uploads, and wrote nothing.
 
+  **The gather launch itself is both cancellable and observable from outside, via mapped pinned
+  memory in each direction (v0.211.0, v0.213.0).** At 960x540 the gather's sub-chunk slice loop —
+  which exists precisely to give `-stop` a seam — degenerates: `sliceOcc = 4 * 2048 * 128` exceeds
+  the 518400-pixel frame, so the loop runs once and covers everything. There is **one kernel
+  launch per spp**, and `518400 samples / 262144 threads = 1` means each thread runs exactly one
+  grid-stride iteration, so a poll at the top of `kGather`'s own loop fires at the launch instant
+  and never again (measured: it did not shorten a stop at all). Shrinking the slice is not the
+  answer — a slice below `sliceOcc` leaves most of the persistent grid idle and cost an 11x
+  throughput regression when it was tried. The fix is that **the host and the launch communicate
+  through host memory the device can address directly**, because the launching thread is parked in
+  `cudaDeviceSynchronize` for the whole launch and can issue no CUDA call: a `cudaHostAlloc(...,
+  cudaHostAllocMapped)` word, its device address published to a `__device__` global by
+  `cudaMemcpyToSymbol` before anything is in flight, and one 50 ms poller thread (RAII-joined).
+
+  Backwards, that word is a **stop flag** the poller raises with a plain store, read where the
+  time actually is — `dGatherPhotonBeams`'s beam-BVH walk every 64 nodes, and `dPhotonGather`'s
+  bounce loop for scenes with no media. Stop latency across the three states: **879 s → 186 s →
+  2 s**, at no measurable throughput cost (matched A/B: per-spp `3:17 / 3:24` vs `3:26 / 3:16`,
+  both reaching 2 spp at 7:24, a between-arm difference smaller than the spread between two
+  identical launches in one process). One correctness change is not optional: the post-launch
+  `i < total` guard had to go, because a cancelled launch leaves the scratch film holding a sample
+  for some pixels and not others while host-side `i` still reaches `total` — folding that partial
+  chunk lays a ~1/spp brightness band across the frame, so it must route to `kFilmFold`'s existing
+  discard path.
+
+  Forwards, the same mechanism is a **progress counter**: `kGather` `atomicAdd_system`s each
+  retired sample into a mapped word and the same poller reads it, which is the only way to see
+  inside a launch the host cannot query. It is `#if __CUDA_ARCH__ >= 600` guarded — system scope
+  is what makes it coherent with a concurrently-reading CPU thread, and it arrived with Pascal,
+  while `all-major` fat binaries still include sm_50/sm_52. The reject path (`pdf <= 0`) retires
+  too, since an undercount would leave the bar stalled just short of 100% at the end of a launch,
+  which reads as exactly the wedged render the counter exists to rule out.
+
+  **This progress deliberately shows no ETA, and that is why `StageProgress` has a second entry
+  point.** `kGather` is wildly divergent — a ray crossing the thickest cloud gathers thousands of
+  beams, one hitting the floor gathers none — so its retirement curve is steeply **convex**:
+  measured on `gallery_rain`, 39% of the frame retires in the first minute, 10% in the second, 1%
+  in the third. A trailing rate window fed that curve collapses to 145/s and predicts `~59:31
+  left` with a minute remaining; a cumulative average under-reads instead, because extrapolating
+  from the fast opening cannot see the tail. Neither estimator survives it. So `reportLive(text,
+  done, total)` shares `report`'s caption and repaint/log throttles but prints percentage +
+  elapsed + `in flight…` with no rate, and — the reason it is a separate function rather than a
+  flag — **does not feed the rate window at all**, so the convexity cannot poison the per-launch
+  `report` calls that follow. Arming is per launch (`progOffset` set to the frame's already-retired
+  base immediately before, cleared to `-1` immediately after) and the clear happens **under the
+  mutex the poller takes**, since a `StageProgress` mutates a shared Ticker that is not reentrant
+  and the main thread is about to call it itself. Verified: the caption climbs `2% → 20% → 37% →
+  47% → 50%` through one launch and on to `100%`, pre-gather phases keep uncorrupted rates, and
+  two spp cost 7:03 against a 7:24 baseline.
+
   **Validated on `scenes/_rainbow_test.ftsl`** against the pre-existing A/B splat estimator,
   which is the only independent implementation of the same single-scatter trade. Getting the
   comparison honest took two corrections worth recording. First, `-mode M` *without* `-beams`
