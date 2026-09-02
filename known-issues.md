@@ -43,10 +43,89 @@ an `n_m` that is too high steals weight from connections and **darkens**, too lo
 merge to a connection-equivalent density with the scalar `etaVCM = πr²·nLightPaths`
 (`vcm.h:1247`). BB1D has no scalar analogue: both objects are 1D, the kernel `K1` is normalised
 over `[-r, r]` (so it carries units of 1/m and there is deliberately no `1/(πr²)`), and the
-estimator already divides by `sinθ` as the Jacobian of the 1D blur. The acceptance cross-section
-a beam presents to a camera ray therefore scales as `2r/sinθ`, i.e. **the MIS weight depends on
-the crossing angle** — which is a real feature of BB1D, not a modelling shortcut. Getting this
-constant wrong is a pure energy error.
+estimator already divides by `sinθ` as the Jacobian of the 1D blur. So the MIS weight depends on
+the **crossing angle** — a real feature of BB1D, not a modelling shortcut. Getting this constant
+wrong is a pure energy error.
+
+#### The derivation (done 2026-09-02, and it corrects this entry's first sketch)
+
+This entry originally guessed the acceptance cross-section scaled as `2r/sinθ`. **It is
+`2r·sinθ`** — the reciprocal. The sketch reasoned from the estimator's `1/sinθ` factor and
+carried it straight into the weight; the actual conversion inverts it, because a *density* is
+the reciprocal of a *contribution*. This is exactly the error the "derive before coding" rule
+exists to catch, and it would have shown up as a grazing-angle-dependent energy error — the
+kind that reads as a plausible image.
+
+**Method.** A technique's MIS density is *defined* by `p_i ≡ f / C_i`, where `f` is the path
+contribution and `C_i` is what the technique's estimator computes. So the ratio needed by the
+balance heuristic is the ratio of the *estimators*, inverted — no separate measure-theoretic
+argument is required, and no dimensional bookkeeping can go wrong that the estimators don't
+already have right.
+
+Let the merge happen at medium point `x`; `z` is the camera subpath's last vertex (the ray
+leaves it along `ω_C`), `y` is the beam's origin vertex (the beam leaves it along `ω_L`), and
+`β_C` / `β_L` are the two subpath throughputs. Three techniques produce this path:
+
+- **M** — the BB1D merge (`photonbeams.h`):
+  `C_M = β_L·Tr_L(y→x)·σ_s(x)·f_p(θ)·Tr_C(z→x)·β_C·K1(d⊥)/sinθ`
+- **C1** — the camera samples the distance to `x` (analog, pdf `σ_t(x)·Tr_C(z→x)`), then
+  connects to `y`. This is a BDPT `(s,t)` split.
+- **C2** — the light samples the distance along the beam, then connects to `z`. The
+  neighbouring split, `(s+1, t-1)`.
+
+Forming `C_C1 / C_M` (every shared factor cancels — including `Tr_L`, which appears in the
+merge as the beam transmittance and in the connection as the shadow-ray transmittance):
+
+```
+p_M / p_C1 = n_m · 2r · sinθ · p_L⊥(x) / p_C^dist(x)
+```
+
+with `p_L⊥(x) = p_dir^L(ω_L)·cosθ_y / ‖x−y‖²` the beam line's **transverse areal density** at
+`x` (the light-side forward pdf with the distance factor divided out), and
+`p_C^dist(x) = σ_t(x)·Tr_C(z→x)` the camera's free-flight distance pdf. Equivalently, in one
+line: the merge's density factorises as
+
+```
+p_M = P_C·P_L · p_C⊥(x) · p_L⊥(x) · n_m · 2r·sinθ
+```
+
+— the two **line** densities times the acceptance — whereas a connection is one line density
+times a distance pdf. `C_C2/C_M` gives the mirror image (`p_dir^C·G(x,z)·sinθ / (σ_t·Tr_L)`),
+which is the consistency check that the algebra is right.
+
+**Where the `2r` comes from, and why it is not `K1(d⊥)`.** The honest ratio carries the
+pointwise kernel `1/K1(d⊥)`. Using it is wrong in the same way it would be wrong in VCM:
+when weighting a *connection*, the hypothetical merge that could have made the same path has
+`d⊥ = 0` exactly, so `K1(0) = 0.75/r` — a different value from the one a real merge would
+see. VCM's answer is to treat merging as **uniform acceptance over the kernel support** and use
+the mean kernel density (`1/(πr²)`, hence `etaVCM`); the 1D analogue is the mean of `K1` over
+`[-r, r]`, which is `1/(2r)`. This stays unbiased: the balance heuristic needs only a consistent
+partition of unity, not the pointwise kernel.
+
+**Signs, checked against intuition.** `p_M/p_C1` rises with `n_m` (more beams ⇒ merging is the
+denser technique ✓), with `r` (a wider kernel accepts more ✓), with `p_L⊥` (the merge had to
+sample that light direction, a connection did not ✓), with `1/σ_t` (a thin medium is one a
+connection rarely collides in ✓), and with `1/Tr_C` (deep inside a thick medium the camera's
+distance sampling almost never reaches, so merging must dominate — this is precisely the regime
+where mode `M` beats mode `D` ✓).
+
+**`sinθ` cross-check, independent of the algebra.** The acceptance volume for a camera element
+`dL` and a beam element `dS` crossing at angle `θ` is `2r·dL·dS·sinθ`. Averaging `sinθ` over
+isotropic orientations (`⟨sinθ⟩ = π/4`) against a beam-length density `S/V` gives
+`E[hits] = (π/2)·r·L·S/V` — which is *already* in `photonbeams.h:64`, derived independently
+years earlier for radius selection. Two derivations, same `sinθ`, so the sign is not a guess.
+
+**A merge cannot make every path a connection can, and the weights must know it.** Beams are
+deposited *straight* — the analog free-flight redirect is skipped (`photonbeams.h:47`) — so a
+light subpath with an in-medium scatter *before* `x` has merge density exactly 0, and
+connections carry it alone at `w = 1`. The merge density is nonzero only when the beam's origin
+`y` is the light path's last vertex.
+
+**Implementation shape.** As in `vcm.h`, the `Σ_j` over *all* `(s,t)` splits (not just C1 and
+C2) is accumulated by running partial-MIS quantities carried along both subpaths — `dVCM`/`dVC`
+as they already exist, plus a `dVB` whose recursion carries the ⊥-density (no distance factor)
+where `dVM` carries the full one. `n_m = bm.nEmitted`, `n_c = 1` per camera sample, and `sinθ`
+is per-merge, so `etaBB1D` is **not** a hoistable constant the way `etaVCM` is.
 
 **So the validation gates come before the estimator, and gate (4) is the cheap one that catches
 plumbing:**
