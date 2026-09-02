@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-09-02, v0.210.0): the mode-M photon map build goes **silent and un-cancellable** above ~200 M photons — a `-n 800M` run spent ~50 min in one phase with zero output, and an acknowledged `ftrace -stop` could not land for over 900 s
+### OPEN (2026-09-02, v0.210.0): mode `M` has a long region with **no progress output and no `-stop` seam** between the aimed caustic pass and the gather's first slice — structural; the timings that exposed it are CONFOUNDED and must be re-measured on a quiet GPU
 
 **Repro.** The `gallery_rain` showcase flags with `-n` raised 4x:
 
@@ -16,22 +16,35 @@ ftrace -in scenes/gallery_rain.ftsl -camera cam -mode M -device gpu -beams \
        -o png/blur/n800_b0025.png
 ```
 
-**What happens.** The forward pass and the aimed caustic pass both print progress normally and
-finish in ~2 min. Then the process prints **nothing at all** for 50+ minutes — no `[gpu] adaptive
-gather radius`, no `photon beams: … BVH in …`, no `[camera] gathering frame`. It is genuinely
-working, not deadlocked: sampled three times 20 s apart, CPU time advanced ~2.1 s per wall second
-and the GPU sat at 100% with 23.6–23.9 GiB of 24.5 GiB VRAM in use. At `-n 200M` (87.8 M stored
-photons) this same phase completes in well under a minute, so the blow-up is strongly
-super-linear in stored photons, and it runs right at the VRAM ceiling.
+**READ THE CONFOUND FIRST.** Partway through this run the machine acquired **44 concurrent CUDA
+contexts** from other work, leaving **518 MiB of 24564 MiB VRAM free**. Every wall-clock number
+below was therefore taken on a GPU that ftrace did not have to itself, and none of them is a
+sound measurement of ftrace's scaling. **Do not quote the timings; re-measure on a quiet GPU
+before treating any of this as a performance defect.** What survives the confound is the
+*structural* claim — the absence of output and of a stop seam in a specific code region — because
+that is readable in the source and does not depend on timing.
 
-**The part that makes it a bug rather than a slow path.** The phase contains **no cancellation
-seam**. `ftrace -stop <pid>` was *acknowledged within seconds* — the watcher thread consumes the
-sentinel and writes `<pid>.ack` independently of the render — but the request could not LAND for
-the entire 900 s busy window, and only took effect much later, once the build finished and the
-gather began (`[stop] external stop requested` appears in the log immediately after the
-`[gpu] photon beams: … uploaded for the volume gather` line). So the phase can be neither
-observed nor cancelled while it runs; the only alternative is a force-kill, which this project
-forbids outright (CUDA TDR risk — see CLAUDE.md).
+**What was observed.** The forward pass and the aimed caustic pass print progress normally and
+finish in ~2 min. The process then printed **nothing** for ~50 minutes before emitting the
+`[gpu] adaptive gather radius` / `photon beams: … BVH in 26.2s` / `… uploaded for the volume
+gather` group. It was working rather than deadlocked (CPU advancing ~2.1 s per wall second, GPU
+100%). At `-n 200M` (87.8 M stored photons) the same stretch completes in well under a minute.
+After the upload line it then sat for a further 35+ minutes without ever reaching the gather's
+first stage line, on 29 threads at ~2.3 cores. Whether any of that is ftrace's own cost or simply
+starvation behind the other 43 contexts is **not established**.
+
+**The structural half, which does not depend on the timings.** `ftrace -stop <pid>` was
+*acknowledged within seconds* — the watcher thread consumes the sentinel and writes `<pid>.ack`
+independently of the render, and `[stop] external stop requested` duly appears in the log right
+after the volume-gather upload — yet the request had still not LANDED 35+ min later, across two
+full 900 s `-stop` windows. `render_cuda.cu`'s own comment (~line 17040) states that the sliced
+gather loop is "the ONLY seam an external `ftrace -stop` can land on inside a gather", and the
+stage line that would name the phase fires *from inside that loop*. So everything upstream of the
+first slice — the photon-map build, the caustic map, the beam split, the BVH build and upload,
+and the per-camera film allocations — is a single region with **neither a progress line nor a
+stop seam**. The window title stays on `building beam map…` throughout, which is precisely the
+symptom the comment at ~line 17063 describes and believed it had fixed; that fix covers the
+gather loop but not the region before it.
 
 **`-stop` itself is NOT at fault and needs no change — an earlier draft of this entry said it
 was, wrongly.** Its two-phase wait (120 s to hear an ack, then 900 s for an acknowledged target
@@ -42,13 +55,20 @@ request and would still exit on its own, said `Nothing was force-killed`, and **
 was `tail`'s status, not ftrace's. The contract in `CLAUDE.md` holds: exit 0 means genuinely
 gone.
 
-**What to fix.** (a) Add a cancellation seam to the mode-M map-build phase, polling the stop flag
-the way the loader and the gather already do — this is the important half, and it is a small
-change at call sites that already thread the flag. (b) Emit a progress line for the build
-(photons sorted / grid built / radius solved), since `-interval` currently governs only the
-render loop. (c) Investigate the super-linear cost itself: at 351351733 stored photons the build
-is >50x the 87.8 M case for 4x the photons, which points at an O(n log n)-or-worse sort or a grid
-rebuild thrashing against the VRAM ceiling rather than at raw throughput.
+**What to fix (the structural half — worth doing regardless of the timings).** (a) Add stop-flag
+polls to the region between the aimed pass and the first gather slice, the way the scene loader
+and the gather loop already do. (b) Give that region the same self-naming stage line the gather
+got, so the window and the log say which of map build / caustic map / beam split / BVH build is
+running instead of leaving the stale `building beam map…` caption up. Together these turn an
+opaque, uncancellable stretch into an observable, interruptible one — which is the whole
+complaint, independent of how long it *should* take.
+
+**What to re-measure on a quiet GPU before believing it.** (c) Whether the ~50 min stretch at
+351351733 stored photons is real super-linear cost or contention. (d) Whether the post-upload
+stall is ftrace at all — with 518 MiB free VRAM, the gather's four film allocations (~33 MB at
+960x540) were being requested against a nearly exhausted device, so allocation pressure is at
+least as likely an explanation as anything in ftrace. If it *is* real, a fail-fast VRAM headroom
+check before the gather would be far better than an unbounded stall.
 
 **Postscript — the run did eventually get through, and its numbers are in the entry below.** It
 reached the gather after ~50 min of silence and reported 351351733 stored photons, 10632728 beams
