@@ -60,10 +60,25 @@ plumbing:**
    rather than merely observe one.
 3. **Analytic slab.** One homogeneous medium, isotropic phase, one area light — single-scatter
    radiance has a closed form. UPBP's mean must match it.
-4. **Mode `D` agreement.** Converged `D` vs converged UPBP on `_rainbow_test.ftsl` (homogeneous
-   `sigma_t 0.6`, `phase rainbow`, already the validated A/B reference scene for `-beams`, and
-   small enough to converge). `D` is unbiased, so *any* UPBP energy error shows up as a mean
-   offset. This is the real gate.
+4. **Mode `D` agreement.** Converged `D` vs converged UPBP on **`scenes/_fog_cornell.ftsl`**
+   (homogeneous `sigma_t 0.6 albedo 0.85 g 0`, one area light, one glass sphere, 256², already
+   the validated GPU-vs-CPU parity scene for backward media). `D` is unbiased, so *any* UPBP
+   energy error shows up as a mean offset. This is the real gate.
+
+   **Not `_rainbow_test.ftsl`**, which this entry originally named. That scene lights its fog
+   with a **collimated** beam, and `bdptUnsupportedFeature` (`main.cpp:14326`) refuses env and
+   collimated emitters for a stated reason that applies to UPBP verbatim: a collimated light is
+   a delta emission *direction* from a finite surface, so a shading point can never next-event-
+   estimate it — the `s=1` strategy has zero measure. Mode `D` therefore cannot render it at
+   all, so it could never have been a `D`-vs-UPBP reference. Measured 2026-09-02:
+   `-mode D -in scenes/_fog_cornell.ftsl -r 64 64 -spp 2` renders in 0.07 s, and
+   `-mode U -in scenes/_fog_cornell.ftsl` refuses with
+   `participating media (mode U is surfaces-only)` — the empirical confirmation of the guard at
+   `main.cpp:14340`, and hence of this entry's premise that mode `U` is not the base to extend.
+
+   The rainbow phase is still worth a *later* check, since an anisotropic `phaseF` is what the
+   merge weight's `f_p(cos θ)` factor exercises — but through a variant lit by an area light,
+   not a collimated one.
 
 **Falsifiable prediction, so the work can be judged.** Mode `M`'s floor should fall
 substantially — the connection strategy *is* resampled per spp, so MIS lets it carry what
