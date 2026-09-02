@@ -329,14 +329,31 @@
 # at the price of noise -- it CONVERTS spp-reducible noise into a permanent floor. So do NOT
 # use `-beamblur` as a speed knob, and do not raise -spp expecting to undo it.
 #
-# WHAT THE FLOOR IMPLIES INSTEAD. It goes as 1/sqrt(beams gathered), and beams gathered goes as
-# (beam density x radius). Density comes from `-n`, which mode M pays ONCE for all 600 cameras,
-# while the gather is paid per frame. So the lever that should work is raising `-n` and cutting
-# `-beamblur` in LOCKSTEP: 2x the photons at half the radius holds beams/probe -- and so the
-# floor -- constant while halving the per-frame gather. NOT YET CONFIRMED: the -n 800M arm that
-# would have demonstrated it never reached its gather (see known-issues.md, "the mode-M photon
-# map build goes silent, unbounded and un-stoppable above ~200M photons"), so treat the lockstep
-# recipe as a well-founded prediction and measure it before planning a run on it.
+# WHAT THE FLOOR IMPLIES -- AND THE LOCKSTEP RECIPE THAT DOES NOT WORK. The floor goes as
+# 1/sqrt(G), G = beams gathered per probe, and G goes as (beam density x radius). Density comes
+# from `-n`, which mode M pays ONCE for all 600 cameras, while the gather is paid per frame. That
+# suggests raising `-n` and cutting `-beamblur` in lockstep to hold G -- and so the floor --
+# constant while cutting per-frame cost. MEASURED 2026-09-02, and it DOES NOT: it moves you
+# ALONG the same cost/quality curve rather than shifting the curve.
+#
+# The -n 800M / -beamblur 0.0025 arm stored 10632728 beams, trimmed to 7998945 by -beamcount,
+# and gathered G = 6325.7 per probe -- within 1.5% of the 6422 predicted by "G is linear in
+# density x radius" (3.01x the density at 1/4 the radius), so the model itself is right. But
+# fitting the sweep above to t = a + b*G gives b = 6.21e-4 min/beam and a FIXED cost
+# a = 0.73 min/spp (it predicts 3.38 and 2.05 against 3.65 and 2.16 measured). Cost therefore
+# tracks G almost entirely -- and the only other term, the BVH, is pinned IDENTICAL in every
+# configuration by -beamsplitmax (~23.7M sub-beams, ~15.2M nodes at -n 200M AND at -n 800M).
+# So holding G constant holds the COST constant too: at -n 800M you would need -beamblur 0.00337
+# to gather the default's 8534.6 beams, and that costs the same 6.03 min/spp the default does.
+# G is the single quantity setting both the cost and the floor, and they move together.
+#
+# WHAT MORE `-n` ACTUALLY BUYS, then, is not speed but DECORRELATION, which is a different
+# artifact: at -n 800M the map holds 7998945 beams with mean split 0.5183 against 2656139 at
+# 0.1715, i.e. many more, much shorter, more independent chords. That attacks the long STREAKS
+# (spatially correlated variance -- neighbouring pixels re-gathering the same long chord), not
+# the per-gather-point floor. So spend `-n` for streaks at equal cost; do not expect it to make
+# the frame cheaper. Note also that -beamcount 8000000 BOUND here (10.6M collected -> 8.0M), so
+# past ~600M photons the extra spend stops raising beam density at all.
 #
 # WHY 960x540 AND NOT 1080p -- this is a HOST RAM ceiling, not a taste call. Read it as a
 # COMMIT ceiling rather than a physical-RAM one: what refuses the allocation is Windows' commit

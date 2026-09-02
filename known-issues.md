@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-09-02, v0.210.0): the mode-M photon map build goes silent, unbounded and **un-stoppable** above ~200 M photons — a `-n 800M` run spent 50+ min in one phase with zero output, and `ftrace -stop` could not interrupt it
+### OPEN (2026-09-02, v0.210.0): the mode-M photon map build goes **silent and un-cancellable** above ~200 M photons — a `-n 800M` run spent ~50 min in one phase with zero output, and an acknowledged `ftrace -stop` could not land for over 900 s
 
 **Repro.** The `gallery_rain` showcase flags with `-n` raised 4x:
 
@@ -24,25 +24,37 @@ and the GPU sat at 100% with 23.6–23.9 GiB of 24.5 GiB VRAM in use. At `-n 200
 photons) this same phase completes in well under a minute, so the blow-up is strongly
 super-linear in stored photons, and it runs right at the VRAM ceiling.
 
-**The part that makes it a bug rather than a slow path.** `ftrace -stop <pid>` **cannot interrupt
-it.** The stop flag is polled during scene load and inside the render/gather loop, but *not* in
-the photon-map build, so the 120 s stop window expired with the process still alive and a
-subsequent bare `-stop` still listed it. That leaves only a force-kill, which this project
-forbids outright (CUDA TDR risk — see CLAUDE.md), so the only remaining option is to wait an
-unknown number of hours. A phase that cannot be cancelled and cannot report progress is the worst
-combination available.
+**The part that makes it a bug rather than a slow path.** The phase contains **no cancellation
+seam**. `ftrace -stop <pid>` was *acknowledged within seconds* — the watcher thread consumes the
+sentinel and writes `<pid>.ack` independently of the render — but the request could not LAND for
+the entire 900 s busy window, and only took effect much later, once the build finished and the
+gather began (`[stop] external stop requested` appears in the log immediately after the
+`[gpu] photon beams: … uploaded for the volume gather` line). So the phase can be neither
+observed nor cancelled while it runs; the only alternative is a force-kill, which this project
+forbids outright (CUDA TDR risk — see CLAUDE.md).
 
-**What to fix.** (a) Poll the stop flag in the mode-M map-build phase the way the loader and the
-gather already do — this is the important half, and it is a small change at the same call sites
-that already thread the flag. (b) Emit a progress line for the build (photons sorted / grid built
-/ radius solved), since `-interval` currently governs only the render loop. (c) Investigate the
-super-linear cost itself: at ~350 M photons the build is >50x the 87.8 M case, which points at an
-O(n log n)-or-worse sort or a grid rebuild thrashing against the VRAM ceiling rather than at raw
-throughput.
+**`-stop` itself is NOT at fault and needs no change — an earlier draft of this entry said it
+was, wrongly.** Its two-phase wait (120 s to hear an ack, then 900 s for an acknowledged target
+to reach a seam) is deliberate, and `main.cpp` documents exactly this scenario. On expiry it
+printed `[stop] FAILED — still running after 900s`, explained that the pid *had* heard the
+request and would still exit on its own, said `Nothing was force-killed`, and **returned 2**. The
+"exit 0" in the first draft was my own shell error — the command piped through `tail`, so `$?`
+was `tail`'s status, not ftrace's. The contract in `CLAUDE.md` holds: exit 0 means genuinely
+gone.
 
-**Consequence for the docs.** This is why `scenes/gallery_rain.ftsl`'s header records the
-"raise `-n`, cut `-beamblur` in lockstep" recipe as a *prediction* rather than a measurement —
-the arm that would have confirmed it is exactly the run that never got past this phase.
+**What to fix.** (a) Add a cancellation seam to the mode-M map-build phase, polling the stop flag
+the way the loader and the gather already do — this is the important half, and it is a small
+change at call sites that already thread the flag. (b) Emit a progress line for the build
+(photons sorted / grid built / radius solved), since `-interval` currently governs only the
+render loop. (c) Investigate the super-linear cost itself: at 351351733 stored photons the build
+is >50x the 87.8 M case for 4x the photons, which points at an O(n log n)-or-worse sort or a grid
+rebuild thrashing against the VRAM ceiling rather than at raw throughput.
+
+**Postscript — the run did eventually get through, and its numbers are in the entry below.** It
+reached the gather after ~50 min of silence and reported 351351733 stored photons, 10632728 beams
+collected (trimmed to 7998945 by `-beamcount`), and G = 6325.7 beams per probe. That was enough
+to settle the `-beamblur` lockstep question, so the follow-up is now closed — see the "every
+performance number in `scenes/gallery_rain.ftsl`'s header is stale" entry.
 
 ### FIXED (2026-09-02, v0.210.0): the `gallery_rain` cloud was still "very iridescent, bars of colour running all through it" — every beam in an achromatic cloud was a single spectral sample, and **more `-spp` could never fix it**
 
@@ -370,12 +382,33 @@ Three results, all of which contradict something the header previously asserted:
    a variable resampled per sample. **So `-beamblur` is not a speed knob** — it converts
    spp-reducible noise into a permanent floor.
 
-**Which retires the "sweep `-beamblur` for speed" idea and replaces it with a different one.**
-The floor goes as `1/sqrt(beams gathered)`, and beams gathered goes as (beam density x radius).
-Density comes from `-n`, which mode M pays **once for all 600 cameras** while the gather is paid
-per frame — so raising `-n` and cutting `-beamblur` in *lockstep* should hold the floor constant
-while cutting per-frame cost. **Still unconfirmed:** the `-n 800M` arm never reached its gather,
-for the reason logged in the entry at the top of this file. That is now the open follow-up.
+**Which retires the "sweep `-beamblur` for speed" idea — and the replacement idea turned out to
+be wrong too, so it is recorded here rather than recommended.** The floor goes as `1/sqrt(G)`,
+`G` = beams gathered per probe, and `G` goes as (beam density × radius). Density comes from `-n`,
+which mode `M` pays **once for all 600 cameras** while the gather is paid per frame — which
+suggests raising `-n` and cutting `-beamblur` in *lockstep* to hold `G` (and the floor) constant
+while cutting per-frame cost. **Measured, and it does not work.** The `-n 800M` /
+`-beamblur 0.0025` arm gathered `G = 6325.7`, within 1.5% of the 6422 predicted by the linear
+density × radius model — so the model is right — but:
+
+- Fitting the sweep to `t = a + b·G` gives `b = 6.21e-4` min/beam and a fixed `a = 0.73` min/spp
+  (predicting 3.38 / 2.05 against 3.65 / 2.16 measured). Cost tracks `G` almost entirely.
+- The only other cost term, the beam BVH, is pinned **identical** in every configuration by
+  `-beamsplitmax` — ~23.7 M sub-beams / ~15.2 M nodes at `-n 200M` *and* at `-n 800M`.
+
+So holding `G` constant holds *cost* constant: at `-n 800M` you would need `-beamblur 0.00337` to
+gather the default's 8534.6 beams, and that costs the same 6.03 min/spp as the default. `G` is
+the single quantity setting both cost and floor, and they move together — the lockstep trade
+slides along the curve instead of shifting it. **There is no free lunch between `-n` and
+`-beamblur`.**
+
+**What more `-n` does buy is decorrelation, not speed.** At `-n 800M` the map holds 7998945 beams
+at mean split 0.5183, against 2656139 at 0.1715 — many more, much shorter, more independent
+chords. That attacks the long *streaks* (spatially correlated variance, from neighbouring pixels
+re-gathering the same long chord), which is a different artifact from the per-gather-point floor.
+Spend `-n` on streaks at equal cost; don't expect it to make a frame cheaper. Note too that
+`-beamcount 8000000` **bound** here (10.6 M collected → 8.0 M kept), so past ~600 M photons the
+extra spend stops raising beam density at all.
 
 **Also validated in passing:** `-loadmap` reproduces a fresh deposit — the banked `blur 0.01`
 arm measured speckle 1.094 / saturation 0.0233 against 1.102 / 0.0229 for an independently
