@@ -159,14 +159,42 @@ plumbing:**
    merge weight's `f_p(cos θ)` factor exercises — but through a variant lit by an area light,
    not a collimated one.
 
-**Falsifiable prediction, so the work can be judged.** Mode `M`'s floor should fall
-substantially — the connection strategy *is* resampled per spp, so MIS lets it carry what
-merging does badly, leaving merging to hold only the bow and the lamp's specular chains (whose
-arc emitter sits inside nested quartz/xenon where NEE cannot reach it at all, so merging is the
-only technique that ever carries it). Per-frame cost will be **≥ mode `D`'s**, because the
-connection half is inherently per-camera: the win is quality at equal time, **not** a cheaper
-flyby. If a measurement shows UPBP beating mode `D` on wall clock for the loop, suspect the
-weights before believing it.
+**Falsifiable prediction, so the work can be judged.** Per-frame cost will be **≥ mode `D`'s**,
+because the connection half is inherently per-camera: the win is quality at equal time, **not**
+a cheaper flyby. If a measurement shows UPBP beating mode `D` on wall clock for the loop,
+suspect the weights before believing it.
+
+**Prediction revised once the weight had an actual number in it (2026-09-02).** This entry first
+claimed mode `M`'s noise floor "should fall substantially" because MIS would let connections
+carry what merging does badly. Putting `gallery_rain`-ish numbers into the derived ratio says
+otherwise, and the correction matters more than the original claim:
+
+```
+p_M/p_C1 = n_m·2r·sinθ·p_L⊥ / (σ_t·Tr_C)
+         ~ 1e8 · 2e-3 · 0.7 · 0.08 / (0.6·0.5)   ~  4e4
+```
+
+So wherever a merge is *available at all*, the balance heuristic hands it ~all the weight —
+roughly 10⁴:1 — and the combined estimator is, for volumetric single scatter, essentially mode
+`M`. Which is the correct MIS answer: with 10⁸ photons the beam estimate really does have the
+lower per-sample variance. But `M`'s floor is **not** variance — it is kernel blur plus the
+fixed beam realization, i.e. bias-like *within a frame* — and the balance heuristic cannot see
+bias. **MIS will not remove a bias by out-weighting it.**
+
+What UPBP therefore actually buys, stated so it can be checked:
+- **Multiple scattering in the volume**, which mode `M` omits outright (beams deposit straight,
+  `photonbeams.h:47`). Merge density is 0 for those paths, so connections carry them at `w = 1`.
+  On a thick cloud (`gallery_rain`'s `sigma_t 2.78 albedo 0.9964`) that is not a detail.
+- **Unbiased surfaces**, since surface transport goes through BDPT rather than a photon-map
+  density estimate.
+- **The specular chains mode `D` cannot reach** — the lamp's arc emitter sits inside nested
+  quartz/xenon where NEE has no path, so merging is the only technique that ever carries it.
+- **The kernel radius becomes a real bias/variance dial.** In mode `M`, shrinking `r` adds noise
+  with nothing to compensate, which is why `-beamblur` bottoms out. Under MIS, shrinking `r`
+  lowers the merge's weight *by exactly the same factor it lowers the blur* (`p_M ∝ 2r`), so
+  connections automatically pick up the slack. This is the mechanism by which the floor could
+  fall, and it is a knob, not an automatic consequence — so the honest test is a **`-beamblur`
+  sweep under UPBP**, checking that the error falls monotonically where mode `M`'s flattens.
 
 ### FIXED (2026-09-02, docs only — no `VERSION` bump, nothing observable changed in the binary): `bdpt.h`'s scope comment claimed heterogeneous media were unsupported, citing a guard that says the opposite
 
