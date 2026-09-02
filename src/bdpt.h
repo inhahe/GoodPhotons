@@ -15,14 +15,35 @@
 // Material scope: Diffuse and Glossy are CONNECTIBLE (non-delta) vertices; the
 // specular family (Dielectric, Mirror, HalfMirror, ThinFilm, Multilayer, Grating)
 // are delta pass-through vertices that carry a chain but never connect (their
-// connection pdf is zero). Emission comes from area/sphere quad lights. HOMOGENEOUS
-// participating media ARE handled: a subpath can scatter at a volume (Medium) vertex
-// via the HG phase function, connections carry a transmittance factor, and the
-// balance-heuristic MIS uses cosine-free phase densities (the σt·exp free-flight and
-// transmittance terms cancel pairwise for homogeneous media, so this is exactly
-// unbiased). Heterogeneous / density-field / implicit-bounded media, fluorescence,
-// spot and environment lights are NOT handled here (use mode B/P/R instead); see the
-// guard in main.cpp.
+// connection pdf is zero). Emission comes from area/sphere quad lights.
+//
+// PARTICIPATING MEDIA ARE HANDLED — HOMOGENEOUS *AND* HETEROGENEOUS. A subpath can
+// scatter at a volume (Medium) vertex via the HG phase function, connections carry a
+// transmittance factor, and the balance-heuristic MIS uses cosine-free phase densities.
+// For a homogeneous medium the σt·exp free-flight and transmittance terms cancel
+// pairwise, so those weights are exact. A heterogeneous (density-field / bounded)
+// medium goes through the SAME `mats.sampleMediaCollision` call in traceSubpath below,
+// which places the vertex by delta (Woodcock) tracking with analog throughput, while
+// connection edges are weighted by ratio-tracking transmittance. Both are unbiased,
+// exactly as the forward tracer does it. The MIS weights then omit the heterogeneous
+// distance-pdf / transmittance — a variance-only simplification (the PBRT-v3
+// convention), because the balance heuristic is a partition of unity for ANY consistent
+// pdfs: the estimator stays unbiased regardless, since only the SAMPLED strategy's
+// throughput has to be exact, which analog + ratio tracking guarantee.
+//
+// THIS COMMENT USED TO SAY heterogeneous media were "NOT handled here (use mode B/P/R
+// instead); see the guard in main.cpp" — which was wrong, and wrong in the expensive
+// direction, because it cited a guard that says the opposite. `bdptUnsupportedFeature`
+// (main.cpp ~14278) refuses exactly one medium class, GRADIENT-INDEX (GRIN), because
+// curved Eikonal paths break BDPT's straight-edge assumptions (the geometric term G,
+// the area-measure pdf conversion and MIS all assume the connecting segment is a line).
+// Everything else — global haze, bounded, density-field — renders here, which is why
+// `gallery_rain` (two heterogeneous media, one with a wavelength-dependent droplet
+// phase) has mode D as its reference path. Corrected 2026-09-02, after the comment sent
+// a reader hunting for a heterogeneous-capable BDPT that was already the one they were
+// reading.
+//
+// Fluorescence, spot and environment lights are genuinely NOT handled; see the guard.
 #pragma once
 #include <vector>
 #include <algorithm>

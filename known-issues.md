@@ -5,6 +5,93 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PLANNED (2026-09-02, v0.213.0): **UPBP** — MIS-combine mode `D`'s BDPT connections with the `-beams` beam×ray estimator, so a volumetric scene stops having to choose between mode M's permanent noise floor and mode D's per-frame cost
+
+**The gap this closes.** On `gallery_rain` the two available estimators each fail in a way the
+other doesn't. Mode `M -beams` amortises one view-independent forward pass over all 600 flyby
+cameras, but its residual is a **floor no `-spp` can cross** (measured `speckle² = s0² + k/spp`;
+`s0 ≈ 0.59` at the default `-beamblur`, derived from the sweep at 4 spp and the file's own
+`s0 ∝ 1/√G` law) — because the beam map is traced ONCE and view-independent, so extra samples
+re-gather *the same beams*. Mode `D` is unbiased and converges to ground truth, but shares
+nothing across cameras, so the loop costs ~65 h at reference quality. VCM (`U`) is exactly the
+right idea and already exists here — but it is **surfaces-only** and hard-refuses this scene at
+`main.cpp:14340` (`participating media (mode U is surfaces-only)`), which would render the
+rain, the cloud and the bow as nothing.
+
+**The architecture: extend `D`, not `U`.** Mode `U` has no volumetric transport at all, so
+adding media to it means rewriting mode `D` inside it. Mode `D` already does correct
+volumetric BDPT *including heterogeneous media* (delta/Woodcock tracking, ratio-tracking
+transmittance — see the corrected scope comment at the top of `bdpt.h`), and `photonbeams.h`
+already provides a view-independent BB1D beam×ray gather with a GPU-resident implementation.
+So the missing piece is only the MIS weighting that lets them share one estimator. This is
+**UPBP** (Křivánek et al. 2014, *Unifying Points, Beams and Paths*), the volumetric
+generalisation of VCM. New mode letter rather than overloading `U`, whose guard and resident
+per-pixel SPPM session mean something different.
+
+**The one genuine departure from textbook UPBP, and it is the whole point.** Standard UPBP
+retraces light subpaths every iteration and merges against *those*. Here the beam map is a
+separate forward pass, traced once and shared by every frame — which is precisely mode `M`'s
+value and the thing worth preserving for a 600-frame flyby. So the two techniques draw from
+**different light-path populations with different sample counts**: `n_c` light subpaths per
+pass for connections (one per pixel, as in BDPT) versus `n_m = beamMap.nEmitted` photons traced
+once. The multi-sample balance heuristic covers exactly this — `w_i = n_i·p_i / Σ_j n_j·p_j` —
+so the counts enter the weights explicitly. Writing them down is not optional bookkeeping:
+an `n_m` that is too high steals weight from connections and **darkens**, too low and it
+**brightens**, and either reads as a plausible image.
+
+**The conversion factor is the risk, and it is orientation-dependent.** Surface VM converts a
+merge to a connection-equivalent density with the scalar `etaVCM = πr²·nLightPaths`
+(`vcm.h:1247`). BB1D has no scalar analogue: both objects are 1D, the kernel `K1` is normalised
+over `[-r, r]` (so it carries units of 1/m and there is deliberately no `1/(πr²)`), and the
+estimator already divides by `sinθ` as the Jacobian of the 1D blur. The acceptance cross-section
+a beam presents to a camera ray therefore scales as `2r/sinθ`, i.e. **the MIS weight depends on
+the crossing angle** — which is a real feature of BB1D, not a modelling shortcut. Getting this
+constant wrong is a pure energy error.
+
+**So the validation gates come before the estimator, and gate (4) is the cheap one that catches
+plumbing:**
+
+1. **Degenerate reductions.** With an empty beam map, UPBP must reduce **bit-identically** to
+   mode `D`. With connections disabled, it must reduce to the mode `M -beams` gather. Both are
+   structural, cost nothing, and catch most wiring errors before any math is in question.
+2. **MIS partition of unity.** Instrument the weights directly: for a sampled path, sum the
+   weights of every technique that could have generated it and assert it equals 1. This tests
+   the weights *independently of the image*, which is the only way to localise an energy bug
+   rather than merely observe one.
+3. **Analytic slab.** One homogeneous medium, isotropic phase, one area light — single-scatter
+   radiance has a closed form. UPBP's mean must match it.
+4. **Mode `D` agreement.** Converged `D` vs converged UPBP on `_rainbow_test.ftsl` (homogeneous
+   `sigma_t 0.6`, `phase rainbow`, already the validated A/B reference scene for `-beams`, and
+   small enough to converge). `D` is unbiased, so *any* UPBP energy error shows up as a mean
+   offset. This is the real gate.
+
+**Falsifiable prediction, so the work can be judged.** Mode `M`'s floor should fall
+substantially — the connection strategy *is* resampled per spp, so MIS lets it carry what
+merging does badly, leaving merging to hold only the bow and the lamp's specular chains (whose
+arc emitter sits inside nested quartz/xenon where NEE cannot reach it at all, so merging is the
+only technique that ever carries it). Per-frame cost will be **≥ mode `D`'s**, because the
+connection half is inherently per-camera: the win is quality at equal time, **not** a cheaper
+flyby. If a measurement shows UPBP beating mode `D` on wall clock for the loop, suspect the
+weights before believing it.
+
+### FIXED (2026-09-02, docs only — no `VERSION` bump, nothing observable changed in the binary): `bdpt.h`'s scope comment claimed heterogeneous media were unsupported, citing a guard that says the opposite
+
+`bdpt.h`'s header read "Heterogeneous / density-field / implicit-bounded media … are NOT
+handled here (use mode B/P/R instead); see the guard in main.cpp." The guard it cites,
+`bdptUnsupportedFeature` (`main.cpp` ~14278), refuses exactly one medium class — **GRIN** —
+and its own comment spells out that heterogeneous media *are* supported via delta (Woodcock)
+tracking with ratio-tracking transmittance on connection edges. The CPU path proves it: the
+media branch in `traceSubpath` calls the same shared `mats.sampleMediaCollision` the forward
+tracer uses. `gallery_rain`, whose two media are both density fields, has mode `D` as its
+reference path precisely because this works.
+
+Wrong in the expensive direction: it sends a reader hunting for a heterogeneous-capable BDPT
+that is already the one they are reading — which is how it was found, while scoping the UPBP
+entry above. What was *correct* in the old text is the narrower claim it had blurred into:
+the heterogeneous **MIS weights** omit the distance-pdf / transmittance terms, which is a
+variance-only simplification (the PBRT-v3 convention) and leaves the estimator unbiased,
+since the balance heuristic is a partition of unity for any consistent pdfs.
+
 ### FIXED (2026-09-02, v0.210.0 → v0.213.0): mode `M`'s gather **degenerates to exactly one launch per spp at 960x540**, so the `-stop` seam its own comment promises does not exist there, and the caption stays stale for a whole spp — plus a second silent region upstream of it
 
 **Status.** The degeneracy itself is structural and still true — there is still exactly one launch
