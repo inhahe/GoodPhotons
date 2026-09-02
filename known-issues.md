@@ -10022,6 +10022,93 @@ computes the exact post-split count. It now reserves that count exactly — one 
 instead of a doubling chain, and the one place the split can plausibly run out of memory is
 also the place that now names `-beamsplitmax`.
 
+### OPEN (environmental, 2026-09-01): the `gallery_rain` 600-frame mode-M flyby cannot start — the machine's COMMIT limit, not its RAM, is the ceiling
+
+Launching the verified showcase command at 0.205.0
+
+```
+ftrace -in scenes/gallery_rain.ftsl -camera fly -mode M -device gpu -beams \
+       -n 200000000 -pmcount 45 -spp 24 \
+       -beamcount 8000000 -beamsplitmax 24000000 -denoise \
+       -r 960 540 -window-min -keepwindow -interval 15 \
+       -o png/gallery_rain_showcase.png
+```
+
+got all the way through the scene build, the shared-map banner and the caustic-aim banner, and
+then died in the film allocation with the 0.199.1 host-OOM report — correctly diagnosing itself
+as the *victim* rather than the cause:
+
+```
+error: out of HOST memory (in an allocation the renderer does not size itself).
+       This render was holding 81.60 MiB; the system had 8.37 GiB of commit left out of 255.95 GiB
+       (20.83 GiB of 63.95 GiB physical free).
+```
+
+**The number that matters is `8.37 GiB of commit left out of 255.95 GiB`, and it is not about
+this render.** Measured immediately afterwards with every ftrace process stopped:
+
+| quantity | value |
+|---|---|
+| commit limit (64 GiB RAM + 192 GiB pagefile) | 255.95 GiB |
+| commit **available** | 8.46 GiB |
+| physical free | 20.97 GiB |
+| pagefile **in use** (of 192 GiB allocated) | 20.61 GiB |
+
+So ~247 GiB is *charged* while only ~64 GiB is actually backed by anything — the commit is
+reserved-but-untouched. Top consumers at the time were four concurrent `claude` sessions at
+57.3 / 53.7 / 28.2 / 25.1 GiB of private bytes each (~171 GiB together) against working sets of
+1.6–3.2 GiB. Windows enforces the commit charge regardless, so the render is refused memory the
+machine physically has.
+
+**Why this render in particular is the one that dies:** the shared mode-M pass holds one film
+per selected camera for the whole run, and 600 cameras at 960×540×24 B is **6.95 GiB in a single
+allocation** — larger than the entire remaining commit on its own, before the photon map
+(~4.9 GiB at `-n 200M`), the beam map and the split array. There is no `-n`/`-beamcount` value
+that fixes this; the film is sized by frames × pixels alone.
+
+**This is not an ftrace defect and there is nothing to fix in the code** — the diagnostic did
+exactly its job and named the real cause on the first try. It is logged because it will recur
+and because the fix is non-obvious. Two ways out, in order of preference:
+
+1. **Raise the pagefile.** `C:` had 500.8 GiB free against a 192 GiB pagefile whose *peak* use
+   was 22.44 GiB. Growing it to ~320 GiB lifts the commit limit to ~384 GiB and costs
+   essentially nothing real, because the commit being charged is never touched. This is an
+   admin-level system change, so it is the user's call, not the agent's.
+2. **Close some of the concurrent Claude sessions.** Never by process name — see the standing
+   rule against blanket kills; this has to be the user closing them.
+
+**Falling back to a single camera does NOT rescue it, which is the measurement that settles
+how bad the shortage is.** Re-run as `-camera cam` (one 24 MB film instead of 600) with the
+map knobs cut by half (`-n 100M -beamcount 4M -beamsplitmax 12M`), it got *further* — through
+the scene build, the aim banner and 1% of the forward trace — and then died anyway:
+
+```
+[camera] tracing photons — 1.0M / 100.0M (1%), 18s, 58.3k/s, ~1699s left
+error: out of memory allocating the photon map payloads: 43918505 x 32 B = 1.31 GiB.
+       This render was holding 8.58 GiB; the system had 38.00 MiB of commit left out of 255.95 GiB
+```
+
+**8.58 GiB is therefore the whole budget available to ftrace on this machine right now**, and
+`gallery_rain`'s scene build alone — 1.85 M-tri cloud shape, ~1.6 M fur segments, the BVH and
+two majorant grids — accounts for roughly 7.5 GiB of it (the run had already taken the 1.05 GiB
+positions array before failing on the 1.31 GiB payload array). That leaves on the order of
+**1 GiB for the photon and beam maps, i.e. `-n` in the low tens of millions** — far below the
+`-n 200M` that the scene's own measurements show is what removes the beam streaks, and far
+below what puts enough photons in the caustic map to showcase caustics. So there is no
+degraded-but-honest still to fall back on either; the scene is simply not renderable at
+showcase quality until commit is freed.
+
+The scene file's "WHY 960x540 AND NOT 1080p" block should be read as a *commit*
+ceiling, not a physical-RAM one — at 1280×720 the film is 13.3 GiB and at 1920×1080 it is
+29.9 GiB, and it is one contiguous request each time.
+
+**Proper long-term fix (real tech debt, independent of this machine):** mode M has no way to
+render a sub-range of a camera path, so the film array is all-or-nothing. A `-frames a:b` flag
+that selected a slice of the path *while keeping the shared forward pass* would cut the film
+cost proportionally and make the loop resumable across invocations — today, splitting it by
+hand re-traces the forward pass per chunk, which is the entire point of mode M. That is the
+allocation to attack, not `-n`.
+
 ## Tech debt
 
 ### Checked-in scenes cite ~22 derivation scripts that live in gitignored `scraps/` — 2026-09-01

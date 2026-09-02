@@ -255,9 +255,18 @@
 # "M can look finished too" budget). Scale it by hand: per-frame cost is LINEAR in -spp, in
 # -beamk and in pixels, so halving -spp to 12 halves the loop to ~13 h.
 #
-# WHY 960x540 AND NOT 1080p -- this is a HOST RAM ceiling, not a taste call. The shared
+# WHY 960x540 AND NOT 1080p -- this is a HOST RAM ceiling, not a taste call. Read it as a
+# COMMIT ceiling rather than a physical-RAM one: what refuses the allocation is Windows' commit
+# charge, which is shared with every other process on the machine, so this render can be denied
+# memory the box physically has free. MEASURED 2026-09-01: four concurrent Claude sessions held
+# ~171 GiB of private bytes against 1.6-3.2 GiB working sets each, leaving 8.4 GiB of a 256 GiB
+# commit limit with 21 GiB of RAM free -- and the flyby below died in the film allocation even
+# though ~247 GiB of the charge was reserved-but-never-touched. Fix is to raise the pagefile or
+# close the other sessions, NOT to shrink this render. See known-issues.md, "the gallery_rain
+# 600-frame mode-M flyby cannot start". The shared
 # mode-M pass holds ONE FILM PER SELECTED CAMERA in RAM for the whole run (600 of them), at
-# 24 B/pixel: 7.5 GB at 960x540, 13.3 GB at 1280x720, 29.9 GB at 1920x1080. Add the photon
+# 24 B/pixel: 7.5 GB at 960x540, 13.3 GB at 1280x720, 29.9 GB at 1920x1080 -- and each is ONE
+# CONTIGUOUS request, so no -n / -beamcount value rescues it. Add the photon
 # map (~56 B per DEPOSITED photon: -n 200M deposits 88.2M = 4.9 GB), the beam map (~72 B per
 # beam) and the split array (~1 GB per 8M sub-beams) and 1280x720 with these settings already
 # died on a 64 GB machine -- correctly reported since 0.199.1 as `out of HOST memory ... the
