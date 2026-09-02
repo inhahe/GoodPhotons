@@ -289,16 +289,54 @@
 #          -beamcount 8000000 -beamsplitmax 24000000 -denoise \
 #          -r 960 540 -window-min -keepwindow -interval 15 \
 #          -o png/gallery_rain_showcase.png
-# The "153 s/frame => ~25.5 h for the 600-frame loop" that used to sit here is STALE and has
-# NOT been re-measured at 0.209.0 -- it predates the same three changes as the preview number
-# above (0.199.0's cloud albedo, 0.201.0's kernel radius, 0.209.0's slice-occupancy fix), so
-# it is wrong in both directions at once and should not be quoted. RE-MEASURE IT BEFORE
-# PLANNING A RUN AGAINST IT. What is still true: per-frame cost is LINEAR in -spp and in
-# pixels, and ~quadratic in `-beamblur` (via beams gathered), and mode D at -spp 140 is
-# ~7.6 h for the loop -- D remains the reference, this is the "M can look finished too"
-# budget. Scale the preview measurement instead: ~29.5 s/spp at -n 20M, times whatever -spp
-# you pick, plus whatever `-n 200M` costs the gather (more stored beams under a fixed
-# radius = more beams gathered per probe, so it is NOT free at gather time either).
+# The "153 s/frame => ~25.5 h for the 600-frame loop" that used to sit here was STALE (it
+# predated 0.199.0's cloud albedo, 0.201.0's kernel radius and 0.209.0's slice-occupancy fix).
+# RE-MEASURED 2026-09-02 at 0.210.0, RTX 4090, 960x540, -n 200M, still camera `cam`, the exact
+# showcase flags above: 4 spp of gather in 24:08, i.e. 6.03 min/spp. At -spp 24 that is
+# ~2.4 h/FRAME and ~60 days for the 600-frame loop. That is not a deliverable budget, and the
+# reason is below: at this beam density the showcase -spp buys very little. Per-frame cost is
+# LINEAR in -spp and in pixels. Mode D at -spp 140 is ~7.6 h for the WHOLE loop and remains the
+# reference; this is the "M can look finished too" budget.
+#
+# THE SCALING RULE HERE WAS ALSO WRONG. This used to say per-frame cost is "~quadratic in
+# `-beamblur` (via beams gathered)". It is LINEAR. MEASURED 2026-09-02 at 0.210.0 -- one banked
+# -savemap re-gathered at four radii with -loadmap, so the beam population is IDENTICAL across
+# the rows and only the kernel moves; -spp 4, 960x540, -n 200M:
+#
+#     -beamblur   beams/probe   4-spp gather   min/spp   speckle   saturation
+#     0.01 (dflt)      8534.6         24:08       6.03     1.094      0.0233
+#     0.005            4263.2         14:37       3.65     1.585      0.0249
+#     0.0025           2125.8          8:38       2.16     2.030      0.0265
+#     0.00125          1080.1          5:37       1.40     2.536      0.0285
+#
+# Beams gathered HALVES when the radius halves (ratios 2.00 / 2.01 / 1.97), because a beam is a
+# LINE, not a point: the count of lines piercing a gather cylinder of radius r and length L goes
+# as r*L, not r^2. Time falls SUB-linearly in that (8x fewer beams buys only 4.3x less time)
+# because the split is -beamsplitmax-saturated in every row, so the BVH barely shrinks
+# (15.3M -> 14.8M nodes) and you pay near-full traversal to collect fewer samples. Y mean moves
+# -0.2% across the whole sweep, inside the beam-split nondeterminism floor -- the radius is a
+# VARIANCE knob, not a bias knob.
+#
+# AND SHRINKING IT IS A LOSS, NOT A TRADE. -beamblur 0.00125 at -spp 16 finished in 16:03 --
+# LESS wall time than the default's 4 spp at 24:08 -- and was still far grainier (speckle 1.925
+# vs 1.094). Fitting speckle^2 = s0^2 + k/spp to the two small-radius points (2.536 @ 4 spp,
+# 1.925 @ 16 spp) gives k = 14.5 and an IRREDUCIBLE FLOOR s0 = 1.67 -- worse than the default
+# radius reaches at 4 spp, and unreachable at any -spp whatsoever. The cause is the one that
+# also makes -spp useless against beam CHROMA noise (see -beamachro in REFERENCE.md): the beam
+# map is traced ONCE and is view-independent, so extra spp re-gather THE SAME BEAMS. The kernel
+# radius fixes how many beams are averaged per gather point, and that error is a fixed function
+# of the beam set, not a variable resampled per sample. Shrinking the radius does not buy speed
+# at the price of noise -- it CONVERTS spp-reducible noise into a permanent floor. So do NOT
+# use `-beamblur` as a speed knob, and do not raise -spp expecting to undo it.
+#
+# WHAT THE FLOOR IMPLIES INSTEAD. It goes as 1/sqrt(beams gathered), and beams gathered goes as
+# (beam density x radius). Density comes from `-n`, which mode M pays ONCE for all 600 cameras,
+# while the gather is paid per frame. So the lever that should work is raising `-n` and cutting
+# `-beamblur` in LOCKSTEP: 2x the photons at half the radius holds beams/probe -- and so the
+# floor -- constant while halving the per-frame gather. NOT YET CONFIRMED: the -n 800M arm that
+# would have demonstrated it never reached its gather (see known-issues.md, "the mode-M photon
+# map build goes silent, unbounded and un-stoppable above ~200M photons"), so treat the lockstep
+# recipe as a well-founded prediction and measure it before planning a run on it.
 #
 # WHY 960x540 AND NOT 1080p -- this is a HOST RAM ceiling, not a taste call. Read it as a
 # COMMIT ceiling rather than a physical-RAM one: what refuses the allocation is Windows' commit

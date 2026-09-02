@@ -5,6 +5,45 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-09-02, v0.210.0): the mode-M photon map build goes silent, unbounded and **un-stoppable** above ~200 M photons — a `-n 800M` run spent 50+ min in one phase with zero output, and `ftrace -stop` could not interrupt it
+
+**Repro.** The `gallery_rain` showcase flags with `-n` raised 4x:
+
+```
+ftrace -in scenes/gallery_rain.ftsl -camera cam -mode M -device gpu -beams \
+       -n 800000000 -pmcount 45 -beamcount 8000000 -beamsplitmax 24000000 \
+       -r 960 540 -spp 4 -beamblur 0.0025 -window-min -keepwindow -interval 15 \
+       -o png/blur/n800_b0025.png
+```
+
+**What happens.** The forward pass and the aimed caustic pass both print progress normally and
+finish in ~2 min. Then the process prints **nothing at all** for 50+ minutes — no `[gpu] adaptive
+gather radius`, no `photon beams: … BVH in …`, no `[camera] gathering frame`. It is genuinely
+working, not deadlocked: sampled three times 20 s apart, CPU time advanced ~2.1 s per wall second
+and the GPU sat at 100% with 23.6–23.9 GiB of 24.5 GiB VRAM in use. At `-n 200M` (87.8 M stored
+photons) this same phase completes in well under a minute, so the blow-up is strongly
+super-linear in stored photons, and it runs right at the VRAM ceiling.
+
+**The part that makes it a bug rather than a slow path.** `ftrace -stop <pid>` **cannot interrupt
+it.** The stop flag is polled during scene load and inside the render/gather loop, but *not* in
+the photon-map build, so the 120 s stop window expired with the process still alive and a
+subsequent bare `-stop` still listed it. That leaves only a force-kill, which this project
+forbids outright (CUDA TDR risk — see CLAUDE.md), so the only remaining option is to wait an
+unknown number of hours. A phase that cannot be cancelled and cannot report progress is the worst
+combination available.
+
+**What to fix.** (a) Poll the stop flag in the mode-M map-build phase the way the loader and the
+gather already do — this is the important half, and it is a small change at the same call sites
+that already thread the flag. (b) Emit a progress line for the build (photons sorted / grid built
+/ radius solved), since `-interval` currently governs only the render loop. (c) Investigate the
+super-linear cost itself: at ~350 M photons the build is >50x the 87.8 M case, which points at an
+O(n log n)-or-worse sort or a grid rebuild thrashing against the VRAM ceiling rather than at raw
+throughput.
+
+**Consequence for the docs.** This is why `scenes/gallery_rain.ftsl`'s header records the
+"raise `-n`, cut `-beamblur` in lockstep" recipe as a *prediction* rather than a measurement —
+the arm that would have confirmed it is exactly the run that never got past this phase.
+
 ### FIXED (2026-09-02, v0.210.0): the `gallery_rain` cloud was still "very iridescent, bars of colour running all through it" — every beam in an achromatic cloud was a single spectral sample, and **more `-spp` could never fix it**
 
 **Reported as** *"the clouds are still rendering very iridescent, there are bars of color running
@@ -295,6 +334,52 @@ correct the "now free" sentence. (c) Sweep `-beamblur` (0.01 default, and e.g. 0
 that gathers ~32 again) against cloud speckle, and record the speed/quality curve, since that is
 now the main per-frame lever on this scene. `-savemap`/`-loadmap` makes the sweep cheap: the
 forward pass is banked once and every `-beamblur` re-solves the kernel from the same file.
+
+**UPDATE 2026-09-02 (0.210.0): (a) and (b) are DONE, (c) is done and came out the opposite way
+to the premise.** The showcase budget was re-measured on the still `cam` at 960x540 / `-n 200M`:
+**24:08 for 4 spp = 6.03 min/spp**, i.e. ~2.4 h/frame at `-spp 24` and ~60 days for the
+600-frame loop. The header now carries that, and the preview number, and no longer says the
+grain is "free".
+
+The `-beamblur` sweep (one banked `-savemap`, four radii re-gathered through `-loadmap`, so the
+beam population is identical across rows) produced:
+
+| `-beamblur` | beams/probe | 4-spp gather | min/spp | speckle | saturation |
+|---|---|---|---|---|---|
+| 0.01 (default) | 8534.6 | 24:08 | 6.03 | 1.094 | 0.0233 |
+| 0.005 | 4263.2 | 14:37 | 3.65 | 1.585 | 0.0249 |
+| 0.0025 | 2125.8 | 8:38 | 2.16 | 2.030 | 0.0265 |
+| 0.00125 | 1080.1 | 5:37 | 1.40 | 2.536 | 0.0285 |
+
+Three results, all of which contradict something the header previously asserted:
+
+1. **Beams gathered is LINEAR in the radius, not quadratic** (ratios 2.00 / 2.01 / 1.97). A beam
+   is a *line*: the number of lines piercing a gather cylinder of radius r and length L goes as
+   `r*L`, not `r^2`. The header's "~quadratic in `-beamblur`" is now corrected.
+2. **Time is SUB-linear in beams gathered** — 8x fewer beams buys only 4.3x less time — because
+   the split is `-beamsplitmax`-saturated at every radius, so the BVH barely shrinks (15.3M →
+   14.8M nodes) and you pay near-full traversal to collect fewer samples.
+3. **Shrinking the radius is a LOSS, not a trade.** `-beamblur 0.00125` at `-spp 16` finished in
+   **16:03 — less wall time than the default's 4 spp at 24:08** — and was still far grainier
+   (speckle 1.925 vs 1.094). Fitting `speckle^2 = s0^2 + k/spp` to the two small-radius points
+   (2.536 @ 4 spp, 1.925 @ 16 spp) gives `k = 14.5` and an **irreducible floor `s0 = 1.67`** —
+   worse than the default radius reaches at 4 spp and unreachable at *any* `-spp`. Same
+   mechanism as the `-beamachro` finding directly above: the beam map is traced once and is
+   view-independent, so extra spp re-gather the *same beams*; the radius fixes how many beams
+   are averaged per gather point, and that error is a fixed function of the beam set rather than
+   a variable resampled per sample. **So `-beamblur` is not a speed knob** — it converts
+   spp-reducible noise into a permanent floor.
+
+**Which retires the "sweep `-beamblur` for speed" idea and replaces it with a different one.**
+The floor goes as `1/sqrt(beams gathered)`, and beams gathered goes as (beam density x radius).
+Density comes from `-n`, which mode M pays **once for all 600 cameras** while the gather is paid
+per frame — so raising `-n` and cutting `-beamblur` in *lockstep* should hold the floor constant
+while cutting per-frame cost. **Still unconfirmed:** the `-n 800M` arm never reached its gather,
+for the reason logged in the entry at the top of this file. That is now the open follow-up.
+
+**Also validated in passing:** `-loadmap` reproduces a fresh deposit — the banked `blur 0.01`
+arm measured speckle 1.094 / saturation 0.0233 against 1.102 / 0.0229 for an independently
+traced run at the same settings.
 
 ### OPEN (2026-09-01, v0.204.0): on `gallery_rain` the aimed caustic pass cannot concentrate — ~275 k of ~275 k prims are flagged "focusing", most of them the gyroid *diffuser*
 
