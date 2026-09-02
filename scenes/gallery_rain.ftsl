@@ -188,16 +188,48 @@
 # the old behaviour bit-for-bit if you want the crisper single-scatter bow.
 # The one caveat that still keeps D the reference here is that mode M carries directly-seen
 # glass and chrome differently from D (see the sun discussion above). So: mode D for the
-# finished piece, `-mode M -beams` when you want the whole loop in under an hour instead of
-# most of a day.
+# finished piece, and `-mode M -beams` when you want the FORWARD pass shared across the loop.
+# It used to say "when you want the whole loop in under an hour instead of most of a day" --
+# no longer true at 960x540 and the default `-beamblur` (~29 h; see the re-measurement below),
+# because the shared pass is ~30 s for all 600 cameras and the whole cost is the per-frame
+# gather. The amortisation works exactly as advertised; the gather got ~26x more expensive in
+# 0.201.0. `-beamblur` is the knob that trades it back.
 #
 # GPU. `-beams` WAS CPU-only and this header said so, until 0.197.0 ported BOTH halves (the
 # beam deposit and the beam gather) to CUDA -- there is a device beam BVH now and the GPU
 # mode-M meter no longer carves out, so `-device gpu` is correct here and is what you want.
-# MEASURED at 0.198.0 on an RTX 4090 with the exact command below (960x540, -spp 6,
-# -n 20000000): 15224 beams stored -> 367540 sub-beams after split, 236293 BVH nodes uploaded
-# for the volume gather, then a steady 5.0 s/frame -- ~50 min for the 600-frame loop, against
-# ~7.6 h under D. The GPU flyby command, verified end to end:
+# RE-MEASURED 2026-09-02 at 0.209.0 on an RTX 4090 with the exact command below (960x540,
+# -spp 6, -n 20000000): 264022 beams stored -> ~6.2M sub-beams after split, ~4.0M BVH nodes
+# uploaded for the volume gather, then ~29.5 s per spp => ~3.0 min/frame, ~29 h for the
+# 600-frame loop. Against ~7.6 h under D -- so at THIS budget M is no longer the fast option
+# and the "whole loop in under an hour" claim above is gone; see below for why, and for the
+# knob that brings it back.
+#
+# WHAT THE OLD NUMBER SAID AND WHY IT WAS WRONG. This slot used to read "15224 beams stored
+# -> 367540 sub-beams, 236293 BVH nodes, then a steady 5.0 s/frame -- ~50 min for the
+# 600-frame loop", measured at 0.198.0. Three things happened to it, and nobody re-measured:
+#   * 0.199.0 (ac5446b) retuned the cloud in the SAME commit as the analog multiple-scattering
+#     fix: albedo 0.92 -> 0.9964. That is correct physics -- water's single-scattering albedo
+#     really is 0.999+ -- but it takes a photon's expected survival from ~12 scatters to ~278,
+#     and beams stored went 15224 -> 264022 (17x), sub-beams 367540 -> ~6.2M, BVH nodes
+#     236293 -> ~4.0M. Only ~1.8x of that 17x is the multiple scattering itself: `-beams-order
+#     1`, the old single-scatter deposit, stores 145873. The rest is the albedo.
+#   * 0.201.0 (ddc9bc7) replaced "solve the kernel radius for -beamk gathered beams" with
+#     "radius = -beamblur x the medium's own measured mean free path". Here that is 0.0129 m,
+#     at which a probe gathers 843.9 beams instead of 32 -- ~26x the per-probe gather work,
+#     and the gather is the ONLY part of mode M that is paid per frame. The paragraph further
+#     down that says the grain this used to cost "is now free" is WRONG in exactly that way:
+#     it is not free, it is bought with a ~26x larger per-frame gather.
+#   * 0.209.0 fixed a slice-occupancy bug that had been costing a further 6x on top (the GPU
+#     gather was launching 8101-sample slices into a 262144-thread grid). Any per-frame number
+#     taken between 0.201.0 and 0.209.0 is therefore wrong twice over.
+# `-beamblur` (default 0.01) is consequently the main per-frame SPEED knob on this scene and
+# not only a quality knob -- gather cost is ~linear in beams gathered, which goes as the
+# radius squared. `-savemap`/`-loadmap` banks the forward pass so a sweep of it costs one
+# deposit. See known-issues.md, "every performance number in scenes/gallery_rain.ftsl's
+# header is stale".
+#
+# The GPU flyby command, verified end to end:
 #   ftrace -in scenes/gallery_rain.ftsl -camera fly -mode M -device gpu -beams \
 #          -n 20000000 -spp 6 -window -keepwindow -interval 15 \
 #          -o png/gallery_rain.png
@@ -231,11 +263,18 @@
 #     per-frame, linearly, with `-beamk`. The radius now comes from each medium's MEASURED
 #     mean free path (`-beamblur`, default 0.01), and on this scene that is 1.29 m for the
 #     cloud and 1.73 m for the rain, at which the probe already gathers ~1730 beams. A
-#     `-beamk` FLOOR of 256 is far below that and never binds. The grain the flag used to buy
-#     is now free, and `-n` reduces it for real (-21% for 4x the photons, against -6.8% under
-#     the old rule). Leaving `-beamk 256` in the command is harmless; dropping it changes
-#     nothing. See known-issues.md, "the gallery_rain cloud rendered as full-saturation RGB
-#     speckle".
+#     `-beamk` FLOOR of 256 is far below that and never binds. Leaving `-beamk 256` in the
+#     command is harmless; dropping it changes nothing. And `-n` reduces the grain for real
+#     now (-21% for 4x the photons, against -6.8% under the old rule). See known-issues.md,
+#     "the gallery_rain cloud rendered as full-saturation RGB speckle".
+#     THIS USED TO SAY THE GRAIN THE FLAG BOUGHT IS "NOW FREE". IT IS NOT FREE -- CORRECTED
+#     2026-09-02. Gather cost is ~linear in beams gathered, so going from a radius solved for
+#     32 to one that gathers 843.9 (at -n 20M; ~1730 at -n 200M) multiplied the per-frame
+#     gather by ~26x. That is a real and defensible trade -- the radius is now a physical
+#     scale that does not move with `n`, which is the whole reason more `-n` finally helps --
+#     but it is a trade, and it is why the 5.0 s/frame at the top of this header became
+#     minutes. It also makes `-beamblur` the per-frame SPEED knob here: halving it quarters
+#     the beams gathered.
 #   * `-denoise` fixes the residual chroma speckle for ~1% of frame time -- it is the single
 #     best quality-per-second flag in the list. `-fireflies 3` measured the same (4.48 vs
 #     4.46) and additionally clamps, so prefer plain -denoise unless you see fireflies.
@@ -250,10 +289,16 @@
 #          -beamcount 8000000 -beamsplitmax 24000000 -denoise \
 #          -r 960 540 -window-min -keepwindow -interval 15 \
 #          -o png/gallery_rain_showcase.png
-# MEASURED: 153 s/frame => ~25.5 h for the 600-frame loop (against ~50 min for the preview
-# budget above, and ~7.6 h for mode D at -spp 140 -- D is still the reference, this is the
-# "M can look finished too" budget). Scale it by hand: per-frame cost is LINEAR in -spp, in
-# -beamk and in pixels, so halving -spp to 12 halves the loop to ~13 h.
+# The "153 s/frame => ~25.5 h for the 600-frame loop" that used to sit here is STALE and has
+# NOT been re-measured at 0.209.0 -- it predates the same three changes as the preview number
+# above (0.199.0's cloud albedo, 0.201.0's kernel radius, 0.209.0's slice-occupancy fix), so
+# it is wrong in both directions at once and should not be quoted. RE-MEASURE IT BEFORE
+# PLANNING A RUN AGAINST IT. What is still true: per-frame cost is LINEAR in -spp and in
+# pixels, and ~quadratic in `-beamblur` (via beams gathered), and mode D at -spp 140 is
+# ~7.6 h for the loop -- D remains the reference, this is the "M can look finished too"
+# budget. Scale the preview measurement instead: ~29.5 s/spp at -n 20M, times whatever -spp
+# you pick, plus whatever `-n 200M` costs the gather (more stored beams under a fixed
+# radius = more beams gathered per probe, so it is NOT free at gather time either).
 #
 # WHY 960x540 AND NOT 1080p -- this is a HOST RAM ceiling, not a taste call. Read it as a
 # COMMIT ceiling rather than a physical-RAM one: what refuses the allocation is Windows' commit

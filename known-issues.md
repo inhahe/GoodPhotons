@@ -5,6 +5,153 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-09-02, v0.209.0): the mode-`M` GPU gather starved its own launches — an adaptive slice controller drove the slice to 3 % occupancy and cost **11x** throughput
+
+**Context.** `renderPhotonMapSharedCuda` slices each spp into sub-chunk `kGather` launches so
+an external `ftrace -stop` has a seam to land on: the outer chunk size has already clamped to a
+single spp at any real resolution, so without slicing the shortest possible stop latency was one
+entire frame of gathering. The slice size adapts, retargeting ~0.25 s of GPU work per launch,
+with a floor of `npix >> 6` (1/64 spp).
+
+**The problem.** `kGather` launches a **persistent grid of `2048 x 128` = 262 144 threads** and
+grid-strides over the slice's sample range. At 960x540 the floor slice is `518400 >> 6` =
+**8 101 samples — 3.1 % of those threads**. The other 96.9 % have nothing to do, throughput
+collapses, the 0.25 s target becomes unreachable at *any* size the controller is willing to try,
+so it shrinks the slice again and pins it at the floor. **The control loop drives its own
+input**: the knob it turns to reduce latency is the knob causing the latency.
+
+Measured on `gallery_rain` (960x540, `-mode M -device gpu -beams -n 20M`, RTX 4090), one frame,
+identical work, via the new `FTRACE_CHUNK_DEBUG=2` slice trace:
+
+| slice size | samples/s |
+|---|---|
+| 503 904 (whole frame in one launch) | **16 927** |
+| 129 616 | **40 165** |
+| 8 101 (the old `npix>>6` floor), sky band | 5 372 – 14 270 |
+| 8 101 (the old `npix>>6` floor), cloud band | **631 – 1 224** |
+
+**It also alternated spp to spp, which is what made it so confusing to diagnose.** Whether a spp
+ran starved or fast depended on whether the *previous* chunk's leftover tail slice happened to be
+small enough to time as "too fast to measure", which takes the `4x` growth branch outright and
+let the size climb back. Four consecutive, identical spp of the same frame:
+
+| spp | wall | samples/s | slices |
+|---|---|---|---|
+| 1 | **5:34** | 1 550 | 50 |
+| 2 | **29.8s** | 17 414 | 3 |
+| 3 | **5:21** | 1 615 | ~50 |
+| 4 | **28.6s** | 18 134 | 3 |
+
+713 s for the frame against ~117 s if every spp had run unstarved — and the two costs are the
+same image, since every seed is a pure function of the global sample index and slicing changes no
+sample. Because the `[gather]` progress line reports only at whole-spp boundaries *and* only on a
+~30 s log cadence, a fast spp's line was routinely throttled away and merged into its neighbour,
+so from the log alone the alternation read as "one slow spp" and the 11x was invisible.
+
+**Fix (v0.209.0).** The floor is now an **occupancy** floor rather than a fraction of the frame:
+`sliceLo = max(npix>>6 + 1, 4 * kGatherGrid * kGatherBlock)`, with the launch geometry named as
+`kGatherGrid`/`kGatherBlock` constants next to `kGather` so the floor cannot drift away from the
+launch it is sizing for.
+
+**Four samples per thread, not one** — filling the grid once turned out to be necessary but not
+sufficient. `kGather` is wildly divergent (a probe ray through the cloud gathers ~840 beams, one
+aimed at the floor gathers none) and the grid-stride loop is the only load balancing in it, so
+with exactly one sample per thread there is nothing to hand a thread that finished early. A
+floor of `1 x grid` already recovered most of the loss; `4 x grid` recovered the rest:
+
+| floor | spp 1 | spp 2 | spp 3 | spp 4 | frame |
+|---|---|---|---|---|---|
+| `npix>>6` = 8 101 (before) | 5:34 | 29.8s | 5:21 | 28.6s | **713 s** |
+| `1 x grid` = 262 144 | 46.8s | 46.7s | 45.9s | 42.5s | 182 s |
+| `4 x grid` = 1 048 576 (shipped) | **32.0s** | **28.4s** | **29.1s** | **29.2s** | **119 s** |
+
+**6.0x end to end, 10.4x on a starved spp, and flat spp to spp** — which matters more than the
+mean for a 600-frame flyby, because a per-frame cost that alternates 10x makes every ETA a lie.
+The image is unchanged: RMS **0.70/255** (mean abs 0.09) against the pre-fix render, which is the
+scene's own pre-existing run-to-run beam-split variation (see the entry below), not the fix.
+
+**The stop seam it costs is small and worth stating plainly**: the worst single launch goes from
+12.8 s (a floor slice in the cloud band) to 32 s (a whole spp), still comfortably inside the
+120 s `-stop` wait — and the frame that seam sits inside now finishes 6x sooner, so a stop lands
+sooner in wall clock either way.
+
+### OPEN (2026-09-02, v0.209.0): the beam **split** is not reproducible run to run, so `-beams` renders of an identical command line differ
+
+**Observed.** Three runs of the identical command (`gallery_rain`, `-mode M -device gpu -beams
+-n 20000000`) deposit **exactly** 264 022 beams every time — the forward pass is deterministic —
+but split them into **6 208 839**, **6 286 537** and **6 168 032** sub-beams (and correspondingly
+3 998 465 / 4 047 745 / 3 970 653 BVH nodes), a ~1.9 % spread. The rendered frames then differ by
+RMS ~0.7/255. That is small, but it means `-beams` renders are **not** bit-reproducible even on
+`-device gpu` with a fixed seed, so an A/B of any other change carries a ~0.7/255 noise floor and
+a regression smaller than that cannot be detected at all.
+
+**Where to look.** `src/photonbeams.h`, the split introduced by `eeac6ec` (0.196.0, "split beams
+at each beam's area optimum, with a work term"): the per-beam split count is chosen from an area
+optimum against a global budget, so anything that makes the *global* term depend on parallel
+reduction order (a float sum accumulated across threads, a `ft::parallelFor` chunk cursor) will
+move split counts near the rounding boundary. The fix is to make the split decision a pure
+function of the beam and a deterministically-computed scalar — reduce in a fixed order, or
+compute the budget scalar in a serial pass — not to reseed anything.
+
+**Diagnostic added in the same change.** `FTRACE_CHUNK_DEBUG=1` now reports per-**spp** cost from
+this gather (it previously covered only `gpuSppChunks`), and `=2` reports every slice's sample
+range, wall time and rate. That trace is what made the cause visible in one run after the
+throttled log had been argued about from differenced timestamps; see `scraps/spp_bands.sh` for a
+summariser. Documented in `REFERENCE.md` under *Backends & performance*.
+
+### OPEN (2026-09-02, v0.209.0): every performance number in `scenes/gallery_rain.ftsl`'s header is stale by up to ~250x, and the header actively asserts the opposite
+
+**Context.** The scene header carries "MEASURED at 0.198.0 ... 15224 beams stored -> 367540
+sub-beams after split, 236293 BVH nodes uploaded ... then a steady **5.0 s/frame** -- ~50 min for
+the 600-frame loop" for the preview flyby, and "**153 s/frame** => ~25.5 h" for the showcase
+budget. Re-measuring the *documented command verbatim* at 0.208.0 gave a per-frame gather in the
+hundreds of seconds, i.e. two orders of magnitude off.
+
+**What the user asked, and the part of it that is fine.** Mode `M`'s amortisation works exactly as
+advertised: the photon deposit, the aimed caustic pass, the photon-map build and the beam BVH are
+view-independent and **shared across every camera**, measured at **~30 s total for all 600
+cameras** (photons 3.75 s to 1 M at 8.6 M/s, beam BVH 6.2 s). Nothing about that is stale. What
+does *not* amortise is the **gather** — camera rays x pixels x spp — and that is where the entire
+per-frame cost lives.
+
+**Two changes since the header was written multiplied the per-frame gather, and neither was
+re-measured.**
+
+| | header (0.198.0) | now (`-n 20M`, same command) | ratio |
+|---|---|---|---|
+| beams stored | 15 224 | **264 022** | 17.3x |
+| sub-beams after split | 367 540 | **6 208 839** | 16.9x |
+| beam-BVH nodes | 236 293 | **3 998 465** | 16.9x |
+| beams gathered per probe ray | (`-beamk 32` solved for 32) | **843.9** | ~26x |
+
+1. **`ac5446b` (0.199.0)** changed the cloud *in the same commit* as the analog
+   multiple-scattering fix: `albedo 0.92 -> 0.9964`, `sigma_t 3.0 -> 2.78`, and the rainbow phase
+   from `supernumerary off` to `dispersion 0.577`. The albedo is correct physics — water's
+   single-scattering albedo really is 0.999+ — but it takes a photon's expected survival from
+   ~12 scatters to ~278, which is where the 17x beam population comes from. Only ~1.8x of it is
+   the multiple-scattering change itself (`-beams-order 1`, the pre-0.199.0 single-scatter
+   deposit, stores 145 873 beams / 493.8 per probe).
+2. **`ddc9bc7` (0.201.0)** replaced "solve the kernel radius for `-beamk` gathered beams" with
+   "radius = `-beamblur` x each medium's measured mean free path". On this scene that is 0.0129 m
+   for the cloud, at which a probe gathers **843.9** beams instead of 32. Beam-gather cost is
+   ~linear in beams gathered, so this is ~26x per probe ray, paid **every frame**.
+
+**The header states the opposite in as many words**, and that is the part that most needs fixing:
+"the probe already gathers ~1730 beams. A `-beamk` FLOOR of 256 is far below that and never
+binds. **The grain the flag used to buy is now free**". The grain is not free — it is bought with
+a ~26x larger per-frame gather. The radius change is defensible (`-beamblur` is a physical scale
+that doesn't move with `n`, which is what made more `-n` finally reduce beam noise), but its cost
+must be stated, and `-beamblur` must be documented as the *speed* knob it also is: halving it
+quarters the gathered count.
+
+**What to do.** (a) Re-measure the preview and showcase flybys on 0.209.0 — which now also
+carries the 11x slice-occupancy fix above, so any number taken before it is wrong twice — and
+rewrite the header's `5.0 s/frame` / `153 s/frame` / `~50 min` / `~25.5 h` claims. (b) Delete or
+correct the "now free" sentence. (c) Sweep `-beamblur` (0.01 default, and e.g. 0.002 for a radius
+that gathers ~32 again) against cloud speckle, and record the speed/quality curve, since that is
+now the main per-frame lever on this scene. `-savemap`/`-loadmap` makes the sweep cheap: the
+forward pass is banked once and every `-beamblur` re-solves the kernel from the same file.
+
 ### OPEN (2026-09-01, v0.204.0): on `gallery_rain` the aimed caustic pass cannot concentrate — ~275 k of ~275 k prims are flagged "focusing", most of them the gyroid *diffuser*
 
 **Context.** `-causticn` (0.203.0 CPU, 0.204.0 GPU) emits extra photons aimed at focusing

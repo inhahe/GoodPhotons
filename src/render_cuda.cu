@@ -12389,6 +12389,13 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
 // with -beams — which is what made a perfectly healthy stop look like a failure. Every
 // seed here is a pure function of the GLOBAL index gidx, never of the launch bounds, so a
 // sliced chunk samples exactly the same paths as an unsliced one.
+//
+// The launch geometry is named because the SLICE SIZE MUST NOT FALL BELOW IT. This is a
+// persistent grid that grid-strides over its sample range, so a slice with fewer samples
+// than there are threads leaves threads idle outright — see the sliceLo comment in
+// renderPhotonMapSharedCuda for the 11x that cost before the floor was tied to this.
+static constexpr int kGatherGrid  = 2048;
+static constexpr int kGatherBlock = 128;
 __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, DCamera cam,
                         double* film, double* hits,
                         long long idxBase, long long idxEnd,
@@ -16880,6 +16887,16 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             out[c].xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
     };
     const bool live = (prog && prog->report);
+    // Diagnostic twin of gpuSppChunks' FTRACE_CHUNK_DEBUG, and for the same reason: this
+    // gather reports only at whole-spp boundaries AND only on the ~30 s log cadence, so an
+    // spp whose line is throttled away merges into its neighbour and two very differently
+    // priced samples read as one. That is not hypothetical — it is how a claimed 10x
+    // per-spp cost difference on gallery_rain came to be argued about from differenced log
+    // timestamps rather than measured. Set FTRACE_CHUNK_DEBUG=1 for every spp's wall time,
+    // =2 for every SLICE's as well (sample range + rate), which is what exposes the
+    // per-scanline-band cost structure inside one spp.
+    const int chunkDebug = [] { const char* e = std::getenv("FTRACE_CHUNK_DEBUG");
+                                return (e && *e) ? std::atoi(e) : 0; }();
     auto lastReport = std::chrono::steady_clock::now();
     bool stopped = false;
     // Learned sub-chunk slice (flat (pixel, sample) units), carried ACROSS cameras: on a
@@ -16910,8 +16927,44 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         // well past the -stop wait, which is exactly how a healthy render came to be
         // reported as a failed stop. Seeds depend only on the global sample index, so
         // slicing changes no sample: the image is the one an unsliced gather produces.
-        const long long sliceLo = ((long long)npix >> 6) + 1;             // never finer than 1/64 spp
+        //
+        // THE FLOOR IS AN OCCUPANCY FLOOR, NOT A FRACTION OF THE FRAME, and getting that
+        // wrong cost an order of magnitude. kGather launches a PERSISTENT grid of
+        // kGatherGrid x kGatherBlock threads and grid-strides over [i, hi): a slice holding
+        // fewer samples than that leaves the surplus threads with literally nothing to do,
+        // so throughput falls off a cliff and the 0.25 s target becomes unreachable — at
+        // which point the controller shrinks the slice again, which starves the device
+        // further. The loop drives its own input. Measured on gallery_rain (960x540,
+        // -beams, RTX 4090), one frame, identical work:
+        //
+        //     slice 503904 (whole frame, one launch)   16927 samples/s
+        //     slice 129616                             40165 samples/s
+        //     slice   8101 (the old npix>>6 floor)       631-1224 samples/s   <- 3% of the grid
+        //
+        // i.e. 334 s for a frame sliced at the old floor against 29.8 s for the same frame
+        // in one launch — an 11x tax for nothing, and it alternated spp to spp depending on
+        // whether the previous chunk's tiny tail slice happened to time as "too fast to
+        // measure" and let the size grow back. Measured end to end on that frame at -spp 4:
+        // 713 s before, 119 s after (6.0x), and flat spp to spp instead of 334/30/321/29.
+        //
+        // The stop seam it buys back is small and worth stating honestly: the worst single
+        // launch goes from 12.8 s (a floor slice in the cloud band) to 32 s (a whole spp),
+        // still comfortably inside the 120 s `-stop` wait, and the frame it is a seam
+        // *within* now finishes 6x sooner — so a stop lands sooner in wall clock either way.
+        //
+        // FOUR samples per thread, not one. Filling the grid once is necessary but not
+        // sufficient: kGather is wildly divergent (a probe ray through the cloud gathers
+        // ~840 beams, one aimed at the floor gathers none), and the grid-stride loop is the
+        // only load balancing there is — with one sample per thread it has nothing to hand
+        // a thread that finished early, and the launch costs its slowest ray. Measured on
+        // the same frame: 262144 samples (1.0/thread) ran the top half at 16085/s and the
+        // bottom half at 8428/s, 46.7 s for the spp; one 503904-sample launch (1.9/thread)
+        // covering BOTH did it at 16927/s, 29.8 s — 1.57x for nothing but a bigger slice.
+        const long long sliceOcc = 4ll * kGatherGrid * kGatherBlock;
+        const long long sliceFrac = ((long long)npix >> 6) + 1;
+        const long long sliceLo = (sliceFrac > sliceOcc) ? sliceFrac : sliceOcc;
         if (slice < sliceLo) slice = ((long long)npix >> 4) + 1;          // first probe: 1/16 spp
+        if (slice < sliceLo) slice = sliceLo;
         long long sppDone = 0;
         bool abandoned = false;
         // Name the gather in the window title / log, with a measure.
@@ -16934,13 +16987,15 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         for (long long base = 0; base < spp; base += chunk) {
             long long cs2 = (base + chunk <= spp) ? chunk : (spp - base);
             long long total = (long long)npix * cs2;
+            const auto ct0 = std::chrono::steady_clock::now();
             CUDA_CHECK(cudaMemset(s_film, 0, npix * 3 * sizeof(double)));
             CUDA_CHECK(cudaMemset(s_hits, 0, npix * sizeof(double)));
             bool chunkDone = true;
             for (long long i = 0; i < total; ) {
                 const long long hi = (i + slice < total) ? (i + slice) : total;
                 const auto t0 = std::chrono::steady_clock::now();
-                kGather<<<2048, 128>>>(up.sc, dpm, dpmC, dbm, hc, s_film, s_hits, i, hi, cs2, spp,
+                kGather<<<kGatherGrid, kGatherBlock>>>(
+                                       up.sc, dpm, dpmC, dbm, hc, s_film, s_hits, i, hi, cs2, spp,
                                        base, resX[c], diffraction ? 1 : 0, fgRays, seed);
                 cudaCheckKernel("photon-gather");
                 CUDA_CHECK(cudaDeviceSynchronize());   // the launch is async; time the WORK
@@ -16948,6 +17003,11 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                     std::chrono::steady_clock::now() - t0).count();
                 const long long did = hi - i;
                 i = hi;
+                if (chunkDebug >= 2)
+                    std::fprintf(stderr, "[chunk] gather c%d spp %lld..%lld slice [%lld,%lld) "
+                                 "%lld samples in %s (%.0f/s)\n", c + 1, base, base + cs2,
+                                 hi - did, hi, did, humanDur(sec).c_str(),
+                                 sec > 0 ? did / sec : 0.0);
                 // Only until the frame's first complete chunk exists: from there on `prog`
                 // below owns the caption and says strictly more (spp, photons, noise %).
                 //
@@ -16996,6 +17056,15 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             kFilmFold<<<256, 128>>>(d_film, d_hits, s_film, s_hits, (long long)npix);
             cudaCheckKernel("photon-gather-fold");
             sppDone = base + cs2;
+            if (chunkDebug >= 1) {
+                const double cdt = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - ct0).count();
+                std::fprintf(stderr, "[chunk] gather cam %d/%d spp %lld..%lld (%lld spp, "
+                             "%lld samples) in %s (%.0f samples/s)\n", c + 1, nc, base,
+                             sppDone, cs2, total, humanDur(cdt).c_str(),
+                             cdt > 0 ? total / cdt : 0.0);
+                std::fflush(stderr);
+            }
             const bool frameDone = (sppDone >= spp);
             const bool stopNow = ft::stopRequested();
             // Live view: after a chunk, hand the host the frame-so-far so it can refresh the

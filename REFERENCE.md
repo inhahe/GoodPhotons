@@ -1183,6 +1183,18 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   extend/shade passes over a persistent photon pool and wins on **divergent /
   deep-path scenes and smaller GPUs**. Their RNG streams differ, so their images
   match only to within Monte-Carlo noise.
+- **`FTRACE_CHUNK_DEBUG` / `FTRACE_CHUNK_SPP` (diagnostics).** Progressive renders split
+  the sample budget into chunks sized by wall clock, and the normal progress line reports
+  only at chunk boundaries *and* only on a ~30 s log cadence — so a chunk whose line is
+  throttled away merges into its neighbour, and two very differently priced samples read as
+  one. `FTRACE_CHUNK_DEBUG=1` prints every chunk's size and wall time to **stderr**
+  (`[chunk] …`), which is what you want the moment a frame costs more than it should;
+  `FTRACE_CHUNK_SPP=<n>` pins the split instead of adapting it, so a measurement isn't at
+  the mercy of the clock. In **mode `M`**'s shared-photon-map GPU gather the same variable
+  reports per-**spp** cost, and `FTRACE_CHUNK_DEBUG=2` additionally reports every internal
+  *slice* (sample range + samples/s), which exposes the per-scanline-band cost structure
+  inside a single spp — on a scene with a dense participating-medium band the sky and the
+  cloud can differ by more than 10x, and only the slice trace shows it.
 
 ---
 
