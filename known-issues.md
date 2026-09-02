@@ -16,13 +16,17 @@ ftrace -in scenes/gallery_rain.ftsl -camera cam -mode M -device gpu -beams \
        -o png/blur/n800_b0025.png
 ```
 
-**READ THE CONFOUND FIRST.** Partway through this run the machine acquired **44 concurrent CUDA
-contexts** from other work, leaving **518 MiB of 24564 MiB VRAM free**. Every wall-clock number
-below was therefore taken on a GPU that ftrace did not have to itself, and none of them is a
-sound measurement of ftrace's scaling. **Do not quote the timings; re-measure on a quiet GPU
-before treating any of this as a performance defect.** What survives the confound is the
-*structural* claim — the absence of output and of a stop seam in a specific code region — because
-that is readable in the source and does not depend on timing.
+**THE "CONTENDED GPU" CONFOUND IS RETRACTED — the timings are real.** An earlier draft of this
+entry warned that the machine had **44 concurrent CUDA contexts** and only **518 MiB of 24564 MiB
+VRAM free**, and told future readers not to quote any timing until it was re-measured on a quiet
+GPU. That was wrong, and `nvidia-smi pmon -s um` settles it: the other 43 contexts are
+`chrome.exe`, `msedge.exe`, `msedgewebview2.exe`, `Discord.exe`, `PowerToys.*`, `Docker
+Desktop.exe`, `explorer.exe` and friends, **every one of them at 0% sm**. Chromium/Electron apps
+hold a CUDA/D3D context permanently and consume VRAM without consuming SM time. The one process
+at **sm 99% was ftrace itself**. So ftrace effectively had the device, the wall-clock numbers
+below are ftrace's own cost, and the ~50 min pre-gather stretch at 351M stored photons is a real
+performance finding rather than starvation. **Lesson: context count and free VRAM say nothing
+about contention; only per-process `sm%` does.**
 
 **What was observed.** The forward pass and the aimed caustic pass print progress normally and
 finish in ~2 min. The process then printed **nothing** for ~50 minutes before emitting the
@@ -111,14 +115,34 @@ gone.
   film download when the sample count is 0) and replaces the stale `building beam map…` caption
   the instant the gather begins, instead of one spp later. This is the actual fix for the
   symptom the 17059-17069 comment set out to solve.
-- **(c) Decide what the slice floor should do when `sliceOcc >= total`.** Right now the frame
-  silently becomes one uninterruptible launch. The occupancy argument in the 17018-17049 comment
-  is sound and must not be undone — a slice below `sliceOcc` genuinely starves the grid — so the
-  answer is probably *not* to shrink the slice, but to (i) raise `chunk` so `total` exceeds
-  `sliceOcc` and the loop gets real slices again (at 960x540, `chunk = 2` gives `total =
-  1036800`, just under two slices), or (ii) accept the single launch but make (a) and (b)
-  unconditional so it is at least captioned and promptly stoppable at its boundaries. Prefer
-  (i)+(a)+(b): it restores the seam *and* keeps the grid full.
+- **(c) STILL OPEN, and confirmed worse than described: the gather has no stop seam at all at
+  ordinary resolutions.** (a) and (b) landed in **v0.210.1** and are verified, but they only
+  make a stop free when it arrives *before or between* launches. A stop arriving *during* one
+  still waits it out, and `sliceOcc >= total` means there is generally only ONE launch:
+
+  | resolution | `npix` | `chunk` | `total` | `sliceOcc` | launches |
+  |---|---|---|---|---|---|
+  | 960x540 | 518400 | 1 | 518400 | 1048576 | 1 per spp |
+  | 320x180 | 57600 | 3 | 172800 | 1048576 | **1 for the whole 3-spp render** |
+
+  Measured on the v0.210.1 verification run at 320x180: a `-stop` issued ~1 min into the gather
+  had still not landed **8+ minutes** later, with the caption frozen at `0 / 172.8k (0%), 0.00s`
+  — no slice had completed because there is only one, spanning every sample in the render.
+
+  **Do not "fix" this by shrinking the slice.** The occupancy argument at 17018-17049 is
+  measured and sound: a slice below `sliceOcc` leaves most of the persistent grid idle and cost
+  an 11x throughput regression when it was tried. Raising `chunk` is also wrong — it makes the
+  single launch *bigger*.
+
+  **The proper fix is device-side cooperative cancellation**, which removes the tension entirely
+  rather than trading one side of it away: allocate the stop flag in mapped pinned host memory
+  (`cudaHostAlloc(..., cudaHostAllocMapped)` + `cudaHostGetDevicePointer`), pass the device
+  pointer into `kGather`, and have its grid-stride loop test it every N samples and return
+  early. Any host thread can then raise the flag with a plain store — no CUDA call, so it works
+  while the launching thread is parked in `cudaDeviceSynchronize`. One poller thread for the
+  whole gather, polling `ft::stopRequested()`, is enough. The abandoned partial chunk is already
+  handled correctly by the existing `chunkDone = false` path, so nothing downstream changes, and
+  stop latency drops from "one whole launch" to microseconds at any slice size.
 - **(d) Give the pre-gather region (photon-map build, caustic map, beam split, BVH build/upload)
   the same treatment** — stop polls and a self-naming stage line — so the ~50 min of silence
   before the upload line is also observable and interruptible. This is the second, separate

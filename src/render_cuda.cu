@@ -16991,6 +16991,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // 600 needlessly small launches for nothing. Re-clamped to the camera's own npix below.
     long long slice = 0;
     for (int c = 0; c < nc && !stopped; ++c) {
+        // A stop pending before the first camera must not buy four device allocations and a
+        // camera bake it will only throw away. `stopped` is seeded false and is only ever set
+        // from inside the loop, so without this the flag is invisible on the first iteration.
+        if (ft::stopRequested()) { stopped = true; break; }
         DCamera hc = bakeCamera(scene, cams[c], resX[c], resY[c], up);
         const size_t npix = (size_t)resX[c] * resY[c];
         double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
@@ -17067,10 +17071,29 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         // single-threaded host build that will not end. A stage line fires every 0.25 s from
         // inside the slice loop instead, so the gather names itself from its first quarter
         // second, and (on the 30 s log cadence) a headless run's log says so too.
+        //
+        // THAT LAST SENTENCE WAS WRONG AND THE BUG SURVIVED IT — see the report added just
+        // before the `base` loop below. "Every 0.25 s from inside the slice loop" assumes the
+        // slice loop ITERATES; where `sliceOcc >= total` it does not, and the first report is
+        // one whole spp away, which is exactly the symptom described above. The report before
+        // the first launch is what actually fixes it; this one refines the caption afterwards.
         const long long sampTotal = (long long)npix * spp;   // pixel-samples in this frame
         char stageText[96];
         std::snprintf(stageText, sizeof stageText, "gathering frame %d/%d", c + 1, nc);
         if (stage && stage->reset) stage->reset();   // rate/ETA measured from THIS phase
+        // Name the gather BEFORE the first launch, not after it.
+        //
+        // The report below fires from inside the slice loop, i.e. only once a launch has
+        // already RETURNED — and wherever `sliceOcc >= total` the loop runs exactly once and
+        // covers the whole frame, so "after the first launch" is one entire spp away. That is
+        // the case at every ordinary resolution: at 960x540, total = 518400 while sliceOcc =
+        // 4*2048*128 = 1048576, twice the frame. So the caption the previous phase left
+        // behind (`building beam map…`) stayed up for the whole first sample — measured at
+        // 45+ minutes on gallery_rain at -n 800M, with a render in perfect health behind it.
+        // Fixing the 17109 report was never going to help; it is on the wrong side of the
+        // launch. This one costs nothing: done/total = 0 is the documented "no meaningful
+        // measure yet" encoding, and passing a null `partial` means no film download.
+        if (stage && stage->report) stage->report(stageText, 0, sampTotal, nullptr, 0.0);
         for (long long base = 0; base < spp; base += chunk) {
             long long cs2 = (base + chunk <= spp) ? chunk : (spp - base);
             long long total = (long long)npix * cs2;
@@ -17079,6 +17102,16 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             CUDA_CHECK(cudaMemset(s_hits, 0, npix * sizeof(double)));
             bool chunkDone = true;
             for (long long i = 0; i < total; ) {
+                // Honour a stop that arrived BEFORE or BETWEEN launches, without paying a
+                // launch first. The post-launch poll further down is guarded by `i < total`,
+                // which is never true wherever `sliceOcc >= total` — the loop runs once and
+                // covers the frame — so a stop that was already pending when the gather
+                // STARTED still cost a full spp before anything looked at the flag. That is
+                // not hypothetical: on gallery_rain at -n 800M the `[stop] external stop
+                // requested` line sits in the log immediately after the beam-BVH upload, i.e.
+                // the flag was set before this loop was entered, and the process still ran
+                // 45+ more minutes. Polling at the top makes such a stop free.
+                if (ft::stopRequested()) { chunkDone = false; break; }
                 const long long hi = (i + slice < total) ? (i + slice) : total;
                 const auto t0 = std::chrono::steady_clock::now();
                 kGather<<<kGatherGrid, kGatherBlock>>>(
