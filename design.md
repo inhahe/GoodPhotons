@@ -188,6 +188,19 @@ transmittance marches, now paid per camera *segment* per bounce rather than once
 as in mode `M`. Phase 3's weights will kill many hits before their marches (hence the ordering
 above), but this is the number to watch.
 
+**Phase 3 will replace the borrowed photon pass.** Phase 1 built the beam map with
+`tracePhotonPass` because that was the cheapest way to get *a* map; that is a scaffold, not the
+design. A balance-heuristic weight is a ratio of the densities with which competing techniques
+would have produced the same path, and a beam from `Renderer::tracePhoton` carries no densities
+and is not even drawn from the same distributions the connection half is weighted against — so
+the ratio would be between two things that are not comparable. Mode `J` will therefore trace its
+own light subpaths with the existing `randomWalk`, recording a `LightSeg` per bounce exactly as
+Phase 2 records a `CamSeg`, and depositing one **long** beam per (segment, medium) crossing.
+`tracePhotonPass` / `emitBeams` and their CUDA twins are then untouched, and `PhotonBeam` grows
+no fields on behalf of a mode that does not use them. See `known-issues.md` for the full
+argument, including why the beams must stay *long* (a short beam's stochastic length already
+carries `Tr`, which `beamgather.h` would then apply a second time).
+
 ## Module map (src/)
 
 - **`main.cpp`** (~6200) — CLI parsing (the option table is a chain of `else if`s split
