@@ -52,6 +52,7 @@
 #include "camera.h"
 #include "hero.h"     // kHeroC / kHeroMax — hero-wavelength bundle sizes
 #include "render.h"   // sampleGlossy, Renderer material primitives, clamp01, PI
+#include "photonbeams.h"  // BeamMap — mode J (UPBP) merges camera rays against photon beams
 
 namespace bdpt {
 
@@ -1668,6 +1669,12 @@ struct BdptRenderer {
     int maxDepth = 8;          // maximum path length in edges (connection cost ~ depth^2)
     bool diffraction = true;   // mirrors Renderer::diffraction for MatType::Grating
     int heroC = 1;             // wavelengths bundled per path pair (1 = plain single-λ)
+
+    // MODE J (UPBP): the view-independent photon-beam cache to merge camera rays against.
+    // Null (mode D) means connections only, and every line below that touches `beams` is
+    // then dead — which is the point, and is gate (1) of the UPBP validation plan in
+    // known-issues.md: an absent (or empty) beam map must leave mode D BIT-IDENTICAL.
+    const BeamMap* beams = nullptr;
 
     // `sampleBase` = absolute index of the first sample rendered here; each
     // (pixel, absolute sample) seeds its own stream via seedUnit(), so the

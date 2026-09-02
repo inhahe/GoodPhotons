@@ -12371,6 +12371,17 @@ static void warnWhittedDeHeroSpp(const Scene& scene, long long spp) {
 // shared kernel doesn't implement the per-camera resample yet).
 static bool g_beamGather = false;
 
+// -nobeams: the opt-OUT, which exists only because mode J opts IN by default.
+//
+// For modes A/B/M the beam map is an extra estimator layered on a render that is complete
+// without it, so it is off unless asked for. Mode J is the opposite: UPBP *is* connections
+// plus beam merges, and a mode-J render with no beam map is not a degraded UPBP, it is
+// literally mode D (the dispatch block says so in as many words). Requiring `-beams` there
+// would make the interesting half of the mode opt-in behind a flag whose absence silently
+// produces a different mode. So mode J defaults it on, and this flag turns it back off —
+// which is exactly what validation gate (1) needs to assert "J minus beams == D".
+static bool g_noBeams = false;
+
 #ifdef _WIN32
 // The console's ORIGINAL output code page, kept so it can be put back. The setting is
 // process-wide but the CONSOLE OUTLIVES THE PROCESS, so leaving it switched would quietly
@@ -12889,13 +12900,16 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
 // by the total light-subpath count (W*H*spp), matching mode B's splat convention. The
 // two normalised films sum to the final radiance; writeFilm(...,1.0) then only divides
 // by cieYIntegral for display, exactly like mode P's composite.
+// `beams` (mode J, UPBP) is the view-independent photon-beam cache to merge against; null
+// (mode D) is connections only and leaves every sample bit-identical.
 static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long spp, int nThreads, int maxDepth, bool diffraction = true,
-                       unsigned long long sampleBase = 0) {
+                       unsigned long long sampleBase = 0, const BeamMap* beams = nullptr) {
     std::vector<Film> camBands(nThreads), splatBands(nThreads);
     auto worker = [&](int tid) {
         bdpt::BdptRenderer br; br.maxDepth = maxDepth; br.diffraction = diffraction;
         br.heroC = g_heroC;   // renderRows applies the media/GRIN/lens gate itself
+        br.beams = beams;
         Film& cf = camBands[tid]; cf.resX = resX; cf.resY = resY; cf.alloc();
         Film& sf = splatBands[tid]; sf.resX = resX; sf.resY = resY; sf.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
@@ -13503,6 +13517,7 @@ static const char* modeLabel(char m) {
         case 'M': return "mode M (photon map)";
         case 'S': return "mode S (SPPM)";
         case 'U': return "mode U (VCM)";
+        case 'J': return "mode J (UPBP)";
         default:  return "";
     }
 }
@@ -14352,12 +14367,18 @@ static OnUnsupported g_onUnsupported = OnUnsupported::Error;
 
 // Core capability check: return a reason string if `mode` cannot render `scene` with a
 // camera of the given `projection`, else nullptr. Only modes with real restrictions (D
-// BDPT, U VCM) gate anything; the general modes (A/B/C/R/M/S/P) render everything here.
+// BDPT, J UPBP, U VCM) gate anything; the general modes (A/B/C/R/M/S/P) render everything.
 static const char* modeFeatureUnsupported(const Scene& scene, char mode, int projection) {
-    if (mode == 'D') {
+    // Mode J (UPBP) is mode D's transport plus beam merging, so it inherits D's scope
+    // EXACTLY — same connections, same MIS densities, same refusals. The beam half adds
+    // no capability of its own: a beam map is built by the same forward photon pass mode M
+    // uses, and a scene whose emitters or media BDPT cannot weight is one whose merges it
+    // cannot weight either.
+    if (mode == 'D' || mode == 'J') {
         if (const char* r = bdptUnsupportedFeature(scene)) return r;
         if (projection != CAM_RECTILINEAR)
-            return "a non-rectilinear (fisheye/panoramic) camera in mode D";
+            return (mode == 'J') ? "a non-rectilinear (fisheye/panoramic) camera in mode J"
+                                 : "a non-rectilinear (fisheye/panoramic) camera in mode D";
     } else if (mode == 'U') {
         if (const char* r = bdptUnsupportedFeature(scene)) return r;
         // Mirrors vcmUnsupportedFeature: spot / sun lights are supported in mode U too.
@@ -14886,7 +14907,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // that dispatch.
     liveWindowPlaceholder(res, resY, g_windowMode + " \xE2\x80\x94 starting\xE2\x80\xA6");
     const bool refMode      = (mode == 'R' || mode == 'V');
-    const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
+    const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' ||
+                               mode == 'D' || mode == 'J' || refMode);
     const bool forwardCatch = (mode == 'C');
     const bool lensMode     = (mode == 'A');   // finite-lens next-event splat (physical camera)
 
@@ -14899,17 +14921,26 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // samples on top), and the composite mode P (dual-film checkpoint — forward SUM + backward
     // SUM). The persistent-state modes M/S/U (photon-map / SPPM / VCM) can't be
     // resumed from a film alone, so keep those gated with a warning.
+    //
+    // Mode J (UPBP) resumes like D, with one honest caveat: its beam map is rebuilt from
+    // the same seed, so the MERGE half of every resumed sample is bit-identical to the one
+    // already in the film. Averaging identical samples cannot shrink their error — which is
+    // not a bug and not a bias, it is simply mode M's view-independence showing through:
+    // extra spp decorrelate the CONNECTION half only. (A resumed render that wanted a fresh
+    // beam realization would have to re-trace the photon pass with a different seed, which
+    // would also throw away the map's whole reason for existing on a flyby.)
     if ((resume || wantCheckpointFlag) &&
-        !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' || mode == 'P')) {
+        !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' ||
+          mode == 'J' || mode == 'P')) {
         std::fprintf(stderr, "[render] -resume/-checkpoint apply only to modes A/B/C "
-                             "(forward), R/D (reference), and P (composite); ignoring for mode %c\n", mode);
+                             "(forward), R/D/J (reference), and P (composite); ignoring for mode %c\n", mode);
         resume = false; wantCheckpointFlag = false;
     }
     if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever) &&
         !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' ||
-          mode == 'P' || mode == 'M' || mode == 'S' || mode == 'U')) {
+          mode == 'J' || mode == 'P' || mode == 'M' || mode == 'S' || mode == 'U')) {
         std::fprintf(stderr, "[render] -time/-noise/-forever apply only to modes A/B/C (forward), "
-                             "R/D (reference/BDPT), P (composite), and M/S/U (photon map / SPPM / VCM); ignoring for mode %c\n", mode);
+                             "R/D/J (reference/BDPT/UPBP), P (composite), and M/S/U (photon map / SPPM / VCM); ignoring for mode %c\n", mode);
         timeBudgetSec = 0.0; noiseTarget = 0.0; runForever = false;
     }
     if (intervalSec <= 0.0) intervalSec = 15.0;
@@ -14965,10 +14996,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // BDPT's camera importance (bdpt.h cameraWe/cameraPdfDir) is the rectilinear
     // pinhole convention and feeds the MIS balance heuristic; a fisheye lens there
     // would give subtly-wrong weights, so mode D rejects it rather than lie.
-    if (fisheyeCam && mode == 'D') {
-        std::fprintf(stderr, "[camera] mode D (BDPT) does not support a fisheye/panoramic "
+    if (fisheyeCam && (mode == 'D' || mode == 'J')) {
+        std::fprintf(stderr, "[camera] mode %c (%s) does not support a fisheye/panoramic "
                              "lens; render this camera with mode B (forward pinhole) or R "
-                             "(reference) instead.\n");
+                             "(reference) instead.\n",
+                     mode, mode == 'J' ? "UPBP" : "BDPT");
         return 1;
     }
     // Model A/C image through a single rectilinear thin lens (lensImage uses
@@ -15349,6 +15381,99 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         };
         // Disk resume/checkpoint (like A/B/C): a budgeted or -checkpoint render writes a
         // resumable .ftbuf sidecar; -resume continues it. The film is a SUM over spp.
+        const bool ckpt = resume || wantCheckpointFlag ||
+                          timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked, res, resY, resume, ckpt,
+                                 checkpointGuard(scene, mode, res, resY), mode);
+    }
+
+    // --- UPBP (mode J) — BDPT connections MIS-combined with photon-beam merges ------
+    //
+    // Mode D and mode M each solve half of a volumetric scene and neither can borrow the
+    // other's half. Mode D is unbiased and resamples every path per spp, so its error is
+    // zero-mean grain that falls as 1/sqrt(spp) — but every one of those paths is traced
+    // from THIS camera, so a 600-frame flyby pays the whole cost 600 times. Mode M traces
+    // its photons once and reuses them for every frame, which is the only reason a flyby is
+    // affordable at all — but its beam gather is a blurred, view-independent CACHE, so extra
+    // spp re-gather the same beams and the error stops falling at a floor (measured on
+    // gallery_rain: speckle^2 = s0^2 + k/spp with s0 != 0).
+    //
+    // UPBP (Krivanek et al. 2014, "Unifying Points, Beams and Paths") is the estimator that
+    // takes both: the same camera sample carries BDPT connections AND merges against the
+    // mode-M beam map, combined by the multi-sample balance heuristic so the pair is still
+    // one unbiased estimator of the same integral. The technique with the lower variance for
+    // a given path wins the weight automatically — merging deep inside a thick medium where
+    // the camera's distance sampling never reaches, connections everywhere merging is blind
+    // (multiple scattering, which straight-deposited beams omit outright).
+    //
+    // The letter: 'U' is VCM and 'B' and 'P' are taken, so this is 'J' for Jarosz, whose
+    // beam x ray estimator (photonbeams.h) is precisely what distinguishes mode J from mode U.
+    //
+    // Scope is mode D's, exactly — see modeFeatureUnsupported. The derivation of the merge
+    // MIS density, the validation gates, and what this is and is not predicted to buy are all
+    // in known-issues.md under the UPBP entry.
+    if (mode == 'J') {
+        if (const char* unsupported = bdptUnsupportedFeature(scene)) {
+            std::fprintf(stderr, "[mode J] this scene uses %s, which UPBP (mode J) does not "
+                                 "support — its connection half is BDPT and inherits mode D's "
+                                 "scope; render it with mode B/P (forward) or mode R "
+                                 "(backward) instead.\n", unsupported);
+            return 1;
+        }
+        int maxDepth = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
+        // The merge half needs a beam map, and a beam map needs media. A media-free scene
+        // is not an error — it is just mode D with extra words — so say so and carry on
+        // rather than refusing, which also makes "mode J == mode D here" a testable claim
+        // (validation gate 1) rather than a special case.
+        //
+        // Note the flag polarity, which is the REVERSE of modes A/B/M: they need `-beams` to
+        // opt in, mode J needs `-nobeams` to opt out. See g_noBeams for why.
+        const bool wantBeams = !g_noBeams && !scene.media.empty();
+        if (!wantBeams)
+            std::printf("mode J: %s, so there is nothing to merge against; "
+                        "this render is mode D exactly.\n",
+                        g_noBeams ? "-nobeams was given" : "no participating media");
+        warnBeamsGrinMedia(scene, wantBeams);
+        PhotonMap pmUnused;            // stays empty: surfaces are BDPT's job here
+        BeamMap bmap;
+        StageProgress stageProg = makeStageProgress(res, resY);
+        if (wantBeams) {
+            std::printf("mode J: UPBP at %dx%d on %d CPU threads (maxDepth=%d, light=%s) — "
+                        "tracing %lld photons for the beam map ...\n",
+                        res, resY, nThreads, maxDepth, lightLabel, N);
+            liveWindowPlaceholder(res, resY, "tracing photon beams\xE2\x80\xA6");
+            auto tp0 = std::chrono::steady_clock::now();
+            tracePhotonPass(scene, N, nThreads, diffraction, pmUnused, g_heroC, 0,
+                            &bmap, g_beamTarget, &stageProg, nullptr, nullptr, 0,
+                            /*depositSurfaces*/false);
+            liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
+            buildBeamMap(bmap, "mode J:",
+                         (double)res * (double)resY * (double)(spp > 0 ? spp : 16));
+            const double buildSec =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
+            std::printf("mode J: %zu beams from %lld emitted photons in %s. "
+                        "Rendering connections + merges ...\n",
+                        bmap.beams.size(), bmap.nEmitted, humanDur(buildSec).c_str());
+            if (bmap.empty())
+                std::fprintf(stderr, "[mode J] warning: the beam map is empty — no photon "
+                                     "reached a medium. This render is mode D exactly.\n");
+        } else {
+            std::printf("mode J: UPBP at %dx%d on %d CPU threads (maxDepth=%d, light=%s) ...\n",
+                        res, resY, nThreads, maxDepth, lightLabel);
+        }
+        // An empty map is passed as null, so the renderer's merge path is not merely skipped
+        // per-ray but never entered — which is what makes gate (1)'s "bit-identical to mode D"
+        // a property of the code rather than of floating-point luck.
+        const BeamMap* beamsPtr = (wantBeams && !bmap.empty()) ? &bmap : nullptr;
+        auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
+            return cpuSppChunks(sppTarget, p, res, resY,
+                [&](long long c, unsigned long long off) {
+                    return renderBdpt(scene, cam, res, resY, c, nThreads, maxDepth,
+                                      diffraction, off, beamsPtr);
+                });
+        };
         const bool ckpt = resume || wantCheckpointFlag ||
                           timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
@@ -16197,7 +16322,10 @@ static void printHelp(const char* prog) {
 "  -beams|-photonbeams   photon beams (single-scatter volumetrics). Modes A/B: decorrelated\n"
 "                        per-camera gather for shared flybys (CPU or GPU; kills frozen\n"
 "                        speckle). Mode M: stores a view-independent BEAM MAP, which is the\n"
-"                        only way mode M sees media at all (CPU only)\n"
+"                        only way mode M sees media at all (CPU only). Mode J: ON already —\n"
+"                        UPBP is connections + beam merges, so the map is the mode\n"
+"  -nobeams|-no-beams    turn the beam map OFF. Only meaningful for mode J, where it is on by\n"
+"                        default; a mode-J render without it is mode D exactly (validation)\n"
 "  -beamblur <frac>      mode-M beam kernel half-width, as a fraction of each MEDIUM'S OWN\n"
 "                        measured mean free path (default 0.01). This is the quality knob:\n"
 "                        the blur is a physical scale independent of the photon count, so\n"
@@ -17229,7 +17357,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
-        else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) g_beamGather = true;
+        else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) { g_beamGather = true; g_noBeams = false; }
+        else if (!std::strcmp(argv[i], "-nobeams") || !std::strcmp(argv[i], "-no-beams")) { g_noBeams = true; g_beamGather = false; }
         // Highest scattering order the beam paths carry. 0 = unlimited (the default), 1 =
         // single scatter (the pre-0.199.0 behaviour, bit-identical). `-beams-single` is the
         // spelling you reach for when you want the old crisp-bow look back.
@@ -17530,7 +17659,9 @@ static int run(int argc, char** argv) {
     // mode R as the primary validation; to exercise D on specular/glossy surfaces use
     // -scene materials (which builds the mirror+glossy scene for every mode).
     const bool refMode = (mode == 'R' || mode == 'V');
-    const bool diffuseScene = refMode || mode == 'D';
+    // Mode J (UPBP) takes the same built-in scene as D, so a built-in J render can be
+    // diffed straight against a built-in D render (validation gate 4).
+    const bool diffuseScene = refMode || mode == 'D' || mode == 'J';
     Scene scene = fromFtsl  ? std::move(ftslScene.scene)
                 : prism     ? buildPrism(res)
                 : grating   ? buildGrating(res, diffraction)
@@ -18050,11 +18181,12 @@ static int run(int argc, char** argv) {
                 c.lens = cs->lens;
                 double flmm = cs->lens->focalLengthMM();
                 double fw = cs->lens->filmW_mm, fh = cs->lens->filmH_mm;
-                if (cmode == 'D') {
-                    std::printf("[camera] '%s' has a physical lens -> mode D (BDPT) with "
+                if (cmode == 'D' || cmode == 'J') {
+                    std::printf("[camera] '%s' has a physical lens -> mode %c (%s) with "
                                 "the lens on the camera subpath (Plan B; light-image splat "
                                 "disabled); f=%.1fmm, sensor %.1fx%.1fmm\n",
-                                cs->name.c_str(), flmm, fw, fh);
+                                cs->name.c_str(), cmode, cmode == 'J' ? "UPBP" : "BDPT",
+                                flmm, fw, fh);
                 } else if (cmode == 'P') {
                     // The composite's forward pass splats to a pinhole and can't be
                     // pushed through the lens, so route to the lens-aware BDPT (mode D)
@@ -18124,7 +18256,7 @@ static int run(int argc, char** argv) {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
         // uses the same camera frame; only the old contact-sensor diagnostic did not.
         const bool useCamera = (mode == 'A' || mode == 'B' || mode == 'C' ||
-                                mode == 'P' || mode == 'D' || mode == 'M' ||
+                                mode == 'P' || mode == 'D' || mode == 'J' || mode == 'M' ||
                                 mode == 'S' || mode == 'U' || refMode);
         int fresX = res, fresY = (resYCli > 0) ? resYCli : res;
         previewUpscale(fresX, fresY);   // big, readable raster preview (no-op for real renders)
@@ -18398,7 +18530,11 @@ static int run(int argc, char** argv) {
             if (cs.filmDist_m > 0.0) { m.cam.filmDist = cs.filmDist_m; m.cam.lensF = cs.lensF_m; }
             else                     { m.cam.setFocus(cs.focus); }
             m.mode = effMode(cs.mode);
-            if (cs.lens) { m.cam.lens = cs.lens; if (m.mode != 'D' && m.mode != 'P') m.mode = 'R'; }
+            // Mode J's camera subpath IS mode D's, lens included (Plan B), so it keeps the lens.
+            if (cs.lens) {
+                m.cam.lens = cs.lens;
+                if (m.mode != 'D' && m.mode != 'J' && m.mode != 'P') m.mode = 'R';
+            }
             m.name = cs.name;
             return m;
         };
@@ -20553,7 +20689,7 @@ static int run(int argc, char** argv) {
         char mode = mc.mode;
         // A scene outside BDPT's transport scope can't meter in mode D (the real render
         // will itself refuse it later, loudly) — meter it with the general forward pass.
-        if (mode == 'D' && bdptUnsupportedFeature(scene)) mode = 'B';
+        if ((mode == 'D' || mode == 'J') && bdptUnsupportedFeature(scene)) mode = 'B';
         Film mf; double eAuto = 0.0;
         switch (mode) {
             case 'A': case 'B': case 'C': {
@@ -20580,7 +20716,12 @@ static int run(int argc, char** argv) {
                 filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
                 break;
             }
-            case 'D': {
+            // Mode J meters as mode D on purpose. The meter only needs an EXPOSURE ANCHOR,
+            // and under a correct MIS combination both estimate the same integral — so the
+            // connection half alone is a legitimate (merely noisier) estimate of the very
+            // image mode J will produce, at a fraction of the cost of building a beam map
+            // per metered frame.
+            case 'D': case 'J': {
                 bool onGpu = false;
 #ifdef HAVE_CUDA
                 if (meterGpu && cudaBdptSupported(scene)) {

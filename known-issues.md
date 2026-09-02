@@ -5,6 +5,40 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PERF — OPEN (2026-09-02, v0.214.0): a mode-`J` flyby rebuilds the beam map **once per frame**, when the map is view-independent and mode `M` already shares one across the whole flight
+
+**What happens.** `groupCameras` in `main.cpp` sorts a multi-camera render into a shared forward
+`A`/`B` group, a shared mode-`M` group, and `restIdx` — the per-camera fallback, which calls
+`runRender` once per camera. Mode `J` is in `restIdx`, correctly, because its *connection* half is
+BDPT and BDPT frames are independent by construction (`C`/`R`/`D`/`P`/`V` are all there for the same
+reason). But mode `J`'s *merge* half is the mode-`M` beam map, and that is **view-independent** — the
+exact property `groupM` exists to exploit. So a 600-frame mode-`J` flythrough traces 600 photon
+passes and builds 600 BVHs over identical data.
+
+**Scale of the waste.** Measured on `_fog_cornell.ftsl` at `-n 200000`, a trivial map: 8.84 s, of which
+8.69 s is the BVH build, against a 0.17 s render. At showcase counts the ratio is far worse — the
+`gallery_rain` beam pass is minutes. This is a pure multiplier on wall clock: 600 frames × one map
+each, where one map would do.
+
+**Why it wasn't done in Phase 1.** Nothing about it is subtle; it is mechanical work that would have
+been mixed into the commit that first makes mode `J` exist, and mode `J` cannot yet be judged worth
+optimising because its merge estimator isn't written (Phases 2–3). It is also *not* a correctness
+issue: each frame's map is a valid independent realisation, so the flyby renders correctly today,
+just slowly.
+
+**The fix.** Give mode `J` its own shared group alongside `groupM`: build the beam map once for the
+group, then run each camera's BDPT+merge pass against the same `const BeamMap*`. The beam map is
+already `const` in the renderer (`BdptRenderer::beams`) and already survives across chunks within one
+frame, so there is no thread-safety work — only hoisting the build out of `runRender`'s mode-`J`
+block into a group driver, which is the same refactor `runSharedGroup` did for `A`/`B`. Note the one
+behavioural consequence to document when it lands: frames would then **share one beam realisation**,
+so the merged component's noise becomes correlated frame-to-frame exactly as mode `M`'s radiance
+solution is — which is the accepted trade there and should be the accepted trade here.
+
+**Related:** the mode-`D` entry below (*"mode `D` has no resident multi-camera session, so a flyby
+re-uploads the whole scene once per frame"*) is the same shape of problem on the other half of mode
+`J`, and a mode-`J` flyby pays both.
+
 ### PLANNED (2026-09-02, v0.213.0): **UPBP** — MIS-combine mode `D`'s BDPT connections with the `-beams` beam×ray estimator, so a volumetric scene stops having to choose between mode M's permanent noise floor and mode D's per-frame cost
 
 **The gap this closes.** On `gallery_rain` the two available estimators each fail in a way the
@@ -133,6 +167,25 @@ plumbing:**
 1. **Degenerate reductions.** With an empty beam map, UPBP must reduce **bit-identically** to
    mode `D`. With connections disabled, it must reduce to the mode `M -beams` gather. Both are
    structural, cost nothing, and catch most wiring errors before any math is in question.
+
+   **First half DONE (2026-09-02, v0.214.0).** Mode `J` now exists as mode `D` plus a beam map the
+   renderer does not yet read, and is byte-identical to mode `D` in all three configurations:
+   media-free (built-in cornell, 96², spp 4), `_fog_cornell.ftsl` with the map actually built
+   (7 873 846 beams from 200 000 photons, plus the BVH), and `_fog_cornell.ftsl -nobeams`. The
+   middle one is the load-bearing test — it proves the photon pass and the BVH build perturb
+   neither the BDPT RNG stream nor anything else the connection half reads, which is the thing a
+   later "the image changed" would otherwise be ambiguous about. An empty or absent map is passed
+   as `nullptr` rather than as an empty map, so the merge path is never *entered*, which is what
+   makes this a property of the code rather than of floating-point luck. Compare against `-mode D
+   -device cpu`, not bare `-mode D`: the latter takes the GPU BDPT megakernel
+   (`gpuBdptMode = (mode == 'D')`) and is a different realisation of the same estimator.
+
+   The **second half** — connections disabled must reproduce the mode-`M -beams` gather — is
+   Phase 2's gate, since it needs the merge estimator to exist. Note it will need care about what
+   "disabled" means: mode `M` gathers beams along a camera ray that has walked to the first
+   *diffuse* hit through specular chains, whereas mode `J` gathers along every segment of a BDPT
+   camera subpath, so the two agree only on the single-segment case unless the comparison is set
+   up to isolate it.
 2. **MIS partition of unity.** Instrument the weights directly: for a sampled path, sum the
    weights of every technique that could have generated it and assert it equals 1. This tests
    the weights *independently of the image*, which is the only way to localise an energy bug

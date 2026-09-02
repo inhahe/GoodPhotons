@@ -88,6 +88,13 @@
 // map's nEmitted stays at the main pass's count. So the aimed pass is a pure variance
 // reduction — an incomplete or over-eager target set costs efficiency, never correctness —
 // and nAimed = 0 leaves every deposit bit-for-bit what it was.
+// `depositSurfaces` = false traces the pass for its BEAMS ALONE and leaves `pm` empty. This
+// is mode J (UPBP), where surface transport is BDPT's job and a surface photon map would be
+// both unused and, at the photon counts a beam map wants, the largest allocation in the
+// process. Every other aspect of the pass — emission, media crossing, Russian roulette, the
+// RNG stream — is untouched, so the beams a beams-only pass deposits are bit-identical to the
+// ones a full mode-M pass would have deposited at the same seed. (Nothing branches on
+// `photonDeposit` except `Renderer::depositPhoton`, which is a no-op when it is null.)
 inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
                             bool diffraction, PhotonMap& pm, int heroC = hero::kHeroC,
                             uint64_t seedBase = 0, BeamMap* bm = nullptr,
@@ -95,7 +102,8 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
                             const StageProgress* stage = nullptr,
                             PhotonMap* pmCaustic = nullptr,
                             const caim::AimMap* aim = nullptr,
-                            long long nAimed = 0) {
+                            long long nAimed = 0,
+                            bool depositSurfaces = true) {
     if (nThreads < 1) nThreads = 1;
     // The aimed pass needs somewhere caustic to deposit and something to aim at.
     const bool doAimed = pmCaustic && aim && !aim->empty() && nAimed > 0 && N > 0;
@@ -158,7 +166,7 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
             r.aimEmission     = true;
             r.beamStraightOnly = (bm != nullptr);
         } else {
-            r.photonDeposit = &banks[tid];
+            if (depositSurfaces) r.photonDeposit = &banks[tid];
             if (pmCaustic) r.causticDeposit = &cbanks[tid];
             if (bm) r.beamDeposit = &bbanks[tid];
         }

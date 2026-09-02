@@ -25,6 +25,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
+| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). CPU only so far | `bdpt.h` + `photonbeams.h` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
 | `-raster` | z-buffer preview rasterizer + interactive fly viewer (`-explore`) | `raster.h`, `raster_cuda.cu` |
 
@@ -57,6 +58,61 @@ regardless — it writes each frame the instant that frame's gather completes.
 **Still CPU-only underneath this:** a `-time` / `-noise` / `-forever` / `-preview` mode-`M`
 render. Closing that means teaching the shared device path to gather in spp chunks under
 `runSppProgressive`, the way the forward and mode-`R` GPU paths already do (`known-issues.md`).
+
+### Mode `J` (UPBP) — how the two halves are wired (0.214.0, Phase 1)
+
+Mode `J` is deliberately **not** a new renderer. It is mode `D`'s renderer given a pointer:
+
+```cpp
+struct BdptRenderer {
+    ...
+    const BeamMap* beams = nullptr;   // null == mode D
+};
+```
+
+Everything else follows from that one field.
+
+- **Dispatch** (`main.cpp`, immediately after mode `D`'s block). It refuses through
+  `bdptUnsupportedFeature` — mode `J` inherits mode `D`'s scope *exactly*, because a scene whose
+  emitters or media BDPT cannot weight is one whose merges it cannot weight either. Then it traces
+  the photon pass, builds the beam map, and hands `&bmap` to `renderBdpt`.
+- **The photon pass deposits beams only.** `tracePhotonPass(..., depositSurfaces=false)` leaves the
+  `PhotonMap` empty: surface transport is BDPT's job here, and a surface map would be both unused
+  and — at the photon counts a beam map wants — the largest allocation in the process. Nothing in
+  the pass branches on `photonDeposit` except `Renderer::depositPhoton`, which is a no-op when it
+  is null, so the beams a beams-only pass deposits are **bit-identical** to those a full mode-`M`
+  pass would deposit at the same seed.
+- **An empty map is passed as `nullptr`, not as an empty map.** So the merge path is never
+  *entered*, rather than entered and skipped per-ray. That is what makes the degenerate-reduction
+  test (below) a property of the code instead of of floating-point luck.
+- **Flag polarity is reversed from `A`/`B`/`M`.** They need `-beams` to opt in; mode `J` needs
+  `-nobeams` to opt out (`g_noBeams`). A mode-`J` render with no beam map is not a degraded UPBP,
+  it is literally mode `D`, so making the interesting half opt-in behind a flag whose absence
+  silently selects a different mode would be a trap.
+- **Everything mode `D` had, mode `J` has**, by being added to the same lists: `useCamera`, the
+  `-time`/`-noise`/`-forever` progressive set, the `-resume`/`-checkpoint` set, the fisheye
+  refusal, the exposure meter's `case 'D': case 'J':`, the built-in-scene selection, the
+  `camera_path` lens routing (`J` keeps its mode when given a lens, as `D` and `P` do), and the
+  `bdptUnsupportedFeature` → fall back to `B` rule.
+
+**Validation gate 1 (the degenerate reduction), passed 0.214.0.** With no beam map, mode `J` must
+be mode `D` byte-for-byte — twice over, once with no media at all and once with the whole beam
+prologue actually running:
+
+| Test | Command pair | Result |
+|---|---|---|
+| 1a — no media | built-in cornell, `-mode D -device cpu` vs `-mode J`, 96², spp 4 | `cmp` **identical** |
+| 1b — media, map built | `_fog_cornell.ftsl -mode J` (beams default on: 7 873 846 beams from 200 000 photons, BVH built) vs `-mode D -device cpu` | `cmp` **identical** |
+| 1c — media, map refused | `_fog_cornell.ftsl -mode J -nobeams` vs `-mode D -device cpu` | `cmp` **identical** |
+
+1b is the load-bearing one: it proves the photon pass and the BVH build perturb neither the BDPT
+RNG stream nor anything else the connection half reads. 1c is the cheap companion that keeps the
+opt-out path honest. Compare mode `D` with **`-device cpu`** —
+plain `-mode D` takes the GPU BDPT megakernel (`gpuBdptMode = (mode == 'D')`) and is a different
+realisation, which is not a bug and not a comparison.
+
+The MIS derivation for the merge weights, the remaining gates, and what UPBP is and is not
+predicted to buy are in `known-issues.md` under the UPBP entry.
 
 ## Module map (src/)
 

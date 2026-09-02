@@ -234,6 +234,17 @@ argument for standing a groom in a hall of polished objects.*
   limit of the representation, refused identically on both backends and per medium, so an
   ordinary fog elsewhere in a GRIN scene still works.) See
   [Mode `M` and participating media](REFERENCE.md#mode-m-and-participating-media---beams).
+- **UPBP (mode `J`) — BDPT paths and photon beams under one MIS weight** *(in progress —
+  the mode exists and reduces exactly to mode `D`; the merge estimator lands next)*. Mode
+  `D` and mode `M -beams` each solve half of a thick-medium scene and fail where the other
+  succeeds: a BDPT connection needs the camera's free-flight distance sampling to *reach*
+  the scattering point, which deep inside an optically thick medium it essentially never
+  does; a photon beam reaches there easily (it is a whole *line* of deposited power) but is
+  deposited **straight**, so a light path that scattered in the medium before the merge is
+  invisible to it. Mode `J` runs both on the same camera sample and combines them with the
+  multiple-sample balance heuristic — the volumetric counterpart of what VCM (`U`) does for
+  surfaces. Beams are **on by default** here (a UPBP render without them is literally mode
+  `D`); `-nobeams` turns them off, which reduces mode `J` to mode `D` bit-for-bit.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look
