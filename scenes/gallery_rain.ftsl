@@ -591,6 +591,25 @@ material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) —
 # exactly that ground: it is physically the honest reading of "a 45 cm ruby", but this is a
 # gallery of caustics and a black gem is a hole in it.)
 #
+# THE PALETTE WAS RE-AUTHORED (2026-09-01) and the stones are no longer jewel names. The
+# asset's second cut replaces the muted gemmological set (amethyst/tanzanite/.../morganite,
+# which peaked at 0.77 in a channel) with twelve SATURATED hues that run 0.888 against 0.006
+# — roughly a doubling of chroma, and the reason for the swap: attenuation colour is what
+# tints a caustic, so a more saturated stone throws a more saturated splash. The bowl is
+# untouched, byte-identical to the first cut, so `cp_bowl` above is unchanged.
+#
+# TWO OF THE TWELVE ARE DELIBERATE EXTREMES, and they are the exception to the paragraph
+# above rather than a mistake in it:
+#   * `cp_onyx` is (0.006,0.006,0.006) — neutral and nearly opaque (sigma 121.6 on all three
+#     channels; ~0.07% transmittance across a stone). It IS the black gem that paragraph
+#     argues against, and it is in the file on purpose: onyx is a black stone. It reads as a
+#     silhouette with a specular highlight and contributes no caustic. Kept because the asset
+#     author chose it and one dark stone among eleven bright ones is contrast, not a hole —
+#     but if the compote ever looks like it is missing a gem, this is why.
+#   * `cp_clear` is (1,1,1) — sigma exactly 0, no absorption at all. In SF10 that makes the
+#     one pure-FIRE stone in the dish: undimmed, so it throws the brightest splash of the
+#     twelve, and colourless in transmission, so all of that splash's colour is dispersion.
+#
 # IOR IS THIS SCENE'S CHOICE, NOT THE FILE'S. The GLB says 1.52 flat for all thirteen, which
 # has no dispersion at all and would make thirteen colourless-fire stones. The bowl takes
 # `glass:crystal`, the house glass whose comment above explains why a gallery's vessel is cut
@@ -611,18 +630,18 @@ material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) —
 #     22, and is the better answer even where it never fires: if two facets ever do touch, a
 #     deterministic winner beats an arbitrary one.
 material "cp_bowl"       { type dielectric  ior glass:crystal  priority  1  absorb rgb  22.3 79.3 70.6 }
-material "cp_amethyst"   { type dielectric  ior glass:SF10     priority  2  absorb rgb  39.0 71.5 15.5 }
-material "cp_tanzanite"  { type dielectric  ior glass:SF10     priority  3  absorb rgb  63.8 57.7 13.1 }
-material "cp_sapphire"   { type dielectric  ior glass:SF10     priority  4  absorb rgb 102.1 54.3 14.1 }
-material "cp_aquamarine" { type dielectric  ior glass:SF10     priority  5  absorb rgb  71.5 18.1 14.1 }
-material "cp_tourmaline" { type dielectric  ior glass:SF10     priority  6  absorb rgb  84.8 22.3 32.6 }
-material "cp_emerald"    { type dielectric  ior glass:SF10     priority  7  absorb rgb 102.1 23.3 53.2 }
-material "cp_peridot"    { type dielectric  ior glass:SF10     priority  8  absorb rgb  30.8 15.5 71.5 }
-material "cp_citrine"    { type dielectric  ior glass:SF10     priority  9  absorb rgb   7.0 22.3 85.7 }
-material "cp_topaz"      { type dielectric  ior glass:SF10     priority 10  absorb rgb   7.0 39.0 85.7 }
-material "cp_garnet"     { type dielectric  ior glass:SF10     priority 11  absorb rgb  14.4 74.5 81.1 }
-material "cp_rhodolite"  { type dielectric  ior glass:SF10     priority 12  absorb rgb  15.2 79.4 44.2 }
-material "cp_morganite"  { type dielectric  ior glass:SF10     priority 13  absorb rgb   6.3 26.9 20.5 }
+material "cp_onyx"       { type dielectric  ior glass:SF10     priority  2  absorb rgb 121.6 121.6 121.6 }
+material "cp_chartreuse" { type dielectric  ior glass:SF10     priority  3  absorb rgb  21.1   2.8  42.9 }
+material "cp_pink"       { type dielectric  ior glass:SF10     priority  4  absorb rgb   2.8  33.4  16.7 }
+material "cp_azure"      { type dielectric  ior glass:SF10     priority  5  absorb rgb  48.1  22.0   2.8 }
+material "cp_yellow"     { type dielectric  ior glass:SF10     priority  6  absorb rgb   2.8   7.2 121.6 }
+material "cp_amber"      { type dielectric  ior glass:SF10     priority  7  absorb rgb   2.8  46.6 121.6 }
+material "cp_clear"      { type dielectric  ior glass:SF10     priority  8  absorb rgb   0.0   0.0   0.0 }
+material "cp_cobalt"     { type dielectric  ior glass:SF10     priority  9  absorb rgb 121.6 121.6   2.8 }
+material "cp_green"      { type dielectric  ior glass:SF10     priority 10  absorb rgb  69.3   2.8 121.6 }
+material "cp_red"        { type dielectric  ior glass:SF10     priority 11  absorb rgb   2.8 121.6 121.6 }
+material "cp_violet"     { type dielectric  ior glass:SF10     priority 12  absorb rgb   8.7  33.8   2.8 }
+material "cp_turquoise"  { type dielectric  ior glass:SF10     priority 13  absorb rgb  54.8   8.5   2.8 }
 
 # --- Fur-creature materials (the eleventh exhibit) ---------------------------------
 # Lifted unchanged from `scenes/fur_creature.ftsl`, prefixed `cr_` so nothing here can
@@ -2047,7 +2066,8 @@ fur "cr_coat_paw_br" {
 # fudge factor.
 #
 # THIRTEEN LOADS OF ONE FILE, which is the part that needs explaining. The asset is one GLB
-# with thirteen nodes -- the bowl plus `gem_00_amethyst` .. `gem_11_morganite` -- and ftrace
+# with thirteen nodes -- the bowl (`glass_ruby`) plus `glass_onyx_00` .. `glass_turquoise_11`
+# -- and ftrace
 # has exactly one lever for giving separate materials to separate nodes of a GLB:
 # `skip_material`, which drops every primitive whose glTF material NAME contains one of the
 # listed substrings. So each load imports the whole file and skips the other twelve pieces.
@@ -2060,45 +2080,45 @@ fur "cr_coat_paw_br" {
 #
 # The commas are not decoration: FTSL starts a new statement at the second bareword, so the
 # twelve patterns must be ONE comma-joined token.
-mesh "cp_ruby" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
+mesh "cp_bowl" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material onyx,chartreuse,pink,azure,yellow,amber,clear,cobalt,green,red,violet,turquoise
     translate 7.35 0.90 6.20   scale 3.0   material cp_bowl }
-mesh "cp_amethyst" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_amethyst }
-mesh "cp_tanzanite" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_tanzanite }
-mesh "cp_sapphire" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_sapphire }
-mesh "cp_aquamarine" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_aquamarine }
-mesh "cp_tourmaline" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_tourmaline }
-mesh "cp_emerald" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_emerald }
-mesh "cp_peridot" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_peridot }
-mesh "cp_citrine" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_citrine }
-mesh "cp_topaz" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_topaz }
-mesh "cp_garnet" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_garnet }
-mesh "cp_rhodolite" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_rhodolite }
-mesh "cp_morganite" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_morganite }
+mesh "cp_onyx" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,chartreuse,pink,azure,yellow,amber,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_onyx }
+mesh "cp_chartreuse" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,pink,azure,yellow,amber,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_chartreuse }
+mesh "cp_pink" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,azure,yellow,amber,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_pink }
+mesh "cp_azure" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,yellow,amber,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_azure }
+mesh "cp_yellow" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,amber,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_yellow }
+mesh "cp_amber" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_amber }
+mesh "cp_clear" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_clear }
+mesh "cp_cobalt" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,clear,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_cobalt }
+mesh "cp_green" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,clear,cobalt,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_green }
+mesh "cp_red" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,clear,cobalt,green,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_red }
+mesh "cp_violet" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,clear,cobalt,green,red,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_violet }
+mesh "cp_turquoise" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,clear,cobalt,green,red,violet
+    translate 7.35 0.90 6.20   scale 3.0   material cp_turquoise }
 
 # ==============================  LIGHTING  ====================================
 # TWO lights now that the roof is gone (the xenon short-arc lamp that used to hang here was
