@@ -921,6 +921,42 @@ inline std::string edgeOnNote(const Stats& st, int n) {
            (st.edgeOn.size() > 1 ? "them" : "it") + ", e.g. " + hint + ", to see it)";
 }
 
+// The 3-D SLICE of N-space that implicit fields are evaluated on, built from the same
+// rotation the mesh path projects with. `A` is the first three COLUMNS of R: the N-D
+// sample point of a 3-D position p is R * (p, 0, ..., 0), so row k of A is dimension k's
+// direction in the slice.
+//
+// This is the FIELD counterpart of apply(), and it needs none of that function's
+// machinery -- no lift, no emboss, no extrusion, no re-tessellation. A mesh is a
+// 2-manifold sitting in a 3-flat, so rotating it and projecting back is provably affine
+// unless something puts content in the extra coordinates. A field is defined EVERYWHERE in
+// N-space, so tilting the slice through it genuinely changes the cross-section -- provided
+// the field actually reads d4.., which is the one condition, and the same one loom's
+// mathnd.py states: a 3-input field sliced in N-D only ever sees an affine remap.
+inline PatSlice sliceOf(const Config& cfg) {
+    PatSlice s;
+    const int n = std::max(3, cfg.n);
+    if (n <= 3) { s.dims = 0; return s; }
+    const std::vector<double> R = rotationMatrix(cfg);
+    s.dims = std::min(n, 3 + kPatMaxExtraDims);
+    for (int k = 0; k < s.dims; ++k) {
+        for (int i = 0; i < 3; ++i) s.a[(size_t)k * 3 + i] = R[(size_t)k * n + i];
+        s.o[k] = 0.0;
+    }
+    return s;
+}
+
+// Does any compiled field in this scene actually read an extra dimension? A field that
+// does not is a 3-input function, and slicing it can only remap (x,y,z) affinely however
+// many dimensions the slice has -- worth saying out loud rather than letting someone
+// conclude the feature is broken.
+inline bool anyFieldReadsExtraDims(const Scene& s) {
+    for (const Implicit& im : s.implicits)
+        for (const PatNode& n : im.exprNodes)
+            if ((int)n.op >= (int)PatOp::VarD4 && (int)n.op <= (int)PatOp::VarD12) return true;
+    return false;
+}
+
 // Put the scene back exactly as it was captured (the warp switched off).
 inline void restore(const Model& m, Scene& s) {
     if (!m.ok) return;

@@ -1,0 +1,47 @@
+# A genuinely 4-dimensional field, sliced back to 3-D by `-nd`.
+#
+# The Schoen gyroid is the level set of the cyclic sum sin(u)cos(next u) over the axes:
+#
+#     G(x,y,z) = sin x cos y + sin y cos z + sin z cos x
+#
+# That structure generalises verbatim to N dimensions — keep the same cyclic sum over an
+# ordered set of axes. Here the cycle runs x -> y -> z -> d4 -> x, so the field genuinely
+# reads a FOURTH spatial coordinate.
+#
+# That is the whole point. `-nd` evaluates implicit fields on a 3-D slice of N-space, and
+# tilting that slice is what a rotation does. A 3-input field sliced this way would only
+# ever see an affine remap of (x,y,z) — tilt, shear, drift, no new structure — which is
+# the same result that forces the MESH path to grow `emboss`/`extrude`. A field that reads
+# `d4` has somewhere for the rotation to take it, so the cross-section genuinely morphs:
+# channels reconnect, handles open and close, the topology changes.
+#
+#   ftrace -in scenes/_nd_gyroid.ftsl -nd 4                 # sliders drive the slice
+#   ftrace -in scenes/_nd_gyroid.ftsl -nd 4 -nd-angle zw=40 -raster -o png/slice.png
+#
+# Compare with `-nd-angle xy=40`, a rotation entirely inside the visible 3-space: that one
+# only turns the solid, exactly as it should.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "wax" { type diffuse reflect whitewall 0.72 }
+
+isosurface {
+    material wax
+    # |G| - t : the gyroid's thickened level set, so the surface is a solid sheet rather
+    # than an infinitely thin one. The cycle is x -> y -> z -> d4 -> x.
+    function {
+        expr "max( abs( sin(6.2*x)*cos(6.2*y) + sin(6.2*y)*cos(6.2*z) + sin(6.2*z)*cos(6.2*d4) + sin(6.2*d4)*cos(6.2*x) ) - 0.55, r - 1.0 )"
+    }
+    contained_by { min -1 -1 -1   max 1 1 1 }
+    max_gradient 26
+}
+
+light env { spd 0.85 }
+
+camera "cam" {
+    eye 0 0.9 3.6   look_at 0 0 0   up 0 1 0   fov_y 36
+    film { res 420 420 }
+}

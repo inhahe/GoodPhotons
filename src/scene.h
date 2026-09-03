@@ -1214,8 +1214,16 @@ struct Scene {
     // build once per ray/traversal, which is the ONLY correct lifetime: a Scene is
     // copied and moved (buildCornell returns by value), so a stored PatTables would
     // dangle. Never cache it in a member — pass it as a parameter.
+    // The N-D slice `-nd` evaluates implicit fields on. `dims == 0` (the default) is the
+    // ordinary 3-D case and every evaluator skips the transform, so a scene without -nd is
+    // untouched. Unlike the mesh path, which has to be given extra-dimensional content by
+    // `emboss`/`extrude`, a FIELD already exists everywhere in N-space: tilting the slice
+    // is enough to make its cross-section genuinely change.
+    PatSlice ndSlice;
+
     PatTables patTables() const {
         PatTables t;
+        t.slice = (ndSlice.dims > 3) ? &ndSlice : nullptr;
         t.grids     = grids.empty()    ? nullptr : grids.data();
         t.nGrids    = (int)grids.size();
         t.scatters  = scatters.empty() ? nullptr : scatters.data();

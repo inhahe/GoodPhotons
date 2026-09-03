@@ -56,6 +56,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Importing Mitsuba scenes](#importing-mitsuba-scenes)
 - [N-dimensional rotation (`-nd`)](#n-dimensional-rotation--nd)
   - [Why a zero-filled lift is only a 3x3 matrix](#why-a-zero-filled-lift-is-only-a-3x3-matrix)
+  - [Implicit fields: the other N-D route](#implicit-fields-the-other-n-d-route)
   - [Filling the extra dimensions](#filling-the-extra-dimensions)
   - [The interactive slider bank](#the-interactive-slider-bank)
   - [Saving the projected model](#saving-the-projected-model)
@@ -2908,7 +2909,8 @@ isosurface {
 ```
 
 The `expr` string is compiled by the **same math VM as procedural patterns** (variables
-`x y z` and `r = |p|`, plus `sin cos tan exp log sqrt abs floor fract sign min max pow
+`x y z`, `r = |p|`, and — for a field evaluated on an
+[N-D slice](#implicit-fields-the-other-n-d-route) — `d4` … `d12`, plus `sin cos tan exp log sqrt abs floor fract sign min max pow
 atan2 clamp mix smoothstep noise`, the vector-noise components `dnoisex/y/z` /
 `dturbx/y/z` for gradient-noise domain warping, cellular noise
 `worley/worley2/worleyd/worleyid(x, y, z, metric)`, blue-noise placement
@@ -4788,6 +4790,39 @@ How much freedom `M` has depends on `n`: at `n = 4` exactly one axis is squashed
 two are preserved), at `n = 5` two are, and from `n = 6` up the sliders can reach **any**
 3x3 contraction. (loom's `mathnd.py` states the same result for *fields* — a 3-input field
 rotated in N-D and sliced back only ever sees an affine remap.)
+
+### Implicit fields: the other N-D route
+
+Everything above is about a **mesh**, and the fills exist because a mesh is a 2-manifold
+sitting in a 3-flat: rotate it in N-D, project back orthographically, and you provably get
+an affine squash unless something puts content in the extra coordinates.
+
+An **implicit field** is not like that. It is defined *everywhere* in N-space, so `-nd`
+does something completely different with one: it tilts the **3-D slice** the field is
+evaluated on. The N-D sample point of a 3-D position `p` is `R · (p, 0, …, 0)`; its first
+three components feed the field's `x`/`y`/`z` and the rest feed **`d4` … `d12`**, nine new
+field variables. Rotating changes which 3-flat of N-space you are looking at, so the
+cross-section genuinely changes — channels reconnect, handles open and close, the topology
+changes. No `emboss`, no `extrude`, no re-tessellation of a source mesh.
+
+The one condition is that the field must actually **read** `d4`. A three-input field
+sliced in N-D only ever sees an affine remap of `(x, y, z)` — the same result, for the same
+reason, as the mesh case — so ftrace says so when it loads one:
+
+```
+[nd] 1 implicit field(s) evaluated on a 4-D slice — but no field reads d4..,
+     so the slice can only remap (x,y,z) affinely; add a d4 term to get a real morph
+```
+
+`scenes/_nd_gyroid.ftsl` is the worked example: the Schoen gyroid's cyclic
+`sin(u)·cos(next u)` sum extended to run `x → y → z → d4 → x`, so it is a genuinely
+four-dimensional field. Rotating `zw` morphs it; rotating `xy` — a rotation entirely inside
+the visible 3-space — merely turns the same solid, which is the control that shows the
+fourth dimension is doing the work.
+
+Both routes share one rotation, so a scene with a mesh *and* an isosurface gets the mesh
+projected and the field sliced by the same sliders. It works in the interactive viewer, in
+the rasterizer (which marches the sliced field) and in the path tracer, on CPU and GPU.
 
 ### Filling the extra dimensions
 

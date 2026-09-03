@@ -6027,6 +6027,36 @@ in the clear pass, which *multiplies* into `clearT`/`milkT` — a doubly-covered
 darken a seam twice, an uncovered one leaves a hairline of un-tinted glass. Costs ~4% on the
 CPU rasterizer; GPU unchanged. History and measurements in `known-issues.md`.
 
+## N-D field slicing (`-nd` on an isosurface, 0.230.0)
+
+The mesh path needs `emboss`/`extrude` because a mesh is a 2-manifold in a 3-flat. A FIELD
+is defined everywhere in N-space, so it needs neither: `-nd` tilts the 3-D SLICE the field
+is evaluated on, and the cross-section genuinely changes. `PatSlice` (in pattern.h, so both
+backends see one definition) carries `A` — the first three columns of the rotation, row k
+being dimension k's direction in the slice — and an offset; `patApplySlice` rewrites a
+PatCtx's x/y/z onto the slice and fills `d4..d12`, nine new VM variables.
+
+**It rides in `PatTables`,** which already reaches every field evaluation on both backends,
+rather than becoming a global or a new parameter on the intersectors. `dims == 0` is the
+ordinary 3-D case and every evaluator skips the transform, so a scene without `-nd` is
+untouched.
+
+**The one condition, stated at load.** A three-input field sliced in N-D only ever sees an
+affine remap of (x,y,z) — the same result as the mesh case and for the same reason — so
+`anyFieldReadsExtraDims` scans the compiled programs and says plainly when nothing reads
+`d4`. Without that, the honest answer ("your field has no fourth dimension to rotate into")
+is indistinguishable from a broken feature.
+
+**Three device evaluators had to learn the opcodes, and forgetting one is silent.** There
+is the host `patternEval`, the device template `dPatternEval` (fp64) — and
+`dPatternEvalF`, an FP32 twin in render_cuda.cu that is what the sphere-trace march
+actually runs. Patching only the first two left the GPU tracer rendering the gyroid as
+*nothing at all*: an unknown opcode makes the VM bail, the field reads 0 everywhere, and an
+invisible surface looks like an empty scene rather than a wrong one. The bisect that found
+it is worth repeating — the same scene rendered correctly by the CPU tracer and by both
+rasterizers, and `scenes/function.ftsl` (no `d4`) rendered identically on both devices,
+which localised it to "the d4 opcode on the device" rather than to the slice.
+
 ## N-D warp (`ndwarp.h`, `-nd`, 0.220.0)
 
 **Where it sits.** The warp mutates `Scene::tris` immediately after the scene is built and

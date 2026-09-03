@@ -18064,13 +18064,29 @@ static int run(int argc, char** argv) {
     // zero-filled lift is provably affine.
     ndwarp::Model ndModel;
     bool ndActive = false;
+    // Implicit fields take the OTHER N-D route, and take it whether or not the scene also
+    // has a mesh: the same rotation tilts the 3-D slice they are evaluated on.
+    bool ndSliced = false;
+    if (ndCfg.n >= 4 && !scene.implicits.empty()) {
+        scene.ndSlice = ndwarp::sliceOf(ndCfg);
+        ndSliced = true;
+        const bool readsExtra = ndwarp::anyFieldReadsExtraDims(scene);
+        std::printf("[nd] %zu implicit field(s) evaluated on a %d-D slice%s\n",
+                    scene.implicits.size(), ndCfg.n,
+                    readsExtra ? " (fields read d4.., so rotating MORPHS them)"
+                               : " — but no field reads d4.., so the slice can only remap "
+                                 "(x,y,z) affinely; add a d4 term to get a real morph");
+        std::fflush(stdout);
+    }
     if (ndCfg.n >= 4) {
         std::string note;
-        if (!ndwarp::capture(scene, ndCfg.object, ndModel, note)) {
+        if (!ndwarp::capture(scene, ndCfg.object, ndModel, note) && !ndSliced) {
             std::fprintf(stderr, "[nd] %s\n", note.c_str());
             return 2;
         }
-        if (!note.empty()) std::fprintf(stderr, "[nd] %s\n", note.c_str());
+        if (!ndModel.ok)
+            std::printf("[nd] no mesh to warp; the field slice is doing the work\n");
+        if (!note.empty() && ndModel.ok) std::fprintf(stderr, "[nd] %s\n", note.c_str());
         const size_t want = ndwarp::projectedTriCount(ndModel, ndCfg);
         if (want > ndBudget) {
             std::fprintf(stderr, "[nd] this configuration would build %zu triangles, over "
@@ -18087,7 +18103,7 @@ static int run(int argc, char** argv) {
                     ndCfg.n, ndwarp::planeCount(ndCfg.n), ndModel.base.size(), fills.c_str());
         const ndwarp::Stats st = ndwarp::apply(ndModel, ndCfg, scene);
         scene.build();          // the warp moved geometry: BVH, bounds and lights all restale
-        ndActive = true;
+        ndActive = true;        // true for a slice-only scene too: the sliders drive it
         std::string dropNote;
         if (st.dropped)
             dropNote = " (" + std::to_string(st.dropped) +
@@ -20522,6 +20538,12 @@ static int run(int argc, char** argv) {
             ndwarp::Stats ndLastStats;
             auto ndReapply = [&]() {
                 if (!ndActive) return;
+                // Retilt the field slice first: it is the whole N-D story for an
+                // isosurface, and unlike the mesh path it costs nothing to update -- no
+                // re-projection, no re-tessellation of the SOURCE, just a new 3x n matrix
+                // the field sampler reads. (The isosurface still has to be re-marched for
+                // the preview, which ensurePrims below does.)
+                if (!scene.implicits.empty()) scene.ndSlice = ndwarp::sliceOf(ndCfg);
                 const size_t want = ndwarp::projectedTriCount(ndModel, ndCfg);
                 if (want > ndBudget) {
                     std::fprintf(stderr, "[nd] %zu triangles would exceed the %zu budget; "
@@ -20566,6 +20588,14 @@ static int run(int argc, char** argv) {
                                                            : "  |  linear (a 3x3 squash)")
                                   : "");
                 std::string line = b;
+                // A slice-only scene has no triangles and no fills to report; what the
+                // sliders are actually doing there is tilting the field's slice.
+                if (!ndModel.ok && !scene.implicits.empty()) {
+                    line = std::to_string(scene.implicits.size()) + " field(s) on a " +
+                           std::to_string(ndCfg.n) + "-D slice";
+                    if (!ndwarp::anyFieldReadsExtraDims(scene))
+                        line += "  |  no d4.. term: affine only";
+                }
                 // The edge-on note matters most HERE: in the viewer the user has just
                 // dragged a slider and is looking for the change it made.
                 const std::string eo = ndwarp::edgeOnNote(ndLastStats, ndCfg.n);

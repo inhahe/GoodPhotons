@@ -1028,6 +1028,7 @@ struct DScene {
     // since it is a pure function of colour and shared by every backend.
     const float* vertColors;  int nVertColors;
     const float* jhLut;
+    PatSlice     ndSlice;     // -nd: the 3-D slice of N-space fields are evaluated on
     const DTri*      tris;  int nTris;
     const DSphere*   sph;   int nSph;
     // Flat mirror surfaces (Scene::mirrorPlanes, uploaded verbatim): one entry per
@@ -1204,6 +1205,7 @@ __host__ __device__ static inline DPatEnv dPatEnvOf(const DScene& sc) {
     e.grids = sc.grids; e.nGrids = sc.nGrids;
     e.scatters = sc.scatters; e.nScatters = sc.nScatters;
     e.dataPool = sc.dataPool; e.dataPoolN = sc.dataPoolN;
+    e.slice = sc.ndSlice;
     return e;
 }
 
@@ -2324,7 +2326,8 @@ __device__ static inline float dSmaxF(float a, float b, float k) { return -dSmin
 __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float x, float y, float z, float f,
                                       float nx, float ny, float nz, float r,
-                                      float u, float v, const DPatEnv& env);
+                                      float u, float v, const DPatEnv& env,
+                                      const float* dext = nullptr);
 
 // `env` publishes the scene's texture/grid/scatter tables so a DF_EXPR leaf can BE a
 // sampled volume or height field (`function { expr "grid:terrain(x, z) - y" }`), exactly
@@ -2336,11 +2339,30 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
     switch (nd.op) {
         case DF_SPHERE:
             return sqrt(px*px + py*py + pz*pz) - nd.p[0];
-        case DF_EXPR: {   // arbitrary formula f(x,y,z); r=|p|, other vars (f/normals) are 0
+        case DF_EXPR: {   // arbitrary formula f(x,y,z[,d4..]); r=|p|, other vars are 0
             if (!exprPool) return BIG;
-            double r = sqrt(px*px + py*py + pz*pz);
-            return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
-                                0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, 0.0, env);
+            // N-D slice: map the 3-D sample onto the slice through N-space, so x/y/z are
+            // the first three components of the N-D point and d4.. the rest. Device twin
+            // of the host's patApplySlice; inactive slice leaves everything untouched.
+            double qx = px, qy = py, qz = pz;
+            double dex[kPatMaxExtraDims];
+            const double* dexp = nullptr;
+            if (env.slice.dims > 3) {
+                const PatSlice& s = env.slice;
+                const int n = (s.dims < 3 + kPatMaxExtraDims) ? s.dims : 3 + kPatMaxExtraDims;
+                for (int k = 0; k < n; ++k) {
+                    const double v = s.a[k*3+0]*px + s.a[k*3+1]*py + s.a[k*3+2]*pz + s.o[k];
+                    if      (k == 0) qx = v;
+                    else if (k == 1) qy = v;
+                    else if (k == 2) qz = v;
+                    else             dex[k-3] = v;
+                }
+                for (int k = n - 3; k < kPatMaxExtraDims; ++k) if (k >= 0) dex[k] = 0.0;
+                dexp = dex;
+            }
+            double r = sqrt(qx*qx + qy*qy + qz*qz);
+            return dPatternEval(exprPool + nd.exprOff, nd.exprN, qx, qy, qz, 0.0,
+                                0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, 0.0, env, dexp);
         }
         case DF_BOX: {
             double r = nd.p[3];
@@ -2411,11 +2433,29 @@ __device__ static float dFieldLeafSDFF(const DFieldNodeF& nd, float px, float py
     switch (nd.op) {
         case DF_SPHERE:
             return sqrtf(px*px + py*py + pz*pz) - nd.p[0];
-        case DF_EXPR: {   // arbitrary formula f(x,y,z); r=|p|, other vars (f/normals) are 0
+        case DF_EXPR: {   // arbitrary formula f(x,y,z[,d4..]); r=|p|, other vars are 0
             if (!exprPool) return (float)BIG;
-            float r = sqrtf(px*px + py*py + pz*pz);
-            return dPatternEvalF(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0f,
-                                 0.0f, 0.0f, 0.0f, r, 0.0f, 0.0f, env);
+            // N-D slice, in the same FP32 the march works in — twin of the double
+            // dFieldLeafSDF above and of the host's patApplySlice.
+            float qx = px, qy = py, qz = pz;
+            float dex[kPatMaxExtraDims];
+            const float* dexp = nullptr;
+            if (env.slice.dims > 3) {
+                const PatSlice& s = env.slice;
+                const int n = (s.dims < 3 + kPatMaxExtraDims) ? s.dims : 3 + kPatMaxExtraDims;
+                for (int k = 0; k < kPatMaxExtraDims; ++k) dex[k] = 0.0f;
+                for (int k = 0; k < n; ++k) {
+                    const float v = (float)(s.a[k*3+0]*px + s.a[k*3+1]*py + s.a[k*3+2]*pz + s.o[k]);
+                    if      (k == 0) qx = v;
+                    else if (k == 1) qy = v;
+                    else if (k == 2) qz = v;
+                    else             dex[k-3] = v;
+                }
+                dexp = dex;
+            }
+            float r = sqrtf(qx*qx + qy*qy + qz*qz);
+            return dPatternEvalF(exprPool + nd.exprOff, nd.exprN, qx, qy, qz, 0.0f,
+                                 0.0f, 0.0f, 0.0f, r, 0.0f, 0.0f, env, dexp);
         }
         case DF_BOX: {
             float r = nd.p[3];
@@ -6319,7 +6359,8 @@ __device__ static float dPatValueNoiseF(float x, float y, float z) {
 __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float x, float y, float z, float f,
                                       float nx, float ny, float nz, float r,
-                                      float u, float v, const DPatEnv& env) {
+                                      float u, float v, const DPatEnv& env,
+                                      const float* dext) {
     float st[64]; int sp = 0;
     float reg[PAT_CSE_REGS];    // CSE registers (float: bit-identical to re-running the
                                 // stored subtree in this evaluator's own precision)
@@ -6328,6 +6369,10 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
         switch ((PatOp)nd.op) {
             case PatOp::Const:    st[sp++] = nd.a; break;
             case PatOp::VarX:     st[sp++] = x;  break;
+            case PatOp::VarD4: case PatOp::VarD5:  case PatOp::VarD6:
+            case PatOp::VarD7: case PatOp::VarD8:  case PatOp::VarD9:
+            case PatOp::VarD10: case PatOp::VarD11: case PatOp::VarD12:
+                st[sp++] = dext ? dext[(int)nd.op - (int)PatOp::VarD4] : 0.0f;  break;
             case PatOp::VarY:     st[sp++] = y;  break;
             case PatOp::VarZ:     st[sp++] = z;  break;
             case PatOp::VarF:     st[sp++] = f;  break;
@@ -14996,6 +15041,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     } else {
         sc.vertColors = nullptr; sc.nVertColors = 0; sc.jhLut = d_jhLut;
     }
+    sc.ndSlice = scene.ndSlice;   // by value: 40 doubles, read by every field sample
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
     sc.mirrorPlanes = d_mirp; sc.nMirrorPlanes = (int)mirrorPlanes.size();

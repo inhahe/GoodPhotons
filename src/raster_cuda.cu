@@ -1291,6 +1291,7 @@ bool available() {
 // Opaque uploaded scene: persistent device triangle + light arrays, plus cached per-pixel
 // scratch (grown as needed) so a camera_path re-renders without re-uploading geometry.
 struct Scene {
+    PatSlice ndSlice;             // -nd: the slice of N-space implicit fields are read on
     DPTri*   dtris   = nullptr;
     int      nTris   = 0;
     DGeo*    dgeos   = nullptr;   // 2*nTris slots: screen geometry (classify/raster read this)
@@ -1363,6 +1364,7 @@ static DPatEnv patEnvOf(const Scene& sc) {
     e.grids    = sc.dgrids;    e.nGrids    = sc.nGrids;
     e.scatters = sc.dscatters; e.nScatters = sc.nScatters;
     e.dataPool = sc.ddataPool; e.dataPoolN = sc.nDataPool;
+    e.slice    = sc.ndSlice;
     return e;
 }
 
@@ -1618,6 +1620,9 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
     if (!hpat.empty() &&
         cudaMemcpy(sc->dpatterns, hpat.data(), sizeof(DPattern) * hpat.size(),
                    cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    // The N-D slice rides in the host-side Scene struct (it is read through patEnvOf,
+    // which is built on the host and passed to the kernels by value), so no upload.
+    if (scene) sc->ndSlice = scene->ndSlice;
     if (scene && !scene->grids.empty()) {
         sc->nGrids = (int)scene->grids.size();
         if (cudaMemcpy(sc->dgrids, scene->grids.data(), sizeof(PatGrid) * scene->grids.size(),
