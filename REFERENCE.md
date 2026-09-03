@@ -2480,7 +2480,17 @@ extension; an extension it does not recognise is parsed as OBJ, and a file that 
 **zero triangles is a hard load error**, never a silently empty scene). glTF brings
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
-roughness → lobe width; `import_materials no` forces the FTSL `material` instead).
+roughness → lobe width; `import_materials no` forces the FTSL `material` instead), plus
+the four KHR extensions that describe **glass** — without which a transmissive asset
+arrives opaque and white, since that is literally what its core block says:
+`KHR_materials_transmission` (≥ 0.5 → a `dielectric`, the same 0.5 cut `metallic` uses),
+`KHR_materials_ior` → `ior`, `KHR_materials_volume` → `absorb` (its
+`attenuationColor`/`attenuationDistance` are Beer-Lambert, so
+σ = −ln(color)/distance, exactly ftrace's per-metre coefficient — and the distance is
+kept as a preview hint, see *See-through*), and `KHR_materials_dispersion`, whose
+strength is defined as 20/Abbe and so converts to a two-term Cauchy index reproducing
+the same n_d and the same F-to-C spread. Clearcoat, sheen and the rest are still
+ignored.
 `skip_material <substr>[,…]` (repeatable) drops glTF primitives whose material name
 matches — the way to strip the ground plane / studio backdrop that asset-store models
 bundle in with the subject, since geometry can't be subtracted after it loads.

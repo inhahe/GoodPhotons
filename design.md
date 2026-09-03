@@ -6100,6 +6100,38 @@ latent in `buildPanel` and `buildBindRow` too and is fixed in all three. Changin
 angles are carried across by PLANE IDENTITY (`planeIndex(oldN, i, j)`), so `xw` stays `xw`
 rather than being silently re-indexed as the plane order lengthens.
 
+## glTF glass: the colour is in the extensions, not the core block (0.224.0)
+
+`gltf.h` read only `pbrMetallicRoughness` and mapped metallic>=0.5 to Glossy and everything
+else to Diffuse. For a transmissive asset that is not an approximation, it is a total loss:
+a coloured gem is routinely authored as `baseColorFactor [1,1,1,1]` with the tint in
+`KHR_materials_volume` and the transparency in `KHR_materials_transmission`, so a tray of
+twelve differently coloured gems imported as twelve identical opaque white ones. Reported
+as "Color only changes the whole tint a little, and See-through does nothing" — both
+symptoms of the same omission, since with no dielectric in the scene the see-through pass
+has nothing to act on.
+
+Now imported: transmission (>=0.5 -> Dielectric, mirroring the existing 0.5 cut on
+metallic, because these are single-BSDF materials), ior, volume (attenuationColor /
+attenuationDistance -> `absorb`, Beer-Lambert both sides so the conversion is just
+sigma = -ln(color)/distance), and dispersion (defined as 20/Abbe, so it converts to a
+two-term Cauchy holding n_d and the F-to-C spread).
+
+**Material::absorbRefDist exists because a coefficient is not a colour.** Beer-Lambert
+absorption is per unit LENGTH; how dark a piece of glass looks needs a distance. The tracer
+measures the real path through the solid, but the preview cannot — its clear pass is
+order-independent precisely so it needs no depth sort, so it never pairs a front face with
+its own back face. glTF states that distance, so recording it lets `clearTintOf` return a
+real transmittance instead of only a hue: measured on the compote's gems, the tints land
+within a few percent of sqrt(attenuationColor), which is the authored figure split over the
+two crossings a closed solid presents. Assets that do not state a distance keep the hue-only
+path.
+
+**The clear surface's SOLID preview is tinted too.** Without see-through a clear material
+previews from `reflect`, which for imported glass is routinely pure white — so the gems came
+out as identical pale ghosts even once the glass colour was known. Multiplying the ghost by
+the same tint is what makes the default view show twelve different gems.
+
 ## See-through glass takes its colour from the material (0.223.0)
 
 Through 0.222.0 the clear-surface pass multiplied ONE scalar per crossing (`-glass-clarity`)

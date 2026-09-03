@@ -98,6 +98,17 @@ struct Material {
     // attenuating glass; also the `absorb` target a field_material can drive). 0 =
     // colorless (default, bit-identical to before). Only consulted for Dielectric.
     Spectrum absorb  = constantSpectrum(0.0);
+    // The characteristic THICKNESS `absorb` was authored against, in scene units, or 0
+    // when nobody said. Beer-Lambert absorption is a coefficient per unit length, so on
+    // its own it cannot say how dark a piece of this glass looks — that needs a distance,
+    // and the ray tracer gets one by measuring the actual path through the solid. The
+    // preview rasterizer cannot: its clear pass is order-independent (that is why it needs
+    // no depth sort) and so never pairs a front face with its own back face. glTF's
+    // KHR_materials_volume states exactly this distance (`attenuationDistance`), so when
+    // an importer knows it, recording it here lets the preview show a deep ruby as deep
+    // ruby instead of merely reddish. Read only by raster.h's clearTintOf; the tracer
+    // ignores it and integrates the real path length.
+    double absorbRefDist = 0.0;
     // Diffuse TRANSMISSION albedo vs lambda (MatType::DiffuseTransmit only). The
     // translucent material is a two-lobe Lambertian: `reflect` scatters cosine-
     // distributed into the FRONT hemisphere (+n), `transmit` into the BACK hemisphere
@@ -2022,15 +2033,37 @@ struct Scene {
         // = half the box diagonal (the box circumradius, guaranteed to enclose all
         // geometry). Sizes forward environment photon emission (disk radius) and
         // the env phase-space weight envGeom = 4*PI^2*R^2.
-        if (!bvh.nodes.empty()) {
-            Aabb b = bvh.nodes[0].box;
+        {
+            Aabb b;
+            if (!bvh.nodes.empty()) b = bvh.nodes[0].box;
             // Geometry summarised into a medium and deleted (a `-fur-volume` coat) is still
             // physically there — it just isn't traced. Put its extent back so the bounding
             // sphere, and therefore environment emission, is the one the strands would have
             // produced. No-op when droppedBounds is empty.
             if (droppedBounds.lo.x <= droppedBounds.hi.x) b.expand(droppedBounds);
-            sceneCenter = b.center();
-            sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
+            // BOUNDED PARTICIPATING MEDIA COUNT AS EXTENT. A fog box is part of the scene even
+            // though it is not in the geometry BVH: light has to reach it, photon beams have to
+            // cross it, and a sun's emission disc has to cover it. Leaving it out made
+            // `sceneRadius` a property of the *props* rather than of the world, which is wrong
+            // in exactly the direction that is hardest to see — it under-reports. The failure
+            // that found this: `scenes/_slab_ss.ftsl` is a 4x2x2 m fog box lit by one 2 cm
+            // sphere and nothing else, so the BVH root was a 4 cm box, sceneRadius was 0.0346 m,
+            // and `Renderer::emitBeams`' escape clamp (kBeamFarScale * sceneRadius) truncated
+            // EVERY photon beam at 0.277 m. The beam map became a stub cloud around the emitter
+            // that never reached the camera's view of the box, so mode J's merges returned
+            // exactly zero while its MIS weights still divided the connections down by the
+            // density those merges were supposed to have — a 44x too-dark image. bmin/bmax is
+            // the region's AABB for every bound shape (box, sphere and implicit alike), so one
+            // union covers all three.
+            for (const Medium& md : media)
+                if (md.bounded && md.bmin.x <= md.bmax.x) {
+                    b.expand(md.bmin);
+                    b.expand(md.bmax);
+                }
+            if (b.lo.x <= b.hi.x) {
+                sceneCenter = b.center();
+                sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
+            }
         }
         // Distant suns are sized by the same bounding sphere: a photon is born on a
         // disc of radius R perpendicular to its (cone-sampled) travel direction, so the

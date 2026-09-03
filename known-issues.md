@@ -5,6 +5,34 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### RASTER-MILK — OPEN (2026-09-03, v0.224.0): the see-through pass's haze **saturates on a faceted pile of glass**, washing out the colours it is meant to sit beside
+
+**What happens.** The clear pass adds a "milk" haze per crossed surface —
+`kMilkPerSurface = (1 - glassClarity) * 0.55` plus a grazing rim term
+`kRimStrength * graze³` — and accumulates it as a product over every crossing. On one
+glass object that reads as frosted edges, which is the intent. On a **dense pile of
+faceted gems** (`compote_with_gems.glb`: a dozen transmissive stones, so a sight line
+crosses six of them, each contributing a large grazing term over most of its area) the
+product saturates and the cluster renders as a flat white veil that hides the
+per-material colours added in v0.223.0.
+
+**Why it did not show before.** Until v0.223.0 clear surfaces had no colour of their own,
+so a white wash over them looked like the intended result rather than a loss.
+
+**Workaround.** `-glass-clarity 1` zeroes the per-surface term, leaving only the rim —
+which recovers most of the colour (verified on the compote). The solid preview
+(see-through OFF) shows the material colours cleanly and is unaffected.
+
+**Two candidate fixes, neither attempted.** (a) **Tint the haze** by the surface it came
+from — a red gem's frost should be pink, not white — which needs the milk product to
+become an RGB weighted average (+4 floats/pixel) and would fix the *lone* coloured glass
+object, though not a six-deep pile, where averaging several gem colours is muddy by
+construction. (b) **Cap the accumulated haze** so it cannot approach 1 however many
+surfaces are crossed, which is what actually restores readability on a pile. Worth noting
+that a genuinely six-deep stack of coloured glass *is* muddy in reality, so (b) is a
+legibility choice, not a correctness one, and should be a flag rather than a silent
+change.
+
 ### RASTER-GPU-DIFF — OPEN (2026-09-03, v0.223.0): the preview rasterizer's two backends **disagree on which triangle owns a shared edge**, so a wall/ceiling seam renders green on the CPU and white on the GPU
 
 **What happens.** `raster.h`'s header and design.md's *GPU raster pipeline* both state the

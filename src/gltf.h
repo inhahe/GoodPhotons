@@ -9,7 +9,9 @@
 //
 // Scope / limitations (see known-issues.md): triangles only (primitive.mode 4);
 // POSITION/NORMAL/TEXCOORD_0 attributes; no skinning/morph targets, no sparse
-// accessors, no KHR material extensions (transmission/clearcoat/etc.), no textures
+// accessors, the KHR material extensions that describe GLASS (ior / transmission /
+// volume / dispersion — see the material loop; clearcoat, sheen etc. are still ignored),
+// no textures
 // (only factor colors), no animation. Enough to drop static Fab/Sketchfab/Blender
 // glTF+GLB models into a scene, smooth-shaded, with plausible materials.
 #pragma once
@@ -377,11 +379,73 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     metallic  = pmr->numAt("metallicFactor", 1.0);
                     roughness = pmr->numAt("roughnessFactor", 1.0);
                 }
+                // --- KHR material extensions: where GLASS actually lives ---------------
+                // A transmissive glTF material says almost nothing in its core block — a
+                // coloured gem is routinely `baseColorFactor [1,1,1,1]`, with the tint in
+                // KHR_materials_volume and the transparency in KHR_materials_transmission.
+                // Ignoring these does not lose a nuance, it turns every gem into an opaque
+                // white ball.
+                double khrIor = 1.5, khrTransmission = 0.0, khrDispersion = 0.0;
+                double attC[3] = {1.0, 1.0, 1.0};
+                double attDist = 0.0;                 // 0 == absent == glTF's +infinity
+                if (const minijson::Value* ext = mj.find("extensions")) {
+                    if (const minijson::Value* e = ext->find("KHR_materials_ior"))
+                        khrIor = e->numAt("ior", 1.5);
+                    if (const minijson::Value* e = ext->find("KHR_materials_transmission"))
+                        khrTransmission = e->numAt("transmissionFactor", 0.0);
+                    if (const minijson::Value* e = ext->find("KHR_materials_dispersion"))
+                        khrDispersion = e->numAt("dispersion", 0.0);
+                    if (const minijson::Value* e = ext->find("KHR_materials_volume")) {
+                        attDist = e->numAt("attenuationDistance", 0.0);
+                        if (const minijson::Value* ac = e->find("attenuationColor");
+                            ac && ac->isArray() && ac->arr.size() >= 3) {
+                            attC[0] = ac->arr[0].asNumber(1.0);
+                            attC[1] = ac->arr[1].asNumber(1.0);
+                            attC[2] = ac->arr[2].asNumber(1.0);
+                        }
+                    }
+                }
                 Material m;
                 m.reflect = rgbToReflectanceJH(r, g, b);
-                // Heuristic map onto the spectral BSDFs: metals -> glossy tinted by the
-                // base color, dielectrics -> diffuse. Roughness carries straight over.
-                if (metallic >= 0.5) {
+                // Heuristic map onto the spectral BSDFs: transmissive -> dielectric,
+                // metals -> glossy tinted by the base color, everything else -> diffuse.
+                // The 0.5 cut on transmission mirrors the one already used on metallic:
+                // these are single-BSDF materials, so a partially transmissive surface has
+                // to be called one thing or the other.
+                if (khrTransmission >= 0.5) {
+                    m.type = MatType::Dielectric;
+                    m.roughness = std::max(0.0, roughness);
+                    // KHR_materials_dispersion states its strength as 20/Abbe, so an Abbe
+                    // number falls straight out of it. Turn that into the two-term Cauchy
+                    // n(l) = A + B/l^2 that reproduces the same n_d and the same F-to-C
+                    // spread: B from V = (n_d-1)/(n_F-n_C), then A so n(587.6nm) == n_d.
+                    if (khrDispersion > 1e-6) {
+                        const double V  = 20.0 / khrDispersion;         // Abbe number
+                        const double lF = 0.4861, lC = 0.6563, lD = 0.5876;   // micrometres
+                        const double B  = (khrIor - 1.0) /
+                                          (V * (1.0 / (lF * lF) - 1.0 / (lC * lC)));
+                        const double A  = khrIor - B / (lD * lD);
+                        m.ior = cauchy(A, B);
+                    } else {
+                        m.ior = iorConstant(khrIor);
+                    }
+                    // KHR_materials_volume: transmittance over a distance d is
+                    // attenuationColor^(d/attenuationDistance) — Beer-Lambert with
+                    // sigma = -ln(attenuationColor)/attenuationDistance, which is exactly
+                    // what ftrace's `absorb` is (a coefficient per metre). An absent or
+                    // infinite attenuationDistance means no absorption at all.
+                    if (attDist > 0.0) {
+                        auto sigma = [attDist](double c) {
+                            c = std::min(1.0, std::max(1e-6, c));       // ln(0) guard
+                            return -std::log(c) / attDist;
+                        };
+                        const double sr = sigma(attC[0]), sg = sigma(attC[1]), sb = sigma(attC[2]);
+                        if (sr > 1e-9 || sg > 1e-9 || sb > 1e-9) {
+                            m.absorb = rgbToReflectanceJH(sr, sg, sb);
+                            m.absorbRefDist = attDist;   // preview hint; see Material
+                        }
+                    }
+                } else if (metallic >= 0.5) {
                     m.type = MatType::Glossy;
                     m.roughness = std::max(0.02, roughness);
                 } else {

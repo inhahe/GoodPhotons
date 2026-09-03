@@ -217,6 +217,19 @@ inline Vec3 clearTintOf(const Material& m) {
         if (t.x + t.y + t.z <= 1e-6) return Vec3{1, 1, 1};
         return t;
     }
+    // If the asset stated the thickness its absorption was authored against
+    // (Material::absorbRefDist — glTF's KHR_materials_volume attenuationDistance), believe
+    // it: the transmittance is then a real number, not just a hue, and a dense onyx reads
+    // near-black instead of white. HALF the distance goes into each crossing, because the
+    // authored figure describes light traversing the body once and a closed solid is
+    // crossed twice — front and back — so splitting it means the pair multiplies back to
+    // what was authored.
+    const double d = (m.absorbRefDist > 0.0) ? m.absorbRefDist * 0.5 : 0.0;
+    if (d > 0.0) {
+        return clamp01(balance(spectrumToLinearRgb(
+            [&m, d](double lam) { return std::exp(-std::max(0.0, m.absorb(lam)) * d); })));
+    }
+    // Nobody said how thick: take the hue only and leave the magnitude to -glass-clarity.
     const Vec3 raw = balance(spectrumToLinearRgb(
         [&m](double lam) { return std::exp(-std::max(0.0, m.absorb(lam))); }));
     // Normalise BEFORE clamping: clipping first would distort the hue of a strongly
@@ -397,7 +410,17 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         s.color    = materialColor(m, em);
         s.emissive = em;
         s.clear    = (!m.isLight && isClearPreviewType(m.type));
-        if (s.clear) s.clearTint = clearTintOf(m);
+        if (s.clear) {
+            s.clearTint = clearTintOf(m);
+            // Tint the SOLID ghost by the same glass colour. Without see-through a clear
+            // material previews from `reflect`, which for imported glass is routinely pure
+            // white — so a tray of differently coloured gems came out as a tray of
+            // identical pale balls. The tint is hue-normalised, so this colours the ghost
+            // without darkening it.
+            s.color = Vec3{s.color.x * s.clearTint.x,
+                           s.color.y * s.clearTint.y,
+                           s.color.z * s.clearTint.z};
+        }
         // An image skin: a diffuse-albedo texture bound via `reflect texture:<name>`.
         // The preview shades from the texture's linear RGB (Texture::sampleRgb), so no
         // Jakob-Hanika coefficient precompute is needed (that's only for spectral hits).
