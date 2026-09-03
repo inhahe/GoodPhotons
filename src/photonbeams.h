@@ -451,6 +451,11 @@ struct BeamMis {
                             // distance the light-side density is measured over
     unsigned char gateC1 = 0;  // is "connect x to y_{s-1}" a legal strategy? (y_{s-1} not
                                // delta) — the reference technique of the whole ratio
+    unsigned short vert = 0;   // the light subpath vertex index j of y_{s-1} (so s = j+1).
+                               // Needed ONLY for the depth cap: merging light vertex j with
+                               // camera vertex k builds a path of depth j + k + 1, and the
+                               // connection loop refuses depth > maxDepth, so the merge must
+                               // refuse it too or mode J renders paths mode D never builds.
 };
 
 // Result of one beam/ray closest-approach test that passed the radius check.

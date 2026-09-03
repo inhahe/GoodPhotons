@@ -1514,6 +1514,9 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 // against — a legal strategy? x is a medium point and never delta, so only
                 // y_{s-1} can veto it.
                 m.gateC1 = y.delta ? 0 : 1;
+                // The light vertex index, carried purely so the gather can apply the same
+                // depth cap the connection loop applies: the merged path has depth j + k + 1.
+                m.vert = (unsigned short)(j < np ? j : np - 1);
                 // eta' of the merge AT y_{s-1}. Its outgoing direction is this segment's own
                 // `d` (the merged path leaves y_{s-1} along the beam), so sin(theta) is known
                 // here; only its transmittance, which needs the not-yet-known distance to x,
@@ -2284,10 +2287,21 @@ struct BeamMergeWeight {
     double etaKCoef   = 0.0;  // sin(theta_k) / (sigma_t(eye[k]) * Tr~(eye[k] -> eye[k-1]))
     double segSumC    = 0.0;  // camera-side connection accumulator from eye[k] inward
     double segSumM    = 0.0;  // camera-side merge accumulator, kappa factored out
+    int    camVert    = 0;    // k: the camera subpath index of the vertex this segment leaves
+    int    maxDepth   = 0;    // the same cap the connection loop applies (see below)
 
     double operator()(const BeamHit& bh, const PhotonBeam& b, double dens, double phase) const {
         const BeamMis* lm = bm->misOf(bh.idx);
         if (!lm) return 1.0;                  // no MIS data: mode M's raw estimator
+        // THE DEPTH CAP. The merged path has s = j+1 light vertices and t = k+2 camera ones,
+        // hence depth = s+t-2 = j+k+1. renderRows' connection loop refuses depth > maxDepth,
+        // so a merge past the cap would contribute a path length mode D never builds — energy
+        // with nothing to MIS against, which is exactly what it looked like: 1.6x too bright
+        // on an optically thick medium, and worse the more beams were emitted (as kappa grows
+        // the weight of an uncontested technique tends to 1). Every strategy in this
+        // denominator describes the SAME path with the same n, so a single gate here is the
+        // whole fix: past the cap the merge does not exist, and no other term needs adjusting.
+        if ((int)lm->vert + camVert + 1 > maxDepth) return 0.0;
         const double tc = bh.tCam;
         const double rhoL = (double)lm->leadIn + bh.sBeam;   // y_{s-1} -> x, not b.o -> x
         if (!(tc > 0.0) || !(rhoL > 0.0)) return 0.0;
@@ -2562,6 +2576,11 @@ struct BdptRenderer {
                                 w1.invPdfFwdK = 1.0 / misRemap0(vk.pdfFwd);
                                 w1.segSumC    = segSumC[k < (size_t)nE ? k : (size_t)nE - 1];
                                 w1.segSumM    = segSumM[k < (size_t)nE ? k : (size_t)nE - 1];
+                                // The depth cap, the same one the connection loop above
+                                // applies: a merge at light vertex j on this segment makes a
+                                // path of depth j + k + 1.
+                                w1.camVert    = (int)(k < (size_t)nE ? k : (size_t)nE - 1);
+                                w1.maxDepth   = maxDepth;
                                 // The merge AT eye[k]. Its light-side incoming direction is
                                 // -sg.d whatever x turns out to be, so sin(theta) and the
                                 // whole coefficient are merge-point INDEPENDENT and belong

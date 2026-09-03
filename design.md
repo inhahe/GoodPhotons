@@ -361,6 +361,18 @@ Three approximations are deliberate and documented under **UPBP-W** in `known-is
 scene-wide kernel radius (`BeamMap::radRef`), a weight built from two wavelengths, and a merge
 dropped when the light-side density is delta. All three are weight *quality*, not bias.
 
+**The depth cap (0.219.0), which is not optional.** The merged path has `s = j+1` light vertices
+and `t = k+2` camera ones, so its depth is `j + k + 1` — up to `2·maxDepth + 2`. The connection
+loop refuses `depth > maxDepth`; until 0.219.0 the merge loop did not, so mode `J` rendered path
+lengths mode `D` never builds, adding energy with no competing technique to weight it against.
+That is invisible in a thin fog and worth **1.65×** at `sigma_t 20 / albedo 0.95`, and it *grew*
+with `-n`, because an uncontested technique's balance weight tends to 1 as `kappa` grows. The fix
+is a single gate — `BeamMis::vert` carries `j`, `BeamMergeWeight` carries `k` and `maxDepth`, and
+the weight returns 0 past the cap. One gate suffices because every strategy in that denominator
+describes the *same* path with the same vertex count, so they are all in or all out together;
+`misWeight`'s hypothetical merge terms need no gating for the identical reason. See **UPBP-DEPTH**
+in `known-issues.md` for the measurements.
+
 **Validation, passed 0.218.0** (`_fog_cornell.ftsl`, `-device cpu`):
 
 | Test | What it proves | Result |

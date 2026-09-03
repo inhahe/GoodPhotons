@@ -35,6 +35,48 @@ in the merge-vs-C1 ratio that Phase 3b is about (see the derivation), so the mer
 right either way, and folding a mode-`D`-wide weight change into the same commit would make the
 UPBP validation renders ambiguous about which change moved them.
 
+### UPBP-DEPTH — FIXED (2026-09-03, v0.219.0): mode `J`'s merges ignored `maxDepth`, so it rendered paths mode `D` never builds — 1.65× too bright in a thick medium
+
+**The symptom, and why it hid for a whole phase.** Phase 3b passed every gate on
+`scenes/_fog_cornell.ftsl` (gate 4: converged `J`/`D` mean ratio **1.0006**). On
+`scenes/_fog_thick.ftsl` — the same box at `sigma_t 20 / albedo 0.95` — mode `J` came out
+**1.56×–1.68×** brighter than a converged mode `D` reference, and *the excess grew with `-n`*:
+
+| render (equal 300 s, `-r 64`) | mean | vs reference |
+|---|---|---|
+| reference (`D`, 900 s, 35 700 spp) | 1.960811e+09 | — |
+| `-mode D` | 1.95719e+09 | 0.998 |
+| `-mode J -n 20000` | 3.06617e+09 | 1.564 |
+| `-mode J -n 100000` | 3.24308e+09 | 1.654 |
+| `-mode J -n 400000` | 3.29649e+09 | 1.681 |
+
+**Root cause.** `BdptRenderer::renderRows`' connection loop refuses any strategy past the path
+length cap — `int depth = t + s - 2; if ((s == 1 && t == 1) || depth < 0 || depth > maxDepth)
+continue;` — but the merge loop applied **no equivalent test**. A merge of light-subpath vertex
+`j` with camera-subpath vertex `k` builds a path with `s = j+1`, `t = k+2`, hence
+`depth = s+t-2 = j+k+1`, running up to `2·maxDepth + 2`. Those are paths mode `D` does not
+build, so their energy is pure addition with nothing to MIS against — and since an uncontested
+technique's balance-heuristic weight `w_M = etaS/den` tends to **1** as `kappa = n_m·2r` grows,
+emitting more beams made it *worse*, which is exactly the trend in the table. In a thin fog the
+over-cap paths carry almost nothing (`albedo 0.6`, `tau 0.6`), which is why `_fog_cornell` — a
+correctness scene by construction — reported 1.0006 and saw none of it.
+
+**The fix** is one gate, because every strategy in a merge weight's denominator describes the
+*same* path with the same vertex count, so they are all inside or all outside the cap together:
+`BeamMis` gained a `vert` field (the light index `j`, written in `traceLightBeamPass`),
+`BeamMergeWeight` gained `camVert` (`k`, from `PathSeg::vert`) and `maxDepth`, and
+`operator()` returns 0 when `j + k + 1 > maxDepth`. `misWeight`'s own hypothetical merge terms
+needed no change for the same reason — every strategy it enumerates shares one `n`.
+
+**After the fix** (same 300 s, `-n 100000`): mean **1.95563e+09**, ratio **0.9973** against the
+reference. Gate 1 (`-mode J -nobeams` `cmp`-identical to `-mode D -device cpu`) and gate 2
+(15 939 weights audited, **0** disagreements, worst 5.064e-15; poisoned control 12 409/15 939 at
+1.000e+00) both still pass.
+
+**The lesson worth keeping:** a correctness scene chosen to make two estimators provably agree
+also makes their disagreements invisible. The bug was found within minutes of building the first
+scene where the two estimators were *supposed* to differ.
+
 ### UPBP-W — OPEN (2026-09-02, v0.218.0): three deliberate approximations inside mode `J`'s merge weight, all of them weight-QUALITY only
 
 Phase 3b's balance heuristic is unbiased for *any* strictly positive, deterministic, technique-
