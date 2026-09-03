@@ -19657,7 +19657,31 @@ static int run(int argc, char** argv) {
                 for (size_t k = 0; k < d.size(); ++k) d[k] = ndCfg.angle[k] * 180.0 / PI;
                 return d;
             };
-            if (ndActive) g_liveWin->enableNdPanel(ndCfg.n, ndPlaneLabels(), ndAnglesDeg());
+            // The per-dimension FILL cells: what each extra dimension contains. Without
+            // these the viewer can only rotate and squash, because a lift whose extra
+            // coordinates are all zero collapses to a single 3x3 matrix.
+            auto ndDimLabels = [&]() {
+                std::vector<std::string> lb;
+                for (int k = 3; k < ndCfg.n; ++k) lb.push_back(ndwarp::axisName(k));
+                return lb;
+            };
+            auto ndFillSel = [&]() {
+                std::vector<int> f;
+                for (const ndwarp::DimSpec& d : ndCfg.extra) f.push_back(ndwarp::fillChoiceOf(d));
+                return f;
+            };
+            auto ndAmounts = [&]() {
+                std::vector<double> a;
+                for (const ndwarp::DimSpec& d : ndCfg.extra)
+                    a.push_back(std::clamp(d.amp, 0.0, 1.0));
+                return a;
+            };
+            auto ndBuildPanel = [&]() {
+                g_liveWin->enableNdPanel(ndCfg.n, ndPlaneLabels(), ndAnglesDeg(),
+                                         ndDimLabels(), ndwarp::fillChoices(),
+                                         ndFillSel(), ndAmounts());
+            };
+            if (ndActive) ndBuildPanel();
             bool   pathMode = false;    // locked to the camera path (orientation + travel follow it)
             bool   playing  = false;    // auto-advancing along the path
             double pathPos  = 0.0;      // fractional camera index (continuous; render uses the nearest)
@@ -20524,7 +20548,8 @@ static int run(int argc, char** argv) {
             };
             if (ndActive) {
                 ndLastStats = ndwarp::apply(ndModel, ndCfg, scene);   // seed the readout
-                g_liveWin->setNdState(ndAnglesDeg(), ndStatus().c_str());
+                g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
+                                      ndStatus().c_str());
             }
 
             auto animAdoptScene = [&](const std::string& path, std::string& aerr) -> bool {
@@ -20586,19 +20611,68 @@ static int run(int argc, char** argv) {
                                     ndCfg.n, ndwarp::planeCount(ndCfg.n));
                         std::fflush(stdout);
                         ndReapply();
-                        g_liveWin->enableNdPanel(ndCfg.n, ndPlaneLabels(), ndAnglesDeg());
-                        g_liveWin->setNdState(ndAnglesDeg(), ndStatus().c_str());
+                        ndBuildPanel();
+                        g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
+                                              ndStatus().c_str());
                         changed = true;
                     } else if (nav.ndReset) {
                         std::fill(ndCfg.angle.begin(), ndCfg.angle.end(), 0.0);
                         ndReapply();
-                        g_liveWin->setNdState(ndAnglesDeg(), ndStatus().c_str());
+                        g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
+                                              ndStatus().c_str());
+                        changed = true;
+                    } else if (nav.ndFillMoved &&
+                               nav.ndFill.size() == ndCfg.extra.size() &&
+                               nav.ndAmount.size() == ndCfg.extra.size()) {
+                        // A fill combo or amount slider moved. This is the control that
+                        // decides whether the warp can do anything beyond rotate and
+                        // squash, so it also carries the two assists below.
+                        const std::vector<ndwarp::DimSpec> before = ndCfg.extra;
+                        for (size_t k = 0; k < ndCfg.extra.size(); ++k) {
+                            ndwarp::applyFillChoice(nav.ndFill[k], ndCfg.extra[k]);
+                            ndCfg.extra[k].amp = nav.ndAmount[k];
+                            // Switching a dimension ON at amount 0 would look exactly like
+                            // leaving it at `zero`, so give it a starting amount the first
+                            // time — the slider is then mirrored back so the two agree.
+                            if (nav.ndFill[k] != 0 && ndwarp::fillChoiceOf(before[k]) == 0 &&
+                                ndCfg.extra[k].amp <= 0.0)
+                                ndCfg.extra[k].amp = ndwarp::defaultAmountFor(nav.ndFill[k]);
+                        }
+                        // An extra dimension only reaches the image through its column of
+                        // the rotation's first three rows. Turn a fill on while every plane
+                        // containing that axis is at zero and the result is invisible (an
+                        // extrusion loses every side wall to the degenerate cull), which
+                        // reads as "the control does nothing". So when a fill is switched on
+                        // into a completely edge-on axis, turn it into view: the slider
+                        // visibly moves, and the user sees what they just asked for.
+                        for (int k = 3; k < ndCfg.n; ++k) {
+                            const size_t e = (size_t)(k - 3);
+                            if (nav.ndFill[e] == 0 || ndwarp::fillChoiceOf(before[e]) != 0) continue;
+                            bool anyTurned = false;
+                            for (int j = 0; j < ndCfg.n; ++j) {
+                                if (j == k) continue;
+                                const int pk = ndwarp::planeIndex(ndCfg.n, std::min(j, k), std::max(j, k));
+                                if (pk >= 0 && ndCfg.angle[(size_t)pk] != 0.0) anyTurned = true;
+                            }
+                            if (anyTurned) continue;
+                            const int pk = ndwarp::planeIndex(ndCfg.n, 2, k);   // the z-<axis> plane
+                            if (pk < 0) continue;
+                            ndCfg.angle[(size_t)pk] = 30.0 * PI / 180.0;
+                            std::printf("[nd] %s was edge-on, so %s is turned to 30 deg to bring "
+                                        "it into view\n", ndwarp::axisName(k).c_str(),
+                                        ndwarp::planeLabel(ndCfg.n, pk).c_str());
+                            std::fflush(stdout);
+                        }
+                        ndReapply();
+                        g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
+                                              ndStatus().c_str());
                         changed = true;
                     } else if (nav.ndMoved && nav.ndAngles.size() == ndCfg.angle.size()) {
                         for (size_t k = 0; k < ndCfg.angle.size(); ++k)
                             ndCfg.angle[k] = nav.ndAngles[k] * PI / 180.0;
                         ndReapply();
-                        g_liveWin->setNdState(ndAnglesDeg(), ndStatus().c_str());
+                        g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
+                                              ndStatus().c_str());
                         changed = true;
                     }
                     if (nav.ndSave) {
@@ -20618,11 +20692,11 @@ static int run(int argc, char** argv) {
                         if (ndwarp::exportModel(scene, ndModel, path, eerr, &wrote)) {
                             std::printf("[nd] wrote %zu triangles to %s\n", wrote, path.c_str());
                             std::printf("[nd] render it with:  ftrace %s\n", path.c_str());
-                            g_liveWin->setNdState(ndAnglesDeg(),
+                            g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
                                                   ("saved " + path).c_str());
                         } else {
                             std::fprintf(stderr, "[nd] export failed: %s\n", eerr.c_str());
-                            g_liveWin->setNdState(ndAnglesDeg(),
+                            g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
                                                   ("save FAILED: " + eerr).c_str());
                         }
                         std::fflush(stdout);

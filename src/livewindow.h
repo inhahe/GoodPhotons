@@ -114,14 +114,23 @@ struct NavInput {
     // steady state it already drew. `ndDims` is the dimension box (0 = unchanged), and the
     // two button edges reset every angle to zero / write the projected model out.
     std::vector<double> ndAngles;        // current per-plane angles in degrees (empty = no panel)
-    bool   ndMoved = false;              // a slider moved since the last drain (one-shot)
+    // Per EXTRA dimension (4th, 5th, ...): what fills it, as an index into the pick-list
+    // handed to enableNdPanel, and how much of it (0..1). Persistent state like ndAngles;
+    // `ndFillMoved` is the one-shot edge saying one of them actually changed. These are
+    // what make the viewer able to do something other than rotate and squash: with every
+    // dimension left at the first entry (`zero`) the whole warp is one 3x3 matrix.
+    std::vector<int>    ndFill;          // per extra dim: index into the fill pick-list
+    std::vector<double> ndAmount;        // per extra dim: emboss amplitude / extrude depth, 0..1
+    bool   ndFillMoved = false;          // a fill combo or amount slider changed (one-shot)
+    bool   ndMoved = false;              // a plane slider moved since the last drain (one-shot)
     int    ndDims  = 0;                  // dimension box (current value; 0 = unchanged/absent)
     bool   ndReset = false;              // "Reset" button: zero every angle (one-shot)
     bool   ndSave  = false;              // "Save" button: export the projected model (one-shot)
     bool   any() const { return lookX || lookY || wheel || wheelSpeed || fwd || back || reset || print
                                 || cycleCollide || toggleTrace || togglePath || togglePlay || scrubTo >= 0
                                 || recToggle || addPoint || insPoint || delPoint || saveCurve || speedReset
-                                || bindApply || bindClear || ndMoved || ndReset || ndSave; }
+                                || bindApply || bindClear || ndMoved || ndFillMoved
+                                || ndReset || ndSave; }
 };
 
 class LiveWindow {
@@ -224,14 +233,26 @@ public:
     // a different plane count REBUILDS the bank in place, which is what changing the
     // dimension box has to do. Marshalled to the UI thread; no-op if the panel isn't
     // enabled, or on non-Windows / stub builds.
-    void enableNdPanel(int dims, const std::vector<std::string>& labels,
-                       const std::vector<double>& anglesDeg);
+    // `planeLabels`/`anglesDeg` are one per rotation plane. `dimLabels` names each EXTRA
+    // dimension (one per dim past the third), `fillChoices` is the pick-list every fill
+    // combo offers (the window knows nothing about what the entries mean — it reports the
+    // selected index), and `fillSel`/`amounts` are their starting values.
+    void enableNdPanel(int dims,
+                       const std::vector<std::string>& planeLabels,
+                       const std::vector<double>& anglesDeg,
+                       const std::vector<std::string>& dimLabels,
+                       const std::vector<std::string>& fillChoices,
+                       const std::vector<int>& fillSel,
+                       const std::vector<double>& amounts);
 
     // Mirror the warp's state onto the N-D panel: `anglesDeg` moves the sliders (e.g.
     // after Reset) and `status` is the readout line under them (triangle counts, or the
     // "this warp is linear" note). Marshalled to the UI thread; setting these never
     // re-emits the corresponding NavInput edge. No-op if the N-D panel isn't shown.
-    void setNdState(const std::vector<double>& anglesDeg, const char* status);
+    void setNdState(const std::vector<double>& anglesDeg,
+                    const std::vector<int>& fillSel,
+                    const std::vector<double>& amounts,
+                    const char* status);
 
     // Update the panel's painted-speed readout (the "Paint" mode shows the local traversal-speed
     // multiplier at the current scrub position, e.g. "1.35x"). Marshalled to the UI thread; no

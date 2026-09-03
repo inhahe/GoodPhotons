@@ -6061,10 +6061,28 @@ like the fill did nothing. It is the correct picture of a solid seen edge-on, so
 `Stats::edgeOn` records it and both the CLI and the panel name the axis and suggest a plane
 rather than leaving the user to wonder.
 
+**The fill cells are the point of the panel.** Shipping the plane sliders without them
+(0.220.0) made the viewer able to do nothing but rotate and squash, because a lift whose
+extra coordinates are all zero is exactly one 3x3 matrix — the fills were reachable only
+from the command line, so the interactive tool could not reach the interesting half of its
+own feature. `ndwarp::fillChoices()` is now the single list both the combo and the CLI
+resolve against, with `applyFillChoice` / `fillChoiceOf` the only conversions, so the two
+front ends cannot drift. Two assists live in the render loop rather than the window,
+because both need the warp's state: a fill picked at amount 0 gets a visible default, and a
+fill switched on into a fully edge-on axis turns the `z`-axis plane to 30 degrees so the
+change is visible instead of silently culled.
+
 **Panel geometry.** The slider bank's height is a function of the window WIDTH (it wraps),
 so `panelH` is re-derived from `panelBaseH` on every layout instead of being accumulated as
 a one-time delta — otherwise narrowing the window would lay slider rows out below the strip
-where they cannot be seen. Changing the dimension box destroys and rebuilds every trackbar;
+where they cannot be seen. Every builder that grows the window must also call `layoutView`,
+not just `layoutPanel`: growing normally fires `WM_SIZE`, which lays out both, but the grow
+is CLAMPED once the window would exceed the work area, and a clamped `SetWindowPos` changes
+nothing and so raises no `WM_SIZE`. The D3D child then keeps a rect taller than the image
+area and the swap chain presents the frame offset and cropped — the model slides off toward
+the bottom right — until some unrelated resize happens to correct it. The N-D bank is what
+exposed this (it is the tallest strip, so it is the one that gets clamped), but the bug was
+latent in `buildPanel` and `buildBindRow` too and is fixed in all three. Changing the dimension box destroys and rebuilds every trackbar;
 angles are carried across by PLANE IDENTITY (`planeIndex(oldN, i, j)`), so `xw` stays `xw`
 rather than being silently re-indexed as the plane order lengthens.
 

@@ -1188,6 +1188,65 @@ inline bool parseDimSpec(const std::string& spec, DimSpec& out, std::string& err
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// The fill pick-list
+// ---------------------------------------------------------------------------
+//
+// One flat list of every (fill, source) pair a dimension can take, so the viewer's combo
+// and the CLI's spec grammar cannot drift apart: the combo reports an index into THIS
+// list, and `applyFillChoice` is the only thing that turns an index into a DimSpec.
+
+inline const std::vector<std::string>& fillChoices() {
+    static const std::vector<std::string> kChoices = {
+        "zero",
+        "emboss curvature",
+        "emboss radius",
+        "emboss height",
+        "emboss noise",
+        "emboss u",
+        "emboss v",
+        "extrude",
+    };
+    return kChoices;
+}
+
+// Sensible starting amount for a fill the user has just switched ON. An emboss at 0 is
+// indistinguishable from `zero`, so picking one and seeing nothing happen would be the
+// same dead end the edge-on case produces.
+inline double defaultAmountFor(int choice) {
+    if (choice <= 0) return 0.0;
+    return (choice == 7) ? 0.5 : 0.25;   // extrude reads better a little deeper
+}
+
+// Set `d`'s fill and source from a pick-list index, leaving `amp`/`freq` alone.
+inline void applyFillChoice(int choice, DimSpec& d) {
+    switch (choice) {
+        case 1: d.fill = Fill::Emboss;  d.src = Emb::Curvature; break;
+        case 2: d.fill = Fill::Emboss;  d.src = Emb::Radius;    break;
+        case 3: d.fill = Fill::Emboss;  d.src = Emb::Height;    break;
+        case 4: d.fill = Fill::Emboss;  d.src = Emb::Noise;     break;
+        case 5: d.fill = Fill::Emboss;  d.src = Emb::U;         break;
+        case 6: d.fill = Fill::Emboss;  d.src = Emb::V;         break;
+        case 7: d.fill = Fill::Extrude;                         break;
+        default: d.fill = Fill::Zero;                           break;
+    }
+}
+
+// The inverse: which pick-list entry a DimSpec currently is.
+inline int fillChoiceOf(const DimSpec& d) {
+    if (d.fill == Fill::Extrude) return 7;
+    if (d.fill != Fill::Emboss)  return 0;
+    switch (d.src) {
+        case Emb::Curvature: return 1;
+        case Emb::Radius:    return 2;
+        case Emb::Height:    return 3;
+        case Emb::Noise:     return 4;
+        case Emb::U:         return 5;
+        case Emb::V:         return 6;
+    }
+    return 0;
+}
+
 inline std::string dimSpecText(const DimSpec& d) {
     switch (d.fill) {
         case Fill::Zero:    return "zero";

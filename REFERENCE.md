@@ -4737,6 +4737,18 @@ the model from the pristine captured copy (angles are absolute, never composed),
 it and re-renders, live. The fly camera, `-see-through` glass and every other viewer control
 keep working throughout.
 
+Above them sits one **fill cell per extra dimension** — the same `zero` / `emboss:<src>` /
+`extrude` choice `-nd-fill` takes, as a pick-list plus an amount slider reading in the same
+model-radius units. This is the control that decides whether the viewer can do anything
+beyond rotate and squash: leave every dimension at `zero` and the whole bank is one 3x3
+matrix, which is why the readout says so.
+
+Two things the cells do for you. Picking a fill while its amount is still 0 starts it at a
+visible default (0.25 emboss, 0.5 extrude), since an emboss at zero is indistinguishable
+from `zero`. And switching one on while its axis is **completely edge-on** turns the
+`z`-*axis* plane to 30° so you can see what you just asked for — the slider visibly moves
+and the reason is printed, rather than leaving you looking at an unchanged model.
+
 Beside them: an **N-D dims** box that changes `n` on the fly (the bank is rebuilt, and
 angles are carried across by **plane identity**, so `xw` stays `xw` rather than being
 re-indexed), a **Reset** that zeroes every angle, **Save model**, and a readout of the
