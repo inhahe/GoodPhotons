@@ -18331,9 +18331,23 @@ static int run(int argc, char** argv) {
             // by being told or by deriving it.
             std::printf("[nd] this warp is LINEAR — every extra dimension is `zero`, so the "
                         "result is the\n"
-                        "     source model under a single 3x3 matrix (det %+.4f%s). "
-                        "Use -nd-fill\n"
-                        "     <dim>=emboss:... or extrude:... for a warp that is not affine.\n",
+                        "     source model under a single 3x3 matrix (det %+.4f%s): it can "
+                        "rotate, shear,\n"
+                        "     squash and (past 180 deg in a mixed plane) MIRROR the model, "
+                        "but it cannot\n"
+                        "     add structure. Fill a dimension to get a warp that is not "
+                        "affine — try:\n"
+                        "       -nd-fill 4=emboss:curvature:1.0   spikes out of the "
+                        "high-curvature detail\n"
+                        "       -nd-fill 4=emboss:noise:1.0       crumples and folds it\n"
+                        "       -nd-fill 4=extrude:0.5            sweeps a real N-D prism "
+                        "(mesh grows ~3.5x)\n"
+                        "     ...then turn a plane containing that axis, e.g. -nd-angle "
+                        "xw=60.\n"
+                        "     In the viewer the same controls are the FILL box + amount "
+                        "slider per axis;\n"
+                        "     the amount is what decides whether you see anything (0.25 is "
+                        "subtle, 1.0 is not).\n",
                         st.det, st.det < 0.0 ? ", MIRRORED" : "");
             if (st.singular)
                 std::printf("[nd] the matrix is singular: the model has been squashed "
@@ -20792,8 +20806,11 @@ static int run(int argc, char** argv) {
                 std::snprintf(b, sizeof b, "%zu tris  |  %s%s",
                               ndLastStats.tris, fills.c_str(),
                               ndLastStats.linear
-                                  ? (ndLastStats.det < 0.0 ? "  |  linear, MIRRORED"
-                                                           : "  |  linear (a 3x3 squash)")
+                                  ? (ndLastStats.det < 0.0
+                                         ? "  |  linear, MIRRORED - set a FILL below (+ raise "
+                                           "its amount) to morph"
+                                         : "  |  linear: rotating can only squash - set a FILL "
+                                           "below (+ raise its amount) to morph")
                                   : "");
                 std::string line = b;
                 // A slice-only scene has no triangles and no fills to report; what the

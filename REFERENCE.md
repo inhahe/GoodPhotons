@@ -4901,7 +4901,17 @@ Above them sits one **fill cell per extra dimension** — the same `zero` / `emb
 `extrude` choice `-nd-fill` takes, as a pick-list plus an amount slider reading in the same
 model-radius units. This is the control that decides whether the viewer can do anything
 beyond rotate and squash: leave every dimension at `zero` and the whole bank is one 3x3
-matrix, which is why the readout says so.
+matrix, which is why the readout says so — and says what to do about it. While every
+dimension is `zero` the panel's status line reads
+
+```
+250744 tris  |  w=zero v=zero  |  linear: rotating can only squash - set a FILL below (+ raise its amount) to morph
+```
+
+naming the control rather than only the symptom. (It used to stop at
+`linear (a 3x3 squash)`, which correctly described the state and left you no idea that the
+dropdown two rows down was the cure.) The same is true on the console: a linear warp prints
+copy-pasteable `-nd-fill` lines rather than an abstract summary of the syntax.
 
 Two things the cells do for you. Picking a fill while its amount is still 0 starts it at a
 visible default (0.25 emboss, 0.5 extrude), since an emboss at zero is indistinguishable
