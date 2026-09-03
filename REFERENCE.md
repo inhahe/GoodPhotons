@@ -2477,7 +2477,13 @@ first.
 **Curves and fibers** below), and `mesh` (**OBJ, glTF 2.0 / GLB,
 Autodesk FBX, Stanford PLY, STL, and `.ftmesh`** import — the loader dispatches on file
 extension; an extension it does not recognise is parsed as OBJ, and a file that yields
-**zero triangles is a hard load error**, never a silently empty scene). glTF brings
+**zero triangles is a hard load error**, never a silently empty scene). Which formats
+carry a *material* differs, and `tools/mesh_format_matrix.py` renders one geometry
+through all of them to prove it: **OBJ** (via `.mtl`), **glTF/GLB** and **FBX** import
+colour and transmissive glass; **PLY** carries per-vertex colours that are not read yet,
+**STL** has no material data in the format at all, and **`.ftmesh`** is deliberately
+geometry-only. For those last three every face takes the `material` the scene assigns.
+glTF brings
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
 roughness → lobe width; `import_materials no` forces the FTSL `material` instead), plus
@@ -2494,8 +2500,21 @@ ignored.
 `skip_material <substr>[,…]` (repeatable) drops glTF primitives whose material name
 matches — the way to strip the ground plane / studio backdrop that asset-store models
 bundle in with the subject, since geometry can't be subtracted after it loads.
+**OBJ** reads its companion **`.mtl`** (named by `mtllib`, resolved beside the file):
+`Kd` → albedo, `d`/`Tr` → dissolve (< 0.5, or `illum` 4/6/7/9, makes the material a
+**dielectric**), `Ni` → `ior`, `Tf` → `absorb` as one scene unit of glass, and `Ks`/`Ns`
+→ a glossy lobe **only** under a raytrace-reflection `illum` (3/5/8) — a high `Ns` alone
+does not mean metal, since Blender writes `Ks 0.5 / Ns 250` for an ordinary diffuse
+export. A scene's own `use_names` materials still win over the library, and a missing or
+unreadable `.mtl` is silent (plenty of OBJs name one that was never shipped).
+
 **FBX** (`.fbx`, via the vendored MIT/public-domain [`ufbx`](https://github.com/ufbx/ufbx)
-library) imports baked triangle geometry — every mesh instance's faces are
+library) imports its materials from ufbx's normalised PBR property set, falling back to
+the legacy FBX one — base colour → albedo, `transmission_factor` ≥ 0.5 → dielectric with
+`specular_ior`/`transmission_color`, `metalness` ≥ 0.5 → glossy — assigned **per face**
+via `face_material`, so a multi-material FBX arrives as several materials. There is
+deliberately no legacy-Phong → glossy rule, for the same reason OBJ requires `illum`.
+It also imports baked triangle geometry — every mesh instance's faces are
 triangulated and baked through ufbx's world transform, with generated-if-missing
 per-vertex normals and the first UV set filling the same smooth-shading / texturing
 slots the OBJ/glTF paths use; the scene is normalized to right-handed Y-up metres at

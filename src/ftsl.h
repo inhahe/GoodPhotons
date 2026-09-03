@@ -5192,7 +5192,10 @@ private:
             std::string ferr;
             {
                 detail::AssetTimer _at;
-                if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
+                // FBX imports its materials by default, like the OBJ (.mtl) and glTF
+                // paths; `import_materials no` opts out of all three.
+                if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr,
+                            strOf(b, "import_materials") != "no") == 0 && !ferr.empty()) {
                     fail("mesh: " + ferr); return false;
                 }
             }
@@ -5260,13 +5263,16 @@ private:
             {
                 detail::AssetTimer _at;
                 const MtlResolver* res = useNames ? &resolver : nullptr;
+                // OBJ now imports its companion .mtl by default, the same way the
+                // glTF path imports its materials; `import_materials no` opts out of both.
+                const bool objImportMats = (strOf(b, "import_materials") != "no");
                 int n = 0;
                 if (const std::string* mb = assetBytes(file))
                     n = loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
-                                     uvProj, uvAxis, creaseAngleDeg);
+                                     uvProj, uvAxis, creaseAngleDeg, objImportMats);
                 else
                     n = loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
-                                uvProj, uvAxis, creaseAngleDeg);
+                                uvProj, uvAxis, creaseAngleDeg, objImportMats);
                 // A mesh that loaded nothing is an error, not an empty object. This
                 // return value used to be discarded, which is precisely how an
                 // unsupported format (.ply/.stl fell through to this OBJ branch)
@@ -5442,7 +5448,10 @@ private:
             std::string ferr;
             {
                 detail::AssetTimer _at;
-                if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
+                // FBX imports its materials by default, like the OBJ (.mtl) and glTF
+                // paths; `import_materials no` opts out of all three.
+                if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr,
+                            strOf(b, "import_materials") != "no") == 0 && !ferr.empty()) {
                     fail("mesh_asset: " + ferr); return false;
                 }
             }
@@ -5497,13 +5506,16 @@ private:
             {
                 detail::AssetTimer _at;
                 const MtlResolver* res = useNames ? &resolver : nullptr;
+                // OBJ now imports its companion .mtl by default, the same way the
+                // glTF path imports its materials; `import_materials no` opts out of both.
+                const bool objImportMats = (strOf(b, "import_materials") != "no");
                 int n = 0;
                 if (const std::string* mb = assetBytes(file))
                     n = loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
-                                     UvProjection::None, 1, creaseAngleDeg);
+                                     UvProjection::None, 1, creaseAngleDeg, objImportMats);
                 else
                     n = loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
-                                UvProjection::None, 1, creaseAngleDeg);
+                                UvProjection::None, 1, creaseAngleDeg, objImportMats);
                 // Same guard as the `mesh` block above — the empty-blas check below
                 // would catch this, but only after losing which FILE was at fault
                 // (a mesh_asset may name several).

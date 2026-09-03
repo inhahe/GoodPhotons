@@ -135,6 +135,134 @@ using MtlResolver = std::function<int(const std::string&)>;
 // (UvProjection / parseUvProjection / projectUV now live in geometry.h so native
 // primitives can reuse the identical wrap — see there.)
 
+
+// ---------------------------------------------------------------------------
+// Wavefront .mtl — the companion library an OBJ names with `mtllib`
+// ---------------------------------------------------------------------------
+//
+// An OBJ file carries no material data at all; everything but the geometry lives in a
+// sibling .mtl. Skipping it does not lose a nuance, it loses the entire look: every face
+// arrives as whatever single fallback the caller supplied, so a model of twelve
+// differently coloured parts renders as twelve identical ones and nothing in it is ever
+// transmissive.
+//
+// The slots that map onto ftrace's spectral BSDFs, and how:
+//
+//   Kd r g b   diffuse albedo        -> `reflect`, upsampled to a reflectance spectrum
+//   d  <a>     dissolve, 1 = opaque  -> a < 0.5 makes the material a DIELECTRIC
+//   Tr <t>     the same thing inverted (t = 1 - d); both spellings are in the wild
+//   Ni <n>     optical density       -> `ior`
+//   Tf r g b   transmission filter   -> `absorb`, via -ln(Tf) (see below)
+//   Ks / Ns    specular + shininess  -> Glossy, with roughness from the Phong exponent
+//   illum      lighting model        -> 4/6/7/9 all mean "transmissive" in practice
+//
+// The transmissive cut is at d < 0.5, mirroring the 0.5 cuts the glTF importer uses on
+// `metallic` and `transmission`: these are single-BSDF materials, so a half-dissolved
+// surface has to be called one thing or the other.
+//
+// `Tf` is a dimensionless per-channel transmittance with no distance attached, unlike
+// glTF's attenuationColor/attenuationDistance pair. Recording it as `absorb = -ln(Tf)`
+// with `absorbRefDist = 1` says exactly that: one scene unit of this glass transmits Tf.
+// The preview then halves the distance across the two crossings a closed solid presents,
+// so a closed object shows the authored Tf overall.
+//
+// Everything else (maps, Ka, Ke, roughness extensions) is ignored for now; a slot ftrace
+// cannot represent is better left at its default than approximated into something else.
+inline std::unordered_map<std::string, int> parseMtl(Scene& s, const std::string& text,
+                                                     const char* path, int* countOut = nullptr) {
+    std::unordered_map<std::string, int> out;
+    std::string name;
+    // Per-material accumulator, flushed by the next `newmtl` and at end of file.
+    Vec3   Kd{0.8, 0.8, 0.8}, Ks{0.0, 0.0, 0.0}, Tf{1.0, 1.0, 1.0};
+    double d = 1.0, Ni = 1.5, Ns = 0.0;
+    bool   haveTf = false;
+    int    illum = 2;
+    auto flush = [&]() {
+        if (name.empty()) return;
+        Material m;
+        m.reflect = rgbToReflectanceJH(Kd.x, Kd.y, Kd.z);
+        const bool transmissive = (d < 0.5) || (illum == 4 || illum == 6 || illum == 7 || illum == 9);
+        const double ksLum = 0.2126 * Ks.x + 0.7152 * Ks.y + 0.0722 * Ks.z;
+        if (transmissive) {
+            m.type = MatType::Dielectric;
+            m.ior  = iorConstant(Ni > 1.0 ? Ni : 1.5);
+            if (haveTf && (Tf.x < 1.0 || Tf.y < 1.0 || Tf.z < 1.0)) {
+                auto sigma = [](double c) {
+                    c = std::min(1.0, std::max(1e-6, c));
+                    return -std::log(c);                    // over one scene unit
+                };
+                m.absorb = rgbToReflectanceJH(sigma(Tf.x), sigma(Tf.y), sigma(Tf.z));
+                m.absorbRefDist = 1.0;
+            } else if (Kd.x < 0.99 || Kd.y < 0.99 || Kd.z < 0.99) {
+                // No Tf, but a tinted Kd on a transmissive material is how a lot of
+                // exporters colour glass. Read it the same way rather than throwing the
+                // only colour the material has.
+                auto sigma = [](double c) {
+                    c = std::min(1.0, std::max(1e-6, c));
+                    return -std::log(c);
+                };
+                m.absorb = rgbToReflectanceJH(sigma(Kd.x), sigma(Kd.y), sigma(Kd.z));
+                m.absorbRefDist = 1.0;
+            }
+        } else if ((illum == 3 || illum == 5 || illum == 8) && ksLum >= 0.5) {
+            // Only the RAYTRACE-REFLECTION illumination models mean metal. A high Ns with
+            // a strong Ks does not: Blender writes `Ks 0.5 / Ns 250` for an ordinary
+            // diffuse Principled BSDF, so keying off those alone would silently turn every
+            // Blender OBJ export into a mirror. `illum` is the only slot in the format that
+            // states the intent rather than a coefficient.
+            m.type = MatType::Glossy;
+            // Phong exponent -> roughness. The usual approximation r = sqrt(2/(Ns+2)),
+            // floored so a mirror-sharp Ns still has a lobe the preview can show.
+            m.roughness = std::max(0.02, std::sqrt(2.0 / (Ns + 2.0)));
+        } else {
+            m.type = MatType::Diffuse;
+        }
+        out[name] = (int)s.mats.size();
+        s.mats.push_back(std::move(m));
+        // Reset to defaults for the next block.
+        Kd = Vec3{0.8, 0.8, 0.8}; Ks = Vec3{0, 0, 0}; Tf = Vec3{1, 1, 1};
+        d = 1.0; Ni = 1.5; Ns = 0.0; haveTf = false; illum = 2;
+    };
+
+    const char* p = text.data();
+    const char* end = p + text.size();
+    auto words = [](const char* a, const char* b, double* v, int n) {
+        for (int i = 0; i < n; ++i) v[i] = 0.0;
+        objParseDoubles(a, b, v, n);
+    };
+    while (p < end) {
+        const char* ls = p;
+        while (p < end && *p != '\n') ++p;
+        const char* le = p;
+        if (le > ls && le[-1] == '\r') --le;
+        if (p < end) ++p;
+        ls = objSkipWs(ls, le);
+        if (ls >= le || *ls == '#') continue;
+        auto is = [&](const char* kw, size_t n) {
+            return (size_t)(le - ls) > n && std::memcmp(ls, kw, n) == 0 && objIsWs(ls[n]);
+        };
+        double v[3];
+        if (is("newmtl", 6)) {
+            flush();
+            const char* q = objSkipWs(ls + 6, le);
+            name.assign(q, le);
+            while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+        } else if (is("Kd", 2)) { words(ls + 2, le, v, 3); Kd = Vec3{v[0], v[1], v[2]}; }
+        else if (is("Ks", 2))   { words(ls + 2, le, v, 3); Ks = Vec3{v[0], v[1], v[2]}; }
+        else if (is("Tf", 2))   { words(ls + 2, le, v, 3); Tf = Vec3{v[0], v[1], v[2]}; haveTf = true; }
+        else if (is("Ni", 2))   { words(ls + 2, le, v, 1); Ni = v[0]; }
+        else if (is("Ns", 2))   { words(ls + 2, le, v, 1); Ns = v[0]; }
+        else if (is("d", 1))    { words(ls + 1, le, v, 1); d  = v[0]; }
+        else if (is("Tr", 2))   { words(ls + 2, le, v, 1); d  = 1.0 - v[0]; }
+        else if (is("illum", 5)){ words(ls + 5, le, v, 1); illum = (int)v[0]; }
+    }
+    flush();
+    if (countOut) *countOut = (int)out.size();
+    if (!out.empty())
+        std::printf("loadMtl: %s -> %zu material(s)\n", path, out.size());
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Shared tail of the mesh loaders (extracted from loadObj, 0.147.0).
 //
@@ -304,7 +432,54 @@ inline int loadObjBytes(Scene& s, const std::string& buf, const char* path, int 
                         const Affine& xf,
                         bool loadUV = false, const MtlResolver* matResolver = nullptr,
                         UvProjection uvProj = UvProjection::None, int uvAxis = 1,
-                        double creaseAngleDeg = -1.0) {
+                        double creaseAngleDeg = -1.0, bool importMaterials = true) {
+    // `mtllib`: load the companion library and let its names resolve `usemtl`. An
+    // explicit `matResolver` (the FTSL `use_names` path) WINS -- a scene that declares
+    // its own materials is stating an intent the file cannot override -- so the imported
+    // table is only consulted for names the caller does not know. The library is resolved
+    // beside the OBJ, which is where the format says it lives; a missing or unreadable one
+    // is silent, because plenty of OBJs name an .mtl that was never shipped with them.
+    std::unordered_map<std::string, int> mtlTable;
+    if (importMaterials) {
+        std::string libName;
+        {
+            const char* p = buf.data();
+            const char* end = p + buf.size();
+            while (p < end) {
+                const char* ls = p;
+                while (p < end && *p != '\n') ++p;
+                const char* le = p;
+                if (le > ls && le[-1] == '\r') --le;
+                if (p < end) ++p;
+                ls = objSkipWs(ls, le);
+                if ((size_t)(le - ls) > 6 && std::memcmp(ls, "mtllib", 6) == 0 && objIsWs(ls[6])) {
+                    const char* q = objSkipWs(ls + 6, le);
+                    libName.assign(q, le);
+                    while (!libName.empty() && (libName.back() == ' ' || libName.back() == '\t'))
+                        libName.pop_back();
+                    break;
+                }
+                // Only the header carries mtllib in practice, and scanning a 100 MB body
+                // for it would cost a whole extra pass: stop at the first face.
+                if ((size_t)(le - ls) >= 2 && ls[0] == 'f' && objIsWs(ls[1])) break;
+            }
+        }
+        if (!libName.empty()) {
+            std::string dir(path);
+            const size_t sl = dir.find_last_of("/\\");
+            dir = (sl == std::string::npos) ? std::string() : dir.substr(0, sl + 1);
+            const std::string libPath = dir + libName;
+            std::string libText;
+            if (assetbytes::readFile(libPath.c_str(), libText))
+                mtlTable = parseMtl(s, libText, libPath.c_str());
+        }
+    }
+    MtlResolver mtlLookup = [&mtlTable](const std::string& n) -> int {
+        auto it = mtlTable.find(n);
+        return (it == mtlTable.end()) ? -1 : it->second;
+    };
+    const bool haveMtl = !mtlTable.empty();
+
     std::vector<Vec3> verts;
     std::vector<Vec3> texcoords;   // (u,v,0) per `vt`
     std::vector<Vec3> normals;     // per `vn`, already in WORLD space (inv-transpose)
@@ -346,12 +521,18 @@ inline int loadObjBytes(Scene& s, const std::string& buf, const char* path, int 
             Vec3 wn = xf.applyNormal(Vec3{d[0], d[1], d[2]});
             double l = std::sqrt(dot(wn, wn));
             normals.push_back(l > 1e-18 ? wn * (1.0 / l) : Vec3{0, 0, 0});
-        } else if (matResolver && le - ls >= 6 && std::memcmp(ls, "usemtl", 6) == 0) {
+        } else if ((matResolver || haveMtl) && le - ls >= 6 &&
+                   std::memcmp(ls, "usemtl", 6) == 0) {
+            // A material NAME can legally contain spaces, so take the rest of the line
+            // rather than the first token — trimmed, since exporters pad it.
             const char* q = objSkipWs(ls + 6, le);
-            const char* qe = q;
-            while (qe < le && !objIsWs(*qe)) ++qe;
-            std::string name(q, qe);
-            int resolved = name.empty() ? -1 : (*matResolver)(name);
+            std::string name(q, le);
+            while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+            int resolved = -1;
+            if (!name.empty()) {
+                if (matResolver) resolved = (*matResolver)(name);       // FTSL names win
+                if (resolved < 0 && haveMtl) resolved = mtlLookup(name);
+            }
             curMat = (resolved >= 0) ? resolved : matId;
         } else if (c0 == 'f' && c1 == ' ') {
             fIdx.clear(); fTidx.clear(); fNidx.clear();
@@ -415,7 +596,7 @@ inline int loadObjBytes(Scene& s, const std::string& buf, const char* path, int 
 inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
                    bool loadUV = false, const MtlResolver* matResolver = nullptr,
                    UvProjection uvProj = UvProjection::None, int uvAxis = 1,
-                   double creaseAngleDeg = -1.0) {
+                   double creaseAngleDeg = -1.0, bool importMaterials = true) {
     std::string buf;
     if (!assetbytes::readFile(path, buf)) {
         std::fprintf(stderr, "loadObj: %s: %s\n", path,
@@ -423,7 +604,7 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
         return 0;
     }
     return loadObjBytes(s, buf, path, matId, xf, loadUV, matResolver, uvProj, uvAxis,
-                        creaseAngleDeg);
+                        creaseAngleDeg, importMaterials);
 }
 
 // MeshXform overload: a single scale+Euler+translate transform (the common case).

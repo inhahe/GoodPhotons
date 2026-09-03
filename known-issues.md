@@ -5,6 +5,27 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PLY-VCOLOR — OPEN (2026-09-03, v0.225.0): PLY **vertex colours are not read**, so a scanned/photogrammetry mesh imports untinted
+
+**What happens.** `loadPlyBytes` reads positions and faces and stamps every triangle with
+the caller's single material. A PLY that carries `property uchar red/green/blue` — which
+is how scan and photogrammetry pipelines ship colour, the format having no material block
+— loses all of it. Confirmed with `tools/mesh_format_matrix.py`: the same geometry that
+shows peak saturation 165 through OBJ and glTF shows 29 through PLY, i.e. only the
+lighting.
+
+**Why it is not just "add a field".** ftrace's `Tri` has per-vertex positions, normals and
+UVs but no per-vertex COLOUR, and the shading path reads albedo from the material, not the
+geometry. So this needs one of: (a) a real per-vertex colour channel on `Tri` plus the
+shade-path plumbing on both raster backends and the tracer; or (b) quantising vertex
+colours and emitting one material per distinct bucket, which is cheap but bands a smooth
+scan and explodes the material table unless capped.
+
+**Not applicable to see-through.** PLY has no transparency or IOR concept whatsoever, so
+`-see-through` can never do anything for a PLY however this is fixed. Same for STL, whose
+format carries no material data at all, and `.ftmesh`, which is deliberately a
+geometry-only machine-to-machine channel (see mesh.h).
+
 ### RASTER-MILK — OPEN (2026-09-03, v0.224.0): the see-through pass's haze **saturates on a faceted pile of glass**, washing out the colours it is meant to sit beside
 
 **What happens.** The clear pass adds a "milk" haze per crossed surface —

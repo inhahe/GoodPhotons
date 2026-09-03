@@ -17051,7 +17051,8 @@ static int run(int argc, char** argv) {
         auto ends  = [](const std::string& t, const char* e){ size_t n = std::strlen(e); return t.size() >= n && t.compare(t.size()-n, n, e) == 0; };
         auto hasSceneExt = [&](const char* s){ std::string t = lower(s); return ends(t,".ftsl") || ends(t,".scene") || ends(t,".fts"); };
         auto hasMeshExt  = [&](const char* s){ std::string t = lower(s);
-            return ends(t,".obj") || ends(t,".gltf") || ends(t,".glb") || ends(t,".fbx") || ends(t,".stl") || ends(t,".ply"); };
+            return ends(t,".obj") || ends(t,".gltf") || ends(t,".glb") || ends(t,".fbx")
+                || ends(t,".stl") || ends(t,".ply") || ends(t,".ftmesh"); };
         auto looksLikeFile = [](const char* s){ std::string t = s; size_t sl = t.find_last_of("/\\");
             std::string base = (sl == std::string::npos) ? t : t.substr(sl + 1);
             return base.find('.') != std::string::npos || sl != std::string::npos; };
