@@ -5,6 +5,110 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BDPT-MIS-TR — OPEN (2026-09-02, v0.217.0): mode `D`'s MIS weights approximate every **connection edge's transmittance as 1** in a participating medium
+
+**What happens.** `randomWalk` stores medium and surface vertex densities as pure geometric
+direction densities — "the free-flight distance pdf and transmittance are omitted here AND in
+`vertexPdf`" (`bdpt.h` ~line 710). The comment says they "cancel pairwise in every
+balance-heuristic ratio". They do not quite: worked out in full under the mode-`J` derivation
+below ("What ftrace's density convention does to that formula"), the `σ_t` factors *do* cancel —
+each interior vertex is sampled exactly once whichever side reaches it — but the transmittances
+telescope to a single surviving term, so the true density is `p_j = G_j·[Π_all Tr]/Tr(e_{j-1})`
+and ftrace uses `G_j`. In words: **the weights pretend the connection edge is transparent.**
+
+**Severity: variance, not bias.** The balance heuristic is unbiased for *any* strictly positive
+function of the technique — the weights still sum to 1 — so no image is wrong. What is lost is
+optimality: in an optically thick medium a long connection is under-penalised relative to a short
+one, so mode `D` is noisier there than it needs to be. The same approximation is in PBRT-v3.
+
+**The fix.** Multiply each vertex density by its edge's transmittance and, at a medium vertex, by
+`σ_t`. Because `pdfRev(v)` and `pdfFwd(v+1)` describe the *same* edge, the two must use the
+**same** number or the telescoping breaks and the weights stop summing to 1 — so the edge's
+transmittance has to be computed once and stored on the vertex, not recomputed per call, and it
+must be a **deterministic** `Tr̃` (a ratio-tracking estimate is a random variable and would bias
+the weights). Cheap and exact for a homogeneous medium; a midpoint/majorant approximation for a
+heterogeneous one, which is fine on the argument above. `misWeight`'s ScopedAssign block would
+also need the connection edge's own `Tr̃`.
+
+**Why it is not being fixed as part of Phase 3b.** It is orthogonal: the factor cancels *exactly*
+in the merge-vs-C1 ratio that Phase 3b is about (see the derivation), so the merge weights are
+right either way, and folding a mode-`D`-wide weight change into the same commit would make the
+UPBP validation renders ambiguous about which change moved them.
+
+### UPBP-W — OPEN (2026-09-02, v0.218.0): three deliberate approximations inside mode `J`'s merge weight, all of them weight-QUALITY only
+
+Phase 3b's balance heuristic is unbiased for *any* strictly positive, deterministic, technique-
+consistent weight function — that is the whole reason the three shortcuts below are acceptable.
+Each costs variance, none costs correctness, and all three are listed together because they share
+that one justification and would each be fixed by a different piece of bookkeeping.
+
+**(a) One kernel radius for the whole scene (`BeamMap::radRef`).** A merge's density carries a
+factor `2r`, and the heuristic only telescopes if every appearance of a given site's `2r` is the
+same number. Mode `J` uses a single scalar `kappa = nEmitted · 2 · radRef()`, where `radRef()` is
+the mean of the per-medium radii. It has to be one scalar: `BeamMis::sumM` — the light half of the
+weight — is accumulated *during the deposit*, in `traceLightBeamPass`, before `buildAuto` has
+chosen any radius at all, so a per-medium factor cannot be folded in there. Exact for a
+single-medium scene (the common case, and the validation case, `_fog_cornell.ftsl`); in a
+multi-medium scene the merges in the medium with the smaller radius are slightly over-weighted
+relative to the connections that compete with them. **The fix** is to defer `sumM` — store the
+per-beam `sin(θ)·p_L/σ_t` partial *unmultiplied* along with its medium id, and apply `2r` when the
+gather reads it, which needs one extra float and a byte per beam.
+
+**(b) The weight mixes two wavelengths.** Camera-side quantities (`σ_t(x)`, `Tr̃` along the camera
+segment, `eye[]` densities) are evaluated at the *camera* path's `λ`; light-side quantities baked
+into `BeamMis::sumC`/`sumM` were evaluated at the *beam's* `λ` when it was deposited; and the phase
+value at the merge point is the one the gather already computed, at the beam's `λ`, used for both
+sides. In a dispersive medium the competing techniques therefore disagree slightly about what
+path they are weighting. This is deterministic and technique-consistent *per hit*, so the sum is
+still 1 and the image is still right — the weights are just built from a chimera. **The fix** is
+to recompute the light-side accumulators at the camera `λ` in the gather, which means storing the
+raw per-vertex densities per beam rather than a collapsed sum: far more memory, for an error that
+only appears when `σ_t` varies strongly with `λ` *and* merges and connections are both viable.
+
+**(c) A merge is DROPPED when the light-side density is delta.** `randomWalk` records
+`pdfFwd = delta ? 0 : pdfW`, so a beam deposited immediately after a specular light bounce has
+`sg.pdfDir == 0`, hence `gL == 0`, hence `etaS == 0`, and `BeamMergeWeight` returns 0. This is not
+a bug to route around: `misWeight`'s own merge terms vanish identically there (`mergeEtaPrime`
+returns 0 for `pLight <= 0`), so the partition of unity holds exactly — the technique is simply
+declared unavailable on that path and its share goes to the connections. Note `misRemap0` is
+applied *only* inside `C1 = remap0(gL)/remap0(gC)`, where it is a ratio of like quantities, and
+never to `etaS`, where substituting 1 for 0 would inject a bogus unit-ful term. The cost is a
+volumetric caustic seen through fog: it loses the merge technique and falls back to mode `D`'s
+noise there. **The fix** is a genuine solid-angle density for the specular lobe, which is the same
+change VCM would need and which no ftrace mode currently has.
+
+### UPBP-CONV — OPEN (2026-09-02, v0.218.0): `-spp` does not converge mode `J`'s merge half at all, and on `_fog_cornell` the merges buy **zero** noise reduction for ~25× the cost
+
+**Two separate observations from the Phase 3b validation, both expected, both worth knowing
+before anyone tunes a mode-`J` render.**
+
+**(1) The beam map is built once, so `-spp` is the wrong knob.** Every sample of every pixel
+merges against the *same* `-n` light subpaths. More `-spp` reduces only camera-side variance; the
+light-side sample set is frozen, so the merge estimator's residual scales as `1/sqrt(n_m)` and
+only **`-n`** moves it. This showed up directly in the gate: the `J/D` mean ratio walked
+`1.0611 → 1.0035 → 0.9897 → 0.9811 → 0.9985 → 1.0006` — oscillating about 1 with an amplitude set
+by the fixed map, not shrinking monotonically the way a per-sample estimator would. Not a bug (the
+estimator is unbiased over the ensemble of maps, which is exactly how mode `M` works too), but it
+means a mode-`J` image that has stopped improving needs `-n`, not `-spp`. **A possible fix** is to
+rebuild the map every N spp and average, which trades the up-front build cost for genuine
+light-side convergence; mode `M` has the same property and the same option.
+
+**(2) No win on the validation scene.** Mode `J` at 43 spp measures 15.25 % noise; mode `D`'s
+4.42 % at 512 spp is 15.25 % scaled by `sqrt`. Identical, for ~25× the wall clock. This is the
+right answer for `_fog_cornell` — a thin fog whose scattering points the camera's free-flight
+sampling reaches easily, so the connections were never starved and the merges have nothing to
+rescue — but it means **the validation scene cannot demonstrate the feature's value**, only its
+correctness. The performance claim has to be made on `gallery_rain` (optically thick, indirectly
+lit), which is the outstanding gate. Until that measurement exists, mode `J` should be described
+as correct and not yet as useful.
+
+**(3) Mode `J` fireflies harder than mode `D`.** Peak pixel 3.13e13 against 1.61e13 on the same
+scene — the beam×ray estimator's `1/sin(theta)` factor is unbounded as a beam becomes parallel to
+the camera ray, and the MIS weight does not suppress it (a near-parallel merge is *also* a
+technique the connections sample badly, so the balance heuristic correctly gives it a large
+weight). UPBP's own paper handles this; ftrace does not yet. The standard remedy is to cap the
+merge contribution or to fold a `sin(theta)`-aware term into the kernel.
+
 ### MEM — OPEN (2026-09-02, v0.216.0): mode `J`'s beam map has **no trim** — it is sized by `-n` alone, and `-beamcount` is inert
 
 **What happens.** Phase 3a's `bdpt::traceLightBeamPass` builds its `BeamBank`s with `cap = 0`, so
@@ -188,6 +292,98 @@ C2) is accumulated by running partial-MIS quantities carried along both subpaths
 as they already exist, plus a `dVB` whose recursion carries the ⊥-density (no distance factor)
 where `dVM` carries the full one. `n_m = bm.nEmitted`, `n_c = 1` per camera sample, and `sinθ`
 is per-merge, so `etaBB1D` is **not** a hoistable constant the way `etaVCM` is.
+
+#### What ftrace's density convention does to that formula (2026-09-02, before Phase 3b)
+
+The derivation above is written in *true* path densities. `bdpt.h` does not store those, and the
+difference is not a rounding detail — it decides whether the merge weight has the `1/(σ_t·Tr_C)`
+boost that is the entire reason UPBP beats BDPT in a thick medium. Worked out once, here, so the
+implementation is not guessing:
+
+**What is actually stored.** `randomWalk` stores, for a medium vertex, "ONLY the phase direction
+density — the free-flight distance pdf and transmittance are omitted here AND in `vertexPdf`"
+(`bdpt.h` ~line 710); a surface vertex likewise stores `p_ω·cos/d²` with no transmittance. So
+ftrace's `pdfFwd`/`pdfRev` are **pure geometric direction densities**, call their product for
+strategy `j` `G_j`. The true density is `p_j = G_j · Π_edges D(e)`, and the distance factor of
+edge `(k,k+1)` is `Tr(e_k)` times `σ_t` at whichever endpoint the technique sampled.
+
+**The omission does not cancel — it telescopes to exactly one edge.** Writing `m(v) = σ_t(v)` at
+a medium vertex and 1 at a surface, strategy `j` uses light-side edges `k < j−1` and camera-side
+edges `k ≥ j`, so
+
+```
+p_j = [Π_all Tr(e_k) / Tr(e_{j-1})] · [Π_{v=1}^{n-2} m(v)] · G_j
+```
+
+— the `m` product is *independent of `j`* (each interior vertex is sampled exactly once whichever
+side reaches it), and the only surviving `j`-dependence is `1/Tr(e_{j-1})`: **the transmittance of
+the connection edge**. So ftrace's `G_j` is the true balance heuristic with every connection
+edge's transmittance approximated as 1. That is a *variance* approximation, not a bias one — any
+positive function of the technique gives a partition of unity — and it is inherited from PBRT.
+Logged as its own item ("BDPT-MIS-TR") below; it is deliberately **not** fixed in Phase 3b.
+
+**For a merge the same accounting leaves two edges and one `σ_t` unsampled.** A merge at unified
+vertex `i` samples neither `e_{i-1}` (the beam's run to `x`) nor `e_i` (the camera ray's run to
+`x`), and never draws the collision at `x` at all:
+
+```
+p_M,i = [Π_all Tr / (Tr(e_{i-1})·Tr(e_i))] · [Π_{v≠i} m(v)] · G_M,i
+```
+
+**Divide the two and the awkward factor cancels.** Against its own C1 competitor (`j = i`):
+
+```
+p_M,i / p_i = (G_M,i / G_i) / (σ_t(x_i) · Tr(e_i))        [Tr(e_{i-1}) cancels exactly]
+```
+
+and against any *other* connection `j`, the residual is `Tr(e_{j-1})/Tr(e_{i-1})` — **the very
+ratio ftrace already approximates as 1 between two connections**. So the convention
+
+> `q̃_j = G_j` for a connection, `q̃_M,i = G_M,i / (σ_t(x_i)·Tr(e_i))` for a merge
+
+is *self-consistent with what mode `D` already does*, is **exact** for the merge-vs-C1 ratio that
+carries the physics, needs no change to mode `D`, and keeps the derived formula verbatim:
+
+```
+η_i ≡ q̃_M,i / q̃_i = n_m · 2r_med · sinθ_i · p_L⊥(x_i) / (σ_t(x_i) · Tr(x_i → camera-side neighbour))
+```
+
+**`Tr` in a weight must be deterministic.** The gather's transmittance is a ratio-tracking
+estimate; putting a *random* number in a density breaks the partition of unity (the same edge
+would get two different values in two techniques' denominators, so the weights would not sum to
+1 and the estimator would be biased). The weights therefore use a separate, deterministic
+`Tr̃(a,b,λ)` — exact for a homogeneous medium, a midpoint-density approximation for a
+heterogeneous one. Being an approximation costs variance and nothing else, on the same argument
+as above.
+
+#### The shape the weight actually takes in `bdpt.h` (PBRT-relative, not SmallVCM)
+
+`vcm.h` uses SmallVCM's `dVCM`/`dVC`/`dVM` recursions because that is what a walk-and-connect-as-
+you-go renderer needs. `bdpt.h` is PBRT-style — it keeps explicit per-vertex `pdfFwd`/`pdfRev` and
+re-runs two ratio loops per strategy — and the merge terms drop into *those loops*, which is far
+less new machinery than porting the recursions:
+
+* **`misWeight` gains `sumRi += ri · η_u`** at each loop step, where the camera loop's index `i`
+  is already known to map to strategy `j = n−i` (gate 2 verified this mapping), so the merge site
+  it must charge is `eye[i-1]`; the light loop's index `i` maps to `j = i`, so its merge site is
+  `light[i]`. Plus one term for the merge at the connection vertex itself (`ri = 1`, site `pt`).
+  Each site contributes only if it is a `VType::Medium` vertex with both neighbours present.
+* **A merged path's densities differ from the recorded ones in exactly three places**, because
+  the beam leaves `y_{s-1}` along the *same ray* the light walk continued on: `pc[s-1]` (density
+  of `y_{s-1}` seen from `x`), the pair at `x` itself (`p_L⊥`, `p_C⊥`), and `pl[s+1]` (density of
+  the camera segment's origin vertex seen from `x`). `pc[s-2]` and everything beyond it are the
+  *recorded* `pdfRev`s — the incoming direction at `y_{s-1}` is unchanged by moving the next
+  vertex along that ray. Both merge-specific phase densities are `phaseValue(−cosT)`, which
+  `gatherPhotonBeamsW` already computes.
+* **So each beam carries a small fixed set of light-side scalars** (in the parallel array Phase 3a
+  reserved for exactly this): the connection-strategy accumulator `Σ_{u≤s-2}`, the merge-strategy
+  accumulator `Σ_{u≤s-2} A'_u·η_u`, `light[s-1].pdfFwd`, the beam's solid-angle direction pdf, the
+  cosine at `y_{s-1}` along the beam, the lead-in distance from `y_{s-1}` to the clipped beam
+  origin `b.o` (`bh.sBeam` is measured from `b.o`, not from the vertex), and what is needed for
+  `η_{s-1}` (whether `y_{s-1}` is a medium vertex, its `σ_t`, and the per-beam-constant `sinθ`
+  there). `PathSeg` carries the mirror image on the camera side.
+* **A beam split (`PhotonBeam::s0`) shares `o`/`d`**, so the parallel array is indexed by beam and
+  split sub-segments simply duplicate the entry.
 
 **PHASE 3 ARCHITECTURE DECISION (2026-09-02, planned at v0.215.0): mode `J` must trace its own
 light subpaths and deposit its own beams. It cannot reuse `tracePhotonPass`.** This reverses
@@ -452,16 +648,52 @@ plumbing:**
    again the moment merge strategies enter the weight, and that is precisely when a silently
    vacuous audit would be most expensive.
 
-   **What this does *not* yet cover:** merge strategies. Gate (2) is currently a statement
-   about the connection half only, which is the whole point of running it before Phase 3b —
-   it establishes that the reference reproduces `misWeight` on paths whose weights are already
-   known good, so that when the merge terms are added, a disagreement can only be the new code.
+   **What this did *not* yet cover, at the time it landed:** merge strategies. Gate (2) was
+   a statement about the connection half only, which is the whole point of running it before
+   Phase 3b — it establishes that the reference reproduces `misWeight` on paths whose weights are
+   already known good, so that when the merge terms are added, a disagreement can only be the new
+   code.
+
+   **Extended to the merges and re-passed (2026-09-02, v0.218.0).** `mergeKappa` is threaded into
+   *both* weight forms, so `misWeightReference` now enumerates the merge strategies alongside the
+   connections and the audit compares them:
+
+   | Run (`_fog_cornell.ftsl`, `-device cpu`) | Weights checked | Disagreed > 1e-9 | Worst relative difference |
+   |---|---|---|---|
+   | `-mode J -r 64 -spp 1 -n 50000 -misaudit` | 62 086 | **0** | 7.903e-15 (at `s=9, t=1`) |
+   | `-mode J … -misaudit-poison` | 62 086 | **47 941** | 1.000e+00 (at `s=3, t=6`) |
+
+   The clean residual is still at the arithmetic-noise level and still peaks on the longest
+   subpath, and the poison control still fires on 77 % of the same weights — so the audit did not
+   go vacuous when the merge terms were added, which was the whole reason for shipping the flag.
+
+   **What gate 2 still cannot see, even now.** It compares two implementations of the weight for a
+   *connection* strategy, both of which now include merge terms. It does **not** exercise
+   `BeamMergeWeight`, which computes the weight of the merge itself from pre-summed accumulators
+   and never assembles a path — there is no vertex array at a beam hit to hand the reference. That
+   half is covered indirectly, by the `J/D` mean ratio: if `BeamMergeWeight`'s denominator did not
+   agree with `misWeight`'s, the two techniques' weights would not sum to 1 and the converged
+   ratio could not sit at 1.0006. A *direct* gate would need mode `J` to retain whole light
+   subpaths behind a debug flag so the merged path could be materialised and fed to
+   `misWeightReference`; worth building if the ratio ever drifts.
 3. **Analytic slab.** One homogeneous medium, isotropic phase, one area light — single-scatter
    radiance has a closed form. UPBP's mean must match it.
 4. **Mode `D` agreement.** Converged `D` vs converged UPBP on **`scenes/_fog_cornell.ftsl`**
    (homogeneous `sigma_t 0.6 albedo 0.85 g 0`, one area light, one glass sphere, 256², already
    the validated GPU-vs-CPU parity scene for backward media). `D` is unbiased, so *any* UPBP
    energy error shows up as a mean offset. This is the real gate.
+
+   **PASSED (2026-09-02, v0.218.0).** Mode `J` (43 spp, `-n 50000`) against mode `D` (512 spp),
+   64², scene-linear PFMs: `J/D` mean **1.0006**, against **2.0374** in 0.215.0 and **1.9348** in
+   0.216.0 when both techniques still contributed at weight 1. 53.3 % of pixels came out *dimmer*
+   than mode `D`, which is the correct new behaviour — the connections are legitimately
+   down-weighted wherever a merge could have produced the same path — and is the sign the weights
+   are actually arbitrating rather than the merges simply being switched off. The ratio walked
+   `1.0611 → 1.0035 → 0.9897 → 0.9811 → 0.9985 → 1.0006` as samples accumulated, i.e. it
+   oscillates about 1 rather than settling beside it. Run at 64² rather than the 256² this entry
+   originally specified because the merge half does not converge with `-spp` at all (see
+   UPBP-CONV): resolution and sample count buy camera-side precision only, and the residual is set
+   by `-n`.
 
    **Not `_rainbow_test.ftsl`**, which this entry originally named. That scene lights its fog
    with a **collimated** beam, and `bdptUnsupportedFeature` (`main.cpp:14326`) refuses env and

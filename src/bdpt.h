@@ -602,6 +602,13 @@ struct PathSeg {
     int nUp = 1;
     double aGlass = 0.0;  // absorption of the dielectric the ray is inside (exp(-a*t) per hit)
     int vert = 0;         // index in the subpath of the vertex this segment leaves
+    // Solid-angle density of `d` at the vertex this segment leaves. The merge weight needs
+    // it on BOTH sides and cannot recover it from the vertex list: a merge point x is not a
+    // vertex, so no Vertex ever recorded the density of the direction that reaches it. On
+    // the camera side it converts to the geometric density of x (pdfDir / t_c^2, cosine-free
+    // because x is a medium point); on the light side it is the beam's own transverse line
+    // density. Zero for a walk that was not asked to record segments.
+    double pdfDir = 0.0;
 };
 using PathSegs = std::vector<PathSeg>;
 
@@ -666,6 +673,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             for (int i = 0; i + 1 < nUp; ++i) sg.betaSec[i] = betaSec[i];
             sg.aGlass = curAbsorb(lambda);
             sg.vert = (int)path.size() - 1;
+            sg.pdfDir = pdfFwd;          // solid-angle density of ray.d (see PathSeg::pdfDir)
             segs->push_back(sg);
         }
 
@@ -1277,6 +1285,83 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     return (int)path.size();
 }
 
+// The "a delta pdf is not a density" remap misWeight applies to every FACTOR of a ratio:
+// a delta vertex stores 0, and a 0 in a telescoped product would annihilate the whole
+// strategy rather than merely excluding it. Free-standing because Phase 3b's accumulators
+// are built outside misWeight (in the light pass) and must use the identical convention.
+inline double misRemap0(double f) { return f != 0.0 ? f : 1.0; }
+
+// --- The merge technique's density, relative to the connection it competes with -------
+//
+// This is the one new quantity Phase 3b adds to the balance heuristic, and the whole of
+// mode J's weight is built from it. Write the path light-to-camera as x_0..x_{n-1} and let
+// x_i be a medium vertex. Two techniques produce that vertex:
+//
+//   * CONNECTION with i light vertices ("C1"): the camera walk sampled a free flight that
+//     landed on x_i, and the light subpath, which ends at x_{i-1}, connected to it.
+//   * MERGE at x_i: the light subpath's beam leaves x_{i-1} and passes THROUGH x_i, and the
+//     camera ray from x_{i+1} passes through it too; the 1D kernel accepts the pair.
+//
+// Every other factor of the two path densities is the same object sampled the same way, so
+// the ratio collapses to what happens at x_i (known-issues.md has the telescoping proof —
+// in particular the transmittance of the connection edge x_{i-1}--x_i cancels EXACTLY, so
+// mode D's existing "omit Tr" convention needs no change):
+//
+//     p_merge / p_C1  =  n_m * 2r * sin(theta_i) * p_L(x_i) / ( sigma_t(x_i) * Tr(e_i) )
+//
+//   p_L(x_i)  the light side's geometric density of x_i — pdf_omega / dist^2, cosine-free,
+//             i.e. exactly what ftrace stores (pdfFwd on the light half of a path, pdfRev on
+//             the eye half, since an eye subpath's "forward" is camera-to-light).
+//   sigma_t   the extinction the camera's free flight would have used — its distance pdf is
+//             sigma_t * Tr, and the merge has no distance pdf at all, which is the entire
+//             source of the ratio.
+//   Tr(e_i)   the transmittance of the CAMERA-side edge x_i--x_{i+1}, deterministic (trDet).
+//   theta_i   the angle between the beam and the camera ray at x_i; the kernel's acceptance
+//             volume is 2r * dL * dS * sin(theta), which is where both factors come from.
+//   n_m       how many light subpaths the beam map holds — the merge technique's sample
+//             count in the multi-sample balance heuristic.
+//
+// `n_m * 2r` is the same constant at every site, so it is factored out (the caller supplies
+// it as `kappa`) and this returns the PRIMED eta. Returning 0 means "no merge technique
+// exists here", which is the correct weight contribution for a non-medium vertex.
+//
+// WHY 2r AND NOT THE KERNEL VALUE K1(d_perp). Same reason VCM uses 1/(pi r^2) rather than
+// its own kernel: when this ratio is used to weight a CONNECTION, the merge being weighed
+// against is hypothetical and has d_perp = 0, where K1 is at its maximum and nothing like
+// what a real merge sees. The balance heuristic needs a consistent partition, not the
+// pointwise kernel; 1/(2r) is the mean of K1 over its support, the 1D analogue of VCM's
+// uniform acceptance. See known-issues.md.
+//
+// It sits HERE, above the light pass, because both halves of mode J need it: the light pass
+// below folds it into each beam's stored accumulator (BeamMis::sumM), and misWeight further
+// down calls it per hypothetical strategy.
+inline double mergeEtaPrime(const Scene& scene, const Vec3& pPrev, const Vertex& v,
+                            const Vec3& pNext, double pLight, double lambda) {
+    if (v.type != VType::Medium) return 0.0;
+    if (v.mediumId < 0 || v.mediumId >= (int)scene.media.size()) return 0.0;
+    if (!(pLight > 0.0)) return 0.0;
+    Vec3 din = v.p - pPrev;
+    const double dl = std::sqrt(dot(din, din));
+    if (!(dl > 0.0)) return 0.0;
+    din = din * (1.0 / dl);
+    Vec3 dout = pNext - v.p;
+    const double dn = std::sqrt(dot(dout, dout));
+    if (!(dn > 0.0)) return 0.0;
+    dout = dout * (1.0 / dn);
+    // sin of the angle between the beam and the camera ray. The camera ray runs x_{i+1}->x_i,
+    // i.e. -dout, but |sin| is unchanged by the flip.
+    const double c = dot(din, dout);
+    const double s2 = 1.0 - c * c;
+    if (!(s2 > 0.0)) return 0.0;                 // exactly collinear: no acceptance volume
+    const Medium& md = scene.media[v.mediumId];
+    const PatTables tabs = scene.patTables();
+    const double sigT = md.sigmaT(lambda) * md.densityAt(v.p, &tabs);
+    if (!(sigT > 0.0)) return 0.0;
+    const double tr = trDet(scene, v.p, dout, dn, lambda, tabs);
+    if (!(tr > 0.0)) return 0.0;
+    return std::sqrt(s2) * pLight / (sigT * tr);
+}
+
 // --- Mode J's own light-subpath / photon-beam pass (UPBP phase 3a) -------------------
 //
 // WHY MODE J DOES NOT REUSE tracePhotonPass (the whole point of this function)
@@ -1332,6 +1417,12 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // stream or its own render-time streams however the counts line up.
     const uint64_t seedBase = 0x4A555042504C4754ULL;
     std::vector<BeamBank> banks((size_t)nThreads);     // cap stays 0: no self-thinning
+    // The light half of every merge's MIS weight, one entry per beam, kept in lockstep with
+    // `banks[t].beams`. It is NOT a member of BeamBank on purpose: mode M's photon pass
+    // shares that type and must not pay 40 bytes a beam for something it never reads, and
+    // BeamBank::halve() would silently desynchronise a parallel array (mode J avoids that by
+    // setting cap = 0, so banks only ever grow — see the note above).
+    std::vector<std::vector<BeamMis>> misBanks((size_t)nThreads);
     std::vector<long long> emitted((size_t)nThreads, 0);
     std::atomic<long long> tracedTotal{0};
 
@@ -1341,6 +1432,9 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         Pcg32 rng;
         std::vector<Vertex> path;
         PathSegs segs;
+        std::vector<BeamMis>& misBank = misBanks[(size_t)tid];
+        std::vector<double> accC, accM;                // per-subpath, reused
+        const PatTables tabs = scene.patTables();
         const long long lo = nPaths * tid / nThreads, hi = nPaths * (tid + 1) / nThreads;
         long long done = 0;
         for (long long i = lo; i < hi; ++i) {
@@ -1364,13 +1458,90 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             hb.C = 1;
             segs.clear();
             generateLightSubpath(scene, cam, mats, hb, maxDepth + 1, rng, path, &segs);
+
+            // --- The light half of every merge weight this subpath can take part in -------
+            // Both accumulators telescope exactly as misWeight's light loop does, one vertex
+            // at a time, so a beam leaving y_j can read off the whole prefix in O(1). The
+            // recurrences (see BeamMis in photonbeams.h for what they sum):
+            //   ratioL(u) = pdfRev(y_u)/pdfFwd(y_u)          [the loop's per-step factor]
+            //   accC[j]   = gate(j) + ratioL(j-1) * accC[j-1]
+            //   accM[j]   =           ratioL(j-1) * (accM[j-1] + eta'(y_{j-1}))
+            // `eta'(y_{j-1})` needs BOTH of y_{j-1}'s neighbours, so it only exists from
+            // j = 2 on; the missing j = 1 term is the merge at y_0, which is the light
+            // itself and is not a medium vertex in any case.
+            const size_t np = path.size();
+            accC.assign(np, 0.0);
+            accM.assign(np, 0.0);
+            for (size_t u = 0; u < np; ++u) {
+                const bool dPrev = (u > 0) ? path[u - 1].delta : path[0].isDeltaLight();
+                const double gate = (!path[u].delta && !dPrev) ? 1.0 : 0.0;
+                if (u == 0) { accC[0] = gate; continue; }
+                const double rL = misRemap0(path[u - 1].pdfRev) / misRemap0(path[u - 1].pdfFwd);
+                const double eL = (u >= 2)
+                    ? mergeEtaPrime(scene, path[u - 2].p, path[u - 1], path[u].p,
+                                    path[u - 1].pdfFwd, hb.lam[0])
+                    : 0.0;
+                accC[u] = gate + rL * accC[u - 1];
+                accM[u] = rL * (accM[u - 1] + eL);
+            }
+
             for (const PathSeg& sg : segs) {
                 if (!(sg.beta > 0.0)) continue;
+                const size_t before = banks[(size_t)tid].beams.size();
                 // MedAll, not the emitBeams default MedStraight: nothing about this span is
                 // carried stochastically (that is what LONG means), so every medium the
                 // lead-in crosses must be charged. See Renderer::emitBeams.
                 mats.emitBeams(scene, sg.o, sg.d, sg.tMax, hb.lam[0], sg.beta, sg.aGlass,
                                rng, Renderer::MedAll);
+                const size_t after = banks[(size_t)tid].beams.size();
+                if (after == before) continue;
+
+                // One template for every beam this segment deposited: they differ only in
+                // where along the segment each medium starts (`leadIn`), because everything
+                // else here is a property of the vertex the segment LEAVES.
+                const size_t j = (size_t)sg.vert;
+                const Vertex& y = path[j < np ? j : np - 1];
+                BeamMis m;
+                m.sumC   = accC[j < np ? j : np - 1];
+                m.sumM   = accM[j < np ? j : np - 1];
+                m.pdfDir = (float)sg.pdfDir;
+                // cos / pdfFwd, the merge-independent half of pdfRev*(y_{s-1})/pdfFwd(y_{s-1}):
+                // the gather multiplies in the phase value at x and 1/rho_L^2. The cosine is
+                // at y_{s-1} and faces along the beam, so it is 1 for a medium vertex.
+                const double cosFac = y.onSurface() ? std::fabs(dot(y.ns, sg.d)) : 1.0;
+                m.rCoef  = (float)(cosFac / misRemap0(y.pdfFwd));
+                // Is "connect x to y_{s-1}" — the technique this whole ratio is measured
+                // against — a legal strategy? x is a medium point and never delta, so only
+                // y_{s-1} can veto it.
+                m.gateC1 = y.delta ? 0 : 1;
+                // eta' of the merge AT y_{s-1}. Its outgoing direction is this segment's own
+                // `d` (the merged path leaves y_{s-1} along the beam), so sin(theta) is known
+                // here; only its transmittance, which needs the not-yet-known distance to x,
+                // is left to the gather.
+                m.etaPrev = 0.0f;
+                if (y.type == VType::Medium && j >= 1 && j < np &&
+                    y.mediumId >= 0 && y.mediumId < (int)scene.media.size() &&
+                    y.pdfFwd > 0.0) {
+                    Vec3 din = y.p - path[j - 1].p;
+                    const double dl = std::sqrt(dot(din, din));
+                    if (dl > 0.0) {
+                        din = din * (1.0 / dl);
+                        const double c = dot(din, sg.d);
+                        const double s2 = 1.0 - c * c;
+                        const Medium& md = scene.media[y.mediumId];
+                        const double sigT = md.sigmaT(hb.lam[0]) * md.densityAt(y.p, &tabs);
+                        if (s2 > 0.0 && sigT > 0.0)
+                            m.etaPrev = (float)(std::sqrt(s2) * y.pdfFwd / sigT);
+                    }
+                }
+                for (size_t bi = before; bi < after; ++bi) {
+                    BeamMis mm = m;
+                    // BeamHit::sBeam is measured from the beam's own clipped origin, not from
+                    // y_{s-1}; this is the difference the gather adds back to recover the full
+                    // y_{s-1} -> x distance the light-side density is expressed over.
+                    mm.leadIn = (float)dot(banks[(size_t)tid].beams[bi].o - sg.o, sg.d);
+                    misBank.push_back(mm);
+                }
             }
         }
         tracedTotal.fetch_add(done & 0xFFF, std::memory_order_relaxed);
@@ -1400,13 +1571,22 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     size_t nb = 0;
     for (auto& b : banks) nb += b.size();
     bm.beams.clear();
+    bm.mis.clear();
+    bm.misIdx.clear();
     ftalloc::reserve(bm.beams, nb, "mode J's photon-beam map", "-n (which sizes it)");
+    ftalloc::reserve(bm.mis, nb, "mode J's per-beam MIS partials", "-n (which sizes it)");
     bm.nEmitted = 0;
     for (int t = 0; t < nThreads; ++t) {
         bm.beams.insert(bm.beams.end(), banks[(size_t)t].beams.begin(),
                         banks[(size_t)t].beams.end());
+        bm.mis.insert(bm.mis.end(), misBanks[(size_t)t].begin(), misBanks[(size_t)t].end());
         bm.nEmitted += emitted[(size_t)t];
     }
+    // The two arrays are built one push apart and can only disagree through a bug; if they
+    // ever do, drop the MIS data rather than index it wrongly — BeamMap::misOf then returns
+    // null and the gather falls back to weight 1, i.e. mode M's (over-bright but not
+    // garbage) estimator, which is a failure the image shows rather than hides.
+    if (bm.mis.size() != bm.beams.size()) bm.mis.clear();
     bm.nDeposited = bm.beams.size();
 }
 
@@ -1487,8 +1667,13 @@ inline void reset() {
 
 // The reference weight itself. `light`/`eye` must already carry the current strategy's
 // patched densities and delta flags (i.e. call from inside misWeight).
-inline double misWeightReference(const std::vector<Vertex>& light,
-                                 const std::vector<Vertex>& eye, int s, int t) {
+//
+// Mode J adds the MERGE strategies to the same sum: one per interior medium vertex, each
+// weighted by mergeEtaPrime * kappa against the connection strategy at that same vertex.
+// `mergeKappa` is 0 in mode D, which deletes them and leaves this function byte-identical.
+inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& light,
+                                 const std::vector<Vertex>& eye, int s, int t,
+                                 double lambda, double mergeKappa) {
     const int n = s + t;
     if (n <= 2) return 1.0;
     auto remap0 = [](double f) { return f != 0.0 ? f : 1.0; };
@@ -1533,6 +1718,21 @@ inline double misWeightReference(const std::vector<Vertex>& light,
         if (!allowed(j)) continue;
         sum += std::exp(A[(size_t)j] + B[(size_t)j] - logPs);
     }
+    // Mode J: one merge strategy per interior vertex. p_merge,i = eta_i * p_i with p_i the
+    // connection strategy at the same vertex, so it rides the ratio already computed above.
+    // No `allowed` test: a merge connects nothing, so a delta neighbour does not kill it —
+    // it only needs both subpaths to REACH x_i, which by construction they do.
+    if (mergeKappa > 0.0) {
+        auto vAt = [&](int i) -> const Vertex& {
+            return (i < s) ? light[(size_t)i] : eye[(size_t)(n - 1 - i)];
+        };
+        for (int i = 1; i <= n - 2; ++i) {
+            const double e = mergeEtaPrime(scene, vAt(i - 1).p, vAt(i), vAt(i + 1).p,
+                                           pl[(size_t)i], lambda);
+            if (e > 0.0)
+                sum += e * mergeKappa * std::exp(A[(size_t)i] + B[(size_t)i] - logPs);
+        }
+    }
     return sum > 0.0 ? 1.0 / sum : 0.0;
 }
 
@@ -1542,9 +1742,28 @@ inline double misWeightReference(const std::vector<Vertex>& light,
 // other strategies that could have produced the same path. `sampled` is the
 // resampled endpoint used when s==1 (light NEE) or t==1 (camera splat). `light`/`eye`
 // are mutated in place but restored by the ScopedAssigns before returning.
+//
+// `mergeKappa` (= n_m * 2r, the merge technique's sample count times the kernel width; 0 in
+// every mode but J) adds the beam-merge strategies to the denominator. It has to be here
+// rather than applied afterwards: a merge is a technique that competes with THIS connection
+// for the same path, so leaving it out would make mode J's connection weights sum with its
+// merge weights to more than 1 and brighten every medium.
+//
+// Index mapping, which is the part worth stating explicitly because it is where an
+// off-by-one hides. Writing the unified path x_0..x_{n-1} light-to-camera:
+//   * the camera loop's `i` accumulates the ratio for strategy j = n - i, whose vertex is
+//     x_{n-i} = eye[i-1]; so the merge site charged at step i is eye[i-1], needing i >= 2
+//     for its camera-side neighbour eye[i-2] to exist.
+//   * the light loop's `i` accumulates strategy j = i, vertex x_i = light[i]; the merge site
+//     is light[i] itself, whose camera-side neighbour is light[i+1] — or `pt` at i == s-1,
+//     where the light subpath ends.
+//   * strategy j = s (this connection, ratio 1) has vertex x_s = pt, so it too carries a
+//     merge site, added once outside both loops.
+// Gate (2) already validated the first two mappings for the connection terms.
 inline double misWeight(const Scene& scene, const Camera& cam,
                         std::vector<Vertex>& light, std::vector<Vertex>& eye,
-                        Vertex& sampled, int s, int t, double lambda) {
+                        Vertex& sampled, int s, int t, double lambda,
+                        double mergeKappa = 0.0) {
     if (s + t == 2) return 1.0;
     auto remap0 = [](double f) { return f != 0.0 ? f : 1.0; };
     Vertex* qs  = s > 0 ? &light[s - 1] : nullptr;
@@ -1582,10 +1801,16 @@ inline double misWeight(const Scene& scene, const Camera& cam,
     ScopedAssign<double> a7;
     if (qsM) a7 = ScopedAssign<double>(&qsM->pdfRev, vertexPdf(scene, cam, pt, *qs, *qsM, lambda));
 
+    const bool merges = mergeKappa > 0.0;
     double sumRi = 0.0, ri = 1.0;
     for (int i = t - 1; i > 0; --i) {                // hypothetical camera strategies
         ri *= remap0(eye[i].pdfRev) / remap0(eye[i].pdfFwd);
         if (!eye[i].delta && !eye[i - 1].delta) sumRi += ri;
+        if (merges && i >= 2) {                      // merge at eye[i-1] (see header note)
+            const double e = mergeEtaPrime(scene, eye[i].p, eye[i - 1], eye[i - 2].p,
+                                           eye[i - 1].pdfRev, lambda);
+            if (e > 0.0) sumRi += ri * e * mergeKappa;
+        }
     }
     ri = 1.0;
     for (int i = s - 1; i >= 0; --i) {               // hypothetical light strategies
@@ -1596,13 +1821,26 @@ inline double misWeight(const Scene& scene, const Camera& cam,
         // sun: infinitely far, no geometry) can never be hit by — PBRT's IsDeltaLight().
         bool deltaPrev = (i > 0) ? light[i - 1].delta : light[0].isDeltaLight();
         if (!light[i].delta && !deltaPrev) sumRi += ri;
+        if (merges && i >= 1 && t > 0) {             // merge at light[i]
+            const Vec3& pNext = (i + 1 <= s - 1) ? light[i + 1].p : eye[t - 1].p;
+            const double e = mergeEtaPrime(scene, light[i - 1].p, light[i], pNext,
+                                           light[i].pdfFwd, lambda);
+            if (e > 0.0) sumRi += ri * e * mergeKappa;
+        }
+    }
+    // The merge at the connection vertex pt itself. Its own connection strategy IS this
+    // one, so the ratio multiplying it is exactly 1.
+    if (merges && s >= 1 && t >= 2) {
+        const double e = mergeEtaPrime(scene, light[s - 1].p, eye[t - 1], eye[t - 2].p,
+                                       eye[t - 1].pdfRev, lambda);
+        if (e > 0.0) sumRi += e * mergeKappa;
     }
     const double w = 1.0 / (1.0 + sumRi);
     // Gate (2), off unless `-misaudit`: cross-check the relative form above against the
     // absolute one, here, where the ScopedAssigns are still installed and both therefore
     // see identical densities.
     if (misaudit::enabled.load(std::memory_order_relaxed)) {
-        const double ref = misWeightReference(light, eye, s, t);
+        const double ref = misWeightReference(scene, light, eye, s, t, lambda, mergeKappa);
         const double den = std::fabs(w) > std::fabs(ref) ? std::fabs(w) : std::fabs(ref);
         misaudit::nChecked.fetch_add(1, std::memory_order_relaxed);
         misaudit::note(den > 0.0 ? std::fabs(w - ref) / den : 0.0, s, t);
@@ -1662,7 +1900,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                           std::vector<Vertex>& light, std::vector<Vertex>& eye,
                           int s, int t, const HeroBundle& hb,
                           Pcg32& rng, int& outPx, int& outPy, bool& isSplat,
-                          double* Lsec, int& nUpConn) {
+                          double* Lsec, int& nUpConn, double mergeKappa = 0.0) {
     const double lambda = hb.lam[0], invPdfLambda = hb.invPdf[0];
     isSplat = false;
     nUpConn = 0;                    // set to the real width only once a contribution exists
@@ -1994,11 +2232,113 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
     double mx = L;
     for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mx) mx = Lsec[i];
     if (!(mx > 0.0)) return 0.0;        // negated: also rejects NaN (see the mxE/mxL note)
-    const double mis = misWeight(scene, cam, light, eye, sampled, s, t, lambda);
+    const double mis = misWeight(scene, cam, light, eye, sampled, s, t, lambda, mergeKappa);
     for (int i = 0; i + 1 < nUp; ++i) Lsec[i] *= mis;
     nUpConn = nUp;
     return L * mis;
 }
+
+// --- The merge weight itself (mode J) ------------------------------------------------
+//
+// One of these is built per CAMERA SEGMENT and handed to gatherPhotonBeamsW, which calls it
+// once per beam hit. It returns the balance-heuristic weight of "merge THIS beam here"
+// against every other technique that could have produced the same path.
+//
+// SHAPE. The merged path is y_0..y_{s-1}, x, eye[k], eye[k-1], ..., eye[0]. Its reference
+// technique is the connection "C1" that would have made x the LAST CAMERA vertex and joined
+// it to y_{s-1} — strategy j = s. Every term below is a density RATIO against that one, so
+// the weight is etaS / (sum of all of them), and no absolute path density is ever formed.
+//
+// The two halves reach it by different routes and that is the whole trick: the camera half
+// is explicit (`eye[]` is right here, so misWeight's own loops can be replayed over it and
+// their results cached per segment), while the light half is long gone — it was summed into
+// BeamMis while the beam was deposited. Only three densities in the merged path differ from
+// the recorded ones, because the beam leaves y_{s-1} along exactly the direction the light
+// walk continued on: pdfRev(y_{s-1}), the pair at x, and pdfRev(eye[k]). Everything else is
+// what the two walks already stored, which is why the accumulators are legal at all.
+//
+// SPECTRAL MISMATCH (documented approximation). The beam carries its own wavelength and the
+// camera path another; a weight built from both is not a function of one path in one
+// spectrum. Camera-side quantities use the camera's lambda, light-side ones the beam's, and
+// the phase value at x — computed once by the gather — is used for both densities there.
+// This is the standard spectral-photon-mapping fudge (mode M and mode U's merges make the
+// same one); it perturbs the weight, never the estimator's support, so it costs quality and
+// not unbiasedness in the achromatic case, and see known-issues.md for the chromatic one.
+//
+// A DELTA LIGHT-SIDE DENSITY RETURNS 0, i.e. drops the merge. If the light walk left
+// y_{s-1} by a SPECULAR bounce then p_L(x) is a Dirac and `lm->pdfDir` is 0 (randomWalk
+// stores 0 for a delta continuation). misWeight's own merge terms vanish in exactly the
+// same case, so the partition of unity still holds and nothing is double- or under-counted
+// — the path is simply left to the connection strategies. It is a variance loss, not a
+// bias, and it is logged in known-issues.md.
+struct BeamMergeWeight {
+    const Scene*   scene = nullptr;
+    const BeamMap* bm    = nullptr;
+    const PathSeg* sg    = nullptr;
+    double lamCam = 0.0;
+    double kappa  = 0.0;      // n_m * 2r: the merge technique's sample count times the kernel
+    // Per-segment camera-side constants (see BdptRenderer::renderRows, where they are built).
+    double gateS1     = 0.0;  // is the reference connection C1 legal? (eye[k] not delta)
+    double cosFacK    = 1.0;  // projected cosine at eye[k] along the segment; 1 off a surface
+    double invPdfFwdK = 1.0;  // 1 / remap0(eye[k].pdfFwd)
+    double etaKCoef   = 0.0;  // sin(theta_k) / (sigma_t(eye[k]) * Tr~(eye[k] -> eye[k-1]))
+    double segSumC    = 0.0;  // camera-side connection accumulator from eye[k] inward
+    double segSumM    = 0.0;  // camera-side merge accumulator, kappa factored out
+
+    double operator()(const BeamHit& bh, const PhotonBeam& b, double dens, double phase) const {
+        const BeamMis* lm = bm->misOf(bh.idx);
+        if (!lm) return 1.0;                  // no MIS data: mode M's raw estimator
+        const double tc = bh.tCam;
+        const double rhoL = (double)lm->leadIn + bh.sBeam;   // y_{s-1} -> x, not b.o -> x
+        if (!(tc > 0.0) || !(rhoL > 0.0)) return 0.0;
+        const double invR2 = 1.0 / (rhoL * rhoL), invT2 = 1.0 / (tc * tc);
+        // The pair of geometric densities AT x. Both are cosine-free: x is a medium point,
+        // so convertDensity applies no projected cosine to it.
+        const double gL = (double)lm->pdfDir * invR2;        // light side  (p_L-perp)
+        const double gC = sg->pdfDir * invT2;                // camera side (the free flight)
+        if (!(gL > 0.0)) return 0.0;                         // delta light-side density
+        const double sigT = scene->media[b.med].sigmaT(lamCam) * dens;
+        if (!(sigT > 0.0)) return 0.0;
+        const double trC = trDet(*scene, sg->o, sg->d, tc, lamCam);   // Tr~(x -> eye[k])
+        if (!(trC > 0.0)) return 0.0;
+        // eta of THIS merge against C1 — the numerator of the weight, and a term of its
+        // denominator (a technique competes with itself at ratio exactly its own).
+        const double etaS = kappa * bh.sinT * gL / (sigT * trC);
+        if (!(etaS > 0.0)) return 0.0;
+
+        // pdfRev(y_{s-1}): the density of the last light vertex seen from x. The phase value
+        // at x is its direction density (HG samples proportionally to its own value), and
+        // BeamMis::rCoef carries the cosine and the 1/pdfFwd that turn it into the ratio the
+        // light loop accumulates.
+        const double R  = phase * (double)lm->rCoef * invR2;
+        // pdfRev(x)/pdfFwd(x): the camera loop's first step. remap0 on BOTH, exactly as
+        // misWeight does, so a delta camera continuation cancels instead of annihilating.
+        const double C1 = misRemap0(gL) / misRemap0(gC);
+        // pdfRev(eye[k]) in the merged path, and the camera loop's second step.
+        const double pdfRevK = phase * cosFacK * invT2;
+        const double C2   = pdfRevK * invPdfFwdK;
+        const double etaK = kappa * etaKCoef * pdfRevK;      // merge AT eye[k]
+        // The merge AT y_{s-1}. Its sin(theta) and p_L were known when the beam was
+        // deposited (its outgoing direction IS the beam); only the transmittance over the
+        // now-known y_{s-1} -> x span is left.
+        double etaPrevTerm = 0.0;
+        if (lm->etaPrev > 0.0f) {
+            const Vec3 yPrev = b.o - b.d * (double)lm->leadIn;
+            const double trP = trDet(*scene, yPrev, b.d, rhoL, (double)b.lambda);
+            if (trP > 0.0) etaPrevTerm = kappa * (double)lm->etaPrev / trP;
+        }
+        const double den = (double)lm->gateC1                    // C1 itself (ratio 1)
+                         + R * lm->sumC                          // light-side connections
+                         + gateS1 * C1                           // the t-1 camera connection
+                         + C1 * C2 * segSumC                     // camera-side connections
+                         + R * (kappa * lm->sumM + etaPrevTerm)  // light-side merges
+                         + etaS                                  // this merge
+                         + C1 * etaK                             // merge at eye[k]
+                         + C1 * C2 * kappa * segSumM;            // camera-side merges
+        if (!(den > 0.0)) return 0.0;
+        return etaS / den;
+    }
+};
 
 // --- Renderer --------------------------------------------------------------------
 // Renders pixel rows [y0,y1). t>=2 (camera-image) contributions land on the current
@@ -2027,6 +2367,8 @@ struct BdptRenderer {
         // Mode J (UPBP) only. Hoisted out of the pixel loop so its capacity is reached once
         // per thread rather than reallocated per sample, exactly like `eye`/`light`.
         PathSegs segs;
+        // Camera-side MIS accumulators, one entry per eye vertex (Phase 3b). Same hoist.
+        std::vector<double> segSumC, segSumM;
         const uint64_t nPix = (uint64_t)camFilm.resX * (uint64_t)camFilm.resY;
         // Hero gate, matching BackwardRenderer: bundling needs a wavelength-independent
         // ray path, so any participating medium (per-λ free flight), a GRIN field
@@ -2042,6 +2384,15 @@ struct BdptRenderer {
         // when it is false the camera walk is not even asked to record its segments and the
         // render is mode D down to the RNG stream (validation gate 1).
         const bool mergeOn = beams && !beams->empty() && beams->nEmitted > 0;
+        // The merge technique's constant: its sample count (one beam map per frame, built
+        // from `nEmitted` light subpaths) times the 1D kernel's full width. Zero unless the
+        // map actually carries MIS partials, and that zero is what makes every merge term
+        // below — and inside misWeight — disappear, leaving mode D's arithmetic untouched.
+        // Weighted and unweighted merges must move together: weighting the connections down
+        // while the merges are still raw would darken the volume as surely as the reverse
+        // brightens it, so ONE flag gates both.
+        const double mergeKappa = (mergeOn && !beams->mis.empty())
+                                ? (double)beams->nEmitted * 2.0 * beams->radRef() : 0.0;
         for (int py = y0; py < y1; ++py)
             for (int px = 0; px < camFilm.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)camFilm.resX + (uint64_t)px;
@@ -2115,7 +2466,8 @@ struct BdptRenderer {
                             double Lsec[hero::kHeroMax - 1] = {0};
                             int nUpConn = 0;
                             double c = connectBDPT(scene, cam, mats, light, eye, s, t, hb,
-                                                   rng, spx, spy, isSplat, Lsec, nUpConn);
+                                                   rng, spx, spy, isSplat, Lsec, nUpConn,
+                                                   mergeKappa);
                             if (nUpConn <= 0) continue;
                             double mx = c;
                             for (int i = 0; i + 1 < nUpConn; ++i)
@@ -2160,11 +2512,81 @@ struct BdptRenderer {
                     // "turn the merges off and mode J is mode D bit-for-bit" survives even
                     // though the two halves share a generator.
                     if (mergeOn) {
+                        // The camera half of every merge weight, replayed ONCE for the whole
+                        // subpath. misWeight's camera loop telescopes inward from the merge
+                        // point; everything it accumulates strictly camera-side of eye[k] is
+                        // independent of where along the segment a beam is hit, so it is
+                        // summed here and read off per segment. (The recurrences mirror the
+                        // light-side ones in traceLightBeamPass; see BeamMergeWeight.)
+                        const double lamCam = hb.lam[0];
+                        const PatTables tabs = scene.patTables();
+                        if (mergeKappa > 0.0) {
+                            segSumC.assign((size_t)nE, 0.0);
+                            segSumM.assign((size_t)nE, 0.0);
+                            for (int k = 1; k < nE; ++k) {
+                                const double gate = (!eye[(size_t)k].delta &&
+                                                     !eye[(size_t)k - 1].delta) ? 1.0 : 0.0;
+                                // eta' of the merge AT eye[k-1]; needs both its neighbours,
+                                // so it starts at k = 2. Its pdfRev is the RECORDED one:
+                                // moving the light-side neighbour of eye[k] along the same
+                                // ray does not change the direction arriving at eye[k-1].
+                                const double eK = (k >= 2)
+                                    ? mergeEtaPrime(scene, eye[(size_t)k].p, eye[(size_t)k - 1],
+                                                    eye[(size_t)k - 2].p,
+                                                    eye[(size_t)k - 1].pdfRev, lamCam)
+                                    : 0.0;
+                                double carry = 0.0, carryM = 0.0;
+                                if (k >= 2) {
+                                    // No ratio exists at the camera vertex itself, which is
+                                    // why the recurrence starts one step in.
+                                    const double rC = misRemap0(eye[(size_t)k - 1].pdfRev) /
+                                                      misRemap0(eye[(size_t)k - 1].pdfFwd);
+                                    carry  = rC * segSumC[(size_t)k - 1];
+                                    carryM = rC * segSumM[(size_t)k - 1];
+                                }
+                                segSumC[(size_t)k] = gate + carry;
+                                segSumM[(size_t)k] = eK + carryM;
+                            }
+                        }
                         for (const PathSeg& sg : segs) {
                             if (!(sg.beta > 0.0)) continue;
+                            BeamMergeWeight w1;
+                            w1.scene = &scene; w1.bm = beams; w1.sg = &sg;
+                            w1.lamCam = lamCam; w1.kappa = mergeKappa;
+                            if (mergeKappa > 0.0) {
+                                const size_t k = (size_t)sg.vert;
+                                const Vertex& vk = eye[k < (size_t)nE ? k : (size_t)nE - 1];
+                                w1.gateS1     = vk.delta ? 0.0 : 1.0;
+                                w1.cosFacK    = vk.onSurface()
+                                              ? std::fabs(dot(vk.ns, sg.d)) : 1.0;
+                                w1.invPdfFwdK = 1.0 / misRemap0(vk.pdfFwd);
+                                w1.segSumC    = segSumC[k < (size_t)nE ? k : (size_t)nE - 1];
+                                w1.segSumM    = segSumM[k < (size_t)nE ? k : (size_t)nE - 1];
+                                // The merge AT eye[k]. Its light-side incoming direction is
+                                // -sg.d whatever x turns out to be, so sin(theta) and the
+                                // whole coefficient are merge-point INDEPENDENT and belong
+                                // here rather than in the per-hit weight.
+                                if (k >= 1 && k < (size_t)nE &&
+                                    vk.type == VType::Medium && vk.mediumId >= 0 &&
+                                    vk.mediumId < (int)scene.media.size()) {
+                                    Vec3 dp = eye[k - 1].p - vk.p;
+                                    const double dn = std::sqrt(dot(dp, dp));
+                                    if (dn > 0.0) {
+                                        dp = dp * (1.0 / dn);
+                                        const double c = dot(sg.d, dp);
+                                        const double s2 = 1.0 - c * c;
+                                        const Medium& md = scene.media[vk.mediumId];
+                                        const double sT = md.sigmaT(lamCam) *
+                                                          md.densityAt(vk.p, &tabs);
+                                        const double tr = trDet(scene, vk.p, dp, dn,
+                                                                lamCam, tabs);
+                                        if (s2 > 0.0 && sT > 0.0 && tr > 0.0)
+                                            w1.etaKCoef = std::sqrt(s2) / (sT * tr);
+                                    }
+                                }
+                            }
                             Vec3 m = gatherPhotonBeamsW(scene, mats, *beams, sg.o, sg.d,
-                                                        sg.tMax, sg.aGlass, rng,
-                                                        BeamWeightOne{});
+                                                        sg.tMax, sg.aGlass, rng, w1);
                             if (m.x != 0.0 || m.y != 0.0 || m.z != 0.0)
                                 camFilm.add(px, py, m * sg.beta);
                         }

@@ -33,8 +33,61 @@
 // The default weight: every beam hit counts once, in full. This is mode M, where the beam
 // map IS the estimator and there is no second technique to share with.
 struct BeamWeightOne {
-    double operator()(const BeamHit&, const PhotonBeam&) const { return 1.0; }
+    double operator()(const BeamHit&, const PhotonBeam&, double, double) const { return 1.0; }
 };
+
+// --- Deterministic transmittance, for MIS WEIGHTS ONLY --------------------------------
+//
+// Renderer::mediaTransmittance is an unbiased ESTIMATOR: for a heterogeneous medium it
+// ratio-tracks, so two calls on the same segment return two different numbers. That is
+// exactly right inside a contribution and exactly wrong inside a weight.
+//
+// A balance heuristic is unbiased only if, for one fixed path, the weights of the competing
+// techniques sum to 1. Every technique's weight is built from the same pool of per-edge
+// densities, and an edge's transmittance appears in several of them; if each appearance is
+// an independent random draw the sum is no longer 1 and the image is biased. So the weight
+// needs a FUNCTION of the path, not an estimate of one.
+//
+// Note what that requirement does NOT demand: accuracy. Any deterministic function keeps
+// the partition of unity — Tr == 1 everywhere would be unbiased too, merely a poor weight
+// with more variance. So the rule here is "deterministic first, accurate second": exact for
+// a homogeneous medium (a closed-form exponential, which is also the overwhelmingly common
+// case), and a fixed midpoint quadrature of the optical depth for a heterogeneous one,
+// where the only cost of the approximation is weight quality.
+inline double trDetMedium(const Medium& med, const Vec3& o, const Vec3& dir, double dist,
+                          double lambda, const PatTables* tabs) {
+    const double stBase = med.sigmaT(lambda);
+    if (stBase <= 0.0) return 1.0;
+    double ta, tb;
+    if (!med.clipToBounds(o, dir, 0.0, dist, ta, tb)) return 1.0;
+    const double L = tb - ta;
+    if (!(L > 0.0)) return 1.0;
+    if (!med.heterogeneous()) return std::exp(-stBase * L);
+    // Midpoint rule. Four samples is enough to track the large-scale shape of a cloud,
+    // which is all a weight needs; it is not integrating radiance.
+    constexpr int kN = 4;
+    const double dt = L / (double)kN;
+    double tau = 0.0;
+    for (int i = 0; i < kN; ++i)
+        tau += med.densityAt(o + dir * (ta + (i + 0.5) * dt), tabs);
+    return std::exp(-stBase * tau * dt);
+}
+
+// Same, over every medium in the scene (extinction adds, so transmittance multiplies).
+inline double trDet(const Scene& scene, const Vec3& o, const Vec3& dir, double dist,
+                    double lambda, const PatTables& tabs) {
+    double Tr = 1.0;
+    for (const Medium& m : scene.media) {
+        Tr *= trDetMedium(m, o, dir, dist, lambda, &tabs);
+        if (Tr <= 0.0) return 0.0;
+    }
+    return Tr;
+}
+inline double trDet(const Scene& scene, const Vec3& o, const Vec3& dir, double dist,
+                    double lambda) {
+    const PatTables tabs = scene.patTables();
+    return trDet(scene, o, dir, dist, lambda, tabs);
+}
 
 // ---- Volume gather: single-scatter radiance along one camera SEGMENT from the beam map ---
 // The Beam x Ray 1D estimator (photonbeams.h). For every stored beam whose kernel cylinder
@@ -98,7 +151,10 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         // is bit-for-bit unchanged.
         const double invC = 1.0 / (double)b.nLam();
         double w = (double)b.power * bm.kernel1D(bh.dPerp, b.med) / bh.sinT * ss * phase * invN * invC;
-        w *= w1(bh, b);   // MIS (mode J); exactly 1.0 and folded away in mode M
+        // MIS (mode J); exactly 1.0 and folded away in mode M. `dens` and `phase` are handed
+        // over rather than recomputed: the merge weight needs sigma_t(x) and the phase value
+        // at the merge point, and both are one multiply away from what this line just built.
+        w *= w1(bh, b, dens, phase);
         if (!(w > 0.0)) return;
         if (b.absorb > 0.0f) w *= std::exp(-(double)b.absorb * bh.sBeam);   // glass, beam side
         if (aGlassCam > 0.0) w *= std::exp(-aGlassCam * bh.tCam);           // glass, camera side

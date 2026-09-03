@@ -84,7 +84,7 @@ paths they can capture at all**.
 | `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras). The map is **surfaces only**: add `-beams` for the view-independent photon-beam volume cache, without which participating media render as nothing | CPU + **GPU** (both the direct estimate and `-beams`) |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU + **GPU** |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU + **GPU** |
-| `J` | UPBP | Mode `D` **plus** the mode-`M` photon-beam volume cache, combined under one MIS weight — the volumetric counterpart of `U`. Connections carry the paths beams are blind to (multiple scattering, surfaces); beam merges carry the deep-in-a-thick-medium paths the camera's distance sampling never reaches. Beams are **on by default** here (`-nobeams` to disable, which reduces it exactly to mode `D`) and are built from mode `J`'s **own light subpaths** since 0.216.0, so `-n` counts subpaths and `-beamcount` is inert. **Incomplete as of 0.216.0 — the MIS weights are not written yet, so both techniques contribute in full and the volume term is double-counted.** See **Mode `J`** below | CPU |
+| `J` | UPBP | Mode `D` **plus** the mode-`M` photon-beam volume cache, combined under one MIS weight — the volumetric counterpart of `U`. Connections carry the paths beams are blind to (multiple scattering, surfaces); beam merges carry the deep-in-a-thick-medium paths the camera's distance sampling never reaches. Beams are **on by default** here (`-nobeams` to disable, which reduces it exactly to mode `D`) and are built from mode `J`'s **own light subpaths** since 0.216.0, so `-n` counts subpaths and `-beamcount` is inert. **Complete as of 0.218.0** — both techniques are MIS-weighted, so mode `J` estimates the same image mode `D` does (`J/D` mean 1.0006 on `_fog_cornell`, against 2.0374 while the weights were missing). See **Mode `J`** below | CPU |
 
 ### Mode `W` — the deterministic (POV-Ray-style) preview
 
@@ -987,13 +987,24 @@ that converges to the same physical image.
   strictly mode `D` with extra words, and it only starts paying for itself where the medium
   is thick enough that `D` alone is starved.
 
-  > **Not finished as of 0.216.0.** Both estimators run, but the balance-heuristic weights
-  > described above are *not implemented yet* — every connection and every beam merge
-  > currently contributes at weight 1. The consequence is a real, visible error and not a
-  > subtlety: on `_fog_cornell.ftsl` the volume term comes out **≈2× too bright**, because
-  > the two techniques both account for it in full. `-mode J -nobeams` is still exactly mode
-  > `D` and is unaffected. Until this note is removed, use `D` or `M` for images you care
-  > about; `J` is a work in progress you are welcome to watch.
+  > **Complete as of 0.218.0, with three caveats.** The balance-heuristic weights described
+  > above are implemented on both sides, so a mode-`J` image is a correct estimate of the
+  > same integral mode `D` estimates: on `_fog_cornell.ftsl` the `J/D` scene-linear mean is
+  > **1.0006**, against **2.0374** in 0.215.0–0.217.0 when both techniques still contributed
+  > at weight 1. The caveats: it is **CPU-only** (`-device gpu` falls back); its beam map has
+  > **no trim** and is sized by `-n` alone, which is the resource that bites first; and the
+  > weights carry three deliberate approximations (one scene-wide kernel radius, a weight
+  > built from two wavelengths, and a merge dropped after a specular light bounce) — all of
+  > them weight *quality*, none of them bias. See **UPBP-W** in `known-issues.md`.
+  >
+  > **Where it does and does not pay.** `_fog_cornell` is a thin fog that BDPT connections
+  > already sample well, and there mode `J` buys **no noise reduction at all** for ~25× mode
+  > `D`'s cost (15.25 % noise at 43 spp, which is exactly mode `D`'s 4.42 % at 512 spp scaled
+  > by `sqrt`). That is the expected result, not a defect: UPBP earns its keep only where the
+  > medium is thick enough, or lit indirectly enough, that the camera's distance sampling
+  > cannot reach the scattering points — which is the regime `-beams` exists for. Mode `J`
+  > also inherits the beam×ray estimator's `1/sin(theta)` tail, so it produces brighter
+  > fireflies than mode `D` on the same scene (peak pixel ~1.9× mode `D`'s here).
 
 The **image-forming modes are all progressive** — the forward camera models
 (`A`/`B`/`C`), the backward reference (`R`), the bidirectional tracer (`D`), UPBP (`J`),

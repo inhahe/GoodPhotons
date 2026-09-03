@@ -413,6 +413,46 @@ struct BeamBank {
     }
 };
 
+// --- Per-beam MIS partials, mode J (UPBP) only ----------------------------------------
+//
+// A merge weight is a balance heuristic over EVERY technique that could have produced the
+// merged path, and half of those techniques live on the light subpath — which, by the time
+// a camera ray gathers this beam, was traced in a different pass and thrown away. So the
+// light half of the weight is precomputed while that subpath is still in hand and carried
+// on the beam. (This is the same trick SmallVCM's dVC/dVM accumulators play; the algebra
+// here is PBRT's telescoped ratio form instead, because that is what bdpt.h's misWeight is.
+// See known-issues.md, "The shape the weight actually takes in bdpt.h".)
+//
+// The two sums are over the LIGHT-side hypothetical strategies of a path that merges on
+// this beam. Writing y_0..y_{s-1} for the light subpath (the beam leaves y_{s-1}) and
+//     B_i = PROD_{u=i}^{s-2} pdfRev(y_u)/pdfFwd(y_u)      (B_{s-1} = 1, empty product)
+//     eta'_i = the merge/connection density ratio at y_i, less the constant n_m * 2r
+// they are  sumC = SUM_{i<=s-1} gate_i * B_i  and  sumM = SUM_{i<=s-2} B_i * eta'_i.
+// Everything that depends on the merge POINT — which is not known until the gather — is
+// left out and supplied there: hence the raw scalars below rather than a finished weight.
+//
+// WHY IT IS NOT A FIELD OF PhotonBeam. Mode M shares this file and must not pay for it:
+// `mis` is empty in mode M and PhotonBeam keeps its size. It is also indexed by the
+// PRE-SPLIT beam, through `misIdx`, because splitting one beam into a thousand
+// sub-segments must not duplicate 40 bytes of identical MIS data a thousand times — the
+// split is a memory ceiling problem already (see splitSah).
+struct BeamMis {
+    // Doubles: these are products/sums of density RATIOS over a whole subpath, so they run
+    // to whatever dynamic range the path has. The rest are geometry and fit in a float.
+    double sumC = 0.0;      // light-side connection accumulator (see above)
+    double sumM = 0.0;      // light-side merge accumulator, without the n_m * 2r factor
+    float  pdfDir = 0.0f;   // solid-angle pdf of the beam's direction at y_{s-1}
+    float  rCoef  = 0.0f;   // cos(y_{s-1}) / pdfFwd(y_{s-1}); the cos is 1 off a surface
+    float  etaPrev = 0.0f;  // sin(theta) * pdfFwd(y_{s-1}) / sigma_t(y_{s-1}) — the merge
+                            // AT y_{s-1}, still missing only its Tr; 0 if y_{s-1} is not a
+                            // medium vertex (i.e. no merge technique exists there)
+    float  leadIn = 0.0f;   // distance from y_{s-1} to THIS beam's clipped origin `o`, so
+                            // the gather can turn BeamHit::sBeam into the full y_{s-1}->x
+                            // distance the light-side density is measured over
+    unsigned char gateC1 = 0;  // is "connect x to y_{s-1}" a legal strategy? (y_{s-1} not
+                               // delta) — the reference technique of the whole ratio
+};
+
 // Result of one beam/ray closest-approach test that passed the radius check.
 struct BeamHit {
     int    idx;      // index into BeamMap::beams
@@ -441,6 +481,11 @@ struct BeamMap {
     // header note: the radius is derived from each medium's own measured mean free path, so a
     // dense cloud and a sparse rain curtain in the same scene get their own blur scale.
     std::vector<float> radMed;
+    // Mode J (UPBP) only, empty otherwise: the light half of every merge's MIS weight.
+    // `mis` is indexed by the ORIGINAL (pre-split) beam; `misIdx` maps a current beam to
+    // its entry and is filled by the first split. See BeamMis.
+    std::vector<BeamMis> mis;
+    std::vector<int>     misIdx;
     double    radius   = 0.02;        // fallback for a beam whose med is out of range, and
                                       // (after buildAuto) the MAX over media — the one number
                                       // worth printing when a scene has a single medium.
@@ -456,6 +501,42 @@ struct BeamMap {
     // a map loaded from a v3 cache before radMed was filled) falls back to the scalar.
     double radOf(int med) const {
         return (med >= 0 && (size_t)med < radMed.size()) ? (double)radMed[(size_t)med] : radius;
+    }
+
+    // The MIS partials of beam `i`, or null when the map carries none (every mode but J).
+    // A null return is the gather's signal to fall back to weight 1 — which is mode M's
+    // estimator, i.e. exactly the behaviour of a map that was never given MIS data.
+    const BeamMis* misOf(size_t i) const {
+        if (mis.empty()) return nullptr;
+        const size_t j = misIdx.empty() ? i : (size_t)misIdx[i];
+        return j < mis.size() ? &mis[j] : nullptr;
+    }
+    // The ONE kernel half-width the mode-J MIS weights are written in terms of.
+    //
+    // A merge's density carries a factor 2r, and the balance heuristic is unbiased only if
+    // every appearance of a given site's 2r is the same number. A per-medium radius would
+    // satisfy that too — except that the light-side accumulators (BeamMis::sumM) are summed
+    // WHILE the beams are being deposited, before buildAuto has chosen any radius at all, so
+    // the per-site factor cannot be folded in there. One scalar, read after the fact by all
+    // three places that evaluate a merge density (the light pass factors it out, misWeight's
+    // hypotheticals and the gather multiply it back in), is the only value they can agree on.
+    //
+    // It is EXACT for a single-medium scene — the common case, and the validation case — and
+    // in a multi-medium scene it costs only weight QUALITY: a deterministic, technique-
+    // consistent constant keeps the partition of unity whatever value it takes.
+    double radRef() const {
+        if (radMed.empty()) return radius;
+        double s = 0.0;
+        for (float r : radMed) s += (double)r;
+        return s / (double)radMed.size();
+    }
+
+    // Give every current beam an explicit `mis` index, so the reordering passes below can
+    // permute it. A no-op unless the map actually carries MIS data.
+    void misEnsureIdx() {
+        if (mis.empty() || !misIdx.empty()) return;
+        misIdx.resize(beams.size());
+        for (size_t i = 0; i < beams.size(); ++i) misIdx[i] = (int)i;
     }
 
     // --- geometry summaries used by the radius heuristic ------------------------------
@@ -485,14 +566,19 @@ struct BeamMap {
         const double q = (double)target / (double)beams.size();
         const float  boost = (float)(1.0 / q);
         Pcg32 rng; rng.seed(seed, 0x13198A2E03707344ULL);
+        misEnsureIdx();
         std::vector<PhotonBeam> out;
+        std::vector<int> idxOut;
         out.reserve(target + target / 8 + 16);
-        for (const PhotonBeam& b : beams) {
+        if (!misIdx.empty()) idxOut.reserve(out.capacity());
+        for (size_t i = 0; i < beams.size(); ++i) {
             if (rng.uniform() >= q) continue;
-            out.push_back(b);
+            out.push_back(beams[i]);
             out.back().power *= boost;
+            if (!misIdx.empty()) idxOut.push_back(misIdx[i]);
         }
         beams.swap(out);
+        misIdx.swap(idxOut);
     }
 
     // The area-optimal sub-segment length for ONE beam at kernel radius `r`. Returns 0 for
@@ -664,11 +750,23 @@ struct BeamMap {
             ftalloc::reserve(out, want, "the split photon-beam array",
                              "-beamsplitmax (or -beamcount, which feeds it)");
         }
+        misEnsureIdx();
+        std::vector<int> idxOut;
+        if (!misIdx.empty()) idxOut.reserve(out.capacity());
         double lenSum = 0.0; size_t nSeg = 0;
-        for (const PhotonBeam& b : beams) {
+        for (size_t bi = 0; bi < beams.size(); ++bi) {
+            const PhotonBeam& b = beams[bi];
+            // Every sub-segment of a beam shares its parent's light-subpath MIS partials
+            // (same origin vertex, same direction, same accumulators) — only `s0` differs,
+            // and the gather reads the merge point's distance from BeamHit, not from s0.
+            const int mi = misIdx.empty() ? 0 : misIdx[bi];
             const double len = (double)b.len;
             const double p   = sahSplitLen(b, radOf(b.med), kappaOverW) * f;
-            if (!(p > 0.0) || len <= p) { out.push_back(b); lenSum += len; ++nSeg; continue; }
+            if (!(p > 0.0) || len <= p) {
+                out.push_back(b); lenSum += len; ++nSeg;
+                if (!misIdx.empty()) idxOut.push_back(mi);
+                continue;
+            }
             int k = (int)std::ceil(len / p);
             if (k > 65536) k = 65536;                  // pathological guard
             const double seg = len / (double)k;
@@ -677,10 +775,12 @@ struct BeamMap {
                 s.s0  = (float)((double)b.s0 + (double)j * seg);
                 s.len = (float)seg;
                 out.push_back(s);
+                if (!misIdx.empty()) idxOut.push_back(mi);
             }
             lenSum += len; nSeg += (size_t)k;
         }
         beams.swap(out);
+        misIdx.swap(idxOut);
         return nSeg ? lenSum / (double)nSeg : 0.0;
     }
 
@@ -699,9 +799,18 @@ struct BeamMap {
         std::vector<PhotonBeam> out;
         ftalloc::reserve(out, beams.size() + extra, "the split photon-beam array",
                          "-beamsplit (or -beamcount, which feeds it)");
-        for (const PhotonBeam& b : beams) {
+        misEnsureIdx();
+        std::vector<int> idxOut;
+        if (!misIdx.empty()) idxOut.reserve(beams.size() + extra);
+        for (size_t bi = 0; bi < beams.size(); ++bi) {
+            const PhotonBeam& b = beams[bi];
+            const int mi = misIdx.empty() ? 0 : misIdx[bi];   // shared by every sub-segment
             const double len = (double)b.len;
-            if (len <= maxLen) { out.push_back(b); continue; }
+            if (len <= maxLen) {
+                out.push_back(b);
+                if (!misIdx.empty()) idxOut.push_back(mi);
+                continue;
+            }
             int k = (int)std::ceil(len / maxLen);
             if (k > 65536) k = 65536;                  // pathological guard
             const double seg = len / (double)k;
@@ -710,9 +819,11 @@ struct BeamMap {
                 s.s0  = (float)((double)b.s0 + (double)j * seg);
                 s.len = (float)seg;
                 out.push_back(s);
+                if (!misIdx.empty()) idxOut.push_back(mi);
             }
         }
         beams.swap(out);
+        misIdx.swap(idxOut);
     }
 
     // Set every medium's kernel half-width to the same value — the `-beamradius` expert
