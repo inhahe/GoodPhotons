@@ -358,6 +358,15 @@ quietly produce a **wrong image** instead of a complaint. See FTSL.md §1.3.
 > (`-window`, `-o`, `-r`, `-camera`, `-view`) keep it a preview; to render the same
 > auto-lit scene with real light transport instead, pass a transport flag —
 > `ftrace model.glb -mode D -n 100000000 -o png/model.png`.
+>
+> **N-dimensional rotation.** Add `-nd <n>` and the same viewer lifts the model into
+> `n`-dimensional space, giving you one slider per rotation **plane** (`n(n-1)/2` of them)
+> and projecting the result back to 3-D live. `-nd-fill` gives the extra dimensions real
+> content — a per-vertex `emboss`, or an `extrude` that sweeps the mesh into a genuine N-D
+> prism — and the projection is a real mesh you can save with `-nd-export` and render for
+> real afterwards. Worth reading
+> [why a zero-filled lift is only a 3x3 matrix](REFERENCE.md#why-a-zero-filled-lift-is-only-a-3x3-matrix)
+> before reaching for a large `n`.
 
 ---
 
@@ -381,6 +390,7 @@ stays something you can actually read end to end.
 | Fog and volumes: homogeneous, bounded, heterogeneous density fields, OpenVDB / NanoVDB import | [Participating media](REFERENCE.md#participating-media--fog) |
 | Reusing computed indirect light across paths — the opt-in world-space radiance cache | [Radiance cache](REFERENCE.md#radiance-cache--radcache--mode-r-cpu) |
 | A tour of the scene language, and stereoscopic / animation workflows | [Scene language](REFERENCE.md#scene-language-ftsl) |
+| Rotating a model in N dimensions and projecting it back to 3-D | [N-dimensional rotation](REFERENCE.md#n-dimensional-rotation--nd) |
 | Every command-line flag | [Command-line reference](REFERENCE.md#command-line-reference) |
 | Output formats, `.ftbuf` checkpoints, resuming, tone mapping | [Output](REFERENCE.md#output) |
 

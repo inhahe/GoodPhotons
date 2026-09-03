@@ -1460,6 +1460,30 @@ the **GPU port**, where mode `M`'s CUDA beam gather is the template; see UPBP-CO
     behind it) and the realised aggregate fraction against the smoothstep: monotone, and
     exactly 0 and 1 at the ends — a coat one-in-a-thousand aggregate at point-blank range is a
     coat with sparkling holes in it.
+- **`ndwarp.h`** (0.220.0) — `-nd`: lift the scene's authored meshes into N dimensions,
+  rotate with the `n(n-1)/2` Givens plane rotations, project orthographically back to 3-D,
+  and REPLACE `Scene::tris` with the result — so the warp reaches the rasterizer, every
+  render mode and the exporter through one path instead of three. The design turns on one
+  fact: a zero-filled lift reads only `R`'s first three columns, so the whole thing collapses
+  to `p' = M p` with `M = R[0:3,0:3]` — one 3x3 contraction, identical for every vertex,
+  which is why `-nd 8` on a plain lift can do nothing a `transform` block cannot. (`M` can
+  still have negative determinant, so the MIRROR image is reachable, which 3-D rotation
+  cannot do.) That case takes a fast path: no welding, no complex, and the authored shading
+  normals carry through the inverse transpose so the model's own creases survive exactly.
+  The per-dimension FILLS are what make it non-affine — `emboss` gives dimension *k* a
+  per-vertex scalar (curvature via the umbrella Laplacian, radius, height, `povSolidNoise`,
+  u, v; each centred to zero mean and unit peak so the model does not drift off-origin),
+  and `extrude` sweeps the mesh into a real N-D prism. A prism's boundary is a 3-manifold,
+  which no triangle rasterizer can draw, so what is built is its **2-skeleton** — both lids
+  plus a quad per welded EDGE, the way a tesseract is drawn as its square faces — giving
+  `V→2V, E→2E+V, F→2F+E` and a `projectedTriCount` that lets `-nd-budget` refuse a
+  configuration before allocating it. Non-linear fills re-derive normals through
+  `mesh.h`'s own `meshFinishTris`, so a warped surface creases exactly where a loaded one
+  would. Warps only `Scene::meshGroups` (native primitives and instanced BLAS assets stay
+  put; emissive meshes are skipped because `addMeshLight` COPIES their triangles into the
+  emitter and the two would disagree), and rewrites the group ranges afterwards since an
+  extrusion changes the triangle count. Exports OBJ (per-corner normals/UVs, `usemtl` per
+  material) or binary `.ftmesh`. `-checknd` pins the algebra and the combinatorics.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only,
   PLY and STL (0.191.0).
@@ -6002,6 +6026,47 @@ Five call sites share the rule: `fillTriangleG` and `fillTriangleClear` (raster.
 in the clear pass, which *multiplies* into `clearT`/`milkT` — a doubly-covered edge would
 darken a seam twice, an uncovered one leaves a hairline of un-tinted glass. Costs ~4% on the
 CPU rasterizer; GPU unchanged. History and measurements in `known-issues.md`.
+
+## N-D warp (`ndwarp.h`, `-nd`, 0.220.0)
+
+**Where it sits.** The warp mutates `Scene::tris` immediately after the scene is built and
+before anything reads geometry, rather than transforming preview triangles. That choice is
+what makes one implementation serve three consumers: `raster::tessellate` sees the warped
+mesh because it reads the scene; every render mode path-traces it for the same reason; and
+`-nd-export` writes the very triangles that were on screen. Transforming `PreviewGeom`
+instead would have been cheaper and would have covered only the preview.
+
+**What is warped.** Every `MeshGroup` with `blasId < 0`, minus emissive ones. Native
+primitives are deliberately excluded — `-nd` is for looking at a *model*, and a scene's
+floor folding up with it is noise — and instanced BLAS assets are not reachable through
+`Scene::tris` at all. Emissive meshes are skipped because `Scene::addMeshLight` copies
+triangle data into the emitter at load time, so warping the surface without rebuilding the
+light leaves the two disagreeing about where the light is. Sensors (`sensorId >= 0`) never
+move. The unwarped triangles keep their relative order at the head of the rebuilt array, so
+an untouched group's range only SHIFTS and can be remapped by counting retained triangles.
+
+**Interactive cost model.** A slider drag re-warps from the pristine captured copy (angles
+are absolute — composing deltas would drift), re-tessellates and re-uploads the GPU
+rasterizer, but deliberately does NOT rebuild the BVH: the rasterizer has no use for one and
+a 2 M-triangle extrusion would cost seconds per tick. The tree is marked stale and rebuilt
+lazily, once, on the first traced ('T') frame that needs it. Emboss signals are cached per
+source for the same reason — curvature costs a full adjacency walk that a drag would
+otherwise repeat sixty times a second.
+
+**The edge-on report.** An extra dimension reaches the image only through column *k* of the
+rotation matrix's first three rows. Until a rotated plane contains axis *k* that column is
+zero: an extrusion's side walls project to exactly zero area and are culled by the
+degenerate-triangle guard, so the count falls straight back to the two lids and it looks
+like the fill did nothing. It is the correct picture of a solid seen edge-on, so
+`Stats::edgeOn` records it and both the CLI and the panel name the axis and suggest a plane
+rather than leaving the user to wonder.
+
+**Panel geometry.** The slider bank's height is a function of the window WIDTH (it wraps),
+so `panelH` is re-derived from `panelBaseH` on every layout instead of being accumulated as
+a one-time delta — otherwise narrowing the window would lay slider rows out below the strip
+where they cannot be seen. Changing the dimension box destroys and rebuilds every trackbar;
+angles are carried across by PLANE IDENTITY (`planeIndex(oldN, i, j)`), so `xw` stays `xw`
+rather than being silently re-indexed as the plane order lengthens.
 
 ## Preview shading model (`raster.h` + `raster_cuda.cu`, 0.135.0; per-hit mix 0.136.0)
 

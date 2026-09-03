@@ -166,6 +166,7 @@
 #include "vcm.h"                // mode U: vertex connection and merging (VCM/UPS, item 3)
 #include "lights.h"
 #include "mesh.h"
+#include "ndwarp.h"          // -nd: N-D lift/rotate/project of the loaded model
 #include "ftsl.h"
 #include "curvedrive.h"         // -anim: loom CurveDrive JSON sidecar (E2 channel a) read/write
 #include "animlive.h"           // -anim -loom: the live editor<->loom value channel (E2 channel b)
@@ -2636,6 +2637,181 @@ static void bvhStats(const Scene& scene, long long rays) {
 //       excitation lambda and centred on the emission band.
 // It exercises the same fluoroInteract()/fluoEmitSampler used by the renderer, so a
 // bug in the transport math surfaces here without needing a full render.
+// -checknd: the N-D warp's algebra and combinatorics (ndwarp.h). Deterministic, no
+// scene and no GPU needed. The claims worth pinning down are the ones a reader would
+// otherwise have to take on trust:
+//
+//   * the Givens product really is a rotation (R R^T = I) for several dimensions;
+//   * a zero-filled lift + orthographic projection really IS one 3x3 matrix, and an x-w
+//     rotation really is "scale x by cos t" -- the fact the whole feature is designed
+//     around, and the one that decides whether a user needs a FILL;
+//   * 180 degrees in a mixed plane really does reach the MIRROR image (det = -1), which
+//     is the one thing 4-D rotation buys that 3-D cannot do;
+//   * the prism's 2-skeleton really has 2F + 2E triangles, so an extrusion's cost is
+//     predictable before it is built.
+static int checkNd() {
+    int fails = 0;
+    auto ok = [&](bool cond, const char* what) {
+        std::printf("[checknd] %s  %s\n", cond ? "ok  " : "FAIL", what);
+        if (!cond) ++fails;
+    };
+    auto approx = [](double a, double b, double e = 1e-9) { return std::fabs(a - b) < e; };
+
+    // ---- plane bookkeeping ---------------------------------------------------
+    ok(ndwarp::planeCount(3) == 3 && ndwarp::planeCount(4) == 6 &&
+       ndwarp::planeCount(6) == 15, "n(n-1)/2 rotation planes (3, 6, 15 for n = 3, 4, 6)");
+    {
+        bool round = true;
+        for (int n = 3; n <= 12; ++n)
+            for (int k = 0; k < ndwarp::planeCount(n); ++k) {
+                int i, j; ndwarp::planeAxes(n, k, i, j);
+                if (ndwarp::planeIndex(n, i, j) != k) round = false;
+            }
+        ok(round, "planeAxes / planeIndex round-trip for n = 3..12");
+    }
+    ok(ndwarp::planeLabel(4, ndwarp::planeIndex(4, 0, 3)) == "xw" &&
+       ndwarp::planeLabel(5, ndwarp::planeIndex(5, 2, 4)) == "zv", "plane labels (xw, zv)");
+
+    // ---- the rotation matrix is orthogonal -----------------------------------
+    {
+        Pcg32 rng; rng.seed(4u, 17u);
+        bool ortho = true, contract = true;
+        for (int n = 4; n <= 8; ++n) {
+            ndwarp::Config cfg; cfg.resize(n);
+            for (double& a : cfg.angle) a = (rng.uniform() * 2.0 - 1.0) * PI;
+            const std::vector<double> R = ndwarp::rotationMatrix(cfg);
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < n; ++j) {
+                    double sum = 0.0;
+                    for (int k = 0; k < n; ++k) sum += R[(size_t)i * n + k] * R[(size_t)j * n + k];
+                    if (!approx(sum, (i == j) ? 1.0 : 0.0, 1e-12)) ortho = false;
+                }
+            if (std::fabs(ndwarp::topLeft3(R, n).det()) > 1.0 + 1e-12) contract = false;
+        }
+        ok(ortho, "R R^T = I for n = 4..8 at random angles");
+        ok(contract, "|det M| <= 1: the projected block can only ever contract");
+    }
+
+    // ---- THE claim the feature is designed around ----------------------------
+    {
+        ndwarp::Config cfg; cfg.resize(4);
+        const double t = 0.7;
+        cfg.angle[(size_t)ndwarp::planeIndex(4, 0, 3)] = t;
+        const ndwarp::Mat3 M = ndwarp::topLeft3(ndwarp::rotationMatrix(cfg), 4);
+        ok(approx(M.m[0], std::cos(t)) && approx(M.m[1], 0) && approx(M.m[2], 0) &&
+           approx(M.m[3], 0) && approx(M.m[4], 1) && approx(M.m[5], 0) &&
+           approx(M.m[6], 0) && approx(M.m[7], 0) && approx(M.m[8], 1),
+           "a zero-filled x-w rotation projects to exactly diag(cos t, 1, 1)");
+        ok(cfg.isLinear(), "a zero-filled config reports itself linear");
+    }
+    {
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.angle[(size_t)ndwarp::planeIndex(4, 0, 3)] = PI;
+        ok(approx(ndwarp::topLeft3(ndwarp::rotationMatrix(cfg), 4).det(), -1.0, 1e-12),
+           "180 deg in x-w gives det = -1: the model's MIRROR image");
+    }
+    {
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.angle[(size_t)ndwarp::planeIndex(4, 0, 3)] = PI * 0.5;
+        const ndwarp::Mat3 M = ndwarp::topLeft3(ndwarp::rotationMatrix(cfg), 4);
+        ndwarp::Mat3 NT;
+        ok(approx(M.det(), 0.0, 1e-12) && !ndwarp::inverseTranspose(M, NT),
+           "90 deg in x-w is singular: the model is edge-on, a flat sheet");
+    }
+    {
+        ndwarp::Config c4; c4.resize(4); c4.angle[(size_t)ndwarp::planeIndex(4, 0, 3)] = 0.6;
+        ndwarp::Config c5; c5.resize(5);
+        c5.angle[(size_t)ndwarp::planeIndex(5, 0, 3)] = 0.6;
+        c5.angle[(size_t)ndwarp::planeIndex(5, 1, 4)] = 0.6;
+        ok(approx(ndwarp::topLeft3(ndwarp::rotationMatrix(c4), 4).det(), std::cos(0.6)) &&
+           approx(ndwarp::topLeft3(ndwarp::rotationMatrix(c5), 5).det(), std::cos(0.6) * std::cos(0.6)),
+           "one squashed axis at n = 4, two at n = 5");
+    }
+
+    // ---- welding, the prism, and the emboss signals --------------------------
+    // A unit cube: V = 8, E = 18, F = 12 (Euler 8 - 18 + 12 = 2).
+    ndwarp::Model m;
+    {
+        const Vec3 c[8] = {{-1,-1,-1},{1,-1,-1},{1,1,-1},{-1,1,-1},
+                           {-1,-1, 1},{1,-1, 1},{1,1, 1},{-1,1, 1}};
+        const int q[6][4] = {{0,1,2,3},{5,4,7,6},{4,0,3,7},{1,5,6,2},{4,5,1,0},{3,2,6,7}};
+        for (const auto& f : q) {
+            Tri a; a.v0 = c[f[0]]; a.v1 = c[f[1]]; a.v2 = c[f[2]]; a.finalize(); m.base.push_back(a);
+            Tri b; b.v0 = c[f[0]]; b.v1 = c[f[2]]; b.v2 = c[f[3]]; b.finalize(); m.base.push_back(b);
+        }
+        m.center = Vec3{0, 0, 0};
+        m.radius = std::sqrt(3.0);
+        ndwarp::detail::weld(m.base, m.topo);
+        m.ok = true;
+    }
+    const size_t V = (size_t)m.topo.nv, E = m.topo.edge.size() / 2, F = m.base.size();
+    ok(V == 8 && E == 18 && F == 12 && V - E + F == 2,
+       "a cube welds to V=8, E=18, F=12 (Euler characteristic 2)");
+    {
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.extra[0].fill = ndwarp::Fill::Extrude; cfg.extra[0].amp = 0.5;
+        const ndwarp::Complex c = ndwarp::buildComplex(m, cfg);
+        ok(ndwarp::projectedTriCount(m, cfg) == 60 && c.tri.size() / 3 == 60 &&
+           (size_t)c.nv == 2 * V && c.edge.size() / 2 == 2 * E + V,
+           "one extrusion: 2F + 2E = 60 triangles, 2V vertices, 2E + V edges");
+        bool centred = true;
+        for (int v = 0; v < c.nv; ++v)
+            if (!approx(std::fabs(c.pos[(size_t)v * 4 + 3]), 0.5 * 0.5 * m.radius, 1e-12))
+                centred = false;
+        ok(centred, "the sweep is centred on the original (+/- depth/2)");
+    }
+    {
+        ndwarp::Config cfg; cfg.resize(5);
+        cfg.extra[0].fill = ndwarp::Fill::Extrude; cfg.extra[0].amp = 0.5;
+        cfg.extra[1].fill = ndwarp::Fill::Extrude; cfg.extra[1].amp = 0.5;
+        ok(ndwarp::projectedTriCount(m, cfg) == 208 &&
+           ndwarp::buildComplex(m, cfg).tri.size() / 3 == 208,
+           "two extrusions compose: 12 -> 60 -> 208 triangles");
+    }
+    {
+        bool normed = true;
+        for (ndwarp::Emb e : {ndwarp::Emb::Curvature, ndwarp::Emb::Radius,
+                              ndwarp::Emb::Height, ndwarp::Emb::Noise}) {
+            const std::vector<double>& sig = ndwarp::embossSignal(m, e, 4.0);
+            double mean = 0.0, peak = 0.0;
+            for (double v : sig) { mean += v; peak = std::max(peak, std::fabs(v)); }
+            mean /= (double)sig.size();
+            // A perfectly uniform signal (a cube has no curvature variation) normalizes to
+            // exactly zero, which is the honest answer rather than a divide by nothing.
+            if (!approx(mean, 0.0, 1e-9) || !(peak == 0.0 || approx(peak, 1.0, 1e-9))) normed = false;
+        }
+        ok(normed, "every emboss signal is zero-mean and unit-peak (or identically zero)");
+    }
+    {
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.extra[0].fill = ndwarp::Fill::Emboss;
+        cfg.extra[0].src  = ndwarp::Emb::Noise;
+        cfg.extra[0].amp  = 0.5;
+        const ndwarp::Complex c = ndwarp::buildComplex(m, cfg);
+        bool any4th = false;
+        for (int v = 0; v < c.nv; ++v)
+            if (std::fabs(c.pos[(size_t)v * 4 + 3]) > 1e-12) any4th = true;
+        ok(any4th && !cfg.isLinear(),
+           "an embossed lift puts real content in the 4th coordinate (so it is not affine)");
+    }
+    {
+        // The edge-on report: a filled axis contributes nothing until a plane containing
+        // it is turned, which is what makes an extrusion look like it did nothing.
+        ndwarp::Config cfg; cfg.resize(5);
+        cfg.extra[1].fill = ndwarp::Fill::Extrude; cfg.extra[1].amp = 0.5;   // dim 4 = v
+        std::vector<double> R = ndwarp::rotationMatrix(cfg);
+        const bool hidden = ndwarp::axisVisibility(R, 5, 4) < 1e-9;
+        cfg.angle[(size_t)ndwarp::planeIndex(5, 2, 4)] = 0.6;                // turn zv
+        R = ndwarp::rotationMatrix(cfg);
+        const bool shown = ndwarp::axisVisibility(R, 5, 4) > 0.5;
+        ok(hidden && shown, "an extruded axis is edge-on until a plane containing it turns");
+    }
+
+    std::printf("[checknd] %s (%d failure%s)\n", fails ? "FAILED" : "PASS",
+                fails, fails == 1 ? "" : "s");
+    return fails ? 1 : 0;
+}
+
 static int checkFluoro() {
     Material m = makeFluoroMaterial();
 
@@ -16577,6 +16753,25 @@ static void printHelp(const char* prog) {
 "                        control points seed from it and Save writes the reshaped curve back\n"
 "  -see-through|-glass   render clear dielectrics as see-through; -glass-clarity <0..1>\n"
 "\n"
+"N-dimensional rotation (-nd): lift the model into N-D, rotate, project back to 3-D:\n"
+"  -nd <n>               enable; n = total dimensions (4..12). Opens the interactive\n"
+"                        viewer with one slider per rotation PLANE (n(n-1)/2 of them)\n"
+"                        unless a real render was asked for. Note: with every extra\n"
+"                        dimension left at `zero` an orthographic projection is provably\n"
+"                        just a 3x3 squash of the original (180 deg in a mixed plane\n"
+"                        gives its MIRROR image); the fills below make it non-affine.\n"
+"  -nd-fill <k>=<spec>   what fills dimension k (4-based, or its axis letter w/v/u/...):\n"
+"                          zero                      the classic lift (default)\n"
+"                          emboss:<src>[:amp[:freq]] x_k = amp * f(vertex); src is one of\n"
+"                                                    curvature|radius|height|noise|u|v\n"
+"                          extrude[:depth]           sweep the mesh into a real N-D prism\n"
+"                        amp/depth are fractions of the model radius. Repeatable.\n"
+"  -nd-angle <plane>=<deg>   seed one plane, e.g. -nd-angle xw=30 (repeatable)\n"
+"  -nd-object <name>     warp only this mesh object (default: every authored mesh)\n"
+"  -nd-crease <deg>      crease angle for re-derived normals (default 30)\n"
+"  -nd-budget <n>        refuse a config producing more than n triangles (default 8000000)\n"
+"  -nd-export <file>     write the projected model (.obj or .ftmesh) and exit\n"
+"\n"
 "Stereoscopic 3-D output:\n"
 "  -stereo sbs|cross|anaglyph|anaglyph-gm   stereo pair / anaglyph composite\n"
 "  -eye-sep <m>          interocular distance (default: 0.063)\n"
@@ -16714,6 +16909,7 @@ static int run(int argc, char** argv) {
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
     bool checkFluoroOnly = false;
+    bool checkNdOnly = false;     // -checknd: N-D warp algebra + prism combinatorics (ndwarp.h)
     const char* meshPath = nullptr;
     double meshScale = 1.0;
     const char* exportMeshPath = nullptr;  // -export-mesh <file.obj>: isosurface -> mesh
@@ -16801,6 +16997,15 @@ static int run(int argc, char** argv) {
     bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
     double rasterClarity  = 0.85; // -glass-clarity <0..1>: per-surface transmittance for see-through mode (higher = clearer)
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
+    // --- N-dimensional rotation (-nd; see ndwarp.h) ---
+    ndwarp::Config ndCfg;         // n == 3 means the warp is off
+    std::string    ndExportPath;  // -nd-export <file.obj|.ftmesh>
+    size_t         ndBudget = 8000000;   // -nd-budget: refuse a config exceeding this
+    // The fill/angle flags are collected as text and resolved AFTER the whole command
+    // line is read: both need the final dimension count (a plane's index is a function
+    // of n), and -nd may legally appear after them.
+    std::vector<std::string> ndFillArgs;    // "<dim>=<spec>"
+    std::vector<std::string> ndAngleArgs;   // "<plane>=<deg>"
     // --- Stereoscopic (3-D) output (-stereo) ---
     int    stereoMode    = STEREO_OFF; // -stereo sbs|cross|anaglyph|anaglyph-gm
     double stereoEyeSep  = 0.063;      // -eye-sep <m>: interocular distance (default 63 mm)
@@ -17306,10 +17511,16 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
         else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
+        else if (!std::strcmp(argv[i], "-checknd")) checkNdOnly = true;
         else handled = false;
 
         // ---- segment 2 (see the nesting note at the top of the loop) ----------------
+        // `handled` is re-armed on entry and cleared again only by this chain's final
+        // `else`: a segment that matches must report the match, or the NEXT segment sees
+        // an unhandled flag and (being the one that owns the unknown-option error) kills
+        // a perfectly valid run.
         if (!handled) {
+        handled = true;
         if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-export-mesh") && i + 1 < argc) exportMeshPath = argv[++i];
@@ -17503,6 +17714,30 @@ static int run(int argc, char** argv) {
         // Retired in 0.79.0 along with the hand-written parser they selected. Accepted so
         // an existing script does not hit the unknown-flag error, but SAID OUT LOUD — a
         // flag that quietly stopped doing anything is worse than one that is gone.
+        else handled = false;
+        }   // end segment 2
+
+        // ---- segment 3 (see the nesting note at the top of the loop) ----------------
+        // Segment 2 reached 107 links, past the ~100 the note asks for, so the N-D warp
+        // opened this one. The unknown-option error has to stay in the LAST segment or a
+        // valid flag defined further down would be rejected before it is ever tested.
+        if (!handled) {
+        handled = true;
+        if ((!std::strcmp(argv[i], "-nd") || !std::strcmp(argv[i], "-ndim")) && i + 1 < argc) {
+            const int d = std::atoi(argv[++i]);
+            if (d < 3 || d > 12) {
+                std::fprintf(stderr, "[nd] -nd %d: dimensions must be 3..12 "
+                                     "(3 = off; 12 already means 66 rotation planes)\n", d);
+                return 2;
+            }
+            ndCfg.resize(d);
+        }
+        else if (!std::strcmp(argv[i], "-nd-fill") && i + 1 < argc) ndFillArgs.push_back(argv[++i]);
+        else if (!std::strcmp(argv[i], "-nd-angle") && i + 1 < argc) ndAngleArgs.push_back(argv[++i]);
+        else if (!std::strcmp(argv[i], "-nd-object") && i + 1 < argc) ndCfg.object = argv[++i];
+        else if (!std::strcmp(argv[i], "-nd-crease") && i + 1 < argc) ndCfg.creaseDeg = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-nd-budget") && i + 1 < argc) ndBudget = (size_t)std::max(0LL, std::atoll(argv[++i]));
+        else if (!std::strcmp(argv[i], "-nd-export") && i + 1 < argc) ndExportPath = argv[++i];
         else if (!std::strcmp(argv[i], "-legacy-parser") ||
                  !std::strcmp(argv[i], "-validate-grammar")) {
             std::fprintf(stderr, "ftrace: %s was retired in 0.79.0 — the shared grammar "
@@ -17516,9 +17751,60 @@ static int run(int argc, char** argv) {
             std::fprintf(stderr, "ftrace: unknown option '%s' (try -h / --help)\n", argv[i]);
             return 2;
         }
-        }   // end segment 2
+        }   // end segment 3
     }
     if (nThreads < 1) nThreads = 1;
+
+    // ---- -nd: resolve the deferred fill / angle specs ---------------------------
+    // Both were collected as text during the option scan because a plane's index and a
+    // dimension's slot are functions of the FINAL dimension count, and `-nd` is allowed
+    // to appear after the flags that depend on it.
+    if (ndCfg.n >= 4) {
+        // A fill names its dimension either 1-based ("4" = the first extra one) or by the
+        // axis letter the sliders are labelled with ("w").
+        auto dimIndex = [&](const std::string& tok, int& out) -> bool {
+            if (!tok.empty() && std::isdigit((unsigned char)tok[0])) {
+                const int d1 = std::atoi(tok.c_str());
+                if (d1 >= 4 && d1 <= ndCfg.n) { out = d1 - 4; return true; }
+                return false;
+            }
+            for (int a = 3; a < ndCfg.n; ++a)
+                if (ndwarp::axisName(a) == tok) { out = a - 3; return true; }
+            return false;
+        };
+        for (const std::string& a : ndFillArgs) {
+            const size_t eq = a.find('=');
+            if (eq == std::string::npos) {
+                std::fprintf(stderr, "[nd] -nd-fill wants <dim>=<spec>, got '%s'\n", a.c_str());
+                return 2;
+            }
+            int slot = -1;
+            if (!dimIndex(a.substr(0, eq), slot)) {
+                std::fprintf(stderr, "[nd] -nd-fill '%s': dimension must be 4..%d "
+                                     "(or its axis letter)\n", a.substr(0, eq).c_str(), ndCfg.n);
+                return 2;
+            }
+            std::string ferr;
+            if (!ndwarp::parseDimSpec(a.substr(eq + 1), ndCfg.extra[(size_t)slot], ferr)) {
+                std::fprintf(stderr, "[nd] -nd-fill '%s': %s\n", a.c_str(), ferr.c_str());
+                return 2;
+            }
+        }
+        for (const std::string& a : ndAngleArgs) {
+            double deg = 0.0; std::string aerr;
+            const int k = ndwarp::parseAngleSpec(ndCfg.n, a, deg, aerr);
+            if (k < 0) {
+                std::fprintf(stderr, "[nd] -nd-angle '%s': %s\n", a.c_str(), aerr.c_str());
+                return 2;
+            }
+            ndCfg.angle[(size_t)k] = deg * PI / 180.0;
+        }
+    } else if (!ndFillArgs.empty() || !ndAngleArgs.empty() ||
+               !ndExportPath.empty() || !ndCfg.object.empty()) {
+        std::fprintf(stderr, "[nd] -nd-fill / -nd-angle / -nd-object / -nd-export need "
+                             "-nd <n> with n >= 4\n");
+        return 2;
+    }
 
     // Bare-invocation quick preview: `ftrace scene.ftsl` (double-click / drag-drop, no
     // other flags) defaults to a fast raster preview shown in a live window — no light
@@ -17570,6 +17856,32 @@ static int run(int argc, char** argv) {
         }
     }
 
+    // ---- -nd implies the interactive viewer -------------------------------------
+    // The deliverable of `-nd` is the slider bank, and a slider needs a window to live
+    // in — so the warp opens the raster explorer the same way -explore does. A genuine
+    // light-transport request still wins: `-nd 4 -nd-angle xw=30 -mode D -n 1e8 -o x.png`
+    // path-traces the warped model once, headless. -nd-export is a write-and-exit job and
+    // wants no window either.
+    if (ndCfg.n >= 4 && ndExportPath.empty()) {
+        static const char* kNdRenderFlags[] = {
+            "-mode", "-n", "-time", "-noise", "-forever", "-preview", "-spp",
+            "-savemap", "-loadmap", "-wavefront", "-raster-bench",
+            // An EXPLICIT -raster is a batch still, not an exploration: `-nd 4 -raster
+            // -o png/x.png` should write the frame and exit rather than open a viewer.
+            // (The -raster the preview path turns on implicitly is set later, so it
+            // cannot be confused with this one.)
+            "-raster", "-raster-gpu"
+        };
+        bool realRender = false;
+        for (int i = 1; i < argc && !realRender; ++i)
+            for (const char* f : kNdRenderFlags)
+                if (!std::strcmp(argv[i], f)) { realRender = true; break; }
+        if (!realRender) {
+            exploreMode = true; doRaster = true;
+            g_showWindow = true; g_keepWindow = true; noMeter = true;
+        }
+    }
+
     // Name the live-preview window after what it is rendering: "ftrace — <scene> → <out>"
     // (em dash + right-arrow are UTF-8; livewindow decodes them properly). The scene is
     // the -in file when given, else the built-in scene name; the output is the -o target.
@@ -17586,6 +17898,7 @@ static int run(int argc, char** argv) {
     if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
+    if (checkNdOnly)       return checkNd();       // deterministic, no scene needed
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed
     if (checkDenoiseOnly)  return checkDenoise();  // deterministic, no scene needed
     if (checkThinFilmOnly) return checkThinFilm(); // deterministic, no scene needed
@@ -17729,6 +18042,87 @@ static int run(int argc, char** argv) {
         std::string removed = scene.applyIgnoreFlags(noMedia, noEnv, noFluoro);
         if (!removed.empty())
             std::printf("[ignore] stripped: %s\n", removed.c_str());
+    }
+
+    // ---- -nd: lift the model into N dimensions, rotate, project back to 3-D -------
+    // Applied to the real Scene rather than to the preview geometry, so the warped model
+    // is what EVERY consumer sees: the rasterizer previews it, any render mode path-traces
+    // it, and -nd-export writes it out. See ndwarp.h for what the fills mean and why a
+    // zero-filled lift is provably affine.
+    ndwarp::Model ndModel;
+    bool ndActive = false;
+    if (ndCfg.n >= 4) {
+        std::string note;
+        if (!ndwarp::capture(scene, ndCfg.object, ndModel, note)) {
+            std::fprintf(stderr, "[nd] %s\n", note.c_str());
+            return 2;
+        }
+        if (!note.empty()) std::fprintf(stderr, "[nd] %s\n", note.c_str());
+        const size_t want = ndwarp::projectedTriCount(ndModel, ndCfg);
+        if (want > ndBudget) {
+            std::fprintf(stderr, "[nd] this configuration would build %zu triangles, over "
+                                 "the %zu budget — raise it with -nd-budget, cut an "
+                                 "extrusion, or decimate the model first\n", want, ndBudget);
+            return 2;
+        }
+        std::string fills;
+        for (int k = 3; k < ndCfg.n; ++k) {
+            if (!fills.empty()) fills += ", ";
+            fills += ndwarp::axisName(k) + "=" + ndwarp::dimSpecText(ndCfg.extra[(size_t)(k - 3)]);
+        }
+        std::printf("[nd] %d-D: %d rotation planes over %zu source triangles; %s\n",
+                    ndCfg.n, ndwarp::planeCount(ndCfg.n), ndModel.base.size(), fills.c_str());
+        const ndwarp::Stats st = ndwarp::apply(ndModel, ndCfg, scene);
+        scene.build();          // the warp moved geometry: BVH, bounds and lights all restale
+        ndActive = true;
+        std::string dropNote;
+        if (st.dropped)
+            dropNote = " (" + std::to_string(st.dropped) +
+                       " collapsed to zero area and were dropped)";
+        std::printf("[nd] projected to %zu triangles over %zu vertices%s\n",
+                    st.tris, st.verts, dropNote.c_str());
+        // A filled dimension that no rotation has turned into view contributes nothing, and
+        // an extrusion in that state loses every side wall to the degenerate cull — which
+        // reads as "extrude did nothing" unless it is said plainly.
+        {
+            const std::string eo = ndwarp::edgeOnNote(st, ndCfg.n);
+            if (!eo.empty()) std::printf("[nd] %s\n", eo.c_str());
+        }
+        if (st.linear) {
+            // Worth saying out loud every time: this is the case where all the N-D
+            // machinery is equivalent to one matrix, and the user can only find that out
+            // by being told or by deriving it.
+            std::printf("[nd] this warp is LINEAR — every extra dimension is `zero`, so the "
+                        "result is the\n"
+                        "     source model under a single 3x3 matrix (det %+.4f%s). "
+                        "Use -nd-fill\n"
+                        "     <dim>=emboss:... or extrude:... for a warp that is not affine.\n",
+                        st.det, st.det < 0.0 ? ", MIRRORED" : "");
+            if (st.singular)
+                std::printf("[nd] the matrix is singular: the model has been squashed "
+                            "completely flat.\n");
+        }
+        std::fflush(stdout);
+    }
+
+    // ---- -nd-export: write the projected model and stop --------------------------
+    // Unless the viewer was ALSO asked for, in which case the path becomes the Save
+    // button's target instead: `-nd 5 -nd-export out.obj -explore` is "let me dial it in,
+    // then write it here", which is the workflow the button exists for.
+    if (!ndExportPath.empty() && !exploreMode) {
+        if (!ndActive) {
+            std::fprintf(stderr, "[nd] -nd-export needs -nd <n>\n");
+            return 2;
+        }
+        std::string eerr; size_t wrote = 0;
+        if (!ndwarp::exportModel(scene, ndModel, ndExportPath, eerr, &wrote)) {
+            std::fprintf(stderr, "[nd] export failed: %s\n", eerr.c_str());
+            return 1;
+        }
+        std::printf("[nd] wrote %zu triangles to %s\n", wrote, ndExportPath.c_str());
+        std::printf("[nd] render it with:  ftrace %s\n", ndExportPath.c_str());
+        std::fflush(stdout);
+        return 0;
     }
     // A scene may declare the path depth its GEOMETRY needs (`render { max_bounce N }`),
     // because that is not a matter of the operator's taste: mode D runs 8 path edges by
@@ -19248,6 +19642,22 @@ static int run(int argc, char** argv) {
             // buttons. Path playback rides the SAME camera-index cursor the timeline scrubs.
             int pathCount = (int)explorePath.size();   // mutable: the editor rebuilds the path
             g_liveWin->enablePanel(pathCount, explorePathFps, collideShort(collide));
+            // ---- N-D rotation bank ---------------------------------------------------
+            // One slider per rotation PLANE of the n-D space the model was lifted into.
+            // Angles are held in DEGREES on the panel side and radians in the Config, so
+            // the slider reads as the number a person would say.
+            auto ndPlaneLabels = [&]() {
+                std::vector<std::string> lb;
+                for (int k = 0; k < ndwarp::planeCount(ndCfg.n); ++k)
+                    lb.push_back(ndwarp::planeLabel(ndCfg.n, k));
+                return lb;
+            };
+            auto ndAnglesDeg = [&]() {
+                std::vector<double> d(ndCfg.angle.size());
+                for (size_t k = 0; k < d.size(); ++k) d[k] = ndCfg.angle[k] * 180.0 / PI;
+                return d;
+            };
+            if (ndActive) g_liveWin->enableNdPanel(ndCfg.n, ndPlaneLabels(), ndAnglesDeg());
             bool   pathMode = false;    // locked to the camera path (orientation + travel follow it)
             bool   playing  = false;    // auto-advancing along the path
             double pathPos  = 0.0;      // fractional camera index (continuous; render uses the nearest)
@@ -20049,6 +20459,74 @@ static int run(int argc, char** argv) {
             // RGB-backward session (which bakes the scene at begin() — setCamera only
             // re-aims, so a swap needs a full End/Begin). The user's POSE is deliberately
             // untouched: the scene changed under them, they did not move.
+            // ---- N-D re-warp -------------------------------------------------------
+            // A slider move rebuilds the model from the PRISTINE captured copy (never from
+            // the last warp — angles are absolute, and composing them would drift), then
+            // re-tessellates and re-uploads exactly as a loom scene swap does.
+            //
+            // What it deliberately does NOT do is rebuild the BVH. The rasterizer does not
+            // use one, and rebuilding it on a 2 M-triangle extrusion would cost seconds per
+            // slider tick; instead the tree is marked stale and rebuilt lazily, once, if a
+            // traced preview actually needs it.
+            bool ndBvhStale = false;
+            ndwarp::Stats ndLastStats;
+            auto ndReapply = [&]() {
+                if (!ndActive) return;
+                const size_t want = ndwarp::projectedTriCount(ndModel, ndCfg);
+                if (want > ndBudget) {
+                    std::fprintf(stderr, "[nd] %zu triangles would exceed the %zu budget; "
+                                         "leaving the last configuration in place\n",
+                                 want, ndBudget);
+                    return;
+                }
+                ndLastStats = ndwarp::apply(ndModel, ndCfg, scene);
+                ndBvhStale = true;
+                plight = raster::deriveLight(scene);
+                prims.clear();
+                tessellated = false;
+#ifdef HAVE_CUDA
+                if (gpuRaster) {
+                    raster_cuda::destroy(gpuRaster);
+                    gpuRaster = nullptr;
+                    ensurePrims();
+                    gpuRaster = raster_cuda::upload(prims, plight, &scene);
+                    if (!gpuRaster)
+                        std::fprintf(stderr, "[nd] GPU re-upload failed; using the CPU rasterizer\n");
+                }
+                if (traceSess) { backwardRGBSessionEnd(traceSess); traceSess = nullptr; }
+#endif
+                traceDirty = true;
+            };
+            // The readout under the sliders: what the warp costs, and — when it applies —
+            // the fact that the whole bank is equivalent to one 3x3 matrix.
+            auto ndStatus = [&]() {
+                char b[256];
+                std::string fills;
+                for (int k = 3; k < ndCfg.n; ++k) {
+                    if (!fills.empty()) fills += " ";
+                    fills += ndwarp::axisName(k) + "=" +
+                             (ndCfg.extra[(size_t)(k - 3)].fill == ndwarp::Fill::Zero ? "zero"
+                              : ndCfg.extra[(size_t)(k - 3)].fill == ndwarp::Fill::Extrude ? "extrude"
+                              : ndwarp::embName(ndCfg.extra[(size_t)(k - 3)].src));
+                }
+                std::snprintf(b, sizeof b, "%zu tris  |  %s%s",
+                              ndLastStats.tris, fills.c_str(),
+                              ndLastStats.linear
+                                  ? (ndLastStats.det < 0.0 ? "  |  linear, MIRRORED"
+                                                           : "  |  linear (a 3x3 squash)")
+                                  : "");
+                std::string line = b;
+                // The edge-on note matters most HERE: in the viewer the user has just
+                // dragged a slider and is looking for the change it made.
+                const std::string eo = ndwarp::edgeOnNote(ndLastStats, ndCfg.n);
+                if (!eo.empty()) line += "  |  " + eo;
+                return line;
+            };
+            if (ndActive) {
+                ndLastStats = ndwarp::apply(ndModel, ndCfg, scene);   // seed the readout
+                g_liveWin->setNdState(ndAnglesDeg(), ndStatus().c_str());
+            }
+
             auto animAdoptScene = [&](const std::string& path, std::string& aerr) -> bool {
                 ftsl::Loaded nl;
                 if (!ftsl::load(path, nl, aerr, supportFn)) return false;
@@ -20087,6 +20565,69 @@ static int run(int argc, char** argv) {
                       std::fflush(stdout);
                   } }
                 NavInput nav = g_liveWin->drainNav();
+
+                // ---- N-D panel ---------------------------------------------------
+                if (ndActive) {
+                    // A dimension change rebuilds the whole bank: n(n-1)/2 planes is a
+                    // different number of sliders, and the angles that survive are the
+                    // ones whose PLANE still exists (the plane order is a prefix as n
+                    // grows, so xw stays xw rather than silently becoming xv).
+                    if (nav.ndDims >= 3 && nav.ndDims != ndCfg.n) {
+                        const int oldN = ndCfg.n;
+                        std::vector<double> keep = ndCfg.angle;
+                        ndCfg.resize(nav.ndDims);
+                        for (int k = 0; k < ndwarp::planeCount(ndCfg.n); ++k) {
+                            int i, j; ndwarp::planeAxes(ndCfg.n, k, i, j);
+                            const int old = ndwarp::planeIndex(oldN, i, j);
+                            ndCfg.angle[(size_t)k] =
+                                (old >= 0 && old < (int)keep.size()) ? keep[(size_t)old] : 0.0;
+                        }
+                        std::printf("[nd] %d-D: %d rotation planes\n",
+                                    ndCfg.n, ndwarp::planeCount(ndCfg.n));
+                        std::fflush(stdout);
+                        ndReapply();
+                        g_liveWin->enableNdPanel(ndCfg.n, ndPlaneLabels(), ndAnglesDeg());
+                        g_liveWin->setNdState(ndAnglesDeg(), ndStatus().c_str());
+                        changed = true;
+                    } else if (nav.ndReset) {
+                        std::fill(ndCfg.angle.begin(), ndCfg.angle.end(), 0.0);
+                        ndReapply();
+                        g_liveWin->setNdState(ndAnglesDeg(), ndStatus().c_str());
+                        changed = true;
+                    } else if (nav.ndMoved && nav.ndAngles.size() == ndCfg.angle.size()) {
+                        for (size_t k = 0; k < ndCfg.angle.size(); ++k)
+                            ndCfg.angle[k] = nav.ndAngles[k] * PI / 180.0;
+                        ndReapply();
+                        g_liveWin->setNdState(ndAnglesDeg(), ndStatus().c_str());
+                        changed = true;
+                    }
+                    if (nav.ndSave) {
+                        // Where to write: the -nd-export path when one was given, else a
+                        // `_nd` sibling of the source model, which is where someone looking
+                        // for "the thing I just made" would look first.
+                        std::string path = ndExportPath;
+                        if (path.empty()) {
+                            path = inFile ? inFile : "model";
+                            const size_t dot = path.find_last_of('.');
+                            const size_t sl  = path.find_last_of("/\\");
+                            if (dot != std::string::npos && (sl == std::string::npos || dot > sl))
+                                path = path.substr(0, dot);
+                            path += "_nd.obj";
+                        }
+                        std::string eerr; size_t wrote = 0;
+                        if (ndwarp::exportModel(scene, ndModel, path, eerr, &wrote)) {
+                            std::printf("[nd] wrote %zu triangles to %s\n", wrote, path.c_str());
+                            std::printf("[nd] render it with:  ftrace %s\n", path.c_str());
+                            g_liveWin->setNdState(ndAnglesDeg(),
+                                                  ("saved " + path).c_str());
+                        } else {
+                            std::fprintf(stderr, "[nd] export failed: %s\n", eerr.c_str());
+                            g_liveWin->setNdState(ndAnglesDeg(),
+                                                  ("save FAILED: " + eerr).c_str());
+                        }
+                        std::fflush(stdout);
+                    }
+                }
 
                 // Fold in whatever loom finished since the last iteration. The editor
                 // never blocks on an emit: it keeps flying the scene it already has and
@@ -20417,6 +20958,15 @@ static int run(int argc, char** argv) {
                 // this idle pose; it suppresses the raster warm-frame and the idle sleep so the
                 // image keeps converging (the accumulate() launch already holds the GPU warm).
                 bool tracingNow = false;
+                // A traced preview (mode W or the GPU path tracer) is the only consumer
+                // that needs the acceleration structure the N-D re-warp deliberately left
+                // stale. Pay for it here, once, on the first traced frame after a slider
+                // move — never on the raster path, which is what the sliders drive.
+                if (ndBvhStale && pvMode != PV_RASTER) {
+                    scene.build();
+                    ndBvhStale = false;
+                    traceDirty = true;
+                }
                 if (pvMode == PV_WHITTED) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);

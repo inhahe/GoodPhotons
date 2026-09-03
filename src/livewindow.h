@@ -106,10 +106,22 @@ struct NavInput {
     bool        bindApply = false;       // "Bind" button: bind bindChannel -> bindTarget (one-shot)
     bool        bindClear = false;       // "Unbind" button: drop any binding on bindChannel (one-shot)
     int         dimsReq   = 0;           // channel-count box (current value; 0 = unchanged/absent)
+    // ---- N-D ROTATION panel outputs (only meaningful when `-nd <n>` is live) ----
+    // One angle per rotation PLANE of the n-D space, in DEGREES, in ndwarp's canonical
+    // plane order. `ndAngles` is persistent state (the sliders' current positions), not an
+    // accumulator, and is only filled in when the panel exists; `ndMoved` is the one-shot
+    // "a slider actually moved" edge, so a render loop can tell a real change from the
+    // steady state it already drew. `ndDims` is the dimension box (0 = unchanged), and the
+    // two button edges reset every angle to zero / write the projected model out.
+    std::vector<double> ndAngles;        // current per-plane angles in degrees (empty = no panel)
+    bool   ndMoved = false;              // a slider moved since the last drain (one-shot)
+    int    ndDims  = 0;                  // dimension box (current value; 0 = unchanged/absent)
+    bool   ndReset = false;              // "Reset" button: zero every angle (one-shot)
+    bool   ndSave  = false;              // "Save" button: export the projected model (one-shot)
     bool   any() const { return lookX || lookY || wheel || wheelSpeed || fwd || back || reset || print
                                 || cycleCollide || toggleTrace || togglePath || togglePlay || scrubTo >= 0
                                 || recToggle || addPoint || insPoint || delPoint || saveCurve || speedReset
-                                || bindApply || bindClear; }
+                                || bindApply || bindClear || ndMoved || ndReset || ndSave; }
 };
 
 class LiveWindow {
@@ -202,6 +214,24 @@ public:
     // error). Marshalled to the UI thread; setting these never re-emits a NavInput edge. No-op if
     // the bind row isn't shown.
     void setBindState(const std::vector<std::string>& targets, const char* status);
+
+    // Reveal the N-D ROTATION panel — the slider bank for `-nd <n>`. One trackbar per
+    // rotation plane of an n-D space (n(n-1)/2 of them, so 6 at n=4 and 45 at n=10),
+    // labelled with the plane it turns ("xw", "zv"), wrapped into as many rows as the
+    // window width needs; plus a dimension box and Reset / Save buttons. The window grows
+    // by the rows the bank needs so the image area is unchanged. `labels` must have one
+    // entry per plane and `anglesDeg` one starting angle per plane. Calling it again with
+    // a different plane count REBUILDS the bank in place, which is what changing the
+    // dimension box has to do. Marshalled to the UI thread; no-op if the panel isn't
+    // enabled, or on non-Windows / stub builds.
+    void enableNdPanel(int dims, const std::vector<std::string>& labels,
+                       const std::vector<double>& anglesDeg);
+
+    // Mirror the warp's state onto the N-D panel: `anglesDeg` moves the sliders (e.g.
+    // after Reset) and `status` is the readout line under them (triangle counts, or the
+    // "this warp is linear" note). Marshalled to the UI thread; setting these never
+    // re-emits the corresponding NavInput edge. No-op if the N-D panel isn't shown.
+    void setNdState(const std::vector<double>& anglesDeg, const char* status);
 
     // Update the panel's painted-speed readout (the "Paint" mode shows the local traversal-speed
     // multiplier at the current scrub position, e.g. "1.35x"). Marshalled to the UI thread; no
