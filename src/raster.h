@@ -519,6 +519,20 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
     };
 
     // (1) World triangles.
+    // Per-vertex colour, flat triangles and instanced BLAS triangles alike. A BLAS keeps
+    // its own triangle array but indexes the SCENE's colour table (see Blas::intersectLocal),
+    // so one helper serves both -- and having one is the point: the instanced path is
+    // exactly where an attribute added to the flat path gets forgotten.
+    auto copyVcol = [&](PTri& p, const Tri& t) {
+        if (t.vcol < 0) return;
+        const size_t i = (size_t)t.vcol * 3;
+        if (i + 8 >= sc.vertColors.size()) return;
+        const float* c = sc.vertColors.data() + i;
+        p.hasVcol = true;
+        p.vc0 = Vec3{c[0], c[1], c[2]};
+        p.vc1 = Vec3{c[3], c[4], c[5]};
+        p.vc2 = Vec3{c[6], c[7], c[8]};
+    };
     out.reserve(sc.tris.size() + 4096);
     for (const auto& t : sc.tris) {
         PTri p;
@@ -526,13 +540,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         p.n0 = t.n0; p.n1 = t.n1; p.n2 = t.n2;
         applyMat(p, t.matId);
         p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;
-        if (t.vcol >= 0 && (size_t)t.vcol * 3 + 8 < sc.vertColors.size() + 1) {
-            const float* c = sc.vertColors.data() + (size_t)t.vcol * 3;
-            p.hasVcol = true;
-            p.vc0 = Vec3{c[0], c[1], c[2]};
-            p.vc1 = Vec3{c[3], c[4], c[5]};
-            p.vc2 = Vec3{c[6], c[7], c[8]};
-        }
+        copyVcol(p, t);
         out.push_back(p);
     }
 
@@ -846,6 +854,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             p.n2 = normalize(inst.toWorld.applyNormal(t.n2));
             applyMat(p, matId);
             p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;   // UVs are instance-invariant
+            copyVcol(p, t);                                // so are vertex colours
             out.push_back(p);
         }
     }

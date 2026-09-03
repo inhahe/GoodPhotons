@@ -511,7 +511,8 @@ struct DMediumStack {
 
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
                  DVec3 tangent; double bitangentSign;    // C6 tangent frame for normal mapping
-                 double curvature; };                    // O3 per-face mean curvature (Tri::finalize)
+                 double curvature;                       // O3 per-face mean curvature (Tri::finalize)
+                 int vcol; };                            // Tri::vcol -> DScene::vertColors, or -1
 struct DSphere { DVec3 c; double r; int matId; };
 // One round cone of a curve/fiber strand — the device twin of CurveSeg (curve.h). The host
 // record is already a POD in exactly this shape; only the scalar type narrows to Real.
@@ -1020,6 +1021,13 @@ struct DEmissiveVolume {
 };
 
 struct DScene {
+    // Per-vertex colours (Scene::vertColors), three linear-RGB floats per entry, indexed
+    // by DTri::vcol; and the shared Jakob-Hanika RGB -> coefficient table that turns an
+    // interpolated one into a spectrum. `jhLut` is the SAME table the stochastic-tiling
+    // textures use (upsample::coeffLut()) — uploaded once and pointed at from both places,
+    // since it is a pure function of colour and shared by every backend.
+    const float* vertColors;  int nVertColors;
+    const float* jhLut;
     const DTri*      tris;  int nTris;
     const DSphere*   sph;   int nSph;
     // Flat mirror surfaces (Scene::mirrorPlanes, uploaded verbatim): one entry per
@@ -2260,6 +2268,17 @@ struct DHit {
     Real u, v;   // interpolated surface texture coordinates
     DVec3 tangent; Real bitangentSign;  // C6 surface tangent frame for normal mapping
     Real curv;   // O3 mean curvature, signed toward the shaded side (see Hit::curv)
+    // Per-vertex COLOUR, deferred: the index into DScene::vertColors plus the two
+    // independent barycentrics (the third is 1-b0-b1, since they sum to one).
+    //
+    // The host resolves this INSIDE intersectTri, because Scene's intersectors are
+    // methods that already hold the table. The device intersector is a free function
+    // called from the BVH leaf loops and has no DScene in scope, and threading one
+    // through the hottest loop in the renderer to serve a rare feature is the wrong
+    // trade — so it stores what it cheaply has (an int and two Reals, no worse than the
+    // three floats the host writes) and dDiffuseRho, which DOES hold the scene, does the
+    // lookup. Same answer, paid for only where it is used.
+    int  vcol; Real vb0, vb1;
     // O3 stage 2 cavity, filled LAZILY by dCavityOf() and cached, exactly like the
     // host's Hit::cavity: it needs whole-scene traversal so no intersector fills it,
     // and one shading point asks for it several times (mix weight, roughness, reflect).
@@ -2817,6 +2836,7 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     hit.bitangentSign = (Real)tri.bitangentSign;
     // O3: curvature follows the shaded side, exactly as the host intersectTri does.
     hit.curv = (Real)(flipped ? -tri.curvature : tri.curvature);
+    hit.vcol = tri.vcol; hit.vb0 = b0; hit.vb1 = b1;
     return true;
 }
 // Interface-preserving wrapper (builds the shear inline) for any one-off caller.
@@ -6679,6 +6699,23 @@ __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const D
                      : dTexReflAt(tx, h.u, h.v, lambda);
         } else {
             rv = specLookup(m.reflect, lambda);
+        }
+    }
+    // Per-vertex colour multiplies the albedo — the device twin of the host's
+    // diffuseReflectance. Interpolate the COLOUR (the quantity that actually varies
+    // linearly across a face), then look the sigmoid coefficients up in the shared table:
+    // exactly what the host does, through the same STOCH_HD stochJhCoeff and the same
+    // upsample::coeffLut() bytes, so the two agree rather than approximate each other.
+    if (h.vcol >= 0 && sc.vertColors && sc.jhLut) {
+        const int i = h.vcol * 3;
+        if (i + 8 < sc.nVertColors) {
+            const Real b0 = h.vb0, b1 = h.vb1, b2 = (Real)1 - b0 - b1;
+            const double r = b0 * sc.vertColors[i + 0] + b1 * sc.vertColors[i + 3] + b2 * sc.vertColors[i + 6];
+            const double g = b0 * sc.vertColors[i + 1] + b1 * sc.vertColors[i + 4] + b2 * sc.vertColors[i + 7];
+            const double b = b0 * sc.vertColors[i + 2] + b1 * sc.vertColors[i + 5] + b2 * sc.vertColors[i + 8];
+            double c[3];
+            stochJhCoeff(sc.jhLut, r, g, b, c);
+            rv *= stochReflAt(c, (double)lambda);   // the host's upsample::reflAt, device side
         }
     }
     return clamp01(m.reflectPat < 0 ? rv : rv * dReflectPatMul(sc, m, h));
@@ -14127,14 +14164,6 @@ static int deviceEmitterShapeCode(EmitterShape s) {
 }
 
 bool cudaForwardSupported(const Scene& scene) {
-    // PER-VERTEX COLOUR is not ported to the device yet. The pieces are all here — the
-    // device already carries the same Jakob-Hanika LUT and the same STOCH_HD
-    // stochJhCoeff for stochastic tiling — but DTri has no vcol index and dDiffuseRho
-    // does not multiply one in, so a GPU render of a vertex-coloured mesh would come out
-    // UNTINTED while the CPU render of the same scene is correct. A silent disagreement
-    // between backends is the one outcome worth refusing outright, so the scene falls
-    // back to the CPU instead. See VCOL-GPU in known-issues.md.
-    if (!scene.vertColors.empty()) return false;
     // Implicit surfaces (isosurface / CSG / metaballs) are now sphere-traced on the
     // device too (DImplicit + intersectImplicit); their materials are checked by the
     // same `unsupported()` gate as tri/sphere materials below.
@@ -14350,6 +14379,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.bitangentSign = t.bitangentSign;
         d.curvature = t.curvature;      // O3 per-face mean curvature (from Tri::finalize)
         d.matId = t.matId; d.sensorId = t.sensorId;
+        d.vcol  = t.vcol;               // per-vertex colour (Scene::vertColors), or -1
         return d;
     };
     // Instancing now uses a true TWO-LEVEL BVH on the device (matching the CPU): base
@@ -14956,6 +14986,16 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     double*   d_fluoCdf = fluoCdfAll.empty() ? nullptr : (double*)keep(uploadVec(fluoCdfAll));
 
     DScene& sc = up.sc;
+    // Per-vertex colour: upload the table, and make sure the JH LUT is resident even
+    // when no stochastic texture asked for it (that was the only previous consumer).
+    if (!scene.vertColors.empty()) {
+        sc.vertColors  = (const float*)keep(uploadVec(scene.vertColors));
+        sc.nVertColors = (int)scene.vertColors.size();
+        if (!d_jhLut) d_jhLut = (const float*)keep(uploadVec(upsample::coeffLut()));
+        sc.jhLut = d_jhLut;
+    } else {
+        sc.vertColors = nullptr; sc.nVertColors = 0; sc.jhLut = d_jhLut;
+    }
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
     sc.mirrorPlanes = d_mirp; sc.nMirrorPlanes = (int)mirrorPlanes.size();

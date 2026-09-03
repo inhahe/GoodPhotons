@@ -34,6 +34,69 @@ Verified across PLY / OBJ / glTF on the CPU rasterizer, the GPU rasterizer (bit-
 to the CPU one) and the path tracer; a mesh with no vertex colours is untouched, and the
 G-buffer channel is not even allocated for one.
 
+### VCOL-GPU — FIXED (2026-09-03, v0.227.0): the GPU tracer resolves per-vertex colour itself, so the CPU fallback gate is gone
+
+Ported rather than gated. `DTri` carries `Tri::vcol`, `Scene::vertColors` is uploaded
+alongside the shared Jakob-Hanika table (which now goes up whenever a scene has vertex
+colours, not only when a stochastic texture asked for it), and `dDiffuseRho` does the same
+multiply the host's `diffuseReflectance` does — through the same `stochJhCoeff` on the same
+table bytes, so the backends agree rather than approximate each other.
+
+One structural difference from the host, and the reason for it: the host resolves the
+colour INSIDE `intersectTri`, because Scene's intersectors are methods already holding the
+table. The device intersector is a free function called from the BVH leaf loops with no
+`DScene` in scope, and threading one through the hottest loop in the renderer to serve a
+rare feature is the wrong trade. So it stores what it cheaply has — the index and two
+barycentrics (the third is `1-b0-b1`), no more writes than the host's three floats — and
+`dDiffuseRho`, which does hold the scene, finishes the job.
+
+Measured on a vertex-coloured PLY at 2048 spp / 500²: **117.5 s CPU → 11.5 s GPU, 10.2×**,
+with the converged images agreeing to 0.22/255 per channel (Monte Carlo noise from
+independent RNG streams, not a shading difference).
+
+### VCOL-BLAS — FIXED (2026-09-03, v0.227.0): `mesh_asset` instances keep their vertex colours
+
+The fix turned out to need no per-BLAS table at all. `mesh_asset` loads through the
+ordinary loaders into `Scene::tris` first and only then copies the run into the BLAS, so
+the `Tri::vcol` indices already point into the scene-wide table — and that table is
+append-only, so slicing the triangles out cannot invalidate them. All that was missing was
+passing `Scene::vcolData()` down into `Blas::intersectLocal`/`occludedLocal`, which the
+TLAS traversal (a Scene method) has in hand.
+
+The raster preview needed one more thing, and it is the failure this class of change
+invites: instanced BLAS triangles are baked in a SECOND loop in `tessellate`, so the
+attribute added to the flat-triangle loop was silently missing there. Both now go through
+one `copyVcol` helper, which is the point of having one.
+
+### PLY-VCOLOR — FIXED (2026-09-03, v0.226.0): per-vertex colour is imported from PLY, OBJ, glTF and FBX, and works in the spectral tracer as well as the preview
+
+**What was wrong.** Every mesh loader stamped one material on every triangle, so a PLY
+carrying `red`/`green`/`blue` — the only way that format can state a colour, and how scan
+and photogrammetry pipelines ship one — imported untinted. Same for OBJ's extended
+`v x y z r g b`, glTF's `COLOR_0` and an FBX colour layer.
+
+**Why the obvious fix was wrong.** `Tri` has no per-vertex colour, and the entry above
+proposed either adding one or quantising colours into bucketed materials. Bucketing bands
+a smooth scan, so per-vertex won — but the interesting part is what to STORE. ftrace is
+spectral: the tracer reads `reflect(lambda)`, so an RGB vertex colour has to become a
+spectral reflectance, and `rgbToReflectanceJH` is a ~40-iteration Gauss-Newton fit that
+cannot run per hit. Storing per-vertex *fitted coefficients* and interpolating those was
+the first plan; it is wrong in two ways at once — it interpolates the wrong quantity (the
+colour varies linearly across a face, the sigmoid coefficients that reproduce it do not),
+and it pays a fit per vertex at load.
+
+**What it actually does.** Store the linear RGB, interpolate the COLOUR, and resolve the
+spectrum per hit through `upsample::coeffLut()` + `stochJhCoeff` — the table stochastic
+tiling already builds for the identical predicament (it invents a colour per hit and then
+owes the renderer a spectrum for it). That is exact where it matters, costs no load-time
+fitting, and — because `stochJhCoeff` is `STOCH_HD` — the device already has everything
+needed for the port. The rasterizer, being an RGB pipeline, skips the lift entirely and
+multiplies the interpolated colour straight into the albedo.
+
+Verified across PLY / OBJ / glTF on the CPU rasterizer, the GPU rasterizer (bit-identical
+to the CPU one) and the path tracer; a mesh with no vertex colours is untouched, and the
+G-buffer channel is not even allocated for one.
+
 ### VCOL-GPU — OPEN (2026-09-03, v0.226.0): the GPU **tracer** has no per-vertex colour, so a vertex-coloured scene falls back to the CPU
 
 **What happens.** `cudaForwardSupported` now returns false when `Scene::vertColors` is

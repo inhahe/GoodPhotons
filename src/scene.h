@@ -1109,23 +1109,28 @@ struct Blas {
     }
     // Closest hit in local space. `h.t` carries the running (world==local) tMax on
     // entry; intersectTri only accepts a closer hit. Returns true if `h` was updated.
-    bool intersectLocal(const Ray& lr, double tmin, Hit& h) const {
+    // `vcolTable` is the SCENE's Scene::vertColors. A BLAS keeps its own triangle array
+    // but not its own colour table, and it does not need one: mesh_asset loads through
+    // the ordinary loaders into Scene::tris first and only then copies the run into the
+    // BLAS, so the Tri::vcol indices already point into the scene-wide table — and that
+    // table is append-only, so slicing the triangles out cannot invalidate them. The
+    // caller passes it down because a Blas has no back-pointer to its Scene.
+    bool intersectLocal(const Ray& lr, double tmin, Hit& h,
+                        const float* vcolTable = nullptr) const {
         bool found = false;
         double tMax = h.t;
         const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
         bvh.traverseClosest(lr, tmin, tMax, [&](int prim, double& tm) {
-            // No vertex-colour table: a BLAS is a SHARED instanced asset with its own
-            // triangle array, so it would need its own table too. `mesh_asset` with
-            // vertex colours is the one path that drops them — see VCOL-BLAS.
-            if (intersectTri(sh, lr, tris[prim], tmin, h, nullptr)) { tm = h.t; found = true; }
+            if (intersectTri(sh, lr, tris[prim], tmin, h, vcolTable)) { tm = h.t; found = true; }
         });
         return found;
     }
-    bool occludedLocal(const Ray& lr, double tmin, double maxDist) const {
+    bool occludedLocal(const Ray& lr, double tmin, double maxDist,
+                       const float* vcolTable = nullptr) const {
         const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
         return bvh.traverseAny(lr, tmin, maxDist, [&](int prim) {
             Hit h; h.t = maxDist;
-            return intersectTri(sh, lr, tris[prim], tmin, h, nullptr);   // see above
+            return intersectTri(sh, lr, tris[prim], tmin, h, vcolTable);
         });
     }
 };
@@ -2411,7 +2416,7 @@ struct Scene {
                 const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
                 Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
                 Hit lh; lh.t = h.t;                    // running world tMax == local tMax
-                if (blasList[inst.blasId].intersectLocal(lr, tmin, lh)) {
+                if (blasList[inst.blasId].intersectLocal(lr, tmin, lh, vcolData())) {
                     instanceHitToWorld(inst, r, lh);
                     h = lh; tm = h.t;
                 }
@@ -2468,7 +2473,7 @@ struct Scene {
             }
             const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
-            return blasList[inst.blasId].occludedLocal(lr, tmin, seg);  // world seg == local seg
+            return blasList[inst.blasId].occludedLocal(lr, tmin, seg, vcolData());  // world seg == local seg
         });
     }
 

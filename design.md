@@ -6141,10 +6141,25 @@ backward reference already share — is the one place that multiplies it in.
 
 `Scene::vertColors` reaches the intersector as an explicit argument rather than a global:
 there are only a handful of call sites and every one is a Scene method holding the vector.
-The exception is `Blas`, which has its own triangle array and no table, so instanced assets
-drop vertex colours (VCOL-BLAS). The GPU tracer is gated off rather than ported (VCOL-GPU) —
-without the gate a GPU render came out untinted while the CPU render of the same scene was
-right, and a silent disagreement between backends is worse than a slower render.
+A `Blas` has its own triangle array but needs no table of its own — `mesh_asset` loads
+through the ordinary loaders into `Scene::tris` and only then copies the run out, so the
+indices already point into the scene-wide table, and that table is append-only so slicing
+the triangles cannot invalidate them. The TLAS traversal passes `vcolData()` down.
+
+**The GPU tracer resolves it in a different place than the host, deliberately.** The host
+does it inside `intersectTri`, which is free because Scene's intersectors are methods
+already holding the table. The device intersector is a free function called from the BVH
+leaf loops with no `DScene` in scope, and threading one through the hottest loop in the
+renderer to serve a rare feature is the wrong trade — so it stores the index and two
+barycentrics (the third is `1-b0-b1`; no more writes than the host's three floats) and
+`dDiffuseRho` finishes the job, using the same `stochJhCoeff` on the same uploaded table.
+Measured 10.2x over the CPU on a vertex-coloured mesh, converged images agreeing to
+0.22/255 per channel.
+
+**The instanced raster path is where this kind of change goes wrong.** `tessellate` bakes
+BLAS triangles in a SECOND loop, and the first version of this work copied the colour only
+in the flat-triangle loop — so instanced meshes rendered untinted in the preview while
+every other backend had them. Both loops now call one `copyVcol` helper.
 
 ## glTF glass: the colour is in the extensions, not the core block (0.224.0)
 

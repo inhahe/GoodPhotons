@@ -2494,9 +2494,12 @@ renders: the rasterizer is an RGB pipeline and uses the colour directly, while t
 spectral tracer interpolates the colour across the face and turns it into a reflectance
 per hit through the shared Jakob-Hanika coefficient table (the same one stochastic tiling
 uses, and for the same reason — a colour that exists at no vertex still needs a spectrum).
-Two limits: `mesh_asset` instances drop vertex colours (they are a shared BLAS with their
-own triangle array), and a vertex-coloured scene falls back to the **CPU** tracer, because
-the device side is not ported yet. Both are logged in `known-issues.md`.
+It works on every backend — CPU and GPU rasterizer, CPU and GPU tracer — and through
+`mesh_asset` instancing, since a BLAS indexes the same scene-wide colour table. The GPU
+tracer resolves the spectrum with the same shared table and the same `stochJhCoeff`
+lookup the host uses, so the two agree rather than approximate each other.
+`tools/vertex_color_check.py` renders a hue-ramped sphere through every importer, every
+backend and the instanced path to prove it.
 glTF brings
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
