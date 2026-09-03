@@ -48,6 +48,23 @@ struct Tri {
     // which is the honest answer: a facet is flat, and a faceted mesh carries its
     // curvature on the edges as a distribution the field cannot represent.
     double curvature = 0.0;
+    // Per-vertex COLOUR, as an index of the first of three consecutive linear-RGB
+    // entries in Scene::vertColors (v0, v1, v2), or -1 for the overwhelming majority of
+    // triangles that have none. Fed by the mesh formats that carry vertex colour: PLY's
+    // red/green/blue, glTF's COLOR_0, OBJ's extended `v x y z r g b`, an FBX colour layer.
+    //
+    // Stored as an INDEX rather than inline because Tri is already ~200 bytes and sits in
+    // the BVH's hot leaf data; nine floats on every triangle to serve the few meshes that
+    // have any would be a poor trade. Stored as RGB rather than as fitted spectral
+    // coefficients because the two consumers want different things and RGB is what both
+    // can start from: the rasterizer IS rgb and uses it directly, while the spectral
+    // tracer interpolates the colour and then looks the coefficients up per hit
+    // (upsample::coeffLut / stochJhCoeff — the same table stochastic tiling uses for the
+    // same reason, a colour that exists at no vertex needing a spectrum at a hit).
+    // Interpolating the colour and looking up is also strictly better than interpolating
+    // pre-fitted coefficients would be: it is the colour that varies linearly across a
+    // face, not the sigmoid coefficients that reproduce it.
+    int vcol = -1;
     void finalize() {
         gn = normalize(cross(v1 - v0, v2 - v0));
         if (dot(n0, n0) < 1e-12) n0 = gn;
@@ -125,6 +142,12 @@ struct Hit {
     // being occluded by it. Nothing else reads this, and the intersector already has the
     // interpolated radius in hand, so it costs one store.
     double fiberRadius = 0.0;
+    // Barycentric-interpolated per-vertex colour at the hit (linear RGB), when the
+    // triangle carried one. Resolved by the intersector, which is the only place that
+    // has both the triangle and the barycentrics; everything downstream reads it off the
+    // Hit exactly as it reads u/v.
+    bool   hasVcol = false;
+    double vcolR = 1.0, vcolG = 1.0, vcolB = 1.0;
     // Mean curvature at the hit, 1/length, exposed to procedural patterns as `curv` (O3).
     // Signed RELATIVE TO THE SIDE BEING SHADED: the intersector negates it whenever it
     // flips the normal to face the ray, so a surface bulging toward the viewer is always
@@ -278,7 +301,7 @@ inline TriShear makeTriShear(const Vec3& d) {
 // Watertight test using a precomputed per-ray shear. Callers in a BVH leaf loop should
 // build the shear once (makeTriShear(lr.d)) and pass it here for every triangle.
 inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
-                         double tmin, Hit& hit) {
+                         double tmin, Hit& hit, const float* vertColorTable = nullptr) {
     const int kx = sh.kx, ky = sh.ky, kz = sh.kz;
     // Triangle vertices relative to the ray origin.
     Vec3 A = tri.v0 - r.o, B = tri.v1 - r.o, C = tri.v2 - r.o;
@@ -329,6 +352,15 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     // b0,b1,b2 == w0,u,v).
     hit.u = b0 * tri.uv0.x + b1 * tri.uv1.x + b2 * tri.uv2.x;
     hit.v = b0 * tri.uv0.y + b1 * tri.uv1.y + b2 * tri.uv2.y;
+    hit.hasVcol = (tri.vcol >= 0);
+    if (hit.hasVcol && vertColorTable) {
+        const float* c = vertColorTable + (size_t)tri.vcol * 3;
+        hit.vcolR = b0 * c[0] + b1 * c[3] + b2 * c[6];
+        hit.vcolG = b0 * c[1] + b1 * c[4] + b2 * c[7];
+        hit.vcolB = b0 * c[2] + b1 * c[5] + b2 * c[8];
+    } else {
+        hit.hasVcol = false;
+    }
     Vec3 ns = tri.n0 * b0 + tri.n1 * b1 + tri.n2 * b2;
     double nl = dot(ns, ns);
     ns = (nl > 1e-18) ? ns * (1.0 / std::sqrt(nl)) : tri.gn;
@@ -370,8 +402,9 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
 
 // Interface-preserving wrapper: builds the per-ray shear inline. Fine for one-off calls;
 // BVH leaf loops hoist makeTriShear(r.d) and use the overload above instead.
-inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit) {
-    return intersectTri(makeTriShear(r.d), r, tri, tmin, hit);
+inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit,
+                         const float* vertColorTable = nullptr) {
+    return intersectTri(makeTriShear(r.d), r, tri, tmin, hit, vertColorTable);
 }
 
 inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit) {

@@ -6100,6 +6100,52 @@ latent in `buildPanel` and `buildBindRow` too and is fixed in all three. Changin
 angles are carried across by PLANE IDENTITY (`planeIndex(oldN, i, j)`), so `xw` stays `xw`
 rather than being silently re-indexed as the plane order lengthens.
 
+## Per-vertex colour: store the COLOUR, resolve the spectrum per hit (0.226.0)
+
+Four formats carry a per-vertex colour — PLY's `red/green/blue`, OBJ's extended
+`v x y z r g b`, glTF's `COLOR_0`, an FBX colour layer — and every loader was dropping it.
+`Tri` gained `vcol`, an INDEX into `Scene::vertColors` rather than nine inline floats,
+because Tri already sits in the BVH's hot leaf data and almost no mesh has vertex colours.
+
+**The design question is what to store, and the obvious answer is wrong.** ftrace is
+spectral: the tracer reads `reflect(lambda)`, so an RGB vertex colour must become a
+spectral reflectance, and `rgbToReflectanceJH` is a ~40-iteration Gauss-Newton fit — the
+file's own comment records that running it per texel cost 45 s of a 47 s scene load, so
+per hit is unthinkable. The natural fix is to fit once per vertex and interpolate the
+COEFFICIENTS. That is wrong twice over: it interpolates the wrong quantity (the colour
+varies linearly across a face; the sigmoid coefficients that reproduce it do not, and they
+move fastest near black), and it pays a fit per vertex at load.
+
+**What it does instead** is store the linear RGB, interpolate the COLOUR at the hit, and
+resolve the spectrum through `upsample::coeffLut()` + `stochJhCoeff`. That table exists
+already, built for the identical predicament: stochastic tiling *invents* a colour at every
+hit by blending three crops and then owes the renderer a spectrum for it. Reusing it means
+no load-time fitting at all, the exact quantity gets interpolated, and — since
+`stochJhCoeff` is `STOCH_HD` — the device port needs no new maths.
+
+**The two consumers want different things from the same numbers, which is why RGB is what
+is stored.** The rasterizer IS an RGB pipeline: it skips the lift entirely and multiplies
+the interpolated colour into the albedo. The tracer needs the spectral lift. Storing fitted
+coefficients would have served neither cleanly.
+
+**Where each backend interpolates, and why they differ.** The host rasterizer's shade pass
+is DEFERRED — it sees only the G-buffer — so the interpolated colour has to be written into
+a G-buffer channel. That channel is allocated only when the tessellation actually contains a
+vertex-coloured triangle, so an ordinary scene pays neither the 24 B/pixel nor the per-pixel
+write. The GPU rasterizer needed no buffer at all: `kShade` already recomputes this pixel's
+barycentrics to recover position/normal/UV, so the colours ride along on `DPTri` for free.
+The two came out bit-identical. The tracer interpolates in `intersectTri`, the only place
+holding both the triangle and the barycentrics, and deposits the result on the `Hit`
+alongside `u`/`v`; `diffuseReflectance` — the single resolver both the forward tracer and the
+backward reference already share — is the one place that multiplies it in.
+
+`Scene::vertColors` reaches the intersector as an explicit argument rather than a global:
+there are only a handful of call sites and every one is a Scene method holding the vector.
+The exception is `Blas`, which has its own triangle array and no table, so instanced assets
+drop vertex colours (VCOL-BLAS). The GPU tracer is gated off rather than ported (VCOL-GPU) —
+without the gate a GPU render came out untinted while the CPU render of the same scene was
+right, and a silent disagreement between backends is worse than a slower render.
+
 ## glTF glass: the colour is in the extensions, not the core block (0.224.0)
 
 `gltf.h` read only `pbrMetallicRoughness` and mapped metallic>=0.5 to Glossy and everything

@@ -481,6 +481,7 @@ inline int loadObjBytes(Scene& s, const std::string& buf, const char* path, int 
     const bool haveMtl = !mtlTable.empty();
 
     std::vector<Vec3> verts;
+    std::vector<Vec3> objColors;   // per-vertex colour from the extended `v x y z r g b`
     std::vector<Vec3> texcoords;   // (u,v,0) per `vt`
     std::vector<Vec3> normals;     // per `vn`, already in WORLD space (inv-transpose)
     int curMat = matId;            // active material (switched by `usemtl` when resolving)
@@ -505,9 +506,24 @@ inline int loadObjBytes(Scene& s, const std::string& buf, const char* path, int 
         if (le - ls < 2) continue;
         const char c0 = ls[0], c1 = ls[1];
         if (c0 == 'v' && c1 == ' ') {
-            double d[3] = {0, 0, 0};
-            objParseDoubles(ls + 2, le, d, 3);
+            // The extended form `v x y z r g b` (MeshLab, most scanner exports) puts a
+            // per-vertex colour after the position. Parse six and count how many were
+            // really there — a plain `v` leaves the last three at the sentinel.
+            double d[6] = {0, 0, 0, -1, -1, -1};
+            objParseDoubles(ls + 2, le, d, 6);
             verts.push_back(xf.apply(Vec3{d[0], d[1], d[2]}));
+            if (d[3] >= 0.0 && d[4] >= 0.0 && d[5] >= 0.0) {
+                // Written 0..1 in practice; a 0..255 file is accepted by scaling when any
+                // channel exceeds 1. Unlike PLY there is no declared type to consult.
+                const double mx = std::max({d[3], d[4], d[5]});
+                const double k = (mx > 1.0) ? (1.0 / 255.0) : 1.0;
+                auto lin = [](double c) {
+                    c = c < 0.0 ? 0.0 : (c > 1.0 ? 1.0 : c);
+                    return (c <= 0.04045) ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+                };
+                objColors.resize(verts.size() - 1, Vec3{1, 1, 1});   // pad any uncoloured prefix
+                objColors.push_back(Vec3{lin(d[3] * k), lin(d[4] * k), lin(d[5] * k)});
+            }
         } else if (loadUV && c0 == 'v' && c1 == 't') {
             double d[2] = {0, 0};
             objParseDoubles(ls + 2, le, d, 2);
@@ -576,6 +592,15 @@ inline int loadObjBytes(Scene& s, const std::string& buf, const char* path, int 
                 // Per-vertex shading normals (zero => finalize() falls back to gn,
                 // preserving exact flat-shading for meshes without `vn`).
                 t.n0 = nAt(fNidx[0]); t.n1 = nAt(fNidx[k]); t.n2 = nAt(fNidx[k + 1]);
+                if (objColors.size() == verts.size()) {
+                    t.vcol = (int)(s.vertColors.size() / 3);
+                    for (int vi : {fIdx[0], fIdx[k], fIdx[k + 1]}) {
+                        const Vec3& c = objColors[(size_t)vi];
+                        s.vertColors.push_back((float)c.x);
+                        s.vertColors.push_back((float)c.y);
+                        s.vertColors.push_back((float)c.z);
+                    }
+                }
                 s.tris.push_back(t);
                 if (recordVI) triVI.push_back({fIdx[0], fIdx[k], fIdx[k + 1]});
                 ++added;
@@ -802,11 +827,13 @@ inline bool parseHeader(const std::string& buf, std::vector<Elem>& elems, int& f
 template <class R>
 inline void readBody(R& rd, const std::vector<Elem>& elems, const Affine& xf, bool loadUV,
                      std::vector<Vec3>& verts, std::vector<Vec3>& normals,
-                     std::vector<Vec3>& uvs, std::vector<std::array<int, 3>>& faces) {
+                     std::vector<Vec3>& uvs, std::vector<std::array<int, 3>>& faces,
+                     std::vector<Vec3>& colors) {
     for (const Elem& e : elems) {
         const bool isVert = (e.name == "vertex");
         const bool isFace = (e.name == "face");
         int ix = -1, iy = -1, iz = -1, inx = -1, iny = -1, inz = -1, iu = -1, iv = -1, iIdx = -1;
+        int icr = -1, icg = -1, icb = -1;
         for (size_t i = 0; i < e.props.size(); ++i) {
             const std::string& n = e.props[i].name;
             if (isVert) {
@@ -818,6 +845,13 @@ inline void readBody(R& rd, const std::vector<Elem>& elems, const Affine& xf, bo
                 else if (n == "nz") inz = (int)i;
                 else if (n == "u" || n == "s" || n == "texture_u" || n == "texture_s") iu = (int)i;
                 else if (n == "v" || n == "t" || n == "texture_v" || n == "texture_t") iv = (int)i;
+                // Vertex colour. PLY has no material block, so this is the only place a
+                // .ply can state a colour at all, and it is how scan / photogrammetry
+                // pipelines ship one. Both the plain and the `diffuse_` spellings are in
+                // the wild; `alpha` is read only to be skipped.
+                else if (n == "red"   || n == "diffuse_red")   icr = (int)i;
+                else if (n == "green" || n == "diffuse_green") icg = (int)i;
+                else if (n == "blue"  || n == "diffuse_blue")  icb = (int)i;
             } else if (isFace && e.props[i].isList &&
                        (n == "vertex_indices" || n == "vertex_index")) {
                 iIdx = (int)i;
@@ -854,6 +888,26 @@ inline void readBody(R& rd, const std::vector<Elem>& elems, const Affine& xf, bo
                     normals.push_back(l > 1e-18 ? wn * (1.0 / l) : Vec3{0, 0, 0});
                 }
                 if (loadUV && iu >= 0 && iv >= 0) uvs.push_back(Vec3{vals[iu], vals[iv], 0});
+                if (icr >= 0 && icg >= 0 && icb >= 0) {
+                    // uchar 0..255 is overwhelmingly the common encoding; a float
+                    // property is already 0..1. Decide by the declared TYPE rather than
+                    // by sniffing the values, which would misread a legitimately dark
+                    // float colour as an 8-bit one.
+                    const bool byteScale = (e.props[icr].type == PT::U8 ||
+                                            e.props[icr].type == PT::I8);
+                    const double k = byteScale ? (1.0 / 255.0) : 1.0;
+                    // sRGB -> LINEAR: vertex colours are authored/scanned in display
+                    // space, and every other colour in ftrace is linear by the time it
+                    // reaches a material. Skipping this is what makes an imported scan
+                    // read washed out.
+                    auto lin = [](double c) {
+                        c = c < 0.0 ? 0.0 : (c > 1.0 ? 1.0 : c);
+                        return (c <= 0.04045) ? c / 12.92
+                                              : std::pow((c + 0.055) / 1.055, 2.4);
+                    };
+                    colors.push_back(Vec3{lin(vals[icr] * k), lin(vals[icg] * k),
+                                          lin(vals[icb] * k)});
+                }
             } else if (wantFace) {
                 for (size_t j = 1; j + 1 < poly.size(); ++j)
                     faces.push_back({poly[0], poly[(int)j], poly[(int)j + 1]});
@@ -874,12 +928,12 @@ inline int loadPlyBytes(Scene& s, const std::string& buf, const char* path, int 
     size_t bodyOff = 0;
     if (!plydetail::parseHeader(buf, elems, fmt, bodyOff, err)) return 0;
 
-    std::vector<Vec3> verts, normals, uvs;
+    std::vector<Vec3> verts, normals, uvs, colors;
     std::vector<std::array<int, 3>> faces;
     bool truncated = false;
     if (fmt == 0) {
         plydetail::AsciiReader rd{buf.data() + bodyOff, buf.data() + buf.size()};
-        plydetail::readBody(rd, elems, xf, loadUV, verts, normals, uvs, faces);
+        plydetail::readBody(rd, elems, xf, loadUV, verts, normals, uvs, faces, colors);
         truncated = !rd.ok;
     } else {
         const unsigned short one = 1;
@@ -888,7 +942,7 @@ inline int loadPlyBytes(Scene& s, const std::string& buf, const char* path, int 
         plydetail::Reader rd{(const unsigned char*)buf.data() + bodyOff,
                              (const unsigned char*)buf.data() + buf.size(),
                              hostLE != fileLE};
-        plydetail::readBody(rd, elems, xf, loadUV, verts, normals, uvs, faces);
+        plydetail::readBody(rd, elems, xf, loadUV, verts, normals, uvs, faces, colors);
         truncated = !rd.ok;
     }
     if (verts.empty()) {
@@ -912,6 +966,7 @@ inline int loadPlyBytes(Scene& s, const std::string& buf, const char* path, int 
     const bool wantSmooth   = (creaseAngleDeg >= 0.0);
     const bool haveN  = (normals.size() == verts.size());
     const bool haveUV = loadUV && (uvs.size() == verts.size());
+    const bool haveC  = (colors.size() == verts.size());
     std::vector<std::array<int, 3>> triVI;
     triVI.reserve(faces.size());
     long long dropped = 0;
@@ -924,6 +979,15 @@ inline int loadPlyBytes(Scene& s, const std::string& buf, const char* path, int 
         Tri t{verts[f[0]], verts[f[1]], verts[f[2]], matId, -1, {}};
         if (haveUV) { t.uv0 = uvs[f[0]];     t.uv1 = uvs[f[1]];     t.uv2 = uvs[f[2]]; }
         if (haveN)  { t.n0  = normals[f[0]]; t.n1  = normals[f[1]]; t.n2  = normals[f[2]]; }
+        if (haveC) {
+            t.vcol = (int)(s.vertColors.size() / 3);
+            for (int c = 0; c < 3; ++c) {
+                const Vec3& col = colors[(size_t)f[c]];
+                s.vertColors.push_back((float)col.x);
+                s.vertColors.push_back((float)col.y);
+                s.vertColors.push_back((float)col.z);
+            }
+        }
         s.tris.push_back(t);
         triVI.push_back(f);
     }

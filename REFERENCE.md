@@ -2480,9 +2480,23 @@ extension; an extension it does not recognise is parsed as OBJ, and a file that 
 **zero triangles is a hard load error**, never a silently empty scene). Which formats
 carry a *material* differs, and `tools/mesh_format_matrix.py` renders one geometry
 through all of them to prove it: **OBJ** (via `.mtl`), **glTF/GLB** and **FBX** import
-colour and transmissive glass; **PLY** carries per-vertex colours that are not read yet,
-**STL** has no material data in the format at all, and **`.ftmesh`** is deliberately
-geometry-only. For those last three every face takes the `material` the scene assigns.
+colour and transmissive glass; **STL** has no material data in the format at all, and
+**`.ftmesh`** is deliberately geometry-only, so for those two every face takes the
+`material` the scene assigns.
+
+**Per-vertex colour** is imported from every format that carries it — PLY's
+`red`/`green`/`blue` (or `diffuse_red`/…), OBJ's extended `v x y z r g b`, glTF's
+`COLOR_0`, and an FBX colour layer — and **multiplies** the material's albedo, which is
+glTF's rule for `COLOR_0` and degrades sensibly elsewhere (against a white material it
+*is* the vertex colour). PLY and OBJ colours are taken as display-space and linearised;
+glTF and FBX state theirs as linear already. It works in the preview **and** in real
+renders: the rasterizer is an RGB pipeline and uses the colour directly, while the
+spectral tracer interpolates the colour across the face and turns it into a reflectance
+per hit through the shared Jakob-Hanika coefficient table (the same one stochastic tiling
+uses, and for the same reason — a colour that exists at no vertex still needs a spectrum).
+Two limits: `mesh_asset` instances drop vertex colours (they are a shared BLAS with their
+own triangle array), and a vertex-coloured scene falls back to the **CPU** tracer, because
+the device side is not ported yet. Both are logged in `known-issues.md`.
 glTF brings
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,

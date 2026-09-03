@@ -141,6 +141,12 @@ struct DPTri {
     int    emissive;
     int    clear;           // see-through transmissive surface (handled by the clear pass)
     float3 clearTint;       // its per-crossing RGB transmittance (raster.h clearTintOf)
+    // Per-vertex colour (linear RGB) and whether it is meaningful. kShade already
+    // recomputes this pixel's barycentrics to recover position/normal/UV, so the colour
+    // rides along for free -- no extra device buffer, unlike the host G-buffer which had
+    // to grow a channel because its shade pass is deferred and has only the buffer.
+    float3 vc0, vc1, vc2;
+    int    hasVcol;
     int    normalTex;       // tangent-space normal map, or -1
     float  normalStrength;  // XY scale applied to the sampled tangent-space normal
     int    reflectPat;      // scalar `pattern` scaling the albedo, or -1
@@ -906,6 +912,10 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     float3 wp0, wp1, wp2, wn0, wn1, wn2, color;
     float2 uv0, uv1, uv2;
     int tex, emissive, nrmTex, rPat, ePat; float tps, nrmS;
+    // Vertex colour comes from the SOURCE triangle either way: a near-clipped slot lerps
+    // position/normal/UV into DAttr, but a clipped triangle's colours are still the
+    // original three, and the barycentrics below are expressed against them.
+    const DPTri& vsrc = tris[slot >> 1];
     if (flags[slot] & kSlotClipped) {
         const DAttr& a = attrs[slot];
         wp0 = a.wp0; wn0 = a.wn0; uv0 = a.uv0;
@@ -974,6 +984,13 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     // Image skin: replace the flat albedo with the texture's linear RGB, sampled either at
     // the interpolated per-vertex UV or by world triplanar projection (mirrors raster.h P3).
     float3 col = color;
+    // Per-vertex colour multiplies the albedo -- the same rule the host rasterizer and
+    // the spectral tracer's diffuseReflectance use, and glTF's rule for COLOR_0.
+    if (vsrc.hasVcol) {
+        const float3 vc = (vsrc.vc0 * (w0 * t.invd0) + vsrc.vc1 * (w1 * t.invd1)
+                           + vsrc.vc2 * (w2 * t.invd2)) * d;
+        col = make_float3(col.x * vc.x, col.y * vc.y, col.z * vc.z);
+    }
     if (tex >= 0 && tex < nTex)
         col = (tps > 0.0f) ? dSampleRgbTri(texMeta, texels, tex, wpos, wn, tps)
                            : dSampleRgb(texMeta, texels, tex, uu, vv);
@@ -1417,6 +1434,10 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         d.clear = t.clear ? 1 : 0;
         d.clearTint = make_float3((float)t.clearTint.x, (float)t.clearTint.y,
                                   (float)t.clearTint.z);
+        d.hasVcol = t.hasVcol ? 1 : 0;
+        d.vc0 = make_float3((float)t.vc0.x, (float)t.vc0.y, (float)t.vc0.z);
+        d.vc1 = make_float3((float)t.vc1.x, (float)t.vc1.y, (float)t.vc1.z);
+        d.vc2 = make_float3((float)t.vc2.x, (float)t.vc2.y, (float)t.vc2.z);
         d.normalTex = t.normalTex;
         d.normalStrength = (float)t.normalStrength;
         d.reflectPat = t.reflectPat;

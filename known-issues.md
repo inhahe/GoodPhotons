@@ -5,26 +5,67 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### PLY-VCOLOR — OPEN (2026-09-03, v0.225.0): PLY **vertex colours are not read**, so a scanned/photogrammetry mesh imports untinted
+### PLY-VCOLOR — FIXED (2026-09-03, v0.226.0): per-vertex colour is imported from PLY, OBJ, glTF and FBX, and works in the spectral tracer as well as the preview
 
-**What happens.** `loadPlyBytes` reads positions and faces and stamps every triangle with
-the caller's single material. A PLY that carries `property uchar red/green/blue` — which
-is how scan and photogrammetry pipelines ship colour, the format having no material block
-— loses all of it. Confirmed with `tools/mesh_format_matrix.py`: the same geometry that
-shows peak saturation 165 through OBJ and glTF shows 29 through PLY, i.e. only the
-lighting.
+**What was wrong.** Every mesh loader stamped one material on every triangle, so a PLY
+carrying `red`/`green`/`blue` — the only way that format can state a colour, and how scan
+and photogrammetry pipelines ship one — imported untinted. Same for OBJ's extended
+`v x y z r g b`, glTF's `COLOR_0` and an FBX colour layer.
 
-**Why it is not just "add a field".** ftrace's `Tri` has per-vertex positions, normals and
-UVs but no per-vertex COLOUR, and the shading path reads albedo from the material, not the
-geometry. So this needs one of: (a) a real per-vertex colour channel on `Tri` plus the
-shade-path plumbing on both raster backends and the tracer; or (b) quantising vertex
-colours and emitting one material per distinct bucket, which is cheap but bands a smooth
-scan and explodes the material table unless capped.
+**Why the obvious fix was wrong.** `Tri` has no per-vertex colour, and the entry above
+proposed either adding one or quantising colours into bucketed materials. Bucketing bands
+a smooth scan, so per-vertex won — but the interesting part is what to STORE. ftrace is
+spectral: the tracer reads `reflect(lambda)`, so an RGB vertex colour has to become a
+spectral reflectance, and `rgbToReflectanceJH` is a ~40-iteration Gauss-Newton fit that
+cannot run per hit. Storing per-vertex *fitted coefficients* and interpolating those was
+the first plan; it is wrong in two ways at once — it interpolates the wrong quantity (the
+colour varies linearly across a face, the sigmoid coefficients that reproduce it do not),
+and it pays a fit per vertex at load.
 
-**Not applicable to see-through.** PLY has no transparency or IOR concept whatsoever, so
-`-see-through` can never do anything for a PLY however this is fixed. Same for STL, whose
-format carries no material data at all, and `.ftmesh`, which is deliberately a
-geometry-only machine-to-machine channel (see mesh.h).
+**What it actually does.** Store the linear RGB, interpolate the COLOUR, and resolve the
+spectrum per hit through `upsample::coeffLut()` + `stochJhCoeff` — the table stochastic
+tiling already builds for the identical predicament (it invents a colour per hit and then
+owes the renderer a spectrum for it). That is exact where it matters, costs no load-time
+fitting, and — because `stochJhCoeff` is `STOCH_HD` — the device already has everything
+needed for the port. The rasterizer, being an RGB pipeline, skips the lift entirely and
+multiplies the interpolated colour straight into the albedo.
+
+Verified across PLY / OBJ / glTF on the CPU rasterizer, the GPU rasterizer (bit-identical
+to the CPU one) and the path tracer; a mesh with no vertex colours is untouched, and the
+G-buffer channel is not even allocated for one.
+
+### VCOL-GPU — OPEN (2026-09-03, v0.226.0): the GPU **tracer** has no per-vertex colour, so a vertex-coloured scene falls back to the CPU
+
+**What happens.** `cudaForwardSupported` now returns false when `Scene::vertColors` is
+non-empty, which drops modes R/W/D onto the CPU for any vertex-coloured mesh. Without the
+gate a GPU render came out *untinted* while the CPU render of the same scene was correct —
+a silent disagreement between backends, which is the one outcome worth refusing outright.
+
+**Why it is only a gate and not a port.** The device already carries both halves of what
+it needs: `upsample::coeffLut()` is uploaded for stochastic tiling and `stochJhCoeff` is
+`STOCH_HD`, so the lookup compiles for the device unchanged. What is missing is plumbing —
+`DTri` needs a `vcol` index, `Scene::vertColors` needs uploading, `DHit` needs the three
+interpolated floats, the device `intersectTri` needs the same three lerps the host one
+does, and `dDiffuseRho` needs the multiply. The GPU rasterizer's equivalent port is the
+worked example (`DPTri::vc0..vc2`, the multiply in `kShade`), and it came out bit-identical
+to the host. Note the raster port needed no new device buffer because `kShade` already
+recomputes barycentrics; the tracer will need the table uploaded, since a hit there has no
+barycentrics lying around.
+
+**Cost of leaving it.** A vertex-coloured scene renders correctly but without GPU
+acceleration.
+
+### VCOL-BLAS — OPEN (2026-09-03, v0.226.0): `mesh_asset` instances drop per-vertex colour
+
+**What happens.** A BLAS is a shared instanced asset with its own triangle array, and it
+has no colour table of its own — `intersectLocal`/`occludedLocal` pass `nullptr` where the
+main scene passes `Scene::vcolData()`. So a vertex-coloured mesh loaded through
+`mesh_asset` (rather than `mesh`) renders untinted.
+
+**The fix** is to give `Blas` its own `vertColors` and have the loaders write there when
+they are filling a BLAS, exactly as they now write to the Scene's. Small, and mostly
+mechanical; not done because `mesh_asset` + vertex colours has not come up, and the two
+loaders that fill a BLAS would each need the branch.
 
 ### RASTER-MILK — OPEN (2026-09-03, v0.224.0): the see-through pass's haze **saturates on a faceted pile of glass**, washing out the colours it is meant to sit beside
 

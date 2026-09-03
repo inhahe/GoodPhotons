@@ -485,12 +485,18 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             int posAcc = attrs->intAt("POSITION", -1);
             int nrmAcc = attrs->intAt("NORMAL", -1);
             int uvAcc  = attrs->intAt("TEXCOORD_0", -1);
+            int colAcc = attrs->intAt("COLOR_0", -1);
             if (posAcc < 0) continue;
             std::vector<double> pos, nrm, uv;
             int pc = 0, nc = 0, uc = 0;
             if (!readAccessorFloat(doc, posAcc, pos, pc) || pc < 3) continue;
             bool hasN = (nrmAcc >= 0) && readAccessorFloat(doc, nrmAcc, nrm, nc) && nc >= 3;
             bool hasUV = (uvAcc >= 0) && readAccessorFloat(doc, uvAcc, uv, uc) && uc >= 2;
+            // COLOR_0 is glTF's per-vertex colour. It is already LINEAR (unlike a PLY's
+            // display-space bytes) and may be VEC3 or VEC4 — the alpha is ignored, since
+            // ftrace has no per-vertex opacity to put it in.
+            std::vector<double> vcol; int cc = 0;
+            bool hasVC = (colAcc >= 0) && readAccessorFloat(doc, colAcc, vcol, cc) && cc >= 3;
             size_t vcount = pos.size() / pc;
             int gltfMat = prim.intAt("material", -1);
             if (gltfMat >= 0 && gltfMat < (int)matSkip.size() && matSkip[gltfMat]) {
@@ -516,6 +522,12 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 Tri t{vertPos(a), vertPos(bIdx), vertPos(c), matId, -1, {}};
                 if (hasUV) { t.uv0 = vertUV(a); t.uv1 = vertUV(bIdx); t.uv2 = vertUV(c); }
                 if (hasN)  { t.n0 = vertNrm(a); t.n1 = vertNrm(bIdx); t.n2 = vertNrm(c); }
+                if (hasVC) {
+                    t.vcol = (int)(s.vertColors.size() / 3);
+                    for (uint32_t vi : {a, bIdx, c})
+                        for (int k = 0; k < 3; ++k)
+                            s.vertColors.push_back((float)std::max(0.0, vcol[vi * cc + k]));
+                }
                 s.tris.push_back(t);
                 ++added;
             };

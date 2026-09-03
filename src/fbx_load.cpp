@@ -170,6 +170,9 @@ int loadFbx(Scene& s, const char* path, int matId, const Affine& xf,
 
         const bool haveN  = mesh->vertex_normal.exists;
         const bool haveUV = loadUV && mesh->vertex_uv.exists;
+        // An FBX colour LAYER, which is how DCC tools ship painted or baked vertex
+        // colour. ufbx normalises it to the same per-index addressing as uv/normal.
+        const bool haveVC = mesh->vertex_color.exists;
 
         for (size_t fi = 0; fi < mesh->faces.count; ++fi) {
             ufbx_face face = mesh->faces.data[fi];
@@ -211,6 +214,16 @@ int loadFbx(Scene& s, const char* path, int matId, const Affine& xf,
                         return Vec3{(double)uv.x, (double)uv.y, 0.0};
                     };
                     tri.uv0 = uvAt(ia); tri.uv1 = uvAt(ib); tri.uv2 = uvAt(ic);
+                }
+                if (haveVC) {
+                    tri.vcol = (int)(s.vertColors.size() / 3);
+                    for (uint32_t i : {ia, ib, ic}) {
+                        const ufbx_vec4 c = mesh->vertex_color[i];
+                        // FBX vertex colour is linear; alpha has nowhere to go.
+                        s.vertColors.push_back((float)(c.x < 0 ? 0 : c.x));
+                        s.vertColors.push_back((float)(c.y < 0 ? 0 : c.y));
+                        s.vertColors.push_back((float)(c.z < 0 ? 0 : c.z));
+                    }
                 }
                 s.tris.push_back(tri);
                 ++added;

@@ -5158,10 +5158,12 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
                                   const DBeamSpec* spec = nullptr) {
     if (!cs.beamCount || !(beta > 0)) return;
     // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
-    // 1e30-long box (host twin: Renderer::kBeamFarScale == 8).
+    // 1e30-long box (host twin: Renderer::kBeamFarScale == 8). Applied PER MEDIUM and only to
+    // the unbounded ones: a bounded medium's own clip is already finite, so the clamp could
+    // only cut a beam short of the region it must fill. See the host comment for the scene
+    // this was found on.
     const double farLimit = 8.0 * fmax(sc.sceneRadius, 1e-3);
-    const double dBeam = fmin((double)dLen, farLimit);
-    if (!(dBeam > 0.0)) return;
+    if (!((double)dLen > 0.0)) return;
     const double keep = cs.beamKeep;
     for (int i = 0; i < sc.mediaN; ++i) {
         const DMedium& md = sc.media[i];
@@ -5173,6 +5175,7 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
         // store. `iorN > 0` is the device's Medium::grin().
         if (md.iorN > 0) continue;
         double ta, tb;
+        const double dBeam = md.bounded ? (double)dLen : fmin((double)dLen, farLimit);
         if (!dMedClip(md, o, dir, 0.0, dBeam, ta, tb)) continue;
         if (!(tb > ta)) continue;
         if (keep < 1.0 && (double)rng.uniform() >= keep) continue;
@@ -14124,6 +14127,14 @@ static int deviceEmitterShapeCode(EmitterShape s) {
 }
 
 bool cudaForwardSupported(const Scene& scene) {
+    // PER-VERTEX COLOUR is not ported to the device yet. The pieces are all here — the
+    // device already carries the same Jakob-Hanika LUT and the same STOCH_HD
+    // stochJhCoeff for stochastic tiling — but DTri has no vcol index and dDiffuseRho
+    // does not multiply one in, so a GPU render of a vertex-coloured mesh would come out
+    // UNTINTED while the CPU render of the same scene is correct. A silent disagreement
+    // between backends is the one outcome worth refusing outright, so the scene falls
+    // back to the CPU instead. See VCOL-GPU in known-issues.md.
+    if (!scene.vertColors.empty()) return false;
     // Implicit surfaces (isosurface / CSG / metaballs) are now sphere-traced on the
     // device too (DImplicit + intersectImplicit); their materials are checked by the
     // same `unsupported()` gate as tri/sphere materials below.

@@ -1114,7 +1114,10 @@ struct Blas {
         double tMax = h.t;
         const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
         bvh.traverseClosest(lr, tmin, tMax, [&](int prim, double& tm) {
-            if (intersectTri(sh, lr, tris[prim], tmin, h)) { tm = h.t; found = true; }
+            // No vertex-colour table: a BLAS is a SHARED instanced asset with its own
+            // triangle array, so it would need its own table too. `mesh_asset` with
+            // vertex colours is the one path that drops them — see VCOL-BLAS.
+            if (intersectTri(sh, lr, tris[prim], tmin, h, nullptr)) { tm = h.t; found = true; }
         });
         return found;
     }
@@ -1122,7 +1125,7 @@ struct Blas {
         const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
         return bvh.traverseAny(lr, tmin, maxDist, [&](int prim) {
             Hit h; h.t = maxDist;
-            return intersectTri(sh, lr, tris[prim], tmin, h);
+            return intersectTri(sh, lr, tris[prim], tmin, h, nullptr);   // see above
         });
     }
 };
@@ -1184,6 +1187,11 @@ struct Scene {
     std::vector<Blas> blasList;        // shared instanced mesh assets (local space)
     std::vector<MeshInstance> instances; // placements of blasList into the world
     std::vector<MeshGroup> meshGroups;   // named mesh objects (for -check-watertight)
+    // Per-vertex COLOURS, three linear-RGB floats per entry, indexed by Tri::vcol (which
+    // names the first of the triangle's three consecutive entries). Empty for the
+    // overwhelming majority of scenes; see Tri::vcol for why this is a side table.
+    std::vector<float> vertColors;
+    const float* vcolData() const { return vertColors.empty() ? nullptr : vertColors.data(); }
     std::vector<Material> mats;
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)
@@ -2382,7 +2390,7 @@ struct Scene {
         const auto leaf = [&](int prim, double& tm) {
             if (prim < (int)nT)            { const Tri& t = tris[prim];
                                              if (hidden(t.matId)) return;
-                                             if (intersectTri(sh, r, t, tmin, h)) tm = h.t; }
+                                             if (intersectTri(sh, r, t, tmin, h, vcolData())) tm = h.t; }
             else if (prim < (int)(nT + nS)){ const Sphere& s = spheres[prim - nT];
                                              if (hidden(s.matId)) return;
                                              if (intersectSphere(r, s, tmin, h)) tm = h.t; }
@@ -2448,7 +2456,7 @@ struct Scene {
         return bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
             if (prim < (int)nT)             { const Tri& t = tris[prim];
-                                              return !hidden(t.matId) && intersectTri(sh, r, t, tmin, h); }
+                                              return !hidden(t.matId) && intersectTri(sh, r, t, tmin, h, vcolData()); }
             if (prim < (int)(nT + nS))      { const Sphere& s = spheres[prim - nT];
                                               return !hidden(s.matId) && intersectSphere(r, s, tmin, h); }
             if (prim < (int)(nT + nS + nI)) { const Implicit& im = implicits[prim - nT - nS];
@@ -2486,7 +2494,7 @@ struct Scene {
         const PatTables tabs = patTables();
         const auto leaf = [&](int prim) {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
+            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h, vcolData());
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
             if (prim < (int)(nT + nS + nI + nC)) {
@@ -2554,7 +2562,7 @@ struct Scene {
         int crossed = 0;
         const bool blocked = bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
+            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h, vcolData());
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI))
                 return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
@@ -2664,7 +2672,7 @@ struct Scene {
     Hit closestHitLinear(const Ray& r, double tmin = 1e-6) const {
         Hit h;
         const TriShear sh = makeTriShear(r.d);
-        for (const auto& t : tris)     intersectTri(sh, r, t, tmin, h);
+        for (const auto& t : tris)     intersectTri(sh, r, t, tmin, h, vcolData());
         for (const auto& s : spheres)  intersectSphere(r, s, tmin, h);
         const PatTables tabs = patTables();
         for (const auto& im : implicits) intersectImplicit(r, im, tmin, h, &tabs);
@@ -2911,6 +2919,34 @@ inline double reflectSlot(const Scene& scene, const Material& m,
     return m.reflectPat < 0 ? v : v * reflectPatMul(scene, m, h);
 }
 
+// Spectral reflectance of a hit's interpolated VERTEX COLOUR, at one wavelength.
+//
+// The file gave RGB and the tracer needs reflect(lambda), so this is the RGB -> spectrum
+// lift every other colour in ftrace already goes through — the difference being that the
+// colour here exists at no vertex and no texel. It is invented per hit by the barycentric
+// blend, so the usual answer (fit it once at load, like an FTSL `rgb` or a texture's
+// texels) has nothing to attach itself to.
+//
+// That is the same predicament stochastic tiling is in — it blends three crops and then
+// owes the renderer a spectrum for a colour nobody authored — and it is already solved:
+// upsample::coeffLut() tabulates the Jakob-Hanika sigmoid coefficients over the RGB cube
+// on a sqrt-warped grid, and stochJhCoeff does the trilinear lookup. Reusing it means
+//
+//   * the COLOUR is what gets interpolated across the face, which is the quantity that
+//     actually varies linearly there — interpolating pre-fitted coefficients instead
+//     would be an approximation, and a worse one near black where they move fastest;
+//   * nothing is fitted at load, so a 2 M-vertex scan costs no Gauss-Newton at all;
+//   * the GPU tracer needs no separate path, since stochJhCoeff is STOCH_HD and the
+//     device already carries the same table for tiling.
+//
+// Accuracy is the table's, measured in upsample.h: mean |dR| 1.4e-4, worst 4.3e-3.
+inline double vertexColorReflectance(const Hit& h, double lambda) {
+    double c[3];
+    stochJhCoeff(upsample::coeffLut().data(), h.vcolR, h.vcolG, h.vcolB, c);
+    const std::array<double, 3> cc{c[0], c[1], c[2]};
+    return upsample::reflAt(cc, lambda);
+}
+
 // Diffuse albedo at a hit: a bound parametric record (highest priority), else the
 // material's spatially-varying texture reflectance if one is bound (Phase 3b), else
 // its constant `reflect` spectrum — and then scaled by a bound reflect pattern, which
@@ -2929,6 +2965,11 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
             rv = m.reflect(lambda);
         }
     }
+    // Vertex colour MULTIPLIES the material's albedo, which is glTF's rule for COLOR_0
+    // and degrades sensibly everywhere else: against a white material it IS the vertex
+    // colour, and against a tinted one it tints further rather than overriding what the
+    // scene asked for.
+    if (h.hasVcol) rv *= vertexColorReflectance(h, lambda);
     return m.reflectPat < 0 ? rv : rv * reflectPatMul(scene, m, h);
 }
 

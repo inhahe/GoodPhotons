@@ -112,6 +112,13 @@ struct PTri : PShade {
     // UV parameterisation is degenerate/absent — the shade pass then falls back to a
     // stable frame about the shading normal, exactly as the old per-pixel path did.
     Vec3 tanRaw{0, 0, 0};
+    // Per-vertex COLOUR (linear RGB), or hasVcol=false. The rasterizer is an RGB pipeline,
+    // so it consumes the mesh's vertex colours directly — no Jakob-Hanika lift, which is
+    // the whole reason Scene::vertColors stores RGB rather than fitted coefficients: the
+    // two backends want different things from the same numbers, and RGB is what both can
+    // start from.
+    bool hasVcol = false;
+    Vec3 vc0{1, 1, 1}, vc1{1, 1, 1}, vc2{1, 1, 1};
 };
 
 // Tessellated preview geometry plus the side tables its triangles index. Bundled so the
@@ -380,7 +387,13 @@ inline void stripColor(PreviewGeom& g, const Vec3& neutral = Vec3{0.72, 0.72, 0.
         s.emitPat        = -1;
         s.normalTex      = -1;
     };
-    for (PTri& t : g.tris) flatten(t);
+    for (PTri& t : g.tris) {
+        flatten(t);
+        // A per-vertex colour is a colour like any other: leaving it multiplied in would
+        // let a vertex-coloured scan keep its tint with "Color" off, which is exactly the
+        // question the toggle exists to answer.
+        t.hasVcol = false;
+    }
     for (PMix& m : g.mixes) {
         // Both children are now the same colour, so the mask decides nothing; dropping it
         // also spares the shade pass a per-pixel pattern/texture evaluation per hit.
@@ -513,6 +526,13 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         p.n0 = t.n0; p.n1 = t.n1; p.n2 = t.n2;
         applyMat(p, t.matId);
         p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;
+        if (t.vcol >= 0 && (size_t)t.vcol * 3 + 8 < sc.vertColors.size() + 1) {
+            const float* c = sc.vertColors.data() + (size_t)t.vcol * 3;
+            p.hasVcol = true;
+            p.vc0 = Vec3{c[0], c[1], c[2]};
+            p.vc1 = Vec3{c[3], c[4], c[5]};
+            p.vc2 = Vec3{c[6], c[7], c[8]};
+        }
         out.push_back(p);
     }
 
@@ -866,6 +886,10 @@ struct VtxScreen {
 // near-plane clipping happen a single time per triangle instead of once per thread.
 struct STri {
     VtxScreen v0, v1, v2;
+    // NB the vertex COLOURS are read from the source PTri in the raster pass rather than
+    // copied here: STri is written once per visible triangle per frame and read by every
+    // covered scanline, so it stays as small as the `src` indirection allows (the same
+    // reason it holds `src` instead of a copy of the shading attributes).
     // Index of the SOURCE PTri rather than a copy of its shading attributes. The shade
     // pass is deferred, so it can fetch colour / texture / pattern / normal-map bindings
     // straight from tris[src] for the one winning fragment. That keeps the rasterizer's
@@ -877,6 +901,7 @@ struct STri {
     bool   needUV;     // interpolate UVs for this triangle (a skin, pattern or normal map reads them)
     bool   emissive;
     bool   clear;      // see-through transmissive surface (handled by the clear-accumulation pass)
+    bool   vcol;       // interpolate this triangle's per-vertex colour into the albedo
     int    iy0, iy1;   // inclusive pixel-row span the triangle can touch
 };
 
@@ -889,6 +914,11 @@ struct GBuffer {
     std::vector<int>     tri;     // index of the winning source PTri, or -1 (background)
     std::vector<uint8_t> emis;    // 1 where the winning triangle is an emitter
     std::vector<Vec3>    uv;      // interpolated texture coords of the winning surface
+    // Interpolated per-vertex colour. Left EMPTY (and untouched by the raster pass)
+    // unless the tessellation actually contains a vertex-coloured triangle, so a scene
+    // without any pays neither the 24 B/pixel nor the per-pixel write — which is why
+    // this is a separate channel rather than another field on a fat per-pixel struct.
+    std::vector<Vec3>    vcol;
 };
 
 // A persistent band pool: N workers that sleep on a condition variable and execute one
@@ -1037,7 +1067,8 @@ inline EdgeFn makeEdge(double Px, double Py, double Qx, double Qy, double s) {
 // Only geometry/albedo is stored here — shading is deferred to a single later pass so
 // each covered pixel is shaded exactly once regardless of overdraw. Attributes are
 // interpolated perspective-correctly via invd.
-inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& g) {
+inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& g,
+                          const PTri* srcTris = nullptr) {
     const VtxScreen& A = t.v0; const VtxScreen& B = t.v1; const VtxScreen& C = t.v2;
     double minx = std::floor(std::min({A.sx, B.sx, C.sx}));
     double maxx = std::ceil (std::max({A.sx, B.sx, C.sx}));
@@ -1057,6 +1088,11 @@ inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& 
     const EdgeFn E1 = makeEdge(C.sx, C.sy, A.sx, A.sy, s);
     const EdgeFn E2 = makeEdge(A.sx, A.sy, B.sx, B.sy, s);
     const uint8_t triEmis = t.emissive ? 1 : 0;
+    // Vertex colour is read off the source PTri once per triangle, not per pixel.
+    const bool wantVcol = t.vcol && srcTris && !g.vcol.empty();
+    const Vec3 C0 = wantVcol ? srcTris[t.src].vc0 : Vec3{1, 1, 1};
+    const Vec3 C1 = wantVcol ? srcTris[t.src].vc1 : Vec3{1, 1, 1};
+    const Vec3 C2 = wantVcol ? srcTris[t.src].vc2 : Vec3{1, 1, 1};
     for (int y = ylo; y <= yhi; ++y) {
         const double py = y + 0.5;
         const double r0 = E0.dx * (py - E0.Py);   // row constants: identical for both sharers
@@ -1083,6 +1119,8 @@ inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& 
             g.tri[row]   = t.src;
             if (t.needUV)
                 g.uv[row] = (A.uv * (w0 * A.invd) + B.uv * (w1 * B.invd) + C.uv * (w2 * C.invd)) * d;
+            if (wantVcol)
+                g.vcol[row] = (C0 * (w0 * A.invd) + C1 * (w1 * B.invd) + C2 * (w2 * C.invd)) * d;
         }
     }
 }
@@ -1555,7 +1593,8 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
             int iy0 = std::max(0, (int)std::floor(lo));
             int iy1 = std::min(H - 1, (int)std::ceil(hi));
             if (iy0 > iy1) return;
-            out.push_back(STri{s0, s1, s2, src, needUV, emis, clr, iy0, iy1});
+            out.push_back(STri{s0, s1, s2, src, needUV, emis, clr,
+                               tris[(size_t)src].hasVcol, iy0, iy1});
         };
         for (size_t ti = a; ti < b; ++ti) {
             const PTri& t = tris[ti];
@@ -1683,14 +1722,27 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     g.tri.resize(N);
     g.emis.resize(N);
     g.uv.resize(N);
+    // The vertex-colour channel is allocated only when the geometry has one, so a scene
+    // without vertex colours pays nothing for the feature: no buffer, no per-pixel write,
+    // and the shade pass's `g.vcol.empty()` test folds away to a single predictable branch.
+    {
+        bool anyVcol = false;
+        for (const PTri& t : tris) if (t.hasVcol) { anyVcol = true; break; }
+        if (anyVcol) { g.vcol.resize(N); }
+        else if (!g.vcol.empty()) g.vcol.clear();     // scratch is reused across frames
+    }
     parallelFor(N, [&](size_t a, size_t b) {
         std::fill(g.zbuf.begin() + a, g.zbuf.begin() + b, 0.0f);
     });
+    if (!g.vcol.empty())
+        parallelFor(N, [&](size_t a, size_t b) {
+            std::fill(g.vcol.begin() + a, g.vcol.begin() + b, Vec3{1, 1, 1});
+        });
     dispatchBands([&](int y0, int y1) {
         for (const STri& s : stris) {
             if (s.iy1 < y0 || s.iy0 >= y1) continue;   // triangle can't touch this band
             if (seeThrough && s.clear) continue;       // clear surfaces handled in Pass 2b
-            fillTriangleG(s, W, H, y0, y1, g);
+            fillTriangleG(s, W, H, y0, y1, g, tris.data());
         }
     });
 
@@ -1794,6 +1846,12 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     double p = scenePtr->patterns[slot].eval(ctx());
                     col = col * (p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p));
                 }
+            }
+            // Per-vertex colour multiplies the material albedo, the same rule the
+            // spectral path uses in diffuseReflectance (and glTF's rule for COLOR_0).
+            if (!g.vcol.empty()) {
+                const Vec3& vc = g.vcol[i];
+                col = Vec3{col.x * vc.x, col.y * vc.y, col.z * vc.z};
             }
             if (g.emis[i]) { accum[i] = col * EMIS_BOOST; continue; }  // raw emitter radiance
             // No two-sided flip here: it is decided ONCE PER TRIANGLE at projection time
