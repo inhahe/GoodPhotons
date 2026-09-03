@@ -25,7 +25,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
-| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). CPU only so far; it traces its own light subpaths for the beam map (0.216.0), but the merges are **not yet MIS-weighted**, so they double-count | `bdpt.h` + `beamgather.h` + `photonbeams.h` |
+| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). CPU only so far; it traces its own light subpaths for the beam map (0.216.0) and both techniques are MIS-weighted (0.218.0), with merged paths capped at `maxDepth` like the connections (0.219.0). Correct, but **not yet faster than `D`** — see UPBP-CONV | `bdpt.h` + `beamgather.h` + `photonbeams.h` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
 | `-raster` | z-buffer preview rasterizer + interactive fly viewer (`-explore`) | `raster.h`, `raster_cuda.cu` |
 
@@ -401,11 +401,21 @@ thing to remember when a mode-`J` image stops improving.
 two are *identical*, for ~25× the time. That is the expected result on this scene and not a
 failure of the weights: `_fog_cornell` is a thin fog whose scattering points the camera's
 free-flight sampling reaches easily, so the connections were never starved and there is nothing
-for the merges to rescue. UPBP pays where distance sampling *cannot* reach — an optically thick
-or indirectly-lit medium — which is what `gallery_rain` is for and what the remaining gate
-measures. Mode `J` also inherits the beam×ray estimator's `1/sin(theta)` tail, so its peak pixel
-is ~1.9× mode `D`'s on the same scene: brighter fireflies, in exchange for reaching paths mode
-`D` cannot.
+for the merges to rescue. Mode `J` also inherits the beam×ray estimator's `1/sin(theta)` tail, so
+its peak pixel is ~1.9× mode `D`'s on the same scene: brighter fireflies, in exchange for reaching
+paths mode `D` cannot.
+
+**And on a thick medium (0.219.1) — the merges work, the estimator is too expensive.** Measured on
+`scenes/_fog_thick.ftsl` (`sigma_t 20 / albedo 0.95`) against a converged mode-`D` reference, mode
+`J`'s **per-sample** variance is **2.4–8.8× lower** than mode `D`'s, and the margin *grows* with
+`-n` — which is the signature of the merges genuinely reaching paths the connections cannot, i.e.
+the feature doing its job. It still loses at equal time by ~19×, purely because a sample costs
+45–250× more: the auto-tuned radius has a probe ray gather **252 beams** per camera segment, and
+cost scales exactly linearly with that count. The MIS weight is *not* the expense — hoisting its
+per-ray work into `TrRay` bought 1.5 % — it is the beam×ray estimator's own two transmittance
+marches per surviving hit, which mode `M` pays identically. The lever that remains is therefore
+the **GPU port**, where mode `M`'s CUDA beam gather is the template; see UPBP-CONV in
+`known-issues.md` for the tables.
 
 ## Module map (src/)
 

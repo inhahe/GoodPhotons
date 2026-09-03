@@ -234,11 +234,16 @@ argument for standing a groom in a hall of polished objects.*
   limit of the representation, refused identically on both backends and per medium, so an
   ordinary fog elsewhere in a GRIN scene still works.) See
   [Mode `M` and participating media](REFERENCE.md#mode-m-and-participating-media---beams).
-- **UPBP (mode `J`) — BDPT paths and photon beams under one MIS weight** *(complete as of
-  0.218.0 on the CPU: both estimators run and both are MIS-weighted, so a mode-`J` image is a
-  correct estimate of the same integral mode `D` estimates — `J/D` mean **1.0006** on
-  `_fog_cornell`, against **2.0374** while the weights were still missing. Still CPU-only, and
-  its beam map is sized by `-n` with no trim.)* Mode
+- **UPBP (mode `J`) — BDPT paths and photon beams under one MIS weight** *(correct as of
+  0.219.0 on the CPU: both estimators run, both are MIS-weighted, and merged paths obey the
+  same `-depth` cap the connections do, so a mode-`J` image is a correct estimate of the same
+  integral mode `D` estimates — `J/D` mean **1.0006** on `_fog_cornell` and **0.9973** on the
+  thick `_fog_thick`, against **2.0374** and **1.654** before the weights and the depth cap.
+  It is not yet a **win**, though: per sample its variance is **2.4–8.8× lower** than mode
+  `D`'s and the margin grows with `-n` — the merges really do reach paths the connections
+  cannot — but a sample costs 45–250× more, so at equal time it loses by ~19×. The remaining
+  lever is the GPU port; see [known-issues.md](known-issues.md) → UPBP-CONV. Still CPU-only,
+  and its beam map is sized by `-n` with no trim.)* Mode
   `D` and mode `M -beams` each solve half of a thick-medium scene and fail where the other
   succeeds: a BDPT connection needs the camera's free-flight distance sampling to *reach*
   the scattering point, which deep inside an optically thick medium it essentially never
