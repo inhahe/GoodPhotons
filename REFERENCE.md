@@ -786,6 +786,29 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > control (`-mode`, `-n`, `-time`, `-noise`, `-forever`, `-device`, `-camera`,
 > `-view`, an explicit `-o`/`-r`, etc.) opts out of the auto-preview and renders
 > normally; `-in <path>` is likewise always an explicit render, never a preview.
+>
+> **A bare *mesh* (`ftrace model.glb`) does the same thing, but yields less
+> readily.** The mesh quick-viewer is *fundamentally* a preview — there is no
+> authored scene to render "properly" — so presentation flags do **not** opt it
+> out: `ftrace model.glb -window -o look.png -r 900` is still a raster preview.
+> Only a genuine light-transport request does (`-mode`, `-n`, `-time`, `-noise`,
+> `-forever`, `-preview`, `-spp`, `-device`, `-savemap`, `-loadmap`,
+> `-wavefront`).
+>
+> When that happens ftrace **says so**, because the opt-out is otherwise silent and
+> surprising — it has just announced `[viewer] quick-view scene for mesh …` and then
+> shows nothing:
+>
+> ```
+> [viewer] -n asks for a real render, so the quick preview window is off;
+>          add -window-min -keepwindow to watch it converge
+> ```
+>
+> The named flag is the one that actually triggered it, and the suggested flags work
+> on the real-render path exactly as they do anywhere else. Such a render also names
+> its output after the **input** (`compote_with_gems.ppm`) rather than falling back to
+> `cornell.ppm`, the built-in Cornell box's default — a run with no Cornell box in it
+> should not leave a file named after one.
 
 ### Speed / accuracy / ability tradeoffs
 

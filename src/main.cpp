@@ -18022,10 +18022,13 @@ static int run(int argc, char** argv) {
             "-savemap","-loadmap","-wavefront"
         };
         bool explicitControl = false;
+        const char* controlFlag = nullptr;   // which one, so the hint below can name it
         auto scan = [&](const char* const* flags, size_t nflags) {
             for (int i = 1; i < argc && !explicitControl; ++i)
                 for (size_t k = 0; k < nflags; ++k)
-                    if (!std::strcmp(argv[i], flags[k])) { explicitControl = true; break; }
+                    if (!std::strcmp(argv[i], flags[k])) {
+                        explicitControl = true; controlFlag = flags[k]; break;
+                    }
         };
         if (positionalMesh) scan(kMeshRenderFlags, sizeof(kMeshRenderFlags)/sizeof(*kMeshRenderFlags));
         else                scan(kSceneRenderFlags, sizeof(kSceneRenderFlags)/sizeof(*kSceneRenderFlags));
@@ -18047,6 +18050,28 @@ static int run(int argc, char** argv) {
                 if (dot != std::string::npos) base = base.substr(0, dot);
                 static std::string previewOut = std::string(tmp) + "/ftrace_preview_" + base + ".png";
                 out = previewOut.c_str();
+            }
+        } else {
+            // The user asked for a real render, so the auto-preview steps aside -- but it
+            // has just printed "[viewer] quick-view scene for mesh ...", and then shows
+            // nothing. Say which flag turned the window off and how to get it back, at the
+            // exact moment the expectation is broken.
+            if (!g_showWindow)
+                std::printf("[viewer] %s asks for a real render, so the quick preview window "
+                            "is off; add -window-min -keepwindow to watch it converge\n",
+                            controlFlag ? controlFlag : "a render-control flag");
+            // ...and don't drop a `cornell.ppm` either. That is the BUILT-IN Cornell box's
+            // output name, and nothing named cornell is anywhere in this run: rendering
+            // `compote_with_gems.glb` should not leave a file named after a different
+            // scene. The preview path above already refuses to; so should this one.
+            if (!std::strcmp(out, "cornell.ppm")) {
+                std::string base = inFile;
+                size_t slash = base.find_last_of("/\\");
+                if (slash != std::string::npos) base = base.substr(slash + 1);
+                size_t dot = base.find_last_of('.');
+                if (dot != std::string::npos) base = base.substr(0, dot);
+                static std::string renderOut = base + ".ppm";
+                out = renderOut.c_str();
             }
         }
     }
