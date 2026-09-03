@@ -394,10 +394,68 @@ plumbing:**
    `spd(λ)·invPdfLambda` off the scene-wide emission sampler. So mode `J` is chroma-noisier than
    mode `M` at equal `-n`. The second "must not forget" bullet (the `cieA` fold) is therefore moot
    for mode `J`'s own beams, but still applies to anything reading a mode-`M` map.
-2. **MIS partition of unity.** Instrument the weights directly: for a sampled path, sum the
-   weights of every technique that could have generated it and assert it equals 1. This tests
-   the weights *independently of the image*, which is the only way to localise an energy bug
-   rather than merely observe one.
+2. **MIS partition of unity** — *superseded, then built and passed as the absolute-form
+   cross-check (2026-09-02, v0.217.0).* The original wording ("for a sampled path, sum the
+   weights of every technique that could have generated it and assert it equals 1") **cannot
+   fail**, for the two reasons argued above, so it was replaced by the second-implementation
+   design and that is what shipped, behind **`-misaudit`**:
+
+   * **`bdpt::misWeightReference`** (`bdpt.h`) computes each strategy's path density
+     **outright** and divides, sharing no arithmetic with `misWeight`'s ratio loops. It builds
+     the unified light-to-camera path `x[0..n-1]` (`x[i] = light[i]` for `i < s`, `eye[n-1-i]`
+     after), gives each vertex **both** densities — `pl[i]` if generated walking from the
+     light, `pc[i]` if from the camera, which is `pdfFwd`/`pdfRev` with the roles **swapped on
+     the eye half**, since "forward" there means camera-to-light — and forms
+     `p_j = prod_{i<j} pl[i] * prod_{i>=j} pc[i]`, `w_j = p_j / sum_k p_k`. Products over a
+     dozen area densities overflow doubles in both directions, so the sum is done in **logs**
+     via prefix/suffix arrays, normalised by `p_s`. Same per-factor `remap0`, same exclusions
+     (strategy `j` needs both ends of the edge `x[j-1]--x[j]` non-delta; `j == 0` additionally
+     needs a non-delta light).
+   * It is called **from inside `misWeight`**, while the `ScopedAssign` patches are still
+     installed, so both forms read identical densities. The densities are not what is under
+     test — the **combination arithmetic** is, which is where the index bugs live.
+   * The enumerations were also checked by hand and agree exactly: `misWeight`'s camera loop
+     index `i` is `j = n - i`, covering `[s+1, n-1]`; its light loop index `i` is `j = i`,
+     covering `[0, s-1]`; plus the current `j = s`. Together `[0, n-1]`, with the delta
+     exclusions landing on the same edges.
+
+   **Results (`_fog_cornell.ftsl`, `-device cpu`, v0.217.0):**
+
+   | Run | Weights checked | Disagreed > 1e-9 | Worst relative difference |
+   |---|---|---|---|
+   | `-mode D -r 96 -spp 2 -misaudit` | 276 198 | **0** | 2.753e-14 (at `s=9, t=1`) |
+   | `-mode J -r 64 -spp 1 -n 50000 -misaudit` | 62 086 | **0** | 5.177e-15 (at `s=7, t=2`) |
+   | `-mode D -r 96 -spp 2 -misaudit-poison` | 276 198 | **213 566** | 1.000e+00 (at `s=6, t=3`) |
+
+   The worst clean difference lands on the **longest** subpath in each run (`s=9`, `s=7`),
+   which is where the largest accumulated floating-point rounding should be — the residual
+   behaves like arithmetic noise rather than like a bug. The poisoned run checks the *same*
+   276 198 weights, which is the evidence that the hook itself is unchanged and it is only
+   the reference that moved; 77 % of them disagree, at up to a **relative difference of 1**.
+   The 23 % that still agree under poison are the paths the poison cannot discriminate
+   (`pdfFwd == pdfRev` on the eye half, or only one strategy allowed so `w = 1` either way) —
+   expected, and the reason the control asserts "some disagreements" rather than "all".
+
+   Re-running the clean audit on the poison-*capable* binary reproduces 276 198 / 0 /
+   2.753e-14 exactly, so the added branch is inert when the flag is off. And the poisoned
+   render is `cmp`-identical to the clean one — the reference weight is *observed*, never
+   used, so even a deliberately wrong one cannot move a pixel.
+
+   **The negative control, and why it is a shipped flag rather than a reverted patch.** A
+   cross-check that has only ever agreed is equally consistent with "both forms are right" and
+   "the check is vacuous" — a hook that never runs, a mistyped tolerance, a reference that
+   accidentally recomputes the thing it audits. So **`-misaudit-poison`** injects exactly the
+   class of bug the gate exists to catch (it omits the eye-half density swap) and the run
+   **must** report disagreements; if it reports none, `main.cpp` prints `FAILED: the poisoned
+   reference agreed anyway ... its clean runs prove nothing`. Keeping it in the binary rather
+   than reverting it after one use means the control is re-runnable — Phase 3b will want it
+   again the moment merge strategies enter the weight, and that is precisely when a silently
+   vacuous audit would be most expensive.
+
+   **What this does *not* yet cover:** merge strategies. Gate (2) is currently a statement
+   about the connection half only, which is the whole point of running it before Phase 3b —
+   it establishes that the reference reproduces `misWeight` on paths whose weights are already
+   known good, so that when the merge terms are added, a disagreement can only be the new code.
 3. **Analytic slab.** One homogeneous medium, isotropic phase, one area light — single-scatter
    radiance has a closed form. UPBP's mean must match it.
 4. **Mode `D` agreement.** Converged `D` vs converged UPBP on **`scenes/_fog_cornell.ftsl`**

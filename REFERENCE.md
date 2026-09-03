@@ -4789,7 +4789,8 @@ alone can't restore, so they are not disk-resumable.
 `-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checkprefer`, `-checkpaths`,
 `-checksdf`, `-checksun`, `-checkbind`, `-checkprop`, `-checkhair`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
-`PASS`/`FAIL`. `-checkpaths` guards **asset path resolution** (see *Where asset paths
+`PASS`/`FAIL`. (`-misaudit` / `-misaudit-poison`, described at the end of this section, are
+also diagnostics but need a scene — they instrument a live render's MIS weights.) `-checkpaths` guards **asset path resolution** (see *Where asset paths
 are looked for*): it builds a throwaway project tree in the temp directory, `cd`s
 somewhere unrelated, and asserts that a scene loads from there with its texture found
 via the scene's *parent* directory, that an absolute path is returned unchanged, that an
@@ -4903,6 +4904,22 @@ noise for a device mismatch to hide behind, and these helpers are pure
 integer-and-`double` arithmetic on both sides, so unlike a rendered image they must
 agree to the last bit — a CUDA build compares them directly, a CPU-only build reports
 that half as `SKIPPED`.
+
+**`-misaudit` / `-misaudit-poison`** are different in kind from the `-check*` family: they
+need a scene, because they instrument a real render. `-misaudit` cross-checks **every CPU
+bidirectional MIS weight** (mode `D -device cpu`, and mode `J`) against a second,
+independently written implementation of the balance heuristic. The shipping one is PBRT's
+*relative* form — it never builds a path density, only ratios, telescoped one vertex at a
+time — so an off-by-one in a ratio loop yields a plausible weight rather than a crash. The
+reference computes each strategy's path density **outright** and divides, summing in logs
+because the products overflow doubles in both directions. At the end of the run ftrace
+prints how many weights were checked, how many disagreed by more than `1e-9`, and the worst
+relative difference with the `(s, t)` it occurred at. It changes no pixel; it only costs
+time. **`-misaudit-poison`** is the negative control: it breaks the reference on purpose
+(omitting the density swap that the eye half needs, since a camera-side subpath is walked
+against the unified path's direction), so the run **must** report disagreements — if it
+does not, the audit is vacuous and ftrace says so in as many words. Run it whenever you
+have reason to doubt that the clean runs mean anything.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are

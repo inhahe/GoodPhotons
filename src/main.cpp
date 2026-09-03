@@ -12382,6 +12382,11 @@ static bool g_beamGather = false;
 // which is exactly what validation gate (1) needs to assert "J minus beams == D".
 static bool g_noBeams = false;
 
+// `-misaudit`: run bdpt.h's absolute-form reference MIS weight alongside the shipping
+// relative-form one and report the largest disagreement. Validation harness, not a
+// rendering option — it never changes a pixel, only what gets printed at the end.
+static bool g_misAudit = false;
+
 #ifdef _WIN32
 // The console's ORIGINAL output code page, kept so it can be put back. The setting is
 // process-wide but the CONSOLE OUTLIVES THE PROCESS, so leaving it switched would quietly
@@ -17369,6 +17374,23 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
         else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) { g_beamGather = true; g_noBeams = false; }
         else if (!std::strcmp(argv[i], "-nobeams") || !std::strcmp(argv[i], "-no-beams")) { g_noBeams = true; g_beamGather = false; }
+        // Gate (2) of the UPBP plan: cross-check every CPU-BDPT MIS weight against an
+        // independently written absolute-form one (see bdpt.h). Validation only — it makes
+        // the weight several times more expensive and changes no pixel.
+        else if (!std::strcmp(argv[i], "-misaudit")) {
+            g_misAudit = true;
+            bdpt::misaudit::reset();                 // -serve re-parses per frame
+            bdpt::misaudit::enabled.store(true);
+        }
+        // The audit's NEGATIVE CONTROL: break the reference weight on purpose, so the alarm
+        // can be watched to fire. A run with this MUST report disagreements — if it reports
+        // none, the audit is not testing anything and its clean runs mean nothing either.
+        else if (!std::strcmp(argv[i], "-misaudit-poison")) {
+            g_misAudit = true;
+            bdpt::misaudit::reset();
+            bdpt::misaudit::enabled.store(true);
+            bdpt::misaudit::poison.store(true);
+        }
         // Highest scattering order the beam paths carry. 0 = unlimited (the default), 1 =
         // single scatter (the pre-0.199.0 behaviour, bit-identical). `-beams-single` is the
         // spelling you reach for when you want the old crisp-bow look back.
@@ -21969,6 +21991,30 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "error: %s\n", e.what());
         rc = 1;
         noteFinishReason("stopped by an error");
+    }
+    // Gate (2) verdict. Printed here rather than in the render driver so it survives every
+    // exit path a render can take (budget reached, -stop, an exception), and so a run that
+    // audited zero weights says so instead of silently looking like a pass.
+    if (g_misAudit) {
+        const long long nChk = bdpt::misaudit::nChecked.load();
+        const long long nBad = bdpt::misaudit::nBad.load();
+        const double    wrst = bdpt::misaudit::worst.load();
+        const bool poisoned = bdpt::misaudit::poison.load();
+        std::printf("[misaudit]%s %lld MIS weights cross-checked against the absolute form: "
+                    "%lld disagreed by more than %.0e; worst relative difference %.3e",
+                    poisoned ? " (POISONED reference — disagreements are the PASS)" : "",
+                    nChk, nBad, bdpt::misaudit::kTol, wrst);
+        if (wrst > 0.0)
+            std::printf(" (at s=%d, t=%d)", bdpt::misaudit::worstS.load(),
+                        bdpt::misaudit::worstT.load());
+        std::printf(".\n");
+        if (nChk == 0)
+            std::printf("[misaudit] NOTHING WAS CHECKED — the audit only instruments the CPU "
+                        "BDPT weight, so it needs -mode D -device cpu or -mode J.\n");
+        else if (poisoned && nBad == 0)
+            std::printf("[misaudit] FAILED: the poisoned reference agreed anyway, so the audit "
+                        "is vacuous and its clean runs prove nothing. Fix the harness.\n");
+        std::fflush(stdout);
     }
     // Say so in the title bar. Rendering is over the moment run() returns, whether the
     // window is about to be torn down or (with -keepwindow) held open for inspection —

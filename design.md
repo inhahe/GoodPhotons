@@ -256,6 +256,45 @@ what Phase 3a had to give up — so this is the resource that will bite first on
 Phase 3b may reinstate an *exact uniform* trim, whose single global keep fraction is a constant
 that folds cleanly into `n_m` and stays readable by the weight.
 
+### Gate (2) — a second MIS weight, and a flag that breaks it on purpose (0.217.0)
+
+`misWeight` is PBRT's **relative** form: it never builds a path density, only the ratios
+`p_j/p_s`, telescoped one vertex at a time. That is where all the index arithmetic lives, and
+an off-by-one there yields a plausible weight rather than a crash — so it wants an audit. The
+obvious one ("sum every strategy's weight, assert 1") **cannot fail**: within a call the result
+is `r_c/(1+Σr)` by construction, and across calls you are summing weights of *different* paths.
+
+`bdpt::misWeightReference` is the audit that can. It computes each strategy's density
+**outright** and divides, sharing no arithmetic with the ratio loops: build the unified
+light-to-camera path `x[0..n-1]`, give each vertex both `pl[i]` (density if walked from the
+light) and `pc[i]` (if from the camera) — `pdfFwd`/`pdfRev` with the roles **swapped on the eye
+half**, since "forward" there means camera-to-light — then
+`p_j = Π_{i<j} pl[i] · Π_{i≥j} pc[i]`. The products overflow doubles in both directions over a
+dozen area densities, so it sums in logs via prefix/suffix arrays normalised by `p_s`. It runs
+*inside* `misWeight`, with the `ScopedAssign`s still installed, so both forms read identical
+densities: the densities are not under test, the combination arithmetic is.
+
+**`-misaudit` reports; `-misaudit-poison` is the negative control.** A cross-check that has only
+ever agreed is equally consistent with "both are right" and "the check is vacuous" — a hook that
+never fires, a mistyped tolerance. So the poison flag injects exactly the bug the gate exists to
+catch (it omits the eye-half swap) and the run **must** disagree; if it doesn't, ftrace prints
+`FAILED: the poisoned reference agreed anyway ... its clean runs prove nothing`. It ships rather
+than being reverted after one use, because Phase 3b will want it again the moment merge
+strategies enter the weight — which is when a vacuous audit would cost the most.
+
+| Run (`_fog_cornell`, `-device cpu`) | Checked | Disagreed | Worst rel. diff |
+|---|---|---|---|
+| `-mode D -r 96 -spp 2 -misaudit` | 276 198 | **0** | 2.753e-14 (`s=9,t=1`) |
+| `-mode J -r 64 -spp 1 -n 50000 -misaudit` | 62 086 | **0** | 5.177e-15 (`s=7,t=2`) |
+| `-mode D -r 96 -spp 2 -misaudit-poison` | 276 198 | **213 566** | 1.000e+00 (`s=6,t=3`) |
+
+The clean residual peaks on the *longest* subpath in each run, which is where accumulated
+rounding should peak. The poisoned run checks the same 276 198 weights — evidence the hook is
+unchanged and only the reference moved — and its render is `cmp`-identical to the clean one,
+since the reference weight is observed and never used. Gate (2) currently certifies the
+**connection half only**; that is the point of running it before Phase 3b, so that a later
+disagreement can only be the new merge code.
+
 ## Module map (src/)
 
 - **`main.cpp`** (~6200) — CLI parsing (the option table is a chain of `else if`s split

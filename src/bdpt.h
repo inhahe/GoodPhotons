@@ -1410,6 +1410,132 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     bm.nDeposited = bm.beams.size();
 }
 
+// --- Gate (2): an independent, ABSOLUTE-form balance heuristic -------------------
+// `misWeight` below is PBRT's RELATIVE form: it never builds a path density, only the
+// ratios p_j/p_s, accumulated by telescoping one vertex at a time. That is fast and it
+// is what ships — but it is also where the index arithmetic lives, and an off-by-one in
+// a ratio loop produces a plausible-looking weight rather than a crash.
+//
+// The obvious audit — "sum the weights of every strategy and assert 1" — CANNOT FAIL and
+// so proves nothing. Within a single call the returned weight is r_c/(1 + sum r) by
+// construction, and summing across calls sums weights belonging to *different sampled
+// paths*. See the UPBP entry in known-issues.md for the full argument.
+//
+// So this is the real check: a second implementation that computes each strategy's path
+// density OUTRIGHT and divides, sharing no arithmetic with the ratio loops.
+//
+//     unified path  x[0..n-1], light-to-camera:   x[i] = light[i]        for i < s
+//                                                 x[i] = eye[n-1-i]      for i >= s
+//     each vertex carries BOTH directions:        pl[i] = density generating x[i]
+//                                                         while walking FROM THE LIGHT
+//                                                 pc[i] = ... FROM THE CAMERA
+//     (which is pdfFwd/pdfRev with the roles swapped on the eye half, because "forward"
+//      on an eye subpath means camera-to-light)
+//
+//     strategy j (j light vertices, n-j camera vertices):
+//         p_j = prod_{i<j} pl[i] * prod_{i>=j} pc[i]
+//         w_j = p_j / sum_k p_k
+//
+// Products over a dozen area densities overflow doubles in both directions, so the sum
+// is done in logs. The same `remap0` (0 -> 1) is applied per FACTOR, matching what the
+// ratio form does per factor, and the same strategies are excluded: strategy j needs the
+// edge x[j-1]--x[j] to be a real connection, so it dies if either end is delta, and j==0
+// (the eye path landing on the emitter) dies for a delta light.
+//
+// Called from inside `misWeight` while its ScopedAssigns are still installed, so both
+// forms read exactly the same patched densities — the densities are not what is under
+// test here, the combination arithmetic is.
+namespace misaudit {
+
+inline std::atomic<bool>      enabled{false};
+// `-misaudit-poison`: deliberately BREAK the reference weight, so the alarm can be seen
+// to fire. A cross-check that has only ever agreed proves nothing on its own — it is
+// equally consistent with "both forms are right" and "the check is vacuous" (a mistyped
+// tolerance, a hook that never runs, a reference that accidentally recomputes the thing
+// it is auditing). This flag injects the exact class of bug the gate exists to catch —
+// forgetting that a subpath walked camera-to-light has its two densities swapped
+// relative to the unified light-to-camera path — and a run with it MUST report
+// disagreements. Kept in the shipping binary, not reverted after one use, so the
+// negative control is re-runnable by anyone later (Phase 3b will want it again).
+inline std::atomic<bool>      poison{false};
+inline std::atomic<long long> nChecked{0};
+inline std::atomic<long long> nBad{0};       // relative discrepancy > kTol
+inline std::atomic<double>    worst{0.0};
+inline std::atomic<int>       worstS{0};
+inline std::atomic<int>       worstT{0};
+constexpr double kTol = 1e-9;
+
+inline void note(double relErr, int s, int t) {
+    if (relErr > kTol) nBad.fetch_add(1, std::memory_order_relaxed);
+    // atomic<double> has no fetch_max; CAS until we are no longer the maximum.
+    double cur = worst.load(std::memory_order_relaxed);
+    while (relErr > cur &&
+           !worst.compare_exchange_weak(cur, relErr, std::memory_order_relaxed)) {}
+    if (relErr >= worst.load(std::memory_order_relaxed)) {
+        worstS.store(s, std::memory_order_relaxed);
+        worstT.store(t, std::memory_order_relaxed);
+    }
+}
+
+inline void reset() {
+    nChecked.store(0, std::memory_order_relaxed);
+    nBad.store(0, std::memory_order_relaxed);
+    worst.store(0.0, std::memory_order_relaxed);
+}
+
+} // namespace misaudit
+
+// The reference weight itself. `light`/`eye` must already carry the current strategy's
+// patched densities and delta flags (i.e. call from inside misWeight).
+inline double misWeightReference(const std::vector<Vertex>& light,
+                                 const std::vector<Vertex>& eye, int s, int t) {
+    const int n = s + t;
+    if (n <= 2) return 1.0;
+    auto remap0 = [](double f) { return f != 0.0 ? f : 1.0; };
+
+    // Unified light-to-camera path, each vertex with both directional densities.
+    std::vector<double> pl((size_t)n), pc((size_t)n);
+    std::vector<char>   dl((size_t)n);
+    const bool bad = misaudit::poison.load(std::memory_order_relaxed);
+    for (int i = 0; i < n; ++i) {
+        const Vertex& v = (i < s) ? light[(size_t)i] : eye[(size_t)(n - 1 - i)];
+        // On the light half "forward" already means light-to-camera; on the eye half the
+        // subpath was walked camera-to-light, so its forward density is the CAMERA one.
+        // (`bad` omits that swap on purpose — see misaudit::poison.)
+        const bool swap = (i >= s) && !bad;
+        pl[(size_t)i] = swap ? v.pdfRev : v.pdfFwd;
+        pc[(size_t)i] = swap ? v.pdfFwd : v.pdfRev;
+        dl[(size_t)i] = v.delta ? 1 : 0;
+    }
+    // The s==0 strategy is the eye path landing on the emitter, which a delta light can
+    // never be hit by. x[0] is light[0] when s>0 and the emitter-hit eye vertex when s==0;
+    // the latter is a Surface, so isDeltaLight() is correctly false for it.
+    const bool deltaLight = (s > 0) ? light[0].isDeltaLight()
+                                    : eye[(size_t)(n - 1)].isDeltaLight();
+
+    // log p_j = A[j] + B[j], with A the light-side prefix and B the camera-side suffix.
+    std::vector<double> A((size_t)n + 1, 0.0), B((size_t)n + 1, 0.0);
+    for (int i = 0; i < n; ++i)
+        A[(size_t)i + 1] = A[(size_t)i] + std::log(remap0(pl[(size_t)i]));
+    for (int i = n - 1; i >= 0; --i)
+        B[(size_t)i] = B[(size_t)i + 1] + std::log(remap0(pc[(size_t)i]));
+
+    // Strategies j = 0..n-1 (t' = n-j >= 1; BDPT never runs t'==0).
+    auto allowed = [&](int j) {
+        if (dl[(size_t)j]) return false;                     // camera-side end of the edge
+        if (j == 0) return !deltaLight;                      // eye path hits the emitter
+        return !dl[(size_t)(j - 1)];                         // light-side end of the edge
+    };
+
+    const double logPs = A[(size_t)s] + B[(size_t)s];
+    double sum = 0.0;
+    for (int j = 0; j < n; ++j) {
+        if (!allowed(j)) continue;
+        sum += std::exp(A[(size_t)j] + B[(size_t)j] - logPs);
+    }
+    return sum > 0.0 ? 1.0 / sum : 0.0;
+}
+
 // --- MIS weight (balance heuristic) ----------------------------------------------
 // PBRT's MISWeight: temporarily rewrite the connection vertices' reverse densities
 // and delta flags for the current strategy (s,t), then sum the density ratios of all
@@ -1471,7 +1597,17 @@ inline double misWeight(const Scene& scene, const Camera& cam,
         bool deltaPrev = (i > 0) ? light[i - 1].delta : light[0].isDeltaLight();
         if (!light[i].delta && !deltaPrev) sumRi += ri;
     }
-    return 1.0 / (1.0 + sumRi);
+    const double w = 1.0 / (1.0 + sumRi);
+    // Gate (2), off unless `-misaudit`: cross-check the relative form above against the
+    // absolute one, here, where the ScopedAssigns are still installed and both therefore
+    // see identical densities.
+    if (misaudit::enabled.load(std::memory_order_relaxed)) {
+        const double ref = misWeightReference(light, eye, s, t);
+        const double den = std::fabs(w) > std::fabs(ref) ? std::fabs(w) : std::fabs(ref);
+        misaudit::nChecked.fetch_add(1, std::memory_order_relaxed);
+        misaudit::note(den > 0.0 ? std::fabs(w - ref) / den : 0.0, s, t);
+    }
+    return w;
 }
 
 // Offset a shadow-ray origin off a surface along the geometric normal, flipped to the
