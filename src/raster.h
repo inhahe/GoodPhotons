@@ -1556,7 +1556,8 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                                         bool autoExpose = true, double* lockAnchor = nullptr,
                                         bool seeThrough = false, double glassClarity = 0.85,
                                         const Scene* scenePtr = nullptr,
-                                        RasterScratch* scratch = nullptr) {
+                                        RasterScratch* scratch = nullptr,
+                                        double hazeCap = 1.0) {
     // Geometry and its side tables arrive together (a PTri's `mix` index is only meaningful
     // against the mixes built alongside it), then are aliased for the passes below.
     const std::vector<PTri>& tris  = geom.tris;
@@ -1804,6 +1805,23 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                                   glassClarity, tint, kMilkPerSurface, kRimStrength);
             }
         });
+        // -glass-haze: cap how much of a pixel the frost may take, however many surfaces
+        // were crossed. The per-surface term is a product, so a sight line through a
+        // dozen faceted gems drives it to 1 and the cluster whites out however dark or
+        // colourful the glass is.
+        //
+        // Applied here, once, on the finished product rather than inside the accumulation:
+        // clamping a decreasing product at every step and clamping it at the end give
+        // exactly the same number (once it is at the floor, further multiplies clamp back
+        // to the floor), and doing it here keeps the hot inner loop and the atomics on the
+        // device twin untouched. Costs one pass over the buffer, and only when asked for.
+        if (hazeCap < 1.0) {
+            const float floorT = (float)std::max(0.0, 1.0 - hazeCap);
+            parallelFor(N, [&](size_t a, size_t b) {
+                for (size_t i = a; i < b; ++i)
+                    if (milkT[i] < floorT) milkT[i] = floorT;
+            });
+        }
     }
 
     // -- Pass 3: shade each covered pixel exactly once (parallel over pixels). Overlapping

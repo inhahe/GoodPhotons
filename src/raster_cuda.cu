@@ -1133,6 +1133,17 @@ __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     }
 }
 
+// Clamp a device float array UP to a floor. `-glass-haze`: the milk product is a running
+// product over crossed surfaces, so a deep pile drives it to 0 (full haze); flooring it
+// caps how much of the pixel the frost may take. Applied to the finished product rather
+// than inside kClear's atomics, which is exactly equivalent for a decreasing product and
+// leaves the accumulation loop (and its atomicMulF) untouched.
+__global__ static void kFloorF(float* a, float lo, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (a[i] < lo) a[i] = lo;
+}
+
 // Fill a device float array with a constant (used to reset clearT/milkT to 1.0 each frame;
 // cudaMemset can only set byte patterns, not an arbitrary float).
 __global__ void kFillF(float* p, float val, size_t n) {
@@ -1703,7 +1714,7 @@ static void profResolve(Scene* sc) {
 // Returns false on any device failure (the caller then falls back to the CPU rasterizer).
 static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
                        double exposure, bool autoExpose, double* lockAnchor,
-                       bool seeThrough, double glassClarity,
+                       bool seeThrough, double glassClarity, double hazeCap,
                        double& finalExp, int& gPix, int& TPBout) {
     if (!sc || sc->nTris == 0 || W <= 0 || H <= 0) return false;
     const size_t N = (size_t)W * H;
@@ -1782,6 +1793,8 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
                                 sc->zbuf, dc, W, H,
                                 (float)glassClarity, (float)kMilkPerSurface, (float)kRimStrength,
                                 sc->clearT, sc->milkT);
+        if (hazeCap < 1.0)
+            kFloorF<<<gPix, TPB>>>(sc->milkT, (float)fmax(0.0, 1.0 - hazeCap), (int)N);
     }
     rec(5);   // recorded either way; the clear window is simply ~0 when see-through is off
 
@@ -1835,13 +1848,13 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
 
 std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int nThreads,
                                  double exposure, bool autoExpose, double* lockAnchor,
-                                 bool seeThrough, double glassClarity) {
+                                 bool seeThrough, double glassClarity, double hazeCap) {
     std::vector<uint8_t> empty;
     (void)nThreads;   // whole frame (incl. expose/tonemap) runs on the device now
     double finalExp = 1.0;
     int gPix = 0, TPB = 0;
     if (!renderCore(sc, cam, W, H, exposure, autoExpose, lockAnchor, seeThrough,
-                    glassClarity, finalExp, gPix, TPB)) return empty;
+                    glassClarity, hazeCap, finalExp, gPix, TPB)) return empty;
     const size_t N = (size_t)W * H;
 
     kToneMap<<<gPix, TPB>>>(sc->accum, sc->zbuf, N, finalExp, seeThrough ? 1 : 0,
@@ -1895,13 +1908,13 @@ bool bindPresentTarget(Scene* sc, void* d3d11Device, void* d3d11Texture, int W, 
 
 bool renderFrameToTarget(Scene* sc, const Camera& cam, int W, int H, int nThreads,
                          double exposure, bool autoExpose, double* lockAnchor,
-                         bool seeThrough, double glassClarity) {
+                         bool seeThrough, double glassClarity, double hazeCap) {
     (void)nThreads;
     if (!sc || !sc->gfxRes || sc->gfxW != W || sc->gfxH != H) return false;
     double finalExp = 1.0;
     int gPix = 0, TPB = 0;
     if (!renderCore(sc, cam, W, H, exposure, autoExpose, lockAnchor, seeThrough,
-                    glassClarity, finalExp, gPix, TPB)) return false;
+                    glassClarity, hazeCap, finalExp, gPix, TPB)) return false;
     const size_t N = (size_t)W * H;
 
     // Map the D3D texture into CUDA's address space, grab its array, and write the
@@ -1940,7 +1953,7 @@ bool renderFrameToTarget(Scene* sc, const Camera& cam, int W, int H, int nThread
 
 bool bindPresentTarget(Scene*, void*, void*, int, int) { return false; }
 bool renderFrameToTarget(Scene*, const Camera&, int, int, int, double, bool, double*,
-                         bool, double) { return false; }
+                         bool, double, double) { return false; }
 
 #endif
 

@@ -130,7 +130,7 @@ they are filling a BLAS, exactly as they now write to the Scene's. Small, and mo
 mechanical; not done because `mesh_asset` + vertex colours has not come up, and the two
 loaders that fill a BLAS would each need the branch.
 
-### RASTER-MILK — PARTLY FIXED (2026-09-03, v0.228.0): the see-through haze is now TINTED by the glass; it can still saturate on a very deep pile
+### RASTER-MILK — FIXED (2026-09-03, v0.228.0 tint, v0.229.0 cap): the see-through haze is TINTED by the glass, and `-glass-haze` caps how much of a pixel it may take
 
 **Fixed: the haze was white.** It is added per crossed surface and stands for light
 scattered inside those surfaces — which reaches the eye through the same tint the
@@ -146,13 +146,19 @@ one. Costs nothing — it reuses the transmittance already accumulated, no new b
 
 Measured on the compote: saturation mean 15.0 / max 26 (a white veil) → **29.5 / 201**.
 
-**Still open: the magnitude.** The per-surface term still accumulates multiplicatively
-without bound, so a sight line crossing six faceted gems drives `(1 - milkT)` toward 1 and
-the cluster stays hazier than it should. `-glass-clarity 1` zeroes the per-surface term and
-leaves only the grazing rim, which is the workaround. The fix would be to cap the
-accumulated haze; note that a genuinely six-deep stack of coloured glass IS muddy in
-reality, so that is a legibility choice rather than a correctness one and belongs behind a
-flag rather than in the default.
+**Also fixed, behind a flag: the magnitude.** The per-surface term accumulates
+multiplicatively without bound, so a sight line crossing six faceted gems drives
+`(1 - milkT)` toward 1 and the cluster stays hazier than it should. **`-glass-haze <0..1>`**
+caps it. Applied to the finished product rather than inside the accumulation: clamping a
+decreasing product at every step and clamping it once at the end give exactly the same
+number (once it is at the floor, further multiplies clamp back to it), and doing it at the
+end leaves the CPU inner loop and the device's `atomicMulF` untouched — one extra pass, and
+only when the flag is used.
+
+It is deliberately NOT a new default, and the default path is provably untouched (the clamp
+is guarded by `hazeCap < 1.0`; measured identical). A genuinely six-deep stack of coloured
+glass really is muddy, so this is a legibility choice the operator makes rather than a
+correction applied for them. On `compote_with_gems.glb`, `0.3` is the readable setting.
 
 ### RASTER-GPU-DIFF — OPEN (2026-09-03, v0.223.0): the preview rasterizer's two backends **disagree on which triangle owns a shared edge**, so a wall/ceiling seam renders green on the CPU and white on the GPU
 

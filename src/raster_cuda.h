@@ -65,7 +65,8 @@ void destroy(Scene* sc);
 std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int nThreads,
                                  double exposure = 1.0, bool autoExpose = true,
                                  double* lockAnchor = nullptr,
-                                 bool seeThrough = false, double glassClarity = 0.85);
+                                 bool seeThrough = false, double glassClarity = 0.85,
+                                 double hazeCap = 1.0);
 
 // ---- Zero-copy present (CUDA <-> Direct3D 11 interop) ----------------------------
 // When the live preview window is presenting with D3D11 (see LiveWindow::renderShared),
@@ -92,7 +93,8 @@ bool bindPresentTarget(Scene* sc, void* d3d11Device, void* d3d11Texture, int W, 
 bool renderFrameToTarget(Scene* sc, const Camera& cam, int W, int H, int nThreads,
                          double exposure = 1.0, bool autoExpose = true,
                          double* lockAnchor = nullptr,
-                         bool seeThrough = false, double glassClarity = 0.85);
+                         bool seeThrough = false, double glassClarity = 0.85,
+                         double hazeCap = 1.0);
 
 // Optional per-pass profiling (used by -raster-bench). While enabled, renderFrame
 // records CUDA events into the stream between passes and accumulates each pass's

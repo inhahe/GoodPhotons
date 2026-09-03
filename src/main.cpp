@@ -16752,6 +16752,8 @@ static void printHelp(const char* prog) {
 "  -anim <file.json>     edit a loom CurveDrive sidecar in the fly viewer (implies -explore);\n"
 "                        control points seed from it and Save writes the reshaped curve back\n"
 "  -see-through|-glass   render clear dielectrics as see-through; -glass-clarity <0..1>\n"
+"  -glass-haze <0..1>    cap how much of a pixel the see-through frost may take (default 1\n"
+"                        = uncapped); lower it to read a deep pile of glass\n"
 "  -flat | -no-color     shade the preview as neutral clay (form only, no albedo/skins);\n"
 "                        both of these are also live toggles in the viewer's control strip\n"
 "\n"
@@ -16999,6 +17001,11 @@ static int run(int argc, char** argv) {
     bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
     bool rasterColor = true;      // -flat: re-shade the preview as neutral clay (viewer "Color" toggle)
     double rasterClarity  = 0.85; // -glass-clarity <0..1>: per-surface transmittance for see-through mode (higher = clearer)
+    // -glass-haze <0..1>: cap on the fraction of a pixel the see-through frost may take,
+    // however many clear surfaces the sight line crossed. 1 = uncapped (the accumulated
+    // product, as before). See RASTER-MILK in known-issues.md for why a cap is a
+    // legibility choice and therefore opt-in rather than a new default.
+    double rasterHaze     = 1.0;
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
     // --- N-dimensional rotation (-nd; see ndwarp.h) ---
     ndwarp::Config ndCfg;         // n == 3 means the warp is off
@@ -17677,6 +17684,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-see-through") || !std::strcmp(argv[i], "-seethrough") || !std::strcmp(argv[i], "-glass")) rasterSeeThrough = true;
         else if (!std::strcmp(argv[i], "-flat") || !std::strcmp(argv[i], "-no-color")) rasterColor = false;
         else if (!std::strcmp(argv[i], "-glass-clarity") && i + 1 < argc) { rasterClarity = std::clamp(std::atof(argv[++i]), 0.0, 1.0); rasterSeeThrough = true; }
+        else if (!std::strcmp(argv[i], "-glass-haze") && i + 1 < argc) { rasterHaze = std::clamp(std::atof(argv[++i]), 0.0, 1.0); rasterSeeThrough = true; }
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-exposure-anchor") && i + 1 < argc) expAnchorArg = argv[++i];
         else if (!std::strcmp(argv[i], "-stereo") && i + 1 < argc) {
@@ -19082,6 +19090,9 @@ static int run(int argc, char** argv) {
             std::printf("[raster] solid-shaded preview: tessellating scene (iso res %d) ...\n", rasterIso);
         if (rasterSeeThrough)
             std::printf("[raster] see-through: clear objects dim/haze what's behind them (clarity %.2f, no refraction)\n", rasterClarity);
+            if (rasterHaze < 1.0)
+                std::printf("[raster] see-through: frost capped at %.0f%% of a pixel "
+                            "(-glass-haze), so a deep pile stays readable\n", rasterHaze * 100.0);
         std::fflush(stdout);
 
         // Pop the live window up IMMEDIATELY (before the potentially-slow tessellation)
@@ -19192,13 +19203,14 @@ static int run(int argc, char** argv) {
             if (gpuRaster) {
                 std::vector<uint8_t> img =
                     raster_cuda::renderFrame(gpuRaster, cam, W, H, nThreads, ev, autoExp, lock,
-                                             rasterSeeThrough, rasterClarity);
+                                             rasterSeeThrough, rasterClarity, rasterHaze);
                 if (!img.empty()) return img;
             }
 #endif
             ensurePrims();   // lazy fallback (also the sole path when the GPU is unavailable)
             return raster::renderFrame(prims, cam, W, H, plight, nThreads, ev, autoExp, lock,
-                                       rasterSeeThrough, rasterClarity, &scene, &rasterScratch);
+                                       rasterSeeThrough, rasterClarity, &scene, &rasterScratch,
+                                       rasterHaze);
         };
 
         // Exposure-lock meter pre-pass: for each locked group, raster its selected metering
@@ -19323,7 +19335,8 @@ static int run(int argc, char** argv) {
                         if (!raster_cuda::bindPresentTarget(gpuRaster, dev, tex, W, H)) return false;
                         return raster_cuda::renderFrameToTarget(gpuRaster, rc.cam, W, H, nThreads,
                                                                 ev, autoExp, nullptr,
-                                                                rasterSeeThrough, rasterClarity);
+                                                                rasterSeeThrough, rasterClarity,
+                                                                rasterHaze);
                     });
                     if (!ok) { zc.clear(); break; }   // no interop here: report it, don't fake it
                     zc.push_back(std::chrono::duration<double, std::milli>(
@@ -20101,7 +20114,8 @@ static int run(int argc, char** argv) {
                     if (!raster_cuda::bindPresentTarget(gpuRaster, dev, tex, w, h)) return false;
                     return raster_cuda::renderFrameToTarget(gpuRaster, c, w, h, nThreads, expo,
                                                             autoExp_, nullptr,
-                                                            rasterSeeThrough, rasterClarity);
+                                                            rasterSeeThrough, rasterClarity,
+                                                            rasterHaze);
                 });
                 // Say which way the pixels are actually flowing — whether the interop engaged
                 // is invisible otherwise (both paths show the same image), and it can legitimately

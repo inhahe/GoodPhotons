@@ -549,6 +549,15 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > instead of losing it to the same absorption twice; colourless glass is unaffected
 > exactly (equal channels make the hue white by construction).
 >
+> **`-glass-haze <0..1>`** caps how much of a pixel the frost may take, however many clear
+> surfaces the sight line crossed. The per-surface term is a product, so a sight line
+> through a dozen faceted gems drives it to 1 and the cluster whites out whatever colour
+> the glass is; capping it trades the frosted look for legibility. Default `1` = uncapped
+> (the accumulated product, unchanged). `0.3` reads a dense pile of coloured glass well;
+> `0` removes the haze entirely. It is deliberately **not** a new default: a genuinely
+> six-deep stack of coloured glass really is muddy, so this is a legibility choice you make,
+> not a correction being applied for you.
+>
 > `-glass-clarity` remains a master multiplier on every crossing, so one dial still
 > controls overall transparency. The exponential is taken in wavelength space and converted
 > afterwards (not the other way round), and the conversion is white-balanced against a flat
