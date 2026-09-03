@@ -5,6 +5,34 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### MEM — OPEN (2026-09-02, v0.216.0): mode `J`'s beam map has **no trim** — it is sized by `-n` alone, and `-beamcount` is inert
+
+**What happens.** Phase 3a's `bdpt::traceLightBeamPass` builds its `BeamBank`s with `cap = 0`, so
+the bank never self-halves and every beam a light subpath deposits is kept. Measured on
+`_fog_cornell.ftsl` at a *trivial* `-n 200000`: 1 202 979 chords → 7 668 297 post-split beams,
+38.34 beams per subpath, **761 MB**. `-beamcount`, which is what bounds this in mode `M` (and
+takes `gallery_rain` from 10.6 M collected down to 8.0 M kept), does nothing in mode `J`. Raising
+`-n` to photon-mapping counts would run the machine out of memory long before it ran out of noise.
+
+**Why it is deliberate, and what the fix must look like.** `BeamBank`'s thinning is **Russian
+roulette**: it is unbiased for the beam's *contribution* because `power` is rescaled, but the MIS
+merge density `p_M` needs the probability that a given beam exists *at all*, and `keepProb` is
+derived from the measured crossing count, so it is history-dependent, per-scene, and not
+reconstructible at gather time. A weight that cannot read the density it divides by is not a MIS
+weight, so Phase 3a had to give the trim up rather than bias the weights.
+
+The fix is an **exact uniform** trim — keep every beam with one global fraction `f` decided after
+the pass, chosen deterministically (e.g. keep beam `i` iff `i·f` crosses an integer) rather than
+by per-beam roulette. Then `n_m` scales by exactly `f`, the weight stays correct, and the memory
+is bounded. Do this in Phase 3b, alongside the code that first *reads* `n_m`, so the constant is
+introduced and consumed in the same change. Until then, mode `J`'s `-n` is a memory budget as much
+as a quality knob, and `-beamcount` should be documented as mode-`M`-only.
+
+**Related:** mode `J`'s beams are also **monochromatic** (a BDPT light subpath's `beta` carries
+`spd(λ)·invPdfLambda`, so `-beamspec` bundles and the `achro`→`cieA` fold cannot apply), so mode
+`J` needs more beams than mode `M` for the same chroma noise — which makes this cap bite sooner,
+not later.
+
 ### PERF — OPEN (2026-09-02, v0.214.0): a mode-`J` flyby rebuilds the beam map **once per frame**, when the map is view-independent and mode `M` already shares one across the whole flight
 
 **What happens.** `groupCameras` in `main.cpp` sorts a multi-camera render into a shared forward
@@ -228,6 +256,43 @@ partition-of-unity instrumentation is the cheapest possible test of the above an
 that localises an error to a technique rather than merely showing a wrong image. Build it
 *before* the weights, so the weights can be checked as they land.
 
+**But it has to be built the RIGHT way, and the obvious way is a tautology (2026-09-02).** The
+naive reading of "sum the weights and assert 1" is to call `misWeight` once per strategy and add
+up the answers. That test can never fail, for two independent reasons, and writing it would buy
+a green light that means nothing:
+
+* **Within one call it is vacuous.** `misWeight(s,t)` returns `1/(1 + Σ_{c≠(s,t)} r_c)` where
+  `r_c = p_c/p_st` is the very `ri` its two loops accumulate. Every strategy's weight on that
+  path is therefore already determined by that one call, as `r_c/(1 + Σ r)`, and those sum to 1
+  by construction — arithmetic, not a property of the renderer.
+* **Across calls it compares different paths.** Calling `misWeight(s',t')` on the same
+  `light[]`/`eye[]` arrays does not re-weight the same path: the path a strategy realises is
+  `light[0..s-1] + eye[t-1..0]`, so changing `s` changes which vertices are in it. Summing those
+  weights adds up numbers belonging to different paths.
+
+**The audit that does have content is a second, independently-written implementation of the
+weight, and it must be written in the *absolute* form rather than the incremental one.** Build a
+unified path array in which every vertex carries **both** area-measure densities — `pdfFromLight`
+and `pdfFromCamera` — noting that these are exactly `pdfFwd`/`pdfRev` with their roles *swapped*
+when a vertex changes sides. Then each strategy's absolute density is a product,
+
+    p_c = Π_{i<c} pdfFromLight[i] · Π_{i>=c} pdfFromCamera[i],      w_c = p_c / Σ_j p_j
+
+with the same delta-vertex exclusions `misWeight`'s loops apply (or the reference disagrees for
+reasons that are not bugs). This shares no control flow with the incremental ratio loops, so it
+catches the indexing, ordering and gating mistakes that are the realistic failure mode — and,
+once Phase 3b lands, it is the only place the **hybrid** merge weight (camera side explicit,
+light side read off a beam's accumulators) can be checked against a number computed a different
+way. That check *is* gate (2); the partition of unity is what makes the reference trustworthy,
+not what is being tested.
+
+**Which fixes the phase order: 3a, then gate (2), then 3b.** The reference needs the light-side
+vertices *with their densities* to build the unified array for a merged path, and those do not
+exist until mode `J` traces its own light subpaths. So the harness cannot be finished before
+Phase 3a — but it can and must be finished before the weights of Phase 3b, which is what the
+paragraph above actually demands. Validate the harness on connections-only paths first, where
+its answer must reproduce `misWeight`'s to floating-point tolerance.
+
 **So the validation gates come before the estimator, and gate (4) is the cheap one that catches
 plumbing:**
 
@@ -293,6 +358,42 @@ plumbing:**
    * **`achro` beams fold to `cieA`, not `CIE(lambda)`.** A weight that is a pure function of
      path geometry (which the balance-heuristic weight is) is unaffected, but anything Phase 3
      adds that reads a beam's spectrum must respect the fold.
+
+   **Phase 3a landed (2026-09-02, v0.216.0): mode `J` now traces its own light subpaths.**
+   `bdpt::traceLightBeamPass` replaces `Renderer::tracePhotonPass` in mode `J`'s dispatch. It runs
+   `generateLightSubpath` — the same function the connection half is weighted against — once per
+   emitted path across a thread pool, and deposits the recorded segments through the *existing*
+   `Renderer::emitBeams`. Nothing in `photonbeams.h` / `render.h` / `render_cuda.cu` changed, so
+   modes `M`/`S`/`U` are untouched by construction. The enabling rename: Phase 2's `CamSeg` was
+   never camera-specific (it is recorded inside the shared `randomWalk`), so it became `PathSeg`
+   and `generateLightSubpath` / `deltaLightSubpath` gained a trailing `PathSegs*`. A light
+   subpath's vertex→surface span *is* the long beam the estimator wants, so the deposit pass is a
+   walk plus a loop over its own segments — no second traversal, no duplicated media logic.
+
+   Gate results (`_fog_cornell.ftsl`, 128², `-device cpu`):
+
+   * `-mode J -nobeams` is **still `cmp`-identical** to `-mode D -device cpu` — gate 1 survived
+     the pass swap.
+   * `J − D` on scene-linear PFMs: mean ratio **1.9348**, **16384 / 16384 brighter, 0 dimmer**,
+     merge min +2.40e10. That the ratio sits next to Phase 2's 2.0374 despite a differently-built
+     map (multiple scattering now included, spectral bundle now gone) is the corroboration that
+     matters — a π or 4π normalisation error could not land there twice.
+
+   **The first of the two "must not forget" bullets is resolved, by avoidance:** mode `J`'s banks
+   are constructed with `cap = 0`, so `BeamBank` never self-halves, `keepProb == 1` for every
+   beam, and `p_M` carries no per-beam existence probability the weight cannot read. The cost is
+   that **`-beamcount` is inert in mode `J`** and the map is sized by `-n` alone with no trim —
+   761 MB at only `-n 200000` on `_fog_cornell` (1 202 979 chords → 7 668 297 post-split beams,
+   38.34 per subpath, 11.1 s of which 10.9 s was the BVH build). This is mode `J`'s first
+   resource wall and is logged as its own entry below. If a trim is reinstated it must be an
+   **exact uniform** one, whose single global keep fraction is a constant that folds into `n_m`
+   and stays readable by the weight — not RR, whose per-beam probability does not.
+
+   **New in 3a: mode `J`'s beams are monochromatic.** `-beamspec` bundles and the achromatic fold
+   both require a wavelength-independent `beta`, and a BDPT light subpath's is not — `Le` carries
+   `spd(λ)·invPdfLambda` off the scene-wide emission sampler. So mode `J` is chroma-noisier than
+   mode `M` at equal `-n`. The second "must not forget" bullet (the `cieA` fold) is therefore moot
+   for mode `J`'s own beams, but still applies to anything reading a mode-`M` map.
 2. **MIS partition of unity.** Instrument the weights directly: for a sampled path, sum the
    weights of every technique that could have generated it and assert it equals 1. This tests
    the weights *independently of the image*, which is the only way to localise an energy bug

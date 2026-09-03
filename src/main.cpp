@@ -15436,29 +15436,39 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         "this render is mode D exactly.\n",
                         g_noBeams ? "-nobeams was given" : "no participating media");
         warnBeamsGrinMedia(scene, wantBeams);
-        PhotonMap pmUnused;            // stays empty: surfaces are BDPT's job here
         BeamMap bmap;
         StageProgress stageProg = makeStageProgress(res, resY);
         if (wantBeams) {
+            // MODE J'S OWN LIGHT PASS (0.216.0), not tracePhotonPass. The beams have to be
+            // sampled by the same machinery as the connection half's `light[]` subpaths, or
+            // the merge weight would be a ratio between densities that are different
+            // FUNCTIONS — see bdpt::traceLightBeamPass and known-issues.md. `-n` therefore
+            // counts LIGHT SUBPATHS here, not photons; the two are the same quantity
+            // (emitter power per path) so the normalisation is unchanged, but a subpath
+            // deposits a beam per span rather than one per straight crossing, and it
+            // scatters in the medium rather than crossing it straight — so this map carries
+            // MULTIPLE scattering where mode M's carries single only.
             std::printf("mode J: UPBP at %dx%d on %d CPU threads (maxDepth=%d, light=%s) — "
-                        "tracing %lld photons for the beam map ...\n",
+                        "tracing %lld light subpaths for the beam map ...\n",
                         res, resY, nThreads, maxDepth, lightLabel, N);
-            liveWindowPlaceholder(res, resY, "tracing photon beams\xE2\x80\xA6");
+            liveWindowPlaceholder(res, resY, "tracing light subpaths\xE2\x80\xA6");
             auto tp0 = std::chrono::steady_clock::now();
-            tracePhotonPass(scene, N, nThreads, diffraction, pmUnused, g_heroC, 0,
-                            &bmap, g_beamTarget, &stageProg, nullptr, nullptr, 0,
-                            /*depositSurfaces*/false);
+            bdpt::traceLightBeamPass(scene, cam, N, nThreads, maxDepth, diffraction,
+                                     bmap, &stageProg);
             liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
             buildBeamMap(bmap, "mode J:",
                          (double)res * (double)resY * (double)(spp > 0 ? spp : 16));
             const double buildSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
-            std::printf("mode J: %zu beams from %lld emitted photons in %s. "
-                        "Rendering connections + merges ...\n",
-                        bmap.beams.size(), bmap.nEmitted, humanDur(buildSec).c_str());
+            std::printf("mode J: %zu beams from %lld light subpaths in %s "
+                        "(%.2f beams/subpath, %.0f MB). Rendering connections + merges ...\n",
+                        bmap.beams.size(), bmap.nEmitted, humanDur(buildSec).c_str(),
+                        bmap.nEmitted ? (double)bmap.beams.size() / (double)bmap.nEmitted : 0.0,
+                        (double)(bmap.beams.size() * sizeof(PhotonBeam)) / (1024.0 * 1024.0));
             if (bmap.empty())
-                std::fprintf(stderr, "[mode J] warning: the beam map is empty — no photon "
-                                     "reached a medium. This render is mode D exactly.\n");
+                std::fprintf(stderr, "[mode J] warning: the beam map is empty — no light "
+                                     "subpath reached a medium. This render is mode D "
+                                     "exactly.\n");
         } else {
             std::printf("mode J: UPBP at %dx%d on %d CPU threads (maxDepth=%d, light=%s) ...\n",
                         res, resY, nThreads, maxDepth, lightLabel);

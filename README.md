@@ -246,7 +246,9 @@ argument for standing a groom in a hall of polished objects.*
   invisible to it. Mode `J` runs both on the same camera sample and combines them with the
   multiple-sample balance heuristic — the volumetric counterpart of what VCM (`U`) does for
   surfaces. Beams are **on by default** here (a UPBP render without them is literally mode
-  `D`); `-nobeams` turns them off, which reduces mode `J` to mode `D` bit-for-bit.
+  `D`); `-nobeams` turns them off, which reduces mode `J` to mode `D` bit-for-bit. Mode `J`
+  builds its beam map from its **own BDPT light subpaths** (0.216.0), so there `-n` counts
+  light subpaths and `-beamcount` / `-beamspec` do not apply.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look

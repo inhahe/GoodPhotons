@@ -25,7 +25,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
-| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). CPU only so far; the merges are wired but **not yet MIS-weighted** (0.215.0), so they double-count | `bdpt.h` + `beamgather.h` + `photonbeams.h` |
+| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). CPU only so far; it traces its own light subpaths for the beam map (0.216.0), but the merges are **not yet MIS-weighted**, so they double-count | `bdpt.h` + `beamgather.h` + `photonbeams.h` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
 | `-raster` | z-buffer preview rasterizer + interactive fly viewer (`-explore`) | `raster.h`, `raster_cuda.cu` |
 
@@ -188,7 +188,7 @@ transmittance marches, now paid per camera *segment* per bounce rather than once
 as in mode `M`. Phase 3's weights will kill many hits before their marches (hence the ordering
 above), but this is the number to watch.
 
-**Phase 3 will replace the borrowed photon pass.** Phase 1 built the beam map with
+**Phase 3a replaces the borrowed photon pass** (done in 0.216.0, next section). Phase 1 built the beam map with
 `tracePhotonPass` because that was the cheapest way to get *a* map; that is a scaffold, not the
 design. A balance-heuristic weight is a ratio of the densities with which competing techniques
 would have produced the same path, and a beam from `Renderer::tracePhoton` carries no densities
@@ -200,6 +200,61 @@ Phase 2 records a `CamSeg`, and depositing one **long** beam per (segment, mediu
 no fields on behalf of a mode that does not use them. See `known-issues.md` for the full
 argument, including why the beams must stay *long* (a short beam's stochastic length already
 carries `Tr`, which `beamgather.h` would then apply a second time).
+
+### Mode `J` Phase 3a — mode `J` traces its own light subpaths (0.216.0)
+
+`bdpt::traceLightBeamPass` replaces `Renderer::tracePhotonPass` as mode `J`'s deposit pass. It
+runs `generateLightSubpath` — the *same* function whose vertices the connection half is weighted
+against — once per emitted path across a thread pool, and deposits the resulting segments through
+the existing `Renderer::emitBeams`. `tracePhotonPass`, `emitBeams`, `BeamBank`, `PhotonBeam` and
+their CUDA twins are all unchanged, exactly as the Phase 2 note promised: the new pass is a
+*caller* of the deposit machinery, not a fork of it.
+
+**`CamSeg` became `PathSeg`, and that is the whole trick.** The span recorder Phase 2 added to
+`randomWalk` was never camera-specific — `randomWalk` is the shared walk, and a light subpath's
+"vertex to the surface that ends the segment" span is *exactly* the long beam the estimator
+wants. So the struct was renamed (`CamSeg`→`PathSeg`, `camVert`→`vert`), `generateLightSubpath`
+and `deltaLightSubpath` gained a trailing `PathSegs*`, and the deposit pass is a walk plus a loop
+over the segments it recorded. No second traversal, no duplicated media logic.
+
+Four consequences worth knowing:
+
+- **`-n` now counts light subpaths, not photons.** The two are the same quantity, which is why
+  `nEmitted` and the `1/nEmitted` in `beamgather.h` need no change: `generateLightSubpath` starts
+  from `betaWalk = Le·cos/(pdfChoice·pdfPos·pdfDir)`, which reduces to `Le·area/pdfChoice` =
+  emitter power, and `Renderer::tracePhoton` is born carrying `scene.totalPower`. Same units, so
+  a beam deposited by either pass means the same thing.
+- **The map now carries multiple scattering**, because a light subpath keeps walking after a
+  medium event and records a segment for every bounce. Phase 1's borrowed map did too, but now
+  every one of those segments has a *vertex index* (`PathSeg::vert`) pointing back into a subpath
+  whose densities Phase 3b can read — which is the entire reason for the change.
+- **No Russian roulette on the deposit.** The banks are built with `cap = 0`, so `BeamBank` never
+  self-halves and `keepProb == 1` for every beam. Mode `M`'s self-thinning leaves each beam a
+  history-dependent existence probability that a merge weight cannot reconstruct at gather time,
+  and a MIS weight that cannot read the density it is dividing by is not a MIS weight.
+  **`-beamcount` is therefore inert in mode `J`** — the map is sized by `-n` alone.
+- **Mode `J`'s beams are monochromatic.** `-beamspec` bundles and the achromatic fold both need a
+  wavelength-independent `beta`, and a BDPT light subpath's is not: `Le` carries
+  `spd(λ)·invPdfLambda` off the scene-wide emission sampler. So mode `J` is chroma-noisier than
+  mode `M` at equal `-n`, and buys that back with correctly-weightable beams.
+
+**Validation, passed 0.216.0** (`_fog_cornell.ftsl`, 128², `-device cpu`):
+
+| Test | What it proves | Result |
+|---|---|---|
+| `-mode J -nobeams` vs `-mode D -device cpu` | gate 1 survives the new pass | `cmp` **identical** |
+| `-mode J` vs `-mode D`, equal spp, `-hdr` | the own-pass merges land, and only additively | `J/D` mean **1.9348**, 16384/16384 brighter, **0 dimmer** |
+
+The ratio landing next to Phase 2's 2.0374 — from a differently-built map, with multiple
+scattering added and the spectral bundle removed — is the corroboration that matters: a π or 4π
+normalisation error could not reproduce it.
+
+**Cost, and the memory to watch.** At `-n 200000` on `_fog_cornell` the pass produced 1 202 979
+chords → 7 668 297 post-split beams (38.34 beams/subpath, **761 MB**), in 11.1 s of which 10.9 s
+was the BVH build. The map is sized by `-n` with **no trim** — mode `M`'s decimation is exactly
+what Phase 3a had to give up — so this is the resource that will bite first on a real scene.
+Phase 3b may reinstate an *exact uniform* trim, whose single global keep fraction is a constant
+that folds cleanly into `n_m` and stays readable by the weight.
 
 ## Module map (src/)
 
