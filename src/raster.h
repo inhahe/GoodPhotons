@@ -75,6 +75,10 @@ struct PShade {
     double normalStrength = 1.0;
     bool emissive = false;
     bool clear    = false;   // dielectric/thin-film/filter surface (see-through mode dims/hazes it)
+    // Per-CROSSING RGB transmittance of a clear surface, from the material itself (see
+    // clearTintOf). White for anything that states no colour, so a plain window behaves
+    // exactly as it did when this was one global scalar. Meaningless unless `clear`.
+    Vec3 clearTint{1, 1, 1};
 };
 
 // A two-child `mix` whose blend is driven per hit by `weight_map pattern:` /
@@ -165,6 +169,63 @@ inline Vec3 spectrumToLinearRgb(const Spectrum& s) {
 // Solid preview colour for a material. Diffuse/glossy/fluorescent/etc. use their
 // reflectance colour; specular materials (mirror/glass/thin-film) get a light tint
 // so they read as a solid object instead of vanishing to black.
+// The RGB transmittance ONE crossing of a clear surface applies, derived from the
+// material rather than from a single global dial — so a red filter tints what is behind
+// it red, and a dense one darkens it more than a clear window does.
+//
+// Where the number comes from depends on what the material actually states:
+//
+//   * `Filter` / `DiffuseTransmit` carry `transmit`, a DIMENSIONLESS T(lambda) in [0,1].
+//     That is a transmittance already, so both the hue and the magnitude are real and are
+//     used as-is.
+//   * `Dielectric` / `ThinFilm` colour their interior with `absorb`, a Beer-Lambert
+//     coefficient per unit LENGTH. Turning that into a transmittance needs a thickness,
+//     and an order-independent rasterizer never pairs a front face with the back face it
+//     belongs to — there is no thickness to raise it to. So only the HUE is taken
+//     (normalised so the strongest channel is 1) and `-glass-clarity` goes on setting how
+//     much each crossing dims. Glass with no absorption is colourless, which is the
+//     physically honest answer rather than a guess.
+//
+// The exponential is taken in WAVELENGTH space and converted afterwards, not the other
+// way round: exp() of an RGB-collapsed coefficient is not the RGB of the exponential, and
+// the difference is exactly the saturation of a strongly absorbing glass.
+inline Vec3 clearTintOf(const Material& m) {
+    // WHITE BALANCE. spectrumToLinearRgb of a FLAT spectrum is not neutral: the CIE
+    // integral of an equal-energy stimulus lands at linear sRGB ~(1.198, 0.950, 0.908),
+    // which is why ftrace's own self-test prints that number. Feeding a transmittance
+    // through it raw would give a perfectly colourless window a warm cast — the tint of
+    // the illuminant model, not of the glass. Dividing by the flat response measures
+    // every transmittance AGAINST no absorption, so `absorb 0` comes out exactly white
+    // and a 0.5 grey gel comes out exactly 0.5 grey.
+    static const Vec3 kFlat = spectrumToLinearRgb(constantSpectrum(1.0));
+    auto balance = [](const Vec3& v) {
+        return Vec3{kFlat.x > 1e-9 ? v.x / kFlat.x : v.x,
+                    kFlat.y > 1e-9 ? v.y / kFlat.y : v.y,
+                    kFlat.z > 1e-9 ? v.z / kFlat.z : v.z};
+    };
+    auto clamp01 = [](Vec3 v) {
+        v.x = std::min(1.0, std::max(0.0, v.x));
+        v.y = std::min(1.0, std::max(0.0, v.y));
+        v.z = std::min(1.0, std::max(0.0, v.z));
+        return v;
+    };
+    if (m.type == MatType::Filter || m.type == MatType::DiffuseTransmit) {
+        const Vec3 t = clamp01(balance(spectrumToLinearRgb(m.transmit)));
+        // A material that transmits nothing at all is not tinted glass, it is opaque —
+        // leave it white and let the (unchanged) clarity dial dim it, rather than
+        // compositing a black hole over the background.
+        if (t.x + t.y + t.z <= 1e-6) return Vec3{1, 1, 1};
+        return t;
+    }
+    const Vec3 raw = balance(spectrumToLinearRgb(
+        [&m](double lam) { return std::exp(-std::max(0.0, m.absorb(lam))); }));
+    // Normalise BEFORE clamping: clipping first would distort the hue of a strongly
+    // coloured glass by flattening whichever channel ran over.
+    const double mx = std::max({raw.x, raw.y, raw.z});
+    if (!(mx > 1e-6)) return Vec3{1, 1, 1};      // opaque or unset: no hue to take
+    return clamp01(raw * (1.0 / mx));             // hue only; magnitude stays with clarity
+}
+
 inline Vec3 materialColor(const Material& m, bool& emissive) {
     emissive = m.isLight;
     if (m.isLight) {
@@ -336,6 +397,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         s.color    = materialColor(m, em);
         s.emissive = em;
         s.clear    = (!m.isLight && isClearPreviewType(m.type));
+        if (s.clear) s.clearTint = clearTintOf(m);
         // An image skin: a diffuse-albedo texture bound via `reflect texture:<name>`.
         // The preview shades from the texture's linear RGB (Texture::sampleRgb), so no
         // Jakob-Hanika coefficient precompute is needed (that's only for spectral hits).
@@ -879,7 +941,7 @@ struct RasterScratch {
     std::vector<Vec3>              accum;    // HDR shade target (bg written by the shade pass)
     std::vector<STri>              stris;    // projected triangles (capacity reused)
     std::vector<std::vector<STri>> parts;    // per-thread projection buffers
-    std::vector<float>             clearT, milkT;   // see-through products
+    std::vector<float>             clearT, milkT;   // see-through products (clearT is RGB: 3/pixel)
     std::unique_ptr<BandPool>      pool;     // persistent workers (created on first frame)
 };
 
@@ -1009,9 +1071,13 @@ inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& 
 // product form is order-independent (commutative), so no depth sort of the transparent
 // fragments is needed — N crossed surfaces just give clarity^N dimming and a growing haze.
 // A grazing-angle (Fresnel-like) term adds extra milk at silhouettes so glass edges read.
+// `clearT` holds THREE floats per pixel (the running RGB transmittance product), `milkT`
+// one (the haze is untinted — it is frosting, not glass colour). `tint` is this surface's
+// own per-crossing transmittance; `clarity` is the master dial that still multiplies it.
 inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, int y0, int y1,
                               const GBuffer& g, std::vector<float>& clearT, std::vector<float>& milkT,
-                              double clarity, double milkPerSurface, double rimStrength) {
+                              double clarity, const Vec3& tint,
+                              double milkPerSurface, double rimStrength) {
     const VtxScreen& A = t.v0; const VtxScreen& B = t.v1; const VtxScreen& C = t.v2;
     double minx = std::floor(std::min({A.sx, B.sx, C.sx}));
     double maxx = std::ceil (std::max({A.sx, B.sx, C.sx}));
@@ -1030,7 +1096,13 @@ inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, in
     const EdgeFn E0 = makeEdge(B.sx, B.sy, C.sx, C.sy, s);
     const EdgeFn E1 = makeEdge(C.sx, C.sy, A.sx, A.sy, s);
     const EdgeFn E2 = makeEdge(A.sx, A.sy, B.sx, B.sy, s);
-    const float tau = (float)clarity;
+    // Rounded to float and multiplied IN float, which is what the device twin does
+    // (kClearAccum takes a float clarity and a float3 tint). Doing the product in double
+    // and rounding once would land a ULP away from the GPU on some pixels, and the two
+    // backends are supposed to agree bit for bit.
+    const float tauR = (float)clarity * (float)tint.x;
+    const float tauG = (float)clarity * (float)tint.y;
+    const float tauB = (float)clarity * (float)tint.z;
     for (int y = ylo; y <= yhi; ++y) {
         const double py = y + 0.5;
         const double r0 = E0.dx * (py - E0.Py);
@@ -1058,8 +1130,10 @@ inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, in
             double graze = 1.0 - ndv;                 // 0 head-on, ->1 at the silhouette
             double perMilk = milkPerSurface + rimStrength * graze * graze * graze;
             if (perMilk > 0.95) perMilk = 0.95;
-            clearT[row] *= tau;
-            milkT[row]  *= (float)(1.0 - perMilk);
+            clearT[row * 3 + 0] *= tauR;
+            clearT[row * 3 + 1] *= tauG;
+            clearT[row * 3 + 2] *= tauB;
+            milkT[row] *= (float)(1.0 - perMilk);
         }
     }
 }
@@ -1205,6 +1279,7 @@ inline std::vector<uint8_t> exposeAndEncodeT(
         FetchVec3&& pixel, const float* zbuf, const uint8_t* emis,
         int W, int H, int nThreads,
         double expComp, bool autoExpose, double* lockAnchor,
+        // `clearT` is THREE floats per pixel (RGB transmittance product), `milkT` one.
         bool seeThrough, const float* clearT, const float* milkT,
         const Vec3& milkColor, BandPool* pool = nullptr) {
     const size_t N = (size_t)W * H;
@@ -1332,9 +1407,14 @@ inline std::vector<uint8_t> exposeAndEncodeT(
             Vec3 c = pixel(i);
             if (zbuf[i] > 0.0f) c = c * finalExp;   // hit pixels get the exposure
             if (seeThrough) {                          // composite clear glass (display-linear)
-                float T = clearT[i], mt = milkT[i];
-                if (T < 1.0f || mt < 1.0f)
-                    c = c * (double)T + milkColor * (1.0 - (double)mt);
+                const float Tr = clearT[i * 3 + 0], Tg = clearT[i * 3 + 1], Tb = clearT[i * 3 + 2];
+                const float mt = milkT[i];
+                if (Tr < 1.0f || Tg < 1.0f || Tb < 1.0f || mt < 1.0f) {
+                    const double m = 1.0 - (double)mt;
+                    c = Vec3{c.x * (double)Tr + milkColor.x * m,
+                             c.y * (double)Tg + milkColor.y * m,
+                             c.z * (double)Tb + milkColor.z * m};
+                }
             }
             img[i * 3 + 0] = encode(c.x);
             img[i * 3 + 1] = encode(c.y);
@@ -1600,18 +1680,23 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     std::vector<float>& milkT  = S.milkT;
     if (!seeThrough) { clearT.clear(); milkT.clear(); }
     if (seeThrough) {
-        clearT.resize(N);
+        clearT.resize(N * 3);            // RGB: a tinted surface transmits per channel
         milkT.resize(N);
         parallelFor(N, [&](size_t a, size_t b) {
-            std::fill(clearT.begin() + a, clearT.begin() + b, 1.0f);
+            std::fill(clearT.begin() + a * 3, clearT.begin() + b * 3, 1.0f);
             std::fill(milkT.begin() + a, milkT.begin() + b, 1.0f);
         });
         dispatchBands([&](int y0, int y1) {
             for (const STri& s : stris) {
                 if (!s.clear) continue;
                 if (s.iy1 < y0 || s.iy0 >= y1) continue;
+                // The tint rides on the source PTri, so it costs no G-buffer channel and
+                // no extra STri field — the same reason STri carries `src` and not a copy
+                // of the shading attributes.
+                const Vec3& tint = (s.src >= 0 && s.src < (int)tris.size())
+                                 ? tris[(size_t)s.src].clearTint : Vec3{1, 1, 1};
                 fillTriangleClear(s, cam, W, H, y0, y1, g, clearT, milkT,
-                                  glassClarity, kMilkPerSurface, kRimStrength);
+                                  glassClarity, tint, kMilkPerSurface, kRimStrength);
             }
         });
     }

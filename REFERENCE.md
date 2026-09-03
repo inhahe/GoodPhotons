@@ -509,7 +509,7 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > the pass stays nearly free. Tune the per-surface transmittance with
 > **`-glass-clarity <0..1>`** (default `0.85`; higher = clearer/less dimming, and
 > passing it implies `-see-through`). This is a *look* preview only — there's still
-> no bending, reflection or coloured absorption. Example:
+> no bending or reflection. Example:
 > `ftrace -in scenes/cornell.ftsl -raster -see-through -window -o png/preview.png`.
 >
 > **Both of these are live toggles in the viewer.** The interactive viewer's control
@@ -526,6 +526,28 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > the baked preview geometry rather than as a flag in the shade pass, so the CPU and GPU
 > rasterizers behave identically; the cost is that toggling it re-tessellates (and
 > re-uploads, on the GPU path) rather than merely re-rendering.
+> **Glass takes its colour from the material.** Each clear surface transmits its own RGB
+> transmittance rather than one global scalar, so a red filter tints what is behind it red
+> and a dense one darkens it more than a clear window does. Where that number comes from
+> depends on what the material states:
+>
+> * **`filter` / `translucent`** carry `transmit`, a *dimensionless* T(λ) in [0,1] — a
+>   transmittance already, so both its hue **and** its magnitude are used as-is.
+> * **`dielectric` / `thin_film`** colour their interior with `absorb`, a Beer-Lambert
+>   coefficient per unit **length**. Turning that into a transmittance needs a thickness,
+>   and an order-independent rasterizer never pairs a front face with the back face it
+>   belongs to — so only the **hue** is taken and `-glass-clarity` goes on setting how much
+>   each crossing dims. Glass with no absorption is exactly colourless.
+>
+> `-glass-clarity` remains a master multiplier on every crossing, so one dial still
+> controls overall transparency. The exponential is taken in wavelength space and converted
+> afterwards (not the other way round), and the conversion is white-balanced against a flat
+> spectrum — without that, an equal-energy stimulus lands at linear sRGB ≈ (1.198, 0.950,
+> 0.908) and a perfectly colourless window would preview with a warm cast. The milk haze is
+> deliberately **not** tinted: it is frosting, not glass colour.
+> `scenes/_glass_tint.ftsl` is the worked example (clear / red / blue dielectrics beside a
+> green gel).
+>
 > Because rasterizing is nearly free, a preview whose size you haven't pinned with
 > `-r` is **upscaled so its long edge is at least 1440 px** (aspect preserved) —
 > a scene that authored a small `film { res 256 256 }` still previews big and

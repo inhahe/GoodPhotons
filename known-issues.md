@@ -5,6 +5,60 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### RASTER-GPU-DIFF — OPEN (2026-09-03, v0.223.0): the preview rasterizer's two backends **disagree on which triangle owns a shared edge**, so a wall/ceiling seam renders green on the CPU and white on the GPU
+
+**What happens.** `raster.h`'s header and design.md's *GPU raster pipeline* both state the
+GPU frames are "verified byte-identical to the CPU path's frames". They are not:
+
+```
+ftrace -in scenes/cornell.ftsl -raster -device cpu -r 512 -o png/a.png
+ftrace -in scenes/cornell.ftsl -raster -device gpu -r 512 -o png/b.png
+```
+
+differ on **89 pixels, 88 of them by more than one LSB, worst case 120/255**.
+
+**It is a coverage tie-break, not shading and not exposure.** The differing pixels are not
+scattered — they lie on **one-pixel-wide diagonal runs**, e.g. (49,462), (50,461),
+(51,460), (52,459) … stepping exactly one pixel left per row. That is the Cornell box's
+wall/ceiling corner edge in screen space. Along it the CPU reports the **green right wall**
+and the GPU the **white** neighbour:
+
+```
+   (49,462)  cpu=[122 164  57]   gpu=[103  93  91]
+   (55,456)  cpu=[127 170  59]   gpu=[103  92  90]
+```
+
+The GPU value is constant down the run while the CPU value tracks the green wall's shading,
+so the two backends are resolving *which triangle covers the pixel* differently, not
+shading the same triangle differently. Signed differences are mixed, and the affected
+pixels are brighter than average (mean luma 166 vs 112 overall) purely because the seam
+is a lit corner — an exposure-anchor difference was ruled out by that sign mixture and by
+the diagonal-run structure.
+
+**Whose tie rule.** design.md documents *Watertight raster coverage (shared by both
+backends, 0.98.2)*: the intent is that a shared edge is claimed by exactly one sharer,
+via `sign(area) * flip` in `makeEdge`/`EdgeFn`. The device twin re-implements the same
+rule, and one of the two implementations evidently disagrees at the tie — most likely
+where the edge function evaluates to exactly zero (`v == 0.0 && !E.tie` on the host) and
+the GPU's float arithmetic does not land on exactly zero for the same edge.
+
+**Not caused by the coloured-glass work (v0.223.0), which is what found it.** The
+measurement above passes **no** `-see-through`, so the clear-glass pass is skipped
+entirely and none of that code runs. Adding `-see-through` gives 100 differing pixels: the
+same 88 large ones plus 12 at exactly ±1 LSB. Those 12 *are* attributable to the clear
+pass and are expected — `atomicMulF` accumulates the transmittance product in
+nondeterministic order and float multiplication is not associative.
+
+**Severity.** A preview, so no render output is wrong. But the byte-identical claim is
+load-bearing: it is the standing check that a shading change did not break one backend,
+and a silent 120/255 divergence means such a comparison cannot distinguish "my change
+broke a backend" from "these never agreed". The claim in `raster.h` and design.md should
+either be repaired or downgraded to what is actually true.
+
+**Reproducing the analysis.** Render both, then diff with the signed per-pixel values —
+the diagonal-run structure is what identifies it as coverage rather than shading, and it
+is invisible in a scalar "N pixels differ" summary.
+
 ### BDPT-MIS-TR — OPEN (2026-09-02, v0.217.0): mode `D`'s MIS weights approximate every **connection edge's transmittance as 1** in a participating medium
 
 **What happens.** `randomWalk` stores medium and surface vertex densities as pure geometric

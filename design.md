@@ -6100,6 +6100,40 @@ latent in `buildPanel` and `buildBindRow` too and is fixed in all three. Changin
 angles are carried across by PLANE IDENTITY (`planeIndex(oldN, i, j)`), so `xw` stays `xw`
 rather than being silently re-indexed as the plane order lengthens.
 
+## See-through glass takes its colour from the material (0.223.0)
+
+Through 0.222.0 the clear-surface pass multiplied ONE scalar per crossing (`-glass-clarity`)
+into a single float per pixel, so a red filter and a clear window previewed identically.
+`PShade::clearTint` now carries a per-surface RGB transmittance and `clearT` is three floats
+per pixel.
+
+**Where the tint comes from is not one rule, because the materials do not state the same
+thing.** `Filter` / `DiffuseTransmit` carry `transmit`, a dimensionless T(lambda) — that IS a
+transmittance, so hue and magnitude are both real. `Dielectric` / `ThinFilm` carry `absorb`,
+a Beer-Lambert coefficient per unit LENGTH, and turning that into a transmittance needs a
+thickness the rasterizer does not have: the pass is order-independent precisely so it needs
+no depth sort, which means it never pairs a front face with its own back face. So a
+dielectric contributes HUE only (normalised to unit peak) and `-glass-clarity` keeps setting
+the magnitude. Faking a thickness would have been the easy option and would have made the
+preview lie about scale.
+
+**Two subtleties that are easy to get wrong, and were.** The exponential is taken in
+WAVELENGTH space and converted to RGB afterwards — `exp()` of an RGB-collapsed coefficient
+is not the RGB of the exponential, and the difference is exactly the saturation of a
+strongly absorbing glass. And the conversion is WHITE-BALANCED against a flat spectrum:
+`spectrumToLinearRgb` of an equal-energy stimulus is ~(1.198, 0.950, 0.908), not (1,1,1), so
+the first cut gave a perfectly colourless window a warm cast — visible as an 18 000-pixel
+change on `cornell.ftsl`. Dividing by the flat response makes `absorb 0` come out exactly
+white by construction (the same input reaches the same converter) rather than approximately.
+
+**The host multiplies tau in float, not double.** `(float)clarity * (float)tint.x`, matching
+`kClearAccum`'s float arithmetic — computing the product in double and rounding once lands a
+ULP away from the device on some pixels. What remains between the backends after that is
++-1 LSB from `atomicMulF`'s nondeterministic accumulation order (float multiplication is not
+associative), and, separately, a PRE-EXISTING coverage tie-break disagreement worth 120/255
+on a wall seam — see RASTER-GPU-DIFF in `known-issues.md`, which this work found but did not
+cause.
+
 ## Preview shading model (`raster.h` + `raster_cuda.cu`, 0.135.0; per-hit mix 0.136.0)
 
 The preview has no light transport, so nothing that needs a *second* bounce — reflection,

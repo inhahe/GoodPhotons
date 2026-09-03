@@ -140,6 +140,7 @@ struct DPTri {
     float  triplanarScale;  // >0: sample the skin by world triplanar instead of UV
     int    emissive;
     int    clear;           // see-through transmissive surface (handled by the clear pass)
+    float3 clearTint;       // its per-crossing RGB transmittance (raster.h clearTintOf)
     int    normalTex;       // tangent-space normal map, or -1
     float  normalStrength;  // XY scale applied to the sampled tangent-space normal
     int    reflectPat;      // scalar `pattern` scaling the albedo, or -1
@@ -1073,7 +1074,12 @@ __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     // MULTIPLIES into clearT/milkT, so an edge covered by both sharers would darken a seam
     // line twice, and one covered by neither would leave a hairline of un-tinted glass.
     const DEdges E = makeEdgesD(t, area);
-    const float tau = clarity;
+    // Per-CHANNEL transmittance: the master clarity dial times this surface's own tint.
+    // The tint rides on the source DPTri, exactly as the host reads it from tris[s.src].
+    const float3 tint = tris[idx >> 1].clearTint;
+    const float tauR = clarity * tint.x;
+    const float tauG = clarity * tint.y;
+    const float tauB = clarity * tint.z;
 
     for (int y = ylo; y <= yhi; ++y) {
         const float py = y + 0.5f;
@@ -1102,7 +1108,9 @@ __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             float graze = 1.0f - ndv;
             float perMilk = milkPerSurface + rimStrength * graze * graze * graze;
             if (perMilk > 0.95f) perMilk = 0.95f;
-            atomicMulF(&clearT[row], tau);
+            atomicMulF(&clearT[row * 3 + 0], tauR);
+            atomicMulF(&clearT[row * 3 + 1], tauG);
+            atomicMulF(&clearT[row * 3 + 2], tauB);
             atomicMulF(&milkT[row], 1.0f - perMilk);
         }
     }
@@ -1188,12 +1196,13 @@ __device__ inline uchar3 tonemapPixel(const float3* accum, const float* zbuf, si
         cz = __dmul_rn(cz, finalExp);
     }
     if (seeThrough) {                              // composite clear glass (display-linear)
-        float T = clearT[i], mt = milkT[i];
-        if (T < 1.0f || mt < 1.0f) {
+        const float Tr = clearT[i * 3 + 0], Tg = clearT[i * 3 + 1], Tb = clearT[i * 3 + 2];
+        const float mt = milkT[i];
+        if (Tr < 1.0f || Tg < 1.0f || Tb < 1.0f || mt < 1.0f) {
             double m = __dsub_rn(1.0, (double)mt); // (1 - mt) evaluated once, as on host
-            cx = __dadd_rn(__dmul_rn(cx, (double)T), __dmul_rn(milkX, m));
-            cy = __dadd_rn(__dmul_rn(cy, (double)T), __dmul_rn(milkY, m));
-            cz = __dadd_rn(__dmul_rn(cz, (double)T), __dmul_rn(milkZ, m));
+            cx = __dadd_rn(__dmul_rn(cx, (double)Tr), __dmul_rn(milkX, m));
+            cy = __dadd_rn(__dmul_rn(cy, (double)Tg), __dmul_rn(milkY, m));
+            cz = __dadd_rn(__dmul_rn(cz, (double)Tb), __dmul_rn(milkZ, m));
         }
     }
     return make_uchar3(encodeSrgb(cx, lut), encodeSrgb(cy, lut), encodeSrgb(cz, lut));
@@ -1283,7 +1292,7 @@ struct Scene {
     float3*             accum  = nullptr;
     float*              zbuf   = nullptr;
     unsigned char*      emis   = nullptr;
-    float*              clearT = nullptr;   // see-through cumulative transmittance
+    float*              clearT = nullptr;   // see-through cumulative transmittance (RGB: 3 per pixel)
     float*              milkT  = nullptr;   // see-through milk (haze) product
     size_t              pixCap = 0;
     // Raster bin lists (slot indices by bbox size, rebuilt per frame) + 3 counters.
@@ -1406,6 +1415,8 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         d.triplanarScale = (float)t.triplanarScale;
         d.emissive = t.emissive ? 1 : 0;
         d.clear = t.clear ? 1 : 0;
+        d.clearTint = make_float3((float)t.clearTint.x, (float)t.clearTint.y,
+                                  (float)t.clearTint.z);
         d.normalTex = t.normalTex;
         d.normalStrength = (float)t.normalStrength;
         d.reflectPat = t.reflectPat;
@@ -1614,7 +1625,7 @@ static bool ensurePix(Scene* sc, size_t N) {
            && tryMalloc((void**)&sc->accum,  sizeof(float3) * N)
            && tryMalloc((void**)&sc->zbuf,   sizeof(float) * N)
            && tryMalloc((void**)&sc->emis,   sizeof(unsigned char) * N)
-           && tryMalloc((void**)&sc->clearT, sizeof(float) * N)
+           && tryMalloc((void**)&sc->clearT, sizeof(float) * N * 3)
            && tryMalloc((void**)&sc->milkT,  sizeof(float) * N)
            && tryMalloc((void**)&sc->dimg,   N * 3)
            && tryMallocHost((void**)&sc->h_img, N * 3);
@@ -1735,7 +1746,11 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
     // See-through clear pass: reset clearT/milkT to 1 and accumulate each clear surface's
     // transmittance/haze against the now-complete opaque depth (sc->zbuf, written by kShade).
     if (seeThrough) {
-        kFillF<<<gPix, TPB>>>(sc->clearT, 1.0f, N);
+        // clearT is 3 floats per pixel, so it needs its own grid: gPix only covers N
+        // threads, and kFillF's `i >= n` guard would silently leave two thirds of the
+        // buffer at whatever the last frame left there.
+        const int gClear = (int)((N * 3 + TPB - 1) / TPB);
+        kFillF<<<gClear, TPB>>>(sc->clearT, 1.0f, N * 3);
         kFillF<<<gPix, TPB>>>(sc->milkT,  1.0f, N);
         // Stream order already runs kClear after both fills complete.
         kClear<<<gSlots, TPB>>>(sc->dtris, sc->dgeos, sc->dattrs, sc->dflags, 2 * sc->nTris,
