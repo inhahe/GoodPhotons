@@ -2289,6 +2289,12 @@ struct BeamMergeWeight {
     double segSumM    = 0.0;  // camera-side merge accumulator, kappa factored out
     int    camVert    = 0;    // k: the camera subpath index of the vertex this segment leaves
     int    maxDepth   = 0;    // the same cap the connection loop applies (see below)
+    // Per-ray transmittance data, hoisted out of the per-hit path. `camTr` is built once for
+    // this camera segment (see TrRay: a dense medium hands one segment hundreds of hits, and
+    // trDet would re-clip and re-evaluate sigma_t for every one of them); `tabs` is the
+    // gather's own PatTables, so the light-side march stops rebuilding one per hit too.
+    const TrRay*     camTr = nullptr;
+    const PatTables* tabs  = nullptr;
 
     double operator()(const BeamHit& bh, const PhotonBeam& b, double dens, double phase) const {
         const BeamMis* lm = bm->misOf(bh.idx);
@@ -2313,7 +2319,7 @@ struct BeamMergeWeight {
         if (!(gL > 0.0)) return 0.0;                         // delta light-side density
         const double sigT = scene->media[b.med].sigmaT(lamCam) * dens;
         if (!(sigT > 0.0)) return 0.0;
-        const double trC = trDet(*scene, sg->o, sg->d, tc, lamCam);   // Tr~(x -> eye[k])
+        const double trC = camTr->at(tc);                             // Tr~(x -> eye[k])
         if (!(trC > 0.0)) return 0.0;
         // eta of THIS merge against C1 — the numerator of the weight, and a term of its
         // denominator (a technique competes with itself at ratio exactly its own).
@@ -2338,7 +2344,7 @@ struct BeamMergeWeight {
         double etaPrevTerm = 0.0;
         if (lm->etaPrev > 0.0f) {
             const Vec3 yPrev = b.o - b.d * (double)lm->leadIn;
-            const double trP = trDet(*scene, yPrev, b.d, rhoL, (double)b.lambda);
+            const double trP = trDet(*scene, yPrev, b.d, rhoL, (double)b.lambda, *tabs);
             if (trP > 0.0) etaPrevTerm = kappa * (double)lm->etaPrev / trP;
         }
         const double den = (double)lm->gateC1                    // C1 itself (ratio 1)
@@ -2562,11 +2568,21 @@ struct BdptRenderer {
                                 segSumM[(size_t)k] = eK + carryM;
                             }
                         }
+                        TrRay camTr;
                         for (const PathSeg& sg : segs) {
                             if (!(sg.beta > 0.0)) continue;
                             BeamMergeWeight w1;
                             w1.scene = &scene; w1.bm = beams; w1.sg = &sg;
                             w1.lamCam = lamCam; w1.kappa = mergeKappa;
+                            w1.tabs = &tabs;
+                            // Hoisted out of the per-hit weight: the ray/bounds clip and the
+                            // spectral sigma_t lookup are constants of the SEGMENT, and a
+                            // dense medium hands one segment hundreds of hits. Built
+                            // unconditionally so `w1.camTr` is never null — cheap (one clip
+                            // per medium) and the alternative is a dangling read the day the
+                            // `mergeKappa == 0 => misOf() is null` coupling stops holding.
+                            camTr.build(scene, sg.o, sg.d, sg.tMax, lamCam, tabs);
+                            w1.camTr = &camTr;
                             if (mergeKappa > 0.0) {
                                 const size_t k = (size_t)sg.vert;
                                 const Vertex& vk = eye[k < (size_t)nE ? k : (size_t)nE - 1];

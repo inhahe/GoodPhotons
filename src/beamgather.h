@@ -89,6 +89,67 @@ inline double trDet(const Scene& scene, const Vec3& o, const Vec3& dir, double d
     return trDet(scene, o, dir, dist, lambda, tabs);
 }
 
+// --- The same transmittance, evaluated at MANY distances along ONE fixed ray -----------
+//
+// `trDet` re-derives, on every call, two things that depend only on the ray and not on the
+// distance: which media it crosses (a ray/bounds clip per medium) and each one's sigma_t at
+// the wavelength (a spectral curve evaluation). Mode `J`'s merge weight calls it once per
+// beam HIT along a single camera segment, and a dense medium hands that segment hundreds of
+// hits — 252 at the auto-tuned radius on `_fog_thick.ftsl` — so essentially all of that is
+// per-ray work being paid per-hit. `TrRay` hoists it: build once, then each evaluation is
+// one `exp` per crossed medium, which is all `trDet`'s own arithmetic reduces to.
+//
+// It is BIT-IDENTICAL to `trDet` rather than merely close, which matters because these are
+// MIS weights: the clip is `[ta, min(tb, t)]` either way (`clipToBounds` intersects the
+// medium's own interval with `[0, dist]`, so clipping to `tMax` and then to `t <= tMax` is
+// the same interval), the surviving media are multiplied in scene order, and a medium that
+// `trDet` would skip contributes exactly 1.0. Gate 1 checks this — mode `J` with an empty
+// map must stay `cmp`-identical to mode `D`.
+//
+// A HETEROGENEOUS medium keeps the slow path. Its 4-point midpoint quadrature samples the
+// density at positions that depend on the interval, so nothing about it can be hoisted;
+// `slow` then routes every evaluation on this ray straight back to `trDet`.
+struct TrRay {
+    static constexpr int kMax = 8;
+    struct Crossed { double sigT, ta, tb; };
+    Crossed xs[kMax];
+    int n = 0;
+    bool slow = false;                 // heterogeneous medium, or more than kMax media
+    const Scene* scene = nullptr;
+    const PatTables* tabs = nullptr;
+    Vec3 o{0, 0, 0}, d{0, 0, 0};
+    double lambda = 0.0;
+
+    void build(const Scene& sc, const Vec3& oo, const Vec3& dd, double tMax, double lam,
+               const PatTables& tb) {
+        scene = &sc; tabs = &tb; o = oo; d = dd; lambda = lam;
+        n = 0; slow = false;
+        if ((int)sc.media.size() > kMax) { slow = true; return; }
+        for (const Medium& m : sc.media) {
+            if (m.heterogeneous()) { slow = true; n = 0; return; }
+            const double st = m.sigmaT(lam);
+            if (st <= 0.0) continue;                       // trDet's 1.0 factor
+            double ta, tb2;
+            if (!m.clipToBounds(oo, dd, 0.0, tMax, ta, tb2)) continue;
+            if (!(tb2 - ta > 0.0)) continue;
+            xs[n].sigT = st; xs[n].ta = ta; xs[n].tb = tb2; ++n;
+        }
+    }
+
+    double at(double t) const {
+        if (slow) return trDet(*scene, o, d, t, lambda, *tabs);
+        double Tr = 1.0;
+        for (int i = 0; i < n; ++i) {
+            const double hi = t < xs[i].tb ? t : xs[i].tb;
+            const double L = hi - xs[i].ta;
+            if (!(L > 0.0)) continue;                      // trDet's 1.0 factor
+            Tr *= std::exp(-xs[i].sigT * L);
+            if (Tr <= 0.0) return 0.0;
+        }
+        return Tr;
+    }
+};
+
 // ---- Volume gather: single-scatter radiance along one camera SEGMENT from the beam map ---
 // The Beam x Ray 1D estimator (photonbeams.h). For every stored beam whose kernel cylinder
 // the segment [oc, oc + dc*tMax] passes through, add

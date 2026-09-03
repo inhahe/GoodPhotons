@@ -119,7 +119,7 @@ volumetric caustic seen through fog: it loses the merge technique and falls back
 noise there. **The fix** is a genuine solid-angle density for the specular lobe, which is the same
 change VCM would need and which no ftrace mode currently has.
 
-### UPBP-CONV — OPEN (2026-09-02, v0.218.0): `-spp` does not converge mode `J`'s merge half at all, and on `_fog_cornell` the merges buy **zero** noise reduction for ~25× the cost
+### UPBP-CONV — OPEN (2026-09-02, v0.218.0; measured on a thick medium 2026-09-03, v0.219.1): `-spp` does not converge mode `J`'s merge half at all, and mode `J` loses to mode `D` at equal time — on per-sample COST, not per-sample quality
 
 **Two separate observations from the Phase 3b validation, both expected, both worth knowing
 before anyone tunes a mode-`J` render.**
@@ -140,9 +140,41 @@ light-side convergence; mode `M` has the same property and the same option.
 right answer for `_fog_cornell` — a thin fog whose scattering points the camera's free-flight
 sampling reaches easily, so the connections were never starved and the merges have nothing to
 rescue — but it means **the validation scene cannot demonstrate the feature's value**, only its
-correctness. The performance claim has to be made on `gallery_rain` (optically thick, indirectly
-lit), which is the outstanding gate. Until that measurement exists, mode `J` should be described
-as correct and not yet as useful.
+correctness. Until a measurement exists on a scene where the two estimators are *supposed* to
+differ, mode `J` should be described as correct and not yet as useful.
+
+**(2b) Measured on a thick medium (2026-09-03, v0.219.1) — mode `J` still loses at equal time, by
+~19×, and the reason is cost, not the estimator.** `scenes/_fog_thick.ftsl` at `sigma_t 20 /
+albedo 0.95`, `-r 64`, 300 s each, against a 900 s / 35 700 spp mode-`D` reference:
+
+| render | spp in 300 s | relMSE | relMSE × spp = per-sample variance |
+|---|---|---|---|
+| `-mode D` | 12 157 | 0.599 | 7282 |
+| `-mode J -n 20000` | 272 | 11.11 | 3022 (**2.4× better than `D`**) |
+| `-mode J -n 100000` | 48 | 17.21 | 826 (**8.8× better than `D`**) |
+| `-mode J -n 400000` | 6 | 51.69 | 310 |
+
+Read that carefully, because it is not the failure it first looks like: **the merges do exactly
+what they are supposed to** — per sample, mode `J` has 2.4–8.8× less variance than mode `D`, and
+the advantage grows with the beam count, which is the signature of the merge technique reaching
+paths the connections cannot. Mode `J` loses only because a sample costs 45–250× more. Splitting
+the error by reference-brightness quartile (`scraps/pfmerr.py -q`) shows mode `D` ahead in every
+quartile, so there is no dim region where mode `J` is quietly winning.
+
+**Where the cost actually is — measured, not assumed.** The auto-tuned radius makes a probe ray
+gather **252 beams** per camera segment, and mode `J` runs the full weight *and* the estimator for
+each. Cost scales exactly linearly with the beam count (`-n` 20 k → 100 k is 5× the beams and
+5.0× fewer spp), so it is per-hit work, not setup. The first suspect was the MIS weight, which
+called `trDet` twice per hit and re-derived per-*ray* constants (the medium clip, the spectral
+`sigma_t`) inside a per-*hit* loop. Hoisting those into `TrRay` (v0.219.1, bit-identical output,
+`cmp`-verified with merges active) bought **~1.5 %**. So the weight is *not* the bottleneck: the
+cost is the beam×ray estimator's own two transmittance marches per surviving hit, which mode `M`
+pays identically and which no weight-side tuning can remove.
+
+**Therefore the outstanding lever is the GPU, not more CPU tuning.** Mode `J` is CPU-only; mode
+`M`'s beam gather already has a CUDA implementation to port from. A 50× gap is exactly the shape
+of a gap a GPU closes, and nothing measured so far suggests the CPU version can be tuned into a
+win. Do not spend more time micro-optimising the weight.
 
 **(3) Mode `J` fireflies harder than mode `D`.** Peak pixel 3.13e13 against 1.61e13 on the same
 scene — the beam×ray estimator's `1/sin(theta)` factor is unbounded as a beam becomes parallel to
