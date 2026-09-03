@@ -94,6 +94,14 @@ struct NavInput {
     // (reset the painted speed track to uniform).
     bool   paintMode  = false;           // "Paint" checkbox: wheel=speed, mouse=orientation on the path (persistent)
     bool   speedReset = false;           // "Flat" button: reset painted speed to uniform (one-shot)
+    // ---- Preview-shading toggles (persistent checkbox state, not edges) ----
+    // `colorOn` shows each surface's real albedo/skins; off re-shades the preview as
+    // neutral clay so only form and lighting remain. `clearOn` is the -see-through /
+    // -glass mode: clear dielectrics dim and haze what is behind them instead of showing
+    // as solid ghosts. Seeded by setShadeToggles (the render loop owns the defaults, and
+    // -see-through may already have been asked for on the command line).
+    bool   colorOn = true;               // "Color" checkbox (persistent)
+    bool   clearOn = false;              // "See-through" checkbox (persistent)
     // ---- Loom BIND-row outputs (only meaningful when `-anim ... -loom scene.py` is live) ----
     // The bind row edits which DRIVE CHANNEL feeds which named scene variable (a loom `Slot`),
     // plus how many channels the drive has. `bindChannel`/`bindTarget` are the row's CURRENT
@@ -253,6 +261,13 @@ public:
                     const std::vector<int>& fillSel,
                     const std::vector<double>& amounts,
                     const char* status);
+
+    // Seed / mirror the two preview-shading checkboxes ("Color" and "See-through"). The
+    // render loop owns their truth — the command line can turn see-through on before the
+    // window exists — so it pushes the state here rather than the panel inventing it.
+    // Marshalled to the UI thread; setting these never re-emits a NavInput change. No-op
+    // if the panel isn't enabled.
+    void setShadeToggles(bool colorOn, bool clearOn);
 
     // Update the panel's painted-speed readout (the "Paint" mode shows the local traversal-speed
     // multiplier at the current scrub position, e.g. "1.35x"). Marshalled to the UI thread; no

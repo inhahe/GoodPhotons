@@ -286,6 +286,36 @@ constexpr size_t kDefaultCurveBudget = 12u * 1000u * 1000u;
 // is by far the slow part of tessellation, so this drives the "tessellating N/M" UI.
 // `curveBudget` (0 = kDefaultCurveBudget) caps the triangles spent on curve/fiber
 // strands; see section (2b).
+// Re-shade a tessellation to NEUTRAL CLAY — the viewer's "Color" toggle off.
+//
+// Done to the baked geometry rather than as a flag inside the shade pass, so both
+// backends get it for free: the CPU rasterizer reads these fields directly and the GPU
+// one uploads them, and neither needs to know the mode exists. Everything that could
+// re-introduce a colour has to go with the albedo, not just the albedo itself — an image
+// skin, a triplanar projection, a `reflect`/`emit` pattern drive, a normal map (which is
+// shape, but shape read out of a coloured texture), and both children of a per-hit mix
+// plus the mask that chooses between them. What is left is form and lighting alone,
+// which is what you want when the question is "what shape is this?" rather than "what
+// does it look like?" — and, for an N-D warp, the shape is the whole question.
+inline void stripColor(PreviewGeom& g, const Vec3& neutral = Vec3{0.72, 0.72, 0.72}) {
+    auto flatten = [&](PShade& s) {
+        s.color          = neutral;
+        s.tex            = -1;
+        s.triplanarScale = 0.0;
+        s.reflectPat     = -1;
+        s.emitPat        = -1;
+        s.normalTex      = -1;
+    };
+    for (PTri& t : g.tris) flatten(t);
+    for (PMix& m : g.mixes) {
+        // Both children are now the same colour, so the mask decides nothing; dropping it
+        // also spares the shade pass a per-pixel pattern/texture evaluation per hit.
+        m.weightPat = -1;
+        m.weightTex = -1;
+        flatten(m.b);
+    }
+}
+
 inline PreviewGeom tessellate(const Scene& sc, int isoRes,
                               const std::function<void(int, int)>& progress = {},
                               size_t curveBudget = 0) {

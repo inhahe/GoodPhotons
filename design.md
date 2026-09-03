@@ -6072,6 +6072,20 @@ because both need the warp's state: a fill picked at amount 0 gets a visible def
 fill switched on into a fully edge-on axis turns the `z`-axis plane to 30 degrees so the
 change is visible instead of silently culled.
 
+**The two shading toggles.** `Color` and `See-through` sit on the panel's first row, so
+they are available in any `-explore` session rather than only under `-nd`. They differ in
+where they act, and that decides what a toggle costs. See-through is read per frame by
+`rasterOne` and handed straight to both `raster::renderFrame` and
+`raster_cuda::renderFrame`, so flipping it costs exactly one re-render. Colour is
+`raster::stripColor`, a pass over the BAKED `PreviewGeom` that replaces every albedo with
+neutral clay and drops everything that could re-introduce a colour (skin, triplanar,
+`reflect`/`emit` pattern drives, normal map, and both children of a per-hit mix plus its
+mask). Doing it to the geometry rather than as a flag inside the shade pass is what makes
+the CPU and GPU backends agree for free — neither needs to know the mode exists — and the
+price is that toggling colour re-tessellates and re-uploads, the same work a scene swap
+does. That trade is right for a button pressed occasionally and wrong for a slider, which
+is why the N-D angles went the other way.
+
 **Panel geometry.** The slider bank's height is a function of the window WIDTH (it wraps),
 so `panelH` is re-derived from `panelBaseH` on every layout instead of being accumulated as
 a one-time delta — otherwise narrowing the window would lay slider rows out below the strip

@@ -22,6 +22,7 @@ void LiveWindow::setPanelState(int, bool, bool, const char*) {}
 void LiveWindow::setPathCount(int) {}
 void LiveWindow::setEditState(bool, int) {}
 void LiveWindow::setSpeedLabel(double) {}
+void LiveWindow::setShadeToggles(bool, bool) {}
 void LiveWindow::enableBindRow(const std::vector<std::string>&, int) {}
 void LiveWindow::setBindState(const std::vector<std::string>&, const char*) {}
 void LiveWindow::enableNdPanel(int, const std::vector<std::string>&, const std::vector<double>&,
@@ -452,6 +453,8 @@ enum {
     ID_REC, ID_ADDPT, ID_INSPT, ID_DELPT, ID_SAVE, ID_TOL, ID_RAW,
     // ---- paint-mode controls (speed + orientation painting) ----
     ID_PAINT, ID_FLAT,
+    // ---- preview-shading toggles ----
+    ID_COLOR, ID_SEETHRU,
     // ---- loom bind row (drive channel -> named scene variable) ----
     ID_BCH, ID_BSLOT, ID_BIND, ID_BCLEAR, ID_BDIMS,
     // ---- N-D rotation panel ----
@@ -546,6 +549,7 @@ struct LiveWindow::Impl {
     // than accumulated, which is what keeps a resize honest.
     int                  panelBaseH = 0;
     int                  pathCount = 0;             // cameras on the timeline (0 = no path controls)
+    HWND hColor=nullptr, hSeeThru=nullptr;   // preview-shading toggles (Color / See-through)
     HWND hClip=nullptr, hReset=nullptr, hPath=nullptr, hPlay=nullptr, hTimeline=nullptr,
          hStrideLbl=nullptr, hStride=nullptr, hRateLbl=nullptr, hRate=nullptr,
          hSwUpdate=nullptr, hSwSec=nullptr;         // child controls (set on UI thread pre-hasPanel)
@@ -578,6 +582,8 @@ struct LiveWindow::Impl {
     double               tolVal = -1.0;             // simplify tolerance (world units; <0 = unset/unchanged)
     bool                 rawVal = false;            // "raw" checkbox: keep every sample vs. simplify
     bool                 paintVal = false;          // "Paint" checkbox: speed/orientation painting on (persistent)
+    bool                 colorVal = true;           // "Color" checkbox (persistent)
+    bool                 clearVal = false;          // "See-through" checkbox (persistent)
     bool                 flatReq = false;           // "Flat" button: reset painted speed (one-shot)
     // ---- Bind-row outputs (guarded by inMtx) ----
     bool                 bindReq = false, bclearReq = false;   // Bind / Unbind edges (one-shot)
@@ -675,6 +681,11 @@ void LiveWindow::Impl::buildPanel(HWND h) {
     std::wstring clipTxt = utf8ToWide("Clip: " + collide);
     hClip  = mk(L"BUTTON", clipTxt.c_str(), BS_PUSHBUTTON, ID_CLIP);
     hReset = mk(L"BUTTON", L"Reset", BS_PUSHBUTTON, ID_RESET);
+    // Preview-shading toggles. Push-like checkboxes rather than buttons because both are
+    // STATES you need to be able to read off the panel, not actions.
+    hColor   = mk(L"BUTTON", L"Color",       BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_COLOR);
+    hSeeThru = mk(L"BUTTON", L"See-through", BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_SEETHRU);
+    SendMessageW(hColor, BM_SETCHECK, BST_CHECKED, 0);   // colour is the default view
     // Path/timeline group is ALWAYS created (so authoring a curve can reveal it later via
     // setPathCount), then hidden when there is no path yet (pathCount < 2).
     // Path (lock-to-path) toggle doubles as the timeline enable — same option, per spec.
@@ -1031,6 +1042,8 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     // hidden, so revealing it later (setPathCount) needs no relayout.
     place(hClip, 84, row1, bh);
     place(hReset, 56, row1, bh);
+    place(hColor, 52, row1, bh);
+    place(hSeeThru, 88, row1, bh);
     place(hPath, 66, row1, bh);
     place(hPlay, 56, row1, bh);
     place(hStrideLbl, 58, row1, bh);
@@ -1482,6 +1495,20 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                             if (v >= 1) { std::lock_guard<std::mutex> lk(self->inMtx); self->bindDimsVal = v; }
                         }
                         break;
+                    case ID_COLOR:
+                        if (self->hColor) {
+                            const bool on = SendMessageW(self->hColor, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                            std::lock_guard<std::mutex> lk(self->inMtx);
+                            self->colorVal = on;
+                        }
+                        break;
+                    case ID_SEETHRU:
+                        if (self->hSeeThru) {
+                            const bool on = SendMessageW(self->hSeeThru, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                            std::lock_guard<std::mutex> lk(self->inMtx);
+                            self->clearVal = on;
+                        }
+                        break;
                     case ID_NDRESET: { std::lock_guard<std::mutex> lk(self->inMtx); self->ndResetReq = true; } break;
                     default:
                         // A fill pick-list. Cached on the notification rather than read at
@@ -1804,6 +1831,8 @@ NavInput LiveWindow::drainNav() {
     n.simplifyTol = impl_->tolVal;  n.rawRecord = impl_->rawVal;
     // Paint-mode outputs: persistent checkbox state + one-shot Flat edge.
     n.paintMode = impl_->paintVal;  n.speedReset = impl_->flatReq;
+    // Preview-shading toggles: current checkbox state (persistent, like paintMode).
+    n.colorOn = impl_->colorVal;    n.clearOn = impl_->clearVal;
     // Loom bind-row outputs: cached combo selections + one-shot Bind/Unbind edges.
     n.bindChannel = impl_->bindChVal;  n.bindTarget = impl_->bindSlotVal;
     n.bindApply   = impl_->bindReq;    n.bindClear  = impl_->bclearReq;
@@ -1883,6 +1912,19 @@ void LiveWindow::setEditState(bool recording, int pointCount) {
     if (impl_->hRec)   SetWindowTextW(impl_->hRec, recording ? L"Stop" : L"Rec");
     if (impl_->hPtLbl) { wchar_t b[32]; swprintf(b, 32, L"pts: %d", pointCount);
                          SetWindowTextW(impl_->hPtLbl, b); }
+}
+
+void LiveWindow::setShadeToggles(bool colorOn, bool clearOn) {
+    if (!impl_ || !impl_->hasPanel.load()) return;
+    // BM_SETCHECK raises no BN_CLICKED, so mirroring the render loop's state here cannot
+    // feed back as a user toggle — the same contract setPanelState keeps.
+    if (impl_->hColor)
+        SendMessageW(impl_->hColor, BM_SETCHECK, colorOn ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (impl_->hSeeThru)
+        SendMessageW(impl_->hSeeThru, BM_SETCHECK, clearOn ? BST_CHECKED : BST_UNCHECKED, 0);
+    std::lock_guard<std::mutex> lk(impl_->inMtx);
+    impl_->colorVal = colorOn;
+    impl_->clearVal = clearOn;
 }
 
 void LiveWindow::setSpeedLabel(double speedX) {

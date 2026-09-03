@@ -511,6 +511,21 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > passing it implies `-see-through`). This is a *look* preview only — there's still
 > no bending, reflection or coloured absorption. Example:
 > `ftrace -in scenes/cornell.ftsl -raster -see-through -window -o png/preview.png`.
+>
+> **Both of these are live toggles in the viewer.** The interactive viewer's control
+> strip carries a **See-through** button (the flag above) and a **Color** button, so a
+> preview can be flipped between them without relaunching. `-see-through` and **`-flat`**
+> (alias `-no-color`) set their starting state.
+>
+> **Neutral shading — `-flat`.** With **Color** off every surface is re-shaded as one
+> neutral clay: no albedo, image skin, triplanar projection, pattern drive or normal map,
+> and both children of a per-hit `mix` collapse to the same thing. What is left is **form
+> and lighting alone**, which is what you want when the question is "what shape is this?"
+> rather than "what does it look like?" — most of all under an [N-D warp](#n-dimensional-rotation--nd),
+> where the shape *is* the question and a bright texture only hides it. It is applied to
+> the baked preview geometry rather than as a flag in the shade pass, so the CPU and GPU
+> rasterizers behave identically; the cost is that toggling it re-tessellates (and
+> re-uploads, on the GPU path) rather than merely re-rendering.
 > Because rasterizing is nearly free, a preview whose size you haven't pinned with
 > `-r` is **upscaled so its long edge is at least 1440 px** (aspect preserved) —
 > a scene that authored a small `film { res 256 256 }` still previews big and

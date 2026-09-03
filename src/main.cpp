@@ -16752,6 +16752,8 @@ static void printHelp(const char* prog) {
 "  -anim <file.json>     edit a loom CurveDrive sidecar in the fly viewer (implies -explore);\n"
 "                        control points seed from it and Save writes the reshaped curve back\n"
 "  -see-through|-glass   render clear dielectrics as see-through; -glass-clarity <0..1>\n"
+"  -flat | -no-color     shade the preview as neutral clay (form only, no albedo/skins);\n"
+"                        both of these are also live toggles in the viewer's control strip\n"
 "\n"
 "N-dimensional rotation (-nd): lift the model into N-D, rotate, project back to 3-D:\n"
 "  -nd <n>               enable; n = total dimensions (4..12). Opens the interactive\n"
@@ -16995,6 +16997,7 @@ static int run(int argc, char** argv) {
     bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
     int  rasterBench = 0;         // -raster-bench <n>: render the first camera n times, report steady-state ms/frame (explorer metric)
     bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
+    bool rasterColor = true;      // -flat: re-shade the preview as neutral clay (viewer "Color" toggle)
     double rasterClarity  = 0.85; // -glass-clarity <0..1>: per-surface transmittance for see-through mode (higher = clearer)
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
     // --- N-dimensional rotation (-nd; see ndwarp.h) ---
@@ -17671,6 +17674,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-raster-curve-budget") && i + 1 < argc)
             rasterCurveBudget = (size_t)std::max(0LL, std::atoll(argv[++i]));
         else if (!std::strcmp(argv[i], "-see-through") || !std::strcmp(argv[i], "-seethrough") || !std::strcmp(argv[i], "-glass")) rasterSeeThrough = true;
+        else if (!std::strcmp(argv[i], "-flat") || !std::strcmp(argv[i], "-no-color")) rasterColor = false;
         else if (!std::strcmp(argv[i], "-glass-clarity") && i + 1 < argc) { rasterClarity = std::clamp(std::atof(argv[++i]), 0.0, 1.0); rasterSeeThrough = true; }
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-exposure-anchor") && i + 1 < argc) expAnchorArg = argv[++i];
@@ -19121,6 +19125,10 @@ static int run(int argc, char** argv) {
                 }
             };
             prims = raster::tessellate(scene, rasterIso, tessProgress, rasterCurveBudget);
+            // "Color" off: re-shade to neutral clay. Done to the baked geometry, so the
+            // CPU and GPU rasterizers both get it without knowing the mode exists — which
+            // is also why toggling it has to re-tessellate rather than just re-render.
+            if (!rasterColor) raster::stripColor(prims);
             auto rt1 = std::chrono::steady_clock::now();
             std::printf("[raster] %zu triangles in %s; rendering %zu camera(s) on %d threads%s\n",
                         prims.size(),
@@ -19642,6 +19650,9 @@ static int run(int argc, char** argv) {
             // buttons. Path playback rides the SAME camera-index cursor the timeline scrubs.
             int pathCount = (int)explorePath.size();   // mutable: the editor rebuilds the path
             g_liveWin->enablePanel(pathCount, explorePathFps, collideShort(collide));
+            // The render loop owns these two: -see-through / -flat may already have been
+            // asked for, so the checkboxes are seeded from the flags rather than guessing.
+            g_liveWin->setShadeToggles(rasterColor, rasterSeeThrough);
             // ---- N-D rotation bank ---------------------------------------------------
             // One slider per rotation PLANE of the n-D space the model was lifted into.
             // Angles are held in DEGREES on the panel side and radians in the Config, so
@@ -20590,6 +20601,37 @@ static int run(int argc, char** argv) {
                       std::fflush(stdout);
                   } }
                 NavInput nav = g_liveWin->drainNav();
+
+                // ---- Preview-shading toggles -------------------------------------
+                // See-through is read per frame by rasterOne, so flipping it costs one
+                // re-render. Colour is baked into the tessellation (so that both
+                // backends get it for nothing), so flipping THAT costs a re-tessellate
+                // and, on the GPU path, a re-upload — the same work a scene swap does.
+                if (nav.clearOn != rasterSeeThrough) {
+                    rasterSeeThrough = nav.clearOn;
+                    std::printf("[viewer] see-through %s\n", rasterSeeThrough ? "on" : "off");
+                    std::fflush(stdout);
+                    traceDirty = true;
+                    changed = true;
+                }
+                if (nav.colorOn != rasterColor) {
+                    rasterColor = nav.colorOn;
+                    std::printf("[viewer] colour %s\n", rasterColor ? "on" : "off (neutral clay)");
+                    std::fflush(stdout);
+                    prims.clear();
+                    tessellated = false;
+#ifdef HAVE_CUDA
+                    if (gpuRaster) {
+                        raster_cuda::destroy(gpuRaster);
+                        gpuRaster = nullptr;
+                        ensurePrims();
+                        gpuRaster = raster_cuda::upload(prims, plight, &scene);
+                        if (!gpuRaster)
+                            std::fprintf(stderr, "[viewer] GPU re-upload failed; using the CPU rasterizer\n");
+                    }
+#endif
+                    changed = true;
+                }
 
                 // ---- N-D panel ---------------------------------------------------
                 if (ndActive) {
