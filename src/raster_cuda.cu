@@ -1217,9 +1217,13 @@ __device__ inline uchar3 tonemapPixel(const float3* accum, const float* zbuf, si
         const float mt = milkT[i];
         if (Tr < 1.0f || Tg < 1.0f || Tb < 1.0f || mt < 1.0f) {
             double m = __dsub_rn(1.0, (double)mt); // (1 - mt) evaluated once, as on host
-            cx = __dadd_rn(__dmul_rn(cx, (double)Tr), __dmul_rn(milkX, m));
-            cy = __dadd_rn(__dmul_rn(cy, (double)Tg), __dmul_rn(milkY, m));
-            cz = __dadd_rn(__dmul_rn(cz, (double)Tb), __dmul_rn(milkZ, m));
+            // Haze tinted by the HUE of the accumulated transmittance — the host twin;
+            // see the long comment there for why the hue and not the magnitude.
+            double tmax = fmax(fmax((double)Tr, (double)Tg), (double)Tb);
+            double inv  = (tmax > 1e-6) ? 1.0 / tmax : 1.0;
+            cx = __dadd_rn(__dmul_rn(cx, (double)Tr), __dmul_rn(milkX * (double)Tr * inv, m));
+            cy = __dadd_rn(__dmul_rn(cy, (double)Tg), __dmul_rn(milkY * (double)Tg * inv, m));
+            cz = __dadd_rn(__dmul_rn(cz, (double)Tb), __dmul_rn(milkZ * (double)Tb * inv, m));
         }
     }
     return make_uchar3(encodeSrgb(cx, lut), encodeSrgb(cy, lut), encodeSrgb(cz, lut));

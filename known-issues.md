@@ -130,33 +130,29 @@ they are filling a BLAS, exactly as they now write to the Scene's. Small, and mo
 mechanical; not done because `mesh_asset` + vertex colours has not come up, and the two
 loaders that fill a BLAS would each need the branch.
 
-### RASTER-MILK — OPEN (2026-09-03, v0.224.0): the see-through pass's haze **saturates on a faceted pile of glass**, washing out the colours it is meant to sit beside
+### RASTER-MILK — PARTLY FIXED (2026-09-03, v0.228.0): the see-through haze is now TINTED by the glass; it can still saturate on a very deep pile
 
-**What happens.** The clear pass adds a "milk" haze per crossed surface —
-`kMilkPerSurface = (1 - glassClarity) * 0.55` plus a grazing rim term
-`kRimStrength * graze³` — and accumulates it as a product over every crossing. On one
-glass object that reads as frosted edges, which is the intent. On a **dense pile of
-faceted gems** (`compote_with_gems.glb`: a dozen transmissive stones, so a sight line
-crosses six of them, each contributing a large grazing term over most of its area) the
-product saturates and the cluster renders as a flat white veil that hides the
-per-material colours added in v0.223.0.
+**Fixed: the haze was white.** It is added per crossed surface and stands for light
+scattered inside those surfaces — which reaches the eye through the same tint the
+background does, so an untinted haze was white light arriving from nowhere. On a dense pile
+of coloured glass it was also the dominant term, so it buried exactly the colours v0.223.0
+had just added: `compote_with_gems.glb` rendered as a white veil.
 
-**Why it did not show before.** Until v0.223.0 clear surfaces had no colour of their own,
-so a white wash over them looked like the intended result rather than a loss.
+It is now tinted by the **hue** of the accumulated transmittance (`clearT` normalised to
+unit peak), not by its magnitude — scaling by `T` itself would apply the same absorption
+twice and dark glass would lose its frost entirely. Colourless glass is unaffected exactly:
+equal channels make the hue white by construction, so the expression reduces to the old
+one. Costs nothing — it reuses the transmittance already accumulated, no new buffer.
 
-**Workaround.** `-glass-clarity 1` zeroes the per-surface term, leaving only the rim —
-which recovers most of the colour (verified on the compote). The solid preview
-(see-through OFF) shows the material colours cleanly and is unaffected.
+Measured on the compote: saturation mean 15.0 / max 26 (a white veil) → **29.5 / 201**.
 
-**Two candidate fixes, neither attempted.** (a) **Tint the haze** by the surface it came
-from — a red gem's frost should be pink, not white — which needs the milk product to
-become an RGB weighted average (+4 floats/pixel) and would fix the *lone* coloured glass
-object, though not a six-deep pile, where averaging several gem colours is muddy by
-construction. (b) **Cap the accumulated haze** so it cannot approach 1 however many
-surfaces are crossed, which is what actually restores readability on a pile. Worth noting
-that a genuinely six-deep stack of coloured glass *is* muddy in reality, so (b) is a
-legibility choice, not a correctness one, and should be a flag rather than a silent
-change.
+**Still open: the magnitude.** The per-surface term still accumulates multiplicatively
+without bound, so a sight line crossing six faceted gems drives `(1 - milkT)` toward 1 and
+the cluster stays hazier than it should. `-glass-clarity 1` zeroes the per-surface term and
+leaves only the grazing rim, which is the workaround. The fix would be to cap the
+accumulated haze; note that a genuinely six-deep stack of coloured glass IS muddy in
+reality, so that is a legibility choice rather than a correctness one and belongs behind a
+flag rather than in the default.
 
 ### RASTER-GPU-DIFF — OPEN (2026-09-03, v0.223.0): the preview rasterizer's two backends **disagree on which triangle owns a shared edge**, so a wall/ceiling seam renders green on the CPU and white on the GPU
 

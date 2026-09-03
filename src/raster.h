@@ -386,6 +386,11 @@ inline void stripColor(PreviewGeom& g, const Vec3& neutral = Vec3{0.72, 0.72, 0.
         s.reflectPat     = -1;
         s.emitPat        = -1;
         s.normalTex      = -1;
+        // A clear surface never reaches the shade pass at all — see-through hands it to
+        // the clear-accumulation pass, which reads ONLY this tint. Leaving it coloured
+        // meant "Color off" did nothing whatsoever on an all-glass model: every triangle
+        // took the clear path, so the two renders came out bit-identical.
+        s.clearTint      = Vec3{1, 1, 1};
     };
     for (PTri& t : g.tris) {
         flatten(t);
@@ -1481,9 +1486,25 @@ inline std::vector<uint8_t> exposeAndEncodeT(
                 const float mt = milkT[i];
                 if (Tr < 1.0f || Tg < 1.0f || Tb < 1.0f || mt < 1.0f) {
                     const double m = 1.0 - (double)mt;
-                    c = Vec3{c.x * (double)Tr + milkColor.x * m,
-                             c.y * (double)Tg + milkColor.y * m,
-                             c.z * (double)Tb + milkColor.z * m};
+                    // TINT THE HAZE BY THE GLASS IT IS IN. The haze stands for light
+                    // scattered inside the crossed surfaces, so it is seen through the
+                    // same tint the background is — an untinted one is white light
+                    // arriving from nowhere. On a single window this changes almost
+                    // nothing (T is near white); on a deep pile of coloured glass it is
+                    // the difference between reading the colours and reading a white
+                    // veil, because the haze is what dominates there.
+                    //
+                    // The HUE of the accumulated transmittance, not its magnitude:
+                    // scaling by T itself would multiply the haze by the same absorption
+                    // twice, and dark glass would lose its frost entirely.
+                    const double tmax = std::max({(double)Tr, (double)Tg, (double)Tb});
+                    const double inv = (tmax > 1e-6) ? 1.0 / tmax : 1.0;
+                    const Vec3 hz{milkColor.x * (double)Tr * inv,
+                                  milkColor.y * (double)Tg * inv,
+                                  milkColor.z * (double)Tb * inv};
+                    c = Vec3{c.x * (double)Tr + hz.x * m,
+                             c.y * (double)Tg + hz.y * m,
+                             c.z * (double)Tb + hz.z * m};
                 }
             }
             img[i * 3 + 0] = encode(c.x);

@@ -519,7 +519,10 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 >
 > **Neutral shading — `-flat`.** With **Color** off every surface is re-shaded as one
 > neutral clay: no albedo, image skin, triplanar projection, pattern drive or normal map,
-> and both children of a per-hit `mix` collapse to the same thing. What is left is **form
+> per-vertex colour, or glass tint, and both children of a per-hit `mix` collapse to the
+> same thing. (The glass tint matters more than it sounds: a clear surface never reaches
+> the shade pass — see-through hands it to the clear-accumulation pass, which reads only
+> that tint — so on an all-glass model it is the *only* thing the toggle can change.) What is left is **form
 > and lighting alone**, which is what you want when the question is "what shape is this?"
 > rather than "what does it look like?" — most of all under an [N-D warp](#n-dimensional-rotation--nd),
 > where the shape *is* the question and a bright texture only hides it. It is applied to
@@ -538,6 +541,13 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 >   and an order-independent rasterizer never pairs a front face with the back face it
 >   belongs to — so only the **hue** is taken and `-glass-clarity` goes on setting how much
 >   each crossing dims. Glass with no absorption is exactly colourless.
+>
+> The **milk haze takes the glass's colour** too — it is light scattered inside the
+> crossed surfaces, so it reaches the eye through the same tint the background does, and an
+> untinted haze is white light arriving from nowhere. It is tinted by the *hue* of the
+> accumulated transmittance rather than its magnitude, so dark glass keeps its frost
+> instead of losing it to the same absorption twice; colourless glass is unaffected
+> exactly (equal channels make the hue white by construction).
 >
 > `-glass-clarity` remains a master multiplier on every crossing, so one dial still
 > controls overall transparency. The exponential is taken in wavelength space and converted
