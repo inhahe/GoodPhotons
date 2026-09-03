@@ -522,6 +522,36 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
 #include "lattice_probe.h"
 bool cudaLatticeProbe(const unsigned long long* idx, int n, double* out);
 
+// Run a batch of pattern programs through BOTH device VMs and hand the results back for
+// the host to compare against its own `patternEval` — the parity check behind `-checkpatops`.
+//
+// It exists because the pattern VM is implemented THREE times: `patternEval` on the host,
+// the fp64 template `dPatternEval`, and `dPatternEvalF`, an FP32 twin that is what the
+// sphere-trace march actually runs. Their switches have no `default:`, so an opcode one of
+// them has never heard of is not a compile error and not a crash — the node is skipped, the
+// stack is left short, and the program quietly returns the wrong slot. When that happened to
+// an isosurface field it read 0 everywhere and the surface simply was not there, which looks
+// like an empty scene rather than a broken shader. This turns that into a named failure.
+//
+// `prog` is a flat pool of `nProg` one-opcode programs described by `off`/`len`; `outF64`
+// and `outF32` each receive `nProg` doubles. Returns false (leaving both untouched) if
+// there is no usable CUDA device or the launch fails, so the caller reports SKIPPED rather
+// than failed — the same contract cudaLatticeProbe keeps.
+// The probe's inputs, in one struct so the host reference and the two device twins cannot
+// drift apart: a check whose three sides disagree about what `y` is would report mismatches
+// that mean nothing. Every value is distinctive and non-zero on purpose — an opcode a VM has
+// never heard of is SKIPPED, which leaves the stack one short, and `patternEval` returns 0.0
+// for an empty stack. Zero inputs would make "skipped" and "evaluated" look identical.
+struct PatOpProbeIn {
+    double x, y, z, f;
+    double nx, ny, nz, r;
+    double u, v, curv, cavity, fw;
+    double d[9];              // d4..d12, the N-D slice coordinates
+};
+
+bool cudaPatOpProbe(const PatNode* prog, const int* off, const int* len, int nProg,
+                    const PatOpProbeIn& in, double* outF64, double* outF32);
+
 // `sizeof(Real)` — the device's working float width (4 with the default FTRACE_GPU_FP32,
 // 8 in an exact-FP64 build). The lattice helpers are `double` either way, but `gridUV`
 // hands its result back as `Real`, so `-checklattice` must narrow the host's double to the

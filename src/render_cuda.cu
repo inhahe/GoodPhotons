@@ -14087,6 +14087,31 @@ __global__ void kSppmGatherConvert(const DPhoton* ph, const int* order, long lon
     }
 }
 
+// One thread per program: evaluate it through both device VMs. Deliberately dumb — this
+// runs once from a self-test, and the point is that it exercises the SAME two functions the
+// renderer calls, not a simplified copy of them.
+__global__ static void kPatOpProbe(const PatNode* prog, const PatNodeF* progF,
+                                   const int* off, const int* len, int nProg,
+                                   const PatOpProbeIn* in, double* outF64, double* outF32) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nProg) return;
+    DPatEnv env = dPatEnvNoneT<DTexture>();
+    // `dext` must be REAL here, not null. It is the extra-dimension bank d4..d12, and it is
+    // the whole reason this check exists: leaving it null would make d4..d12 read 0 on the
+    // device AND 0 on the host, so the family that shipped broken in 0.230.0 would agree
+    // with itself and pass. The check has to supply the inputs that make a missing opcode
+    // observable.
+    float dF[9];
+    for (int k = 0; k < 9; ++k) dF[k] = (float)in->d[k];
+    outF64[i] = dPatternEval(prog + off[i], len[i], in->x, in->y, in->z, in->f,
+                             in->nx, in->ny, in->nz, in->r, in->u, in->v,
+                             in->curv, in->cavity, in->fw, env, in->d);
+    outF32[i] = (double)dPatternEvalF(progF + off[i], len[i],
+                                      (float)in->x, (float)in->y, (float)in->z, (float)in->f,
+                                      (float)in->nx, (float)in->ny, (float)in->nz,
+                                      (float)in->r, (float)in->u, (float)in->v, env, dF);
+}
+
 } // namespace gpu
 
 // ============================ host: bake + launch ============================
@@ -14115,6 +14140,41 @@ const char* cudaDeviceName() { cudaAvailable(); return g_devName; }
 // list travels as a plain device buffer rather than a `__constant__` symbol, so this needs
 // no API beyond the handful the HIP shim at the top of this file already covers.
 int cudaRealBytes() { return gpu::realBytes(); }
+bool cudaPatOpProbe(const PatNode* prog, const int* off, const int* len, int nProg,
+                    const PatOpProbeIn& in, double* outF64, double* outF32) {
+    if (!cudaAvailable() || nProg <= 0) return false;
+    int total = 0;
+    for (int i = 0; i < nProg; ++i) total = (off[i] + len[i] > total) ? off[i] + len[i] : total;
+    std::vector<gpu::PatNodeF> hF((size_t)total);
+    for (int i = 0; i < total; ++i) { hF[i].op = (int)prog[i].op; hF[i].a = (float)prog[i].a; }
+
+    PatNode*  dP  = nullptr; gpu::PatNodeF* dPF = nullptr;
+    int*      dO  = nullptr; int*      dL  = nullptr;
+    double*   d64 = nullptr; double*   d32 = nullptr;
+    PatOpProbeIn* dIn = nullptr;
+    bool ok = cudaMalloc(&dP,  sizeof(PatNode)  * total) == cudaSuccess
+           && cudaMalloc(&dPF, sizeof(gpu::PatNodeF) * total) == cudaSuccess
+           && cudaMalloc(&dO,  sizeof(int) * nProg) == cudaSuccess
+           && cudaMalloc(&dL,  sizeof(int) * nProg) == cudaSuccess
+           && cudaMalloc(&d64, sizeof(double) * nProg) == cudaSuccess
+           && cudaMalloc(&d32, sizeof(double) * nProg) == cudaSuccess
+           && cudaMalloc(&dIn, sizeof(PatOpProbeIn)) == cudaSuccess;
+    if (ok) ok = cudaMemcpy(dP,  prog,     sizeof(PatNode)  * total, cudaMemcpyHostToDevice) == cudaSuccess
+              && cudaMemcpy(dPF, hF.data(), sizeof(gpu::PatNodeF) * total, cudaMemcpyHostToDevice) == cudaSuccess
+              && cudaMemcpy(dO,  off,      sizeof(int) * nProg, cudaMemcpyHostToDevice) == cudaSuccess
+              && cudaMemcpy(dL,  len,      sizeof(int) * nProg, cudaMemcpyHostToDevice) == cudaSuccess
+              && cudaMemcpy(dIn, &in,       sizeof(PatOpProbeIn), cudaMemcpyHostToDevice) == cudaSuccess;
+    if (ok) {
+        gpu::kPatOpProbe<<<(nProg + 127) / 128, 128>>>(dP, dPF, dO, dL, nProg, dIn, d64, d32);
+        ok = cudaDeviceSynchronize() == cudaSuccess
+          && cudaMemcpy(outF64, d64, sizeof(double) * nProg, cudaMemcpyDeviceToHost) == cudaSuccess
+          && cudaMemcpy(outF32, d32, sizeof(double) * nProg, cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+    cudaFree(dP); cudaFree(dPF); cudaFree(dO); cudaFree(dL); cudaFree(d64); cudaFree(d32);
+    cudaFree(dIn);
+    return ok;
+}
+
 bool cudaLatticeProbe(const unsigned long long* idx, int n, double* out) {
     if (!cudaAvailable() || n <= 0) return false;
     unsigned long long* dIdx = nullptr;

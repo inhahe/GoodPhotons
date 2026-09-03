@@ -1484,6 +1484,21 @@ the **GPU port**, where mode `M`'s CUDA beam gather is the template; see UPBP-CO
   emitter and the two would disagree), and rewrites the group ranges afterwards since an
   extrusion changes the triangle count. Exports OBJ (per-corner normals/UVs, `usemtl` per
   material) or binary `.ftmesh`. `-checknd` pins the algebra and the combinatorics.
+
+The N-D *field* route (`-nd` over an `isosurface` whose formula reads `d4`…) has a hazard
+the mesh route does not: it runs through the pattern VM, and the VM exists three times — the
+host `patternEval`, the fp64 device `dPatternEval`, and `dPatternEvalF`, the FP32 twin the
+sphere-trace march uses. Adding the `d4`…`d12` opcodes to two of the three left the GPU
+tracer rendering the gyroid as *nothing*: no `default:` case means an unknown opcode is
+skipped rather than diagnosed, the stack ends up one short, the field reads 0 everywhere and
+never crosses the isolevel. An invisible surface is indistinguishable from an empty scene,
+so it cost a bisect across four backends. `-checkpatops` now closes that hole permanently:
+one minimal program per opcode through all three VMs, non-zero inputs (including the
+extra-dimension bank, without which the very family that broke would agree with itself at
+zero and pass), arity taken from `patOpStackEffect`, and a declared exemption table for the
+three opcodes that genuinely do not belong in all three. Verified by deleting the FP32
+`d4` case again: it reports nine mismatches, names each opcode, and identifies the fp32 VM
+as the one at fault.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only,
   PLY and STL (0.191.0).

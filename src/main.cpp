@@ -2649,6 +2649,186 @@ static void bvhStats(const Scene& scene, long long rays) {
 //     is the one thing 4-D rotation buys that 3-D cannot do;
 //   * the prism's 2-skeleton really has 2F + 2E triangles, so an extrusion's cost is
 //     predictable before it is built.
+// -checkpatops: every pattern opcode, through all THREE implementations of the VM.
+//
+// The VM exists three times — `patternEval` on the host, the fp64 device template
+// `dPatternEval`, and `dPatternEvalF`, an FP32 twin that is what the sphere-trace march
+// actually runs. None of their switches has a `default:`, so an opcode one of them has
+// never heard of is neither a compile error nor a crash: the node is skipped, the operand
+// stack is left one short, and the program returns the wrong slot. That is how adding
+// `d4` (0.230.0) left the GPU tracer rendering an isosurface as NOTHING — the field read 0
+// everywhere, and an invisible surface looks like an empty scene rather than a broken
+// shader. It cost a bisect across four backends to localise.
+//
+// So: build a minimal well-formed program per opcode, run it through all three, compare.
+// A skipped opcode changes what is on top of the stack, so it shows up as a mismatch
+// against the host rather than as silence.
+//
+// Arity comes from patOpStackEffect, the VM's own table, which also reports when an arity
+// is not knowable from the node alone (Grid/Scatter, whose arity is the named table's
+// dimensionality). Those are counted as SKIPPED rather than quietly passing — a check that
+// says "all clear" about opcodes it never exercised would be worse than no check.
+static const char* patOpLabel(PatOp op) {
+    // varName() names the VARIABLE opcodes (the ones this check exists for); anything
+    // else is identified by its enum index, which is all a failure report needs.
+    if (const char* v = varName(op)) if (v[0]) return v;
+    if (op == PatOp::Spec) return "spec:";
+    static char buf[24];
+    std::snprintf(buf, sizeof buf, "op#%d", (int)op);
+    return buf;
+}
+
+// Opcodes that are DELIBERATELY not in all three VMs, with the reason. Anything not listed
+// here is required to agree everywhere.
+//
+// This table is as much the point of the check as the comparison is. A VM that silently
+// drops an opcode and a VM that was never meant to have it look identical from the outside
+// -- both return 0 -- so the only thing that can tell them apart is a written-down decision.
+// Adding an opcode here is a deliberate edit that says "this divergence is intended";
+// leaving it out means the check fails until someone either implements it or explains it.
+enum PatOpWhere { PW_ALL, PW_HOST_ONLY, PW_NO_FP32 };
+
+static PatOpWhere patOpWhere(PatOp op, const char*& why) {
+    switch (op) {
+        case PatOp::Spec:
+            // `spec:<name>(w)` samples a named spectrum through a host std::function, and
+            // the compiler accepts it ONLY inside an `upsample` body -- which the loader
+            // evaluates on the host at load time to bake a Spectrum. No device VM can ever
+            // be handed a program containing it, so neither implements it.
+            why = "host-only: legal only in an `upsample` body, evaluated at load time";
+            return PW_HOST_ONLY;
+        case PatOp::VarCurv: case PatOp::VarCavity: case PatOp::VarFootprint:
+            // dPatternEvalF has no parameter for these: it is the FP32 VM the sphere-trace
+            // march runs, and a march samples a FIELD, not a surface -- there is no hit to
+            // measure curvature, cavity or a shading footprint at. The fp64 device VM does
+            // implement them (it also serves surface sites) and is checked normally.
+            why = "not in the FP32 VM: a field march has no surface to measure";
+            return PW_NO_FP32;
+        default:
+            why = nullptr;
+            return PW_ALL;
+    }
+}
+
+// -checkpatops: every pattern opcode, through all THREE implementations of the VM.
+//
+// The VM exists three times -- `patternEval` on the host, the fp64 device template
+// `dPatternEval`, and `dPatternEvalF`, an FP32 twin that is what the sphere-trace march
+// actually runs. None of their switches has a `default:`, so an opcode one of them has
+// never heard of is neither a compile error nor a crash: the node is skipped, the operand
+// stack is left one short, and the program returns the wrong slot. That is how adding
+// `d4` (0.230.0) left the GPU tracer rendering an isosurface as NOTHING -- the field read 0
+// everywhere, and an invisible surface looks like an empty scene rather than a broken
+// shader. It cost a bisect across four backends to localise.
+//
+// So: build a minimal well-formed program per opcode, run it through all three, compare.
+// A skipped opcode leaves a different value at the bottom of the stack -- `patternEval`
+// returns `sp > 0 ? st[0] : 0.0` -- so it surfaces as a mismatch rather than as silence.
+//
+// Arity comes from patOpStackEffect, the VM's own table, which also reports when an arity
+// is not knowable from the node alone (Grid/Scatter, whose arity is the named table's
+// dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
+// says "all clear" about opcodes it never exercised would be worse than no check.
+static int checkPatOps() {
+    struct Prog { PatOp op; int off, len; };
+    std::vector<PatNode> pool;
+    std::vector<Prog>    progs;
+    std::vector<int>     offs, lens;
+    int unknownArity = 0;
+
+    // Distinctive operand values: a degenerate 0/1 would make too many operators agree by
+    // accident, which is exactly what a coverage check must not do.
+    static const double kArgs[8] = {0.53, 0.31, 0.79, 0.17, 0.61, 0.43, 0.23, 0.71};
+
+    for (int i = 0; i <= (int)PatOp::VarFootprint; ++i) {
+        const PatOp op = (PatOp)i;
+        // `a` matters for the ops that read it. PovFn's id selects the function (and its
+        // arity); Tex/Grid/Scatter index tables that are deliberately absent here, so they
+        // return 0 on every backend -- equal, hence passing, which is honest: this check is
+        // about opcode COVERAGE, and the table samplers have their own tests.
+        double a = 0.0;
+        int pops = 0, pushes = 0;
+        if (!patOpStackEffect(op, a, pops, pushes)) { ++unknownArity; continue; }
+        if (pops > 8) { ++unknownArity; continue; }
+        // LdReg reads a register StReg never wrote in a one-op program; that is not a
+        // coverage question, so give it a program that writes first.
+        const int off = (int)pool.size();
+        if (op == PatOp::LdReg) {
+            pool.push_back(PatNode{PatOp::Const, kArgs[0]});
+            pool.push_back(PatNode{PatOp::StReg, 0.0});
+            pool.push_back(PatNode{PatOp::LdReg, 0.0});
+        } else {
+            for (int k = 0; k < pops; ++k) pool.push_back(PatNode{PatOp::Const, kArgs[k]});
+            pool.push_back(PatNode{op, a});
+        }
+        progs.push_back(Prog{op, off, (int)pool.size() - off});
+    }
+    for (const Prog& p : progs) { offs.push_back(p.off); lens.push_back(p.len); }
+
+    PatOpProbeIn in;
+    in.x = 0.37; in.y = -0.61; in.z = 0.83; in.f = 0.29;
+    in.nx = 0.21; in.ny = 0.47; in.nz = 0.86; in.r = 1.11;
+    in.u = 0.63; in.v = 0.19; in.curv = 0.41; in.cavity = 0.55; in.fw = 0.13;
+    for (int k = 0; k < 9; ++k) in.d[k] = 0.29 + 0.13 * k;   // d4..d12, all distinct
+
+    // Host reference, from the same inputs the device probe uses.
+    std::vector<double> host(progs.size(), 0.0);
+    {
+        PatCtx c;
+        c.x = in.x; c.y = in.y; c.z = in.z; c.f = in.f;
+        c.nx = in.nx; c.ny = in.ny; c.nz = in.nz; c.r = in.r;
+        c.u = in.u; c.v = in.v; c.curv = in.curv; c.cavity = in.cavity; c.fw = in.fw;
+        for (int k = 0; k < 9; ++k) c.d[k] = in.d[k];
+        for (size_t i = 0; i < progs.size(); ++i)
+            host[i] = patternEval(pool.data() + progs[i].off, progs[i].len, c);
+    }
+
+    std::vector<double> d64(progs.size(), 0.0), d32(progs.size(), 0.0);
+    bool haveDev = false;
+#ifdef HAVE_CUDA
+    haveDev = cudaPatOpProbe(pool.data(), offs.data(), lens.data(), (int)progs.size(),
+                             in, d64.data(), d32.data());
+#endif
+
+    int bad64 = 0, bad32 = 0, exempt = 0;
+    for (size_t i = 0; i < progs.size(); ++i) {
+        if (!haveDev) break;
+        const char* why = nullptr;
+        const PatOpWhere w = patOpWhere(progs[i].op, why);
+        if (w != PW_ALL) {
+            ++exempt;
+            std::printf("[checkpatops] EXEMPT   %-14s %s\n", patOpLabel(progs[i].op), why);
+            if (w == PW_HOST_ONLY) continue;
+        }
+        const double h = host[i];
+        // fp64 twin: should track the host closely. fp32 twin is a different precision by
+        // design, so it gets a loose tolerance -- the failure this catches is a SKIPPED
+        // opcode, which lands on a different stack slot entirely, not a last-digit drift.
+        const double tol64 = 1e-9 * (1.0 + std::fabs(h));
+        const double tol32 = 2e-3 * (1.0 + std::fabs(h));
+        const bool okA = !(std::fabs(d64[i] - h) > tol64) || (std::isnan(h) && std::isnan(d64[i]));
+        const bool okB = w == PW_NO_FP32 ||
+                         !(std::fabs(d32[i] - h) > tol32) || (std::isnan(h) && std::isnan(d32[i]));
+        if (!okA || !okB) {
+            if (!okA) ++bad64;
+            if (!okB) ++bad32;
+            std::printf("[checkpatops] MISMATCH %-14s host=%+.9g  fp64=%+.9g  fp32=%+.9g\n",
+                        patOpLabel(progs[i].op), h, d64[i], d32[i]);
+        }
+    }
+    std::printf("[checkpatops] %zu opcodes exercised, %d with an arity the VM cannot state "
+                "from the node alone (skipped), %d exempt by declaration\n",
+                progs.size(), unknownArity, exempt);
+    if (!haveDev) {
+        std::printf("[checkpatops] no CUDA device: host VM only, device twins SKIPPED\n");
+        std::printf("[checkpatops] PASS (host only)\n");
+        return 0;
+    }
+    std::printf("[checkpatops] device fp64 mismatches %d, fp32 mismatches %d\n", bad64, bad32);
+    std::printf("[checkpatops] %s\n", (bad64 || bad32) ? "FAIL" : "PASS");
+    return (bad64 || bad32) ? 1 : 0;
+}
+
 static int checkNd() {
     int fails = 0;
     auto ok = [&](bool cond, const char* what) {
@@ -16914,6 +17094,7 @@ static int run(int argc, char** argv) {
     bool checkLensOnly = false;
     bool checkFluoroOnly = false;
     bool checkNdOnly = false;     // -checknd: N-D warp algebra + prism combinatorics (ndwarp.h)
+    bool checkPatOpsOnly = false; // -checkpatops: every VM opcode across all three evaluators
     const char* meshPath = nullptr;
     double meshScale = 1.0;
     const char* exportMeshPath = nullptr;  // -export-mesh <file.obj>: isosurface -> mesh
@@ -17523,6 +17704,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
         else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
         else if (!std::strcmp(argv[i], "-checknd")) checkNdOnly = true;
+        else if (!std::strcmp(argv[i], "-checkpatops")) checkPatOpsOnly = true;
         else handled = false;
 
         // ---- segment 2 (see the nesting note at the top of the loop) ----------------
@@ -17912,6 +18094,7 @@ static int run(int argc, char** argv) {
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
     if (checkNdOnly)       return checkNd();       // deterministic, no scene needed
+    if (checkPatOpsOnly)   return checkPatOps();   // deterministic, no scene needed
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed
     if (checkDenoiseOnly)  return checkDenoise();  // deterministic, no scene needed
     if (checkThinFilmOnly) return checkThinFilm(); // deterministic, no scene needed

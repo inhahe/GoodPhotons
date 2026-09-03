@@ -5111,9 +5111,31 @@ alone can't restore, so they are not disk-resumable.
 `-checkbluenoise`, `-checkfnoise`, `-checkstochtile`, `-checkreaction`, `-checkcurv`,
 `-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checkprefer`, `-checkpaths`,
 `-checksdf`, `-checksun`, `-checkbind`, `-checkprop`, `-checkhair`,
-`-checkarray`, `-checklattice`, `-checknd`. Each runs deterministically without a scene and prints
+`-checkarray`, `-checklattice`, `-checknd`, `-checkpatops`. Each runs deterministically without a scene and prints
 `PASS`/`FAIL`. (`-misaudit` / `-misaudit-poison`, described at the end of this section, are
-also diagnostics but need a scene — they instrument a live render's MIS weights.) `-checkpaths` guards **asset path resolution** (see *Where asset paths
+also diagnostics but need a scene — they instrument a live render's MIS weights.)
+
+`-checkpatops` guards **the pattern VM against itself**. The VM is implemented three
+times — `patternEval` on the host, the fp64 device template `dPatternEval`, and
+`dPatternEvalF`, an FP32 twin that is what the sphere-trace march actually runs — and none
+of the three switches has a `default:` case. So an opcode that one of them has never heard
+of is not a compile error and not a crash: the node is skipped, the operand stack is left
+one short, and the program returns the wrong slot. When that happened to an isosurface
+field the field read `0` everywhere, never crossed the isolevel, and the surface simply was
+not there — which looks like an empty scene rather than a broken shader, and took a bisect
+across four backends to localise. The check builds one minimal well-formed program per
+opcode (operand count from `patOpStackEffect`, the VM's own arity table), evaluates each on
+all three, and compares. Inputs are deliberately non-zero, *including* the `d4`…`d12`
+extra-dimension bank, because a skipped opcode returns `0` and zero inputs would make
+"skipped" and "evaluated" indistinguishable. Opcodes with an arity that cannot be read from
+the node alone (`grid:`, `scatter:`, whose arity is the named table's dimensionality) are
+reported as skipped rather than silently passed. Three opcodes are **exempt by
+declaration**, printed with their reason on every run: `spec:` is host-only (the compiler
+accepts it only inside an `upsample` body, which the loader evaluates at load time), and
+`curv` / `cavity` / `fw` are absent from the FP32 VM because a field march has no surface to
+measure them on. That table is half the check — a VM that silently drops an opcode and one
+that was never meant to have it are indistinguishable from the outside, so the only thing
+that separates them is a written-down decision. `-checkpaths` guards **asset path resolution** (see *Where asset paths
 are looked for*): it builds a throwaway project tree in the temp directory, `cd`s
 somewhere unrelated, and asserts that a scene loads from there with its texture found
 via the scene's *parent* directory, that an absolute path is returned unchanged, that an
