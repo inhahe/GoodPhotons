@@ -2207,9 +2207,9 @@ static bool ndRun(NdResident* nd, const double* R3n, double cx, double cy, doubl
 }
 
 bool ndReproject(Scene* sc, NdResident* nd, const double* R3n,
-                 double cx, double cy, double cz) {
-    if (!sc || !nd || sc->nTris != nd->ntri) return false;
-    return ndRun(nd, R3n, cx, cy, cz, sc->dtris, nullptr);
+                 double cx, double cy, double cz, int triOffset) {
+    if (!sc || !nd || triOffset < 0 || triOffset + nd->ntri > sc->nTris) return false;
+    return ndRun(nd, R3n, cx, cy, cz, sc->dtris + triOffset, nullptr);
 }
 
 bool ndProbe(NdResident* nd, const double* R3n, double cx, double cy, double cz,

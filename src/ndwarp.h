@@ -851,7 +851,13 @@ struct Cache {
                    voff.clear(); vcorner.clear(); }
 };
 
-inline Stats apply(const Model& m, const Config& cfg, Scene& s, Cache* cache = nullptr) {
+// `keepDegenerate` keeps triangles the projection squashed to zero area instead of
+// dropping them. The GPU-resident path needs it: it re-projects in place into a DPTri
+// array whose slots were fixed at upload, and the set of triangles that survive a given
+// rotation is not. Zero-area triangles cost nothing to carry -- the rasterizer's own area
+// test discards them -- but a changing triangle COUNT would invalidate every slot.
+inline Stats apply(const Model& m, const Config& cfg, Scene& s, Cache* cache = nullptr,
+                   bool keepDegenerate = false) {
     Stats st;
     if (!m.ok) return st;
     // Phase timings. A slider drag re-runs this whole function per event, so when it
@@ -1031,7 +1037,7 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s, Cache* cache = n
             const std::array<int, 3>& vi = T.tvi[i];
             const Vec3 cr = cross(proj[(size_t)vi[1]] - proj[(size_t)vi[0]],
                                   proj[(size_t)vi[2]] - proj[(size_t)vi[0]]);
-            keep[i] = dot(cr, cr) > 1e-30 ? 1u : 0u;
+            keep[i] = (keepDegenerate || dot(cr, cr) > 1e-30) ? 1u : 0u;
         });
         // Serial only over a byte array: a running count on 4M bytes is a few ms, and
         // it is what lets the scatter above and the write below both be parallel.

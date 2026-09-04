@@ -15969,29 +15969,44 @@ serial with a comment saying so; revisiting it needs uninitialised storage, not 
 
 Net: a slider event went ~3.6 s -> ~2.4 s end to end (rebuild 2460 -> ~2256 ms plus the render).
 
-**Still open, and now clearly the right next step: (4), the async rebuild.** With three roughly
-equal costs and the total still over two seconds, shaving another 200 ms from any one of them
-does not change how it feels. What does is not blocking the input thread at all:
+**GPU-resident projection: DONE (0.238.0).** The warp's topology never changes while a
+slider moves -- `buildComplex` reads only the dimension count and the fills -- so the complex
+now lives on the device: its N-D vertex positions, its triangle indices and its crease
+adjacency. A drag uploads a 3xN matrix and runs three kernels (project, face normals and
+corner angles, crease gather) that write positions and normals straight into the DPTri array.
 
-- run the rebuild on a worker against a snapshot of the config;
-- keep the last good model on screen while it runs, so the viewport never shows a half-built
-  scene (which is what made a mid-rebuild frame render as an empty one);
-- stamp each request with a generation counter, drop superseded ones instead of queueing, and
-  ignore a completed rebuild whose generation is stale;
-- the panel already owns slider positions during a drag (see setNdStatus above), so nothing
-  needs to be echoed back and there is no position race to lose.
+Measured on the two-extrude config, 1,002,976 triangles:
 
-The obstacle is that `ndwarp::apply` writes straight into the live `Scene`, and the render loop
-reads it. The worker would need to produce the triangle vector and stats, with the main thread
-doing only the swap + deriveLight + tessellate + upload between frames. That keeps every existing
-data structure single-threaded and confines the change to the viewer loop.
+```
+[nd] rebuild 680 ms  (warp 325, tessellate 195, gpu-upload 161)   <- first event, host path
+[nd] complex is resident on the GPU ... (11.7 ms for 1002976 triangles)   <- every event after
+```
 
-**The bigger idea, if this is ever wanted properly.** All of the above still re-materialises
-4.26M triangles through three separate arrays (scene tris -> PTri -> DPTri) on every event, which
-is why the floor is seconds. The complex's topology and its N-D vertex positions never change
-during a drag -- only a 3xN matrix does. Uploading the complex ONCE and doing the projection on
-the GPU would make a drag cost a matrix upload and a kernel launch, i.e. genuinely interactive,
-at the price of a second geometry path for the -nd viewer.
+**680 ms -> 11.7 ms.** What makes it tractable is that `kProject` rebuilds the screen geometry
+(DGeo/DAttr/flags) from DPTri every frame and already culls zero-area triangles, so writing
+DPTri is sufficient and nothing needs compacting.
+
+Two consequences that had to be handled rather than ignored:
+
+- **The triangle COUNT must not move**, because the DPTri slots are fixed at upload while the
+  set of triangles surviving a given rotation is not. So `apply` grew a `keepDegenerate` mode,
+  used whenever the GPU rasterizer owns the slots. Zero-area triangles cost nothing to carry.
+- **`Scene::tris` goes stale**, holding the previous rotation, since the fast path never
+  touches host geometry. `ndHostStale` tracks that, and anything reading host geometry -- an
+  export, the path-traced preview -- forces a real culled rebuild first. Getting this wrong
+  would mean the preview and the exported model quietly disagreeing, which is the one failure
+  this path must not have.
+
+`-checkndgpu` pins the device kernels against `ndwarp::apply` on a 5-D cube carrying both an
+extrude and a radius emboss: every projected vertex and every per-corner crease normal, max
+|dpos| 7.6e-08 and |dnrm| 1.3e-07, which is fp32-against-fp64 and nothing more.
+
+**Still open:** the FIRST slider event after a fill change still takes the host path (~680 ms),
+because that is what uploads the topology; only subsequent drags are fast. Establishing the
+resident during the initial build would remove that, at the cost of one redundant rebuild at
+startup. Also untested: `ndWarpStart`, the offset for scenes that mix warped and unwarped
+geometry, is exercised only at 0 by the models to hand.
+
 ### extrude + see-through: FIXED -- the prism was emitting interior partition walls
 
 Reported as "extrude + see-through makes the whole thing a silhouette of undifferentiated solid

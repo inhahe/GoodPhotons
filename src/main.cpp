@@ -20918,6 +20918,33 @@ static int run(int argc, char** argv) {
             // the FILLS, so editing a fill rebuilds it while moving any slider -- in any
             // plane, including ones that swing an extra dimension into view -- reuses it.
             ndwarp::Cache ndCache;
+            // GPU-resident complex. While this is live a slider event never touches host
+            // geometry at all: the topology is already on the device, so a drag uploads a
+            // 3xN matrix and runs three kernels straight into the DPTri array.
+            //
+            // The cost is that Scene::tris then goes STALE -- it still holds the previous
+            // rotation. Anything that reads host geometry (an export, the path-traced
+            // preview, the CPU rasterizer) has to force a real rebuild first, which is what
+            // ndHostStale tracks. Getting that wrong would mean the preview and the
+            // exported model quietly disagreeing, which is the one failure this whole path
+            // must not have.
+            raster_cuda::NdResident* ndRes = nullptr;
+            bool   ndHostStale = false;     // Scene::tris is behind the displayed rotation
+            int    ndWarpStart = 0;         // where warped triangles begin in Scene::tris
+            auto ndDropResident = [&]() {
+#ifdef HAVE_CUDA
+                if (ndRes) { raster_cuda::ndDestroy(ndRes); ndRes = nullptr; }
+#endif
+                ndHostStale = false;
+            };
+            auto ndRows3 = [&]() {          // the first three rows of the rotation
+                const std::vector<double> R = ndwarp::rotationMatrix(ndCfg);
+                std::vector<double> r3((size_t)3 * ndCfg.n);
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < ndCfg.n; ++j)
+                        r3[(size_t)i * ndCfg.n + j] = R[(size_t)i * ndCfg.n + j];
+                return r3;
+            };
             auto ndReapply = [&]() {
                 if (!ndActive) return;
                 // Retilt the field slice first: it is the whole N-D story for an
@@ -20958,12 +20985,56 @@ static int run(int argc, char** argv) {
                                                      : (double)want / (double)ndModel.base.size());
                     std::fflush(stdout);
                 }
+#ifdef HAVE_CUDA
+                // Angle-only change with the complex already resident: nothing about the
+                // topology moved, so re-project on the device and skip the entire host
+                // rebuild. ndCache.matches() is the same test that decides whether the
+                // complex can be reused, so the two can never disagree about what changed.
+                if (ndRes && gpuRaster && ndCache.matches(ndModel, ndCfg)) {
+                    const std::vector<double> r3 = ndRows3();
+                    const auto tR = std::chrono::steady_clock::now();
+                    if (raster_cuda::ndReproject(gpuRaster, ndRes, r3.data(),
+                                                 ndModel.center.x, ndModel.center.y,
+                                                 ndModel.center.z, ndWarpStart)) {
+                        ndLastStats.det    = ndwarp::topLeft3(ndwarp::rotationMatrix(ndCfg),
+                                                              ndCfg.n).det();
+                        ndLastStats.linear = ndCfg.isLinear();
+                        ndHostStale = true;
+                        traceDirty  = true;
+                        const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - tR).count();
+                        // Say so the FIRST time, then only if it ever gets slow. Whether
+                        // the fast path engaged is otherwise invisible -- both routes draw
+                        // the same picture -- and "it silently did nothing" looks exactly
+                        // like "it worked" from outside.
+                        static bool saidResident = false;
+                        if (!saidResident) {
+                            saidResident = true;
+                            std::printf("[nd] complex is resident on the GPU: a slider now "
+                                        "uploads a 3x%d matrix and re-projects there "
+                                        "(%.1f ms for %zu triangles)\n",
+                                        ndCfg.n, ms, ndCache.tmpl.size());
+                            std::fflush(stdout);
+                        } else if (ms > 250.0) {
+                            std::printf("[nd] gpu re-project %.0f ms\n", ms);
+                            std::fflush(stdout);
+                        }
+                        return;
+                    }
+                    ndDropResident();   // it failed: fall through and rebuild honestly
+                }
+#endif
                 using rclock = std::chrono::steady_clock;
                 const auto tA = rclock::now();
                 auto msSince = [](rclock::time_point a) {
                     return std::chrono::duration<double, std::milli>(rclock::now() - a).count();
                 };
-                ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache);
+                // Keep zero-area triangles when the GPU rasterizer is in play, so the
+                // slot layout the resident path writes into cannot shift under it.
+                const bool keepDegen = (gpuRaster != nullptr);
+                ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache, keepDegen);
+                ndWarpStart = (int)ndModel.keep.size();
+                ndHostStale = false;
                 const double msWarp = msSince(tA);
                 ndBvhStale = true;
                 plight = raster::deriveLight(scene);
@@ -20982,6 +21053,14 @@ static int run(int argc, char** argv) {
                     msUp = msSince(tU);
                     if (!gpuRaster)
                         std::fprintf(stderr, "[nd] GPU re-upload failed; using the CPU rasterizer\n");
+                    // Hand the (angle-independent) topology to the device so the NEXT
+                    // slider move can skip all of this.
+                    ndDropResident();
+                    if (gpuRaster && !ndCache.tmpl.empty())
+                        ndRes = raster_cuda::ndUpload(
+                            ndCache.c.pos.data(), ndCache.c.nv, ndCfg.n,
+                            &ndCache.tvi[0][0], (int)ndCache.tmpl.size(),
+                            ndCache.voff.data(), ndCache.vcorner.data(), ndCfg.creaseDeg);
                 }
                 if (traceSess) { backwardRGBSessionEnd(traceSess); traceSess = nullptr; }
 #endif
@@ -21197,6 +21276,17 @@ static int run(int argc, char** argv) {
                         changed = true;
                     }
                     if (nav.ndSave) {
+                        // The GPU-resident path leaves Scene::tris one rotation behind, and
+                        // it also carries the zero-area triangles the device needs stable
+                        // slots for. Neither belongs in a file, so re-run the real warp --
+                        // culled, on the host -- before writing anything out.
+                        if (ndHostStale) {
+                            ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache, false);
+                            ndHostStale = false;
+                            ndBvhStale  = true;
+                            prims.clear();
+                            tessellated = false;
+                        }
                         // Where to write: the -nd-export path when one was given, else a
                         // `_nd` sibling of the source model, which is where someone looking
                         // for "the thing I just made" would look first.
@@ -21673,6 +21763,18 @@ static int run(int argc, char** argv) {
                 }
 #ifdef HAVE_CUDA
                 if (pvMode == PV_PT && traceAvail) {
+                    // The path-traced preview reads the HOST scene, which the resident
+                    // re-projection deliberately leaves behind. Sync before it bakes, or
+                    // the traced image would show a different rotation from the raster one
+                    // it replaced on screen.
+                    if (ndHostStale) {
+                        ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache, false);
+                        ndHostStale = false;
+                        ndBvhStale  = true;
+                        prims.clear();
+                        tessellated = false;
+                        if (traceSess) { backwardRGBSessionEnd(traceSess); traceSess = nullptr; }
+                    }
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
                     // (Re)create the resident session on first use or after a resize.

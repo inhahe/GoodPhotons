@@ -92,8 +92,10 @@ void        ndDestroy(NdResident* nd);
 // Re-project for a new rotation and rewrite `sc`'s triangle positions and normals in
 // place. `R3n` is the first three ROWS of the n x n rotation, row-major (3*n doubles) --
 // the only rows an orthographic projection can see. Returns false if anything fails.
+// `triOffset` is where the warped triangles start in the uploaded array: a scene's
+// UNwarped triangles are emitted first, so the complex does not begin at slot 0.
 bool ndReproject(Scene* sc, NdResident* nd, const double* R3n,
-                 double cx, double cy, double cz);
+                 double cx, double cy, double cz, int triOffset);
 
 // Self-test hook: run the same three kernels and hand back the projected positions and
 // the per-triangle corner normals, so the host can check them against ndwarp's own result.
