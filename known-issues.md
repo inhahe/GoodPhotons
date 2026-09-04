@@ -16055,6 +16055,16 @@ partition walls are exactly what breaks that.
 
 The rim fix (a silhouette cue must not compound) stands on its own and is unrelated.
 
+**Follow-up (0.240.0): both sweeps are now offered rather than one chosen.** Removing the
+interior walls fixed see-through and cut the mesh, but it also changed what an extrusion LOOKS
+like: a closed mesh became two copies drifting apart, losing the connected 4-D read that the
+swept edges gave it. That was a genuine loss, not just a cleanup, and it is a judgement call
+rather than a correctness one -- so `extrude` (boundary) and `extrude skeleton` (every edge, the
+tesseract depiction) are now separate entries in the fill pull-down and separate CLI specs.
+`-checknd` pins both: closed cube to 2F = 24 under `extrude`, to 2F + 2E = 60 under `skeleton`,
+and 12 -> 60 -> 208 for two composed skeleton sweeps, which is exactly what the test asserted
+before the split.
+
 ### Residual: hue lost at true underflow (OPEN, minor)
 
 With every material in the model transmissive, an extrude multiplies the crossed surfaces enough

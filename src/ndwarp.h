@@ -34,13 +34,22 @@
 //                       and the projection reveals shape that was not in the original.
 //                       Topology is untouched — every vertex and every edge connection
 //                       survives exactly, which is the whole point.
-//   * `Fill::Extrude` — sweep the mesh into a real prism along that axis. The boundary
-//                       of a 4-D prism is a 3-manifold, which no triangle rasterizer
-//                       can draw, so what is built is its 2-SKELETON: the original
-//                       triangles at one end, their copy at the other, and every mesh
-//                       EDGE swept into a quad. That is exactly how a tesseract is
-//                       drawn as its square faces, and it is a genuine N-D solid whose
-//                       3-D projection changes qualitatively as it turns.
+//   * `Fill::Extrude` — sweep the mesh into a real prism along that axis and keep its
+//                       BOUNDARY. The boundary of S x [0,h] is S u (S+h) u (dS x [0,h]),
+//                       so a closed mesh simply doubles and only an open one grows walls
+//                       along its rim. A clean manifold: nothing is buried inside the
+//                       solid, which is what `-see-through` needs (it charges a
+//                       transmittance per crossed surface, so interior partitions would
+//                       saturate it) and what keeps the triangle count down.
+//   * `Fill::Skeleton`— the same sweep, but keeping the CW 2-SKELETON: additionally every
+//                       mesh EDGE swept into a quad, interior edges included. That is how
+//                       a tesseract is drawn as its 24 squares -- 12 of which are swept
+//                       cube edges -- and it is what makes a prism read as ONE connected
+//                       object as it turns, rather than as two copies drifting apart.
+//                       The price is those interior quads: they are partitions buried in
+//                       the solid, invisible to an opaque render but charged per crossing
+//                       by `-see-through`, and on a dense mesh there is one per edge.
+//                       Right for a coarse polytope, expensive for a scanned surface.
 //
 // The three fills are INDEPENDENT and per-dimension: dim 4 can extrude while dim 5
 // embosses curvature and dim 6 stays zero. They compose in the obvious order (lift,
@@ -119,7 +128,7 @@ inline std::string planeLabel(int n, int k) {
 // Configuration
 // ---------------------------------------------------------------------------
 
-enum class Fill : int { Zero = 0, Emboss, Extrude };
+enum class Fill : int { Zero = 0, Emboss, Extrude, Skeleton };
 
 // Per-vertex scalar fields available to `Fill::Emboss`. Every one is CENTERED to zero
 // mean and normalized to unit peak before `amp` scales it, so the embossed model stays
@@ -160,7 +169,7 @@ inline bool operator==(const DimSpec& a, const DimSpec& b) {
     if (a.fill != b.fill) return false;
     if (a.fill == Fill::Zero) return true;
     if (a.amp != b.amp) return false;
-    if (a.fill == Fill::Extrude) return true;
+    if (a.fill == Fill::Extrude || a.fill == Fill::Skeleton) return true;
     return a.src == b.src && a.freq == b.freq;
 }
 
@@ -177,7 +186,8 @@ struct Config {
         angle.resize((size_t)planeCount(n), 0.0);
     }
     bool anyExtrude() const {
-        for (const DimSpec& d : extra) if (d.fill == Fill::Extrude && d.amp != 0.0) return true;
+        for (const DimSpec& d : extra)
+            if ((d.fill == Fill::Extrude || d.fill == Fill::Skeleton) && d.amp != 0.0) return true;
         return false;
     }
     bool anyEmboss() const {
@@ -637,8 +647,13 @@ inline size_t projectedTriCount(const Model& m, const Config& cfg) {
     // produces a closed surface and no LATER sweep adds walls. Hence B is used once.
     size_t B = boundaryEdgeCount(m);
     for (const DimSpec& d : cfg.extra) {
-        if (d.fill != Fill::Extrude || d.amp == 0.0) continue;
-        const size_t F2 = 2 * F + 2 * B;
+        const bool sweep = (d.fill == Fill::Extrude || d.fill == Fill::Skeleton);
+        if (!sweep || d.amp == 0.0) continue;
+        // Skeleton sweeps EVERY edge, boundary sweeps only the rim. After either kind of
+        // sweep the result is closed, so a later boundary sweep adds nothing -- but a
+        // later SKELETON sweep still has every edge of the new complex to work with.
+        const size_t E_swept = (d.fill == Fill::Skeleton) ? E : B;
+        const size_t F2 = 2 * F + 2 * E_swept;
         const size_t E2 = 2 * E + V;
         const size_t V2 = 2 * V;
         F = F2; E = E2; V = V2; B = 0;
@@ -683,7 +698,7 @@ inline Complex buildComplex(const Model& m, const Config& cfg) {
     // (2E + V) or a second extrusion would have nothing to raise its walls from.
     for (int k = 3; k < n; ++k) {
         const DimSpec& d = cfg.extra[(size_t)(k - 3)];
-        if (d.fill != Fill::Extrude) continue;
+        if (d.fill != Fill::Extrude && d.fill != Fill::Skeleton) continue;
         const double h = d.amp * m.radius;
         if (h == 0.0) continue;
 
@@ -734,16 +749,19 @@ inline Complex buildComplex(const Model& m, const Config& cfg) {
         // phantom boundaries and collapsing the model to a flat silhouette. Dropping them
         // also cuts the extruded mesh by 43% (877,628 -> 501,488 here), which every stage
         // downstream pays for on every slider event.
+        const bool sweepAllEdges = (d.fill == Fill::Skeleton);
         std::unordered_map<uint64_t, int> edgeFaces;
-        edgeFaces.reserve(nt0 * 3);
-        for (size_t i = 0; i < nt0; ++i)
-            for (int e2 = 0; e2 < 3; ++e2) {
-                uint32_t u = c.tri[i * 3 + e2], v = c.tri[i * 3 + (e2 + 1) % 3];
-                if (u > v) std::swap(u, v);
-                ++edgeFaces[((uint64_t)u << 32) | v];
-            }
+        if (!sweepAllEdges) {
+            edgeFaces.reserve(nt0 * 3);
+            for (size_t i = 0; i < nt0; ++i)
+                for (int e2 = 0; e2 < 3; ++e2) {
+                    uint32_t u = c.tri[i * 3 + e2], v = c.tri[i * 3 + (e2 + 1) % 3];
+                    if (u > v) std::swap(u, v);
+                    ++edgeFaces[((uint64_t)u << 32) | v];
+                }
+        }
         for (size_t e = 0; e < ne0; ++e) {
-            {
+            if (!sweepAllEdges) {
                 uint32_t u = c.edge[e * 2 + 0], v = c.edge[e * 2 + 1];
                 if (u > v) std::swap(u, v);
                 // EXACTLY one incident face is a boundary. Two is interior. ZERO is a
@@ -1477,6 +1495,14 @@ inline bool parseDimSpec(const std::string& spec, DimSpec& out, std::string& err
         out.amp  = (f.size() > 1 && !f[1].empty()) ? std::atof(f[1].c_str()) : 0.5;
         return true;
     }
+    // The same sweep keeping the full CW 2-skeleton -- every edge swept, not just the rim.
+    // `tesseract` is an alias because that is what it looks like and what people ask for.
+    if (head == "skeleton" || head == "2skeleton" || head == "tesseract" ||
+        head == "extrude-skeleton") {
+        out.fill = Fill::Skeleton;
+        out.amp  = (f.size() > 1 && !f[1].empty()) ? std::atof(f[1].c_str()) : 0.5;
+        return true;
+    }
     if (head == "emboss") {
         out.fill = Fill::Emboss;
         std::string src = (f.size() > 1) ? f[1] : "curvature";
@@ -1515,6 +1541,7 @@ inline const std::vector<std::string>& fillChoices() {
         "emboss u",
         "emboss v",
         "extrude",
+        "extrude skeleton",
     };
     return kChoices;
 }
@@ -1524,7 +1551,7 @@ inline const std::vector<std::string>& fillChoices() {
 // same dead end the edge-on case produces.
 inline double defaultAmountFor(int choice) {
     if (choice <= 0) return 0.0;
-    return (choice == 7) ? 0.5 : 0.25;   // extrude reads better a little deeper
+    return (choice == 7 || choice == 8) ? 0.5 : 0.25;   // a sweep reads better a little deeper
 }
 
 // Set `d`'s fill and source from a pick-list index, leaving `amp`/`freq` alone.
@@ -1537,13 +1564,15 @@ inline void applyFillChoice(int choice, DimSpec& d) {
         case 5: d.fill = Fill::Emboss;  d.src = Emb::U;         break;
         case 6: d.fill = Fill::Emboss;  d.src = Emb::V;         break;
         case 7: d.fill = Fill::Extrude;                         break;
+        case 8: d.fill = Fill::Skeleton;                        break;
         default: d.fill = Fill::Zero;                           break;
     }
 }
 
 // The inverse: which pick-list entry a DimSpec currently is.
 inline int fillChoiceOf(const DimSpec& d) {
-    if (d.fill == Fill::Extrude) return 7;
+    if (d.fill == Fill::Extrude)  return 7;
+    if (d.fill == Fill::Skeleton) return 8;
     if (d.fill != Fill::Emboss)  return 0;
     switch (d.src) {
         case Emb::Curvature: return 1;
@@ -1559,7 +1588,8 @@ inline int fillChoiceOf(const DimSpec& d) {
 inline std::string dimSpecText(const DimSpec& d) {
     switch (d.fill) {
         case Fill::Zero:    return "zero";
-        case Fill::Extrude: return "extrude " + std::to_string(d.amp);
+        case Fill::Extrude:  return "extrude " + std::to_string(d.amp);
+        case Fill::Skeleton: return "skeleton " + std::to_string(d.amp);
         case Fill::Emboss:  return std::string("emboss ") + embName(d.src) + " " +
                                    std::to_string(d.amp);
     }

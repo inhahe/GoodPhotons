@@ -155,7 +155,8 @@ number means the same thing on a 2&nbsp;cm ring and a 40&nbsp;m building.</p>
 <tr><td>emboss&nbsp;height</td><td>The vertex's own <em>y</em>. Note this is a <em>linear</em> function of position, so rotating it in gives an affine <strong>shear</strong> — very dramatic, but not a genuine 4-D morph.</td></tr>
 <tr><td>emboss&nbsp;noise</td><td>Solid noise sampled in model-radius units, so <code>freq</code> reads as cycles across the model. Crumples and folds it.</td></tr>
 <tr><td>emboss&nbsp;u / v</td><td>The vertex's texture coordinate. Smooth and predictable on a model with continuous UVs; on an <em>atlased</em> model the UV islands are discontinuous, so the displacement tears along every seam and the result looks shredded. That is the atlas showing through, not a bug — use it on parametric surfaces.</td></tr>
-<tr><td>extrude</td><td>Sweeps the mesh into a real N-D prism along that axis, depth in model radii. See below.</td></tr>
+<tr><td>extrude</td><td>Sweeps the mesh into a real N-D prism along that axis, depth in model radii, keeping its <strong>boundary</strong>. See below.</td></tr>
+<tr><td>extrude&nbsp;skeleton</td><td>The same sweep, keeping the full <strong>2-skeleton</strong> &mdash; every edge swept, not just the rim. Reads as one connected solid; costs a lot more triangles. See below.</td></tr>
 </table>
 
 <p>Two things the fill cells do for you. Picking a fill while its amount is still 0 starts it at a
@@ -168,12 +169,24 @@ An extra dimension reaches the image only through its column of the rotation's f
 Until some plane containing that axis is turned, the column is zero, the sweep projects to zero
 area, and it looks like nothing happened. Turn <code>zw</code>, <code>xw</code> or similar.</div>
 
-<h3>What <code>extrude</code> builds</h3>
-<p>The boundary of the swept solid: the original triangles at one end, their copy at the other,
-and each <em>boundary</em> edge swept into a quad. For a <strong>closed</strong> mesh there are no
-boundary edges, so it simply doubles — you see the two copies separate as you rotate, with nothing
-between them, because for a closed surface there is genuinely nothing there. An <em>open</em> mesh
-(a plane, a shell with a hole) grows walls along its rim, which is what closes its prism.</p>
+<h3>The two sweeps</h3>
+<p>Both build the same 4-D prism. They differ in which of its two-dimensional pieces actually get
+drawn, and that changes both what you see and what it costs.</p>
+<table>
+<tr><th></th><th>extrude</th><th>extrude skeleton</th></tr>
+<tr><td>Draws</td><td>The prism's <em>boundary</em>: both ends, plus each <strong>boundary</strong> edge swept into a quad.</td><td>The prism's full <em>2-skeleton</em>: both ends, plus <strong>every</strong> edge swept, interior ones included.</td></tr>
+<tr><td>Closed mesh</td><td>Has no boundary edges at all, so it simply doubles: <code>F &rarr; 2F</code>. You see the two copies separate as you rotate, with nothing between them.</td><td><code>F &rarr; 2F + 2E</code>. The swept edges fill the space between the copies, so it reads as <strong>one connected solid</strong> turning in 4-D.</td></tr>
+<tr><td>Cost</td><td>Doubles the mesh.</td><td>About 3.5&times; on a triangulated surface, and again on a second sweep.</td></tr>
+<tr><td>With See-through</td><td>Clean: a manifold with nothing buried inside it.</td><td>Every interior quad is a partition buried in the solid, and see-through charges a transmittance per crossed surface. On a dense mesh that saturates and the model reads as a flat silhouette.</td></tr>
+</table>
+<p><strong>Which to use.</strong> <em>skeleton</em> is the classic depiction, and the one that makes
+an extrusion look like a 4-D object &mdash; a tesseract is drawn as its 24 squares, 12 of which are
+swept cube edges. It is right for a coarse polytope. <em>extrude</em> is right for a dense scanned
+or sculpted surface, where every edge is an artefact of triangulation rather than real structure,
+and where those interior quads would be both invisible to an opaque render and ruinous to
+see-through.</p>
+<p>An <em>open</em> mesh (a plane, a shell with a hole) grows walls along its rim under either
+setting &mdash; that rim is genuinely part of the boundary, and sweeping it is what closes the prism.</p>
 
 <h3>Other N-D controls</h3>
 <table>

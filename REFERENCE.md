@@ -4881,7 +4881,8 @@ letter (`w`, `v`, `u`, …). Repeatable.
 |---|---|
 | `zero` | The classic lift (default). Affine, per above. |
 | `emboss:<src>[:amp[:freq]]` | `x_k = amp · f(vertex)` for a per-vertex scalar `f`. Now `x_k` **varies over the surface**, so `p' = M p + Σ col_k · f_k(p)` is genuinely non-linear and the projection reveals shape that was not in the original. **Topology is untouched** — every vertex and every edge connection survives exactly. |
-| `extrude[:depth]` | Sweeps the mesh into a **real N-D prism** along that axis. |
+| `extrude[:depth]` | Sweeps the mesh into a **real N-D prism** along that axis, keeping its **boundary**. |
+| `skeleton[:depth]` | The same sweep keeping the full CW **2-skeleton** — every edge swept, not just the rim. Aliases: `tesseract`, `2skeleton`, `extrude-skeleton`. |
 
 `amp` and `depth` are fractions of the **model radius**, so the same number means the same
 visual amount whether the model is a 2 cm ring or a 40 m building.
@@ -4910,10 +4911,20 @@ a shell with a hole — does get walls along its rim, which is what closes the p
 > `V+F−2` phantom walls — saturated to a flat silhouette. It also made the mesh far larger
 > than it needed to be.
 
-Cost is therefore `V → 2V`, `E → 2E + V`, `F → 2F + 2B` with `B` the boundary-edge count: a
-closed mesh **doubles** per extrusion, and only an open one pays more. (Before, a closed mesh
-cost about **3.5x** per extrusion.) `-nd-budget <n>` (default 8 000 000) refuses a configuration
-past a triangle ceiling instead of trying to build it.
+Cost is therefore `V → 2V`, `E → 2E + V`, and `F → 2F + 2B` for `extrude` with `B` the
+boundary-edge count, or `F → 2F + 2E` for `skeleton`: a closed mesh **doubles** under `extrude`
+and grows about **3.5x** under `skeleton`. `-nd-budget <n>` (default 8 000 000) refuses a
+configuration past a triangle ceiling instead of trying to build it.
+
+**Which to use.** `skeleton` is the classic depiction and the one that makes an extrusion read as
+a single 4-D object — a tesseract is drawn as its 24 squares, 12 of them swept cube edges — so it
+is right for a coarse polytope. `extrude` is right for a dense scanned or sculpted surface, where
+every edge is an artefact of triangulation rather than real structure: there the swept interior
+quads are invisible to an opaque render (the z-buffer discards them) but ruinous to
+`-see-through`, which charges a transmittance per crossed surface and saturates to a flat
+silhouette. A closed mesh under `extrude` simply doubles, so you see the two copies separate as
+you rotate with nothing between them, which is honest — for a closed surface there is genuinely
+nothing there.
 
 > **An extruded axis is invisible until you turn it into view.** An extra dimension reaches
 > the image only through column `k` of the rotation matrix's first three rows; until some

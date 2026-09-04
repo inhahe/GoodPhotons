@@ -3085,6 +3085,19 @@ static int checkNd() {
         ok(ndwarp::projectedTriCount(m, cfg) == 24 && c.tri.size() / 3 == 24 &&
            (size_t)c.nv == 2 * V && c.edge.size() / 2 == 2 * E + V,
            "closed cube extrudes to 2F = 24 triangles (no side walls), 2V vertices");
+    }
+    {
+        // The OTHER sweep: `skeleton` keeps the full CW 2-skeleton, so every edge is swept
+        // whether it is on the rim or buried. That is the tesseract depiction -- a 4-cube
+        // is drawn as 24 squares, 12 of which are swept cube edges -- and it is what makes
+        // a prism read as one connected object instead of two copies drifting apart. On a
+        // triangulated cube the 18 edges include 6 face diagonals, so 2F + 2E = 60.
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.extra[0].fill = ndwarp::Fill::Skeleton; cfg.extra[0].amp = 0.5;
+        const ndwarp::Complex c = ndwarp::buildComplex(m, cfg);
+        ok(ndwarp::projectedTriCount(m, cfg) == 60 && c.tri.size() / 3 == 60 &&
+           (size_t)c.nv == 2 * V && c.edge.size() / 2 == 2 * E + V,
+           "skeleton sweeps EVERY edge: 2F + 2E = 60 triangles, 2V vertices");
         bool centred = true;
         for (int v = 0; v < c.nv; ++v)
             if (!approx(std::fabs(c.pos[(size_t)v * 4 + 3]), 0.5 * 0.5 * m.radius, 1e-12))
@@ -3117,6 +3130,15 @@ static int checkNd() {
         ok(ndwarp::projectedTriCount(m, cfg) == 48 &&
            ndwarp::buildComplex(m, cfg).tri.size() / 3 == 48,
            "two extrusions compose: 12 -> 24 -> 48 (each sweep closes, so none add walls)");
+    }
+    {
+        // Two skeleton sweeps compose the way the 2-skeleton always has.
+        ndwarp::Config cfg; cfg.resize(5);
+        cfg.extra[0].fill = ndwarp::Fill::Skeleton; cfg.extra[0].amp = 0.5;
+        cfg.extra[1].fill = ndwarp::Fill::Skeleton; cfg.extra[1].amp = 0.5;
+        ok(ndwarp::projectedTriCount(m, cfg) == 208 &&
+           ndwarp::buildComplex(m, cfg).tri.size() / 3 == 208,
+           "two skeleton sweeps compose: 12 -> 60 -> 208 triangles");
     }
     {
         bool normed = true;
@@ -21102,6 +21124,7 @@ static int run(int argc, char** argv) {
                     fills += ndwarp::axisName(k) + "=" +
                              (ndCfg.extra[(size_t)(k - 3)].fill == ndwarp::Fill::Zero ? "zero"
                               : ndCfg.extra[(size_t)(k - 3)].fill == ndwarp::Fill::Extrude ? "extrude"
+                              : ndCfg.extra[(size_t)(k - 3)].fill == ndwarp::Fill::Skeleton ? "skeleton"
                               : ndwarp::embName(ndCfg.extra[(size_t)(k - 3)].src));
                 }
                 std::snprintf(b, sizeof b, "%zu tris  |  %s%s",
