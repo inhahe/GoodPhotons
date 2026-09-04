@@ -597,16 +597,39 @@ struct Complex {
 
 // Triangle count the current config would produce, without building anything — so a
 // budget can be enforced before the allocation rather than after it.
+// Boundary edges of the base mesh: those with fewer than two incident faces. Only these
+// are swept into side walls (see buildComplex), so only these add triangles.
+inline size_t boundaryEdgeCount(const Model& m) {
+    std::unordered_map<uint64_t, int> f;
+    f.reserve(m.base.size() * 3);
+    const Topo& t = m.topo;
+    const size_t nt = t.vtri.size() / 3;
+    for (size_t i = 0; i < nt; ++i)
+        for (int e = 0; e < 3; ++e) {
+            uint32_t u = t.vtri[i * 3 + e], v = t.vtri[i * 3 + (e + 1) % 3];
+            if (u > v) std::swap(u, v);
+            ++f[((uint64_t)u << 32) | v];
+        }
+    size_t nb = 0;
+    for (const auto& kv : f) if (kv.second == 1) ++nb;
+    return nb;
+}
+
 inline size_t projectedTriCount(const Model& m, const Config& cfg) {
     size_t V = (size_t)m.topo.nv;
     size_t E = m.topo.edge.size() / 2;
     size_t F = m.base.size();
+    // Side walls go over BOUNDARY edges only, so a closed mesh just doubles. After one
+    // sweep the result is still closed if the input was (two closed copies), and an open
+    // input's boundary is swept into walls that close it -- so in both cases the sweep
+    // produces a closed surface and no LATER sweep adds walls. Hence B is used once.
+    size_t B = boundaryEdgeCount(m);
     for (const DimSpec& d : cfg.extra) {
         if (d.fill != Fill::Extrude || d.amp == 0.0) continue;
-        const size_t F2 = 2 * F + 2 * E;   // both copies, plus two triangles per swept edge
+        const size_t F2 = 2 * F + 2 * B;
         const size_t E2 = 2 * E + V;
         const size_t V2 = 2 * V;
-        F = F2; E = E2; V = V2;
+        F = F2; E = E2; V = V2; B = 0;
     }
     return F;
 }
@@ -683,8 +706,41 @@ inline Complex buildComplex(const Model& m, const Config& cfg) {
             ref2.push_back(c.ref[i * 3 + 2]);
             ref2.push_back(c.ref[i * 3 + 1]);
         }
-        // Side walls: one quad per edge, as two triangles.
+        // Side walls: one quad per BOUNDARY edge, as two triangles.
+        //
+        // Only boundary edges. Sweeping a surface S along a vector gives the 3-manifold
+        // S x [0,h], whose boundary is S u (S+h) u (dS x [0,h]) -- so an edge that already
+        // has two faces contributes NOTHING to the boundary, and a CLOSED S (dS empty)
+        // needs no side walls at all. Emitting one per edge, as this did, builds the CW
+        // 2-skeleton instead of the boundary: correct as a complex, wrong as a surface to
+        // render, because every interior wall is a partition buried inside the solid.
+        //
+        // It was not a harmless extra either. Those walls are invisible to an opaque render
+        // (the z-buffer discards them) but NOT to `-see-through`, which charges a
+        // transmittance per crossed surface: a closed 250,744-triangle mesh has
+        // V+F-2 = 376,140 interior edges, so the preview was multiplying glass by ~40
+        // phantom boundaries and collapsing the model to a flat silhouette. Dropping them
+        // also cuts the extruded mesh by 43% (877,628 -> 501,488 here), which every stage
+        // downstream pays for on every slider event.
+        std::unordered_map<uint64_t, int> edgeFaces;
+        edgeFaces.reserve(nt0 * 3);
+        for (size_t i = 0; i < nt0; ++i)
+            for (int e2 = 0; e2 < 3; ++e2) {
+                uint32_t u = c.tri[i * 3 + e2], v = c.tri[i * 3 + (e2 + 1) % 3];
+                if (u > v) std::swap(u, v);
+                ++edgeFaces[((uint64_t)u << 32) | v];
+            }
         for (size_t e = 0; e < ne0; ++e) {
+            {
+                uint32_t u = c.edge[e * 2 + 0], v = c.edge[e * 2 + 1];
+                if (u > v) std::swap(u, v);
+                // EXACTLY one incident face is a boundary. Two is interior. ZERO is a
+                // dangling 1-cell -- after a sweep the complex's edge list still carries
+                // the connecting edges (2E+V) even though no wall used them, and treating
+                // those as boundary would grow a second sweep by 2V phantom triangles.
+                const auto it = edgeFaces.find(((uint64_t)u << 32) | v);
+                if (it == edgeFaces.end() || it->second != 1) continue;
+            }
             const uint32_t a = c.edge[e * 2 + 0], b = c.edge[e * 2 + 1];
             const uint32_t a2 = a + (uint32_t)nv0, b2 = b + (uint32_t)nv0;
             const uint32_t ra = c.vref[a], rb = c.vref[b];

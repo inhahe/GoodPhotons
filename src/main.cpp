@@ -2931,9 +2931,15 @@ static int checkNd() {
         ndwarp::Config cfg; cfg.resize(4);
         cfg.extra[0].fill = ndwarp::Fill::Extrude; cfg.extra[0].amp = 0.5;
         const ndwarp::Complex c = ndwarp::buildComplex(m, cfg);
-        ok(ndwarp::projectedTriCount(m, cfg) == 60 && c.tri.size() / 3 == 60 &&
+        // A CLOSED surface has no boundary, and the boundary of S x [0,h] is
+        // S u (S+h) u (dS x [0,h]) -- so with dS empty there are no side walls and the
+        // sweep is just the two lids. Emitting a wall per EDGE would build the CW
+        // 2-skeleton instead, which is a different object: correct as a complex, wrong as
+        // a surface, and every extra wall is a partition buried inside the solid that
+        // -see-through then charges a glass crossing for.
+        ok(ndwarp::projectedTriCount(m, cfg) == 24 && c.tri.size() / 3 == 24 &&
            (size_t)c.nv == 2 * V && c.edge.size() / 2 == 2 * E + V,
-           "one extrusion: 2F + 2E = 60 triangles, 2V vertices, 2E + V edges");
+           "closed cube extrudes to 2F = 24 triangles (no side walls), 2V vertices");
         bool centred = true;
         for (int v = 0; v < c.nv; ++v)
             if (!approx(std::fabs(c.pos[(size_t)v * 4 + 3]), 0.5 * 0.5 * m.radius, 1e-12))
@@ -2941,12 +2947,31 @@ static int checkNd() {
         ok(centred, "the sweep is centred on the original (+/- depth/2)");
     }
     {
+        // The other half of the rule, which a closed cube cannot exercise: an OPEN mesh
+        // does have a boundary, and sweeping it is what closes the prism. One quad =
+        // 2 triangles, 4 vertices, 5 edges, of which 4 are boundary (the diagonal is
+        // shared). So 2F + 2B = 4 + 8 = 12.
+        ndwarp::Model q;
+        const Vec3 p[4] = {{-1,-1,0},{1,-1,0},{1,1,0},{-1,1,0}};
+        Tri a; a.v0 = p[0]; a.v1 = p[1]; a.v2 = p[2]; a.finalize(); q.base.push_back(a);
+        Tri b; b.v0 = p[0]; b.v1 = p[2]; b.v2 = p[3]; b.finalize(); q.base.push_back(b);
+        q.center = Vec3{0, 0, 0}; q.radius = std::sqrt(2.0);
+        ndwarp::detail::weld(q.base, q.topo);
+        q.ok = true;
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.extra[0].fill = ndwarp::Fill::Extrude; cfg.extra[0].amp = 0.5;
+        ok(ndwarp::boundaryEdgeCount(q) == 4, "an open quad has 4 boundary edges of 5");
+        ok(ndwarp::projectedTriCount(q, cfg) == 12 &&
+           ndwarp::buildComplex(q, cfg).tri.size() / 3 == 12,
+           "open quad extrudes to 2F + 2B = 12 triangles (its boundary IS swept)");
+    }
+    {
         ndwarp::Config cfg; cfg.resize(5);
         cfg.extra[0].fill = ndwarp::Fill::Extrude; cfg.extra[0].amp = 0.5;
         cfg.extra[1].fill = ndwarp::Fill::Extrude; cfg.extra[1].amp = 0.5;
-        ok(ndwarp::projectedTriCount(m, cfg) == 208 &&
-           ndwarp::buildComplex(m, cfg).tri.size() / 3 == 208,
-           "two extrusions compose: 12 -> 60 -> 208 triangles");
+        ok(ndwarp::projectedTriCount(m, cfg) == 48 &&
+           ndwarp::buildComplex(m, cfg).tri.size() / 3 == 48,
+           "two extrusions compose: 12 -> 24 -> 48 (each sweep closes, so none add walls)");
     }
     {
         bool normed = true;

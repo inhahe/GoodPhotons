@@ -15992,44 +15992,53 @@ is why the floor is seconds. The complex's topology and its N-D vertex positions
 during a drag -- only a 3xN matrix does. Uploading the complex ONCE and doing the projection on
 the GPU would make a drag cost a matrix upload and a kernel launch, i.e. genuinely interactive,
 at the price of a second geometry path for the -nd viewer.
-### see-through on a deeply extruded all-glass model is SATURATED, not broken (OPEN, by design)
+### extrude + see-through: FIXED -- the prism was emitting interior partition walls
 
 Reported as "extrude + see-through makes the whole thing a silhouette of undifferentiated solid
-colours, so it can't be rendering it right". Investigated properly; the render is faithful and
-the model is the problem. There are THREE independent accumulators and an extrude saturates all
-three:
+colours, so it can't be rendering it right", with the sharp observation that extrude *alone* is
+fine, see-through *alone* is fine, and extrude only changes vertices and adds faces. That framing
+was right and it found a real bug.
 
-1. **Transmittance.** `clearTintOf` keeps the glass HUE only (magnitude belongs to
-   `-glass-clarity`), so ruby's attenuation (0.262, 0.0086, 0.0144) becomes ~(1, 0.033, 0.055)
-   and per-surface tau is 0.85 * that. `T.r = 0.85^N`, which at the ~40 crossings an extruded
-   shell produces is 0.001. Physically correct: that much ruby glass IS opaque.
-2. **Physical milk.** `kMilkPerSurface = (1 - clarity) * 0.55 = 0.0825` compounds too;
-   `0.9175^40 = 0.03`, i.e. full haze. Also correct -- thicker glass is hazier.
-3. **The silhouette rim.** THIS one was a genuine bug and is now FIXED (see below).
+`buildComplex` swept a side wall over EVERY edge, building the prism's CW 2-skeleton. But the
+object we render is a SURFACE, and the boundary of `S x [0,h]` is `S u (S+h) u (dS x [0,h])` --
+so an edge that already has two incident faces contributes nothing to the boundary, and a CLOSED
+`S` needs no side walls at all. Every wall over an interior edge was a partition buried inside
+the solid.
 
-With 1 and 2 saturated there is no dynamic range left, so the model reads as a flat tinted
-silhouette. Nothing is being computed wrongly; an order-independent see-through with no
-refraction simply has nothing left to show once the glass is optically opaque.
+Invisible to an opaque render (the z-buffer discards them) but not to `-see-through`, which
+charges a transmittance per crossed surface. The reported model is a closed genus-0 manifold --
+its wall count was exactly `V+F-2 = 376,140`, confirming every edge was interior -- so the
+preview was multiplying glass by ~40 phantom boundaries per pixel and collapsing the model to a
+flat silhouette.
 
-**Fixed: the rim compounded.** `perMilk = milkPerSurface + rimStrength * graze^3` with
-rimStrength 0.55, multiplied into the haze product for EVERY crossed surface. The rim is a
-screen-space silhouette CUE, not an optical depth -- physical thickness is already carried by
-the transmittance product -- so compounding it double-counts. A sphere crosses 2 surfaces and
-gets the intended rim; an extrude crosses 20+ whose side walls are edge-on for geometric
-reasons (interior sweeps parallel to the view, not silhouettes), so after ~10 the haze whited
-out. The rim now combines by MAX (stored as 1-max, a min, as order-independent as the product it
-replaced) in a second half of the milk buffer, folded back before shading so no downstream
-signature changed. Verified on `scenes/_glass_tint.ftsl`: unchanged apart from a slightly
-cleaner rim, which is the point.
+Side walls now go over boundary edges only, defined as **exactly one** incident face. Zero
+matters too: after a sweep the complex's edge list still carries the connecting edges (`2E+V`)
+that no wall used, and treating those as boundary would grow a second sweep by `2V` phantom
+triangles.
 
-It does NOT fix the extruded case, because 1 and 2 saturate on their own.
+Consequences, all good:
 
-**The real fix, when someone wants it: graceful degradation to opaque shading.** The point of
-`-see-through` is to see THROUGH glass; when the glass is too dense to see through, the useful
-thing to show is the ordinary shaded surface -- which for this model is excellent (`-see-through`
-off gives a detailed ruby compote). That needs the frontmost clear surface kept in a second
-G-buffer layer so the composite can blend toward it as T falls. Until then: turn see-through off
-when using extrude.
+| | before | after |
+|---|---|---|
+| one extrude | 877,628 tris | 501,488 |
+| two extrudes | 4,262,700 tris | 1,002,976 |
+| warp (two extrudes) | 1470 ms | 791 ms |
+| extrude + see-through | flat silhouette | correct translucent glass |
+
+`-checknd` was pinning the old formula and now pins the corrected one, on both sides of the rule:
+a closed cube extrudes to `2F = 24` with no walls, and an open quad to `2F + 2B = 12` because its
+boundary genuinely is swept. The open case is new -- a cube alone could never have caught this.
+
+**What this supersedes.** Two earlier diagnoses in this file blamed physics (transmittance and
+milk both saturating over ~40 crossings) and proposed graceful degradation, then a thickness-based
+Beer-Lambert accumulator, as the fix. Both were reasoning from a crossing count that should never
+have been that high. The saturation was real but it was a symptom. A thickness model is still a
+defensible improvement on its own merits -- it would make see-through insensitive to tessellation
+density generally -- but it is no longer needed for this, and it would NOT have worked here: the
+signed-depth trick it relies on needs a closed, consistently-oriented manifold, and interior
+partition walls are exactly what breaks that.
+
+The rim fix (a silhouette cue must not compound) stands on its own and is unrelated.
 
 ### Residual: hue lost at true underflow (OPEN, minor)
 
