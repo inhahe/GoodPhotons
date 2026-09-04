@@ -2829,6 +2829,132 @@ static int checkPatOps() {
     return (bad64 || bad32) ? 1 : 0;
 }
 
+// -checkndgpu: the resident N-D complex re-projected on the GPU must agree with the warp
+// ndwarp::apply computes on the host.
+//
+// This is the pairing that makes the viewer's fast path safe. A drag only changes angles,
+// so the device can hold the complex and re-project it -- but that means the SAME geometry
+// is now derived by two independent implementations, and a divergence would show as the
+// preview quietly disagreeing with what an export or a real render produces. The whole
+// point of the fast path is that you can trust the picture, so it has to be pinned.
+//
+// Compared: every projected vertex position and every per-corner crease normal. The test
+// picks a rotation where nothing projects to zero area, so `apply`'s cull drops nothing and
+// its output triangles line up one-for-one with the complex's, in the same order.
+static int checkNdGpu() {
+#ifndef HAVE_CUDA
+    std::printf("[checkndgpu] built without CUDA — SKIPPED\n");
+    std::printf("[checkndgpu] PASS (skipped)\n");
+    return 0;
+#else
+    ndwarp::Model m;
+    {
+        const Vec3 c[8] = {{-1,-1,-1},{1,-1,-1},{1,1,-1},{-1,1,-1},
+                           {-1,-1, 1},{1,-1, 1},{1,1, 1},{-1,1, 1}};
+        const int q[6][4] = {{0,1,2,3},{5,4,7,6},{4,0,3,7},{1,5,6,2},{4,5,1,0},{3,2,6,7}};
+        for (const auto& f : q) {
+            Tri a; a.v0 = c[f[0]]; a.v1 = c[f[1]]; a.v2 = c[f[2]]; a.finalize(); m.base.push_back(a);
+            Tri b; b.v0 = c[f[0]]; b.v1 = c[f[2]]; b.v2 = c[f[3]]; b.finalize(); m.base.push_back(b);
+        }
+        m.center = Vec3{0, 0, 0};
+        m.radius = std::sqrt(3.0);
+        ndwarp::detail::weld(m.base, m.topo);
+        m.ok = true;
+    }
+    ndwarp::Config cfg; cfg.resize(5);
+    cfg.extra[0].fill = ndwarp::Fill::Extrude; cfg.extra[0].amp = 0.5;
+    cfg.extra[1].fill = ndwarp::Fill::Emboss;  cfg.extra[1].src = ndwarp::Emb::Radius;
+    cfg.extra[1].amp  = 0.35;
+    // Angles chosen so no triangle projects edge-on; then apply()'s cull drops nothing and
+    // its output is the complex's triangles in order, which is what lets us compare.
+    const double D2R = PI / 180.0;
+    cfg.angle[(size_t)ndwarp::planeIndex(5, 0, 1)] = 13.0 * D2R;
+    cfg.angle[(size_t)ndwarp::planeIndex(5, 0, 3)] = 37.0 * D2R;
+    cfg.angle[(size_t)ndwarp::planeIndex(5, 2, 3)] = 21.0 * D2R;
+    cfg.angle[(size_t)ndwarp::planeIndex(5, 1, 4)] = 29.0 * D2R;
+
+    // apply() emits per SOURCE GROUP and rewrites Scene::meshGroups ranges, so the model
+    // needs one group and the scene needs the entry it points at. (Without them apply emits
+    // nothing, and the groupIdx write lands outside an empty vector.)
+    m.groups.push_back(ndwarp::Source{"cube", 0, m.base.size(), 0});
+    Scene scene;
+    scene.meshGroups.resize(1);
+    scene.meshGroups[0].name = "cube";
+    scene.meshGroups[0].triStart = 0;
+    scene.meshGroups[0].triCount = m.base.size();
+    scene.tris = m.base;
+    ndwarp::Cache cache;
+    const ndwarp::Stats st = ndwarp::apply(m, cfg, scene, &cache);
+    if (st.dropped != 0 || cache.tmpl.empty()) {
+        std::printf("[checkndgpu] setup produced %zu dropped triangles — cannot pair up\n",
+                    st.dropped);
+        std::printf("[checkndgpu] FAIL\n");
+        return 1;
+    }
+    const int ntri = (int)cache.tmpl.size();
+    const int nv   = cache.c.nv;
+    const int n    = cfg.n;
+    if ((int)scene.tris.size() != ntri) {
+        std::printf("[checkndgpu] %zu scene triangles vs %d complex — cannot pair up\n",
+                    scene.tris.size(), ntri);
+        std::printf("[checkndgpu] FAIL\n");
+        return 1;
+    }
+
+    const std::vector<double> R = ndwarp::rotationMatrix(cfg);
+    std::vector<double> R3n((size_t)3 * n);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < n; ++j) R3n[(size_t)i * n + j] = R[(size_t)i * n + j];
+
+    raster_cuda::NdResident* nd = raster_cuda::ndUpload(
+        cache.c.pos.data(), nv, n, &cache.tvi[0][0], ntri,
+        cache.voff.data(), cache.vcorner.data(), cfg.creaseDeg);
+    if (!nd) {
+        std::printf("[checkndgpu] no usable CUDA device — SKIPPED\n");
+        std::printf("[checkndgpu] PASS (skipped)\n");
+        return 0;
+    }
+    std::vector<float> gproj((size_t)nv * 3), gnrm((size_t)ntri * 9);
+    const bool ok = raster_cuda::ndProbe(nd, R3n.data(), m.center.x, m.center.y, m.center.z,
+                                         gproj.data(), gnrm.data());
+    raster_cuda::ndDestroy(nd);
+    if (!ok) {
+        std::printf("[checkndgpu] probe launch failed — SKIPPED\n");
+        std::printf("[checkndgpu] PASS (skipped)\n");
+        return 0;
+    }
+
+    // fp32 on the device against fp64 on the host, so the tolerance is a float one scaled
+    // by the model size; a real divergence (a wrong index, a missed crease) is orders out.
+    const double tol = 2e-4 * m.radius;
+    int badP = 0, badN = 0;
+    double worstP = 0.0, worstN = 0.0;
+    for (int i = 0; i < ntri; ++i) {
+        const Tri& t = scene.tris[(size_t)i];
+        const Vec3 hp[3] = {t.v0, t.v1, t.v2};
+        const Vec3 hn[3] = {t.n0, t.n1, t.n2};
+        for (int c = 0; c < 3; ++c) {
+            const int v = cache.tvi[(size_t)i][c];
+            const Vec3 gp{gproj[(size_t)v*3+0], gproj[(size_t)v*3+1], gproj[(size_t)v*3+2]};
+            const Vec3 dp = hp[c] - gp;
+            const double ep = std::sqrt(dot(dp, dp));
+            if (ep > worstP) worstP = ep;
+            if (ep > tol) ++badP;
+            const Vec3 gn{gnrm[(size_t)i*9+c*3+0], gnrm[(size_t)i*9+c*3+1], gnrm[(size_t)i*9+c*3+2]};
+            const Vec3 dn = hn[c] - gn;
+            const double en = std::sqrt(dot(dn, dn));
+            if (en > worstN) worstN = en;
+            if (en > 2e-3) ++badN;
+        }
+    }
+    std::printf("[checkndgpu] %d triangles, %d vertices, %d-D: max |dpos| = %.3e, "
+                "max |dnrm| = %.3e\n", ntri, nv, n, worstP, worstN);
+    std::printf("[checkndgpu] %d position mismatches, %d normal mismatches\n", badP, badN);
+    std::printf("[checkndgpu] %s\n", (badP || badN) ? "FAIL" : "PASS");
+    return (badP || badN) ? 1 : 0;
+#endif
+}
+
 static int checkNd() {
     int fails = 0;
     auto ok = [&](bool cond, const char* what) {
@@ -17120,6 +17246,7 @@ static int run(int argc, char** argv) {
     bool checkFluoroOnly = false;
     bool checkNdOnly = false;     // -checknd: N-D warp algebra + prism combinatorics (ndwarp.h)
     bool checkPatOpsOnly = false; // -checkpatops: every VM opcode across all three evaluators
+    bool checkNdGpuOnly = false;  // -checkndgpu: resident N-D re-projection vs the host warp
     const char* meshPath = nullptr;
     double meshScale = 1.0;
     const char* exportMeshPath = nullptr;  // -export-mesh <file.obj>: isosurface -> mesh
@@ -17730,6 +17857,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
         else if (!std::strcmp(argv[i], "-checknd")) checkNdOnly = true;
         else if (!std::strcmp(argv[i], "-checkpatops")) checkPatOpsOnly = true;
+        else if (!std::strcmp(argv[i], "-checkndgpu")) checkNdGpuOnly = true;
         else handled = false;
 
         // ---- segment 2 (see the nesting note at the top of the loop) ----------------
@@ -18145,6 +18273,7 @@ static int run(int argc, char** argv) {
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
     if (checkNdOnly)       return checkNd();       // deterministic, no scene needed
     if (checkPatOpsOnly)   return checkPatOps();   // deterministic, no scene needed
+    if (checkNdGpuOnly)    return checkNdGpu();    // deterministic, no scene needed
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed
     if (checkDenoiseOnly)  return checkDenoise();  // deterministic, no scene needed
     if (checkThinFilmOnly) return checkThinFilm(); // deterministic, no scene needed

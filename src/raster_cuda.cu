@@ -2047,4 +2047,183 @@ bool renderFrameToTarget(Scene*, const Camera&, int, int, int, double, bool, dou
 
 #endif
 
+
+// ---- Resident N-D complex ---------------------------------------------------------
+// One thread per vertex: rotate into N-space and keep the first three coordinates. Only
+// the first three ROWS of R are read, which is the whole argument for why an orthographic
+// projection of an N-D rotation is a 3xN matrix.
+__global__ static void kNdProject(const float* pos, int nv, int n, const float* R,
+                                  float cx, float cy, float cz, float* proj) {
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= nv) return;
+    const float* P = pos + (size_t)v * n;
+    float q[3];
+    for (int i = 0; i < 3; ++i) {
+        float acc = 0.0f;
+        const float* Ri = R + (size_t)i * n;
+        for (int j = 0; j < n; ++j) acc += Ri[j] * P[j];
+        q[i] = acc;
+    }
+    proj[(size_t)v * 3 + 0] = q[0] + cx;
+    proj[(size_t)v * 3 + 1] = q[1] + cy;
+    proj[(size_t)v * 3 + 2] = q[2] + cz;
+}
+
+// Face normal and the three Thurmer-Wuthrich corner angles, per complex triangle. A
+// degenerate triangle gets a zero normal, which can never clear the crease threshold, so
+// it drops out of the gather below without needing a separate test.
+__global__ static void kNdFace(const float* proj, const int* tvi, int ntri,
+                               float* fn, float* ang) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ntri) return;
+    const int a = tvi[i * 3 + 0], b = tvi[i * 3 + 1], c = tvi[i * 3 + 2];
+    const float3 P0 = make_float3(proj[(size_t)a*3+0], proj[(size_t)a*3+1], proj[(size_t)a*3+2]);
+    const float3 P1 = make_float3(proj[(size_t)b*3+0], proj[(size_t)b*3+1], proj[(size_t)b*3+2]);
+    const float3 P2 = make_float3(proj[(size_t)c*3+0], proj[(size_t)c*3+1], proj[(size_t)c*3+2]);
+    float3 cr = cross3(P1 - P0, P2 - P0);
+    const float l = sqrtf(dot3(cr, cr));
+    const float3 fnv = (l > 1e-18f) ? cr * (1.0f / l) : make_float3(0.0f, 0.0f, 0.0f);
+    fn[i * 3 + 0] = fnv.x; fn[i * 3 + 1] = fnv.y; fn[i * 3 + 2] = fnv.z;
+    const float3 V[3] = {P0, P1, P2};
+    for (int k = 0; k < 3; ++k) {
+        const float3 A = V[k];
+        float3 e1 = V[(k + 1) % 3] - A, e2 = V[(k + 2) % 3] - A;
+        const float l1 = sqrtf(dot3(e1, e1)), l2 = sqrtf(dot3(e2, e2));
+        float t = 0.0f;
+        if (l1 >= 1e-18f && l2 >= 1e-18f) {
+            float ca = dot3(e1, e2) / (l1 * l2);
+            ca = ca < -1.0f ? -1.0f : (ca > 1.0f ? 1.0f : ca);
+            t = acosf(ca);
+        }
+        ang[i * 3 + k] = t;
+    }
+}
+
+// The crease gather, then write positions and normals into the uploaded DPTri. Mirrors
+// meshFinishTris' fan average: each corner sums the incident faces whose normal is within
+// the crease angle, weighted by the corner angle.
+__global__ static void kNdWrite(const float* proj, const int* tvi, int ntri,
+                                const float* fn, const float* ang,
+                                const unsigned* voff, const unsigned* vcorner,
+                                float cosThresh, DPTri* tris, float* outNrm) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ntri) return;
+    const int idx[3] = {tvi[i * 3 + 0], tvi[i * 3 + 1], tvi[i * 3 + 2]};
+    const float3 fni = make_float3(fn[i*3+0], fn[i*3+1], fn[i*3+2]);
+    float3 P[3], N[3];
+    for (int c = 0; c < 3; ++c) {
+        const int v = idx[c];
+        P[c] = make_float3(proj[(size_t)v*3+0], proj[(size_t)v*3+1], proj[(size_t)v*3+2]);
+        float3 sum = make_float3(0.0f, 0.0f, 0.0f);
+        for (unsigned k = voff[v], e = voff[v + 1]; k < e; ++k) {
+            const unsigned cid = vcorner[k];
+            const float3 fnj = make_float3(fn[(cid/3)*3+0], fn[(cid/3)*3+1], fn[(cid/3)*3+2]);
+            if (dot3(fni, fnj) >= cosThresh) sum = sum + fnj * ang[cid];
+        }
+        const float l = sqrtf(dot3(sum, sum));
+        N[c] = (l > 1e-12f) ? sum * (1.0f / l) : fni;
+    }
+    if (tris) {
+        DPTri& t = tris[i];
+        t.p0 = P[0]; t.p1 = P[1]; t.p2 = P[2];
+        t.n0 = N[0]; t.n1 = N[1]; t.n2 = N[2];
+    }
+    if (outNrm)
+        for (int c = 0; c < 3; ++c) {
+            outNrm[(size_t)i*9 + c*3 + 0] = N[c].x;
+            outNrm[(size_t)i*9 + c*3 + 1] = N[c].y;
+            outNrm[(size_t)i*9 + c*3 + 2] = N[c].z;
+        }
+}
+
+
+// ---- Resident N-D complex: host side ----------------------------------------------
+struct NdResident {
+    float*    pos = nullptr;     // nv * n
+    int*      tvi = nullptr;     // ntri * 3
+    unsigned* voff = nullptr;    // nv + 1
+    unsigned* vcorner = nullptr; // ntri * 3
+    float*    proj = nullptr;    // nv * 3
+    float*    fn = nullptr;      // ntri * 3
+    float*    ang = nullptr;     // ntri * 3
+    float*    R = nullptr;       // 3 * n
+    int nv = 0, n = 0, ntri = 0;
+    float cosThresh = 0.0f;
+};
+
+NdResident* ndUpload(const double* pos, int nv, int n, const int* tvi, int ntri,
+                     const unsigned* voff, const unsigned* vcorner, double creaseDeg) {
+    if (!available() || nv <= 0 || ntri <= 0 || n < 3) return nullptr;
+    NdResident* nd = new NdResident();
+    nd->nv = nv; nd->n = n; nd->ntri = ntri;
+    nd->cosThresh = (float)std::cos(creaseDeg * 3.14159265358979323846 / 180.0);
+    std::vector<float> hp((size_t)nv * n);
+    for (size_t k = 0; k < hp.size(); ++k) hp[k] = (float)pos[k];
+    bool ok = cudaMalloc(&nd->pos, sizeof(float) * hp.size()) == cudaSuccess
+           && cudaMalloc(&nd->tvi, sizeof(int) * (size_t)ntri * 3) == cudaSuccess
+           && cudaMalloc(&nd->voff, sizeof(unsigned) * ((size_t)nv + 1)) == cudaSuccess
+           && cudaMalloc(&nd->vcorner, sizeof(unsigned) * (size_t)ntri * 3) == cudaSuccess
+           && cudaMalloc(&nd->proj, sizeof(float) * (size_t)nv * 3) == cudaSuccess
+           && cudaMalloc(&nd->fn, sizeof(float) * (size_t)ntri * 3) == cudaSuccess
+           && cudaMalloc(&nd->ang, sizeof(float) * (size_t)ntri * 3) == cudaSuccess
+           && cudaMalloc(&nd->R, sizeof(float) * 3 * (size_t)n) == cudaSuccess;
+    if (ok) ok = cudaMemcpy(nd->pos, hp.data(), sizeof(float) * hp.size(), cudaMemcpyHostToDevice) == cudaSuccess
+             && cudaMemcpy(nd->tvi, tvi, sizeof(int) * (size_t)ntri * 3, cudaMemcpyHostToDevice) == cudaSuccess
+             && cudaMemcpy(nd->voff, voff, sizeof(unsigned) * ((size_t)nv + 1), cudaMemcpyHostToDevice) == cudaSuccess
+             && cudaMemcpy(nd->vcorner, vcorner, sizeof(unsigned) * (size_t)ntri * 3, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (!ok) { ndDestroy(nd); return nullptr; }
+    return nd;
+}
+
+void ndDestroy(NdResident* nd) {
+    if (!nd) return;
+    if (nd->pos) cudaFree(nd->pos);
+    if (nd->tvi) cudaFree(nd->tvi);
+    if (nd->voff) cudaFree(nd->voff);
+    if (nd->vcorner) cudaFree(nd->vcorner);
+    if (nd->proj) cudaFree(nd->proj);
+    if (nd->fn) cudaFree(nd->fn);
+    if (nd->ang) cudaFree(nd->ang);
+    if (nd->R) cudaFree(nd->R);
+    delete nd;
+}
+
+// Shared by ndReproject and ndProbe: upload the matrix and run the three kernels.
+static bool ndRun(NdResident* nd, const double* R3n, double cx, double cy, double cz,
+                  DPTri* tris, float* outNrm) {
+    if (!nd) return false;
+    std::vector<float> hr((size_t)3 * nd->n);
+    for (size_t k = 0; k < hr.size(); ++k) hr[k] = (float)R3n[k];
+    if (cudaMemcpy(nd->R, hr.data(), sizeof(float) * hr.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    const int TPB = 256;
+    kNdProject<<<(nd->nv + TPB - 1) / TPB, TPB>>>(nd->pos, nd->nv, nd->n, nd->R,
+                                                       (float)cx, (float)cy, (float)cz, nd->proj);
+    kNdFace<<<(nd->ntri + TPB - 1) / TPB, TPB>>>(nd->proj, nd->tvi, nd->ntri, nd->fn, nd->ang);
+    kNdWrite<<<(nd->ntri + TPB - 1) / TPB, TPB>>>(nd->proj, nd->tvi, nd->ntri, nd->fn,
+                                                       nd->ang, nd->voff, nd->vcorner,
+                                                       nd->cosThresh, tris, outNrm);
+    return cudaDeviceSynchronize() == cudaSuccess && cudaGetLastError() == cudaSuccess;
+}
+
+bool ndReproject(Scene* sc, NdResident* nd, const double* R3n,
+                 double cx, double cy, double cz) {
+    if (!sc || !nd || sc->nTris != nd->ntri) return false;
+    return ndRun(nd, R3n, cx, cy, cz, sc->dtris, nullptr);
+}
+
+bool ndProbe(NdResident* nd, const double* R3n, double cx, double cy, double cz,
+             float* outProj, float* outNrm) {
+    if (!available() || !nd) return false;
+    float* dN = nullptr;
+    if (cudaMalloc(&dN, sizeof(float) * (size_t)nd->ntri * 9) != cudaSuccess) return false;
+    bool ok = ndRun(nd, R3n, cx, cy, cz, nullptr, dN);
+    if (ok) ok = cudaMemcpy(outProj, nd->proj, sizeof(float) * (size_t)nd->nv * 3,
+                            cudaMemcpyDeviceToHost) == cudaSuccess
+             && cudaMemcpy(outNrm, dN, sizeof(float) * (size_t)nd->ntri * 9,
+                           cudaMemcpyDeviceToHost) == cudaSuccess;
+    cudaFree(dN);
+    return ok;
+}
+
 }  // namespace raster_cuda

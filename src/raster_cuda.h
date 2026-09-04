@@ -68,6 +68,39 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
                                  bool seeThrough = false, double glassClarity = 0.85,
                                  double hazeCap = 1.0);
 
+// ---- Resident N-D complex (GPU-side re-projection) --------------------------------
+// The N-D warp's topology does not depend on the rotation: buildComplex reads only the
+// dimension count and the per-dimension fills. Only a 3xN matrix changes while a slider
+// moves. So the complex can live on the device -- its N-D vertex positions, its triangle
+// indices and its crease adjacency -- and a drag becomes "upload a matrix, run three
+// kernels" instead of re-materialising every triangle through Scene::tris, PTri and DPTri
+// on the host and pushing the result back across the bus.
+//
+// It writes positions and normals straight into the uploaded DPTri array. That is enough
+// because kProject rebuilds the screen geometry (DGeo/DAttr/flags) from DPTri every frame,
+// and zero-area triangles are already culled there -- so nothing needs compacting and the
+// buffer stays a fixed size whatever the rotation does.
+struct NdResident;
+
+// Upload the complex once, for a given set of fills. `pos` is nv*n doubles (row per
+// vertex), `tvi` is ntri*3 complex vertex ids in the SAME order as the DPTri array already
+// uploaded to `sc`, and voff/vcorner are the CSR crease adjacency over complex vertices.
+NdResident* ndUpload(const double* pos, int nv, int n, const int* tvi, int ntri,
+                     const unsigned* voff, const unsigned* vcorner, double creaseDeg);
+void        ndDestroy(NdResident* nd);
+
+// Re-project for a new rotation and rewrite `sc`'s triangle positions and normals in
+// place. `R3n` is the first three ROWS of the n x n rotation, row-major (3*n doubles) --
+// the only rows an orthographic projection can see. Returns false if anything fails.
+bool ndReproject(Scene* sc, NdResident* nd, const double* R3n,
+                 double cx, double cy, double cz);
+
+// Self-test hook: run the same three kernels and hand back the projected positions and
+// the per-triangle corner normals, so the host can check them against ndwarp's own result.
+// Returns false when there is no usable device, exactly as cudaLatticeProbe does.
+bool ndProbe(NdResident* nd, const double* R3n, double cx, double cy, double cz,
+             float* outProj, float* outNrm);
+
 // ---- Zero-copy present (CUDA <-> Direct3D 11 interop) ----------------------------
 // When the live preview window is presenting with D3D11 (see LiveWindow::renderShared),
 // the finished frame does not have to come back to the host at all: CUDA can be given
