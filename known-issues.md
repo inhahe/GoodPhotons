@@ -15992,7 +15992,46 @@ is why the floor is seconds. The complex's topology and its N-D vertex positions
 during a drag -- only a 3xN matrix does. Uploading the complex ONCE and doing the projection on
 the GPU would make a drag cost a matrix upload and a kernel launch, i.e. genuinely interactive,
 at the price of a second geometry path for the -nd viewer.
-### Residual: see-through saturates on a deeply extruded all-glass model (OPEN, minor)
+### see-through on a deeply extruded all-glass model is SATURATED, not broken (OPEN, by design)
+
+Reported as "extrude + see-through makes the whole thing a silhouette of undifferentiated solid
+colours, so it can't be rendering it right". Investigated properly; the render is faithful and
+the model is the problem. There are THREE independent accumulators and an extrude saturates all
+three:
+
+1. **Transmittance.** `clearTintOf` keeps the glass HUE only (magnitude belongs to
+   `-glass-clarity`), so ruby's attenuation (0.262, 0.0086, 0.0144) becomes ~(1, 0.033, 0.055)
+   and per-surface tau is 0.85 * that. `T.r = 0.85^N`, which at the ~40 crossings an extruded
+   shell produces is 0.001. Physically correct: that much ruby glass IS opaque.
+2. **Physical milk.** `kMilkPerSurface = (1 - clarity) * 0.55 = 0.0825` compounds too;
+   `0.9175^40 = 0.03`, i.e. full haze. Also correct -- thicker glass is hazier.
+3. **The silhouette rim.** THIS one was a genuine bug and is now FIXED (see below).
+
+With 1 and 2 saturated there is no dynamic range left, so the model reads as a flat tinted
+silhouette. Nothing is being computed wrongly; an order-independent see-through with no
+refraction simply has nothing left to show once the glass is optically opaque.
+
+**Fixed: the rim compounded.** `perMilk = milkPerSurface + rimStrength * graze^3` with
+rimStrength 0.55, multiplied into the haze product for EVERY crossed surface. The rim is a
+screen-space silhouette CUE, not an optical depth -- physical thickness is already carried by
+the transmittance product -- so compounding it double-counts. A sphere crosses 2 surfaces and
+gets the intended rim; an extrude crosses 20+ whose side walls are edge-on for geometric
+reasons (interior sweeps parallel to the view, not silhouettes), so after ~10 the haze whited
+out. The rim now combines by MAX (stored as 1-max, a min, as order-independent as the product it
+replaced) in a second half of the milk buffer, folded back before shading so no downstream
+signature changed. Verified on `scenes/_glass_tint.ftsl`: unchanged apart from a slightly
+cleaner rim, which is the point.
+
+It does NOT fix the extruded case, because 1 and 2 saturate on their own.
+
+**The real fix, when someone wants it: graceful degradation to opaque shading.** The point of
+`-see-through` is to see THROUGH glass; when the glass is too dense to see through, the useful
+thing to show is the ordinary shaded surface -- which for this model is excellent (`-see-through`
+off gives a detailed ruby compote). That needs the frontmost clear surface kept in a second
+G-buffer layer so the composite can blend toward it as T falls. Until then: turn see-through off
+when using extrude.
+
+### Residual: hue lost at true underflow (OPEN, minor)
 
 With every material in the model transmissive, an extrude multiplies the crossed surfaces enough
 that the accumulated transmittance underflows to exactly zero over part of the silhouette. There

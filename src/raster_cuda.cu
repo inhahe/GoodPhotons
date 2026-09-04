@@ -1123,12 +1123,20 @@ __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             float3 Vv = normalize3(cam.eye - wpos);
             float ndv = fabsf(dot3(Nn, Vv));
             float graze = 1.0f - ndv;
-            float perMilk = milkPerSurface + rimStrength * graze * graze * graze;
+            // See raster.h: the rim is a silhouette CUE and must saturate, not compound.
+            float perMilk = milkPerSurface;
             if (perMilk > 0.95f) perMilk = 0.95f;
+            float rim = rimStrength * graze * graze * graze;
+            if (rim > 0.95f) rim = 0.95f;
             atomicMulF(&clearT[row * 3 + 0], tauR);
             atomicMulF(&clearT[row * 3 + 1], tauG);
             atomicMulF(&clearT[row * 3 + 2], tauB);
             atomicMulF(&milkT[row], 1.0f - perMilk);
+            // (1-rim) combined by MIN. These are all in [0,1], and for non-negative
+            // floats the IEEE bit pattern orders the same as the value, so an unsigned
+            // atomicMin is exactly a float min here.
+            atomicMin((unsigned*)&milkT[(size_t)W * H + row],
+                      __float_as_uint(1.0f - rim));
         }
     }
 }
@@ -1142,6 +1150,16 @@ __global__ static void kFloorF(float* a, float lo, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     if (a[i] < lo) a[i] = lo;
+}
+
+// Fold the rim half of milkT into the physical half and apply the haze floor, so every
+// downstream reader still sees one float per pixel. Mirrors raster.h's fold pass.
+__global__ static void kFoldRim(float* milkT, int n, float floorT) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = milkT[i] * milkT[n + i];
+    if (v < floorT) v = floorT;
+    milkT[i] = v;
 }
 
 // Fill a device float array with a constant (used to reset clearT/milkT to 1.0 each frame;
@@ -1683,7 +1701,7 @@ static bool ensurePix(Scene* sc, size_t N) {
            && tryMalloc((void**)&sc->zbuf,   sizeof(float) * N)
            && tryMalloc((void**)&sc->emis,   sizeof(unsigned char) * N)
            && tryMalloc((void**)&sc->clearT, sizeof(float) * N * 3)
-           && tryMalloc((void**)&sc->milkT,  sizeof(float) * N)
+           && tryMalloc((void**)&sc->milkT,  sizeof(float) * N * 2)   // physical + rim
            && tryMalloc((void**)&sc->dimg,   N * 3)
            && tryMallocHost((void**)&sc->h_img, N * 3);
     if (!ok) return false;
@@ -1807,15 +1825,16 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
         // threads, and kFillF's `i >= n` guard would silently leave two thirds of the
         // buffer at whatever the last frame left there.
         const int gClear = (int)((N * 3 + TPB - 1) / TPB);
+        const int gPix2 = (int)((N * 2 + TPB - 1) / TPB);
         kFillF<<<gClear, TPB>>>(sc->clearT, 1.0f, N * 3);
-        kFillF<<<gPix, TPB>>>(sc->milkT,  1.0f, N);
+        kFillF<<<gPix2, TPB>>>(sc->milkT,  1.0f, N * 2);   // both halves
         // Stream order already runs kClear after both fills complete.
         kClear<<<gSlots, TPB>>>(sc->dtris, sc->dgeos, sc->dattrs, sc->dflags, 2 * sc->nTris,
                                 sc->zbuf, dc, W, H,
                                 (float)glassClarity, (float)kMilkPerSurface, (float)kRimStrength,
                                 sc->clearT, sc->milkT);
-        if (hazeCap < 1.0)
-            kFloorF<<<gPix, TPB>>>(sc->milkT, (float)fmax(0.0, 1.0 - hazeCap), (int)N);
+        kFoldRim<<<gPix, TPB>>>(sc->milkT, (int)N,
+                                hazeCap < 1.0 ? (float)fmax(0.0, 1.0 - hazeCap) : 0.0f);
     }
     rec(5);   // recorded either way; the clear window is simply ~0 when see-through is off
 

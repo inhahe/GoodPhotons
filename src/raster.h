@@ -1209,12 +1209,29 @@ inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, in
             Vec3 V  = normalize(cam.eye - wpos);
             double ndv = std::fabs(dot(Nn, V));
             double graze = 1.0 - ndv;                 // 0 head-on, ->1 at the silhouette
-            double perMilk = milkPerSurface + rimStrength * graze * graze * graze;
+            // THE RIM IS A CUE, NOT AN OPTICAL DEPTH. The grazing term exists so a glass
+            // object's SILHOUETTE reads; it is a screen-space hint, not a physical
+            // quantity, and physical thickness is already accounted for by the clearT
+            // product (more glass = more crossings = darker). Multiplying (1 - 0.55) into
+            // the haze for every grazing surface therefore double-counts, and worse, it
+            // compounds: a sphere crosses 2 surfaces and gets the intended rim, but an -nd
+            // extrude crosses 20+ whose side walls are edge-on for GEOMETRIC reasons --
+            // they are interior sweeps parallel to the view, not silhouettes -- so after
+            // ~10 of them the haze saturates and every pixel of the model turns to flat
+            // frost. Combine the rim by MAX instead (stored as 1-max, so a min, which is
+            // as order-independent as the product it replaces) and let only the physical
+            // per-surface milk compound.
+            double perMilk = milkPerSurface;
             if (perMilk > 0.95) perMilk = 0.95;
+            double rim = rimStrength * graze * graze * graze;
+            if (rim > 0.95) rim = 0.95;
             clearT[row * 3 + 0] *= tauR;
             clearT[row * 3 + 1] *= tauG;
             clearT[row * 3 + 2] *= tauB;
             milkT[row] *= (float)(1.0 - perMilk);
+            const size_t NPX = (size_t)W * H;
+            float& r = milkT[NPX + row];
+            if ((float)(1.0 - rim) < r) r = (float)(1.0 - rim);
         }
     }
 }
@@ -1816,10 +1833,13 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     if (!seeThrough) { clearT.clear(); milkT.clear(); }
     if (seeThrough) {
         clearT.resize(N * 3);            // RGB: a tinted surface transmits per channel
-        milkT.resize(N);
+        // TWO halves: [0,N) the compounding physical milk, [N,2N) the silhouette rim as
+        // (1 - max), so it saturates instead of accumulating. Folded together below.
+        milkT.resize(N * 2);
         parallelFor(N, [&](size_t a, size_t b) {
             std::fill(clearT.begin() + a * 3, clearT.begin() + b * 3, 1.0f);
             std::fill(milkT.begin() + a, milkT.begin() + b, 1.0f);
+            std::fill(milkT.begin() + N + a, milkT.begin() + N + b, 1.0f);
         });
         dispatchBands([&](int y0, int y1) {
             for (const STri& s : stris) {
@@ -1844,13 +1864,16 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
         // exactly the same number (once it is at the floor, further multiplies clamp back
         // to the floor), and doing it here keeps the hot inner loop and the atomics on the
         // device twin untouched. Costs one pass over the buffer, and only when asked for.
-        if (hazeCap < 1.0) {
-            const float floorT = (float)std::max(0.0, 1.0 - hazeCap);
-            parallelFor(N, [&](size_t a, size_t b) {
-                for (size_t i = a; i < b; ++i)
-                    if (milkT[i] < floorT) milkT[i] = floorT;
-            });
-        }
+        // Fold the rim half into the physical half, then apply the cap, so everything
+        // downstream still reads one float per pixel and needs no signature change.
+        const float floorT = (hazeCap < 1.0) ? (float)std::max(0.0, 1.0 - hazeCap) : 0.0f;
+        parallelFor(N, [&](size_t a, size_t b) {
+            for (size_t i = a; i < b; ++i) {
+                float v = milkT[i] * milkT[N + i];
+                if (v < floorT) v = floorT;
+                milkT[i] = v;
+            }
+        });
     }
 
     // -- Pass 3: shade each covered pixel exactly once (parallel over pixels). Overlapping
