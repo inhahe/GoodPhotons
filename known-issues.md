@@ -15884,33 +15884,54 @@ cost problem much less pressing, but it does not answer the crossover question, 
 the thing to measure: render the same coat at 90 k / 900 k / 9 M strands and find where the two
 curves cross.
 
-## `-nd` viewer: a heavy fill makes the slider bank feel dead (OPEN)
+## `-nd` viewer: a heavy fill makes the slider bank feel dead (MOSTLY DONE)
 
-Reported from the viewer with `extrude` picked on **both** extra dimensions of a 250,744-triangle
-glTF. Two symptoms remain after the see-through black was fixed (that one is DONE — see the
-commit for `raster.h`'s no-hue haze fallback):
+Reported from the viewer with `extrude` on **both** extra dimensions of a 250,744-triangle
+glTF: the model went black, and no slider appeared to do anything.
 
-1. **~4 s of latency per slider event.** Every event rebuilds the warp from the pristine copy,
-   re-shades, re-tessellates and re-uploads to the GPU. `extrude` takes F -> 2F+E *per
-   dimension*, so extruding two turns 250,744 triangles into 4,262,700 (~17x). Measured on a
-   live viewer by driving slider 1202 through `WM_HSCROLL` and polling the panel's status text:
-   the label moved immediately, the triangle count only changed 4.8 s later. Dragging queues
-   events, so it never visibly catches up and reads as "no slider does anything".
-2. **The slider snaps back to centre a couple of seconds after a drag.** Not reproduced under
-   synthetic driving (the angle stuck at +40 and the mesh rebuilt), but reported consistently by
-   hand with see-through on, where each cycle is far slower. The suspect is the panel state push:
-   the render loop calls `setNdState(ndAnglesDeg(), ...)` after a rebuild, so a push that lands
-   after the user has moved the slider again will overwrite the new position with the angle the
-   rebuild used. That is a genuine race whenever a rebuild outlives the next input, which is
-   exactly what a multi-second rebuild guarantees.
+**The black: DONE**, and it was not an N-D bug at all -- the see-through composite turned any
+sufficiently dense stack of clear surfaces into exactly black. See the `raster.h` no-hue haze
+fallback commit. An extrude simply reaches that density faster than anything else.
 
-**What the fix looks like.** Both come from rebuilding synchronously on the input thread at a
-size the design never anticipated. The proper answer is to make the re-warp asynchronous and
-coalescing: keep the last good model on screen, run the rebuild on a worker against a snapshot
-of the config, drop superseded requests instead of queueing them, and only push panel state for
-a config that is still current (stamp each request with a generation counter and ignore a push
-whose generation is stale). A 0.231.3 warning now fires once when a config crosses 2M triangles,
-which makes the cost visible but does not remove it.
+**The slider snapping back to centre: DONE.** The handler for a slider move called
+`setNdState(ndAnglesDeg(), ...)` after re-warping, which pushes slider POSITIONS as well as the
+status text. On a heavy fill the re-warp takes seconds, so by the time it finished the drag had
+moved on and the push set the thumb back to the angle that rebuild had used -- roughly where
+the drag began. The panel owns those positions while the user is driving them, so that path now
+calls `setNdStatus()`, a status-only push that touches no control. `setNdState` is still used
+where WE change the angles (reset, dims resize, the edge-on assist), which is what it is for.
 
-Workaround: use `emboss`, which reshapes just as much and adds no triangles, or extrude only one
-dimension (~878 k, still interactive).
+**The latency: IMPROVED ~1.7x, not eliminated.** The warp was entirely single-threaded --
+`ndwarp.h` had no `parallelFor` at all, and neither did `mesh.h`'s crease pass. Measured on the
+4,011,904-triangle config:
+
+| phase | before | after |
+|---|---|---|
+| buildComplex | 88 ms | 109 ms |
+| project | (serial) | 3 ms |
+| emit | 354 ms | 649 ms |
+| **normals** (`meshFinishTris`) | **2003 ms** | **647 ms** |
+| **total warp** | **2498 ms** | **1470 ms** |
+
+Parallelised the per-vertex projection and both loops of the crease-normal pass (the fan gather
+was the dominant one), and dropped a ~100 MB `verts = proj` copy per event. All of it is
+bit-identical to the serial version, verified by rendering the same config before and after: 0
+differing pixels, and likewise for an ordinary glTF load and for `_glass_tint`.
+
+**What is still open.** A slider event on that config still costs ~3.6 s end to end (warp 1.5 s,
+then tessellate + GPU re-upload + render). Remaining ideas, roughly in value order:
+
+1. **The emit loop is still serial** and now costs as much as the normals do. It `push_back`s
+   into one `out` vector per group; parallelising means pre-sizing each group's range and
+   writing by index. Straightforward, just not done.
+2. **Rebuilding at all is the real problem.** A rotation-only change (no fill edit) does not
+   need `buildComplex` re-run or normals re-derived from scratch -- the topology is identical
+   and only the 3x3 projection changed. Caching the complex across angle-only edits would make
+   a drag nearly free, and is the single biggest remaining win.
+3. **Async + generation counter** (the original plan): run the rebuild on a worker against a
+   config snapshot, keep the last good model on screen, drop superseded requests, and ignore a
+   panel push whose generation is stale. Worth doing only after (2), since (2) may make the
+   rebuild cheap enough that asynchrony stops mattering.
+
+Workaround unchanged: `emboss` reshapes as much and adds no triangles; one extrude (~878 k)
+stays interactive.

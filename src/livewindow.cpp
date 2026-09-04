@@ -621,6 +621,7 @@ struct LiveWindow::Impl {
     int                  ndDimsVal = 0;          // dimension box (current value)
     // Staged enableNdPanel() / setNdState() params.
     std::vector<std::string> reqNdLabels, reqNdDimLabels, reqNdFillChoices;
+    bool                 reqNdStatusOnly = false;   // push the status line, not the controls
     std::vector<double>      reqNdAngles, reqNdAmounts;
     std::vector<int>         reqNdFill;
     int                      reqNdDims = 0;
@@ -988,9 +989,17 @@ void LiveWindow::Impl::applyNdState(HWND h) {
     std::vector<double> angles, amounts;
     std::vector<int>    fillSel;
     std::string status;
+    bool statusOnly = false;
     { std::lock_guard<std::mutex> lk(inMtx);
       angles = reqNdAngles; status = reqNdStatus;
-      fillSel = reqNdFill; amounts = reqNdAmounts; }
+      fillSel = reqNdFill; amounts = reqNdAmounts; statusOnly = reqNdStatusOnly; }
+    // A status-only push must not touch a control: the whole point is that the user may be
+    // mid-drag, and TBM_SETPOS would move the thumb out from under the mouse.
+    if (statusOnly) {
+        if (hNdStat) { std::wstring w = utf8ToWide(status); SetWindowTextW(hNdStat, w.c_str()); }
+        (void)h;
+        return;
+    }
     for (size_t k = 0; k < hNdSlider.size() && k < angles.size(); ++k) {
         if (k < ndAngleVal.size()) ndAngleVal[k] = angles[k];
         if (hNdSlider[k])
@@ -1971,6 +1980,17 @@ void LiveWindow::enableNdPanel(int dims,
     SendMessageW(hw, WM_MKNDPANEL, 0, 0);
 }
 
+void LiveWindow::setNdStatus(const char* status) {
+    HWND hw = impl_ ? impl_->hwnd.load() : nullptr;
+    if (!hw || !impl_->hasNdPanel.load()) return;
+    {
+        std::lock_guard<std::mutex> lk(impl_->inMtx);
+        impl_->reqNdStatus     = status ? status : "";
+        impl_->reqNdStatusOnly = true;
+    }
+    SendMessageW(hw, WM_SETNDSTATE, 0, 0);
+}
+
 void LiveWindow::setNdState(const std::vector<double>& anglesDeg,
                             const std::vector<int>& fillSel,
                             const std::vector<double>& amounts,
@@ -1983,6 +2003,7 @@ void LiveWindow::setNdState(const std::vector<double>& anglesDeg,
         impl_->reqNdFill    = fillSel;
         impl_->reqNdAmounts = amounts;
         impl_->reqNdStatus  = status ? status : "";
+        impl_->reqNdStatusOnly = false;
     }
     SendMessageW(hw, WM_SETNDSTATE, 0, 0);
 }

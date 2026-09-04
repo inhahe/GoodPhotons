@@ -61,7 +61,9 @@
 #include <cctype>
 #include <algorithm>
 #include <unordered_map>
+#include <chrono>
 #include "linalg.h"
+#include "parallel.h"
 #include "geometry.h"
 #include "scene.h"
 #include "mesh.h"            // meshFinishTris: the loaders' own crease-smoothing pass
@@ -743,6 +745,15 @@ inline double axisVisibility(const std::vector<double>& R, int n, int k) {
 inline Stats apply(const Model& m, const Config& cfg, Scene& s) {
     Stats st;
     if (!m.ok) return st;
+    // Phase timings. A slider drag re-runs this whole function per event, so when it
+    // takes long enough to be felt, say WHERE it went rather than leaving the viewer
+    // looking hung. Silent below a quarter second, which is every ordinary model.
+    using nclock = std::chrono::steady_clock;
+    const auto tStart = nclock::now();
+    double msComplex = 0, msProject = 0, msEmit = 0, msNormals = 0;
+    auto since = [](nclock::time_point a) {
+        return std::chrono::duration<double, std::milli>(nclock::now() - a).count();
+    };
 
     const int n = std::max(3, cfg.n);
     const std::vector<double> R = rotationMatrix(cfg);
@@ -817,15 +828,22 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s) {
         st.verts = (size_t)m.topo.nv;
     } else {
         // ---- General path: build the N-D complex, rotate it, project it -----------
+        const auto tC = nclock::now();
         const Complex c = buildComplex(m, cfg);
+        msComplex = since(tC);
         st.verts = (size_t)c.nv;
 
         // Rotate every vertex and keep the first three coordinates. Only the first
         // three ROWS of R are ever read — the rest of the matrix decides nothing an
         // orthographic projection can see, which is the header's whole argument.
+        // Per-vertex and independent, so it threads perfectly. It was serial, which on a
+        // 12-core machine left eleven of them idle through the most obviously parallel
+        // loop in the warp. Only the first three ROWS of R are read (the header's whole
+        // argument), so each vertex is 3n multiply-adds and nothing is shared.
         std::vector<Vec3> proj((size_t)c.nv);
-        for (int v = 0; v < c.nv; ++v) {
-            const double* P = &c.pos[(size_t)v * n];
+        const auto tP = nclock::now();
+        (void)ft::parallelFor((size_t)c.nv, 4096, [&](size_t v) {
+            const double* P = &c.pos[v * (size_t)n];
             double q[3] = {0, 0, 0};
             for (int i = 0; i < 3; ++i) {
                 double acc = 0.0;
@@ -833,9 +851,9 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s) {
                 for (int j = 0; j < n; ++j) acc += Ri[j] * P[j];
                 q[i] = acc;
             }
-            proj[(size_t)v] = Vec3{q[0], q[1], q[2]} + m.center;
-        }
-        verts = proj;
+            proj[v] = Vec3{q[0], q[1], q[2]} + m.center;
+        });
+        msProject = since(tP);
 
         // Every warped triangle belongs to the group its base corner came from, so an
         // extruded prism stays part of the object it was swept out of.
@@ -854,6 +872,7 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s) {
             const unsigned k = ref % 3;
             return (k == 0) ? tr.uv0 : (k == 1) ? tr.uv1 : tr.uv2;
         };
+        const auto tE = nclock::now();
         for (size_t gi = 0; gi < m.groups.size(); ++gi) {
             groupFirst[gi] = out.size();
             for (size_t i : byGroup[gi]) {
@@ -865,6 +884,8 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s) {
             }
             groupCount[gi] = out.size() - groupFirst[gi];
         }
+        msEmit = since(tE);
+        verts = std::move(proj);          // proj is dead here; do not copy ~100 MB
     }
 
     st.tris = out.size() - warpStart;
@@ -874,10 +895,18 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s) {
     // haveNormals=false` is exactly the loaders' crease pass: angle-weighted averaging
     // of face normals, merged only across edges softer than `creaseDeg`, so an extruded
     // prism's lids stay sharp against its walls instead of smearing into them.
+    const auto tN = nclock::now();
     if (reNormal && !triVI.empty())
         meshFinishTris(s, warpStart, verts, triVI, /*proceduralUV*/false,
                        UvProjection::None, 1, /*wantSmooth*/true, /*haveNormals*/false,
                        cfg.creaseDeg);
+    msNormals = since(tN);
+    if (since(tStart) > 250.0) {
+        std::printf("[nd] warp %.0f ms for %zu tris  (complex %.0f, project %.0f, "
+                    "emit %.0f, normals %.0f)\n",
+                    since(tStart), st.tris, msComplex, msProject, msEmit, msNormals);
+        std::fflush(stdout);
+    }
 
     for (Tri& t : s.tris) t.finalize();
 

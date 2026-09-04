@@ -18,6 +18,7 @@
 #include <cmath>
 #include <unordered_map>
 #include "assetbytes.h"
+#include "parallel.h"
 #include "geometry.h"
 #include "scene.h"
 
@@ -381,7 +382,8 @@ inline bool meshFinishTris(Scene& s, size_t triStart,
         // fan; now it is 3*nt total. Same formula, same inputs => same bits.
         const double cosThresh = std::cos(creaseAngleDeg * 3.14159265358979323846 / 180.0);
         std::vector<double> ang((size_t)nt * 3);
-        for (size_t i = 0; i < nt; ++i) {
+        // Per triangle, writing only its own three slots: threads with no coordination.
+        (void)ft::parallelFor(nt, 4096, [&](size_t i) {
             const std::array<int, 3>& vi = triVI[i];
             for (int c = 0; c < 3; ++c) {
                 const Vec3& P = verts[vi[c]];
@@ -395,8 +397,17 @@ inline bool meshFinishTris(Scene& s, size_t triStart,
                 }
                 ang[i * 3 + c] = a;
             }
-        }
-        for (size_t i = 0; i < nt; ++i) {
+        });
+        // The fan gather. Every table it reads (fn, ang, weld, voff, vcorner, triVI) is
+        // finished and read-only by now, and iteration i writes exactly one triangle's
+        // three normals, so this parallelises with no locking and no change of result --
+        // each corner still sums the same incident faces in the same order, so it is
+        // bit-identical to the serial version, not merely equivalent.
+        //
+        // It is worth doing because this is the dominant cost of a warp: an -nd extrude
+        // re-derives normals over the whole projected mesh on every slider event, and at
+        // 4M triangles this single loop was ~2.0 s of a 2.5 s warp, on one core of twelve.
+        (void)ft::parallelFor(nt, 2048, [&](size_t i) {
             Tri& t = s.tris[triStart + i];
             const Vec3 fni = fn[i];
             for (int c = 0; c < 3; ++c) {
@@ -411,7 +422,7 @@ inline bool meshFinishTris(Scene& s, size_t triStart,
                 Vec3 sn = (l > 1e-12) ? sum * (1.0 / l) : fni;
                 if (c == 0) t.n0 = sn; else if (c == 1) t.n1 = sn; else t.n2 = sn;
             }
-        }
+        });
         didSmooth = true;
     }
     return didSmooth;

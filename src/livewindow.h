@@ -257,6 +257,15 @@ public:
     // after Reset) and `status` is the readout line under them (triangle counts, or the
     // "this warp is linear" note). Marshalled to the UI thread; setting these never
     // re-emits the corresponding NavInput edge. No-op if the N-D panel isn't shown.
+    // Status text ONLY, leaving every slider and combo exactly where the user has it.
+    //
+    // setNdState below pushes positions too, which is right when WE changed them (a reset,
+    // a dims resize, the edge-on assist) and wrong when the USER did: a re-warp can take
+    // seconds on a heavy fill, and by the time it finishes the drag has moved on, so
+    // echoing back the angles we just applied yanks the slider to where the drag STARTED.
+    // A handler reacting to the user's own input wants this one.
+    void setNdStatus(const char* status);
+
     void setNdState(const std::vector<double>& anglesDeg,
                     const std::vector<int>& fillSel,
                     const std::vector<double>& amounts,

@@ -21008,8 +21008,14 @@ static int run(int argc, char** argv) {
                         for (size_t k = 0; k < ndCfg.angle.size(); ++k)
                             ndCfg.angle[k] = nav.ndAngles[k] * PI / 180.0;
                         ndReapply();
-                        g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
-                                              ndStatus().c_str());
+                        // STATUS ONLY. The angles came from the panel, so pushing them back
+                        // tells it what it already knows -- and ndReapply() can take seconds
+                        // on a heavy fill, by which time the user has dragged further. The
+                        // old full push then set the thumb back to the angle this rebuild
+                        // used, i.e. roughly where the drag began, which read as "the slider
+                        // snaps back to centre and nothing I do sticks". The panel owns the
+                        // positions while the user is driving them; we only own the readout.
+                        g_liveWin->setNdStatus(ndStatus().c_str());
                         changed = true;
                     }
                     if (nav.ndSave) {
