@@ -2861,97 +2861,116 @@ static int checkNdGpu() {
         ndwarp::detail::weld(m.base, m.topo);
         m.ok = true;
     }
-    ndwarp::Config cfg; cfg.resize(5);
-    cfg.extra[0].fill = ndwarp::Fill::Extrude; cfg.extra[0].amp = 0.5;
-    cfg.extra[1].fill = ndwarp::Fill::Emboss;  cfg.extra[1].src = ndwarp::Emb::Radius;
-    cfg.extra[1].amp  = 0.35;
-    // Angles chosen so no triangle projects edge-on; then apply()'s cull drops nothing and
-    // its output is the complex's triangles in order, which is what lets us compare.
+    // EVERY fill mode, not one config. The resident path is the only geometry the live
+    // viewer shows once a drag is under way, and it is a second implementation of the warp
+    // -- so a mode it gets wrong would be invisible to any headless render, which always
+    // goes through the host path. That is exactly the class of divergence that has bitten
+    // this feature before.
+    struct Mode { const char* name; ndwarp::Fill fill; ndwarp::Emb src; double amp; };
+    static const Mode kModes[] = {
+        {"extrude:0.3",         ndwarp::Fill::Extrude, ndwarp::Emb::Curvature, 0.3},
+        {"extrude:1.0",         ndwarp::Fill::Extrude, ndwarp::Emb::Curvature, 1.0},
+        {"emboss:curvature",    ndwarp::Fill::Emboss,  ndwarp::Emb::Curvature, 0.7},
+        {"emboss:radius",       ndwarp::Fill::Emboss,  ndwarp::Emb::Radius,    0.7},
+        {"emboss:height",       ndwarp::Fill::Emboss,  ndwarp::Emb::Height,    0.7},
+        {"emboss:noise",        ndwarp::Fill::Emboss,  ndwarp::Emb::Noise,     0.7},
+        {"emboss:u",            ndwarp::Fill::Emboss,  ndwarp::Emb::U,         0.7},
+        {"emboss:v",            ndwarp::Fill::Emboss,  ndwarp::Emb::V,         0.7},
+        {"zero",                ndwarp::Fill::Zero,    ndwarp::Emb::Curvature, 0.0},
+    };
     const double D2R = PI / 180.0;
-    cfg.angle[(size_t)ndwarp::planeIndex(5, 0, 1)] = 13.0 * D2R;
-    cfg.angle[(size_t)ndwarp::planeIndex(5, 0, 3)] = 37.0 * D2R;
-    cfg.angle[(size_t)ndwarp::planeIndex(5, 2, 3)] = 21.0 * D2R;
-    cfg.angle[(size_t)ndwarp::planeIndex(5, 1, 4)] = 29.0 * D2R;
+    int failures = 0, ran = 0;
 
-    // apply() emits per SOURCE GROUP and rewrites Scene::meshGroups ranges, so the model
-    // needs one group and the scene needs the entry it points at. (Without them apply emits
-    // nothing, and the groupIdx write lands outside an empty vector.)
-    m.groups.push_back(ndwarp::Source{"cube", 0, m.base.size(), 0});
-    Scene scene;
-    scene.meshGroups.resize(1);
-    scene.meshGroups[0].name = "cube";
-    scene.meshGroups[0].triStart = 0;
-    scene.meshGroups[0].triCount = m.base.size();
-    scene.tris = m.base;
-    ndwarp::Cache cache;
-    const ndwarp::Stats st = ndwarp::apply(m, cfg, scene, &cache);
-    if (st.dropped != 0 || cache.tmpl.empty()) {
-        std::printf("[checkndgpu] setup produced %zu dropped triangles — cannot pair up\n",
-                    st.dropped);
-        std::printf("[checkndgpu] FAIL\n");
-        return 1;
-    }
-    const int ntri = (int)cache.tmpl.size();
-    const int nv   = cache.c.nv;
-    const int n    = cfg.n;
-    if ((int)scene.tris.size() != ntri) {
-        std::printf("[checkndgpu] %zu scene triangles vs %d complex — cannot pair up\n",
-                    scene.tris.size(), ntri);
-        std::printf("[checkndgpu] FAIL\n");
-        return 1;
-    }
+    for (const Mode& md : kModes) {
+        ndwarp::Config cfg; cfg.resize(5);
+        cfg.extra[0].fill = md.fill; cfg.extra[0].src = md.src; cfg.extra[0].amp = md.amp;
+        // A second, different fill on dimension 5 so the two extra axes are never
+        // interchangeable -- a kernel that mixed up the column order would still pass if
+        // both columns held the same thing.
+        cfg.extra[1].fill = ndwarp::Fill::Emboss;
+        cfg.extra[1].src  = ndwarp::Emb::Noise;
+        cfg.extra[1].amp  = 0.4;
+        // Angles chosen so nothing projects edge-on; then apply()'s cull drops nothing and
+        // its output is the complex's triangles in order, which is what lets us compare.
+        cfg.angle[(size_t)ndwarp::planeIndex(5, 0, 1)] = 13.0 * D2R;
+        cfg.angle[(size_t)ndwarp::planeIndex(5, 0, 3)] = 37.0 * D2R;
+        cfg.angle[(size_t)ndwarp::planeIndex(5, 2, 3)] = 21.0 * D2R;
+        cfg.angle[(size_t)ndwarp::planeIndex(5, 1, 4)] = 29.0 * D2R;
 
-    const std::vector<double> R = ndwarp::rotationMatrix(cfg);
-    std::vector<double> R3n((size_t)3 * n);
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < n; ++j) R3n[(size_t)i * n + j] = R[(size_t)i * n + j];
-
-    raster_cuda::NdResident* nd = raster_cuda::ndUpload(
-        cache.c.pos.data(), nv, n, &cache.tvi[0][0], ntri,
-        cache.voff.data(), cache.vcorner.data(), cfg.creaseDeg);
-    if (!nd) {
-        std::printf("[checkndgpu] no usable CUDA device — SKIPPED\n");
-        std::printf("[checkndgpu] PASS (skipped)\n");
-        return 0;
-    }
-    std::vector<float> gproj((size_t)nv * 3), gnrm((size_t)ntri * 9);
-    const bool ok = raster_cuda::ndProbe(nd, R3n.data(), m.center.x, m.center.y, m.center.z,
-                                         gproj.data(), gnrm.data());
-    raster_cuda::ndDestroy(nd);
-    if (!ok) {
-        std::printf("[checkndgpu] probe launch failed — SKIPPED\n");
-        std::printf("[checkndgpu] PASS (skipped)\n");
-        return 0;
-    }
-
-    // fp32 on the device against fp64 on the host, so the tolerance is a float one scaled
-    // by the model size; a real divergence (a wrong index, a missed crease) is orders out.
-    const double tol = 2e-4 * m.radius;
-    int badP = 0, badN = 0;
-    double worstP = 0.0, worstN = 0.0;
-    for (int i = 0; i < ntri; ++i) {
-        const Tri& t = scene.tris[(size_t)i];
-        const Vec3 hp[3] = {t.v0, t.v1, t.v2};
-        const Vec3 hn[3] = {t.n0, t.n1, t.n2};
-        for (int c = 0; c < 3; ++c) {
-            const int v = cache.tvi[(size_t)i][c];
-            const Vec3 gp{gproj[(size_t)v*3+0], gproj[(size_t)v*3+1], gproj[(size_t)v*3+2]};
-            const Vec3 dp = hp[c] - gp;
-            const double ep = std::sqrt(dot(dp, dp));
-            if (ep > worstP) worstP = ep;
-            if (ep > tol) ++badP;
-            const Vec3 gn{gnrm[(size_t)i*9+c*3+0], gnrm[(size_t)i*9+c*3+1], gnrm[(size_t)i*9+c*3+2]};
-            const Vec3 dn = hn[c] - gn;
-            const double en = std::sqrt(dot(dn, dn));
-            if (en > worstN) worstN = en;
-            if (en > 2e-3) ++badN;
+        ndwarp::Model mm = m;
+        mm.groups.clear();
+        mm.groups.push_back(ndwarp::Source{"cube", 0, mm.base.size(), 0});
+        Scene scene;
+        scene.meshGroups.resize(1);
+        scene.meshGroups[0].name = "cube";
+        scene.meshGroups[0].triStart = 0;
+        scene.meshGroups[0].triCount = mm.base.size();
+        scene.tris = mm.base;
+        ndwarp::Cache cache;
+        const ndwarp::Stats st = ndwarp::apply(mm, cfg, scene, &cache);
+        if (st.dropped != 0 || cache.tmpl.empty() ||
+            (int)scene.tris.size() != (int)cache.tmpl.size()) {
+            std::printf("[checkndgpu] %-18s cannot pair up (%zu dropped) — SKIPPED\n",
+                        md.name, st.dropped);
+            continue;
         }
+        const int ntri = (int)cache.tmpl.size(), nv = cache.c.nv, n = cfg.n;
+
+        const std::vector<double> R = ndwarp::rotationMatrix(cfg);
+        std::vector<double> R3n((size_t)3 * n);
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < n; ++j) R3n[(size_t)i * n + j] = R[(size_t)i * n + j];
+
+        raster_cuda::NdResident* nd = raster_cuda::ndUpload(
+            cache.c.pos.data(), nv, n, &cache.tvi[0][0], ntri,
+            cache.voff.data(), cache.vcorner.data(), cfg.creaseDeg);
+        if (!nd) {
+            std::printf("[checkndgpu] no usable CUDA device — SKIPPED\n");
+            std::printf("[checkndgpu] PASS (skipped)\n");
+            return 0;
+        }
+        std::vector<float> gproj((size_t)nv * 3), gnrm((size_t)ntri * 9);
+        const bool ok = raster_cuda::ndProbe(nd, R3n.data(), mm.center.x, mm.center.y,
+                                             mm.center.z, gproj.data(), gnrm.data());
+        raster_cuda::ndDestroy(nd);
+        if (!ok) {
+            std::printf("[checkndgpu] probe launch failed — SKIPPED\n");
+            std::printf("[checkndgpu] PASS (skipped)\n");
+            return 0;
+        }
+
+        const double tol = 2e-4 * mm.radius;
+        int badP = 0, badN = 0;
+        double worstP = 0.0, worstN = 0.0;
+        for (int i = 0; i < ntri; ++i) {
+            const Tri& t = scene.tris[(size_t)i];
+            const Vec3 hp[3] = {t.v0, t.v1, t.v2};
+            const Vec3 hn[3] = {t.n0, t.n1, t.n2};
+            for (int c = 0; c < 3; ++c) {
+                const int v = cache.tvi[(size_t)i][c];
+                const Vec3 gp{gproj[(size_t)v*3+0], gproj[(size_t)v*3+1], gproj[(size_t)v*3+2]};
+                const Vec3 dp = hp[c] - gp;
+                const double ep = std::sqrt(dot(dp, dp));
+                if (ep > worstP) worstP = ep;
+                if (ep > tol) ++badP;
+                const Vec3 gn{gnrm[(size_t)i*9+c*3+0], gnrm[(size_t)i*9+c*3+1],
+                              gnrm[(size_t)i*9+c*3+2]};
+                const Vec3 dn = hn[c] - gn;
+                const double en = std::sqrt(dot(dn, dn));
+                if (en > worstN) worstN = en;
+                if (en > 2e-3) ++badN;
+            }
+        }
+        ++ran;
+        if (badP || badN) ++failures;
+        std::printf("[checkndgpu] %-18s %6d tris  |dpos| %.2e  |dnrm| %.2e  %s\n",
+                    md.name, ntri, worstP, worstN,
+                    (badP || badN) ? "MISMATCH" : "ok");
     }
-    std::printf("[checkndgpu] %d triangles, %d vertices, %d-D: max |dpos| = %.3e, "
-                "max |dnrm| = %.3e\n", ntri, nv, n, worstP, worstN);
-    std::printf("[checkndgpu] %d position mismatches, %d normal mismatches\n", badP, badN);
-    std::printf("[checkndgpu] %s\n", (badP || badN) ? "FAIL" : "PASS");
-    return (badP || badN) ? 1 : 0;
+    std::printf("[checkndgpu] %d fill modes compared against the host warp, %d mismatched\n",
+                ran, failures);
+    std::printf("[checkndgpu] %s\n", failures ? "FAIL" : "PASS");
+    return failures ? 1 : 0;
 #endif
 }
 
