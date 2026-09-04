@@ -128,7 +128,12 @@ struct PTri : PShade {
 struct PreviewGeom {
     std::vector<PTri> tris;
     std::vector<PMix> mixes;
-    void clear() { tris.clear(); mixes.clear(); }
+    // Half-diagonal of the tessellated bounds. The see-through pass integrates absorption
+    // over PATH LENGTH, so it needs a length scale, and taking it from the geometry itself
+    // means the CPU and GPU backends cannot disagree about it (a Scene pointer is optional
+    // on the render entry points; this is not) and a 2 cm ring behaves like a 40 m building.
+    double radius = 1.0;
+    void clear() { tris.clear(); mixes.clear(); radius = 1.0; }
     bool empty() const { return tris.empty(); }
     size_t size() const { return tris.size(); }
 };
@@ -881,6 +886,19 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
              geom.mixes[p.mix].b.normalTex >= 0);
         if (wantTan) p.tanRaw = triTangentRaw(p);
     }
+    // Length scale for the see-through path integral, from the geometry actually built.
+    {
+        Vec3 lo{1e300, 1e300, 1e300}, hi{-1e300, -1e300, -1e300};
+        for (const PTri& p : out) {
+            for (const Vec3& v : {p.p0, p.p1, p.p2}) {
+                lo = Vec3{std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+                hi = Vec3{std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+            }
+        }
+        const Vec3 d = (hi - lo) * 0.5;
+        const double r = std::sqrt(dot(d, d));
+        geom.radius = (r > 1e-12 && std::isfinite(r)) ? r : 1.0;
+    }
     return geom;   // `out` aliases geom.tris; geom.mixes was filled during the material bake
 }
 
@@ -1014,7 +1032,11 @@ struct RasterScratch {
     std::vector<Vec3>              accum;    // HDR shade target (bg written by the shade pass)
     std::vector<STri>              stris;    // projected triangles (capacity reused)
     std::vector<std::vector<STri>> parts;    // per-thread projection buffers
-    std::vector<float>             clearT, milkT;   // see-through products (clearT is RGB: 3/pixel)
+    // clearT is SIX floats per pixel while accumulating (signed optical depth + the
+    // open-surface fallback); clearRGB is the folded 3-float transmittance the composite
+    // reads. They must be separate buffers: folding 6->3 in place races, because writing
+    // slot 3i lands on slot 6(i/2), which another thread may not have consumed yet.
+    std::vector<float>             clearT, clearRGB, milkT;
     std::unique_ptr<BandPool>      pool;     // persistent workers (created on first frame)
 };
 
@@ -1158,7 +1180,7 @@ inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& 
 inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, int y0, int y1,
                               const GBuffer& g, std::vector<float>& clearT, std::vector<float>& milkT,
                               double clarity, const Vec3& tint,
-                              double milkPerSurface, double rimStrength) {
+                              double milkPerSurface, double rimStrength, double invL0) {
     const VtxScreen& A = t.v0; const VtxScreen& B = t.v1; const VtxScreen& C = t.v2;
     double minx = std::floor(std::min({A.sx, B.sx, C.sx}));
     double maxx = std::ceil (std::max({A.sx, B.sx, C.sx}));
@@ -1184,6 +1206,15 @@ inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, in
     const float tauR = (float)clarity * (float)tint.x;
     const float tauG = (float)clarity * (float)tint.y;
     const float tauB = (float)clarity * (float)tint.z;
+    // BEER-LAMBERT, NOT PER-SURFACE. `tau` used to be applied once per crossed triangle,
+    // which makes the result depend on how finely the glass happens to be tessellated --
+    // two panes and one finely-diced pane absorbed differently for no physical reason. The
+    // physical quantity is optical depth over the PATH LENGTH through the medium, so keep
+    // the same `tau` but reinterpret it as the transmittance of one reference length L0
+    // and accumulate sigma * length. `g = -ln(tau)` is that sigma, times L0.
+    const float gR = -std::log(std::max(tauR, 1e-6f));
+    const float gG = -std::log(std::max(tauG, 1e-6f));
+    const float gB = -std::log(std::max(tauB, 1e-6f));
     for (int y = ylo; y <= yhi; ++y) {
         const double py = y + 0.5;
         const double r0 = E0.dx * (py - E0.Py);
@@ -1221,17 +1252,35 @@ inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, in
             // frost. Combine the rim by MAX instead (stored as 1-max, so a min, which is
             // as order-independent as the product it replaces) and let only the physical
             // per-surface milk compound.
-            double perMilk = milkPerSurface;
-            if (perMilk > 0.95) perMilk = 0.95;
             double rim = rimStrength * graze * graze * graze;
             if (rim > 0.95) rim = 0.95;
-            clearT[row * 3 + 0] *= tauR;
-            clearT[row * 3 + 1] *= tauG;
-            clearT[row * 3 + 2] *= tauB;
-            milkT[row] *= (float)(1.0 - perMilk);
+            // Front or back? The normal's sign against the view direction says which side
+            // of the medium this fragment is, and the signed sum of depths over a CLOSED
+            // surface is exactly the path length inside it -- order-independent, like the
+            // product it replaces, so still no depth sort.
+            // Geometric normal, not the shading one: see the device twin. The winding is
+            // a fact about the surface; a shading normal is authored data.
+            const Vec3 fnG = cross(B.wpos - A.wpos, C.wpos - A.wpos);
+            const float sgn = (dot(fnG, cam.eye - wpos) > 0.0) ? -1.0f : 1.0f;
+            const float sd  = sgn * (float)d;
+            const float k   = sd * (float)invL0;
             const size_t NPX = (size_t)W * H;
+            clearT[row * 6 + 0] += k * gR;
+            clearT[row * 6 + 1] += k * gG;
+            clearT[row * 6 + 2] += k * gB;
+            // Open-surface fallback: a single-sided sheet (a `filter` gel, a one-quad
+            // window) has a front and no back, so there is no path length to integrate.
+            // Accumulating the FRONT faces' -ln(tau) reproduces the old per-crossing model
+            // exactly, and the fold below uses it whenever the signed depth came out empty.
+            if (sgn < 0.0f) {
+                clearT[row * 6 + 3] += gR;
+                clearT[row * 6 + 4] += gG;
+                clearT[row * 6 + 5] += gB;
+            }
+            milkT[row] += sd;                       // signed thickness
             float& r = milkT[NPX + row];
             if ((float)(1.0 - rim) < r) r = (float)(1.0 - rim);
+            (void)milkPerSurface;
         }
     }
 }
@@ -1768,6 +1817,13 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     // and the opaque background dims what's behind it by `glassClarity` (transmittance) and
     // adds a little milky haze; both accumulate with the number of clear surfaces crossed.
     const double kMilkPerSurface = std::max(0.0, (1.0 - glassClarity)) * 0.55; // haze per surface
+    // The reference length the per-crossing dials are reinterpreted against: a slab this
+    // thick absorbs and hazes exactly as one crossing used to, so existing scenes keep
+    // their look while the result stops depending on tessellation. Tied to the scene so a
+    // 2 cm ring and a 40 m building behave the same.
+    const double L0    = (geom.radius > 0.0 ? geom.radius : 1.0) * 0.05;
+    const double invL0 = 1.0 / L0;
+    const double milkPer = kMilkPerSurface;
     const double kRimStrength    = 0.55;                     // extra silhouette milk (Fresnel-ish)
     const Vec3   kMilkColor{0.52, 0.55, 0.60};               // display-space haze tint
 
@@ -1830,15 +1886,21 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     // reusing the scratch allocation).
     std::vector<float>& clearT = S.clearT;
     std::vector<float>& milkT  = S.milkT;
-    if (!seeThrough) { clearT.clear(); milkT.clear(); }
+    std::vector<float>& clearRGB = S.clearRGB;
+    if (!seeThrough) { clearT.clear(); clearRGB.clear(); milkT.clear(); }
     if (seeThrough) {
-        clearT.resize(N * 3);            // RGB: a tinted surface transmits per channel
-        // TWO halves: [0,N) the compounding physical milk, [N,2N) the silhouette rim as
-        // (1 - max), so it saturates instead of accumulating. Folded together below.
+        // clearT holds SIX floats while accumulating: [0,3) the signed optical depth over
+        // path length, [3,6) the front-face-only per-crossing depth used when the geometry
+        // turns out to be open. The fold below collapses it back to the three
+        // transmittances everything downstream expects, in place.
+        clearT.resize(N * 6);
+        clearRGB.resize(N * 3);
+        // milkT: [0,N) signed thickness (a SUM, so it starts at 0), [N,2N) the silhouette
+        // rim as (1 - max), which starts at 1.
         milkT.resize(N * 2);
         parallelFor(N, [&](size_t a, size_t b) {
-            std::fill(clearT.begin() + a * 3, clearT.begin() + b * 3, 1.0f);
-            std::fill(milkT.begin() + a, milkT.begin() + b, 1.0f);
+            std::fill(clearT.begin() + a * 6, clearT.begin() + b * 6, 0.0f);
+            std::fill(milkT.begin() + a, milkT.begin() + b, 0.0f);
             std::fill(milkT.begin() + N + a, milkT.begin() + N + b, 1.0f);
         });
         dispatchBands([&](int y0, int y1) {
@@ -1851,7 +1913,7 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                 const Vec3& tint = (s.src >= 0 && s.src < (int)tris.size())
                                  ? tris[(size_t)s.src].clearTint : Vec3{1, 1, 1};
                 fillTriangleClear(s, cam, W, H, y0, y1, g, clearT, milkT,
-                                  glassClarity, tint, kMilkPerSurface, kRimStrength);
+                                  glassClarity, tint, kMilkPerSurface, kRimStrength, invL0);
             }
         });
         // -glass-haze: cap how much of a pixel the frost may take, however many surfaces
@@ -1864,14 +1926,29 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
         // exactly the same number (once it is at the floor, further multiplies clamp back
         // to the floor), and doing it here keeps the hot inner loop and the atomics on the
         // device twin untouched. Costs one pass over the buffer, and only when asked for.
-        // Fold the rim half into the physical half, then apply the cap, so everything
-        // downstream still reads one float per pixel and needs no signature change.
+        // Fold: optical depth -> transmittance, thickness -> haze, rim applied, all
+        // collapsed into the 3-float clearT and 1-float milkT the composite reads. Writing
+        // clearT[i*3+c] from clearT[i*6+c] is safe in place because 3i <= 6i.
         const float floorT = (hazeCap < 1.0) ? (float)std::max(0.0, 1.0 - hazeCap) : 0.0f;
+        const double kHaze = (milkPer > 0.0 && milkPer < 1.0)
+                           ? -std::log(1.0 - milkPer) * invL0 : 0.0;
         parallelFor(N, [&](size_t a, size_t b) {
             for (size_t i = a; i < b; ++i) {
-                float v = milkT[i] * milkT[N + i];
-                if (v < floorT) v = floorT;
-                milkT[i] = v;
+                // Blend rather than branch -- see the device twin's note. The thickness is
+                // a sum whose exact value near zero is order-dependent, so a hard
+                // threshold there would flip pixels between the two models.
+                const float L  = milkT[i];
+                const float w  = std::min(std::max(L / (0.02f * (float)L0), 0.0f), 1.0f);
+                const double Lh = std::max((double)L, 0.02 * L0);
+                for (int c = 0; c < 3; ++c) {
+                    float tauP = clearT[i * 6 + c] * (float)invL0 * (float)L0;
+                    if (!(tauP > 0.0f)) tauP = 0.0f;
+                    const float tauO = clearT[i * 6 + 3 + c];
+                    clearRGB[i * 3 + c] = std::exp(-(w * tauP + (1.0f - w) * tauO));
+                }
+                float m = (float)std::exp(-kHaze * Lh) * milkT[N + i];
+                if (m < floorT) m = floorT;
+                milkT[i] = m;
             }
         });
     }
@@ -2012,7 +2089,7 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     // !seeThrough and simply ignored by the helper in that case. Rides the same worker pool
     // as the passes above (its three scans used to spawn their own threads each).
     return exposeAndEncode(accum, g.zbuf, g.emis, W, H, nThreads, expComp, autoExpose,
-                           lockAnchor, seeThrough, clearT, milkT, kMilkColor, pool);
+                           lockAnchor, seeThrough, clearRGB, milkT, kMilkColor, pool);
 }
 
 // Draw a red look-at crosshair at world point `target` onto an already-rendered RGB

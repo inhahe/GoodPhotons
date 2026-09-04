@@ -1061,7 +1061,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
 __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
                        const int* flags, int nSlots, const float* zbuf,
                        DCam cam, int W, int H, float clarity, float milkPerSurface,
-                       float rimStrength, float* clearT, float* milkT) {
+                       float rimStrength, float invL0, float* clearT, float* milkT) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nSlots) return;
     int flg = flags[idx];                       // dense probe before touching the record
@@ -1123,20 +1123,38 @@ __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             float3 Vv = normalize3(cam.eye - wpos);
             float ndv = fabsf(dot3(Nn, Vv));
             float graze = 1.0f - ndv;
-            // See raster.h: the rim is a silhouette CUE and must saturate, not compound.
-            float perMilk = milkPerSurface;
-            if (perMilk > 0.95f) perMilk = 0.95f;
+            // Sign from the GEOMETRIC normal, not the shading one. Shading normals are
+            // authored data -- they can be flipped, smoothed across a crease, or bent by a
+            // normal map -- and the front/back decision here has to be a fact about the
+            // surface, identical on both backends. The winding is that fact.
+            const float3 fnG = cross3(wp1 - wp0, wp2 - wp0);
+            const float ndvSigned = dot3(fnG, cam.eye - wpos);
+            const float dpt = 1.0f / fmaxf(invd, 1e-12f);
+            // See raster.h: Beer-Lambert over PATH LENGTH, not once per crossed surface,
+            // and the rim is a silhouette cue that must saturate rather than compound.
             float rim = rimStrength * graze * graze * graze;
             if (rim > 0.95f) rim = 0.95f;
-            atomicMulF(&clearT[row * 3 + 0], tauR);
-            atomicMulF(&clearT[row * 3 + 1], tauG);
-            atomicMulF(&clearT[row * 3 + 2], tauB);
-            atomicMulF(&milkT[row], 1.0f - perMilk);
-            // (1-rim) combined by MIN. These are all in [0,1], and for non-negative
-            // floats the IEEE bit pattern orders the same as the value, so an unsigned
-            // atomicMin is exactly a float min here.
+            const float gR = -logf(fmaxf(tauR, 1e-6f));
+            const float gG = -logf(fmaxf(tauG, 1e-6f));
+            const float gB = -logf(fmaxf(tauB, 1e-6f));
+            const float sgn = (ndvSigned > 0.0f) ? -1.0f : 1.0f;
+            const float sd  = sgn * dpt;
+            const float kk  = sd * invL0;
+            // Native float atomicAdd, where the transmittance product needed atomicMulF --
+            // a compare-and-swap RETRY loop, since CUDA has no float multiply atomic. More
+            // accumulators, but none of them spin.
+            atomicAdd(&clearT[row * 6 + 0], kk * gR);
+            atomicAdd(&clearT[row * 6 + 1], kk * gG);
+            atomicAdd(&clearT[row * 6 + 2], kk * gB);
+            if (sgn < 0.0f) {                       // front faces: the open-surface fallback
+                atomicAdd(&clearT[row * 6 + 3], gR);
+                atomicAdd(&clearT[row * 6 + 4], gG);
+                atomicAdd(&clearT[row * 6 + 5], gB);
+            }
+            atomicAdd(&milkT[row], sd);             // signed thickness
             atomicMin((unsigned*)&milkT[(size_t)W * H + row],
                       __float_as_uint(1.0f - rim));
+            (void)milkPerSurface;
         }
     }
 }
@@ -1154,12 +1172,29 @@ __global__ static void kFloorF(float* a, float lo, int n) {
 
 // Fold the rim half of milkT into the physical half and apply the haze floor, so every
 // downstream reader still sees one float per pixel. Mirrors raster.h's fold pass.
-__global__ static void kFoldRim(float* milkT, int n, float floorT) {
+__global__ static void kFold(const float* clearT, float* clearRGB, float* milkT, int n,
+                             float floorT, float L0, float invL0, float kHaze) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float v = milkT[i] * milkT[n + i];
-    if (v < floorT) v = floorT;
-    milkT[i] = v;
+    // BLEND, do not branch, on "is there an enclosed path?". The thickness is an
+    // atomically summed float, so its exact value near zero depends on the order the
+    // fragments landed -- which differs between the backends and between runs. A hard
+    // threshold there turns that into a visible pixel flipping between the path-length
+    // and per-crossing models. Ramping over a thin sliver of L0 keeps small numerical
+    // differences producing small image differences, and reads correctly anyway: very
+    // thin glass IS the single-crossing case.
+    const float L  = milkT[i];
+    const float w  = fminf(fmaxf(L / (0.02f * L0), 0.0f), 1.0f);   // 0 = open, 1 = enclosed
+    const float Lh = fmaxf(L, 0.02f * L0);
+    for (int c = 0; c < 3; ++c) {
+        float tauP = clearT[i * 6 + c] * invL0 * L0;
+        if (!(tauP > 0.0f)) tauP = 0.0f;
+        const float tauO = clearT[i * 6 + 3 + c];
+        clearRGB[i * 3 + c] = expf(-(w * tauP + (1.0f - w) * tauO));
+    }
+    float m = expf(-kHaze * Lh) * milkT[n + i];
+    if (m < floorT) m = floorT;
+    milkT[i] = m;
 }
 
 // Fill a device float array with a constant (used to reset clearT/milkT to 1.0 each frame;
@@ -1358,6 +1393,8 @@ struct Scene {
     unsigned char*      emis   = nullptr;
     float*              clearT = nullptr;   // see-through cumulative transmittance (RGB: 3 per pixel)
     float*              milkT  = nullptr;   // see-through milk (haze) product
+    float*              clearRGB = nullptr; // folded 3-float transmittance (see raster.h)
+    float               radius = 1.0f;      // geometry half-diagonal: the path-length scale
     size_t              pixCap = 0;
     // Raster bin lists (slot indices by bbox size, rebuilt per frame) + 3 counters.
     int* dbinSmall = nullptr;
@@ -1443,6 +1480,7 @@ void destroy(Scene* sc) {
     if (sc->emis)     cudaFree(sc->emis);
     if (sc->clearT)   cudaFree(sc->clearT);
     if (sc->milkT)    cudaFree(sc->milkT);
+    if (sc->clearRGB) cudaFree(sc->clearRGB);
     if (sc->dbinSmall) cudaFree(sc->dbinSmall);
     if (sc->dbinMed)   cudaFree(sc->dbinMed);
     if (sc->dbinLarge) cudaFree(sc->dbinLarge);
@@ -1463,6 +1501,7 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
     if (!available() || tris.empty()) return nullptr;
     Scene* sc = new Scene();
     sc->nTris = (int)tris.size();
+    sc->radius = (float)(geom.radius > 0.0 ? geom.radius : 1.0);   // path-length scale
     const std::vector<Texture>* textures = scene ? &scene->textures : nullptr;
 
     // Bake triangles.
@@ -1693,6 +1732,7 @@ static bool ensurePix(Scene* sc, size_t N) {
     if (sc->emis)   { cudaFree(sc->emis);   sc->emis = nullptr; }
     if (sc->clearT) { cudaFree(sc->clearT); sc->clearT = nullptr; }
     if (sc->milkT)  { cudaFree(sc->milkT);  sc->milkT = nullptr; }
+    if (sc->clearRGB) { cudaFree(sc->clearRGB); sc->clearRGB = nullptr; }
     if (sc->dimg)   { cudaFree(sc->dimg);   sc->dimg = nullptr; }
     if (sc->h_img)  { cudaFreeHost(sc->h_img); sc->h_img = nullptr; }
     sc->pixCap = 0;
@@ -1700,8 +1740,9 @@ static bool ensurePix(Scene* sc, size_t N) {
            && tryMalloc((void**)&sc->accum,  sizeof(float3) * N)
            && tryMalloc((void**)&sc->zbuf,   sizeof(float) * N)
            && tryMalloc((void**)&sc->emis,   sizeof(unsigned char) * N)
-           && tryMalloc((void**)&sc->clearT, sizeof(float) * N * 3)
-           && tryMalloc((void**)&sc->milkT,  sizeof(float) * N * 2)   // physical + rim
+           && tryMalloc((void**)&sc->clearT, sizeof(float) * N * 6)   // 6 while accumulating
+           && tryMalloc((void**)&sc->milkT,  sizeof(float) * N * 2)   // thickness + rim
+           && tryMalloc((void**)&sc->clearRGB, sizeof(float) * N * 3)
            && tryMalloc((void**)&sc->dimg,   N * 3)
            && tryMallocHost((void**)&sc->h_img, N * 3);
     if (!ok) return false;
@@ -1826,15 +1867,24 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
         // buffer at whatever the last frame left there.
         const int gClear = (int)((N * 3 + TPB - 1) / TPB);
         const int gPix2 = (int)((N * 2 + TPB - 1) / TPB);
-        kFillF<<<gClear, TPB>>>(sc->clearT, 1.0f, N * 3);
-        kFillF<<<gPix2, TPB>>>(sc->milkT,  1.0f, N * 2);   // both halves
+        const int gClr6 = (int)((N * 6 + TPB - 1) / TPB);
+        kFillF<<<gClr6, TPB>>>(sc->clearT, 0.0f, N * 6);   // sums, so they start at 0
+        kFillF<<<gPix, TPB>>>(sc->milkT,  0.0f, N);        // thickness: a sum
+        kFillF<<<gPix, TPB>>>(sc->milkT + N, 1.0f, N);     // rim: a min of (1-r)
         // Stream order already runs kClear after both fills complete.
         kClear<<<gSlots, TPB>>>(sc->dtris, sc->dgeos, sc->dattrs, sc->dflags, 2 * sc->nTris,
                                 sc->zbuf, dc, W, H,
                                 (float)glassClarity, (float)kMilkPerSurface, (float)kRimStrength,
+                                (float)(1.0 / ((sc->radius > 0.0f ? (double)sc->radius : 1.0) * 0.05)),
                                 sc->clearT, sc->milkT);
-        kFoldRim<<<gPix, TPB>>>(sc->milkT, (int)N,
-                                hazeCap < 1.0 ? (float)fmax(0.0, 1.0 - hazeCap) : 0.0f);
+        {
+            const double L0d = (sc->radius > 0.0f ? (double)sc->radius : 1.0) * 0.05;
+            const double mp  = fmax(0.0, 1.0 - glassClarity) * 0.55;
+            const double kH  = (mp > 0.0 && mp < 1.0) ? -log(1.0 - mp) / L0d : 0.0;
+            kFold<<<gPix, TPB>>>(sc->clearT, sc->clearRGB, sc->milkT, (int)N,
+                                 hazeCap < 1.0 ? (float)fmax(0.0, 1.0 - hazeCap) : 0.0f,
+                                 (float)L0d, (float)(1.0 / L0d), (float)kH);
+        }
     }
     rec(5);   // recorded either way; the clear window is simply ~0 when see-through is off
 
@@ -1898,7 +1948,7 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     const size_t N = (size_t)W * H;
 
     kToneMap<<<gPix, TPB>>>(sc->accum, sc->zbuf, N, finalExp, seeThrough ? 1 : 0,
-                            sc->clearT, sc->milkT, kMilkColor.x, kMilkColor.y, kMilkColor.z,
+                            sc->clearRGB, sc->milkT, kMilkColor.x, kMilkColor.y, kMilkColor.z,
                             sc->dlut, sc->dimg);
     if (g_prof) cudaEventRecord(sc->ev[6], 0);
 
@@ -1970,7 +2020,7 @@ bool renderFrameToTarget(Scene* sc, const Camera& cam, int W, int H, int nThread
         cudaSurfaceObject_t surf = 0;
         if (cudaCreateSurfaceObject(&surf, &rd) == cudaSuccess) {
             kToneMapSurf<<<gPix, TPB>>>(sc->accum, sc->zbuf, N, W, finalExp, seeThrough ? 1 : 0,
-                                        sc->clearT, sc->milkT,
+                                        sc->clearRGB, sc->milkT,
                                         kMilkColor.x, kMilkColor.y, kMilkColor.z,
                                         sc->dlut, surf);
             if (g_prof) cudaEventRecord(sc->ev[6], 0);

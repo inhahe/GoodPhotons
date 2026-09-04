@@ -506,10 +506,31 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > two crossings, front + back), so thicker/stacked glass reads progressively darker
 > and hazier. A grazing-angle (Fresnel-like) term thickens the haze at silhouettes
 > so glass edges still read. It's **order-independent** (the transmittance is a
-> commutative product), so overlapping transparent objects need no depth sort and
-> the pass stays nearly free. Tune the per-surface transmittance with
+> commutative sum), so overlapping transparent objects need no depth sort and
+> the pass stays nearly free. Tune the absorption with
 > **`-glass-clarity <0..1>`** (default `0.85`; higher = clearer/less dimming, and
-> passing it implies `-see-through`). This is a *look* preview only — there's still
+> passing it implies `-see-through`).
+>
+> **Absorption follows Beer–Lambert over the PATH LENGTH through the glass, not once per
+> crossed surface** (since 0.236.0). Each clear fragment contributes its depth with a sign
+> — negative entering, positive leaving — so the signed sum over a closed surface is
+> exactly the distance the ray spends inside it. That sum commutes just like the product it
+> replaced, so it still needs no sorting. `-glass-clarity` is now read as the transmittance
+> of one *reference length* (5 % of the geometry's half-diagonal, so it is scale-free), and
+> a slab that thick looks exactly as one crossing used to.
+>
+> The point is that the result no longer depends on **how finely the glass is tessellated**.
+> Two panes and one finely-diced pane are now the same picture; before, every extra triangle
+> along the ray cost another full application of the transmittance. That was not a corner
+> case — an `-nd extrude` on a closed mesh used to add a wall over every interior edge and
+> drive the preview to a flat silhouette (see *N-dimensional rotation*).
+>
+> Single-sided glass — a `filter` gel, a one-quad window — has a front and no back, so there
+> is no enclosed path to integrate. Those pixels fall back to the old per-crossing
+> behaviour, ramped in over a thin sliver of the reference length rather than switched, so a
+> grazing edge cannot flip between the two models. The front/back decision is taken from the
+> **geometric** normal (the winding), never the shading normal, which may be flipped,
+> creased or normal-mapped. This is a *look* preview only — there's still
 > no bending or reflection. Example:
 > `ftrace -in scenes/cornell.ftsl -raster -see-through -window -o png/preview.png`.
 >
@@ -559,8 +580,8 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > six-deep stack of coloured glass really is muddy, so this is a legibility choice you make,
 > not a correction being applied for you.
 >
-> `-glass-clarity` remains a master multiplier on every crossing, so one dial still
-> controls overall transparency. The exponential is taken in wavelength space and converted
+> `-glass-clarity` remains the master dial — now the transmittance of one reference
+> length rather than of one crossing — so one control still sets overall transparency. The exponential is taken in wavelength space and converted
 > afterwards (not the other way round), and the conversion is white-balanced against a flat
 > spectrum — without that, an equal-energy stimulus lands at linear sRGB ≈ (1.198, 0.950,
 > 0.908) and a perfectly colourless window would preview with a warm cast. The milk haze is
