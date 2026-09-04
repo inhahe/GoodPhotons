@@ -50,6 +50,7 @@
 #include <array>
 #include <string>
 #include <cstdio>
+#include "parallel.h"
 #include "scene.h"
 #include "camera.h"
 #include "color.h"
@@ -539,6 +540,11 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         p.vc2 = Vec3{c[6], c[7], c[8]};
     };
     out.reserve(sc.tris.size() + 4096);
+    // Per scene triangle, in order. Tried threading this (resize + index fill) and it came
+    // out SLOWER -- 604 ms to ~750 -- because vector::resize value-initialises 4.26M PTri
+    // before the fill overwrites every field, and that zeroing costs more than the loop it
+    // was meant to save. Left serial deliberately; if this is ever worth revisiting it needs
+    // uninitialised storage, not a resize.
     for (const auto& t : sc.tris) {
         PTri p;
         p.p0 = t.v0; p.p1 = t.v1; p.p2 = t.v2;

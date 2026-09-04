@@ -15941,26 +15941,57 @@ Note the cache does NOT speed up a one-shot CLI render: template construction mo
 emit and into complex, so a cold `apply` is a wash (~1500 ms either way). It only pays on repeat,
 which is exactly the drag case it exists for.
 
-**What is still open.** A slider event still costs ~3.6 s end to end, but the warp is now only
-~28% of that. The measured remainder is tessellation (0.72 s) plus the GPU rasterizer teardown
-and re-upload of 4.26M triangles, plus the render itself. So further warp optimisation is no
-longer the lever. In value order now:
+**Rebuild breakdown, measured rather than assumed.** `ndReapply` now prints one line per
+rebuild once it exceeds 250 ms, so the next person starts from a measurement:
 
-1. **Incremental GPU re-upload.** `ndReapply` destroys the whole `raster_cuda::Scene` and
-   re-uploads it. On an angle-only edit only vertex POSITIONS changed -- materials, UVs, indices
-   and textures are identical -- so this could be a position-buffer update instead of a full
-   rebuild. Biggest remaining win by some distance.
-2. **Skip the re-tessellation** on an angle-only edit for the same reason.
-3. **Cache the crease adjacency.** `meshFinishTris` re-welds and rebuilds its CSR every call
-   (557 ms of the 1017). It welds by PROJECTED position, which is also a latent correctness wart:
-   an orthographic projection is a contraction, so which vertices fuse -- and therefore how
-   normals smooth -- is angle-dependent and can pop mid-drag. Re-keying the weld on complex
-   topology would make it both cacheable and angle-stable.
-4. **Async + generation counter**, still last: worth doing only if 1-3 leave it slow.
+```
+[nd] rebuild 2256 ms  (warp 984, tessellate 651, gpu-upload 621)
+```
 
-Workaround unchanged: `emboss` reshapes as much and adds no triangles; one extrude (~878 k)
-stays interactive.
+Three comparable costs, no single dominant one -- which is why the earlier plan (which assumed
+the warp dominated) kept mis-ranking the work.
 
+**Done since:**
+
+- **Crease adjacency cached on complex topology** -- normals 557 -> ~300 ms. `meshFinishTris`
+  rebuilt its weld map and CSR every call by welding PROJECTED positions; the warp now carries a
+  CSR over the complex's own vertices in `Cache`, built once per fill. Bit-identical on this
+  model (0 differing px), and it removes a latent wart: position welding is angle-dependent
+  (an orthographic projection is a contraction, so which vertices fuse changes as you rotate),
+  which could pop shading mid-drag for no reason the model explains.
+- **GPU DPTri bake threaded** -- upload ~612 -> ~460-620 ms (noisy). The bake is per-triangle
+  and was single-threaded; the memcpy after it is one transfer either way.
+
+**Tried and REVERTED: threading the tessellation loop.** Index-filling `out` in parallel made it
+*slower*, 604 -> ~750 ms, because `vector::resize` value-initialises 4.26M `PTri` before the fill
+overwrites every field, and that zeroing costs more than the loop it was meant to save. Left
+serial with a comment saying so; revisiting it needs uninitialised storage, not a resize.
+
+Net: a slider event went ~3.6 s -> ~2.4 s end to end (rebuild 2460 -> ~2256 ms plus the render).
+
+**Still open, and now clearly the right next step: (4), the async rebuild.** With three roughly
+equal costs and the total still over two seconds, shaving another 200 ms from any one of them
+does not change how it feels. What does is not blocking the input thread at all:
+
+- run the rebuild on a worker against a snapshot of the config;
+- keep the last good model on screen while it runs, so the viewport never shows a half-built
+  scene (which is what made a mid-rebuild frame render as an empty one);
+- stamp each request with a generation counter, drop superseded ones instead of queueing, and
+  ignore a completed rebuild whose generation is stale;
+- the panel already owns slider positions during a drag (see setNdStatus above), so nothing
+  needs to be echoed back and there is no position race to lose.
+
+The obstacle is that `ndwarp::apply` writes straight into the live `Scene`, and the render loop
+reads it. The worker would need to produce the triangle vector and stats, with the main thread
+doing only the swap + deriveLight + tessellate + upload between frames. That keeps every existing
+data structure single-threaded and confines the change to the viewer loop.
+
+**The bigger idea, if this is ever wanted properly.** All of the above still re-materialises
+4.26M triangles through three separate arrays (scene tris -> PTri -> DPTri) on every event, which
+is why the floor is seconds. The complex's topology and its N-D vertex positions never change
+during a drag -- only a 3xN matrix does. Uploading the complex ONCE and doing the projection on
+the GPU would make a drag cost a matrix upload and a kernel launch, i.e. genuinely interactive,
+at the price of a second geometry path for the -nd viewer.
 ### Residual: see-through saturates on a deeply extruded all-glass model (OPEN, minor)
 
 With every material in the model transmissive, an extrude multiplies the crossed surfaces enough

@@ -1448,8 +1448,11 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
     const std::vector<Texture>* textures = scene ? &scene->textures : nullptr;
 
     // Bake triangles.
+    // Baking DPTri is per-triangle and independent, and an -nd warp re-uploads millions
+    // of them on every slider event -- this was ~0.6 s of a 2.5 s rebuild, on one core.
+    // The memcpy that follows is a single transfer either way; only the bake threads.
     std::vector<DPTri> h(tris.size());
-    for (size_t i = 0; i < tris.size(); ++i) {
+    (void)ft::parallelFor(tris.size(), 8192, [&](size_t i) {
         const raster::PTri& t = tris[i];
         DPTri& d = h[i];
         d.p0 = toF3(t.p0); d.p1 = toF3(t.p1); d.p2 = toF3(t.p2);
@@ -1473,7 +1476,7 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         d.reflectPat = t.reflectPat;
         d.emitPat    = t.emitPat;
         d.mix        = t.mix;
-    }
+    });
     // Bake the per-hit `mix` side table (raster.h's PMix -> DMix). One entry per
     // weight-mapped mix MATERIAL, so this stays tiny however many triangles index it.
     std::vector<DMix> hmix(geom.mixes.size());

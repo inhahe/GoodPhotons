@@ -20804,23 +20804,41 @@ static int run(int argc, char** argv) {
                                                      : (double)want / (double)ndModel.base.size());
                     std::fflush(stdout);
                 }
+                using rclock = std::chrono::steady_clock;
+                const auto tA = rclock::now();
+                auto msSince = [](rclock::time_point a) {
+                    return std::chrono::duration<double, std::milli>(rclock::now() - a).count();
+                };
                 ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache);
+                const double msWarp = msSince(tA);
                 ndBvhStale = true;
                 plight = raster::deriveLight(scene);
                 prims.clear();
                 tessellated = false;
+                double msTess = 0, msUp = 0;
 #ifdef HAVE_CUDA
                 if (gpuRaster) {
+                    const auto tD = rclock::now();
                     raster_cuda::destroy(gpuRaster);
                     gpuRaster = nullptr;
                     ensurePrims();
+                    msTess = msSince(tD);
+                    const auto tU = rclock::now();
                     gpuRaster = raster_cuda::upload(prims, plight, &scene);
+                    msUp = msSince(tU);
                     if (!gpuRaster)
                         std::fprintf(stderr, "[nd] GPU re-upload failed; using the CPU rasterizer\n");
                 }
                 if (traceSess) { backwardRGBSessionEnd(traceSess); traceSess = nullptr; }
 #endif
                 traceDirty = true;
+                // One line per rebuild once it is slow enough to feel, so whoever optimises
+                // this next starts from a measurement rather than an assumption.
+                if (msWarp + msTess + msUp > 250.0) {
+                    std::printf("[nd] rebuild %.0f ms  (warp %.0f, tessellate %.0f, gpu-upload %.0f)\n",
+                                msWarp + msTess + msUp, msWarp, msTess, msUp);
+                    std::fflush(stdout);
+                }
             };
             // The readout under the sliders: what the warp costs, and — when it applies —
             // the fact that the whole bank is equivalent to one 3x3 matrix.

@@ -776,12 +776,23 @@ struct Cache {
     std::vector<Tri>               tmpl;
     std::vector<std::array<int, 3>> tvi;    // complex vertex ids per template triangle
     std::vector<size_t>            gStart, gCount;   // template ranges per source group
+    // Crease adjacency over the COMPLEX, in CSR form: for each complex vertex, the list
+    // of complex corners (tri*3 + c) touching it.
+    //
+    // meshFinishTris rebuilds this every call by welding PROJECTED positions, which is
+    // both the bulk of its cost and subtly wrong here: an orthographic projection is a
+    // contraction, so which vertices land on top of each other -- and therefore which
+    // faces get smoothed together -- CHANGES AS YOU ROTATE. Shading pops mid-drag for no
+    // reason the model can explain. The complex already carries the real topology, and it
+    // does not depend on the angle, so welding on it is both cacheable and stable.
+    std::vector<uint32_t>          voff, vcorner;
 
     bool matches(const Model& m, const Config& cfg) const {
         return owner == &m && n == std::max(3, cfg.n) && extra == cfg.extra && !tmpl.empty();
     }
     void clear() { owner = nullptr; n = -1; extra.clear(); c = Complex{};
-                   tmpl.clear(); tvi.clear(); gStart.clear(); gCount.clear(); }
+                   tmpl.clear(); tvi.clear(); gStart.clear(); gCount.clear();
+                   voff.clear(); vcorner.clear(); }
 };
 
 inline Stats apply(const Model& m, const Config& cfg, Scene& s, Cache* cache = nullptr) {
@@ -818,6 +829,7 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s, Cache* cache = n
     // re-derive crease-correct normals over the whole warped mesh in one pass.
     std::vector<Vec3>               verts;
     std::vector<std::array<int, 3>> triVI;
+    bool ndGeneralNormalsDone = false;   // the general path derives its own (see below)
     const bool reNormal = !st.linear;   // a non-linear warp has to re-derive normals
 
     // Which output triangles came from which source group, so the group ranges can be
@@ -910,6 +922,20 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s, Cache* cache = n
                 }
                 T.gCount[gi] = T.tmpl.size() - T.gStart[gi];
             }
+            // CSR adjacency over complex vertices, counting sort. Built from T.tvi so the
+            // corner ids index the TEMPLATE order, which is what the gather below walks.
+            const size_t nT = T.tmpl.size();
+            T.voff.assign((size_t)cc.nv + 1, 0u);
+            for (size_t i = 0; i < nT; ++i)
+                for (int k = 0; k < 3; ++k) ++T.voff[(size_t)T.tvi[i][k] + 1];
+            for (int v = 0; v < cc.nv; ++v) T.voff[(size_t)v + 1] += T.voff[(size_t)v];
+            T.vcorner.assign(nT * 3, 0u);
+            {
+                std::vector<uint32_t> cur(T.voff.begin(), T.voff.end() - 1);
+                for (size_t i = 0; i < nT; ++i)
+                    for (int k = 0; k < 3; ++k)
+                        T.vcorner[cur[(size_t)T.tvi[i][k]]++] = (uint32_t)(i * 3 + k);
+            }
         }
         const Complex& c = T.c;
         msComplex = since(tC);
@@ -974,6 +1000,60 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s, Cache* cache = n
             groupCount[gi] = (e < ntc ? slot[e] : kept) - (b < ntc ? slot[b] : kept);
         }
         msEmit = since(tE);
+
+        // ---- Crease normals from the cached topology ------------------------------
+        // Same Thurmer-Wuthrich angle weighting and same crease threshold meshFinishTris
+        // uses, but over the COMPLEX's own adjacency instead of a freshly welded one, and
+        // only over the triangles that survived the projection. Degenerate neighbours are
+        // excluded by their zero face normal, which can never clear cosThresh.
+        const auto tN2 = nclock::now();
+        if (reNormal && kept) {
+            const double cosThresh = std::cos(cfg.creaseDeg * PI / 180.0);
+            std::vector<Vec3>   fnC(ntc);
+            std::vector<double> angC(ntc * 3);
+            (void)ft::parallelFor(ntc, 4096, [&](size_t i) {
+                const std::array<int, 3>& vi = T.tvi[i];
+                const Vec3& P0 = proj[(size_t)vi[0]];
+                const Vec3& P1 = proj[(size_t)vi[1]];
+                const Vec3& P2 = proj[(size_t)vi[2]];
+                Vec3 cr = cross(P1 - P0, P2 - P0);
+                const double l = std::sqrt(dot(cr, cr));
+                fnC[i] = (l > 1e-18) ? cr * (1.0 / l) : Vec3{0, 0, 0};
+                for (int c = 0; c < 3; ++c) {
+                    const Vec3& A = proj[(size_t)vi[c]];
+                    Vec3 e1 = proj[(size_t)vi[(c + 1) % 3]] - A;
+                    Vec3 e2 = proj[(size_t)vi[(c + 2) % 3]] - A;
+                    const double l1 = std::sqrt(dot(e1, e1)), l2 = std::sqrt(dot(e2, e2));
+                    double a = 0.0;
+                    if (l1 >= 1e-18 && l2 >= 1e-18) {
+                        double ca = dot(e1, e2) / (l1 * l2);
+                        ca = ca < -1.0 ? -1.0 : (ca > 1.0 ? 1.0 : ca);
+                        a = std::acos(ca);
+                    }
+                    angC[i * 3 + c] = a;
+                }
+            });
+            (void)ft::parallelFor(ntc, 2048, [&](size_t i) {
+                if (!keep[i]) return;
+                Tri& t = out[warpStart + slot[i]];
+                const Vec3 fni = fnC[i];
+                const std::array<int, 3>& vi = T.tvi[i];
+                for (int c = 0; c < 3; ++c) {
+                    const uint32_t wv = (uint32_t)vi[c];
+                    Vec3 sum{0, 0, 0};
+                    for (uint32_t k = T.voff[wv], e = T.voff[wv + 1]; k < e; ++k) {
+                        const uint32_t cid = T.vcorner[k];
+                        const Vec3& fnj = fnC[cid / 3];
+                        if (dot(fni, fnj) >= cosThresh) sum += fnj * angC[cid];
+                    }
+                    const double l = std::sqrt(dot(sum, sum));
+                    const Vec3 sn = (l > 1e-12) ? sum * (1.0 / l) : fni;
+                    if (c == 0) t.n0 = sn; else if (c == 1) t.n1 = sn; else t.n2 = sn;
+                }
+            });
+        }
+        msNormals = since(tN2);
+        ndGeneralNormalsDone = true;
         verts = std::move(proj);          // proj is dead here; do not copy ~100 MB
     }
 
@@ -985,11 +1065,12 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s, Cache* cache = n
     // of face normals, merged only across edges softer than `creaseDeg`, so an extruded
     // prism's lids stay sharp against its walls instead of smearing into them.
     const auto tN = nclock::now();
-    if (reNormal && !triVI.empty())
+    if (reNormal && !ndGeneralNormalsDone && !triVI.empty()) {
         meshFinishTris(s, warpStart, verts, triVI, /*proceduralUV*/false,
                        UvProjection::None, 1, /*wantSmooth*/true, /*haveNormals*/false,
                        cfg.creaseDeg);
-    msNormals = since(tN);
+        msNormals = since(tN);
+    }
     if (since(tStart) > 250.0) {
         std::printf("[nd] warp %.0f ms for %zu tris  (complex %.0f, project %.0f, "
                     "emit %.0f, normals %.0f)\n",
