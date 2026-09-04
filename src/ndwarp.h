@@ -398,15 +398,27 @@ inline void weld(const std::vector<Tri>& tris, Topo& t) {
 // Center to zero mean, then scale to unit peak. A signal that is entirely constant
 // (a perfectly flat mesh's curvature, say) becomes exactly zero, which is the honest
 // answer — there is nothing in it to emboss with.
+//
+// "Constant" has to be judged RELATIVE to the signal's own magnitude, not against an
+// absolute epsilon. A sphere's `radius` is the same at every vertex — but only to the
+// precision the mesh was stored at, and an OBJ written with six decimals leaves residuals
+// around 1e-7. Against a 1e-15 floor those count as signal, so normalising to unit peak
+// amplified pure quantisation noise by seven orders of magnitude and shredded the model
+// into shards. Any mesh from a text format hits this; it was found by embossing `radius`
+// on a UV sphere, where the correct answer is visibly "nothing happens".
 inline void normalizeSignal(std::vector<double>& s) {
     if (s.empty()) return;
-    double mean = 0.0;
-    for (double v : s) mean += v;
+    double mean = 0.0, rawPeak = 0.0;
+    for (double v : s) { mean += v; rawPeak = std::max(rawPeak, std::fabs(v)); }
     mean /= (double)s.size();
     double peak = 0.0;
     for (double& v : s) { v -= mean; peak = std::max(peak, std::fabs(v)); }
-    if (peak > 1e-15) { const double inv = 1.0 / peak; for (double& v : s) v *= inv; }
-    else              { for (double& v : s) v = 0.0; }
+    // Scale to compare against: how big the values were before centering. A signal whose
+    // variation is a millionth of its own size carries nothing but round-off.
+    const double scale = std::max(std::fabs(mean), rawPeak);
+    const double floorAbs = std::max(1e-15, 1e-6 * scale);
+    if (peak > floorAbs) { const double inv = 1.0 / peak; for (double& v : s) v *= inv; }
+    else                 { for (double& v : s) v = 0.0; }
 }
 
 inline void appendDouble(std::string& b, double v) {
