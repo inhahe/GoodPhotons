@@ -1,3 +1,4 @@
+#include "viewerhelp.h"
 #include "livewindow.h"
 
 // Shared by both builds: on a headless build there is no window to minimize, but the
@@ -447,7 +448,7 @@ bool LivePresenter::readbackBgra(std::vector<uint8_t>& bgra, int& w, int& h) {
 // Child-window command IDs (WM_COMMAND LOWORD) + the trackbar. Kept out of the low
 // range Windows reserves for standard dialog buttons.
 enum {
-    ID_CLIP = 1001, ID_RESET, ID_PATH, ID_PLAY,
+    ID_CLIP = 1001, ID_RESET, ID_HELP, ID_PATH, ID_PLAY,
     ID_TIMELINE, ID_STRIDE, ID_RATE, ID_SW_UPDATE, ID_SW_SEC,
     // ---- curve-editor row ----
     ID_REC, ID_ADDPT, ID_INSPT, ID_DELPT, ID_SAVE, ID_TOL, ID_RAW,
@@ -550,6 +551,7 @@ struct LiveWindow::Impl {
     int                  panelBaseH = 0;
     int                  pathCount = 0;             // cameras on the timeline (0 = no path controls)
     HWND hColor=nullptr, hSeeThru=nullptr;   // preview-shading toggles (Color / See-through)
+    HWND hHelp=nullptr;
     HWND hClip=nullptr, hReset=nullptr, hPath=nullptr, hPlay=nullptr, hTimeline=nullptr,
          hStrideLbl=nullptr, hStride=nullptr, hRateLbl=nullptr, hRate=nullptr,
          hSwUpdate=nullptr, hSwSec=nullptr;         // child controls (set on UI thread pre-hasPanel)
@@ -682,6 +684,11 @@ void LiveWindow::Impl::buildPanel(HWND h) {
     std::wstring clipTxt = utf8ToWide("Clip: " + collide);
     hClip  = mk(L"BUTTON", clipTxt.c_str(), BS_PUSHBUTTON, ID_CLIP);
     hReset = mk(L"BUTTON", L"Reset", BS_PUSHBUTTON, ID_RESET);
+    // Every other control in this strip is a verb with no label explaining it, and
+    // the N-D bank in particular is a wall of sliders whose meaning is not guessable
+    // from looking at it. One button that opens a written page costs a few pixels and
+    // removes the guessing.
+    hHelp  = mk(L"BUTTON", L"Help", BS_PUSHBUTTON, ID_HELP);
     // Preview-shading toggles. Push-like checkboxes rather than buttons because both are
     // STATES you need to be able to read off the panel, not actions.
     hColor   = mk(L"BUTTON", L"Color",       BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_COLOR);
@@ -1051,6 +1058,7 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     // hidden, so revealing it later (setPathCount) needs no relayout.
     place(hClip, 84, row1, bh);
     place(hReset, 56, row1, bh);
+    place(hHelp, 48, row1, bh);
     place(hColor, 52, row1, bh);
     place(hSeeThru, 88, row1, bh);
     place(hPath, 66, row1, bh);
@@ -1420,6 +1428,7 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                 switch (id) {
                     case ID_CLIP:  { std::lock_guard<std::mutex> lk(self->inMtx); self->collideReq = true; } break;
                     case ID_RESET: { std::lock_guard<std::mutex> lk(self->inMtx); self->resetReq   = true; } break;
+                    case ID_HELP:  ftViewerHelpOpen(); break;
                     case ID_PATH:  { std::lock_guard<std::mutex> lk(self->inMtx); self->pathReq     = true; } break;
                     case ID_PLAY:  { std::lock_guard<std::mutex> lk(self->inMtx); self->playReq     = true; } break;
                     case ID_SW_UPDATE:
