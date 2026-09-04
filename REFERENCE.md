@@ -4872,13 +4872,27 @@ coordinates). Every source is centred to zero mean and normalised to unit peak b
 scales it, so an embossed model stays put rather than drifting off-origin.
 
 **What `extrude` actually builds.** The boundary of a 4-D prism is a 3-manifold, which no
-triangle rasterizer can draw, so what is built is its **2-skeleton**: the original triangles
-at one end, their copy at the other, and every mesh **edge** swept into a quad. That is
-exactly how a tesseract is drawn as its square faces, and it is a genuine N-D solid whose
-3-D projection changes qualitatively as it turns. Cost is predictable — `V → 2V`,
-`E → 2E + V`, `F → 2F + E` — so for a closed mesh (where `E ≈ 1.5 F`) one extrusion is about
-**5x** the triangles and a second about 5x again. `-nd-budget <n>` (default 8 000 000)
-refuses a configuration past a triangle ceiling instead of trying to build it.
+triangle rasterizer can draw, so what is built is the **boundary surface** of the sweep: the
+original triangles at one end, their copy at the other, and each **boundary** edge swept into
+a quad. It is a genuine N-D solid whose 3-D projection changes qualitatively as it turns.
+
+*Boundary* edges only, meaning those with exactly one incident face. The boundary of `S × [0,h]`
+is `S ∪ (S+h) ∪ (∂S × [0,h])`, so an edge that already has two faces contributes nothing to it,
+and a **closed** mesh (`∂S = ∅`) simply doubles: `F → 2F`, no side walls. An open mesh — a plane,
+a shell with a hole — does get walls along its rim, which is what closes the prism.
+
+> Until 0.235.0 a wall was swept over *every* edge, which builds the CW **2-skeleton** rather
+> than the boundary. That is a different object: correct as a complex, wrong as a surface,
+> because every wall over an interior edge is a partition buried inside the solid. Opaque
+> renders never showed it (the z-buffer discards those walls) but `-see-through` charges a
+> transmittance per crossed surface, so a closed model — where *every* edge is interior, i.e.
+> `V+F−2` phantom walls — saturated to a flat silhouette. It also made the mesh far larger
+> than it needed to be.
+
+Cost is therefore `V → 2V`, `E → 2E + V`, `F → 2F + 2B` with `B` the boundary-edge count: a
+closed mesh **doubles** per extrusion, and only an open one pays more. (Before, a closed mesh
+cost about **3.5x** per extrusion.) `-nd-budget <n>` (default 8 000 000) refuses a configuration
+past a triangle ceiling instead of trying to build it.
 
 > **An extruded axis is invisible until you turn it into view.** An extra dimension reaches
 > the image only through column `k` of the rotation matrix's first three rows; until some
