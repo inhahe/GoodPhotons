@@ -15883,3 +15883,34 @@ strand render, so the 3.8× only applies where the aggregate is actually wanted.
 cost problem much less pressing, but it does not answer the crossover question, which is still
 the thing to measure: render the same coat at 90 k / 900 k / 9 M strands and find where the two
 curves cross.
+
+## `-nd` viewer: a heavy fill makes the slider bank feel dead (OPEN)
+
+Reported from the viewer with `extrude` picked on **both** extra dimensions of a 250,744-triangle
+glTF. Two symptoms remain after the see-through black was fixed (that one is DONE — see the
+commit for `raster.h`'s no-hue haze fallback):
+
+1. **~4 s of latency per slider event.** Every event rebuilds the warp from the pristine copy,
+   re-shades, re-tessellates and re-uploads to the GPU. `extrude` takes F -> 2F+E *per
+   dimension*, so extruding two turns 250,744 triangles into 4,262,700 (~17x). Measured on a
+   live viewer by driving slider 1202 through `WM_HSCROLL` and polling the panel's status text:
+   the label moved immediately, the triangle count only changed 4.8 s later. Dragging queues
+   events, so it never visibly catches up and reads as "no slider does anything".
+2. **The slider snaps back to centre a couple of seconds after a drag.** Not reproduced under
+   synthetic driving (the angle stuck at +40 and the mesh rebuilt), but reported consistently by
+   hand with see-through on, where each cycle is far slower. The suspect is the panel state push:
+   the render loop calls `setNdState(ndAnglesDeg(), ...)` after a rebuild, so a push that lands
+   after the user has moved the slider again will overwrite the new position with the angle the
+   rebuild used. That is a genuine race whenever a rebuild outlives the next input, which is
+   exactly what a multi-second rebuild guarantees.
+
+**What the fix looks like.** Both come from rebuilding synchronously on the input thread at a
+size the design never anticipated. The proper answer is to make the re-warp asynchronous and
+coalescing: keep the last good model on screen, run the rebuild on a worker against a snapshot
+of the config, drop superseded requests instead of queueing them, and only push panel state for
+a config that is still current (stamp each request with a generation counter and ignore a push
+whose generation is stale). A 0.231.3 warning now fires once when a config crosses 2M triangles,
+which makes the cost visible but does not remove it.
+
+Workaround: use `emboss`, which reshapes just as much and adds no triangles, or extrude only one
+dimension (~878 k, still interactive).

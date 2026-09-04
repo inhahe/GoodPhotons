@@ -20773,6 +20773,31 @@ static int run(int argc, char** argv) {
                                  want, ndBudget);
                     return;
                 }
+                // Every slider event rebuilds the whole warp from the pristine copy, re-shades
+                // it, re-tessellates and re-uploads to the GPU. That is instant on the source
+                // mesh and seconds once a fill has multiplied it -- and `extrude` multiplies
+                // HARD, because the prism 2-skeleton takes F -> 2F+E. Extruding two dimensions
+                // applies that twice: a 250k-triangle model becomes 4.3M, ~17x, and a drag then
+                // stalls for seconds per event with no indication that anything is happening.
+                // Say so ONCE, when the config first gets heavy, instead of letting the viewer
+                // read as broken.
+                static bool warnedHeavy = false;
+                if (!warnedHeavy && want > 2000000) {
+                    warnedHeavy = true;
+                    std::printf("[nd] this fill makes %zu triangles from %zu source (%.1fx) — "
+                                "each slider move now\n"
+                                "     rebuilds all of them, so expect a pause of seconds per "
+                                "drag. `extrude` is the\n"
+                                "     expensive one (F -> 2F+E per dimension, so two extrudes "
+                                "square it); `emboss`\n"
+                                "     reshapes just as much and adds NO triangles. Lower the "
+                                "amount, extrude one\n"
+                                "     dimension instead of two, or decimate the model first.\n",
+                                want, ndModel.base.size(),
+                                ndModel.base.empty() ? 0.0
+                                                     : (double)want / (double)ndModel.base.size());
+                    std::fflush(stdout);
+                }
                 ndLastStats = ndwarp::apply(ndModel, ndCfg, scene);
                 ndBvhStale = true;
                 plight = raster::deriveLight(scene);

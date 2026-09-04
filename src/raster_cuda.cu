@@ -1231,10 +1231,20 @@ __device__ inline uchar3 tonemapPixel(const float3* accum, const float* zbuf, si
             // Haze tinted by the HUE of the accumulated transmittance — the host twin;
             // see the long comment there for why the hue and not the magnitude.
             double tmax = fmax(fmax((double)Tr, (double)Tg), (double)Tb);
-            double inv  = (tmax > 1e-6) ? 1.0 / tmax : 1.0;
-            cx = __dadd_rn(__dmul_rn(cx, (double)Tr), __dmul_rn(milkX * (double)Tr * inv, m));
-            cy = __dadd_rn(__dmul_rn(cy, (double)Tg), __dmul_rn(milkY * (double)Tg * inv, m));
-            cz = __dadd_rn(__dmul_rn(cz, (double)Tb), __dmul_rn(milkZ * (double)Tb * inv, m));
+            // See raster.h's exposeAndEncodeCore: with no hue to take, take none. Falling
+            // back to inv = 1 leaves hz = milkColor * T ~ 0, so a dense stack composites to
+            // EXACTLY black instead of to the frost that should be all that is left. The two
+            // backends must agree bit for bit, so this branch is duplicated verbatim.
+            bool   hasHue = tmax > 1e-6;
+            double inv  = hasHue ? 1.0 / tmax : 1.0;
+            // Same expression order as the host (plain double, left to right) so the two
+            // stay bit-identical; only the no-hue fallback differs from what it was.
+            double hzX = hasHue ? milkX * (double)Tr * inv : milkX;
+            double hzY = hasHue ? milkY * (double)Tg * inv : milkY;
+            double hzZ = hasHue ? milkZ * (double)Tb * inv : milkZ;
+            cx = __dadd_rn(__dmul_rn(cx, (double)Tr), __dmul_rn(hzX, m));
+            cy = __dadd_rn(__dmul_rn(cy, (double)Tg), __dmul_rn(hzY, m));
+            cz = __dadd_rn(__dmul_rn(cz, (double)Tb), __dmul_rn(hzZ, m));
         }
     }
     return make_uchar3(encodeSrgb(cx, lut), encodeSrgb(cy, lut), encodeSrgb(cz, lut));

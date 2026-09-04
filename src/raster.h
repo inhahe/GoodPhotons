@@ -1498,10 +1498,23 @@ inline std::vector<uint8_t> exposeAndEncodeT(
                     // scaling by T itself would multiply the haze by the same absorption
                     // twice, and dark glass would lose its frost entirely.
                     const double tmax = std::max({(double)Tr, (double)Tg, (double)Tb});
-                    const double inv = (tmax > 1e-6) ? 1.0 / tmax : 1.0;
-                    const Vec3 hz{milkColor.x * (double)Tr * inv,
-                                  milkColor.y * (double)Tg * inv,
-                                  milkColor.z * (double)Tb * inv};
+                    // When the stack is too DENSE to carry a hue, the haze must survive on its own.
+                    // `hz` tints the frost by the HUE of the accumulated transmittance, which
+                    // needs T normalized by its own max. Falling back to inv = 1 when tmax is
+                    // ~0 does not do that -- it leaves hz = milkColor * T, i.e. ~0 -- so both
+                    // terms of the composite vanish and the pixel comes out EXACTLY black.
+                    // That is wrong in precisely the case the haze exists for: it stands for
+                    // light scattered inside the glass, so it is what is left when you can no
+                    // longer see through. A deep stack (an -nd extrude multiplies the crossed
+                    // surfaces several-fold) turned the whole model into a black silhouette.
+                    // With no hue to take, take none: untinted frost.
+                    const bool   hasHue = tmax > 1e-6;
+                    const double inv = hasHue ? 1.0 / tmax : 1.0;
+                    const Vec3 hz = hasHue
+                        ? Vec3{milkColor.x * (double)Tr * inv,
+                               milkColor.y * (double)Tg * inv,
+                               milkColor.z * (double)Tb * inv}
+                        : milkColor;
                     c = Vec3{c.x * (double)Tr + hz.x * m,
                              c.y * (double)Tg + hz.y * m,
                              c.z * (double)Tb + hz.z * m};
