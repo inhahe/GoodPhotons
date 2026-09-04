@@ -15918,20 +15918,45 @@ was the dominant one), and dropped a ~100 MB `verts = proj` copy per event. All 
 bit-identical to the serial version, verified by rendering the same config before and after: 0
 differing pixels, and likewise for an ordinary glTF load and for `_glass_tint`.
 
-**What is still open.** A slider event on that config still costs ~3.6 s end to end (warp 1.5 s,
-then tessellate + GPU re-upload + render). Remaining ideas, roughly in value order:
+**Warp caching + parallel emit: DONE (0.233.0), and it moved the bottleneck elsewhere.**
+`ndwarp::Cache` holds the angle-independent half of a warp -- the N-D complex plus a per-triangle
+template carrying material and UVs -- keyed on the Model and the FILLS. `buildComplex` never
+reads an angle (verified: not one reference to `cfg.angle` or `rotationMatrix` in its 130 lines),
+so this is reused by a rotation in ANY plane, including ones that swing an extra dimension into
+view. The serial emit became a parallel project-and-compact into a pre-sized array. On a cached
+drag of the 4.26M-triangle config:
 
-1. **The emit loop is still serial** and now costs as much as the normals do. It `push_back`s
-   into one `out` vector per group; parallelising means pre-sizing each group's range and
-   writing by index. Straightforward, just not done.
-2. **Rebuilding at all is the real problem.** A rotation-only change (no fill edit) does not
-   need `buildComplex` re-run or normals re-derived from scratch -- the topology is identical
-   and only the 3x3 projection changed. Caching the complex across angle-only edits would make
-   a drag nearly free, and is the single biggest remaining win.
-3. **Async + generation counter** (the original plan): run the rebuild on a worker against a
-   config snapshot, keep the last good model on screen, drop superseded requests, and ignore a
-   panel push whose generation is stale. Worth doing only after (2), since (2) may make the
-   rebuild cheap enough that asynchrony stops mattering.
+| phase | before caching | cached drag |
+|---|---|---|
+| complex | 436 ms | **0 ms** |
+| project | 2 ms | 3 ms |
+| emit | 649 ms | 453 ms |
+| normals | 647 ms | 557 ms |
+| **total warp** | **1470 ms** | **1017 ms** |
+
+Bit-identical throughout (0 differing pixels on the two-extrude render, on emboss+see-through,
+and on a plain glTF load), checknd / checkmesh / checktrinormal / checkpatops all PASS.
+
+Note the cache does NOT speed up a one-shot CLI render: template construction moves cost out of
+emit and into complex, so a cold `apply` is a wash (~1500 ms either way). It only pays on repeat,
+which is exactly the drag case it exists for.
+
+**What is still open.** A slider event still costs ~3.6 s end to end, but the warp is now only
+~28% of that. The measured remainder is tessellation (0.72 s) plus the GPU rasterizer teardown
+and re-upload of 4.26M triangles, plus the render itself. So further warp optimisation is no
+longer the lever. In value order now:
+
+1. **Incremental GPU re-upload.** `ndReapply` destroys the whole `raster_cuda::Scene` and
+   re-uploads it. On an angle-only edit only vertex POSITIONS changed -- materials, UVs, indices
+   and textures are identical -- so this could be a position-buffer update instead of a full
+   rebuild. Biggest remaining win by some distance.
+2. **Skip the re-tessellation** on an angle-only edit for the same reason.
+3. **Cache the crease adjacency.** `meshFinishTris` re-welds and rebuilds its CSR every call
+   (557 ms of the 1017). It welds by PROJECTED position, which is also a latent correctness wart:
+   an orthographic projection is a contraction, so which vertices fuse -- and therefore how
+   normals smooth -- is angle-dependent and can pop mid-drag. Re-keying the weld on complex
+   topology would make it both cacheable and angle-stable.
+4. **Async + generation counter**, still last: worth doing only if 1-3 leave it slow.
 
 Workaround unchanged: `emboss` reshapes as much and adds no triangles; one extrude (~878 k)
 stays interactive.

@@ -20758,6 +20758,12 @@ static int run(int argc, char** argv) {
             // traced preview actually needs it.
             bool ndBvhStale = false;
             ndwarp::Stats ndLastStats;
+            // The angle-independent half of the warp, held across slider events. A drag
+            // only changes angles, and buildComplex never reads one, so this turns each
+            // event from "rebuild the model" into "re-project it". Keyed on the Model and
+            // the FILLS, so editing a fill rebuilds it while moving any slider -- in any
+            // plane, including ones that swing an extra dimension into view -- reuses it.
+            ndwarp::Cache ndCache;
             auto ndReapply = [&]() {
                 if (!ndActive) return;
                 // Retilt the field slice first: it is the whole N-D story for an
@@ -20798,7 +20804,7 @@ static int run(int argc, char** argv) {
                                                      : (double)want / (double)ndModel.base.size());
                     std::fflush(stdout);
                 }
-                ndLastStats = ndwarp::apply(ndModel, ndCfg, scene);
+                ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache);
                 ndBvhStale = true;
                 plight = raster::deriveLight(scene);
                 prims.clear();
@@ -20853,7 +20859,7 @@ static int run(int argc, char** argv) {
                 return line;
             };
             if (ndActive) {
-                ndLastStats = ndwarp::apply(ndModel, ndCfg, scene);   // seed the readout
+                ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache);   // seed the readout
                 g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
                                       ndStatus().c_str());
             }

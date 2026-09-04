@@ -140,6 +140,9 @@ inline const char* embName(Emb e) {
     return "?";
 }
 
+struct DimSpec;
+inline bool operator==(const DimSpec& a, const DimSpec& b);
+
 struct DimSpec {
     Fill   fill = Fill::Zero;
     Emb    src  = Emb::Curvature;
@@ -149,6 +152,17 @@ struct DimSpec {
     double amp  = 0.25;
     double freq = 4.0;      // Emb::Noise only: cycles across the model's diameter
 };
+
+// Fill equality decides whether a cached complex is still good, so it compares every
+// field the complex is built from -- and `src`/`freq` only matter for an Emboss, which
+// is why a plain `memcmp` would wrongly invalidate on a stale src behind Fill::Zero.
+inline bool operator==(const DimSpec& a, const DimSpec& b) {
+    if (a.fill != b.fill) return false;
+    if (a.fill == Fill::Zero) return true;
+    if (a.amp != b.amp) return false;
+    if (a.fill == Fill::Extrude) return true;
+    return a.src == b.src && a.freq == b.freq;
+}
 
 struct Config {
     int n = 3;                       // total dimensions; 3 = the warp is a no-op
@@ -742,7 +756,35 @@ inline double axisVisibility(const std::vector<double>& R, int n, int k) {
 // still name the right triangles. Does NOT rebuild the BVH or the emitter tables —
 // the interactive previewer re-rasterizes many times a second and needs none of that,
 // so the caller decides when to pay for `Scene::build()`.
-inline Stats apply(const Model& m, const Config& cfg, Scene& s) {
+// Everything about a warp that does NOT depend on the rotation, kept across edits.
+//
+// buildComplex reads exactly two things from the config -- `n` and the per-dimension
+// FILLS -- and never looks at an angle. The rotation enters only where the complex's
+// vertices are projected, three rows of a matrix multiply per vertex. So dragging any
+// slider, in ANY plane (a rotation that swings the 4th dimension into view no less than
+// one that spins the model in place), leaves all of this identical and re-derivable for
+// free. Holding it is what turns a drag from "rebuild the model" into "re-project it".
+//
+// `tmpl` is one output triangle per complex triangle with everything but its positions
+// and normals already filled in (material, UVs), in the same group-major order the emit
+// loop produced, so a re-projection is a parallel scatter rather than a serial build.
+struct Cache {
+    const Model* owner = nullptr;    // which Model this was built from
+    int                  n = -1;
+    std::vector<DimSpec> extra;      // the fills it was built for
+    Complex                        c;
+    std::vector<Tri>               tmpl;
+    std::vector<std::array<int, 3>> tvi;    // complex vertex ids per template triangle
+    std::vector<size_t>            gStart, gCount;   // template ranges per source group
+
+    bool matches(const Model& m, const Config& cfg) const {
+        return owner == &m && n == std::max(3, cfg.n) && extra == cfg.extra && !tmpl.empty();
+    }
+    void clear() { owner = nullptr; n = -1; extra.clear(); c = Complex{};
+                   tmpl.clear(); tvi.clear(); gStart.clear(); gCount.clear(); }
+};
+
+inline Stats apply(const Model& m, const Config& cfg, Scene& s, Cache* cache = nullptr) {
     Stats st;
     if (!m.ok) return st;
     // Phase timings. A slider drag re-runs this whole function per event, so when it
@@ -828,8 +870,48 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s) {
         st.verts = (size_t)m.topo.nv;
     } else {
         // ---- General path: build the N-D complex, rotate it, project it -----------
+        // Reuse the angle-independent half when only angles moved. `local` is the
+        // fallback storage for callers with no cache (an export, a one-shot render).
+        Cache  local;
+        Cache& T = cache ? *cache : local;
         const auto tC = nclock::now();
-        const Complex c = buildComplex(m, cfg);
+        if (!T.matches(m, cfg)) {
+            T.clear();
+            T.owner = &m; T.n = n; T.extra = cfg.extra;
+            T.c = buildComplex(m, cfg);
+            const Complex& cc = T.c;
+            // Group-major template order, matching what the old serial emit produced,
+            // so the compaction below preserves the group contiguity apply promises.
+            std::vector<size_t> baseTriGroup(m.base.size(), 0);
+            for (size_t gi = 0; gi < m.groups.size(); ++gi)
+                for (size_t i = m.groups[gi].start; i < m.groups[gi].start + m.groups[gi].count; ++i)
+                    baseTriGroup[i] = gi;
+            const size_t ntc = cc.tri.size() / 3;
+            std::vector<std::vector<size_t>> byGroup(m.groups.size());
+            for (size_t i = 0; i < ntc; ++i)
+                byGroup[baseTriGroup[cc.ref[i * 3] / 3]].push_back(i);
+            auto uvOfC = [&](uint32_t ref) -> const Vec3& {
+                const Tri& tr = m.base[ref / 3];
+                const unsigned k = ref % 3;
+                return (k == 0) ? tr.uv0 : (k == 1) ? tr.uv1 : tr.uv2;
+            };
+            T.tmpl.reserve(ntc); T.tvi.reserve(ntc);
+            T.gStart.assign(m.groups.size(), 0); T.gCount.assign(m.groups.size(), 0);
+            for (size_t gi = 0; gi < m.groups.size(); ++gi) {
+                T.gStart[gi] = T.tmpl.size();
+                for (size_t i : byGroup[gi]) {
+                    const uint32_t a = cc.tri[i * 3 + 0], b = cc.tri[i * 3 + 1], d = cc.tri[i * 3 + 2];
+                    const uint32_t ra = cc.ref[i * 3 + 0], rb = cc.ref[i * 3 + 1], rd = cc.ref[i * 3 + 2];
+                    Tri t = m.base[ra / 3];
+                    t.uv0 = uvOfC(ra); t.uv1 = uvOfC(rb); t.uv2 = uvOfC(rd);
+                    t.n0 = t.n1 = t.n2 = Vec3{0, 0, 0};
+                    T.tmpl.push_back(t);
+                    T.tvi.push_back({(int)a, (int)b, (int)d});
+                }
+                T.gCount[gi] = T.tmpl.size() - T.gStart[gi];
+            }
+        }
+        const Complex& c = T.c;
         msComplex = since(tC);
         st.verts = (size_t)c.nv;
 
@@ -855,34 +937,41 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s) {
         });
         msProject = since(tP);
 
-        // Every warped triangle belongs to the group its base corner came from, so an
-        // extruded prism stays part of the object it was swept out of.
-        std::vector<size_t> baseTriGroup(m.base.size(), 0);
-        for (size_t gi = 0; gi < m.groups.size(); ++gi)
-            for (size_t i = m.groups[gi].start; i < m.groups[gi].start + m.groups[gi].count; ++i)
-                baseTriGroup[i] = gi;
-
-        const size_t nt = c.tri.size() / 3;
-        std::vector<std::vector<size_t>> byGroup(m.groups.size());
-        for (size_t i = 0; i < nt; ++i)
-            byGroup[baseTriGroup[c.ref[i * 3] / 3]].push_back(i);
-
-        auto uvOf = [&](uint32_t ref) -> const Vec3& {
-            const Tri& tr = m.base[ref / 3];
-            const unsigned k = ref % 3;
-            return (k == 0) ? tr.uv0 : (k == 1) ? tr.uv1 : tr.uv2;
-        };
+        // Project-and-compact, in parallel. Same cull as `emit` (a projection that
+        // squashed a triangle to zero area would hand finalize() a zero cross product
+        // and put NaNs in the geometric normal), same output order, same result -- but
+        // the per-triangle work is a parallel scatter into a pre-sized array instead of
+        // a serial push_back that also re-looked-up every material and UV.
         const auto tE = nclock::now();
+        const size_t ntc = T.tmpl.size();
+        std::vector<uint8_t> keep(ntc);
+        (void)ft::parallelFor(ntc, 8192, [&](size_t i) {
+            const std::array<int, 3>& vi = T.tvi[i];
+            const Vec3 cr = cross(proj[(size_t)vi[1]] - proj[(size_t)vi[0]],
+                                  proj[(size_t)vi[2]] - proj[(size_t)vi[0]]);
+            keep[i] = dot(cr, cr) > 1e-30 ? 1u : 0u;
+        });
+        // Serial only over a byte array: a running count on 4M bytes is a few ms, and
+        // it is what lets the scatter above and the write below both be parallel.
+        std::vector<uint32_t> slot(ntc);
+        uint32_t kept = 0;
+        for (size_t i = 0; i < ntc; ++i) { slot[i] = kept; kept += keep[i]; }
+        st.dropped += ntc - kept;
+        out.resize(warpStart + kept);
+        if (reNormal) triVI.resize(kept);
+        (void)ft::parallelFor(ntc, 8192, [&](size_t i) {
+            if (!keep[i]) return;
+            const size_t o = warpStart + slot[i];
+            const std::array<int, 3>& vi = T.tvi[i];
+            Tri t = T.tmpl[i];
+            t.v0 = proj[(size_t)vi[0]]; t.v1 = proj[(size_t)vi[1]]; t.v2 = proj[(size_t)vi[2]];
+            out[o] = t;
+            if (reNormal) triVI[slot[i]] = vi;
+        });
         for (size_t gi = 0; gi < m.groups.size(); ++gi) {
-            groupFirst[gi] = out.size();
-            for (size_t i : byGroup[gi]) {
-                const uint32_t a = c.tri[i * 3 + 0], b = c.tri[i * 3 + 1], d = c.tri[i * 3 + 2];
-                const uint32_t ra = c.ref[i * 3 + 0], rb = c.ref[i * 3 + 1], rd = c.ref[i * 3 + 2];
-                emit(m.base[ra / 3], proj[a], proj[b], proj[d],
-                     Vec3{0, 0, 0}, Vec3{0, 0, 0}, Vec3{0, 0, 0},
-                     uvOf(ra), uvOf(rb), uvOf(rd), (int)a, (int)b, (int)d);
-            }
-            groupCount[gi] = out.size() - groupFirst[gi];
+            const size_t b = T.gStart[gi], e = b + T.gCount[gi];
+            groupFirst[gi] = warpStart + (b < ntc ? slot[b] : kept);
+            groupCount[gi] = (e < ntc ? slot[e] : kept) - (b < ntc ? slot[b] : kept);
         }
         msEmit = since(tE);
         verts = std::move(proj);          // proj is dead here; do not copy ~100 MB
