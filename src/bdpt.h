@@ -60,8 +60,45 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
 
 namespace bdpt {
+
+// Diagnostic tallies for the mode-J merge path, printed at exit when FTRACE_J_HALF is set.
+// Every counter is behind that flag, so a normal render pays nothing: the atomics would
+// otherwise be incremented once per beam hit, and a dense medium hands one camera segment
+// hundreds of those.
+struct JDiag {
+    std::atomic<long long> segs{0}, hits{0}, capped{0}, zeroed{0};
+    ~JDiag() {
+        const long long s = segs.load(), h = hits.load();
+        if (s || h)
+            std::fprintf(stderr, "[jdiag] camera segments gathered along: %lld | beam hits: %lld"
+                                 " | depth-capped: %lld | weight==0: %lld\n",
+                         s, h, capped.load(), zeroed.load());
+    }
+};
+inline JDiag& jDiag() { static JDiag d; return d; }
+
+// Diagnostic knob for mode J: `FTRACE_J_HALF=connections` or `=merges` renders only one
+// half of the UPBP estimator, MIS weights and all. Neither half is a correct image on its
+// own, but their SUM is exactly the full mode-J image (the RNG is re-seeded per
+// (pixel, sample), so suppressing one half cannot perturb the other's stream), which makes
+// it possible to attribute a whole-frame energy error to the connections or to the merges
+// with two renders. Off (0) unless the variable is set; read once.
+inline int jHalfMode() {
+    static const int v = [] {
+        const char* e = std::getenv("FTRACE_J_HALF");
+        if (!e) return 0;
+        if (!std::strcmp(e, "connections")) return 1;
+        if (!std::strcmp(e, "merges")) return 2;
+        if (!std::strcmp(e, "merges-raw")) return 3;
+        return 0;
+    }();
+    return v;
+}
 
 // Which direction a subpath transports. Radiance = from the camera (eye subpath);
 // Importance = from a light (light subpath). Only affects the (non-reciprocal)
@@ -2296,7 +2333,12 @@ struct BeamMergeWeight {
     const TrRay*     camTr = nullptr;
     const PatTables* tabs  = nullptr;
 
+    bool   raw = false;       // FTRACE_J_HALF=merges-raw (diagnostic): skip the weight entirely
+    JDiag* diag = nullptr;    // non-null only under FTRACE_J_HALF (see JDiag)
+
     double operator()(const BeamHit& bh, const PhotonBeam& b, double dens, double phase) const {
+        if (diag) diag->hits.fetch_add(1, std::memory_order_relaxed);
+        if (raw) return 1.0;                  // diagnostic: unweighted BB1D, i.e. mode M's
         const BeamMis* lm = bm->misOf(bh.idx);
         if (!lm) return 1.0;                  // no MIS data: mode M's raw estimator
         // THE DEPTH CAP. The merged path has s = j+1 light vertices and t = k+2 camera ones,
@@ -2307,7 +2349,10 @@ struct BeamMergeWeight {
         // the weight of an uncontested technique tends to 1). Every strategy in this
         // denominator describes the SAME path with the same n, so a single gate here is the
         // whole fix: past the cap the merge does not exist, and no other term needs adjusting.
-        if ((int)lm->vert + camVert + 1 > maxDepth) return 0.0;
+        if ((int)lm->vert + camVert + 1 > maxDepth) {
+            if (diag) diag->capped.fetch_add(1, std::memory_order_relaxed);
+            return 0.0;
+        }
         const double tc = bh.tCam;
         const double rhoL = (double)lm->leadIn + bh.sBeam;   // y_{s-1} -> x, not b.o -> x
         if (!(tc > 0.0) || !(rhoL > 0.0)) return 0.0;
@@ -2413,8 +2458,26 @@ struct BdptRenderer {
         // brightens it, so ONE flag gates both.
         const double mergeKappa = (mergeOn && !beams->mis.empty())
                                 ? (double)beams->nEmitted * 2.0 * beams->radRef() : 0.0;
+        // FTRACE_J_HALF (diagnostic): 1 = connections only, 2 = merges only. Deliberately
+        // does NOT touch mergeKappa — both halves keep the SAME MIS weights they have in a
+        // full render, so the two images sum to the full one.
+        const int jHalf = jHalfMode();
         for (int py = y0; py < y1; ++py)
             for (int px = 0; px < camFilm.resX; ++px) {
+                // Cooperative `-stop` / Ctrl-C, polled per pixel. WITHOUT this the camera
+                // pass is uninterruptible: the light/beam pass at the top of this file polls
+                // every 4096 paths, but nothing here did, so a `-stop` aimed at a mode-D/J
+                // render could only ever land BETWEEN spp chunks. That is not a theoretical
+                // gap — mode J on `scenes/_fog_cornell.ftsl` spent over half an hour inside
+                // its very first 1-spp chunk (the beam gather is far dearer per sample than a
+                // mode-D connection), ignored `-stop` throughout, and could not be ended
+                // without the force-kill this project forbids, while holding ftrace.exe open
+                // against a rebuild. One relaxed atomic load per pixel is free next to a full
+                // BDPT path.
+                //
+                // Returning leaves the rest of this thread's band at whatever it has so far;
+                // the caller drops a stopped chunk rather than merging a partial one.
+                if (ft::stopRequested()) return;
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)camFilm.resX + (uint64_t)px;
                 for (long long si = 0; si < spp; ++si) {
                     Pcg32 rng;
@@ -2503,6 +2566,7 @@ struct BdptRenderer {
                             for (int i = 0; i + 1 < nUpConn; ++i)
                                 contrib = contrib + cie[i + 1] * Lsec[i];
                             if (nUpConn > 1) contrib = contrib * (1.0 / nUpConn);
+                            if (jHalf >= 2) continue;   // FTRACE_J_HALF=merges*: drop connections
                             if (isSplat) splatFilm.add(spx, spy, contrib);
                             else         camFilm.add(px, py, contrib);
                         }
@@ -2531,7 +2595,7 @@ struct BdptRenderer {
                     // stream is re-seeded per (pixel, sample) at the top of this loop — so
                     // "turn the merges off and mode J is mode D bit-for-bit" survives even
                     // though the two halves share a generator.
-                    if (mergeOn) {
+                    if (mergeOn && jHalf != 1) {
                         // The camera half of every merge weight, replayed ONCE for the whole
                         // subpath. misWeight's camera loop telescopes inward from the merge
                         // point; everything it accumulates strictly camera-side of eye[k] is
@@ -2575,6 +2639,8 @@ struct BdptRenderer {
                             w1.scene = &scene; w1.bm = beams; w1.sg = &sg;
                             w1.lamCam = lamCam; w1.kappa = mergeKappa;
                             w1.tabs = &tabs;
+                            w1.raw = (jHalf == 3);
+                            if (jHalf) { w1.diag = &jDiag(); jDiag().segs.fetch_add(1, std::memory_order_relaxed); }
                             // Hoisted out of the per-hit weight: the ray/bounds clip and the
                             // spectral sigma_t lookup are constants of the SEGMENT, and a
                             // dense medium hands one segment hundreds of hits. Built

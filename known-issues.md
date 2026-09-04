@@ -5,6 +5,149 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### J-BEAMCOST — OPEN (performance, 2026-09-04): mode J's beam map is sized by `-n` alone, so the default budget builds a 12 M-beam / 1.2 GB map with a degenerate BVH — and an *open* scene makes every beam run to the escape clamp
+
+**Symptom.** `ftrace -in scenes/_fog_cornell.ftsl -mode J -device cpu -max-bounce 8 -r 64
+-time 30` does not finish. Not "is slow" — a **64×64** frame with a 30-second budget spends
+over seven minutes inside its very first 1-spp chunk. At the scene's own 256×256 it ran for
+39 minutes without ever writing a first image, which is why a `-time 90` mode-J render looks
+indistinguishable from a hang.
+
+**Where the cost is.** The beam pass reports it itself:
+
+```
+mode J: photon beams: medium 0: 12040064 chords, mean free path 2.519 m
+        -> kernel radius 0.02519 m
+mode J: photon beams: 12040064 stored -> 12040064 after split,
+        a probe ray gathers 2222.9 beams, box area 2.459e+08 m^2
+        [split limited by -beamsplitmax, not by the rule], BVH in 30.6s
+mode J: 12040064 beams from 2000000 light subpaths in 32.9s
+        (6.02 beams/subpath, 1194 MB)
+```
+
+Two multiplying causes:
+
+1. **The budget is `-n`, and nothing scales it to the frame.** In mode J `-n` counts *light
+   subpaths* (main.cpp ~16017), and each deposits one beam per span, so the default
+   `-n 2000000` at `-max-bounce 8` yields ~6 beams per subpath = 12 M beams / 1.2 GB —
+   for an image of 4096 pixels. Mode M has `-beamcount` (default 1 000 000) and thins with
+   Russian roulette to hit it; mode J deliberately does **not** (a per-beam, history-
+   dependent `keepProb` is not something the merge weight can read — see the
+   `traceLightBeamPass` header), so `g_beamTarget` never applies and the map keeps every
+   chord. The workaround today is to pass a smaller `-n` by hand.
+2. **`_fog_cornell` is an *open* box — five quads, no front wall — under an *unbounded*
+   medium.** A photon that leaves through the missing wall never hits anything, so its beam
+   is cut only by the escape clamp `kBeamFarScale * sceneRadius` = 8 × 0.866 ≈ 6.9 m, in a
+   scene one metre across. Hence a 2.5 m mean chord and a beam BVH whose total box area is
+   **2.459e+08 m²** for a 1 m³ scene. The traversal then visits far more nodes than the
+   2223 beams it returns, and that is the real per-camera-segment cost.
+
+**Not a regression from the `sceneRadius` fix.** That fix only stopped the clamp being
+applied to *bounded* media and only added *bounded* media to the bounding sphere; this
+medium is unbounded, so `dBeam = min(dLen, farLimit)` is byte-for-byte the old behaviour
+here. Verified by reading the diff, and the mode-J validation gates still pass.
+
+**What the proper fix looks like** (in rough order of value):
+
+- **Budget the map against the frame, not against `-n`.** `buildBeamMap` is already told
+  `res * resY * spp`; the *count* should be derived from that too, so a 64×64 preview does
+  not build the same 1.2 GB map as a 4K frame. The bias constraint is real — the merge
+  weight needs a readable density — but a budget applied as a *uniform* keep probability
+  chosen up front (one scalar, known to the weight, folded into `nEmitted`) satisfies it,
+  unlike mode M's history-dependent bank halving.
+- **Clamp beams to the region a camera can see, not to `8 × sceneRadius`.** A beam that has
+  left the view frustum and the scene's bounding sphere can only ever cost BVH area. The
+  escape clamp exists to stop a 1e30-long box; it is not a claim that 6.9 m of empty space
+  outside a 1 m box is worth indexing.
+- **Report the pathology instead of hiding it.** The build already knows `box area` and
+  `beams gathered per probe ray`; when the area-to-scene ratio is this extreme it should say
+  so in the same voice as the existing `-beamsplitmax` hint, because from the outside the
+  only visible symptom is a render that never writes a frame.
+
+**Related, and fixed in the same session:** the camera pass could not be interrupted at all
+(see J-NOSTOP below), which is what turned this from "slow" into "unkillable".
+
+### J-NOSTOP — FIXED (2026-09-04, v0.241.0): a mode-D/J render ignored `-stop` for as long as one spp chunk took, and a slow chunk therefore made the process unkillable
+
+**What was wrong.** `bdpt::renderRows` — the camera pass for modes D and J — polled
+`ft::stopRequested()` **nowhere**. The light/beam pass at the top of `bdpt.h` polls every
+4096 subpaths, and `ft::parallelFor` polls per chunk, but the per-pixel camera loop ran to
+completion no matter what. `-stop` could therefore only ever land *between* spp chunks.
+
+That is fine while chunks are short, and `cpuSppChunks` starts at 1 spp — but mode J's first
+1-spp chunk on `scenes/_fog_cornell.ftsl` takes tens of minutes (see J-BEAMCOST above). The
+observed result: a render that ignored three separate `ftrace -stop` invocations across half
+an hour, could not be ended without the `taskkill /F` this project forbids, and held
+`ftrace.exe` open so `build.bat` could not replace it. (`renderRows` is run from raw
+`std::thread`s, not `parallelFor`, so it inherited no polling; `render.h`'s backward camera
+pass has the same gap, but its chunks are short enough that it has never mattered.)
+
+**The fix.** One `if (ft::stopRequested()) return;` at the top of the per-pixel loop — a
+relaxed atomic load per pixel, free next to a full BDPT path.
+
+That alone would have been a *correctness* bug, because a chunk abandoned part-way covers
+only the pixels reached before the stop, and `cpuSppChunks` merged every chunk
+unconditionally while crediting it the full `c` spp — baking a permanent dark band into the
+image. So the chunk driver now **drops** a chunk that was cut short and reports once more
+with the spp genuinely accumulated, and `runSppProgressive` no longer claims "image saved"
+when the stop landed before the first sample completed and there is no image.
+
+**Note for the workaround era:** on Windows a *running* `.exe` can be renamed even though it
+cannot be overwritten, so `mv ftrace.exe ftrace_stuck.exe && build.bat` unblocks a rebuild
+that a stuck render is holding hostage, without force-killing anything.
+
+### J-SCENERADIUS — FIXED (2026-09-04, v0.241.0): `Scene::sceneRadius` ignored participating media, so a fog box lit by a small emitter had every photon beam truncated to a stub and mode J rendered 44× too dark
+
+**What was wrong.** `sceneRadius` was computed from the geometry BVH root alone. A bounded
+medium is not in that BVH — it is a region, not a primitive — so a scene that is mostly *fog*
+reported the bounding sphere of its *props*. `scenes/_slab_ss.ftsl` is a 4 × 2 × 2 m fog box
+lit by one 2 cm sphere and nothing else, so the BVH root was a 4 cm box and `sceneRadius`
+came out **0.0346 m**.
+
+`Renderer::emitBeams` then clamped every photon beam to `kBeamFarScale * sceneRadius`
+= 8 × 0.0346 = **0.277 m** — the escape-to-infinity guard, applied unconditionally, including
+to *bounded* media that already hand `clipToBounds` a finite exit. The beam map became a stub
+cloud around the emitter that never reached the camera's view of the box.
+
+**Why it read as a MIS bug for so long.** Mode J's merges returned exactly zero while its MIS
+weights still divided the connections down by the density those merges were supposed to be
+contributing. Every reading pointed at the weight: `-misaudit` passed (it only cross-checks
+*connection* weights, never the gather's merge weight), the image was uniformly dark rather
+than structurally wrong, and the deficit was a clean constant. What finally separated them was
+a pair of diagnostic knobs, now kept:
+
+- **`FTRACE_J_HALF=connections|merges|merges-raw`** (bdpt.h) renders one half of the UPBP
+  estimator, MIS weights and all; the two halves sum to exactly the full image because the RNG
+  is re-seeded per (pixel, sample). `merges` summed to **0**, and `merges-raw` — weight forced
+  to 1 — was *also* 0, which exonerated the weight outright.
+- **`FTRACE_BEAM_DIAG=1`** (photonbeams.h) tallies what the beam×ray query actually sees:
+  candidates handed over by the BVH, which of the four geometric rejections consumed them, and
+  which of the gather's own tests dropped the survivors. It showed 1.92 M candidates and 0
+  geometric hits — and grep then showed all 1.92 M came from the *beam-density probe*
+  (photonbeams.h:1000), not from the render's `gather()` (photonbeams.h:1151), which saw zero.
+
+The number that closed it was the reported mean free path, **0.2772 m** — exactly
+8 × 0.02 × √3 × 1.0001, i.e. the clamp against a scene radius computed from the emitter sphere
+alone.
+
+**The fix, in two halves.** `Scene::build()` now unions every **bounded** medium's AABB into
+the scene bounding sphere (`bmin`/`bmax` is the region AABB for box, sphere and implicit
+alike, so one union covers all three); and `emitBeams` applies the escape clamp **per medium
+and only to unbounded ones**, since a bounded medium's own clip is already finite and the
+clamp could only ever cut a beam short of the region it must fill. Clamping up front also
+meant one unbounded haze could shorten the beams of an unrelated bounded cloud it happened to
+overlap. `dEmitBeams` in `render_cuda.cu` carries the same change.
+
+**Observable side effect, by design:** `sceneRadius` also sizes sun emission discs
+(`spotOmega·π·R²`) and environment emission (`4π²R²`), so a scene with a bounded medium larger
+than its geometry now gets a correspondingly larger emission disc — which is the *correct*
+extent, and the reason the old value was wrong in the hardest direction to notice: it
+under-reported.
+
+**Measured effect on `scenes/_slab_ss.ftsl`:** mean beam chord 0.2772 → 1.168 m, merge hits
+0 → 347 597, and gate 3 (the analytic single-scattering reference, `tools/slab_ss_ref.py`)
+0.0227× → **1.0030×**.
+
 ### PLY-VCOLOR — FIXED (2026-09-03, v0.226.0): per-vertex colour is imported from PLY, OBJ, glTF and FBX, and works in the spectral tracer as well as the preview
 
 **What was wrong.** Every mesh loader stamped one material on every triangle, so a PLY
@@ -6537,6 +6680,18 @@ scatterer chosen by Poisson superposition" loop the forward tracer and the devic
 use, and give `neeVolume` the per-medium phase/albedo lookup. Then delete `backwardMedium()` and
 the warning entirely. Until then, prefer `-device gpu` for any backward render of a scene with
 more than one medium.
+
+**It bites a *single*-medium scene too, whenever that medium is `bounds`ed — and it does not
+look like a fog bug when it does (2026-09-04).** `scenes/_slab_ss.ftsl` has exactly one medium,
+so "more than one medium" above does not cover it, yet the medium is a bounded box and the CPU
+tracer drops the bounds — rendering an *unbounded* fog, i.e. a different scene rather than a
+noisier one. Used as mode J's gate-3 analytic reference (see `tools/slab_ss_ref.py`), CPU mode
+`R` fitted the closed form at **304×** the correct level with a noise rms of **51**, which
+presents as a catastrophic absolute-radiance failure in the mode under test. `-device gpu`
+reproduces the analytic answer to 1.5 %. The rule to state is therefore the broader one: prefer
+`-device gpu` for any backward render of a scene whose media are multiple, bounded, **or**
+heterogeneous — a single homogeneous *unbounded* haze is the only case the CPU path renders
+faithfully.
 
 ### BUG — DONE (2026-08-04, v0.128.0): the fp32 GPU build lost most of a DISTANT light's energy (a sun modelled as a far-away sphere rendered 2.7x too dim)
 

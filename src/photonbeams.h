@@ -181,6 +181,10 @@
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include "linalg.h"
 #include "rng.h"
 #include "color.h"
@@ -457,6 +461,77 @@ struct BeamMis {
                                // connection loop refuses depth > maxDepth, so the merge must
                                // refuse it too or mode J renders paths mode D never builds.
 };
+
+// ---- Diagnostic tallies for the beam x ray query (FTRACE_BEAM_DIAG=1) ---------------------
+// A gather that returns nothing is indistinguishable from a gather that was never called, and
+// both look like "the merges contribute zero". These counters split the difference: how many
+// beams the BVH actually handed to closestApproach, which of its four geometric rejections
+// consumed them, and then which of the gather's own tests dropped the survivors.
+//
+// They are here because that distinction is what found the `sceneRadius` beam-truncation bug
+// (see Scene::build): mode J was 44x too dark on `scenes/_slab_ss.ftsl`, `-misaudit` passed,
+// and every reading was consistent with a broken MIS weight right up until these counters
+// showed 1.9M candidates, 0 geometric hits, and 0 weight evaluations — i.e. the weight was
+// never the problem, the beams were simply not where the estimator needed them.
+//
+// COST: `on` is a namespace-scope inline bool, not a function-local static, so reading it is a
+// plain load with no thread-safe-initialisation guard, and every atomic is behind it.
+// closestApproach is one of the hottest functions in modes J and M (a dense medium runs it
+// hundreds of times per camera segment), so a guarded static here would be a real tax on every
+// render that never sets the variable.
+//
+// Measured, 0.241.0 — this build against a control built from the same tree with these
+// counters stashed out; `_fog_thick.ftsl -mode M -device cpu -r 128 -spp 16` with
+// FTRACE_CHUNK_SPP=4 pinning the chunk schedule so both do identical work, six alternating
+// runs each: control mean 13.25 s (10.15-15.75), instrumented mean 12.95 s (11.64-14.34). The
+// instrumented build is nominally *faster*, i.e. the branches are entirely inside this
+// machine's ±20 % run-to-run noise. The two PFMs are `cmp`-identical, which is structural
+// rather than lucky: with `on` false no counter is written and no arithmetic changes at all,
+// `minD2` included.
+//
+// That measurement is why this is a RUNTIME switch and not an `#ifdef`. A diagnostic gated at
+// compile time costs a ten-minute rebuild at exactly the moment you need it — when a render is
+// already misbehaving and you do not yet know why — and at that price it is worth nothing.
+// This one found a 44x radiance error (J-SCENERADIUS in known-issues.md) by being there.
+struct BeamDiag {
+    bool on = false;
+    mutable std::atomic<long long> cand{0}, rejPar{0}, rejT{0}, rejS{0}, rejR{0};
+    mutable std::atomic<long long> pass{0}, rejMed{0}, rejSS{0}, rejPh{0}, rejW{0}, rejTr{0};
+    mutable std::atomic<long long> minRatio{1LL << 62};  // min (d_perp/r) * 1e6, as an integer
+    void bump(std::atomic<long long>& c) const {
+        if (on) c.fetch_add(1, std::memory_order_relaxed);
+    }
+    void minD2(double d2, double r) const {
+        if (!(r > 0.0)) return;
+        const long long v = (long long)(std::sqrt(d2) / r * 1e6);
+        long long cur = minRatio.load(std::memory_order_relaxed);
+        while (v < cur && !minRatio.compare_exchange_weak(cur, v,
+                                                          std::memory_order_relaxed)) {}
+    }
+    ~BeamDiag() {
+        if (!on || cand.load() == 0) return;
+        std::fprintf(stderr,
+            "[beamdiag] candidates %lld | rejected: parallel %lld, t-range %lld, s-range %lld,"
+            " radius %lld | closest approach seen = %.4g x the kernel radius\n",
+            cand.load(), rejPar.load(), rejT.load(), rejS.load(), rejR.load(),
+            (double)minRatio.load() * 1e-6);
+        std::fprintf(stderr,
+            "[beamdiag] geometric hits %lld | dropped by: bad medium %lld, sigma_s<=0 %lld,"
+            " phase<=0 %lld, weight<=0 %lld, transmittance<=0 %lld\n",
+            pass.load(), rejMed.load(), rejSS.load(), rejPh.load(), rejW.load(),
+            rejTr.load());
+    }
+};
+inline BeamDiag gBeamDiag;
+// Dynamic initialiser, ordered after gBeamDiag by declaration order within this header. It
+// only ever flips `on`, so even if some other translation unit's static initialiser managed to
+// gather before this ran, the cost would be a lost count and never a wrong render.
+inline const bool gBeamDiagInit = [] {
+    const char* e = std::getenv("FTRACE_BEAM_DIAG");
+    gBeamDiag.on = (e && *e && std::strcmp(e, "0") != 0);
+    return true;
+}();
+inline BeamDiag& beamDiag() { return gBeamDiag; }
 
 // Result of one beam/ray closest-approach test that passed the radius check.
 struct BeamHit {
@@ -1067,19 +1142,23 @@ struct BeamMap {
     // the closest approach falls outside either segment, or beyond the kernel radius.
     bool closestApproach(int i, const Vec3& oc, const Vec3& dc, double tMax, BeamHit& out) const {
         const PhotonBeam& b = beams[i];
+        if (beamDiag().on) beamDiag().cand.fetch_add(1, std::memory_order_relaxed);
         const double cosT = dot(dc, b.d);
         const double den  = 1.0 - cosT * cosT;              // == sin^2(theta)
-        if (den < 1e-9) return false;                       // parallel: reject
+        if (den < 1e-9) { beamDiag().bump(beamDiag().rejPar); return false; }  // parallel
         const Vec3 w0 = oc - b.o;
         const double dd = dot(dc, w0), ee = dot(b.d, w0);
         const double t = (cosT * ee - dd) / den;
         const double s = (ee - cosT * dd) / den;
-        if (t < 0.0 || t > tMax) return false;
-        if (s < (double)b.s0 || s > (double)b.s0 + (double)b.len) return false;
+        if (t < 0.0 || t > tMax) { beamDiag().bump(beamDiag().rejT); return false; }
+        if (s < (double)b.s0 || s > (double)b.s0 + (double)b.len) {
+            beamDiag().bump(beamDiag().rejS); return false;
+        }
         const Vec3 diff = (oc + dc * t) - (b.o + b.d * s);
         const double d2 = dot(diff, diff);
         const double r  = radOf(b.med);           // per medium — see the header note
-        if (d2 >= r * r) return false;
+        if (beamDiag().on) beamDiag().minD2(d2, r);
+        if (d2 >= r * r) { beamDiag().bump(beamDiag().rejR); return false; }
         out.idx = i; out.tCam = t; out.sBeam = s;
         out.dPerp = std::sqrt(d2);
         out.sinT = std::sqrt(den); out.cosT = cosT;

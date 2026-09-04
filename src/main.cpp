@@ -15083,6 +15083,19 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
         long long c = chunk; if (c > sppTarget - done) c = sppTarget - done;
         auto t0 = clk::now();
         Film f = renderOne(c, seedBias + (unsigned long long)done);
+        // A renderer may now ABANDON its chunk part-way when `-stop` / Ctrl-C arrives —
+        // mode D/J's camera pass polls per pixel (bdpt.h renderRows). Such a film covers
+        // only the pixels reached before the stop, so merging it while crediting the full
+        // `c` spp would divide a partial image by a whole sample count and bake a dark
+        // band in permanently. Throw it away instead: `acc` already holds a complete,
+        // correctly normalised render of `done` spp, which is exactly what should be
+        // written out. Report once more so the final image and checkpoint are flushed with
+        // the spp count that is genuinely in them (skipped at done == 0, where there is no
+        // image yet and reporting would write a black frame over nothing).
+        if (ft::stopRequested()) {
+            if (done > 0) prog->report(acc, done, /*final*/true);
+            break;
+        }
         acc.merge(f);
         done += c;
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
@@ -15245,8 +15258,14 @@ static int runSppProgressive(
                    : metTime         ? "time budget reached"
                    : runForever      ? "stopped"
                                      : "sample target reached");
-    if (g_stopRequested)
+    if (g_stopRequested && finalSpp > 0)
         std::printf("\n[stop] interrupted at %lld spp — image saved.\n", finalSpp);
+    else if (g_stopRequested)
+        // Reachable now that the camera pass can be interrupted inside the FIRST chunk:
+        // no sample ever completed, so there is no image and claiming one was saved
+        // would send the user looking for a file that is not there.
+        std::printf("\n[stop] interrupted before the first sample completed — "
+                    "nothing was written.\n");
     else if (metNoise)
         std::printf("[noise] reached the ~%.2g%% target at %lld spp — image saved.\n",
                     noiseTarget, finalSpp);

@@ -874,9 +874,17 @@ struct Renderer {
         // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
         // 1e30-long box (see kBeamFarScale).
         // (named `farLimit`, not `far`: `far` is a legacy Windows SDK keyword macro)
+        //
+        // Applied PER MEDIUM, and only to the unbounded ones. A bounded medium already hands
+        // `clipToBounds` a finite exit, so the clamp can only ever cut a beam SHORT of the
+        // region it is supposed to fill — which is what it did on `scenes/_slab_ss.ftsl`: the
+        // clamp is a multiple of `sceneRadius`, and until this was fixed alongside it
+        // sceneRadius did not count media at all, so a big fog box lit by a small emitter
+        // truncated every beam to a stub. Clamping the whole call up front also meant one
+        // unbounded haze could shorten the beams of an unrelated bounded cloud it happened to
+        // overlap. (Device twin: dEmitBeams in render_cuda.cu.)
         const double farLimit = kBeamFarScale * std::max(scene.sceneRadius, 1e-3);
-        const double dBeam = std::min(dLen, farLimit);
-        if (!(dBeam > 0.0)) return;
+        if (!(dLen > 0.0)) return;
         const double keep = beamDeposit->keepProb;
         for (int i = 0; i < (int)scene.media.size(); ++i) {
             const Medium& md = scene.media[i];
@@ -888,6 +896,7 @@ struct Renderer {
             // photon has no segment to store.
             if (md.grin()) continue;
             double ta, tb;
+            const double dBeam = md.bounded ? dLen : std::min(dLen, farLimit);
             if (!md.clipToBounds(o, dir, 0.0, dBeam, ta, tb)) continue;
             if (!(tb > ta)) continue;
             // Russian roulette on the beam count (photonbeams.h): a beam lights a whole

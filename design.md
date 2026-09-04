@@ -417,6 +417,99 @@ marches per surviving hit, which mode `M` pays identically. The lever that remai
 the **GPU port**, where mode `M`'s CUDA beam gather is the template; see UPBP-CONV in
 `known-issues.md` for the tables.
 
+### Mode `J` gate 3 — an *analytic* reference, and the truncation bug it found (0.241.0)
+
+Gates 1, 2 and 4 all compare mode `J` against its own siblings: gate 1 says it reduces to mode
+`D`, gate 2 says its MIS weights sum to one, gate 4 says it converges to mode `D`'s image. None
+of them can catch an error the whole family shares, and none pins the **absolute** radiance to
+physics. Gate 3 does.
+
+**The rig.** `scenes/_slab_ss.ftsl` is a homogeneous slab (`sigma_t 2.0 albedo 1.0 g 0.0`,
+bounded `-1 -1 -1` → `3 1 1`) containing one small emitting sphere and *no other geometry at
+all*, so the only light transport in the frame is single scattering from a point-like source.
+`tools/slab_ss_ref.py` evaluates that integral by deterministic Simpson quadrature
+(`NQUAD = 4096`; its own self-test drifts 9.6e-14) and compares whole-frame **energy ratios**,
+`sum(image) / sum(reference)`, banded by reference quartile.
+
+Two things make this work as physics rather than as another renderer:
+
+- **A uniformly-emitting Lambertian sphere is *exactly* a point source of intensity Φ/(4π)** at
+  every external point, so the closed form needs no small-angle approximation. Inside a medium
+  the disc-averaged transmittance multiplier is distance-independent, so it lands entirely in
+  the fitted global constant and cannot fake a distance-dependent error.
+- **The comparator is an energy ratio, not a median per-pixel ratio.** A median is biased *low*
+  on a noisy Monte Carlo image, which mimics precisely the missing-energy bug this gate exists
+  to detect.
+
+**What it caught immediately: mode `J` was 0.0227× — 44× too dark.** The diagnosis is written up
+in full under **J-SCENERADIUS** in `known-issues.md`; in short, `Scene::sceneRadius` counted only
+the geometry BVH, so a scene that is mostly *fog* reported the bounding sphere of its *props*
+(0.0346 m here), and `Renderer::emitBeams`' escape clamp `kBeamFarScale * sceneRadius` truncated
+every photon beam at 0.277 m. The merges returned exactly zero while the MIS weights still
+divided the connections down by the density those merges were supposed to supply — which is why
+it read as a weight bug for so long, and why `-misaudit` passing meant nothing (it cross-checks
+*connection* weights only, never the gather's merge weight).
+
+**Two diagnostics were built to separate weight from map, and are kept** (documented in
+`REFERENCE.md` under the environment-variable diagnostics):
+
+- **`FTRACE_J_HALF=connections|merges|merges-raw`** (`bdpt.h`) renders one half of the estimator
+  with its MIS weights intact. The halves sum to *exactly* the full image because the RNG is
+  re-seeded per (pixel, sample), so suppressing one cannot perturb the other's stream. `merges`
+  was 0; `merges-raw` — weight forced to 1 — was *also* 0, which exonerated the weight outright.
+- **`FTRACE_BEAM_DIAG=1`** (`photonbeams.h`) tallies the beam×ray query: BVH candidates, each of
+  `closestApproach`'s four geometric rejections, the closest approach ever seen as a multiple of
+  the kernel radius, and each of the gather's own drops. It reported 1.92 M candidates and 0
+  geometric hits — and grep then showed all 1.92 M came from the *beam-density probe*
+  (`photonbeams.h:1000`), not from the render's `gather()` (`photonbeams.h:1151`), which saw
+  nothing at all. `gBeamDiag` is a namespace-scope `inline` variable, not a function-local
+  static, precisely because `closestApproach` is the hottest function in mode `J` and a
+  thread-safe-init guard there would tax every render that never sets the variable. Measured
+  cost of leaving it in: none above this machine's ±20 % run-to-run noise, and byte-identical
+  output — the numbers are in the header comment beside the struct.
+
+**Run mode `R` on the GPU, and only on the GPU.** The CPU backward tracer collapses every
+authored medium into one global *homogeneous* haze and ignores `bounds` regions entirely (it
+says so on startup) — and `_slab_ss.ftsl` is nothing *but* a bounded box medium, so under
+`-device cpu` mode `R` renders an unbounded fog: a different scene, not a noisier one. It then
+fits the reference at **304×** the correct level with a noise rms of **51**, which reads as a
+catastrophic gate-3(b) failure and is really just the wrong scene. Modes `D` and `J` honour the
+bounds on either device, so the gate is `-mode R -device gpu` against `-mode D`/`-mode J`
+`-device cpu`.
+
+**Gate 3, passing** (`_slab_ss.ftsl`, mode `R` `-device gpu`, modes `D`/`J` `-device cpu`;
+quadrature converged to 1e-13, 13 250× dynamic range across the frame):
+
+| image | scale | Q1 | Q2 | Q3 | Q4 | noise rms |
+|---|---|---|---|---|---|---|
+| `slab_r.pfm` (mode `R`) | 4.40908e+09 | 1.0018 | 1.0005 | 0.9998 | 1.0000 | 0.0156 |
+| `slab_d.pfm` (mode `D`) | 0.9997× | 1.0038 | 1.0000 | 1.0008 | 0.9998 | 0.0505 |
+| `slab_j_nb.pfm` (`J -nobeams`) | 1.0006× | 1.0027 | 1.0119 | 0.9903 | 1.0011 | 1.0476 |
+| `slab_j.pfm` (mode `J`) | 1.0030× | 1.0213 | 1.0153 | 0.9926 | 1.0005 | 0.2826 |
+
+The last row is the gate: mode `J`'s absolute radiance matches closed-form single scattering to
+0.3 %, with no reference to mode `D` or mode `R` anywhere in the chain. It reproduces from a
+clean rebuild — an independent re-run landed mode `R` on the identical `4.40908e+09` and mode
+`J` on `1.0029×`.
+
+**Gate 4 re-run after the fix**, to show the scenes where mode `J` was *already* right were not
+disturbed by it (`-r 128 -n 50000 -max-bounce 8 -device cpu`, whole-frame energy ratio against a
+converged mode `D`):
+
+| scene | mode `J` | mode `D` | `J/D` | previously |
+|---|---|---|---|---|
+| `_fog_cornell.ftsl` | 9 spp | 410 spp | **1.0057** | 1.0006 (43 spp) |
+| `_fog_thick.ftsl` | 35 spp | 1672 spp | **1.0152** | 0.9973 |
+
+Both are inside their own sampling error at these spp counts (the `_fog_cornell` ratio has
+historically walked `1.0611 → 1.0035 → 0.9897 → 0.9811 → 0.9985 → 1.0006` while accumulating,
+and `_fog_thick` is a 17 %-noise image), and neither scene has a bounded medium, so the
+`sceneRadius` change cannot reach them — which is what the numbers say.
+
+Both fog scenes need `-n` well below the default here: at `-n 200000` and 256² the beam map
+alone is 7.7 M beams and mode `J` cannot finish a single spp inside a two-minute budget. See
+**J-BEAMCOST** in `known-issues.md`.
+
 ## Module map (src/)
 
 - **`main.cpp`** (~6200) — CLI parsing (the option table is a chain of `else if`s split
@@ -1392,6 +1485,22 @@ the **GPU port**, where mode `M`'s CUDA beam gather is the template; see UPBP-CO
     `dropHairCurves` accumulates the deleted extent into `Scene::droppedBounds`, which `build()`
     unions back in. The geometry is still physically there; it just isn't traced. Empty (`lo > hi`)
     and inert for every scene that drops nothing.
+  - *The same sphere also unions every **bounded participating medium** (0.241.0).* A fog box is
+    part of the world even though it is not a BVH primitive: light has to reach it, photon beams
+    have to cross it, and a sun's emission disc has to cover it. Deriving `sceneRadius` from the
+    props alone made it a property of the furniture rather than of the scene, and it
+    *under*-reported — the failure direction that is hardest to see. `scenes/_slab_ss.ftsl`
+    (a 4 × 2 × 2 m fog box lit by one 2 cm sphere and nothing else) reported `sceneRadius`
+    0.0346 m, and `Renderer::emitBeams`' escape clamp `kBeamFarScale * sceneRadius` then truncated
+    every photon beam at 0.277 m — so mode J's merges returned exactly zero while its MIS weights
+    still divided the connections down by the density those merges were supposed to supply, and the
+    image came out 44× too dark. `build()` now unions each bounded medium's `bmin`/`bmax` (the
+    region AABB for box, sphere and implicit alike) into the same box, and `emitBeams` applies the
+    escape clamp **per medium and only to unbounded ones** — a bounded medium's own `clipToBounds`
+    is already finite, so the clamp could only ever cut a beam short of the region it must fill,
+    and clamping up front also let one unbounded haze shorten the beams of an unrelated bounded
+    cloud it happened to overlap. `dEmitBeams` in `render_cuda.cu` carries the identical change.
+    See known-issues.md → J-SCENERADIUS.
   - *Compaction, not a second container.* `curveSegs` is stably compacted in place with a
     `newIndex` remap, then `shrink_to_fit()` (handing the pages back is the entire point), and the
     `Curve` records' `firstSeg` / `segCount` are rewritten through the remap. `buildNoHairBvh`

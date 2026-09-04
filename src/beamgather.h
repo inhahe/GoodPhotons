@@ -192,7 +192,10 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
     const PatTables tabs = scene.patTables();
     bm.gather(oc, dc, tMax, [&](const BeamHit& bh) {
         const PhotonBeam& b = bm.beams[bh.idx];
-        if (b.med < 0 || b.med >= (int)scene.media.size()) return;
+        beamDiag().bump(beamDiag().pass);
+        if (b.med < 0 || b.med >= (int)scene.media.size()) {
+            beamDiag().bump(beamDiag().rejMed); return;
+        }
         const double lam = (double)b.lambda;
         const Medium& md = scene.media[b.med];
         const Vec3 xc = oc + dc * bh.tCam;
@@ -201,11 +204,11 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         // is wavelength-INDEPENDENT, so one evaluation serves the whole spectral bundle.
         const double dens = md.densityAt(xc, &tabs);
         const double ss = md.sigma_s(lam) * dens;
-        if (!(ss > 0.0)) return;
+        if (!(ss > 0.0)) { beamDiag().bump(beamDiag().rejSS); return; }
         // Scattering angle. connectVolume's convention: phaseValue(dot(wIn, wToCamera)),
         // wIn = the photon's propagation direction (b.d), wToCamera = -dc.
         const double phase = md.phaseValue(-bh.cosT, lam);
-        if (!(phase > 0.0)) return;
+        if (!(phase > 0.0)) { beamDiag().bump(beamDiag().rejPh); return; }
         // `invC` splits the chord's flux evenly over its spectral bundle (PhotonBeam: every
         // wavelength in a bundle carries the same power). It is exactly 1.0 for a
         // monochromatic beam, so the whole expression — and thus every pre-0.202.0 render —
@@ -216,12 +219,12 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         // over rather than recomputed: the merge weight needs sigma_t(x) and the phase value
         // at the merge point, and both are one multiply away from what this line just built.
         w *= w1(bh, b, dens, phase);
-        if (!(w > 0.0)) return;
+        if (!(w > 0.0)) { beamDiag().bump(beamDiag().rejW); return; }
         if (b.absorb > 0.0f) w *= std::exp(-(double)b.absorb * bh.sBeam);   // glass, beam side
         if (aGlassCam > 0.0) w *= std::exp(-aGlassCam * bh.tCam);           // glass, camera side
         if (bh.sBeam > 0.0)  w *= mats.mediaTransmittance(scene, b.o, b.d, bh.sBeam, lam, rng);
         if (bh.tCam  > 0.0)  w *= mats.mediaTransmittance(scene, oc, dc, bh.tCam, lam, rng);
-        if (!(w > 0.0)) return;
+        if (!(w > 0.0)) { beamDiag().bump(beamDiag().rejTr); return; }
         acc += bm.cie[bh.idx] * w;
         // SECONDARY wavelengths of the bundle. They share this beam's geometry, its kernel
         // weight and BOTH transmittance marches — the bundle only exists on a path whose

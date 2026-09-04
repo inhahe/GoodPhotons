@@ -254,7 +254,10 @@ argument for standing a groom in a hall of polished objects.*
   surfaces. Beams are **on by default** here (a UPBP render without them is literally mode
   `D`); `-nobeams` turns them off, which reduces mode `J` to mode `D` bit-for-bit. Mode `J`
   builds its beam map from its **own BDPT light subpaths** (0.216.0), so there `-n` counts
-  light subpaths and `-beamcount` / `-beamspec` do not apply.
+  light subpaths and `-beamcount` / `-beamspec` do not apply — and because nothing trims that
+  map, **`-n` is the first knob to turn down**: the default 2 M subpaths build a 12 M-beam,
+  1.2 GB map even for a 64×64 frame. Its absolute radiance is validated against **closed-form
+  single scattering** (`tools/slab_ss_ref.py` — matching to 0.3 %), not only against mode `D`.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look
