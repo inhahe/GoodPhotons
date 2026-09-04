@@ -1088,9 +1088,10 @@ that converges to the same physical image.
   bit-for-bit. Since 0.216.0 mode `J` builds that map from **its own light subpaths** rather
   than from a photon pass, which changes three things relative to mode `M`: **`-n` counts
   light subpaths** (the same physical quantity — each carries emitter power — so brightness
-  is unaffected), **`-beamcount` is inert** (mode `M` trims the map with Russian roulette,
-  whose per-beam survival probability a MIS weight cannot read, so mode `J` keeps every beam
-  and is sized by `-n` alone — mind the memory), and mode `J`'s beams are
+  is unaffected), **`-beamcount` is met by tracing fewer subpaths rather than by thinning**
+  (mode `M` trims the map with Russian roulette, whose per-beam survival probability a MIS
+  weight cannot read, so mode `J` keeps every beam it traces and instead traces the right
+  number of them — see the beam-budget box below), and mode `J`'s beams are
   **monochromatic**, so `-beamspec` does not apply and chroma noise falls more slowly than
   mode `M`'s at equal `-n`. The remaining `-beam*` knobs (`-beamblur`, `-beamk`,
   `-beamsplit*`, `-beams-order`) work as documented. Scope is mode `D`'s
@@ -1134,17 +1135,50 @@ that converges to the same physical image.
   > that remains is the **GPU port**, not more CPU tuning — see **UPBP-CONV** in
   > `known-issues.md` for the tables.
   >
-  > **The default `-n` is far too large for a small frame, and an *open* scene makes it
-  > worse.** `-n` counts light subpaths, each depositing one beam per span, so the default
-  > `-n 2000000` at `-max-bounce 8` builds **12 M beams / 1.2 GB** — whether the image is 4 K
-  > or 64×64. On `scenes/_fog_cornell.ftsl` (five quads: no front wall, under an *unbounded*
-  > fog) a photon that leaves through the missing wall is cut only by the escape clamp
-  > `8 × sceneRadius` ≈ 6.9 m in a scene one metre across, giving a 2.5 m mean chord and a beam
-  > BVH with **2.46e+08 m² of box area** for a 1 m³ scene. The traversal then dominates
-  > everything: a **64×64** frame with a `-time 30` budget spends over seven minutes inside its
-  > first 1-spp chunk, and at the scene's own 256×256 it ran 39 minutes without writing a first
-  > image — indistinguishable, from outside, from a hang. `-n 200000` renders the same scene in
-  > the budget you asked for. Tracked as **J-BEAMCOST** in `known-issues.md`.
+  > **Do not pass `-n` in mode `J` (0.242.0) — the map sizes itself, and passing `-n` turns
+  > that off.** `-n` counts light subpaths, each depositing one beam per span, so the inherited
+  > default `-n 2000000` at `-max-bounce 8` built **12 M beams / 1.2 GB** whether the image was
+  > 4 K or 64×64, and a **64×64** frame with a `-time 30` budget spent over seven minutes inside
+  > its first 1-spp chunk — indistinguishable, from outside, from a hang. Mode `J` now sizes the
+  > map itself: a small **pilot** of light subpaths is traced, measured, and thrown away, and
+  > from it the pass learns how many beams a subpath deposits *in this scene* and where the
+  > scene's **`-beamk` knee** is — the beam count past which the floor stops holding the gathered
+  > count at 32 and every further beam starts being paid for in full. It then traces the
+  > subpaths that fit that knee.
+  >
+  > The knee is a property of the **scene**, not the frame, and that is measured rather than
+  > assumed: at a fixed 120 s budget on `_fog_cornell`, 18 708 / 75 288 / 300 033 raw beams give
+  > 15 / 15 / 4 spp at 0.426 / **0.410** / 0.887 relative RMSE at 128², and 4 / 4 / 1 spp at
+  > **0.805** / 0.822 / 1.888 at 256² — four times the pixels, same knee. Across *scenes* it
+  > moves 23× (`_fog_thick` is already past the floor at 16 428 beams, where `_fog_cornell`
+  > needs ~300 000), which is why no fixed default and no frame formula could be right.
+  >
+  > Left to itself the budget lands where the sweep says it should: on `_fog_thick` it **beats
+  > every hand-picked `-n`** in the grid above by 29 % (relative RMSE 1.942 against a best of
+  > 2.741), by choosing a map smaller than the smallest one swept. On `_fog_cornell` it comes
+  > out above the sweep's best (0.587 against 0.410), that scene's equal-time optimum being
+  > nearer 0.66× its knee — see the paragraph below for why the knee is still the default.
+  > Its pilots put the two scenes' knees **8.7× apart** (~114 000 beams against ~13 000), and
+  > both runs are knee-bound rather than ceiling-bound.
+  >
+  > It aims **at** the knee, not below it (0.243.0 — it aimed at half the knee in 0.242.0, and
+  > that was a measurable bias). Below the knee the `-beamk` floor *widens the kernel radius* to
+  > keep the gathered count at 32, so the render silently uses a kernel wider than the
+  > `-beamblur` you asked for: on the analytic gate scene the half-knee map came out **6.4 % off
+  > the absolute radiance**, which falls to **0.34 %** at the knee. A smaller map does buy real
+  > speed (the beam BVH is cheaper to traverse), but that trade is declined by default because
+  > noise washes out with render time and a widened kernel does not. So read the knee as *the
+  > smallest map that gets you the kernel width you asked for*, not as a ceiling. On scenes
+  > where the gather is a small share of per-sample cost (very low `-max-bounce`), quality keeps
+  > improving past it — raise `-beamcount` there; and where you would rather have the spp than
+  > the exact kernel, lower `-beamcount` below the knee.
+  >
+  > Overrides, most specific first: **`-n <count>` disables the budget entirely** and traces
+  > exactly that many subpaths (which is what keeps the historical measurements above
+  > reproducible); **`-beamcount <n>`** sets a resource ceiling, and the budget enforced is
+  > `min(ceiling, knee)`; **`-beamk`** moves the knee itself. The pass prints all of it —
+  > the pilot size, the measured beams/subpath, the knee, and which half was binding. Tracked
+  > as **J-BEAMCOST** in `known-issues.md` (fixed).
 
 The **image-forming modes are all progressive** — the forward camera models
 (`A`/`B`/`C`), the backward reference (`R`), the bidirectional tracer (`D`), UPBP (`J`),
@@ -5080,7 +5114,7 @@ survive exactly.
 | `-beamk <K>` | Mode-`M` **floor** on the beam gather population: the minimum number of photon beams a camera segment should collect (default `32`). Not a target — `buildAuto` probes the count at the `-beamblur` radii and scales them **up only** if a segment would gather fewer, which is what stops a very sparse map rendering as individual resolvable streaks. It never scales them down; see `-beamblur` for why that direction is the trap. |
 | `-beamareaslack <f>` | Mode-`M` cost ceiling on the beam kernel (default `1.0`). The kernel inflates every sub-beam's AABB, and a camera ray's cost is proportional to the total box area it must enter, so the per-medium radii are capped at the largest uniform scale whose inflation grows that area by at most `f` over the tight (`r = 0`) area — solved in closed form, since the area is exactly quadratic in the scale. Applied after the `-beamk` floor, so it wins. |
 | `-beamradius <r>` | Mode-`M` beam kernel half-width in world units, one value for **every** medium, overriding `-beamblur` / `-beamk` / `-beamareaslack`. Default is automatic (per medium). **Do not set this to the photon-map gather radius**: a beam is a 1-D object blurred in 1-D, so the gathered population grows *linearly* in `r` (and in total stored beam length) rather than as `r²` — at the surface map's radius an ordinary fog box collects tens of thousands of beams per ray and the render never finishes. The automatic size is smaller by orders of magnitude. |
-| `-beamcount <n>` | Mode-`M` **ceiling** on stored beams (default `1000000`; `0` = unlimited; accepts `2e6` form). **Mode-`M` only — it has no effect in mode `J`**, whose beams come from BDPT light subpaths and are kept in full: the roulette below rescales power correctly but leaves each beam a survival probability that mode `J`'s MIS weights would have to divide by and cannot recover, so mode `J` keeps everything and its map is sized by `-n` alone. A ceiling, not a quota: the pass keeps every beam it generates until it reaches this number, so a scene whose media are small and bounded (a rain box inside a large hall) legitimately stores far fewer, and that is not a fault. Beams past the ceiling are dropped by Russian roulette with the survivors' power rescaled, so the estimate is unbiased either way. A beam lights a whole chord rather than a point, so far fewer beams than photons are needed — and beams are additionally split for BVH quality (see `-beamsplitmax`). Raising it buys **lower noise, at unchanged sharpness** — since 0.201.0 the kernel radius is a physical scale that does not move with the stored count, so more beams means more samples under the same kernel. (Before 0.201.0 it was the other way round: the radius shrank to keep `-beamk` on target, so `-beamcount` traded sharpness against time and did nothing for noise.) Since 0.196.0 the cost of raising it is much flatter than it was: the split now shrinks with the radius, so a denser map no longer means proportionally slower traversal. Since 0.199.1, if the map does not fit in RAM ftrace says so by name — `out of memory allocating the photon-beam map: N x B B = X GiB. Lower -beamcount` — instead of the old bare `error: bad allocation` that left you bisecting `-n` by hand. |
+| `-beamcount <n>` | **Ceiling** on stored beams (default `1000000`; `0` = unlimited; accepts `2e6` form). **The two modes meet it differently.** Mode `M` meets it by *thinning* with the Russian roulette described below. Mode `J` cannot — the roulette rescales power correctly but leaves each beam a survival probability that mode `J`'s MIS weights would have to divide by and cannot recover — so since 0.242.0 mode `J` meets it by tracing **fewer light subpaths**, sized by a discarded pilot, and there the enforced budget is `min(this ceiling, ½ × the scene's -beamk knee)`; an explicit `-n` turns the whole budget off. (Before 0.242.0 it had no effect in mode `J` at all, and the map was sized by `-n` alone.) A ceiling, not a quota: the pass keeps every beam it generates until it reaches this number, so a scene whose media are small and bounded (a rain box inside a large hall) legitimately stores far fewer, and that is not a fault. Beams past the ceiling are dropped by Russian roulette with the survivors' power rescaled, so the estimate is unbiased either way. A beam lights a whole chord rather than a point, so far fewer beams than photons are needed — and beams are additionally split for BVH quality (see `-beamsplitmax`). Raising it buys **lower noise, at unchanged sharpness** — since 0.201.0 the kernel radius is a physical scale that does not move with the stored count, so more beams means more samples under the same kernel. (Before 0.201.0 it was the other way round: the radius shrank to keep `-beamk` on target, so `-beamcount` traded sharpness against time and did nothing for noise.) Since 0.196.0 the cost of raising it is much flatter than it was: the split now shrinks with the radius, so a denser map no longer means proportionally slower traversal. Since 0.199.1, if the map does not fit in RAM ftrace says so by name — `out of memory allocating the photon-beam map: N x B B = X GiB. Lower -beamcount` — instead of the old bare `error: bad allocation` that left you bisecting `-n` by hand. |
 | `-beamsplitmax <n>` | Ceiling on **sub-beams after the BVH split** (default `8000000`). Beams are split into sub-segments so the BVH gets tight boxes instead of the mostly-empty AABB of a long diagonal; each beam is split at *its own* cost-optimal length, `sqrt(3/Q)·sqrt(4r² + κ/W)`, derived by minimising total AABB **surface area** — the quantity a ray's box-entry count is proportional to, and measurably the real cost of the gather. This flag caps the **memory** that costs (~1 GB per 8 M sub-beams with its BVH), not the quality: below the cap you get the optimum, above it the finest split that fits, and the build log says which. Raising it buys a tighter, faster BVH — worth it for a long flythrough, where the one-time build amortises over every frame. Since 0.199.1 the split array is allocated **once** at its exact final size rather than regrown geometrically from a 2x guess, and an out-of-memory here names this flag. |
 | `-beamsplit <len>` | Pin a **uniform** split length instead of the per-beam rule (expert). Only for measuring the rule against a fixed baseline — the per-beam rule beats any single length, because an axis-aligned beam has a tight box already and wants no split at all while a diagonal one wants many. |
 | `-beamspec <n>` | Wavelengths carried by **one stored beam**, `1..4` (default `4`; `1` = the classic monochromatic beam, bit-for-bit). New in 0.202.0. A surface photon is a *point*, so a single spectral sample there reads as grain; a beam is a *line*, so a single sample lays a **saturated coloured streak** down its whole length, which the eye reads as structure. With `-beamspec 4` the beam stores its hero wavelength plus 3 stratified secondaries (`u + i/C` through the same emission CDF) and the gather folds all four into XYZ **from the same chord**. It is nearly free because the gather's cost is almost entirely wavelength-*independent* — geometry, `densityAt`, and the two ratio-tracking transmittance marches are shared; only `sigma_s(λ)`, the phase function and the CIE lookups repeat, measured at ~1.1× gather time. It needs no per-wavelength weight either: emission samples with `p(λ) = SPD(λ)/∫SPD`, so `spd/pdf` is independent of λ and every wavelength in the bundle carries identical power. Unbiased by construction — the bundle survives exactly **one** transport iteration and collapses to a plain monochromatic beam at any wavelength-dependent event (GRIN, glass absorption, image-env emitters, volumetric births), and the whole feature switches off in any scene where a medium's extinction is chromatic, since the shared transmittance march would otherwise hand a secondary the hero's attenuation. Measured on the isolated rain scene: **−8.5 % chroma texture, −4.1 % luma texture** with the mode-M-vs-mode-D invariant unmoved. Set `1` only to reproduce pre-0.202.0 output. |

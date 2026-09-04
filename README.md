@@ -242,8 +242,8 @@ argument for standing a groom in a hall of polished objects.*
   It is not yet a **win**, though: per sample its variance is **2.4–8.8× lower** than mode
   `D`'s and the margin grows with `-n` — the merges really do reach paths the connections
   cannot — but a sample costs 45–250× more, so at equal time it loses by ~19×. The remaining
-  lever is the GPU port; see [known-issues.md](known-issues.md) → UPBP-CONV. Still CPU-only,
-  and its beam map is sized by `-n` with no trim.)* Mode
+  lever is the GPU port; see [known-issues.md](known-issues.md) → UPBP-CONV. Still CPU-only.)*
+  Mode
   `D` and mode `M -beams` each solve half of a thick-medium scene and fail where the other
   succeeds: a BDPT connection needs the camera's free-flight distance sampling to *reach*
   the scattering point, which deep inside an optically thick medium it essentially never
@@ -254,10 +254,12 @@ argument for standing a groom in a hall of polished objects.*
   surfaces. Beams are **on by default** here (a UPBP render without them is literally mode
   `D`); `-nobeams` turns them off, which reduces mode `J` to mode `D` bit-for-bit. Mode `J`
   builds its beam map from its **own BDPT light subpaths** (0.216.0), so there `-n` counts
-  light subpaths and `-beamcount` / `-beamspec` do not apply — and because nothing trims that
-  map, **`-n` is the first knob to turn down**: the default 2 M subpaths build a 12 M-beam,
-  1.2 GB map even for a 64×64 frame. Its absolute radiance is validated against **closed-form
-  single scattering** (`tools/slab_ss_ref.py` — matching to 0.3 %), not only against mode `D`.
+  light subpaths and `-beamspec` does not apply. **Leave `-n` off** (0.242.0): the map now
+  sizes *itself* from a discarded pilot that measures where this scene's `-beamk` knee is —
+  the beam count past which extra beams stop being free — and passing `-n` disables that.
+  Left to itself it beat every hand-picked `-n` on a thick-medium equal-time test. Its absolute
+  radiance is validated against **closed-form single scattering** (`tools/slab_ss_ref.py` —
+  matching to 0.3 %), not only against mode `D`.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look

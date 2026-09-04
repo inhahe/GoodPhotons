@@ -12080,11 +12080,36 @@ static void buildCausticMap(PhotonMap& pmC, double radius, const char* tag, doub
 //                        wants many.
 static double    g_beamRadiusAbs = 0.0;
 static long long g_beamTarget    = 1000000;
+static bool      g_beamTargetSet = false;  // was -beamcount given? (mode J reports it differently)
+// Was `-n` given? File-scope rather than a `main()` local because the two flags are read
+// together, in the render helper, to settle which of the two knobs on mode J's map size wins:
+// explicit `-n` beats explicit `-beamcount` beats the scene's own measured knee.
+static bool      g_nFromCli      = false;
 static double    g_beamBlur      = 0.01;   // kernel half-width as a fraction of the mfp
 static double    g_beamK         = 32.0;   // FLOOR on the gathered count, not a target
 static double    g_beamAreaSlack = 1.0;    // ceiling: allowed box-area growth from the kernel
 static long long g_beamSplitMax  = 8000000;
 static double    g_beamSplitLen  = 0.0;
+
+// MODE J'S BEAM BUDGET, IN RAW (PRE-SPLIT) BEAMS -- see J-BEAMCOST and bdpt.h's long note.
+//
+// Mode M sizes its map with `-beamcount` directly, because its deposit is a photon pass whose
+// count IS the map. Mode J cannot: `-n` there counts LIGHT SUBPATHS, and how many beams a
+// subpath deposits is scene-dependent (well under 1 for a small cloud in a big room, up to
+// `maxDepth` for a global haze). So `-beamcount` names the map size in mode J too, and
+// bdpt::traceLightBeamPass converts it to a subpath count with a discarded pilot.
+//
+// WHY THERE IS NO FRAME TERM HERE, THOUGH J-BEAMCOST ASKED FOR ONE. The plausible rule was
+// that a beam map is a cache -- built once, paid back once per camera sample -- so the size
+// worth building should scale with res*resY*spp, exactly as buildBeamMap's split length does.
+// Measurement says no. Sweeping `-n` at a fixed 120 s budget against a converged mode-D
+// reference (scraps/_jn_sweep*.sh, scored by scraps/_jn_score.py) collapses at the same RAW
+// BEAM COUNT at 128x128 and at 256x256 -- four times the pixels, same knee. Only the BUILD is
+// amortised over the frame; the GATHER is per-sample and grows with the map, so the two scale
+// together and cancel. The knee is a property of the scene, and mode J therefore measures it
+// per scene in the pilot instead of predicting it from the frame.
+//
+// What is left here is a plain resource ceiling, which is what `-beamcount` already meant.
 
 // Bin the beam map and say what it settled on, mirroring buildPhotonMap's reporting: a
 // silently-different kernel radius would be baffling when comparing renders — and for beams
@@ -12206,6 +12231,21 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
         if (ai.budgetBit)
             std::printf("%s   raise -beamsplitmax for a tighter (faster) BVH at more memory, "
                         "or lower -beamcount to get there for free.\n", tag);
+        // THE KNEE. While the `-beamk` floor is binding (probeK0 < targetK) the floor is
+        // holding the GATHERED count at targetK by inflating the radii, so extra beams cost
+        // the gather nothing and buy a tighter kernel — strictly better. Once probeK0 passes
+        // targetK the floor lets go, the gather's cost becomes linear in the beam count, and
+        // every further beam is paid for in full. Measured on `_fog_cornell` at 128x128, 120 s:
+        // 18708 raw beams (probeK0 2.6) and 75288 (probeK0 25.9) both reached 15 spp, at 0.426
+        // and 0.410 relative RMSE; 300033 (probeK0 36.2, floor no longer binding) fell to 4 spp
+        // and 0.887. The cliff is here, so name it — it is otherwise invisible in a line that
+        // reports probeK0 as a bare number.
+        else if (ai.targetK > 0.0 && ai.probeK0 > ai.targetK && ai.rawBeams)
+            std::printf("%s   note: past the -beamk floor (%.1f > %.0f), so the gather now pays "
+                        "for every extra beam. Fewer beams here is likely FASTER for the same "
+                        "error — lower -beamcount%s.\n",
+                        tag, ai.probeK0, ai.targetK,
+                        g_nFromCli ? " (or -n, which is currently sizing this map)" : "");
     }
     if (bm.beams.empty())
         std::fprintf(stderr, "[beams] warning: 0 beams stored — no photon crossed a "
@@ -16020,13 +16060,46 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // deposits a beam per span rather than one per straight crossing, and it
             // scatters in the medium rather than crossing it straight — so this map carries
             // MULTIPLE scattering where mode M's carries single only.
-            std::printf("mode J: UPBP at %dx%d on %d CPU threads (maxDepth=%d, light=%s) — "
-                        "tracing %lld light subpaths for the beam map ...\n",
-                        res, resY, nThreads, maxDepth, lightLabel, N);
+            // THE BEAM BUDGET (0.242.0, J-BEAMCOST). Off when the user gave an explicit `-n`:
+            // two knobs on one quantity, and the more specific one wins. `-beamcount` is a
+            // plain resource ceiling on the map; what actually sizes it is the scene's own
+            // `-beamk` knee, measured by a discarded pilot inside traceLightBeamPass. There is
+            // deliberately NO frame term -- see the note above buildBeamMap for the measurement
+            // that ruled one out -- and bdpt.h's note for why 0.243.0 aims at the knee itself
+            // rather than below it.
+            bdpt::BeamBudgetReq jreq;
+            jreq.maxBeams = g_nFromCli ? 0 : g_beamTarget;
+            // Forwarded, not re-defaulted: the pilot's knee is only the real knee if it is
+            // measured at the radii buildBeamMap is about to build with.
+            jreq.blur     = g_beamBlur;
+            jreq.targetK  = g_beamK;
+            bdpt::BeamBudgetInfo jbb;
+            if (jreq.maxBeams > 0)
+                std::printf("mode J: UPBP at %dx%d on %d CPU threads (maxDepth=%d, light=%s) — "
+                            "sizing the light pass to a beam map of at most %lld beams "
+                            "(-beamcount)%s ...\n",
+                            res, resY, nThreads, maxDepth, lightLabel, jreq.maxBeams,
+                            g_beamTargetSet ? "" : ", or this scene's -beamk knee if that is lower");
+            else
+                std::printf("mode J: UPBP at %dx%d on %d CPU threads (maxDepth=%d, light=%s) — "
+                            "tracing %lld light subpaths for the beam map (-n given: no beam "
+                            "budget) ...\n",
+                            res, resY, nThreads, maxDepth, lightLabel, N);
             liveWindowPlaceholder(res, resY, "tracing light subpaths\xE2\x80\xA6");
             auto tp0 = std::chrono::steady_clock::now();
             bdpt::traceLightBeamPass(scene, cam, N, nThreads, maxDepth, diffraction,
-                                     bmap, &stageProg);
+                                     bmap, &stageProg, jreq, &jbb);
+            // Say what the budget did, always. A pass that silently traced 3 % of the subpaths
+            // the command line named would be exactly the kind of invisible surprise this whole
+            // change is about — and the measured rate and knee are the numbers a user needs in
+            // order to override the budget sensibly with `-beamcount`, `-beamk` or `-n`.
+            if (jbb.pilotPaths)
+                std::printf("mode J: beam budget: pilot of %lld subpaths measured %.2f raw "
+                            "beams/subpath, -beamk knee at ~%lld beams -> %lld beams from %lld "
+                            "subpaths (%s)%s\n",
+                            jbb.pilotPaths, jbb.beamsPerPath, jbb.kneeBeams, jbb.budget,
+                            jbb.pathsUsed, jbb.kneeBound ? "knee-bound" : "-beamcount-bound",
+                            jbb.applied ? "" : " [not binding: -n was already smaller]");
             liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
             buildBeamMap(bmap, "mode J:",
                          (double)res * (double)resY * (double)(spp > 0 ? spp : 16));
@@ -17702,6 +17775,11 @@ static int run(int argc, char** argv) {
             const char* s = argv[++i];
             if (std::strpbrk(s, "eE.")) N = (long long)std::llround(std::atof(s));
             else                        N = std::atoll(s);
+            // Recorded, because in mode J `-n` and the beam budget are two knobs on the same
+            // quantity and only one of them can win. An explicit `-n` is an expert saying
+            // exactly how many light subpaths to trace, so it turns the budget OFF rather than
+            // being silently overridden by it. See bdpt::BeamBudgetReq.
+            g_nFromCli = true;
         }
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) {
             res = std::atoi(argv[++i]); resFromCli = true;
@@ -18019,7 +18097,10 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-beams-single") || !std::strcmp(argv[i], "-beams-ss"))
             pbeams::gOrderMax = 1;
         else if (!std::strcmp(argv[i], "-beamradius") && i + 1 < argc) g_beamRadiusAbs = std::atof(argv[++i]);
-        else if (!std::strcmp(argv[i], "-beamcount") && i + 1 < argc) g_beamTarget = (long long)std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamcount") && i + 1 < argc) {
+            g_beamTarget = (long long)std::atof(argv[++i]);
+            g_beamTargetSet = true;   // mode J only mentions its knee fallback when this is absent
+        }
         else if (!std::strcmp(argv[i], "-beamk") && i + 1 < argc) g_beamK = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamblur") && i + 1 < argc) g_beamBlur = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamareaslack") && i + 1 < argc) g_beamAreaSlack = std::atof(argv[++i]);

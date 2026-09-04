@@ -25,7 +25,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
-| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). CPU only so far; it traces its own light subpaths for the beam map (0.216.0) and both techniques are MIS-weighted (0.218.0), with merged paths capped at `maxDepth` like the connections (0.219.0). Correct, but **not yet faster than `D`** — see UPBP-CONV | `bdpt.h` + `beamgather.h` + `photonbeams.h` |
+| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). CPU only so far; it traces its own light subpaths for the beam map (0.216.0) and both techniques are MIS-weighted (0.218.0), with merged paths capped at `maxDepth` like the connections (0.219.0). The map sizes itself from the scene's `-beamk` knee via a discarded pilot (0.242.0), so **leave `-n` off** — passing it disables the budget. Correct, but **not yet faster than `D`** — see UPBP-CONV | `bdpt.h` + `beamgather.h` + `photonbeams.h` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
 | `-raster` | z-buffer preview rasterizer + interactive fly viewer (`-explore`) | `raster.h`, `raster_cuda.cu` |
 
@@ -232,7 +232,9 @@ Four consequences worth knowing:
   self-halves and `keepProb == 1` for every beam. Mode `M`'s self-thinning leaves each beam a
   history-dependent existence probability that a merge weight cannot reconstruct at gather time,
   and a MIS weight that cannot read the density it is dividing by is not a MIS weight.
-  **`-beamcount` is therefore inert in mode `J`** — the map is sized by `-n` alone.
+  **`-beamcount` therefore cannot be met by *thinning* in mode `J`** — but since 0.242.0 it is
+  not inert: it is met by tracing **fewer subpaths**, sized by a discarded pilot. See the beam
+  budget below.
 - **Mode `J`'s beams are monochromatic.** `-beamspec` bundles and the achromatic fold both need a
   wavelength-independent `beta`, and a BDPT light subpath's is not: `Le` carries
   `spd(λ)·invPdfLambda` off the scene-wide emission sampler. So mode `J` is chroma-noisier than
@@ -251,10 +253,79 @@ normalisation error could not reproduce it.
 
 **Cost, and the memory to watch.** At `-n 200000` on `_fog_cornell` the pass produced 1 202 979
 chords → 7 668 297 post-split beams (38.34 beams/subpath, **761 MB**), in 11.1 s of which 10.9 s
-was the BVH build. The map is sized by `-n` with **no trim** — mode `M`'s decimation is exactly
-what Phase 3a had to give up — so this is the resource that will bite first on a real scene.
-Phase 3b may reinstate an *exact uniform* trim, whose single global keep fraction is a constant
-that folds cleanly into `n_m` and stays readable by the weight.
+was the BVH build. The map was sized by `-n` with **no trim** — mode `M`'s decimation is exactly
+what Phase 3a had to give up — so this was the resource that bit first on a real scene. It is
+now bounded by the beam budget below.
+
+### The beam budget — sizing the map from the scene's own knee (0.242.0)
+
+`-n` alone was a cliff, not a tuning wart: at the inherited forward-mode default of `-n 2e6`,
+`_fog_cornell` at 128² deposited so many beams that a 120 s budget produced **no image at
+all**. The fix is a budget, and the measurement that shaped it is the interesting part.
+
+**The obvious rule is wrong.** A beam map looks like a cache — built once, paid back once per
+camera sample — so its worthwhile size ought to scale with `res · resY · spp`, exactly as
+`buildBeamMap`'s split length does. Sweeping `-n` at a fixed 120 s budget against a converged
+mode-`D` reference says otherwise: 18 708 / 75 288 / 300 033 raw beams give 15 / 15 / 4 spp at
+0.426 / **0.410** / 0.887 relative RMSE at 128², and 4 / 4 / 1 spp at **0.805** / 0.822 / 1.888
+at 256². Four times the pixels, **same knee**. Only the build is amortised over the frame; the
+gather is per-sample and grows with the map, so the two scale together and cancel.
+
+**What the knee actually is: the `-beamk` floor releasing.** While `probeK` at the raw
+`blur × mfp` radii is below the floor (32), `buildAuto` inflates the radii to hold the
+*gathered* count at 32 — so extra beams cost the gather nothing and buy a tighter, less blurred
+kernel. Past that point the floor lets go and every further beam is gathered and paid for. It is
+a property of the **scene**, and it moves a long way: `_fog_thick` (σ_t 20, bounded, mfp 0.48 m)
+is already past the floor at 16 428 beams, where `_fog_cornell` needs ~300 000 — **23× at the
+same resolution**.
+
+So mode `J` measures it per scene, in a pilot it runs and then throws away:
+
+- **`BeamBudgetReq` → `traceLightBeamPass`.** The budget is spent by lowering `nPaths`, never by
+  thinning afterwards: the map is the pass's only product, and a uniform post-hoc thin is equal
+  only *in expectation* to tracing fewer subpaths anyway (keeping fraction `keep` and
+  normalising by `nEmitted · keep` is what `nEmitted = nPaths · keep` already means).
+- **One pilot, two measurements**: beams per subpath (converting a beam count into a subpath
+  count) and `probeK0` at the real radii (locating the knee, via its near-linearity in the beam
+  count — 3.98× beams gave 4.09× `probeK0` on `_fog_thick`). The budget sits **at** the knee —
+  the smallest map that gets the requested kernel width without the `-beamk` floor widening it.
+- **The pilot is discarded, and that is the point.** Reusing its beams would make `nPaths` a
+  function of the map's own contents and introduce an O(pilot/nPaths) bias. Mode `J`'s whole
+  claim is that its *absolute* radiance is right (gate 3). Run under an independent salt and
+  thrown away, the pilot leaves the map unbiased for every fixed `nPaths`, hence unbiased over
+  the pilot's choice of it.
+- **Precedence:** explicit **`-n` disables the budget** (the more specific knob wins);
+  otherwise `-beamcount` is a resource ceiling and the enforced budget is `min(ceiling, knee)`.
+- **`buildBeamMap` now names the knee** when `probeK0` has passed `-beamk`, in the same voice as
+  the existing `-beamsplitmax` hint — for modes `M` and `J` alike.
+
+**Measured landing** (`scraps/_jauto.sh`, same 120 s and reference as the sweep, `-n` absent):
+the two scenes' knees differ by **8.7×** (`_fog_cornell` ~113 995 beams, `_fog_thick` ~13 122),
+and both runs report `knee-bound`. On `_fog_thick` the budget **beats every hand-swept point**
+(rel. RMSE **1.942** vs a best of 2.741 — 29 % better) by choosing a map *smaller* than the
+sweep's cheapest: 13 285 beams with `probeK` exactly at the floor. On `_fog_cornell` it comes
+out above the sweep's best (0.587 at 7 spp vs 0.410 at 15), because that scene's equal-time
+optimum is near 0.66× its knee. Normalised by the knee the optimum spans only **0.66×–1.0×**
+across the two scenes — a 1.5× residual from a 23× raw spread, which is the case for the knee
+as normaliser.
+
+**Why it aims at the knee and not below it (0.243.0).** It first shipped aiming at *half* the
+knee. That was a bias, and the equal-time comparisons above could not see it — nor could any of
+the four gates, since all four pin `-n` and pinning `-n` disables the budget. Gate 3 re-run with
+`-n` dropped came out **6.4 % off the absolute level**; at the knee that falls to **0.34 %**.
+The cause is that **below the knee `buildAuto` widens the radii** to hold the gathered count at
+the `-beamk` floor, and a wider kernel bleeds energy from bright regions into dim ones.
+Undershooting is not free, though — traversal cost (not the pinned returned count) is where
+per-segment time goes, so a smaller map genuinely buys spp. The trade is declined because the
+sides differ in kind: noise washes out with render time, a silently widened kernel does not,
+and it means `-beamblur` no longer says what the render did. The knee is the smallest map whose
+radii are the requested `blur × mfp` un-inflated. Caveat: when the gather is a small share of
+per-sample cost (`_slab_ss` at `-max-bounce 1`), quality keeps improving past the knee;
+`-beamcount` / `-n` are the escape hatch.
+
+The escape clamp `kBeamFarScale` was **deliberately left alone**: on `_fog_cornell` its 8 × 0.866
+≈ 6.9 m is only 2.8 mfp, so a principled mfp-based clamp would make beams *longer*. Tightening
+it for speed would be a silent accuracy regression buying a cost the budget removes properly.
 
 ### Gate (2) — a second MIS weight, and a flag that breaks it on purpose (0.217.0)
 
@@ -506,9 +577,11 @@ historically walked `1.0611 → 1.0035 → 0.9897 → 0.9811 → 0.9985 → 1.00
 and `_fog_thick` is a 17 %-noise image), and neither scene has a bounded medium, so the
 `sceneRadius` change cannot reach them — which is what the numbers say.
 
-Both fog scenes need `-n` well below the default here: at `-n 200000` and 256² the beam map
-alone is 7.7 M beams and mode `J` cannot finish a single spp inside a two-minute budget. See
-**J-BEAMCOST** in `known-issues.md`.
+Both fog scenes needed `-n` well below the default here: at `-n 200000` and 256² the beam map
+alone is 7.7 M beams and mode `J` cannot finish a single spp inside a two-minute budget. Since
+0.242.0 that is what the beam budget prevents — **leave `-n` off** and the pilot sizes the map
+from the scene's `-beamk` knee. Passing `-n` explicitly still turns the budget off, which is
+why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
 
 ## Module map (src/)
 

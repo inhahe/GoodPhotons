@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### J-BEAMCOST — OPEN (performance, 2026-09-04): mode J's beam map is sized by `-n` alone, so the default budget builds a 12 M-beam / 1.2 GB map with a degenerate BVH — and an *open* scene makes every beam run to the escape clamp
+### J-BEAMCOST — FIXED (2026-09-04, v0.242.0): mode J's beam map was sized by `-n` alone, so the default budget built a 12 M-beam / 1.2 GB map with a degenerate BVH — and an *open* scene made every beam run to the escape clamp
 
 **Symptom.** `ftrace -in scenes/_fog_cornell.ftsl -mode J -device cpu -max-bounce 8 -r 64
 -time 30` does not finish. Not "is slow" — a **64×64** frame with a 30-second budget spends
@@ -47,22 +47,166 @@ applied to *bounded* media and only added *bounded* media to the bounding sphere
 medium is unbounded, so `dBeam = min(dLen, farLimit)` is byte-for-byte the old behaviour
 here. Verified by reading the diff, and the mode-J validation gates still pass.
 
-**What the proper fix looks like** (in rough order of value):
+**The fix, and the measurement that changed its shape.** The entry originally proposed
+budgeting the map against the frame — `buildBeamMap` is already told `res * resY * spp`, so a
+64×64 preview should not build the same 1.2 GB map as a 4K frame. **That hypothesis was
+measured and is wrong**, so it is not what shipped.
 
-- **Budget the map against the frame, not against `-n`.** `buildBeamMap` is already told
-  `res * resY * spp`; the *count* should be derived from that too, so a 64×64 preview does
-  not build the same 1.2 GB map as a 4K frame. The bias constraint is real — the merge
-  weight needs a readable density — but a budget applied as a *uniform* keep probability
-  chosen up front (one scalar, known to the weight, folded into `nEmitted`) satisfies it,
-  unlike mode M's history-dependent bank halving.
-- **Clamp beams to the region a camera can see, not to `8 × sceneRadius`.** A beam that has
-  left the view frustum and the scene's bounding sphere can only ever cost BVH area. The
-  escape clamp exists to stop a 1e30-long box; it is not a claim that 6.9 m of empty space
-  outside a 1 m box is worth indexing.
-- **Report the pathology instead of hiding it.** The build already knows `box area` and
-  `beams gathered per probe ray`; when the area-to-scene ratio is this extreme it should say
-  so in the same voice as the existing `-beamsplitmax` hint, because from the outside the
-  only visible symptom is a render that never writes a frame.
+Sweeping `-n` at a fixed 120 s budget against a converged mode-D reference
+(`scraps/_jn_sweep*.sh`, scored by `scraps/_jn_score.py`) puts the collapse at the same **raw
+beam count** at both resolutions:
+
+| scene | res | raw beams | probeK at raw radii | spp in 120 s | rel. RMSE |
+|---|---|---|---|---|---|
+| `_fog_cornell` | 128² | 18 708 | 2.6 | 15 | 0.426 |
+| `_fog_cornell` | 128² | 75 288 | 25.9 | 15 | **0.410** |
+| `_fog_cornell` | 128² | 300 033 | 36.2 | 4 | 0.887 |
+| `_fog_cornell` | 256² | 18 708 | 2.6 | 4 | **0.805** |
+| `_fog_cornell` | 256² | 75 288 | 25.9 | 4 | 0.822 |
+| `_fog_cornell` | 256² | 300 033 | 36.2 | 1 | 1.888 |
+
+Four times the pixels, same knee. Only the *build* is amortised over the frame; the *gather*
+is per-sample and grows with the map, so the two scale together and cancel. What the knee
+actually tracks is the **`-beamk` floor**: while `probeK` at the raw `blur × mfp` radii is
+below the floor (32), `buildAuto` inflates the radii to hold the *gathered* count at 32, so
+extra beams cost the gather nothing and buy a tighter, less blurred kernel — strictly better.
+Once `probeK0` passes the floor the floor lets go and every further beam is gathered and paid
+for in full.
+
+That knee is a property of the **scene**, and it moves a long way. On `_fog_thick`
+(σ_t 20, bounded, mfp 0.48 m) 16 428 beams already give `probeK0` 38.4 — past the floor — where
+`_fog_cornell` needs ~300 000 to get there. A **23× spread at the same resolution**, which is
+why no constant and no frame formula can be right.
+
+So mode J measures it per scene, in the pilot it was already running:
+
+- **`bdpt::traceLightBeamPass` takes a `BeamBudgetReq`** and spends it by lowering `nPaths`,
+  not by thinning beams afterwards. The map is the pass's only product, so tracing subpaths
+  whose beams are discarded is pure waste — and a uniform post-hoc thin is only equal *in
+  expectation* to tracing fewer subpaths anyway, since keeping a fraction `keep` and
+  normalising by `nEmitted * keep` is what `nEmitted = nPaths * keep` already means.
+- **A pilot of a few thousand subpaths measures two things and is then discarded**: beams per
+  subpath (which converts a beam count into a subpath count) and `probeK0` at the real
+  `blur × mfp` radii (which locates the knee, by the near-linearity of `probeK0` in the beam
+  count — 16 428 → 38.4 and 65 393 → 157.2 on `_fog_thick` is 3.98× beams for 4.09× `probeK0`).
+  The budget then sits **at** the knee — the smallest map that gets the requested kernel width
+  without the `-beamk` floor having to widen it. (It shipped at *half* the knee for one
+  version; gate 3 showed that was a bias source. See "The safety factor was wrong" below.)
+- **Discarding the pilot is the point.** If its beams were kept, `nPaths` would be a function
+  of those same beams, the normalisation would correlate with the map's contents, and the
+  estimator would pick up an O(pilot/nPaths) bias. Mode J's whole validation story is that its
+  *absolute* radiance is right (gate 3), and "biased by an amount we think is small" is not
+  that. Run under an independent salt and thrown away, the pilot makes `nPaths` independent of
+  the map's randomness, so the map is unbiased for every fixed `nPaths` and hence unbiased
+  averaged over the pilot's choice of it.
+- **`-beamcount` now names the map size in mode J too** (it already did for mode M), as a plain
+  resource ceiling; the knee is applied as `min(ceiling, knee)`. An explicit **`-n` turns
+  the budget off entirely** — two knobs on one quantity, and the more specific one wins.
+- **The pathology is reported, not hidden.** `buildBeamMap` now says when `probeK0` has passed
+  the `-beamk` floor and names the flag to lower, in the same voice as the existing
+  `-beamsplitmax` hint.
+
+**Does it land where the sweep says it should?** That is the only question worth asking of an
+automatic budget, so `scraps/_jauto.sh` re-runs both scenes at the same 120 s against the same
+converged mode-D reference, changing exactly one thing: `-n` is absent. The pilot's two scenes
+disagree about the knee by **8.7×** — which is the whole argument for measuring it:
+
+| scene | pilot measured | knee estimate | budget chosen | raw beams | probeK | spp | energy | rel. RMSE | best hand-swept |
+|---|---|---|---|---|---|---|---|---|---|
+| `_fog_cornell` | 6.02 beams/subpath | ~113 995 | 113 995 (18 940 subpaths) | 113 857 | 32.0 | 7 | 1.001 | 0.587 | 0.410 |
+| `_fog_thick` | 5.19 beams/subpath | ~13 122 | 13 122 (2 527 subpaths) | 13 285 | 32.0 | 269 | 1.130 | **1.942** | 2.741 |
+
+On `_fog_thick` the budget **beats every hand-swept point by 29 %**, because it picked a map
+smaller than the smallest one the sweep thought to try — 13 285 beams holding `probeK` exactly
+at the floor, where the sweep's cheapest point was already at 38.4 and past it. On
+`_fog_cornell` it comes out above the sweep's best (0.587 against 0.410): the knee there is
+~114 000 beams but the equal-time optimum is nearer 75 000, so aiming at the knee spends spp
+(7 rather than 15) to get the un-inflated kernel. That is a deliberate choice, argued below.
+Both runs report `knee-bound`, i.e. the scene's knee bound the map, not the `-beamcount`
+ceiling — and note `_fog_cornell`'s energy ratio of 1.001, the best of any point on its grid.
+
+Normalised by the knee, the true optimum sits between **0.66×** (`_fog_cornell`) and **1.0×**
+(`_fog_thick`). A 1.5× residual spread, out of a 23× raw spread in beam count, is the actual
+case for using the knee as the normaliser.
+
+**The safety factor was wrong, and gate 3 is what caught it (0.243.0).** The budget first
+shipped aiming at **half** the knee, reasoning that overshooting costs ~2× the error while
+undershooting costs "a few percent of kernel tightness and nothing else". The second half of
+that is false. Every validation gate passes an explicit `-n`, and an explicit `-n` turns the
+budget off, so all four gates were unaffected *by construction* and none of them tested the
+budget at all. Re-running gate 3 with `-n` dropped (`scraps/_jgate3_auto.sh`) — the one gate
+whose ground truth is a closed-form quadrature rather than another ftrace mode — failed
+**both** halves: 6.4 % off the absolute level, and a shape trend of 1.29 in the dimmest
+brightness quartile against 0.99 in the brightest.
+
+Sweeping `-n` across the knee on `_slab_ss` (`scraps/_jsafety.sh`; `-max-bounce 1` makes it
+exactly 1 beam/subpath, so `-n` *is* the beam count) isolates it:
+
+| beams | vs knee | scale (want 1.000×) | Q1 (dimmest) | noise rms |
+|---|---|---|---|---|
+| 4 371 | ½× — *the old default* | **1.064×** | **1.291** | 1.168 |
+| 8 742 | 1× — the knee | 0.943× | 1.150 | 1.121 |
+| 17 484 | 2× | 0.924× | 1.046 | 0.804 |
+| 50 000 | 5.7× | 0.906× | 1.058 | 0.592 |
+| 200 000 | 22.9× | 0.940× | 1.021 | 0.281 |
+
+The last four agree on the absolute level to ~4 %; the half-knee map alone sits ~6 % above
+them. The level error is the real finding, and its cause is that **below the knee `buildAuto`
+inflates the radii** to hold the gathered count at the `-beamk` floor, so a wider kernel smears
+energy from the bright near-light region into the dim far one. That is bias, and render time
+does not remove it. Re-running the same gate at `safety = 1.0` takes the level error from
+**6.4 % to 0.34 %**.
+
+(The `Q1` column is *not* a second symptom — it is noise. Past the knee the radius is fixed at
+`blur × mfp`, so the 2×, 5.7× and 22.9× rows share an identical kernel, yet their `Q1` still
+tracks `noise rms` monotonically. `Q1` is the dimmest quartile, where a positively-skewed ratio
+estimator reads high; the elevated `Q1` at the knee goes away with render time, the 6 % level
+error at half the knee does not. Worth stating because the two look alike in the table.)
+
+**Undershooting is not free — it is a trade we decline.** The first version of this note
+claimed the knee costs nothing to reach, on the grounds that the floor pins the *returned*
+count at `targetK`. That is true and beside the point: traversal cost, not returned count, is
+where the per-camera-segment time goes, and traversal gets cheaper with fewer split sub-beams
+and smaller box area even while the returned count is pinned. So a smaller map really does buy
+spp. Measured on `_fog_cornell` at 120 s / 128²: 57 k beams → 13 spp at 0.450, 114 k (the knee)
+→ 7 spp at 0.587.
+
+The default aims at the knee anyway, because the two sides of that trade are different kinds of
+error. Noise is removable by rendering longer; a widened kernel is not — and it is *silent*,
+since below the knee the render quietly uses a kernel wider than the `-beamblur` that was
+asked for. Mode `J`'s headline claim is that its **absolute** radiance is right (gate 3), so
+the default belongs at the point where `-beamblur` means what it says: the **smallest map whose
+radii are the requested `blur × mfp` with no inflation**. That is the knee. `safety` now
+defaults to **1.0**, and anyone who wants `_fog_cornell`'s extra spp can ask with `-beamcount`.
+
+**Known limitation, not papered over.** On a scene whose gather is very cheap the table above
+keeps improving well past the knee — `_slab_ss` is `-max-bounce 1`, one medium span per camera
+path, so per-sample cost is dominated by everything *except* the gather and a bigger map is
+nearly free. The knee is the right target when the gather is a significant share of per-sample
+cost, which is precisely the case that motivated this entry (a 12 M-beam map that made a 64×64
+frame look like a hang), and a conservative one when it is not. `-beamcount` (or an explicit
+`-n`) is the escape hatch.
+
+**Not bias — fireflies.** The sum-based energy ratio on `_fog_thick`'s auto run reads 1.279,
+which looks alarming next to the swept points' 0.95–1.05 until the distribution is examined
+(`scraps/_jfire.py`): the auto run has the **lowest** 99th-percentile pixel ratio of any point
+on the grid (8.9 against 16–22) and the smallest firefly share (4.7 % of image energy in its
+16 brightest pixels, against up to 12 %). It is the *cleanest* image in the set; a sum is
+simply the wrong statistic on a thick medium where neighbouring sweep points swing 0.39× to
+2.2× on the same measure. The bias question is settled properly by gate 3 instead — see below.
+
+**Lesson worth keeping: a gate that cannot see the feature is not evidence about it.** All
+four mode-J gates passed throughout, and all four were blind here for the same structural
+reason — they pin `-n`, and pinning `-n` disables the thing under test. `scraps/_jgate3_auto.sh`
+exists so that the budget itself is exercised, and any future change to the budget's target
+should be re-checked with it rather than with the gates alone.
+
+**Deliberately NOT done: tightening the `kBeamFarScale` escape clamp.** The entry proposed
+clamping beams to what a camera can see rather than to `8 × sceneRadius`. On `_fog_cornell`
+that limit is 8 × 0.866 ≈ 6.9 m, which at mfp 2.51 m is only 2.8 mean free paths — a
+*principled* mfp-based clamp would make beams **longer**, not shorter. Tightening it to buy
+speed would be a silent accuracy regression traded for a cost the beam budget now removes
+properly. Left alone on purpose.
 
 **Related, and fixed in the same session:** the camera pass could not be interrupted at all
 (see J-NOSTOP below), which is what turned this from "slow" into "unkillable".

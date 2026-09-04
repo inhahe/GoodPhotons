@@ -1445,14 +1445,144 @@ inline double mergeEtaPrime(const Scene& scene, const Vec3& pPrev, const Vertex&
 // keepProb at exactly 1 for every beam — and, incidentally, draws no RNG in emitBeams, so
 // the deposit is deterministic in the path index alone. The beam count is therefore
 // `nPaths` x (media crossings per path), and it is reported by the caller.
+//
+// What the pilot below settled on, so the driver can report it. A budget that silently
+// rewrote the user's `-n` would be the same kind of invisible surprise this whole entry is
+// about, so mode J prints every field of this.
+struct BeamBudgetInfo {
+    long long pilotPaths   = 0;      // subpaths traced and thrown away to measure the rate
+    double    beamsPerPath = 0.0;    // ... and the rate it measured
+    long long kneeBeams    = 0;      // ... and where it put the -beamk knee (0 = not measured)
+    long long pathsAsked   = 0;      // `-n`, or mode J's default
+    long long pathsUsed    = 0;      // what the budget allowed
+    long long budget       = 0;      // the beam ceiling actually enforced
+    bool      kneeBound    = false;  // was the knee the binding half, or the resource ceiling?
+    bool      applied      = false;  // did it bite at all, or was `-n` already smaller?
+};
+
+// What the caller wants of the map. A struct rather than three more parameters because `blur`
+// and `targetK` MUST be the same values the subsequent buildAuto() is given -- the knee is only
+// meaningful at the radii the real build will use -- so they are forwarded from the one place
+// that owns them (`-beamblur` / `-beamk`) rather than defaulted twice.
+struct BeamBudgetReq {
+    long long maxBeams = 0;      // resource ceiling in raw beams; 0 disables the budget entirely
+    double    blur     = 0.01;   // -beamblur:  kernel half-width as a fraction of the mfp
+    double    targetK  = 32.0;   // -beamk:     the FLOOR whose release marks the knee
+    double    safety   = 1.0;    // scale on the measured knee; 1.0 = aim AT it (see the note below)
+};
+// WHY `safety` DEFAULTS TO 1.0, AND NOT TO SOMETHING SAFELY BELOW THE KNEE.
+//
+// It shipped at 0.5 on the reasoning that the knee is where extra beams stop being free, so
+// sitting under it must be the cautious side. Gate 3 -- the closed-form single-scatter slab,
+// the one validation gate whose ground truth is not another ftrace mode -- says otherwise.
+// Sweeping `-n` across the knee on scenes/_slab_ss.ftsl (knee ~8742 beams; `-max-bounce 1`
+// makes it exactly 1 beam/subpath, which is what makes this the clean scene to measure on),
+// each run 90 s, `scale` relative to the first row and `Q1` the dimmest brightness quartile:
+//
+//     beams    vs knee    scale     Q1      noise rms
+//      4371      0.5x     1.064x   1.291      1.168     <- the old default: the ONLY outlier
+//      8742      1.0x     0.943x   1.150      1.121
+//     17484      2.0x     0.924x   1.046      0.804
+//     50000      5.7x     0.906x   1.058      0.592
+//    200000     22.9x     0.940x   1.021      0.281
+//
+// The last four agree on the absolute level to ~4 %; the half-knee map alone sits ~6 % above
+// them, with a monotonic shape error across the quartiles (1.29 in the dimmest, 0.99 in the
+// brightest). Both are the same artefact: below the knee `buildAuto` INFLATES the radii to
+// hold the gathered count at the `-beamk` floor, and a wider kernel smears energy from the
+// bright near-light region into the dim far one. That is bias, and no amount of render time
+// removes it.
+//
+// What undershooting actually trades, stated carefully -- because the first version of this
+// comment got it wrong. Below the knee the gather still RETURNS `targetK` beams per probe (the
+// floor guarantees exactly that), so shrinking the map does not reduce the estimator's
+// variance-per-sample. But it does still make the BVH cheaper to traverse -- fewer split
+// sub-beams, smaller total box area -- and traversal, not the returned count, is where the
+// per-camera-segment time goes. So undershooting is not free: it buys spp, and it pays for
+// them in kernel width. Measured on `_fog_cornell` at 120 s, 128^2: 57 k beams -> 13 spp and
+// 0.450 relative RMSE, 114 k (the knee) -> 7 spp and 0.587.
+//
+// We decline that trade anyway, on the grounds that the two sides are not the same kind of
+// error. Noise is removable by rendering longer; a widened kernel is not, and worse, it is
+// silent -- below the knee the render is using a kernel wider than the `-beamblur` the user
+// asked for, and nothing says so. Mode J's headline claim is that its ABSOLUTE radiance is
+// right (gate 3), so the default belongs where `-beamblur` means what it says. The knee is
+// exactly that point: the SMALLEST map whose radii are the requested `blur * mfp` with no
+// inflation. Anyone who wants `_fog_cornell`'s extra spp can ask for it with `-beamcount`.
+//
+// Known limitation, deliberately not papered over: on a scene whose gather is very cheap
+// (`_slab_ss` is `-max-bounce 1`, so one medium span per camera path) the table above keeps
+// improving well past the knee, because the per-sample cost is dominated by everything other
+// than the gather. The knee is a good target when the gather is a significant share of
+// per-sample cost -- which is the case that motivated the budget at all (J-BEAMCOST: a 12 M
+// beam map that made a 64x64 frame look like a hang) -- and merely a conservative one when it
+// is not. Raising `-beamcount` (or setting `-n`) is the escape hatch for that case.
+//
+// The measured spread of the true optimum, once normalised by the knee, is narrow: about
+// 0.66x the knee on `_fog_cornell` and about 1.0x on `_fog_thick` (where the knee beat every
+// hand-swept point by 29 %). That 1.5x spread is what is left of a 23x raw spread in beam
+// count, which is the real justification for the knee as the normaliser.
+//
+// Pilot sizing. `kPilotMin` is large enough that the measured rate is stable to a few percent
+// on any scene where the media are reachable at all; `kPilotMax` caps it so a huge `-n` does
+// not pay for a huge pilot it does not need (the rate is an average — its error falls as
+// 1/sqrt(n) and 64k subpaths is already far past the point of usefulness).
+inline constexpr long long kPilotMin = 2048;
+inline constexpr long long kPilotMax = 65536;
+// Never let the budget shrink the pass to a map too sparse to be a technique at all. A map
+// this small contributes almost nothing and the MIS weights correctly give it almost nothing,
+// so the render degrades to mode D rather than going wrong.
+inline constexpr long long kPathsMin = 256;
+
+// THE BEAM BUDGET, AND WHY IT IS SPENT ON *SUBPATHS* RATHER THAN ON BEAMS (0.242.0)
+// --------------------------------------------------------------------------------
+// Because the deposit takes no Russian roulette, the map's size is `nPaths` times a
+// scene-dependent "media spans per subpath", and NOTHING used to bound it. That is not a
+// tuning wart, it is a cliff: the gather's cost per camera segment is linear in the stored
+// beam count (the kernel radius is `blur * mfp`, fixed, so twice the beams means twice the
+// beams a probe ray sweeps), and past `-beamsplitmax` the BVH-tightening split is starved
+// outright and the box area jumps ~100x. Measured on `_fog_cornell` at 128x128 against a
+// converged mode-D reference, 120 s each: `-n 12500` reached 15 spp at 0.44 relative RMSE,
+// `-n 200000` reached 1 spp at 1.24 and tripped the split budget, and the DEFAULT `-n
+// 2000000` did not finish a single sample and wrote no image at all. See J-BEAMCOST.
+//
+// `req` therefore caps the map. It is spent by lowering `nPaths`, not by thinning the beams
+// afterwards, for two reasons. The map is this pass's ONLY product — mode J's connection half
+// traces its own light subpaths at render time — so tracing subpaths whose beams get thrown
+// away is pure waste. And a uniform post-hoc thin is only equivalent to tracing fewer subpaths
+// in expectation anyway, since keeping a fraction `keep` of the beams and normalising by
+// `nEmitted * keep` is exactly what `nEmitted = nPaths * keep` already means. Lowering
+// `nPaths` gets the same map for less work.
+//
+// THE PILOT MEASURES TWO THINGS, and neither is knowable up front. (1) Spans-per-subpath, which
+// ranges from well under 1 (a small bounded cloud in a big room, most subpaths missing it) to
+// `maxDepth` (a global haze) — this converts a beam count into a subpath count. (2) The KNEE:
+// the beam count past which extra beams stop being free, which is where the `-beamk` floor
+// releases. See the note at the measurement itself. Both come from one pilot of a few thousand
+// subpaths, which is then DISCARDED.
+//
+// Discarding it is the point, not laziness about reusing it. If the pilot's beams were kept,
+// `nPaths` would be a function of those same beams, the map's normalisation would be
+// correlated with its contents, and the estimator would pick up an O(pilot/nPaths) bias --
+// small, but this mode's whole validation story is that its absolute radiance is right (gate
+// 3), and "biased by an amount we think is small" is not that. Run under an INDEPENDENT salt
+// and thrown away, the pilot makes `nPaths` a random variable independent of the map's own
+// randomness; the map is unbiased for every fixed `nPaths`, hence unbiased averaged over the
+// pilot's choice of it. The cost of that guarantee is the pilot's own tracing, a couple of
+// percent of the pass.
 inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long nPaths,
                                int nThreads, int maxDepth, bool diffraction,
-                               BeamMap& bm, StageProgress* stage = nullptr) {
+                               BeamMap& bm, StageProgress* stage = nullptr,
+                               BeamBudgetReq req = {}, BeamBudgetInfo* budgetOut = nullptr) {
     if (nThreads < 1) nThreads = 1;
     if (nPaths < 1) nPaths = 1;
+    const long long nPathsAsked = nPaths;
     // "JUPBPLGT" — a salt of its own, so mode J's light pass cannot alias mode M's photon
     // stream or its own render-time streams however the counts line up.
     const uint64_t seedBase = 0x4A555042504C4754ULL;
+    // "JUPBPPLT" — the pilot's own stream, disjoint from the map's. See the note above: this
+    // independence is what keeps the budget from biasing the estimator.
+    const uint64_t pilotSeed = 0x4A55504250504C54ULL;
     std::vector<BeamBank> banks((size_t)nThreads);     // cap stays 0: no self-thinning
     // The light half of every merge's MIS weight, one entry per beam, kept in lockstep with
     // `banks[t].beams`. It is NOT a member of BeamBank on purpose: mode M's photon pass
@@ -1463,7 +1593,11 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     std::vector<long long> emitted((size_t)nThreads, 0);
     std::atomic<long long> tracedTotal{0};
 
-    auto worker = [&](int tid) {
+    // `pilot` shares the deposit path with the real pass and skips only the MIS bookkeeping,
+    // which is deliberate: what the pilot has to predict is how many beams `emitBeams` makes,
+    // so it must run the SAME code that makes them. A separate hand-written estimator would
+    // silently drift the first time the deposit rule changed.
+    auto worker = [&](int tid, long long total, uint64_t salt, bool pilot) {
         Renderer mats; mats.diffraction = diffraction;
         mats.beamDeposit = &banks[(size_t)tid];
         Pcg32 rng;
@@ -1472,16 +1606,16 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         std::vector<BeamMis>& misBank = misBanks[(size_t)tid];
         std::vector<double> accC, accM;                // per-subpath, reused
         const PatTables tabs = scene.patTables();
-        const long long lo = nPaths * tid / nThreads, hi = nPaths * (tid + 1) / nThreads;
+        const long long lo = total * tid / nThreads, hi = total * (tid + 1) / nThreads;
         long long done = 0;
         for (long long i = lo; i < hi; ++i) {
             // Cooperative `-stop` / Ctrl-C on the same 4096-path cadence as the photon pass.
             if ((done & 0xFFF) == 0) {
-                if (done) tracedTotal.fetch_add(0x1000, std::memory_order_relaxed);
+                if (done && !pilot) tracedTotal.fetch_add(0x1000, std::memory_order_relaxed);
                 if (ft::stopRequested()) break;
             }
             // Seeded by ABSOLUTE path index, so the map is identical for any thread count.
-            seedUnit(rng, seedBase + (uint64_t)i, 0xD1B54A32D192ED03ULL);
+            seedUnit(rng, salt + (uint64_t)i, 0xD1B54A32D192ED03ULL);
             ++done;
             // Single-λ, always. The hero bundle exists to share one ray path across C
             // wavelengths, and a scene with media has a per-λ free flight — renderRows
@@ -1507,6 +1641,15 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             // j = 2 on; the missing j = 1 term is the merge at y_0, which is the light
             // itself and is not a medium vertex in any case.
             const size_t np = path.size();
+            if (pilot) {
+                // Count only. The pilot's beams are thrown away with the bank it fills, so
+                // the merge-weight prefixes below would be computed for nothing.
+                for (const PathSeg& sg : segs)
+                    if (sg.beta > 0.0)
+                        mats.emitBeams(scene, sg.o, sg.d, sg.tMax, hb.lam[0], sg.beta,
+                                       sg.aGlass, rng, Renderer::MedAll);
+                continue;
+            }
             accC.assign(np, 0.0);
             accM.assign(np, 0.0);
             for (size_t u = 0; u < np; ++u) {
@@ -1584,14 +1727,113 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 }
             }
         }
-        tracedTotal.fetch_add(done & 0xFFF, std::memory_order_relaxed);
+        // The tail, matching the in-loop `done && !pilot` guard: the pilot's subpaths are
+        // thrown away, so counting them here would report more progress than the pass will
+        // ever have work for and drive the percentage past 100.
+        if (!pilot) tracedTotal.fetch_add(done & 0xFFF, std::memory_order_relaxed);
         // Count what was actually emitted, not what was asked for: an early `-stop` that
         // reported the full share would scale the whole map down and darken the merges.
         emitted[(size_t)tid] = done;
     };
 
+    // --- PILOT: how many beams does one subpath actually deposit in THIS scene? ----------
+    // Sized as a fraction of the request with a hard ceiling, so it is a rounding error on a
+    // large run and never dominates a small one. Skipped entirely when there is no budget to
+    // meet, or when the request is already too small to be worth measuring.
+    if (req.maxBeams > 0 && nPaths > 4 * kPilotMin) {
+        const long long nPilot = std::clamp(nPaths / 32, kPilotMin, kPilotMax);
+        std::vector<std::thread> ppool;
+        for (int t = 0; t < nThreads; ++t)
+            ppool.emplace_back(worker, t, nPilot, pilotSeed, /*pilot*/true);
+        for (auto& th : ppool) th.join();
+        // Merge the pilot's beams into a throwaway map, because the SECOND thing the pilot
+        // measures needs them as a map rather than as a count — see the knee note below.
+        BeamMap pm;
+        size_t pilotBeams = 0;
+        for (auto& b : banks) pilotBeams += b.size();
+        pm.beams.reserve(pilotBeams);
+        for (auto& b : banks) {
+            pm.beams.insert(pm.beams.end(), b.beams.begin(), b.beams.end());
+            b.beams.clear(); b.beams.shrink_to_fit();
+        }
+        // A pilot that deposited NOTHING says the media are hard to reach, not that they are
+        // unreachable — leave `nPaths` alone rather than dividing by zero or inflating it to
+        // something unbounded on the strength of a sample that measured nothing.
+        const double perPath = (double)pilotBeams / (double)nPilot;
+
+        // THE KNEE, MEASURED ON THIS SCENE (0.242.0). The caller's `beamBudget` is a resource
+        // ceiling, not a physics one. The count that actually matters is where the `-beamk`
+        // FLOOR stops binding: while the raw-mfp-radius gather is below the floor, buildAuto
+        // inflates the radii to hold the GATHERED count at `-beamk`, so extra beams cost the
+        // gather nothing and buy a tighter (less blurred) kernel. Past that point the floor
+        // lets go and every extra beam is gathered and paid for.
+        //
+        // MEASURED, and it is the reason this is not the frame-scaled rule J-BEAMCOST first
+        // proposed. On `_fog_cornell` at 120 s, the collapse happens at the same RAW BEAM COUNT
+        // at both resolutions -- 128x128: 18708 beams -> 15 spp / 0.426 relRMSE, 75288 -> 15 spp
+        // / 0.410, 300033 -> 4 spp / 0.887. 256x256: the same three maps give 4 spp / 0.805,
+        // 4 spp / 0.822, 1 spp / 1.888. Four times the pixels, same knee. The optimum is a
+        // property of the SCENE (mfp, extent, how far beams reach), not of the frame, so it is
+        // measured here rather than computed from res*spp.
+        //
+        // probeGatherCount at the raw radii is exactly buildAuto's `probeK0`, and it is very
+        // nearly linear in the beam count, so one pilot extrapolates it:
+        //     beams at the knee ~= pilotBeams * (targetK / probeK0_pilot)
+        // The estimate is biased LOW -- the map's bounding box grows with the beam count, which
+        // damps probeK0's growth -- which is the safe direction: the RMSE curve is flat below
+        // the knee (0.426 vs 0.410 over a 4x range) and doubles above it.
+        // Mirrors buildAuto's radius rule exactly (r = blur * mfp per medium, with a medium
+        // that stored nothing borrowing the largest radius seen so nothing divides by zero).
+        // It has to: `probeK0` is only the knee's coordinate if it is measured at the radii the
+        // real build will actually use.
+        double kneeBeams = 0.0;
+        if (pilotBeams && req.targetK > 0.0) {
+            std::vector<BeamMap::MedStat> st = pm.mediumStats();
+            double rSeen = 0.0;
+            for (BeamMap::MedStat& s : st) { s.r = req.blur * s.mfp; rSeen = std::max(rSeen, s.r); }
+            if (!(rSeen > 0.0)) {
+                const Vec3 ext = pm.bounds().hi - pm.bounds().lo;
+                rSeen = 1e-4 * std::max(std::sqrt(dot(ext, ext)), 1e-9);
+            }
+            pm.radMed.resize(st.size());
+            for (size_t m = 0; m < st.size(); ++m)
+                pm.radMed[m] = (float)(st[m].r > 0.0 ? st[m].r : rSeen);
+            const double k0 = pm.probeGatherCount(pm.bounds());
+            if (k0 > 1e-6) kneeBeams = (double)pilotBeams * (req.targetK / k0);
+        }
+        pm.beams.clear(); pm.beams.shrink_to_fit();
+
+        // The budget that binds is the smaller of the two: the caller's resource ceiling and
+        // the scene's own knee. `req.safety` scales the knee, and it defaults to 1.0 -- i.e.
+        // aim AT the knee -- because the knee is not "where extra beams stop being free", it is
+        // the SMALLEST map whose kernel is the one the user asked for. Below it `buildAuto`
+        // widens the radii to hold the gathered count at the `-beamk` floor, so undershooting
+        // buys no time (the gather still returns `targetK` beams either way) and pays for it in
+        // kernel blur. That is a bias, not just noise, and gate 3 measures it: see the sweep in
+        // the header note above `kPilotMin`.
+        double effBudget = (double)req.maxBeams;
+        if (kneeBeams > 0.0) effBudget = std::min(effBudget, req.safety * kneeBeams);
+        if (perPath > 0.0) {
+            const long long fit = (long long)(effBudget / perPath);
+            nPaths = std::clamp(fit, kPathsMin, nPathsAsked);
+        }
+        if (budgetOut) {
+            budgetOut->pilotPaths   = nPilot;
+            budgetOut->beamsPerPath = perPath;
+            budgetOut->kneeBeams    = (long long)kneeBeams;
+            budgetOut->pathsAsked   = nPathsAsked;
+            budgetOut->pathsUsed    = nPaths;
+            budgetOut->budget       = (long long)effBudget;
+            budgetOut->kneeBound    = (kneeBeams > 0.0 &&
+                                       req.safety * kneeBeams < (double)req.maxBeams);
+            budgetOut->applied      = (nPaths < nPathsAsked);
+        }
+        if (ft::stopRequested()) { bm.beams.clear(); bm.mis.clear(); bm.nEmitted = 0; return; }
+    }
+
     std::vector<std::thread> pool;
-    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
+    for (int t = 0; t < nThreads; ++t)
+        pool.emplace_back(worker, t, nPaths, seedBase, /*pilot*/false);
     std::atomic<bool> monitorStop{false};
     std::thread monitor;
     if (stage && stage->report) {
