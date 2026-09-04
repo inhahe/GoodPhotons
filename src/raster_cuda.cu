@@ -1235,7 +1235,10 @@ __device__ inline uchar3 tonemapPixel(const float3* accum, const float* zbuf, si
             // back to inv = 1 leaves hz = milkColor * T ~ 0, so a dense stack composites to
             // EXACTLY black instead of to the frost that should be all that is left. The two
             // backends must agree bit for bit, so this branch is duplicated verbatim.
-            bool   hasHue = tmax > 1e-6;
+            // See raster.h: the hue is well defined for any strictly positive tmax
+            // because inv only normalises T by its own max, in double. 1e-6 discarded it
+            // ~130 crossings in, which an extrude reaches easily.
+            bool   hasHue = tmax > 1e-300;
             double inv  = hasHue ? 1.0 / tmax : 1.0;
             // Same expression order as the host (plain double, left to right) so the two
             // stay bit-identical; only the no-hue fallback differs from what it was.

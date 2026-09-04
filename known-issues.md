@@ -15935,3 +15935,17 @@ then tessellate + GPU re-upload + render). Remaining ideas, roughly in value ord
 
 Workaround unchanged: `emboss` reshapes as much and adds no triangles; one extrude (~878 k)
 stays interactive.
+
+### Residual: see-through saturates on a deeply extruded all-glass model (OPEN, minor)
+
+With every material in the model transmissive, an extrude multiplies the crossed surfaces enough
+that the accumulated transmittance underflows to exactly zero over part of the silhouette. There
+is then no hue left to tint the frost with and no image behind it, so that patch reads as flat
+untinted white while the rest of the model keeps its colour. Lowering the hue threshold to the
+bottom of the double range (0.232.1) shrank this from "the whole compote" to a patch inside the
+bowl, but cannot remove it: once the float product is 0, the information is gone.
+
+The real fix is to stop the product underflowing at all -- accumulate log-transmittance, or keep
+a separately renormalised hue alongside the magnitude. Both cost work in the hot per-fragment
+loop and in the device atomics, which is why neither is done yet. Not worth it until someone
+actually needs see-through on a stack this deep.

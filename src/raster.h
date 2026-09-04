@@ -1508,7 +1508,17 @@ inline std::vector<uint8_t> exposeAndEncodeT(
                     // longer see through. A deep stack (an -nd extrude multiplies the crossed
                     // surfaces several-fold) turned the whole model into a black silhouette.
                     // With no hue to take, take none: untinted frost.
-                    const bool   hasHue = tmax > 1e-6;
+                    // The threshold is deliberately near the bottom of the double range, not a
+                    // comfortable epsilon. `inv` only ever divides T by its own largest
+                    // channel, so the result is a hue in [0,1] for ANY strictly positive
+                    // tmax, and the division is done in double -- a tmax of 1e-30 is as
+                    // safe as one of 0.5. Using 1e-6 threw the hue away far too early: a
+                    // ruby glass crossed ~130 times has tmax ~ 0.9^130 = 1e-6, which is
+                    // nothing unusual once an -nd extrude multiplies the crossed surfaces,
+                    // and the model then jumped from ruby frost to a flat untinted white
+                    // while less-crossed parts of the same image (the gems) stayed
+                    // coloured. Only a genuine underflow to zero has no hue left to take.
+                    const bool   hasHue = tmax > 1e-300;
                     const double inv = hasHue ? 1.0 / tmax : 1.0;
                     const Vec3 hz = hasHue
                         ? Vec3{milkColor.x * (double)Tr * inv,
