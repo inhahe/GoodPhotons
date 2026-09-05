@@ -585,6 +585,16 @@ struct Renderer {
     // (beamSpectralOK scans every medium's spectra and must not run inside the trace).
     bool beamAchroOK = false;
 
+    // The SAME scene-wide predicate, stated positively and independently of either CLI flag,
+    // for the one caller that needs it when both are off: bdpt.h's light-beam pass. Mode J
+    // draws lambda from the scene-wide emitSampler rather than from the chosen emitter's own
+    // SPD, so before it can deposit a beam at all it has to convert its beta into the one
+    // render.h's photon would have carried (bdpt.h, BeamSpectral) -- and that conversion rests
+    // on the same claim these two flags rest on, that no free flight in this scene depends on
+    // lambda. Mode M has no use for it: its photon is already born at the right density, so it
+    // reads the predicate through `beamSpecC > 1` / `beamAchroOK` and never needs it alone.
+    bool beamSpecOK = false;
+
     // Longest beam we will store when the photon escapes to infinity through an UNBOUNDED
     // medium, as a multiple of the scene radius. An unbounded medium clips to [0, 1e30], and
     // a 1e30-long AABB would swallow the whole BVH; transmittance has long since killed the

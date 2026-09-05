@@ -964,10 +964,12 @@ is bounded. Do this in Phase 3b, alongside the code that first *reads* `n_m`, so
 introduced and consumed in the same change. Until then, mode `J`'s `-n` is a memory budget as much
 as a quality knob, and `-beamcount` should be documented as mode-`M`-only.
 
-**Related:** mode `J`'s beams are also **monochromatic** (a BDPT light subpath's `beta` carries
-`spd(λ)·invPdfLambda`, so `-beamspec` bundles and the `achro`→`cieA` fold cannot apply), so mode
-`J` needs more beams than mode `M` for the same chroma noise — which makes this cap bite sooner,
-not later.
+**Related (RESOLVED 2026-09-05, v0.250.0 + v0.251.0):** mode `J`'s beams used to be
+**monochromatic** — the reasoning was that a BDPT light subpath's `beta` carries
+`spd(λ)·invPdfLambda` off the *scene-wide* emission sampler, so neither `-beamspec` bundles nor
+the `achro`→`cieA` fold could apply — which made mode `J` need more beams than mode `M` for the
+same chroma noise, and made this cap bite sooner. Both now apply (see the two FIXED entries
+below), so that particular pressure on the cap is gone; the cap itself is unchanged.
 
 ### PERF — OPEN (2026-09-02, v0.214.0): a mode-`J` flyby rebuilds the beam map **once per frame**, when the map is view-independent and mode `M` already shares one across the whole flight
 
@@ -1417,11 +1419,14 @@ plumbing:**
    **exact uniform** one, whose single global keep fraction is a constant that folds into `n_m`
    and stays readable by the weight — not RR, whose per-beam probability does not.
 
-   **New in 3a: mode `J`'s beams are monochromatic.** `-beamspec` bundles and the achromatic fold
-   both require a wavelength-independent `beta`, and a BDPT light subpath's is not — `Le` carries
-   `spd(λ)·invPdfLambda` off the scene-wide emission sampler. So mode `J` is chroma-noisier than
-   mode `M` at equal `-n`. The second "must not forget" bullet (the `cieA` fold) is therefore moot
-   for mode `J`'s own beams, but still applies to anything reading a mode-`M` map.
+   **New in 3a: mode `J`'s beams are monochromatic.** *(Fixed in v0.250.0 and v0.251.0 — see the
+   two FIXED entries below; kept here because the reasoning was wrong in an instructive way.)*
+   `-beamspec` bundles and the achromatic fold were both held to require a wavelength-independent
+   `beta`, and a BDPT light subpath's is not — `Le` carries `spd(λ)·invPdfLambda` off the
+   scene-wide emission sampler. So mode `J` was chroma-noisier than mode `M` at equal `-n`. The
+   fold needed only the *expectation* to be λ-independent (v0.250.0), and the bundle was bought by
+   converting the subpath's `beta` and wavelengths to the emitter's own density (v0.251.0). Both
+   now apply to mode `J`'s own beams as well as to anything reading a mode-`M` map.
 2. **MIS partition of unity** — *superseded, then built and passed as the absolute-form
    cross-check (2026-09-02, v0.217.0).* The original wording ("for a sampled path, sum the
    weights of every technique that could have generated it and assert it equals 1") **cannot
@@ -2032,6 +2037,80 @@ in the one place where `-beamachro` provably cannot help.
 sub-beam ceiling), plus a per-secondary material evaluation at each surface along the photon path.
 Not free, unlike `-beamachro`, which is why it is logged rather than done in the same change.
 
+### FIXED (2026-09-05, v0.251.0): mode `J`'s **rain** was still iridescent after the fold — bought the `-beamspec` bundle by converting the subpath's `β` to the emitter's own spectral density
+
+**The remainder of the entry below.** v0.250.0 gave mode `J` the achromatic fold, which neutralised
+`gallery_rain`'s cloud (rain-crop saturation was untouched at **0.1320**, against mode `D`'s 0.0933
+and mode `M`'s 0.1085). The rain curtain uses `phase rainbow`, so `mediumAchromatic` is false and it
+structurally cannot fold — its scattering really *is* chromatic. Mode `M` covers that case with
+`-beamspec 4`, whose bundle survives a rainbow phase because the bundle needs achromatic
+**extinction** only, not achromatic scattering. Mode `J` had no bundle, so it stayed the worst of
+the three modes exactly where mode `M` was fine.
+
+**Why the bundle looked impossible.** `PhotonBeam` stores wavelengths and **no per-wavelength
+weights**, so every member of a bundle must carry *identical* power. Mode `M` gets that free: its
+photon draws λ from the **chosen emitter's own SPD**, whose pdf is `spd/∫spd`, so `spd(λ)/p(λ)` is
+that emitter's SPD integral for every λ alike. Mode `J` draws λ from the **scene-wide**
+`emitSampler` *before* the emitter is chosen — the camera and light subpaths have to agree on a hero
+wavelength — so its `β` carries `spd_em(λ)/p_comb(λ)`, which genuinely varies with λ in any scene
+mixing emitters of different colour.
+
+**The fix: don't weaken the requirement, satisfy it.** That ratio is the *only* λ-dependence in
+`Le` — the emission pattern, a spot's falloff, the cosine and all three pdfs are λ-free — so it can
+be divided out in closed form at the subpath's birth (`BeamSpectral` / `beginBeamSpectral`,
+`bdpt.h`):
+
+* **`scale = ∫spd_em / (spdFn(hero)·invPdfLambda(hero))`**, applied to `sg.beta` at the deposit,
+  replaces `spd_em(λ)/p_comb(λ)` with the flat `∫spd_em` — exactly the power a mode-`M` photon
+  carries.
+* **all `C` deposit wavelengths are drawn stratified from `em.spd`**, the emitter's own SPD, by one
+  uniform variate offset `i/C` through the emission CDF (the same scheme `render.h` uses, so the
+  two modes' bundles stratify alike).
+
+The deposit is then arithmetically the one mode `M` would have made, so mode `M`'s bundle *and* its
+fold are both valid for it.
+
+**The trap, which cost a rewrite before any code was compiled.** The first design kept the
+subpath's hero λ as bundle member 0 and added `C-1` secondaries from `em.spd`. Working the
+expectation through shows member 0 would then contribute `K∫spd·∫p_comb·f` while its siblings
+contribute `(K/C)∫spd·f` — the estimate is dragged toward `∫p_comb·f` instead of `∫p_em·f`, i.e.
+**biased**. The hero comes from the wrong density and therefore cannot be a `1/C`-weighted member
+of the right one. So it is **replaced**, not extended: `bs.nLam ≥ 1` whenever the claim holds, and
+even `-beamspec 1` swaps the wavelength rather than merely rescaling (a rescale-without-swap would
+have been biased for any medium that does not fold).
+
+**MIS-safe.** `mergeEtaPrime` (`bdpt.h`) touches λ only through `md.sigmaT(λ)` and `trDet(...)` —
+i.e. only **extinction**, which `beamSpectralOK` already certifies λ-free scene-wide. The light-side
+merge partials `accC`/`accM` are computed at `hb.lam[0]` and stay exactly right while the *deposit*
+moves elsewhere.
+
+**Measured** (`gallery_rain`, 640×360, `-mode J -beams -time 180 -seed 1`, matched references):
+
+| Crop | metric | mode `D` | mode `M` | `J` v0.250.0 | `J` v0.251.0 |
+|---|---|---|---|---|---|
+| rain | saturation | 0.0933 | 0.1085 | 0.1320 | **0.0928** |
+| rain | speckle | 8.60 | 11.33 | 11.56 | **9.69** |
+| cloud | saturation | 0.0545 | 0.0609 | 0.0560 | **0.0390** |
+| cloud | chroma sd `r` / `g` | .069/.062 | .074/.059 | .069/.064 | **.048/.041** |
+
+The rain goes from worst to matching mode `D` and beating mode `M`. The **cloud improved too**,
+though it was already folding — because `scale` also removes the `spd_em/p_comb` weight-ratio
+variance, which is why this is a strict improvement even at `-beamspec 1 -beamachro off`. It is
+variance removal and not desaturation: the chroma *means* stay on mode `D`'s (`r` 0.350 vs 0.347,
+`g` 0.330 vs 0.331) rather than collapsing toward the 1/3 white point. Whole-frame `Y` moved
+**+0.2 %**, so the λ swap introduced no exposure shift.
+
+**Blast radius.** Mode `D` is **bit-identical** — `generateLightSubpath`'s `bs` parameter defaults
+to `nullptr` and only `traceLightBeamPass` passes one, so `beginBeamSpectral`, the sole new RNG
+consumer, never runs outside the beam pass. Mode `M` is unchanged apart from an inert
+`r.beamSpecOK` assignment. No device twin, no `-savemap` change (both reach the GPU through
+`BeamMap::cie[]` / `PhotonBeam::lamS[]` at map-build time, which the CUDA gather already reads).
+
+**Reporting.** The per-medium beam-map log line now prints `NN% spectrally bundled (NN% by power)`
+beside the fold figure, so `gallery_rain` reads `medium 0: … 48.4% folded achromatically (90.5% by
+power)` and `medium 1: … achromatic fold n/a, 36.4% spectrally bundled (85.3% by power)` — the
+cloud-folds/rain-bundles split is now visible in the log instead of only in pixel statistics.
+
 ### FIXED (2026-09-05, v0.250.0): mode `J`'s clouds AND rain rendered iridescent — `-beamachro` had never been ported to it, ruled out by an argument that is only true of `-beamspec`
 
 **Reported.** "In mode `J`, the clouds and the rain showed up iridescent, which they shouldn't.
@@ -2051,7 +2130,9 @@ mode `J` draws λ from the **scene-wide** `emitSampler` *before* choosing an emi
 conclusion is correct **for the bundle** and wrong **for the fold**:
 
 * `-beamspec` stores wavelengths and **no weights**, so its members must carry *identical power*.
-  That requires a λ-independent `β` pointwise. Mode `J` cannot have it. It stays off there.
+  That requires a λ-independent `β` pointwise. Mode `J` does not have it *as sampled* — so at
+  0.250.0 the bundle stayed off there. (v0.251.0 bought it anyway, by *converting* `β` to the
+  emitter's own density rather than by weakening the requirement. See the entry above.)
 * `-beamachro` needs only the **expectation** to come out right, and it does for any density `p`:
 
   ```
@@ -2083,12 +2164,12 @@ per medium), **no device twin** (the fold lands in `BeamMap::cie[]` at map-build
 what the CUDA gather reads, and mode `J`'s light pass is CPU-only on both backends), and **no
 `-savemap` format change** (mode `J` does not write one).
 
-**Still open for mode `J`: the rain.** `phase rainbow` makes `mediumAchromatic` false, so the
-rain's beams stay per-wavelength — correctly, since its scattering really is chromatic — and mode
-`J` has no `-beamspec` to fall back on there the way mode `M` does. That is the same gap the entry
-immediately above describes, reached from the other direction: **per-wavelength weights on the
-beam record** would fix mode `M`'s dispersively-disqualified 11 % *and* give mode `J` a bundle it
-can legally carry, since a weighted bundle does not need equal power. One change, two payoffs.
+**Still open for mode `J` at 0.250.0: the rain.** `phase rainbow` makes `mediumAchromatic` false,
+so the rain's beams stay per-wavelength — correctly, since its scattering really is chromatic —
+and mode `J` had no `-beamspec` to fall back on there the way mode `M` does. **Closed in
+v0.251.0**, and *not* by the per-wavelength-weights route guessed here: it turned out mode `J`'s
+`β` could simply be converted to the density mode `M` samples from, after which the existing
+equal-power bundle is legal as-is. See the entry above.
 
 ### FIXED (2026-09-02, v0.209.0): the mode-`M` GPU gather starved its own launches — an adaptive slice controller drove the slice to 3 % occupancy and cost **11x** throughput
 

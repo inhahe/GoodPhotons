@@ -12151,44 +12151,68 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
     if (bm.nDeposited > raw)
         say("%s photon beams: %zu collected, trimmed to %zu by -beamcount "
                     "(survivors rescaled, unbiased)\n", tag, bm.nDeposited, raw);
-    // ACHROMATIC-PATH FOLD COVERAGE (-beamachro, photonbeams.h). Reported BY POWER as well as
-    // by count, and the power figure is the one that matters: the fold removes the chromatic
-    // variance of the beams it covers and does nothing at all for the rest, so what is left in
-    // the image is set by how much ENERGY is still monochromatic, not by how many records are.
-    // A handful of bright unfolded beams is exactly what draws a saturated streak across an
-    // otherwise grey cloud, and a count-only figure would report that as a rounding error.
-    // Silent when the flag is off or when no beam qualified, so a scene the fold cannot help
-    // (a chromatic medium, an image environment) says nothing rather than printing two zeros.
+    // SPECTRAL COVERAGE OF THE STORED BEAMS (photonbeams.h): what fraction carry the
+    // achromatic fold (`-beamachro`), and what fraction carry a stratified wavelength bundle
+    // (`-beamspec`). The two are alternatives, not additions — BeamBank::push prefers the fold
+    // when a beam is offered both — so a beam falls in exactly one of three classes: folded,
+    // bundled, or plain monochromatic. Only the third one paints coloured streaks.
+    //
+    // Reported BY POWER as well as by count, and the power figure is the one that matters: a
+    // fold or a bundle removes the chromatic variance of the beams it covers and does nothing
+    // at all for the rest, so what is left in the image is set by how much ENERGY is still
+    // monochromatic, not by how many records are. A handful of bright unfolded beams is exactly
+    // what draws a saturated streak across an otherwise grey cloud, and a count-only figure
+    // would report that as a rounding error.
     //
     // Collected PER MEDIUM, and printed on the per-medium line below, because the fold's third
     // condition IS per medium: a scene holding an achromatic cloud and a `phase rainbow` rain
-    // curtain has one medium at ~90% and one at a structural 0%, and a single blended figure
-    // would read as "half broken" when both media are behaving exactly as designed. The split
-    // also localises the diagnosis — a cloud below ~90% means paths are arriving via surfaces
-    // or via the chromatic medium, which is a fact about the scene, not about the fold.
-    std::vector<size_t> foldN;
-    std::vector<double> foldP, foldPT;
-    if (pbeams::gAchro && raw) {
+    // curtain has the cloud folding at ~90% and the rain structurally unable to fold at all —
+    // its scattering really is chromatic — while the rain still bundles. A single blended
+    // figure would read as "half broken" when both media are behaving exactly as designed. The
+    // split also localises the diagnosis: a cloud below ~90% folded means paths are arriving
+    // via surfaces or via the chromatic medium, which is a fact about the scene, not a fault.
+    std::vector<size_t> foldN, specN;
+    std::vector<double> foldP, specP, foldPT;
+    if (raw) {
         for (const PhotonBeam& b : bm.beams) {
             const size_t m = (size_t)(b.med < 0 ? 0 : b.med);
-            if (m >= foldN.size()) { foldN.resize(m + 1, 0); foldP.resize(m + 1, 0.0); foldPT.resize(m + 1, 0.0); }
+            if (m >= foldN.size()) {
+                foldN.resize(m + 1, 0); specN.resize(m + 1, 0);
+                foldP.resize(m + 1, 0.0); specP.resize(m + 1, 0.0); foldPT.resize(m + 1, 0.0);
+            }
             // Energy, not power: a long beam lays a long streak, so `power * len` is what the
             // image actually sees and what a "% by power" figure has to weight by.
             const double p = (double)b.power * (double)b.len;
             foldPT[m] += p;
-            if (b.achro) { ++foldN[m]; foldP[m] += p; }
+            if (b.achro)         { ++foldN[m]; foldP[m] += p; }
+            else if (b.nSec > 0) { ++specN[m]; specP[m] += p; }
         }
     }
     // "n/a" rather than "0.0%" for a medium the fold structurally cannot serve, so a rainbow
-    // curtain reads as out of scope instead of as a failure. `-beamachro off` prints nothing.
+    // curtain reads as out of scope instead of as a failure — but it still gets its bundle
+    // figure, which is the thing that is actually doing the work there. `-beamachro off` says
+    // nothing about the fold; a build with no bundles says nothing about bundles.
     auto foldStr = [&](size_t m, size_t n) -> std::string {
-        if (!pbeams::gAchro || m >= foldN.size() || !n) return std::string();
-        if (!foldN[m]) return std::string(", achromatic fold n/a");
+        if (m >= foldN.size() || !n) return std::string();
+        std::string out;
         char buf[128];
-        std::snprintf(buf, sizeof buf, ", %.1f%% folded achromatically (%.1f%% by power)",
-                      100.0 * (double)foldN[m] / (double)n,
-                      foldPT[m] > 0 ? 100.0 * foldP[m] / foldPT[m] : 0.0);
-        return std::string(buf);
+        if (pbeams::gAchro) {
+            if (!foldN[m]) out += ", achromatic fold n/a";
+            else {
+                std::snprintf(buf, sizeof buf,
+                              ", %.1f%% folded achromatically (%.1f%% by power)",
+                              100.0 * (double)foldN[m] / (double)n,
+                              foldPT[m] > 0 ? 100.0 * foldP[m] / foldPT[m] : 0.0);
+                out += buf;
+            }
+        }
+        if (specN[m]) {
+            std::snprintf(buf, sizeof buf, ", %.1f%% spectrally bundled (%.1f%% by power)",
+                          100.0 * (double)specN[m] / (double)n,
+                          foldPT[m] > 0 ? 100.0 * specP[m] / foldPT[m] : 0.0);
+            out += buf;
+        }
+        return out;
     };
     const size_t splitBudget = g_beamSplitMax > 0 ? (size_t)g_beamSplitMax : 0;
     if (g_beamRadiusAbs > 0.0) {
@@ -12207,16 +12231,23 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
                     areaBefore > 0 ? bm.totalBoxArea() / areaBefore : 1.0,
                     humanDur(std::chrono::duration<double>(
                                  std::chrono::steady_clock::now() - t0).count()).c_str());
-        // `-beamradius` has no per-medium line to hang the fold coverage on, so report it
+        // `-beamradius` has no per-medium line to hang the spectral coverage on, so report it
         // summed. The per-medium breakdown is the informative one (see foldStr above); this
         // branch is the expert override, and losing the breakdown is part of overriding.
         if (!foldN.empty()) {
-            size_t nA = 0; double pA = 0, pT = 0;
-            for (size_t m = 0; m < foldN.size(); ++m) { nA += foldN[m]; pA += foldP[m]; pT += foldPT[m]; }
+            size_t nA = 0, nS = 0; double pA = 0, pS = 0, pT = 0;
+            for (size_t m = 0; m < foldN.size(); ++m) {
+                nA += foldN[m]; nS += specN[m];
+                pA += foldP[m]; pS += specP[m]; pT += foldPT[m];
+            }
             if (nA)
                 say("%s photon beams: %zu of %zu folded achromatically (%.1f%% by count,"
                             " %.1f%% by power) — -beamachro\n", tag, nA, raw,
                             100.0 * (double)nA / (double)raw, pT > 0 ? 100.0 * pA / pT : 0.0);
+            if (nS)
+                say("%s photon beams: %zu of %zu spectrally bundled (%.1f%% by count,"
+                            " %.1f%% by power) — -beamspec\n", tag, nS, raw,
+                            100.0 * (double)nS / (double)raw, pT > 0 ? 100.0 * pS / pT : 0.0);
         }
     } else {
         const BeamMap::AutoInfo ai =

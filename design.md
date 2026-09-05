@@ -235,41 +235,78 @@ Four consequences worth knowing:
   **`-beamcount` therefore cannot be met by *thinning* in mode `J`** — but since 0.242.0 it is
   not inert: it is met by tracing **fewer subpaths**, sized by a discarded pilot. See the beam
   budget below.
-- **Mode `J`'s beams get the achromatic fold (0.250.0) but not the `-beamspec` bundle.** This
-  bullet used to say neither applied, on the grounds that both "need a wavelength-independent
+- **Mode `J`'s beams get BOTH the achromatic fold and the `-beamspec` bundle (0.250.0, 0.251.0).**
+  This bullet used to say neither applied, on the grounds that both "need a wavelength-independent
   `beta`" and a BDPT light subpath's is not (`Le` carries `spd(λ)·invPdfLambda` off the
   **scene-wide** emission sampler, so `spd/pdf` is a function of λ whenever the scene holds more
-  than one emitter — `gallery_rain` holds five). **That is right about the bundle and wrong about
-  the fold**, and the error cost a visibly iridescent cloud: mode `J` deposited one saturated
-  wavelength per subpath, and a beam is a *line*, so each deposit laid a coloured streak down a
-  whole chord.
-  - The **bundle** genuinely does need a λ-independent `beta`, because the record stores
-    wavelengths and *no weights* — every member has to carry identical power, and here they do
-    not. It stays off in mode `J`.
-  - The **fold** only needs the ESTIMATOR'S EXPECTATION to be λ-independent, which holds for any
-    sampling density `p`:
+  than one emitter — `gallery_rain` holds five). That error cost a visibly iridescent cloud *and*
+  rain curtain: mode `J` deposited one saturated wavelength per subpath, and a beam is a *line*,
+  so each deposit laid a coloured streak down a whole chord. Both halves are now fixed, by two
+  different arguments that are worth keeping separate.
+  - The **fold** (0.250.0) only needs the ESTIMATOR'S EXPECTATION to be λ-independent, which holds
+    for any sampling density `p`:
     `E_λ[β(λ)·CIE(λ)] = ∫p·(K·spd/p)·CIE = K∫spd·CIE`, and
     `E_λ[β(λ)]·cieMean = K(∫spd)·(∫spd·CIE/∫spd)` — the same number. So substituting
-    `Emitter::cieMean` for the sampled `CIE(λ)` is unbiased in mode `J` exactly as in mode `M`.
+    `Emitter::cieMean` for the sampled `CIE(λ)` is unbiased in mode `J` exactly as in mode `M`,
+    with no change to `beta` at all. That is what neutralised the cloud.
+  - The **bundle** genuinely does need a pointwise λ-independent `beta`, because the record stores
+    wavelengths and *no per-wavelength weights* — every member has to carry identical power. Mode
+    `J` gets there (0.251.0) by **converting its subpath into mode `M`'s**, analytically, at the
+    subpath's birth (`BeamSpectral` / `beginBeamSpectral`, `bdpt.h`):
+    - `scale = ∫spd_em / (spdFn(hero)·invPdfLambda(hero))` multiplies `beta` so that the
+      `spd_em(λ)/p_comb(λ)` it was carrying becomes the flat `∫spd_em` a mode-`M` photon carries.
+    - the deposit's wavelengths are then **all** drawn stratified from that emitter's OWN SPD.
+      The subpath's hero λ is **replaced, not extended**: it came from the scene-wide mixture
+      density, so weighting it `1/C` beside the others would bias the estimate toward
+      `∫p_comb·f` instead of `∫p_em·f`.
+
+    The result is arithmetically the deposit mode `M` would have made, so mode `M`'s bundle *and*
+    fold both become valid. This is a strict improvement even at `-beamspec 1 -beamachro off`,
+    where it reduces to "deposit at a wavelength drawn from the right density instead of the
+    wrong one" and removes the `spd_em/p_comb` weight-ratio variance — measurably: it took the
+    **cloud** crop's chroma noise *further* down (saturation 0.0560 → 0.0390) even though the
+    cloud was already folding.
+  - The two are **alternatives per beam, not additions** — `BeamBank::push` prefers the fold when
+    offered both — and `emitBeams` chooses **per medium**, so one segment crossing `gallery_rain`'s
+    achromatic cloud and its `phase rainbow` rain folds the cloud's beam and bundles the rain's.
+    The rain cannot fold (its scattering really is chromatic, so `mediumAchromatic` is false) but
+    it can and now does bundle, which is what neutralised the curtain. Measured on `gallery_rain`
+    at 640×360, 180 s, seed 1 — rain-crop saturation **0.1320 → 0.0928**, against mode `D`'s
+    0.0933 and mode `M`'s 0.1085, so mode `J` went from worst to matching the path-traced
+    reference and beating mode `M`. Whole-frame `Y` moved +0.2%, i.e. the λ swap introduced no
+    exposure shift.
+  - The λ swap is **MIS-safe**: `mergeEtaPrime` uses λ only for `md.sigmaT(λ)` and `trDet(...)`,
+    i.e. only for **extinction**, which `beamSpectralOK` already guarantees is λ-free scene-wide.
+    So the light-side merge partials (`accC`/`accM`, computed at `hb.lam[0]`) stay exactly right
+    while the *deposit* moves to a different wavelength.
   - Nothing on the CAMERA side has to be λ-independent either, and that is worth stating because
     it looks like an exposure and is not: the merge already multiplies a camera-λ throughput by a
     beam-λ colour (the documented spectral-mismatch fudge in `mergeWeightJ`), so the two λs are
     already independent draws. The fold replaces `E[CIE(λ_b)·g(λ_b)]` with `cieMean·E[g(λ_b)]`,
     which are equal under the same per-medium flatness the fold already tests — whatever the
     camera side happens to be.
-  - Implementation: `PathSeg` carries `achro`/`achroCie`, `randomWalk` runs the same
+  - Implementation: `PathSeg` carries `achro` (the per-segment half of the claim), the subpath
+    carries one `BeamSpectral` (the per-emitter half), and `randomWalk` runs the same
     survives-an-achromatic-scatter rule `Renderer::tracePhoton` runs (cleared by any surface
     event, by glass absorption, and by a scatter in a chromatic medium — but **not** by a scatter
-    in an achromatic one, which is what lets it ride the cloud's ~278 bounces), and
-    `traceLightBeamPass` sets `Renderer::beamAchroOK` and hands `sg.achroCie` to `emitBeams`.
+    in an achromatic one, which is what lets it ride the cloud's ~278 bounces). The rule tests the
+    medium the walk is scattering *in*, not the media the segment *crosses*, which is precisely
+    why a subpath that scattered in the cloud can still deposit a good bundle into the rain.
+    `traceLightBeamPass` hoists `beamSpecOK`/`beamAchroOK`/`beamSpecC` out of the worker
+    (`beamSpectralOK` scans every medium's spectra and must not run per subpath).
     No GRIN guard is needed, unlike the photon walk: `bdptUnsupportedFeature` refuses GRIN
-    scene-wide. No device twin is needed: the fold lands in `BeamMap::cie[]` at map-build time,
-    which is what the CUDA gather reads, and mode `J`'s light pass is CPU-only on both backends.
-  - What is left is the **rain**, whose `phase rainbow` makes `mediumAchromatic` false, so its
-    beams stay per-wavelength — correctly, since its scattering really is chromatic. Mode `M`
-    buys that back with `-beamspec 4`; mode `J` cannot, per the first sub-bullet, so it stays
-    chroma-noisier than mode `M` there at equal `-n`. Fixing it needs per-wavelength weights on
-    the record (already logged in `known-issues.md` as the follow-up to `-beamachro`).
+    scene-wide. No device twin is needed: both land in `BeamMap::cie[]` / `PhotonBeam::lamS[]` at
+    map-build time, which is what the CUDA gather reads, and mode `J`'s light pass is CPU-only on
+    both backends.
+  - Mode `D` is **bit-identical**: `generateLightSubpath`'s `bs` parameter defaults to `nullptr`
+    and only `traceLightBeamPass` passes one, so `beginBeamSpectral` — the only new RNG consumer —
+    never runs outside the beam pass and the general BDPT RNG stream is untouched.
+  - Coverage is reported per medium on the `photon beams: medium N:` log line, as
+    `NN% folded achromatically` and/or `NN% spectrally bundled`, each by count and by **power**
+    (`power × len`, since a long beam lays a long streak). A medium that structurally cannot fold
+    prints `achromatic fold n/a` rather than `0.0%`, so a rainbow curtain reads as out of scope
+    instead of as a failure — while still showing its bundle figure, which is what is doing the
+    work there.
 
 **Validation, passed 0.216.0** (`_fog_cornell.ftsl`, 128², `-device cpu`):
 
@@ -3088,6 +3125,11 @@ as the one at fault.
   `spd(λ)/pdf(λ) = ∫SPD` independent of λ, and every wavelength in the bundle carries exactly
   `power/nLam()`; the record stores wavelengths only, and the gather multiplies `invC = 1/nLam()`
   onto the *end* of the hero weight so the `nSec = 0` case stays bit-identical to pre-0.202.0.
+  **This is the one fact mode `J` had to buy rather than inherit** — its λ comes from the
+  scene-wide sampler, not the chosen emitter's SPD — which it does by converting `β` and redrawing
+  the deposit's wavelengths at birth (0.251.0; see the mode-`J` beam-map section above). Everything
+  below applies to both modes unchanged, because after that conversion the two deposits are the
+  same arithmetic.
   (2) **the gather's cost is almost entirely λ-independent** — geometry, `densityAt` (hoisted to
   one call shared by hero and secondaries) and the two ratio-tracking `mediaTransmittance` marches
   dominate and are shared; the per-λ tail is `sigma_s(λ)`, `phaseValue(cosθ, λ)` and three CIE

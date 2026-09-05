@@ -181,6 +181,11 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         r.useHero = heroOn; r.heroC = heroC;
         r.beamSpecC = aimed ? 1 : beamSpecC;
         r.beamAchroOK = !aimed && beamAchroOK;
+        // Mode M never consults this one — its photon is born at the chosen emitter's own
+        // spectral density, so it needs no conversion (see bdpt.h, BeamSpectral). It is set
+        // anyway so the field never reads as "this scene's extinction is chromatic" in a
+        // scene where it is not.
+        r.beamSpecOK = !aimed && bm && beamSpectralOK(scene);
         Pcg32 rng;
         const long long Np = aimed ? nAimed : N;
         const uint64_t salt = aimed ? 0x94D049BB133111EBULL : 0xEB44ACCAB455D165ULL;

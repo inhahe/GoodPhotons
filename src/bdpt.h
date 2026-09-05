@@ -646,16 +646,92 @@ struct PathSeg {
     // because x is a medium point); on the light side it is the beam's own transverse line
     // density. Zero for a walk that was not asked to record segments.
     double pdfDir = 0.0;
-    // ACHROMATIC-PATH STATE for the `-beamachro` fold (photonbeams.h). True while nothing
-    // wavelength-dependent has happened to `beta` since the subpath left the emitter, so the
-    // beam this segment deposits may be folded at the emitter's SPD-mean CIE instead of at
-    // the one sampled λ. `achroCie` is that mean. Carried on the SEGMENT rather than read at
-    // the deposit site because the deposit happens later, in the mode-J beam pass, long after
-    // the walk that established the claim has moved on. See randomWalk for the update rule.
-    Vec3 achroCie{0, 0, 0};
+    // SPECTRAL-CLAIM STATE (see BeamSpectral below). True while nothing wavelength-dependent
+    // has happened to `beta` since the subpath left the emitter, so the beam this segment
+    // deposits may be re-expressed at the emitter's own spectral density — folded to its
+    // SPD-mean CIE (`-beamachro`), or spread over a stratified bundle (`-beamspec`), or at
+    // worst moved to a single wavelength drawn from the right density instead of the wrong
+    // one. Carried on the SEGMENT rather than read at the deposit site because the deposit
+    // happens later, in the mode-J beam pass, long after the walk that established the claim
+    // has moved on. See randomWalk for the update rule.
     bool achro = false;
 };
 using PathSegs = std::vector<PathSeg>;
+
+// THE EMITTER-SIDE SPECTRAL CLAIM a mode-J light subpath hands to its beam deposits.
+//
+// Built once at the subpath's birth and read back unchanged at every deposit that subpath
+// makes; `PathSeg::achro` says whether the claim was still alive where a given segment
+// began. It exists because the two beam-depositing modes draw λ from different densities
+// and the beam record cannot express the difference:
+//
+//   * render.h's photon (mode M) draws λ from the CHOSEN emitter's own SPD. Its pdf is
+//     spd/∫spd, so spd(λ)/p(λ) is that emitter's SPD integral for every λ alike and the
+//     photon's power comes out λ-free. THAT is what lets a beam store several wavelengths
+//     with no per-wavelength weight, and what makes the mean-CIE fold exact.
+//   * bdpt.h (mode J) draws λ from the SCENE-WIDE `emitSampler`, before the emitter is even
+//     chosen, because the camera and light subpaths must agree on a hero wavelength. So a
+//     mode-J subpath's beta carries spd_em(λ)/p_comb(λ), which genuinely varies with λ
+//     whenever the scene mixes emitters of different colour — gallery_rain has five.
+//
+// `scale` converts the second into the first: multiplying beta by it replaces
+// spd_em(λ)/p_comb(λ) with ∫spd_em, giving exactly the power render.h's photon would have
+// carried. `lam[0..nLam)` are C wavelengths drawn stratified from the emitter's OWN SPD,
+// replacing the hero for the deposit — the hero comes from the wrong density and so cannot
+// be a bundle member (weighting it like the others would bias the estimate toward
+// ∫p_comb·f instead of ∫p_em·f). Both together make mode J's deposit arithmetically
+// identical to mode M's, which is what lets it use mode M's bundle AND its fold.
+//
+// Note this is a strict improvement even at `-beamspec 1 -beamachro off`, where it reduces
+// to "deposit at one wavelength drawn from the emitter's SPD rather than from the mixture":
+// the estimator loses the spd_em(λ)/p_comb(λ) weight ratio, which in a five-emitter scene
+// is itself a large source of beam-to-beam variance.
+struct BeamSpectral {
+    Vec3   cie{0, 0, 0};              // Emitter::cieMean — the `-beamachro` fold colour
+    double scale = 1.0;               // ∫spd_em / (spdFn(hero) · invPdfLambda(hero))
+    double lam[kBeamSpecMax] = {0};   // C wavelengths ~ this emitter's own SPD
+    int    nLam = 0;
+    bool   ok = false;                // false: deposit exactly as a pre-0.251.0 build did
+};
+
+// Fill `bs` at a light subpath's birth. `leSpectral` is the λ-DEPENDENT part of the emitted
+// radiance — spdFn(hero) · invPdfLambda(hero) — and is the only thing `scale` has to undo,
+// because every other factor in Le (the emission pattern, a spot's falloff, the cosine and
+// the three pdfs) is λ-free and cancels between the two forms.
+inline void beginBeamSpectral(const Scene& scene, const Renderer& mats, const Emitter& em,
+                              double leSpectral, Pcg32& rng, BeamSpectral& bs) {
+    bs = BeamSpectral{};
+    // An IMAGE environment is excluded for the reason render.h excludes it from its bundle:
+    // its emitted radiance carries a directional factor L(dir,λ)/spd(λ) that is genuinely
+    // per-wavelength, so no single `scale` describes it. (BDPT refuses env maps today; the
+    // guard costs nothing and keeps this honest if that ever changes.)
+    if (!mats.beamDeposit || !mats.beamSpecOK) return;
+    if (em.shape == EmitterShape::Env && scene.envMap) return;
+    if (!(leSpectral > 0.0) || !(em.spd.integral > 0.0)) return;
+    bs.scale = em.spd.integral / leSpectral;
+    bs.cie   = em.cieMean;
+    const int C = mats.beamSpecC < 1 ? 1
+                : (mats.beamSpecC > kBeamSpecMax ? kBeamSpecMax : mats.beamSpecC);
+    // ONE uniform variate, stratified: member i takes u + i/C wrapped into [0,1) through the
+    // emission CDF, so the bundle spans the emitter's spectrum instead of clumping. Same
+    // scheme render.h uses, deliberately, so the two modes' bundles stratify alike.
+    const double u0 = rng.uniform();
+    for (int i = 0; i < C; ++i) {
+        double uu = u0 + (double)i / (double)C;
+        if (uu >= 1.0) uu -= 1.0;
+        double pI = 0.0;
+        const double lI = em.spd.sampleAt(uu, pI);
+        // A zero-density member would have to be given weight 0 while the survivors kept 1/C,
+        // and the record stores no per-wavelength weight — so drop the WHOLE claim rather
+        // than renormalise over the survivors, which would over-count them. (Inverting a CDF
+        // at a uniform variate cannot land in a zero-mass bin, so this is a guard, not a
+        // path.)
+        if (!(pI > 0.0)) { bs = BeamSpectral{}; return; }
+        bs.lam[i] = lI;
+    }
+    bs.nLam = C;
+    bs.ok   = true;
+}
 
 // Continue a subpath whose endpoint is already path[0] (Camera or Light). `ray` is
 // the first ray leaving that endpoint; `beta` the throughput carried along it;
@@ -673,8 +749,8 @@ using PathSegs = std::vector<PathSeg>;
 // refracted direction, so the bundle de-heros: nUp drops to 1 for this and every
 // later vertex. See Vertex::nUp for why no ×C boost is applied here.
 //
-// `achroIn`/`achroCieIn` seed the achromatic-path claim for the `-beamachro` fold (see
-// PathSeg::achro). A caller that does not deposit beams leaves them off and the walk is
+// `achroIn` seeds the spectral claim the beam deposits rest on (see BeamSpectral and
+// PathSeg::achro). A caller that does not deposit beams leaves it off and the walk is
 // bit-identical. No GRIN guard is needed here, unlike render.h's photon walk, which has to
 // exclude a bent path per medium: BDPT refuses a scene containing ANY gradient-index medium
 // outright (`bdptUnsupportedFeature`, main.cpp), so a mode-J walk can never bend.
@@ -682,13 +758,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                        Ray ray, double beta, double pdfDir, const HeroBundle& hb,
                        int maxDepth, Mode mode, Pcg32& rng, std::vector<Vertex>& path,
                        const double* betaSecIn, int nUpIn, Escape* esc = nullptr,
-                       PathSegs* segs = nullptr,
-                       bool achroIn = false, const Vec3* achroCieIn = nullptr) {
+                       PathSegs* segs = nullptr, bool achroIn = false) {
     (void)cam;   // cam reserved for future NEE-to-camera use; mode now drives adjoint corr
     const double lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
-    bool achroPath = achroIn && achroCieIn;
-    const Vec3 achroCie = achroCieIn ? *achroCieIn : Vec3(0, 0, 0);
+    bool achroPath = achroIn;
     double pdfFwd = pdfDir;   // solid-angle density of the current ray direction
     // Live secondary throughputs. betaSec[i] tracks wavelength hb.lam[i+1].
     double betaSec[hero::kHeroMax - 1] = {0};
@@ -728,7 +802,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             sg.aGlass = curAbsorb(lambda);
             sg.vert = (int)path.size() - 1;
             sg.pdfDir = pdfFwd;          // solid-angle density of ray.d (see PathSeg::pdfDir)
-            // Snapshot the achromatic claim AS IT STANDS AT THE SEGMENT ORIGIN, which is the
+            // Snapshot the spectral claim AS IT STANDS AT THE SEGMENT ORIGIN, which is the
             // point the deposited beam's power refers to (`beta` above is the same snapshot,
             // taken for the same reason). The per-iteration rule below decides the NEXT
             // segment, not this one.
@@ -740,7 +814,6 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             // condition render.h's tracePhoton reaches by clearing the flag with the
             // Beer-Lambert step that precedes its deposit.
             sg.achro = achroPath && !(sg.aGlass > 0.0);
-            sg.achroCie = achroCie;
             segs->push_back(sg);
         }
 
@@ -781,23 +854,26 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
         }
 
-        // THE ACHROMATIC-PATH RULE, applied once per iteration, unconditionally, and BEFORE
+        // THE SPECTRAL-CLAIM RULE, applied once per iteration, unconditionally, and BEFORE
         // the event below is acted on — the segment above already took its snapshot, so what
-        // is being decided here is whether the NEXT segment may still fold. The claim is that
-        // beta represents the whole band at equal power; an event that is itself
-        // wavelength-independent leaves it intact, and a scatter in an achromatic medium is
-        // exactly such an event (achromatic sigma_t for the free flight that reached it, a
-        // flat albedo for the roulette, and an HG direction that depends only on `g`).
-        // Everything else — any surface interaction, a scatter in a `phase rainbow` or
-        // spectrally-varying medium, absorption in glass (handled above) — clears it.
+        // is being decided here is whether the NEXT segment may still claim. The claim is
+        // that beta is still the emitter's own spectrum times a λ-free factor; an event that
+        // is itself wavelength-independent leaves that intact, and a scatter in an achromatic
+        // medium is exactly such an event (achromatic sigma_t for the free flight that
+        // reached it, a flat albedo for the roulette, and an HG direction that depends only
+        // on `g`). Everything else — any surface interaction, a scatter in a `phase rainbow`
+        // or spectrally-varying medium, absorption in glass (handled above) — clears it.
         //
-        // That weaker-than-the-bundle rule is the whole point: at gallery_rain's cloud albedo
-        // of 0.9964 a light subpath scatters on the order of 278 times inside the cloud, so a
-        // one-event rule would reach ~1 deposit in 278 there. This reaches all of them, which
-        // is what stops mode J's clouds coming out iridescent. The rain curtain uses `phase
-        // rainbow`, so mediumAchromatic is false for it and its beams stay per-wavelength —
-        // correctly, since its scattering really is chromatic. (Twins: render.h tracePhoton
-        // and render_cuda.cu, same position in each.)
+        // That the rule survives a scatter at all is the whole point: at gallery_rain's cloud
+        // albedo of 0.9964 a light subpath scatters on the order of 278 times inside the
+        // cloud, so a one-event rule would reach ~1 deposit in 278 there. This reaches all of
+        // them, which is what stops mode J's clouds coming out iridescent.
+        //
+        // Note the test is on the medium the walk is scattering IN, not on the media the
+        // segment crosses: a subpath that scatters in the achromatic cloud keeps the claim
+        // and its next segment can still deposit a good beam into the `phase rainbow` rain it
+        // passes through — as a stratified bundle rather than a fold, which emitBeams decides
+        // per medium. (Twins: render.h tracePhoton and render_cuda.cu, same position.)
         if (achroPath && !(mediumEvent && mediumAchromatic(scene.media[scatterMed])))
             achroPath = false;
 
@@ -1241,7 +1317,7 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
 inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Renderer& mats,
                              const Emitter& em, double pdfChoice, const HeroBundle& hb,
                              int maxDepth, Pcg32& rng, std::vector<Vertex>& path,
-                             PathSegs* segs = nullptr) {
+                             PathSegs* segs = nullptr, BeamSpectral* bs = nullptr) {
     const double lambda = hb.lam[0], invPdfLambda = hb.invPdf[0];
     const bool isSun = (em.shape == EmitterShape::Sun);
     double u1 = rng.uniform(), u2 = rng.uniform();
@@ -1293,15 +1369,14 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
     double betaWalkSec[hero::kHeroMax - 1];
     for (int i = 0; i + 1 < hb.C; ++i) betaWalkSec[i] = LeSec[i] * invP;
     Ray ray{org, dir};
-    // Achromatic-path birth (see randomWalk / PathSeg::achro). `fall` and the cone pdf are
+    // Spectral-claim birth (see BeamSpectral). `fall` and the cone pdf are
     // wavelength-independent, so a spot or a sun starts the walk with the claim intact for
-    // exactly the same reason an area light does. An emitter with no visible-band energy has
-    // cieMean {0,0,0} and stays per-wavelength.
-    const bool achro0 = mats.beamAchroOK && mats.beamDeposit &&
-                        (em.cieMean.x > 0.0 || em.cieMean.y > 0.0 || em.cieMean.z > 0.0);
+    // exactly the same reason an area light does, and `spdFn(lambda) * invPdfLambda` is the
+    // whole of the λ-dependence in `Le`.
+    if (bs) beginBeamSpectral(scene, mats, em, em.spdFn(lambda) * invPdfLambda, rng, *bs);
     randomWalk(scene, cam, mats, ray, betaWalk, pdfDir, hb, maxDepth - 1,
                Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs,
-               achro0, &em.cieMean);
+               bs && bs->ok);
     // Infinite-light density patch (PBRT): the first scene vertex was given a solid-angle
     // density converted with 1/dist^2 from the fictitious disc point, but the reverse
     // direction (vertexPdfLight) reports the planar 1/(pi R^2). Rewrite it to match.
@@ -1322,9 +1397,13 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
 inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Renderer& mats,
                                 const HeroBundle& hb, int maxDepth,
                                 Pcg32& rng, std::vector<Vertex>& path,
-                                PathSegs* segs = nullptr) {
+                                PathSegs* segs = nullptr, BeamSpectral* bs = nullptr) {
     const double lambda = hb.lam[0], invPdfLambda = hb.invPdf[0];
     path.clear();
+    // No claim until an emitter is chosen and accepted below; a caller that reuses one
+    // `BeamSpectral` across subpaths must not see the previous subpath's claim on a path
+    // that took one of the early returns.
+    if (bs) *bs = BeamSpectral{};
     if (scene.emitters.empty() || scene.totalPower <= 0.0) return 0;
     int ei = scene.selectEmitter(rng);
     const Emitter& em = scene.emitters[ei];
@@ -1332,7 +1411,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     if (pdfChoiceSel <= 0.0) return 0;
     if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Sun)
         return deltaLightSubpath(scene, cam, mats, em, pdfChoiceSel, hb, maxDepth, rng, path,
-                                segs);
+                                segs, bs);
     if (em.shape == EmitterShape::Env || em.collimated)
         return 0;                                    // unsupported in BDPT scope
 
@@ -1378,24 +1457,15 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     for (int i = 0; i + 1 < hb.C; ++i)
         betaWalkSec[i] = L0.betaSec[i] * cosLight / (pdfChoice * pdfPos * pdfDir);
     Ray ray{y + nOut * 1e-6, dir};
-    // ACHROMATIC-PATH BIRTH for the `-beamachro` fold (photonbeams.h; twin of the block in
-    // render.h's tracePhoton). The claim the fold rests on is that the beam's power is the
-    // same for every wavelength in the band up to one common factor — and that holds here
-    // even though `betaWalk` is manifestly λ-dependent (Le = spdFn(λ)/pdf(λ) × …), because
-    // what has to be λ-independent is the ESTIMATOR'S EXPECTATION, not one draw:
-    //
-    //     E_λ[ β(λ)·CIE(λ) ]  =  ∫ p(λ) · K·spd(λ)/p(λ) · CIE(λ) dλ  =  K ∫ spd·CIE dλ
-    //     E_λ[ β(λ) ]·cieMean =  K (∫ spd dλ) · (∫ spd·CIE / ∫ spd)  =  the same
-    //
-    // for ANY sampling density p, which matters because mode J draws λ from the scene-wide
-    // `emitSampler` (all emitters combined) rather than from this emitter's own SPD. So the
-    // fold replaces one noisy CIE(λ) draw with its exact mean and changes nothing else.
-    // Emitters with no visible-band energy carry cieMean {0,0,0} and stay per-wavelength.
-    const bool achro0 = mats.beamAchroOK && mats.beamDeposit &&
-                        (em.cieMean.x > 0.0 || em.cieMean.y > 0.0 || em.cieMean.z > 0.0);
+    // SPECTRAL-CLAIM BIRTH for the beam deposits (see BeamSpectral; twin of the bundle and
+    // achro blocks in render.h's tracePhoton). `Le`'s only λ-dependence is
+    // `spdFn(lambda) * invPdfLambda` — `emitPatW`, the cosine and all three pdfs are λ-free —
+    // so that product is exactly what `scale` has to undo to recover the emitter-normalised
+    // power a mode-M photon would have carried.
+    if (bs) beginBeamSpectral(scene, mats, em, em.spdFn(lambda) * invPdfLambda, rng, *bs);
     randomWalk(scene, cam, mats, ray, betaWalk, pdfDir, hb, maxDepth - 1,
                Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs,
-               achro0, &em.cieMean);
+               bs && bs->ok);
     return (int)path.size();
 }
 
@@ -1675,21 +1745,27 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // so it must run the SAME code that makes them. A separate hand-written estimator would
     // silently drift the first time the deposit rule changed.
 
-    // Whether the `-beamachro` fold may be used at all in this scene, hoisted out of the
-    // worker because beamSpectralOK() scans every medium's spectra and must not run per
-    // subpath. Mode M's driver sets the identical flag in photonmap_render.h; without it
-    // here, mode J deposited a beam at ONE saturated wavelength per subpath and painted the
-    // cloud in coloured streaks — a beam is a line, so a monochromatic deposit lays its hue
-    // down a whole chord and reads as iridescent structure rather than as grain.
-    const bool beamAchroOK = pbeams::gAchro && beamSpectralOK(scene);
+    // The scene-wide spectral predicate, hoisted out of the worker because beamSpectralOK()
+    // scans every medium's spectra and must not run per subpath. Mode M's driver sets the
+    // same three fields in photonmap_render.h; without them here, mode J deposited a beam at
+    // ONE saturated wavelength per subpath — drawn, worse, from the scene-wide mixture rather
+    // than from the emitter that actually emitted it — and painted both media in coloured
+    // streaks. A beam is a LINE, so a monochromatic deposit lays its hue down a whole chord
+    // and reads as iridescent structure rather than as grain.
+    const bool beamSpecOK  = beamSpectralOK(scene);
+    const bool beamAchroOK = pbeams::gAchro && beamSpecOK;
+    const int  beamSpecC   = beamSpecOK ? pbeams::gSpecC : 1;
 
     auto worker = [&](int tid, long long total, uint64_t salt, bool pilot) {
         Renderer mats; mats.diffraction = diffraction;
         mats.beamDeposit = &banks[(size_t)tid];
         mats.beamAchroOK = beamAchroOK;
+        mats.beamSpecOK  = beamSpecOK;
+        mats.beamSpecC   = beamSpecC;
         Pcg32 rng;
         std::vector<Vertex> path;
         PathSegs segs;
+        BeamSpectral bs;                               // per-subpath, reset by every call
         std::vector<BeamMis>& misBank = misBanks[(size_t)tid];
         std::vector<double> accC, accM;                // per-subpath, reused
         const PatTables tabs = scene.patTables();
@@ -1715,7 +1791,21 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             hb.invPdf[0] = scene.invPdfLambda(hb.lam[0]);
             hb.C = 1;
             segs.clear();
-            generateLightSubpath(scene, cam, mats, hb, maxDepth + 1, rng, path, &segs);
+            generateLightSubpath(scene, cam, mats, hb, maxDepth + 1, rng, path, &segs, &bs);
+            // The deposit form this subpath's segments will use, decided once (it is a
+            // property of the emitter, not of the segment; `sg.achro` supplies the per-segment
+            // half). See BeamSpectral for why the hero wavelength is REPLACED rather than
+            // extended: it comes from the scene-wide mixture density, and a bundle member
+            // weighted 1/C has to come from the emitter's own.
+            const double* dLamS = (bs.ok && bs.nLam > 1) ? bs.lam + 1 : nullptr;
+            const int     dSec  = (bs.ok && bs.nLam > 1) ? bs.nLam - 1 : 0;
+            // The fold is the one part still gated on `-beamachro`; the rest of the claim is
+            // unconditional because it costs nothing and is never worse.
+            const Vec3*   dCie  = (bs.ok && beamAchroOK &&
+                                   (bs.cie.x > 0.0 || bs.cie.y > 0.0 || bs.cie.z > 0.0))
+                                  ? &bs.cie : nullptr;
+            const double  dLam  = bs.ok ? bs.lam[0] : hb.lam[0];
+            const double  dSc   = bs.ok ? bs.scale : 1.0;
 
             // --- The light half of every merge weight this subpath can take part in -------
             // Both accumulators telescope exactly as misWeight's light loop does, one vertex
@@ -1733,9 +1823,12 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 // the merge-weight prefixes below would be computed for nothing.
                 for (const PathSeg& sg : segs)
                     if (sg.beta > 0.0)
-                        mats.emitBeams(scene, sg.o, sg.d, sg.tMax, hb.lam[0], sg.beta,
+                        mats.emitBeams(scene, sg.o, sg.d, sg.tMax,
+                                       sg.achro ? dLam : hb.lam[0],
+                                       sg.achro ? sg.beta * dSc : sg.beta,
                                        sg.aGlass, rng, Renderer::MedAll,
-                                       nullptr, 0, sg.achro ? &sg.achroCie : nullptr);
+                                       sg.achro ? dLamS : nullptr, sg.achro ? dSec : 0,
+                                       sg.achro ? dCie : nullptr);
                 continue;
             }
             accC.assign(np, 0.0);
@@ -1759,14 +1852,19 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 // MedAll, not the emitBeams default MedStraight: nothing about this span is
                 // carried stochastically (that is what LONG means), so every medium the
                 // lead-in crosses must be charged. See Renderer::emitBeams.
-                // `sg.achro` is the achromatic-path claim as it stood where this span began
+                // `sg.achro` is the spectral claim as it stood where this span began
                 // (randomWalk / PathSeg::achro); emitBeams then asks the further, per-medium
                 // question of whether THIS medium's gather tail is flat, so a subpath crossing
                 // the achromatic cloud and the `phase rainbow` rain in one step folds the
-                // cloud's beam and leaves the rain's at its own wavelength.
-                mats.emitBeams(scene, sg.o, sg.d, sg.tMax, hb.lam[0], sg.beta, sg.aGlass,
-                               rng, Renderer::MedAll,
-                               nullptr, 0, sg.achro ? &sg.achroCie : nullptr);
+                // cloud's beam to a single colour and gives the rain's a stratified bundle
+                // instead — the rain's scattering really is chromatic, so its beam has to keep
+                // wavelengths, it just no longer has to keep only ONE.
+                mats.emitBeams(scene, sg.o, sg.d, sg.tMax,
+                               sg.achro ? dLam : hb.lam[0],
+                               sg.achro ? sg.beta * dSc : sg.beta,
+                               sg.aGlass, rng, Renderer::MedAll,
+                               sg.achro ? dLamS : nullptr, sg.achro ? dSec : 0,
+                               sg.achro ? dCie : nullptr);
                 const size_t after = banks[(size_t)tid].beams.size();
                 if (after == before) continue;
 
