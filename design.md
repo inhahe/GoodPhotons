@@ -713,7 +713,27 @@ why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
   the tree (22 KB) costs ~42 ms of lex+parse. `tools/gpda_lexcheck/` is the permanent
   differential validator for the lexer's fast paths: it brute-forces that no rule's
   first-set ever excludes a byte the rule's own regex could match, and that the fast
-  lexer's token stream is identical to a naive all-regex one.
+  lexer's token stream is identical to a naive all-regex one. It also pins the
+  **comment-marker semantics** as literal token streams — a check nothing else covers,
+  because both of the above compare the lexer against *itself* and so pass happily on a
+  wrong rule table.
+
+  **Comment markers (0.248.0): `#` and `//`.** `#` is the original; `//` was added
+  because it is what an author who has written any C-family language types without
+  thinking, and until then it rejected the *whole file* with a message that never said
+  the word "comment" (`//` lexed as a WORD, the following word became a block name, and
+  the parser demanded a `{`). One grammar terminal changed —
+  `COMMENT = /(?:#|\/\/)[^\n]*/` — and rule order plus longest match does the rest:
+  `// foo` is 6 chars of COMMENT against 2 of WORD so COMMENT wins, while in `a//b` no
+  rule *starts* at the slashes at all, so an embedded `//` cannot cut a bareword or an
+  unquoted path in half. (That is a deliberate asymmetry with `#`, which *is* excluded
+  from WORD's character class and does split `a#b`.) Verified by tokenizing all 683
+  `.ftsl` in the tree under the old and new tables: exactly one file differs, the
+  purpose-built repro. There is no `/* … */` and there will not be — NEWLINE is a
+  significant token here, so a comment able to cross a line would silently delete the
+  statement separators it crossed; instead `ftsl_frontend.hpp::block_comment_hint`
+  appends a named diagnostic when a failing parse has a `/*` at a token start on the
+  error's line, so the twin trap also has a way out.
 - **`scene.h` / `ftsl.h`** — scene model and the FTSL semantic pass
   (cameras, camera_curve/path/orbit, materials, lights, media, implicits, meshes).
   `FTSL.md` documents the language. Everything downstream of

@@ -6,7 +6,8 @@
 // already renders) plus Phase 1e (full mesh transforms).
 //
 // Grammar (informal):
-//   # line comment
+//   # line comment                             // …also works; both run to end of line
+//                                              // (no /* … */ — see ftsl_frontend.hpp)
 //   spectrum "name" = <spectrum-expr>          # named reusable spectrum
 //   material "name" { key value ...  key value }
 //   material "name" { type mix  layer "child" w  layer "child2" w  ... }  # stochastic blend

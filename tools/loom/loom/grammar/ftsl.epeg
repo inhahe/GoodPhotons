@@ -20,7 +20,10 @@ start element
 
 # ---- skips + terminals ----------------------------------------------
 WS      = /[ \t]+/ @skip           # inter-token whitespace, always invisible
-COMMENT = /#[^\r\n]*/ @skip        # `# …` to end of line
+# `# …` or `// …` to end of line.  Both markers, matching ftsl_scene.epeg (see the long
+# note there): loom READS hand-written .ftsl with this grammar, so a marker ftrace
+# accepts and loom rejects would make loom unable to open a scene that renders fine.
+COMMENT = /(?:#|\/\/)[^\r\n]*/ @skip
 NEWLINE = /\r?\n/                  # significant: delimits channel lines
 
 # A compact `LO-HI` domain (incl. `-1-2`): matched whole so its inner dash

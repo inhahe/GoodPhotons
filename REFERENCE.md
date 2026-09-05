@@ -4234,6 +4234,15 @@ sphere=((0.5, 0.45, 0.5), 0.32), density_max=1.2)`.
 > default, spectrum/pattern/material form, and parsing quirk). The overview below is a
 > quick tour; `FTSL.md` is the authoritative spec.
 
+**Comments are `#` or `//`, to end of line.** Both markers are equivalent and both stop
+at the newline; `#` is the canonical one used throughout `scenes/`, and `//` is accepted
+because it is what most people type by reflex. There is deliberately **no `/* … */`** —
+newlines are significant in FTSL (they end statements), so a comment that could cross a
+line would silently delete the statement separators it crossed; a scene containing a
+stray `/*` gets a parse error that says exactly that. A marker only starts a comment at
+the **beginning of a token**, so a `//` inside a bareword (or inside a quoted path, which
+lexes as a string) is left alone.
+
 An FTSL file is a list of blocks. Top-level block types: `scene` (the
 `units …` / `spectral …` header), `material`, `texture`, `pattern` (procedural scalar
 field), `spectrum`, `sphere`, `quad`, `triangle`, `mesh`, `curve` (a hair/fur/wire

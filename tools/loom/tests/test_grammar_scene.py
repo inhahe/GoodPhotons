@@ -113,5 +113,34 @@ def test_camera_fields_roundtrip():
     assert back.emit(_ctx()) == cam.emit(_ctx())
 
 
+def test_both_comment_markers_are_skipped():
+    """`#` and `//` are equivalent line comments (0.248.0).
+
+    `//` was added because it is the marker everyone reaches for first, and before
+    0.248.0 it rejected the whole file with an error that never said "comment".
+    Loom reads hand-written .ftsl with this grammar, so a marker ftrace accepts and
+    loom rejects would leave loom unable to open a scene that renders fine — hence a
+    test here and not only on the C++ side.
+    """
+    for marker in ("#", "//"):
+        src = ("%s leading comment\n"
+               "l = light { kind point   %s trailing comment\n"
+               "  spd blackbody 3200     %s another\n"
+               "}\n" % (marker, marker, marker))
+        lt = parse_element(src)
+        assert lt.props["spd"] == "blackbody 3200", marker
+
+
+# NOTE — the "a marker only counts at a TOKEN START" rule is deliberately NOT asserted
+# here.  It is a property of ftrace's catch-all WORD terminal (`ftsl_scene.epeg`), which
+# runs straight through an embedded `//`; this typed grammar has no such terminal (NAME /
+# NUMBER / REF / KVWORD carve the same text up differently), so `a//b` is two tokens here
+# and the trailing `//b` really is a comment.  That divergence is inside the documented
+# scope boundary between the two grammars (DESIGN.md: full-language barewords are
+# `ftsl_scene.epeg`'s job), and it is unreachable in practice — no `.ftsl` in the tree
+# contains `//` at all.  The token-start rule is asserted where it belongs, against the
+# real table, in tools/gpda_lexcheck/lexcheck.cpp.
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

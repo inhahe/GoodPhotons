@@ -12,12 +12,20 @@ This is the complete reference; the loader lives in `src/ftsl.h`.
 
 ## 1. Lexical structure
 
-- **Comments**: `#` to end of line (anywhere).
+- **Comments**: `#` **or** `//`, to end of line (anywhere). There is no `/* … */`:
+  newlines are significant here (they end statements), so a comment able to cross a
+  line would delete the separators it crossed. A `/*` in a scene that fails to parse
+  is diagnosed by name rather than left as a mystery syntax error.
+  A marker is only recognised at the **start of a token**, so `a//b` stays one
+  bareword — quote paths (`"…"`) as everything in the corpus already does and `//`
+  inside them is untouched.
 - **Whitespace**: spaces / tabs / newlines separate tokens. Newlines terminate
   statements, but several `key value` pairs may share one line.
 - **Strings**: `"double quoted"` — used for block names and quoted expressions.
 - **Braces**: `{ … }` open a block body or a nested sub-block.
-- **Barewords**: any run of non-space, non-brace, non-quote, non-`#` characters. A
+- **Barewords**: any run of non-space, non-brace, non-quote, non-`#` characters (a
+  `//` *inside* one does not split it — only a `//` that begins a token starts a
+  comment). A
   bareword is a *number* iff `strtod` consumes all of it (`-1`, `0.999`, `1e30`).
 
 ### 1.1 Statements and value continuations

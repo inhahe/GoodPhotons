@@ -888,7 +888,7 @@ gpda_tok::Graph build_ftsl_scene_graph() {
 std::vector<gpda_lex::LexRule> ftsl_scene_lex_rules() {
     return {
         {"WS", "[ \\t\\r]+"},
-        {"COMMENT", "#[^\\n]*"},
+        {"COMMENT", "(?:#|\\/\\/)[^\\n]*"},
         {"NEWLINE", "\\n"},
         {"STRING", "\"[^\"]*\""},
         {"PARENWORD", "\\((?:[^\\r\\n(){}#\"]|\\((?:[^\\r\\n(){}#\"]|\\((?:[^\\r\\n(){}#\"]|\\([^\\r\\n(){}#\"]*\\))*\\))*\\))*\\)"},
