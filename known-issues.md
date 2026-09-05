@@ -5,6 +5,38 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### J-BANNER — FIXED (2026-09-05, v0.249.0): every mode-`J` refresh epoch printed "(-n given: no beam budget)" on a command line with no `-n`, quoted the wrong subpath count, and repeated the whole header once per epoch
+
+**Symptom.** `ftrace -in scenes/gallery_rain.ftsl -mode J -device gpu -camera cam -r 320 180
+-spp 96` — no `-n` anywhere — printed, five times:
+
+```
+mode J: UPBP at 320x180 — ... — tracing 2000000 light subpaths for the beam map (-n given: no beam budget) ...
+```
+
+Three separate falsehoods in one line. `-n` was **not** given (the run was knee-bound, and epoch 0
+had already said so). `2000000` is the *default* `N`, not what the epoch traces — the refresh
+traces `jbb.pathsUsed`, here **420131**, a 4.8× overstatement. And the line repeated per epoch,
+directly contradicting the "Said ONCE" comment three lines above it, burying the `-interval`
+status lines that carry the actual progress.
+
+**Root cause — keying a message on a variable that merely correlates with the thing it means.**
+The banner was one `if (epoch == 1) / else if (jreq.maxBeams > 0) / else` chain. A refresh sets
+`jreq.maxBeams = 0` **by design** (`(g_nFromCli || !first) ? 0 : g_beamTarget` — the sizing
+question is answered once at epoch 0 and re-asking it would cost a pilot per epoch to get the
+same answer with more noise on it). So on epoch ≥ 2 the chain fell past the `epoch == 1` arm,
+found `maxBeams == 0`, and printed the sentence written for "the user gave `-n`". `maxBeams == 0`
+had two causes and the message assumed one of them.
+
+**Fix.** Branch on the **epoch** first, which is what the three messages are actually about:
+epoch 0 announces the sizing, epoch 1 announces that refreshes happen, epoch ≥ 2 is silent. The
+`-n` sentence is now reachable only from epoch 0, where it is true by construction. The count in
+it also changed from `N` to `Nepoch`.
+
+**Why it mattered beyond tidiness.** It was found while measuring mode `J` for a per-element
+accuracy comparison, where the first question is "did the beam budget engage?" — and the banner
+was asserting it had not.
+
 ### J-BEAMCOST — FIXED (2026-09-04, v0.242.0): mode J's beam map was sized by `-n` alone, so the default budget built a 12 M-beam / 1.2 GB map with a degenerate BVH — and an *open* scene made every beam run to the escape clamp
 
 **Symptom.** `ftrace -in scenes/_fog_cornell.ftsl -mode J -device cpu -max-bounce 8 -r 64
@@ -898,7 +930,18 @@ python scraps/_jgpu_cmp.py png/ref64.pfm png/n256.pfm     # ~1.63
 python scraps/_jgpu_cmp.py png/ref64.pfm png/n8192.pfm    # ~1.01
 ```
 
-### MEM — OPEN (2026-09-02, v0.216.0): mode `J`'s beam map has **no trim** — it is sized by `-n` alone, and `-beamcount` is inert
+### MEM — SUPERSEDED (2026-09-02, v0.216.0; resolved by J-BEAMCOST in v0.242.0, differently than proposed below): mode `J`'s beam map has **no trim** — it is sized by `-n` alone, and `-beamcount` is inert
+
+> **How it was actually resolved.** The "exact uniform trim" proposed below was never needed,
+> because J-BEAMCOST attacked the *input* rather than the output: `-beamcount` is now met by
+> **tracing fewer subpaths**, not by thinning the beams a subpath produced. That sidesteps the
+> whole difficulty this entry is about — no beam is ever discarded, so `p_M` never has to know a
+> survival probability — and it bounds memory strictly, because the count is decided *before* the
+> beams exist. The map now also sizes itself from the scene's `-beamk` knee, so the default no
+> longer depends on `-n` at all. `-beamcount` is a live resource ceiling in mode `J`, not inert;
+> the closing sentence below ("`-beamcount` should be documented as mode-`M`-only") is obsolete
+> and REFERENCE.md was corrected in v0.249.0. Retained for the MIS argument, which is still the
+> reason roulette thinning is not an option.
 
 **What happens.** Phase 3a's `bdpt::traceLightBeamPass` builds its `BeamBank`s with `cap = 0`, so
 the bank never self-halves and every beam a light subpath deposits is kept. Measured on

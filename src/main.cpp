@@ -16104,10 +16104,21 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // the merge weight would be a ratio between densities that are different
             // FUNCTIONS — see bdpt::traceLightBeamPass and known-issues.md. `-n` therefore
             // counts LIGHT SUBPATHS here, not photons; the two are the same quantity
-            // (emitter power per path) so the normalisation is unchanged, but a subpath
-            // deposits a beam per span rather than one per straight crossing, and it
-            // scatters in the medium rather than crossing it straight — so this map carries
-            // MULTIPLE scattering where mode M's carries single only.
+            // (emitter power per path) so the normalisation is unchanged.
+            //
+            // NOT the difference from mode M's map (this comment used to say so, and was
+            // wrong from the day it was written): both maps carry MULTIPLE scattering. Mode
+            // M's photon has run analog transport under `-beams` since 0.199.0, depositing
+            // one chord per scattering event with `beamOrderMax == 0` (unlimited) by default
+            // — see render.h's beamMSAllowed. `-beams-order 1` is what reduces it to the
+            // pre-0.199.0 single-scatter straight crossing, and it is off by default.
+            //
+            // The real difference is WHOSE density the beams are drawn from. Mode M's come
+            // from the forward photon pass and are reconstructed on their own; mode J's come
+            // from the BDPT light subpaths, which is the only reason the merge and the
+            // connection can be put under one MIS weight at all — a beam and a connection
+            // have to be two estimators of the same integral before their weights can sum
+            // to one.
             // THE BEAM BUDGET (0.242.0, J-BEAMCOST). Off when the user gave an explicit `-n`:
             // two knobs on one quantity, and the more specific one wins. `-beamcount` is a
             // plain resource ceiling on the map; what actually sizes it is the scene's own
@@ -16125,15 +16136,29 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // therefore no pilot: the sizing question was answered once and re-asking it would
             // cost a pilot per epoch to get the same answer with more noise on it.
             const long long Nepoch = first ? N : (jbb.pathsUsed > 0 ? jbb.pathsUsed : N);
-            // Said ONCE. A cheap scene refreshes every second or so, and a line per refresh would
-            // be hundreds of identical sentences drowning the -interval status lines that
-            // actually carry information. The count is reported again at the end of the render.
-            if (epoch == 1)
-                std::printf("mode J: light-side refresh — redrawing %lld subpaths under a fresh "
-                            "salt every ~%.0f%% of the wall clock and averaging the realizations, "
-                            "so the MERGE noise falls with the render too (-beamfreeze to opt "
-                            "out; -beamrefresh to retune) ...\n",
-                            Nepoch, 100.0 * g_beamRefreshFrac);
+            // WHAT EACH EPOCH SAYS. Epoch 0 announces how the map is being sized; epoch 1
+            // announces that refreshes are happening at all; every epoch after that is
+            // SILENT. That last clause is the point — a cheap scene refreshes every second
+            // or so, and a line per refresh would be hundreds of identical sentences
+            // drowning the -interval status lines that actually carry information. The
+            // realization count is reported once more at the end of the render.
+            //
+            // This used to be a single if/else-if/else chain keyed on `jreq.maxBeams`, which
+            // got epochs >= 2 wrong three ways at once (0.249.0): a refresh sets maxBeams=0
+            // by design — the sizing question was answered at epoch 0 — so it fell through to
+            // the `-n` branch and printed "(-n given: no beam budget)" on a command line with
+            // no -n, quoting `N` (the *default* 2000000) rather than the `Nepoch` it actually
+            // traces, once per refresh. Keying on the epoch instead of on a variable that
+            // merely correlates with it is what makes those three impossible rather than
+            // fixed: the `-n` sentence can now only be reached from epoch 0, where it is true.
+            if (!first) {
+                if (epoch == 1)
+                    std::printf("mode J: light-side refresh — redrawing %lld subpaths under a "
+                                "fresh salt every ~%.0f%% of the wall clock and averaging the "
+                                "realizations, so the MERGE noise falls with the render too "
+                                "(-beamfreeze to opt out; -beamrefresh to retune) ...\n",
+                                Nepoch, 100.0 * g_beamRefreshFrac);
+            }
             else if (jreq.maxBeams > 0)
                 std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
                             "threads (maxDepth=%d, light=%s) — sizing the light pass to a beam "
@@ -16145,7 +16170,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
                             "threads (maxDepth=%d, light=%s) — tracing %lld light subpaths for "
                             "the beam map (-n given: no beam budget) ...\n",
-                            res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel, N);
+                            res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel, Nepoch);
             // Only epoch 0 blanks the window to a caption. A refresh happens with a partly
             // converged image already on screen, and replacing it with "tracing light subpaths…"
             // every epoch would make the live preview flash between the render and a placeholder
