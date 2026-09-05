@@ -802,6 +802,24 @@ struct Sensor {
 // baked into an HDRI produces fireflies (see known-issues, K2 follow-up).
 enum class EmitterShape { Quad, Sphere, Spot, Env, Cylinder, Mesh, Sun };
 
+// SPECTRAL FOLD QUADRATURE (Emitter::foldCie / foldLam; used by render.h's photon tracer
+// and photonbeams.h's beam records). The achromatic fold replaces a beam's noisy
+// CIE(lambda_hero) sample with the emitter's mean response cieMean = E_lam[CIE(lam)]; the
+// SPECTRAL fold generalises it to E_lam[CIE(lam) * T(lam)], where T is the running ratio of
+// the path's spectral throughput at lam versus at the hero wavelength. That expectation
+// needs a QUADRATURE over lambda, and this is its bin count: the band is split into
+// kFoldBins intervals of EQUAL SPD MASS, so every bin carries the same 1/K of the emission
+// probability and the sum of the per-bin CIE means is exactly cieMean (the unweighted case
+// therefore stays bit-identical to the plain achromatic fold).
+//
+// 12 is chosen because the thing being integrated is a product of two smooth curves — the
+// CIE observer and a surface reflectance — over ~360 nm. Reflectance spectra in this engine
+// are either constants, blackbody/measured curves, or RGB-upsampled Jakob-Hanika sigmoids,
+// none of which carry structure narrower than ~30 nm, which is what 12 bins resolve. Going
+// higher costs a per-bin reflectance evaluation on every diffuse bounce of every photon for
+// no visible gain; going lower starts to alias the observer's sharp blue lobe.
+static constexpr int kFoldBins = 12;
+
 // Smoothstep spotlight falloff as a function of cos(angle-off-axis). 1 inside the
 // inner cone, 0 outside the outer cone, cubic-smooth (3t^2-2t^3) in the penumbra.
 inline double spotFalloff(double ct, double cosInner, double cosOuter) {
@@ -875,6 +893,28 @@ struct Emitter {
     // rather than merely averaging it down (photonbeams.h, ACHROMATIC-PATH BEAMS). Set for
     // EVERY emitter in finalizeEmitters(), unlike viewXYZ which only suns need.
     Vec3 cieMean{0, 0, 0};
+    // THE SPECTRAL FOLD TABLE (kFoldBins above). `foldCie[k]` is the CIE response integrated
+    // over bin k against the emitter's own emission pdf,
+    //
+    //     foldCie[k] = integral_{bin k} CIE(lam) * SPD(lam) dlam / integral SPD(lam) dlam
+    //
+    // and `foldLam[k]` is that bin's SPD-weighted mean wavelength — the single lambda at
+    // which a path factor is evaluated to stand for the whole bin. The bins are cut at
+    // EQUAL SPD MASS, so each holds 1/K of the emission probability and, by construction,
+    //
+    //     sum_k foldCie[k] == cieMean
+    //
+    // exactly. That identity is what makes the generalisation free: a path with no spectral
+    // factors folds to sum_k foldCie[k]*1 = cieMean, reproducing the achromatic fold
+    // bit-for-bit, while a path that has picked up factors folds to sum_k foldCie[k]*T_k,
+    // the quadrature of E_lam[CIE(lam)*T(lam)]. Filled for EVERY emitter in
+    // finalizeEmitters(), on the same 1 nm grid as cieMean.
+    // `foldN` is how many of the kFoldBins entries are LIVE, compacted to the front. A
+    // broadband SPD fills all of them; a laser line fills one. Loops run to foldN, so a
+    // narrow emitter pays only for the bins it actually occupies.
+    Vec3   foldCie[kFoldBins] = {};
+    double foldLam[kFoldBins] = {};
+    int    foldN = 0;
     std::vector<EmitTri> meshTris; // Mesh: per-triangle area CDF for uniform sampling
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
@@ -1256,26 +1296,12 @@ struct Scene {
     // point), so transmittance is the product of per-medium transmittances and a
     // collision is the earliest of the media's independent free-flight samples (with
     // the scattering medium chosen by the Poisson superposition theorem). Empty =>
-    // vacuum. BDPT (mode D, both devices) and the GPU backward megakernel superpose the
-    // full vector too; only the CPU backward tracer still degrades to backwardMedium().
+    // vacuum. EVERY transport layer superposes the full vector: the forward tracer, BDPT
+    // (mode D/J, both devices), both device megakernels, and — since 0.254.0 — the CPU
+    // backward tracer, which until then collapsed it to a single unbounded homogeneous
+    // haze via a `backwardMedium()` accessor that no longer exists.
     std::vector<Medium> media;
 
-    // The CPU backward tracer (src/backward.h — modes R/W/V and the P composite's
-    // camera-side layer) supports only a single GLOBAL HOMOGENEOUS haze and ignores
-    // density/bounds. This returns the medium it uses as that haze — the first authored
-    // medium — or a disabled default if there is none.
-    //
-    // NOTE this is now a CPU-only limitation, and a source of CPU/GPU divergence: the
-    // device backward megakernel (render_cuda.cu dMediaSampleCollision / bkNeeVolume)
-    // superposes the whole `media` vector, bounds + density fields + per-medium phase
-    // functions included, so a GPU mode-R/W render of a multi-medium scene looks different
-    // (and more correct) than the CPU one. main.cpp warns when a render's backward layer
-    // actually lands on this degraded path. Tracked in known-issues.md; the fix is to port
-    // the superposition into backward.h and delete this accessor.
-    const Medium& backwardMedium() const {
-        static const Medium none;   // disabled (enabled=false) sentinel
-        return media.empty() ? none : media.front();
-    }
     bool anyMedium() const { return !media.empty(); }
 
     // Emitters. Forward tracing selects one per photon with probability
@@ -1641,6 +1667,49 @@ struct Scene {
                 den += s;
             }
             e.cieMean = (den > 0.0) ? num * (1.0 / den) : Vec3{0, 0, 0};
+            // THE SPECTRAL FOLD TABLE (Emitter::foldCie/foldLam). Same grid, second pass:
+            // split the band into kFoldBins intervals of EQUAL SPD MASS and record each
+            // one's CIE integral and its SPD-weighted mean wavelength.
+            //
+            // A grid sample is assigned WHOLE to the bin its own mass MIDPOINT falls into,
+            // never split across two bins. That is what makes sum_k foldCie[k] == cieMean an
+            // exact identity rather than an approximate one (every sample is counted once,
+            // in exactly one bin), which in turn is what makes an unweighted spectral fold
+            // reproduce the plain achromatic fold bit-for-bit. Equal-MASS rather than
+            // equal-WIDTH bins are the right cut because the weight each bin carries in the
+            // final sum is then uniform, so the quadrature spends its 12 reflectance
+            // evaluations where the emitter actually emits — a 5800 K sun puts none of them
+            // in the far red where the SPD has fallen off, and a narrow LED puts all of them
+            // inside its line instead of 11 on empty band and 1 on the peak.
+            for (int k = 0; k < kFoldBins; ++k) { e.foldCie[k] = Vec3{0, 0, 0}; e.foldLam[k] = 0.0; }
+            e.foldN = 0;
+            if (den > 0.0) {
+                Vec3   bCie[kFoldBins] = {};
+                double bMass[kFoldBins] = {}, bLam[kFoldBins] = {};
+                double acc = 0.0;
+                for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0) {
+                    const double s = e.spdFn(lam);
+                    if (!(s > 0.0)) continue;
+                    int k = (int)(((acc + 0.5 * s) / den) * kFoldBins);
+                    if (k < 0) k = 0;
+                    if (k >= kFoldBins) k = kFoldBins - 1;
+                    bCie[k] += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * s;
+                    bMass[k] += s;
+                    bLam[k] += s * lam;
+                    acc += s;
+                }
+                // Compact the live bins to the front. A well-behaved broadband SPD fills all
+                // twelve (equal mass guarantees it whenever the band has at least kFoldBins
+                // non-zero grid samples), but a laser line or a single-sample SPD leaves most
+                // empty — and an empty bin would otherwise cost a reflectance evaluation at a
+                // meaningless wavelength for a guaranteed-zero contribution.
+                for (int k = 0; k < kFoldBins; ++k) {
+                    if (!(bMass[k] > 0.0)) continue;
+                    e.foldCie[e.foldN] = bCie[k] * (1.0 / den);
+                    e.foldLam[e.foldN] = bLam[k] / bMass[k];
+                    ++e.foldN;
+                }
+            }
         }
         emitterCdf.assign(emitters.size(), 0.0);
         for (size_t i = 0; i < emitters.size(); ++i) {

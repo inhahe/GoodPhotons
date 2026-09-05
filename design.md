@@ -59,6 +59,159 @@ regardless — it writes each frame the instant that frame's gather completes.
 render. Closing that means teaching the shared device path to gather in spp chunks under
 `runSppProgressive`, the way the forward and mode-`R` GPU paths already do (`known-issues.md`).
 
+### The SPECTRAL FOLD — carrying the achromatic fold through surfaces (0.255.0)
+
+**The problem it solves.** A stored photon beam is a *line*: one deposit paints a whole chord,
+so a beam that carries a single saturated `CIE(λ)` sample lays a **coloured streak** across the
+image rather than a coloured dot. That is the "coloured bars" artifact, and it is chromatic
+variance, not geometry — the `1/sinθ` Beam×Ray-1D singularity produces *dots* (a near-parallel
+beam projects to a point) and is only log-divergent, so it was never the cause.
+
+Since 0.210.0 the **achromatic fold** (`-beamachro`) removes that variance outright when it can:
+if nothing on the path has depended on λ, the estimator's expected colour is the per-emitter
+constant `cieMean = ∫CIE·SPD/∫SPD`, so substituting the constant for the sample is unbiased *and*
+noiseless. But the claim was **all-or-nothing** — the first λ-dependent event retired it for good
+— and instrumenting `gallery_rain` showed exactly where it died:
+
+```
+[achrokill] deposits: folded 2004785 | unfolded by: surface 11321, chromatic-medium
+                                       scatter 1574, glass absorption 0, GRIN 0, birth 0
+```
+
+**87.8 % of unfolded deposits lost the fold to a SURFACE event** — a diffuse albedo — and 12.2 %
+to the genuinely chromatic rain. Forcing the fold on for 100 % of beams (a deliberately *wrong*
+diagnostic build) measured the floor: cloud chroma p99 **560 → 182**, mean **80 → 23**, with the
+bars gone and only the rain's (correct) per-wavelength streaks left. So the whole artifact was
+recoverable, and the surface case was the lever.
+
+**The generalisation.** A diffuse albedo is wavelength-*dependent* but not wavelength-
+*divergent*: it leaves the path's geometry identical for every λ and only rescales its weight.
+So carry the rescaling instead of surrendering. Replace the fold `E_λ[CIE(λ)]` with
+
+```
+    cieFold = E_λ[ CIE(λ) · T(λ) ],   T(λ) = Π_j f_j(λ) / Π_j f_j(λ_hero)
+```
+
+where `f_j` are the path's spectral factors so far. A deposited beam contributes
+`CIE(λ_h)·β·G` with `β = P_emit·Π f_j(λ_h)/Π p_j`; direction pdfs are λ-independent on such a
+path, so the `p_j` factor out and the *only* λ-dependence in the estimator is `CIE·Π f_j`.
+Substituting gives `E_λ[CIE(λ)·Π f_j(λ)]·G/Π p_j` — exactly the spectral integral the
+monochromatic estimator only reaches in expectation. `T(λ_h) ≡ 1`, so a path with no spectral
+factors folds to `cieMean` and reproduces the old behaviour **bit-for-bit**.
+
+At a Lambertian vertex the factor is applied as an **analog roulette** (survive with probability
+`ρ(λ_h)`, `β` unchanged), so conditional on survival the fold carries `T_k *= ρ(λ_k)/ρ(λ_h)`;
+its expectation over the roulette is `ρ(λ_h)·ρ(λ_k)/ρ(λ_h) = ρ(λ_k)`, which is the per-λ weight
+the integral wants with the survival lottery cancelled out. Unbiased.
+
+**The quadrature** (`scene.h`, `kFoldBins = 12`). `Emitter::foldCie[k]` is the CIE response
+integrated over bin *k* against the emitter's own emission pdf, and `foldLam[k]` is that bin's
+SPD-weighted mean wavelength. The bins are cut at **equal SPD mass**, so each carries `1/K` of
+the emission probability, the 12 reflectance evaluations land where the emitter actually emits
+(a 5800 K sun spends none of them in the far red; a narrow LED spends all of them inside its
+line), and — because a 1 nm grid sample is assigned *whole* to one bin, never split — the
+identity `Σ_k foldCie[k] == cieMean` is **exact**. That exactness is what makes the unweighted
+case bit-identical. `foldN` compacts the live bins forward so a laser line costs one evaluation,
+not twelve. Built in `finalizeEmitters` beside `cieMean`, on the same grid.
+
+**When NOT to fold, and why the test may not look at λ_hero.** Folding trades the chromatic
+variance of `CIE(λ_h)` for a `1/f(λ_h)` in the weight, and for a sharply *peaked* factor that
+is a loss — a saturated red wall sampled at a green hero λ produces a surviving photon carrying
+an enormous `T`, i.e. a firefly. Both second moments are computable in closed form from the
+quadrature already in hand, so `foldWorthIt` compares them rather than guessing a threshold:
+
+```
+    unfolded  E[X²] = E_λ[ f |CIE|² ]        ≈ K · Σ_k f_k |F_k|²
+    folded    E[Y²] = E_λ[1/f] · |E_λ[CIE f]|²  ≈ (1/K Σ_k 1/f_k) · |Σ_k f_k F_k|²
+```
+
+with `F_k = foldCie[k]`. For a **constant** `f`, Cauchy–Schwarz makes `E[Y²] ≤ E[X²]`
+unconditionally — a neutral surface always folds, which is the case the artifact lives in.
+
+The verdict must be a function of the *surface and emitter only*, never of `λ_hero`. If it
+depended on `λ_h` the fold/no-fold split would correlate with the wavelength and the mixture
+would stop being unbiased: `P(fold)·E_λ[CIE·f] ≠ ∫_{folded λ} p·f·CIE` in general. This is also
+why `DiffuseTransmit` tests **both** lobes up front and folds only if both pass — *which* lobe
+the photon takes is itself a function of `ρ_R(λ_h)`, so a per-lobe verdict would be a `λ_h`-
+dependent verdict. (Its energy guard `ρ_R+ρ_T ≤ 1` is re-applied **per bin**, because the guard
+changes the sampling *probability* and the probability is what the analog roulette uses.)
+
+**What still retires the fold**, and why each is right rather than merely conservative:
+
+| Event | Why |
+|---|---|
+| Dispersive refraction, gratings, thin film / multilayer, fluorescence, hair | The wavelengths no longer share a *chord*. There is no `T(λ)` to carry — the fold is undefined, not just unprofitable. |
+| `Layered` coat | Its Fresnel/Airy reflectance is the archetypal peaked factor (near-zero at one λ, near-one two bins away), so `1/R(λ_h)` is an outright firefly generator — and its iridescence is the *point* of the material, which a fold would smear. |
+| Glass absorption `exp(-σ_a(λ)·d)` | Foldable in principle; measured **0** deposits lost to it, so it stays retired rather than earning a code path nothing exercises. |
+| GRIN | The arc's *geometry* is a function of λ. |
+| Scatter in a chromatic medium (`phase rainbow`) | Same: the direction sampling diverges per λ. Measured at 8.53 % of the cloud's foldable deposits after the surface case was absorbed (see the ceiling section below), and it is **correct** that it does not fold — folding the rain would kill the bow. The lever there is the `-beamspec` bundle, which needs per-wavelength weights on the record (`PhotonBeam::wS[]`) to survive more than one transport step. |
+
+**Cost.** `kFoldBins` reflectance evaluations per Lambertian bounce, gated on `achroPath`, which
+is only ever set when the render is actually depositing beams. A photon that never reaches a
+surface pays nothing: `foldT[]` is left uninitialised until the first spectral factor arrives
+(`foldChroma`).
+
+**Not yet ported to the device.** `render_cuda.cu`'s forward tracer still runs the 0.210.0
+all-or-nothing rule, so a `-device gpu` mode-`M` render folds less and is noisier than the CPU
+one. Both are unbiased and converge to the same image; only the variance differs.
+
+#### What it measured, and where the ceiling is (0.255.1)
+
+`FTRACE_FOLDDIAG=1` turns on a per-medium attribution of every beam that *could* have folded
+(its medium is achromatic, so the gather-time tail is flat) but didn't, keyed by the exact
+event that retired the path — `FoldKill` / `g_foldKillHist` in `render.h`, printed as a
+`[folddiag]` line beside the per-medium beam stats. `FTRACE_FOLDFORCE=1` additionally makes
+`foldWorthIt` answer yes unless the fold is *undefined* (a zero bin), so one render separates
+"the guard declined it" from "the path genuinely diverged".
+
+On `gallery_rain` at 640×360, mode `M -beams`, seed 1:
+
+```
+medium 0: 12047 foldable deposits: folded 90.10%, chroma-medium 8.53%,
+                                   specular 1.35%, decline-diffuse 0.02%
+```
+
+That is the answer to the question the fold was built to settle. **The variance guard is not
+the bottleneck** — it declines 0.02 % of the opportunities, i.e. essentially none; the surface
+case that used to be 87.8 % of the residual is now fully absorbed. What is left is 8.53 %
+`chroma-medium` (a photon that scattered in the `phase rainbow` rain and then crossed the
+cloud) and 1.35 % `specular`, and **neither can be folded, at any tuning**:
+
+- The fold's whole premise is that every wavelength travels the *same chord*, so the only
+  λ-dependence left is a scalar factor `T(λ)`. A rainbow scatter samples its outgoing
+  direction *from* a λ-dependent phase function, so the wavelengths physically go different
+  ways. There is no shared chord to attach `T` to.
+- The obvious repair — sample the direction at λ_hero and reweight with
+  `T_k *= p(ω|λ_k)/p(ω|λ_h)` — **is biased**, and for the reason the λ_hero-independence rule
+  above already names. `ω` is drawn from `p(·|λ_h)`, so the `foldWorthIt` verdict computed on
+  those per-bin phase values is a function of λ_hero. Writing the mixture out, the folded
+  branch contributes `∫dλ_h p_e(λ_h) Σ_k F_k P_k(A_{λ_h})` and the monochromatic branch
+  `Σ_k F_k P_k(A^c_{λ_k})`; those sum to `Σ_k F_k` only if
+  `∫dλ_h p_e P_k(A_{λ_h}) = P_k(A_{λ_k})`, which is false in general. Removing the guard to
+  restore λ_hero-independence makes it unbiased and useless: at the bow the ratio is exactly
+  the peak that fireflies. Drawing `ω` from a λ-independent proposal instead *would* be both
+  unbiased and guardable, but it hands the hero path the peak ratio as its own weight, which
+  is a strictly worse trade.
+
+So **90.1 % is the fold's principled ceiling on this scene**, and the residual bars are not a
+bug: they are correct single-wavelength samples of genuinely divergent chromatic transport,
+whose expectation is right and whose variance falls with photon count. The two remaining
+levers are (i) the weighted `-beamspec` bundle (`PhotonBeam::wS[]`), which is the only thing
+that can help the *rain's own* beams — medium 1 can never fold, and half its beams are still
+plain monochromatic — and (ii) simply more light-side realisations.
+
+Visually (`scraps/bars_compare.png`, cloud+rain crop, A = 0.254.0, C = forced 100 % fold, E =
+0.255.0): the forced-fold floor is dramatically cleaner than either, which is the same fact
+from the other side — the ~10 % of beams that cannot fold carry nearly all the visible colour,
+because a beam is a *line* and one saturated wavelength paints its whole length. Chroma spread
+about the ROI median hue (×1000, luminance-masked, `scraps/_chromabars.py`):
+
+| | mean | p90 | p99 | max |
+|---|---|---|---|---|
+| 0.254.0 baseline, cloud | 80.32 | 181.37 | 559.56 | 4266.66 |
+| 0.255.0 spectral fold, cloud | 73.82 | 171.80 | 545.71 | 4267.33 |
+| forced 100 % fold, cloud | 22.75 | 47.81 | 181.65 | 606.97 |
+
 ### Mode `J` (UPBP) — how the two halves are wired (0.214.0, Phase 1)
 
 Mode `J` is deliberately **not** a new renderer. It is mode `D`'s renderer given a pointer:
@@ -5616,8 +5769,10 @@ as the one at fault.
   gains a `tempGrid` + emission params, `DScene` gains a `DEmissiveVolume[]` (+ per-volume Planck-λ CDF)
   and `totalEmissionPower`, and `genPhoton` has the same power-split volume-birth branch +
   `connectEmissionVolume`/`camSplatEmissionAll` device splat (validated GPU-vs-CPU on `scraps/vdb_fire.ftsl`).
-  The **CPU** backward reference (modes R/W/V) never samples the grid — it treats media as one
-  homogeneous haze (`scene.backwardMedium()`); the GPU backward megakernel does sample it.
+  The **CPU** backward reference (modes R/W/V) does not sample the *emission* grid — volumetric
+  blackbody emission stays forward-only — but since 0.254.0 it samples the media themselves
+  correctly, superposing the whole vector with each region's `bounds` and `density` field,
+  exactly as the GPU backward megakernel does.
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.
@@ -5641,13 +5796,16 @@ as the one at fault.
   volume NEE `bkNeeVolume`, Beer–Lambert `dMediaTransmittance` on NEE + throughput,
   HG scatter + albedo Russian roulette) — homogeneous *and* heterogeneous, and over the
   **whole** `scene.media` vector by Poisson superposition (bounds regions and density
-  fields honoured). **This is strictly ahead of the CPU twin**, which still collapses
-  everything to `scene.backwardMedium()` = `media.front()` as a single global homogeneous
-  haze with `bounds`/`density` ignored, so a multi-medium scene rendered in mode `R`/`W`
-  looks materially different on the two devices (`gallery_rain` shows its clouds and its
-  spectral rainbow only on the GPU). `main.cpp` warns, after the `-device` resolution, when
-  a render's backward layer actually lands on the degraded CPU path; the real fix is to port
-  the superposition into `backward.h` and delete `backwardMedium()` (known-issues.md).
+  fields honoured). This was strictly ahead of the CPU twin until **0.254.0**, which closed
+  the gap: `backward.h` now calls the *same* `Renderer::sampleMediaCollision` /
+  `Renderer::mediaTransmittance` the forward tracer uses (via `BackwardRenderer::mediaTr`,
+  which short-circuits a vacuum scene so media-free renders stay bit-identical), instead of
+  collapsing everything to `media.front()` as an unbounded homogeneous haze. `Scene::
+  backwardMedium()` and the `[medium] …` warning are gone. Besides fixing modes `R`/`W`/`V`
+  and `P`'s camera layer, this fixed **mode `M`'s `-pmfg` final gather**, which borrows
+  `neeLight` for its direct term and so was multiplying every shadow ray in `gallery_rain`
+  by the raincloud's `exp(−σ_t·d)` at 10–30 m — deleting the direct lighting outright
+  (M-FGDARK, known-issues.md).
   A second CPU/GPU-shared gap: mode `W`'s quadrature covers only the *surface* estimators —
   the fog branch is still an analog free flight plus a one-sample volume NEE on both devices,
   so a medium makes mode `W` speckled (deterministic, but not noise-free) at `-spp 1`.

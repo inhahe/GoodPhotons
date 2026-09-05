@@ -12304,6 +12304,27 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
                         tag, m, s.n, s.mfp, s.r, s.mfp > 0 ? s.r / s.mfp : 0.0,
                         foldStr(m, s.n).c_str());
         }
+        // SPECTRAL-FOLD ATTRIBUTION (FTRACE_FOLDDIAG=1; render.h FoldKill). One row per
+        // medium that could fold at all, listing why the beams that DIDN'T fold lost it.
+        if (foldDiagOn()) {
+            for (int m = 0; m < 16; ++m) {
+                uint64_t tot = 0;
+                for (int k = 0; k < FK_COUNT; ++k)
+                    tot += g_foldKillHist[m][k].load(std::memory_order_relaxed);
+                if (!tot) continue;
+                std::string row;
+                char b[96];
+                for (int k = 0; k < FK_COUNT; ++k) {
+                    const uint64_t c = g_foldKillHist[m][k].load(std::memory_order_relaxed);
+                    if (!c) continue;
+                    std::snprintf(b, sizeof b, "%s%s %.2f%%", row.empty() ? "" : ", ",
+                                  foldKillName(k), 100.0 * (double)c / (double)tot);
+                    row += b;
+                }
+                say("%s [folddiag] medium %d: %llu foldable deposits: %s\n", tag, m,
+                    (unsigned long long)tot, row.c_str());
+            }
+        }
         // `box area` is the cost metric, not a curiosity: a camera ray's expected box-entry
         // count — which measurement showed IS the gather's cost, far more than the number of
         // beams it actually gathers — is proportional to it. Printing before/after is what
@@ -13011,7 +13032,7 @@ static const int kWhittedDeHeroSpp = 64;
 // (kWSppCap, in the -explore loop) cannot drift apart.
 static const char* whittedDeHeroes(const Scene& scene) {
     if (g_heroC <= 1)                   return "-heroc 1 (the hero bundle is off)";
-    if (scene.backwardMedium().enabled) return "participating media";
+    if (!scene.media.empty())           return "participating media";
     if (grin::sceneHasGrin(scene))      return "a GRIN volume";
     return nullptr;
 }
@@ -15648,26 +15669,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     }
     if (intervalSec <= 0.0) intervalSec = 15.0;
 
-    // Heterogeneous / bounded participating media (a `density` field or a `bounds`
-    // box on `medium`) are honored only by the FORWARD light tracer (modes A/B/C, and
-    // the forward layers of V/P) and by the DEVICE tracers. The *CPU* backward tracer
-    // (backward.h, used by modes R/W/V and the camera-side layer of P) still collapses
-    // the whole `scene.media` vector to `scene.backwardMedium()` — the FIRST authored
-    // medium, treated as a global homogeneous haze with its `density` and `bounds`
-    // ignored. `mediaNeedForward` records whether this scene would actually notice.
-    // Mode D (volumetric BDPT) is excluded: it handles multiple superposed,
-    // box/sphere/object-bounded AND heterogeneous media correctly on both devices —
-    // subpath medium vertices are placed by delta tracking and connections weighted by
-    // ratio-tracking transmittance. The GPU backward megakernel (render_cuda.cu
-    // dMediaSampleCollision / bkNeeVolume) likewise superposes the full media vector,
-    // per-medium phase function included, so a GPU R/W render is NOT degraded and must
-    // not be warned about — which is why the warning itself now lives AFTER the -device
-    // resolution below rather than here. (Tracked in known-issues.md: the CPU backward's
-    // single-haze limitation, and the CPU/GPU divergence it causes.)
-    bool mediaNeedForward = scene.media.size() > 1;   // >1 medium: only the CPU backward suffers
-    for (const Medium& m : scene.media)
-        if (m.heterogeneous() || m.bounded) mediaNeedForward = true;
-    mediaNeedForward = mediaNeedForward && scene.anyMedium();
+    // Participating media used to need a warning here: until 0.254.0 the CPU backward
+    // tracer (backward.h — modes R/W/V and the camera-side layer of P) collapsed the whole
+    // `scene.media` vector to `Scene::backwardMedium()`, the FIRST authored medium treated
+    // as an unbounded global homogeneous haze with `density` and `bounds` ignored, while
+    // the forward tracer and both device megakernels superposed the vector properly. The
+    // superposition is now shared verbatim (Renderer::sampleMediaCollision /
+    // mediaTransmittance, called from backward.h), so every tracer on both devices agrees
+    // and there is nothing left to warn about.
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and
@@ -15895,40 +15904,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // point where `useGpu` stops changing, so stamping here reports the device the frames
     // are really traced on rather than the one `-device` asked for.
     g_windowBackend = backendLabel(useGpu, nThreads);
-
-    // Now that the device is resolved, warn if this render's BACKWARD layer will actually
-    // run on the CPU tracer, which collapses `scene.media` to `backwardMedium()` (see the
-    // `mediaNeedForward` computation above). The GPU backward megakernel superposes the
-    // full media vector — bounds, density fields and per-medium phase functions included —
-    // so the same scene on the GPU renders the authored fog and gets no warning. Modes:
-    //   R/W — the whole image is the backward tracer; degraded iff !useGpu.
-    //   V   — its backward reference is CPU-by-design, so always degraded.
-    //   P   — only the camera-side (specular) layer is backward; it is on the GPU only when
-    //         the forward layer is too AND the scene is in backward-GPU scope.
-    if (mediaNeedForward) {
-        bool cpuBackward = false;
-        if      (mode == 'R') cpuBackward = !useGpu;
-        else if (mode == 'V') cpuBackward = true;
-#ifdef HAVE_CUDA
-        else if (mode == 'P') cpuBackward = !(useGpu && backwardOnGpuOk(scene, cam));
-#else
-        else if (mode == 'P') cpuBackward = true;
-#endif
-        if (cpuBackward) {
-            const char* layer = (mode == 'R')
-                ? "this render"
-                : (mode == 'V' ? "mode V's backward reference"
-                               : "mode P's camera-side layer");
-            std::fprintf(stderr,
-                "[medium] %s runs on the CPU backward tracer, which treats participating "
-                "media as a SINGLE global HOMOGENEOUS haze (the first authored medium); any "
-                "additional media, `density` fields and `bounds` regions (box/sphere/object) are "
-                "IGNORED here. The GPU backward megakernel does support them, so `-device gpu` "
-                "(mode %c) renders the authored fog; otherwise use a forward mode (A/B/C) or "
-                "volumetric BDPT (mode D).\n",
-                layer, g_whitted ? 'W' : mode);
-        }
-    }
 
     // Same "the device is now resolved" moment, for -radcache. The cache is read from
     // exactly ONE place -- BackwardRenderer::radianceHeroLoop, on the CPU -- so a
