@@ -12742,6 +12742,73 @@ allocation to attack, not `-n`.
 
 ## Tech debt
 
+### The 12 render modes are 5 estimators wearing 12 letters — and one of the splits costs a real capability — 2026-09-05
+
+**Question asked.** "We have a lot of modes now. Are they all necessary? Can any of them be
+combined into fewer modes by just combining their features?" Answered by reading the dispatch
+rather than the docs, because the docs describe intent and the dispatch describes what is
+actually distinct. Current letters: `A B C P R W V D M S U J`.
+
+**1. Two are already flags, in the source, today.**
+
+* **`W` is not a mode.** `main.cpp:18028` reads `if (mode == 'W' || mode == 'w') { mode = 'R';
+  g_whitted = true; }`. The letter is rewritten to `R` before anything dispatches on it. It is
+  `-mode R -whitted` with a shorter spelling.
+* **`V` is not an estimator.** It is a harness: run `B`, run `R`, report the best-fit residual
+  (`main.cpp:15991`). `refMode` even folds it in with `R` for every downstream decision
+  (`main.cpp:15572`). It is `-validate`.
+
+**2. Three letters, one function call.** `A`/`B`/`C` fall through a single
+`case 'A': case 'B': case 'C':` (`main.cpp:22366`, and the real path at `16652`) into **one**
+`renderForward(...)` differing by exactly two booleans — `forwardCatch = (mode=='C')` and
+`lensMode = (mode=='A')`, defined together at `main.cpp:15575-15576`. They are one forward
+estimator with a 2-bit camera-measurement selector, which is precisely what `REFERENCE.md`
+already says in prose ("trace **identical forward physics** and differ only in how the camera
+*measures* the light").
+
+**3. `P` is a scheduling policy over two other modes** — forward `B` for diffuse/caustic pixels
+plus a backward camera ray for specular/coated ones, composited by pixel class. It calls
+`renderForward` and `renderBackward` and blends. A genuinely useful product, but not a third
+estimator; `-composite` would say so.
+
+**4. `M` and `S` share the forward tracer** — the GPU SPPM comment states it outright: each pass
+"deposits a bounded photon set with the **SAME forward tracer as mode M**" (`main.cpp:16432`).
+`S` is `M` plus per-pixel progressive radius state. The *camera* halves do genuinely differ (`M`
+gathers from a prebuilt map at the first diffuse hit or one bounce away with `-pmfg`; `S` stores
+visible points and shrinks each pixel's radius), so this is a weaker merge than the three above —
+`-progressive` on `M` would be a real refactor, not a rename.
+
+**5. `U` and `J` are the two halves of one algorithm, and splitting them costs capability.**
+This is the only item here that is a **functional** gap rather than surface area:
+
+* `vcmUnsupportedFeature` (`main.cpp:14993`) = `bdptUnsupportedFeature` **plus** "no media",
+  "no lens", "rectilinear only".
+* Mode `J`'s gate (`main.cpp:15021`) = `bdptUnsupportedFeature` **plus** "rectilinear only".
+* So **`U`'s supported scope is a strict subset of `J`'s.**
+* `U` merges at **surfaces**. `J` merges "one per interior **medium** vertex"
+  (`bdpt.h:2145`) — volumes only, no surface merges at all.
+
+Their union is the actual UPBP algorithm — *Unifying Points, Beams, and Paths*: `J` currently
+ships paths + beams, `U` ships paths + points, and neither ships all three. **A scene holding
+both a caustic and a cloud must therefore choose which half of UPBP it gets**, and `gallery_rain`
+is exactly such a scene (a glass/gem caustic under a scattering cloud and a rain curtain). Since
+`U ⊂ J` in scope and `J` already carries D's full MIS machinery, the merge direction is clear:
+add `U`'s surface-merge strategy to `J`'s weight sum and retire `U` — the two merge kinds are
+already weighted the same way against the same connection strategies, just at different vertex
+types.
+
+**Where that lands.** 12 letters → **5 estimators**: forward (`A`/`B`/`C`/`P`), backward
+(`R`/`W`), bidirectional (`D`), photon-map (`M`/`S`), and one unified points+beams+paths mode
+(`U`+`J`). `D`, `R` and `M` are irreducible — backward, bidirectional and photon-map are three
+genuinely different estimators.
+
+**What is *not* being proposed.** Deleting user-visible letters is a compatibility break for every
+checked-in scene, batch file and doc example in the repo, and the letters are good UX regardless
+of how the code is factored — `-mode W` is a better thing to type than `-mode R -whitted`. The
+debt is that the *implementation* pretends these are twelve peers when the dispatch shows five;
+the fix is to make the letters thin aliases over five estimator entry points, and to close the
+`U`/`J` gap because that one is costing real image quality, not just clarity.
+
 ### Checked-in scenes cite ~22 derivation scripts that live in gitignored `scraps/` — 2026-09-01
 
 `scenes/*.ftsl` comments name the script that solved each authored constant, which is the
