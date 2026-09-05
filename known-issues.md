@@ -698,7 +698,63 @@ technique the connections sample badly, so the balance heuristic correctly gives
 weight). UPBP's own paper handles this; ftrace does not yet. The standard remedy is to cap the
 merge contribution or to fold a `sin(theta)`-aware term into the kernel.
 
-### UPBP-THICK — OPEN (2026-09-04, v0.244.0): on an optically **thick, multi-bounce** scene mode `J` reads up to **1.6×** an independent reference, and the error is governed by the **light-subpath count**, not by `-spp` — identically on CPU and GPU
+### UPBP-THICK — DIAGNOSED (2026-09-04, v0.246.0), fix OPEN: on an optically **thick, multi-bounce** scene mode `J` has a **noise floor that `-spp` cannot touch** — it is set by the light-subpath count `-n`, and it is **variance, not bias**
+
+> **RESOLVED QUESTION (v0.246.0), and it inverts the diagnosis below.** With `-seed` in hand the
+> ambiguity flagged under "Caveat on bias vs. frozen-map variance" is settled, and the answer is
+> **frozen-map variance**. Eight *independent* realizations of the `-n 256 -beamk 1` case
+> (`-r 64 -max-bounce 8 -time 60`, each vs `png/ref64.pfm`, `png/upbp_seed/s*`):
+>
+> | `-n` | ratios across 8 seeds | mean | median | s.d. | mean vs 1.0 |
+> |---|---|---|---|---|---|
+> | 256 | 1.629 1.552 1.058 0.869 0.981 0.941 1.052 0.754 | 1.105 | 1.017 | **31.6 %** | +0.93 σ |
+> | 8192 | 1.012 0.949 0.973 0.901 1.045 0.911 1.000 0.990 | 0.973 | 0.982 | **5.0 %** | −1.56 σ |
+>
+> **The estimator is consistent AND unbiased.** The mean is within ~1.5 σ of 1.0 at both counts,
+> and it lands on *opposite sides* of 1.0 at the two counts — not the signature of a bias. The
+> spread shrinks **6.36×** for a 32× rise in `n`, against **5.66×** predicted by `1/√n` and 32×
+> by `1/n`; with an 8-sample s.d. (itself ±25 %) that is a clean match to pure variance.
+>
+> **So the headline "1.6× too bright" was one unlucky draw** — seed 0 happens to be the
+> historical stream, and at `n = 256` it sits at the top of a distribution spanning 0.75–1.63.
+> The old `-n` sweep's apparently `1/n` decay was **regression to the mean** of that one outlier
+> trajectory, not bias decay; the nesting caveat below was the right suspicion for the wrong
+> reason. The "one 315-px blob carries 72 % of the excess" observation is now *explained* rather
+> than damning: with 256 subpaths a single beam that passes near a camera ray with a small
+> `1/sin(theta)` denominator paints a coherent streak, because a beam's footprint is a line.
+>
+> **What is actually wrong is worse than a 15 % offset, and it is a design property, not a bug in
+> a formula.** Mode `J`'s error is the sum of a camera-side term that `-spp` drives to zero and a
+> light-side term that `-spp` **cannot touch at all**, because every camera sample gathers from
+> the *same* frozen beam map. Mode `J` therefore has a **noise floor** — on `_fog_thick` it is
+> 31.6 % at `-n 256` and 5.0 % at `-n 8192`, whole-frame, and it is *invisible*: the image goes
+> visually smooth (`~7.8 %` reported pixel noise at 164 spp) while the overall light level stays
+> several percent off. An error that looks converged is the worst kind to ship.
+>
+> **The fix follows from a cost measurement, and it is cheap.** From `png/upbp_seed/b0.log`, at
+> `-n 8192` the entire light side — 8192 subpaths → 769 115 sub-beams **plus** the 495 727-node
+> BVH — costs **1.55 s of a 60 s render (2.6 %)**. UPBP-CONV already established that the
+> *gather* is what dominates mode `J`. So **rebuilding the beam map with a fresh light-side
+> realization every progressive chunk is nearly free**, and it converts the frozen floor into an
+> average over `k` independent maps that falls as `1/√k`: at ~10 % time overhead the 5.0 % floor
+> becomes ~2.5 %, and it keeps falling with render time instead of stopping. It needs no MIS
+> change — averaging `k` independent unbiased estimators is still unbiased, and `kappa` is
+> per-map. There is precedent in this codebase: modes `A`/`B` already decorrelate the per-camera
+> beam gather for exactly this reason ("kills frozen speckle"). It also turns UPBP-CONV's PERF
+> complaint — that a mode-`J` flyby rebuilds the map once per frame — into a *feature*, since
+> those per-frame maps decorrelate along the flyby.
+>
+> **Revised next steps.** (a) Refresh the light-side realization per progressive chunk (salt the
+> light pass with the chunk index) so mode `J` converges with time rather than plateauing.
+> (b) Then the auto-sizer's accuracy floor is a *variance* criterion, not a bias one — and it
+> becomes far less critical, because a too-small `n` is no longer a permanent error, just a
+> slower one. (c) Step 3 below (auditing `mergeKappa`, `1/nEmitted`, the 91 sub-beams) is
+> **moot**: there is no bias to find. (d) Step 4 still stands — `tools/slab_ss_ref.py` at
+> `-max-bounce 1` cannot see any of this, and a multi-bounce gate should now assert on the
+> *spread across seeds*, which `-seed` finally makes possible.
+>
+> *Everything below is the original 2026-09-04 write-up, kept because its measurements are sound;
+> only its bias interpretation is superseded.*
 
 **Found while validating the GPU port; it is not caused by it, and it is not a port bug**: CPU
 and GPU agree with each other to **0.11 %** while both sit 1.67× above the reference, so the
