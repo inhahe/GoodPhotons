@@ -583,6 +583,19 @@ texture "tex_marble_creature" { file textures/marble_creature.png encoding srgb 
 # (k=0.45, s=0.30) rather than the orb's, because this cap catches coloured caustics from
 # THIRTEEN refracting solids at once and the stone must not tint any of them.
 texture "tex_marble_compote"  { file textures/marble_compote.png  encoding srgb  filter bilinear  wrap clamp }
+# The THIRTEENTH cap, and the THIRD sheet quarried rather than given its own: ten drops,
+# thirteen stands. `marble texture 1.jpeg` is cut top/bottom — the gold gyroid keeps the TOP
+# half with the heavy gold band, Alice takes the BOTTOM, whose veining is finer and whose
+# field is more white. At 1098x1960 the sheet halves to 1098x980, still over the tool's
+# 1024 MAXDIM, so the gyroid's 634x293 px cap loses nothing visible; the two crops share no
+# pixel, so they are two slabs off one block. Prepared at k=0.70 / s=0.80 rather than the
+# free caps' 1.0/1.0, for two reasons, one of which no other cap has:
+#   * her SHOES are dark and #1 bottoms out at 0.035 linear uncompressed — the creature's
+#     problem exactly, and k=0.70 is the creature's answer (floor lifted to 0.071);
+#   * she is the one object in this hall whose colour is imported PAINT rather than physics
+#     (a glTF baseColor atlas), so a saturated gold slab under her would be the only thing in
+#     the frame competing with the only texture in the frame. s=0.80 keeps the vein a vein.
+texture "tex_marble_alice"    { file textures/marble_alice.png    encoding srgb  filter bilinear  wrap clamp }
 
 # `wrap clamp` (not `repeat`) with `uv planar axis=y` on each cap isosurface maps ONE slab
 # across each tabletop, referenced to that primitive's own world bounds — a quarried slab cut
@@ -602,6 +615,7 @@ material "capmarble_oil"      { type diffuse  reflect texture:tex_marble_oil }
 material "capmarble_axicon"   { type diffuse  reflect texture:tex_marble_axicon }
 material "capmarble_creature" { type diffuse  reflect texture:tex_marble_creature }
 material "capmarble_compote"  { type diffuse  reflect texture:tex_marble_compote }
+material "capmarble_alice"    { type diffuse  reflect texture:tex_marble_alice }
 
 # --- Hero-object materials -----------------------------------------------------
 # `roughness` after `preset` overrides the preset's polished lobe. Gold needs a LOT here, and
@@ -759,6 +773,15 @@ material "cr_belly" { type diffuse  reflect rgb 0.66 0.55 0.40 }   # pale unders
 material "cr_tan"   { type diffuse  reflect rgb 0.58 0.46 0.34 }
 material "cr_eye"   { type glossy   reflect rgb 0.04 0.03 0.03  roughness 0.05 }
 material "cr_nose"  { type glossy   reflect rgb 0.12 0.08 0.08  roughness 0.15 }
+
+# --- Alice's fallback material (the thirteenth exhibit) -----------------------------
+# FTSL requires a `material` on every `mesh`, and this one is never meant to be seen: Alice
+# loads with `import_materials yes` and the glTF material replaces this on every primitive.
+# It exists as a TRIPWIRE. If the baseColor atlas ever fails to import — a re-export that
+# drops the texture, a loader regression, an out-of-range image index — the primitives fall
+# back here, and flat mid-grey on a figure is unmistakable in a frame where nothing else is
+# grey. A plausible-looking skin tone here would let that failure ship silently.
+material "alice_unpainted" { type diffuse  reflect rgb 0.5 0.5 0.5 }
 
 # --- THE GROUND. One quad, 46 x 45 m, x[-18,28] z[-19,26] — no walls, no ceiling.
 # The exhibits used to occupy the old hall's footprint (x in [3.2, 6.8], z in [1.5, 4.8]); the
@@ -1402,6 +1425,86 @@ isosurface "stand_compote_cap" { material capmarble_compote
     # comment above warns about. It costs nothing: the nearest thing in -z is
     # stand_creature_cap, still 0.55 m away.
     box { center 7.46 0.80 6.00  size 1.00 0.20 1.20  round 0.02 } }
+
+# --- exhibit: ALICE (the thirteenth stand) ---------------------------------------------
+# In world coordinates with no `group { translate }` wrapper, for the compote's and the
+# axicon's reason: this piece has no pre-spread layout position to be displaced from, so a
+# `translate 0 0 0` would be noise.
+#
+# WHY HERE: (9.15, 3.55), the FAR-RIGHT court, out past the glass orb at the near edge of the
+# rain shaft. Every other exhibit in this hall is a solid; Alice is the first FIGURE, and the
+# first object whose colour is an imported paint atlas rather than a spectrum. Siting her is
+# therefore a different problem from siting the compote, and `scraps/_alicesite.py` (a grid
+# search that projects every legal plot through the real still camera, then scores it on
+# screen-space overlap against every other exhibit and against the bow) says something blunt
+# about it: THERE IS NO CLEAN FLOOR IN THIS HALL. All 8783 legal floor sites are at least
+# partly screened by a nearer piece, because twelve stands 1.6x apart is a packed room seen
+# from a low eye. Two whole classes of siting had to be thrown out before this one:
+#   * ON THE FLOOR, as a VISITOR rather than an exhibit. Thematically the strongest reading —
+#     the one thing in the room that is not on a plinth — and it fails on geometry, not on
+#     taste. The bottom-centre ray of this camera meets the floor at z=5.479, so a
+#     floor-standing figure any nearer than that has her FEET BELOW THE FRAME, and every site
+#     further away than that is behind the near row. The best floor plot the search could find
+#     (9.00, 4.05 at 0.80) came back 70% covered by the compote and the orb.
+#   * IN THE AISLE, x≈5.0. The centre of a layout is not free floor, it is the sight line of
+#     everything behind it — the compote comment above learned the same thing — and here it is
+#     worse: the gold gyroid spans z 5.00..7.10 across the middle of the aisle, so the whole
+#     aisle behind it is its shadow and the whole aisle in front of it is below the frame.
+# ELEVATION is what breaks the deadlock. On a 0.90 m cap her head reaches y=2.51, which is
+# ABOVE every other exhibit in the hall (the tallest, the gold gyroid's clip, tops out at
+# 2.13), so the top two thirds of her stand in empty sky that nothing can screen. That is the
+# whole argument for making her the thirteenth EXHIBIT rather than the first visitor.
+#
+# The far-right court then wins on four measurements, all from `_alicesite.py`:
+#   * IN FRAME AND LARGE. Alice projects to x 1070..1258, y 266..481 — 188 x 215 px, taller
+#     than anything else in the still and second only to the gyroid in area, with 22 px still
+#     to the right edge. The cap clears it by 27 px. The frame's right margin was the last
+#     empty band left after the compote took the bottom-right corner.
+#   * ALMOST NOTHING IN FRONT OF HER. The only nearer silhouette her box touches is the glass
+#     orb's, and only a 47 px strip of its right edge — which is a BALL OF CRYSTAL, so that
+#     strip refracts her rather than hiding her. (The compote's box grazes her by 6 px.)
+#   * SHE STANDS IN FRONT OF THE BOW, not on top of it. The bow lives at x 772..1188,
+#     y 228..388 and its crown is at x≈950; her left edge at 1070 cuts only its right limb.
+#     A figure with the arc terminating behind her is the whole reason to put her on this side
+#     of the hall instead of the empty left one, where she would have had the axicon in front
+#     of her and black sky behind.
+#   * OFF THE FLIGHT PATH. The flyby's furthest-right control point is x=7.70 (through the
+#     glass orb), so the loop never comes within 1.45 m of this cap — see FLYBY.
+# THE CAP DIPS 0.35 m INTO THE RAIN. Its far edge is at z=3.05 against the rain shaft's near
+# face at z=3.40. That is deliberate and it is cheap: 0.35 m at sigma_t 0.35 is optical depth
+# 0.12, a 12% attenuation smoothly ramped across the slab's far corner and invisible at this
+# size — and a plinth standing with one foot in the weather is the right read for a hall whose
+# subject is rain.
+isosurface "stand_alice" {   # cap top y=0.90
+    material wirecage  union {
+        difference {
+            box { center 9.15 0.09 3.55  size 0.80  0.18  0.80  }
+            box { center 9.15 0.09 3.55  size 0.82  0.158 0.778 }
+            box { center 9.15 0.09 3.55  size 0.778 0.20  0.778 }
+            box { center 9.15 0.09 3.55  size 0.778 0.158 0.82  }
+        }
+        difference {
+            box { center 9.15 0.525 3.55  size 0.40  0.69  0.40  }
+            box { center 9.15 0.525 3.55  size 0.42  0.668 0.378 }
+            box { center 9.15 0.525 3.55  size 0.378 0.71  0.378 }
+            box { center 9.15 0.525 3.55  size 0.378 0.668 0.42  }
+        }
+    }
+}
+isosurface "stand_alice_cap" { material capmarble_alice
+    uv planar axis=y
+    # CENTRED, unlike the four cantilevered caps, and for a reason that is a measurement and
+    # not an oversight: Alice is OPAQUE and DIFFUSE. She throws no caustic to catch, so there
+    # is no downwind for the slab to lean toward and `_gemsweep.py` has nothing to sweep. The
+    # only thing this tabletop has to hold is her own footprint.
+    #
+    # 1.00 x 1.00 rather than the 0.90 the footprint alone would justify. `rotate 0 20 0`
+    # turns a 0.669 x 0.498 m footprint into an 0.799 x 0.697 m AXIS-ALIGNED one, and 0.90
+    # would have left 0.05 m in x — which is not a margin, it is the coincidence the axicon's
+    # cap comment warns about. 1.00 puts it at 0.10 x / 0.15 z. It costs nothing: the nearest
+    # cap is stand_glass_cap, 0.40 m away in x, and the slab still clears the frame edge by
+    # 27 px.
+    box { center 9.15 0.81 3.55  size 1.00 0.18 1.00  round 0.02 } }
 
 # ==============================  HERO PIECES  =================================
 # Each piece is wrapped in the SAME `group { translate }` as its stand — see THE SPREAD
@@ -2172,11 +2275,18 @@ fur "cr_coat_paw_br" {
 # `skip_material`, which drops every primitive whose glTF material NAME contains one of the
 # listed substrings. So each load imports the whole file and skips the other twelve pieces.
 # That is 13 x 4.5 MB of parsing, but it is 250,744 triangles total (the bowl is 250,000 of
-# them; each stone is 62), and the alternative -- `import_materials yes` -- would DESTROY the
-# asset: every material in the file is baseColor (1,1,1) with metallic 0, because the colour
-# lives entirely in KHR_materials_volume/transmission, which ftrace's reader does not
-# implement. All thirteen would import as the same white DIFFUSE surface, i.e. a plaster
-# bowl of plaster pebbles in a gallery whose entire subject is dielectric caustics.
+# them; each stone is 62), and it is still worth it even now that `import_materials yes` no
+# longer DESTROYS the asset. It used to: every material in the file is baseColor (1,1,1) with
+# metallic 0 and all the colour lives in KHR_materials_volume/transmission, so back when the
+# reader ignored that extension family all thirteen arrived as the same white DIFFUSE surface
+# -- a plaster bowl of plaster pebbles in a gallery whose entire subject is dielectric
+# caustics. src/gltf.h reads ior/transmission/volume/dispersion now, so an import would at
+# least arrive as GLASS. What it would not arrive as is THIS glass: KHR's attenuation is one
+# RGB triple with no dispersion in it, and the twelve stones below are authored on a named
+# optical glass (SF10, Abbe ~28) precisely so their caustics SPLIT — nor does glTF have any
+# way to express the nested-dielectric `priority` chain that stops twelve stones sitting in a
+# bowl from double-counting their shared interfaces. Keeping the thirteen loads is now a
+# choice about spectra and interface bookkeeping, not a workaround for a missing extension.
 #
 # The commas are not decoration: FTSL starts a new statement at the second bareword, so the
 # twelve patterns must be ONE comma-joined token.
@@ -2219,6 +2329,44 @@ mesh "cp_violet" { file "meshes/compote_with_gems.glb"  import_materials no
 mesh "cp_turquoise" { file "meshes/compote_with_gems.glb"  import_materials no
     skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,clear,cobalt,green,red,violet
     translate 7.35 0.90 6.20   scale 3.0   material cp_turquoise }
+
+# --- ALICE (the thirteenth exhibit): the only PAINTED object in the hall ----------------
+# On stand_alice_cap (top y=0.90) at the near edge of the rain shaft — see the stand block
+# above for why the far-right court is the only place in this room a figure can stand.
+#
+# THE ONLY `import_materials yes` IN THE SCENE, and that is the point of her being here. Every
+# other surface in this gallery is authored: a measured n/k metal, a named optical glass, a
+# Jakob-Hanika reflectance, a marble slab rescaled to a target albedo. Alice arrives with an
+# 8192^2 sRGB baseColor atlas and a 4096^2 metallic-roughness map baked into the GLB, and
+# ftrace paints her from them directly (src/gltf.h decodes both straight out of the BIN chunk
+# and area-averages them down to 2048 — an 8K atlas as Vec3 doubles plus its Jakob-Hanika
+# coefficient table is 3.2 GB otherwise). So she is the scene's demonstration that a
+# spectral forward renderer can eat an off-the-shelf textured asset without being re-authored.
+#
+# THE FALLBACK MATERIAL IS NOT DECORATION. FTSL requires one on every `mesh` and it is what
+# the primitives get if the glTF material fails to import, so it has to be a value that would
+# be VISIBLY WRONG rather than plausibly right: `alice_unpainted` is flat 0.5 grey, so a
+# silent texture-import regression shows up as a grey statuette instead of quietly shipping.
+#
+# `metallicFactor` in this GLB is 1.0 — the value that used to turn her into a mirror, because
+# reading the factor alone put her over the metallic>=0.5 cut and typed her Glossy. The real
+# metalness is in the map's blue channel, whose mean is 0.281; the loader now multiplies the
+# two, so she types Diffuse. This is the case that motivated the mean-metalness harvest.
+#
+# SEATING. The GLB is centred on the origin in x/z with its base at y = -0.950291, so unlike
+# the compote there IS a fudge factor and it is exactly that number times the scale: at 0.85,
+# translate y = 0.90 + 0.807747 = 1.707747. Scale 0.85 makes her 1.614 m — read as a figure
+# on a plinth rather than a doll, and her head then reaches 2.514 m, above every other exhibit
+# in the hall, which is the whole reason she is visible at all.
+#
+# `rotate 0 20 0`. The model faces +z out of the box, and +z from this court is 37 deg off the
+# bearing to the still camera at (5.0, 2.95, 9.35) — i.e. she would face out of the frame to
+# the right. A positive y-rotation swings +z toward -x here (scraps/_aliceface.ftsl renders
+# the sign rather than assuming it), so 20 deg turns her most of the way back into the hall:
+# 17 deg off the camera axis, which is a three-quarter view and not a mugshot, and it points
+# her gaze along the row of exhibits instead of off the edge of the picture.
+mesh "alice" { file "meshes/alice.glb"  material alice_unpainted
+    translate 9.15 1.707747 3.55   rotate 0 20 0   scale 0.85 }
 
 # ==============================  LIGHTING  ====================================
 # TWO lights now that the roof is gone (the xenon short-arc lamp that used to hang here was

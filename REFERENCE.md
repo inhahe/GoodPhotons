@@ -2674,6 +2674,27 @@ kept as a preview hint, see *See-through*), and `KHR_materials_dispersion`, whos
 strength is defined as 20/Abbe and so converts to a two-term Cauchy index reproducing
 the same n_d and the same F-to-C spread. Clearcoat, sheen and the rest are still
 ignored.
+It also imports **textures**: `baseColorTexture` → the material's reflectance map (decoded
+as sRGB, with the base-colour factor folded into its texels), `metallicRoughnessTexture` →
+the roughness map (glTF packs occlusion/roughness/metalness into R/G/B, so the **green**
+plane is broadcast to all three channels for ftrace's scalar sampler) and `normalTexture` →
+the normal map, with glTF's `scale` as its strength. Images are decoded **in place** — from
+a bufferView of the GLB's own BIN chunk, a base64 `data:` URI, or a sibling file — so a
+single self-contained `.glb` needs nothing beside it. Two things happen on the way in that
+are worth knowing about:
+* **Big atlases are area-averaged down to 2048 px** in linear light. A texture is stored as
+  `Vec3` doubles and a reflectance map carries a Jakob-Hanika coefficient table beside it,
+  so the 8192² atlases AI mesh generators emit as a matter of course would cost gigabytes;
+  2048 still leaves 4.2 M texels for an asset that covers tens of thousands of pixels.
+* **Metalness is read from the map, not just the factor.** The mean of the map's blue
+  channel multiplies `metallicFactor` before the ≥ 0.5 diffuse-vs-metal cut, because
+  exporters routinely write `metallicFactor 1.0` and put the real (near-zero) metalness in
+  the map — reading the factor alone turns a painted character into a mirror.
+Only `TEXCOORD_0` is used (a map declared on texCoord 1 is sampled with set 0's UVs), there
+is no `KHR_texture_transform`, and occlusion/emissive maps are ignored. Sampler `wrapS` and
+`magFilter` are honoured; ftrace has one wrap mode per texture, so an S/T pair that
+disagrees collapses to S. The load line reports what arrived —
+`loadGltf: alice.glb -> 407792 tris [glTF materials, 2 textures]`.
 `skip_material <substr>[,…]` (repeatable) drops glTF primitives whose material name
 matches — the way to strip the ground plane / studio backdrop that asset-store models
 bundle in with the subject, since geometry can't be subtracted after it loads.

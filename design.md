@@ -5415,11 +5415,17 @@ as the one at fault.
     - **The gem compote is the twelfth exhibit, and it is the scene's worked example of
       giving one GLB thirteen different materials.** The asset (`meshes/compote_with_gems.glb`)
       is a crystal dish holding twelve faceted stones as thirteen nodes. It **must not** be
-      loaded with `import_materials yes`: ftrace's glTF reader implements no KHR material
-      extension (`src/gltf.h`), and this file keeps all of its colour in
-      `KHR_materials_volume`/`transmission`, so every one of the thirteen would arrive as
-      baseColor (1,1,1) / metallic 0 — thirteen identical **white diffuse** surfaces, i.e. the
-      asset destroyed. The only lever for per-node materials is **`skip_material`**, which
+      loaded with `import_materials yes` — originally because ftrace's glTF reader implemented
+      no KHR material extension, and this file keeps all of its colour in
+      `KHR_materials_volume`/`transmission`, so every one of the thirteen arrived as
+      baseColor (1,1,1) / metallic 0: thirteen identical **white diffuse** surfaces, i.e. the
+      asset destroyed. `src/gltf.h` reads that extension family now (0.224.0), so an import
+      would at least arrive as *glass* — but not as **this** glass, and the reasons are
+      permanent rather than a missing feature: KHR's attenuation is one RGB triple with **no
+      dispersion**, whereas the twelve stones are authored on SF10 (Abbe ≈ 28) precisely so
+      their caustics split; and glTF has no way at all to express the nested-dielectric
+      `priority` chain below. The choice is now about spectra and interface bookkeeping.
+      The only lever for per-node materials is **`skip_material`**, which
       drops primitives whose glTF material *name* matches a substring and works independently
       of `import_materials`; so the scene loads the file **thirteen times**, each load skipping
       the other twelve names, and binds a hand-authored dielectric to each. Two consequences

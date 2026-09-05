@@ -40,6 +40,12 @@ extern "C" {
     void           stbi_image_free(void* retval_from_stbi_load);
     int            stbi_is_hdr(const char* filename);
     const char*    stbi_failure_reason(void);
+    // glTF/GLB embed their images IN the file (a bufferView of the BIN chunk, or a
+    // base64 data URI), so there is no path to hand stbi_load. Writing them out to
+    // temporary files first would be both slower and observable; decoding in place is
+    // the only sane seam. See Texture::loadMemory and gltfimpl::decodeGltfImage.
+    unsigned char* stbi_load_from_memory(const unsigned char* buffer, int len,
+                                         int* x, int* y, int* channels, int desired);
 }
 
 enum class TexEncoding { sRGB, Linear };
@@ -398,6 +404,35 @@ struct Texture {
         if (m0 == 'P' && (m1 == 'F' || m1 == 'f')) { f.seekg(0); return loadPFM(f, err); }
         f.close();
         return loadSTB(path, err);   // PNG / JPG / BMP / TGA / HDR via stb_image
+    }
+
+    // Decode an ALREADY-IN-MEMORY compressed image (PNG/JPEG/...). Used by the glTF
+    // loader for images embedded in a GLB's BIN chunk or in a base64 data URI, which
+    // have no filename to give `load` above. `what` only ever appears in the error
+    // message, so it can be any label the caller finds useful ("glTF image 0").
+    //
+    // LDR only, deliberately: glTF cannot reference a Radiance .hdr, and stb's HDR
+    // decode returns floats through a different entry point that would need its own
+    // branch here for a case that cannot occur.
+    bool loadMemory(const unsigned char* data, size_t n, const std::string& what,
+                    std::string& err) {
+        if (!data || n == 0) { err = "empty image payload (" + what + ")"; return false; }
+        if (n > (size_t)INT32_MAX) { err = "image too large to decode (" + what + ")"; return false; }
+        int nc = 0;
+        unsigned char* px = stbi_load_from_memory(data, (int)n, &w, &h, &nc, 3);
+        if (!px) {
+            err = "stb_image: " + std::string(stbi_failure_reason() ? stbi_failure_reason()
+                                                                   : "decode failed") +
+                  " (" + what + ")";
+            return false;
+        }
+        rgb.clear();
+        rgb.reserve((size_t)w * h);
+        const double inv = 1.0 / 255.0;
+        for (size_t i = 0; i < (size_t)w * h; ++i)
+            storeLinear(px[i * 3] * inv, px[i * 3 + 1] * inv, px[i * 3 + 2] * inv);
+        stbi_image_free(px);
+        return true;
     }
 
   private:

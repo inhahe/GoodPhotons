@@ -65,9 +65,9 @@ _S2L = [srgb_to_lin(i / 255.0) for i in range(256)]
 #
 # Sources are also matched to cap SCREEN SIZE, because two of the drops are only ~200 px
 # across and the caps span 72-634 px in the still.  Cap footprints (1280x720, still camera):
-# gyroid 634x293, axicon 411x109, diamond 288x75, glass 225x70, klein 153x37, dumbbell
-# 105x28, chrome 105x21, brass 91x19, heart 84x19, oil 72x16.  So the two 197x256 drops go
-# to caps under 160 px and the 4650^2 and 1600x1067 sheets go to the two that matter.
+# gyroid 634x293, axicon 411x109, diamond 288x75, glass 225x70, alice 206x64, klein 153x37,
+# dumbbell 105x28, chrome 105x21, brass 91x19, heart 84x19, oil 72x16.  So the two 197x256
+# drops go to caps under 160 px and the 4650^2 and 1600x1067 sheets go to the two that matter.
 CAPS = [
     # ---- caustic-critical: calm, pale, near-neutral -------------------------------------
     # #6 is the flattest AND most neutral sheet in the set (contrast 0.18, chroma 0.003), so
@@ -96,8 +96,28 @@ CAPS = [
     # The gold-veined sheets go under the GOLD gyroid and the BRASS cluster on purpose: the
     # centrepiece cap is the biggest surface in the frame and the vein colour rhymes with the
     # metal standing on it, at zero caustic cost because both pieces are opaque.
-    ('marble_gold',    'marble texture 1.jpeg',   'stand_gyroid_cap',   None,           1.00, 1.00),
+    #
+    # #1 IS THE THIRD SHEET CUT INTO TWO SLABS (after #2 for chrome/creature and #7 for
+    # orb/compote), because the gallery grew a THIRTEENTH cap -- Alice -- and there are still
+    # only ten source drops. #1 is the one to quarry now for the same reason #2 and #7 were:
+    # at 1098x1960 it is the second-tallest sheet in the set, and half of it is still 1098x980
+    # against a MAXDIM of 1024, so the gyroid's 634x293 px cap loses nothing visible.
+    # The gyroid keeps the TOP half, which carries the heavy gold band; Alice takes the
+    # BOTTOM, whose veining is finer and whose field is more white. The two crops share no
+    # pixel, so they are two slabs off one block rather than the same stone printed twice.
+    ('marble_gold',    'marble texture 1.jpeg',   'stand_gyroid_cap',  (0, 0, 1, 0.50),  1.00, 1.00),
     ('marble_brass',   'marble texture 8.jpg',    'stand_brass_cap',    None,           1.00, 1.00),
+    # ALICE's cap is free by the caustic ranking -- she is an opaque painted figure and throws
+    # nothing -- but it is the only cap in the hall with a COLOURED subject standing on it, so
+    # it gets calmed for the two reasons the creature's was, one of which is new:
+    #   * her SHOES are dark and her stockings are white, and both have to separate from the
+    #     stone (the creature's k=0.70 exists for exactly this, its dark paws on #2's near-
+    #     black field);
+    #   * she is the one object in this gallery whose colour is PAINT rather than physics --
+    #     an imported baseColor atlas -- so a saturated gold slab beneath her would compete
+    #     with the only texture in the frame. s=0.80 leaves the vein visible as vein and takes
+    #     the tint off the light bouncing back up into her pinafore.
+    ('marble_alice',   'marble texture 1.jpeg',   'stand_alice_cap',   (0, 0.50, 1, 1),  0.70, 0.80),
     # #2 carries a near-black grey field beside its gold; at full contrast it bottoms out at
     # 0.006 linear (sRGB 19), which reads as a HOLE in the tabletop rather than dark stone.
     # k=0.75 lifts the floor without touching the veins.

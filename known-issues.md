@@ -12627,14 +12627,30 @@ as a cleanly-capped solid by default, an open shell with `open`).
 The new glTF 2.0 loader (`src/gltf.h` + `src/third_party/json.h`) covers the common
 static-mesh case but deliberately omits a number of glTF features. Each is a scoped
 follow-up, not a bug:
-- **No textures.** Only `baseColorFactor`/`metallicFactor`/`roughnessFactor` *scalars*
-  are read; `baseColorTexture`/`metallicRoughnessTexture`/`normalTexture` are ignored.
-  Proper fix: decode referenced images (glTF images are PNG/JPEG — the renderer already
-  vendors stb_image), register them as `Scene::textures`, and set `reflectTex`/UV set.
-- **No KHR material extensions** (transmission, clearcoat, volume, ior, emissive
-  strength, sheen, specular). A glass glTF loads as an opaque glossy/diffuse, not a
-  dielectric. Proper fix: read `extensions.KHR_materials_transmission`/`_ior` → map to
-  `MatType::Dielectric` with the given ior; other extensions as feasible.
+- ~~**No textures.**~~ **FIXED 2026-09-04 (v0.245.0).** `baseColorTexture` →
+  `Material::reflectTex` (de-gamma'd, the base-colour factor folded into its texels),
+  `metallicRoughnessTexture` → `Material::roughnessTex` (its GREEN plane broadcast to all
+  three channels, because `Texture::scalarAt` averages them) and `normalTexture` →
+  `Material::normalTex` with the glTF `scale` as `normalStrength`. Images are decoded in
+  place — `Texture::loadMemory` wraps `stbi_load_from_memory`, so a bufferView of the GLB's
+  BIN chunk, a base64 data URI and a sibling file all work — then area-averaged in LINEAR
+  light down to `kGltfMaxTexDim` (2048). The cap is not cosmetic: `Texture::rgb` is
+  `Vec3` doubles (24 B/texel) and a reflectance map builds a Jakob-Hanika coefficient table
+  beside it (another 24 B), so an 8192² atlas would cost 3.2 GB of host RAM before a ray is
+  traced. Two subtleties that cost a render each to find: glTF's UV origin is the image's
+  TOP-left and ftrace's is the BOTTOM-left, so `vertUV` flips `v` (flipping the UV rather
+  than the image keeps the derived tangent frames right for normal maps); and the MEAN
+  metalness of the map's blue channel is harvested before the green plane overwrites it and
+  multiplied into `metallicFactor`, because Meshy-class exporters emit `metallicFactor 1.0`
+  with the real metalness in the map — reading the factor alone types a painted character
+  as `MatType::Glossy` and renders it as a mirror. Still open, all narrow: only
+  `TEXCOORD_0` (a map on texCoord 1 is sampled with set 0's UVs), no `KHR_texture_transform`,
+  no occlusion or emissive maps, and one wrap mode per texture so an S/T pair that disagrees
+  collapses to S. Exercised by `scenes/gallery_rain.ftsl`'s Alice.
+- ~~**No KHR material extensions**~~ — **PARTLY FIXED**: the four that describe GLASS are
+  read (`KHR_materials_ior`, `_transmission`, `_volume`, `_dispersion`), so a glass glTF now
+  loads as a `MatType::Dielectric` with the right ior and attenuation instead of an opaque
+  glossy. Clearcoat, sheen, specular and emissive-strength are still ignored.
 - **No `emissiveFactor` import.** Emissive glTF materials load unlit. The underlying
   mechanism now exists — mesh-emitter area lights shipped in 0.186.0 (C5): an FTSL `emit`
   material bound to a `mesh` registers an `EmitterShape::Mesh` sampled light. What's

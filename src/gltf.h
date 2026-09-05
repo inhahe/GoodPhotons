@@ -7,13 +7,19 @@
 // spectral BSDFs (baseColor -> upsampled reflectance; metallic -> glossy tint;
 // roughness -> lobe width), each created once and referenced by primitive.
 //
+// TEXTURES are imported too: baseColorTexture -> Material::reflectTex (de-gamma'd),
+// metallicRoughnessTexture -> Material::roughnessTex (its green plane) plus the mean
+// metalness that decides diffuse-vs-metal, normalTexture -> Material::normalTex. Images
+// are decoded straight out of the GLB's BIN chunk / a data URI / a sibling file, and
+// area-averaged down to kGltfMaxTexDim so an 8K atlas does not cost gigabytes.
+//
 // Scope / limitations (see known-issues.md): triangles only (primitive.mode 4);
 // POSITION/NORMAL/TEXCOORD_0 attributes; no skinning/morph targets, no sparse
 // accessors, the KHR material extensions that describe GLASS (ior / transmission /
 // volume / dispersion — see the material loop; clearcoat, sheen etc. are still ignored),
-// no textures
-// (only factor colors), no animation. Enough to drop static Fab/Sketchfab/Blender
-// glTF+GLB models into a scene, smooth-shaded, with plausible materials.
+// only TEXCOORD_0 (a map on texCoord 1 is sampled with set 0's UVs) and no
+// KHR_texture_transform, no occlusion/emissive maps, no animation. Enough to drop static
+// Fab/Sketchfab/Blender/Meshy glTF+GLB models into a scene, smooth-shaded and painted.
 #pragma once
 #include <cstdint>
 #include <cstdio>
@@ -107,6 +113,78 @@ inline int typeNumComp(const std::string& t) {
     if (t == "MAT3")   return 9;
     if (t == "MAT4")   return 16;
     return 0;
+}
+
+// ---------------------------------------------------------------------------------
+// TEXTURES.  A glTF material's colour usually does NOT live in `baseColorFactor` --
+// every DCC and every AI generator exports factor (1,1,1) and puts the whole look in
+// `baseColorTexture`. Reading only the factor therefore does not lose "a nuance", it
+// turns a painted character into a white blank, which is exactly what a Meshy export
+// used to import as (metallicFactor is 1.0 in those files too, so the blank was also
+// a MIRROR). The three maps below are the ones that change what a surface IS:
+//
+//   baseColorTexture         -> Material::reflectTex   (sRGB; the albedo)
+//   metallicRoughnessTexture -> Material::roughnessTex (linear; G channel only) and,
+//                               via its MEAN metallic, the diffuse/glossy decision
+//   normalTexture            -> Material::normalTex    (linear tangent-space)
+//
+// Everything else glTF can attach (occlusion, emissive, clearcoat/sheen maps) is still
+// ignored -- see the file header.
+struct TexRef { int index = -1; int texCoord = 0; };
+
+// Read a glTF textureInfo object (`{"index":n,"texCoord":k}`) out of `parent[key]`.
+inline TexRef texRefOf(const minijson::Value* parent, const char* key) {
+    TexRef t;
+    if (!parent) return t;
+    if (const minijson::Value* v = parent->find(key); v && v->isObject()) {
+        t.index = v->intAt("index", -1);
+        t.texCoord = v->intAt("texCoord", 0);
+    }
+    return t;
+}
+
+// What a decoded image is going to be USED for. The same glTF image can legitimately
+// be wanted twice with different decodes (a colour map is sRGB, a data map is linear),
+// and metallicRoughness has to be split into a single channel before it can drive a
+// scalar parameter -- so the cache below is keyed on (glTF texture index, role), not
+// on the image alone.
+enum class TexRole { Color, Roughness, Normal };
+
+// Largest texture dimension kept on import. A Texture stores LINEAR doubles (24 B per
+// texel) and a reflectance map builds a Jakob-Hanika coefficient table beside it (another
+// 24 B), so an 8192x8192 base-colour atlas -- which is what AI mesh generators emit as a
+// matter of course -- would cost 3.2 GB of host RAM before a single ray is traced, then
+// the same again on the way to the device. Area-averaging it down to 2048 leaves 200 MB
+// and still gives 4.2 M texels to an asset that covers a few tens of thousands of pixels
+// in any frame it appears in; the filtering happens in linear light after decode, so it
+// is a correct box downsample rather than a resample of gamma-encoded bytes. Raising this
+// is safe but buys nothing until an asset genuinely fills the frame.
+inline constexpr int kGltfMaxTexDim = 2048;
+
+// Area-average an already-decoded LINEAR image so neither dimension exceeds `maxDim`.
+// Source rectangles are computed with integer arithmetic so they tile the source exactly
+// (no texel counted twice, none dropped) even when the ratio is not an integer.
+inline void downscaleTexture(Texture& t, int maxDim) {
+    if (!t.valid() || (t.w <= maxDim && t.h <= maxDim)) return;
+    const double sc = (double)maxDim / (double)std::max(t.w, t.h);
+    const int nw = std::max(1, (int)std::lround(t.w * sc));
+    const int nh = std::max(1, (int)std::lround(t.h * sc));
+    std::vector<Vec3> out((size_t)nw * nh);
+    for (int y = 0; y < nh; ++y) {
+        const int y0 = (int)((int64_t)y * t.h / nh);
+        const int y1 = std::max(y0 + 1, (int)((int64_t)(y + 1) * t.h / nh));
+        for (int x = 0; x < nw; ++x) {
+            const int x0 = (int)((int64_t)x * t.w / nw);
+            const int x1 = std::max(x0 + 1, (int)((int64_t)(x + 1) * t.w / nw));
+            Vec3 acc{0, 0, 0};
+            for (int sy = y0; sy < y1; ++sy)
+                for (int sx = x0; sx < x1; ++sx)
+                    acc = acc + t.rgb[(size_t)sy * t.w + sx];
+            out[(size_t)y * nw + x] = acc * (1.0 / (double)((y1 - y0) * (x1 - x0)));
+        }
+    }
+    t.w = nw; t.h = nh;
+    t.rgb.swap(out);
 }
 
 struct BufferView { int buffer = -1; size_t offset = 0; size_t length = 0; size_t stride = 0; };
@@ -224,6 +302,45 @@ inline Affine nodeLocalAffine(const minijson::Value& node) {
             a.m[r * 3 + c] = R[r * 3 + c] * sArr[c];
     a.t = T;
     return a;
+}
+
+// Decode one entry of the document's `images` array into `out` under encoding `enc`.
+// glTF gives an image either as a bufferView (the GLB case: the JPEG/PNG bytes sit
+// inside the BIN chunk, which is already resolved into doc.buffers) or as a URI, which
+// may itself be a base64 data payload or an external file beside the document. All three
+// end in Texture::loadMemory, so there is one decode path and no temporary files.
+inline bool decodeGltfImage(const Doc& doc, const minijson::Value* imagesArr,
+                            int imageIdx, const std::string& baseDir,
+                            TexEncoding enc, Texture& out, std::string& err) {
+    if (!imagesArr || !imagesArr->isArray() ||
+        imageIdx < 0 || imageIdx >= (int)imagesArr->arr.size()) {
+        err = "glTF image index " + std::to_string(imageIdx) + " out of range";
+        return false;
+    }
+    const minijson::Value& img = imagesArr->arr[imageIdx];
+    const std::string what = "glTF image " + std::to_string(imageIdx);
+    // Set BEFORE decoding: Texture::storeLinear consults `encoding` per texel, so a
+    // colour map must already be marked sRGB when its bytes are de-gamma'd, and a data
+    // map (roughness, normals) must already be marked Linear so its bytes are NOT.
+    out.encoding = enc;
+    if (const minijson::Value* bvv = img.find("bufferView"); bvv && bvv->isNumber()) {
+        const int bvi = bvv->asInt();
+        if (bvi < 0 || bvi >= (int)doc.views.size()) { err = "bad bufferView in " + what; return false; }
+        const BufferView& bv = doc.views[bvi];
+        if (bv.buffer < 0 || bv.buffer >= (int)doc.buffers.size()) { err = "bad buffer in " + what; return false; }
+        const std::vector<uint8_t>& buf = doc.buffers[bv.buffer];
+        if (bv.offset + bv.length > buf.size()) { err = "truncated " + what; return false; }
+        return out.loadMemory(buf.data() + bv.offset, bv.length, what, err);
+    }
+    if (const minijson::Value* uri = img.find("uri"); uri && uri->isString()) {
+        std::vector<uint8_t> bytes;
+        if (!resolveBufferUri(uri->str, baseDir, bytes) || bytes.empty()) {
+            err = "cannot resolve image uri: " + uri->str; return false;
+        }
+        return out.loadMemory(bytes.data(), bytes.size(), what, err);
+    }
+    err = what + " has neither bufferView nor uri";
+    return false;
 }
 
 }  // namespace gltfimpl
@@ -360,6 +477,93 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
         }
     }
 
+    // --- image textures --------------------------------------------------------------
+    // Decoded lazily and memoised, because one atlas is routinely referenced by several
+    // materials and an 8192^2 JPEG costs seconds to decode. The key is not the image
+    // alone: the SAME image legitimately wants two different decodes (a colour map is
+    // sRGB, a data map is linear), and the factor that glTF multiplies the map by is
+    // baked into the texels here (ftrace's texture bindings replace the constant, they
+    // do not scale it), so two materials sharing a map with different factors must get
+    // two textures. Hence (glTF texture index, role, factor) -> Scene::textures id.
+    const minijson::Value* texturesArr = doc.root.find("textures");
+    const minijson::Value* imagesArr   = doc.root.find("images");
+    const minijson::Value* samplersArr = doc.root.find("samplers");
+    struct TexCacheEnt { int gltfTex; int role; double p0, p1, p2; int sceneTex; double meanMetal; };
+    std::vector<TexCacheEnt> texCache;
+    bool texStopped = false;   // buildReflCoeff refused: `ftrace -stop` during scene load
+
+    // Bind glTF texture `ti` in `role` (with glTF's per-material factor `p0..p2` folded
+    // in) to a Scene::textures slot, returning its id or -1. `outMeanMetal`, when given,
+    // receives the mean of the map's BLUE channel -- for a metallicRoughness map that is
+    // the mean metallic, which is the only thing the single-BSDF material choice below
+    // can act on (ftrace has no per-texel metal/dielectric blend).
+    auto bindTex = [&](int ti, TexRole role, double p0, double p1, double p2,
+                       double* outMeanMetal) -> int {
+        if (texStopped) return -1;
+        if (!texturesArr || !texturesArr->isArray() || ti < 0 || ti >= (int)texturesArr->arr.size())
+            return -1;
+        for (const TexCacheEnt& e : texCache)
+            if (e.gltfTex == ti && e.role == (int)role &&
+                e.p0 == p0 && e.p1 == p1 && e.p2 == p2) {
+                if (outMeanMetal) *outMeanMetal = e.meanMetal;
+                return e.sceneTex;
+            }
+        const minijson::Value& tj = texturesArr->arr[ti];
+        const int src = tj.intAt("source", -1);
+        if (src < 0) return -1;
+
+        Texture tex;
+        const TexEncoding enc = (role == TexRole::Color) ? TexEncoding::sRGB : TexEncoding::Linear;
+        std::string terr;
+        if (!decodeGltfImage(doc, imagesArr, src, baseDir, enc, tex, terr)) {
+            std::fprintf(stderr, "[gltf] %s: %s (texture ignored)\n", authored.c_str(), terr.c_str());
+            return -1;
+        }
+        downscaleTexture(tex, kGltfMaxTexDim);
+
+        // --- sampler: glTF's GL enums -> ftrace's wrap/filter -------------------------
+        if (const int si = tj.intAt("sampler", -1);
+            si >= 0 && samplersArr && samplersArr->isArray() && si < (int)samplersArr->arr.size()) {
+            const minijson::Value& sm = samplersArr->arr[si];
+            auto wrapOf = [](int e) {
+                return e == 33071 ? TexWrap::Clamp : (e == 33648 ? TexWrap::Mirror : TexWrap::Repeat);
+            };
+            // ftrace has a single wrap mode per texture, so an S/T pair that disagrees
+            // has to collapse; S wins, which is what every real asset agrees on anyway.
+            tex.wrap   = wrapOf(sm.intAt("wrapS", 10497));
+            tex.filter = (sm.intAt("magFilter", 9729) == 9728) ? TexFilter::Nearest
+                                                              : TexFilter::Bilinear;
+        }
+
+        double meanMetal = 0.0;
+        if (role == TexRole::Roughness) {
+            // glTF packs occlusion/roughness/metalness into R/G/B of one image. ftrace's
+            // scalarAt averages the three channels, so the G plane has to be broadcast to
+            // all three or a rough surface would read as (0 + rough + metal)/3. The mean
+            // metallic is harvested first, before B is overwritten.
+            const size_t n = tex.rgb.size();
+            for (const Vec3& c : tex.rgb) meanMetal += c.z;
+            meanMetal = n ? meanMetal / (double)n : 0.0;
+            for (Vec3& c : tex.rgb) {
+                const double g = std::min(1.0, std::max(0.0, c.y * p0));
+                c = Vec3{g, g, g};
+            }
+        } else if (role == TexRole::Color) {
+            if (p0 != 1.0 || p1 != 1.0 || p2 != 1.0)
+                for (Vec3& c : tex.rgb) c = Vec3{c.x * p0, c.y * p1, c.z * p2};
+            if (!tex.buildReflCoeff()) { texStopped = true; return -1; }
+        }
+
+        tex.name = authored + "#tex" + std::to_string(ti) +
+                   (role == TexRole::Color ? ":color"
+                                           : (role == TexRole::Roughness ? ":rough" : ":normal"));
+        const int id = (int)s.textures.size();
+        s.textures.push_back(std::move(tex));
+        texCache.push_back(TexCacheEnt{ti, (int)role, p0, p1, p2, id, meanMetal});
+        if (outMeanMetal) *outMeanMetal = meanMetal;
+        return id;
+    };
+
     // --- materials: map each glTF material index -> a scene material id ------------
     std::vector<int> matMap;   // gltf material index -> scene mat id
     if (importMaterials) {
@@ -369,6 +573,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 const minijson::Value& mj = mats->arr[i];
                 double r = 0.8, g = 0.8, b = 0.8;
                 double metallic = 1.0, roughness = 1.0;
+                TexRef baseTex, mrTex;
                 if (const minijson::Value* pmr = mj.find("pbrMetallicRoughness")) {
                     if (const minijson::Value* bc = pmr->find("baseColorFactor");
                         bc && bc->isArray() && bc->arr.size() >= 3) {
@@ -378,7 +583,33 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     }
                     metallic  = pmr->numAt("metallicFactor", 1.0);
                     roughness = pmr->numAt("roughnessFactor", 1.0);
+                    baseTex = texRefOf(pmr, "baseColorTexture");
+                    mrTex   = texRefOf(pmr, "metallicRoughnessTexture");
                 }
+                const TexRef nrmTex = texRefOf(&mj, "normalTexture");
+                double normalScale = 1.0;
+                if (const minijson::Value* nt = mj.find("normalTexture"); nt && nt->isObject())
+                    normalScale = nt->numAt("scale", 1.0);
+
+                // Bind the maps BEFORE the BSDF is chosen: `metallic` below is the number
+                // that decides diffuse-vs-metal, and in a textured material the factor is
+                // only half of it -- Meshy and friends emit metallicFactor 1.0 with the
+                // real (near-zero) metalness in the map's blue channel, so reading the
+                // factor alone turns a painted character into a mirror.
+                int reflectTexId = -1, roughTexId = -1, normalTexId = -1;
+                if (baseTex.index >= 0) {
+                    reflectTexId = bindTex(baseTex.index, TexRole::Color, r, g, b, nullptr);
+                    if (reflectTexId >= 0) { r = g = b = 1.0; }   // factor folded into the texels
+                }
+                if (mrTex.index >= 0) {
+                    double meanMetal = metallic;
+                    roughTexId = bindTex(mrTex.index, TexRole::Roughness, roughness, 0.0, 0.0,
+                                         &meanMetal);
+                    if (roughTexId >= 0) metallic *= meanMetal;
+                }
+                if (nrmTex.index >= 0)
+                    normalTexId = bindTex(nrmTex.index, TexRole::Normal, 0.0, 0.0, 0.0, nullptr);
+                if (texStopped) { err = "scene load stopped"; return 0; }
                 // --- KHR material extensions: where GLASS actually lives ---------------
                 // A transmissive glTF material says almost nothing in its core block — a
                 // coloured gem is routinely `baseColorFactor [1,1,1,1]`, with the tint in
@@ -451,6 +682,16 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 } else {
                     m.type = MatType::Diffuse;
                 }
+                // Bind the maps. reflectTex REPLACES the constant `reflect` spectrum at
+                // each hit (the factor is already folded into its texels above), so it is
+                // safe on every BSDF; roughnessTex is inert on a Diffuse material but is
+                // bound anyway, so that a material re-typed later still has its data.
+                m.reflectTex  = reflectTexId;
+                m.roughnessTex = roughTexId;
+                if (normalTexId >= 0) {
+                    m.normalTex = normalTexId;
+                    m.normalStrength = normalScale;
+                }
                 int id = (int)s.mats.size();
                 s.mats.push_back(m);
                 matMap[i] = id;
@@ -515,7 +756,15 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             };
             auto vertUV = [&](uint32_t vi) -> Vec3 {
                 if (!hasUV) return Vec3{0, 0, 0};
-                return Vec3{uv[vi*uc+0], uv[vi*uc+1], 0};
+                // glTF's UV origin is the image's TOP-left (v grows downward); ftrace's
+                // is the BOTTOM-left (Texture::sampleRgb indexes row (1-v)*h of top-left
+                // storage), which is the OBJ/OpenGL convention the rest of the loader
+                // family already uses. Without this flip every glTF texture renders
+                // vertically mirrored -- and mirrored on a UV atlas is not "upside down",
+                // it is each shell landing on a DIFFERENT shell's pixels, i.e. noise.
+                // Flipping here rather than flipping the image also keeps the derived
+                // tangent frames (geometry.h) consistent, so normal maps stay correct.
+                return Vec3{uv[vi*uc+0], 1.0 - uv[vi*uc+1], 0};
             };
             auto emitTri = [&](uint32_t a, uint32_t bIdx, uint32_t c) {
                 if (a >= vcount || bIdx >= vcount || c >= vcount) return;
@@ -586,8 +835,16 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     char skipNote[64] = {0};
     if (skippedByMat)
         std::snprintf(skipNote, sizeof skipNote, " (skip_material dropped %d prims)", skippedByMat);
-    std::printf("loadGltf: %s -> %d tris%s%s%s\n", path, added,
-                (importMaterials && !matMap.empty()) ? " [glTF materials]" : "",
+    // Report the texture count: a glTF that silently imported ZERO maps is the failure
+    // mode that looks like a lighting bug (a painted character arrives as a white blank),
+    // so the load line has to say whether any arrived.
+    char matNote[64] = {0};
+    if (importMaterials && !matMap.empty()) {
+        if (texCache.empty()) std::snprintf(matNote, sizeof matNote, " [glTF materials]");
+        else std::snprintf(matNote, sizeof matNote, " [glTF materials, %d textures]",
+                           (int)texCache.size());
+    }
+    std::printf("loadGltf: %s -> %d tris%s%s%s\n", path, added, matNote,
                 skippedNonTri ? " (skipped non-triangle primitives)" : "", skipNote);
     if (added == 0 && err.empty()) err = "no triangles loaded (unsupported primitive layout?)";
     return added;
