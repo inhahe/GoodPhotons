@@ -698,63 +698,90 @@ technique the connections sample badly, so the balance heuristic correctly gives
 weight). UPBP's own paper handles this; ftrace does not yet. The standard remedy is to cap the
 merge contribution or to fold a `sin(theta)`-aware term into the kernel.
 
-### UPBP-THICK — OPEN (2026-09-04, v0.244.0): on an optically **thick, multi-bounce** scene mode `J` overshoots a **converged** mode `D` by 15 % at the default `-beamk` and **64 %** with the radius floor off — identically on CPU and GPU, so it is an estimator bias, not a port bug
+### UPBP-THICK — OPEN (2026-09-04, v0.244.0): on an optically **thick, multi-bounce** scene mode `J` reads up to **1.6×** an independent reference, and the error is governed by the **light-subpath count**, not by `-spp` — identically on CPU and GPU
 
-**Found while validating the GPU port; it is not caused by it.** `scenes/_fog_thick.ftsl`
-(`sigma_t 20 / albedo 0.95`, bounded to the box), 128², `-max-bounce 8`, whole-frame scene-linear
-energy via `scraps/_jgpu_cmp.py`:
+**Found while validating the GPU port; it is not caused by it, and it is not a port bug**: CPU
+and GPU agree with each other to **0.11 %** while both sit 1.67× above the reference, so the
+device faithfully reproduces something the CPU already did.
 
-| render | spp | noise | energy | vs converged `D` |
+**The reference is mode `R`, not mode `D`, and getting that right mattered.** The first
+comparison used mode `D` and was nearly derailed by a settings mismatch: **`-max-bounce`
+defaults to 32, but modes `D`/`U` default to 8**, so an unmatched mode `R` ran 32 bounces in an
+`albedo 0.95` medium and read **8.4×** mode `D`. At a *matched* `-max-bounce 8`, mode `R` at
+1 541 100 spp / 0.08 % noise validates mode `D` (`D/R = 1.021`) and both indict mode `J`.
+`scenes/_fog_thick.ftsl`, 128², `-max-bounce 8`, whole-frame scene-linear energy
+(`scraps/_jgpu_cmp.py`):
+
+| render | spp | vs mode `R` @ `-max-bounce 8` |
+|---|---|---|
+| `-mode D -device gpu` | 146 250 | **1.021** |
+| `-mode J -device gpu` (auto-sized map) | 2 871 | 1.177 |
+| `-mode J -device cpu` (auto-sized map) | 1 042 | 1.156 |
+| `-mode J -device gpu -beamk 1` | 50 767 | 1.671 |
+| `-mode J -device cpu -beamk 1` | 3 354 | 1.673 |
+
+**The excess is coherent, not fireflies** — which is what rules out "just bound the
+`1/sin(theta)` tail" as the fix. The **median** per-pixel ratio is **1.0047** (the bulk of the
+frame is right), but of the total excess, blobs of ≥ 16 px carry **76 %** and single-pixel blobs
+carry **0.6 %**; one 315-px blob alone carries 72 %, and a 3×3 median filter barely dents the
+whole-frame ratio (1.637 → 1.477). A whole region is too bright, not a scatter of spikes.
+
+**It is the light-subpath count, and `-spp` does not touch it.** `-beamcount` is inert (see MEM
+below) — the auto-sizer overrides it — so the `-beamk` sweep that first looked like a *radius*
+dependence was really varying the subpath count. Holding `-beamk 1` and sweeping `-n` directly
+keeps the kernel radius constant to 1 % and moves the error by 50× (`-r 64`, 60 s each, against
+a 3 521 551-spp mode-`R` reference):
+
+| `-n` subpaths | kernel radius | kappa | `J`/ref | error |
 |---|---|---|---|---|
-| `-mode D -device gpu` | 72 881 | 0.37 % | 9.6473e13 | — |
-| `-mode D -device gpu` (resumed) | 146 250 | 0.26 % | 9.6593e13 | **1.0012** |
-| `-mode J -device cpu` (default `-beamk`) | 1 042 | 3.10 % | 1.0940e14 | 1.132 |
-| `-mode J -device gpu` (default `-beamk`) | 2 871 | 1.87 % | 1.1140e14 | **1.153** |
-| `-mode J -device cpu -beamk 1 -beamcount 1000000` | 3 354 | 1.73 % | 1.5826e14 | 1.638 |
-| `-mode J -device gpu -beamk 1 -beamcount 1000000` | 50 767 | 0.44 % | 1.5809e14 | **1.637** |
+| 256 | 0.004810 | 2.46 | 1.6294 | **+63 %** |
+| 512 | 0.004841 | 4.96 | 1.2539 | +25 % |
+| 1024 | 0.004856 | 9.95 | 1.1797 | +18 % |
+| 2048 | 0.004851 | 19.87 | 1.1690 | +17 % |
+| 4096 | 0.004834 | 39.60 | 1.0503 | +5 % |
+| 8192 | 0.004852 | 79.49 | 1.0116 | +1 % |
+| 16384 | 0.004847 | 158.8 | 0.9239 | −8 % |
+| 32768 | 0.004848 | 317.7 | 0.9628 | −4 % |
 
-**Mode `D` is the converged one.** Doubling its samples (72 881 → 146 250) moved its energy by
-**0.12 %**, so it is settled to ~0.1 % and the 15 %/64 % gaps are not mode `D` still climbing. The
-excess is concentrated in the **bright** quartile (Q4 ratio 1.154 while Q2 is 1.000), and in the
-`-beamk 1` case the peak pixel is **1.55e12 against mode `D`'s 8.37e10 — 18×**.
+So the merge half is **consistent** — it converges to the reference — but on this scene it needs
+`n ≳ 8000` light subpaths to get within a few percent, and the auto-sizer's `-beamk` knee chose
+**2527**, squarely inside the biased region. **That is the actionable defect**: the knee is a
+*cost* heuristic (J-BEAMCOST, where extra beams stop being free) and it is being used as if it
+were an *accuracy* heuristic. It has no notion of how far the merge estimator is from converged,
+so on a thick scene it confidently picks a map that renders 15 % too bright.
 
-**It is not the port.** CPU and GPU agree with each other to **0.11 %** at `-beamk 1` (1.5826e14 vs
-1.5809e14) while both sit 1.64× above mode `D`. The device reproduces the CPU bias exactly, which
-is the strongest available evidence that the two share one cause in the estimator.
+**Caveat on "bias vs. frozen-map variance" — not yet settled, and there is no tool to settle
+it.** UPBP-CONV(1) already notes the merge half is frozen on one light-side sample set, so an
+error that decays with `n` could be either a true bias or the noise of a single realization. The
+sweep above cannot distinguish them, because **successive `-n` values share an RNG prefix** —
+`-n 512` traces `-n 256`'s subpaths plus 256 more — so the points are nested, not independent,
+and their smooth monotonicity is partly an artifact of that nesting. (An earlier "six independent
+realizations" check at `n = 256…296` is invalid for the same reason.) What *does* favour a real
+bias: the error falls by ~50× over a 32× rise in `n`, which is close to `1/n` and far steeper
+than the `1/sqrt(n)` a variance explanation predicts.
 
-**It is not the `-beamk` radius floor either — the floor is masking it.** The intuition is
-backwards: *shrinking* the kernel makes the overshoot **worse** (15 % → 64 %). An unbiased merge
-estimator's expectation is radius-independent, so a radius-dependent error means the merge's
-normalisation is wrong in a way that scales with `1/r` somewhere — which is also consistent with
-the excess living in the bright quartile and in the peak, since the `1/sin(theta)` tail sharpens as
-`r` shrinks.
-
-**Gate 3 does not cover this, which is why it was missed.** `tools/slab_ss_ref.py` runs the slab at
-`-max-bounce 1`, so it validates the merge only at **single scattering**, where mode `J` reads
-1.0030 (CPU) / 1.0029 (GPU) against closed form. Everything above is multi-bounce. A depth sweep on
-`_fog_thick` at `-r 64` / 45 s gave `J/D` = 1.060, 1.063, 0.961 for `-max-bounce` 1, 2, 3 — too
-noisy at that budget to localise the depth, and re-running it converged is the first step.
-
-**Suspects, in the order worth checking.**
-1. **The `1/sin(theta)` tail is not merely fireflying, it is biasing the mean.** A single
-   near-parallel merge at 18× mode `D`'s peak, in a frame whose total is 1.6×, is a large share of
-   the excess. Check whether clamping the merge contribution collapses the gap; if it does, the
-   estimator is fine and the *variance* is so heavy-tailed that neither image's mean is trustworthy
-   — in which case the right measurement is a median or a clamped mean, not total energy.
-2. **`mergeEtaPrime` uses `2r`, not the pointwise kernel value.** That is correct for the standard
-   1D kernel normalisation, but it is exactly the `r`-dependent term, so an error there would show
-   up as the radius dependence observed.
-3. **`mergeKappa = nEmitted · 2 · radRef()`** — the same `r` factor from the other side. If the
-   kernel actually used in the gather and the `radRef()` used in `kappa` ever disagree (per-medium
-   radii vs one scene-wide `radRef`), the weights stop summing to 1 and the bias is radius-scaled.
-4. **A depth-dependent term in the MIS weight**, given gate 3 passes at depth 1 and this fails at
-   depth 8.
+**Next steps, in order.**
+1. **Add a `-seed` flag.** ftrace has none, and without one there is no way to draw independent
+   light-side realizations, which is the only clean way to separate bias from frozen-map
+   variance. This blocks the rest of the diagnosis and is worth having on its own.
+2. **Give the auto-sizer an accuracy floor.** Whatever the mechanism, a map that renders 15 %
+   hot is the wrong default. The knee should be a lower bound that an accuracy criterion can
+   raise, not the final answer.
+3. If (1) shows a true bias, audit the `n`-dependent terms: `mergeKappa = nEmitted · 2 · radRef()`
+   (verified to match the logged kappa exactly: 256 × 2 × 0.00481 = 2.463), the `1/nEmitted` in
+   the gather's beam power, and whether the ~91 sub-beams a single subpath deposits in a thick
+   medium are being treated as independent merge samples.
+4. Gate 3 cannot catch any of this: `tools/slab_ss_ref.py` runs at `-max-bounce 1`, so it
+   validates only **single** scattering, where mode `J` reads 1.0030 (CPU) / 1.0029 (GPU). A
+   multi-bounce analytic or `R`-referenced gate is needed.
 
 **Reproduce:**
 ```
-ftrace -in scenes/_fog_thick.ftsl -mode D -device gpu -r 128 -time 420 -hdr -o png/thick_d.png -window-min -interval 200
-ftrace -in scenes/_fog_thick.ftsl -mode J -device gpu -r 128 -beamcount 1000000 -beamk 1 -time 420 -hdr -o png/thick_j_k1.png -window-min -interval 200
-python scraps/_jgpu_cmp.py png/thick_d.pfm png/thick_j_k1.pfm
+ftrace -in scenes/_fog_thick.ftsl -mode R -device gpu -r 64 -max-bounce 8 -time 240 -hdr -o png/ref64.png -window-min -interval 200
+ftrace -in scenes/_fog_thick.ftsl -mode J -device gpu -r 64 -max-bounce 8 -n 256  -beamk 1 -time 60 -hdr -o png/n256.png  -window-min -interval 55
+ftrace -in scenes/_fog_thick.ftsl -mode J -device gpu -r 64 -max-bounce 8 -n 8192 -beamk 1 -time 60 -hdr -o png/n8192.png -window-min -interval 55
+python scraps/_jgpu_cmp.py png/ref64.pfm png/n256.pfm     # ~1.63
+python scraps/_jgpu_cmp.py png/ref64.pfm png/n8192.pfm    # ~1.01
 ```
 
 ### MEM — OPEN (2026-09-02, v0.216.0): mode `J`'s beam map has **no trim** — it is sized by `-n` alone, and `-beamcount` is inert
