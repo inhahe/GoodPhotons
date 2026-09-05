@@ -328,7 +328,18 @@ struct PhotonBeam {
     // A beam with `achro` never carries a bundle (nSec == 0): the bundle exists to average
     // CIE over a few wavelengths, and this is that average exactly.
     float cieA[3];
+    // 0 = no fold (classic monochromatic, possibly with a bundle).
+    // 1 = DEPOSIT-time fold: use `cieA`, and the medium's gather tail is flat.
+    // 2 = GATHER-time fold (0.256.0): the path was wavelength-independent AND carried no
+    //     spectral weight (T == 1), but the medium's PHASE is a rainbow table, so the colour
+    //     cannot be decided until the scattering angle is known. `emIdx` names the emitter
+    //     whose Scene::bowLut the gather evaluates; `cieA` still holds that emitter's cieMean
+    //     as the fallback any consumer without the table (the device gather) can fall back to.
     unsigned char achro;
+    // Emitter index for `achro == 2`, else -1. Sixteen bits because a scene with more than
+    // 32767 emitters would have bigger problems; `emitBeams` refuses the fold above that
+    // rather than truncating, so the field can never name the wrong light.
+    short emIdx;
 
     // nSec is 0 for both a classic monochromatic beam and an achromatic-path one, so this is
     // the plain nSec+1 it always was; the achromatic beam carries the full chord power.
@@ -384,14 +395,19 @@ struct BeamBank {
     // for a classic monochromatic deposit, which is what every non-spectral caller does.
     // `cieA` (optional) is the emitter's mean CIE for an ACHROMATIC-PATH beam; passing it
     // supersedes the bundle, since it is the exact limit the bundle was approximating.
+    // `emIdx >= 0` asks for the GATHER-time fold (achro == 2): the caller has established that
+    // the path was wavelength-independent with unit spectral weight and that this medium's
+    // only chromatic term is its phase table. `cieA` must still be supplied, as the fallback.
     void push(const Vec3& o, const Vec3& d, double len, double power,
               double lambda, double absorb, int med,
-              const double* lamS = nullptr, int nSec = 0, const double* cieA = nullptr) {
+              const double* lamS = nullptr, int nSec = 0, const double* cieA = nullptr,
+              int emIdx = -1) {
         PhotonBeam b;
         b.o = o; b.d = d;
         b.s0 = 0.0f; b.len = (float)len; b.power = (float)power;
         b.lambda = (float)lambda; b.absorb = (float)absorb; b.med = med;
-        b.achro = cieA ? 1 : 0;
+        b.achro = cieA ? (emIdx >= 0 ? 2 : 1) : 0;
+        b.emIdx = (b.achro == 2) ? (short)emIdx : (short)-1;
         for (int i = 0; i < 3; ++i) b.cieA[i] = cieA ? (float)cieA[i] : 0.0f;
         if (nSec > kBeamSecMax) nSec = kBeamSecMax;
         b.nSec = (lamS && nSec > 0 && !cieA) ? nSec : 0;

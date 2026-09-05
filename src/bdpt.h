@@ -692,6 +692,14 @@ struct BeamSpectral {
     double lam[kBeamSpecMax] = {0};   // C wavelengths ~ this emitter's own SPD
     int    nLam = 0;
     bool   ok = false;                // false: deposit exactly as a pre-0.251.0 build did
+    // Index of the emitter above, for the GATHER-TIME spectral fold (0.256.0, Scene::BowLut).
+    // A beam crossing a `phase rainbow` medium cannot be folded at deposit time — its colour
+    // is a function of a scattering angle nobody knows yet — but it CAN be folded at gather
+    // time if the gather is told which emitter's spectrum to integrate against. `scale` is
+    // what makes that legal here: it converts the subpath's β from the scene-wide emission
+    // mixture to the emitter's OWN density, which is exactly the density BowLut integrates.
+    // -1 when no emitter is identifiable (then the beam stays monochromatic, as before).
+    int    emIdx = -1;
 };
 
 // Fill `bs` at a light subpath's birth. `leSpectral` is the λ-DEPENDENT part of the emitted
@@ -710,6 +718,14 @@ inline void beginBeamSpectral(const Scene& scene, const Renderer& mats, const Em
     if (!(leSpectral > 0.0) || !(em.spd.integral > 0.0)) return;
     bs.scale = em.spd.integral / leSpectral;
     bs.cie   = em.cieMean;
+    // Recover `em`'s index for the gather-time fold. `em` is always a reference INTO
+    // scene.emitters (generateLightSubpath picks it from there), so pointer arithmetic is
+    // well-defined; the bounds test is belt-and-braces, and the 32767 clamp is the width of
+    // PhotonBeam::emIdx.
+    if (!scene.emitters.empty()) {
+        const ptrdiff_t k = &em - &scene.emitters[0];
+        if (k >= 0 && k < (ptrdiff_t)scene.emitters.size() && k <= 32767) bs.emIdx = (int)k;
+    }
     const int C = mats.beamSpecC < 1 ? 1
                 : (mats.beamSpecC > kBeamSpecMax ? kBeamSpecMax : mats.beamSpecC);
     // ONE uniform variate, stratified: member i takes u + i/C wrapped into [0,1) through the
@@ -1806,6 +1822,37 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                                   ? &bs.cie : nullptr;
             const double  dLam  = bs.ok ? bs.lam[0] : hb.lam[0];
             const double  dSc   = bs.ok ? bs.scale : 1.0;
+            // MODE J DECLINES THE GATHER-TIME FOLD (0.256.0), AT DEPOSIT TIME, ON PURPOSE.
+            // `-1` here is the whole opt-out, and it has to be here rather than only at the
+            // gather, for a reason that is easy to miss: BeamBank::push treats the fold and the
+            // `-beamspec` BUNDLE as mutually exclusive (`nSec = (lamS && nSec > 0 && !cieA)`),
+            // because one record cannot carry both an emitter-folded colour and a set of
+            // secondary wavelengths. So asking for the fold SILENTLY DESTROYS the bundle. Mode
+            // J's gather refuses to use the fold (BeamMergeWeight::kFoldGatherTime is false),
+            // so requesting it here would leave the rain's beams with neither a fold nor a
+            // bundle: strictly monochromatic, the worst of the three. Measured on
+            // gallery_rain's rain ROI against the 6212-spp mode-D reference, relative RMSE:
+            //
+            //                             seed 7   seed 11
+            //   monochromatic (neither)   0.4263   0.5033
+            //   bow fold, no bundle       0.4157   0.4875
+            //   bundle, no fold           0.2876   0.2835
+            //   SHIPPED (bundle + the cloud's own deposit-time fold)
+            //                             0.2587   0.2788
+            //
+            // The bundle is worth roughly 4x what the fold is worth here, and the two are
+            // mutually exclusive, so mode `J` takes the bundle. (Mode `M` orders the middle two
+            // the other way round — there the beam map IS the whole volumetric estimate, so
+            // removing ALL chromatic variance from every crossing beats sampling four
+            // wavelengths of it; in mode `J` the merge is one MIS-weighted technique among
+            // several and the weight stays lambda-dependent whatever the colour does, which is
+            // variance the fold cannot reach but a bundle can.)  See known-issues.md,
+            // UPBP-BOWFOLD.
+            //
+            // `bs.emIdx` is still computed and still travels, because it costs nothing and is
+            // the field a future WEIGHTED bundle (`float wS[3]`) would need; it simply is not
+            // requested here.
+            const int     dEm   = -1;
 
             // --- The light half of every merge weight this subpath can take part in -------
             // Both accumulators telescope exactly as misWeight's light loop does, one vertex
@@ -1828,7 +1875,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                                        sg.achro ? sg.beta * dSc : sg.beta,
                                        sg.aGlass, rng, Renderer::MedAll,
                                        sg.achro ? dLamS : nullptr, sg.achro ? dSec : 0,
-                                       sg.achro ? dCie : nullptr);
+                                       sg.achro ? dCie : nullptr,
+                                       dEm);
                 continue;
             }
             accC.assign(np, 0.0);
@@ -1864,7 +1912,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                                sg.achro ? sg.beta * dSc : sg.beta,
                                sg.aGlass, rng, Renderer::MedAll,
                                sg.achro ? dLamS : nullptr, sg.achro ? dSec : 0,
-                               sg.achro ? dCie : nullptr);
+                               sg.achro ? dCie : nullptr,
+                               dEm);
                 const size_t after = banks[(size_t)tid].beams.size();
                 if (after == before) continue;
 
@@ -2746,6 +2795,18 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
 // — the path is simply left to the connection strategies. It is a variance loss, not a
 // bias, and it is logged in known-issues.md.
 struct BeamMergeWeight {
+    // NO GATHER-TIME SPECTRAL FOLD HERE (beamgather.h, WeightFn::kFoldGatherTime). The fold
+    // substitutes E_lambda[CIE(lambda)*p(cos,lambda)] for one sample of it — an exact
+    // substitution only when nothing else in the term depends on lambda. `operator()` below is
+    // a ratio of path densities and one of them carries the phase function, so the weight IS a
+    // function of lambda and E[w*CIE*p] != E[w]*E[CIE*p]; the residual is Cov(w, CIE*p).
+    // Measured, that residual is below the noise floor (see the note at the fold site), so this
+    // flag is not what makes mode J correct. What it does is keep the gather bit-identical to
+    // pre-0.256.0 if a folded bank ever reaches it. The DECISIVE reason mode J has no bow fold
+    // is upstream, at the deposit: a record cannot hold both a fold and a `-beamspec` bundle,
+    // and mode J's answer to a rainbow medium is emphatically the bundle — rain relative RMSE
+    // 0.2788 with it against 0.4875 folded, at seed 11. See known-issues.md, UPBP-BOWFOLD.
+    static constexpr bool kFoldGatherTime = false;
     const Scene*   scene = nullptr;
     const BeamMap* bm    = nullptr;
     const PathSeg* sg    = nullptr;
@@ -2874,7 +2935,7 @@ struct BdptRenderer {
         // (per-λ curvature) or a dispersive finite lens (per-λ refraction at the
         // elements) forces the scalar single-λ path.
         const int C = (heroC > hero::kHeroMax) ? hero::kHeroMax : heroC;
-        const bool useHero = (C > 1) && !scene.backwardMedium().enabled &&
+        const bool useHero = (C > 1) && scene.media.empty() &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         // Only pay for escape tracking when the scene actually has a distant sun.
         const bool hasSun = scene.sunCount > 0;

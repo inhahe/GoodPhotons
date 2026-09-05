@@ -32,7 +32,16 @@
 
 // The default weight: every beam hit counts once, in full. This is mode M, where the beam
 // map IS the estimator and there is no second technique to share with.
+//
+// `kFoldGatherTime` says whether this weight lets the GATHER-TIME SPECTRAL FOLD (0.256.0,
+// Scene::BowLut, PhotonBeam::achro == 2) be taken. Folding integrates λ out of the
+// contribution, which is an exact substitution only if NOTHING ELSE in the term depends on λ.
+// A weight of exactly 1 satisfies that trivially, so mode M folds. A MIS weight does not — see
+// the long note at the fold's use site below — so mode J does not. In mode J the practical
+// reason is even simpler than the theoretical one, and it is measured: a folded beam cannot
+// also be a `-beamspec` bundle, and in mode J the bundle is worth far more.
 struct BeamWeightOne {
+    static constexpr bool kFoldGatherTime = true;
     double operator()(const BeamHit&, const PhotonBeam&, double, double) const { return 1.0; }
 };
 
@@ -207,8 +216,52 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         if (!(ss > 0.0)) { beamDiag().bump(beamDiag().rejSS); return; }
         // Scattering angle. connectVolume's convention: phaseValue(dot(wIn, wToCamera)),
         // wIn = the photon's propagation direction (b.d), wToCamera = -dc.
-        const double phase = md.phaseValue(-bh.cosT, lam);
+        // THE GATHER-TIME SPECTRAL FOLD (scene.h, Scene::BowLut; PhotonBeam::achro == 2).
+        // This beam's path was wavelength-independent, but its medium's phase is a rainbow
+        // table, so the fold could not be taken at deposit time — the colour is not decidable
+        // until the scattering angle is known, and it is known right here. Substitute the
+        // whole spectral integral for the single sample: `bowCie * bowPhase` IS
+        // integral of spd*CIE*p(cos,lambda) dlambda, so multiplying `bowCie` by a `w` built
+        // from `bowPhase` reproduces it exactly while every other factor stays where it was.
+        // sigma_s and both transmittance marches are evaluated at `lam` as before, which is
+        // sound precisely because BowLut is only built for media with flat coefficients.
+        //
+        // WHY THIS IS GATED ON THE WEIGHT (WeightFn::kFoldGatherTime). Folding is a
+        // Rao-Blackwellisation: it replaces CIE(lambda)*p(cos,lambda) by its conditional
+        // expectation over lambda. That substitution is EXACT — unbiased and variance-reducing
+        // — only if lambda appears NOWHERE ELSE in the term. Mode M satisfies that exactly: its
+        // weight is the constant 1. Mode J does not: the merge's MIS weight is a ratio of path
+        // densities and one of them carries the phase function, so w1 is itself a function of
+        // lambda and E[w1(l)*CIE(l)*p(l)] != E[w1]*E[CIE*p]. The residual is Cov_lambda(w1,
+        // CIE*p), and folding the weight too would not remove it: the connection techniques
+        // evaluate their densities at the camera's hero wavelength, so a band-averaged merge
+        // weight would stop summing to 1.
+        //
+        // HONEST ABOUT THE MAGNITUDE: that covariance term is NOT measurable here. Isolating it
+        // (bundle suppressed in both arms, `-beamspec 1`) on gallery_rain's rain against the
+        // 6212-spp mode-D reference, relative RMSE was 0.4157 folded vs 0.4263 unfolded at seed
+        // 7, and 0.4875 vs 0.5033 at seed 11 — the fold is slightly BETTER on both seeds, so
+        // whatever bias it carries is below the variance it removes. The gate is therefore
+        // justified by a different fact, and that one IS decisive: BeamBank::push cannot store a
+        // fold and a `-beamspec` bundle in the same record, and in mode J the bundle wins by a
+        // mile (0.2587 / 0.2788 vs the numbers above). So mode J declines the fold at DEPOSIT
+        // time and keeps its bundle; this gate is the belt to that braces, and it is what makes
+        // the gather bit-identical to pre-0.256.0 should a folded bank reach it anyway (a
+        // `-loadmap` of a map some other mode wrote). See known-issues.md, UPBP-BOWFOLD.
+        const Scene::BowLut* bow =
+            (WeightFn::kFoldGatherTime && b.achro == 2)
+                ? scene.bowLut((int)b.emIdx, b.med) : nullptr;
+        Vec3   bowCie{0, 0, 0};
+        double phase;
+        if (bow) bow->eval(-bh.cosT, bowCie, phase);
+        else     phase = md.phaseValue(-bh.cosT, lam);
         if (!(phase > 0.0)) { beamDiag().bump(beamDiag().rejPh); return; }
+        // Belt and braces: `bow` is null under any MIS weight by the gate above, so this is
+        // just `phase`. It stays because the invariant it encodes is the important one — a
+        // band-averaged phase belongs in the ESTIMATOR and nowhere else; every density a MIS
+        // weight compares is the hero wavelength's. (Mode M's BeamWeightOne ignores the
+        // argument entirely, so this costs nothing there and is bit-identical.)
+        const double phaseMis = bow ? md.phaseValue(-bh.cosT, lam) : phase;
         // `invC` splits the chord's flux evenly over its spectral bundle (PhotonBeam: every
         // wavelength in a bundle carries the same power). It is exactly 1.0 for a
         // monochromatic beam, so the whole expression — and thus every pre-0.202.0 render —
@@ -218,14 +271,14 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         // MIS (mode J); exactly 1.0 and folded away in mode M. `dens` and `phase` are handed
         // over rather than recomputed: the merge weight needs sigma_t(x) and the phase value
         // at the merge point, and both are one multiply away from what this line just built.
-        w *= w1(bh, b, dens, phase);
+        w *= w1(bh, b, dens, phaseMis);
         if (!(w > 0.0)) { beamDiag().bump(beamDiag().rejW); return; }
         if (b.absorb > 0.0f) w *= std::exp(-(double)b.absorb * bh.sBeam);   // glass, beam side
         if (aGlassCam > 0.0) w *= std::exp(-aGlassCam * bh.tCam);           // glass, camera side
         if (bh.sBeam > 0.0)  w *= mats.mediaTransmittance(scene, b.o, b.d, bh.sBeam, lam, rng);
         if (bh.tCam  > 0.0)  w *= mats.mediaTransmittance(scene, oc, dc, bh.tCam, lam, rng);
         if (!(w > 0.0)) { beamDiag().bump(beamDiag().rejTr); return; }
-        acc += bm.cie[bh.idx] * w;
+        acc += (bow ? bowCie : bm.cie[bh.idx]) * w;
         // SECONDARY wavelengths of the bundle. They share this beam's geometry, its kernel
         // weight and BOTH transmittance marches — the bundle only exists on a path whose
         // extinction is achromatic (Renderer::beamSpecC), which is precisely the condition

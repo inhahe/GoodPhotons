@@ -929,7 +929,7 @@ struct Renderer {
                    double lambda, double beta, double aGlass, Pcg32& rng,
                    MedFilter offFilt = MedStraight,
                    const double* lamS = nullptr, int nSec = 0,
-                   const Vec3* achroCie = nullptr) const {
+                   const Vec3* achroCie = nullptr, int foldEmIdx = -1) const {
         if (!beamDeposit || !(beta > 0.0)) return;
         // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
         // 1e30-long box (see kBeamFarScale).
@@ -984,15 +984,26 @@ struct Renderer {
                                   achroCie ? achroCie->y : 0.0,
                                   achroCie ? achroCie->z : 0.0};
             const bool useAchro = achroCie && mediumAchromatic(md);
-            // Fold diagnostics: only a beam in an ACHROMATIC medium had a fold available to
-            // lose, so a chromatic medium's beams are excluded rather than filed under a
-            // cause they never had. `g_foldKill` is FK_None exactly when the path is still
-            // folded, which makes row 0 the coverage figure and the rest the attribution.
-            if (foldDiagOn() && i < 16 && mediumAchromatic(md))
-                g_foldKillHist[i][useAchro ? FK_None : g_foldKill].fetch_add(
+            // GATHER-TIME FOLD (scene.h, Scene::BowLut). The medium's coefficients are flat but
+            // its phase is a rainbow table, so `useAchro` above correctly refused the fold — the
+            // colour is not decidable without the scattering angle. It IS decidable at gather
+            // time, from a per-(emitter, medium) table, provided the path carried no spectral
+            // weight of its own (`foldEmIdx >= 0` is the caller's assertion that T == 1). This
+            // is what stops a rain curtain being drawn as saturated single-wavelength streaks.
+            const int bowEm = (!useAchro && achroCie && foldEmIdx >= 0 &&
+                               scene.bowLut(foldEmIdx, i)) ? foldEmIdx : -1;
+            // Fold diagnostics. Row FK_None counts the beams whose PATH was still
+            // wavelength-independent at the deposit; the rest attribute the ones that were not
+            // to the event that retired them. Deliberately keyed off `achroCie`, NOT
+            // `useAchro`: in a CHROMATIC medium the path can be perfectly foldable and still
+            // be refused, because it is the medium's gather-time tail that is not flat. That
+            // gap is exactly the population a gather-time fold would serve, so it has to be
+            // visible rather than hidden behind the same zero as a genuinely divergent path.
+            if (foldDiagOn() && i < 16)
+                g_foldKillHist[i][achroCie ? FK_None : g_foldKill].fetch_add(
                     1, std::memory_order_relaxed);
             beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i,
-                              lamS, nSec, useAchro ? ca : nullptr);
+                              lamS, nSec, (useAchro || bowEm >= 0) ? ca : nullptr, bowEm);
         }
     }
 
@@ -2941,9 +2952,20 @@ struct Renderer {
                         for (int k = 0; k < foldEm->foldN; ++k)
                             cieF += foldEm->foldCie[k] * foldT[k];
                     }
+                    // The GATHER-time fold (scene.h, Scene::BowLut) needs the emitter's
+                    // identity, and needs T == 1 — a path carrying per-bin weights has a
+                    // spectrum the per-emitter table cannot describe. `foldChroma` is exactly
+                    // that predicate, so an unweighted path names its emitter and a weighted
+                    // one passes -1 and keeps the deposit-time behaviour.
+                    int foldEmIdx = -1;
+                    if (achroPath && !foldChroma && foldEm && !scene.emitters.empty()) {
+                        const ptrdiff_t k = foldEm - &scene.emitters[0];
+                        if (k >= 0 && k < (ptrdiff_t)scene.emitters.size() && k <= 32767)
+                            foldEmIdx = (int)k;
+                    }
                     emitBeams(scene, ray.o, ray.d, dChord, lambda, betaPre, curAbsorb(lambda), rng,
                               beamMS ? MedAll : MedStraight, specLam, specSec,
-                              achroPath ? &cieF : nullptr);
+                              achroPath ? &cieF : nullptr, foldEmIdx);
                 }
                 if (!beamMS) {
                     // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over

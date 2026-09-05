@@ -16427,7 +16427,18 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
                               nullptr, 0.0);
         }
         const PhotonBeam& b = bmap->beams[i];
-        const Vec3&      ci = bmap->cie[i];
+        // GATHER-TIME SPECTRAL FOLD (achro == 2, scene.h Scene::BowLut). `bmap->cie[i]` holds
+        // the emitter's mean CIE for such a beam, but the whole point of the gather-time fold
+        // is that the colour is only decidable once the scattering angle is known — and the
+        // device gather has no bow table to consult. Using the mean here would pair a
+        // band-averaged colour with a SINGLE-wavelength phase value, which is neither the
+        // folded estimator nor the monochromatic one. So demote to the monochromatic record:
+        // CIE(lambda) is exactly what this beam meant before 0.256.0, so a device gather of a
+        // CPU-traced map stays unbiased — it is simply as noisy as it was, and re-gathering on
+        // the CPU is what buys the fold. (Device parity is tracked in known-issues.md.)
+        const Vec3 ci = (b.achro == 2)
+                        ? Vec3(cieX((double)b.lambda), cieY((double)b.lambda), cieZ((double)b.lambda))
+                        : bmap->cie[i];
         gpu::DBeamRec& r = recs[i];
         r.o = gpu::DVec3(b.o.x, b.o.y, b.o.z);
         r.d = gpu::DVec3(b.d.x, b.d.y, b.d.z);
@@ -17734,6 +17745,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 // BeamMap::build in place of CIE(lambda). Mutually exclusive with the bundle.
                 b.achro = d.achro ? 1 : 0;
                 for (int k = 0; k < 3; ++k) b.cieA[k] = b.achro ? d.cieA[k] : 0.0f;
+                // GATHER-time fold (achro == 2, scene.h Scene::BowLut): the device tracer does
+                // not implement it, so it can never deposit one. -1 says so explicitly instead
+                // of leaving the field to whatever the allocation held.
+                b.emIdx = -1;
             }
         }
         bmap->nEmitted   = pm.nEmitted;      // same pass, same normalisation

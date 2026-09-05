@@ -5,57 +5,110 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### M-FGDARK — OPEN (2026-09-05, v0.253.0): mode `M`'s Jensen final gather (`-pmfg <K>`) renders **darker than the direct density estimate on every scene tested** — mildly on `cornell`, by **12–77×** on `gallery_rain`, where it takes the image to near-black
+### UPBP-BOWFOLD — OPEN (2026-09-05, v0.256.0): mode `J`'s rain is still noticeably noisier than mode `D`'s, because the two tools that could fix it are mutually exclusive in one `PhotonBeam` record and the better of them is capped at ~36 % coverage
 
-**Reproduce.**
+**Not a correctness bug.** Mode `J` is unbiased on the rain (+2.0 % / +4.1 % against the
+reference at two seeds, which is its known volume residual, not a chromatic effect). This entry
+is about *variance*, and about a structural limitation that blocks the obvious fix.
 
+**The setup.** `gallery_rain`'s medium 1 is a `phase rainbow` curtain: flat σ_s/σ_t, chromatic
+phase. Two mechanisms can stop a beam in it painting a saturated single-wavelength streak:
+
+1. **The gather-time spectral fold** (`Scene::BowLut`, 0.256.0). Tabulates
+   `∫spd·CIE·p(cosθ,λ)dλ` per (emitter, medium) and paints the whole bow at the crossing angle.
+   Covers **83.9 %** of the rain's deposits.
+2. **The `-beamspec` bundle.** Carries up to 4 wavelengths in one record, each with its own
+   phase. Covers only **36.2 %**, because `PhotonBeam` stores no per-member weight, so the
+   members must have equal power and the bundle is retired at the first event that would make
+   them differ.
+
+**They cannot coexist.** `BeamBank::push` computes `nSec = (lamS && nSec > 0 && !cieA)` — one
+record cannot hold both an emitter-folded colour and a set of secondary wavelengths. Requesting
+the fold therefore *silently destroys* the bundle.
+
+**Measured.** Rain ROI relative RMSE against the 6212-spp mode-`D` reference
+`png/barsdiag/REF_D.pfm`, 300 s each:
+
+| mode `J` rain | seed 7 | seed 11 |
+|---|---|---|
+| monochromatic (neither; `-beamspec 1`, fold declined) | 0.4263 | 0.5033 |
+| bow fold, no bundle | 0.4157 | 0.4875 |
+| bundle, no fold (`-beamachro off`) | 0.2876 | 0.2835 |
+| **shipped** (bundle + the cloud's own deposit-time fold) | **0.2587** | **0.2788** |
+
+These are `-time 300` runs, so the sample count varies a little between runs even at a fixed
+seed; a repeat of the shipped seed-11 row landed at 0.3072. Read the table as ~±0.03 per cell —
+which is far smaller than the gap it is being used to establish.
+
+So the bundle is worth roughly 4× the fold in mode `J`, and 0.256.0 ships the bundle: `bdpt.h`
+passes `foldEmIdx = -1`, and `BeamMergeWeight::kFoldGatherTime` is `false` as a second line of
+defence for a `-loadmap`ed bank. Mode `M` orders the middle two the other way (rain 0.4340
+folded against 0.5731 bundled at seed 11) because there the beam map is the *entire* volumetric
+estimate; in mode `J` the merge is one MIS-weighted technique among several.
+
+**A note on the MIS argument, because it was initially overstated.** Folding under mode `J`'s
+merge weight is not a valid Rao–Blackwellisation — the weight is a ratio of path densities, one
+of which carries the phase, so it is λ-dependent and leaves a residual `Cov_λ(w1, CIE·p)`. That
+is true, and folding the weight too would not fix it (the connection techniques evaluate their
+densities at the camera's hero λ, so the weights would stop summing to 1). **But the residual is
+below the noise floor**: isolated with the bundle suppressed in both arms, the folded arm is
+*slightly better* on both seeds (rows 1 vs 2 above). The decision rests on the exclusivity in
+`push`, not on the bias.
+
+**The proper fix: a WEIGHTED spectral bundle** — `float wS[3]` on `PhotonBeam`. With a
+per-member weight the bundle stops requiring equal power, so it survives every event whose
+*geometry* is λ-independent exactly as the deposit-time fold does, and its 36.2 % coverage
+should approach the fold's 83.9 %. That would give mode `J` a 4-wavelength sample of the bow on
+the paths that today give it one, with no fold and therefore no MIS interaction to argue about.
+It costs a record widening (12 bytes) and an FTPMP version bump, and it benefits mode `M` too.
+
+**Reproduce:**
 ```
-ftrace scenes/cornell.ftsl -mode M -device cpu -r 96 96 -spp 16 -n 200000 -o png/pm_noFG.png
-ftrace scenes/cornell.ftsl -mode M -device cpu -r 96 96 -spp 16 -n 200000 -pmfg 16 -o png/pm_FG.png
+ftrace scenes/gallery_rain.ftsl -camera cam -mode J -r 640 360 -time 300 -seed 11        -o png/barsdiag/J.png -hdr -window-min -interval 60
+python scraps/_referr.py png/barsdiag/REF_D.pfm png/barsdiag/J.pfm
 ```
+Swap `-beamspec 1` / `-beamachro off` to reproduce the other rows.
 
-Auto-exposure `6.14e-14` → `4.95e-14`, and the FG image's walls are visibly dimmer and much
-blotchier at the same spp. On `gallery_rain` the same substitution is catastrophic
-(`-mode M -beams -pmfg 24 -time 900 -seed 1`, `png/modecmp/acc/pmfg/`): everything **diffuse**
-goes black, leaving only the emissive grid and the specular/glossy heroes.
+### FOLD-GPU — OPEN (2026-09-05, v0.256.0): the device forward tracer and the device beam gather implement **neither** of the two spectral folds, so a `-device gpu` mode-`M` beams render is correct but visibly grainier than the CPU one
 
-**Measured** against the mode-`R` anchor, single seed, scene-linear `.pfm` (R channel):
+**What the CPU has and the GPU does not.** Two separate mechanisms, both in the
+`-beamachro` family (see `design.md`, "The SPECTRAL FOLD" and "The GATHER-TIME SPECTRAL
+FOLD"):
 
-| element | plain `M` | `M -pmfg 24` | `R` (anchor) | FG factor |
-|---|---|---|---|---|
-| `grid_ground` | 0.01070 | 0.000855 | 0.00992 | **12× dark** |
-| `cap_gyroid` | 0.10275 | 0.001592 | 0.12260 | **77× dark** |
-| `cap_axicon` | 0.08247 | 0.001281 | 0.15647 | **64× dark** |
-| `compote` | 0.03705 | 0.003278 | 0.01796 | 11× dark |
-| `gyroid` (glossy) | 0.98832 | 0.31149 | 0.41165 | — |
-| `glass_orb` (dielectric) | 0.03449 | 0.031671 | 0.01499 | ~unchanged |
+1. **Deposit-time spectral fold** (0.255.0). `render.h`'s tracer carries `T(λ) = Πf(λ)/Πf(λ_h)`
+   across diffuse surfaces on a 12-bin equal-SPD-mass quadrature and stores `E_λ[CIE·T]`.
+   `render_cuda.cu` still runs the 0.210.0 **all-or-nothing** rule — any spectral factor at
+   all retires the fold — so it folds ~88 % where the CPU folds ~90 %, and it loses the whole
+   surface case.
+2. **Gather-time spectral fold** (0.256.0). `Scene::BowLut` tabulates
+   `∫spd·CIE·p(cosθ,λ)dλ` per (emitter, medium) and `beamgather.h` evaluates it at the
+   crossing angle. The device has **no bow table at all**.
 
-**The shape of the failure names the suspect.** The final-gather branch in
-`photonmap_render.h` (~line 668) is gated on `fgRays > 0 && m.type == MatType::Diffuse`. Every
-element that collapses is `Diffuse`; every element that survives (`gyroid` glossy, `glass_orb`
-dielectric, the emissive grid) is one that never enters that branch. So the loss is inside the FG
-branch itself, not in the map, the deposit or the refresh.
+**Consequences, exactly.**
+- A GPU-traced beam map never carries `achro == 2`; `render_cuda.cu`'s download loop sets
+  `emIdx = -1` explicitly so the field is never garbage.
+- A **CPU-traced** map gathered on the GPU (`-loadmap`, or the shared-pass route) hits
+  `uploadBeamMapCuda`, which **demotes** an `achro == 2` beam to `CIE(b.lambda)` — the
+  pre-0.256.0 monochromatic record. That is deliberate and it is the only unbiased choice
+  available: `bmap->cie[i]` holds the band-averaged `cieMean` for such a beam, and pairing a
+  band-averaged colour with the device's **single-wavelength** phase value would be neither
+  the folded estimator nor the monochromatic one. The demotion costs variance, not
+  correctness.
+- So both backends converge to the same image; only the rate differs. Nothing here is a bias.
 
-**Not yet root-caused; do not guess in the fix.** Two candidates, both cheap to test:
-* the **direct** half — `bw.neeLight(scene, h, rhoVis, invPdfL, lambda, rng)` on a
-  default-constructed `BackwardRenderer`. Worth checking whether `bw` needs state the caller never
-  gives it, and whether `pickEmitters`' 1/pdf is being applied consistently with the non-FG path.
-  Note `backward.h` is included with the comment "`neeLight` / `neeEnv` for final-gather direct
-  lighting" but **only `neeLight` is ever called** (`grep -n "neeEnv" src/photonmap_render.h` →
-  the include comment and nothing else), so an `env`-lit scene has no direct term at the visible
-  point at all; `gallery_rain` is `sun` + area lit rather than `env` lit, so that alone does not
-  explain this one, but it is a real hole on its own.
-* the **indirect** half — `photonGatherSub`'s claim that "the cosine/pdf and Lambertian 1/pi
-  cancel to rho(x), folded inside photonGatherSub". If that cancellation is applied in both places
-  (once by the cosine-hemisphere sampling and once explicitly), the indirect term is scaled by an
-  extra `rho`, which on a dark-ish diffuse surface is a large loss and compounds per bounce.
+**The proper fix** is to port both to the device:
+- For (1), mirror `Emitter::foldCie/foldLam/foldN` and `foldWorthIt` into the device emitter
+  table and carry `foldT[kFoldBins]` in the device photon state. The quadrature is 12 doubles
+  per bounce — cheap in flops, but it widens the per-thread state, which is what needs
+  measuring before committing to it.
+- For (2), upload `Scene::BowLut` as a 2-D texture (8192 × nEmitter×nMedium, 4 channels:
+  `cie.xyz` + `phaseLum`) and have the device gather sample it when `achro == 2`, exactly as
+  `beamgather.h` does. This is the easier of the two and the bigger win on a rainbow scene —
+  it is a texture fetch replacing a `phaseValue` evaluation, so it may even be *faster*.
 
-The first diagnostic should be to render `cornell` with `-pmfg 1` and with the FG branch's direct
-and indirect halves reported separately, against the non-FG estimate on the same seed — the two
-candidates predict different splits (a missing direct term vs a scaled indirect one).
-
-**Bearing on M-GATHERAREA:** `-pmfg` is the standard remedy for that entry's blur and is currently
-unusable, so the two have to be fixed in order — this one first.
+**Reproduce**: `ftrace -in scenes/gallery_rain.ftsl -camera cam -mode M -beams -device gpu
+-r 640 360 -time 300 -seed 7 -hdr -o png/barsdiag/gpu.png` and compare
+`python scraps/_streak.py` against the CPU render at the same budget.
 
 ### M-GATHERAREA — OPEN (2026-09-05, v0.253.0): mode `M`'s direct density estimate divides by the area of a **full disc** while gathering from only the part of it that is real, on-cone surface — so it is dark in proportion to how much of the disc misses: flat ground 0 %, a cap edge −38 %, Alice's dress −44 %, her hair −70 %
 
@@ -3604,11 +3657,12 @@ binary built from HEAD in a scratch git worktree** (deleted afterwards):
    spread, not something GRIN introduces.
 4. **The 36 deterministic self-tests** (`-checkbvh` … `-checklattice`) all **PASS**.
 
-(Note for whoever repeats check 3: mode `R` on the **CPU** is useless for it. `backwardMedium()`
-collapses the media vector to one global homogeneous haze and *ignores bounds*, so a bounded
-medium is smeared over the whole scene and the image comes out ~145x dark. That is the
-long-standing CPU limitation documented at `scene.h:1154`, it warns loudly at startup, and it
-reproduces identically on the 0.197.2 baseline — nothing to do with GRIN.)
+(Note for whoever repeated check 3 *before v0.254.0*: mode `R` on the **CPU** was useless for it.
+`backwardMedium()` collapsed the media vector to one global homogeneous haze and *ignored
+bounds*, so a bounded medium was smeared over the whole scene and the image came out ~145x dark.
+That was the long-standing CPU limitation, it warned loudly at startup, and it reproduced
+identically on the 0.197.2 baseline — nothing to do with GRIN. **v0.254.0 removed it**: the CPU
+backward tracer superposes the full media vector, so CPU mode `R` is a valid check again.)
 
 **Cost, which is real and expected.** A scattering GRIN medium is now much more expensive than
 it was, because photons that used to fly straight through it now actually scatter — and each
@@ -7479,9 +7533,46 @@ free flight, accumulate `sigma_s * T * phase * NEE` at each stratum, and give `n
 fixed `4x4` light-sample grid `neeLight` uses (`gridUV(s, G, u1, u2)` at ~540/578) rather than
 `rng.uniform()`. Both are `whitted`-gated, so mode R stays bit-identical.
 
-### OPEN (2026-08-04): the CPU and GPU backward tracers render DIFFERENT fog — the CPU one still collapses `scene.media` to a single global haze
+### DONE (2026-09-05, v0.254.0): the CPU and GPU backward tracers rendered DIFFERENT fog — the CPU one collapsed `scene.media` to a single global haze
 
-**Symptom.** `scenes/gallery_rain.ftsl -mode W` renders the ceiling cloud, the mesh-bound
+**Fixed** by doing exactly what the "Proper fix" paragraph below prescribed: `src/backward.h`
+now superposes the whole `scene.media` vector, calling the *same* `Renderer::sampleMediaCollision`
+/ `Renderer::mediaTransmittance` the forward tracer uses (both made `static` in `render.h` for the
+purpose, and wrapped in `BackwardRenderer::mediaTr`, which short-circuits a vacuum scene to `1.0`
+without touching the rng so every media-free render stays bit-identical). Concretely:
+
+* every shadow-leg exponential in `neeLight` / `neeEnv` / `neeVolume` / `neeEnvVolume` became a
+  `mediaTr` call over all media — which needed `emitterGeom` to hand back the connection
+  direction it built the weight for (new `Vec3& wiOut` out-param), since the sampled point on a
+  sphere/cylinder/quad emitter is chosen inside it and the transmittance is per-λ;
+* `neeVolume` / `neeEnvVolume` take the scattering `const Medium&` explicitly and read *its*
+  phase function and albedo, instead of `media.front()`'s;
+* `radiance()`'s collision draw is `Renderer::sampleMediaCollision` (earliest of the media's
+  independent free flights, scatterer by Poisson superposition; exact inverse-CDF for
+  homogeneous media, Woodcock tracking for heterogeneous ones), and the GRIN pre-march draws one
+  per straight sub-segment rather than pre-drawing a single exponential from a global `sigma_t`
+  that a bounded/heterogeneous medium does not have;
+* the GRIN march now also charges the enclosing dielectric's Beer-Lambert absorption over the
+  marched arc, which the forward tracer always did and the backward one silently did not;
+* the two `useHero` gates (`backward.h`, `bdpt.h`) and `whittedDeHeroes` test `scene.media.empty()`;
+* `Scene::backwardMedium()`, `mediaNeedForward` and the whole `[medium] …` warning are **deleted**.
+
+**Its most expensive consequence was not in modes R/W/V at all — it was M-FGDARK.** Mode `M`'s
+Jensen final gather (`-pmfg <K>`) borrows `BackwardRenderer::neeLight` for its direct term, so it
+inherited the degraded model: in `gallery_rain` the first authored medium is the raincloud
+(`sigma_t 2.78` in a ~3 m box), and shadow rays of 10 m (sky panel) to 30 m (sun, `dist =
+length(sceneCenter − p) + sceneRadius`) were multiplied by `exp(−27.8) ≈ 8e-13` down to
+`exp(−83) ≈ 1e-36`. Every `Diffuse` element lost its ENTIRE direct term and the image went
+near-black (12–77× dark; `grid_ground` 0.01070 → 0.000855, `cap_gyroid` 0.10275 → 0.001592),
+while glossy/dielectric/emissive elements — which never enter the FG branch — were untouched.
+That shape (only `Diffuse` collapses) is what first pointed at the FG branch; splitting it into
+its direct and indirect halves under `FT_FGDIAG` showed the indirect half reproducing the full
+image and the direct half returning ~0, and the control scenes closed it: `cornell` and
+`scraps/_sun_cornell.ftsl` have **no media** (so the term was skipped entirely — ratios 1.0001
+and 1.0017), and `_fog_cornell`'s thin fog in a 1 m room is negligible. `-pmfg` is the standard
+remedy for **M-GATHERAREA**, so this also unblocks that entry.
+
+**Symptom (as filed).** `scenes/gallery_rain.ftsl -mode W` rendered the ceiling cloud, the mesh-bound
 raincloud and a full spectral **rainbow** from the `phase rainbow { droplet_um 500 }` curtain on
 the **GPU**, and none of them on the **CPU** — same scene, same mode, same spp, two different
 pictures:
@@ -7506,12 +7597,11 @@ render on a multi/bounded/heterogeneous-media scene, including GPU ones where no
 lost. It now runs *after* the `-device` resolution in `src/main.cpp` and fires only when the
 render's backward layer really lands on the CPU tracer, and it names `-device gpu` as the fix.
 
-**Proper fix.** Port the superposition to `backward.h`: replace the single
+**Proper fix (this is what was done).** Port the superposition to `backward.h`: replace the single
 `scene.backwardMedium()` with the same "earliest of the media's independent free-flight samples,
 scatterer chosen by Poisson superposition" loop the forward tracer and the device kernel already
 use, and give `neeVolume` the per-medium phase/albedo lookup. Then delete `backwardMedium()` and
-the warning entirely. Until then, prefer `-device gpu` for any backward render of a scene with
-more than one medium.
+the warning entirely.
 
 **It bites a *single*-medium scene too, whenever that medium is `bounds`ed — and it does not
 look like a fog bug when it does (2026-09-04).** `scenes/_slab_ss.ftsl` has exactly one medium,
@@ -7520,10 +7610,9 @@ tracer drops the bounds — rendering an *unbounded* fog, i.e. a different scene
 noisier one. Used as mode J's gate-3 analytic reference (see `tools/slab_ss_ref.py`), CPU mode
 `R` fitted the closed form at **304×** the correct level with a noise rms of **51**, which
 presents as a catastrophic absolute-radiance failure in the mode under test. `-device gpu`
-reproduces the analytic answer to 1.5 %. The rule to state is therefore the broader one: prefer
-`-device gpu` for any backward render of a scene whose media are multiple, bounded, **or**
-heterogeneous — a single homogeneous *unbounded* haze is the only case the CPU path renders
-faithfully.
+reproduced the analytic answer to 1.5 %; **as of v0.254.0 the CPU path does too**, and the
+"prefer `-device gpu` for bounded/heterogeneous/multiple media" advice above is obsolete —
+every tracer on both devices now sees the same authored media.
 
 ### BUG — DONE (2026-08-04, v0.128.0): the fp32 GPU build lost most of a DISTANT light's energy (a sun modelled as a far-away sphere rendered 2.7x too dim)
 
@@ -13456,8 +13545,9 @@ physically: extinction adds, so total transmittance is the **product** of the pe
 transmittances (`Renderer::mediaTransmittance` / `dMediaTransmittance`), and the first
 collision is the **earliest** of the media's independent free-flights, with the winning
 medium's albedo/`g` driving the scatter (`sampleMediaCollision` / `dMediaSampleCollision` —
-Poisson superposition). A single-medium scene stays bit-identical. `Scene::backwardMedium()`
-returns the first medium for the homogeneous-only backward/BDPT path. Implemented in
+Poisson superposition). A single-medium scene stays bit-identical. (`Scene::backwardMedium()`
+returned the first medium for the then homogeneous-only backward path; **deleted in v0.254.0**,
+which gave the backward tracer the same superposition.) Implemented in
 `scene.h`, `render.h`, `ftsl.h` (`addMedium` appends), `render_cuda.cu` (`DScene.media`/
 `mediaN` + a `DMedium` array). Validated on an RTX 4090 mode B: `scraps/fogmulti.ftsl`
 (warm + cool disjoint orbs + global haze) GPU-vs-CPU 16×16-block RMSE 1.40/255 (bias 0.012,
@@ -13547,12 +13637,14 @@ skipped rather than as a vacuously airtight 0-triangle object.
   0.30211 (−0.7%) — within the ~6% MC noise floor, confirming unbiased. See the resolved
   entry below for why the homogeneous cancellation is *not* required for correctness.
 - **Backward modes (R/V) + P camera layer still treat it as homogeneous** (on BOTH
-  backends). `backward.h` (modes R/V) and the camera-side layer of the P composite still
-  use the medium as a single global homogeneous haze and ignore `density`/`bounds`; on the
-  GPU, `cudaBackwardSupported` rejects *any* medium so R/V fall back to the CPU tracer,
-  which shares that homogeneous-only limitation. `main.cpp` `runRender` **warns** when a
-  heterogeneous/bounded medium is rendered in R/V/P. Proper fix: port delta/ratio tracking
-  into the backward volume march too (then mirror it on the GPU).
+  backends) — *true when written; fixed on the GPU in v0.128.x and on the CPU in
+  **v0.254.0**, which ported the superposition into `backward.h` and deleted both
+  `Scene::backwardMedium()` and the `[medium] …` warning.* As written: `backward.h`
+  (modes R/V) and the camera-side layer of the P composite used the medium as a single
+  global homogeneous haze and ignored `density`/`bounds`; on the GPU,
+  `cudaBackwardSupported` rejected *any* medium so R/V fell back to the CPU tracer, which
+  shared that limitation. `main.cpp` `runRender` warned when a heterogeneous/bounded medium
+  was rendered in R/V/P.
 
 ### Heterogeneous (density-field) media in BDPT (mode D) — DONE 2026-07-12 (CPU + GPU)
 **What:** BDPT (mode D) now renders **heterogeneous** (`density`-field) media unbiasedly on

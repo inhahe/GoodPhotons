@@ -483,8 +483,20 @@ struct Medium {
     // Scene::build() fills it via computeAchromatic(); the default of 0 is the safe answer
     // (classic monochromatic beams) for any medium that somehow never reaches it.
     int achro = 0;
-    bool computeAchromatic() const {
-        if (rainbow()) return false;
+    bool computeAchromatic() const { return !rainbow() && computeAchromaticSigma(); }
+
+    // ---- ACHROMATIC in its COEFFICIENTS only (the phase may still be a rainbow) -----------
+    // `achro` above is the conjunction of two independent facts, and 0.256.0 needs them apart.
+    // A medium whose sigma_s / sigma_t are flat but whose PHASE is a rainbow table is not
+    // achromatic — a beam in it cannot be folded at the emitter's mean CIE, because the phase
+    // would then be evaluated at one wavelength and the bow would collapse. But it is also not
+    // hopeless: the ONLY wavelength-dependent factor left in the gather is p(cos, lambda), and
+    // that is a function of a single scalar the gather already has. So the fold can move from
+    // DEPOSIT time to GATHER time — see Scene::bowLut — and a beam whose path was
+    // wavelength-independent can paint the whole spectral bow at its own angle instead of one
+    // saturated sample of it. Measured on gallery_rain: 83.9% of the rain's beams qualify.
+    int achroSigma = 0;
+    bool computeAchromaticSigma() const {
         double sLo = 1e300, sHi = -1e300, tLo = 1e300, tHi = -1e300;
         for (int i = 0; i <= 32; ++i) {
             const double lam = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * (double)i / 32.0;
@@ -1346,6 +1358,132 @@ struct Scene {
     std::vector<EmissiveVolume> emissiveVolumes;
     double totalEmissionPower = 0.0;
 
+    // ================= THE SPECTRAL BOW LUT (gather-time fold, 0.256.0) =====================
+    //
+    // The deposit-time fold (Emitter::cieMean, and the SPECTRAL FOLD that carries T(lambda)
+    // through surfaces) can only fire when the beam's medium has a FLAT gather-time tail,
+    // because folding throws the wavelength away and the gather then has nothing to evaluate
+    // sigma_s / phase / CIE at. A `phase rainbow` medium fails that test, so every beam in
+    // gallery_rain's rain curtain is stored monochromatic — and a beam is a LINE, so each one
+    // paints a saturated streak down its whole length. Measured: 83.9% of the rain's beams sit
+    // on a path that was wavelength-independent the whole way and are refused for this reason
+    // alone.
+    //
+    // But look at what is actually left. For a medium whose sigma_s and sigma_t are flat and
+    // whose ONLY chromatic term is the phase table, the gather's per-wavelength factor is
+    //
+    //     CIE(lambda) * p(cosTheta, lambda)
+    //
+    // and cosTheta is a scalar the gather already computed. So the fold does not have to
+    // happen at deposit time at all: store the beam with its emitter's identity, and let the
+    // GATHER integrate
+    //
+    //     Bow(cosTheta) = integral over lambda of  spd_e(lambda) * CIE(lambda)
+    //                                              * p(cosTheta, lambda)  d lambda
+    //                     / integral spd_e
+    //
+    // which is a function of ONE variable per (emitter, medium) pair and can be tabulated once
+    // at build time. The beam then paints the ENTIRE spectral bow at its own scattering angle,
+    // exactly, with no chromatic variance — instead of one sample of it. The bow gets sharper
+    // and cleaner at the same time, because the tabulated integral is the answer the many
+    // monochromatic beams were converging to.
+    //
+    // Two properties worth being explicit about:
+    //   * It is NOT the 12-bin `Emitter::foldCie` quadrature. That grid exists to carry a
+    //     smooth product of two smooth curves through a surface; a bow at a fixed angle is
+    //     sharply peaked IN lambda (that is what makes it a bow), and 12 bins would alias it
+    //     into visible colour steps. The table below integrates on the 1 nm grid, so the
+    //     quadrature error is the same as everywhere else in the renderer.
+    //   * It needs the path's spectral throughput to be flat, i.e. T(lambda) == 1. A beam that
+    //     picked up a surface albedo carries per-bin weights that this table cannot know, so
+    //     it does not qualify and falls back to the monochromatic record.
+    //
+    // `phaseLum` is the same integral against luminance alone, normalised by the emitter's
+    // cieMean.y. It is what the gather uses as the SCALAR phase value — for the >0 guard and
+    // for mode J's MIS weight — so that `cie * w` reproduces the spectral integral exactly
+    // while every other factor in the chain stays where it was.
+    struct BowLut {
+        static constexpr int kBins = 8192;   // uniform in cosTheta over [-1, 1]
+        std::vector<Vec3>   cie;             // Bow(cos) / phaseLum(cos): the effective colour
+        std::vector<float>  phaseLum;        // the effective scalar phase
+        bool valid() const { return !cie.empty(); }
+        // Nearest-lower bin with linear interpolation; cosTheta is clamped, never wrapped.
+        void eval(double cosTheta, Vec3& cieOut, double& phaseOut) const {
+            double u = (cosTheta + 1.0) * 0.5 * (double)(kBins - 1);
+            if (!(u > 0.0)) u = 0.0;
+            if (u > (double)(kBins - 1)) u = (double)(kBins - 1);
+            const int   i = (int)u;
+            const int   j = (i + 1 < kBins) ? i + 1 : i;
+            const double f = u - (double)i;
+            cieOut   = cie[i] * (1.0 - f) + cie[j] * f;
+            phaseOut = (double)phaseLum[i] * (1.0 - f) + (double)phaseLum[j] * f;
+        }
+    };
+    // Row-major [emitter * media.size() + medium]. Entries for ineligible pairs are left
+    // empty (`valid() == false`), so the lookup is a single bounds-checked index.
+    std::vector<BowLut> bowLuts;
+    const BowLut* bowLut(int em, int med) const {
+        if (em < 0 || med < 0 || media.empty()) return nullptr;
+        const size_t k = (size_t)em * media.size() + (size_t)med;
+        if (k >= bowLuts.size() || !bowLuts[k].valid()) return nullptr;
+        return &bowLuts[k];
+    }
+    // A medium qualifies when its coefficients are flat but its phase is not: that is exactly
+    // the case the deposit-time fold must refuse and this table can serve.
+    static bool bowLutEligible(const Medium& m) { return m.achroSigma != 0 && m.rainbow(); }
+
+    void finalizeBowLuts() {
+        bowLuts.clear();
+        if (media.empty() || emitters.empty()) return;
+        bool any = false;
+        for (const auto& m : media) if (bowLutEligible(m)) { any = true; break; }
+        if (!any) return;
+        bowLuts.resize(emitters.size() * media.size());
+        // Pre-tabulate each emitter's normalised SPD * CIE on the 1 nm grid once, so the
+        // per-(emitter, medium) loop below is `kBins * nLam` phase lookups and nothing else.
+        const int nLam = (int)(LAMBDA_MAX - LAMBDA_MIN) + 1;
+        std::vector<double> lam((size_t)nLam);
+        for (int i = 0; i < nLam; ++i) lam[(size_t)i] = LAMBDA_MIN + (double)i;
+        for (size_t e = 0; e < emitters.size(); ++e) {
+            const Emitter& em = emitters[e];
+            std::vector<Vec3> wCie((size_t)nLam);
+            double den = 0.0;
+            for (int i = 0; i < nLam; ++i) {
+                const double s = em.spdFn(lam[(size_t)i]);
+                wCie[(size_t)i] = Vec3(cieX(lam[(size_t)i]), cieY(lam[(size_t)i]),
+                                       cieZ(lam[(size_t)i])) * s;
+                den += s;
+            }
+            if (!(den > 0.0)) continue;
+            const double invDen = 1.0 / den;
+            for (int i = 0; i < nLam; ++i) wCie[(size_t)i] = wCie[(size_t)i] * invDen;
+            // cieMean.y is the normaliser that makes `cie * phaseLum` reproduce the integral;
+            // an emitter with no luminous response has no bow to tabulate.
+            const double yMean = em.cieMean.y;
+            if (!(yMean > 0.0)) continue;
+            for (size_t mi = 0; mi < media.size(); ++mi) {
+                const Medium& md = media[mi];
+                if (!bowLutEligible(md)) continue;
+                BowLut& L = bowLuts[e * media.size() + mi];
+                L.cie.assign((size_t)BowLut::kBins, Vec3{0, 0, 0});
+                L.phaseLum.assign((size_t)BowLut::kBins, 0.0f);
+                for (int b = 0; b < BowLut::kBins; ++b) {
+                    const double c = -1.0 + 2.0 * (double)b / (double)(BowLut::kBins - 1);
+                    Vec3 sum{0, 0, 0};
+                    for (int i = 0; i < nLam; ++i) {
+                        const double p = md.phaseValue(c, lam[(size_t)i]);
+                        if (p > 0.0) sum += wCie[(size_t)i] * p;
+                    }
+                    const double pl = sum.y / yMean;
+                    L.phaseLum[(size_t)b] = (float)pl;
+                    // Factor the scalar back out so the gather's arithmetic chain is untouched:
+                    // it multiplies `cie` by a `w` that already contains `phaseLum`.
+                    L.cie[(size_t)b] = (pl > 0.0) ? sum * (1.0 / pl) : Vec3{0, 0, 0};
+                }
+            }
+        }
+    }
+
     // Estimate each emissive medium's mean emission and selection power. Called by
     // build() after finalizeEmitters(). Cheap Monte-Carlo over the grid AABB × band.
     void finalizeEmissiveVolumes() {
@@ -2178,9 +2316,13 @@ struct Scene {
         // scan of two Spectrum objects. Done for DISABLED media too: `enabled` is a render
         // flag that can be flipped by applyIgnoreFlags after build(), and a stale -1 would be
         // worse than a computed answer nobody reads.
-        for (auto& m : media) m.achro = m.computeAchromatic() ? 1 : 0;
+        for (auto& m : media) {
+            m.achroSigma = m.computeAchromaticSigma() ? 1 : 0;
+            m.achro      = m.computeAchromatic()      ? 1 : 0;
+        }
         finalizeEmitters();
         finalizeEmissiveVolumes();
+        finalizeBowLuts();
     }
     void finalizeTris() { build(); }   // kept for existing call sites
 

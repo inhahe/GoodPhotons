@@ -144,7 +144,7 @@ changes the sampling *probability* and the probability is what the analog roulet
 | `Layered` coat | Its Fresnel/Airy reflectance is the archetypal peaked factor (near-zero at one λ, near-one two bins away), so `1/R(λ_h)` is an outright firefly generator — and its iridescence is the *point* of the material, which a fold would smear. |
 | Glass absorption `exp(-σ_a(λ)·d)` | Foldable in principle; measured **0** deposits lost to it, so it stays retired rather than earning a code path nothing exercises. |
 | GRIN | The arc's *geometry* is a function of λ. |
-| Scatter in a chromatic medium (`phase rainbow`) | Same: the direction sampling diverges per λ. Measured at 8.53 % of the cloud's foldable deposits after the surface case was absorbed (see the ceiling section below), and it is **correct** that it does not fold — folding the rain would kill the bow. The lever there is the `-beamspec` bundle, which needs per-wavelength weights on the record (`PhotonBeam::wS[]`) to survive more than one transport step. |
+| Scatter in a chromatic medium (`phase rainbow`) | Same: the direction sampling diverges per λ. Measured at 8.53 % of the cloud's foldable deposits after the surface case was absorbed (see the ceiling section below), and it is **correct** that it does not fold — folding the rain would kill the bow. The lever there is the `-beamspec` bundle, which needs per-wavelength weights on the record (`PhotonBeam::wS[]`) to survive more than one transport step. Note this is *scattering* in such a medium; merely **depositing** in one is handled by the gather-time fold (0.256.0), which resolves the colour once the angle is known. |
 
 **Cost.** `kFoldBins` reflectance evaluations per Lambertian bounce, gated on `achroPath`, which
 is only ever set when the render is actually depositing beams. A photon that never reaches a
@@ -193,12 +193,21 @@ cloud) and 1.35 % `specular`, and **neither can be folded, at any tuning**:
   unbiased and guardable, but it hands the hero path the peak ratio as its own weight, which
   is a strictly worse trade.
 
-So **90.1 % is the fold's principled ceiling on this scene**, and the residual bars are not a
-bug: they are correct single-wavelength samples of genuinely divergent chromatic transport,
-whose expectation is right and whose variance falls with photon count. The two remaining
-levers are (i) the weighted `-beamspec` bundle (`PhotonBeam::wS[]`), which is the only thing
-that can help the *rain's own* beams — medium 1 can never fold, and half its beams are still
-plain monochromatic — and (ii) simply more light-side realisations.
+So **90.1 % is the deposit-time fold's principled ceiling on this scene**, and the residual bars
+are not a bug: they are correct single-wavelength samples of genuinely divergent chromatic
+transport, whose expectation is right and whose variance falls with photon count.
+
+Widening the same diagnostic to every medium is what found the next lever, though:
+
+```
+medium 1: 14355 foldable deposits: folded 83.89%, chroma-medium 10.87%,
+                                   specular 5.23%, decline-diffuse 0.01%
+```
+
+83.89 % of the **rain's** beams are on a wavelength-independent path — they are refused not
+because the path diverged but because the rain's *gather-time phase* is a rainbow, so a
+deposit-time fold has nothing to write down. That is a different problem with a different
+answer, and it is what the gather-time fold below solves.
 
 Visually (`scraps/bars_compare.png`, cloud+rain crop, A = 0.254.0, C = forced 100 % fold, E =
 0.255.0): the forced-fold floor is dramatically cleaner than either, which is the same fact
@@ -211,6 +220,152 @@ about the ROI median hue (×1000, luminance-masked, `scraps/_chromabars.py`):
 | 0.254.0 baseline, cloud | 80.32 | 181.37 | 559.56 | 4266.66 |
 | 0.255.0 spectral fold, cloud | 73.82 | 171.80 | 545.71 | 4267.33 |
 | forced 100 % fold, cloud | 22.75 | 47.81 | 181.65 | 606.97 |
+
+### The GATHER-TIME SPECTRAL FOLD — folding a rainbow phase (0.256.0)
+
+The deposit-time fold asks "what colour is this beam?" and writes the answer on the record.
+For a medium whose **phase function** is chromatic that question has no answer at deposit
+time, because the colour depends on the scattering angle and the scattering angle is not
+known until a camera ray crosses the beam. So the beam is stored monochromatic and paints a
+saturated streak. That is the `medium 1: folded 83.89 %` line above: five sixths of the rain's
+beams are on a perfectly wavelength-independent path and are refused purely for want of an
+angle.
+
+The fix is to move the fold to the other end. A camera ray crossing a beam *does* know
+`cosθ`, and for a medium with flat `σ_s`/`σ_t` (`Medium::achroSigma`) the phase is the **only**
+λ-dependent factor left in the gather. So the whole spectral integral collapses to a function
+of one scalar variable, tabulable once per (emitter, medium) pair at scene-build time:
+
+```
+Bow(cosθ) = ∫ spd_e(λ) · CIE(λ) · p(cosθ, λ) dλ  /  ∫ spd_e(λ) dλ
+```
+
+`Scene::BowLut` (`scene.h`) holds 8192 bins uniform in `cosθ ∈ [-1, 1]`, integrated on the
+**1 nm grid** — deliberately *not* the 12-bin `Emitter::foldCie` quadrature, which exists to
+carry a smooth product through a surface and would alias a sharply-λ-peaked bow into visible
+colour steps. `finalizeBowLuts()` builds it only for media where `bowLutEligible` — flat
+coefficients, chromatic phase — which is exactly the case the deposit-time fold must refuse.
+
+**Splitting `Medium::achro`.** The old flag meant two things at once. It is now
+`achroSigma` (are the coefficients flat?) and `achro = !rainbow() && achroSigma` (is the whole
+medium λ-independent?). `mediumAchromatic()` keeps its old meaning and its old callers; the
+new table keys off `achroSigma` alone.
+
+**The record.** `PhotonBeam::achro` becomes three-valued: `0` = no fold, `1` = deposit-time
+fold (use `cieA`), `2` = **gather-time** fold — the path was wavelength-independent and carried
+no spectral weight (`T ≡ 1`), but the colour is still undecided. A `short emIdx` names the
+emitter whose `bowLut` the gather is to evaluate; `cieA` still carries `cieMean` as the
+fallback. This widened the on-disk beam a third time, so `photonmap_io.h` freezes
+`PhotonBeamV6` and bumps the magic to `FTPMP07`; a v6 file widens to `emIdx = -1`, which is
+exactly "this file predates the gather-time fold".
+
+**`phaseLum`, and why the gather's arithmetic is untouched.** The table stores
+`phaseLum = Bow.y / cieMean.y` and `cie = Bow / phaseLum`. The gather substitutes `phaseLum`
+for the scalar `md.phaseValue(...)` it would otherwise have computed and `cie` for
+`bm.cie[idx]`, so the contribution is `(Bow/phaseLum) · (rest · phaseLum) = Bow · rest` —
+identically the spectral integral the monochromatic beams were converging to — while the `> 0`
+phase guard and mode `J`'s MIS weight keep seeing a scalar phase value and need no changes.
+
+**Measured** (`gallery_rain`, 640×360, mode `M -beams`, 300 s, seed 7). The plain
+"spread about the median hue" metric is the wrong instrument here — a rainbow ROI is
+*supposed* to be multi-hued — so `scraps/_streak.py` scores the chroma left after subtracting
+a 7 px box blur, which a saturated streak has and a smooth arc does not (×1000):
+
+| | cloud mean | cloud p99 | rain mean | rain p99 |
+|---|---|---|---|---|
+| `-beamachro off` (no fold at all) | 846.45 | 4146.93 | 385.12 | 1562.53 |
+| both folds on (0.256.0) | 219.55 | 1261.85 | 298.12 | 1215.24 |
+
+and at 150 s, seed 1, against the earlier generations (`png/barsdiag/`):
+
+| | cloud mean | rain mean |
+|---|---|---|
+| A 0.254.0 baseline | 276.69 | 459.95 |
+| E 0.255.0 deposit-time fold | 258.02 | 451.72 |
+| **G 0.256.0 + gather-time fold** | **246.42** | **381.03** |
+| C forced 100 % deposit-time fold | 107.18 | 414.77 |
+
+The last row is the point: the gather-time fold beats a *hypothetical 100 %-successful*
+deposit-time fold on the rain, because no deposit-time fold can resolve a rainbow phase at
+all.
+
+**Unbiasedness, measured.** The algebra above says the substitution is *exact*, and three
+seeds (7, 11, 13) × 300 s of `-beamachro off` vs both-folds-on agree with that: every
+per-channel ROI mean moves by less than the **seed-to-seed spread of either arm** (cloud
++3.46/+0.25/−3.77 % against a ±2.3…±5.0 % spread; rain +0.12/+1.51/+1.26 % against ±2.9…±6.3 %;
+full frame +4.65/−1.53/+1.61 % against ±4.4…±17.4 %). The same table shows the variance
+reduction from the other side: the cloud's blue-channel **seed spread itself** falls from
+±5.03 % to ±0.95 %. Comparing single-seed *means* is the wrong instrument here, and instructively
+so — the unfolded arm is heavy-tailed by construction (a saturated streak is a rare large
+value), so its mean is noisy while its median sits low; folding raises the median toward the
+mean without moving the mean.
+
+**Mode `J` does NOT get it — but for a measured reason, not the theoretical one.** Both
+reasons are worth stating, because the tempting one turns out to be the weaker one.
+
+*The theoretical objection.* The fold is a *Rao–Blackwellisation*: it replaces the sample
+`CIE(λ)·p(cosθ,λ)` by its conditional expectation over λ. That substitution is exact — unbiased
+**and** variance-reducing — under one precondition: λ must appear **nowhere else** in the term.
+Mode `M` satisfies it exactly, because its weight is the constant 1 (`BeamWeightOne`). Mode `J`
+does not: the merge's MIS weight is a ratio of **path densities**, one of which carries the
+phase function, so `w1` is *itself a function of λ* and
+
+> `E[w1(λ)·CIE(λ)·p(λ)]  −  E[w1(λ)]·E[CIE(λ)·p(λ)]  =  Cov_λ(w1, CIE·p)  ≠  0`
+
+Folding the weight as well would not remove it: every *connection* technique evaluates its
+densities at the camera's hero λ, so a band-averaged merge weight would be comparing itself
+against quantities no other technique sees, and the partition of unity would break.
+
+*But that covariance is not measurable here.* Isolating it — bundle suppressed in **both** arms
+with `-beamspec 1`, so the fold is the only difference — against the 6212-spp mode-`D`
+reference, the folded arm comes out *slightly better* on both seeds (rain relRMSE 0.4157 vs
+0.4263 at seed 7; 0.4875 vs 0.5033 at seed 11). Whatever bias it carries is smaller than the
+variance it removes. So the theoretical objection, though real, is **not** what decides this.
+
+*What decides it* sits one level up, at the deposit: `BeamBank::push` cannot store a fold and a
+`-beamspec` bundle in the same record (`nSec = (lamS && nSec > 0 && !cieA)`), because one
+`PhotonBeam` cannot carry both an emitter-folded colour and a set of secondary wavelengths. So
+**asking for the fold silently destroys the bundle** — and in mode `J` the bundle is worth about
+four times what the fold is worth. Rain ROI, relative RMSE:
+
+| mode `J` rain | seed 7 | seed 11 |
+|---|---|---|
+| monochromatic (neither) | 0.4263 | 0.5033 |
+| bow fold, no bundle | 0.4157 | 0.4875 |
+| bundle, no fold | 0.2876 | 0.2835 |
+| **shipped** (bundle + the cloud's own deposit-time fold) | **0.2587** | **0.2788** |
+
+Mode `M` orders the middle two the other way round (rain 0.4340 folded against 0.5731 bundled,
+seed 11), and that is not a contradiction: in mode `M` the beam map **is** the entire volumetric
+estimate, so removing *all* chromatic variance from every crossing beats sampling four
+wavelengths of it. In mode `J` the merge is one MIS-weighted technique among several, and the
+weight stays λ-dependent whatever the colour does — variance a fold cannot reach, but a bundle,
+each of whose members carries a whole wavelength, can.
+
+So mode `J` declines the fold **at deposit time**, by passing `foldEmIdx = -1`, and that is what
+keeps its rain beams bundled. The gather-side gate is the belt to that braces: a compile-time
+trait on the weight functor, `WeightFn::kFoldGatherTime` — `true` on `BeamWeightOne`, `false` on
+`BeamMergeWeight` — so that if a folded bank ever does reach mode `J` (a `-loadmap` of a map
+another mode wrote) the gather stays bit-identical to pre-0.256.0 rather than quietly taking a
+substitution it cannot justify. Tracked as `UPBP-BOWFOLD` in `known-issues.md`.
+
+`gatherPhotonBeamsW` also hands `w1` a separate `phaseMis`, the monochromatic
+`phaseValue(cosθ, λ_hero)`. Under the gate that is redundant — `bow` is null whenever a MIS
+weight is in play — but it keeps the invariant the code depends on: a band-averaged phase
+belongs in the **estimator** and nowhere else.
+
+**Where it does not apply.** Scattering *inside* a rainbow medium still retires the
+deposit-time fold, for the λ_hero-independence reason proved in the previous section — the
+table folds a *gather* whose angle is a given, not a *sample* whose direction is drawn from a
+λ-dependent density. It also needs `T(λ) ≡ 1`: a beam that picked up a surface albedo carries
+per-bin weights the table cannot know, and falls back to the monochromatic record.
+
+**Not on the device.** `render_cuda.cu`'s forward tracer never deposits `achro == 2` (it sets
+`emIdx = -1` explicitly), and the device gather has no bow table, so `uploadBeamMapCuda`
+**demotes** a CPU-traced `achro == 2` beam to `CIE(λ)` — the pre-0.256.0 record. Pairing the
+band-averaged `cieMean` with a single-wavelength phase value would be neither estimator; the
+demotion keeps a GPU gather of a CPU-traced map unbiased, merely as noisy as it was. Tracked
+in `known-issues.md`.
 
 ### Mode `J` (UPBP) — how the two halves are wired (0.214.0, Phase 1)
 

@@ -6339,8 +6339,8 @@ private:
     // ---- medium ----
     // Each `medium { }` block appends one independent region to Scene::media. Several
     // may be authored (overlapping or disjoint boxes/spheres/heterogeneous blobs) and
-    // the forward tracer superposes them (extinction adds). Backward/BDPT modes use
-    // only the first as a global homogeneous haze (see Scene::backwardMedium()).
+    // every transport layer superposes them (extinction adds): the forward tracer, BDPT
+    // (D/J), the CPU backward tracer (R/W/V/P/M's final gather) and both device kernels.
     bool addMedium(const Block& b, Loaded& L) {
         Medium med;
         med.enabled = true;

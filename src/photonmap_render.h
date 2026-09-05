@@ -41,6 +41,7 @@
 #include "parallel.h"      // ft::stopRequested — cooperative `-stop` inside the pixel loop
 #include "render_progress.h"   // StageProgress — deposit progress for the live window/title
 #include <atomic>
+
 #include <chrono>
 
 // ---- Forward photon pass: deposit into the map, no camera splat ---------------------
@@ -673,6 +674,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     // (a) DIRECT lighting from finite emitters via low-variance next-event
                     //     estimation (shadow rays), so we avoid the high variance of gather
                     //     rays randomly striking a small area light.
+                    //     `neeLight` carries the shadow leg's media transmittance over the
+                    //     WHOLE superposed `scene.media` vector. Until 0.254.0 it applied one
+                    //     unbounded homogeneous haze built from media.front() instead, which
+                    //     in a scene whose first medium is a dense bounded cloud (gallery_rain:
+                    //     sigma_t 2.78, a 3 m box) multiplied every 10-30 m shadow ray by
+                    //     exp(-28)..exp(-83) and deleted mode M's ENTIRE direct term (M-FGDARK).
                     BackwardRenderer bw; bw.diffraction = diffraction;
                     double rhoVis = clamp01(diffuseReflectance(scene, m, h, lambda));
                     double direct = bw.neeLight(scene, h, rhoVis, invPdfL, lambda, rng);

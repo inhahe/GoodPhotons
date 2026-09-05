@@ -27,10 +27,12 @@
 //                continuation. This is the unbiased backward adjoint of the forward
 //                tracer's fluoroInteract(), so -scene fluoro now validates with modes
 //                R/V (previously fluoro was forward-only).
-// Participating media (scene.backwardMedium() / -fog) IS supported here: camera and
-// scattered rays sample volume free-flight, and volume vertices do phase-function
-// NEE to the light (neeVolume). So -fog CAN be combined with modes R/V, which is
-// how the forward fog transport is cross-validated.
+// Participating media (`medium {}` / -fog) ARE supported here, and since 0.254.0 the
+// WHOLE `scene.media` vector is superposed exactly as the forward tracer does it —
+// bounds, heterogeneous density fields and per-medium phase functions included (see
+// BackwardRenderer::mediaTr). Camera and scattered rays sample the volume free flight,
+// and volume vertices do phase-function NEE to the light (neeVolume). So -fog CAN be
+// combined with modes R/V, which is how the forward fog transport is cross-validated.
 // Emission is added only when a light is reached via the camera ray or a
 // specular/near-specular bounce; diffuse arrivals are covered by NEE (no double
 // counting).
@@ -52,6 +54,32 @@
 #include "radcache.h" // -radcache: biased early termination into a world-space irradiance cache
 
 struct BackwardRenderer {
+    // --- Participating media: the WHOLE `scene.media` vector, superposed ----------------
+    // Until v0.254.0 every media term in this file went through `Scene::backwardMedium()`,
+    // which is literally `scene.media.front()` treated as an UNBOUNDED HOMOGENEOUS haze —
+    // `bounds` and `density` ignored, every other medium dropped. That was a documented CPU
+    // limitation of modes R/W/V (the GPU megakernel and the forward tracer always superposed
+    // properly), and it silently poisoned mode M as well once `-pmfg` started borrowing
+    // `neeLight` for its final-gather direct term: in `scenes/gallery_rain.ftsl` the first
+    // authored medium is the raincloud (sigma_t 2.78, a 3 m box), so a 10 m shadow ray from
+    // Alice's dress to the sky panel was multiplied by exp(-27.8) ~ 8e-13 and mode M lost
+    // ALL of its direct lighting (M-FGDARK: every diffuse element read 2-5% of the
+    // non-final-gather estimate).
+    //
+    // Superposition is exact and is what every other transport layer already does:
+    //   * extinction ADDS, so T_total is the PRODUCT of the per-medium transmittances;
+    //   * the first collision in a union of independent Poisson processes is the EARLIEST
+    //     of their independent free flights, and the medium that produced it is the
+    //     scatterer.
+    // Both are implemented once, in Renderer (render.h), and shared verbatim here so the
+    // forward and backward estimators cannot drift apart. A vacuum scene short-circuits to
+    // 1.0 without touching the rng, so every media-free render stays bit-identical.
+    static double mediaTr(const Scene& scene, const Vec3& o, const Vec3& d, double dist,
+                          double lambda, Pcg32& rng) {
+        if (scene.media.empty()) return 1.0;
+        return Renderer::mediaTransmittance(scene, o, d, dist, lambda, rng);
+    }
+
     int maxBounce = 32;
     // Direct-only (Whitted) preview (CLI -direct-only): after a non-specular
     // (diffuse / diffuse-transmit / fluorescent-elastic / fog-scatter) vertex does its
@@ -422,8 +450,14 @@ struct BackwardRenderer {
     //     using an interpolated normal as a projection axis, which a fiber does not do.
     //   * the shadow ray starts a couple of diameters out so the tube does not occlude its
     //     own transmitted lobe (hair_shade.h).
+    // `wiOut` is the connection direction the weight was built for. It is an output rather
+    // than something the caller can recompute because a sphere/cylinder/quad emitter picks
+    // its own sample point inside here, and the caller needs the direction to evaluate the
+    // shadow leg's MEDIA TRANSMITTANCE — which is wavelength-dependent and so cannot live
+    // in the lambda-independent `w`.
     bool emitterGeom(const Scene& scene, const Hit& h, const Vec3& ngo,
                      const Emitter& em, double u1, double u2, double& dist, double& w,
+                     Vec3& wiOut,
                      const HairShade* hs = nullptr,
                      const HairDualCtx* dctx = nullptr) const {
         // Dual scattering (P3 stage 4) makes the shadow ray part of the SHADING: what it
@@ -487,6 +521,7 @@ struct BackwardRenderer {
             if (fall <= 0) return false;
             if (blocked(wi, dist, 2e-6)) return false;
             w = fall * cosSurf / dist2 * stG;                // I(w)/dist^2 (× BRDF & SPD by caller)
+            wiOut = wi;
             return true;
         }
         if (em.shape == EmitterShape::Sun) {
@@ -506,6 +541,7 @@ struct BackwardRenderer {
             if (!response(wi, cosSurf, stG)) return false;
             if (blocked(wi, dist, 0.0)) return false;
             w = cosSurf * em.spotOmega * stG;
+            wiOut = wi;
             return true;
         }
         Vec3 y, nLight, wi;
@@ -530,6 +566,7 @@ struct BackwardRenderer {
             if (!response(wi, cosSurf, stG)) return false;
             if (blocked(wi, dist, 2e-6)) return false;
             w = cosSurf / pdfW * stG;                        // solid-angle measure
+            wiOut = wi;
             return true;
         }
         // quad / mesh / interior-sphere / cylinder fallback. emitterSamplePoint also
@@ -552,6 +589,7 @@ struct BackwardRenderer {
         double G = cosSurf * cosLight / dist2;           // geometry term
         w = G * effArea * stG;                           // pdf_area = 1/effArea (visible area for cylinder)
         if (epat != 1.0) w *= epat;                      // no-op (and bit-identical) without a pattern
+        wiOut = wi;
         return true;
     }
 
@@ -824,7 +862,7 @@ struct BackwardRenderer {
         // tris / analytic spheres (ngo == h.n there). The shadow ray is also offset
         // along ngo so it clears the true surface rather than the shading normal.
         const Vec3 ngo = orientedGeoN(h);
-        const bool med = scene.backwardMedium().enabled;
+        const bool med = !scene.media.empty();
         // The cache is keyed on wavelength slot 0, so a scalar caller inside a hero
         // path (post-de-hero interactMaterial) reuses the hero table's i==0 column;
         // a fluorescent λ-switch fails matches() and falls back to a live spdFn call.
@@ -852,6 +890,7 @@ struct BackwardRenderer {
                 if (whitted) { if (uv) gridUV(s, G, u1, u2); }
                 else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
                 double dist = 0.0, w = 0.0;
+                Vec3 wiConn{0, 0, 0};
                 // Dual scattering draws its one forward-spread sample here, per emitter
                 // sample, unconditionally — so the rng stream depends on the scene's
                 // lights and not on how many strands a shadow ray happened to cross.
@@ -864,15 +903,18 @@ struct BackwardRenderer {
                     // render bit-identical rather than merely equal in expectation.
                     if (dc.grid) dc.u3 = rng.uniform();
                 }
-                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, hs,
+                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, wiConn, hs,
                                  dctx ? &dc : nullptr)) continue;
                 if (!haveSpd) {   // evaluated at most once per emitter, as before
                     spdV = cached ? spdCache->at(e, 0) : em.spdFn(lambda);
                     haveSpd = true;
                 }
                 double contrib = (rho / PI) * (spdV * invPdfLambda) * w;
-                if (med)                                          // Beer-Lambert on the shadow ray
-                    contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
+                // Media transmittance on the shadow leg, over the WHOLE superposed media
+                // vector and each medium's own bounds/density field (see mediaTr). The
+                // shadow ray starts at the same offset point `blocked` used, so the two
+                // measure the same segment.
+                if (med) contrib *= mediaTr(scene, h.p + ngo * 1e-6, wiConn, dist, lambda, rng);
                 acc += contrib;
             }
             // selW is 1 on the exact path, so this multiply is a no-op there (and the
@@ -907,7 +949,8 @@ struct BackwardRenderer {
                 if (whitted) { if (uv) gridUV(s, G, u1, u2); }
                 else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
                 double dist = 0.0, w = 0.0;
-                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w)) continue;
+                Vec3 wiConn{0, 0, 0};   // unused here: the hero path is gated on a vacuum scene
+                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, wiConn)) continue;
                 double ws = (nS > 1) ? w * invS : w;
                 ws *= selW;                       // no-op (bit-exact) on the exact path
                 if (cached) {
@@ -1008,10 +1051,16 @@ struct BackwardRenderer {
 
     // Volume next-event estimation: connect a fog scattering vertex `p` (photon
     // arriving along `wIn`) to a uniformly-sampled light point. The surface BRDF
-    // and cosine are replaced by the single-scattering albedo and the Henyey-
-    // Greenstein phase function; the shadow ray carries fog transmittance. This is
-    // the backward mirror of the forward tracer's connectVolume().
-    double neeVolume(const Scene& scene, const Vec3& p, const Vec3& wIn,
+    // and cosine are replaced by the single-scattering albedo and the phase
+    // function; the shadow ray carries media transmittance. This is the backward
+    // mirror of the forward tracer's connectVolume().
+    //
+    // `med` is the medium that actually scattered — chosen by Poisson superposition
+    // in the caller, exactly as the forward tracer does — so its phase function and
+    // albedo are the ones evaluated here. The shadow leg's transmittance, by
+    // contrast, is over the WHOLE media vector (mediaTr), because every medium the
+    // connection crosses attenuates it regardless of which one scattered.
+    double neeVolume(const Scene& scene, const Medium& med, const Vec3& p, const Vec3& wIn,
                      double lambda, double invPdfLambda, Pcg32& rng,
                      const SpdCache* spdCache = nullptr) const {
         double total = 0.0;
@@ -1035,9 +1084,9 @@ struct BackwardRenderer {
                 double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
                 if (fall <= 0) continue;
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
-                double phase  = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
-                double albedo = scene.backwardMedium().albedo(lambda);
-                double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
+                double phase  = med.phaseValue(dot(wIn, wi), lambda);
+                double albedo = med.albedo(lambda);
+                double T = mediaTr(scene, p + wi * 1e-6, wi, dist, lambda, rng);
                 double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
                 total += albedo * phase * emitW * fall / dist2 * T * selW;
                 continue;
@@ -1049,9 +1098,9 @@ struct BackwardRenderer {
                 Vec3 wi = em.sampleCone(-em.beamDir, s1, s2);
                 double dist = length(scene.sceneCenter - p) + scene.sceneRadius;
                 if (scene.occluded(p + wi * 1e-6, wi, dist)) continue;
-                double phase  = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
-                double albedo = scene.backwardMedium().albedo(lambda);
-                double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
+                double phase  = med.phaseValue(dot(wIn, wi), lambda);
+                double albedo = med.albedo(lambda);
+                double T = mediaTr(scene, p + wi * 1e-6, wi, dist, lambda, rng);
                 double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
                 total += albedo * phase * emitW * em.spotOmega * T * selW;
                 continue;
@@ -1067,12 +1116,12 @@ struct BackwardRenderer {
                               !em.caps &&   // capped tubes: uniform samplePoint covers the caps too
                               em.sampleCylinderVisible(p, u1, u2, y, nLight, pdfAreaCyl);
             if (cylVisible) effArea = 1.0 / pdfAreaCyl;
-            double albedo = scene.backwardMedium().albedo(lambda);
+            double albedo = med.albedo(lambda);
             double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
             double contrib;
             if (coneSampled) {
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
-                double phase = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
+                double phase = med.phaseValue(dot(wIn, wi), lambda);
                 contrib = albedo * phase * emitW / pdfW;   // solid-angle measure
             } else {
                 // quad / mesh / interior-sphere / cylinder fallback; also returns the
@@ -1086,12 +1135,12 @@ struct BackwardRenderer {
                 double cosLight = dot(nLight, -wi);        // light is one-sided
                 if (cosLight <= 0) continue;
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
-                double phase = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
+                double phase = med.phaseValue(dot(wIn, wi), lambda);
                 double G = cosLight / dist2;               // no surface cosine at a volume vertex
                 contrib = albedo * phase * emitW * G * effArea;
                 if (epat != 1.0) contrib *= epat;
             }
-            contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
+            contrib *= mediaTr(scene, p + wi * 1e-6, wi, dist, lambda, rng);
             total += contrib * selW;           // selW == 1 on the exact all-emitters path
         }
         return total;
@@ -1181,8 +1230,8 @@ struct BackwardRenderer {
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
         double contrib = (rho / PI) * Lenv * cosSurf * invPdfLambda / pdfW * wMis * stG;
-        if (scene.backwardMedium().enabled)                       // Beer-Lambert to the scene exit
-            contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * farDist);
+        if (!scene.media.empty())        // media attenuation out to the scene exit
+            contrib *= mediaTr(scene, h.p + orientedGeoN(h) * 1e-6, wi, farDist, lambda, rng);
         return contrib;
     }
 
@@ -1201,10 +1250,11 @@ struct BackwardRenderer {
     }
 
     // Environment NEE at a fog scattering vertex: same as neeEnv but the surface
-    // BRDF/cosine is replaced by the single-scattering albedo and the HG phase
+    // BRDF/cosine is replaced by the single-scattering albedo and the phase
     // function (which is also the pdf used for the MIS weight against the phase-
     // sampled continuation). Only invoked when the scene has an env light.
-    double neeEnvVolume(const Scene& scene, const Vec3& p, const Vec3& wIn,
+    // `med` is the scattering medium (see neeVolume); the transmittance is over all.
+    double neeEnvVolume(const Scene& scene, const Medium& med, const Vec3& p, const Vec3& wIn,
                         double lambda, double invPdfLambda, Pcg32& rng) const {
         double pdfW;
         Vec3 wi = scene.sampleEnvDir(rng, pdfW);
@@ -1213,10 +1263,10 @@ struct BackwardRenderer {
         if (scene.occluded(p + wi * 1e-6, wi, farDist)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
-        double phase  = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);  // == BSDF pdf here
-        double albedo = scene.backwardMedium().albedo(lambda);
+        double phase  = med.phaseValue(dot(wIn, wi), lambda);   // == BSDF pdf here
+        double albedo = med.albedo(lambda);
         double wMis   = pdfW / (pdfW + phase);          // balance heuristic
-        double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * farDist);
+        double T = mediaTr(scene, p + wi * 1e-6, wi, farDist, lambda, rng);
         return albedo * phase * Lenv * invPdfLambda / pdfW * wMis * T;
     }
 
@@ -1670,35 +1720,41 @@ struct BackwardRenderer {
             // when the ray reaches a surface (within one step) or leaves all GRIN regions
             // it stops and we fall through to the straight-ray body.
             //
-            // The fog free flight is sampled ALONG THE CURVE, one straight sub-segment at
-            // a time (grin.h). Before 0.198.0 the marched span was invisible to the fog
-            // block below, which only ever saw the short straight remainder — so a medium
-            // that both scatters and carries `ior` lost nearly all of its scattering.
-            // `preMed >= 0` is a free flight drawn BEFORE the march and consumed by it: the
-            // marcher walks the curve accumulating arc length and stops the moment the
-            // accumulated length passes the drawn distance. One draw for the whole path
-            // (curve + remainder) rather than one per Eikonal step — identical in
-            // distribution for a homogeneous medium (the exponential is memoryless) and
-            // ~10^5x fewer RNG calls on a ray that spends a long time inside a lens.
-            // `preMed` is then handed to the fog block below as the residual flight over
-            // the straight remainder. -1 means "no medium / no GRIN": draw as before.
-            double preMed = -1.0;
-            bool   medInMarch = false;
+            // The media free flight is sampled ALONG THE CURVE, one straight sub-segment
+            // at a time (grin.h). Before 0.198.0 the marched span was invisible to the
+            // media block below, which only ever saw the short straight remainder — so a
+            // medium that both scatters and carries `ior` lost nearly all of its
+            // scattering. Each sub-segment now draws its own SUPERPOSED collision, the
+            // same `Renderer::sampleMediaCollision` call the forward tracer makes
+            // (render.h). Until 0.254.0 this drew ONE exponential from
+            // `backwardMedium().sigmaT` before the march and consumed it by arc length —
+            // memoryless and therefore exact, but only for a single unbounded homogeneous
+            // haze. A bounded or heterogeneous medium has no such global sigma_t, which is
+            // the whole reason that model is gone.
+            int  marchMed   = -1;      // medium that collided during the march, if any
+            bool medInMarch = false;
             if (grinAny) {
-                const double stG = scene.backwardMedium().enabled
-                                       ? scene.backwardMedium().sigmaT(lambda) : 0.0;
-                if (stG > 0.0) preMed = -std::log(1.0 - rng.uniformOpen()) / stG;
-                double sAcc = 0.0;
+                double arc = 0.0;
                 medInMarch = grin::marchSegments(scene, ray,
-                    [&](const Vec3&, const Vec3&, double slen, double& tStop) -> bool {
-                        if (preMed < 0.0) return false;
-                        if (sAcc + slen <= preMed) { sAcc += slen; return false; }
-                        tStop = preMed - sAcc; sAcc = preMed; return true;
+                    [&](const Vec3& so, const Vec3& sd, double slen, double& tStop) -> bool {
+                        if (scene.media.empty()) { arc += slen; return false; }
+                        double t = 0.0; int which = -1;
+                        if (!Renderer::sampleMediaCollision(scene, so, sd, slen, lambda,
+                                                            rng, t, which)) {
+                            arc += slen;
+                            return false;
+                        }
+                        tStop = t; arc += t; marchMed = which; return true;
                     },
                     // Camera segment: the marcher's own hit test must skip a `hide_camera`
                     // surface too, or the bending would stop dead at an invisible flat.
                     /*camHide=*/(b == 0 && gi.depth == 0));
-                if (preMed >= 0.0) preMed = medInMarch ? 0.0 : (preMed - sAcc);
+                // Glass Beer-Lambert over the marched arc: the block below only charges the
+                // straight remainder, so without this a dielectric enclosing a GRIN region
+                // would not attenuate the curved part of the path at all. The forward tracer
+                // has always done this (render.h); the backward one silently did not.
+                const double aG = curAbsorb(lambda);
+                if (aG > 0.0 && arc > 0.0) thr *= std::exp(-aG * arc);
             }
 
             // Which fur tier this path believes in — rolled once, on its first segment, and
@@ -1732,34 +1788,37 @@ struct BackwardRenderer {
                 if (fl.hit) dSurf = fl.t;
             }
 
-            // Homogeneous fog: sample a free-flight collision that competes with
-            // the surface. On a volume collision, estimate direct light via phase-
-            // function NEE, then scatter (HG) or absorb — analog, throughput
-            // unchanged. Mirrors the forward tracer exactly, so the two agree.
-            if (scene.backwardMedium().enabled) {
-                double st = scene.backwardMedium().sigmaT(lambda);
-                if (st > 0.0) {
-                    // `preMed` is the residual of the flight already drawn for the marched
-                    // curve (0 = it collided during the march, at ray.o); otherwise draw.
-                    double tMed = (preMed >= 0.0) ? preMed
-                                                  : -std::log(1.0 - rng.uniformOpen()) / st;
-                    if (medInMarch || tMed < dSurf) {
-                        Vec3 p = ray.o + ray.d * tMed;
-                        // Beer-Lambert attenuation over the in-glass free-flight leg.
-                        {
-                            double a = curAbsorb(lambda);
-                            if (a > 0.0) thr *= std::exp(-a * tMed);
-                        }
-                        L += thr * neeVolume(scene, p, ray.d, lambda, invPdfLambda, rng, spdCache);
-                        if (scene.envIndex >= 0)   // env-NEE at the volume vertex
-                            L += thr * neeEnvVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
-                        if (directOnly) return L;  // Whitted: single-scatter only, no indirect
-                        if (rng.uniform() >= scene.backwardMedium().albedo(lambda)) return L; // absorbed
-                        Vec3 wOut = scene.backwardMedium().phaseSample(ray.d, lambda, rng, contBsdfPdf);
-                        ray = Ray{p, wOut};
-                        specularArrival = false;   // phase-NEE covered the direct light
-                        continue;
+            // Participating media: sample a free-flight collision that competes with the
+            // surface, over the WHOLE `scene.media` vector superposed — one draw per
+            // medium, earliest wins, and the winner is the scatterer (Poisson
+            // superposition). Homogeneous media use the exact inverse-CDF flight,
+            // heterogeneous ones Woodcock tracking; both live in Renderer and are shared
+            // verbatim with the forward tracer, so the two estimators cannot drift apart.
+            // On a collision, estimate direct light via phase-function NEE, then scatter or
+            // absorb — analog, throughput unchanged.
+            if (!scene.media.empty()) {
+                double tMed = 0.0; int which = marchMed;
+                // A collision found DURING the march already happened, at ray.o.
+                const bool hitMed = medInMarch ||
+                    Renderer::sampleMediaCollision(scene, ray.o, ray.d, dSurf, lambda, rng,
+                                                   tMed, which);
+                if (hitMed) {
+                    const Medium& med = scene.media[which];
+                    Vec3 p = ray.o + ray.d * tMed;
+                    // Beer-Lambert attenuation over the in-glass free-flight leg.
+                    {
+                        double a = curAbsorb(lambda);
+                        if (a > 0.0) thr *= std::exp(-a * tMed);
                     }
+                    L += thr * neeVolume(scene, med, p, ray.d, lambda, invPdfLambda, rng, spdCache);
+                    if (scene.envIndex >= 0)   // env-NEE at the volume vertex
+                        L += thr * neeEnvVolume(scene, med, p, ray.d, lambda, invPdfLambda, rng);
+                    if (directOnly) return L;  // Whitted: single-scatter only, no indirect
+                    if (rng.uniform() >= med.albedo(lambda)) return L;   // absorbed
+                    Vec3 wOut = med.phaseSample(ray.d, lambda, rng, contBsdfPdf);
+                    ray = Ray{p, wOut};
+                    specularArrival = false;   // phase-NEE covered the direct light
+                    continue;
                 }
             }
 
@@ -2601,7 +2660,7 @@ struct BackwardRenderer {
     void renderRows(const Scene& scene, const Camera& cam, Film& film,
                     int y0, int y1, long long spp, unsigned long long sampleBase) const {
         const int C = heroC;
-        const bool useHero = (C > 1) && !scene.backwardMedium().enabled &&
+        const bool useHero = (C > 1) && scene.media.empty() &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         const uint64_t nPix = (uint64_t)film.resX * (uint64_t)film.resY;
         // Per-sample SPD table (see SpdCache): nBase×C (nBase×1 on the scalar path),
