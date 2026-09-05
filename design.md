@@ -235,10 +235,41 @@ Four consequences worth knowing:
   **`-beamcount` therefore cannot be met by *thinning* in mode `J`** — but since 0.242.0 it is
   not inert: it is met by tracing **fewer subpaths**, sized by a discarded pilot. See the beam
   budget below.
-- **Mode `J`'s beams are monochromatic.** `-beamspec` bundles and the achromatic fold both need a
-  wavelength-independent `beta`, and a BDPT light subpath's is not: `Le` carries
-  `spd(λ)·invPdfLambda` off the scene-wide emission sampler. So mode `J` is chroma-noisier than
-  mode `M` at equal `-n`, and buys that back with correctly-weightable beams.
+- **Mode `J`'s beams get the achromatic fold (0.250.0) but not the `-beamspec` bundle.** This
+  bullet used to say neither applied, on the grounds that both "need a wavelength-independent
+  `beta`" and a BDPT light subpath's is not (`Le` carries `spd(λ)·invPdfLambda` off the
+  **scene-wide** emission sampler, so `spd/pdf` is a function of λ whenever the scene holds more
+  than one emitter — `gallery_rain` holds five). **That is right about the bundle and wrong about
+  the fold**, and the error cost a visibly iridescent cloud: mode `J` deposited one saturated
+  wavelength per subpath, and a beam is a *line*, so each deposit laid a coloured streak down a
+  whole chord.
+  - The **bundle** genuinely does need a λ-independent `beta`, because the record stores
+    wavelengths and *no weights* — every member has to carry identical power, and here they do
+    not. It stays off in mode `J`.
+  - The **fold** only needs the ESTIMATOR'S EXPECTATION to be λ-independent, which holds for any
+    sampling density `p`:
+    `E_λ[β(λ)·CIE(λ)] = ∫p·(K·spd/p)·CIE = K∫spd·CIE`, and
+    `E_λ[β(λ)]·cieMean = K(∫spd)·(∫spd·CIE/∫spd)` — the same number. So substituting
+    `Emitter::cieMean` for the sampled `CIE(λ)` is unbiased in mode `J` exactly as in mode `M`.
+  - Nothing on the CAMERA side has to be λ-independent either, and that is worth stating because
+    it looks like an exposure and is not: the merge already multiplies a camera-λ throughput by a
+    beam-λ colour (the documented spectral-mismatch fudge in `mergeWeightJ`), so the two λs are
+    already independent draws. The fold replaces `E[CIE(λ_b)·g(λ_b)]` with `cieMean·E[g(λ_b)]`,
+    which are equal under the same per-medium flatness the fold already tests — whatever the
+    camera side happens to be.
+  - Implementation: `PathSeg` carries `achro`/`achroCie`, `randomWalk` runs the same
+    survives-an-achromatic-scatter rule `Renderer::tracePhoton` runs (cleared by any surface
+    event, by glass absorption, and by a scatter in a chromatic medium — but **not** by a scatter
+    in an achromatic one, which is what lets it ride the cloud's ~278 bounces), and
+    `traceLightBeamPass` sets `Renderer::beamAchroOK` and hands `sg.achroCie` to `emitBeams`.
+    No GRIN guard is needed, unlike the photon walk: `bdptUnsupportedFeature` refuses GRIN
+    scene-wide. No device twin is needed: the fold lands in `BeamMap::cie[]` at map-build time,
+    which is what the CUDA gather reads, and mode `J`'s light pass is CPU-only on both backends.
+  - What is left is the **rain**, whose `phase rainbow` makes `mediumAchromatic` false, so its
+    beams stay per-wavelength — correctly, since its scattering really is chromatic. Mode `M`
+    buys that back with `-beamspec 4`; mode `J` cannot, per the first sub-bullet, so it stays
+    chroma-noisier than mode `M` there at equal `-n`. Fixing it needs per-wavelength weights on
+    the record (already logged in `known-issues.md` as the follow-up to `-beamachro`).
 
 **Validation, passed 0.216.0** (`_fog_cornell.ftsl`, 128², `-device cpu`):
 

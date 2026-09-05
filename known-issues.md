@@ -2032,6 +2032,64 @@ in the one place where `-beamachro` provably cannot help.
 sub-beam ceiling), plus a per-secondary material evaluation at each surface along the photon path.
 Not free, unlike `-beamachro`, which is why it is logged rather than done in the same change.
 
+### FIXED (2026-09-05, v0.250.0): mode `J`'s clouds AND rain rendered iridescent — `-beamachro` had never been ported to it, ruled out by an argument that is only true of `-beamspec`
+
+**Reported.** "In mode `J`, the clouds and the rain showed up iridescent, which they shouldn't.
+You already fixed the problem in mode `M`, though in mode `M` the rain didn't show up iridescent,
+only the clouds." That asymmetry is the whole diagnosis, and it is worth spelling out because it
+identifies the cause before any code is read: mode `M` folds the cloud (achromatic HG) and refuses
+the rain (`phase rainbow`), so its rain has to be saved by something *else* — `-beamspec 4`. Mode
+`J` showed both symptoms, so it had **neither** mechanism.
+
+**Root cause.** `traceLightBeamPass` (`bdpt.h`) never set `Renderer::beamAchroOK` and called
+`emitBeams` with no `achroCie`, so every beam mode `J` deposited carried one saturated sampled
+wavelength. `design.md` recorded the reasoning: "`-beamspec` bundles and the achromatic fold both
+need a wavelength-independent `beta`, and a BDPT light subpath's is not." The premise is correct —
+mode `J` draws λ from the **scene-wide** `emitSampler` *before* choosing an emitter, so
+`Le = spd(λ)·invPdfLambda` is genuinely λ-dependent whenever the scene has more than one emitter
+(`gallery_rain` has five: a sun, a sky panel, two fill panels, and the emissive grid floor). The
+conclusion is correct **for the bundle** and wrong **for the fold**:
+
+* `-beamspec` stores wavelengths and **no weights**, so its members must carry *identical power*.
+  That requires a λ-independent `β` pointwise. Mode `J` cannot have it. It stays off there.
+* `-beamachro` needs only the **expectation** to come out right, and it does for any density `p`:
+
+  ```
+  E_λ[ β(λ)·CIE(λ) ] = ∫ p·(K·spd/p)·CIE dλ = K ∫ spd·CIE dλ
+  E_λ[ β(λ) ]·cieMean = K(∫spd) · (∫spd·CIE / ∫spd) = the same
+  ```
+
+  The `p` cancels, which is exactly why the scene-wide sampler is not an obstacle. One pointwise
+  condition was mistaken for a distributional one, and the two are not the same requirement.
+
+**Nor does the camera side have to be achromatic**, which is the next place the argument looks
+like it should fail. The gather returns `bm.cie[idx]·w` and the caller multiplies by the camera
+segment's own `sg.beta` at the *camera's* λ — the merge therefore already pairs two independently
+drawn wavelengths (`mergeWeightJ`'s documented spectral-mismatch approximation). The fold replaces
+`E[CIE(λ_b)·g(λ_b)]` with `cieMean·E[g(λ_b)]`, which are equal under precisely the flat-`sigma_s`,
+non-rainbow-phase test the fold already applies per medium. So it is unbiased *relative to the
+unfolded mode-`J` estimator* whatever the camera side is doing, and adds no approximation that
+was not there before.
+
+**Fix.** `PathSeg` gained `achro`/`achroCie`; `randomWalk` gained `achroIn`/`achroCieIn` and runs
+the same rule `Renderer::tracePhoton` runs — cleared by any surface event, by glass Beer-Lambert,
+and by a scatter in a chromatic medium, but **not** by a scatter in an achromatic one, which is
+what lets the claim survive the cloud's ~278 bounces. Both light-subpath generators seed it from
+`Emitter::cieMean`, and `traceLightBeamPass` sets `beamAchroOK` and passes `sg.achroCie` at both
+`emitBeams` call sites (the pilot's included, so the pilot keeps predicting the same beam count
+the real pass produces). Three things that look like they need work and do not: **no GRIN guard**
+(`bdptUnsupportedFeature` refuses GRIN scene-wide, unlike the photon walk which must exclude it
+per medium), **no device twin** (the fold lands in `BeamMap::cie[]` at map-build time, which is
+what the CUDA gather reads, and mode `J`'s light pass is CPU-only on both backends), and **no
+`-savemap` format change** (mode `J` does not write one).
+
+**Still open for mode `J`: the rain.** `phase rainbow` makes `mediumAchromatic` false, so the
+rain's beams stay per-wavelength — correctly, since its scattering really is chromatic — and mode
+`J` has no `-beamspec` to fall back on there the way mode `M` does. That is the same gap the entry
+immediately above describes, reached from the other direction: **per-wavelength weights on the
+beam record** would fix mode `M`'s dispersively-disqualified 11 % *and* give mode `J` a bundle it
+can legally carry, since a weighted bundle does not need equal power. One change, two payoffs.
+
 ### FIXED (2026-09-02, v0.209.0): the mode-`M` GPU gather starved its own launches — an adaptive slice controller drove the slice to 3 % occupancy and cost **11x** throughput
 
 **Context.** `renderPhotonMapSharedCuda` slices each spp into sub-chunk `kGather` launches so
