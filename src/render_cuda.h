@@ -284,9 +284,18 @@ bool cudaBdptSupported(const Scene& scene);
 // chroma noise). It is clamped to hero::kHeroMax and silently dropped to 1 for scenes the
 // hero walk does not cover (participating media, GRIN, a physical lens) — the same gate the
 // CPU BDPT applies. heroC <= 1 reproduces the original single-λ kernel bit-for-bit.
+//
+// `bmap` non-null is MODE J (UPBP): the caller's already-built photon-beam map, uploaded with
+// its MIS partials and MIS-combined with the connections inside the kernel. Null is mode D,
+// and then the kernel is bit-for-bit the mode-D one (no segment recording, no merge terms —
+// the merge machinery is a template parameter, not a runtime branch, so mode D does not even
+// pay the occupancy). A non-null but EMPTY map (`-nobeams`) also degenerates to exactly mode
+// D, which is validation gate 1. `stage` reports progress during the (potentially very long)
+// host-to-device conversion of a multi-million-sub-beam map.
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction,
-                    const SppProgress* prog = nullptr, int heroC = 1);
+                    const SppProgress* prog = nullptr, int heroC = 1,
+                    const BeamMap* bmap = nullptr, const StageProgress* stage = nullptr);
 
 // True if this scene + camera can be rendered by the GPU backward reference megakernel
 // (mode R), including the physical (mesh-lens) camera as a ray-generation front-end.

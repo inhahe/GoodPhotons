@@ -90,7 +90,7 @@ paths they can capture at all**.
 | `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras). The map is **surfaces only**: add `-beams` for the view-independent photon-beam volume cache, without which participating media render as nothing | CPU + **GPU** (both the direct estimate and `-beams`) |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU + **GPU** |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU + **GPU** |
-| `J` | UPBP | Mode `D` **plus** the mode-`M` photon-beam volume cache, combined under one MIS weight — the volumetric counterpart of `U`. Connections carry the paths beams are blind to (multiple scattering, surfaces); beam merges carry the deep-in-a-thick-medium paths the camera's distance sampling never reaches. Beams are **on by default** here (`-nobeams` to disable, which reduces it exactly to mode `D`) and are built from mode `J`'s **own light subpaths** since 0.216.0, so `-n` counts subpaths and `-beamcount` is inert. **Correct as of 0.219.0** — both techniques are MIS-weighted and merged paths obey the same `-depth` cap the connections do, so mode `J` estimates the same image mode `D` does (`J/D` mean 1.0006 on `_fog_cornell` and 0.9973 on the thick `_fog_thick`, against 2.0374 and 1.654 before the weights and the cap). Correct, but not yet *faster* than `D` — see **Mode `J`** below | CPU |
+| `J` | UPBP | Mode `D` **plus** the mode-`M` photon-beam volume cache, combined under one MIS weight — the volumetric counterpart of `U`. Connections carry the paths beams are blind to (multiple scattering, surfaces); beam merges carry the deep-in-a-thick-medium paths the camera's distance sampling never reaches. Beams are **on by default** here (`-nobeams` to disable, which reduces it exactly to mode `D`) and are built from mode `J`'s **own light subpaths** since 0.216.0, so `-n` counts subpaths and `-beamcount` is inert. **Correct as of 0.219.0** — both techniques are MIS-weighted and merged paths obey the same `-depth` cap the connections do, so mode `J` estimates the same image mode `D` does (`J/D` mean 1.0006 on `_fog_cornell` and 0.9973 on the thick `_fog_thick`, against 2.0374 and 1.654 before the weights and the cap). Correct, but not yet *faster* than `D` — see **Mode `J`** below | CPU + **GPU** (camera pass, 0.244.0; the light/beam pass stays on the CPU on both backends) |
 
 ### Mode `W` — the deterministic (POV-Ray-style) preview
 
@@ -1106,8 +1106,10 @@ that converges to the same physical image.
   > `-depth` cap the connections do, so a mode-`J` image is a correct estimate of the same
   > integral mode `D` estimates: the `J/D` scene-linear mean is **1.0006** on
   > `_fog_cornell.ftsl` and **0.9973** on the thick `_fog_thick.ftsl`, against **2.0374** and
-  > **1.654** before the weights and the depth cap. The caveats: it is **CPU-only**
-  > (`-device gpu` falls back); its beam map has **no trim** and is sized by `-n` alone, which
+  > **1.654** before the weights and the depth cap. The caveats: on an optically **thick,
+  > multi-bounce** scene it overshoots a converged mode `D` — see **UPBP-THICK** in
+  > `known-issues.md`, a pre-0.244.0 bias reproduced identically by both backends; its beam
+  > map has **no trim** and is sized by `-n` alone, which
   > is the resource that bites first — **pass a smaller `-n` before anything else** (see the
   > box below); and the weights carry three deliberate approximations
   > (one scene-wide kernel radius, a weight built from two wavelengths, and a merge dropped
@@ -1134,6 +1136,23 @@ that converges to the same physical image.
   > transmittance marches per surviving hit, which mode `M` pays identically. So the lever
   > that remains is the **GPU port**, not more CPU tuning — see **UPBP-CONV** in
   > `known-issues.md` for the tables.
+  >
+  > **The GPU port landed in 0.244.0.** `-device gpu` now runs mode `J`'s **camera** pass as
+  > mode `D`'s BDPT megakernel with the merges switched on (`kBdptT<…, MERGE=true>`), with the
+  > beam map, its BVH and its per-beam MIS partials uploaded once alongside. The **light** pass
+  > — tracing the subpaths, splitting them into sub-beams, building the BVH — stays on the CPU
+  > on both backends, because it is a one-off build whose cost does not scale with spp; the
+  > startup banner says where each half runs rather than claiming one backend for the whole
+  > render. Measured on `_fog_thick` at 128², equal 7-minute budgets: **2871 spp on the GPU vs
+  > 1042 on the CPU (2.8×)** at the default `-beamk`, where the divergent beam gather
+  > dominates, and **50767 vs 3354 (15×)** at `-beamk 1`, where it does not — the gather is the
+  > part that parallelises worst, so the speedup is a function of how many beams a segment
+  > collects. Agreement is verified three ways: mode `J` is **bit-for-bit** mode `D` on the GPU
+  > both with no media and with media under `-nobeams`; against the closed-form single-scatter
+  > slab the GPU reads **1.0029×** where the CPU reads 1.0030×; and CPU-vs-GPU whole-frame
+  > energy on `_fog_thick` agrees to **0.1 %**. The VRAM preflight reports the larger of the
+  > hero and merge kernels for mode `J`, since which of the two launches is not knowable before
+  > the beam map exists.
   >
   > **Do not pass `-n` in mode `J` (0.242.0) — the map sizes itself, and passing `-n` turns
   > that off.** `-n` counts light subpaths, each depositing one beam per span, so the inherited

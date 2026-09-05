@@ -672,12 +672,90 @@ pays identically and which no weight-side tuning can remove.
 of a gap a GPU closes, and nothing measured so far suggests the CPU version can be tuned into a
 win. Do not spend more time micro-optimising the weight.
 
+**(2c) The GPU port landed (2026-09-04, v0.244.0) and it is worth 2.8×, not the ~19× the gap
+needs.** `_fog_thick` at 128², equal 7-minute budgets, RTX 4090 vs 12 CPU threads:
+
+| configuration | CPU spp | GPU spp | speedup |
+|---|---|---|---|
+| default `-beamk 32` (a segment gathers 32 beams) | 1042 | 2871 | **2.8×** |
+| `-beamk 1` (a segment gathers ~1 beam) | 3354 | 50767 | **15×** |
+
+**The two rows are the finding.** The device closes the gap by 15× on the *walk* and only 2.8×
+once the beam gather is switched back on — so the gather is not merely the CPU bottleneck (2b),
+it is the part that **resists the GPU specifically**: a per-segment BVH traversal collecting 32
+beams, each with its own transmittance marches, is maximally divergent inside a warp, so threads
+in a warp serialise against each other's beam lists. That means the remaining lever is no longer
+"port it" — it is to make the gather itself cheaper or less divergent (sorting segments by
+locality, a fixed-size gather with reservoir sampling, or a wavefront pass that separates traversal
+from evaluation). At 2.8× against a ~19× deficit, mode `J` on the GPU is still slower than mode `D`
+on the GPU at equal time; the port is a correctness and infrastructure win, not yet a performance
+one. Do not treat UPBP-CONV as closed.
+
 **(3) Mode `J` fireflies harder than mode `D`.** Peak pixel 3.13e13 against 1.61e13 on the same
 scene — the beam×ray estimator's `1/sin(theta)` factor is unbounded as a beam becomes parallel to
 the camera ray, and the MIS weight does not suppress it (a near-parallel merge is *also* a
 technique the connections sample badly, so the balance heuristic correctly gives it a large
 weight). UPBP's own paper handles this; ftrace does not yet. The standard remedy is to cap the
 merge contribution or to fold a `sin(theta)`-aware term into the kernel.
+
+### UPBP-THICK — OPEN (2026-09-04, v0.244.0): on an optically **thick, multi-bounce** scene mode `J` overshoots a **converged** mode `D` by 15 % at the default `-beamk` and **64 %** with the radius floor off — identically on CPU and GPU, so it is an estimator bias, not a port bug
+
+**Found while validating the GPU port; it is not caused by it.** `scenes/_fog_thick.ftsl`
+(`sigma_t 20 / albedo 0.95`, bounded to the box), 128², `-max-bounce 8`, whole-frame scene-linear
+energy via `scraps/_jgpu_cmp.py`:
+
+| render | spp | noise | energy | vs converged `D` |
+|---|---|---|---|---|
+| `-mode D -device gpu` | 72 881 | 0.37 % | 9.6473e13 | — |
+| `-mode D -device gpu` (resumed) | 146 250 | 0.26 % | 9.6593e13 | **1.0012** |
+| `-mode J -device cpu` (default `-beamk`) | 1 042 | 3.10 % | 1.0940e14 | 1.132 |
+| `-mode J -device gpu` (default `-beamk`) | 2 871 | 1.87 % | 1.1140e14 | **1.153** |
+| `-mode J -device cpu -beamk 1 -beamcount 1000000` | 3 354 | 1.73 % | 1.5826e14 | 1.638 |
+| `-mode J -device gpu -beamk 1 -beamcount 1000000` | 50 767 | 0.44 % | 1.5809e14 | **1.637** |
+
+**Mode `D` is the converged one.** Doubling its samples (72 881 → 146 250) moved its energy by
+**0.12 %**, so it is settled to ~0.1 % and the 15 %/64 % gaps are not mode `D` still climbing. The
+excess is concentrated in the **bright** quartile (Q4 ratio 1.154 while Q2 is 1.000), and in the
+`-beamk 1` case the peak pixel is **1.55e12 against mode `D`'s 8.37e10 — 18×**.
+
+**It is not the port.** CPU and GPU agree with each other to **0.11 %** at `-beamk 1` (1.5826e14 vs
+1.5809e14) while both sit 1.64× above mode `D`. The device reproduces the CPU bias exactly, which
+is the strongest available evidence that the two share one cause in the estimator.
+
+**It is not the `-beamk` radius floor either — the floor is masking it.** The intuition is
+backwards: *shrinking* the kernel makes the overshoot **worse** (15 % → 64 %). An unbiased merge
+estimator's expectation is radius-independent, so a radius-dependent error means the merge's
+normalisation is wrong in a way that scales with `1/r` somewhere — which is also consistent with
+the excess living in the bright quartile and in the peak, since the `1/sin(theta)` tail sharpens as
+`r` shrinks.
+
+**Gate 3 does not cover this, which is why it was missed.** `tools/slab_ss_ref.py` runs the slab at
+`-max-bounce 1`, so it validates the merge only at **single scattering**, where mode `J` reads
+1.0030 (CPU) / 1.0029 (GPU) against closed form. Everything above is multi-bounce. A depth sweep on
+`_fog_thick` at `-r 64` / 45 s gave `J/D` = 1.060, 1.063, 0.961 for `-max-bounce` 1, 2, 3 — too
+noisy at that budget to localise the depth, and re-running it converged is the first step.
+
+**Suspects, in the order worth checking.**
+1. **The `1/sin(theta)` tail is not merely fireflying, it is biasing the mean.** A single
+   near-parallel merge at 18× mode `D`'s peak, in a frame whose total is 1.6×, is a large share of
+   the excess. Check whether clamping the merge contribution collapses the gap; if it does, the
+   estimator is fine and the *variance* is so heavy-tailed that neither image's mean is trustworthy
+   — in which case the right measurement is a median or a clamped mean, not total energy.
+2. **`mergeEtaPrime` uses `2r`, not the pointwise kernel value.** That is correct for the standard
+   1D kernel normalisation, but it is exactly the `r`-dependent term, so an error there would show
+   up as the radius dependence observed.
+3. **`mergeKappa = nEmitted · 2 · radRef()`** — the same `r` factor from the other side. If the
+   kernel actually used in the gather and the `radRef()` used in `kappa` ever disagree (per-medium
+   radii vs one scene-wide `radRef`), the weights stop summing to 1 and the bias is radius-scaled.
+4. **A depth-dependent term in the MIS weight**, given gate 3 passes at depth 1 and this fails at
+   depth 8.
+
+**Reproduce:**
+```
+ftrace -in scenes/_fog_thick.ftsl -mode D -device gpu -r 128 -time 420 -hdr -o png/thick_d.png -window-min -interval 200
+ftrace -in scenes/_fog_thick.ftsl -mode J -device gpu -r 128 -beamcount 1000000 -beamk 1 -time 420 -hdr -o png/thick_j_k1.png -window-min -interval 200
+python scraps/_jgpu_cmp.py png/thick_d.pfm png/thick_j_k1.pfm
+```
 
 ### MEM — OPEN (2026-09-02, v0.216.0): mode `J`'s beam map has **no trim** — it is sized by `-n` alone, and `-beamcount` is inert
 

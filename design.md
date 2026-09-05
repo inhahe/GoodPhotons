@@ -25,7 +25,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
-| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). CPU only so far; it traces its own light subpaths for the beam map (0.216.0) and both techniques are MIS-weighted (0.218.0), with merged paths capped at `maxDepth` like the connections (0.219.0). The map sizes itself from the scene's `-beamk` knee via a discarded pilot (0.242.0), so **leave `-n` off** — passing it disables the budget. Correct, but **not yet faster than `D`** — see UPBP-CONV | `bdpt.h` + `beamgather.h` + `photonbeams.h` |
+| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). It traces its own light subpaths for the beam map (0.216.0) and both techniques are MIS-weighted (0.218.0), with merged paths capped at `maxDepth` like the connections (0.219.0). The map sizes itself from the scene's `-beamk` knee via a discarded pilot (0.242.0), so **leave `-n` off** — passing it disables the budget. The **camera pass runs on the GPU** as of 0.244.0 (mode `D`'s megakernel with `MERGE=true`); the light/beam pass stays on the CPU on both backends. Correct, but **not yet faster than `D`** — see UPBP-CONV, and UPBP-THICK for a thick-medium bias | `bdpt.h` + `beamgather.h` + `photonbeams.h` + `render_cuda.cu` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
 | `-raster` | z-buffer preview rasterizer + interactive fly viewer (`-explore`) | `raster.h`, `raster_cuda.cu` |
 
@@ -487,6 +487,65 @@ per-ray work into `TrRay` bought 1.5 % — it is the beam×ray estimator's own t
 marches per surviving hit, which mode `M` pays identically. The lever that remains is therefore
 the **GPU port**, where mode `M`'s CUDA beam gather is the template; see UPBP-CONV in
 `known-issues.md` for the tables.
+
+### Mode `J` on the GPU (0.244.0)
+
+**What moved and what did not.** Mode `J` is two passes with opposite cost profiles. The **light
+pass** — trace light subpaths, split each medium span into sub-beams, build the beam BVH, and
+precompute each beam's MIS partials — is a *one-off build* whose cost is independent of spp, so
+porting it would buy a constant. The **camera pass** is paid once per sample per pixel, and it is
+already mode `D`'s BDPT megakernel plus a merge loop. So only the camera pass moved: `-device gpu`
+launches `kBdptT<NS, MAXD, MERGE=true>` with the finished beam map, its BVH and its MIS partials
+uploaded once, while the light pass stays on the CPU on **both** backends. The banner prints both
+halves (`camera pass on GPU, light pass on 12 CPU threads`) rather than naming a single backend,
+because naming one would be false about half the render.
+
+**Why `MERGE` is a template parameter and not a runtime flag.** `mergeKappa` is zero in every mode
+but `J`, and that zero already deletes every merge term arithmetically — so a runtime flag would be
+*correct*. It would also cost mode `D`, the far more common mode, the registers and the local-memory
+footprint of the `DPathSeg` array that only merges use. Templating it means mode `D` compiles to
+exactly the kernel it compiled to before the port, which is what makes "mode `J` with no beams is
+mode `D` **bit-for-bit**" true on the device and not merely true in principle.
+
+**The camera walk has to record segments.** A connection is evaluated at a *vertex*; a merge is
+integrated along a whole *ray*. `dRandomWalk` therefore fills a `DPathSeg` array — origin, direction,
+`tMax` to the surface that ends the ray (past any medium collision), throughput carrying **no**
+free-flight factor, and `vert = n - 1` — recorded after the hit is resolved and *before* the
+free-flight draw, and consuming no RNG, so a mode-`J` walk draws the identical random stream a mode-`D`
+walk does. That array is the port's whole VRAM delta: the preflight reports mode `D`'s kernel at
+4.36 GB local and mode `J`'s at 4.58 GB.
+
+**The preflight has to guess which kernel will launch.** `cudaMegakernelLocalBytes` is called before
+the beam map exists, and mode `J` can launch either instantiation — a media-free scene is mode `D`
+exactly, hero-wavelength bundle and all, while a scene *with* a medium has the hero bundle gated off
+by the medium and takes the scalar merge kernel with the `DPathSeg` array on top. Under-reporting is
+the failure that matters (it is what lets a render start and then thrash on host memory over PCIe),
+so it reports the **larger** of the two.
+
+**The bug the gates caught.** Gate 1a — mode `J` == mode `D` bit-for-bit on a media-free scene —
+failed on the first build, and not for any reason involving merges: mode `J` was passing `heroC = 1`
+to `renderBdptCuda` where mode `D` passes `g_heroC`, so mode `D` ran the hero-wavelength bundle and
+mode `J` did not. Forcing `-mode D -device gpu -heroc 1` reproduced mode `J`'s image exactly, which
+is what identified it. The fix is to pass `g_heroC`; the kernel applies the same hero gate the CPU
+`BdptRenderer` does, so a scene with a medium falls back to the single-λ walk on its own and the
+merge kernel is still the one that launches.
+
+**Measured (RTX 4090 vs 12 CPU threads, `_fog_thick`, 128², equal 7-minute budgets).**
+
+| configuration | CPU spp | GPU spp | speedup | why |
+|---|---|---|---|---|
+| default `-beamk 32` | 1042 | 2871 | **2.8×** | a segment gathers 32 beams; the divergent BVH traversal dominates and parallelises worst |
+| `-beamk 1` | 3354 | 50767 | **15×** | a segment gathers ~1 beam; the BDPT walk dominates, which is what the GPU is good at |
+
+So the speedup is a function of how many beams a segment collects, and the beam gather — not the
+MIS weight, not the walk — is the part that resists the device, exactly as the CPU profile predicted.
+
+**Agreement, three ways.** Bit-for-bit against mode `D` on the GPU with no media *and* with media
+under `-nobeams` (gates 1a/1c); **1.0029×** against the closed-form single-scatter slab where the CPU
+reads 1.0030× (gate 3); and CPU-vs-GPU whole-frame energy on `_fog_thick` agreeing to **0.1 %** at
+`-beamk 1`. That last number is the one that matters for a port, and it is also what proved the
+thick-medium overshoot (UPBP-THICK) is *not* a port bug: both backends overshoot mode `D` by the same
+1.64×, so the device faithfully reproduces a bias the CPU already had.
 
 ### Mode `J` gate 3 — an *analytic* reference, and the truncation bug it found (0.241.0)
 

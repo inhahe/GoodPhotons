@@ -4915,6 +4915,97 @@ __device__ static inline Real dPmAdaptiveRadius(const DPhotonMap& pm, const DVec
     return pm.radius;                        // fewer than k in the disc — nothing to tighten
 }
 
+// ---------------------- DETERMINISTIC transmittance, for MIS WEIGHTS ONLY --------------
+//
+// Device twin of beamgather.h's trDet / trDetMedium, and it exists for the same reason:
+// dMediaTransmittance is an unbiased ESTIMATOR (ratio tracking through a heterogeneous
+// medium), so two calls on the same segment return two different numbers. That is exactly
+// right inside a contribution and exactly wrong inside a weight — a balance heuristic is
+// unbiased only if, for one fixed path, the competing techniques' weights sum to 1, and an
+// edge's transmittance appears in several of them. Independent draws break the partition.
+//
+// "Deterministic first, accurate second", again matching the host: exact for a homogeneous
+// medium (the common case, and the validation case), a fixed 4-point midpoint quadrature of
+// the optical depth for a heterogeneous one. The quadrature's only cost is weight QUALITY.
+__device__ static double dTrDetMedium(const DMedium& m, const DVec3& o, const DVec3& dir,
+                                      double dist, Real lambda, const DPatEnv& env) {
+    const double stBase = (double)medSigmaT(m, lambda);
+    if (stBase <= 0.0) return 1.0;
+    double ta, tb;
+    if (!dMedClip(m, o, dir, 0.0, dist, ta, tb)) return 1.0;
+    const double L = tb - ta;
+    if (!(L > 0.0)) return 1.0;
+    if (!m.heterogeneous) return exp(-stBase * L);
+    const int kN = 4;                       // host trDetMedium's kN — keep the two in step
+    const double dt = L / (double)kN;
+    double tau = 0.0;
+    for (int i = 0; i < kN; ++i)
+        tau += dMedDensityAt(m, o + dir * (Real)(ta + ((double)i + 0.5) * dt), env);
+    return exp(-stBase * tau * dt);
+}
+__device__ static double dTrDet(const DScene& sc, const DVec3& o, const DVec3& dir,
+                                double dist, Real lambda, const DPatEnv& env) {
+    double Tr = 1.0;
+    for (int i = 0; i < sc.mediaN; ++i) {
+        Tr *= dTrDetMedium(sc.media[i], o, dir, dist, lambda, env);
+        if (Tr <= 0.0) return 0.0;
+    }
+    return Tr;
+}
+
+// The same transmittance evaluated at MANY distances along ONE fixed ray — device twin of
+// beamgather.h's TrRay, and hoisted for the same reason: mode J's merge weight calls dTrDet
+// once per beam HIT along a single camera segment, and a dense medium hands that segment
+// hundreds of hits, so essentially all of the clip + spectral lookup is per-RAY work being
+// paid per-hit. Build once per segment; each evaluation is then one exp per crossed medium.
+//
+// BIT-IDENTICAL to dTrDet rather than merely close (dMedClip intersects the medium's own
+// interval with [0,dist], so clipping to tMax and then to t <= tMax is the same interval;
+// the surviving media multiply in scene order; a skipped medium contributes exactly 1).
+// A HETEROGENEOUS medium keeps the slow path — its quadrature samples positions that depend
+// on the interval, so nothing about it can be hoisted.
+//
+// kMax is 4 here against the host's 8 purely to bound thread-local memory; the overflow path
+// is `slow`, which routes straight back to dTrDet and is numerically the same answer.
+struct DTrRay {
+    static const int kMax = 4;
+    double sigT[kMax], ta[kMax], tb[kMax];
+    int n;
+    int slow;
+    __device__ void build(const DScene& sc, const DVec3& oo, const DVec3& dd, double tMax,
+                          Real lam) {
+        n = 0; slow = 0;
+        if (sc.mediaN > kMax) { slow = 1; return; }
+        for (int i = 0; i < sc.mediaN; ++i) {
+            const DMedium& m = sc.media[i];
+            if (m.heterogeneous) { slow = 1; n = 0; return; }
+            const double st = (double)medSigmaT(m, lam);
+            if (st <= 0.0) continue;                       // dTrDet's 1.0 factor
+            double a, b;
+            if (!dMedClip(m, oo, dd, 0.0, tMax, a, b)) continue;
+            if (!(b - a > 0.0)) continue;
+            sigT[n] = st; ta[n] = a; tb[n] = b; ++n;
+        }
+    }
+    __device__ double at(const DScene& sc, const DVec3& oo, const DVec3& dd, double t,
+                         Real lam, const DPatEnv& env) const {
+        if (slow) return dTrDet(sc, oo, dd, t, lam, env);
+        double Tr = 1.0;
+        for (int i = 0; i < n; ++i) {
+            const double hi = t < tb[i] ? t : tb[i];
+            const double L = hi - ta[i];
+            if (!(L > 0.0)) continue;                      // dTrDet's 1.0 factor
+            Tr *= exp(-sigT[i] * L);
+            if (Tr <= 0.0) return 0.0;
+        }
+        return Tr;
+    }
+};
+
+// remap0 of the MIS machinery: a zero density is a DELTA one, and the ratio it appears in
+// must cancel rather than annihilate. Host twin: bdpt.h's misRemap0 / its local `remap0`.
+__device__ static inline double dMisRemap0(double f) { return f != 0.0 ? f : 1.0; }
+
 // ---------------------- photon BEAMS on the device (mode M volume) --------------------
 // Gather-tuned sub-beam record — what the device beam estimator actually reads. It is the
 // beam analogue of DGatherPhoton: the host BeamMap's per-beam constants (carried flux, the
@@ -4965,6 +5056,29 @@ struct DBeamRec {
     }
 };
 
+// The LIGHT half of every merge's MIS weight, one entry per PRE-SPLIT beam — device twin of
+// photonbeams.h's BeamMis, uploaded only in mode J (`DBeamMap::mis` is null in mode M, which
+// is the gather's signal to fall back to weight 1, i.e. mode M's own raw estimator).
+//
+// Why the light half arrives this way at all: the camera half of a merge weight is explicit
+// (the eye vertices are right there in the kernel and its loops can be replayed over them),
+// but the light subpath is long gone by gather time — it was summed into these accumulators
+// while the beam was deposited. See BeamMergeWeight in bdpt.h for the shape of the sum.
+//
+// Field order mirrors the host struct, but the LAYOUT does not have to: this is rebuilt
+// field-by-field at upload, so there is no memcpy to keep in step.
+struct DBeamMis {
+    double sumC;          // light-side connection accumulator
+    double sumM;          // light-side merge accumulator, without the n_m * 2r factor
+    float  pdfDir;        // solid-angle pdf of the beam's direction at y_{s-1}
+    float  rCoef;         // cos(y_{s-1}) / pdfFwd(y_{s-1}); the cos is 1 off a surface
+    float  etaPrev;       // the merge AT y_{s-1}, still missing only its Tr; 0 if not a medium
+    float  leadIn;        // distance from y_{s-1} to THIS beam's clipped origin
+    int    gateC1;        // is "connect x to y_{s-1}" a legal strategy? (y_{s-1} not delta)
+    int    vert;          // the light subpath vertex index j of y_{s-1} (so s = j+1) — the
+                          // depth cap needs it, and nothing else does
+};
+
 // The uploaded BeamMap: the host's BVH over kernel-inflated per-sub-beam AABBs (photonbeams.h)
 // plus the records it indexes. `nNodes == 0` means "no volume gather" and every entry point
 // tests for it, so a media-less scene pays nothing.
@@ -4975,6 +5089,42 @@ struct DBeamMap {
     Real            radiusMax = 0;   // largest per-medium half-width — reporting only; the
                                      // gather reads each record's own invRad
     int             nNodes    = 0;
+    // --- MODE J only (null/0 in mode M, and then the gather is bit-for-bit the old one) ---
+    // `mis` is indexed by the PRE-SPLIT beam through `misIdx`, exactly as the host is: one
+    // beam splits into up to thousands of sub-beams and duplicating 40 B of identical MIS
+    // data per sub-beam would multiply the map's VRAM footprint by the split factor.
+    const DBeamMis* mis     = nullptr;
+    const int*      misIdx  = nullptr;   // sub-beam -> mis entry (null => identity)
+    int             nMis     = 0;
+    // n_m * 2r: the merge technique's sample count times the 1D kernel's full width. It is a
+    // property of the MAP (nEmitted x radRef), so it travels with the map rather than as a
+    // separate kernel argument that could be forgotten at one of the call sites.
+    double          mergeKappa = 0.0;
+
+    // The MIS partials of sub-beam `i`, or null when the map carries none.
+    __device__ const DBeamMis* misOf(int i) const {
+        if (!mis) return nullptr;
+        const int j = misIdx ? misIdx[i] : i;
+        return (j >= 0 && j < nMis) ? &mis[j] : nullptr;
+    }
+};
+
+// The per-CAMERA-SEGMENT constants of a merge weight — device twin of the camera-side half
+// of bdpt.h's BeamMergeWeight, which the host builds once per segment and reads per hit.
+// Everything here is independent of WHERE along the segment a beam is hit, which is exactly
+// why it is hoisted: a dense medium hands one segment hundreds of hits.
+struct DBeamMergeW {
+    double kappa      = 0.0;  // == DBeamMap::mergeKappa, copied in for locality
+    double lamCam     = 0.0;  // the CAMERA path's wavelength (see the spectral note below)
+    double pdfDirCam  = 0.0;  // PathSeg::pdfDir: solid-angle density of the segment direction
+    double gateS1     = 0.0;  // is the reference connection C1 legal? (eye[k] not delta)
+    double cosFacK    = 1.0;  // projected cosine at eye[k] along the segment; 1 off a surface
+    double invPdfFwdK = 1.0;  // 1 / remap0(eye[k].pdfFwd)
+    double etaKCoef   = 0.0;  // sin(theta_k) / (sigma_t(eye[k]) * Tr~(eye[k] -> eye[k-1]))
+    double segSumC    = 0.0;  // camera-side connection accumulator from eye[k] inward
+    double segSumM    = 0.0;  // camera-side merge accumulator, kappa factored out
+    int    camVert    = 0;    // k: the camera subpath index of the vertex this segment leaves
+    int    maxDepth   = 0;    // the same cap the connection loop applies
 };
 
 // Beam x Ray 1D single-scatter estimate along the camera segment [oc, oc + dc*tMax] —
@@ -5041,10 +5191,94 @@ __device__ __forceinline__ void dGatherRetire() {
 #endif
 }
 
+// --- The merge weight itself (mode J) --------------------------------------------------
+//
+// Device twin of bdpt.h's BeamMergeWeight::operator(), called once per beam hit. It returns
+// the balance-heuristic weight of "merge THIS beam here" against every other technique that
+// could have produced the same path.
+//
+// SHAPE. The merged path is y_0..y_{s-1}, x, eye[k], ..., eye[0]. Its reference technique is
+// the connection "C1" that would have made x the LAST CAMERA vertex and joined it to
+// y_{s-1}. Every term below is a density RATIO against that one, so the weight is
+// etaS / (sum of them) and no absolute path density is ever formed.
+//
+// SPECTRAL MISMATCH (documented approximation, and the host makes the same one): the beam
+// carries its own wavelength and the camera path another. Camera-side quantities use `lamCam`,
+// light-side ones the beam's, and the phase value at x — computed once by the gather — serves
+// both densities there. It perturbs the weight, never the estimator's support.
+//
+// A DELTA light-side density returns 0, i.e. drops the merge: `lm->pdfDir` is 0 when the light
+// walk left y_{s-1} by a specular bounce, and dMisWeight's own merge terms vanish in exactly
+// the same case, so the partition of unity still holds.
+__device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& mw,
+                                          const DBeamMis& lm, const DBeamRec& b,
+                                          const DTrRay& camTr, const DVec3& oc, const DVec3& dc,
+                                          double tCam, double sBeam, double sinT,
+                                          double dens, double phase, const DPatEnv& env) {
+    // THE DEPTH CAP. The merged path has s = j+1 light vertices and t = k+2 camera ones,
+    // hence depth = j+k+1. The connection loop refuses depth > maxDepth, so a merge past the
+    // cap would contribute a path length mode D never builds — energy with nothing to MIS
+    // against, which measured 1.6x too bright on an optically thick medium.
+    if (lm.vert + mw.camVert + 1 > mw.maxDepth) return 0.0;
+    const double rhoL = (double)lm.leadIn + sBeam;   // y_{s-1} -> x, not b.o -> x
+    if (!(tCam > 0.0) || !(rhoL > 0.0)) return 0.0;
+    const double invR2 = 1.0 / (rhoL * rhoL), invT2 = 1.0 / (tCam * tCam);
+    // The pair of geometric densities AT x. Both are cosine-free: x is a medium point.
+    const double gL = (double)lm.pdfDir * invR2;     // light side  (p_L-perp)
+    const double gC = mw.pdfDirCam * invT2;          // camera side (the free flight)
+    if (!(gL > 0.0)) return 0.0;                     // delta light-side density
+    if (b.med < 0 || b.med >= sc.mediaN) return 0.0;
+    const double sigT = (double)medSigmaT(sc.media[b.med], (Real)mw.lamCam) * dens;
+    if (!(sigT > 0.0)) return 0.0;
+    const double trC = camTr.at(sc, oc, dc, tCam, (Real)mw.lamCam, env);   // Tr~(x -> eye[k])
+    if (!(trC > 0.0)) return 0.0;
+    // eta of THIS merge against C1 — the numerator of the weight, and a term of its
+    // denominator (a technique competes with itself at ratio exactly its own).
+    const double etaS = mw.kappa * sinT * gL / (sigT * trC);
+    if (!(etaS > 0.0)) return 0.0;
+
+    // pdfRev(y_{s-1}): the density of the last light vertex seen from x. The phase value at x
+    // is its direction density (HG samples proportionally to its own value), and rCoef carries
+    // the cosine and the 1/pdfFwd that turn it into the ratio the light loop accumulates.
+    const double R  = phase * (double)lm.rCoef * invR2;
+    // pdfRev(x)/pdfFwd(x): remap0 on BOTH, exactly as dMisWeight does, so a delta camera
+    // continuation cancels instead of annihilating.
+    const double C1 = dMisRemap0(gL) / dMisRemap0(gC);
+    const double pdfRevK = phase * mw.cosFacK * invT2;   // pdfRev(eye[k]) in the merged path
+    const double C2   = pdfRevK * mw.invPdfFwdK;
+    const double etaK = mw.kappa * mw.etaKCoef * pdfRevK;  // merge AT eye[k]
+    // The merge AT y_{s-1}. Its sin(theta) and p_L were known when the beam was deposited
+    // (its outgoing direction IS the beam); only the transmittance over the now-known
+    // y_{s-1} -> x span is left.
+    double etaPrevTerm = 0.0;
+    if (lm.etaPrev > 0.f) {
+        const DVec3 yPrev = b.o - b.d * (Real)lm.leadIn;
+        const double trP = dTrDet(sc, yPrev, b.d, rhoL, b.lambda, env);
+        if (trP > 0.0) etaPrevTerm = mw.kappa * (double)lm.etaPrev / trP;
+    }
+    const double den = (double)lm.gateC1                     // C1 itself (ratio 1)
+                     + R * lm.sumC                           // light-side connections
+                     + mw.gateS1 * C1                        // the t-1 camera connection
+                     + C1 * C2 * mw.segSumC                  // camera-side connections
+                     + R * (mw.kappa * lm.sumM + etaPrevTerm)  // light-side merges
+                     + etaS                                  // this merge
+                     + C1 * etaK                             // merge at eye[k]
+                     + C1 * C2 * mw.kappa * mw.segSumM;      // camera-side merges
+    if (!(den > 0.0)) return 0.0;
+    return etaS / den;
+}
+
+// `mw` non-null is MODE J: every hit is multiplied by the merge weight above, and the map is
+// then one half of a two-technique MIS estimator rather than the whole estimate. Null is mode
+// M, and then not one line below changes — the gather is bit-for-bit the pre-mode-J one.
+// `camTr` is the caller's per-segment deterministic-transmittance cache (unused when `mw` is
+// null, and built by the caller precisely because it is a constant of the SEGMENT).
 __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DVec3& oc, const DVec3& dc, Real tMax,
                                           double aGlassCam, DRng& rng,
-                                          double& oX, double& oY, double& oZ) {
+                                          double& oX, double& oY, double& oZ,
+                                          const DBeamMergeW* mw = nullptr,
+                                          const DTrRay* camTr = nullptr) {
     oX = oY = oZ = 0.0;
     if (bm.nNodes == 0) return;
     const DVec3 invD{(Real)1 / dc.x, (Real)1 / dc.y, (Real)1 / dc.z};
@@ -5102,7 +5336,20 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 // 1D Epanechnikov kernel, normalised so its integral over [-r, r] is 1.
                 const double kk = 1.0 - x2;
                 const double K1 = 0.75 * (double)b.invRad * kk;
-                double w = K1 / (double)sqrt((double)den) * ss * phase;
+                const double sinT = (double)sqrt((double)den);
+                double w = K1 / sinT * ss * phase;
+                // MIS (mode J); exactly absent in mode M. `dens` and `phase` are handed over
+                // rather than recomputed: the merge weight needs sigma_t(x) and the phase
+                // value at the merge point, and both are one multiply away from what the
+                // lines above just built. Applied BEFORE the `w > 0` reject so a technique
+                // the weight kills costs no transmittance marches — the host's order too.
+                if (mw) {
+                    const DBeamMis* lm = bm.misOf(bm.primIdx[n.first + i]);
+                    // A null entry means the map carries no MIS data for this beam, which is
+                    // the gather's signal to fall back to weight 1 (mode M's estimator).
+                    if (lm) w *= dBeamMergeWeight(sc, *mw, *lm, b, *camTr, oc, dc,
+                                                  (double)t, (double)s, sinT, dens, phase, env);
+                }
                 if (!(w > 0.0)) continue;
                 if (b.absorb > 0.f)  w *= exp(-(double)b.absorb * (double)s);   // glass, beam side
                 if (aGlassCam > 0.0) w *= exp(-aGlassCam * (double)t);          // glass, camera side
@@ -8627,6 +8874,46 @@ __device__ static inline bool dOnSurface(const DVertex& v) {
 __device__ static inline bool dConnectibleType(int tp) {
     return tp == D_DIFFUSE || tp == D_GLOSSY || tp == D_FLUORESCENT || tp == D_DIFFUSETRANSMIT;
 }
+
+// --- MODE J (UPBP): eta' of the merge technique at a medium vertex ----------------------
+//
+// Device twin of bdpt.h mergeEtaPrime. The merge/connection density RATIO at `v`, less the
+// constant kappa = n_m * 2r the caller factors out (it is the same at every site, so it does
+// not belong in here). Returning 0 means "no merge technique exists here", which is the
+// correct weight contribution for a non-medium vertex — and is what makes every call below
+// vanish in mode D, where kappa is 0 and none of them is even reached.
+//
+// WHY 2r AND NOT THE KERNEL VALUE: same reason VCM uses 1/(pi r^2) rather than its own
+// kernel. When this ratio weights a CONNECTION, the merge being weighed against is
+// hypothetical and has d_perp = 0, where the kernel is at its maximum and nothing like what
+// a real merge sees. The balance heuristic needs a consistent partition, not the pointwise
+// kernel; 1/(2r) is the mean of K1 over its support.
+__device__ static double dMergeEtaPrime(const DScene& sc, const DVec3& pPrev, const DVertex& v,
+                                        const DVec3& pNext, double pLight, Real lambda,
+                                        const DPatEnv& env) {
+    if (v.type != BV_MEDIUM) return 0.0;
+    if (v.mediumId < 0 || v.mediumId >= sc.mediaN) return 0.0;
+    if (!(pLight > 0.0)) return 0.0;
+    DVec3 din = v.p - pPrev;
+    const double dl = sqrt(ddot(din, din));
+    if (!(dl > 0.0)) return 0.0;
+    din = din * (Real)(1.0 / dl);
+    DVec3 dout = pNext - v.p;
+    const double dn = sqrt(ddot(dout, dout));
+    if (!(dn > 0.0)) return 0.0;
+    dout = dout * (Real)(1.0 / dn);
+    // sin of the angle between the beam and the camera ray. The camera ray runs the other
+    // way (-dout), but |sin| is unchanged by the flip.
+    const double c = ddot(din, dout);
+    const double s2 = 1.0 - c * c;
+    if (!(s2 > 0.0)) return 0.0;                 // exactly collinear: no acceptance volume
+    const DMedium& md = sc.media[v.mediumId];
+    const double sigT = (double)medSigmaT(md, lambda) * dMedDensityAt(md, v.p, env);
+    if (!(sigT > 0.0)) return 0.0;
+    const double tr = dTrDet(sc, v.p, dout, dn, lambda, env);
+    if (!(tr > 0.0)) return 0.0;
+    return sqrt(s2) * pLight / (sigT * tr);
+}
 __device__ static bool dVertConnectible(const DScene& sc, const DVertex& v) {
     if (v.type == BV_CAMERA) return true;
     if (v.type == BV_MEDIUM) return true;   // volume in-scatter always connects
@@ -11114,6 +11401,36 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
     }
 }
 
+// --- Subpath ray segments, for the mode-J (UPBP) beam merge ---------------------------
+//
+// Device twin of bdpt.h's PathSeg. A BDPT *connection* joins two sampled vertices, so it
+// only ever needs the vertices; a beam *merge* integrates along a whole RAY, pairing it with
+// every photon beam whose kernel that ray passes through — so what it needs is the SEGMENT,
+// which the vertex list does not contain and dRandomWalk otherwise throws away.
+//
+// A segment is NOT "the edge between path[i] and path[i+1]": it runs from path[i] to the
+// SURFACE that ends the ray, which is strictly further whenever a medium collision created
+// path[i+1] in between. That is the point — the merge is an *alternative* to the free-flight
+// distance sample, so it must see the whole span that sample was drawn from. For the same
+// reason `beta` is the throughput arriving at the segment's ORIGIN with no free-flight
+// factor in it (analog media transport makes it constant along the span), and the segment's
+// own transmittance is left to the gather, which computes Tr to each beam's own closest
+// approach rather than to a shared endpoint.
+//
+// Trimmed relative to the host struct: no betaSec[]/nUp. The host's renderRows splats
+// `m * sg.beta` and never touches the secondaries, and the hero bundle is gated off for any
+// scene with media anyway — so carrying C-1 extra doubles per segment through thread-local
+// memory would cost occupancy to store a value nothing reads.
+struct DPathSeg {
+    DVec3  o;          // segment origin
+    DVec3  d;          // unit direction
+    double tMax;       // distance to the surface that ends it (1e30 if the ray escapes)
+    double beta;       // throughput arriving at `o` (no free-flight factor; see above)
+    double aGlass;     // absorption of the dielectric the ray is inside (exp(-a*t) per hit)
+    double pdfDir;     // solid-angle density of `d` at the vertex this segment leaves
+    int    vert;       // index in the subpath of that vertex
+};
+
 // Continue a subpath whose endpoint is already path[0]; append surface vertices
 // until a miss/absorption/maxDepth. Direct port of bdpt.h randomWalk.
 // `importance` marks the LIGHT (particle) subpath: only then is the Veach adjoint
@@ -11133,7 +11450,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                                    const DHeroBundle& hb, int maxDepth, DRng& rng,
                                    DVertex* path, double* pathSec, int secStride, int maxV, int& n,
                                    bool importance, const double* betaSecIn, int nUpIn,
-                                   DEscape* esc = nullptr) {
+                                   DEscape* esc = nullptr,
+                                   DPathSeg* segs = nullptr, int* nSegs = nullptr,
+                                   int maxSegs = 0) {
     const Real lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;
@@ -11150,6 +11469,21 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                             /*camHide=*/(!importance && bounces == 0));
         if (h.valid && h.sensorId >= 0) return;
         double dSurf = h.valid ? (double)h.t : 1e30;
+
+        // Record the segment for the mode-J (UPBP) merge, BEFORE the free-flight draw below
+        // consumes it (see DPathSeg). `dSurf` is 1e30 on an escaping ray, which the gather
+        // clips to the beams that actually exist — so a ray leaving the scene through a
+        // medium needs no special case. Records no RNG draw, so a walk that passes `segs`
+        // and one that does not produce bit-identical paths.
+        if (segs && *nSegs < maxSegs) {
+            DPathSeg& sg = segs[*nSegs];
+            sg.o = ro; sg.d = rd; sg.tMax = dSurf; sg.beta = beta;
+            const int cmS = stk.topMat();
+            sg.aGlass = (cmS >= 0) ? (double)specLookup(sc.mats[cmS].absorb, lambda) : 0.0;
+            sg.pdfDir = pdfFwd;
+            sg.vert   = n - 1;
+            ++(*nSegs);
+        }
 
         // Participating media: sample the earliest real collision up to the surface
         // (or 1e30 in open space). Homogeneous free-flight — its transmittance is
@@ -11431,7 +11765,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, int diffraction,
                                         int px, int py, const DHeroBundle& hb, int maxDepth,
                                         DRng& rng, DVertex* path, double* pathSec, int secStride,
-                                        int maxV, DEscape* esc = nullptr) {
+                                        int maxV, DEscape* esc = nullptr,
+                                        DPathSeg* segs = nullptr, int* nSegs = nullptr,
+                                        int maxSegs = 0) {
     const Real lambda = hb.lam[0];
     // The camera vertex sees every wavelength at unit throughput: the bundle starts at full
     // width with all secondary throughputs 1 (importance leaves the camera achromatic).
@@ -11460,7 +11796,8 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         path[0] = c; int n = 1;
         double pdfDir = dCameraPdfDir(cam, ddot(rd, cam.w));   // MIS-irrelevant placeholder
         dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, hb, maxDepth - 1, rng,
-                    path, pathSec, secStride, maxV, n, false, betaSec0, 1, esc);
+                    path, pathSec, secStride, maxV, n, false, betaSec0, 1, esc,
+                    segs, nSegs, maxSegs);
         return n;
     }
     c.p = cam.eye;
@@ -11472,7 +11809,8 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     double cosCam = ddot(rd, cam.w);
     double pdfDir = dCameraPdfDir(cam, cosCam);
     dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, hb, maxDepth - 1, rng,
-                path, pathSec, secStride, maxV, n, false, betaSec0, hb.C, esc);
+                path, pathSec, secStride, maxV, n, false, betaSec0, hb.C, esc,
+                segs, nSegs, maxSegs);
     return n;
 }
 // Sample a light subpath. path[0] is the light endpoint (beta = Le).
@@ -11605,11 +11943,32 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
 // other strategies, then rolls the mutations back. Here the vertices live in the
 // per-thread local arrays, so we save whole vertices before ANY mutation and restore
 // them at the end (whole-vertex restore subsumes PBRT's field-wise ScopedAssignments).
+//
+// MERGES (mode J / UPBP). `mergeKappa` is n_m * 2r, zero in every mode but J, and that zero
+// deletes every merge term below — so mode D stays bit-for-bit what it was. Non-zero, each
+// hypothetical strategy in the two walks additionally carries the MERGE that would have
+// happened at its own vertex, because a merge competes with this connection for the very
+// same path; leaving it out makes the connection weights and the merge weights sum to more
+// than 1 and brightens every medium. Index mapping (the part where an off-by-one hides), per
+// the host header note at bdpt.h misWeight:
+//   * camera loop step i accumulates strategy j = n - i, whose vertex is eye[i-1]; so the
+//     merge site charged at step i is eye[i-1], needing i >= 2 for eye[i-2] to exist.
+//   * light loop step i accumulates strategy j = i, vertex light[i]; its camera-side
+//     neighbour is light[i+1], or `pt` at i == s-1 where the light subpath ends.
+//   * strategy j = s (this connection, ratio exactly 1) has vertex pt, added once outside.
+// The substitutions are the pointer/index ones this function already uses: eye[i-1].pdfRev
+// is the a5 override at i-1 == tMi (i-1 == ti is unreachable, i <= t-1); eye[t-1] is PtP so
+// t == 1 picks up `sampled`; light[s-1] is QsP; eye[t-1].pdfRev is the a4 override ptPdfRev.
+// Accumulated in a SEPARATE double: kappa is ~n_m*2r ~ 1e3, and sumRi/ri are float here.
 __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
                                     const DVertex* light, const DVertex* eye,
-                                    const DVertex& sampled, int s, int t, Real lambda) {
+                                    const DVertex& sampled, int s, int t, Real lambda,
+                                    double mergeKappa = 0.0) {
     if (s + t == 2) return 1.0;
     const int si = s - 1, ti = t - 1, sMi = s - 2, tMi = t - 2;
+    const bool merges = mergeKappa > 0.0;
+    const DPatEnv env = merges ? dPatEnvOf(sc) : dPatEnvNone();
+    double sumMg = 0.0;
 
     // Non-mutating rewrite of the PBRT ScopedAssignment dance: the old code copied the
     // four vertices adjacent to the connection edge to locals, wrote hypotheticals into
@@ -11641,6 +12000,12 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
         else               { num = (float)eye[i].pdfRev; den = (float)eye[i].pdfFwd; dl = eye[i].delta; }
         ri *= (num != 0.f ? num : 1.f) / (den != 0.f ? den : 1.f);
         if (!dl && !eye[i - 1].delta) sumRi += ri;
+        if (merges && i >= 2) {                      // merge at eye[i-1]
+            const double pRev = (i - 1 == tMi) ? (double)ptMPdfRev : eye[i - 1].pdfRev;
+            const double e = dMergeEtaPrime(sc, eye[i].p, eye[i - 1], eye[i - 2].p,
+                                            pRev, lambda, env);
+            if (e > 0.0) sumMg += (double)ri * e * mergeKappa;
+        }
     }
     ri = 1.f;
     for (int i = s - 1; i >= 0; --i) {
@@ -11658,8 +12023,21 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
         bool deltaPrev = (i > 0) ? (light[i - 1].delta != 0)
                                  : dIsDeltaLightVertex(sc, (si == 0) ? *QsP : light[0]);
         if (!dl && !deltaPrev) sumRi += ri;
+        if (merges && i >= 1 && t > 0) {             // merge at light[i]
+            const DVec3 pNext = (i + 1 <= s - 1) ? light[i + 1].p : PtP->p;
+            const double e = dMergeEtaPrime(sc, light[i - 1].p, light[i], pNext,
+                                            light[i].pdfFwd, lambda, env);
+            if (e > 0.0) sumMg += (double)ri * e * mergeKappa;
+        }
     }
-    return 1.0 / (1.0 + (double)sumRi);
+    // The merge at the connection vertex pt itself. Its own connection strategy IS this one,
+    // so the ratio multiplying it is exactly 1.
+    if (merges && s >= 1 && t >= 2) {
+        const double e = dMergeEtaPrime(sc, QsP->p, *PtP, eye[tMi].p,
+                                        (double)ptPdfRev, lambda, env);
+        if (e > 0.0) sumMg += e * mergeKappa;
+    }
+    return 1.0 / (1.0 + (double)sumRi + sumMg);
 }
 
 // Connect strategy (s,t); returns the MIS-weighted radiance of the HERO wavelength. For
@@ -11677,7 +12055,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
                                       const double* lightSec, const double* eyeSec, int secStride,
                                       int s, int t, const DHeroBundle& hb, DRng& rng,
                                       int& outPx, int& outPy, int& isSplat,
-                                      double* Lsec, int& nUpConn) {
+                                      double* Lsec, int& nUpConn, double mergeKappa = 0.0) {
     const Real lambda = hb.lam[0];
     const double invPdfLambda = hb.invPdf[0];
     isSplat = 0;
@@ -12016,7 +12394,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     double mx = L;
     for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mx) mx = Lsec[i];
     if (!(mx > 0.0)) return 0.0;
-    const double mis = dMisWeight(sc, cam, light, eye, sampled, s, t, lambda);
+    const double mis = dMisWeight(sc, cam, light, eye, sampled, s, t, lambda, mergeKappa);
     for (int i = 0; i + 1 < nUp; ++i) Lsec[i] *= mis;
     nUpConn = nUp;
     return L * mis;
@@ -12048,13 +12426,34 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 // launched — when `-max-bounce N` asks for N > BDPT_MAXDEPTH. The connection double-loop
 // below is O(MAXD^2), so the deep variant is genuinely slower per sample; that, plus the
 // local-memory cost, is why it is opt-in rather than the default.
-template <int NS, int MAXD>
+//
+// Templated on MERGE = mode J (UPBP). False is mode D and the kernel is bit-for-bit what it
+// was: no DPathSeg array, no segSum arrays, mergeKappa == 0 (so every merge term inside
+// dMisWeight vanishes) and no merge block. True adds the beam×ray half of the estimator.
+// A template flag rather than a runtime one because the per-thread segment array is the
+// kernel's largest single local allocation after the vertex stacks — mode D must not pay
+// occupancy for storage it never writes. Mode J only ever instantiates NS == 0: the hero
+// bundle is gated off for any scene with a participating medium, and mode J without one has
+// nothing to merge.
+template <int NS, int MAXD, bool MERGE>
 __global__ void __launch_bounds__(128, 3)
 kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                       long long totalSamples, long long chunkSpp, long long sppTotal,
                       long long sampleBase, int resX, int maxDepth,
-                      int diffraction, unsigned long long seedBase, int heroC) {
-    enum { SECN = (NS > 0 ? NS : 1), MAXV = BDPT_MAXV_OF(MAXD) };
+                      int diffraction, unsigned long long seedBase, int heroC,
+                      DBeamMap bm) {
+    enum { SECN = (NS > 0 ? NS : 1), MAXV = BDPT_MAXV_OF(MAXD),
+           SEGN = (MERGE ? BDPT_MAXV_OF(MAXD) : 1) };
+    // `bm.beams == nullptr` is the dispatcher's own "-nobeams / empty map" signal, so this
+    // single test is the whole gate — with it false the camera walk is not even asked to
+    // record its segments and the render is mode D down to the RNG stream (gate 1).
+    const bool mergeOn = MERGE && bm.beams != nullptr && bm.nNodes > 0;
+    // The merge technique's constant, n_m * 2r, travelling with the map so no call site can
+    // forget it. Zero unless the map actually carries MIS partials, and that zero is what
+    // makes every merge term inside dMisWeight disappear. Weighted and unweighted merges
+    // must move together: weighting the connections down while the merges are still raw
+    // would darken the volume as surely as the reverse brightens it, so ONE value gates both.
+    const double mergeKappa = mergeOn ? bm.mergeKappa : 0.0;
     if (maxDepth > MAXD) maxDepth = MAXD;   // device array bound (host picks the variant)
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
@@ -12094,10 +12493,14 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
 
         DVertex eye[MAXV], light[MAXV];
         double eyeSec[MAXV * SECN], lightSec[MAXV * SECN];
+        DPathSeg segs[SEGN];
+        int nSegs = 0;
         // Only pay for escape tracking when the scene actually has a distant sun.
         DEscape esc; esc.escaped = 0; esc.beta = 0.0; esc.nUp = 1;
         int nE = dGenCameraSubpath(sc, cam, diffraction, px, py, hb, maxDepth + 1, rng, eye, eyeSec, NS, MAXV,
-                                   (sc.sunCount > 0) ? &esc : nullptr);
+                                   (sc.sunCount > 0) ? &esc : nullptr,
+                                   mergeOn ? segs : nullptr, mergeOn ? &nSegs : nullptr,
+                                   mergeOn ? (int)SEGN : 0);
         int nL = dGenLightSubpath(sc, cam, diffraction, hb, maxDepth + 1, rng, light, lightSec, NS, MAXV);
 
         Real cx = cieX(lambda), cy = cieY(lambda), cz = cieZ(lambda);
@@ -12142,7 +12545,8 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 int spx = 0, spy = 0, isSplat = 0, nUpConn = 0;
                 double Lsec[SECN];
                 double c = dConnectBDPT(sc, cam, light, eye, lightSec, eyeSec, NS,
-                                        s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn);
+                                        s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn,
+                                        mergeKappa);
                 if (nUpConn <= 0) continue;
                 // Reject a non-positive — and, critically, a NON-FINITE — contribution before
                 // it reaches the film, exactly as BdptRenderer::renderRows does. Negated form
@@ -12176,6 +12580,113 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                     atomicAdd(&camFilm[o + 2], az);
                 }
             }
+
+        // ---- MERGES (mode J / UPBP) -------------------------------------------------
+        // The other half of the estimator: every photon beam whose kernel this camera
+        // subpath passed through. Unlike a connection this needs no light subpath at all —
+        // the beam map IS a cache of light subpaths, traced once for the whole frame —
+        // which is exactly why it reaches where a connection cannot: deep inside a thick
+        // medium the camera's own free-flight sampling essentially never lands on the
+        // scattering point a connection would have to be made from, whereas a beam is a
+        // whole LINE of deposited power and is hit by merely passing near it.
+        //
+        // The gather returns XYZ built at the BEAMS' wavelengths, not at this sample's hero
+        // λ (the standard spectral-photon-mapping estimate); `sg.beta` is this sample's own
+        // hero throughput to the segment origin, a scalar multiplying the XYZ triple.
+        //
+        // Placed after every connection deliberately: the gather draws from `rng`
+        // (ratio-tracked transmittance in a heterogeneous medium), and running it here means
+        // those draws cannot shift the connection half of the SAME sample. They cannot shift
+        // the next sample either, because the stream is re-seeded per (pixel,sample) at the
+        // top of this loop — so "turn the merges off and mode J is mode D bit-for-bit"
+        // survives even though the two halves share a generator. Host twin: renderRows.
+        if (mergeOn) {
+            // The camera half of every merge weight, replayed ONCE for the whole subpath.
+            // dMisWeight's camera loop telescopes inward from the merge point; everything it
+            // accumulates strictly camera-side of eye[k] is independent of WHERE along the
+            // segment a beam is hit, so it is summed here and read off per segment.
+            double segSumC[SEGN], segSumM[SEGN];
+            if (mergeKappa > 0.0) {
+                for (int k = 0; k < nE && k < (int)SEGN; ++k) segSumC[k] = segSumM[k] = 0.0;
+                for (int k = 1; k < nE && k < (int)SEGN; ++k) {
+                    const double gate = (!eye[k].delta && !eye[k - 1].delta) ? 1.0 : 0.0;
+                    // eta' of the merge AT eye[k-1]; needs both its neighbours, so it starts
+                    // at k = 2. Its pdfRev is the RECORDED one: moving the light-side
+                    // neighbour of eye[k] along the same ray does not change the direction
+                    // arriving at eye[k-1].
+                    const double eK = (k >= 2)
+                        ? dMergeEtaPrime(sc, eye[k].p, eye[k - 1], eye[k - 2].p,
+                                         eye[k - 1].pdfRev, lambda, dPatEnvOf(sc))
+                        : 0.0;
+                    double carry = 0.0, carryM = 0.0;
+                    if (k >= 2) {
+                        // No ratio exists at the camera vertex itself, which is why the
+                        // recurrence starts one step in.
+                        const double rC = dMisRemap0(eye[k - 1].pdfRev) /
+                                          dMisRemap0(eye[k - 1].pdfFwd);
+                        carry  = rC * segSumC[k - 1];
+                        carryM = rC * segSumM[k - 1];
+                    }
+                    segSumC[k] = gate + carry;
+                    segSumM[k] = eK + carryM;
+                }
+            }
+            for (int i = 0; i < nSegs; ++i) {
+                const DPathSeg& sg = segs[i];
+                if (!(sg.beta > 0.0)) continue;
+                // Hoisted out of the per-hit weight: the ray/bounds clip and the spectral
+                // sigma_t lookup are constants of the SEGMENT, and a dense medium hands one
+                // segment hundreds of hits. Built unconditionally so the gather's `camTr` is
+                // never dangling — cheap (one clip per medium).
+                DTrRay camTr;
+                camTr.build(sc, sg.o, sg.d, sg.tMax, lambda);
+                DBeamMergeW mw;
+                mw.kappa = mergeKappa; mw.lamCam = (double)lambda; mw.pdfDirCam = sg.pdfDir;
+                if (mergeKappa > 0.0) {
+                    const int k = (sg.vert < nE) ? sg.vert : nE - 1;
+                    const DVertex& vk = eye[k < 0 ? 0 : k];
+                    mw.gateS1     = vk.delta ? 0.0 : 1.0;
+                    mw.cosFacK    = (vk.type == BV_SURFACE || vk.type == BV_LIGHT)
+                                  ? fabs((double)ddot(vk.ns, sg.d)) : 1.0;
+                    mw.invPdfFwdK = 1.0 / dMisRemap0(vk.pdfFwd);
+                    mw.segSumC    = (k >= 0 && k < (int)SEGN) ? segSumC[k] : 0.0;
+                    mw.segSumM    = (k >= 0 && k < (int)SEGN) ? segSumM[k] : 0.0;
+                    // The depth cap, the same one the connection loop above applies: a merge
+                    // at light vertex j on this segment makes a path of depth j + k + 1.
+                    mw.camVert    = k;
+                    mw.maxDepth   = maxDepth;
+                    // The merge AT eye[k]. Its light-side incoming direction is -sg.d
+                    // whatever x turns out to be, so sin(theta) and the whole coefficient are
+                    // merge-point INDEPENDENT and belong here, not in the per-hit weight.
+                    if (k >= 1 && vk.type == BV_MEDIUM &&
+                        vk.mediumId >= 0 && vk.mediumId < sc.mediaN) {
+                        DVec3 dp = eye[k - 1].p - vk.p;
+                        const double dn = sqrt(ddot(dp, dp));
+                        if (dn > 0.0) {
+                            dp = dp * (Real)(1.0 / dn);
+                            const double cc = ddot(sg.d, dp);
+                            const double s2 = 1.0 - cc * cc;
+                            const DMedium& md = sc.media[vk.mediumId];
+                            const DPatEnv env = dPatEnvOf(sc);
+                            const double sT = (double)medSigmaT(md, lambda) *
+                                              dMedDensityAt(md, vk.p, env);
+                            const double tr = dTrDet(sc, vk.p, dp, dn, lambda, env);
+                            if (s2 > 0.0 && sT > 0.0 && tr > 0.0)
+                                mw.etaKCoef = sqrt(s2) / (sT * tr);
+                        }
+                    }
+                }
+                double mX = 0.0, mY = 0.0, mZ = 0.0;
+                dGatherPhotonBeams(sc, bm, sg.o, sg.d, (Real)sg.tMax, sg.aGlass, rng,
+                                   mX, mY, mZ, &mw, &camTr);
+                if (mX != 0.0 || mY != 0.0 || mZ != 0.0) {
+                    size_t o = ((size_t)py * resX + px) * 3;
+                    atomicAdd(&camFilm[o + 0], mX * sg.beta);
+                    atomicAdd(&camFilm[o + 1], mY * sg.beta);
+                    atomicAdd(&camFilm[o + 2], mZ * sg.beta);
+                }
+            }
+        }
     }
 }
 
@@ -15874,9 +16385,113 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     }
 }
 
+// ---- upload a built photon-beam map to the device ------------------------------------
+//
+// Shared by mode M's volume gather and mode J's BDPT merges, which need the SAME device
+// layout and differ only in whether the MIS partials come with it. Same fold-at-upload trick
+// as DGatherPhoton: the per-beam constants (carried flux, the 1/nEmitted pass normalisation,
+// and the CIE triple at the beam's own wavelength — the host precomputed the last one in
+// BeamMap::build for exactly this reason) collapse into one float3, so the inner loop
+// multiplies geometry and medium terms alone. The BVH goes over verbatim; nNodes == 0 is the
+// "no volume gather" sentinel every entry point tests.
+//
+// `withMis` is mode J. It additionally uploads BeamMis + misIdx and sets `mergeKappa` —
+// n_m * 2r, the merge technique's sample count times the 1D kernel's full width — which is
+// what turns the device gather from mode M's whole estimator into one half of a two-technique
+// MIS pair. The three travel together on purpose: a null `mis` makes DBeamMap::misOf return
+// null, which the gather reads as "weight 1", and a zero `mergeKappa` deletes every merge
+// term inside dMisWeight. Uploading one without the other would double-count or under-count.
+static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& dbm,
+                              const StageProgress* stage, bool withMis) {
+    if (!bmap || bmap->beams.empty() || bmap->bvh.nodes.empty() || bmap->nEmitted <= 0) return;
+    const double invN = 1.0 / (double)bmap->nEmitted;
+    const size_t nb = bmap->beams.size();
+    // The fourth and last silent stretch: converting millions of sub-beams and millions of
+    // BVH nodes into their device layouts, on one host thread, before the line at the bottom
+    // of this block finally says anything. Name it and make it interruptible.
+    if (stage && stage->reset)  stage->reset();
+    if (stage && stage->report) stage->report("uploading photon beams", 0, (long long)nb,
+                                              nullptr, 0.0);
+    std::vector<gpu::DBeamRec> recs(nb);
+    for (size_t i = 0; i < nb; ++i) {
+        if ((i & 0xFFFFF) == 0) {
+            if (ft::stopRequested()) break;
+            if (stage && stage->report)
+                stage->report("uploading photon beams", (long long)i, (long long)nb,
+                              nullptr, 0.0);
+        }
+        const PhotonBeam& b = bmap->beams[i];
+        const Vec3&      ci = bmap->cie[i];
+        gpu::DBeamRec& r = recs[i];
+        r.o = gpu::DVec3(b.o.x, b.o.y, b.o.z);
+        r.d = gpu::DVec3(b.d.x, b.d.y, b.d.z);
+        r.s0 = b.s0; r.len = b.len;
+        // `invC` splits the chord's flux evenly over its spectral bundle — every wavelength
+        // in it carries the same power (photonbeams.h) — and is exactly 1.0 for a
+        // monochromatic beam, so a `-beamspec 1` render is bit-identical.
+        const double invC = 1.0 / (double)b.nLam();
+        const double w = (double)b.power * invN * invC;
+        r.pX = (float)(ci.x * w); r.pY = (float)(ci.y * w); r.pZ = (float)(ci.z * w);
+        r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
+        r.nSec = (unsigned char)b.nSec; r.pad = 0;
+        r.pwSec = (float)w;      // the same shared constant, minus the CIE fold
+        for (int k = 0; k < 3; ++k)
+            r.lamS[k] = (k < b.nSec) ? gpu::DBeamRec::packLam((double)b.lamS[k]) : (unsigned short)0;
+        const double rm = bmap->radOf(b.med);
+        r.invRad = (float)(rm > 0.0 ? 1.0 / rm : 0.0);
+    }
+    std::vector<gpu::DNode> bnodes(bmap->bvh.nodes.size());
+    for (size_t i = 0; i < bnodes.size(); ++i) {
+        if ((i & 0xFFFFF) == 0 && ft::stopRequested()) break;
+        const BvhNode& s = bmap->bvh.nodes[i]; gpu::DNode& d = bnodes[i];
+        d.lo = {s.box.lo.x, s.box.lo.y, s.box.lo.z};
+        d.hi = {s.box.hi.x, s.box.hi.y, s.box.hi.z};
+        d.left = s.left; d.right = s.right; d.first = s.first; d.count = s.count;
+    }
+    // A stop during either conversion leaves `recs`/`bnodes` half-built. Don't pay the PCIe
+    // transfer for data nothing will read, and above all don't print the "uploaded" line,
+    // which would be a plain lie in the log about what the device holds. `dbm` stays zeroed,
+    // and `nNodes == 0` is already the "no volume gather" sentinel.
+    if (ft::stopRequested()) return;
+    dbm.beams     = (const gpu::DBeamRec*)up.keep(uploadVec(recs));
+    dbm.nodes     = (const gpu::DNode*)up.keep(uploadVec(bnodes));
+    dbm.primIdx   = (const int*)up.keep(uploadVec(bmap->bvh.primIdx));
+    dbm.radiusMax = (gpu::Real)bmap->radius;
+    dbm.nNodes    = (int)bnodes.size();
+    size_t nMis = 0;
+    if (withMis && !bmap->mis.empty()) {
+        std::vector<gpu::DBeamMis> dm(bmap->mis.size());
+        for (size_t i = 0; i < dm.size(); ++i) {
+            const BeamMis& s = bmap->mis[i]; gpu::DBeamMis& d = dm[i];
+            d.sumC = s.sumC; d.sumM = s.sumM;
+            d.pdfDir = s.pdfDir; d.rCoef = s.rCoef;
+            d.etaPrev = s.etaPrev; d.leadIn = s.leadIn;
+            d.gateC1 = (int)s.gateC1; d.vert = (int)s.vert;
+        }
+        nMis = dm.size();
+        dbm.mis    = (const gpu::DBeamMis*)up.keep(uploadVec(dm));
+        dbm.nMis   = (int)nMis;
+        if (!bmap->misIdx.empty())
+            dbm.misIdx = (const int*)up.keep(uploadVec(bmap->misIdx));
+        dbm.mergeKappa = (double)bmap->nEmitted * 2.0 * bmap->radRef();
+    }
+    double rlo = bmap->radius;
+    for (float rm : bmap->radMed) if (rm > 0.f) rlo = std::min(rlo, (double)rm);
+    char rtxt[64];
+    if (rlo < bmap->radius) std::snprintf(rtxt, sizeof rtxt, "%.4g .. %.4g", rlo, bmap->radius);
+    else                    std::snprintf(rtxt, sizeof rtxt, "%.4g", bmap->radius);
+    if (nMis)
+        std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %s, "
+                    "%zu MIS entries (kappa %.4g) uploaded for the mode-J merges\n",
+                    nb, bnodes.size(), rtxt, nMis, dbm.mergeKappa);
+    else
+        std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %s "
+                    "uploaded for the volume gather\n", nb, bnodes.size(), rtxt);
+}
+
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction, const SppProgress* prog,
-                    int heroC) {
+                    int heroC, const BeamMap* bmap, const StageProgress* stage) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
@@ -15924,20 +16539,35 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                             camH[3 * i + 1] + splatH[3 * i + 1],
                             camH[3 * i + 2] + splatH[3 * i + 2]);
     };
+    // Mode J: the beam map, and with it the merge half of the estimator. Uploaded here and
+    // freed with the rest of `up`. A null/empty map leaves `dbm.nNodes == 0`, which the
+    // MERGE=true kernel reads as "no merges" — so `-nobeams` degenerates to mode D exactly.
+    DBeamMap dbm{};
+    if (bmap) uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/true);
+    const bool mergeOn = (dbm.nNodes > 0);
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
-        if (useHero && deep)
-            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C);
+        // Mode J only ever instantiates the scalar (NS == 0) kernel: `useHero` is already
+        // false for any scene with a participating medium, and a mode-J scene without one
+        // has nothing to merge.
+        if (mergeOn && deep)
+            kBdptT<0, BDPT_DEEPDEPTH, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                           resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm);
+        else if (mergeOn)
+            kBdptT<0, BDPT_MAXDEPTH, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                          resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm);
+        else if (useHero && deep)
+            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm);
         else if (useHero)
-            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                            resX, maxDepth, diffraction ? 1 : 0, seed, C);
+            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                            resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm);
         else if (deep)
-            kBdptT<0, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1);
+            kBdptT<0, BDPT_DEEPDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm);
         else
-            kBdptT<0, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                    resX, maxDepth, diffraction ? 1 : 0, seed, 1);
+            kBdptT<0, BDPT_MAXDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                    resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm);
         cudaCheckKernel("bdpt");
     };
 
@@ -15990,16 +16620,33 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
     using namespace gpu;                      // the megakernels live there
     if (!cudaAvailable()) return 0;
     const void* fn = nullptr;
-    if (mode == 'D') {
+    if (mode == 'D' || mode == 'J') {
         // Mirrors renderBdptCuda's dispatch exactly (deep = maxDepth past the default
         // instantiation; hero = the multi-wavelength bundle). The deep variant is the
         // expensive one: BDPT_DEEPDEPTH is 64 vertices of local path state per thread.
+        //
+        // Mode J can launch EITHER kernel and this is called before the beam map exists, so
+        // which one is not yet knowable: a mode-J scene with a medium takes the scalar MERGE
+        // instantiation (the hero bundle is gated off by the medium) and adds the DPathSeg
+        // array on top, while a media-free one is mode D exactly, hero bundle and all. The
+        // answer this function owes its caller is a budget, so it reports the LARGER of the
+        // two — under-reporting is the failure mode that matters here (it is what lets a
+        // render start and then thrash on host memory over PCIe).
         const bool deep = (maxDepth > BDPT_MAXDEPTH);
         const bool hero = (heroC > 1);
-        if      (hero && deep) fn = (const void*)kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH>;
-        else if (hero)         fn = (const void*)kBdptT<BDPT_NSEC, BDPT_MAXDEPTH>;
-        else if (deep)         fn = (const void*)kBdptT<0, BDPT_DEEPDEPTH>;
-        else                   fn = (const void*)kBdptT<0, BDPT_MAXDEPTH>;
+        if (hero && deep)      fn = (const void*)kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false>;
+        else if (hero)         fn = (const void*)kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false>;
+        else if (deep)         fn = (const void*)kBdptT<0, BDPT_DEEPDEPTH, false>;
+        else                   fn = (const void*)kBdptT<0, BDPT_MAXDEPTH, false>;
+        if (mode == 'J') {
+            const void* mfn = deep ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, true>
+                                   : (const void*)kBdptT<0, BDPT_MAXDEPTH, true>;
+            cudaFuncAttributes fm{}, fc{};
+            if (cudaFuncGetAttributes(&fm, mfn) == cudaSuccess &&
+                cudaFuncGetAttributes(&fc, fn)  == cudaSuccess &&
+                fm.localSizeBytes > fc.localSizeBytes) fn = mfn;
+            cudaGetLastError();
+        }
     } else if (mode == 'R' || mode == 'W') {
         fn = (const void*)kBackward;
     } else if (mode == 'P') {
@@ -17181,76 +17828,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     else                                    dpmC.cellStart = dpm.cellStart;  // never dereferenced
 
     // ---- upload the built beam map ----
-    // Same fold-at-upload trick as DGatherPhoton: the per-beam constants (carried flux, the
-    // 1/nEmitted pass normalisation, and the CIE triple at the beam's own wavelength — the
-    // host precomputed the last one in BeamMap::build for exactly this reason) collapse into
-    // one float3, so the inner loop multiplies geometry and medium terms alone. The BVH goes
-    // over verbatim; nNodes == 0 is the "no volume gather" sentinel every entry point tests.
+    // Mode M's volume gather: the same device layout mode J's merges use, minus the MIS
+    // partials (see uploadBeamMapCuda). nNodes == 0 is the "no volume gather" sentinel.
     DBeamMap dbm{};
-    if (bmap && !bmap->beams.empty() && !bmap->bvh.nodes.empty() && bmap->nEmitted > 0) {
-        const double invN = 1.0 / (double)bmap->nEmitted;
-        const size_t nb = bmap->beams.size();
-        // The fourth and last silent stretch: converting millions of sub-beams and millions of
-        // BVH nodes into their device layouts, on one host thread, before the line at the bottom
-        // of this block finally says anything. Name it and make it interruptible.
-        if (stage && stage->reset)  stage->reset();
-        if (stage && stage->report) stage->report("uploading photon beams", 0, (long long)nb,
-                                                  nullptr, 0.0);
-        std::vector<DBeamRec> recs(nb);
-        for (size_t i = 0; i < nb; ++i) {
-            if ((i & 0xFFFFF) == 0) {
-                if (ft::stopRequested()) break;
-                if (stage && stage->report)
-                    stage->report("uploading photon beams", (long long)i, (long long)nb,
-                                  nullptr, 0.0);
-            }
-            const PhotonBeam& b = bmap->beams[i];
-            const Vec3&      ci = bmap->cie[i];
-            DBeamRec& r = recs[i];
-            r.o = DVec3(b.o.x, b.o.y, b.o.z);
-            r.d = DVec3(b.d.x, b.d.y, b.d.z);
-            r.s0 = b.s0; r.len = b.len;
-            // `invC` splits the chord's flux evenly over its spectral bundle — every
-            // wavelength in it carries the same power (photonbeams.h) — and is exactly 1.0
-            // for a monochromatic beam, so a `-beamspec 1` render is bit-identical.
-            const double invC = 1.0 / (double)b.nLam();
-            const double w = (double)b.power * invN * invC;
-            r.pX = (float)(ci.x * w); r.pY = (float)(ci.y * w); r.pZ = (float)(ci.z * w);
-            r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
-            r.nSec = (unsigned char)b.nSec; r.pad = 0;
-            r.pwSec = (float)w;      // the same shared constant, minus the CIE fold
-            for (int k = 0; k < 3; ++k)
-                r.lamS[k] = (k < b.nSec) ? DBeamRec::packLam((double)b.lamS[k]) : (unsigned short)0;
-            const double rm = bmap->radOf(b.med);
-            r.invRad = (float)(rm > 0.0 ? 1.0 / rm : 0.0);
-        }
-        std::vector<DNode> bnodes(bmap->bvh.nodes.size());
-        for (size_t i = 0; i < bnodes.size(); ++i) {
-            if ((i & 0xFFFFF) == 0 && ft::stopRequested()) break;
-            const BvhNode& s = bmap->bvh.nodes[i]; DNode& d = bnodes[i];
-            d.lo = {s.box.lo.x, s.box.lo.y, s.box.lo.z};
-            d.hi = {s.box.hi.x, s.box.hi.y, s.box.hi.z};
-            d.left = s.left; d.right = s.right; d.first = s.first; d.count = s.count;
-        }
-        // A stop during either conversion leaves `recs`/`bnodes` half-built. Don't pay the PCIe
-        // transfer for data nothing will read, and above all don't print the "uploaded for the
-        // volume gather" line, which would be a plain lie in the log about what the device holds.
-        // `dbm` stays zeroed, and `nNodes == 0` is already the "no volume gather" sentinel.
-        if (!ft::stopRequested()) {
-            dbm.beams     = (const DBeamRec*)up.keep(uploadVec(recs));
-            dbm.nodes     = (const DNode*)up.keep(uploadVec(bnodes));
-            dbm.primIdx   = (const int*)up.keep(uploadVec(bmap->bvh.primIdx));
-            dbm.radiusMax = (Real)bmap->radius;
-            dbm.nNodes    = (int)bnodes.size();
-            double rlo = bmap->radius;
-            for (float rm : bmap->radMed) if (rm > 0.f) rlo = std::min(rlo, (double)rm);
-            char rtxt[64];
-            if (rlo < bmap->radius) std::snprintf(rtxt, sizeof rtxt, "%.4g .. %.4g", rlo, bmap->radius);
-            else                    std::snprintf(rtxt, sizeof rtxt, "%.4g", bmap->radius);
-            std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %s "
-                        "uploaded for the volume gather\n", nb, bnodes.size(), rtxt);
-        }
-    }
+    uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/false);
 
     // ---- gather each camera ----
     // Pull the current device accumulation for camera c into out[c] (film + hit map).

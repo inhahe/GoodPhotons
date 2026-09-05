@@ -241,8 +241,13 @@ argument for standing a groom in a hall of polished objects.*
   thick `_fog_thick`, against **2.0374** and **1.654** before the weights and the depth cap.
   It is not yet a **win**, though: per sample its variance is **2.4–8.8× lower** than mode
   `D`'s and the margin grows with `-n` — the merges really do reach paths the connections
-  cannot — but a sample costs 45–250× more, so at equal time it loses by ~19×. The remaining
-  lever is the GPU port; see [known-issues.md](known-issues.md) → UPBP-CONV. Still CPU-only.)*
+  cannot — but a sample costs 45–250× more, so at equal time it loses by ~19×. **It runs on
+  the GPU as of 0.244.0** (`-device gpu`) — the camera pass is mode `D`'s megakernel with the
+  merges switched on, worth **2.8×** when the beam gather dominates and **15×** when it does
+  not, while the light/beam pass stays on the CPU on both backends. See
+  [known-issues.md](known-issues.md) → UPBP-CONV, and UPBP-THICK for a brightness bias on
+  optically thick multi-bounce scenes that predates the port and is identical on both
+  backends.)*
   Mode
   `D` and mode `M -beams` each solve half of a thick-medium scene and fail where the other
   succeeds: a BDPT connection needs the camera's free-flight distance sampling to *reach*

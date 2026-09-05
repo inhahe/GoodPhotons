@@ -15592,7 +15592,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // projection remap) for the pinhole-splat modes (B/V/P).
     const bool gpuForwardMode =
         (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
-    const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
+    // GPU BDPT megakernel (own support check). Mode J (UPBP) runs the SAME megakernel:
+    // its camera pass is mode D's connections plus the beam merges, so the device kernel
+    // is kBdptT<..., MERGE=true> with the already-built beam map uploaded alongside. The
+    // light/beam pass (tracing the photon beams and building their BVH + MIS partials)
+    // stays on the CPU either way -- the GPU flag only governs the camera pass.
+    const bool gpuBdptMode = (mode == 'D' || mode == 'J');
     // GPU backward reference megakernel (own check). -mode W runs here too: the device
     // megakernel carries a full twin of the deterministic estimators (the bkWhitted /
     // bkGrid / bkGi* / bkHeroSplit / bkAmbient DScene knobs + the dWhitted* lattice helpers
@@ -15652,16 +15657,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
         } else if (gpuBdptMode) {
-            // Mode D has its own (stricter) GPU support check: BDPT scope only. A realistic
-            // lens on the camera subpath (Plan B) is supported on-device too — the BDPT
-            // kernel generates the lens ray via dGenLensRay, exactly as the GPU mode-R
-            // backward megakernel does.
+            // Modes D and J share this (stricter) GPU support check: BDPT scope only — mode J
+            // is the same megakernel with the merges switched on, so anything mode D can run
+            // on the device, mode J can. A realistic lens on the camera subpath (Plan B) is
+            // supported on-device too — the BDPT kernel generates the lens ray via
+            // dGenLensRay, exactly as the GPU mode-R backward megakernel does.
             if (!cudaBdptSupported(scene)) {
                 const char* why = "scene has a BDPT-GPU-unsupported feature "
-                                  "(fluorescent/oversized-mix material, fog, "
-                                  "spot/sun/env/collimated light, an `emit pattern:` emission "
-                                  "profile, or a per-hit BSDF the GPU BDPT can't MIS: a "
-                                  "procedural pattern or frosted/colored glass)";
+                                  "(hair, GRIN media, env/collimated light, or a "
+                                  "GPU-unsupported material: layered, indexed-palette, "
+                                  "oversized multilayer/mix, or an emissive 'fire' volume)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -15744,7 +15749,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // the CPU path — merely slow — is strictly better than a GPU path that is 1000x slow.
     // So: measure, and say exactly what is wrong and who to blame.
     if (useGpu) {
-        const int hero = (mode == 'D') ? g_heroC : 1;
+        const int hero = (mode == 'D' || mode == 'J') ? g_heroC : 1;
         const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
         size_t needLocal = cudaMegakernelLocalBytes(mode, mdep, hero);
         size_t freeB = 0, totalB = 0;
@@ -16035,6 +16040,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             return 1;
         }
         int maxDepth = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
+        // WHICH HALF RUNS WHERE. Mode J's camera pass is mode D's megakernel with the merges
+        // switched on (kBdptT<..., MERGE=true>), so it follows the same -device decision mode D
+        // does. The LIGHT pass — tracing the subpaths, splitting them into sub-beams, building
+        // the BVH and the per-beam MIS partials — stays on the CPU on both backends: it is a
+        // one-off build whose cost is independent of spp, and the map it produces is uploaded
+        // to the device once. So the two halves genuinely can differ, and the banner says so
+        // rather than claiming a single "on N CPU threads" that would be a lie about half the
+        // render.
+        const std::string camWhere =
+            useGpu ? std::string("GPU") : (std::to_string(nThreads) + " CPU threads");
         // The merge half needs a beam map, and a beam map needs media. A media-free scene
         // is not an error — it is just mode D with extra words — so say so and carry on
         // rather than refusing, which also makes "mode J == mode D here" a testable claim
@@ -16075,16 +16090,17 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             jreq.targetK  = g_beamK;
             bdpt::BeamBudgetInfo jbb;
             if (jreq.maxBeams > 0)
-                std::printf("mode J: UPBP at %dx%d on %d CPU threads (maxDepth=%d, light=%s) — "
-                            "sizing the light pass to a beam map of at most %lld beams "
-                            "(-beamcount)%s ...\n",
-                            res, resY, nThreads, maxDepth, lightLabel, jreq.maxBeams,
+                std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
+                            "threads (maxDepth=%d, light=%s) — sizing the light pass to a beam "
+                            "map of at most %lld beams (-beamcount)%s ...\n",
+                            res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel,
+                            jreq.maxBeams,
                             g_beamTargetSet ? "" : ", or this scene's -beamk knee if that is lower");
             else
-                std::printf("mode J: UPBP at %dx%d on %d CPU threads (maxDepth=%d, light=%s) — "
-                            "tracing %lld light subpaths for the beam map (-n given: no beam "
-                            "budget) ...\n",
-                            res, resY, nThreads, maxDepth, lightLabel, N);
+                std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
+                            "threads (maxDepth=%d, light=%s) — tracing %lld light subpaths for "
+                            "the beam map (-n given: no beam budget) ...\n",
+                            res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel, N);
             liveWindowPlaceholder(res, resY, "tracing light subpaths\xE2\x80\xA6");
             auto tp0 = std::chrono::steady_clock::now();
             bdpt::traceLightBeamPass(scene, cam, N, nThreads, maxDepth, diffraction,
@@ -16115,14 +16131,28 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                      "subpath reached a medium. This render is mode D "
                                      "exactly.\n");
         } else {
-            std::printf("mode J: UPBP at %dx%d on %d CPU threads (maxDepth=%d, light=%s) ...\n",
-                        res, resY, nThreads, maxDepth, lightLabel);
+            std::printf("mode J: UPBP at %dx%d on %s (maxDepth=%d, light=%s) ...\n",
+                        res, resY, camWhere.c_str(), maxDepth, lightLabel);
         }
         // An empty map is passed as null, so the renderer's merge path is not merely skipped
         // per-ray but never entered — which is what makes gate (1)'s "bit-identical to mode D"
         // a property of the code rather than of floating-point luck.
         const BeamMap* beamsPtr = (wantBeams && !bmap.empty()) ? &bmap : nullptr;
         auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
+#ifdef HAVE_CUDA
+            // `g_heroC`, exactly as mode D passes it — NOT 1. The kernel applies the same
+            // hero gate the CPU BdptRenderer does (a medium, GRIN or a physical lens falls
+            // back to the single-λ walk), so a mode-J scene WITH a medium is scalar anyway
+            // and the merge kernel is the one that launches. What passing 1 here would break
+            // is the media-FREE case, which mode J states is "mode D exactly": mode D would
+            // run the hero bundle and mode J would not, and gate 1a — J == D bit-for-bit —
+            // fails on the wavelength sampling rather than on anything to do with merges.
+            // (Measured: it did, before this was g_heroC.)
+            // `stageProg` reports the host->device conversion of the beam map, which for a
+            // multi-million-sub-beam map is long enough to look like a hang without it.
+            if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth,
+                                              diffraction, p, g_heroC, beamsPtr, &stageProg);
+#endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     return renderBdpt(scene, cam, res, resY, c, nThreads, maxDepth,
