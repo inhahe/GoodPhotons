@@ -17004,6 +17004,12 @@ static void printHelp(const char* prog) {
 "  -noise <pct>          stop at target graininess (progressive)\n"
 "  -forever              trace until Ctrl-C (progressive)\n"
 "  -spp <n>              samples/pixel for backward modes R/V\n"
+"  -seed <n>             draw a DIFFERENT realization of the same render. ftrace is otherwise\n"
+"                        deterministic, so a fixed set of flags gives one image bit-for-bit —\n"
+"                        which means one sample of every estimator, and no way to tell a bias\n"
+"                        from the luck of one draw. Re-render at a few seeds and compare.\n"
+"                        Salts every stream, CPU and GPU, all modes; -seed 0 (the default) is\n"
+"                        the historical stream, so old reference images still reproduce\n"
 "  -beams|-photonbeams   photon beams (single-scatter volumetrics). Modes A/B: decorrelated\n"
 "                        per-camera gather for shared flybys (CPU or GPU; kills frozen\n"
 "                        speckle). Mode M: stores a view-independent BEAM MAP, which is the\n"
@@ -18049,6 +18055,13 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-check-airtight-rays") && i + 1 < argc) airtightRays = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-mesh-decimate") && i + 1 < argc) { exportMeshDecimate = std::atof(argv[++i]); exportMeshAdaptive = true; }
         else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) spp = std::atoll(argv[++i]);
+        // Draw a DIFFERENT realization of the same render. Everything else about ftrace is
+        // deterministic, so without this there is exactly one sample of every estimator and
+        // no way to separate a bias from the luck of one draw — see the block comment over
+        // `setGlobalSeed` in src/rng.h, and UPBP-THICK in known-issues.md, which is the case
+        // that made it necessary. `-seed 0` is the historical stream, bit-for-bit.
+        else if (!std::strcmp(argv[i], "-seed") && i + 1 < argc)
+            setGlobalSeed((uint64_t)std::strtoull(argv[++i], nullptr, 10));
         else if (!std::strcmp(argv[i], "-fog") && i + 1 < argc) fogSigmaT = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-fogalbedo") && i + 1 < argc) fogAlbedo = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-fogg") && i + 1 < argc) fogG = std::atof(argv[++i]);

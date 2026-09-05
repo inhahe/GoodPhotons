@@ -127,9 +127,12 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         if (beamTarget > 0)
             bbanks[t].cap = std::max<size_t>(1024, (size_t)(2 * beamTarget / nThreads));
         // Private, per-thread stream for the self-thinning draws, so which beams get dropped
-        // never depends on — or perturbs — the photon tracer's own RNG sequence.
+        // never depends on — or perturbs — the photon tracer's own RNG sequence. Salted by
+        // `-seed` like every other stream: WHICH beams the roulette drops is part of the
+        // realization, so leaving it fixed would have left mode M's beam map partly frozen
+        // across seeds, which is the opposite of what the flag is for.
         bbanks[t].rng.seed(seedBase + 0x9E3779B97F4A7C15ULL * (uint64_t)(t + 1),
-                           0xBF58476D1CE4E5B9ULL);
+                           0xBF58476D1CE4E5B9ULL ^ g_rngSalt);
     }
 
     // Hero-wavelength deposit (modes M/S): each traced path deposits its live wavelengths

@@ -1238,6 +1238,9 @@ inline void vcmPass(const Scene& scene, const Camera& cam, VcmState& st, double 
                     int nThreads, bool diffraction, int maxDepth, uint64_t passSeed,
                     int heroC = 1) {
     if (nThreads < 1) nThreads = 1;
+    // `-seed`: every stream in this pass descends from `passSeed`, so salting it once here
+    // is the whole of the flag for mode `U` (0 by default, so XOR is the identity).
+    passSeed ^= g_rngSalt;
     const int W = st.resX, H = st.resY;
     const long long nPix = (long long)W * H;
 

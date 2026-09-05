@@ -247,6 +247,9 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                      double alpha, int maxBounce, uint64_t passSeed,
                      int heroC = hero::kHeroC) {
     if (nThreads < 1) nThreads = 1;
+    // `-seed`: this pass's streams all descend from `passSeed`, so salting it once here is
+    // the whole of the flag for mode `S` (0 by default, so XOR is the identity).
+    passSeed ^= g_rngSalt;
     const int W = st.resX, H = st.resY;
 
     // (1) Camera pass — fresh visible point + direct sample per pixel this pass.

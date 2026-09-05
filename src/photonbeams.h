@@ -645,7 +645,8 @@ struct BeamMap {
         if (target == 0 || beams.size() <= target) return;
         const double q = (double)target / (double)beams.size();
         const float  boost = (float)(1.0 / q);
-        Pcg32 rng; rng.seed(seed, 0x13198A2E03707344ULL);
+        // `-seed`: which beams the final trim keeps is part of the realization too.
+        Pcg32 rng; rng.seed(seed, 0x13198A2E03707344ULL ^ g_rngSalt);
         misEnsureIdx();
         std::vector<PhotonBeam> out;
         std::vector<int> idxOut;

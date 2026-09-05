@@ -91,6 +91,11 @@
 #include "parallel.h"     // ft::stopRequested — cooperative `-stop` between deposit chunks
 #include "duration.h"     // humanDur: "[[[dd:]hh:]mm:]ss" for the stall watchdog's elapsed times
                           // (the header is dependency-free and __host__ __device__ for this)
+#include "rng.h"          // g_rngSalt — `-seed`, folded into every DEVICE seed origin below.
+                          // The salt is a host value and the kernels take their seed as a
+                          // launch argument, so the device needs no state of its own: every
+                          // place a seed is *derived* on the host XORs it in, and nothing
+                          // inside a kernel changes.
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
 // every kernel launch/sync return code MUST be checked: under GPU contention (a second
@@ -16002,7 +16007,8 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     using namespace gpu;
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation chunk
     // passes a distinct cumulative-photon offset for an independent stream.
-    unsigned long long kseed = 0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL;
+    unsigned long long kseed = (0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL)
+                             ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     // Hero-wavelength sampling shares one BVH walk across C stratified wavelengths, cutting
     // chromatic noise. It is only physical without participating media / GRIN bending (the
     // geometry must be wavelength-independent between dispersive events), and it lives ONLY
@@ -16528,7 +16534,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     const long long sppBase  = prog ? (long long)prog->sampleBase : 0;
     const long long sppTotal = sppBase + spp;
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
-        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
+        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL)
+        ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
 
     std::vector<double> camH(npix * 3), splatH(npix * 3);
     auto download = [&](Film& o) {
@@ -16768,7 +16775,8 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     // with a stream the checkpointed samples already drew, and two correlated samples are
     // worse than a decorrelated stream.
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
-        ^ ((prog && !whitted) ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
+        ^ ((prog && !whitted) ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL)
+        ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
 
     std::vector<double> film(npix * 3);
     auto download = [&](Film& o) {
@@ -16855,7 +16863,8 @@ Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int 
     const long long sppBase  = prog ? (long long)prog->sampleBase : 0;
     const long long sppTotal = sppBase + spp;
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
-        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
+        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL)
+        ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
 
     std::vector<double> film(npix * 3);
     auto download = [&](Film& o) {
@@ -16931,7 +16940,8 @@ long long backwardRGBSessionAccumulate(BackwardRGBSession* s, long long spp, boo
     if (!s || !s->haveCam || spp <= 0) return s ? s->accum : 0;
     const long long base = s->accum;
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
-        ^ (unsigned long long)base * 0x9E3779B97F4A7C15ULL;
+        ^ (unsigned long long)base * 0x9E3779B97F4A7C15ULL
+        ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     long long totalSamples = (long long)s->npix * spp;
     kBackwardRGB<<<2048, 128>>>(s->up.sc, s->up.dc, s->d_film, s->d_hits,
                                 totalSamples, spp, BackwardRGBSession::kSppCap, base,
@@ -17944,7 +17954,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         // to the photon map this mode is already holding.
         double* s_film = nullptr; CUDA_CHECK(cudaMalloc(&s_film, npix * 3 * sizeof(double)));
         double* s_hits = nullptr; CUDA_CHECK(cudaMalloc(&s_hits, npix * sizeof(double)));
-        const unsigned long long seed = 0xA24BAED4963EE407ULL ^ (0x9E3779B97F4A7C15ULL * (unsigned long long)(c + 1));
+        const unsigned long long seed = 0xA24BAED4963EE407ULL
+                                      ^ (0x9E3779B97F4A7C15ULL * (unsigned long long)(c + 1))
+                                      ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
         // Chunk spp so a single launch stays well under the Windows TDR watchdog even when a
         // caustic cell holds a dense photon cluster (heavy density query).
         long long chunk = 200000 / (long long)(npix ? npix : 1); if (chunk < 1) chunk = 1;
@@ -18318,7 +18330,8 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
 
     // (1) Camera visible-point pass: fresh visible point + direct sample per pixel.
     unsigned long long vpSeed = 0xA24BAED4963EE407ULL
-                              ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL);
+                              ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL)
+                              ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     kSppmVisiblePoint<<<2048, 128>>>(s->up.sc, s->cam, s->st, s->resX, s->resY,
                                      s->maxBounce, vpSeed, passIdx + 1);
     cudaCheckKernel("sppm-visible-point");
@@ -18613,7 +18626,8 @@ void vcmSessionPass(VcmSession* s, double radius) {
     // (1) Light pass — zero the per-pass splat, then trace one light subpath per pixel.
     CUDA_CHECK(cudaMemset(s->d_splat, 0, np * 3 * sizeof(double)));
     unsigned long long seedL = 0xD1B54A32D192ED03ULL
-                             ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL);
+                             ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL)
+                             ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     if (s->secStride > 0)
         kVcmLightT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
                                  s->d_lvSlab, s->d_lvSecSlab, s->secStride, s->heroC,
@@ -18695,7 +18709,8 @@ void vcmSessionPass(VcmSession* s, double radius) {
 
     // (5) Camera pass — one camera subpath per pixel; adds this pass's radiance into accum.
     unsigned long long seedC = 0xC2B2AE3D27D4EB4FULL
-                             ^ ((unsigned long long)(passIdx + 1) * 0xA24BAED4963EE407ULL);
+                             ^ ((unsigned long long)(passIdx + 1) * 0xA24BAED4963EE407ULL)
+                             ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     if (s->secStride > 0)
         kVcmCameraT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
                               (nLV > 0) ? s->d_lvSecCompact : nullptr, s->secStride, s->heroC,

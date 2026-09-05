@@ -761,9 +761,15 @@ bias: the error falls by ~50× over a 32× rise in `n`, which is close to `1/n` 
 than the `1/sqrt(n)` a variance explanation predicts.
 
 **Next steps, in order.**
-1. **Add a `-seed` flag.** ftrace has none, and without one there is no way to draw independent
-   light-side realizations, which is the only clean way to separate bias from frozen-map
-   variance. This blocks the rest of the diagnosis and is worth having on its own.
+1. ~~**Add a `-seed` flag.**~~ **DONE (v0.246.0).** `-seed <n>` salts every RNG stream, host and
+   device, in every mode: the `seedUnit` funnel in `src/rng.h` covers the CPU estimators, nine
+   host-side seed origins in `src/render_cuda.cu` cover the device, `sppm_render.h` / `vcm.h`
+   salt their per-pass seeds, and `photonmap_render.h` / `photonbeams.h` salt the beam-trim
+   roulette so *which* beams get dropped is part of the realization too. The salt is `0` by
+   default and XORed in, so `-seed 0` **is** the historical stream — gated on `_fog_thick.ftsl`
+   in `D`/gpu, `D`/cpu, `J`/gpu and `M`/cpu-`-beams`: no flag and `-seed 0` produce byte-identical
+   `.pfm`s in all four, `-seed 1` differs in all four. Every pre-existing reference image
+   therefore still reproduces.
 2. **Give the auto-sizer an accuracy floor.** Whatever the mechanism, a map that renders 15 %
    hot is the wrong default. The knee should be a lower bound that an accuracy criterion can
    raise, not the final answer.

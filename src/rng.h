@@ -49,13 +49,48 @@ inline uint64_t mix64(uint64_t x) {
     return x ^ (x >> 31);
 }
 
+// ---------------------------------------------------------------------------------
+// GLOBAL SEED (`-seed <n>`) — one number that moves every estimator's realization.
+//
+// ftrace is otherwise DETERMINISTIC by design: a fixed set of flags renders the same
+// image bit-for-bit, which is what makes `cmp`-verified refactors possible and what
+// every regression gate in the repo leans on. That determinism has one cost, and it
+// is not cosmetic — with a single realization available there is no way to tell a
+// systematic BIAS from the noise of one particular draw. UPBP-THICK is exactly that
+// question (mode `J`'s beam map is built once, so its error could be either), and
+// known-issues.md lists this flag as step 1 of the diagnosis for that reason: an
+// error that shrinks as you add samples to ONE stream is ambiguous; a spread measured
+// across INDEPENDENT streams at fixed sample count is not.
+//
+// The mechanism is a salt XORed into every seed derivation, host and device. It is
+// `0` by default and XOR by zero is the identity, so a run without `-seed` is
+// bit-identical to every run that came before this flag existed — there is no
+// "default seed 0 that happens to differ from the old stream", which is the usual way
+// a feature like this silently invalidates a repository's worth of reference images.
+// `-seed 0` therefore names the historical stream rather than being a special case.
+//
+// Set ONCE, from argument parsing, before any render begins; nothing reads it during
+// a trace except the seeding helpers below, so it needs no synchronisation.
+inline uint64_t g_rngSalt = 0;
+
+// `-seed <n>` -> the salt. Run `n` through the avalanche mix so that consecutive seeds
+// (`-seed 1`, `-seed 2`, …, the natural way anyone draws a handful of realizations)
+// give streams that differ in every bit rather than in one, and map `n == 0` back to
+// the historical zero salt.
+inline void setGlobalSeed(uint64_t n) { g_rngSalt = (n == 0) ? 0ULL : mix64(n); }
+
 // Seed `rng` for the k-th unit of work (absolute photon index, or a pixel-sample
 // pair folded into one index) of the estimator family `salt`. Every CPU estimator
 // seeds per WORK UNIT through this one helper, so a render's realization depends
 // only on (unit index, salt) — never on how units are chunked into progressive
 // batches or banded across threads. That is what makes fixed-parameter CPU renders
 // bit-identical across -t values, -window/-time chunking, and resume boundaries.
+//
+// The global salt folds into `salt`, not into `k`: `salt` is the per-ESTIMATOR
+// constant, so salting it moves every estimator's stream by the same offset and keeps
+// the families disjoint from one another exactly as they were.
 inline void seedUnit(Pcg32& rng, uint64_t k, uint64_t salt) {
+    salt ^= g_rngSalt;
     rng.seed(mix64(k ^ salt), mix64(k + salt));
 }
 
