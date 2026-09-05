@@ -25,7 +25,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
-| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). It traces its own light subpaths for the beam map (0.216.0) and both techniques are MIS-weighted (0.218.0), with merged paths capped at `maxDepth` like the connections (0.219.0). The map sizes itself from the scene's `-beamk` knee via a discarded pilot (0.242.0), so **leave `-n` off** — passing it disables the budget. The **camera pass runs on the GPU** as of 0.244.0 (mode `D`'s megakernel with `MERGE=true`); the light/beam pass stays on the CPU on both backends. Correct, but **not yet faster than `D`** — see UPBP-CONV, and UPBP-THICK for a thick-medium bias | `bdpt.h` + `beamgather.h` + `photonbeams.h` + `render_cuda.cu` |
+| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). It traces its own light subpaths for the beam map (0.216.0) and both techniques are MIS-weighted (0.218.0), with merged paths capped at `maxDepth` like the connections (0.219.0). The map sizes itself from the scene's `-beamk` knee via a discarded pilot (0.242.0), so **leave `-n` off** — passing it disables the budget. The **camera pass runs on the GPU** as of 0.244.0 (mode `D`'s megakernel with `MERGE=true`); the light/beam pass stays on the CPU on both backends. Since 0.247.0 the light side is **re-drawn every epoch and averaged** (`-beamfreeze` to opt out), so the merge half converges with render time instead of freezing on one realization — that was UPBP-THICK, and it was variance, not bias. Correct, but **not yet faster than `D`** — see UPBP-CONV | `bdpt.h` + `beamgather.h` + `photonbeams.h` + `render_cuda.cu` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
 | `-raster` | z-buffer preview rasterizer + interactive fly viewer (`-explore`) | `raster.h`, `raster_cuda.cu` |
 
@@ -460,12 +460,28 @@ could have produced the same path (53.3 % of pixels here). The ratio walked
 `1.0611 → 1.0035 → 0.9897 → 0.9811 → 0.9985 → 1.0006` as mode `J` accumulated samples, i.e. it
 oscillates about 1 rather than settling off it.
 
-**Read that convergence correctly: `-spp` does not converge the merge half.** The beam map is
-built **once**, before the first pixel, and every sample of every pixel merges against the *same*
-50 000 light subpaths. More `-spp` therefore reduces only the camera-side variance; the light-side
-sample set is frozen, so the merge estimator's residual scales as `1/sqrt(n_m)` and the knob that
-moves it is **`-n`**. This is a property of UPBP-with-a-shared-map, not a defect, but it is the
-thing to remember when a mode-`J` image stops improving.
+**Read that convergence correctly: `-spp` does not converge the merge half.** The beam map used to
+be built **once**, before the first pixel, so every sample of every pixel merged against the *same*
+50 000 light subpaths. More `-spp` therefore reduced only the camera-side variance; the light-side
+sample set was frozen, so the merge estimator's residual scaled as `1/sqrt(n_m)` and the only knob
+that moved it was **`-n`**.
+
+**That stopped being true in 0.247.0, and calling it "a property, not a defect" was the mistake.**
+Measured with `-seed` (see UPBP-THICK in known-issues.md), the frozen light side is not a small
+residual: on `_fog_thick.ftsl` at `-n 256` it is a **31.6 % whole-frame standard deviation** across
+independent realizations, and it is a *floor* — no amount of render time touches it — which the
+image hides by going visually smooth at 0.6 % pixel noise while sitting up to 63 % off. A
+converged-*looking* wrong answer is worse than a visibly noisy one. So mode `J` now **refreshes the
+light side**: the render is split into epochs, the subpaths are re-traced under a fresh salt between
+them (`RngSaltScope`, `src/rng.h`), and the epochs' films are averaged, which makes the merge noise
+fall as `1/sqrt(epochs)` alongside the connection noise. Same `-n`, same 60 s: s.d.
+**31.6 % → 2.4 %**, worst-case error **62.9 % → 4.0 %**, for ~10 % fewer samples. It is affordable
+only because the *gather* dominates mode `J` (UPBP-CONV) — the whole light side is ~2.6 % of a
+render. `-beamfreeze` restores the old single-map behaviour bit-for-bit; `-beamrefresh <frac>`
+(default 0.10) sets the rebuild share of the wall clock, and the epoch length adapts to the
+*measured* per-epoch overhead, so a heavy scene — where `renderBdptCuda` re-uploads the whole scene
+every epoch — stretches its epochs out and degrades gracefully toward `-beamfreeze` instead of
+thrashing.
 
 **What it costs and what it buys here — honestly, nothing yet.** On `_fog_cornell` mode `J` at
 43 spp measures 15.25 % noise; mode `D`'s 4.42 % at 512 spp is 15.25 % when scaled by `sqrt`. The

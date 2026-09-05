@@ -698,9 +698,61 @@ technique the connections sample badly, so the balance heuristic correctly gives
 weight). UPBP's own paper handles this; ftrace does not yet. The standard remedy is to cap the
 merge contribution or to fold a `sin(theta)`-aware term into the kernel.
 
-### UPBP-THICK — DIAGNOSED (2026-09-04, v0.246.0), fix OPEN: on an optically **thick, multi-bounce** scene mode `J` has a **noise floor that `-spp` cannot touch** — it is set by the light-subpath count `-n`, and it is **variance, not bias**
+### UPBP-THICK — FIXED (2026-09-04, v0.247.0): mode `J` had a **noise floor `-spp` could not touch**, frozen into a beam map built once. It now redraws the light side every epoch and averages, cutting the error spread **13×** at the same `-n` and the same wall clock
 
-> **RESOLVED QUESTION (v0.246.0), and it inverts the diagnosis below.** With `-seed` in hand the
+> **THE FIX (v0.247.0): a light-side refresh, on by default.** The render is split into epochs;
+> between them the light subpaths are re-traced under a fresh salt (`RngSaltScope`, `src/rng.h`)
+> and the epochs' films are averaged, so the merge noise falls as `1/√epochs` alongside the
+> connection noise instead of standing still. Same eight seeds, same `-n 256 -beamk 1 -r 64
+> -max-bounce 8 -time 60`, same `png/ref64.pfm` reference:
+>
+> | light side | ratios across 8 seeds | mean | s.d. | range | worst error |
+> |---|---|---|---|---|---|
+> | frozen (`-beamfreeze`, ≤ 0.246.0) | 1.629 1.552 1.058 0.869 0.981 0.941 1.052 0.754 | 1.105 | **31.6 %** | 0.75–1.63 | **62.9 %** |
+> | refreshing (default, 0.247.0) | 0.960 1.016 1.006 1.032 0.993 0.973 0.979 1.008 | 0.996 | **2.4 %** | 0.96–1.03 | **4.0 %** |
+>
+> **13.1× tighter for ~10 % fewer samples** (25 734 spp vs 28 721 in the same 60 s), averaging 53
+> independent realizations. And the difference is qualitative, not just 13×: the frozen number was
+> a *floor* — the map does not change, so more time could never have improved it — whereas the
+> refreshed one keeps falling with render time. Verified directly, same four seeds at 60 s and
+> 240 s (`png/upbp_seed/rf*` vs `L*`):
+>
+> | budget | epochs averaged | mean | s.d. | RMS error |
+> |---|---|---|---|---|
+> | 60 s | 53 | 1.0035 | 3.09 % | **2.70 %** |
+> | 240 s | 221 | 0.9887 | 0.67 % | **1.27 %** |
+>
+> RMS error fell **2.12×** for a 4.2× rise in epochs, against **2.04×** predicted by `1/√k`. Mode
+> `J` converges with render time now; before this it did not.
+>
+> **One loose end, logged rather than papered over.** At 240 s the mean sits at **0.9887**, about
+> 1.1 % low, which across four seeds (s.d. 0.67 %) is ~3 σ — where the 60 s figures straddle 1.0
+> comfortably. That is either a genuine ~1 % residual in the merge estimator that only becomes
+> visible once the 31 % variance is out of the way, or an error in `png/ref64.pfm` itself (a mode-`R`
+> render, quoted at 0.08 % noise, but never cross-checked against a second estimator). Four seeds is
+> a thin basis for a 3 σ claim. Worth a follow-up with more seeds and an independent reference; it is
+> two orders of magnitude smaller than what this entry started out being about.
+>
+> **Why it is affordable** is the asymmetry UPBP-CONV measured: the gather dominates mode `J`, so
+> the entire light side (subpaths, split, BVH) is ~2.6 % of a render, and decorrelation is nearly
+> free. `-beamrefresh <frac>` (default 0.10) sets the share of wall clock spent rebuilding.
+> The epoch length adapts to the **measured** per-epoch overhead rather than a fixed time, which
+> matters because `renderBdptCuda` re-uploads the whole scene per call: a heavy scene stretches
+> its epochs out, degrading gracefully toward the old behaviour, while a cheap one refreshes about
+> once a second.
+>
+> **Gates.** `-beamfreeze` reproduces the pre-0.247.0 stream **bit-for-bit**
+> (`md5` on `_fog_thick`, mode `J`/gpu), and `-mode J -nobeams` is still `-mode D` bit-for-bit
+> (gate 1a), so the no-map path — which must stay mode `D` exactly — is untouched.
+>
+> **What is left.** The auto-sizer's accuracy floor (old step 2) is now a much smaller matter: a
+> too-small `-n` is no longer a permanent error, just a slower-converging one, since the refresh
+> makes `-n` trade off against epoch count rather than against final accuracy. Old step 3 (auditing
+> `mergeKappa`, `1/nEmitted`, the 91 sub-beams) is **moot** — there is no bias to find. Old step 4
+> stands: `tools/slab_ss_ref.py` runs at `-max-bounce 1` and cannot see any of this; a multi-bounce
+> gate should assert on the **spread across `-seed`s**, which is now measurable.
+
+> **HOW IT WAS DIAGNOSED (v0.246.0) — this inverts the original write-up below.** With `-seed` the
 > ambiguity flagged under "Caveat on bias vs. frozen-map variance" is settled, and the answer is
 > **frozen-map variance**. Eight *independent* realizations of the `-n 256 -beamk 1` case
 > (`-r 64 -max-bounce 8 -time 60`, each vs `png/ref64.pfm`, `png/upbp_seed/s*`):

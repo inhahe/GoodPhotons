@@ -12088,6 +12088,19 @@ static bool      g_nFromCli      = false;
 static double    g_beamBlur      = 0.01;   // kernel half-width as a fraction of the mfp
 static double    g_beamK         = 32.0;   // FLOOR on the gathered count, not a target
 static double    g_beamAreaSlack = 1.0;    // ceiling: allowed box-area growth from the kernel
+// MODE J'S LIGHT-SIDE REFRESH (0.247.0, the UPBP-THICK fix). Mode J's error is the sum of a
+// camera-side term that `-spp` averages away and a light-side term frozen into a beam map
+// built once — which `-spp` cannot touch at all, because every camera sample gathers from
+// that same map. So mode J plateaus at a noise floor (measured 5.0 % whole-frame on
+// `_fog_thick.ftsl` at `-n 8192`) that LOOKS converged. The render therefore rebuilds the
+// light side under a fresh salt every epoch and averages over independent maps, turning the
+// floor into a `1/sqrt(epochs)` decay. `-beamfreeze` restores the historical single map,
+// which is what reproduces pre-0.247.0 mode-J references and what measures the improvement.
+static bool      g_beamFreeze    = false;
+// Share of mode J's wall clock allowed to go on light-side rebuilds. It buys the decorrelation
+// above; 0.10 is chosen because the light side is only ~2.6 % of a mode-J render (the gather
+// dominates — UPBP-CONV), so a 10 % budget affords several rebuilds without being felt.
+static double    g_beamRefreshFrac = 0.10;
 static long long g_beamSplitMax  = 8000000;
 static double    g_beamSplitLen  = 0.0;
 
@@ -12119,7 +12132,14 @@ static double    g_beamSplitLen  = 0.0;
 // on it, because the BVH build is a one-time cost amortised over exactly that much gathering.
 // A 600-frame flythrough should split far finer than a single still of the same scene — see
 // BeamMap::sahSplitLen for the derivation and the measurements behind the constant.
-static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
+static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet = false) {
+    // `quiet` exists for mode J's light-side REFRESH (see g_beamFreeze): that rebuilds this
+    // map once per progressive epoch, and re-printing the same four-line map description on
+    // every rebuild would bury the render's own status lines under a description that has not
+    // changed — only the realization has. Epoch 0 still reports everything.
+    const auto say = [quiet](const char* fmt, auto... args) {
+        if (!quiet) std::printf(fmt, args...);
+    };
     auto t0 = std::chrono::steady_clock::now();
     const size_t raw = bm.beams.size();
     double r;
@@ -12129,7 +12149,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
     // 1e6?" into an observation, and makes a scene that never reaches its budget (small
     // bounded media in a large scene) visibly different from one that blows through it.
     if (bm.nDeposited > raw)
-        std::printf("%s photon beams: %zu collected, trimmed to %zu by -beamcount "
+        say("%s photon beams: %zu collected, trimmed to %zu by -beamcount "
                     "(survivors rescaled, unbiased)\n", tag, bm.nDeposited, raw);
     // ACHROMATIC-PATH FOLD COVERAGE (-beamachro, photonbeams.h). Reported BY POWER as well as
     // by count, and the power figure is the one that matters: the fold removes the chromatic
@@ -12180,7 +12200,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
         double meanSplit = 0.0;
         bm.build(g_beamSplitLen, splitBudget, work, &meanSplit);
         r = g_beamRadiusAbs;
-        std::printf("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g "
+        say("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g "
                     "(-beamradius), mean split %.4g, box area %.4g -> %.4g m^2 (%.2fx), "
                     "BVH in %s\n", tag, raw, bm.beams.size(), r, meanSplit,
                     areaBefore, bm.totalBoxArea(),
@@ -12194,7 +12214,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
             size_t nA = 0; double pA = 0, pT = 0;
             for (size_t m = 0; m < foldN.size(); ++m) { nA += foldN[m]; pA += foldP[m]; pT += foldPT[m]; }
             if (nA)
-                std::printf("%s photon beams: %zu of %zu folded achromatically (%.1f%% by count,"
+                say("%s photon beams: %zu of %zu folded achromatically (%.1f%% by count,"
                             " %.1f%% by power) — -beamachro\n", tag, nA, raw,
                             100.0 * (double)nA / (double)raw, pT > 0 ? 100.0 * pA / pT : 0.0);
         }
@@ -12208,7 +12228,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
         for (size_t m = 0; m < ai.med.size(); ++m) {
             const BeamMap::MedStat& s = ai.med[m];
             if (!s.n) continue;
-            std::printf("%s photon beams: medium %zu: %zu chords, mean free path %.4g m "
+            say("%s photon beams: medium %zu: %zu chords, mean free path %.4g m "
                         "-> kernel radius %.4g m (%.3g x mfp)%s\n",
                         tag, m, s.n, s.mfp, s.r, s.mfp > 0 ? s.r / s.mfp : 0.0,
                         foldStr(m, s.n).c_str());
@@ -12217,7 +12237,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
         // count — which measurement showed IS the gather's cost, far more than the number of
         // beams it actually gathers — is proportional to it. Printing before/after is what
         // makes a change to the split rule verifiable instead of asserted.
-        std::printf("%s photon beams: %zu stored -> %zu after split, a probe ray gathers %.1f "
+        say("%s photon beams: %zu stored -> %zu after split, a probe ray gathers %.1f "
                     "beams (%.1f at the raw mfp radii; -beamk floor %.0f)%s%s, mean split %.4g, "
                     "box area %.4g -> %.4g m^2 (%.3fx)%s, BVH in %s\n",
                     tag, ai.rawBeams, ai.outBeams, ai.probeK, ai.probeK0, ai.targetK,
@@ -12229,7 +12249,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
                     humanDur(std::chrono::duration<double>(
                                  std::chrono::steady_clock::now() - t0).count()).c_str());
         if (ai.budgetBit)
-            std::printf("%s   raise -beamsplitmax for a tighter (faster) BVH at more memory, "
+            say("%s   raise -beamsplitmax for a tighter (faster) BVH at more memory, "
                         "or lower -beamcount to get there for free.\n", tag);
         // THE KNEE. While the `-beamk` floor is binding (probeK0 < targetK) the floor is
         // holding the GATHERED count at targetK by inflating the radii, so extra beams cost
@@ -12241,7 +12261,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
         // and 0.887. The cliff is here, so name it — it is otherwise invisible in a line that
         // reports probeK0 as a bare number.
         else if (ai.targetK > 0.0 && ai.probeK0 > ai.targetK && ai.rawBeams)
-            std::printf("%s   note: past the -beamk floor (%.1f > %.0f), so the gather now pays "
+            say("%s   note: past the -beamk floor (%.1f > %.0f), so the gather now pays "
                         "for every extra beam. Fewer beams here is likely FASTER for the same "
                         "error — lower -beamcount%s.\n",
                         tag, ai.probeK0, ai.targetK,
@@ -16065,7 +16085,20 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         warnBeamsGrinMedia(scene, wantBeams);
         BeamMap bmap;
         StageProgress stageProg = makeStageProgress(res, resY);
-        if (wantBeams) {
+        // Hoisted out of the build below because epoch 0 DECIDES the map size and every later
+        // epoch reuses that decision: re-running the budget pilot per refresh would pay for it
+        // over and over and let the subpath count wander between realizations for no benefit.
+        bdpt::BeamBudgetInfo jbb;
+        // THE LIGHT SIDE AS A FUNCTION OF THE EPOCH, rather than a one-off. Epoch 0 is the
+        // original build bit-for-bit; every later epoch redraws the same map under a different
+        // salt, so the render averages over INDEPENDENT light-side realizations instead of
+        // freezing on one. That is the whole of the UPBP-THICK fix — see g_beamFreeze for the
+        // measurements, and rng.h's RngSaltScope for why the salt has to come back off before
+        // the camera pass runs.
+        auto buildLightSide = [&](uint64_t epoch) {
+            RngSaltScope saltScope(epoch);
+            const bool first = (epoch == 0);
+            if (!first) bmap = BeamMap{};      // drop the old realization before redrawing
             // MODE J'S OWN LIGHT PASS (0.216.0), not tracePhotonPass. The beams have to be
             // sampled by the same machinery as the connection half's `light[]` subpaths, or
             // the merge weight would be a ratio between densities that are different
@@ -16083,13 +16116,25 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // that ruled one out -- and bdpt.h's note for why 0.243.0 aims at the knee itself
             // rather than below it.
             bdpt::BeamBudgetReq jreq;
-            jreq.maxBeams = g_nFromCli ? 0 : g_beamTarget;
+            jreq.maxBeams = (g_nFromCli || !first) ? 0 : g_beamTarget;
             // Forwarded, not re-defaulted: the pilot's knee is only the real knee if it is
             // measured at the radii buildBeamMap is about to build with.
             jreq.blur     = g_beamBlur;
             jreq.targetK  = g_beamK;
-            bdpt::BeamBudgetInfo jbb;
-            if (jreq.maxBeams > 0)
+            // A refresh traces exactly the subpath count epoch 0 settled on, with no budget and
+            // therefore no pilot: the sizing question was answered once and re-asking it would
+            // cost a pilot per epoch to get the same answer with more noise on it.
+            const long long Nepoch = first ? N : (jbb.pathsUsed > 0 ? jbb.pathsUsed : N);
+            // Said ONCE. A cheap scene refreshes every second or so, and a line per refresh would
+            // be hundreds of identical sentences drowning the -interval status lines that
+            // actually carry information. The count is reported again at the end of the render.
+            if (epoch == 1)
+                std::printf("mode J: light-side refresh — redrawing %lld subpaths under a fresh "
+                            "salt every ~%.0f%% of the wall clock and averaging the realizations, "
+                            "so the MERGE noise falls with the render too (-beamfreeze to opt "
+                            "out; -beamrefresh to retune) ...\n",
+                            Nepoch, 100.0 * g_beamRefreshFrac);
+            else if (jreq.maxBeams > 0)
                 std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
                             "threads (maxDepth=%d, light=%s) — sizing the light pass to a beam "
                             "map of at most %lld beams (-beamcount)%s ...\n",
@@ -16101,35 +16146,44 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             "threads (maxDepth=%d, light=%s) — tracing %lld light subpaths for "
                             "the beam map (-n given: no beam budget) ...\n",
                             res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel, N);
-            liveWindowPlaceholder(res, resY, "tracing light subpaths\xE2\x80\xA6");
+            // Only epoch 0 blanks the window to a caption. A refresh happens with a partly
+            // converged image already on screen, and replacing it with "tracing light subpaths…"
+            // every epoch would make the live preview flash between the render and a placeholder
+            // for the whole run — the picture the user is watching is still perfectly valid.
+            if (first) liveWindowPlaceholder(res, resY, "tracing light subpaths\xE2\x80\xA6");
             auto tp0 = std::chrono::steady_clock::now();
-            bdpt::traceLightBeamPass(scene, cam, N, nThreads, maxDepth, diffraction,
+            bdpt::traceLightBeamPass(scene, cam, Nepoch, nThreads, maxDepth, diffraction,
                                      bmap, &stageProg, jreq, &jbb);
             // Say what the budget did, always. A pass that silently traced 3 % of the subpaths
             // the command line named would be exactly the kind of invisible surprise this whole
             // change is about — and the measured rate and knee are the numbers a user needs in
             // order to override the budget sensibly with `-beamcount`, `-beamk` or `-n`.
-            if (jbb.pilotPaths)
+            if (first && jbb.pilotPaths)
                 std::printf("mode J: beam budget: pilot of %lld subpaths measured %.2f raw "
                             "beams/subpath, -beamk knee at ~%lld beams -> %lld beams from %lld "
                             "subpaths (%s)%s\n",
                             jbb.pilotPaths, jbb.beamsPerPath, jbb.kneeBeams, jbb.budget,
                             jbb.pathsUsed, jbb.kneeBound ? "knee-bound" : "-beamcount-bound",
                             jbb.applied ? "" : " [not binding: -n was already smaller]");
-            liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
+            if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
             buildBeamMap(bmap, "mode J:",
-                         (double)res * (double)resY * (double)(spp > 0 ? spp : 16));
+                         (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
+                         /*quiet*/!first);
             const double buildSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
-            std::printf("mode J: %zu beams from %lld light subpaths in %s "
-                        "(%.2f beams/subpath, %.0f MB). Rendering connections + merges ...\n",
-                        bmap.beams.size(), bmap.nEmitted, humanDur(buildSec).c_str(),
-                        bmap.nEmitted ? (double)bmap.beams.size() / (double)bmap.nEmitted : 0.0,
-                        (double)(bmap.beams.size() * sizeof(PhotonBeam)) / (1024.0 * 1024.0));
-            if (bmap.empty())
+            if (first)
+                std::printf("mode J: %zu beams from %lld light subpaths in %s "
+                            "(%.2f beams/subpath, %.0f MB). Rendering connections + merges ...\n",
+                            bmap.beams.size(), bmap.nEmitted, humanDur(buildSec).c_str(),
+                            bmap.nEmitted ? (double)bmap.beams.size() / (double)bmap.nEmitted : 0.0,
+                            (double)(bmap.beams.size() * sizeof(PhotonBeam)) / (1024.0 * 1024.0));
+            if (first && bmap.empty())
                 std::fprintf(stderr, "[mode J] warning: the beam map is empty — no light "
                                      "subpath reached a medium. This render is mode D "
                                      "exactly.\n");
+        };
+        if (wantBeams) {
+            buildLightSide(0);
         } else {
             std::printf("mode J: UPBP at %dx%d on %s (maxDepth=%d, light=%s) ...\n",
                         res, resY, camWhere.c_str(), maxDepth, lightLabel);
@@ -16138,7 +16192,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // per-ray but never entered — which is what makes gate (1)'s "bit-identical to mode D"
         // a property of the code rather than of floating-point luck.
         const BeamMap* beamsPtr = (wantBeams && !bmap.empty()) ? &bmap : nullptr;
-        auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
+        auto renderEpoch = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
             // `g_heroC`, exactly as mode D passes it — NOT 1. The kernel applies the same
             // hero gate the CPU BdptRenderer does (a medium, GRIN or a physical lens falls
@@ -16158,6 +16212,81 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     return renderBdpt(scene, cam, res, resY, c, nThreads, maxDepth,
                                       diffraction, off, beamsPtr);
                 });
+        };
+        // ---------------------------------------------------------------------------------
+        // THE LIGHT-SIDE REFRESH LOOP (0.247.0) — what makes mode J converge instead of
+        // plateauing. Everything above renders against ONE beam map; this splits the render
+        // into epochs, redraws the map between them, and averages the epochs' films. See
+        // g_beamFreeze for the measurements that made it necessary.
+        //
+        // Two things have to be true for the average to be the right one:
+        //   * each epoch's camera samples must be NEW samples, not a re-draw of epoch 0's —
+        //     hence `sampleBase` advances by the spp already banked, which is exactly the
+        //     mechanism `-resume` uses to continue a checkpoint without correlating;
+        //   * the outer reporter must always see the WHOLE film, so the live image, the
+        //     noise estimate and the .ftbuf checkpoint stay in terms of total spp rather
+        //     than resetting to zero at every epoch boundary.
+        auto renderChunked = [&](long long sppTarget, const SppProgress* prog) -> Film {
+            // Nothing to decorrelate (no map => mode D exactly, and gate 1a requires that path
+            // stay bit-identical), or the user asked for the historical single map.
+            if (!beamsPtr || g_beamFreeze || !prog || !prog->report)
+                return renderEpoch(sppTarget, prog);
+            using clk = std::chrono::steady_clock;
+            Film acc; acc.resX = res; acc.resY = resY; acc.alloc();
+            long long sppAll = 0;
+            bool stopAll = false;
+            uint64_t epoch = 0;
+            for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
+                double rebuildSec = 0.0;
+                if (epoch > 0) {
+                    auto tr = clk::now();
+                    buildLightSide(epoch);
+                    rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
+                    // A refresh that came back empty would leave the gather pointing at an
+                    // empty map, which silently turns the rest of the render into mode D.
+                    // Cannot happen if epoch 0 was non-empty (same scene, same counts), but
+                    // "cannot happen" is exactly what a silent half-render looks like.
+                    if (bmap.empty()) {
+                        std::fprintf(stderr, "[mode J] light-side refresh produced an empty "
+                                             "map; keeping the render on the previous one.\n");
+                        break;
+                    }
+                }
+                const auto tEpoch = clk::now();
+                // How long this epoch should run. The overhead being amortised is NOT just the
+                // subpath trace: renderBdptCuda re-uploads the whole scene on every call, so on
+                // a heavy scene the per-epoch cost is dominated by that instead. Measuring the
+                // real gap — rebuild, plus everything before the first sample lands — makes the
+                // rule self-correcting: a cheap scene refreshes often, an expensive one
+                // stretches its epochs out until, in the limit, it behaves like -beamfreeze.
+                double epochSec = 0.0;
+                long long epochSpp = 0;
+                SppProgress inner;
+                inner.sampleBase = prog->sampleBase + sppAll;
+                inner.report = [&](const Film& f, long long sppDone, bool final) -> bool {
+                    if (epochSec <= 0.0) {
+                        const double setupSec =
+                            std::chrono::duration<double>(clk::now() - tEpoch).count();
+                        epochSec = (rebuildSec + setupSec) / g_beamRefreshFrac;
+                        if (epochSec < 1.0) epochSec = 1.0;   // never thrash on a trivial scene
+                    }
+                    epochSpp = sppDone;
+                    Film comb = f; comb.merge(acc);
+                    const long long tot = sppAll + sppDone;
+                    if (prog->report(comb, tot, final && tot >= sppTarget)) { stopAll = true; return true; }
+                    // Not a stop — just the end of this epoch, so the next one draws a new map.
+                    return std::chrono::duration<double>(clk::now() - tEpoch).count() >= epochSec;
+                };
+                Film f = renderEpoch(sppTarget - sppAll, &inner);
+                if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
+                acc.merge(f);
+                sppAll += epochSpp;
+            }
+            if (epoch > 1)
+                std::printf("mode J: averaged %llu independent light-side realizations "
+                            "(%lld spp total) — the merge noise fell with the render, not just "
+                            "the connection noise\n", (unsigned long long)epoch, sppAll);
+            return acc;
         };
         const bool ckpt = resume || wantCheckpointFlag ||
                           timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
@@ -17017,6 +17146,16 @@ static void printHelp(const char* prog) {
 "                        UPBP is connections + beam merges, so the map is the mode\n"
 "  -nobeams|-no-beams    turn the beam map OFF. Only meaningful for mode J, where it is on by\n"
 "                        default; a mode-J render without it is mode D exactly (validation)\n"
+"  -beamfreeze           mode J: build the beam map ONCE, as it did before 0.247.0. By default\n"
+"                        mode J redraws the light side under a fresh salt every few seconds and\n"
+"                        averages the realizations, because the light-side error is frozen into\n"
+"                        the map and -spp cannot reduce it — so a frozen render plateaus at a\n"
+"                        noise floor that LOOKS converged (5%% whole-frame on a thick test scene\n"
+"                        at -n 8192). Use this to reproduce pre-0.247.0 output or to measure\n"
+"                        what the refresh is worth; it is not otherwise a good idea\n"
+"  -beamrefresh <frac>   share of mode J's wall clock spent on those rebuilds (default 0.10).\n"
+"                        The epoch length adapts to the measured per-epoch overhead, so a heavy\n"
+"                        scene refreshes rarely and a cheap one often. 0 means -beamfreeze\n"
 "  -beamblur <frac>      mode-M beam kernel half-width, as a fraction of each MEDIUM'S OWN\n"
 "                        measured mean free path (default 0.01). This is the quality knob:\n"
 "                        the blur is a physical scale independent of the photon count, so\n"
@@ -18116,6 +18255,14 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
         else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) { g_beamGather = true; g_noBeams = false; }
         else if (!std::strcmp(argv[i], "-nobeams") || !std::strcmp(argv[i], "-no-beams")) { g_noBeams = true; g_beamGather = false; }
+        // Opt back OUT of the light-side refresh: one frozen beam map for the whole render, as
+        // mode J behaved before 0.247.0. Needed to reproduce older references and to measure
+        // what the refresh is worth; it is not otherwise a good idea (see g_beamFreeze).
+        else if (!std::strcmp(argv[i], "-beamfreeze")) g_beamFreeze = true;
+        else if (!std::strcmp(argv[i], "-beamrefresh") && i + 1 < argc) {
+            g_beamRefreshFrac = std::atof(argv[++i]);
+            if (g_beamRefreshFrac <= 0.0) g_beamFreeze = true;   // `-beamrefresh 0` == -beamfreeze
+        }
         // Gate (2) of the UPBP plan: cross-check every CPU-BDPT MIS weight against an
         // independently written absolute-form one (see bdpt.h). Validation only — it makes
         // the weight several times more expensive and changes no pixel.

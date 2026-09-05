@@ -69,8 +69,9 @@ inline uint64_t mix64(uint64_t x) {
 // a feature like this silently invalidates a repository's worth of reference images.
 // `-seed 0` therefore names the historical stream rather than being a special case.
 //
-// Set ONCE, from argument parsing, before any render begins; nothing reads it during
-// a trace except the seeding helpers below, so it needs no synchronisation.
+// Set from argument parsing before any render begins, and thereafter changed only
+// BETWEEN passes by RngSaltScope (below) — never while a trace is in flight, so it
+// needs no synchronisation.
 inline uint64_t g_rngSalt = 0;
 
 // `-seed <n>` -> the salt. Run `n` through the avalanche mix so that consecutive seeds
@@ -78,6 +79,44 @@ inline uint64_t g_rngSalt = 0;
 // give streams that differ in every bit rather than in one, and map `n == 0` back to
 // the historical zero salt.
 inline void setGlobalSeed(uint64_t n) { g_rngSalt = (n == 0) ? 0ULL : mix64(n); }
+
+// ---------------------------------------------------------------------------------
+// A SCOPED EXTRA SALT — one *pass* of a render draws its own realization.
+//
+// `-seed` moves the whole render; this moves one bracketed pass within it, and exists
+// because of a distinction that cost a full investigation to pin down (UPBP-THICK).
+// Mode `J`'s error has two halves: a camera-side half that `-spp` averages away, and a
+// light-side half frozen into a beam map that is built ONCE and then gathered from by
+// every camera sample. No amount of `-spp` touches the frozen half, so mode `J` has a
+// noise floor — measured at 31.6 % (`-n 256`) and 5.0 % (`-n 8192`) whole-frame on
+// `_fog_thick.ftsl` — and, worse, an invisible one: the picture goes visually smooth
+// while its overall level stays several percent off.
+//
+// The cure is to stop freezing it. Rebuild the light side once per progressive epoch
+// under a different salt and the render averages over `k` INDEPENDENT maps, so the
+// floor falls as `1/sqrt(k)` instead of standing still. It is affordable only because
+// of a measured asymmetry: the light side is 2.6 % of a mode-`J` render (the gather
+// dominates — see UPBP-CONV), so buying decorrelation with rebuilds is close to free.
+//
+// Why RAII rather than a plain setter: the salt must be *restored* before the camera
+// pass runs. Camera-side decorrelation is already handled, correctly and portably, by
+// `SppProgress::sampleBase` — the absolute sample index — and that mechanism's whole
+// guarantee is that the realization depends only on (unit index, salt). Leaving an
+// epoch's salt applied across the camera pass would make the camera realization depend
+// on the epoch boundaries too, which is exactly the chunk-dependence `seedUnit` exists
+// to prevent. So the salt goes on for the build and comes off for the render, and a
+// scope guard is the only way that stays true down every early-return and throw path.
+struct RngSaltScope {
+    uint64_t prev;
+    // `k == 0` is the identity, so "epoch 0" keeps the historical stream and a render
+    // that never refreshes is bit-for-bit what it was before this existed.
+    explicit RngSaltScope(uint64_t k) : prev(g_rngSalt) {
+        if (k) g_rngSalt ^= mix64(k * 0x9E3779B97F4A7C15ULL + 0xA5A5A5A5A5A5A5A5ULL);
+    }
+    ~RngSaltScope() { g_rngSalt = prev; }
+    RngSaltScope(const RngSaltScope&) = delete;
+    RngSaltScope& operator=(const RngSaltScope&) = delete;
+};
 
 // Seed `rng` for the k-th unit of work (absolute photon index, or a pixel-sample
 // pair folded into one index) of the estimator family `salt`. Every CPU estimator
