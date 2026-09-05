@@ -22,7 +22,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased; CPU + GPU since 0.110.0, fully on-device since 0.116.0) | `backward.h` (`whitted`), `render_cuda.cu` (`WhittedOpts`) |
 | `P` | composite: forward B + backward R passes merged | `main.cpp` orchestration |
 | `D` | bidirectional path tracer (BDPT, MIS) | `bdpt.h` |
-| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves) | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
+| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves). Since 0.252.0 a **single-camera** render re-draws all three maps every epoch under a fresh salt and averages the epochs' films (`-beamfreeze` to opt out), so the light-side half of its error converges with render time instead of freezing — that was M-FROZEN, whose visible symptom was coloured bars through `phase rainbow` media. **Multi-camera renders still build once**, which is the cross-frame amortisation this mode exists for | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
 | `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). It traces its own light subpaths for the beam map (0.216.0) and both techniques are MIS-weighted (0.218.0), with merged paths capped at `maxDepth` like the connections (0.219.0). The map sizes itself from the scene's `-beamk` knee via a discarded pilot (0.242.0), so **leave `-n` off** — passing it disables the budget. The **camera pass runs on the GPU** as of 0.244.0 (mode `D`'s megakernel with `MERGE=true`); the light/beam pass stays on the CPU on both backends. Since 0.247.0 the light side is **re-drawn every epoch and averaged** (`-beamfreeze` to opt out), so the merge half converges with render time instead of freezing on one realization — that was UPBP-THICK, and it was variance, not bias. Correct, but **not yet faster than `D`** — see UPBP-CONV | `bdpt.h` + `beamgather.h` + `photonbeams.h` + `render_cuda.cu` |
@@ -550,6 +550,25 @@ render. `-beamfreeze` restores the old single-map behaviour bit-for-bit; `-beamr
 *measured* per-epoch overhead, so a heavy scene — where `renderBdptCuda` re-uploads the whole scene
 every epoch — stretches its epochs out and degrades gracefully toward `-beamfreeze` instead of
 thrashing.
+
+**Mode `M` has the same disease, and got the same cure in 0.252.0** (M-FROZEN in known-issues.md).
+A single-camera mode-`M` render builds its photon map, caustic map and beam map once and then
+spends the whole budget growing camera spp, so the light-side half of its error is a floor — and
+one that gets *more* visible with time, because the camera grain that was masking it falls away
+and leaves the frozen pattern standing as apparent structure. On `gallery_rain` that reads as
+saturated **coloured bars** through the rain and cloud: `phase rainbow` is genuinely
+wavelength-dependent, so a beam that scatters in the rain must retire its spectral bundle and
+deposit at one wavelength (50.5 % of that scene's rain chords, 42.3 % of its power, and there is
+no way to make them white), and a beam is a **line**, so a single-λ deposit is a streak down a
+whole chord rather than a speck of grain. Un-freezing is therefore the only available fix, and it
+works because the streaks then land somewhere new every realization. The mode-`M` block reuses
+mode `J`'s epoch loop verbatim, with two additions: its **gather radii are pinned to epoch 0's
+choice** (photon mapping is biased at a finite radius, so re-adapting per epoch would make each
+epoch a *different* estimator and their average a mixture rather than a variance reduction), and
+refreshes are **silent** since the map's shape does not change, only its realization. It is even
+cheaper here than in mode `J` — the deposit and all three builds are ~0.35 % of a 900 s render.
+The **multi-camera / flyby** path is deliberately excluded: there, building the map once and
+reusing it across frames *is* the feature.
 
 **What it costs and what it buys here — honestly, nothing yet.** On `_fog_cornell` mode `J` at
 43 spp measures 15.25 % noise; mode `D`'s 4.42 % at 512 spp is 15.25 % when scaled by `sqrt`. The

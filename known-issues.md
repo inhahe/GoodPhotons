@@ -5,6 +5,105 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### M-FROZEN — FIXED (2026-09-05, v0.252.0): mode `M` showed **coloured bars through the rain and cloud that got worse the longer it rendered**, because its photon / caustic / beam maps were built once and every camera sample gathered from that one realization
+
+**Symptom, as reported.** "The view for the ftrace instance that was running mode M on
+`M_s4.png` showed coloured bars throughout the rain and clouds." Confirmed in
+`png/modecmp/acc/M_s4.png` (`gallery_rain`, `-mode M -beams -time 900 -seed 4`): saturated
+rainbow streaks laid down the length of the rain shaft and speckled across the cloud.
+
+**Why it looked like a *new* bug when the code had not changed.** It is a floor, and floors get
+*more* visible as everything around them improves. Mode `M` builds its light side once — the log
+says so plainly, `tracing 2000000 photons` appears before `Gathering camera pass` and never
+again — and then spends the whole budget growing camera spp (10 → 155 over 15 minutes on this
+frame). Camera noise falls as `1/√spp`; the map's own noise does not fall at all. So the grain
+that had been *masking* the frozen pattern melts away and leaves it standing as apparent
+structure. The user was watching a live window, which is exactly where that transition is
+visible: early frames look like noise, late frames look like bars.
+
+**Why the bars are coloured, and why that half cannot be fixed.** `gallery_rain`'s rain medium
+carries `phase rainbow` — a genuinely wavelength-dependent phase function, which is the whole
+point of the scene (it is what produces the 42° bow). A beam may only carry the spectral bundle
+or the achromatic fold while *nothing on its path has depended on λ*, so the first scatter in the
+rain retires the claim and every chord after it deposits at one wavelength. Measured on this
+frame, from the per-medium report added in 0.251.0:
+
+| medium | chords | spectral claim | monochromatic |
+|---|---|---|---|
+| 0 — cloud (HG, achromatic) | 12 143 | 88.6 % folded achromatically (89.6 % by power) | 11.4 % |
+| 1 — rain (`phase rainbow`) | 14 430 | fold impossible; 50.5 % bundled (57.7 % by power) | **49.5 % (42.3 % by power)** |
+
+Half the rain's chords are monochromatic *and must be*: the record stores wavelengths and no
+per-wavelength weights, and a rainbow scatter is not a λ-invariant event. And a beam is a **line**,
+so one saturated single-λ deposit is not a speck of grain — it is a coloured **streak** down a
+whole chord, which reads as structure. There is no way to make those beams white. The only
+available fix is to stop *freezing* them, so that the streaks land somewhere different every
+realization and average back to white as `1/√epochs`.
+
+**The fix: give mode `M` the light-side refresh mode `J` got in 0.247.0** (UPBP-THICK, below —
+the same disease, and mode `M` had a worse case of it). `main.cpp`'s mode-`M` block now hoists
+the deposit and the three builds into a `buildLightSide(epoch)` lambda scoped by
+`RngSaltScope(epoch)`, and wraps the gather in the same epoch loop mode `J` uses: redraw the
+photon map, the caustic map and the beam map under a fresh salt, render more camera samples
+against them, average the epochs' films. `epoch 0` is `RngSaltScope(0)` — the identity — so an
+unrefreshed render is bit-for-bit what it was before.
+
+Three details that are not optional:
+
+* **The gather radii are pinned to what epoch 0 chose** (`rebuildPhotonMapAt` /
+  `rebuildCausticMapAt`). Photon mapping is *biased* at a finite radius, so re-running
+  `buildAuto` per epoch would leave each epoch estimating a slightly **different** quantity and
+  their average would not be an average of one estimator. Pinned, every epoch is the same
+  estimator and averaging is plain variance reduction with the bias left exactly where epoch 0
+  put it. It also skips a redundant probe per epoch.
+* **`pmC.kGather` is carried across by hand.** `PhotonMap::build` does not set it, so a naive
+  rebuild would silently drop mode `M` back to a fixed-radius caustic gather.
+* **Refreshes are silent** (`buildBeamMap(..., quiet=!first)`, `StageProgress` only at epoch 0).
+  The adaptive-radius, stored-flux and beam-map lines describe the map's *shape*, which does not
+  change across epochs — only the realization does. Reprinting them would bury the `-interval`
+  status lines under a description that never changes. Epoch 1 prints one line saying refreshes
+  are happening; the end of the render reports how many were averaged.
+
+**It is nearly free here, for a reason peculiar to mode `M`.** The deposit plus all three builds
+is **2.61 s + 0.53 s of a 900 s render — about 0.35 %**. The gather dominates that completely
+(UPBP-CONV), so the default `-beamrefresh 0.10` budget buys many independent realizations
+without being felt (measured: 3 realizations in 180 s, 10 in 900 s, for ~12 % of the samples).
+
+**Measured.** Same scene, same `-seed 4`, cloud crop `(410,30)-(580,150)` and rain crop
+`(430,120)-(545,200)` via `scraps/cloudstat.py`. Two rows for the fix: a 180 s run at **1/5 the
+frozen run's samples**, and a matched 900 s run. The short run already wins on every chromatic
+metric — the frozen-floor signature exactly, since the frozen run's extra 5× of samples bought it
+nothing at all — and the matched run then goes past mode `D`:
+
+| | spp | cloud sat | cloud chroma sd | cloud speckle | rain sat | rain chroma sd | rain speckle |
+|---|---|---|---|---|---|---|---|
+| `M` frozen (≤ 0.251.0), 900 s | 155 | 0.0623 | .076 / .066 | 5.42 | 0.1075 | .110 / .108 | 9.26 |
+| `M` refreshed (0.252.0), **180 s** | 29 | 0.0473 | .055 / .042 | 4.15 | 0.0913 | .102 / .102 | — |
+| `M` refreshed (0.252.0), 900 s | 136 | **0.0366** | **.040 / .030** | **2.77** | **0.0761** | **.087 / .091** | **6.40** |
+| `D` (reference), 300 s | — | 0.0444 | .058 / .049 | 2.71 | 0.0865 | .098 / .099 | 7.47 |
+| `J` (0.251.0), 600 s | — | 0.0269 | .037 / .026 | 2.14 | 0.0730 | .090 / .092 | 6.85 |
+
+The matched 900 s run averaged **10 independent light-side realizations** and still reached 136 spp
+against the frozen run's 155 — the refresh cost ~12 % of the samples and bought a **41 %** drop in
+cloud saturation and a **49 %** drop in cloud speckle. Note also that *every* frozen metric is
+worse than mode `D`'s while *every* refreshed one is better, and the luminance moved the right way
+too (cloud `Y` 0.4060 → 0.4218 against `D`'s 0.4252): the freeze was costing mode `M` accuracy, not
+just prettiness.
+
+Note the rain crop is *supposed* to carry chroma — it contains the bow — so the target there is
+`D`'s 0.0865, not zero. Refreshed mode `M` lands just under it, alongside mode `J`.
+
+**Blast radius.** Only the single-camera `mode == 'M'` block changed. The **multi-camera / flyby**
+path (`main.cpp` ~23234) is deliberately untouched: there the whole point is to amortise one map
+across many frames, and refreshing would destroy the amortisation that mode `M` exists to
+provide. Fixed-`-spp` renders take the `!prog->report` branch and are unchanged. `-beamfreeze`
+(new alias `-lightfreeze`) restores the historical single cache.
+
+**Flag naming.** `-beamfreeze` / `-beamrefresh` are now half a lie — mode `M`'s refresh redraws
+its *surface* photon map and its caustic map as well as its beam map. Renaming outright would
+break every existing command line, so `-lightfreeze` / `-lightrefresh` were added as aliases and
+both spellings are documented.
+
 ### J-BANNER — FIXED (2026-09-05, v0.249.0): every mode-`J` refresh epoch printed "(-n given: no beam budget)" on a command line with no `-n`, quoted the wrong subpath count, and repeated the whole header once per epoch
 
 **Symptom.** `ftrace -in scenes/gallery_rain.ftsl -mode J -device gpu -camera cam -r 320 180

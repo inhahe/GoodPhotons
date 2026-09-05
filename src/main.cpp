@@ -12017,6 +12017,31 @@ static void buildCausticMap(PhotonMap& pmC, double radius, const char* tag, doub
                     tag, flux / (long double)pmC.nEmitted, pmC.photons.size());
 }
 
+// REFRESH rebuilds of the two photon maps (mode M's light-side refresh; see g_beamFreeze).
+// A refresh redraws the maps under a fresh salt and bins them at EXACTLY the radii epoch 0
+// settled on, silently. Both halves of that matter:
+//
+//   * PINNED RADIUS. Re-running buildAuto per epoch would re-answer a question already
+//     answered, with a fresh probe's noise on the answer. Worse, photon mapping is BIASED at
+//     a finite radius, so each epoch would then estimate a slightly DIFFERENT quantity and
+//     their average would not be an average of one estimator. Pinning the radius makes every
+//     epoch the same estimator, which is what makes averaging them plain variance reduction
+//     with the bias left exactly where epoch 0 put it.
+//   * SILENT. The adaptive-radius and stored-flux lines describe the map's SHAPE, which does
+//     not change across epochs — only the realization does. Re-printing them dozens of times
+//     would bury the -interval status lines under a description that never changes.
+static void rebuildPhotonMapAt(PhotonMap& pm, double r) {
+    if (r > 0.0) pm.build(r);
+}
+// The caustic map's twin. `kGather` is the per-query adaptive-gather target chosen at epoch 0
+// (0 when -pmadaptive is off); PhotonMap::build does not set it, so it is carried across by
+// hand or every refresh would silently drop mode M back to a fixed-radius caustic gather.
+static void rebuildCausticMapAt(PhotonMap& pmC, double r, double kGather) {
+    if (pmC.photons.empty() || !(r > 0.0)) return;
+    pmC.build(r);
+    pmC.kGather = kGather;
+}
+
 // Mode-M PHOTON BEAMS (CLI -beams, shared with the mode-A/B splat gather of the same name).
 // The surface photon map holds no volume records at all, so mode M renders fog / rain /
 // cloud / rainbow as NOTHING. -beams switches the photon pass to straight medium crossings
@@ -12088,18 +12113,33 @@ static bool      g_nFromCli      = false;
 static double    g_beamBlur      = 0.01;   // kernel half-width as a fraction of the mfp
 static double    g_beamK         = 32.0;   // FLOOR on the gathered count, not a target
 static double    g_beamAreaSlack = 1.0;    // ceiling: allowed box-area growth from the kernel
-// MODE J'S LIGHT-SIDE REFRESH (0.247.0, the UPBP-THICK fix). Mode J's error is the sum of a
-// camera-side term that `-spp` averages away and a light-side term frozen into a beam map
-// built once — which `-spp` cannot touch at all, because every camera sample gathers from
-// that same map. So mode J plateaus at a noise floor (measured 5.0 % whole-frame on
-// `_fog_thick.ftsl` at `-n 8192`) that LOOKS converged. The render therefore rebuilds the
-// light side under a fresh salt every epoch and averages over independent maps, turning the
-// floor into a `1/sqrt(epochs)` decay. `-beamfreeze` restores the historical single map,
-// which is what reproduces pre-0.247.0 mode-J references and what measures the improvement.
+// THE LIGHT-SIDE REFRESH — mode J (0.247.0, the UPBP-THICK fix) and mode M (0.252.0, M-FROZEN).
+//
+// Both modes' error is the sum of a camera-side term that `-spp` averages away and a light-side
+// term frozen into a cache built once — which `-spp` cannot touch at all, because every camera
+// sample gathers from that same cache. So both plateau at a noise floor that LOOKS converged,
+// and in fact gets MORE conspicuous as the render proceeds: the camera grain that was masking
+// it falls away and leaves the frozen pattern standing as apparent structure.
+//
+//   * mode J freezes its BEAM MAP. Measured floor: 5.0 % whole-frame on `_fog_thick.ftsl` at
+//     `-n 8192`; the frozen/refreshed error spread differs 13x at equal wall clock.
+//   * mode M freezes its PHOTON MAP, its CAUSTIC MAP and its BEAM MAP. On `gallery_rain` the
+//     visible symptom is coloured bars through the rain and cloud: `phase rainbow` is genuinely
+//     wavelength-dependent, so a beam that scatters in the rain must drop its spectral bundle
+//     and deposit monochromatically, and a beam is a LINE — one saturated single-wavelength
+//     deposit is a coloured STREAK down a whole chord. 50.5 % of that scene's rain chords
+//     (42.3 % of its power) are monochromatic and cannot be made otherwise, so un-freezing is
+//     the only fix; refreshed, the streaks average back to white as 1/sqrt(epochs).
+//
+// Each mode therefore rebuilds its light side under a fresh salt every epoch and averages over
+// independent realizations, turning the floor into a `1/sqrt(epochs)` decay. `-beamfreeze`
+// (alias `-lightfreeze`) restores the historical single cache, which is what reproduces
+// pre-refresh references and what measures the improvement.
 static bool      g_beamFreeze    = false;
-// Share of mode J's wall clock allowed to go on light-side rebuilds. It buys the decorrelation
-// above; 0.10 is chosen because the light side is only ~2.6 % of a mode-J render (the gather
-// dominates — UPBP-CONV), so a 10 % budget affords several rebuilds without being felt.
+// Share of the wall clock allowed to go on light-side rebuilds. It buys the decorrelation
+// above; 0.10 is chosen because the light side is a small fraction of either render (mode J
+// ~2.6 %, mode M ~0.35 % — both are dominated by the gather, see UPBP-CONV), so a 10 % budget
+// affords many rebuilds without being felt.
 static double    g_beamRefreshFrac = 0.10;
 static long long g_beamSplitMax  = 8000000;
 static double    g_beamSplitLen  = 0.0;
@@ -16302,9 +16342,19 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     // empty map, which silently turns the rest of the render into mode D.
                     // Cannot happen if epoch 0 was non-empty (same scene, same counts), but
                     // "cannot happen" is exactly what a silent half-render looks like.
+                    //
+                    // Note what `break` does here and what it does NOT do: the previous
+                    // realization is already gone (buildLightSide drops it before redrawing),
+                    // so there is nothing to fall back ONTO. What is salvaged is `acc`, which
+                    // holds every completed epoch — a correct, correctly-normalised render of
+                    // `sppAll` spp. Stopping is therefore the right answer, not a compromise,
+                    // and the message says so rather than claiming a fallback that does not
+                    // exist (which is what it claimed through 0.251.0).
                     if (bmap.empty()) {
                         std::fprintf(stderr, "[mode J] light-side refresh produced an empty "
-                                             "map; keeping the render on the previous one.\n");
+                                             "beam map; stopping here with the %lld spp already "
+                                             "averaged over %llu realization(s).\n",
+                                     sppAll, (unsigned long long)epoch);
                         break;
                     }
                 }
@@ -16381,21 +16431,62 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         liveWindowPlaceholder(res, resY, "tracing photons\xE2\x80\xA6");
         long long nAimed = 0;
         const caim::AimMap aimMap = buildAimMap(scene, N, nAimed, "mode M:");
-        tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
-                        wantBeams ? &bmap : nullptr, g_beamTarget, &stageProg,
-                        g_pmCaustics ? &pmC : nullptr, &aimMap, nAimed);
-        liveWindowPlaceholder(res, resY, "building photon map\xE2\x80\xA6");
-        radius = buildPhotonMap(pm, radius, "mode M:");
-        if (g_pmCaustics) buildCausticMap(pmC, radius, "mode M:", pm.radius);
-        // One camera, so the BVH build is amortised over exactly this frame's samples. A
-        // progressive budget (-time/-noise/-forever) has no spp up front; assume a modest
-        // number rather than 0, since 0 would mean "build is free" and over-split for a frame
-        // that might stop after one pass.
-        if (wantBeams) {
-            liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
-            buildBeamMap(bmap, "mode M:",
-                         (double)res * (double)resY * (double)(spp > 0 ? spp : 16));
-        }
+        // The radii epoch 0 settles on. Every later epoch re-bins at exactly these, so all the
+        // epochs are the same estimator and averaging them is plain variance reduction — see
+        // rebuildPhotonMapAt for why re-adapting per epoch would not be.
+        const double radius0 = radius;
+        double radiusC = 0.0, kGatherC = 0.0;
+        // THE LIGHT SIDE AS A FUNCTION OF THE EPOCH, rather than a one-off (0.252.0). This is
+        // the same fix mode J got in 0.247.0 (UPBP-THICK), applied to the mode that needed it
+        // at least as badly — see g_beamFreeze and known-issues.md "M-FROZEN".
+        //
+        // Mode M's caches are built ONCE and then gathered from by every camera sample, so the
+        // light-side half of its error is a floor that `-spp` cannot touch: 155 spp of gather
+        // averages the CAMERA noise away and leaves the map's own noise standing, which is why
+        // the artifact gets MORE conspicuous as the render converges rather than less. On
+        // gallery_rain that floor is visible as coloured bars through the rain and cloud,
+        // because `phase rainbow` is genuinely wavelength-dependent — a beam that scatters in
+        // the rain must drop its spectral bundle (photonbeams.h) and deposit monochromatically,
+        // and a beam is a LINE, so one saturated single-wavelength deposit lays a coloured
+        // STREAK down its whole chord. Frozen, those streaks are structure; refreshed, they
+        // average back to white at 1/sqrt(epochs). (Measured on this scene: 50.5 % of rain
+        // chords carrying 42.3 % of the rain's power are monochromatic and cannot be made
+        // otherwise, so removing the FREEZE is the only available fix.)
+        //
+        // It is also nearly free here for a reason peculiar to mode M: the deposit is ~3 s of a
+        // 900 s render (the gather dominates completely), so a 10 % rebuild budget buys tens of
+        // independent realizations.
+        auto buildLightSide = [&](uint64_t epoch) {
+            RngSaltScope saltScope(epoch);
+            const bool first = (epoch == 0);
+            if (!first) { pm = PhotonMap{}; pmC = PhotonMap{}; bmap = BeamMap{}; }
+            tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
+                            wantBeams ? &bmap : nullptr, g_beamTarget,
+                            first ? &stageProg : nullptr,
+                            g_pmCaustics ? &pmC : nullptr, &aimMap, nAimed);
+            if (first) {
+                liveWindowPlaceholder(res, resY, "building photon map\xE2\x80\xA6");
+                radius = buildPhotonMap(pm, radius0, "mode M:");
+                if (g_pmCaustics) {
+                    buildCausticMap(pmC, radius, "mode M:", pm.radius);
+                    radiusC = pmC.radius; kGatherC = pmC.kGather;
+                }
+            } else {
+                rebuildPhotonMapAt(pm, radius);
+                rebuildCausticMapAt(pmC, radiusC, kGatherC);
+            }
+            // One camera, so the BVH build is amortised over exactly this frame's samples. A
+            // progressive budget (-time/-noise/-forever) has no spp up front; assume a modest
+            // number rather than 0, since 0 would mean "build is free" and over-split for a
+            // frame that might stop after one pass.
+            if (wantBeams) {
+                if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
+                buildBeamMap(bmap, "mode M:",
+                             (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
+                             /*quiet*/!first);
+            }
+        };
+        buildLightSide(0);
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("mode M: deposited %zu photons from %lld emitted in %s; "
                     "grid %dx%dx%d. Gathering camera pass at %dx%d ...\n",
@@ -16404,7 +16495,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if (pm.photons.empty())
             std::fprintf(stderr, "[mode M] warning: 0 photons deposited — no diffuse "
                                  "surfaces reached? The image will be black.\n");
-        auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
+        auto renderEpoch = [&](long long sppTarget, const SppProgress* p) -> Film {
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
@@ -16412,6 +16503,87 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                               wantBeams ? &bmap : nullptr,
                                               g_pmCaustics ? &pmC : nullptr);
                 });
+        };
+        // ---------------------------------------------------------------------------------
+        // THE LIGHT-SIDE REFRESH LOOP — structurally identical to mode J's (see there for the
+        // two conditions the average has to satisfy: each epoch's camera samples must be NEW
+        // ones, via `sampleBase`; and the outer reporter must always see the WHOLE film so the
+        // live image, the noise estimate and the checkpoint stay in terms of total spp).
+        auto renderChunked = [&](long long sppTarget, const SppProgress* prog) -> Film {
+            if (g_beamFreeze || !prog || !prog->report) return renderEpoch(sppTarget, prog);
+            using clk = std::chrono::steady_clock;
+            Film acc; acc.resX = res; acc.resY = resY; acc.alloc();
+            long long sppAll = 0;
+            bool stopAll = false;
+            uint64_t epoch = 0;
+            for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
+                double rebuildSec = 0.0;
+                if (epoch > 0) {
+                    auto tr = clk::now();
+                    buildLightSide(epoch);
+                    rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
+                    // A refresh that came back empty would leave the gather pointing at empty
+                    // maps, which silently turns the rest of the render black (or, for the beam
+                    // map alone, silently deletes every participating medium from it). Cannot
+                    // happen if epoch 0 was non-empty — same scene, same counts — but "cannot
+                    // happen" is exactly what a silent half-render looks like.
+                    //
+                    // Note what `break` does here and what it does NOT do: the previous
+                    // realization is already gone (buildLightSide drops it before redrawing),
+                    // so there is nothing to fall back ONTO. What is salvaged is `acc`, which
+                    // holds every completed epoch — a correct, correctly-normalised render of
+                    // `sppAll` spp. Stopping is therefore the right answer, not a compromise,
+                    // and the message says so rather than claiming a fallback that does not
+                    // exist.
+                    const bool lost = pm.photons.empty() || (wantBeams && bmap.empty());
+                    if (lost) {
+                        std::fprintf(stderr, "[mode M] light-side refresh produced an empty "
+                                             "%s; stopping here with the %lld spp already "
+                                             "averaged over %llu realization(s).\n",
+                                     pm.photons.empty() ? "photon map" : "beam map",
+                                     sppAll, (unsigned long long)epoch);
+                        break;
+                    }
+                    if (epoch == 1)
+                        std::printf("mode M: light-side refresh — redrawing %lld photons under "
+                                    "a fresh salt every ~%.0f%% of the wall clock and averaging "
+                                    "the realizations, so the MAP noise falls with the render "
+                                    "too (-beamfreeze to opt out; -beamrefresh to retune) ...\n",
+                                    N, 100.0 * g_beamRefreshFrac);
+                }
+                const auto tEpoch = clk::now();
+                // How long this epoch should run. Measuring the real gap — rebuild, plus
+                // everything before the first sample lands — makes the rule self-correcting: a
+                // cheap scene refreshes often, an expensive one stretches its epochs out until,
+                // in the limit, it behaves like -beamfreeze.
+                double epochSec = 0.0;
+                long long epochSpp = 0;
+                SppProgress inner;
+                inner.sampleBase = prog->sampleBase + sppAll;
+                inner.report = [&](const Film& f, long long sppDone, bool final) -> bool {
+                    if (epochSec <= 0.0) {
+                        const double setupSec =
+                            std::chrono::duration<double>(clk::now() - tEpoch).count();
+                        epochSec = (rebuildSec + setupSec) / g_beamRefreshFrac;
+                        if (epochSec < 1.0) epochSec = 1.0;   // never thrash on a trivial scene
+                    }
+                    epochSpp = sppDone;
+                    Film comb = f; comb.merge(acc);
+                    const long long tot = sppAll + sppDone;
+                    if (prog->report(comb, tot, final && tot >= sppTarget)) { stopAll = true; return true; }
+                    // Not a stop — just the end of this epoch, so the next one draws new maps.
+                    return std::chrono::duration<double>(clk::now() - tEpoch).count() >= epochSec;
+                };
+                Film f = renderEpoch(sppTarget - sppAll, &inner);
+                if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
+                acc.merge(f);
+                sppAll += epochSpp;
+            }
+            if (epoch > 1)
+                std::printf("mode M: averaged %llu independent light-side realizations "
+                            "(%lld spp total) — the map noise fell with the render, not just "
+                            "the gather noise\n", (unsigned long long)epoch, sppAll);
+            return acc;
         };
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                  timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
@@ -17202,16 +17374,20 @@ static void printHelp(const char* prog) {
 "                        UPBP is connections + beam merges, so the map is the mode\n"
 "  -nobeams|-no-beams    turn the beam map OFF. Only meaningful for mode J, where it is on by\n"
 "                        default; a mode-J render without it is mode D exactly (validation)\n"
-"  -beamfreeze           mode J: build the beam map ONCE, as it did before 0.247.0. By default\n"
-"                        mode J redraws the light side under a fresh salt every few seconds and\n"
-"                        averages the realizations, because the light-side error is frozen into\n"
-"                        the map and -spp cannot reduce it — so a frozen render plateaus at a\n"
-"                        noise floor that LOOKS converged (5%% whole-frame on a thick test scene\n"
-"                        at -n 8192). Use this to reproduce pre-0.247.0 output or to measure\n"
-"                        what the refresh is worth; it is not otherwise a good idea\n"
-"  -beamrefresh <frac>   share of mode J's wall clock spent on those rebuilds (default 0.10).\n"
-"                        The epoch length adapts to the measured per-epoch overhead, so a heavy\n"
-"                        scene refreshes rarely and a cheap one often. 0 means -beamfreeze\n"
+"  -beamfreeze           modes J and M (alias -lightfreeze): build the light-side cache ONCE, as\n"
+"                        they did before 0.247.0 / 0.252.0. By default both redraw it under a\n"
+"                        fresh salt every few seconds and average the realizations, because the\n"
+"                        light-side error is frozen into the cache and -spp cannot reduce it —\n"
+"                        so a frozen render plateaus at a noise floor that LOOKS converged (mode\n"
+"                        J: 5%% whole-frame on a thick test scene at -n 8192; mode M: coloured\n"
+"                        bars through rainbow rain that get MORE visible as the gather smooths).\n"
+"                        Mode J redraws the beam map, mode M the photon, caustic and beam maps.\n"
+"                        Use this to reproduce pre-refresh output or to measure what the refresh\n"
+"                        is worth; it is not otherwise a good idea\n"
+"  -beamrefresh <frac>   share of a mode-J/M render's wall clock spent on those rebuilds\n"
+"                        (default 0.10; alias -lightrefresh). The epoch length adapts to the\n"
+"                        measured per-epoch overhead, so a heavy scene refreshes rarely and a\n"
+"                        cheap one often. 0 means -beamfreeze\n"
 "  -beamblur <frac>      mode-M beam kernel half-width, as a fraction of each MEDIUM'S OWN\n"
 "                        measured mean free path (default 0.01). This is the quality knob:\n"
 "                        the blur is a physical scale independent of the photon count, so\n"
@@ -18311,11 +18487,19 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
         else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) { g_beamGather = true; g_noBeams = false; }
         else if (!std::strcmp(argv[i], "-nobeams") || !std::strcmp(argv[i], "-no-beams")) { g_noBeams = true; g_beamGather = false; }
-        // Opt back OUT of the light-side refresh: one frozen beam map for the whole render, as
-        // mode J behaved before 0.247.0. Needed to reproduce older references and to measure
-        // what the refresh is worth; it is not otherwise a good idea (see g_beamFreeze).
-        else if (!std::strcmp(argv[i], "-beamfreeze")) g_beamFreeze = true;
-        else if (!std::strcmp(argv[i], "-beamrefresh") && i + 1 < argc) {
+        // Opt back OUT of the light-side refresh: one frozen light-side cache for the whole
+        // render, as mode J behaved before 0.247.0 and mode M before 0.252.0. Needed to
+        // reproduce older references and to measure what the refresh is worth; it is not
+        // otherwise a good idea (see g_beamFreeze).
+        //
+        // The `-light*` aliases exist because the `-beam*` names are now half a lie: mode M's
+        // refresh redraws its SURFACE photon map and its caustic map as well as its beam map,
+        // and freezes them all. Renaming outright would break every existing command line, so
+        // both spellings are accepted and the flag is documented under both.
+        else if (!std::strcmp(argv[i], "-beamfreeze") ||
+                 !std::strcmp(argv[i], "-lightfreeze")) g_beamFreeze = true;
+        else if ((!std::strcmp(argv[i], "-beamrefresh") ||
+                  !std::strcmp(argv[i], "-lightrefresh")) && i + 1 < argc) {
             g_beamRefreshFrac = std::atof(argv[++i]);
             if (g_beamRefreshFrac <= 0.0) g_beamFreeze = true;   // `-beamrefresh 0` == -beamfreeze
         }
