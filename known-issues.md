@@ -5,6 +5,134 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### M-FGDARK — OPEN (2026-09-05, v0.253.0): mode `M`'s Jensen final gather (`-pmfg <K>`) renders **darker than the direct density estimate on every scene tested** — mildly on `cornell`, by **12–77×** on `gallery_rain`, where it takes the image to near-black
+
+**Reproduce.**
+
+```
+ftrace scenes/cornell.ftsl -mode M -device cpu -r 96 96 -spp 16 -n 200000 -o png/pm_noFG.png
+ftrace scenes/cornell.ftsl -mode M -device cpu -r 96 96 -spp 16 -n 200000 -pmfg 16 -o png/pm_FG.png
+```
+
+Auto-exposure `6.14e-14` → `4.95e-14`, and the FG image's walls are visibly dimmer and much
+blotchier at the same spp. On `gallery_rain` the same substitution is catastrophic
+(`-mode M -beams -pmfg 24 -time 900 -seed 1`, `png/modecmp/acc/pmfg/`): everything **diffuse**
+goes black, leaving only the emissive grid and the specular/glossy heroes.
+
+**Measured** against the mode-`R` anchor, single seed, scene-linear `.pfm` (R channel):
+
+| element | plain `M` | `M -pmfg 24` | `R` (anchor) | FG factor |
+|---|---|---|---|---|
+| `grid_ground` | 0.01070 | 0.000855 | 0.00992 | **12× dark** |
+| `cap_gyroid` | 0.10275 | 0.001592 | 0.12260 | **77× dark** |
+| `cap_axicon` | 0.08247 | 0.001281 | 0.15647 | **64× dark** |
+| `compote` | 0.03705 | 0.003278 | 0.01796 | 11× dark |
+| `gyroid` (glossy) | 0.98832 | 0.31149 | 0.41165 | — |
+| `glass_orb` (dielectric) | 0.03449 | 0.031671 | 0.01499 | ~unchanged |
+
+**The shape of the failure names the suspect.** The final-gather branch in
+`photonmap_render.h` (~line 668) is gated on `fgRays > 0 && m.type == MatType::Diffuse`. Every
+element that collapses is `Diffuse`; every element that survives (`gyroid` glossy, `glass_orb`
+dielectric, the emissive grid) is one that never enters that branch. So the loss is inside the FG
+branch itself, not in the map, the deposit or the refresh.
+
+**Not yet root-caused; do not guess in the fix.** Two candidates, both cheap to test:
+* the **direct** half — `bw.neeLight(scene, h, rhoVis, invPdfL, lambda, rng)` on a
+  default-constructed `BackwardRenderer`. Worth checking whether `bw` needs state the caller never
+  gives it, and whether `pickEmitters`' 1/pdf is being applied consistently with the non-FG path.
+  Note `backward.h` is included with the comment "`neeLight` / `neeEnv` for final-gather direct
+  lighting" but **only `neeLight` is ever called** (`grep -n "neeEnv" src/photonmap_render.h` →
+  the include comment and nothing else), so an `env`-lit scene has no direct term at the visible
+  point at all; `gallery_rain` is `sun` + area lit rather than `env` lit, so that alone does not
+  explain this one, but it is a real hole on its own.
+* the **indirect** half — `photonGatherSub`'s claim that "the cosine/pdf and Lambertian 1/pi
+  cancel to rho(x), folded inside photonGatherSub". If that cancellation is applied in both places
+  (once by the cosine-hemisphere sampling and once explicitly), the indirect term is scaled by an
+  extra `rho`, which on a dark-ish diffuse surface is a large loss and compounds per bounce.
+
+The first diagnostic should be to render `cornell` with `-pmfg 1` and with the FG branch's direct
+and indirect halves reported separately, against the non-FG estimate on the same seed — the two
+candidates predict different splits (a missing direct term vs a scaled indirect one).
+
+**Bearing on M-GATHERAREA:** `-pmfg` is the standard remedy for that entry's blur and is currently
+unusable, so the two have to be fixed in order — this one first.
+
+### M-GATHERAREA — OPEN (2026-09-05, v0.253.0): mode `M`'s direct density estimate divides by the area of a **full disc** while gathering from only the part of it that is real, on-cone surface — so it is dark in proportion to how much of the disc misses: flat ground 0 %, a cap edge −38 %, Alice's dress −44 %, her hair −70 %
+
+**Found by** the `gallery_rain` accuracy campaign (5 seeds × {R, D, J, M}, 640×360, anchor =
+mode `R`; `scraps/_modecmp_acc.bat`, `scraps/roi_stats.py`, ROIs in `scraps/gallery_rain.rois`).
+Run against **refreshed** mode `M` (v0.252.0+), so this is not M-FROZEN in disguise — the frozen
+frames are archived under `png/modecmp/acc/frozenM/`.
+
+**Measured**, mean over 5 seeds, deviation from the mode-`R` anchor (worst channel, σ in brackets):
+
+| element | what it is | `D` | `J` | `M` |
+|---|---|---|---|---|
+| `grid_ground` | a flat quad | ✅ | ✅ | ✅ |
+| `cap_gyroid` | flat tabletop, ROI is an **edge strip** | +2 % | ✅ | **−38 %** (9σ) |
+| `creature` | moderate curvature | ✅ | ✅ | +13 % (11σ) |
+| `alice_dress` | broad folded cloth, textured diffuse | ✅ | ✅ | **−44 %** (31σ) |
+| `alice_hair` | fine high-curvature strands | ✅ | ✅ | **−70 %** (72σ) |
+| `compote` | narrow ruby stem **beside bright gems** | +25 % | ✅ | **+462 %** (19σ) |
+
+**The mechanism, and the number that settles it.** `photonmap_render.h`'s direct estimate is
+`L_r(x) = (1/N) Σ_p f_r · Φ_p / (π r²)`. The `π r² N` denominator is the area of a **full disc**;
+the numerator sums only the photons that actually got gathered, and two things stop that from
+being the same set:
+
+* `queryR`'s callback drops any photon whose normal disagrees with the hit's —
+  `if (dot(ph.n, h.n) < 0.5) return;`, a 60° cone, there to stop cross-surface leakage. Correct,
+  and *not* compensated for in the normalisation.
+* Nothing at all clips the disc to the **surface**. Where the disc overhangs a silhouette or an
+  edge, that part of it collected no photons because there is no geometry there to collect from.
+
+Both are area mismatches and both are one-sided (they can only *lose* energy), so they add.
+
+**The gather radius on this scene is `0.3846 m`** (from the campaign log: `adaptive gather radius:
+0.6547 -> 0.3846`, target 192 photons of 878 797 stored). Alice is a 0.85-scaled figure; **the
+gather disc is wider than her head.** Her hair is centimetre-scale strands sampled with a 38 cm
+disc, so almost the whole disc is off-surface or off-cone — hence −70 %. Her dress is a broader,
+flatter panel, so less of the disc is wasted — hence −44 %. `cap_gyroid`'s ROI is an *edge strip*
+of a tabletop, where the disc hangs off one side — −38 %. `grid_ground` is a 46×45 m quad where a
+0.38 m disc is entirely on-surface and on-cone — and it is the one element mode `M` gets exactly
+right. The ordering is not a coincidence, it is the fraction of the disc that is real surface.
+
+`compote` fails through the same radius from the opposite side: a narrow dark stem sitting among
+bright gems, where the disc reaches *off* the stem and blurs its neighbours' energy onto it. Same
+blur, opposite sign — which is why the set cannot be fixed by a global scale factor.
+
+**This is not the same thing as the ordinary "photon mapping is biased at a finite radius"
+caveat** that `PmRadiiPin` and `-beamrefresh` already document. That bias is a smoothing bias that
+vanishes as `r → 0` and is *expected*. This one is a **normalisation mismatch** that does not
+vanish with more photons at a fixed radius, and it is large enough (70 %) to make mode `M`'s
+surfaces unusable as a reference on anything but flat geometry.
+
+**What the proper fix looks like.** Divide by the area actually gathered from rather than the
+disc's. Two standard options, in increasing order of correctness and cost:
+* Accumulate the rejected/accepted split inside `queryR` and normalise by the accepted fraction.
+  Cheap, and it is exactly the quantity the estimator is missing — but it is a *count* ratio
+  standing in for an *area* ratio, so it is only right when photon density is locally uniform.
+* Estimate the covered area properly — the standard remedies are a **convex-hull / ellipse fit**
+  over the gathered photons' positions projected into the tangent plane, or Hachisuka's
+  gather-radius ray-differential bound. More work, correct on a boundary as well as a fold.
+
+The same fix belongs in `photonGatherSub` (the final-gather twin), in the CUDA gather in
+`render_cuda.cu`, and in the caustic map's per-query adaptive path, which all share the estimator.
+
+**`-pmfg <K>` ought to be the workaround, and is not.** Jensen's final gather moves the density
+estimate one bounce away from the visible surface, so a curved *visible* surface would stop paying
+the penalty (it relocates the bias rather than fixing it, but on this scene the curved things are
+the heroes and the surfaces one bounce away are flat ground and flat caps). Tried, and it makes
+matters far worse — see **M-FGDARK** below. So there is no workaround today; use mode `D` or `J`
+for surfaces.
+
+**Bearing on the mode-comparison question.** Mode `M` is the **best** mode in this scene's
+*volume* (it is the only one that agrees with the `R` anchor on cloud, cloud base, cloud limb,
+rain column and rainbow, once unfrozen) and the **worst** on its *surfaces*. Modes `D` and `J`
+are the reverse on surfaces. So there is currently no single best mode for `gallery_rain`, and
+this entry plus mode `J`'s +9…17 % volume residual are the two things standing between the engine
+and one.
+
 ### M-FROZEN — FIXED (2026-09-05, v0.252.0 + v0.253.0): mode `M` showed **coloured bars through the rain and cloud that got worse the longer it rendered**, because its photon / caustic / beam maps were built once and every camera sample gathered from that one realization
 
 **Symptom, as reported.** "The view for the ftrace instance that was running mode M on
