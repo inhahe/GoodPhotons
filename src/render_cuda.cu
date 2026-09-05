@@ -16486,6 +16486,9 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
     char rtxt[64];
     if (rlo < bmap->radius) std::snprintf(rtxt, sizeof rtxt, "%.4g .. %.4g", rlo, bmap->radius);
     else                    std::snprintf(rtxt, sizeof rtxt, "%.4g", bmap->radius);
+    // Silent on a light-side refresh epoch: the sub-beam / BVH / radius figures describe the
+    // map's SHAPE, which every epoch of a run shares — see g_gpuQuietRebuild.
+    if (g_gpuQuietRebuild) return;
     if (nMis)
         std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %s, "
                     "%zu MIS entries (kappa %.4g) uploaded for the mode-J merges\n",
@@ -17188,7 +17191,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             int fgRays, double autoK, BeamPass* beams,
                                             const StageProgress* stage, double causticK,
                                             const caim::AimMap* aim, long long nAimed,
-                                            double causticAdaptK) {
+                                            double causticAdaptK, PmRadiiPin* pin) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -17221,12 +17224,16 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // a silently-different one would be baffling when comparing renders. The gather below
     // reads pm.radius, so nothing else needs to know which branch ran.
     auto buildMap = [&]() {
-        if (autoK <= 0.0) { pm.build(radius); return; }
+        // A refresh epoch re-bins at the radius the first pass settled on — see PmRadiiPin for
+        // why re-adapting per epoch would not be variance reduction.
+        if (pin && pin->radius > 0.0) { pm.build(pin->radius); return; }
+        if (autoK <= 0.0) { pm.build(radius); if (pin) pin->radius = pm.radius; return; }
         double nProbe = 0.0, kTarget = 0.0;
         const double r = pm.buildAuto(radius, autoK, &nProbe, &kTarget);
         std::printf("[gpu] adaptive gather radius: %.4g -> %.4g (a typical gather saw %.0f "
                     "photons at the starting radius; target %.0f for %zu stored)\n",
                     radius, r, nProbe, kTarget, pm.photons.size());
+        if (pin) pin->radius = pm.radius;
     };
     // Host twin: buildCausticMap in main.cpp. Always adaptive — a caustic map built at the
     // GLOBAL radius is the very thing the split exists to avoid — and short-circuited on an
@@ -17235,9 +17242,19 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     auto buildCaustic = [&]() {
         if (!causticsOn) return;
         pmC.nEmitted = pm.nEmitted;          // counts PATHS EMITTED, not photons stored
+        // Refresh epoch: re-bin at the first pass's radius and carry its per-query target.
+        // `kGather` is NOT derived from the radius by PhotonMap, so dropping it here would
+        // silently return the caustic gather to a fixed radius on every epoch but the first.
+        if (pin && pin->radiusC > 0.0) {
+            pmC.build(pin->radiusC);
+            pmC.kGather = pin->kGather;
+            return;
+        }
         if (pmC.photons.empty()) {
-            std::printf("[gpu] caustic map: 0 photons (no L-S+-D path in this scene)\n");
+            if (!g_gpuQuietRebuild)
+                std::printf("[gpu] caustic map: 0 photons (no L-S+-D path in this scene)\n");
             pmC.build(pm.radius);            // still bin it, so the empty gather is well-formed
+            if (pin) pin->radiusC = pmC.radius;
             return;
         }
         // Probe from the radius the GLOBAL map settled on, not the command-line starting
@@ -17269,6 +17286,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         if (pmC.nEmitted > 0)
             std::printf("[gpu] caustic map: stored flux/emitted = %.6Lg (%zu photons)\n",
                         flux / (long double)pmC.nEmitted, pmC.photons.size());
+        if (pin) { pin->radiusC = pmC.radius; pin->kGather = pmC.kGather; }
     };
 
     // The photon-BEAM volume pass (-beams). Only live when the caller supplied a BeamPass AND
@@ -17669,9 +17687,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                     ++w;
                 }
             }
-            std::printf("[gpu] aimed caustic pass: %lld photons -> %llu caustic deposits "
-                        "(main pass: %zu)\n",
-                        (long long)aimEmitted, (unsigned long long)nAimDep, base);
+            if (!g_gpuQuietRebuild)
+                std::printf("[gpu] aimed caustic pass: %lld photons -> %llu caustic deposits "
+                            "(main pass: %zu)\n",
+                            (long long)aimEmitted, (unsigned long long)nAimDep, base);
         }
         if (d_aphotons) cudaFree(d_aphotons);
         cudaFree(d_energyAim); d_energyAim = nullptr;   // discarded: not additional emission

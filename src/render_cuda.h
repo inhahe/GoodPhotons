@@ -248,6 +248,31 @@ struct BeamPass {
     bool      loadedMissing = false;       // out: -loadmap succeeded but the file held no beams
 };
 
+// PINNED GATHER RADII FOR THE LIGHT-SIDE REFRESH (main.cpp's mode-M epoch loop, 0.253.0).
+//
+// Default-constructed and handed to the FIRST pass: that pass adapts its radii exactly as it
+// always did and records what it settled on here. Every later pass is given the same struct
+// back, sees non-zero radii, and re-bins at them instead of re-probing.
+//
+// This is a correctness requirement, not a tidiness one. Photon mapping is BIASED at a finite
+// radius, so epochs that each re-adapt would be estimating slightly DIFFERENT quantities and
+// their average would be a mixture of estimators rather than variance reduction on one. Pinned,
+// every epoch is the same estimator, the bias stays exactly where the first pass put it, and
+// the average is plain 1/sqrt(epochs). (Host twin: rebuildPhotonMapAt / rebuildCausticMapAt in
+// main.cpp, which pin the CPU mode-M path for the same reason.)
+//
+// `kGather` has to travel too: it is the caustic map's per-query adaptive target, PhotonMap
+// does not derive it from the radius, and a re-bin that dropped it would silently return the
+// caustic gather to a fixed radius.
+struct PmRadiiPin {
+    double radius  = 0.0;   // global map gather radius (0 = not decided yet: adapt and record)
+    double radiusC = 0.0;   // caustic map gather radius
+    double kGather = 0.0;   // caustic per-query adaptive target (0 = fixed radius)
+};
+
+// (g_gpuQuietRebuild — the refresh-epoch narration gate — lives in render_progress.h, because
+// mode J's epoch loop sets it from code that is not inside #ifdef HAVE_CUDA.)
+
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
@@ -261,7 +286,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             double causticK = 0.0,
                                             const caim::AimMap* aim = nullptr,
                                             long long nAimed = 0,
-                                            double causticAdaptK = 0.0);
+                                            double causticAdaptK = 0.0,
+                                            PmRadiiPin* pin = nullptr);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

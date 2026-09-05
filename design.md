@@ -22,7 +22,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased; CPU + GPU since 0.110.0, fully on-device since 0.116.0) | `backward.h` (`whitted`), `render_cuda.cu` (`WhittedOpts`) |
 | `P` | composite: forward B + backward R passes merged | `main.cpp` orchestration |
 | `D` | bidirectional path tracer (BDPT, MIS) | `bdpt.h` |
-| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves). Since 0.252.0 a **single-camera** render re-draws all three maps every epoch under a fresh salt and averages the epochs' films (`-beamfreeze` to opt out), so the light-side half of its error converges with render time instead of freezing — that was M-FROZEN, whose visible symptom was coloured bars through `phase rainbow` media. **Multi-camera renders still build once**, which is the cross-frame amortisation this mode exists for | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
+| `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves). Since 0.252.0 a **single-camera** render re-draws all three maps every epoch under a fresh salt and averages the epochs' films (`-beamfreeze` to opt out), so the light-side half of its error converges with render time instead of freezing — that was M-FROZEN, whose visible symptom was coloured bars through `phase rainbow` media. 0.253.0 extended that to the **shared/GPU** route, which a plain fixed-`-spp` single-camera render takes. **Multi-camera renders still build once**, which is the cross-frame amortisation this mode exists for | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
 | `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). It traces its own light subpaths for the beam map (0.216.0) and both techniques are MIS-weighted (0.218.0), with merged paths capped at `maxDepth` like the connections (0.219.0). The map sizes itself from the scene's `-beamk` knee via a discarded pilot (0.242.0), so **leave `-n` off** — passing it disables the budget. The **camera pass runs on the GPU** as of 0.244.0 (mode `D`'s megakernel with `MERGE=true`); the light/beam pass stays on the CPU on both backends. Since 0.247.0 the light side is **re-drawn every epoch and averaged** (`-beamfreeze` to opt out), so the merge half converges with render time instead of freezing on one realization — that was UPBP-THICK, and it was variance, not bias. Correct, but **not yet faster than `D`** — see UPBP-CONV | `bdpt.h` + `beamgather.h` + `photonbeams.h` + `render_cuda.cu` |
@@ -569,6 +569,24 @@ refreshes are **silent** since the map's shape does not change, only its realiza
 cheaper here than in mode `J` — the deposit and all three builds are ~0.35 % of a 900 s render.
 The **multi-camera / flyby** path is deliberately excluded: there, building the map once and
 reusing it across frames *is* the feature.
+
+**Mode `M` reaches that light side down two routes, and 0.253.0 taught the second one to refresh
+as well.** Which route a mode-`M` render takes is decided by `plainRender` — no `-time`, `-noise`,
+`-forever` or `-preview` — and a *plain* fixed-`-spp` render is grouped into the **shared**
+photon-map path even when there is only one camera, because that path is where the GPU gather
+lives. So through 0.252.0 `-mode M -beams -time 900` refreshed while `-mode M -beams -spp 400`
+stayed frozen. The shared path now runs the same epoch loop for a lone camera, and a lone camera
+that would *not* actually get the device gather (no CUDA, `-device cpu`, a lens camera, an
+unsupported scene) is folded back to `runRender`'s branch instead, since staying would have bought
+a CPU gather off a frozen map rather than the same CPU gather off a refreshed one. `-savemap` /
+`-loadmap` pin a render to the shared path and switch the refresh off: they are implemented only
+there, and a *loaded* map is a stored realization with nothing left to re-trace. On the device the
+salt does both jobs at once — the gather seed mixes `g_rngSalt`, so one `RngSaltScope` around the
+whole pass decorrelates the map and the camera stream together and no `sampleBase` analogue is
+needed. Two shared structs carry the epoch discipline across the host/device line: `PmRadiiPin`
+(`render_cuda.h`) pins the gather radii and the caustic `kGather` to epoch 0's choice, and
+`g_gpuQuietRebuild` (`render_progress.h`) is the device twin of `buildBeamMap(..., quiet)` — mode
+`J` sets it too, since `renderBdptCuda` re-uploads and re-reports the beam map every epoch.
 
 **What it costs and what it buys here — honestly, nothing yet.** On `_fog_cornell` mode `J` at
 43 spp measures 15.25 % noise; mode `D`'s 4.42 % at 512 spp is 15.25 % when scaled by `sqrt`. The

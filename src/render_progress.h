@@ -103,3 +103,21 @@ struct StageProgress {
     // divided by the deposit's minutes and an ETA to match. Call it when a phase begins.
     std::function<void()> reset;
 };
+
+// NARRATION GATE FOR A LIGHT-SIDE REFRESH EPOCH (0.253.0).
+//
+// Set by the mode-J and mode-M refresh loops for every epoch AFTER the first, cleared again as
+// soon as that epoch's pass returns. The GPU paths narrate the SHAPE of the caches they build
+// — the adaptive gather radius they settled on, the caustic map's population, the aimed pass's
+// yield, the beam map's sub-beam and BVH counts. That shape is a property of the whole render,
+// not of one epoch: a refresh redraws the map, it does not re-size it (and since 0.253.0 the
+// radii are literally pinned — see PmRadiiPin in render_cuda.h). So reprinting it per refresh
+// wedges a paragraph of unchanging text between every pair of progress lines, and on a cheap
+// scene that refreshes every second or so it buries the -interval status entirely.
+//
+// This is the device twin of the `quiet` argument the CPU paths already pass to buildBeamMap.
+// It lives HERE rather than in render_cuda.h for one reason: mode J's epoch loop is ordinary
+// host code with the CUDA call buried inside renderEpoch, so it sets the flag from outside any
+// #ifdef HAVE_CUDA and a CPU-only build has to still compile. A CPU-only build simply has
+// nothing that reads it.
+inline bool g_gpuQuietRebuild = false;

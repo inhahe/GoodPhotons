@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### M-FROZEN — FIXED (2026-09-05, v0.252.0): mode `M` showed **coloured bars through the rain and cloud that got worse the longer it rendered**, because its photon / caustic / beam maps were built once and every camera sample gathered from that one realization
+### M-FROZEN — FIXED (2026-09-05, v0.252.0 + v0.253.0): mode `M` showed **coloured bars through the rain and cloud that got worse the longer it rendered**, because its photon / caustic / beam maps were built once and every camera sample gathered from that one realization
 
 **Symptom, as reported.** "The view for the ftrace instance that was running mode M on
 `M_s4.png` showed coloured bars throughout the rain and clouds." Confirmed in
@@ -93,11 +93,71 @@ just prettiness.
 Note the rain crop is *supposed* to carry chroma — it contains the bow — so the target there is
 `D`'s 0.0865, not zero. Refreshed mode `M` lands just under it, alongside mode `J`.
 
-**Blast radius.** Only the single-camera `mode == 'M'` block changed. The **multi-camera / flyby**
-path (`main.cpp` ~23234) is deliberately untouched: there the whole point is to amortise one map
-across many frames, and refreshing would destroy the amortisation that mode `M` exists to
-provide. Fixed-`-spp` renders take the `!prog->report` branch and are unchanged. `-beamfreeze`
+**Blast radius.** In 0.252.0 only the single-camera `mode == 'M'` block in `runRender` changed —
+which turned out to be half the mode; see the routing follow-up below. The **multi-camera / flyby**
+path is deliberately untouched in both versions: there the whole point is to amortise one map
+across many frames, refreshing would destroy that amortisation, and handing consecutive frames
+different realizations is temporal flicker rather than convergence. `-beamfreeze`
 (new alias `-lightfreeze`) restores the historical single cache.
+
+#### Follow-up (v0.253.0): the *other* mode-`M` path was still frozen, and the most ordinary command line took it
+
+0.252.0 fixed `runRender`'s mode-`M` branch. But which branch a mode-`M` render reaches is decided
+by `plainRender` (`main.cpp` ~22843) — `!(timeBudgetSec > 0 || noiseTarget > 0 || runForever ||
+preview)` — and a **plain fixed-`-spp`** render is grouped into the *shared* photon-map path
+(`runSharedPhotonMap`) even when there is only ONE camera. So:
+
+```
+ftrace scene.ftsl -mode M -beams -time 900     # refreshed as of 0.252.0
+ftrace scene.ftsl -mode M -beams -spp 400      # still FROZEN, coloured bars and all
+```
+
+Two paths, same mode, opposite behaviour, selected by a flag that has nothing to do with the light
+side. Every measurement in the table above was taken with `-time`, so none of them ever touched
+the frozen half.
+
+**Fixed two ways, because there are two different reasons a lone camera lands there.**
+
+* **The shared path now refreshes for a lone camera** (`refreshGpu` + epoch loop, `main.cpp`
+  ~23440). Structurally the same loop as `runRender`'s, but simpler in one respect: on the device
+  there is no `sampleBase` analogue to advance, because the gather seed is
+  `… ^ (K * (cam+1)) ^ g_rngSalt` and the sample index restarts at 0 on every call. Keeping the
+  salt applied across the whole `renderPhotonMapSharedCuda` call therefore decorrelates the **map
+  and the camera stream together**, which is exactly what the average needs. (On the CPU paths the
+  salt is deliberately dropped before the camera pass and `sampleBase` does that job instead.)
+  `stageProg` is passed on every epoch, not just the first: `splitDeposit = (stage &&
+  stage->report)`, so dropping it would turn each refresh deposit back into one monolithic launch
+  — which is what the Windows TDR watchdog shoots at.
+* **A lone camera that would not actually get the GPU gather is folded back** into `restIdx`
+  (`main.cpp` ~22873). The only thing the shared path does for a single camera that `runRender`'s
+  branch does not is hand it the *device* gather; with no CUDA build, `-device cpu`, a lens
+  camera, or an unsupported scene, staying there bought a CPU gather off a **frozen** map when the
+  other branch offers the same CPU gather off a **refreshed** one — strictly worse on both axes.
+  `-savemap` / `-loadmap` pin it to the shared path regardless: they are implemented only there,
+  and a *loaded* map is a stored realization with no trace to refresh.
+
+**Two things the device loop needed that the host loop already had.**
+
+* **`PmRadiiPin`** (`render_cuda.h`). Epoch 0 adapts its gather radii and *records* them; every
+  later epoch re-bins its fresh photons at exactly those radii, and `kGather` travels with them.
+  Same argument as the host's `rebuildPhotonMapAt`/`rebuildCausticMapAt`: a photon-map estimate is
+  **biased** at a finite radius, so per-epoch re-adaptation would average estimators that are not
+  the same estimator. Not theoretical — the first working build drifted 0.05781 → 0.05794 between
+  two epochs of `_fog_cornell`.
+* **`g_gpuQuietRebuild`** (`render_progress.h`; the device twin of `buildBeamMap(..., quiet)`).
+  Suppresses the adaptive-radius, caustic-population, aimed-yield and sub-beam/BVH lines on
+  refresh epochs. It lives in `render_progress.h` rather than `render_cuda.h` because mode `J`'s
+  epoch loop sets it from code outside `#ifdef HAVE_CUDA` — mode `J` had the identical problem,
+  since `renderBdptCuda` re-uploads and re-reports the beam map on every epoch.
+
+**Verified (v0.253.0, `_fog_cornell`).** GPU lone camera at `-spp 400`: `averaged 2 independent
+light-side realizations`, epoch 1 silent, no radius drift, an intermediate write at the epoch
+boundary with no spurious "stopped at N / spp" line. `-beamfreeze` at `-spp 120` is **bit-identical
+(md5)** to `scraps/ftrace_0252.exe`'s default output for the same command line. A 2-camera scene
+still builds one map and announces both frames normally. `-device cpu` at `-spp 40` now reports
+`mode M: averaged 4 independent light-side realizations`, and so does a bare no-window `-spp 20`
+run. `-savemap` still pins to the shared path and writes the map that was actually gathered from.
+Mode `J` on the GPU over 2 epochs now prints its sub-beam/BVH line **once**.
 
 **Flag naming.** `-beamfreeze` / `-beamrefresh` are now half a lie — mode `M`'s refresh redraws
 its *surface* photon map and its caustic map as well as its beam map. Renaming outright would

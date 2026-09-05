@@ -16383,7 +16383,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     // Not a stop — just the end of this epoch, so the next one draws a new map.
                     return std::chrono::duration<double>(clk::now() - tEpoch).count() >= epochSec;
                 };
+                // On the GPU, renderEpoch re-enters renderBdptCuda, which re-uploads the beam
+                // map and reports its SHAPE (sub-beam count, BVH nodes, blur radius). That
+                // report is true of every epoch of the run, not just this one — the map is
+                // redrawn, not re-sized — so after the first it is a block of unchanging text
+                // wedged between every pair of progress lines. The same rule buildBeamMap's
+                // own `quiet` argument follows one screen up. Restored immediately after, so
+                // any later non-epoch caller narrates normally.
+                g_gpuQuietRebuild = (epoch != 0);
                 Film f = renderEpoch(sppTarget - sppAll, &inner);
+                g_gpuQuietRebuild = false;
                 if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
                 acc.merge(f);
                 sppAll += epochSpp;
@@ -22874,6 +22883,25 @@ static int run(int argc, char** argv) {
     // is the ONLY GPU route for mode M and it handles a single camera fine. Keep even one
     // plain mode-M camera here so `-camera #N`/`near=`/name can aim the live window at one
     // frame of a long camera_curve and still render it on the GPU.
+    //
+    // ... with ONE exception, added in 0.253.0 for the light-side refresh (M-FROZEN). A lone
+    // mode-M camera shares nothing, and the ONLY thing the shared path does for it that
+    // runRender's mode-M branch does not is hand it the GPU gather. When that gather is not
+    // actually available — no CUDA build, `-device cpu`, a lens camera, an unsupported scene —
+    // staying here buys a CPU gather off a FROZEN map, while runRender's branch gives the same
+    // CPU gather off a map that is redrawn between epochs. That is strictly worse on both axes,
+    // so fold it back. `-savemap` / `-loadmap` pin it here regardless: they are implemented
+    // only on this path, and a LOADED map is a stored realization with no trace to refresh.
+    if (groupM.size() == 1 && !g_beamFreeze && g_pmapLoad.empty() && g_pmapSave.empty()) {
+        bool gpuRoute = false;
+#ifdef HAVE_CUDA
+        // Mirrors runSharedPhotonMap's own gate exactly; if that changes, this must too.
+        gpuRoute = (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
+                   !toRender[groupM[0]].cam.hasLens() &&
+                   cudaAvailable() && cudaPhotonMapSupported(scene);
+#endif
+        if (!gpuRoute) { restIdx.push_back(groupM[0]); groupM.clear(); }
+    }
     std::sort(restIdx.begin(), restIdx.end());
 
     bool sharedWriteFail = false;
@@ -23283,11 +23311,18 @@ static int run(int argc, char** argv) {
                 // the very end means an interrupt / crash / power loss throws away ALL of it.
                 // Writing per frame also lets the device path free each film as it goes, so a
                 // long render stays near one-frame of host RAM instead of ~3 GB of films.
+                //
+                // `midEpoch` is set by the light-side refresh loop below while it writes the
+                // running AVERAGE between epochs. Such a write is a healthy progressive
+                // checkpoint, not a truncated frame, so it must not announce itself as one
+                // ("stopped at N / spp"), must not re-announce the output path, and must not
+                // advance the title's frame counter past the one frame there is.
+                bool midEpoch = false;
                 std::function<bool(int, const Film&, long long)> writeFrame =
                     [&](int k, const Film& f, long long sppDone) -> bool {
                         const RenderCam& rc = toRender[idx[k]];
                         std::string op = outFor(rc.name);
-                        if (toRender.size() > 1)
+                        if (toRender.size() > 1 && !midEpoch)
                             std::printf("[camera] '%s' (mode M/GPU, %dx%d) -> %s\n",
                                         rc.name.c_str(), rc.res, rc.resY, op.c_str());
                         double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
@@ -23296,12 +23331,13 @@ static int run(int argc, char** argv) {
                         // normalising by `spp` here wrote it darkened by exactly the fraction
                         // it never gathered — the one frame of a stopped flythrough that a
                         // viewer is most likely to look at, and the one that used to be wrong.
-                        if (sppDone < spp)
+                        if (sppDone < spp && !midEpoch)
                             std::printf("[camera] '%s' stopped at %lld / %lld spp — writing "
                                         "what gathered.\n", rc.name.c_str(), sppDone, spp);
                         if (!writeFilm(op.c_str(), f, (double)sppDone, rc.exposure, false, anchor, scene.absolute))
                             sharedWriteFail = true;
-                        gatherFrame = (size_t)k + 1;   // advances the title's "frame k/n"
+                        if (!midEpoch)
+                            gatherFrame = (size_t)k + 1;   // advances the title's "frame k/n"
                         return g_stopRequested != 0;   // window closed / Ctrl-C -> stop after this frame
                     };
                 // The photon-beam volume pass. THE work term, and the case it exists for:
@@ -23312,6 +23348,12 @@ static int run(int argc, char** argv) {
                 // split rule must not depend on which device runs the gather.)
                 BeamMap  bmapGpu;
                 BeamPass beamPass;
+                // Which light-side realization is being built. Only epoch 0 narrates itself:
+                // the adaptive-radius / stored-flux / sub-beam lines describe the map's SHAPE,
+                // which every epoch shares — only the draw changes — so reprinting them per
+                // epoch would bury the actual progress lines under a description that never
+                // moves. (Exactly the rule the CPU mode-M and mode-J refreshes follow.)
+                uint64_t lightEpoch = 0;
                 if (wantBeams) {
                     double work = 0.0;
                     for (int i : idx)
@@ -23323,9 +23365,10 @@ static int run(int argc, char** argv) {
                     // Name the stage in the title bar: the beam BVH on a big scene is minutes
                     // of silence between the deposit and the first gathered frame, and without
                     // this the window sits on the previous caption looking wedged.
-                    beamPass.build  = [work, tw, th](BeamMap& bm) {
-                        liveWindowPlaceholder(tw, th, "building beam map\xE2\x80\xA6");
-                        buildBeamMap(bm, "[camera]", work);
+                    beamPass.build  = [work, tw, th, &lightEpoch](BeamMap& bm) {
+                        if (lightEpoch == 0)
+                            liveWindowPlaceholder(tw, th, "building beam map\xE2\x80\xA6");
+                        buildBeamMap(bm, "[camera]", work, /*quiet*/lightEpoch != 0);
                     };
                 }
                 // Aimed caustic emission (-causticn), the exact twin of the CPU call below.
@@ -23335,18 +23378,162 @@ static int run(int argc, char** argv) {
                 const caim::AimMap aimMapGpu =
                     g_pmapLoad.empty() ? buildAimMap(scene, N, nAimedGpu, "[camera]")
                                        : caim::AimMap{};
-                renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e,
-                                          diffraction, spp,
-                                          g_showWindow ? &liveProg : nullptr, &writeFrame,
-                                          g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
-                                          g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC,
-                                          g_pmFinalGather,
-                                          g_pmAutoRadius ? g_pmAutoCount : 0.0,
-                                          wantBeams ? &beamPass : nullptr, &stageProg,
-                                          g_pmCaustics ? g_pmCausticCount : 0.0,
-                                          &aimMapGpu, nAimedGpu,
-                                          g_pmAdaptive ? (g_pmAdaptiveK > 0.0 ? g_pmAdaptiveK
-                                                                              : -1.0) : 0.0);
+                // One realization of the light side plus `sppWant` camera samples gathered
+                // from it. The whole device pass — scene upload, deposit, map builds, beam
+                // BVH, gather, teardown — lives in here, which is what makes the epoch loop
+                // below a loop over *complete independent renders* rather than a partial
+                // rebuild of something held across calls.
+                // `stageProg` is passed on EVERY pass, refresh epochs included. It is not
+                // merely narration: `splitDeposit = (stage && stage->report)` in the device
+                // path, so dropping it on later epochs would turn each refresh deposit back
+                // into one monolithic launch — minutes long at a showcase `-n`, and exactly
+                // what the Windows TDR watchdog shoots at. The captions it drives ("tracing
+                // photons…", "building photon map…") are also true again on every epoch, so
+                // there is nothing to suppress; what does get suppressed is buildBeamMap's
+                // shape report, via `lightEpoch` above.
+                // The gather radii the epochs share. Epoch 0 adapts and RECORDS into this;
+                // every later epoch re-bins its fresh photons at exactly those radii. Not
+                // cosmetic: a photon-map estimate is BIASED at a finite radius, so letting
+                // each epoch re-adapt would average estimators that are not the same
+                // estimator, and the average would converge to none of them. (Observed
+                // drifting 0.05781 -> 0.05794 across two epochs before this was pinned.)
+                // Left at its zeros by the no-refresh call below, which therefore adapts
+                // exactly as it always did. See PmRadiiPin in render_cuda.h.
+                PmRadiiPin radiiPin;
+                auto runPass = [&](long long sppWant, const SppProgress* p,
+                                   const std::function<bool(int, const Film&, long long)>* onF,
+                                   PmRadiiPin* pin) {
+                    renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e,
+                                              diffraction, sppWant, p, onF,
+                                              g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
+                                              g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC,
+                                              g_pmFinalGather,
+                                              g_pmAutoRadius ? g_pmAutoCount : 0.0,
+                                              wantBeams ? &beamPass : nullptr, &stageProg,
+                                              g_pmCaustics ? g_pmCausticCount : 0.0,
+                                              &aimMapGpu, nAimedGpu,
+                                              g_pmAdaptive ? (g_pmAdaptiveK > 0.0 ? g_pmAdaptiveK
+                                                                                  : -1.0) : 0.0,
+                                              pin);
+                };
+                // ---------------------------------------------------------------------------
+                // THE LIGHT-SIDE REFRESH, ON THE DEVICE, FOR A LONE CAMERA (0.253.0).
+                //
+                // Everything above builds ONE photon/caustic/beam realization and gathers every
+                // camera sample from it, which is precisely the M-FROZEN floor that 0.252.0
+                // removed from runRender's mode-M branch — and this path is reached by the most
+                // ordinary mode-M command line there is. `plainRender` (a fixed `-spp`, no
+                // -time/-noise/-forever/-preview) routes even a SINGLE mode-M camera here, so
+                // `ftrace scene.ftsl -mode M -beams -spp 400` kept the frozen maps and the
+                // coloured bars that come with them, while the same render with `-time` did not.
+                // Two paths, same mode, opposite behaviour, decided by a flag that has nothing
+                // to do with the light side: that is the gap this closes.
+                //
+                // A MULTI-camera group deliberately does NOT refresh. There the single map is
+                // the FEATURE — amortising one forward pass across every frame of a flythrough
+                // is the entire reason mode M has a shared path — and refreshing would both
+                // destroy that amortisation and hand consecutive frames different realizations,
+                // which is temporal flicker rather than convergence.
+                //
+                // Camera-side decorrelation comes from the salt too, NOT from `sampleBase`.
+                // On the CPU paths the salt is deliberately dropped before the camera pass and
+                // the camera side decorrelates by absolute sample index (see RngSaltScope's
+                // note), but the device gather derives its stream from (camera index, salt) and
+                // restarts its sample index at 0 on every call, so `sampleBase` has no device
+                // analogue here. Leaving the salt applied across the gather gives each epoch an
+                // independent camera stream as well as an independent map, which is what the
+                // average needs; and within an epoch the salt is constant, so an epoch's own
+                // realization is still independent of how it was chunked.
+                //
+                // -savemap / -loadmap opt out, for the same reasons they do everywhere else: a
+                // LOADED map is a stored realization with no trace to refresh, and a SAVED one
+                // has to be the map that was actually gathered from.
+                const bool refreshGpu = (cams.size() == 1) && !g_beamFreeze &&
+                                        g_pmapLoad.empty() && g_pmapSave.empty();
+                if (!refreshGpu) {
+                    runPass(spp, g_showWindow ? &liveProg : nullptr, &writeFrame, nullptr);
+                } else {
+                    using clk = std::chrono::steady_clock;
+                    Film acc; acc.resX = rxs[0]; acc.resY = rys[0]; acc.alloc();
+                    Film epochFilm;
+                    long long sppAll = 0, epochSpp = 0;
+                    bool stopAll = false;
+                    // Captures this epoch's finished film. The device path MOVES its film out
+                    // after calling onFrame (so a flythrough runs in one frame of host RAM), so
+                    // the copy has to be taken here rather than from the returned vector.
+                    std::function<bool(int, const Film&, long long)> grabFrame =
+                        [&](int, const Film& f, long long sppDone) -> bool {
+                            epochFilm = f; epochSpp = sppDone;
+                            return g_stopRequested != 0;
+                        };
+                    for (; !stopAll && sppAll < spp && !ft::stopRequested(); ++lightEpoch) {
+                        RngSaltScope saltScope(lightEpoch);
+                        // Everything the device prints about the map's SHAPE — the adaptive
+                        // radius it settled on, the caustic-map population, the sub-beam /
+                        // BVH summary — is a property epoch 0 already reported and the pin
+                        // now holds fixed, so a refresh epoch has nothing new to say and
+                        // would only bury the progress lines. Restored below the loop.
+                        g_gpuQuietRebuild = (lightEpoch != 0);
+                        if (lightEpoch > 0) {
+                            // Drop the previous realization outright. The device path clears
+                            // the raw crossings itself but the built split/BVH is host state,
+                            // and appending a second epoch's beams to a first epoch's tree is
+                            // the one failure mode here that would look like a working render.
+                            bmapGpu = BeamMap{};
+                            if (lightEpoch == 1)
+                                std::printf("[camera] light-side refresh — redrawing %lld "
+                                            "photons under a fresh salt every ~%.0f%% of the "
+                                            "wall clock and averaging the realizations, so the "
+                                            "MAP noise falls with the render too (-beamfreeze "
+                                            "to opt out; -beamrefresh to retune) ...\n",
+                                            N, 100.0 * g_beamRefreshFrac);
+                        }
+                        const auto tEpoch = clk::now();
+                        double epochSec = 0.0;
+                        epochSpp = 0;
+                        // How long this epoch should run. The overhead being amortised is the
+                        // WHOLE per-pass preamble — scene upload, deposit, both map builds, the
+                        // beam BVH and its host->device conversion — so it is measured rather
+                        // than assumed: whatever elapsed before the first sample landed IS the
+                        // overhead, and the epoch runs 1/frac of it. Self-correcting, so a
+                        // heavy scene stretches its epochs out until it behaves like
+                        // -beamfreeze and a cheap one refreshes often.
+                        SppProgress inner;
+                        inner.report = [&](const Film& f, long long sppDone, bool final) -> bool {
+                            if (epochSec <= 0.0) {
+                                epochSec = std::chrono::duration<double>(clk::now() - tEpoch).count()
+                                         / g_beamRefreshFrac;
+                                if (epochSec < 1.0) epochSec = 1.0;
+                            }
+                            // The live view must always see the WHOLE render, not this epoch's
+                            // slice, or the window would reset to a black frame every refresh.
+                            if (liveProg.report) {
+                                Film comb = f; comb.merge(acc);
+                                if (liveProg.report(comb, sppAll + sppDone, final)) {
+                                    stopAll = true; return true;
+                                }
+                            }
+                            return std::chrono::duration<double>(clk::now() - tEpoch).count()
+                                   >= epochSec;
+                        };
+                        runPass(spp - sppAll, &inner, &grabFrame, &radiiPin);
+                        if (epochSpp <= 0) break;          // stopped before a complete sample
+                        acc.merge(epochFilm);
+                        sppAll += epochSpp;
+                        epochFilm = Film{};
+                        // Crash-safe: write the running average after every epoch, exactly as
+                        // the un-refreshed path writes after its one and only gather.
+                        midEpoch = (sppAll < spp) && !stopAll && !ft::stopRequested();
+                        if (writeFrame(0, acc, sppAll)) stopAll = true;
+                        midEpoch = false;
+                    }
+                    g_gpuQuietRebuild = false;
+                    if (lightEpoch > 1)
+                        std::printf("[camera] averaged %llu independent light-side realizations "
+                                    "(%lld spp total) — the map noise fell with the render, not "
+                                    "just the gather noise\n",
+                                    (unsigned long long)lightEpoch, sppAll);
+                }
                 if (wantBeams && beamPass.loadedMissing)
                     std::fprintf(stderr,
                         "[loadmap] warning: %s has no beam data (saved without -beams, or its\n"
