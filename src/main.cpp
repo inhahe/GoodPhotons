@@ -141,12 +141,7 @@
 #include <mutex>               // guards the live-window title (the deposit monitor re-titles)
 #include <filesystem>          // -review: scan a directory of rendered frames
 
-// Baked in by CMake from the repo-root VERSION file (see CMakeLists.txt). The
-// fallback only fires for a hand-rolled compile outside the CMake build; a real
-// build.bat binary always carries the real number.
-#ifndef FTRACE_VERSION
-#define FTRACE_VERSION "unknown"
-#endif
+#include "version.h"          // ftraceVersion(): the repo-root VERSION string, baked into one tiny TU
 
 #include "scene.h"
 #include "parallel.h"           // ft::setStopProbe — lets load-time loops see the stop flag
@@ -17516,8 +17511,9 @@ static bool stereoComposite(int mode, const std::string& left, const std::string
 // the exhaustive list (fog, thin-film, mesh export, physics diagnostics, …) lives in
 // README.md, which this points at rather than duplicating.
 static void printHelp(const char* prog) {
+    std::printf("ftrace %s", ftraceVersion());
     std::printf(
-"ftrace " FTRACE_VERSION " — spectral forward + backward photon raytracer\n"
+" — spectral forward + backward photon raytracer\n"
 "\n"
 "Usage:\n"
 "  %s -in <scene.ftsl> [options]         render a scene file\n"
@@ -17917,7 +17913,7 @@ static int run(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-version") || !std::strcmp(argv[i], "--version") ||
             !std::strcmp(argv[i], "-V")) {
-            std::printf("ftrace %s\n", FTRACE_VERSION);
+            std::printf("ftrace %s\n", ftraceVersion());
             return 0;
         }
     }

@@ -7923,6 +7923,25 @@ cost a black frame, never the display driver.
 
 ## Build & release
 
+- **Build time (0.259.2).** Measured on the i7-8700K with ~3 cores of other load: a build
+  that recompiles only `render_cuda.cu` is ~3:37 through MSBuild — CudaCompile 174 s, host
+  link 30 s, device link 6 s — so the build system adds ~40 s and the rest is nvcc on one
+  18k-line TU, whose optimiser (`cicc`) and assembler (`ptxas`) are single-threaded per TU.
+  Three changes: (1) `--split-compile=0` partitions that TU's device code across all cores
+  (ptxas 52.6 → 21.1 s, cicc 64.3 → 43.2 s, the TU 2:49 → 1:50; codegen checked by a render
+  speed A/B); (2) `/MP` for the host TUs, which only matters on a full rebuild; (3) the
+  version string moved into `src/version.cpp`, the only TU with `FTRACE_VERSION` defined —
+  it used to be target-wide, so every `VERSION` bump rebuilt *everything*, which is what
+  made the "15-minute builds" of 2026-09-06: bumps plus foreign CPU load, not the compiler.
+  What is left is serial by nature: `cudafe++` (14 s), preprocessing (12 s), the host pass
+  of the .cu (17 s) and the links; splitting `render_cuda.cu` into per-mode TUs would
+  parallelise those too, at the cost of duplicating the shared device helpers per TU.
+  One constraint `--split-compile` adds: a `__device__` function with EXTERNAL linkage (a
+  plain `inline` template in a header, as `dPatternEval` was) can be partitioned away from
+  a `__launch_bounds__`-capped caller, and `nvlink` then rejects the link when the callee's
+  own register allocation exceeds the cap (169 vs 168 for `kBdptT`). Device helpers must be
+  `static` (internal linkage) so the partitioner keeps them with their callers — already
+  the house style, and now a requirement.
 - `build.bat` → CMake/VS2022 x64 Release into `build_cuda2/`, copies
   `ftrace.exe` to the repo root. **Warning:** freshly-configured build dirs
   currently produce a GPU-silently-dead exe (see known-issues, 2026-07-22) — build

@@ -78,7 +78,7 @@ __device__ static inline double dPatValueNoise(double x, double y, double z) {
 // density/ior) — the host compiler rejects `tex:`/`grid:` at those sites, so such a node
 // can never actually appear.
 template <class TexT>
-__device__ inline double dPatternEval(const PatNode* nodes, int n,
+__device__ static inline double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
                                       double u, double v, double curv, double cavity,
