@@ -2916,6 +2916,37 @@ as the one at fault.
   observed in mode `B` as photons re-hitting the emitter they were born on (GPU-ORIGIN-EPS).
   The origin fix is not a relative epsilon (that leaks through walls at city scale) but
   Wächter–Binder's integer ulp offset along the departure-side geometric normal.
+  0.259.1 made that the rule. `dOffsetAlong(p, ng, w)` (render_cuda.cu, next to `DVec3`) is
+  the ONLY way a device ray may leave a surface: it advances `p` by 256 float ulps along
+  `ng` flipped to the side of `w` (Ray Tracing Gems ch. 6), with a 1/65536 absolute push
+  inside |p| < 1/32 where ulps are too fine to matter — scale-correct by construction and
+  bounded in absolute terms (0.25 units at |p| = 10 km, which is also the thinnest wall
+  fp32 can still resolve there). It replaced ~100 `p + n*RAY_EPS` bounce and shadow
+  origins, the BDPT/VCM `ng*1e-6f` connection origins, the caustic chains' double
+  `1e-6` (which the cast to float had been discarding), and the photon-birth
+  `origin + dir*RAY_EPS`, which was along the wrong vector as well as the wrong size:
+  births now step along `emitN`. Medium vertices have nothing to clear and are not
+  offset; hair fibres keep `dHairExitOffset` (2.5 radii along the exit direction). The
+  fp64 device build keeps `p + n*1e-6`, bit-identical to the CPU. `tmin = RAY_EPS` on
+  the next trace stays as a second guard, not the first.
+  **A scale-correct origin push breaks an invariant the old code relied on**, and the first
+  build with it showed how: the far-end shortening (`2*RAY_EPS`) used to be *larger* than the
+  origin push (`RAY_EPS`), so a shadow ray that kept the direction and length computed
+  from the unmoved point still stopped short of its target. With a 256-ulp push toward the
+  target that is no longer true whenever the light is nearer than ~3x the shading point's
+  coordinate magnitude: the far end overshoots the sampled emitter point by push*cos(a),
+  lands inside the emitter, and the sample is discarded as occluded — a radius-6 sphere
+  613 units from a quad at |p| = 5000 lost 97 % of its NEE samples in modes R and D alike
+  (a spot light there: clean; mode B, whose shadow rays end at the pinhole: clean). So
+  every occlusion query with a specific far-end point now goes through `occludedTo(sc, o,
+  target, eps)`, which re-aims the ray *from the moved origin* (PBRT's `SpawnRayTo`) —
+  the estimator's own G, pdfs and directions are untouched — and `connMaxT` gained a
+  `coordMag` term (8 float ulps of the target's largest coordinate) because at |p| ~ 5e4
+  the target point's own quantisation (4e-3) is as large as `dist*1e-5`. The four
+  scene-exit rays (sun cone, environment) keep plain `occluded()`: nothing sits at their
+  far end to overshoot into. Rule: **moving a ray's origin means re-deriving its direction
+  and length from where it now starts; never keep a direction computed from a point the
+  ray no longer leaves from.**
 
   `-rgb` is refused in mode `W` (`main.cpp`, with a message): the fast RGB backward is a
   separate reduced tracer with no deterministic estimator, so it would return precisely the

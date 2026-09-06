@@ -10595,10 +10595,11 @@ to deleting the medium. The repro scene confounded three things at once: *has a 
 **+0.61%**, near control **+0.62%** — the far scene now behaves identically to the near one,
 and the shared +0.6% is the ordinary fp32-vs-double envelope, present in both regimes.
 
-**Still absolute after this fix (follow-up, same arithmetic):** `bkHairBlocked`'s
-`len = d - off - RAY_EPS` — the far end of a HAIR vertex's NEE ray is on the emitter too,
-so hair lit by a distant light keeps the bug — and the two hair camera legs `connectHair` /
-`connectLensHair` (`dist - off - RAY_EPS`). Convert to `connMaxT(d - off, RAY_EPS)`.
+**Hair (done in 0.259.1):** `bkHairBlocked`'s `len = d - off - RAY_EPS` and the two hair camera
+legs `connectHair` / `connectLensHair` (`dist - off - RAY_EPS`) had the same absolute
+shortening; they now go through `connMaxT(d - off, RAY_EPS, coordMag)`. Their origin steps
+along the ray itself (`p + wi*off`), so the far end shortens by exactly `off` and the re-aim
+below is not needed there.
 
 **Also explains** the "separate pre-existing global ~1.2x mode-R float-GPU vs double-CPU
 exposure difference ... even with NO medium" noted in the GRIN entry above (1/0.764 = 1.31);
@@ -10611,7 +10612,7 @@ half failing means the end-shortening has gone absolute again; both failing mean
 generic. Any scene whose lights sit thousands of units from the shading geometry (a sun
 modelled as a far sphere, a city block, an outdoor flyby) exercises this.
 
-### BUG — OPEN (2026-09-06) [GPU-ORIGIN-EPS]: the GPU's ray-ORIGIN offsets are absolute (1e-4, and 1e-6 in the BDPT/VCM/caustic paths), so far from the world origin they round away — observed as photons dying on their own emitter (mode B `absorbed=0.1525` on a 6 km light)
+### BUG — DONE (2026-09-06, 0.259.1) [GPU-ORIGIN-EPS]: the GPU's ray-ORIGIN offsets were absolute (1e-4, and 1e-6 in the BDPT/VCM/caustic paths) and rounded away far from the world origin — photons died on their own emitter (mode B `absorbed=0.1525` on a 6 km light); now Wächter–Binder ulp offsets plus re-aimed shadow rays
 
 Found while fixing GPU-NEE-EPS above, which is the same arithmetic at the other end of the
 ray. Three different origin-offset styles are in use on the device, and in the fp32 build
@@ -10645,19 +10646,49 @@ emitter's own camera splat (`connect` from the emission point, `p + ng*RAY_EPS`)
 defect, so a *visible* distant light should show rim darkening in forward modes on the GPU
 (predicted, not yet rendered).
 
-**Do NOT fix it the way GPU-NEE-EPS was fixed.** A relative offset is safe for shortening a
-ray's far end (overshooting only trims a segment with nothing in it) but dangerous at the
-origin: `1e-5 * |p|` on a 100 km scene is a 1 m push, which leaks light straight through a
-wall. The correct fix is Wächter & Binder's integer `offset_ray` (Ray Tracing Gems ch. 6):
-advance the origin by a fixed number of *ulps* along the geometric normal, on the departure
-side (`sign(dot(w, ng))`, so reflection and transmission both clear the surface) —
-scale-correct by construction at every magnitude and bounded in absolute terms. One helper
-replaces all three styles; emission offsets along `emitN`, never along `dir`; the fp64 build
-keeps its current constants so it stays bit-identical to the CPU reference. It perturbs
-every GPU image slightly, so it is its own commit with its own before/after sweep:
-`scraps/rbnm_d1.ftsl` mode B must come to ~0.0009, `scraps/rbnm_xlate.ftsl` and the +50000-
-translated `scraps/rbnm_s01.ftsl` must not move, and `_cornell_diffuse` / `_slab_ss` must
-stay within their current envelopes.
+**Fix (0.259.1).** `dOffsetAlong(p, ng, w)` (render_cuda.cu, next to `DVec3`) replaces all three
+styles at 102 sites: Wächter & Binder's integer offset (Ray Tracing Gems ch. 6) — 256 float
+ulps along the geometric normal, flipped to the side of the direction the ray leaves in, with a
+1/65536 absolute push inside |p| < 1/32 — so reflection and transmission both clear the
+surface at every scale. Photon births step along `emitN` instead of `dir`. Medium vertices
+(nothing to clear) and hair fibres (`dHairExitOffset`) are untouched; the fp64 device build
+keeps `p + n*1e-6`, bit-identical to the CPU. A relative epsilon was rejected on purpose:
+`1e-5 * |p|` is a metre at 100 km and walks through walls.
+
+**What the first build with it taught — the re-aim.** The birth kill was gone (below), but
+the translated scenes `scraps/rbnm_far{5000,20000,50k}.ftsl` (the near-origin scene moved out
+in z, same image by construction) came back **−97 %** on the GPU in modes R *and* D — flat
+across scale, clean with a spot light, clean in mode B. The old code had an invariant nobody
+had written down: the far-end shortening (`2*RAY_EPS`) was *larger* than the origin push
+(`RAY_EPS`), so a shadow ray that kept the direction and length computed from the unmoved
+point still stopped short of its target. A 256-ulp push toward the light breaks that whenever
+the light is nearer than ~3x the shading point's coordinate magnitude: the far end overshoots
+the sampled emitter point by push·cos(a), lands inside the emitter, and the sample is thrown
+away as occluded (at |p| = 5000 the push is 0.125 units against a 6e-3 shortening). Hence
+`occludedTo(sc, o, target, eps)`: every occlusion query with a specific far-end point is
+re-aimed *from the moved origin* (PBRT's `SpawnRayTo`; 25 sites), and `connMaxT` gained a
+`coordMag` term — 8 float ulps of the target's largest coordinate — because at |p| ~ 5e4 the
+target's own quantisation (4e-3) is as large as `dist*1e-5`. The estimator's G, pdfs and
+directions are untouched; the four scene-exit rays (sun cone, environment) keep plain
+`occluded()`.
+
+**Validation (GPU vs the double CPU build unless stated):**
+
+| check | before | after |
+|---|---|---|
+| `scraps/rbnm_d1.ftsl` mode B `absorbed=` (CPU 0.0009, independent walk 0.00087) | **0.1525** | **0.0009** |
+| `scraps/rb_val_hg.ftsl` — the original 2026-07-23 repro, medium included (CPU 0.0008) | **0.1525** | **0.0008** |
+| `scraps/rbnm_far5000.ftsl` mode R / D | −97.1 % / −97.0 % | +0.61 % / +0.61 % |
+| `scraps/rbnm_far20000.ftsl` mode R / D | −96.6 % / — | +0.62 % / +0.59 % |
+| `scraps/rbnm_far50k.ftsl` mode R / D | −95.6 % / — | +0.61 % / +0.57 % |
+| `scraps/rbnm_far5000_lightnear.ftsl` mode R (light 5613 units away) | −99.9 % | +0.00 % |
+| `tools/check_distant_light.py` far / near | +0.61 % / +0.61 % | +0.62 % / +0.62 % |
+| `_cornell_diffuse` R / B / D | +0.02 / −0.02 / +0.12 % | +0.02 / −0.02 / +0.12 % |
+| `_slab_ss` closed-form gate, mode D (Q1..Q4 flat) | 4.40928e9 | 4.40934e9 |
+| `_glass_tint` R mean / `_mirror_sphere_fwd` B mean | −0.05 % / −0.01 % | −0.01 % / −0.01 % |
+
+The +0.6 % on the translated and distant-light scenes is the ordinary fp32-vs-double envelope
+(it is identical in the near control), not a residual of either bug.
 
 ### PERF — DONE (2026-07-23): interactive `-explore`/`-fly` felt intermittently slow (GPU parked in its idle power state between mouse-look bursts)
 
