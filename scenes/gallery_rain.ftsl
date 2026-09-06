@@ -71,8 +71,9 @@
 # --- Why the sun is a real `light sun` (it used to be a distant sphere) ---------------
 # Mode D is the only mode that renders BOTH this scene's bounded heterogeneous media and
 # its directly-seen glass and chrome. (Forward A/B/C do the media but leave a directly-seen
-# dielectric black, which is most of this room; R and the P composite shade the glass but
-# flatten every bounded medium into one global homogeneous haze; see README "Modes".) So
+# dielectric black, which is most of this room; R and the P composite shaded the glass but,
+# until 0.254.0, flattened every bounded medium into one global homogeneous haze — they now
+# superpose the media properly, so that half of the reason is history; see README "Modes".) So
 # whatever the sun is, mode D has to accept it — and when this scene was written it did not
 # accept `light sun`: a delta light was not connectible in BDPT at all, and after v0.124.0
 # made it connectible on the CPU the GPU BDPT kernels still rejected it, which would have

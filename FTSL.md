@@ -2218,7 +2218,7 @@ a faint global haze). The forward tracer superposes them physically: extinction 
 so total transmittance is the *product* of the per-medium transmittances, and each
 collision is drawn from the *earliest* of the media's independent free-flights (with
 the winning medium's albedo/`g` driving the scatter). A scene with a single `medium`
-is bit-identical to before. *(Superposition is a forward-mode feature — see the mode
+is bit-identical to before. *(Since 0.254.0 every render mode superposes — see the mode
 note at the end of §12.1.)*
 
 ### 12.1 Bounded and heterogeneous fog (blobs)
@@ -2370,10 +2370,12 @@ to before.
 > connections weighted by ratio-tracking transmittance, exactly as the forward tracer
 > samples them. (The MIS weights omit the heterogeneous transmittance — a variance-only
 > PBRT-v3 simplification; the balance heuristic is a partition of unity, so the estimator
-> stays unbiased regardless.) The backward reference (R/V) and the camera-side layer of the
-> P composite treat the medium as a single global homogeneous haze and **ignore** `density`
-> and `bounds` (the renderer warns when you do this). Render heterogeneous fog for those
-> modes with a forward mode instead.
+> stays unbiased regardless.) **Since 0.254.0 the backward reference (R/W/V), the camera-side
+> layer of the P composite and mode M's `-pmfg` final gather superpose the media too**, each
+> region with its own `bounds`, `density` field and phase function, on both devices — so every
+> mode now renders the fog you authored. (Before 0.254.0 the CPU backward tracer collapsed the
+> list to the *first* medium as an unbounded homogeneous haze and warned when it did; there is
+> no longer any reason to prefer a forward mode or `-device gpu` for heterogeneous fog.)
 
 ### Volumetric blackbody emission ("fire")
 
