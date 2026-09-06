@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### UPBP-VM — OPEN (2026-09-06, v0.258.0): mode `J`'s surface point merges (`-jsurf`, the half folded in from mode `U`) are **opt-in and CPU-only**, so mode `U` cannot be retired yet and a `-jsurf` render cannot use the GPU
+### UPBP-VM — OPEN, narrowed (2026-09-06, v0.260.0): mode `J`'s surface point merges (`-jsurf`) are **on by default on the CPU** since 0.260.0 — all three gates green — but have **no device twin**, so a GPU mode-`J` run is still the two-technique estimator and mode `U` cannot be retired yet
 
 **What shipped in v0.258.0.** Mode `J` now has a *second* merge kind. The same light subpaths that
 deposit photon beams into the medium also deposit **surface photons** at every non-delta surface
@@ -67,14 +67,34 @@ three gates pass:
      1024 spp against `U`'s 1024, since `J`'s refresh cadence was tuned for an expensive *beam* map.
      Worth revisiting for the surfaces-only case; not a blocker, and folded into **UPBP-CONV**.
 
-3. **Gate 3 (three-way) — not yet run.** A scene with media *and* surfaces must not brighten or
-   darken against a long mode-`R` / mode-`D` reference — i.e. the three-technique denominator really
-   does sum to one. This is the only gate left before `-jsurf` flips to default-on. Note it is
-   entangled with the separately-tracked **+9…+17 % volume residual** in the beam-merge weight (its X-channel part was `UPBP-CHROMA`, fixed in 0.259.3; a colour-neutral +3…8 % mean remains at 120 s): gate
-   3 cannot be read cleanly until that is understood, since a three-way run inherits it.
+3. **Gate 3 (three-way) — GREEN (0.259.3 binary, after `UPBP-CHROMA`).** `_fog_cornell.ftsl`
+   (fog + coloured walls + dispersive glass) at 600 s on the CPU, `-mode J` against
+   `-mode J -jsurf`, both against a 300 s mode-`D` GPU reference (per channel, mean / median):
 
-Until those are green, `-jsurf` stays opt-in; when they are, it flips to default-on and `-nojsurf`
-becomes the opt-out exactly as `-nobeams` is today, and mode `U` becomes a deprecated alias.
+   | run | X | Y | Z |
+   |---|---|---|---|
+   | `-mode J` vs `D` | −6.9 % / −20.5 % | −0.1 % / −18.1 % | −1.2 % / −14.1 % |
+   | `-mode J -jsurf` vs `D` | −7.7 % / −19.3 % | −0.4 % / −17.0 % | −1.1 % / −13.1 % |
+   | `-mode J -jsurf` vs `-mode J` (the gate) | −0.86 % / −0.10 % | −0.27 % / −0.07 % | +0.12 % / −0.04 % |
+
+   Switching the third technique in moves the energy by X −0.86 % / Y −0.27 % / Z +0.12 % mean, per-pixel medians within 0.1 % — inside the run-to-run noise of
+   the two-technique estimator itself — so the three-technique denominator does sum to one. The
+   colour-neutral residual both runs share against `D` is the merge estimator's convergence tail
+   at this budget (UPBP-CONV / UPBP-W), no longer entangled with a spectral error.
+   One thing to keep an eye on there: X sits ~5 % below Y in both 600 s runs (and ~4 % at
+   120 s) — small enough to be the tail, but consistent in sign across budgets and runs.
+
+**Flipped in 0.260.0.** `-jsurf` is on by default and `-nojsurf` is the opt-out, exactly as
+`-nobeams` — *on the CPU*. On the GPU the default yields to the two-technique estimator with a
+notice, because the device merge weight carries one merge kind and the choice has to be made
+before the light pass (a light pass that deposited surface photons would under-weight the beam
+merges in the device gather); an explicit `-jsurf` forces the CPU as before.
+
+**What remains before mode `U` can retire:** a device twin of the surface merges — the device
+`BeamMis` needs the second primed accumulator (`sumMs`) and its `kappa`, plus a device surface
+photon map and a per-camera-vertex gather mirroring `bdpt::SurfMergeWeight` — so that a GPU
+mode-`J` run is the same three-technique estimator the CPU now runs by default. Until then
+mode `U` is the only way to get vertex merging on the GPU, and stays.
 
 **The CPU-only gate is a correctness gate, not a missing feature.** `render_cuda.cu`'s device
 `DBeamMis` carries a **single** merge kind. A `-jsurf` render on the GPU would therefore not merely

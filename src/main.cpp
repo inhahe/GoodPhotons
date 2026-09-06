@@ -13082,13 +13082,19 @@ static bool g_noBeams = false;
 // runs BDPT connections, beam x ray merges in the media AND vertex merges on the surfaces,
 // all under one balance heuristic, which is a strict superset of what either mode does alone.
 //
-// OPT-IN FOR NOW, deliberately, and on a schedule rather than forever: the weight is new (see
-// bdpt::SurfMergeWeight) and mode J's default has to stay the thing the existing validation
-// suite measured until the point merges have been checked against mode U on a surfaces-only
-// scene and against mode J itself on a media one. When that lands, this flips to default-on
-// and `-nojsurf` becomes the opt-out, exactly as `-nobeams` is today. Tracked in
-// known-issues.md under UPBP-VM.
-static bool g_jSurf = false;
+// ON BY DEFAULT since 0.260.0, once all three UPBP-VM gates were green: bit-identity with
+// mode D when both merge kinds are off, agreement with mode U on a surfaces-only scene, and
+// no energy shift on a media+surfaces scene when the third technique is switched in (the
+// three-way balance heuristic sums to one). `-nojsurf` is the opt-out, exactly as `-nobeams`.
+//
+// WHERE IMPLEMENTED means the CPU: the device merge weight carries one merge kind, so a GPU
+// run cannot deposit surface photons at all (a light pass that did would under-weight the
+// beam merges in the device gather). The default therefore yields to the two-technique
+// estimator on the GPU, with a notice; an EXPLICIT -jsurf is a request for the three-way
+// estimator and forces the CPU as it always has. The device twin is what still stands
+// between mode U and retirement. Tracked in known-issues.md under UPBP-VM.
+static bool g_jSurf = true;
+static bool g_jSurfExplicit = false;   // -jsurf / -jsurf-radius named on the command line
 // -jsurf-radius: the gather disc's radius r_s in world units. 0 = auto, meaning the same
 // `sceneRadius * g_pmRadiusFactor` (`-pmradiusfrac`) that modes M/S/U start from — mode J's
 // merges deliberately share the photon-map radius convention so a like-for-like comparison
@@ -16158,11 +16164,25 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // refuses, so the flag forces the CPU and says so. Lift this when the surface map is
         // ported (render_cuda.cu's host->device BeamMis copy has the marker).
         if (g_jSurf && useGpu) {
-            std::fprintf(stderr, "[device] mode J: -jsurf (surface point merges) is CPU-only "
-                                 "— the device merge weight carries one merge kind. Using the "
-                                 "CPU; pass -nojsurf to render the beams-only estimator on "
-                                 "the GPU.\n");
-            useGpu = false;
+            // Decided HERE, before the light pass: the device merge weight carries one merge
+            // kind, so a GPU run must not deposit surface photons at all (a light pass that did
+            // would under-weight the beam merges in the device gather). The default (on since
+            // 0.260.0) yields to the two-technique estimator on the GPU; an explicit -jsurf is a
+            // request for the three-way one and forces the CPU. UPBP-VM tracks the device twin.
+            if (g_jSurfExplicit) {
+                std::fprintf(stderr, "[device] mode J: -jsurf (surface point merges) is CPU-only "
+                                     "— the device merge weight carries one merge kind. Using the "
+                                     "CPU; pass -nojsurf to render the beams-only estimator on "
+                                     "the GPU.\n");
+                useGpu = false;
+            } else {
+                std::fprintf(stderr, "[device] mode J on the GPU renders the two-technique "
+                                     "estimator (connections + beam merges): the surface point "
+                                     "merges that are on by default on the CPU have no device twin "
+                                     "yet (known-issues UPBP-VM). Pass -jsurf to force the CPU "
+                                     "three-way estimator.\n");
+                g_jSurf = false;
+            }
         }
         const std::string camWhere =
             useGpu ? std::string("GPU") : (std::to_string(nThreads) + " CPU threads");
@@ -18737,13 +18757,15 @@ static int run(int argc, char** argv) {
             g_beamTarget = (long long)std::atof(argv[++i]);
             g_beamTargetSet = true;   // mode J only mentions its knee fallback when this is absent
         }
-        else if (!std::strcmp(argv[i], "-jsurf") || !std::strcmp(argv[i], "-jmerge-surf"))
-            g_jSurf = true;
-        else if (!std::strcmp(argv[i], "-nojsurf") || !std::strcmp(argv[i], "-no-jsurf"))
-            g_jSurf = false;
+        else if (!std::strcmp(argv[i], "-jsurf") || !std::strcmp(argv[i], "-jmerge-surf")) {
+            g_jSurf = true; g_jSurfExplicit = true;
+        }
+        else if (!std::strcmp(argv[i], "-nojsurf") || !std::strcmp(argv[i], "-no-jsurf")) {
+            g_jSurf = false; g_jSurfExplicit = false;
+        }
         else if (!std::strcmp(argv[i], "-jsurf-radius") && i + 1 < argc) {
             g_jSurfRadius = std::atof(argv[++i]);
-            g_jSurf = true;      // naming the radius is asking for the merges
+            g_jSurf = true; g_jSurfExplicit = true;   // naming the radius is asking for the merges
         }
         else if ((!std::strcmp(argv[i], "-jsurf-count") ||
                   !std::strcmp(argv[i], "-jsurfcount")) && i + 1 < argc) {

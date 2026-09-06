@@ -3273,6 +3273,11 @@ as the one at fault.
   `dIsDeltaEmitter` and the area path keeps its RNG draw order.
 - **`surfmerge.h`** (0.258.0) — the **surface photon map mode `J` merges against**, i.e. the
   half folded in from mode `U`. Three things live here and nowhere else:
+  **On by default on the CPU since 0.260.0** — all three UPBP-VM gates green (gate 3: switching the
+  third technique in on `_fog_cornell` moved the image by X −0.86 % / Y −0.27 % / Z +0.12 % mean,
+  medians within 0.1 %). On the GPU the default yields to the two-technique estimator, because the
+  device merge weight carries one merge kind and the choice has to be made before the light pass;
+  an explicit `-jsurf` forces the CPU. The device twin is what remains before mode `U` retires.
 
   * **`SurfPhoton`** — a light-subpath vertex on a surface: position, `wo` toward the previous
     (light-side) vertex, λ, β, the precomputed CIE triple (the same trick that bought mode `M`
