@@ -5,6 +5,125 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### VOLCACHE — OPEN (2026-09-06, v0.257.0): the radiance cache covers diffuse *surfaces* only, so the volumetric gather — which is where ~all of a `gallery_rain` frame's time actually goes — is recomputed in full every frame of a flyby
+
+**The measurement that motivates this.** A flyby amortises the forward pass across frames, and
+that is a real saving, but it is the wrong 2 %. From `png/barsdiag/R_mverify_s11.log` (mode `M`,
+CPU, 640×360, `-time 300`):
+
+| Phase | Cost |
+|---|---|
+| forward pass, 2 M photons → 878 641 deposits | **5.02 s** |
+| beam split + BVH build | **0.73 s** |
+| **camera gather, 37 spp** | **~300 s** |
+
+So the reusable part is **under 2 %** of a frame; freeze it across a 200-frame flyby and the whole
+saving is six seconds. Everything expensive is per-frame, because a photon-map gather is not a
+lookup, it is a *search*: the same log reports `target 192` photons per surface gather and
+`a probe ray gathers 80.2 beams`, each beam costing a closest-approach solve, a phase evaluation
+and **two ratio-tracking transmittance marches**. Mode `D` pays about two ray casts at the same
+vertex. That is why photon mapping does not win on speed here — it is a *variance-reduction*
+technique that costs more per sample and wins only when it buys enough noise reduction to pay
+for that (caustics, SDS, deep multiple scattering).
+
+**The fix is the one games use, applied to the half that can take it.** Games hit framerate by
+baking the *gather result* — not the photons — into a lightmap or an irradiance probe, so the
+runtime does a texture fetch. What that costs is view-independence, which is why it is only ever
+applied to low-frequency diffuse indirect. The same split works here:
+
+* **Cacheable:** the multiple-scattering, low-frequency in-scatter wash inside a medium. Slowly
+  varying in space, nearly isotropic after a few scatters — exactly the profile `radcache.h`
+  already exploits for surfaces.
+* **NOT cacheable, must stay per-frame:** view-dependent single scatter. In `gallery_rain` that
+  is the whole point — a rainbow's colour at a point is a function of the angle between the view
+  ray and the sun, so there is no view-independent value to bake. This is precisely why beams are
+  stored *with their direction* and the phase function is evaluated per frame (see the
+  gather-time spectral fold), and any cache that flattened it would destroy the bow.
+
+**What exists already.** `src/radcache.h` (`-radcache`, opt-in, biased, off by default) is a
+world-space cache of *indirect irradiance at diffuse surfaces*, fed by a dedicated update pass
+rather than by camera paths (the header explains why: data starvation and a selection-bias
+minefield). It already survives camera motion and resume — "a resumed flyby recycles the cells
+that had gone stale before" — and recycles slots that leave the frame. So the persistence,
+confidence gating, cumulative mean/variance and slot recycling are all built and validated.
+
+**What is missing.** The cache has no notion of a *medium* cell: nothing caches in-scatter, so
+`-radcache` does nothing for the 80-beams-per-probe cost above. The work is to add a volumetric
+cell type storing the multiple-scatter in-scatter (order ≥ 2, matching `-beams-order`), leave
+single scatter to the existing per-frame beam gather, and gate it on the same confidence test.
+Keep it **opt-in and biased-by-declaration** like the surface cache — mode `R` must stay
+bit-for-bit unbiased with no `-radcache` on the command line.
+
+**Sequencing note.** This overlaps `UPBP-CONV` (making the beam gather cheap enough that mode `J`
+wins at equal time) and is arguably the better attack on it: caching removes the work rather than
+optimising it. Do the profiling half of `UPBP-CONV` first — an exact per-frame split of light
+pass vs surface gather vs beam gather — since it sizes both.
+
+### FOLD-GLOSSY — OPEN (2026-09-06, v0.257.0): `Glossy` still retires the spectral claim in both forward tracers even though its lobe *geometry* is wavelength-free, so a λ-dependent glossy albedo drops a beam to monochromatic where a diffuse one would now fold
+
+Fallout from `UPBP-BOWFOLD`. 0.257.0 established the right rule — retire only on wavelength-
+**divergence**, absorb mere wavelength-**dependence** into `foldT[]` / `beamW[]` — and applied it
+to `Diffuse` and `DiffuseTransmit`. `Glossy` was left out, but by the new rule it does not
+obviously belong out: a microfacet lobe's *sampling* is λ-independent, so all wavelengths still
+travel the same chord, which is the actual test. Only its albedo/Fresnel varies with λ, and that
+is exactly the ratio the fold was built to carry.
+
+**Where it lives.** `src/render.h:3210` groups `Glossy` with `Hair` / `Fluorescent` in the
+specular retirement; `src/bdpt.h`'s material switch mirrors it. Hair and fluorescence belong
+there permanently (they really do send wavelengths different ways); `Glossy` is there by
+inheritance from the 0.210.0 all-or-nothing rule.
+
+**Constraint that makes this non-trivial: it must change in BOTH tracers in one commit.**
+`tracePhoton` (mode `M`) and `randomWalk` (mode `J`) deposit into the *same* `PhotonBeam` records
+read back by the *same* gather. If one folds glossy and the other retires it, two beams in one
+bank disagree about what `power`, `cieA` and `wS` mean. This is why `foldWorthIt` was hoisted to
+a free function in `render.h` in the first place — the shared verdict is the enforcement point,
+so the change is: evaluate the glossy lobe's albedo on `foldLam[]` + `bs.lam[]`, run the existing
+`foldWorthIt` second-moment guard on it, and let the guard decline the saturated cases.
+
+**Caveat on the payoff.** Likely small on `gallery_rain`, which has little glossy in the cloud /
+rain crops — the fold's residual there is already attributed to `chroma-medium` (8.53 %) and
+`specular` (1.35 %), and only part of that 1.35 % is glossy. Measure with `FTRACE_FOLDDIAG=1`
+first to size it, on a scene with a coloured glossy surface in the volume (Alice's dress would
+do). If it is worth <0.5 % coverage, log that and close it as not worth the divergence risk.
+
+### RASTER-PBR — OPEN (2026-09-06, v0.257.0): `-explore` / `-raster` cannot show a glossy material at all, so an asset whose look depends on its specular lobe (Alice's dress) previews flat — where a web viewer like Meshy shows it correctly in real time
+
+**The gap, in the code's own words.** `src/raster.h`'s header: *"There is NO transparency,
+refraction, reflection, shadows, caustics or global illumination… **Glossy lobes do not exist
+here either, so roughness/film-thickness maps are ignored by design**."* Shading is
+diffuse + headlight. Everything about a surface's *albedo* is already previewed well (image
+skins, palettes, procedural patterns on albedo and emission, normal maps, per-pixel `mix`
+resolution through `weight_map`), so the missing piece is specifically the specular response.
+
+**Why a real-time viewer can do this and we are not "cheating" by copying it.** Meshy et al. are
+glTF PBR rasterisers using the **split-sum approximation**: prefilter the environment into a
+roughness-indexed mip chain, precompute the 2-D BRDF integration LUT (the DFG term), then
+specular ≈ `prefiltered(R, roughness) · (F0·A + B)` — two texture fetches. That is the *same
+idea* as the radiance cache in `VOLCACHE` above: prefilter a light field over direction so the
+runtime only does a lookup, accepting view-independence of the *environment* (not of the view
+vector) as the price.
+
+**Proposed work.**
+1. Build an irradiance representation for diffuse (SH9 is ample) and a roughness-mipped
+   prefiltered specular cubemap, from the scene's environment/emitters, once at raster setup.
+2. Add the analytic DFG LUT (Karis' approximation avoids shipping a texture).
+3. Shade `Glossy` (and the specular half of `Layered`) through it; honour `roughness` maps, which
+   are currently ignored.
+4. Optionally a single shadow map for the dominant emitter — the biggest remaining "looks wrong"
+   cue after specular, and cheap.
+
+**Scope discipline.** This is a *preview*, and the header's promise that it shows composition and
+flyby motion "in a fraction of a second per frame" is the constraint to hold. `-raster-bench <n>`
+already reports steady-state ms/frame, so there is a ready regression metric: land this without
+materially moving that number. It must not become a second renderer — mode `W` and the forward
+modes remain the physical answer, and nothing here feeds light transport.
+
+**Note on the fur case.** The creature scenes tessellate to ~1 M fur segments
+(`[fur]` lines in any `gallery_rain` log), which is a different problem from previewing a single
+GLB; expect the mesh-file / single-asset case to hit interactive rates long before a full furred
+scene does. Judge success on the asset-viewer case first.
+
 ### UPBP-BOWFOLD — **DONE** (2026-09-05, fixed in v0.257.0): mode `J`'s rain was noisier than mode `D`'s because the `-beamspec` bundle was capped at ~36 % coverage — `PhotonBeam` stored no per-member weight, so the bundle died at the first λ-dependent event
 
 **Not a correctness bug.** Mode `J` is unbiased on the rain (+2.0 % / +4.1 % against the
