@@ -16,19 +16,25 @@ light ~24% too dark. It went unnoticed for six weeks because it was mis-filed as
 participating-media bug (it reproduces with no medium at all) and because no scene in the
 repo put a light thousands of units from its geometry. This gate is that missing scene.
 
-It renders BOTH halves of the pair:
+It renders three scenes:
 
-  * ``scenes/_distant_light.ftsl``      -- light ~6325 units away (the regime that broke)
+  * ``scenes/_distant_light.ftsl``      -- light ~6325 units away (the regime GPU-NEE-EPS broke)
   * ``scenes/_distant_light_near.ftsl`` -- the same scene scaled by 0.1 (the control)
+  * ``scenes/_distant_geometry.ftsl``   -- the near scene translated to |p| ~ 5000: quad,
+    camera and light all far from the origin, with the light NEARER than the shading
+    point's coordinate magnitude (the regime GPU-ORIGIN-EPS broke, twice -- first the
+    absolute origin offset rounding away, then un-re-aimed shadow rays overshooting the
+    sampled emitter point after a scale-correct push)
 
 and compares ``-device gpu`` against ``-device cpu`` for each. Comparing the two devices
 rather than against a stored golden image is deliberate: the double CPU build is the
 reference, so the gate keeps working when sampling changes legitimately alter both.
 
-The control matters. If both halves fail, something generic is broken (the device build,
-the emitter sampler). If only the far half fails, it is specifically the float-magnitude
-regime -- which is the failure this exists to catch, and a single scene could not
-distinguish the two.
+The control matters. If all three fail, something generic is broken (the device build, the
+emitter sampler). If only the far-light scene fails, a far-end shortening has gone absolute
+again (``connMaxT``). If only the far-geometry scene fails, a ray ORIGIN has gone absolute
+again, or an occlusion query is no longer re-aimed from its moved origin (``dOffsetAlong`` /
+``occludedTo``). A single scene could not distinguish these.
 
 Usage::
 
@@ -50,8 +56,9 @@ _OUT = os.path.join(_REPO, "png")
 
 # (scene, label, why it is here)
 _PAIR = (
-    ("_distant_light",      "far  (~6325 units)", "the regime GPU-NEE-EPS broke"),
-    ("_distant_light_near", "near (~632 units)",  "control: same image, smaller floats"),
+    ("_distant_light",      "far light (~6325 units)",  "the regime GPU-NEE-EPS broke"),
+    ("_distant_light_near", "near      (~632 units)",   "control: same image, smaller floats"),
+    ("_distant_geometry",   "far geometry (|p|~5000)",  "the regime GPU-ORIGIN-EPS broke, twice"),
 )
 
 
@@ -129,7 +136,7 @@ def main():
     print("GPU-vs-CPU parity for distant lights (mode %s, %ds/render, tol +-%.1f%%)"
           % (a.mode, a.time, a.tol))
     print()
-    print("%-22s %10s %8s   %s" % ("scene", "GPU/CPU", "verdict", "role"))
+    print("%-26s %10s %8s   %s" % ("scene", "GPU/CPU", "verdict", "role"))
     bad = 0
     for scene, label, why in _PAIR:
         cpu = render(scene, "cpu", a.mode, a.time)
@@ -138,17 +145,19 @@ def main():
         off = 100.0 * (ratio - 1.0)
         ok = abs(off) <= a.tol
         bad += not ok
-        print("%-22s %+9.2f%% %8s   %s" % (label, off, "ok" if ok else "FAIL", why))
+        print("%-26s %+9.2f%% %8s   %s" % (label, off, "ok" if ok else "FAIL", why))
 
     print()
     if bad:
         print("FAILED: the float32 device disagrees with the double CPU reference.")
-        print("If ONLY the far scene failed, the shadow-ray end-shortening has gone")
-        print("absolute again -- see connMaxT() in src/render_cuda.cu and the")
-        print("GPU-NEE-EPS entry in known-issues.md. If BOTH failed, suspect something")
-        print("generic (the device build, the emitter sampler) rather than precision.")
+        print("Only the far-LIGHT scene: a shadow-ray end-shortening has gone absolute again")
+        print("  (connMaxT, known-issues GPU-NEE-EPS).")
+        print("Only the far-GEOMETRY scene: a ray origin has gone absolute again, or an")
+        print("  occlusion query is no longer re-aimed from its moved origin (dOffsetAlong /")
+        print("  occludedTo, known-issues GPU-ORIGIN-EPS).")
+        print("All three: suspect something generic (the device build, the emitter sampler).")
     else:
-        print("PASS: both magnitude regimes agree across devices.")
+        print("PASS: all three magnitude regimes agree across devices.")
     return 1 if bad else 0
 
 

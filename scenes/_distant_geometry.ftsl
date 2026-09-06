@@ -1,0 +1,25 @@
+# Third case of the device-parity gate (tools/check_distant_light.py): far GEOMETRY.
+#
+# scenes/_distant_light_near.ftsl translated by +5000 in z: the quad, the camera and the
+# light all sit at |p| ~ 5000, where one float ulp is 4.9e-4. Same angles, same ratios, same
+# image as the near scene -- only the coordinate magnitudes differ.
+#
+# This is the regime the far-LIGHT scenes do not exercise, and it broke twice on 2026-09-06
+# (known-issues.md GPU-ORIGIN-EPS): first the absolute 1e-4 ray-origin offset rounded away
+# here, then the scale-correct replacement pushed shadow-ray origins toward a light that is
+# nearer (613 units) than the shading point's coordinate magnitude, so un-re-aimed rays
+# overshot the sampled emitter point and 97 % of NEE samples were discarded as occluded.
+# Both failures are invisible on the other two gate scenes, whose lights are far away
+# relative to their geometry.
+
+scene { units meters  spectral 360 830 1 }
+
+material "dark" { type diffuse reflect rgb 0.02 0.02 0.02 }
+quad { origin -40 -30 5013.5   u 80 0 0   v 0 60 0   material dark }
+
+light sphere { center 0 200 4400   radius 6   spd preset:bb6500   lumens 3e13 }
+
+camera "cam" {
+    eye 0 0.16 5000   look_at 0 -1.68 5009.49   up 0 1 0   fov_y 100
+    film { res 160 120 }
+}
