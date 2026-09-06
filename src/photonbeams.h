@@ -311,12 +311,28 @@ struct PhotonBeam {
                      // each contributes its own sigma_s and its own phase function.
 
     // SPECTRAL BUNDLE (see the note above). `lamS[0..nSec)` are the stratified SECONDARY
-    // wavelengths this chord also carries; `lambda` is the hero. Every wavelength in the
-    // bundle carries the same power `power / nLam()`, because the emission sampler's pdf is
-    // proportional to the emitter's own SPD, so spd(lambda)/pdf(lambda) is the SPD's integral
-    // for every wavelength alike — there is no per-wavelength weight to store. nSec == 0 is
-    // the classic monochromatic beam and every code path collapses to the old arithmetic.
+    // wavelengths this chord also carries; `lambda` is the hero. Each member starts life with
+    // the same power `power / nLam()`, because the emission sampler's pdf is proportional to
+    // the emitter's own SPD, so spd(lambda)/pdf(lambda) is the SPD's integral for every
+    // wavelength alike. nSec == 0 is the classic monochromatic beam and every code path
+    // collapses to the old arithmetic.
+    //
+    // `wS[i]` is member i's RELATIVE spectral throughput, T(lamS[i]) / T(lambda) — the hero's
+    // weight is 1 by construction and is not stored. Member i's flux at `o` is therefore
+    // `power / nLam() * wS[i]`.
+    //
+    // WHY THIS FIELD EXISTS (0.257.0). Before it, the bundle could only be kept while every
+    // member's throughput stayed IDENTICAL, so the tracer retired the whole bundle after one
+    // transport iteration and it reached ~36% of the chords a rainbow scene deposits. That is
+    // a stricter rule than physics needs: a wavelength-DEPENDENT event does not invalidate the
+    // bundle, it just makes the members' weights diverge — which is exactly what one float per
+    // member records. With `wS` the bundle survives every event whose spectral factor can be
+    // evaluated at all four wavelengths, and only a wavelength-DIVERGENT event (one that would
+    // send the members down different geometric paths — refraction through dispersive glass, a
+    // per-wavelength sampled direction) still retires it. Same rule `achroPath` already used
+    // for the deposit-time fold, and it reaches ~84% of chords instead of 36%.
     float lamS[kBeamSecMax];
+    float wS[kBeamSecMax];
     int   nSec;
 
     // ACHROMATIC-PATH FOLD (see the note above the struct). When `achro` is set this beam's
@@ -393,6 +409,8 @@ struct BeamBank {
 
     // `lamS`/`nSec` are the spectral bundle's secondaries (see PhotonBeam); pass nSec == 0
     // for a classic monochromatic deposit, which is what every non-spectral caller does.
+    // `wS` (optional) is the matching array of relative throughputs T(lamS[i])/T(lambda);
+    // null means all-1, which is what a bundle whose path never diverged spectrally carries.
     // `cieA` (optional) is the emitter's mean CIE for an ACHROMATIC-PATH beam; passing it
     // supersedes the bundle, since it is the exact limit the bundle was approximating.
     // `emIdx >= 0` asks for the GATHER-time fold (achro == 2): the caller has established that
@@ -401,7 +419,7 @@ struct BeamBank {
     void push(const Vec3& o, const Vec3& d, double len, double power,
               double lambda, double absorb, int med,
               const double* lamS = nullptr, int nSec = 0, const double* cieA = nullptr,
-              int emIdx = -1) {
+              int emIdx = -1, const double* wS = nullptr) {
         PhotonBeam b;
         b.o = o; b.d = d;
         b.s0 = 0.0f; b.len = (float)len; b.power = (float)power;
@@ -412,6 +430,8 @@ struct BeamBank {
         if (nSec > kBeamSecMax) nSec = kBeamSecMax;
         b.nSec = (lamS && nSec > 0 && !cieA) ? nSec : 0;
         for (int i = 0; i < kBeamSecMax; ++i) b.lamS[i] = (i < b.nSec) ? (float)lamS[i] : 0.0f;
+        for (int i = 0; i < kBeamSecMax; ++i)
+            b.wS[i] = (i < b.nSec) ? (float)(wS ? wS[i] : 1.0) : 0.0f;
         beams.push_back(b);
         if (cap && beams.size() >= cap) halve();
     }

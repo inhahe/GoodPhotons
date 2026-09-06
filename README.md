@@ -259,7 +259,9 @@ argument for standing a groom in a hall of polished objects.*
   surfaces. Beams are **on by default** here (a UPBP render without them is literally mode
   `D`); `-nobeams` turns them off, which reduces mode `J` to mode `D` bit-for-bit. Mode `J`
   builds its beam map from its **own BDPT light subpaths** (0.216.0), so there `-n` counts
-  light subpaths and `-beamspec` does not apply. **Leave `-n` off** (0.242.0): the map now
+  light subpaths and `-beamcount` does not apply. (`-beamspec` and `-beamachro` *do* apply,
+  since 0.251.0 / 0.250.0; 0.257.0 made the bundle survive a diffuse bounce, taking mode `J`'s
+  rain-curtain coverage from 36 % to 75 %.) **Leave `-n` off** (0.242.0): the map now
   sizes *itself* from a discarded pilot that measures where this scene's `-beamk` knee is —
   the beam count past which extra beams stop being free — and passing `-n` disables that.
   Left to itself it beat every hand-picked `-n` on a thick-medium equal-time test. Its absolute

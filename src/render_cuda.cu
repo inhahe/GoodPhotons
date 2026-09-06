@@ -5048,9 +5048,14 @@ struct DBeamRec {
     unsigned short lamS[3];
     unsigned char  nSec;     // 0 = classic monochromatic beam; <= kBeamSecMax
     unsigned char  pad;
-    // power / (nEmitted * nLam) WITHOUT the CIE fold — the shared per-record constant a
-    // secondary needs, since it supplies its own CIE triple. Unused when nSec == 0.
-    float pwSec;
+    // power / (nEmitted * nLam) * wS[k], WITHOUT the CIE fold — the per-secondary constant a
+    // member needs, since it supplies its own CIE triple. Unused when nSec == 0.
+    //
+    // This is ONE array rather than a shared scalar times `PhotonBeam::wS[k]` because the two
+    // always appear multiplied: folding the weight in here costs 8 bytes of record and saves a
+    // multiply in the innermost loop of the volume gather, which is the opposite of the trade
+    // the quantised `lamS` above is making.
+    float pwSec[3];
 
     __host__ __device__ float lamSec(int i) const { return 360.0f + (float)lamS[i] * 0.01f; }
     static unsigned short packLam(double lam) {
@@ -5370,14 +5375,14 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 // sigma_s * phase * CIE. `w / (ss * phase)` recovers the shared factor with one
                 // division instead of rebuilding the chain; both terms are known positive here.
                 if (b.nSec) {
-                    const double wShared = w / (ss * phase) * (double)b.pwSec;
+                    const double wShared = w / (ss * phase);
                     for (int k = 0; k < (int)b.nSec; ++k) {
                         const Real li = b.lamSec(k);
                         const double ssi = (double)specLookup(md.sigma_s, li) * dens;
                         if (!(ssi > 0.0)) continue;
                         const double phi = (double)dMedPhase(md, -cosT, li);
                         if (!(phi > 0.0)) continue;
-                        const double wi = wShared * ssi * phi;
+                        const double wi = wShared * (double)b.pwSec[k] * ssi * phi;
                         oX += (double)cieX(li) * wi;
                         oY += (double)cieY(li) * wi;
                         oZ += (double)cieZ(li) * wi;
@@ -16451,9 +16456,13 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
         r.pX = (float)(ci.x * w); r.pY = (float)(ci.y * w); r.pZ = (float)(ci.z * w);
         r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
         r.nSec = (unsigned char)b.nSec; r.pad = 0;
-        r.pwSec = (float)w;      // the same shared constant, minus the CIE fold
-        for (int k = 0; k < 3; ++k)
+        for (int k = 0; k < 3; ++k) {
+            // The same shared constant, minus the CIE fold, times this member's relative
+            // spectral throughput. `wS` is 1 for every member of a bundle whose path never
+            // diverged spectrally, so a pre-0.257.0 map uploads to exactly the old numbers.
+            r.pwSec[k] = (k < b.nSec) ? (float)(w * (double)b.wS[k]) : 0.0f;
             r.lamS[k] = (k < b.nSec) ? gpu::DBeamRec::packLam((double)b.lamS[k]) : (unsigned short)0;
+        }
         const double rm = bmap->radOf(b.med);
         r.invRad = (float)(rm > 0.0 ? 1.0 / rm : 0.0);
     }
@@ -17741,6 +17750,11 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 // beam, which is what every non-qualifying scene deposits.
                 b.nSec = (d.nSec < 0) ? 0 : (d.nSec > kBeamSecMax ? kBeamSecMax : d.nSec);
                 for (int k = 0; k < kBeamSecMax; ++k) b.lamS[k] = (k < b.nSec) ? d.lamS[k] : 0.0f;
+                // Per-member weights (0.257.0). The device tracer still retires the bundle at
+                // the first wavelength-DEPENDENT event rather than reweighting it, so every
+                // bundle it deposits is an equal-weight one and 1 is exact, not a placeholder.
+                // (Weighted deposit on the device is FOLD-GPU's other half; see known-issues.md.)
+                for (int k = 0; k < kBeamSecMax; ++k) b.wS[k] = (k < b.nSec) ? 1.0f : 0.0f;
                 // Achromatic-path fold (`-beamachro`): the emitter's mean CIE, used by
                 // BeamMap::build in place of CIE(lambda). Mutually exclusive with the bundle.
                 b.achro = d.achro ? 1 : 0;

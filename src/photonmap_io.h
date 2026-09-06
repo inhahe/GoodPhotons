@@ -18,18 +18,26 @@
 //      path, the two flags were silently mutually exclusive — `-savemap -beams` exited 0 and
 //      wrote nothing at all.
 //
-// Format. `FTPMP07\n` = header, surface block, beam block, CAUSTIC block. `FTPMP06\n`,
-// `FTPMP05\n` and `FTPMP04\n` have the same block layout but successively NARROWER beam
-// records (v6 lacks the gather-time spectral fold, v5 lacks that AND the deposit-time
-// achromatic fold, v4 lacks all three — see PhotonBeamV6 / PhotonBeamV5 / PhotonBeamV4 below);
-// `FTPMP03\n` (header + surface + beam) and `FTPMP02\n` (surface only) are older still.
-// Every one of them loads: a v6 file's beams widen to emIdx == -1, which is exactly the
+// Format. `FTPMP08\n` = header, surface block, beam block, CAUSTIC block. `FTPMP07\n`,
+// `FTPMP06\n`, `FTPMP05\n` and `FTPMP04\n` have the same block layout but successively NARROWER
+// beam records (v7 lacks the bundle's per-member weights, v6 lacks those AND the gather-time
+// spectral fold, v5 lacks all that AND the deposit-time achromatic fold, v4 lacks all four —
+// see PhotonBeamV7 / PhotonBeamV6 / PhotonBeamV5 / PhotonBeamV4 below); `FTPMP03\n` (header +
+// surface + beam) and `FTPMP02\n` (surface only) are older still.
+// Every one of them loads: a v7 file's beams widen to wS == 1, which is exactly the
+// equal-weight bundle they were saved as; a v6 file's widen to emIdx == -1, which is exactly the
 // deposit-time-folded beam they were saved as; a v5 file's widen to achro == 0, which is
 // exactly the per-wavelength beam they were saved as; a v4 file's additionally widen to
 // nSec == 0, which is exactly the monochromatic beam they were saved as; a v3 file simply has
 // every deposit in the global map, which is the pre-0.199.7 single-map behaviour; a v2 file
 // additionally reports no beams. So no existing cache is invalidated by any of these changes —
 // each just re-gathers as the render it was saved from.
+//
+// NOTE ON THE wS WIDENING SPECIFICALLY: unlike the achromatic one below, `wS = 1` is exact and
+// not merely safe. A v7 bundle could only exist on a path along which every member's spectral
+// throughput was IDENTICAL — that was the condition the tracer required before 0.257.0 — so its
+// members' relative weights were all 1 by construction, and writing 1 reproduces the file's own
+// estimator bit for bit rather than approximating it.
 //
 // NOTE ON THE ACHROMATIC WIDENING SPECIFICALLY: `achro == 0` is not merely a safe default, it is
 // the CORRECT one. A cached beam has no record of the emitter it came from, so the fold constant
@@ -110,10 +118,28 @@ struct PhotonBeamV6 {
     float cieA[3];
     unsigned char achro;
 };
+// The FTPMP07 beam record, frozen — the same story one version on again. Widening `PhotonBeam`
+// for the spectral bundle's PER-MEMBER WEIGHTS (0.257.0: `float wS[kBeamSecMax];`) changed its
+// size a fourth time. A v7 file read at the live stride would be garbage beams, not a parse
+// error. Reading it through THIS layout and setting every `wS` to 1 is exact, not approximate:
+// see the note at the top of this file.
+//
+// Same rule as the three above: never edit this. The next widening adds a PhotonBeamV8.
+struct PhotonBeamV7 {
+    Vec3  o;
+    Vec3  d;
+    float s0, len, power, lambda, absorb;
+    int   med;
+    float lamS[3];
+    int   nSec;
+    float cieA[3];
+    unsigned char achro;
+    short emIdx;
+};
 static_assert(kBeamSecMax == 3,
-              "kBeamSecMax changed: PhotonBeam's on-disk width moved, so FTPMP07 no longer "
-              "describes the live record. Freeze the old layout as PhotonBeamV7 and bump the "
-              "magic to FTPMP08 — do NOT edit PhotonBeamV5 or PhotonBeamV6.");
+              "kBeamSecMax changed: PhotonBeam's on-disk width moved, so FTPMP08 no longer "
+              "describes the live record. Freeze the old layout as PhotonBeamV8 and bump the "
+              "magic to FTPMP09 — do NOT edit PhotonBeamV5, V6 or V7.");
 
 // Scene-identity guard: refuses to blend a stale cache into a different scene. Cheap and
 // coarse on purpose — it catches "wrong file", not "same scene, one triangle moved".
@@ -139,7 +165,7 @@ inline bool savePhotonMap(const char* path, const PhotonMap& pm,
                           const PhotonMap* pmCaustic = nullptr) {
     std::FILE* f = std::fopen(path, "wb");
     if (!f) { std::fprintf(stderr, "[savemap] cannot open %s for writing\n", path); return false; }
-    const char magic[8] = {'F','T','P','M','P','0','7','\n'};
+    const char magic[8] = {'F','T','P','M','P','0','8','\n'};
     long long nPh = (long long)pm.photons.size();
     double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
     bool ok = true;
@@ -205,22 +231,24 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
     char magic[8] = {0};
     long long nEmitted = 0, nPh = 0; double en[5] = {0,0,0,0,0}; uint64_t g = 0;
     bool ok = std::fread(magic, 1, 8, f) == 8;
-    const bool v7 = ok && std::memcmp(magic, "FTPMP07\n", 8) == 0;
+    const bool v8 = ok && std::memcmp(magic, "FTPMP08\n", 8) == 0;
+    const bool v7 = v8 || (ok && std::memcmp(magic, "FTPMP07\n", 8) == 0);   // v8 ⊃ v7 blocks
     const bool v6 = v7 || (ok && std::memcmp(magic, "FTPMP06\n", 8) == 0);   // v7 ⊃ v6 blocks
     const bool v5 = v6 || (ok && std::memcmp(magic, "FTPMP05\n", 8) == 0);   // v6 ⊃ v5 blocks
     const bool v4 = v5 || (ok && std::memcmp(magic, "FTPMP04\n", 8) == 0);   // v5 ⊃ v4 blocks
     const bool v3 = v4 || (ok && std::memcmp(magic, "FTPMP03\n", 8) == 0);   // v4 ⊃ v3 layout
     const bool v2 = ok && std::memcmp(magic, "FTPMP02\n", 8) == 0;
-    // Only the BEAM RECORD differs between v4, v5, v6 and v7; the block structure is identical
-    // from v4 on, which is why the flags above nest and only the record WIDTH distinguishes
-    // them. One number carries that, so the read and the skip-seek cannot disagree about the
-    // stride:
+    // Only the BEAM RECORD differs between v4..v8; the block structure is identical from v4 on,
+    // which is why the flags above nest and only the record WIDTH distinguishes them. One
+    // number carries that, so the read and the skip-seek cannot disagree about the stride:
     //   v4 -> PhotonBeamV4 (no bundle, no fold), v5 -> PhotonBeamV5 (bundle, no fold),
-    //   v6 -> PhotonBeamV6 (deposit-time fold), v7 -> the live PhotonBeam.
-    const long long beamRec = v7 ? (long long)sizeof(PhotonBeam)
-                                 : v6 ? (long long)sizeof(PhotonBeamV6)
-                                      : v5 ? (long long)sizeof(PhotonBeamV5)
-                                           : (long long)sizeof(PhotonBeamV4);
+    //   v6 -> PhotonBeamV6 (deposit-time fold), v7 -> PhotonBeamV7 (gather-time fold),
+    //   v8 -> the live PhotonBeam (per-member bundle weights).
+    const long long beamRec = v8 ? (long long)sizeof(PhotonBeam)
+                                 : v7 ? (long long)sizeof(PhotonBeamV7)
+                                      : v6 ? (long long)sizeof(PhotonBeamV6)
+                                           : v5 ? (long long)sizeof(PhotonBeamV5)
+                                                : (long long)sizeof(PhotonBeamV4);
     if (!v3 && !v2) {
         // Name the stale-version case explicitly: a user with a cache from before the
         // split layout should be told to re-deposit, not left guessing.
@@ -266,7 +294,7 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
             ftalloc::resize(bm->beams, (size_t)nBm, "the photon-beam map (-loadmap)",
                             "the beam count the map was saved with");
             bool rok;
-            if (v7) {
+            if (v8) {
                 rok = std::fread(bm->beams.data(), sizeof(PhotonBeam), (size_t)nBm, f) == (size_t)nBm;
             } else {
                 // Widen an older file in place. Read into the frozen old layout a chunk at a
@@ -275,18 +303,19 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
                 // a working -loadmap into an OOM on exactly the caches big enough to be worth
                 // saving. 64 K records is a few MB of scratch and one fread per 64 K beams.
                 //
-                // v4, v5 and v6 share this loop because widening is cumulative: a v4 record
-                // is a v5 record minus the bundle, and a v6 record is the live one minus
-                // `emIdx`. `common` fills the fields every generation has, and each absent
-                // generation's fields get the value that MEANS "this file predates it"
-                // (nSec = 0 for the bundle, achro = 0 for the deposit-time fold, emIdx = -1
-                // for the gather-time one).
+                // v4..v7 share this loop because widening is cumulative: a v4 record is a v5
+                // record minus the bundle, a v6 record is a v7 one minus `emIdx`, and a v7
+                // record is the live one minus `wS`. `common` fills the fields every generation
+                // has, and each absent generation's fields get the value that MEANS "this file
+                // predates it" (nSec = 0 for the bundle, achro = 0 for the deposit-time fold,
+                // emIdx = -1 for the gather-time one, wS = 1 for the per-member weights).
                 //
                 // The two source vectors are read into by separate branches rather than aliasing
                 // one buffer through both struct types: the layouts share a prefix, but punning
                 // a PhotonBeamV5* to a PhotonBeamV4* is undefined behaviour, and an optimiser is
                 // entitled to reorder around it. The duplication is three lines; the alternative
                 // is a load that works until the day someone raises the optimisation level.
+                std::vector<PhotonBeamV7> chunk7;
                 std::vector<PhotonBeamV6> chunk6;
                 std::vector<PhotonBeamV5> chunk5;
                 std::vector<PhotonBeamV4> chunk4;
@@ -302,11 +331,35 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
                     // v7 added the GATHER-time fold. Nothing older can name an emitter, and -1
                     // is the right answer: the beam re-gathers exactly as the file was traced.
                     b.emIdx = -1;
+                    // v8 added the bundle's per-member weights. Every pre-v8 bundle was an
+                    // EQUAL-weight one by construction, so 1 is exact rather than merely safe.
+                    for (int k = 0; k < kBeamSecMax; ++k) b.wS[k] = 1.0f;
                 };
                 rok = true;
                 for (long long done = 0; done < nBm && rok; ) {
                     const size_t n = (size_t)std::min<long long>(65536, nBm - done);
-                    if (v6) {
+                    if (v7) {
+                        chunk7.resize(n);
+                        rok = std::fread(chunk7.data(), sizeof(PhotonBeamV7), n, f) == n;
+                        for (size_t i = 0; rok && i < n; ++i) {
+                            PhotonBeam& b = bm->beams[(size_t)done + i];
+                            const PhotonBeamV7& s = chunk7[i];
+                            common(b, s.o, s.d, s.s0, s.len, s.power, s.lambda, s.absorb, s.med);
+                            b.nSec = (s.nSec < 0) ? 0 : (s.nSec > kBeamSecMax ? kBeamSecMax : s.nSec);
+                            for (int k = 0; k < kBeamSecMax; ++k)
+                                b.lamS[k] = (k < b.nSec) ? s.lamS[k] : 0.0f;
+                            // A v7 file carries BOTH folds, so `common`'s achro = 0 / emIdx = -1
+                            // are not the answer here. Values above 2 cannot occur in a v7 file
+                            // and are clamped rather than trusted; an `achro == 2` whose emIdx is
+                            // out of range is demoted to the deposit-time fold, which `cieA`
+                            // supports on its own, so a corrupt byte cannot index bowLuts wrongly.
+                            unsigned char a = (s.achro > 2) ? 0 : s.achro;
+                            if (a == 2 && s.emIdx < 0) a = 1;
+                            b.achro = a;
+                            b.emIdx = (a == 2) ? s.emIdx : (short)-1;
+                            for (int k = 0; k < 3; ++k) b.cieA[k] = s.cieA[k];
+                        }
+                    } else if (v6) {
                         chunk6.resize(n);
                         rok = std::fread(chunk6.data(), sizeof(PhotonBeamV6), n, f) == n;
                         for (size_t i = 0; rok && i < n; ++i) {

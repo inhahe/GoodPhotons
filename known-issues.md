@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### UPBP-BOWFOLD — OPEN (2026-09-05, v0.256.0): mode `J`'s rain is still noticeably noisier than mode `D`'s, because the two tools that could fix it are mutually exclusive in one `PhotonBeam` record and the better of them is capped at ~36 % coverage
+### UPBP-BOWFOLD — **DONE** (2026-09-05, fixed in v0.257.0): mode `J`'s rain was noisier than mode `D`'s because the `-beamspec` bundle was capped at ~36 % coverage — `PhotonBeam` stored no per-member weight, so the bundle died at the first λ-dependent event
 
 **Not a correctness bug.** Mode `J` is unbiased on the rain (+2.0 % / +4.1 % against the
 reference at two seeds, which is its known volume residual, not a chromatic effect). This entry
@@ -62,7 +62,87 @@ should approach the fold's 83.9 %. That would give mode `J` a 4-wavelength sampl
 the paths that today give it one, with no fold and therefore no MIS interaction to argue about.
 It costs a record widening (12 bytes) and an FTPMP version bump, and it benefits mode `M` too.
 
-**Reproduce:**
+---
+
+**RESOLVED in v0.257.0.** The fix is the one proposed above, plus the rule change it unlocks.
+
+1. **`float PhotonBeam::wS[kBeamSecMax]`.** The gather multiplies member `i` by `b.wS[i]`, so
+   members may now diverge in power. Record widened a fourth time: `photonmap_io.h` freezes
+   `PhotonBeamV7`, magic becomes **`FTPMP08`**; a v7 file widens to `wS[k] = 1.0f`, which is
+   *exact* (equal weights is what a v7 bundle meant), not merely a safe default. `render_cuda.cu`
+   uploads `pwSec[k] = w · b.wS[k]`.
+2. **Retire only on wavelength-DIVERGENCE, not wavelength-DEPENDENCE.** With weights available, a
+   diffuse albedo no longer invalidates anything — it is absorbed as `foldT[k] *= f(λ_k)/f(λ_h)`
+   and `beamW[i] *= f(bs.lam[i])/f(λ_h)` in one evaluation loop, since those are the same quantity
+   on two grids. Only dispersion / gratings / thin film / fluorescence / hair / GRIN / glass
+   absorption / a scatter in a chromatic medium still retire it. `Diffuse` and `DiffuseTransmit`
+   are covered in **both** forward tracers.
+3. **`foldWorthIt` hoisted to a free function in `render.h`**, shared by `tracePhoton` (mode `M`)
+   and `randomWalk` (mode `J`), because both deposit into the same bank read by the same gather —
+   if their verdicts drifted, two beams in one bank would disagree about what `power`/`cieA`/`wS`
+   mean.
+
+**Measured** (mode `J`, `gallery_rain`, 640×360, seed 11): coverage **47.0 % → 82.4 %** folded
+(cloud) and **36.2 % → 75.1 %** bundled (rain), against mode `M`'s 90.8 % / 81.8 %. Coverage *by
+power* moved far less (91.2 → 93.6 %, 85.9 → 88.1 %) — the newly-covered beams are the low-energy
+post-bounce ones, which is why the tail metrics improve much more than the means:
+
+| `-spp 64`, one binary, one seed | seed 11 before → after | seed 7 before → after |
+|---|---|---|
+| cloud chromaRMSE | 2.0938 → **1.2067** (−42 %) | 1.3831 → 1.3277 (−4 %) |
+| cloud streak p99 | 2601 → **1516** (−42 %) | 1438 → 1329 (−7.6 %) |
+| rain relRMSE | 0.3414 → **0.3107** (−9.0 %) | — |
+| rain streak mean | — | 263.5 → 255.5 (−3.0 %) |
+| cloud bias % | +9.92 → +9.86 | +11.51 → +11.64 |
+| rain bias % | +2.31 → +2.35 | +4.38 → +4.33 |
+
+Bias is unmoved at both seeds, which is the point — the change is *correct*, not merely quieter.
+
+**Mode `M` regression check** (the fix restructured `render.h`'s claim birth and *every* retirement
+site, so `M` had to be proven unchanged). At seed 11, `-n 2000000`, the light pass is
+bit-identical to v0.256.0: same **11612 / 14005** chords, same **90.8 % / 81.8 %** folded
+(92.2 % / 85.2 % by power), same **878641** deposits, same 25617 → 608871 split. Those figures
+would move if any birth gate, retirement site or the worth-it verdict had drifted, so the fold
+itself is untouched. The one *behavioural* delta is that medium 1 now also reports
+**2.2 % spectrally bundled** — the weighted bundle picking up part of the fold's residual, which
+in `M` is small precisely because the gather-time fold already takes 81.8 %. Isolated with a
+paired deterministic A/B (`-device cpu -spp 40 -beamfreeze -seed 11`, `-beamspec 1` vs `4`, both
+folding 90.8 %/81.8 % so those 2.2 % are the *only* difference):
+
+| mode `M` CPU, seed 11 | `-beamspec 1` | `-beamspec 4` |
+|---|---|---|
+| cloud relRMSE / chromaRMSE | 0.7173 / 1.6544 | 0.7172 / 1.6543 |
+| cloud streak mean | 309.66 | 309.14 |
+| rain relRMSE / chromaRMSE | 0.5009 / 0.3366 | 0.4975 / **0.3201** (−4.9 %) |
+| rain streak mean / p99 | 341.94 / 1179.98 | **319.41** / **1137.91** (−6.6 % / −3.6 %) |
+| rain bias % | −6.72 | −5.56 |
+
+The cloud is identical to four decimal places (it folds, so the bundle correctly does nothing
+there) and the rain is strictly better with bias moving *toward* zero. **Two measurement traps
+worth remembering**, both of which produced a spurious "regression" before being controlled for:
+`-beamfreeze` makes the render eligible for the **device**, which implements neither fold (see
+`FOLD-GPU`) and so reports `achromatic fold n/a` — pass `-device cpu` to compare CPU against CPU;
+and mode `M`'s light-side refresh re-draws the map on a **wall-clock** cadence, so two `-time`
+runs are not paired even at a fixed seed. Pin both with `-device cpu -spp N -beamfreeze`.
+
+The same A/B on the **device** (where stage 1 changed the `pwSec` upload to carry `w · b.wS[k]`)
+also comes out healthy: rain relRMSE 0.7366 → 0.6393 (−13 %), chromaRMSE 0.8801 → 0.6113 (−31 %),
+cloud and bias unmoved.
+
+**`FTRACE_NOSURFFOLD=1`** makes `foldWorthIt` always answer NO, restoring the
+retire-at-any-surface rule exactly. That is the A/B switch the table was taken with. It exists
+because `-time` budgets vary ±0.03 relRMSE run-to-run (see the caveat above) — more than this
+feature's effect — so the measurement must be one binary, one seed, one fixed `-spp`, two runs.
+
+**Follow-up (not a regression, deliberate):** `Glossy` is still retired by both tracers even
+though nothing about its lobe *geometry* is λ-dependent, so a λ-dependent glossy albedo could in
+principle be folded the same way `Diffuse` now is. `render.h:3210` groups `Glossy` with
+`Hair`/`Fluorescent` in the specular retirement and `bdpt.h` matches it. Keeping the two tracers
+identical matters more than the extra coverage, so if this is ever changed it must be changed in
+both at once. Unmeasured; likely small on `gallery_rain`, which has little glossy in the volume
+crops.
+
+**Reproduce (the original investigation):**
 ```
 ftrace scenes/gallery_rain.ftsl -camera cam -mode J -r 640 360 -time 300 -seed 11        -o png/barsdiag/J.png -hdr -window-min -interval 60
 python scraps/_referr.py png/barsdiag/REF_D.pfm png/barsdiag/J.pfm

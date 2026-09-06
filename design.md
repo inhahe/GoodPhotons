@@ -144,7 +144,7 @@ changes the sampling *probability* and the probability is what the analog roulet
 | `Layered` coat | Its Fresnel/Airy reflectance is the archetypal peaked factor (near-zero at one λ, near-one two bins away), so `1/R(λ_h)` is an outright firefly generator — and its iridescence is the *point* of the material, which a fold would smear. |
 | Glass absorption `exp(-σ_a(λ)·d)` | Foldable in principle; measured **0** deposits lost to it, so it stays retired rather than earning a code path nothing exercises. |
 | GRIN | The arc's *geometry* is a function of λ. |
-| Scatter in a chromatic medium (`phase rainbow`) | Same: the direction sampling diverges per λ. Measured at 8.53 % of the cloud's foldable deposits after the surface case was absorbed (see the ceiling section below), and it is **correct** that it does not fold — folding the rain would kill the bow. The lever there is the `-beamspec` bundle, which needs per-wavelength weights on the record (`PhotonBeam::wS[]`) to survive more than one transport step. Note this is *scattering* in such a medium; merely **depositing** in one is handled by the gather-time fold (0.256.0), which resolves the colour once the angle is known. |
+| Scatter in a chromatic medium (`phase rainbow`) | Same: the direction sampling diverges per λ. Measured at 8.53 % of the cloud's foldable deposits after the surface case was absorbed (see the ceiling section below), and it is **correct** that it does not fold — folding the rain would kill the bow. The lever there is the `-beamspec` bundle, which since 0.257.0 **does** carry per-wavelength weights on the record (`float PhotonBeam::wS[]`) and so survives arbitrarily many λ-dependent transport steps instead of dying at the first one. Note this is *scattering* in such a medium; merely **depositing** in one is handled by the gather-time fold (0.256.0), which resolves the colour once the angle is known. |
 
 **Cost.** `kFoldBins` reflectance evaluations per Lambertian bounce, gated on `achroPath`, which
 is only ever set when the render is actually depositing beams. A photon that never reaches a
@@ -162,7 +162,15 @@ one. Both are unbiased and converge to the same image; only the variance differs
 event that retired the path — `FoldKill` / `g_foldKillHist` in `render.h`, printed as a
 `[folddiag]` line beside the per-medium beam stats. `FTRACE_FOLDFORCE=1` additionally makes
 `foldWorthIt` answer yes unless the fold is *undefined* (a zero bin), so one render separates
-"the guard declined it" from "the path genuinely diverged".
+"the guard declined it" from "the path genuinely diverged". `FTRACE_NOSURFFOLD=1` (0.257.0) is
+the opposite lever: `foldWorthIt` always answers **no**, which retires the claim at every
+surface and so restores the pre-0.255.0 (mode `M`) / pre-0.257.0 (mode `J`) rule exactly. It is
+the A/B switch the surface fold is *measured* with — one binary, one seed, one fixed `-spp`,
+two runs, so the only difference between the two images is the fold itself. That matters
+because a `-time`-budgeted run varies ±0.03 relRMSE between repeats at a fixed seed, which is
+larger than the effect being measured; and in mode `M` the light-side refresh re-draws the map
+on a *wall-clock* cadence, so two `-time` runs are not paired even in principle. Pin both with
+`-spp N -beamfreeze`.
 
 On `gallery_rain` at 640×360, mode `M -beams`, seed 1:
 
@@ -257,7 +265,9 @@ no spectral weight (`T ≡ 1`), but the colour is still undecided. A `short emId
 emitter whose `bowLut` the gather is to evaluate; `cieA` still carries `cieMean` as the
 fallback. This widened the on-disk beam a third time, so `photonmap_io.h` freezes
 `PhotonBeamV6` and bumps the magic to `FTPMP07`; a v6 file widens to `emIdx = -1`, which is
-exactly "this file predates the gather-time fold".
+exactly "this file predates the gather-time fold". (0.257.0 widened it a fourth time for the
+weighted bundle — `PhotonBeamV7` is frozen and the current magic is **`FTPMP08`**; see the
+mode-`J` bundle section.)
 
 **`phaseLum`, and why the gather's arithmetic is untouched.** The table stores
 `phaseLum = Bow.y / cieMean.y` and `cie = Bow / phaseLum`. The gather substitutes `phaseLum`
@@ -574,6 +584,65 @@ Four consequences worth knowing:
     wrong one" and removes the `spd_em/p_comb` weight-ratio variance — measurably: it took the
     **cloud** crop's chroma noise *further* down (saturation 0.0560 → 0.0390) even though the
     cloud was already folding.
+  - **Weighted bundles, and one shared surface rule (0.257.0 — `UPBP-BOWFOLD`).** Both claims used
+    to die at the **first surface interaction of any kind**, which is what capped mode `J` at
+    36.2 % bundled / 47.0 % folded: a subpath that so much as grazed a diffuse wall deposited the
+    rest of its chords monochromatically. Two things were wrong with that rule.
+    - The record had **no per-member weight**, so a bundle's members had to carry *identical*
+      power, so any λ-dependent factor — even a plain Lambertian albedo — genuinely did invalidate
+      it. `PhotonBeam` now carries `float wS[kBeamSecMax]`, the gather multiplies member `i` by
+      `b.wS[i]`, and the members may therefore diverge in power. This widened the on-disk record a
+      fourth time: `photonmap_io.h` freezes `PhotonBeamV7` and the magic becomes **`FTPMP08`**. A
+      v7 file widens to `wS[k] = 1.0f`, which is **exact**, not merely safe — equal weights is
+      precisely what a v7 bundle meant.
+    - With weights available, the retirement rule becomes the same one the fold already wanted:
+      only a wavelength-**DIVERGENT** event retires the claim (the table at the top of this
+      document — dispersion, gratings, thin film, fluorescence, hair, GRIN, glass absorption, a
+      scatter in a chromatic medium). A merely wavelength-**DEPENDENT** event — a diffuse albedo —
+      is now *absorbed* into the weights instead: `foldT[k] *= f(foldLam[k])/f(λ_h)` for the fold's
+      12 quadrature bins and `beamW[i] *= f(bs.lam[i])/f(λ_h)` for the bundle's members, in one
+      evaluation loop over `fldF[kFoldBins + kBeamSpecMax]`, because they are the same quantity on
+      two different grids. `Diffuse` and `DiffuseTransmit` are covered; `Glossy` is deliberately
+      **not** (see the follow-up note in `known-issues.md`).
+    - `foldWorthIt` — the second-moment verdict that decides whether `E[1/f]` is affordable — was
+      **hoisted out of `tracePhoton` into a free function in `render.h`**, because both forward
+      tracers now need the identical verdict: `tracePhoton` (mode `M`) and `randomWalk` (mode `J`)
+      deposit into the *same* `PhotonBeam` records read back by the *same* gather. If their rules
+      could drift, two beams in one bank would disagree about what `power`, `cieA` and `wS` mean.
+      `DiffuseTransmit` must test **both** lobes up front, since which lobe is taken depends on
+      λ_h, and its expected-value ratio `secF/betaFactor = ρ_k(lobe)/ρ_hero(lobe)` is identical to
+      the analog-roulette ratio `render.h` uses — the two tracers really do agree.
+    - `beamW[0]` is what makes this exact in mode `J` specifically. Unlike `render.h`'s `specW`
+      (relative to a hero that *is* a member), the bundle's hero λ_walk is **not** a member — it
+      came from the scene-wide `p_comb`, and the λ-replacement to `bs.lam[0]` is inseparable from
+      the `scale` factor described above. So `beamW` covers member 0 too, deposit power becomes
+      `sg.beta · dSc · fW[0]`, and `wS[i-1] = fW[i]/fW[0]`. A zero `fW[0]` means `T(bs.lam[0]) == 0`
+      — no flux — and the deposit is skipped.
+    - **Measured** on `gallery_rain` at 640×360, mode `J`, seed 11: coverage **47.0 % → 82.4 %**
+      folded (cloud) and **36.2 % → 75.1 %** bundled (rain), against mode `M`'s 90.8 % / 81.8 %.
+      Coverage *by power* moved much less (91.2 → 93.6 %, 85.9 → 88.1 %) because the newly-covered
+      beams are the low-energy post-bounce ones — which is exactly why the **tail** metrics move
+      far more than the means. At a fixed `-spp 64` (same binary, same seed, `FTRACE_NOSURFFOLD`
+      off vs on) seed 11 gives cloud chromaRMSE **2.0938 → 1.2067** (−42 %), cloud streak p99
+      **2601 → 1516** (−42 %), rain relRMSE **0.3414 → 0.3107** (−9.0 %); seed 7 gives cloud streak
+      p99 1438 → 1329 (−7.6 %) and rain streak mean 263.5 → 255.5 (−3.0 %). **Bias is unmoved at
+      both seeds** (cloud +9.92 → +9.86 and +11.51 → +11.64; rain +2.31 → +2.35 and +4.38 → +4.33),
+      which is the point: the change is *correct*, not merely quieter.
+    - `FTRACE_NOSURFFOLD=1` makes `foldWorthIt` always answer NO, restoring the retire-at-any-surface
+      rule exactly. It is the A/B switch the numbers above were taken with, and it exists because
+      `-time`-budgeted runs vary ±0.03 relRMSE run-to-run — more than this feature's effect — so the
+      measurement has to be one binary, one seed, one fixed `-spp`, two runs.
+    - **Mode `M` is unchanged, and was proven so rather than assumed** — the fix restructured
+      `render.h`'s claim birth and every retirement site, so `M`'s light pass had to be re-measured:
+      same 11612 / 14005 chords, same 90.8 % / 81.8 % folded, same 878641 deposits, same
+      25617 → 608871 split as v0.256.0. Its one behavioural delta is a new **2.2 % spectrally
+      bundled** on medium 1 — the weighted bundle collecting part of the gather-time fold's
+      residual — which a paired deterministic A/B shows is a strict improvement (rain chromaRMSE
+      −4.9 %, streak mean −6.6 %, bias toward zero; cloud identical to four decimals). See
+      `known-issues.md` for the table and for the two measurement traps it exposed: `-beamfreeze`
+      silently makes a render eligible for the **device**, which implements neither fold, and mode
+      `M`'s light-side refresh re-draws on a **wall-clock** cadence, so `-time` runs are never
+      paired. Compare with `-device cpu -spp N -beamfreeze`.
   - The two are **alternatives per beam, not additions** — `BeamBank::push` prefers the fold when
     offered both — and `emitBeams` chooses **per medium**, so one segment crossing `gallery_rain`'s
     achromatic cloud and its `phase rainbow` rain folds the cloud's beam and bundles the rain's.
@@ -595,9 +664,11 @@ Four consequences worth knowing:
     camera side happens to be.
   - Implementation: `PathSeg` carries `achro` (the per-segment half of the claim), the subpath
     carries one `BeamSpectral` (the per-emitter half), and `randomWalk` runs the same
-    survives-an-achromatic-scatter rule `Renderer::tracePhoton` runs (cleared by any surface
-    event, by glass absorption, and by a scatter in a chromatic medium — but **not** by a scatter
-    in an achromatic one, which is what lets it ride the cloud's ~278 bounces). The rule tests the
+    survives-an-achromatic-scatter rule `Renderer::tracePhoton` runs (since 0.257.0: cleared by a
+    wavelength-*divergent* surface event, by glass absorption, and by a scatter in a chromatic
+    medium — but **not** by a diffuse bounce, which is folded into `foldT`/`beamW` instead, and
+    **not** by a scatter in an achromatic medium, which is what lets it ride the cloud's ~278
+    bounces). `PathSeg` carries the resulting `fCie` and `fW[]` per segment. The rule tests the
     medium the walk is scattering *in*, not the media the segment *crosses*, which is precisely
     why a subpath that scattered in the cloud can still deposit a good bundle into the rain.
     `traceLightBeamPass` hoists `beamSpecOK`/`beamAchroOK`/`beamSpecC` out of the worker

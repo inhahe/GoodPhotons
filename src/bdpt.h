@@ -655,6 +655,23 @@ struct PathSeg {
     // happens later, in the mode-J beam pass, long after the walk that established the claim
     // has moved on. See randomWalk for the update rule.
     bool achro = false;
+    // THE SPECTRAL CLAIM'S PAYLOAD, snapshotted alongside `achro` and for the same reason:
+    // the deposit happens in the beam pass, long after the walk that accumulated these.
+    //
+    //  * `fCie` is the `-beamachro` colour — sum_k foldCie[k] * T(foldLam[k]) over the
+    //    emitter's quadrature table (scene.h, Emitter::foldCie). A claim that has picked up
+    //    no spectral factor leaves it at the emitter's plain cieMean, so a neutral scene
+    //    deposits bit-for-bit the beams it deposited before this existed.
+    //  * `fW[i]` is T(bs.lam[i]) / T(lambda_walk) — bundle member i's accumulated spectral
+    //    throughput RELATIVE TO THE WAVELENGTH THE WALK ACTUALLY USED. The record's hero is
+    //    bs.lam[0], not the walk's lambda (see BeamSpectral), so unlike render.h's `specW`
+    //    this covers member 0 too: the deposited power is beta * scale * fW[0] and the
+    //    record's per-member weights are fW[i] / fW[0].
+    //
+    // Both stay at 1 / cieMean until something wavelength-dependent happens, which before
+    // 0.257.0 was the only state that could reach a deposit at all.
+    Vec3   fCie{0, 0, 0};
+    double fW[kBeamSpecMax] = {1.0, 1.0, 1.0, 1.0};
 };
 using PathSegs = std::vector<PathSeg>;
 
@@ -737,11 +754,11 @@ inline void beginBeamSpectral(const Scene& scene, const Renderer& mats, const Em
         if (uu >= 1.0) uu -= 1.0;
         double pI = 0.0;
         const double lI = em.spd.sampleAt(uu, pI);
-        // A zero-density member would have to be given weight 0 while the survivors kept 1/C,
-        // and the record stores no per-wavelength weight — so drop the WHOLE claim rather
-        // than renormalise over the survivors, which would over-count them. (Inverting a CDF
-        // at a uniform variate cannot land in a zero-mass bin, so this is a guard, not a
-        // path.)
+        // A zero-density member cannot be carried: `randomWalk` accumulates every member's
+        // weight as a RATIO to the hero's factor, and a member the emitter cannot emit at all
+        // has no meaningful ratio. Drop the WHOLE claim rather than renormalise over the
+        // survivors, which would over-count them. (Inverting a CDF at a uniform variate cannot
+        // land in a zero-mass bin, so this is a guard, not a path.)
         if (!(pI > 0.0)) { bs = BeamSpectral{}; return; }
         bs.lam[i] = lI;
     }
@@ -765,20 +782,63 @@ inline void beginBeamSpectral(const Scene& scene, const Renderer& mats, const Em
 // refracted direction, so the bundle de-heros: nUp drops to 1 for this and every
 // later vertex. See Vertex::nUp for why no ×C boost is applied here.
 //
-// `achroIn` seeds the spectral claim the beam deposits rest on (see BeamSpectral and
-// PathSeg::achro). A caller that does not deposit beams leaves it off and the walk is
-// bit-identical. No GRIN guard is needed here, unlike render.h's photon walk, which has to
-// exclude a bent path per medium: BDPT refuses a scene containing ANY gradient-index medium
-// outright (`bdptUnsupportedFeature`, main.cpp), so a mode-J walk can never bend.
+// `bsIn` seeds the spectral claim the beam deposits rest on (see BeamSpectral and
+// PathSeg::achro) — it is read, never written, and supplies both the emitter identity the
+// fold quadrature belongs to and the bundle's wavelengths. A caller that does not deposit
+// beams passes nullptr and the walk is bit-identical. No GRIN guard is needed here, unlike
+// render.h's photon walk, which has to exclude a bent path per medium: BDPT refuses a scene
+// containing ANY gradient-index medium outright (`bdptUnsupportedFeature`, main.cpp), so a
+// mode-J walk can never bend.
 inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& mats,
                        Ray ray, double beta, double pdfDir, const HeroBundle& hb,
                        int maxDepth, Mode mode, Pcg32& rng, std::vector<Vertex>& path,
                        const double* betaSecIn, int nUpIn, Escape* esc = nullptr,
-                       PathSegs* segs = nullptr, bool achroIn = false) {
+                       PathSegs* segs = nullptr, const BeamSpectral* bsIn = nullptr) {
     (void)cam;   // cam reserved for future NEE-to-camera use; mode now drives adjoint corr
     const double lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
-    bool achroPath = achroIn;
+
+    // ---- THE SPECTRAL CLAIM (see PathSeg::achro / BeamSpectral / render.h's foldWorthIt) --
+    //
+    // Before 0.257.0 this was a bare bool that ANY surface interaction cleared, because the
+    // beam record could express only "every wavelength on this chord carries equal power".
+    // With `PhotonBeam::wS` it can express unequal power, so the rule becomes the same one
+    // render.h's tracePhoton uses: a wavelength-DIVERGENT event (one after which the
+    // wavelengths no longer share a chord) retires the claim, while a merely
+    // wavelength-DEPENDENT one (a diffuse albedo) is FOLDED into `foldT` / `beamW` and the
+    // claim survives. That is the difference between mode J's rain reaching 36.2 % of its
+    // beams with a bundle and reaching the same ~84 % mode M's fold reaches.
+    const BeamSpectral* bs = (bsIn && bsIn->ok) ? bsIn : nullptr;
+    bool achroPath = bs != nullptr;
+    // The emitter whose quadrature table `foldT` indexes and whose bins the verdict reads.
+    // `foldN == 0` would leave foldWorthIt nothing to judge, so such an emitter simply keeps
+    // the pre-0.257.0 behaviour (retire at the first surface).
+    const Emitter* foldEm =
+        (bs && bs->emIdx >= 0 && bs->emIdx < (int)scene.emitters.size() &&
+         scene.emitters[bs->emIdx].foldN > 0) ? &scene.emitters[bs->emIdx] : nullptr;
+    const int specN = bs ? bs->nLam : 0;      // bundle members, INCLUDING the record's hero
+    double foldT[kFoldBins];                  // T(foldLam[k]) — lazily initialised
+    bool   foldChroma = false;                // has anything been folded into foldT yet?
+    double beamW[kBeamSpecMax];               // T(bs->lam[i]) / T(lambda)
+    for (int i = 0; i < kBeamSpecMax; ++i) beamW[i] = 1.0;
+    if (segs && mode == Mode::Importance) g_foldKill = achroPath ? FK_None : FK_NeverBorn;
+    // Retire the claim, stamping the diagnostic histogram with the event that killed it (and
+    // only while it was actually live, so the attribution stays with the true cause).
+    auto retireSpectral = [&](FoldKill why) {
+        if (achroPath) { g_foldKill = why; achroPath = false; }
+    };
+    // Multiply the per-bin ratios f(lam_k)/f(lambda) into the running claim. `fk` is TWO
+    // grids in one array — [0, K) the emitter's quadrature bins, [K, K + specN) the bundle's
+    // own wavelengths — because they share every expensive thing: one texture fetch per
+    // wavelength, one energy guard, one verdict. Exactly render.h's foldApply, except that
+    // the bundle half runs over ALL members here (mode J's record hero is bs->lam[0], not
+    // the walk's lambda, so member 0 needs a weight too).
+    auto foldApply = [&](double fHero, const double* fk, int K) {
+        const double inv = 1.0 / fHero;
+        if (!foldChroma) { for (int k = 0; k < K; ++k) foldT[k] = 1.0; foldChroma = true; }
+        for (int k = 0; k < K; ++k) foldT[k] *= fk[k] * inv;
+        for (int i = 0; i < specN; ++i) beamW[i] *= fk[K + i] * inv;
+    };
     double pdfFwd = pdfDir;   // solid-angle density of the current ray direction
     // Live secondary throughputs. betaSec[i] tracks wavelength hb.lam[i+1].
     double betaSec[hero::kHeroMax - 1] = {0};
@@ -830,6 +890,20 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             // condition render.h's tracePhoton reaches by clearing the flag with the
             // Beer-Lambert step that precedes its deposit.
             sg.achro = achroPath && !(sg.aGlass > 0.0);
+            if (sg.achro) {
+                // Collapse the running per-bin ratios into the single CIE triple this beam
+                // will be stored with. With nothing folded yet (`foldChroma` false) that is
+                // still the emitter's plain cieMean, so an achromatic scene deposits
+                // bit-for-bit what it deposited before the fold existed.
+                if (foldChroma && foldEm) {
+                    Vec3 c{0, 0, 0};
+                    for (int k = 0; k < foldEm->foldN; ++k) c += foldEm->foldCie[k] * foldT[k];
+                    sg.fCie = c;
+                } else {
+                    sg.fCie = bs->cie;
+                }
+                for (int i = 0; i < specN; ++i) sg.fW[i] = beamW[i];
+            }
             segs->push_back(sg);
         }
 
@@ -860,7 +934,12 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             // once it has been applied `beta` no longer represents the whole band at equal
             // power and the achromatic claim is dead. (Twin of render.h's tracePhoton, which
             // clears it at the same point and for the same reason.)
-            if (a > 0.0) { beta *= std::exp(-a * dEvent); achroPath = false; }
+            //
+            // This one stays FATAL even now that the claim can carry per-member weights,
+            // because `PhotonBeam::absorb` is a single scalar the gather re-applies to every
+            // member of the record alike: there is nowhere to put a per-wavelength Beer
+            // exponent. (Same reasoning as render.h's FK_GlassAbsorb.)
+            if (a > 0.0) { beta *= std::exp(-a * dEvent); retireSpectral(FK_GlassAbsorb); }
             // Per-λ absorption for the bundle. A non-empty stack means we are inside a
             // dielectric, and entering one de-heros — so nUp is always 1 whenever `a`
             // can be non-zero and this loop never actually runs. Kept for generality.
@@ -870,15 +949,17 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
         }
 
-        // THE SPECTRAL-CLAIM RULE, applied once per iteration, unconditionally, and BEFORE
-        // the event below is acted on — the segment above already took its snapshot, so what
-        // is being decided here is whether the NEXT segment may still claim. The claim is
-        // that beta is still the emitter's own spectrum times a λ-free factor; an event that
-        // is itself wavelength-independent leaves that intact, and a scatter in an achromatic
-        // medium is exactly such an event (achromatic sigma_t for the free flight that
-        // reached it, a flat albedo for the roulette, and an HG direction that depends only
-        // on `g`). Everything else — any surface interaction, a scatter in a `phase rainbow`
-        // or spectrally-varying medium, absorption in glass (handled above) — clears it.
+        // THE SPECTRAL-CLAIM RULE, medium half. Applied BEFORE the event below is acted on —
+        // the segment above already took its snapshot, so what is being decided here is
+        // whether the NEXT segment may still claim.
+        //
+        // A scatter in an ACHROMATIC medium is wavelength-independent outright (achromatic
+        // sigma_t for the free flight that reached it, a flat albedo for the roulette, and an
+        // HG direction that depends only on `g`), so the claim passes through untouched. A
+        // scatter in a `phase rainbow` or spectrally-varying medium is wavelength-DIVERGENT —
+        // the members would leave along different directions — and retires it. There is no
+        // middle case here the way there is at a surface: a medium's chromaticity changes the
+        // GEOMETRY, which no per-member weight can absorb.
         //
         // That the rule survives a scatter at all is the whole point: at gallery_rain's cloud
         // albedo of 0.9964 a light subpath scatters on the order of 278 times inside the
@@ -890,8 +971,12 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // and its next segment can still deposit a good beam into the `phase rainbow` rain it
         // passes through — as a stratified bundle rather than a fold, which emitBeams decides
         // per medium. (Twins: render.h tracePhoton and render_cuda.cu, same position.)
-        if (achroPath && !(mediumEvent && mediumAchromatic(scene.media[scatterMed])))
-            achroPath = false;
+        //
+        // The SURFACE half of the rule lives in the material switch below, because unlike a
+        // medium event a surface event can be wavelength-DEPENDENT without being divergent,
+        // and telling those apart needs the material in hand.
+        if (achroPath && mediumEvent && !mediumAchromatic(scene.media[scatterMed]))
+            retireSpectral(FK_ChromaMedium);
 
         // A medium collision precedes the surface: append a volume in-scatter vertex,
         // then scatter (prob = single-scattering albedo) or absorb. Throughput is
@@ -993,6 +1078,21 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // past them; only their per-λ reflectance/transmittance differs. Those set
         // `keepBundle` to opt out of the `if (delta) nUp = 1` collapse below.
         bool delta = false, terminate = false, keepBundle = false;
+        // THE SPECTRAL-CLAIM RULE, surface half (see the medium half above, and render.h's
+        // foldWorthIt / foldApply — ONE rule, because both tracers fill the same beam bank).
+        // A case that can express its wavelength dependence as a scalar ratio per bin fills
+        // `fldF` (the two-grid array foldApply consumes), sets `fldHero` to the factor the
+        // walk's own lambda took, and sets `fldOK`. Everything else leaves `fldOK` false and
+        // retires the claim with `fldWhy`, which defaults to the divergent case: a lobe that
+        // picks its continuation direction as a function of lambda (dispersive refraction, a
+        // grating order, thin-film/multilayer interference, fluorescence's wavelength switch)
+        // leaves the members without a shared chord at all, so there is no T(lambda) to carry
+        // and no weight that could rescue it.
+        bool     fldOK = false;
+        int      fldK = 0;
+        double   fldHero = 0.0;
+        FoldKill fldWhy = FK_Specular;
+        double   fldF[kFoldBins + kBeamSpecMax];
         switch (mp->type) {
             case MatType::Diffuse:
             case MatType::Fluorescent: {              // elastic base only (see header)
@@ -1005,6 +1105,27 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 secChromatic = true;                  // rho <= 0 is caught by the max test
                 for (int i = 0; i + 1 < nUp; ++i)
                     secF[i] = clamp01(diffuseReflectance(scene, *mp, h, hb.lam[i + 1]));
+                // SPECTRAL FOLD. A Lambertian albedo is the archetypal wavelength-DEPENDENT
+                // but non-divergent factor: every wavelength leaves along the one cosine-
+                // sampled direction, and only the throughput differs, as rho(lam_k)/rho(lam).
+                // FLUORESCENCE IS EXCLUDED — it shares this case for its elastic base, but a
+                // re-emission moves the photon to a different wavelength entirely, which is
+                // divergent in the strongest sense. (Twin: render.h's MatType::Diffuse.)
+                if (achroPath && mp->type == MatType::Diffuse) {
+                    fldK = foldEm ? foldEm->foldN : 0;
+                    for (int k = 0; k < fldK + specN; ++k) {
+                        const double lk = (k < fldK) ? foldEm->foldLam[k] : bs->lam[k - fldK];
+                        fldF[k] = clamp01(diffuseReflectance(scene, *mp, h, lk));
+                    }
+                    // One verdict, over the QUADRATURE half only. The bundle's wavelengths
+                    // are drawn from the same variate as the walk's lambda, so a test that
+                    // read them would correlate the fold/no-fold split with lambda and bias
+                    // the mixture; the quadrature bins depend on the emitter alone.
+                    bool ok = fldK > 0 && rho > 0.0 && foldWorthIt(*foldEm, fldF, fldK);
+                    for (int i = 0; i < specN && ok; ++i) ok = fldF[fldK + i] > 0.0;
+                    if (ok) { fldOK = true; fldHero = rho; }
+                    else fldWhy = (rho > 0.0) ? FK_DeclineDiffuse : FK_ZeroWeight;
+                }
                 break;
             }
             case MatType::Glossy: {
@@ -1035,6 +1156,38 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 double tot = rhoR + rhoT;
                 if (tot <= 0.0) { terminate = true; break; }
                 const bool reflLobe = (rng.uniform() * tot < rhoR);
+                // SPECTRAL FOLD. Both lobes are cosine-sampled about the same normal, so no
+                // wavelength diverges — but WHICH lobe is taken depends on the walk's lambda,
+                // and a verdict that depended on the lobe would therefore depend on lambda
+                // and bias the estimator. So evaluate and test BOTH lobes up front, and only
+                // then keep the one that was actually sampled. The per-bin ratio works out to
+                // rho_k(lobe)/rho_hero(lobe): the secondary's factor here is the expected-
+                // value form rho_k(lobe) * tot / rho_hero(lobe) and the hero's is `tot`, so
+                // the `tot` cancels — the same ratio render.h's analog roulette arrives at
+                // from the other direction. `diffuseTransmitAlbedos` applies the shared energy
+                // guard per wavelength, which matters because the guard changes the SAMPLING
+                // PROBABILITY and it is the guarded value the split actually used.
+                if (achroPath) {
+                    double fldTr[kFoldBins + kBeamSpecMax];
+                    fldK = foldEm ? foldEm->foldN : 0;
+                    for (int k = 0; k < fldK + specN; ++k) {
+                        const double lk = (k < fldK) ? foldEm->foldLam[k] : bs->lam[k - fldK];
+                        double a, b; diffuseTransmitAlbedos(*mp, lk, scene, &h, a, b);
+                        fldF[k] = a; fldTr[k] = b;
+                    }
+                    const double hero = reflLobe ? rhoR : rhoT;
+                    bool ok = fldK > 0 && hero > 0.0 &&
+                              foldWorthIt(*foldEm, fldF, fldK) && foldWorthIt(*foldEm, fldTr, fldK);
+                    for (int i = 0; i < specN && ok; ++i)
+                        ok = fldF[fldK + i] > 0.0 && fldTr[fldK + i] > 0.0;
+                    if (ok) {
+                        fldOK = true; fldHero = hero;
+                        if (!reflLobe)
+                            for (int k = 0; k < fldK + specN; ++k) fldF[k] = fldTr[k];
+                    } else {
+                        fldWhy = (hero > 0.0) ? FK_DeclineTransmit : FK_ZeroWeight;
+                    }
+                }
                 if (reflLobe) wi = cosineHemisphere(cur.ns, rng);          // reflect
                 else          wi = cosineHemisphere(cur.ns * -1.0, rng);   // transmit
                 pdfW    = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
@@ -1200,6 +1353,13 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
 
         beta *= betaFactor;
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
+        // Fold this vertex's spectral factor into the beam claim, or retire it. Sits beside
+        // `beta *= betaFactor` because it is the same multiplication seen per wavelength:
+        // foldT and beamW carry f(lam_k)/f(lambda), the ratio beta itself cannot express.
+        if (achroPath) {
+            if (fldOK) foldApply(fldHero, fldF, fldK);
+            else       retireSpectral(fldWhy);
+        }
         // Veach shading-normal ADJOINT correction (§5.3) for the LIGHT (Importance)
         // subpath only: a particle tracer deposits irradiance per GEOMETRIC area, so an
         // interpolated shading normal must be reweighted at each non-specular vertex or
@@ -1391,8 +1551,7 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
     // whole of the λ-dependence in `Le`.
     if (bs) beginBeamSpectral(scene, mats, em, em.spdFn(lambda) * invPdfLambda, rng, *bs);
     randomWalk(scene, cam, mats, ray, betaWalk, pdfDir, hb, maxDepth - 1,
-               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs,
-               bs && bs->ok);
+               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs, bs);
     // Infinite-light density patch (PBRT): the first scene vertex was given a solid-angle
     // density converted with 1/dist^2 from the fictitious disc point, but the reverse
     // direction (vertexPdfLight) reports the planar 1/(pi R^2). Rewrite it to match.
@@ -1480,8 +1639,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     // power a mode-M photon would have carried.
     if (bs) beginBeamSpectral(scene, mats, em, em.spdFn(lambda) * invPdfLambda, rng, *bs);
     randomWalk(scene, cam, mats, ray, betaWalk, pdfDir, hb, maxDepth - 1,
-               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs,
-               bs && bs->ok);
+               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs, bs);
     return (int)path.size();
 }
 
@@ -1815,11 +1973,6 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             // weighted 1/C has to come from the emitter's own.
             const double* dLamS = (bs.ok && bs.nLam > 1) ? bs.lam + 1 : nullptr;
             const int     dSec  = (bs.ok && bs.nLam > 1) ? bs.nLam - 1 : 0;
-            // The fold is the one part still gated on `-beamachro`; the rest of the claim is
-            // unconditional because it costs nothing and is never worse.
-            const Vec3*   dCie  = (bs.ok && beamAchroOK &&
-                                   (bs.cie.x > 0.0 || bs.cie.y > 0.0 || bs.cie.z > 0.0))
-                                  ? &bs.cie : nullptr;
             const double  dLam  = bs.ok ? bs.lam[0] : hb.lam[0];
             const double  dSc   = bs.ok ? bs.scale : 1.0;
             // MODE J DECLINES THE GATHER-TIME FOLD (0.256.0), AT DEPOSIT TIME, ON PURPOSE.
@@ -1849,10 +2002,57 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             // variance the fold cannot reach but a bundle can.)  See known-issues.md,
             // UPBP-BOWFOLD.
             //
-            // `bs.emIdx` is still computed and still travels, because it costs nothing and is
-            // the field a future WEIGHTED bundle (`float wS[3]`) would need; it simply is not
-            // requested here.
+            // `bs.emIdx` is still computed and still travels, because randomWalk needs it to
+            // find the emitter's fold quadrature table (0.257.0); it simply is not requested
+            // as a GATHER-time fold here.
             const int     dEm   = -1;
+
+            // Deposit one segment's beams. The per-segment spectral payload (PathSeg::fCie /
+            // fW) is what randomWalk accumulated up to that segment's ORIGIN, which is the
+            // point the beam's stored power refers to.
+            //
+            //   power   = beta * scale * fW[0]      — the flux a mode-M photon drawn from
+            //                                         this emitter's own SPD at bs.lam[0]
+            //                                         would have carried (see BeamSpectral)
+            //   wS[i-1] = fW[i] / fW[0]             — member i relative to that hero
+            //
+            // With no spectral factor folded, every fW is 1 and this reduces exactly to the
+            // pre-0.257.0 `sg.beta * dSc` with an equal-weight bundle.
+            auto depositSeg = [&](const PathSeg& sg) {
+                double lam = hb.lam[0], pw = sg.beta;
+                const double* lamS = nullptr; int nSec = 0;
+                const Vec3* cie = nullptr;
+                double wsBuf[kBeamSpecMax];
+                if (sg.achro) {
+                    const double w0 = sg.fW[0];
+                    if (!(w0 > 0.0)) return;                 // T(bs.lam[0]) == 0: no flux
+                    lam = dLam;
+                    pw  = sg.beta * dSc * w0;
+                    if (dSec > 0) {
+                        for (int i = 0; i < dSec; ++i) wsBuf[i] = sg.fW[i + 1] / w0;
+                        lamS = dLamS; nSec = dSec;
+                    }
+                    // The fold is the one part still gated on `-beamachro`; the rest of the
+                    // claim is unconditional because it costs nothing and is never worse.
+                    if (beamAchroOK &&
+                        (sg.fCie.x > 0.0 || sg.fCie.y > 0.0 || sg.fCie.z > 0.0))
+                        cie = &sg.fCie;
+                }
+                // MedAll, not the emitBeams default MedStraight: nothing about this span is
+                // carried stochastically (that is what LONG means), so every medium the
+                // lead-in crosses must be charged. See Renderer::emitBeams.
+                //
+                // `sg.achro` is the spectral claim as it stood where this span began
+                // (randomWalk / PathSeg::achro); emitBeams then asks the further, per-medium
+                // question of whether THIS medium's gather tail is flat, so a subpath crossing
+                // the achromatic cloud and the `phase rainbow` rain in one step folds the
+                // cloud's beam to a single colour and gives the rain's a weighted bundle
+                // instead — the rain's scattering really is chromatic, so its beam has to keep
+                // wavelengths, it just no longer has to keep only ONE.
+                mats.emitBeams(scene, sg.o, sg.d, sg.tMax, lam, pw, sg.aGlass, rng,
+                               Renderer::MedAll, lamS, nSec, cie, dEm,
+                               nSec > 0 ? wsBuf : nullptr);
+            };
 
             // --- The light half of every merge weight this subpath can take part in -------
             // Both accumulators telescope exactly as misWeight's light loop does, one vertex
@@ -1869,14 +2069,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 // Count only. The pilot's beams are thrown away with the bank it fills, so
                 // the merge-weight prefixes below would be computed for nothing.
                 for (const PathSeg& sg : segs)
-                    if (sg.beta > 0.0)
-                        mats.emitBeams(scene, sg.o, sg.d, sg.tMax,
-                                       sg.achro ? dLam : hb.lam[0],
-                                       sg.achro ? sg.beta * dSc : sg.beta,
-                                       sg.aGlass, rng, Renderer::MedAll,
-                                       sg.achro ? dLamS : nullptr, sg.achro ? dSec : 0,
-                                       sg.achro ? dCie : nullptr,
-                                       dEm);
+                    if (sg.beta > 0.0) depositSeg(sg);
                 continue;
             }
             accC.assign(np, 0.0);
@@ -1897,23 +2090,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             for (const PathSeg& sg : segs) {
                 if (!(sg.beta > 0.0)) continue;
                 const size_t before = banks[(size_t)tid].beams.size();
-                // MedAll, not the emitBeams default MedStraight: nothing about this span is
-                // carried stochastically (that is what LONG means), so every medium the
-                // lead-in crosses must be charged. See Renderer::emitBeams.
-                // `sg.achro` is the spectral claim as it stood where this span began
-                // (randomWalk / PathSeg::achro); emitBeams then asks the further, per-medium
-                // question of whether THIS medium's gather tail is flat, so a subpath crossing
-                // the achromatic cloud and the `phase rainbow` rain in one step folds the
-                // cloud's beam to a single colour and gives the rain's a stratified bundle
-                // instead — the rain's scattering really is chromatic, so its beam has to keep
-                // wavelengths, it just no longer has to keep only ONE.
-                mats.emitBeams(scene, sg.o, sg.d, sg.tMax,
-                               sg.achro ? dLam : hb.lam[0],
-                               sg.achro ? sg.beta * dSc : sg.beta,
-                               sg.aGlass, rng, Renderer::MedAll,
-                               sg.achro ? dLamS : nullptr, sg.achro ? dSec : 0,
-                               sg.achro ? dCie : nullptr,
-                               dEm);
+                depositSeg(sg);
                 const size_t after = banks[(size_t)tid].beams.size();
                 if (after == before) continue;
 

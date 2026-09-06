@@ -81,8 +81,69 @@ inline bool foldForceOn() {
     }();
     return on;
 }
+// FTRACE_NOSURFFOLD=1 makes `foldWorthIt` always say NO, which retires the spectral claim at
+// every surface and so restores the pre-0.255.0 (mode `M`) / pre-0.257.0 (mode `J`) rule
+// exactly. It is the A/B switch the surface fold is measured with: one binary, one seed, one
+// `-spp`, two runs, so the only thing that differs between the two images is the fold itself.
+// Without it the arms have to be two binaries or two `-time` budgets, and a `-time` budget
+// varies the sample count run to run by more than the effect being measured.
+inline bool foldNoSurfOn() {
+    static const bool on = [] {
+        const char* s = std::getenv("FTRACE_NOSURFFOLD");
+        return s && *s && *s != '0';
+    }();
+    return on;
+}
 
 inline double clamp01(double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+
+// ---- IS FOLDING THIS FACTOR WORTH IT? --------------------------------------------------
+//
+// Folding removes the chromatic variance of CIE(lambda_h) but introduces a 1/f(lambda_h)
+// in its place, and for a strongly PEAKED factor — a saturated red wall sampled at a green
+// hero wavelength — that trade is a loss: the surviving photon carries a huge T and turns
+// into a firefly. Both second moments are computable in closed form from the quadrature we
+// already have, so decide by comparing them rather than by a hand-tuned threshold:
+//
+//   unfolded  E[X^2] = E_lam[ f(lam) |CIE(lam)|^2 ]      ~  K * sum_k f_k |F_k|^2
+//   folded    E[Y^2] = E_lam[1/f] * |E_lam[CIE f]|^2     ~ (1/K sum_k 1/f_k)
+//                                                          * | sum_k f_k F_k |^2
+//
+// with F_k = em.foldCie[k] (which already carries the bin's 1/K of the emission mass).
+// For a CONSTANT f, Cauchy-Schwarz makes E[Y^2] <= E[X^2] unconditionally, so a neutral
+// surface always folds — which is the case the artifact lives in.
+//
+// THE VERDICT MUST NOT DEPEND ON lambda_hero. If it did, the fold/no-fold split would
+// correlate with the wavelength and the mixture would stop being unbiased (P(fold) *
+// E[CIE f] != integral over the folded subset). Everything the test reads — the per-bin
+// factors and the emitter's table — is a function of the surface and the emitter alone,
+// never of lambda_h, which is what keeps the estimator exact.
+//
+// A FREE FUNCTION rather than a lambda inside one tracer, because BOTH forward tracers
+// need the identical verdict: `tracePhoton` below (mode M) and `randomWalk` in bdpt.h
+// (mode J's beam pass) deposit into the same `PhotonBeam` records, read back by the same
+// gather. If their fold/no-fold rules could drift apart, two beams in one bank would
+// disagree about what `power`, `cieA` and `wS` mean. One definition is the only way that
+// stays true.
+inline bool foldWorthIt(const Emitter& em, const double* fk, int K) {
+    if (foldNoSurfOn()) return false;      // diagnostics: restore the retire-at-any-surface rule
+    double A = 0.0, invF = 0.0;
+    Vec3 M{0, 0, 0};
+    for (int k = 0; k < K; ++k) {
+        if (!(fk[k] > 0.0)) return false;     // a zero bin makes E[1/f] infinite
+        const Vec3& F = em.foldCie[k];
+        A += fk[k] * (F.x * F.x + F.y * F.y + F.z * F.z);
+        invF += 1.0 / fk[k];
+        M += F * fk[k];
+    }
+    A *= (double)K;
+    const double B = (invF / (double)K) * (M.x * M.x + M.y * M.y + M.z * M.z);
+    // FTRACE_FOLDFORCE (diagnostics): say yes unless the fold is UNDEFINED — the zero bin
+    // above still returns false — so a single render measures how much of the residual
+    // "coloured bars" the variance guard itself is responsible for.
+    if (foldForceOn()) return true;
+    return B <= A;
+}
 
 // Power-cosine lobe around a mirror direction (rough specular), from two CANONICAL
 // uniforms rather than an rng. roughness in [0,1]: 0 -> sharp mirror, 1 -> broad.
@@ -922,14 +983,17 @@ struct Renderer {
     // and the gather integrates Tr analytically), so every medium must be charged: MedAll.
     //
     // `lamS`/`nSec` are the photon's live SPECTRAL BUNDLE — extra stratified wavelengths that
-    // this same chord also carries (photonbeams.h). They ride along untouched: the chord's
-    // geometry, its power and its transmittance are all wavelength-independent wherever the
-    // bundle is still alive, which is exactly the condition tracePhoton maintains.
+    // this same chord also carries (photonbeams.h), and `specW` their relative throughputs
+    // T(lamS[i])/T(lambda). They ride along untouched: the chord's GEOMETRY and its
+    // transmittance are wavelength-independent wherever the bundle is still alive, which is
+    // exactly the condition tracePhoton maintains; only the members' accumulated spectral
+    // weights may differ, and that is what `specW` carries.
     void emitBeams(const Scene& scene, const Vec3& o, const Vec3& dir, double dLen,
                    double lambda, double beta, double aGlass, Pcg32& rng,
                    MedFilter offFilt = MedStraight,
                    const double* lamS = nullptr, int nSec = 0,
-                   const Vec3* achroCie = nullptr, int foldEmIdx = -1) const {
+                   const Vec3* achroCie = nullptr, int foldEmIdx = -1,
+                   const double* specW = nullptr) const {
         if (!beamDeposit || !(beta > 0.0)) return;
         // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
         // 1e30-long box (see kBeamFarScale).
@@ -1003,7 +1067,8 @@ struct Renderer {
                 g_foldKillHist[i][achroCie ? FK_None : g_foldKill].fetch_add(
                     1, std::memory_order_relaxed);
             beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i,
-                              lamS, nSec, (useAchro || bowEm >= 0) ? ca : nullptr, bowEm);
+                              lamS, nSec, (useAchro || bowEm >= 0) ? ca : nullptr, bowEm,
+                              specW);
         }
     }
 
@@ -2373,9 +2438,19 @@ struct Renderer {
         // SPECTRAL BEAM BUNDLE (photonbeams.h). The extra stratified wavelengths this photon's
         // beam deposits will carry alongside `lambda`, and how many are still live. Filled at
         // birth for a plain SPD-sampled emitter, and dropped to zero — collapsing the beam back
-        // to the classic monochromatic record — the instant the path does anything the
-        // wavelengths would not agree on. Untouched (and therefore free) when beamSpecC == 1.
+        // to the classic monochromatic record — the instant the path does something the
+        // wavelengths would not SHARE A CHORD through. Untouched (and therefore free) when
+        // beamSpecC == 1.
+        //
+        // `specW[i]` is member i's running spectral weight T(specLam[i]) / T(lambda), i.e.
+        // EXACTLY the quantity `foldT[k]` below carries, on a different grid: the bundle's own
+        // wavelengths instead of the emitter's quadrature bins. Before 0.257.0 there was no such
+        // array and the bundle had to be retired every transport iteration, because a member
+        // whose weight had diverged could not be represented; every site that folds a spectral
+        // factor into `foldT` now folds the same factor into `specW` in the same breath, so the
+        // bundle lives exactly as long as the achromatic-path claim does.
         double specLam[kBeamSecMax];
+        double specW[kBeamSecMax];
         int specSec = 0;
         // ACHROMATIC-PATH STATE (photonbeams.h, ACHROMATIC-PATH BEAMS; device twin:
         // DBeamSpec::achro/cie). The stronger, longer-lived claim beside the bundle: that
@@ -2599,8 +2674,24 @@ struct Renderer {
         // L(dir,lam)/(4*pi*pdfW*spd(lam)), which is genuinely per-wavelength; so is a
         // volumetric blackbody birth, whose beta carries kappa_e(x,lam). Both keep C == 1
         // rather than being reweighted, which costs those scenes nothing they had before.
-        if (beamSpecC > 1 && beamDeposit &&
-            !(em.shape == EmitterShape::Env && scene.envMap)) {
+        // ONE PRECONDITION FOR BOTH (0.257.0). The bundle and the achromatic-path fold rest on
+        // the same two facts — that `beta` is wavelength-independent, and that this emitter has
+        // a quadrature table to decide a fold's variance against — so they are decided from one
+        // predicate rather than two that drifted apart. An IMAGE environment fails it because
+        // its beta carries L(dir,lam)/(4*pi*pdfW*spd(lam)); a volumetric blackbody birth never
+        // reaches here at all (it takes the other branch), and its beta carries kappa_e(x,lam).
+        // `foldN > 0` and a non-black cieMean are what make `foldWorthIt` answerable: without a
+        // table the bundle could still be BORN but could never be REWEIGHTED, so it would have
+        // to die at the first spectral factor — which is the pre-0.257.0 behaviour this change
+        // exists to remove. Refusing it up front keeps one rule instead of two.
+        const bool specBirthOK = beamDeposit && em.foldN > 0 &&
+                                 !(em.shape == EmitterShape::Env && scene.envMap) &&
+                                 (em.cieMean.x > 0.0 || em.cieMean.y > 0.0 || em.cieMean.z > 0.0);
+        // The emitter whose quadrature table `foldT` indexes and whose bins `foldWorthIt`
+        // reads. Set for EITHER consumer, not just the achromatic one: `-beamachro off
+        // -beamspec 4` is a supported combination and its bundle needs the same table.
+        if (specBirthOK) foldEm = &em;
+        if (beamSpecC > 1 && specBirthOK) {
             const int C = (beamSpecC > kBeamSpecMax) ? kBeamSpecMax : beamSpecC;
             for (int i = 1; i < C; ++i) {
                 double uu = uLam + (double)i / (double)C;
@@ -2608,24 +2699,22 @@ struct Renderer {
                 double pI = 0.0;
                 const double lI = em.spd.sampleAt(uu, pI);
                 // A zero-density secondary would have to be given weight 0 while the survivors
-                // kept 1/C, and the record stores no per-wavelength weight — so drop the WHOLE
-                // bundle instead of renormalising over the survivors, which would over-count
-                // them. (Inverting a CDF at a uniform variate cannot land in a zero-mass bin,
-                // so this is a guard, not a path.)
+                // kept 1/C, so drop the WHOLE bundle instead of renormalising over the
+                // survivors, which would over-count them. (`wS` could express the zero, but the
+                // member would then contribute nothing while still consuming one of the C
+                // shares of the chord's power — a silent energy loss, not a reweighting.
+                // Inverting a CDF at a uniform variate cannot land in a zero-mass bin, so this
+                // is a guard, not a path.)
                 if (!(pI > 0.0)) { specSec = 0; break; }
+                specW[specSec] = 1.0;   // relative to the hero, which starts at parity
                 specLam[specSec++] = lI;
             }
         }
-        // ACHROMATIC-PATH STATE at birth. The same exclusions as the bundle, for the same
-        // reason (both rest on beta being wavelength-independent), minus the `-beamspec`
-        // condition — this fold stores no extra wavelengths, so it applies at -beamspec 1.
-        // An emitter with no visible-band energy has cieMean {0,0,0} and stays monochromatic.
-        if (beamAchroOK && beamDeposit &&
-            !(em.shape == EmitterShape::Env && scene.envMap) &&
-            (em.cieMean.x > 0.0 || em.cieMean.y > 0.0 || em.cieMean.z > 0.0)) {
+        // ACHROMATIC-PATH STATE at birth. Same precondition, minus the `-beamspec` count —
+        // this fold stores no extra wavelengths, so it applies at `-beamspec 1`.
+        if (beamAchroOK && specBirthOK) {
             achroCie = em.cieMean;
             achroPath = true;
-            foldEm = &em;   // spectral fold: this emitter's quadrature table indexes foldT
         }
         g_foldKill = achroPath ? FK_None : FK_NeverBorn;   // fold diagnostics
 
@@ -2657,50 +2746,53 @@ struct Renderer {
 
         // --- SPECTRAL FOLD helpers (see the foldT declaration above) ------------------------
         //
-        // IS FOLDING THIS FACTOR WORTH IT? Folding removes the chromatic variance of
-        // CIE(lambda_h) but introduces a 1/f(lambda_h) in its place, and for a strongly
-        // PEAKED factor — a saturated red wall sampled at a green hero wavelength — that
-        // trade is a loss: the surviving photon carries a huge T and turns into a firefly.
-        // Both second moments are computable in closed form from the quadrature we already
-        // have, so decide by comparing them rather than by a hand-tuned threshold:
+        // The verdict itself is `foldWorthIt(*foldEm, fk, K)`, a free function at the top of
+        // this header — bdpt.h's randomWalk deposits into the same beam bank and must reach
+        // exactly the same decision, so there is one definition rather than one per tracer.
         //
-        //   unfolded  E[X^2] = E_lam[ f(lam) |CIE(lam)|^2 ]      ~  K * sum_k f_k |F_k|^2
-        //   folded    E[Y^2] = E_lam[1/f] * |E_lam[CIE f]|^2     ~ (1/K sum_k 1/f_k)
-        //                                                          * | sum_k f_k F_k |^2
-        //
-        // with F_k = foldCie[k] (which already carries the bin's 1/K of the emission mass).
-        // For a CONSTANT f, Cauchy-Schwarz makes E[Y^2] <= E[X^2] unconditionally, so a
-        // neutral surface always folds — which is the case the artifact lives in.
-        //
-        // THE VERDICT MUST NOT DEPEND ON lambda_hero. If it did, the fold/no-fold split
-        // would correlate with the wavelength and the mixture would stop being unbiased
-        // (P(fold) * E[CIE f] != integral over the folded subset). Everything the test reads
-        // — the per-bin factors and the emitter's table — is a function of the surface and
-        // the emitter alone, never of lambda_h, which is what keeps the estimator exact.
-        auto foldWorthIt = [&](const double* fk, int K) -> bool {
-            double A = 0.0, invF = 0.0;
-            Vec3 M{0, 0, 0};
-            for (int k = 0; k < K; ++k) {
-                if (!(fk[k] > 0.0)) return false;     // a zero bin makes E[1/f] infinite
-                const Vec3& F = foldEm->foldCie[k];
-                A += fk[k] * (F.x * F.x + F.y * F.y + F.z * F.z);
-                invF += 1.0 / fk[k];
-                M += F * fk[k];
-            }
-            A *= (double)K;
-            const double B = (invF / (double)K) * (M.x * M.x + M.y * M.y + M.z * M.z);
-            // FTRACE_FOLDFORCE (diagnostics): say yes unless the fold is UNDEFINED — the zero
-            // bin above still returns false — so a single render measures how much of the
-            // residual "coloured bars" the variance guard itself is responsible for.
-            if (foldForceOn()) return true;
-            return B <= A;
-        };
         // Multiply the per-bin ratios f(lam_k)/f(lambda_h) into the running fold. The caller
         // has already established that every fk[k] > 0 (via foldWorthIt) and that fHero > 0.
-        auto foldApply = [&](double fHero, const double* fk, int K) {
-            if (!foldChroma) { for (int k = 0; k < K; ++k) foldT[k] = 1.0; foldChroma = true; }
+        //
+        // `fk` is TWO grids in one array: entries [0, K) are the emitter's quadrature bins and
+        // feed `foldT`, entries [K, K+S) are the live bundle's own wavelengths and feed `specW`.
+        // They share an array — and a caller — because they share every expensive thing: one
+        // texture fetch / pattern evaluation per wavelength, one energy guard, one verdict. The
+        // alternative was a second evaluation loop over the same material at three more
+        // wavelengths, which is the same work done twice and two places to keep in step.
+        //
+        // NOTE that the VERDICT (`foldWorthIt`) is deliberately taken over the [0, K) half only.
+        // The bundle's wavelengths are drawn from the same uniform variate as the hero, so a
+        // test that read them would correlate the fold/no-fold decision with lambda_h and bias
+        // the mixture — the exact failure the long note above foldWorthIt exists to prevent.
+        // The quadrature bins are a function of the emitter alone, so they are safe to test and
+        // their verdict governs both grids.
+        // `K` is where the bundle's entries START in `fk`, whether or not the achromatic claim
+        // is still live — the caller fills the array the same way either way, so the two halves
+        // cannot drift apart when only one consumer is switched on (`-beamachro off -beamspec 4`
+        // is exactly that case). Whether `foldT` is touched is read from `achroPath` here rather
+        // than encoded in `K`, so there is one place that knows the layout.
+        auto foldApply = [&](double fHero, const double* fk, int K, int S) {
             const double inv = 1.0 / fHero;
-            for (int k = 0; k < K; ++k) foldT[k] *= fk[k] * inv;
+            if (achroPath) {
+                if (!foldChroma) { for (int k = 0; k < K; ++k) foldT[k] = 1.0; foldChroma = true; }
+                for (int k = 0; k < K; ++k) foldT[k] *= fk[k] * inv;
+            }
+            for (int i = 0; i < S; ++i) specW[i] *= fk[K + i] * inv;
+        };
+        // Retire BOTH spectral claims. Every event that ends the achromatic-path fold also ends
+        // the bundle, because the two now live or die by the same rule: a wavelength-DIVERGENT
+        // event (one after which the wavelengths no longer share a chord) kills them, and a
+        // merely wavelength-DEPENDENT one is folded into `foldT`/`specW` instead. The decline
+        // cases go through here too — a factor whose fold `foldWorthIt` judged a firefly risk
+        // is exactly as much of a risk in `specW`, which carries the same 1/f(lambda_h).
+        //
+        // `g_foldKill` is only stamped while the fold was actually live, so the diagnostic
+        // histogram keeps attributing each loss to the event that caused it rather than to
+        // whatever came after. `specSec` is cleared unconditionally: with `-beamachro off`
+        // there is no `achroPath` to guard it, and the bundle must still retire.
+        auto retireSpectral = [&](FoldKill why) {
+            if (achroPath) { g_foldKill = why; achroPath = false; }
+            specSec = 0;
         };
 
         // PHOTON-BEAMS gather (CLI -beams, shared multi-camera pass only): a per-photon
@@ -2725,7 +2817,7 @@ struct Renderer {
         // inside the bending medium anyway (emitBeams skips it per medium).
         // The achromatic-path claim dies for the same reason and more strongly: a GRIN arc IS
         // a function of lambda, so the path's geometry differs per wavelength.
-        if (grinAny) { specSec = 0; if (achroPath) g_foldKill = FK_Grin; achroPath = false; }
+        if (grinAny) retireSpectral(FK_Grin);
 
         // PHOTON-BEAM deposit (mode M with -beams): store the crossed segment in the
         // view-independent beam map instead of splatting it to a camera list. GRIN media are
@@ -2869,15 +2961,17 @@ struct Renderer {
             double betaPre = beta;
             {
                 double a = curAbsorb(lambda);
-                // Glass absorption is spectral (that is what makes coloured glass coloured),
-                // and emitBeams re-applies it over the beam's own lead-in, so a bundle inside a
-                // dielectric would be attenuated at the wrong wavelengths. Collapse it here,
-                // BEFORE the deposit below reads it.
-                // The achromatic-path claim dies here for the same reason and a stronger one:
-                // `beta` has just been multiplied by a wavelength-dependent factor, so the
-                // photon no longer represents the whole band at equal power.
-                if (a > 0.0) { beta *= std::exp(-a * dEvent); specSec = 0;
-                               if (achroPath) g_foldKill = FK_GlassAbsorb; achroPath = false; }
+                // Glass absorption is spectral (that is what makes coloured glass coloured), and
+                // this is one wavelength-DEPENDENT factor that is nonetheless NOT foldable into
+                // `specW`, for a reason that lives downstream rather than here: `PhotonBeam`
+                // stores a single scalar `absorb`, and the gather Beer-Lamberts every member of
+                // the bundle with it, at the hero's coefficient, over the beam's own lead-in. A
+                // reweighted bundle would therefore be right about the glass it has already
+                // crossed and wrong about the glass it is still inside. Collapse both claims
+                // here, BEFORE the deposit below reads them. (Making this foldable means giving
+                // the record a per-member `absorb`, which is a second widening for a case — a
+                // beam deposited inside coloured glass — that no scene in the suite exercises.)
+                if (a > 0.0) { beta *= std::exp(-a * dEvent); retireSpectral(FK_GlassAbsorb); }
             }
 
             // PHOTON-BEAMS single-scatter gather (CLI -beams, shared multi-camera pass).
@@ -2965,7 +3059,7 @@ struct Renderer {
                     }
                     emitBeams(scene, ray.o, ray.d, dChord, lambda, betaPre, curAbsorb(lambda), rng,
                               beamMS ? MedAll : MedStraight, specLam, specSec,
-                              achroPath ? &cieF : nullptr, foldEmIdx);
+                              achroPath ? &cieF : nullptr, foldEmIdx, specW);
                 }
                 if (!beamMS) {
                     // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over
@@ -2989,51 +3083,48 @@ struct Renderer {
                     e.absorbed += (before - beta);
                 }
             }
-            // The spectral bundle survives exactly ONE transport iteration. Everything the
-            // photon can do from here on — scatter off a surface, scatter in the medium, be
-            // attenuated by the single-scatter transmittance above — is wavelength-dependent,
-            // and the record carries no per-wavelength weight with which to track the
-            // divergence. Retiring it here is therefore the conservative, provably-correct
-            // rule: later chords deposit exactly the monochromatic beams they always did, so
-            // nothing regresses, and the chord that matters most (a light's DIRECT crossing of
-            // the medium, which is where a shaft's flux overwhelmingly comes from) is the one
-            // that gets the bundle. Relaxing this per event is a later refinement.
+            // BOTH SPECTRAL CLAIMS NOW USE THE SAME RULE: only a wavelength-DIVERGENT event
+            // retires them. This is where the bundle used to be killed unconditionally, once
+            // per transport iteration, and that line is gone (0.257.0).
             //
-            // This sits OUTSIDE the beam block on purpose. If that block is skipped (a march
-            // hit, or a zero-length chord) nothing was deposited, but the photon still goes on
-            // to interact — so a bundle left live here would be picked up by a LATER chord's
-            // deposit, after a wavelength-dependent surface event. One retirement per loop
-            // iteration, unconditionally, is what makes the rule airtight.
-            specSec = 0;
-            // THE ACHROMATIC-PATH FLAG USES A WEAKER RULE, which is the whole reason it is a
-            // separate piece of state rather than a fourth wavelength in the bundle. The
-            // bundle must die every step because the record has no per-wavelength weights and
-            // so cannot represent wavelengths that have started to diverge; `achroPath` claims
-            // that they have NOT diverged, and an event that is itself wavelength-independent
-            // leaves that claim intact. A scatter in an achromatic medium is exactly such an
-            // event — achromatic sigma_t for the free flight that reached it, a flat albedo
-            // for the roulette just below, and an HG direction that depends only on `g`.
-            // Everything else clears it. (Device twin: render_cuda.cu, same position.)
+            // The old rule was conservative for a real reason — the record carried no
+            // per-wavelength weight, so a bundle whose members' throughputs had begun to
+            // diverge could not be represented at all, and the only sound thing to do was throw
+            // it away before the first event that could diverge them. `PhotonBeam::wS` is that
+            // missing weight, and `specW` is the tracer-side accumulator that fills it, so the
+            // bundle can now do exactly what `achroPath` already did: survive an event that is
+            // merely wavelength-DEPENDENT by folding its ratio in, and retire only at one that
+            // is wavelength-DIVERGENT — one after which the members no longer share a chord, so
+            // there is no single beam left to store them on.
             //
-            // The paragraph above about "the chord that matters most is the DIRECT one" is
-            // true for a shaft and false for a CLOUD: at albedo 0.9964 a photon scatters of
-            // the order of 278 times inside gallery_rain's cloud, so the one-step rule reached
-            // ~1 chord in 278 there and `-beamspec 4` measured -8.5% chroma for it. This rule
-            // reaches all 278.
+            // What that is worth, measured on gallery_rain: the old rule reached the light's
+            // DIRECT crossing of a medium and nothing after it, which is most of a SHAFT's flux
+            // but almost none of a CLOUD's — at albedo 0.9964 a photon scatters of the order of
+            // 278 times inside that cloud, so one-chord-in-278 carried a bundle (36.2% of
+            // deposits overall) while `achroPath`'s weaker rule reached 83.9%. The two now
+            // coincide.
             //
-            // A SURFACE event is no longer decided here. It used to be — this was a
-            // pre-emptive catch-all that retired the fold before the material was even
-            // known — and measurement showed that single line was 87.8% of the residual
-            // "coloured bars". A diffuse albedo is wavelength-dependent but it is not
-            // wavelength-DIVERGENT: it leaves the path's geometry identical for every
-            // wavelength and only rescales its weight, which is exactly the case the
-            // SPECTRAL FOLD above is built to absorb. So the decision moved down into the
-            // material switch, where the albedo can be folded instead of thrown away.
-            // Everything in the switch that this file does not explicitly fold still
-            // retires, so nothing became less conservative by accident.
-            if (achroPath && mediumEvent && !mediumAchromatic(scene.media[scatterMed])) {
-                g_foldKill = FK_ChromaMedium; achroPath = false;
-            }
+            // A scatter in an ACHROMATIC medium is the archetypal survivable event: achromatic
+            // sigma_t for the free flight that reached it, a flat albedo for the roulette
+            // below, and an HG direction that depends only on `g`. A CHROMATIC one is the
+            // archetypal fatal one, and not merely because its coefficients differ — its
+            // `phaseSample` draws a DIRECTION as a function of lambda, so after it the
+            // wavelengths are on different rays and no per-member weight could reconcile them.
+            //
+            // A SURFACE event is not decided here. It used to be — a pre-emptive catch-all that
+            // retired the fold before the material was even known — and measurement showed that
+            // single line was 87.8% of the residual "coloured bars". A diffuse albedo is
+            // wavelength-dependent but not wavelength-divergent: it leaves the geometry
+            // identical for every wavelength and only rescales the weight, which is exactly what
+            // `foldT`/`specW` absorb. So the decision lives in the material switch, where the
+            // albedo can be folded instead of thrown away. Everything in that switch which this
+            // file does not explicitly fold still retires, so nothing became less conservative
+            // by accident. (Device twin: render_cuda.cu, same position — still on the old
+            // one-iteration rule, which is why a device-traced bundle is always equal-weight;
+            // see known-issues.md, FOLD-GPU.)
+            if ((achroPath || specSec > 0) && mediumEvent &&
+                !mediumAchromatic(scene.media[scatterMed]))
+                retireSpectral(FK_ChromaMedium);
 
             if (mediumEvent) {
                 const Medium& sm = scene.media[scatterMed];
@@ -3090,9 +3181,11 @@ struct Renderer {
                 // bins away, so the 1/R(lambda_h) it would put into the weight is an outright
                 // firefly generator. (Its iridescence is also the POINT of the material, and
                 // a fold would smear the very colour it is there to produce.) Retire, exactly
-                // as this vertex did before the spectral fold existed.
-                if (achroPath) g_foldKill = FK_Layered;
-                achroPath = false;
+                // as this vertex did before the spectral fold existed. The bundle goes with it,
+                // and for a reason the fold's variance argument does not even have to reach:
+                // the coat's roughness lobe is sampled once, so a reflected bundle would be
+                // riding a direction chosen for the hero alone.
+                retireSpectral(FK_Layered);
                 double R = layeredCoatReflectance(scene, cm, h, ray.d, lambda);
                 if (rng.uniform() < R) {                    // coat reflection
                     double cr = materialRoughness(scene, cm, h);
@@ -3153,9 +3246,10 @@ struct Renderer {
                     // order), interferes (thin film, multilayer), or switches the wavelength
                     // outright (fluorescence). In all three the wavelengths no longer share a
                     // chord at all, so there is no T(lam) to carry — the fold is not merely
-                    // unprofitable here, it is undefined. Retire.
-                    if (achroPath) g_foldKill = FK_Specular;
-                    achroPath = false;
+                    // unprofitable here, it is undefined. Retire, and the bundle with it: this
+                    // is the textbook wavelength-DIVERGENT vertex, the one case no per-member
+                    // weight could ever rescue.
+                    retireSpectral(FK_Specular);
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e))
                         return;
                     continue;
@@ -3182,21 +3276,35 @@ struct Renderer {
                     // sampling PROBABILITY, and the probability is what the analog roulette
                     // actually uses — so it is the guarded value, not the raw slot, that the
                     // ratio has to be taken of.
-                    int    foldK = 0;
-                    double foldR[kFoldBins], foldTr[kFoldBins];
-                    if (achroPath) {
+                    //
+                    // The SPECTRAL BUNDLE rides the same evaluation: entries [foldK, foldK+foldS)
+                    // hold the same two slots at the bundle's own live wavelengths, so one pass
+                    // over the material serves both grids (see foldApply). `foldS` is snapshot
+                    // before the verdict because a decline retires the bundle, and the loop that
+                    // filled the array must not disagree with the loop that consumes it.
+                    int    foldK = 0, foldS = specSec;
+                    double foldR[kFoldBins + kBeamSecMax], foldTr[kFoldBins + kBeamSecMax];
+                    if (achroPath || foldS > 0) {
                         foldK = foldEm->foldN;
-                        for (int k = 0; k < foldK; ++k) {
-                            const double lk = foldEm->foldLam[k];
+                        for (int k = 0; k < foldK + foldS; ++k) {
+                            const double lk = (k < foldK) ? foldEm->foldLam[k]
+                                                          : specLam[k - foldK];
                             double a = clamp01(diffuseReflectance(scene, m, h, lk));
                             double b = clamp01(transmitSlot(scene, m, h, lk));
                             const double s = a + b;
                             if (s > 1.0) { a /= s; b /= s; }
                             foldR[k] = a; foldTr[k] = b;
                         }
-                        if (foldK <= 0 || !foldWorthIt(foldR, foldK) || !foldWorthIt(foldTr, foldK)) {
-                            g_foldKill = FK_DeclineTransmit; achroPath = false;
-                        }
+                        // One verdict, over the quadrature half only, governing both grids —
+                        // and a decline retires both, because `specW` carries the very
+                        // 1/f(lambda_h) whose firefly risk the verdict just weighed.
+                        // `foldWorthIt` also rejects a zero bin, so the loops below can divide.
+                        bool ok = foldK > 0 && foldWorthIt(*foldEm, foldR, foldK) &&
+                                  foldWorthIt(*foldEm, foldTr, foldK);
+                        if (ok)
+                            for (int i = 0; i < foldS && ok; ++i)
+                                ok = foldR[foldK + i] > 0.0 && foldTr[foldK + i] > 0.0;
+                        if (!ok) { retireSpectral(FK_DeclineTransmit); foldS = 0; }
                     }
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
@@ -3215,14 +3323,18 @@ struct Renderer {
                     // factor makes it lobe-agnostic, so (h.n, ngo) serve both lobes.
                     double u = rng.uniform();
                     if (u < rhoR) {
-                        if (achroPath) { if (rhoR > 0.0) foldApply(rhoR, foldR, foldK);
-                                         else { g_foldKill = FK_ZeroWeight; achroPath = false; } }
+                        if (achroPath || foldS > 0) {
+                            if (rhoR > 0.0) foldApply(rhoR, foldR, foldK, foldS);
+                            else retireSpectral(FK_ZeroWeight);
+                        }
                         Vec3 wo = cosineHemisphere(h.n, rng);
                         beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
                         ray = Ray{h.p + h.n * 1e-6, wo}; continue;
                     } else if (u < sum) {
-                        if (achroPath) { if (rhoT > 0.0) foldApply(rhoT, foldTr, foldK);
-                                         else { g_foldKill = FK_ZeroWeight; achroPath = false; } }
+                        if (achroPath || foldS > 0) {
+                            if (rhoT > 0.0) foldApply(rhoT, foldTr, foldK, foldS);
+                            else retireSpectral(FK_ZeroWeight);
+                        }
                         Vec3 wo = cosineHemisphere(Vec3{-h.n.x, -h.n.y, -h.n.z}, rng);
                         beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
                         ray = Ray{h.p - h.n * 1e-6, wo}; continue;
@@ -3239,15 +3351,25 @@ struct Renderer {
                     // over the roulette is rho(lam_k) — precisely the per-wavelength weight
                     // the spectral integral wants. Decided BEFORE the roulette so the verdict
                     // is a property of the surface rather than of this photon's luck.
-                    int    foldK = 0;
-                    double foldRho[kFoldBins];
-                    if (achroPath) {
+                    // The SPECTRAL BUNDLE rides the same evaluation: entries [foldK, foldK+foldS)
+                    // are the same albedo at the bundle's own live wavelengths (see foldApply),
+                    // so a `-beamspec 4` bundle now survives a diffuse bounce carrying
+                    // rho(lam_i)/rho(lambda_h) instead of being thrown away.
+                    int    foldK = 0, foldS = specSec;
+                    double foldRho[kFoldBins + kBeamSecMax];
+                    if (achroPath || foldS > 0) {
                         foldK = foldEm->foldN;
-                        for (int k = 0; k < foldK; ++k)
-                            foldRho[k] = clamp01(diffuseReflectance(scene, m, h, foldEm->foldLam[k]));
-                        if (foldK <= 0 || !foldWorthIt(foldRho, foldK)) {
-                            g_foldKill = FK_DeclineDiffuse; achroPath = false;
-                        }
+                        for (int k = 0; k < foldK + foldS; ++k)
+                            foldRho[k] = clamp01(diffuseReflectance(
+                                scene, m, h, (k < foldK) ? foldEm->foldLam[k] : specLam[k - foldK]));
+                        // One verdict, over the quadrature half only (it must not depend on
+                        // lambda_h, and the bundle's wavelengths share the hero's variate), and
+                        // a decline retires both grids — `specW` carries the same 1/rho(lambda_h)
+                        // whose firefly risk the verdict just weighed.
+                        bool ok = foldK > 0 && foldWorthIt(*foldEm, foldRho, foldK);
+                        if (ok)
+                            for (int i = 0; i < foldS && ok; ++i) ok = foldRho[foldK + i] > 0.0;
+                        if (!ok) { retireSpectral(FK_DeclineDiffuse); foldS = 0; }
                     }
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
@@ -3264,8 +3386,10 @@ struct Renderer {
                     // with beta unchanged. Unbiased; average path length ~1/(1-rho)
                     // bounces instead of running to the maxBounce cap.
                     if (rng.uniform() >= rho) { e.absorbed += beta; return; }
-                    if (achroPath) { if (rho > 0.0) foldApply(rho, foldRho, foldK);
-                                     else { g_foldKill = FK_ZeroWeight; achroPath = false; } }
+                    if (achroPath || foldS > 0) {
+                        if (rho > 0.0) foldApply(rho, foldRho, foldK, foldS);
+                        else retireSpectral(FK_ZeroWeight);
+                    }
                     Vec3 wo = cosineHemisphere(h.n, rng);
                     beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
                     ray = Ray{h.p + h.n * 1e-6, wo};

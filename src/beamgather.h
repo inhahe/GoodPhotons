@@ -283,8 +283,14 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         // weight and BOTH transmittance marches — the bundle only exists on a path whose
         // extinction is achromatic (Renderer::beamSpecC), which is precisely the condition
         // that makes those marches wavelength-independent — so all that differs is
-        // sigma_s * phase * CIE. `w / (ss * phase)` recovers the shared factor with one
-        // division instead of rebuilding the chain, and both terms are known positive.
+        // sigma_s * phase * CIE, and each member's own accumulated spectral weight `wS`.
+        // `w / (ss * phase)` recovers the shared factor with one division instead of
+        // rebuilding the chain, and both terms are known positive.
+        //
+        // `wS[i]` is T(lamS[i])/T(lambda) — what the path's spectral factors did to member i
+        // RELATIVE to the hero (photonbeams.h; the tracer-side accumulator is render.h's
+        // `specW`). It is exactly 1 on a path that never met such a factor, which is every
+        // bundle a pre-0.257.0 build could deposit, so those renders are bit-identical.
         if (b.nSec > 0) {
             const double wShared = w / (ss * phase);
             for (int i = 0; i < b.nSec; ++i) {
@@ -293,7 +299,8 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
                 if (!(ssi > 0.0)) continue;
                 const double phi = md.phaseValue(-bh.cosT, li);
                 if (!(phi > 0.0)) continue;
-                acc += Vec3(cieX(li), cieY(li), cieZ(li)) * (wShared * ssi * phi);
+                acc += Vec3(cieX(li), cieY(li), cieZ(li)) *
+                       (wShared * (double)b.wS[i] * ssi * phi);
             }
         }
     });
