@@ -1,0 +1,32 @@
+# Device-parity gate for GPU-NEE-EPS (known-issues.md): a light far enough away that a
+# shadow ray's fp32 end-shortening is at risk of rounding away.
+#
+# The light sits ~6325 units from the shading geometry. On a float32 device build the
+# old `dist - 2*RAY_EPS` shortening (2e-4) is 0.27 ulp at that magnitude, so it rounded
+# straight back to `dist`, the shadow ray reached the sampled emitter point exactly,
+# re-hit the emitter it was sampled from, and the sample was discarded as occluded --
+# the GPU rendered 23.7% dark while the double CPU build was correct.
+#
+# Deliberately trivial otherwise: one diffuse quad, one sphere light, direct lighting
+# only. That leaves emitter DISTANCE as the only variable, which is what makes this a
+# gate rather than another render to eyeball. `lumens` pins an absolute sensor gain so
+# the two devices are compared without auto-exposure in the way.
+#
+# Paired with scenes/_distant_light_near.ftsl, which is this scene with every coordinate
+# scaled by 0.1 -- same angles, same ratios, same image, only smaller floats. That one
+# was already correct before the fix, so it is the control that says "the renderer is
+# fine, the magnitudes were not".
+#
+# Driven by tools/check_distant_light.py.
+
+scene { units meters  spectral 360 830 1 }
+
+material "dark" { type diffuse  reflect rgb 0.02 0.02 0.02 }
+quad { origin -400 -300 135   u 800 0 0   v 0 600 0   material dark }
+
+light sphere { center 0 2000 -6000   radius 60   spd preset:bb6500   lumens 3e13 }
+
+camera "cam" {
+    eye 0 1.6 0   look_at 0 -16.8 94.9   up 0 1 0   fov_y 100
+    film { res 160 120 }
+}

@@ -2899,6 +2899,24 @@ as the one at fault.
   any epsilon compared against a distance must be relative on the device, and any quadratic
   solved there must be written in a cancellation-free form.**
 
+  0.259.0 found that rule had only been applied to the BDPT/VCM *connection* rays. Every
+  NEE shadow ray (`bkEmitterGeom`, `bkNeeVolume`, `bkNeeLightRGB`) and every forward-mode
+  camera leg (`connect*`, `connectEmission*`, `connectHero`/`connectLensHero`) still used
+  the absolute `dist - 2*RAY_EPS` — 2e-4, which is below half an ulp of a float past
+  ~3360 scene units. The symptom was the same one again in mode `R`: a sphere light
+  6325 units away rendered 23.7 % dark on the GPU, 1.6 % at 3162, clean at 1581, and the
+  identical scene scaled by 0.1 was clean — a precision failure, not an algorithmic one
+  (known-issues.md GPU-NEE-EPS; it had been misfiled for six weeks as a participating-media
+  disagreement). All fourteen sites now go through `connMaxT(dist, 2*RAY_EPS)`, and
+  `tools/check_distant_light.py` renders a far/near scene pair on both devices as a gate.
+  Two gaps remain and are logged: the hair variants (`bkHairBlocked`, `connectHair`,
+  `connectLensHair`) still subtract an absolute `off + RAY_EPS`; and the ray **origins**
+  are all absolute — `p + n*RAY_EPS` (dead past ~1680 units), the BDPT/VCM `ng*1e-6f` and
+  the caustic chains' double `1e-6` cast to float (both dead past ~17 units) — which is
+  observed in mode `B` as photons re-hitting the emitter they were born on (GPU-ORIGIN-EPS).
+  The origin fix is not a relative epsilon (that leaks through walls at city scale) but
+  Wächter–Binder's integer ulp offset along the departure-side geometric normal.
+
   `-rgb` is refused in mode `W` (`main.cpp`, with a message): the fast RGB backward is a
   separate reduced tracer with no deterministic estimator, so it would return precisely the
   noise the mode exists to remove.

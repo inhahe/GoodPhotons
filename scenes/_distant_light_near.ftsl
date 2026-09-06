@@ -1,0 +1,29 @@
+# The CONTROL half of the GPU-NEE-EPS gate: scenes/_distant_light.ftsl with every
+# coordinate scaled by 0.1.
+#
+# Same angles, same ratios, same solid angles, same image -- only the absolute float
+# magnitudes are 10x smaller (light distance ~632 instead of ~6325). At that scale the
+# old fixed 2e-4 shadow-ray shortening was 5.3 ulp and survived, so this scene rendered
+# correctly on the GPU even before the fix.
+#
+# That is the whole point of shipping it alongside: if BOTH scenes ever fail together
+# the cause is something generic (a broken device build, a bad emitter sampler), whereas
+# only the far one failing is specifically the float-magnitude regime. A single scene
+# could not tell those apart.
+#
+# `lumens` is unchanged on purpose: scaling the scene by s scales the emitter area by
+# s^2 and the inverse-square falloff by 1/s^2, so the irradiance on the quad -- and
+# hence the image -- is invariant. The two renders should match each other, not just
+# match across devices.
+
+scene { units meters  spectral 360 830 1 }
+
+material "dark" { type diffuse  reflect rgb 0.02 0.02 0.02 }
+quad { origin -40 -30 13.5   u 80 0 0   v 0 60 0   material dark }
+
+light sphere { center 0 200 -600   radius 6   spd preset:bb6500   lumens 3e13 }
+
+camera "cam" {
+    eye 0 0.16 0   look_at 0 -1.68 9.49   up 0 1 0   fov_y 100
+    film { res 160 120 }
+}

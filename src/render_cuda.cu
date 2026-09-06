@@ -230,6 +230,32 @@ __device__ __host__ inline Real connMaxT(double dist, double absEps = 2e-6) {
     double e = dist * CONN_REL_EPS;
     return (Real)(dist - (e > absEps ? e : absEps));
 }
+// The SAME reasoning applies to every NEE / light-sampling shadow ray, whose far end is
+// also a sampled point on an emitter, and to the camera legs — all of which used to
+// shorten by a hard-coded `dist - 2*RAY_EPS`. With RAY_EPS = 1e-4f that shortening is
+// 2e-4, while one ulp of a float at magnitude d is d*2^-23, so the subtraction rounds
+// straight back to `dist` once
+//
+//     2e-4 < 0.5 ulp   <=>   d > 2e-4 / (0.5 * 2^-23)  ~=  3360 scene units.
+//
+// Past that the ray reaches the sampled point exactly, re-hits the emitter it was
+// sampled from, and the sample is thrown away as occluded. Measured on a sphere light
+// at four distances (scraps/rbnm_d*.ftsl, mode R, GPU vs the CPU double build):
+//
+//     d = 6325  (0.27 ulp, lost entirely)      -23.67%      <- predicted broken
+//     d = 3162  (0.53 ulp, on the round bound)  -1.64%      <- predicted marginal
+//     d = 1581  (1.06 ulp, survives)            -0.20%      <- predicted clean
+//     d =  632  (5.3  ulp, survives)            -0.36%      <- predicted clean
+//
+// i.e. the predicted ~3360 threshold falls exactly between the marginal and the broken
+// case. Uniformly scaling that scene by 0.1 -- same angles, same ratios, same image,
+// only smaller floats -- takes the error from -23.67% to -0.36%, which is what makes it
+// a precision failure rather than an algorithmic one. This was the real cause of the
+// long-standing "GPU and CPU disagree on participating-media brightness" report: it has
+// nothing to do with media (it reproduces with no medium in the scene at all), it is
+// simply that the repro scene put its light 6 km away. See known-issues.md GPU-NEE-EPS.
+
+
 
 // DVec3 stores Real and does Real arithmetic (the hot path), but its 3-arg
 // constructor keeps DOUBLE parameters so the host baking code's brace-init from
@@ -3901,7 +3927,7 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     if (stG <= (Real)0) return;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    if (occluded(sc, p + ng * RAY_EPS, wdir, connMaxT(dist, 2 * RAY_EPS), RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real f = rho / (Real)DPI;
     // Projection-general splat: contrib = beta*f*cosSurf*corr / (dist^2 * pixelSolidAngle).
     // For a rectilinear lens pixelSolidAngle = pixelPlaneArea*cosCam^3, recovering the
@@ -3924,7 +3950,7 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
     DVec3 wdir = toCam / dist;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, connMaxT(dist, 2 * RAY_EPS), RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real ph = dMedPhase(med, dot(wIn, wdir), lambda);
     Real Lambda = medAlbedo(med, lambda);
     // Projection-general splat (no cosSurf for a volume vertex): the phase carries the
@@ -3961,7 +3987,7 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (cosLens <= (Real)1e-6) return;               // not heading toward the film
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    if (occluded(sc, p + ng * RAY_EPS, wdir, connMaxT(dist, 2 * RAY_EPS), RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
     Real contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
     // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification) — CPU twin: render.h connectLens.
@@ -3993,7 +4019,7 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, connMaxT(dist, 2 * RAY_EPS), RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real ph = dMedPhase(med, dot(wIn, wdir), lambda);
     Real Lambda = medAlbedo(med, lambda);
     Real contrib = beta * Lambda * ph * cosLens * (Real)DPI * (R * R) / (dist * dist);
@@ -5562,7 +5588,7 @@ __device__ static void connectEmissionVolume(const DScene& sc, const DCamera& ca
     DVec3 wdir = toCam / dist;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, connMaxT(dist, 2 * RAY_EPS), RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) / (Real)((double)dist2 * solidAngle);
     contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
@@ -5585,7 +5611,7 @@ __device__ static void connectEmissionLensVolume(const DScene& sc, const DCamera
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, connMaxT(dist, 2 * RAY_EPS), RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) * cosLens * (Real)DPI * (R * R) / (dist * dist);
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
@@ -8137,7 +8163,7 @@ __device__ static void connectHero(const DScene& sc, const DCamera& cam, double*
     if (stG <= (Real)0) return;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    if (occluded(sc, p + ng * RAY_EPS, wdir, connMaxT(dist, 2 * RAY_EPS), RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real geo = cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
@@ -8170,7 +8196,7 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    if (occluded(sc, p + ng * RAY_EPS, wdir, connMaxT(dist, 2 * RAY_EPS), RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     Real cellNorm = (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     Real geo = cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG * cellNorm;
@@ -9457,7 +9483,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
         if (g.fall <= (Real)0) return false;
         if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-               : occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
+               : occluded(sc, h.p + ngo * RAY_EPS, g.wi, connMaxT(g.dist, 2 * RAY_EPS))) return false;
         g.G = (Real)0; g.spot = true; g.sun = false;
         return true;
     }
@@ -9511,7 +9537,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     Real cosLight = dot(nL, -g.wi);               // light is one-sided
     if (cosLight <= 0) return false;
     if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-           : occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
+           : occluded(sc, h.p + ngo * RAY_EPS, g.wi, connMaxT(g.dist, 2 * RAY_EPS))) return false;
     g.G = g.cosSurf * cosLight / g.dist2;
     if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
     g.fall = (Real)1; g.spot = false; g.sun = false;
@@ -9696,7 +9722,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             DVec3 wi = toL / dist;
             Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
-            if (occluded(sc, p + wi * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+            if (occluded(sc, p + wi * RAY_EPS, wi, connMaxT(dist, 2 * RAY_EPS))) continue;
             Real phase = dMedPhase(med, dot(wIn, wi), lambda);
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
             double contrib = (double)(alb * phase * fall / dist2) * emitW;
@@ -9729,7 +9755,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         DVec3 wi = toL / dist;
         Real cosLight = dot(nL, wi * (Real)(-1));         // light is one-sided
         if (cosLight <= 0) continue;
-        if (occluded(sc, p + wi * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+        if (occluded(sc, p + wi * RAY_EPS, wi, connMaxT(dist, 2 * RAY_EPS))) continue;
         Real phase = dMedPhase(med, dot(wIn, wi), lambda); // phase == its own pdf (HG or rainbow)
         Real G = cosLight / dist2;                        // no surface cosine at a volume vertex
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
@@ -11003,7 +11029,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             if (stG <= (Real)0) continue;
             Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
-            if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+            if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, connMaxT(dist, 2 * RAY_EPS))) continue;
             total = total + hadamard(f * (fall * cosSurf / dist2 * stG * selWr), em.rgbEmit);
             continue;
         }
@@ -11034,7 +11060,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         if (stG <= (Real)0) continue;
         Real cosLight = dot(nL, -wi);
         if (cosLight <= 0) continue;
-        if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+        if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, connMaxT(dist, 2 * RAY_EPS))) continue;
         Real G = cosSurf * cosLight / dist2;
         if (epat != 1.0) G = (Real)((double)G * epat);   // no-op without a pattern
         total = total + hadamard(f * (G * em.area * stG * selWr), em.rgbEmit);

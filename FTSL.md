@@ -2178,7 +2178,17 @@ medium {
 block. `rain_mm_h 1` ≈ 366 µm (drizzle), `5` ≈ 514 µm, `25` ≈ 723 µm (downpour).
 
 - `phase hg` (or no `phase` statement) is the default Henyey-Greenstein lobe — nothing
-  changes; a bare `phase hg` is only for making the choice explicit.
+  changes; a bare `phase hg` is only for making the choice explicit. Its one parameter is
+  the anisotropy `g`, which may be written **either** as a medium-level key **or** inside
+  the block, so both of these are the same medium:
+
+  ```
+  medium { sigma_t 2  g 0.46 }
+  medium { sigma_t 2  phase hg { g 0.46 } }
+  ```
+
+  (Before 0.259.0 only the first form worked: the second warned `unknown key 'g'` and then
+  rendered isotropic. A `g` in the block now overrides a medium-level one.)
 - **`phase rainbow { .. }`** replaces the lobe with a physically-tabulated **water-droplet
   phase** (Airy theory of the rainbow, `rainbow.h`). A fog/rain medium then shows a real
   **primary bow (~42°) + secondary bow (~51°)**, wavelength dispersion (red outer / violet

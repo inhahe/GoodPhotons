@@ -6835,7 +6835,28 @@ private:
                 rp->build(prm);
                 med.rainbowPhase = rp;
             } else if (kind == "hg" || kind.empty()) {
-                // explicit HG (or `phase` with no argument): default lobe, nothing to do.
+                // Explicit HG (or `phase` with no argument). The lobe's ONE parameter is `g`,
+                // which is also a medium-level key (read at the top of addMedium), so both
+                // spellings must work:
+                //
+                //     medium { sigma_t 2  g 0.46 }                  # the original form
+                //     medium { sigma_t 2  phase hg { g 0.46 } }     # the form `phase rainbow` teaches
+                //
+                // Only the first used to be honoured. The second parsed, warned `unknown key
+                // 'g'`, and then rendered ISOTROPIC — a silently wrong image, which is exactly
+                // the failure mode the used-key audit exists to prevent. It is an easy mistake
+                // to make because `phase rainbow { .. }` DOES take its parameters in the block,
+                // so the block form looks like the general shape of a phase statement.
+                // (Found via scraps/rb_val_hg.ftsl, which authors `phase hg { g 0.0 }` — that
+                // scene happened to ask for the default, so the bug cost it nothing; a scene
+                // asking for a forward lobe would have lost it.)
+                //
+                // Reading it here also clears the warning, since `find` marks the statement
+                // used. A block-level `g` OVERRIDES the medium-level one: it is the more
+                // specific spelling, and naming both is a contradiction the author should see
+                // resolved in favour of the phase block they wrote it in.
+                if (const Block* pb = ph->val.block.get())
+                    med.g = dblOf(*pb, "g", med.g);
             } else {
                 fail("medium `phase " + kind + "` is not a known phase model (use `hg` or `rainbow`)");
                 return false;

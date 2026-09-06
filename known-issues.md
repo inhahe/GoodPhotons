@@ -10496,35 +10496,168 @@ deferred. Repro: render `scraps/grin_lin.ftsl -mode R` on `-device gpu` and `-de
 `python scraps/grin_residual.py png/grin_lin_gpu.png png/grin_lin_cpu.png` (watch disc rel-err
 vs spp).
 
-### BUG — OPEN (2026-07-23): GPU vs CPU participating-media brightness disagree systematically across modes (phase-independent, pre-existing)
+### BUG — DONE (2026-09-06, 0.259.0) [GPU-NEE-EPS]: GPU NEE/camera shadow rays lost their end-shortening past ~3360 scene units, so any DISTANT light came out too dark — logged for six weeks as a "participating-media" disagreement, which it never was
 
-Discovered while statistically validating M10 (rainbow media on device). For a bounded
-homogeneous fog scene (`scraps/rb_val_lowvar.ftsl` / `rb_val_hg.ftsl`, absolute exposure so
-GPU and CPU share a FIXED gain), the GPU and CPU converge to **different overall brightness**
-for the SAME mode/scene — and the gap is **phase-independent** (a plain-HG control shows the
-same factor as a rainbow medium), so it is **not** an M10 rainbow bug:
+Filed 2026-07-23 as "GPU vs CPU participating-media brightness disagree systematically
+across modes (phase-independent, pre-existing)", with a headline 2.41x mode-D gap and a
+190x `[energy] absorbed=` gap, and the suspicion pointed at the **CPU** ("CPU appears to
+barely absorb via medium albedo"). Every part of that framing was wrong. The bug is on the
+GPU, it is a float32 precision failure in the shadow-ray epsilon, and **it has nothing to
+do with participating media** — it reproduces with no medium in the scene at all.
 
-| mode | GPU↔CPU B/A (CPU/GPU), rainbow | HG control | notes |
+**Root cause.** `bkEmitterGeom` / `bkNeeVolume` / `bkNeeLightRGB` and the camera legs all
+shortened their occlusion ray with a hard-coded `dist - 2*RAY_EPS`. `RAY_EPS` is `1e-4f`,
+so the shortening is `2e-4`, while one ulp of a float at magnitude `d` is `d*2^-23`. The
+subtraction therefore rounds straight back to `dist` once
+
+    2e-4 < 0.5 ulp   <=>   d > 2e-4 / (0.5 * 2^-23)  ~=  3360 scene units
+
+and the shortening vanishes entirely. The ray then reaches the sampled emitter point
+*exactly*, re-hits the emitter it was sampled from, and the sample is discarded as
+occluded. This is the identical failure `connMaxT` (render_cuda.cu:228) was introduced to
+fix for BDPT/VCM **connection** rays — the NEE and camera-leg sites were simply never
+converted. Fix: route all 14 of them through `connMaxT(dist, 2*RAY_EPS)`, which shortens by
+a *relative* `1e-5` (~84 ulp at any scale) while keeping the old absolute value as a floor
+for near geometry. The fp64 build sets `CONN_REL_EPS = 0`, so it stays bit-identical there.
+
+**How it was pinned down** (each step is a measurement, none of it inference):
+
+1. *A closed-form arbiter, not another renderer.* `tools/slab_ss_ref.py` + `scenes/_slab_ss.ftsl`
+   compute single scattering by deterministic quadrature. Its one weakness is a fitted global
+   constant, which a uniform factor would absorb — so the gate was run at `albedo` 1.0 / 0.5 /
+   0.25 (`scraps/_slab_a*.ftsl`), where the *ratio* is analytically exactly 0.5 with no fitted
+   constant involved. GPU-D, CPU-D and GPU-R all passed flat to 0.4% and agreed on the absolute
+   constant to **0.04%**. So the volumetric physics both backends call is correct.
+2. *The 2.41x no longer reproduced at all* (mode D, matched noise: +0.04% X, +0.03% Y, -0.27% Z).
+3. *An independent implementation.* `scraps/absmc.py` is a bare ~150-line numpy random walk of
+   the repro scene sharing no code with ftrace. It also reports `hit anything`, a hard upper
+   bound on `absorbed` — nothing else in the scene can absorb a photon. Against the emitter-
+   distance sweep `scraps/rb_hg_d{1,2,4,8,16}.ftsl` (`[energy] absorbed=`, mode B):
+
+   | light dist | independent walk | upper bound | CPU | GPU |
+   |---|---|---|---|---|
+   | 6325 | 0.000865 | 0.000892 | 0.0008 | **0.1525** |
+   | 3162 | 0.003315 | 0.003401 | 0.0032 | **0.0648** |
+   | 1581 | 0.011808 | 0.012152 | 0.0115 | **0.0242** |
+   |  791 | 0.038138 | 0.039376 | 0.0369 | 0.0398 |
+   |  395 | 0.097115 | 0.101065 | 0.0937 | 0.0944 |
+
+   The CPU tracks the reference to ~3% across a 112x range; the GPU exceeds the **upper bound**
+   by 171x. The GPU column is also non-monotonic in distance, which no physical absorbed
+   fraction can be. This inverted the entry's suspicion: the GPU is the wrong backend.
+4. *Not media.* The GPU printed `absorbed=0.1525` identically with the full medium, with a
+   2-unit medium, and with **no medium at all** (`scraps/rb_hg_{tiny,nomed}.ftsl`) — a Monte
+   Carlo estimate cannot be invariant to deleting the thing it estimates.
+5. *Not just the diagnostic.* On the no-medium scene the images differ too, and normalising to
+   CPU mode R: **R cpu 1.000, B cpu 1.009, R gpu 0.764, B gpu 0.465.** The two CPU modes agree
+   with each other; both GPU modes are dark.
+6. *Localised.* Stock `_cornell_diffuse` agrees GPU-vs-CPU to **+0.02%**, so the GPU R engine is
+   fine in general. The gap is exactly achromatic (-23.68 / -23.69 / -23.68 in X/Y/Z), survives
+   swapping the sphere light for an area light (-25.3%), and is independent of the emitter
+   radius (6 -> 600 both ~-23%) — ruling out spectral, light-type and solid-angle-pdf causes.
+7. *Precision, not algorithm.* `scraps/rbnm_s01.ftsl` is the same scene with every coordinate
+   scaled by 0.1 — identical angles, ratios and image, only smaller floats. The error goes from
+   **-23.67% to -0.36%.** And the distance sweep in mode R brackets the predicted threshold:
+
+   | light dist | 2e-4 in ulp | predicted | measured |
+   |---|---|---|---|
+   | 6325 | 0.27 ulp, lost entirely | broken | -23.67% |
+   | 3162 | 0.53 ulp, on the round-to-nearest boundary | marginal | -1.64% |
+   | 1581 | 1.06 ulp, survives | clean | -0.20% |
+   |  632 | 5.3 ulp, survives | clean | -0.36% |
+
+   The ~3360 prediction falls exactly between the marginal and the broken case.
+
+**Why the old entry read the way it did — and the part of it that was a SECOND bug.**
+The headline 2.41x (mode D) had already been fixed by `connMaxT` when it was introduced for
+the BDPT connections (the "1.85 m sphere 400 m away, 2.7x too dim" note above it), which is
+why it "no longer reproduced"; the mode-R darkening was this entry's bug; but the mode-B
+`[energy] absorbed=0.1525 vs 0.0008` that the old entry leaned on hardest is **neither**.
+It survives the fix unchanged, and two discriminators pin it to the *emission origin*
+instead of the shadow ray's far end (all mode B, `[energy] absorbed=`, GPU / CPU):
+
+| scene | what changed | GPU | CPU |
 |---|---|---|---|
-| B (forward photon) | ~1.25 (median 1.02) | ~1.58 (median 1.00) | firefly-heavy; **bulk medians agree**, but the image *mean* and the `[energy]` line disagree |
-| D (BDPT) | **2.41 uniform** (median 2.44, p10=1.48…p90=4.27) | **2.41 uniform** | cleanest signal: well-converged (~3% noise), low firefly tail, uniform shift across *every* percentile ⇒ real systematic factor, not noise |
-| R (backward ref) | ~1000× (CPU near-black) | ~1000× | mode R forces media to a single GLOBAL homogeneous haze; camera embedded in fog renders lit-fog+bow on GPU but near-black on CPU ⇒ CPU mode-R likely mishandles camera-inside-global-haze in-scatter/NEE |
+| `scraps/rbnm_d1.ftsl` | sphere light 6 km out (the repro) | **0.1525** | 0.0008 |
+| `scraps/rbnm_spot.ftsl` | a SPOT at the same spot: no surface of its own to re-hit | 0.0928 | 0.0922 |
+| `scraps/rbnm_xlate.ftsl` | same sphere, scene translated so the light is at the ORIGIN | 0.0009 | 0.0009 |
 
-Corroborating engine diagnostic: at albedo 0.5 (slab optical depth ~0.16) forward mode prints
-`[energy] absorbed=0.1516` on GPU vs `absorbed=0.0008` on CPU — a ~190× gap. GPU's ~0.15 is the
-physically-expected single-pass absorbed fraction; **CPU appears to barely absorb via medium
-albedo**, which would also make CPU *brighter* (consistent with B/A>1 in modes B and D). So the
-direction hints the **CPU** may be the wrong one (under-absorbing / an accounting-vs-transport
-mismatch) — but it could equally be the GPU BDPT missing volume connection strategies (which
-would make GPU dimmer). **Needs investigation to determine which backend is correct.**
+A photon born on a far-away sphere is being killed on its own emitter before it goes
+anywhere — the sampled point is float-formed (`y = c + d*R`, up to ½ ulp off the surface,
+inside half the time), the `+ dir*RAY_EPS` nudge is along the *direction* and rounds away,
+and the stable sphere intersector then returns the exit chord (> tmin). That is
+GPU-ORIGIN-EPS below, now promoted from "latent" to observed. It was invisible to the image
+comparison only because the light sat outside the frame; it is why `absorbed` was invariant
+to deleting the medium. The repro scene confounded three things at once: *has a medium*,
+*light far from the geometry* (this entry) and *light far from the origin* (the next one).
 
-Scope: affects ALL GPU participating media (HG and rainbow alike); pre-existing (M10's git diff
-leaves the HG BDPT phase path bit-for-bit unchanged, yet HG still shows the 2.41×). Repro:
-`ftrace scraps/rb_val_hg.ftsl -mode D -o ppm/x_gpu.ppm -device gpu -noise 3` and again with
-`-device cpu`, then `python scraps/rb_robust_compare.py ppm/x_gpu.ppm 6 ppm/x_cpu.ppm 6`.
-Proper fix: reconcile the two backends' medium collision/absorption + BDPT volume-connection
-strategies so GPU==CPU converges to B/A≈1.0; likely a forward-medium albedo-absorption
-accounting fix on CPU and/or a missing GPU-BDPT volume strategy.
+**Gate (post-fix, `tools/check_distant_light.py`, mode R, 25 s/render):** far scene
+**+0.61%**, near control **+0.62%** — the far scene now behaves identically to the near one,
+and the shared +0.6% is the ordinary fp32-vs-double envelope, present in both regimes.
+
+**Still absolute after this fix (follow-up, same arithmetic):** `bkHairBlocked`'s
+`len = d - off - RAY_EPS` — the far end of a HAIR vertex's NEE ray is on the emitter too,
+so hair lit by a distant light keeps the bug — and the two hair camera legs `connectHair` /
+`connectLensHair` (`dist - off - RAY_EPS`). Convert to `connMaxT(d - off, RAY_EPS)`.
+
+**Also explains** the "separate pre-existing global ~1.2x mode-R float-GPU vs double-CPU
+exposure difference ... even with NO medium" noted in the GRIN entry above (1/0.764 = 1.31);
+that observation was this bug and should be considered closed with it.
+
+Repro / gate: `python tools/check_distant_light.py` renders `scenes/_distant_light.ftsl`
+(light ~6325 units out) and `scenes/_distant_light_near.ftsl` (the same scene scaled by 0.1)
+on both devices and fails if either median GPU/CPU ratio is off by more than 3%. Only the far
+half failing means the end-shortening has gone absolute again; both failing means something
+generic. Any scene whose lights sit thousands of units from the shading geometry (a sun
+modelled as a far sphere, a city block, an outdoor flyby) exercises this.
+
+### BUG — OPEN (2026-09-06) [GPU-ORIGIN-EPS]: the GPU's ray-ORIGIN offsets are absolute (1e-4, and 1e-6 in the BDPT/VCM/caustic paths), so far from the world origin they round away — observed as photons dying on their own emitter (mode B `absorbed=0.1525` on a 6 km light)
+
+Found while fixing GPU-NEE-EPS above, which is the same arithmetic at the other end of the
+ray. Three different origin-offset styles are in use on the device, and in the fp32 build
+every one of them is below one float ulp at ordinary scene scales:
+
+| style | sites | rounds away past (per-component magnitude) |
+|---|---|---|
+| `p + n * RAY_EPS` (1e-4f) — bounce and shadow origins, emission | ~95 (42 × `h.n`, 15 × `rd`, 7 × `ngo`, 4 × `wi`/`wdir`/`ng`, 3 × `dir`/`nb`/`ngo0`/`outDir`, …) | ~1680 (½ ulp at 1e-4) |
+| `h.ng * (Real)(sgn * 1e-6)` — BDPT s=1 / t=1 / s,t connections, VCM NEE and connections | 4 | **~17** |
+| `(p + wP * 1e-6).toR()` — caustic-chain connections, offset in double then cast to float | 5 | **~17** (the cast destroys it) |
+
+Below the threshold the origin sits exactly ON the surface it just left (and on a curved
+surface, up to ½ ulp *inside* it, because the hit point itself is float-formed). What has
+been hiding this is `tmin = RAY_EPS = 1e-4` on the next trace: a flat self-hit lands at
+t ≈ 0 and is culled. What tmin cannot cull is a re-hit with t > 1e-4 — a **curved** surface
+whose exit chord from a rounded-inside point is δ/cosθ up to √(2Rδ), or a **grazing**
+departure across a large flat, where the plane re-hit lands at t = jitter/sinθ.
+
+**Observed, mode B, and NOT fixed by GPU-NEE-EPS:** the emission launch
+`ro = origin + dir * RAY_EPS` (render_cuda.cu, both `emitPhoton` twins). The sampled sphere
+point `y = c + d*R` is float-formed; at |y| ≈ 6325 it lands up to ~2.4e-4 off the surface,
+inside about half the time; the 1e-4 nudge is along `dir` — the wrong vector even when it
+survives, since a grazing direction gains ~t²/2R of clearance from a sphere — and rounds away
+regardless; the RTG-ch.7 intersector then returns the exit chord, which exceeds tmin, and the
+photon terminates as `eAbsorbed` on the light it was born on. Evidence (`[energy] absorbed=`,
+GPU / CPU): the repro sphere **0.1525 / 0.0008** (independent walk `scraps/absmc.py`:
+0.00087); a SPOT at the same position, which has no surface — 0.0928 / 0.0922; the same
+sphere with the whole scene translated so the light is at the origin — 0.0009 / 0.0009. The
+value was also invariant to deleting the medium, which is what first said "not media". The
+emitter's own camera splat (`connect` from the emission point, `p + ng*RAY_EPS`) shares the
+defect, so a *visible* distant light should show rim darkening in forward modes on the GPU
+(predicted, not yet rendered).
+
+**Do NOT fix it the way GPU-NEE-EPS was fixed.** A relative offset is safe for shortening a
+ray's far end (overshooting only trims a segment with nothing in it) but dangerous at the
+origin: `1e-5 * |p|` on a 100 km scene is a 1 m push, which leaks light straight through a
+wall. The correct fix is Wächter & Binder's integer `offset_ray` (Ray Tracing Gems ch. 6):
+advance the origin by a fixed number of *ulps* along the geometric normal, on the departure
+side (`sign(dot(w, ng))`, so reflection and transmission both clear the surface) —
+scale-correct by construction at every magnitude and bounded in absolute terms. One helper
+replaces all three styles; emission offsets along `emitN`, never along `dir`; the fp64 build
+keeps its current constants so it stays bit-identical to the CPU reference. It perturbs
+every GPU image slightly, so it is its own commit with its own before/after sweep:
+`scraps/rbnm_d1.ftsl` mode B must come to ~0.0009, `scraps/rbnm_xlate.ftsl` and the +50000-
+translated `scraps/rbnm_s01.ftsl` must not move, and `_cornell_diffuse` / `_slab_ss` must
+stay within their current envelopes.
 
 ### PERF — DONE (2026-07-23): interactive `-explore`/`-fly` felt intermittently slow (GPU parked in its idle power state between mouse-look bursts)
 
