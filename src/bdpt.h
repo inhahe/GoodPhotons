@@ -666,8 +666,10 @@ struct PathSeg {
     //  * `fW[i]` is T(bs.lam[i]) / T(lambda_walk) — bundle member i's accumulated spectral
     //    throughput RELATIVE TO THE WAVELENGTH THE WALK ACTUALLY USED. The record's hero is
     //    bs.lam[0], not the walk's lambda (see BeamSpectral), so unlike render.h's `specW`
-    //    this covers member 0 too: the deposited power is beta * scale * fW[0] and the
-    //    record's per-member weights are fW[i] / fW[0].
+    //    this covers member 0 too: an UNFOLDED deposit is beta * scale * fW[0] with
+    //    per-member weights fW[i] / fW[0]. A FOLDED deposit (fCie in use) is beta * scale
+    //    at the walk's own wavelength -- fCie's ratios are relative to that, not to
+    //    member 0 (see depositSeg; getting this wrong was the mode-J X excess).
     //
     // Both stay at 1 / cieMean until something wavelength-dependent happens, which before
     // 0.257.0 was the only state that could reach a deposit at all.
@@ -2141,19 +2143,37 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 const Vec3* cie = nullptr;
                 double wsBuf[kBeamSpecMax];
                 if (sg.achro) {
-                    const double w0 = sg.fW[0];
-                    if (!(w0 > 0.0)) return;                 // T(bs.lam[0]) == 0: no flux
-                    lam = dLam;
-                    pw  = sg.beta * dSc * w0;
-                    if (dSec > 0) {
-                        for (int i = 0; i < dSec; ++i) wsBuf[i] = sg.fW[i + 1] / w0;
-                        lamS = dLamS; nSec = dSec;
-                    }
-                    // The fold is the one part still gated on `-beamachro`; the rest of the
-                    // claim is unconditional because it costs nothing and is never worse.
-                    if (beamAchroOK &&
-                        (sg.fCie.x > 0.0 || sg.fCie.y > 0.0 || sg.fCie.z > 0.0))
+                    const bool fold = beamAchroOK &&
+                        (sg.fCie.x > 0.0 || sg.fCie.y > 0.0 || sg.fCie.z > 0.0);
+                    if (fold) {
+                        // FOLDED (-beamachro): the beam is gathered at `fCie`, whose per-bin
+                        // ratios foldT[k] = T(foldLam[k]) / T(lambda_walk) are relative to the
+                        // WALK's wavelength. So the power must be the walk's own throughput,
+                        // beta * scale, at lambda_walk. It used to be beta * scale * fW[0] --
+                        // the throughput re-expressed at bundle member 0, which in mode J is a
+                        // FRESH SPD sample, not the walk's hero (see BeamSpectral) -- and the
+                        // product then carried a stray T(lam0)/T(lambda_walk). Over two
+                        // independent wavelengths that factor averages E[T]*E[1/T] >= 1: 1.00
+                        // on a flat white wall, several-fold on a red wall (T 0.05..0.6), which
+                        // is why _fog_cornell came out +40% in X with Y untouched, mode J only
+                        // (mode M's member 0 IS its walk's hero), and clean with -beamachro off.
+                        // The bundle is mutually exclusive with the fold (emitBeams zeroes nSec
+                        // when cieA is given), so no per-member weight needs the same treatment.
+                        lam = hb.lam[0];
+                        pw  = sg.beta * dSc;
                         cie = &sg.fCie;
+                    } else {
+                        // MONOCHROMATIC at bundle member 0 (with the other members as a bundle):
+                        // here the beam really is the flux at bs.lam[0], so fW[0] applies.
+                        const double w0 = sg.fW[0];
+                        if (!(w0 > 0.0)) return;             // T(bs.lam[0]) == 0: no flux
+                        lam = dLam;
+                        pw  = sg.beta * dSc * w0;
+                        if (dSec > 0) {
+                            for (int i = 0; i < dSec; ++i) wsBuf[i] = sg.fW[i + 1] / w0;
+                            lamS = dLamS; nSec = dSec;
+                        }
+                    }
                 }
                 // MedAll, not the emitBeams default MedStraight: nothing about this span is
                 // carried stochastically (that is what LONG means), so every medium the

@@ -579,7 +579,13 @@ Four consequences worth knowing:
       `∫p_comb·f` instead of `∫p_em·f`.
 
     The result is arithmetically the deposit mode `M` would have made, so mode `M`'s bundle *and*
-    fold both become valid. This is a strict improvement even at `-beamspec 1 -beamachro off`,
+    fold both become valid. **With one reference-wavelength rule (0.259.3, `UPBP-CHROMA`):** the
+    replacement only covers an *unfolded* deposit, whose power `beta·scale·fW[0]` is the flux
+    at member 0 and is gathered at `CIE(lam₀)`. A *folded* deposit is gathered at
+    `Σ foldCie[k]·foldT[k]`, whose ratios are relative to the walk's own hero, so its power
+    must be `beta·scale` at that hero — re-expressing it at member 0 left a stray
+    `T(lam₀)/T(λ_walk)` whose mean over two independent wavelengths is `E[T]·E[1/T] ≥ 1`:
+    nothing on a flat wall, +40 % in X off the red one. This is a strict improvement even at `-beamspec 1 -beamachro off`,
     where it reduces to "deposit at a wavelength drawn from the right density instead of the
     wrong one" and removes the `spd_em/p_comb` weight-ratio variance — measurably: it took the
     **cloud** crop's chroma noise *further* down (saturation 0.0560 → 0.0390) even though the

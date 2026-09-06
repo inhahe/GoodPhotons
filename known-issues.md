@@ -70,7 +70,7 @@ three gates pass:
 3. **Gate 3 (three-way) — not yet run.** A scene with media *and* surfaces must not brighten or
    darken against a long mode-`R` / mode-`D` reference — i.e. the three-technique denominator really
    does sum to one. This is the only gate left before `-jsurf` flips to default-on. Note it is
-   entangled with the separately-tracked **+9…+17 % volume residual** in the beam-merge weight: gate
+   entangled with the separately-tracked **+9…+17 % volume residual** in the beam-merge weight (its X-channel part was `UPBP-CHROMA`, fixed in 0.259.3; a colour-neutral +3…8 % mean remains at 120 s): gate
    3 cannot be read cleanly until that is understood, since a three-way run inherits it.
 
 Until those are green, `-jsurf` stays opt-in; when they are, it flips to default-on and `-nojsurf`
@@ -206,6 +206,51 @@ modes remain the physical answer, and nothing here feeds light transport.
 (`[fur]` lines in any `gallery_rain` log), which is a different problem from previewing a single
 GLB; expect the mesh-file / single-asset case to hit interactive rates long before a full furred
 scene does. Judge success on the asset-viewer case first.
+
+### UPBP-CHROMA — DONE (2026-09-06, 0.259.3): mode `J` rendered `_fog_cornell` +40 % too bright in X (Y untouched) — a folded beam's power was re-expressed at bundle member 0 while its folded CIE ratios were relative to the walk's wavelength
+
+The "mode J volume residual" that blocked gate 3 of the U→J merge, referenced in three places
+and tracked nowhere until now. Measured before the fix (mode J CPU vs a mode-D reference of
+the same scene, per channel, mean / median):
+
+| variant | X | Y | Z |
+|---|---|---|---|
+| `_fog_cornell`, default (`-beamachro` on) | +44.7 % / +26.3 % | +8.3 % / −30.1 % | +4.0 % / −27.9 % |
+| same, `-beamachro off` | +3.2 % / −34.4 % | +7.7 % / −30.9 % | +3.9 % / −27.9 % |
+| walls made neutral (`whitewall 0.75` everywhere) | +4.5 % / −33.6 % | +6.8 % / −32.5 % | −0.6 % / −33.3 % |
+| glass sphere removed | — (variant malformed pre-fix; see after) | — | — |
+
+The excess needs the fold **and** a strongly coloured diffuse surface; it does not need the
+dispersive sphere. The `-beamspec` bundle had already been exonerated (`-beamspec 1` gave the
+same numbers).
+
+**Root cause (bdpt.h, `depositSeg`).** In mode J every bundle wavelength — member 0 included —
+is a fresh sample of the emitter's SPD, *not* the walk's hero (`BeamSpectral`: "the record's
+hero is `bs.lam[0]`, not the walk's lambda"). The deposit therefore re-expresses the walk's
+throughput at member 0: `power = beta · scale · fW[0]`, with `fW[0] = Π T(lam₀) / Π T(λ_walk)`.
+That is right for a monochromatic beam gathered at `CIE(lam₀)`. But a **folded** beam is
+gathered at `fCie = Σ_k foldCie[k] · foldT[k]`, whose per-bin ratios `foldT[k] = Π T(λ_k) /
+Π T(λ_walk)` are relative to the *walk's* wavelength — so the product carried a stray
+`Π T(lam₀) / Π T(λ_walk)`. Over two independent wavelengths that factor averages
+`E[T]·E[1/T] ≥ 1`: exactly 1 on a flat 0.75 white wall (hence no Y error), several-fold on the
+red wall's 0.05…0.6 reflectance (hence X), a little on Z. Mode M is unaffected because its
+member 0 *is* the walk's hero (`fW[0] ≡ 1`), which is why the bug was mode-J-only; and
+`-beamachro off` removes it because an unfolded beam is genuinely the flux at `lam₀`.
+
+**Fix.** A folded deposit now carries the walk's own throughput, `beta · scale` at `λ_walk`;
+the unfolded/bundle path keeps `fW[0]` (there the beam really is the flux at `lam₀`). The
+bundle is mutually exclusive with the fold at `emitBeams`, so no per-member weight needed the
+same treatment. After the fix, same scenes and references:
+
+| variant | X | Y | Z |
+|---|---|---|---|
+| `_fog_cornell`, default | +3.2 % / −34.1 % | +7.6 % / −31.1 % | +3.6 % / −28.5 % |
+| walls neutral | +4.5 % / −33.6 % | +6.8 % / −32.5 % | −0.6 % / −33.3 % |
+| glass removed | +1.3 % / −34.0 % | +7.3 % / −30.4 % | +3.1 % / −27.9 % |
+
+What remains after the fix is mode J's ordinary volume residual against mode D at these
+budgets (the `-beamachro off` row above shows its size with no fold in play), which is the
+UPBP-CONV / UPBP-W territory, not a spectral error. Repro: `scraps/chroma_bisect.sh`.
 
 ### UPBP-BOWFOLD — **DONE** (2026-09-05, fixed in v0.257.0): mode `J`'s rain was noisier than mode `D`'s because the `-beamspec` bundle was capped at ~36 % coverage — `PhotonBeam` stored no per-member weight, so the bundle died at the first λ-dependent event
 
@@ -465,7 +510,7 @@ for surfaces.
 *volume* (it is the only one that agrees with the `R` anchor on cloud, cloud base, cloud limb,
 rain column and rainbow, once unfrozen) and the **worst** on its *surfaces*. Modes `D` and `J`
 are the reverse on surfaces. So there is currently no single best mode for `gallery_rain`, and
-this entry plus mode `J`'s +9…17 % volume residual are the two things standing between the engine
+this entry plus mode `J`'s volume residual (its X-channel part was `UPBP-CHROMA`, fixed in 0.259.3; the colour-neutral remainder is UPBP-CONV / UPBP-W) are the two things standing between the engine
 and one.
 
 ### M-FROZEN — FIXED (2026-09-05, v0.252.0 + v0.253.0): mode `M` showed **coloured bars through the rain and cloud that got worse the longer it rendered**, because its photon / caustic / beam maps were built once and every camera sample gathered from that one realization
