@@ -129,11 +129,12 @@ inline Vec3 fiberOrigin(const Hit& h, bool isHair, const Vec3& dir) {
 // correction. NOTE: the standalone photon-map / SPPM gathers (modes M/S) already smooth-shade
 // in this renderer and must NOT use this — only the MIS-coupled VM merge needs it. Why the
 // coupling makes the difference is logged as tech debt in known-issues.md.
-inline double vmGatherCorr(const Vec3& wp, const Vec3& ns, const Vec3& ng) {
-    double denom = std::fabs(dot(wp, ng));
-    if (denom <= 1e-8) return 1.0;
-    return std::fabs(dot(wp, ns)) / denom;
-}
+//
+// DEFINED IN surfmerge.h (via bdpt.h), not here: mode J's point merge is the same estimator
+// and needs the identical correction, so the function moved to the shared header and this is
+// now only the name. Keeping two copies would let mode U and mode J's merges drift apart on
+// smooth meshes — precisely the class of difference this correction exists to remove.
+using bdpt::vmGatherCorr;
 
 // A stored light-subpath vertex (only connectible/non-delta surface vertices are kept).
 struct LightVertex {

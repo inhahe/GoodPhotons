@@ -25,7 +25,7 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather; optional `-beams` view-independent volume cache; two-map caustic split with an aimed second emission pass; `-savemap`/`-loadmap` persist both halves). Since 0.252.0 a **single-camera** render re-draws all three maps every epoch under a fresh salt and averages the epochs' films (`-beamfreeze` to opt out), so the light-side half of its error converges with render time instead of freezing — that was M-FROZEN, whose visible symptom was coloured bars through `phase rainbow` media. 0.253.0 extended that to the **shared/GPU** route, which a plain fixed-`-spp` single-camera render takes. **Multi-camera renders still build once**, which is the cross-frame amortisation this mode exists for | `photonmap.h`, `photonmap_render.h`, `photonbeams.h`, `causticaim.h`, `photonmap_io.h` |
 | `S` | SPPM (progressive photon mapping, shrinking radius) | `sppm_render.h` |
 | `U` | VCM (vertex connection & merging) | `vcm.h` |
-| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). It traces its own light subpaths for the beam map (0.216.0) and both techniques are MIS-weighted (0.218.0), with merged paths capped at `maxDepth` like the connections (0.219.0). The map sizes itself from the scene's `-beamk` knee via a discarded pilot (0.242.0), so **leave `-n` off** — passing it disables the budget. The **camera pass runs on the GPU** as of 0.244.0 (mode `D`'s megakernel with `MERGE=true`); the light/beam pass stays on the CPU on both backends. Since 0.247.0 the light side is **re-drawn every epoch and averaged** (`-beamfreeze` to opt out), so the merge half converges with render time instead of freezing on one realization — that was UPBP-THICK, and it was variance, not bias. Correct, but **not yet faster than `D`** — see UPBP-CONV | `bdpt.h` + `beamgather.h` + `photonbeams.h` + `render_cuda.cu` |
+| `J` | UPBP (unifying points, beams and paths): mode `D`'s BDPT connections **and** mode `M`'s `-beams` beam×ray merges under one MIS weight — the volumetric counterpart of `U`. Beams default **on** (`-nobeams` reduces it to `D` bit-for-bit). It traces its own light subpaths for the beam map (0.216.0) and both techniques are MIS-weighted (0.218.0), with merged paths capped at `maxDepth` like the connections (0.219.0). The map sizes itself from the scene's `-beamk` knee via a discarded pilot (0.242.0), so **leave `-n` off** — passing it disables the budget. The **camera pass runs on the GPU** as of 0.244.0 (mode `D`'s megakernel with `MERGE=true`); the light/beam pass stays on the CPU on both backends. Since 0.247.0 the light side is **re-drawn every epoch and averaged** (`-beamfreeze` to opt out), so the merge half converges with render time instead of freezing on one realization — that was UPBP-THICK, and it was variance, not bias. Correct, but **not yet faster than `D`** — see UPBP-CONV. Since 0.258.0 `-jsurf` adds a **second merge kind** — mode `U`'s surface point×point merges, deposited by the same light subpaths and gathered per camera surface vertex — so connections, beam merges and vertex merges share **one** balance-heuristic denominator; opt-in and CPU-only until validated, after which mode `U` is retired (UPBP-VM) | `bdpt.h` + `surfmerge.h` + `beamgather.h` + `photonbeams.h` + `render_cuda.cu` |
 | `V` | validation: renders B and R, reports residual | `main.cpp` |
 | `-raster` | z-buffer preview rasterizer + interactive fly viewer (`-explore`) | `raster.h`, `raster_cuda.cu` |
 
@@ -3216,6 +3216,69 @@ as the one at fault.
   0.9996 in absolute units, solar disc `1/16` on both — and `cornell.ftsl` mode U is
   **byte-identical** before and after the port, since every new density sits behind
   `dIsDeltaEmitter` and the area path keeps its RNG draw order.
+- **`surfmerge.h`** (0.258.0) — the **surface photon map mode `J` merges against**, i.e. the
+  half folded in from mode `U`. Three things live here and nowhere else:
+
+  * **`SurfPhoton`** — a light-subpath vertex on a surface: position, `wo` toward the previous
+    (light-side) vertex, λ, β, the precomputed CIE triple (the same trick that bought mode `M`
+    3.65×), and `misIdx` into a parallel `SurfMis` array.
+  * **`SurfMis`** — the light half of the merge weight, frozen at deposit time:
+    `sumC` (light-side connections), `sumMb` / `sumMs` (light-side merges, one accumulator per
+    merge KIND because `n_m·2r_b` and `n_m·π r_s²` cannot be folded into one κ), `pdfFwdA`,
+    `rCoef` (the cosine, the inverse-square and the remapped `1/pdfFwd` of the one step the
+    gather has to patch), `gateC1`, and `vert` for the depth cap. **The index shift is the
+    subtle part**: `bdpt.h`'s convention is that C1 is "the merge site is the last *camera*
+    vertex", and a point merge's site *is* an existing vertex rather than a new one, so C1
+    splits after `y_{j-1}` and every light-side accumulator is read at **j-1** — one index
+    earlier than a beam merge, which inserts a vertex and reads at **j**.
+  * **`SurfMap`** — flat SoA arrays plus a counting-sort uniform grid with `long long` cell
+    arithmetic that **coarsens** rather than refusing on a huge scene (mode `U`'s own dense grid
+    still has the `(int)(nCells+1)` overflow this avoids). `query(p, fn)` scans the 3×3×3 cell
+    box and keeps the inscribed sphere. `misOf(i)` returns **null** when the map carries no
+    weight for a photon, and the gather then **skips the merge entirely** rather than weighting
+    it 1 — unlike a beam map, whose weight-1 fallback degrades to mode `M`'s estimator (too
+    bright, still a picture), an unweighted point merge would be added *on top of* a complete
+    BDPT sum and double-count every path it touches.
+
+  `vmGatherCorr` (the shading-vs-geometric-normal correction the density estimate needs, exactly
+  1 on flat geometry) was **moved** here out of `vcm.h`, which now does `using bdpt::vmGatherCorr;`
+  — mode `J`'s point merge and mode `U`'s VM are the same estimator and must not be able to drift
+  apart. Modes `M`/`S` deliberately do **not** use it.
+
+  The deposit side lives in `bdpt.h`'s `traceLightBeamPass` (same subpaths, same `nEmitted`, as
+  the beams — they are two views of *one* set of light subpaths, which is why the two merge kinds
+  can share a denominator at all), and the gather side in `BdptRenderer::renderRows` under
+  `SurfMergeWeight`. Per **vertex**, not per segment: a point merge happens where the camera walk
+  actually landed, so there is no ray to march and **no RNG draw** — which keeps "merges off ==
+  mode `D` bit-for-bit" true for free.
+
+  **The radius shrinks per light-side epoch, and that is a correctness property, not a tuning
+  knob.** `main.cpp`'s `surfRadiusFor(epoch)` applies Georgiev/SmallVCM's schedule
+  `r_e = r_0·(e+1)^((α−1)/2)` under the same `-vcmalpha` mode `U` uses, mode `J`'s refresh epoch
+  being its analogue of a VCM iteration. A merge estimator's bias is `O(r²)`, so a fixed radius is
+  a bias floor sampling cannot get under — measured on `_cornell_diffuse` (1024 spp vs an 8192 spp
+  mode-`D` reference) with `r` pinned: **−0.11 %** at `r=0.005`, **−0.45 %** at `0.0173`, **−0.52 %**
+  at `0.035`, monotone and heading for zero, i.e. the `O(r²)` floor rather than a defect in the
+  weight. Consistency then follows from plain averaging: epoch bias `~C·r_e² ~ e^(α−1) → 0`, and the
+  render reports the unweighted mean of its epochs, so the total bias is the Cesàro mean of a null
+  sequence. This was the one thing mode `U` had that mode `J` lacked, and it had to be acquired
+  before `U` could be retired. Only one plumbing fact makes it a two-line change: `mk.surf` is
+  derived from `SurfMap::radius` at gather time and the light pass's `κ_s` from the same field, so
+  handing `build()` a different radius retunes the estimator *and* its MIS weight together, per
+  epoch, with no second source of truth. Epoch 0 gets `r_0` exactly.
+
+  **Sizing (`-jsurf-count`, default `4e6` ≈ 288 MB at 72 B per photon+`SurfMis`).** The surface map
+  and the beam map are budgeted by the *same* pilot but with deliberately different authority. The
+  beam side names a *beam* ceiling and sizes the pass, because its radius **adapts** to the budget
+  and undershooting the `-beamk` knee widens the kernel — a measured bias (+6.4 % on the analytic
+  slab). The surface side names a *photon* ceiling and may only clamp the subpath count
+  **downward**, after the beams have chosen, because its radius follows the schedule above and a
+  larger map costs nothing but memory. On a media-free scene the beam pilot measures nothing, so the
+  light pass is sized at **one subpath per pixel** (mode `U`'s convention) and capped by this
+  ceiling; before that existed, the inert `-n 2000000` default asked for 7.3 M photons / 500 MB and
+  failed the allocation outright. The pilot's own subpaths are discarded, so its surface banks are
+  **cleared** alongside the beam banks — `nEmitted` comes from the real pass, and leaving the
+  pilot's photons in the map would put ~3 % more flux in it than the normalisation divides by.
 - **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`/`photonmap_io.h`/`causticaim.h`** — U/S/M.
   PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.

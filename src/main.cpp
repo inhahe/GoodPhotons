@@ -13082,6 +13082,43 @@ static bool g_beamGather = false;
 // which is exactly what validation gate (1) needs to assert "J minus beams == D".
 static bool g_noBeams = false;
 
+// -jsurf / -nojsurf: mode J's SECOND merge kind, the point x point surface merge that mode U
+// (VCM) exists to provide. This is the flag that folds U into J — a mode-J render with it on
+// runs BDPT connections, beam x ray merges in the media AND vertex merges on the surfaces,
+// all under one balance heuristic, which is a strict superset of what either mode does alone.
+//
+// OPT-IN FOR NOW, deliberately, and on a schedule rather than forever: the weight is new (see
+// bdpt::SurfMergeWeight) and mode J's default has to stay the thing the existing validation
+// suite measured until the point merges have been checked against mode U on a surfaces-only
+// scene and against mode J itself on a media one. When that lands, this flips to default-on
+// and `-nojsurf` becomes the opt-out, exactly as `-nobeams` is today. Tracked in
+// known-issues.md under UPBP-VM.
+static bool g_jSurf = false;
+// -jsurf-radius: the gather disc's radius r_s in world units. 0 = auto, meaning the same
+// `sceneRadius * g_pmRadiusFactor` (`-pmradiusfrac`) that modes M/S/U start from — mode J's
+// merges deliberately share the photon-map radius convention so a like-for-like comparison
+// against mode U is a matter of the mode letter alone.
+//
+// FIXED, not shrinking. Mode U shrinks r per pass (Georgiev's r_i = R0 * i^((alpha-1)/2)) to
+// buy consistency; mode J's beam radius is already fixed and its light-side REFRESH is what
+// makes it converge (the map is redrawn under a fresh salt per epoch and the realizations
+// averaged — see g_beamFreeze), so the point merges use the same policy as the beam merges
+// rather than importing a second one into the same denominator.
+static double g_jSurfRadius = 0.0;
+// -jsurf-count: the resource ceiling on STORED surface photons, the point-merge counterpart of
+// `-beamcount`. It is a memory bound and nothing else — a SurfPhoton plus its SurfMis is 72 B,
+// so 4 M is ~288 MB, and the default `-n 2000000` on a scene with no media (where the beam
+// budget measures nothing and so never lowers the subpath count) asks for 7.3 M / 500 MB before
+// a single pixel is traced. That is the failure this exists to stop.
+//
+// It lowers the SUBPATH COUNT rather than thinning the map, deliberately: mode J cannot trim a
+// map after the fact, because Russian roulette's per-record survival probability is exactly the
+// quantity a MIS weight has no way to read — the same reason `-beamcount` is met by tracing
+// fewer subpaths (see J-BEAMCOST). And it only ever moves the count DOWN: with a fixed
+// `-jsurf-radius` a bigger surface map is strictly better, so this must never raise a count the
+// beam knee already chose.
+static long long g_jSurfCount = 4000000;
+
 // `-misaudit`: run bdpt.h's absolute-form reference MIS weight alongside the shipping
 // relative-form one and report the largest disagreement. Validation harness, not a
 // rendering option — it never changes a pixel, only what gets printed at the end.
@@ -13609,12 +13646,14 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
 // (mode D) is connections only and leaves every sample bit-identical.
 static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long spp, int nThreads, int maxDepth, bool diffraction = true,
-                       unsigned long long sampleBase = 0, const BeamMap* beams = nullptr) {
+                       unsigned long long sampleBase = 0, const BeamMap* beams = nullptr,
+                       const bdpt::SurfMap* photons = nullptr) {
     std::vector<Film> camBands(nThreads), splatBands(nThreads);
     auto worker = [&](int tid) {
         bdpt::BdptRenderer br; br.maxDepth = maxDepth; br.diffraction = diffraction;
         br.heroC = g_heroC;   // renderRows applies the media/GRIN/lens gate itself
         br.beams = beams;
+        br.photons = photons;   // mode J's point merges; null == beams only (or mode D)
         Film& cf = camBands[tid]; cf.resX = resX; cf.resY = resY; cf.alloc();
         Film& sf = splatBands[tid]; sf.resX = resX; sf.resY = resY; sf.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
@@ -16114,6 +16153,22 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // to the device once. So the two halves genuinely can differ, and the banner says so
         // rather than claiming a single "on N CPU threads" that would be a lie about half the
         // render.
+        //
+        // ...with ONE exception, and it is a correctness gate rather than a missing feature:
+        // `-jsurf` (the point x point merges folded in from mode U) has no device twin. The
+        // kernel's DBeamMis carries a single merge kind, so a GPU run would not merely skip
+        // the surface merges — it would also under-weight the BEAM ones, whose denominator
+        // has to include the point-merge terms to sum to one. Silently rendering a different
+        // (and wrong) estimator on one backend is exactly the failure mode this codebase
+        // refuses, so the flag forces the CPU and says so. Lift this when the surface map is
+        // ported (render_cuda.cu's host->device BeamMis copy has the marker).
+        if (g_jSurf && useGpu) {
+            std::fprintf(stderr, "[device] mode J: -jsurf (surface point merges) is CPU-only "
+                                 "— the device merge weight carries one merge kind. Using the "
+                                 "CPU; pass -nojsurf to render the beams-only estimator on "
+                                 "the GPU.\n");
+            useGpu = false;
+        }
         const std::string camWhere =
             useGpu ? std::string("GPU") : (std::to_string(nThreads) + " CPU threads");
         // The merge half needs a beam map, and a beam map needs media. A media-free scene
@@ -16124,12 +16179,58 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // Note the flag polarity, which is the REVERSE of modes A/B/M: they need `-beams` to
         // opt in, mode J needs `-nobeams` to opt out. See g_noBeams for why.
         const bool wantBeams = !g_noBeams && !scene.media.empty();
-        if (!wantBeams)
+        // THE SECOND MERGE KIND (-jsurf): point x point on surfaces, i.e. what mode U does.
+        // Independent of the beams in both directions — a media-free scene gets surface merges
+        // and no beams, a pure-fog scene beams and no surface photons, and a scene with both
+        // gets both under ONE denominator, which is the entire reason for folding mode U in
+        // here rather than leaving two modes that each solve half the problem.
+        const bool wantSurf = g_jSurf;
+        // The gather disc. Shares -pmradius/-pmradiusfrac's default with modes M/S/U on
+        // purpose: it makes "mode J -jsurf" against "mode U" a comparison of estimators
+        // rather than of radii.
+        const double surfRadius0 = (g_jSurfRadius > 0.0) ? g_jSurfRadius
+                                 : (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                                         : scene.sceneRadius * g_pmRadiusFactor;
+        // ...and it is only the STARTING radius, because a fixed one would make the point
+        // merges inconsistent — the one thing mode U has that mode J must not lose when U is
+        // retired. A merge estimator's bias is O(r^2); hold r still and that bias is a floor no
+        // amount of sampling gets under. Measured on _cornell_diffuse at 1024 spp against an
+        // 8192 spp mode-D reference, with the radius held fixed:
+        //
+        //     r = 0.005    energy bias -0.11%      r = 0.0173   -0.45%      r = 0.035   -0.52%
+        //
+        // — monotone in r and heading for zero, i.e. exactly the O(r^2) floor and not a bug in
+        // the weight. Mode U escapes it by shrinking R0 per iteration on Georgiev/SmallVCM's
+        // schedule, so here mode J shrinks on the SAME schedule under the SAME -vcmalpha,
+        // indexed by the light-side refresh epoch (mode J's analogue of a VCM iteration: one
+        // independent realization of the whole light-side map).
+        //
+        // Why uniform averaging over epochs still converges: epoch e's bias is ~C*r_e^2 with
+        // r_e^2 ~ r_0^2 * e^(alpha-1), and the render reports the plain mean of the epochs, so
+        // the total bias is the Cesaro mean (1/E)*sum_e C*r_e^2 ~ E^(alpha-1) -> 0. Consistency
+        // does not need a weighted average, only bias_e -> 0.
+        //
+        // Nothing else has to change to follow the schedule: `mk.surf` is derived from
+        // `SurfMap::radius` at gather time (bdpt.h ~3512) and the light pass's kappa_s comes
+        // from the same field, so handing build() a different radius retunes the estimator AND
+        // its MIS weight together, per epoch, with no second source of truth.
+        auto surfRadiusFor = [&](uint64_t epoch) {
+            const double it = (double)(epoch + 1);
+            const double r  = surfRadius0 * std::pow(it, 0.5 * (g_vcmAlpha - 1.0));
+            return (r > 0.0) ? r : surfRadius0;    // guards a pathological -vcmalpha
+        };
+        if (!wantBeams && !wantSurf)
             std::printf("mode J: %s, so there is nothing to merge against; "
-                        "this render is mode D exactly.\n",
+                        "this render is mode D exactly (-jsurf adds surface merges).\n",
                         g_noBeams ? "-nobeams was given" : "no participating media");
+        else if (!wantBeams)
+            std::printf("mode J: %s, so the merge half is surface point merges only "
+                        "(-jsurf, r=%.4g shrinking at -vcmalpha %.3g).\n",
+                        g_noBeams ? "-nobeams was given" : "no participating media",
+                        surfRadius0, g_vcmAlpha);
         warnBeamsGrinMedia(scene, wantBeams);
         BeamMap bmap;
+        bdpt::SurfMap smap;
         StageProgress stageProg = makeStageProgress(res, resY);
         // Hoisted out of the build below because epoch 0 DECIDES the map size and every later
         // epoch reuses that decision: re-running the budget pilot per refresh would pay for it
@@ -16144,7 +16245,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         auto buildLightSide = [&](uint64_t epoch) {
             RngSaltScope saltScope(epoch);
             const bool first = (epoch == 0);
-            if (!first) bmap = BeamMap{};      // drop the old realization before redrawing
+            if (!first) { bmap = BeamMap{}; smap = bdpt::SurfMap{}; }   // drop the old
+                                                       // realization before redrawing
             // MODE J'S OWN LIGHT PASS (0.216.0), not tracePhotonPass. The beams have to be
             // sampled by the same machinery as the connection half's `light[]` subpaths, or
             // the merge weight would be a ratio between densities that are different
@@ -16178,6 +16280,27 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // measured at the radii buildBeamMap is about to build with.
             jreq.blur     = g_beamBlur;
             jreq.targetK  = g_beamK;
+            // THE SURFACE MAP'S HALF OF THE SAME DECISION (-jsurf). One subpath count feeds two
+            // maps, and the arbitration is made HERE because this is where the scene is known:
+            //
+            //  * When there ARE beams, they size the pass, because undershooting their knee is a
+            //    documented BIAS (buildAuto widens the kernel) while a surface map is merely
+            //    noisier for being smaller — its radius is fixed. So `surfPaths` stays 0 and the
+            //    surface side gets only its memory ceiling.
+            //  * When there are NO beams, the beam budget measures nothing and the pass would
+            //    otherwise inherit the inert `-n 2000000` default — 7 M photons / 500 MB for a
+            //    64x64 image, which is how this was first found. There the surface side names the
+            //    count, at mode U's convention of one light subpath per pixel per epoch, which is
+            //    also what makes "-mode J -jsurf" against "-mode U" a comparison of estimators.
+            //
+            // Both are off when the user gave an explicit `-n` (the more specific knob wins,
+            // exactly as for `maxBeams`) and on refresh epochs (the sizing question was answered
+            // at epoch 0; `Nepoch` below re-traces that answer).
+            if (wantSurf && !g_nFromCli && first) {
+                if (!wantBeams)
+                    jreq.surfPaths = (long long)res * (long long)resY;
+                jreq.maxSurfPhotons = g_jSurfCount;
+            }
             // A refresh traces exactly the subpath count epoch 0 settled on, with no budget and
             // therefore no pilot: the sizing question was answered once and re-asking it would
             // cost a pilot per epoch to get the same answer with more noise on it.
@@ -16205,6 +16328,17 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                 "(-beamfreeze to opt out; -beamrefresh to retune) ...\n",
                                 Nepoch, 100.0 * g_beamRefreshFrac);
             }
+            // A media-free `-jsurf` run gets its OWN sentence rather than the beam one, because
+            // the beam sentence would be a lie there in the specific way that matters: it names
+            // `-beamcount` as the thing sizing the pass, when on a scene with no media the beam
+            // budget measures nothing and `-jsurf`'s per-pixel target is what actually decided.
+            else if (jreq.surfPaths > 0)
+                std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
+                            "threads (maxDepth=%d, light=%s) — no media, so the light pass is "
+                            "sized for the SURFACE map: %lld subpaths (one per pixel, mode U's "
+                            "convention), capped at %lld stored photons (-jsurf-count) ...\n",
+                            res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel,
+                            jreq.surfPaths, g_jSurfCount);
             else if (jreq.maxBeams > 0)
                 std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
                             "threads (maxDepth=%d, light=%s) — sizing the light pass to a beam "
@@ -16224,7 +16358,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (first) liveWindowPlaceholder(res, resY, "tracing light subpaths\xE2\x80\xA6");
             auto tp0 = std::chrono::steady_clock::now();
             bdpt::traceLightBeamPass(scene, cam, Nepoch, nThreads, maxDepth, diffraction,
-                                     bmap, &stageProg, jreq, &jbb);
+                                     bmap, &stageProg, jreq, &jbb,
+                                     wantSurf ? &smap : nullptr);
             // Say what the budget did, always. A pass that silently traced 3 % of the subpaths
             // the command line named would be exactly the kind of invisible surprise this whole
             // change is about — and the measured rate and knee are the numbers a user needs in
@@ -16236,24 +16371,61 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             jbb.pilotPaths, jbb.beamsPerPath, jbb.kneeBeams, jbb.budget,
                             jbb.pathsUsed, jbb.kneeBound ? "knee-bound" : "-beamcount-bound",
                             jbb.applied ? "" : " [not binding: -n was already smaller]");
-            if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
-            buildBeamMap(bmap, "mode J:",
-                         (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
-                         /*quiet*/!first);
+            // The surface half of the same pilot, reported only when it actually LOWERED the
+            // count. Said unconditionally it would be noise on every media scene (where the
+            // beam knee normally lands far under the photon ceiling); said when it binds it is
+            // the one line that explains a subpath count neither `-n` nor `-beamcount` predicts.
+            if (first && jbb.surfBound)
+                std::printf("mode J: surface budget: %.2f surface photons/subpath -> the "
+                            "-jsurf-count ceiling of %lld photons lowered the pass to %lld "
+                            "subpaths (raise it if you have the RAM; it is a memory bound, not "
+                            "a quality target)\n",
+                            jbb.surfPerPath, g_jSurfCount, jbb.pathsUsed);
+            // Both of these are skipped outright on a media-free `-jsurf` run rather than run on
+            // an empty map: the build would announce a radius/split decision it did not make, and
+            // the line below would report "0 beams from N light subpaths" as though something had
+            // gone wrong, when the correct reading is that this scene has no volume to beam.
+            if (wantBeams) {
+                if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
+                buildBeamMap(bmap, "mode J:",
+                             (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
+                             /*quiet*/!first);
+            }
             const double buildSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
-            if (first)
+            if (first && wantBeams)
                 std::printf("mode J: %zu beams from %lld light subpaths in %s "
                             "(%.2f beams/subpath, %.0f MB). Rendering connections + merges ...\n",
                             bmap.beams.size(), bmap.nEmitted, humanDur(buildSec).c_str(),
                             bmap.nEmitted ? (double)bmap.beams.size() / (double)bmap.nEmitted : 0.0,
                             (double)(bmap.beams.size() * sizeof(PhotonBeam)) / (1024.0 * 1024.0));
-            if (first && bmap.empty())
+            if (first && wantBeams && bmap.empty())
                 std::fprintf(stderr, "[mode J] warning: the beam map is empty — no light "
                                      "subpath reached a medium. This render is mode D "
                                      "exactly.\n");
+            // The point-merge map, gridded off the SAME subpaths the beams came from (see
+            // traceLightBeamPass: one pass, two outputs, one n_m). Built after the beam map so
+            // the two allocations do not overlap their peak.
+            if (wantSurf) {
+                if (first) liveWindowPlaceholder(res, resY, "building surface photon map\xE2\x80\xA6");
+                // Per-EPOCH radius, not the fixed one: see surfRadiusFor above for why the
+                // schedule is what keeps the point merges consistent. Epoch 0 gets exactly
+                // surfRadius0 (pow(1, x) == 1), so the first realization is unchanged.
+                smap.build(surfRadiusFor(epoch));
+                if (first)
+                    std::printf("mode J: %zu surface photons from the same %lld subpaths, "
+                                "r=%.4g (%.0f MB). Point merges ON (-jsurf).\n",
+                                smap.size(), smap.nEmitted, smap.radius,
+                                (double)(smap.size() * (sizeof(bdpt::SurfPhoton) +
+                                                        sizeof(bdpt::SurfMis))) /
+                                (1024.0 * 1024.0));
+                if (first && smap.empty())
+                    std::fprintf(stderr, "[mode J] warning: the surface photon map is empty — "
+                                         "no light subpath reached a connectible surface. "
+                                         "-jsurf is doing nothing here.\n");
+            }
         };
-        if (wantBeams) {
+        if (wantBeams || wantSurf) {
             buildLightSide(0);
         } else {
             std::printf("mode J: UPBP at %dx%d on %s (maxDepth=%d, light=%s) ...\n",
@@ -16261,8 +16433,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         }
         // An empty map is passed as null, so the renderer's merge path is not merely skipped
         // per-ray but never entered — which is what makes gate (1)'s "bit-identical to mode D"
-        // a property of the code rather than of floating-point luck.
+        // a property of the code rather than of floating-point luck. Same for the photons.
         const BeamMap* beamsPtr = (wantBeams && !bmap.empty()) ? &bmap : nullptr;
+        const bdpt::SurfMap* photonsPtr =
+            (wantSurf && !smap.empty() && smap.nEmitted > 0) ? &smap : nullptr;
         auto renderEpoch = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
             // `g_heroC`, exactly as mode D passes it — NOT 1. The kernel applies the same
@@ -16275,13 +16449,19 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // (Measured: it did, before this was g_heroC.)
             // `stageProg` reports the host->device conversion of the beam map, which for a
             // multi-million-sub-beam map is long enough to look like a hang without it.
+            //
+            // NOT when the point merges are on: the device twin of the merge weight
+            // (render_cuda.cu's DBeamMis / dMisWeight) carries ONE merge kind, so a GPU run
+            // with `-jsurf` would silently drop every surface merge AND under-weight the beam
+            // ones (their denominator would be missing the point-merge terms). The gate is
+            // above, at `useGpu`, rather than a comment here — see the -jsurf block.
             if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth,
                                               diffraction, p, g_heroC, beamsPtr, &stageProg);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     return renderBdpt(scene, cam, res, resY, c, nThreads, maxDepth,
-                                      diffraction, off, beamsPtr);
+                                      diffraction, off, beamsPtr, photonsPtr);
                 });
         };
         // ---------------------------------------------------------------------------------
@@ -16300,7 +16480,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         auto renderChunked = [&](long long sppTarget, const SppProgress* prog) -> Film {
             // Nothing to decorrelate (no map => mode D exactly, and gate 1a requires that path
             // stay bit-identical), or the user asked for the historical single map.
-            if (!beamsPtr || g_beamFreeze || !prog || !prog->report)
+            if ((!beamsPtr && !photonsPtr) || g_beamFreeze || !prog || !prog->report)
                 return renderEpoch(sppTarget, prog);
             using clk = std::chrono::steady_clock;
             Film acc; acc.resX = res; acc.resY = resY; acc.alloc();
@@ -16325,10 +16505,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     // `sppAll` spp. Stopping is therefore the right answer, not a compromise,
                     // and the message says so rather than claiming a fallback that does not
                     // exist (which is what it claimed through 0.251.0).
-                    if (bmap.empty()) {
+                    // Each map is checked only if this render is actually using it: with
+                    // `-jsurf` on a media-free scene the beam map is legitimately empty every
+                    // epoch, and treating that as a failure would stop the render on its
+                    // first refresh.
+                    if ((beamsPtr && bmap.empty()) || (photonsPtr && smap.empty())) {
                         std::fprintf(stderr, "[mode J] light-side refresh produced an empty "
-                                             "beam map; stopping here with the %lld spp already "
+                                             "%s map; stopping here with the %lld spp already "
                                              "averaged over %llu realization(s).\n",
+                                     (beamsPtr && bmap.empty()) ? "beam" : "surface photon",
                                      sppAll, (unsigned long long)epoch);
                         break;
                     }
@@ -16349,7 +16534,32 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         const double setupSec =
                             std::chrono::duration<double>(clk::now() - tEpoch).count();
                         epochSec = (rebuildSec + setupSec) / g_beamRefreshFrac;
-                        if (epochSec < 1.0) epochSec = 1.0;   // never thrash on a trivial scene
+                        // The floor was a full second, from when the only map here was an
+                        // expensive BEAM map and the epoch count was purely a decorrelation
+                        // knob. With `-jsurf` it is no longer only that: the surface radius
+                        // shrinks on the EPOCH INDEX (surfRadiusFor above), so anything capping
+                        // how many epochs fit in a render also caps how far down the shrink
+                        // schedule that render can travel — i.e. it caps CONSISTENCY, not
+                        // merely variance. Dropping the floor to 0.1 s is therefore right in
+                        // principle: the proportional rule on the line above is the actual
+                        // guard, spending 10x the measured rebuild+setup cost rendering at
+                        // `-beamrefresh 0.10` and so holding overhead near 9 % however cheap or
+                        // dear the map is, which leaves the floor with only one job — stopping
+                        // pathological churn when the measurement is near the clock's
+                        // resolution.
+                        //
+                        // BUT DO NOT READ THIS AS THE FIX FOR THE EPOCH COUNT; it was measured
+                        // and it is not. On `_cornell_diffuse` (128^2, 1024 spp, media-free, so
+                        // the light side rebuilds in milliseconds) it moved the run from 56
+                        // epochs to 59 — energy bias -0.36 % to -0.35 % — against mode U's 1024
+                        // iterations on the same schedule. The binding constraint is the
+                        // proportional rule itself, because `setupSec` measures the gap to the
+                        // FIRST REPORT, which already includes rendering; an epoch is thus
+                        // about ten report-intervals long no matter what this floor says.
+                        // Closing the remaining gap to mode U means revisiting the report
+                        // cadence or `-beamrefresh` for a cheap map, which is UPBP-CONV's
+                        // territory and wants its own measurements.
+                        if (epochSec < 0.1) epochSec = 0.1;
                     }
                     epochSpp = sppDone;
                     Film comb = f; comb.merge(acc);
@@ -17398,6 +17608,18 @@ static void printHelp(const char* prog) {
 "                        bundle shares the beam's geometry and both transmittance marches, so\n"
 "                        4 wavelengths cost ~1.1x the gather instead of 4x. Ignored in a scene\n"
 "                        whose media have chromatic extinction (the shared march would bias it)\n"
+"  -jsurf                mode J: ALSO merge camera surface vertices against surface photons\n"
+"                        (VCM's vertex merging, i.e. what mode U does), MIS-combined with the\n"
+"                        connections and the beam merges in one weight. Turns mode J into\n"
+"                        paths + beams + points; -nojsurf (default for now) leaves the\n"
+"                        beams-only estimator. CPU only\n"
+"  -jsurf-radius <r>     -jsurf gather disc radius in world units (default: the same\n"
+"                        -pmradius / -pmradiusfrac modes M/S/U use). Implies -jsurf\n"
+"  -jsurf-count <n>      ceiling on STORED surface photons (default 4000000; 0 = unbounded).\n"
+"                        The point-merge counterpart of -beamcount, and a MEMORY bound only:\n"
+"                        it is met by tracing fewer light subpaths, never by thinning the map\n"
+"                        (roulette's survival probability is what a MIS weight cannot read).\n"
+"                        Implies -jsurf\n"
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
 "  -rgb                  mode R fast RGB (non-spectral) backward preview on the GPU (much\n"
 "                        faster; drops dispersion/thin-film/fluorescence — Option B)\n"
@@ -18518,6 +18740,21 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-beamcount") && i + 1 < argc) {
             g_beamTarget = (long long)std::atof(argv[++i]);
             g_beamTargetSet = true;   // mode J only mentions its knee fallback when this is absent
+        }
+        else if (!std::strcmp(argv[i], "-jsurf") || !std::strcmp(argv[i], "-jmerge-surf"))
+            g_jSurf = true;
+        else if (!std::strcmp(argv[i], "-nojsurf") || !std::strcmp(argv[i], "-no-jsurf"))
+            g_jSurf = false;
+        else if (!std::strcmp(argv[i], "-jsurf-radius") && i + 1 < argc) {
+            g_jSurfRadius = std::atof(argv[++i]);
+            g_jSurf = true;      // naming the radius is asking for the merges
+        }
+        else if ((!std::strcmp(argv[i], "-jsurf-count") ||
+                  !std::strcmp(argv[i], "-jsurfcount")) && i + 1 < argc) {
+            // atof, not atoi, so `-jsurf-count 4e6` works the way `-beamcount 1e6` does.
+            const double v = std::atof(argv[++i]);
+            g_jSurfCount = (v > 0.0) ? (long long)v : 0;   // 0 = unbounded, at your own risk
+            g_jSurf = true;      // naming the ceiling is asking for the merges
         }
         else if (!std::strcmp(argv[i], "-beamk") && i + 1 < argc) g_beamK = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamblur") && i + 1 < argc) g_beamBlur = std::atof(argv[++i]);

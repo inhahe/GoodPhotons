@@ -53,6 +53,7 @@
 #include "hero.h"     // kHeroC / kHeroMax — hero-wavelength bundle sizes
 #include "render.h"   // sampleGlossy, Renderer material primitives, clamp01, PI
 #include "photonbeams.h"  // BeamMap — mode J (UPBP) merges camera rays against photon beams
+#include "surfmerge.h"    // SurfMap — mode J's OTHER merge kind, the point x point (VCM's VM)
 #include "beamgather.h"   // gatherPhotonBeamsW — the Beam x Ray estimator, with a MIS hook
 #include "parallel.h"          // ft::stopRequested — cooperative -stop inside mode J's beam pass
 #include "render_progress.h"   // StageProgress — deposit progress for the live window/title
@@ -1680,7 +1681,7 @@ inline double misRemap0(double f) { return f != 0.0 ? f : 1.0; }
 //             count in the multi-sample balance heuristic.
 //
 // `n_m * 2r` is the same constant at every site, so it is factored out (the caller supplies
-// it as `kappa`) and this returns the PRIMED eta. Returning 0 means "no merge technique
+// it as `kappa`) and this returns the PRIMED eta. Returning 0 means "no beam-merge technique
 // exists here", which is the correct weight contribution for a non-medium vertex.
 //
 // WHY 2r AND NOT THE KERNEL VALUE K1(d_perp). Same reason VCM uses 1/(pi r^2) rather than
@@ -1693,8 +1694,8 @@ inline double misRemap0(double f) { return f != 0.0 ? f : 1.0; }
 // It sits HERE, above the light pass, because both halves of mode J need it: the light pass
 // below folds it into each beam's stored accumulator (BeamMis::sumM), and misWeight further
 // down calls it per hypothetical strategy.
-inline double mergeEtaPrime(const Scene& scene, const Vec3& pPrev, const Vertex& v,
-                            const Vec3& pNext, double pLight, double lambda) {
+inline double mergeEtaPrimeBeam(const Scene& scene, const Vec3& pPrev, const Vertex& v,
+                                const Vec3& pNext, double pLight, double lambda) {
     if (v.type != VType::Medium) return 0.0;
     if (v.mediumId < 0 || v.mediumId >= (int)scene.media.size()) return 0.0;
     if (!(pLight > 0.0)) return 0.0;
@@ -1718,6 +1719,85 @@ inline double mergeEtaPrime(const Scene& scene, const Vec3& pPrev, const Vertex&
     const double tr = trDet(scene, v.p, dout, dn, lambda, tabs);
     if (!(tr > 0.0)) return 0.0;
     return std::sqrt(s2) * pLight / (sigT * tr);
+}
+
+// --- The SECOND merge kind: point x point on a surface (UPBP's P-P, VCM's VM) ----------
+//
+// A photon stored at a light-subpath surface vertex, gathered by a camera subpath vertex
+// that lands within r_s of it. Same balance-heuristic question as above, and it turns out to
+// have a far simpler answer than the beam case, for a reason worth writing down: a beam
+// merge INSERTS a vertex neither walk had (so the camera side's free-flight distance density
+// survives in the ratio and the medium's sigma_t*Tr appears), whereas a surface merge
+// IDENTIFIES a vertex both walks already have — the camera walk had to land its own vertex
+// there too — so the camera-side area density cancels outright.
+//
+// Merged path x_0..x_{n-1} light-to-camera, merge site x_i (the photon's own position; the
+// camera vertex within r_s of it is the same vertex to O(r_s), which is VCM's one geometric
+// approximation). Reference technique, as for beams, is the CONNECTION strategy at that same
+// index: m = i, i.e. "x_i is the last camera vertex, joined to x_{i-1}".
+//
+//     p_merge  = [prod_{u<=i} pl_u] * [prod_{u>i} pc_u] * n_m * pi r_s^2 * pc_i
+//     p_C1     = [prod_{u<i}  pl_u] * [prod_{u>=i} pc_u]
+//     ratio    = n_m * pi r_s^2 * pl_i
+//
+// (the `pi r_s^2 * pc_i` factor is the probability that the camera walk's own vertex lands
+// inside the acceptance disc, and n_m the number of light subpaths that could have supplied
+// the photon — the merge technique's sample count in the multi-sample balance heuristic.)
+//
+// CROSS-CHECK against SmallVCM, since this is the one place the two formalisms can be made
+// to speak: vcm.h weighs the merge against a CONNECTION at strategy m = i+1 and gets
+// `etaVCM * camDirPdfA` (`vcm.h`, wLight/wCamera in the connect branch), where camDirPdfA is
+// the camera-side AREA density of the light vertex. Converting the reference here from m = i
+// to m = i+1 multiplies by p_{m=i}/p_{m=i+1} = pc_i/pl_i, giving n_m*pi r_s^2*pc_i. Same
+// expression. The two derivations share no arithmetic, so this is a real check.
+//
+// So the whole per-site part is `pLight` — the light-side AREA density of the merge site,
+// which is exactly what the vertex already stores (pdfFwd on the light half, pdfRev on the
+// eye half). The gate is only "could a photon have been STORED here", and it must agree
+// EXACTLY with what the light pass stores or the partition of unity breaks: a site the
+// weight counts but the map never fills under-weights every competing technique, and a site
+// the map fills but the weight ignores double-counts. Hence one predicate, used by both.
+inline bool surfMergeSite(const Vertex& v) {
+    return v.type == VType::Surface && !v.delta && v.mat && isConnectibleMat(*v.mat);
+}
+inline double mergeEtaPrimeSurf(const Vertex& v, double pLight) {
+    if (!surfMergeSite(v)) return 0.0;
+    return (pLight > 0.0) ? pLight : 0.0;
+}
+
+// The two merge kinds' constants, and one site's primed eta in each. They travel as a pair
+// because a mode-J denominator has to carry BOTH: a camera path crossing a cloud and landing
+// on a wall competes with beam merges in the medium and point merges on the wall, in the same
+// sum, and dropping either one over-weights everything that is left.
+//
+// WHY THE CONSTANTS ARE DEFERRED (i.e. why `MergeEta` is primed rather than finished): the
+// light pass accumulates each subpath's merge terms BEFORE either constant exists — n_m is
+// how many subpaths that pass turns out to emit, and both radii are chosen from the finished
+// map — so a stored accumulator has to keep the two kinds apart and let the camera pass scale
+// them. Everything downstream of the map (misWeight, the gathers) knows both and uses
+// `scale()` immediately.
+struct MergeK {
+    double beam = 0.0;      // n_m * 2 r_b     — beam x ray (BB1D), 1D kernel of full width 2r
+    double surf = 0.0;      // n_m * pi r_s^2  — point x point (VM), acceptance disc
+    bool any() const { return beam > 0.0 || surf > 0.0; }
+};
+struct MergeEta {
+    double beam = 0.0;
+    double surf = 0.0;
+    double scale(const MergeK& k) const { return k.beam * beam + k.surf * surf; }
+    bool any() const { return beam > 0.0 || surf > 0.0; }
+};
+
+// Both primed etas at one site. At most one is ever non-zero (a vertex is in a medium or on a
+// surface, not both), but they are returned as a pair so no caller has to know which.
+inline MergeEta mergeEtaPrime(const Scene& scene, const Vec3& pPrev, const Vertex& v,
+                              const Vec3& pNext, double pLight, double lambda) {
+    MergeEta e;
+    if (v.type == VType::Medium)
+        e.beam = mergeEtaPrimeBeam(scene, pPrev, v, pNext, pLight, lambda);
+    else
+        e.surf = mergeEtaPrimeSurf(v, pLight);
+    return e;
 }
 
 // --- Mode J's own light-subpath / photon-beam pass (UPBP phase 3a) -------------------
@@ -1779,6 +1859,9 @@ struct BeamBudgetInfo {
     long long budget       = 0;      // the beam ceiling actually enforced
     bool      kneeBound    = false;  // was the knee the binding half, or the resource ceiling?
     bool      applied      = false;  // did it bite at all, or was `-n` already smaller?
+    // --- the surface map's half of the same decision (-jsurf) ---------------------------
+    double    surfPerPath  = 0.0;    // surface photons per subpath, measured by the same pilot
+    bool      surfBound    = false;  // did the SURFACE ceiling pick nPaths, rather than the beams?
 };
 
 // What the caller wants of the map. A struct rather than three more parameters because `blur`
@@ -1790,6 +1873,25 @@ struct BeamBudgetReq {
     double    blur     = 0.01;   // -beamblur:  kernel half-width as a fraction of the mfp
     double    targetK  = 32.0;   // -beamk:     the FLOOR whose release marks the knee
     double    safety   = 1.0;    // scale on the measured knee; 1.0 = aim AT it (see the note below)
+    // --- THE SURFACE MAP'S HALF (-jsurf, 0.258.0) ---------------------------------------
+    // One subpath count feeds TWO maps, so both get a say, and they say different kinds of
+    // thing. The beam side names a *beam* ceiling because its radius adapts: undershoot the
+    // knee and buildAuto silently widens the kernel, which is a BIAS (see `safety`). The
+    // surface side has a FIXED radius (-jsurf-radius), so more photons is only ever more
+    // quality for more cost -- never a different estimator. Its two knobs reflect that:
+    //
+    //   `surfPaths` -- a subpath TARGET, applied only when the caller knows the beams have no
+    //   opinion (a media-free scene). Mode U's convention, one light subpath per pixel per
+    //   pass, is what makes "-mode J -jsurf against -mode U" a comparison of estimators; and
+    //   without it a media-free mode-J render inherits the inert `-n 2000000` default and
+    //   tries to store ~7 M photons for a 64x64 image.
+    //
+    //   `maxSurfPhotons` -- a pure MEMORY ceiling, applied always. A SurfPhoton + its SurfMis
+    //   is 72 B, so an unbounded map is the one way this feature can take the process down;
+    //   it lowers nPaths, never thins the map (a thinned map's survival probability is exactly
+    //   what a MIS weight cannot read -- the same reason mode J refuses to trim its beams).
+    long long surfPaths      = 0;   // subpath target from the surface side; 0 = no opinion
+    long long maxSurfPhotons = 0;   // ceiling on STORED surface photons; 0 = unbounded
 };
 // WHY `safety` DEFAULTS TO 1.0, AND NOT TO SOMETHING SAFELY BELOW THE KNEE.
 //
@@ -1891,10 +1993,19 @@ inline constexpr long long kPathsMin = 256;
 // randomness; the map is unbiased for every fixed `nPaths`, hence unbiased averaged over the
 // pilot's choice of it. The cost of that guarantee is the pilot's own tracing, a couple of
 // percent of the pass.
+//
+// SURFACE PHOTONS RIDE ALONG (`smOut`, 0.258.0). The point-merge map has to be built from
+// these SAME subpaths, for exactly the reason this function exists at all: a merge weight is
+// a ratio against the connections `renderRows` makes, and only a photon carrying this pass's
+// own pdfFwd/pdfRev bookkeeping is a ratio between comparable things. It is a second output
+// rather than a second pass because a second pass would be a second set of subpaths — the
+// beams and the photons would then have different n_m, and every weight that mentions both
+// (which is every weight in a scene with media AND surfaces) would be wrong.
 inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long nPaths,
                                int nThreads, int maxDepth, bool diffraction,
                                BeamMap& bm, StageProgress* stage = nullptr,
-                               BeamBudgetReq req = {}, BeamBudgetInfo* budgetOut = nullptr) {
+                               BeamBudgetReq req = {}, BeamBudgetInfo* budgetOut = nullptr,
+                               SurfMap* smOut = nullptr) {
     if (nThreads < 1) nThreads = 1;
     if (nPaths < 1) nPaths = 1;
     const long long nPathsAsked = nPaths;
@@ -1911,6 +2022,12 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // BeamBank::halve() would silently desynchronise a parallel array (mode J avoids that by
     // setting cap = 0, so banks only ever grow — see the note above).
     std::vector<std::vector<BeamMis>> misBanks((size_t)nThreads);
+    // The point-merge map's per-thread banks, filled only when the caller asked for one.
+    // Same lockstep discipline as `misBanks`: SurfBank holds the photon and its MIS partials
+    // in two arrays pushed one after the other, and a size mismatch at the end is treated as
+    // a bug rather than indexed through (see the merge below).
+    std::vector<SurfBank> sbanks((size_t)nThreads);
+    const bool wantSurf = (smOut != nullptr);
     std::vector<long long> emitted((size_t)nThreads, 0);
     std::atomic<long long> tracedTotal{0};
 
@@ -1941,7 +2058,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         PathSegs segs;
         BeamSpectral bs;                               // per-subpath, reset by every call
         std::vector<BeamMis>& misBank = misBanks[(size_t)tid];
-        std::vector<double> accC, accM;                // per-subpath, reused
+        std::vector<double> accC, accMb, accMs;        // per-subpath, reused
         const PatTables tabs = scene.patTables();
         const long long lo = total * tid / nThreads, hi = total * (tid + 1) / nThreads;
         long long done = 0;
@@ -2060,10 +2177,16 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             // recurrences (see BeamMis in photonbeams.h for what they sum):
             //   ratioL(u) = pdfRev(y_u)/pdfFwd(y_u)          [the loop's per-step factor]
             //   accC[j]   = gate(j) + ratioL(j-1) * accC[j-1]
-            //   accM[j]   =           ratioL(j-1) * (accM[j-1] + eta'(y_{j-1}))
+            //   accM*[j]  =           ratioL(j-1) * (accM*[j-1] + eta'(y_{j-1}))
             // `eta'(y_{j-1})` needs BOTH of y_{j-1}'s neighbours, so it only exists from
             // j = 2 on; the missing j = 1 term is the merge at y_0, which is the light
-            // itself and is not a medium vertex in any case.
+            // itself and is neither a medium vertex nor a stored photon site in any case.
+            //
+            // TWO merge accumulators, not one, because the two kinds' constants are not the
+            // same number and neither is known yet (MergeK): `accMb` sums the beam-merge
+            // sites (medium vertices), `accMs` the point-merge ones (stored photons), and the
+            // camera pass scales each by its own kappa. Folding them together here would be
+            // an unrecoverable loss — the ratio between the kinds varies per site.
             const size_t np = path.size();
             if (pilot) {
                 // Count only. The pilot's beams are thrown away with the bank it fills, so
@@ -2073,18 +2196,60 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 continue;
             }
             accC.assign(np, 0.0);
-            accM.assign(np, 0.0);
+            accMb.assign(np, 0.0);
+            accMs.assign(np, 0.0);
             for (size_t u = 0; u < np; ++u) {
                 const bool dPrev = (u > 0) ? path[u - 1].delta : path[0].isDeltaLight();
                 const double gate = (!path[u].delta && !dPrev) ? 1.0 : 0.0;
                 if (u == 0) { accC[0] = gate; continue; }
                 const double rL = misRemap0(path[u - 1].pdfRev) / misRemap0(path[u - 1].pdfFwd);
-                const double eL = (u >= 2)
+                const MergeEta eL = (u >= 2)
                     ? mergeEtaPrime(scene, path[u - 2].p, path[u - 1], path[u].p,
                                     path[u - 1].pdfFwd, hb.lam[0])
-                    : 0.0;
-                accC[u] = gate + rL * accC[u - 1];
-                accM[u] = rL * (accM[u - 1] + eL);
+                    : MergeEta{};
+                // --- STORE A SURFACE PHOTON, if this vertex is one -----------------------
+                // Done HERE rather than in a second loop because everything a point merge's
+                // light half needs is in hand at exactly this step and nowhere else: the
+                // accumulators one index BACK (a point merge's reference connection splits
+                // after y_{u-1}, not after y_u — see SurfMis), plus `eL`, which is the merge
+                // at y_{u-1} that the recurrence would not fold in until the next iteration.
+                if (wantSurf && surfMergeSite(path[u]) && path[u].pdfFwd > 0.0 &&
+                    path[u].beta > 0.0) {
+                    Vec3 dPrev = path[u - 1].p - path[u].p;
+                    const double rho2 = dot(dPrev, dPrev);
+                    if (rho2 > 0.0) {
+                        const double rho = std::sqrt(rho2);
+                        dPrev = dPrev * (1.0 / rho);
+                        // The cosine of pdfRev*(y_{u-1}) is at y_{u-1} and faces back along
+                        // this same edge; 1 at a medium vertex, which has no normal.
+                        const double cosPrev = path[u - 1].onSurface()
+                                             ? std::fabs(dot(path[u - 1].ns, dPrev)) : 1.0;
+                        SurfBank& sb = sbanks[(size_t)tid];
+                        SurfPhoton ph;
+                        ph.p      = path[u].p;
+                        ph.wo     = dPrev;                 // unit, toward the previous vertex
+                        ph.lambda = (float)hb.lam[0];
+                        ph.beta   = (float)path[u].beta;
+                        ph.cx = (float)cieX(ph.lambda);
+                        ph.cy = (float)cieY(ph.lambda);
+                        ph.cz = (float)cieZ(ph.lambda);
+                        ph.misIdx = (unsigned)sb.mis.size();
+                        SurfMis sm;
+                        sm.sumC    = accC[u - 1];
+                        sm.sumMb   = accMb[u - 1] + eL.beam;
+                        sm.sumMs   = accMs[u - 1] + eL.surf;
+                        sm.pdfFwdA = path[u].pdfFwd;
+                        sm.rCoef   = (float)(cosPrev /
+                                             (rho2 * misRemap0(path[u - 1].pdfFwd)));
+                        sm.gateC1  = (unsigned char)(gate > 0.0 ? 1 : 0);
+                        sm.vert    = (unsigned short)u;
+                        sb.pts.push_back(ph);
+                        sb.mis.push_back(sm);
+                    }
+                }
+                accC[u]  = gate + rL * accC[u - 1];
+                accMb[u] = rL * (accMb[u - 1] + eL.beam);
+                accMs[u] = rL * (accMs[u - 1] + eL.surf);
             }
 
             for (const PathSeg& sg : segs) {
@@ -2101,7 +2266,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 const Vertex& y = path[j < np ? j : np - 1];
                 BeamMis m;
                 m.sumC   = accC[j < np ? j : np - 1];
-                m.sumM   = accM[j < np ? j : np - 1];
+                m.sumMb  = accMb[j < np ? j : np - 1];
+                m.sumMs  = accMs[j < np ? j : np - 1];
                 m.pdfDir = (float)sg.pdfDir;
                 // cos / pdfFwd, the merge-independent half of pdfRev*(y_{s-1})/pdfFwd(y_{s-1}):
                 // the gather multiplies in the phase value at x and 1/rho_L^2. The cosine is
@@ -2120,6 +2286,11 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 // here; only its transmittance, which needs the not-yet-known distance to x,
                 // is left to the gather.
                 m.etaPrev = 0.0f;
+                // Its POINT twin, for a beam that left a SURFACE: eta = pdfFwd(y_{s-1}), and
+                // there is nothing merge-point-dependent left in it at all. The j >= 1 gate
+                // matches the beam one — y_0 is the emitter, which no photon is stored at.
+                m.etaPrevS = (j >= 1 && j < np && surfMergeSite(y) && y.pdfFwd > 0.0)
+                                 ? (float)y.pdfFwd : 0.0f;
                 if (y.type == VType::Medium && j >= 1 && j < np &&
                     y.mediumId >= 0 && y.mediumId < (int)scene.media.size() &&
                     y.pdfFwd > 0.0) {
@@ -2154,11 +2325,23 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         emitted[(size_t)tid] = done;
     };
 
+    // --- THE SURFACE MAP'S SUBPATH TARGET, which needs no measurement --------------------
+    // Applied before the pilot so the pilot is sized against the count that will actually be
+    // traced. The caller sets this only when it knows the beams have no opinion (see
+    // BeamBudgetReq::surfPaths), so there is no arbitration to do here: whichever side is
+    // speaking is the only side speaking.
+    if (smOut && req.surfPaths > 0)
+        nPaths = std::clamp(req.surfPaths, kPathsMin, nPathsAsked);
+
     // --- PILOT: how many beams does one subpath actually deposit in THIS scene? ----------
     // Sized as a fraction of the request with a hard ceiling, so it is a rounding error on a
     // large run and never dominates a small one. Skipped entirely when there is no budget to
     // meet, or when the request is already too small to be worth measuring.
-    if (req.maxBeams > 0 && nPaths > 4 * kPilotMin) {
+    //
+    // A surface-photon ceiling is the SECOND thing that can require a pilot, and it can do so
+    // on a scene with no media at all (where `maxBeams` measures nothing) — hence the `||`
+    // rather than a beams-only gate.
+    if ((req.maxBeams > 0 || (smOut && req.maxSurfPhotons > 0)) && nPaths > 4 * kPilotMin) {
         const long long nPilot = std::clamp(nPaths / 32, kPilotMin, kPilotMax);
         std::vector<std::thread> ppool;
         for (int t = 0; t < nThreads; ++t)
@@ -2174,6 +2357,18 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             pm.beams.insert(pm.beams.end(), b.beams.begin(), b.beams.end());
             b.beams.clear(); b.beams.shrink_to_fit();
         }
+        // THE SURFACE BANKS MUST BE EMPTIED HERE TOO, and this is not symmetry for its own
+        // sake: the pilot's subpaths are thrown away, but `smOut->nEmitted` is set from the
+        // REAL pass's emission count. Leaving the pilot's photons in the banks would put
+        // ~3 % more flux in the map than the normalisation divides by, i.e. a silent
+        // brightening of every surface merge that scales with the pilot fraction.
+        size_t pilotSurf = 0;
+        for (SurfBank& sb : sbanks) pilotSurf += sb.size();
+        for (SurfBank& sb : sbanks) {
+            sb.pts.clear(); sb.pts.shrink_to_fit();
+            sb.mis.clear(); sb.mis.shrink_to_fit();
+        }
+        const double surfPerPath = (double)pilotSurf / (double)nPilot;
         // A pilot that deposited NOTHING says the media are hard to reach, not that they are
         // unreachable — leave `nPaths` alone rather than dividing by zero or inflating it to
         // something unbounded on the strength of a sample that measured nothing.
@@ -2231,9 +2426,20 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         // the header note above `kPilotMin`.
         double effBudget = (double)req.maxBeams;
         if (kneeBeams > 0.0) effBudget = std::min(effBudget, req.safety * kneeBeams);
-        if (perPath > 0.0) {
+        if (req.maxBeams > 0 && perPath > 0.0) {
             const long long fit = (long long)(effBudget / perPath);
             nPaths = std::clamp(fit, kPathsMin, nPathsAsked);
+        }
+        // THE SURFACE CEILING, applied AFTER the beam knee and only ever downward. It is a
+        // memory bound, not a quality target: the point-merge radius is fixed, so a bigger
+        // surface map is strictly better and this must not be allowed to raise nPaths back up
+        // on a scene where the beam knee already chose a smaller one.
+        bool surfBound = false;
+        if (smOut && req.maxSurfPhotons > 0 && surfPerPath > 0.0) {
+            const long long fitS = (long long)((double)req.maxSurfPhotons / surfPerPath);
+            const long long capped = std::clamp(fitS, kPathsMin, nPaths);
+            surfBound = (capped < nPaths);
+            nPaths = capped;
         }
         if (budgetOut) {
             budgetOut->pilotPaths   = nPilot;
@@ -2245,10 +2451,24 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             budgetOut->kneeBound    = (kneeBeams > 0.0 &&
                                        req.safety * kneeBeams < (double)req.maxBeams);
             budgetOut->applied      = (nPaths < nPathsAsked);
+            budgetOut->surfPerPath  = surfPerPath;
+            budgetOut->surfBound    = surfBound;
         }
-        if (ft::stopRequested()) { bm.beams.clear(); bm.mis.clear(); bm.nEmitted = 0; return; }
+        if (ft::stopRequested()) {
+            bm.beams.clear(); bm.mis.clear(); bm.nEmitted = 0;
+            if (smOut) { smOut->pts.clear(); smOut->mis.clear(); smOut->nEmitted = 0; }
+            return;
+        }
     }
 
+    // The subpath count is settled here whether a pilot ran or not, and the caller needs it
+    // either way: a refresh epoch re-traces exactly `pathsUsed`, so leaving it 0 on the
+    // no-pilot path would make every epoch after the first fall back to the raw `-n` default
+    // and quietly trace hundreds of times more than epoch 0 did.
+    if (budgetOut) {
+        budgetOut->pathsAsked = nPathsAsked;
+        budgetOut->pathsUsed  = nPaths;
+    }
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t)
         pool.emplace_back(worker, t, nPaths, seedBase, /*pilot*/false);
@@ -2288,6 +2508,43 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // garbage) estimator, which is a failure the image shows rather than hides.
     if (bm.mis.size() != bm.beams.size()) bm.mis.clear();
     bm.nDeposited = bm.beams.size();
+
+    // --- The SECOND output: the surface photon map (mode J's point merges) -----------
+    // Merged from the same banks the beams came from, and given the SAME nEmitted, because
+    // the beams and the photons are two views of ONE set of light subpaths. Every weight
+    // that mentions both kinds (SurfMis::sumMb / BeamMis::sumMs, and the camera-side
+    // segSumM which is scaled by both kappas) assumes a single n_m; two passes would give
+    // them two, and every cross term would be wrong by that ratio.
+    if (smOut) {
+        size_t np = 0;
+        for (const SurfBank& sb : sbanks) np += sb.size();
+        smOut->pts.clear();
+        smOut->mis.clear();
+        ftalloc::reserve(smOut->pts, np, "mode J's surface photon map", "-n (which sizes it)");
+        ftalloc::reserve(smOut->mis, np, "mode J's per-photon MIS partials",
+                         "-n (which sizes it)");
+        smOut->nEmitted = bm.nEmitted;
+        for (int t = 0; t < nThreads; ++t) {
+            SurfBank& sb = sbanks[(size_t)t];
+            // `misIdx` is BANK-LOCAL (each worker numbered from 0 into its own `sb.mis`), so
+            // it MUST be rebased by the running offset as the banks are concatenated. Getting
+            // this wrong does not crash and does not look wrong — it silently pairs a photon
+            // with another thread's MIS partials, which is the one bug class this file cannot
+            // survive, so the rebase happens in the same loop as the copy and nowhere else.
+            const unsigned base = (unsigned)smOut->mis.size();
+            for (const SurfPhoton& ph : sb.pts) {
+                SurfPhoton q = ph;
+                q.misIdx += base;
+                smOut->pts.push_back(q);
+            }
+            smOut->mis.insert(smOut->mis.end(), sb.mis.begin(), sb.mis.end());
+        }
+        // Same contract as the beams': the two arrays are pushed one after the other and can
+        // only disagree through a bug. Dropping the MIS array disables the point merges
+        // outright (SurfMap::misOf returns null) rather than adding unweighted energy to an
+        // already-complete BDPT sum.
+        if (smOut->mis.size() != smOut->pts.size()) { smOut->mis.clear(); smOut->pts.clear(); }
+    }
 }
 
 // --- Gate (2): an independent, ABSOLUTE-form balance heuristic -------------------
@@ -2368,12 +2625,13 @@ inline void reset() {
 // The reference weight itself. `light`/`eye` must already carry the current strategy's
 // patched densities and delta flags (i.e. call from inside misWeight).
 //
-// Mode J adds the MERGE strategies to the same sum: one per interior medium vertex, each
-// weighted by mergeEtaPrime * kappa against the connection strategy at that same vertex.
-// `mergeKappa` is 0 in mode D, which deletes them and leaves this function byte-identical.
+// Mode J adds the MERGE strategies to the same sum: one per interior vertex that a photon
+// beam (medium) or a photon (surface) could have been stored at, each weighted by its primed
+// eta times that kind's constant, against the connection strategy at that same vertex. `mk`
+// is all-zero in mode D, which deletes them and leaves this function byte-identical.
 inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& light,
                                  const std::vector<Vertex>& eye, int s, int t,
-                                 double lambda, double mergeKappa) {
+                                 double lambda, const MergeK& mk) {
     const int n = s + t;
     if (n <= 2) return 1.0;
     auto remap0 = [](double f) { return f != 0.0 ? f : 1.0; };
@@ -2422,15 +2680,15 @@ inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& 
     // connection strategy at the same vertex, so it rides the ratio already computed above.
     // No `allowed` test: a merge connects nothing, so a delta neighbour does not kill it —
     // it only needs both subpaths to REACH x_i, which by construction they do.
-    if (mergeKappa > 0.0) {
+    if (mk.any()) {
         auto vAt = [&](int i) -> const Vertex& {
             return (i < s) ? light[(size_t)i] : eye[(size_t)(n - 1 - i)];
         };
         for (int i = 1; i <= n - 2; ++i) {
             const double e = mergeEtaPrime(scene, vAt(i - 1).p, vAt(i), vAt(i + 1).p,
-                                           pl[(size_t)i], lambda);
+                                           pl[(size_t)i], lambda).scale(mk);
             if (e > 0.0)
-                sum += e * mergeKappa * std::exp(A[(size_t)i] + B[(size_t)i] - logPs);
+                sum += e * std::exp(A[(size_t)i] + B[(size_t)i] - logPs);
         }
     }
     return sum > 0.0 ? 1.0 / sum : 0.0;
@@ -2443,8 +2701,8 @@ inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& 
 // resampled endpoint used when s==1 (light NEE) or t==1 (camera splat). `light`/`eye`
 // are mutated in place but restored by the ScopedAssigns before returning.
 //
-// `mergeKappa` (= n_m * 2r, the merge technique's sample count times the kernel width; 0 in
-// every mode but J) adds the beam-merge strategies to the denominator. It has to be here
+// `mk` (the two merge kinds' constants — see MergeK; all-zero in every mode but J) adds the
+// merge strategies to the denominator. It has to be here
 // rather than applied afterwards: a merge is a technique that competes with THIS connection
 // for the same path, so leaving it out would make mode J's connection weights sum with its
 // merge weights to more than 1 and brighten every medium.
@@ -2463,7 +2721,7 @@ inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& 
 inline double misWeight(const Scene& scene, const Camera& cam,
                         std::vector<Vertex>& light, std::vector<Vertex>& eye,
                         Vertex& sampled, int s, int t, double lambda,
-                        double mergeKappa = 0.0) {
+                        const MergeK& mk = MergeK{}) {
     if (s + t == 2) return 1.0;
     auto remap0 = [](double f) { return f != 0.0 ? f : 1.0; };
     Vertex* qs  = s > 0 ? &light[s - 1] : nullptr;
@@ -2501,15 +2759,15 @@ inline double misWeight(const Scene& scene, const Camera& cam,
     ScopedAssign<double> a7;
     if (qsM) a7 = ScopedAssign<double>(&qsM->pdfRev, vertexPdf(scene, cam, pt, *qs, *qsM, lambda));
 
-    const bool merges = mergeKappa > 0.0;
+    const bool merges = mk.any();
     double sumRi = 0.0, ri = 1.0;
     for (int i = t - 1; i > 0; --i) {                // hypothetical camera strategies
         ri *= remap0(eye[i].pdfRev) / remap0(eye[i].pdfFwd);
         if (!eye[i].delta && !eye[i - 1].delta) sumRi += ri;
         if (merges && i >= 2) {                      // merge at eye[i-1] (see header note)
             const double e = mergeEtaPrime(scene, eye[i].p, eye[i - 1], eye[i - 2].p,
-                                           eye[i - 1].pdfRev, lambda);
-            if (e > 0.0) sumRi += ri * e * mergeKappa;
+                                           eye[i - 1].pdfRev, lambda).scale(mk);
+            if (e > 0.0) sumRi += ri * e;
         }
     }
     ri = 1.0;
@@ -2524,23 +2782,23 @@ inline double misWeight(const Scene& scene, const Camera& cam,
         if (merges && i >= 1 && t > 0) {             // merge at light[i]
             const Vec3& pNext = (i + 1 <= s - 1) ? light[i + 1].p : eye[t - 1].p;
             const double e = mergeEtaPrime(scene, light[i - 1].p, light[i], pNext,
-                                           light[i].pdfFwd, lambda);
-            if (e > 0.0) sumRi += ri * e * mergeKappa;
+                                           light[i].pdfFwd, lambda).scale(mk);
+            if (e > 0.0) sumRi += ri * e;
         }
     }
     // The merge at the connection vertex pt itself. Its own connection strategy IS this
     // one, so the ratio multiplying it is exactly 1.
     if (merges && s >= 1 && t >= 2) {
         const double e = mergeEtaPrime(scene, light[s - 1].p, eye[t - 1], eye[t - 2].p,
-                                       eye[t - 1].pdfRev, lambda);
-        if (e > 0.0) sumRi += e * mergeKappa;
+                                       eye[t - 1].pdfRev, lambda).scale(mk);
+        if (e > 0.0) sumRi += e;
     }
     const double w = 1.0 / (1.0 + sumRi);
     // Gate (2), off unless `-misaudit`: cross-check the relative form above against the
     // absolute one, here, where the ScopedAssigns are still installed and both therefore
     // see identical densities.
     if (misaudit::enabled.load(std::memory_order_relaxed)) {
-        const double ref = misWeightReference(scene, light, eye, s, t, lambda, mergeKappa);
+        const double ref = misWeightReference(scene, light, eye, s, t, lambda, mk);
         const double den = std::fabs(w) > std::fabs(ref) ? std::fabs(w) : std::fabs(ref);
         misaudit::nChecked.fetch_add(1, std::memory_order_relaxed);
         misaudit::note(den > 0.0 ? std::fabs(w - ref) / den : 0.0, s, t);
@@ -2600,7 +2858,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                           std::vector<Vertex>& light, std::vector<Vertex>& eye,
                           int s, int t, const HeroBundle& hb,
                           Pcg32& rng, int& outPx, int& outPy, bool& isSplat,
-                          double* Lsec, int& nUpConn, double mergeKappa = 0.0) {
+                          double* Lsec, int& nUpConn, const MergeK& mk = MergeK{}) {
     const double lambda = hb.lam[0], invPdfLambda = hb.invPdf[0];
     isSplat = false;
     nUpConn = 0;                    // set to the real width only once a contribution exists
@@ -2932,7 +3190,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
     double mx = L;
     for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mx) mx = Lsec[i];
     if (!(mx > 0.0)) return 0.0;        // negated: also rejects NaN (see the mxE/mxL note)
-    const double mis = misWeight(scene, cam, light, eye, sampled, s, t, lambda, mergeKappa);
+    const double mis = misWeight(scene, cam, light, eye, sampled, s, t, lambda, mk);
     for (int i = 0; i + 1 < nUp; ++i) Lsec[i] *= mis;
     nUpConn = nUp;
     return L * mis;
@@ -2988,14 +3246,22 @@ struct BeamMergeWeight {
     const BeamMap* bm    = nullptr;
     const PathSeg* sg    = nullptr;
     double lamCam = 0.0;
-    double kappa  = 0.0;      // n_m * 2r: the merge technique's sample count times the kernel
+    double kappa  = 0.0;      // n_m * 2r: THIS technique's sample count times its kernel
+    double kappaS = 0.0;      // n_m * pi r_s^2: the OTHER merge kind's, for the denominator.
+                              // A camera ray that crosses a medium and lands on a wall is
+                              // competed for by point merges as well as beam ones, and a
+                              // denominator missing them over-weights every beam merge.
     // Per-segment camera-side constants (see BdptRenderer::renderRows, where they are built).
     double gateS1     = 0.0;  // is the reference connection C1 legal? (eye[k] not delta)
     double cosFacK    = 1.0;  // projected cosine at eye[k] along the segment; 1 off a surface
     double invPdfFwdK = 1.0;  // 1 / remap0(eye[k].pdfFwd)
     double etaKCoef   = 0.0;  // sin(theta_k) / (sigma_t(eye[k]) * Tr~(eye[k] -> eye[k-1]))
+    double etaKSurf   = 0.0;  // kappaS if eye[k] is a stored-photon site, else 0 — the POINT
+                              // merge at eye[k], whose eta is just kappaS * pdfRev(eye[k])
     double segSumC    = 0.0;  // camera-side connection accumulator from eye[k] inward
-    double segSumM    = 0.0;  // camera-side merge accumulator, kappa factored out
+    double segSumM    = 0.0;  // camera-side merge accumulator, BOTH kinds, already scaled by
+                              // their kappas (unlike the light side, the camera pass knows
+                              // them, so nothing is deferred here)
     int    camVert    = 0;    // k: the camera subpath index of the vertex this segment leaves
     int    maxDepth   = 0;    // the same cap the connection loop applies (see below)
     // Per-ray transmittance data, hoisted out of the per-hit path. `camTr` is built once for
@@ -3054,7 +3320,11 @@ struct BeamMergeWeight {
         // pdfRev(eye[k]) in the merged path, and the camera loop's second step.
         const double pdfRevK = phase * cosFacK * invT2;
         const double C2   = pdfRevK * invPdfFwdK;
-        const double etaK = kappa * etaKCoef * pdfRevK;      // merge AT eye[k]
+        // Merge AT eye[k], of whichever kind eye[k] admits: the beam form when it is a medium
+        // vertex (etaKCoef carries its sin/sigma_t/Tr), the point form when it is a stored-
+        // photon site (eta = kappaS * pdfRev, so the coefficient IS kappaS). Both read the
+        // same PATCHED pdfRev — the density of eye[k] seen from the merge point x.
+        const double etaK = (kappa * etaKCoef + etaKSurf) * pdfRevK;
         // The merge AT y_{s-1}. Its sin(theta) and p_L were known when the beam was
         // deposited (its outgoing direction IS the beam); only the transmittance over the
         // now-known y_{s-1} -> x span is left.
@@ -3064,14 +3334,99 @@ struct BeamMergeWeight {
             const double trP = trDet(*scene, yPrev, b.d, rhoL, (double)b.lambda, *tabs);
             if (trP > 0.0) etaPrevTerm = kappa * (double)lm->etaPrev / trP;
         }
+        // ...and the POINT merge at y_{s-1}, for the case the beam left a SURFACE into the
+        // medium. Nothing about it depends on x (its eta is kappaS * pdfFwd(y_{s-1}) — see
+        // mergeEtaPrimeSurf), so unlike its beam twin above it needs no transmittance and was
+        // finished at deposit time.
+        const double etaPrevS = kappaS * (double)lm->etaPrevS;
         const double den = (double)lm->gateC1                    // C1 itself (ratio 1)
                          + R * lm->sumC                          // light-side connections
                          + gateS1 * C1                           // the t-1 camera connection
                          + C1 * C2 * segSumC                     // camera-side connections
-                         + R * (kappa * lm->sumM + etaPrevTerm)  // light-side merges
+                         + R * (kappa * lm->sumMb + kappaS * lm->sumMs
+                                + etaPrevTerm + etaPrevS)        // light-side merges
                          + etaS                                  // this merge
                          + C1 * etaK                             // merge at eye[k]
-                         + C1 * C2 * kappa * segSumM;            // camera-side merges
+                         + C1 * C2 * segSumM;                    // camera-side merges
+        if (!(den > 0.0)) return 0.0;
+        return etaS / den;
+    }
+};
+
+// --- The OTHER merge weight (mode J): point x point on a surface ----------------------
+//
+// One of these is built per CAMERA VERTEX (not per segment — a point merge happens AT a
+// vertex, not along a ray) and applied once per gathered photon.
+//
+// SHAPE. The merged path is y_0 .. y_{j-1}, [ y_j == eye[k] ], eye[k-1], .., eye[0]: j+k+1
+// vertices, depth j+k — one SHORTER than a beam merge with the same indices, because this
+// merge identifies a vertex both walks already have instead of inserting a new one. For the
+// same reason its reference technique C1 is the connection at split s = j (join y_{j-1} to
+// the merge site, which is the last camera vertex), one strategy earlier than the beam case.
+// EVERY light-side accumulator is therefore read at j-1 where BeamMis reads at j; that offset
+// is baked into SurfMis at store time, so nothing here has to know about it.
+//
+// THE PATCHED DENSITIES. The light walk left y_j along its own continuation and the camera
+// walk arrived along another, so two recorded densities are wrong in the merged path and are
+// recomputed from the CAMERA vertex's BSDF (the photon's own material is never consulted —
+// a merge shades with the camera vertex's BSDF, and its density has to match):
+//
+//   pdfRev(y_{j-1})  <- pdfDirRev = pdf(eye[k]: wo_cam -> photon.wo)   [VCM's camDirPdfW]
+//   pdfRev(eye[k-1]) <- pdfDirFwd = pdf(eye[k]: photon.wo -> wo_cam)   [VCM's camRevPdfW]
+//
+// The pair AT the site does not appear at all, unlike the beam case: with no inserted vertex
+// the camera-side area density of the site cancels between p_merge and p_C1, leaving
+// p_merge/p_C1 = n_m * pi r_s^2 * pl_j — the light-side area density alone. See
+// mergeEtaPrimeSurf for that derivation and its SmallVCM cross-check.
+//
+// SPECTRAL MISMATCH: same documented approximation as BeamMergeWeight — the photon carries
+// its own wavelength, the camera path another, and the two BSDF pdfs above are evaluated at
+// the PHOTON's (they pair with light-side densities). See that struct's note.
+struct SurfMergeWeight {
+    double kappaB = 0.0;      // n_m * 2 r_b     — the OTHER merge kind, for the denominator
+    double kappaS = 0.0;      // n_m * pi r_s^2  — THIS technique's constant
+    // Per-camera-vertex constants (built in BdptRenderer::renderRows).
+    double invPdfFwdK   = 1.0;  // 1 / remap0(eye[k].pdfFwd)
+    double gateD1       = 0.0;  // is connecting eye[k] to eye[k-1] legal? (eye[k-1] not delta;
+                                // eye[k] cannot be, surfMergeSite already refused a delta)
+    double cosPrev      = 1.0;  // |cos| at eye[k-1] along the eye[k]<->eye[k-1] edge; 1 in a
+                                // medium and at the camera vertex, neither of which has one
+    double invDistPrev2 = 0.0;  // 1 / |eye[k] - eye[k-1]|^2
+    double invPdfFwdKm1 = 1.0;  // 1 / remap0(eye[k-1].pdfFwd)
+    double etaKm1Coef   = 0.0;  // the merge AT eye[k-1], less its pdfRev: kappaB*sin/(sigT*Tr)
+                                // in a medium, kappaS at a stored-photon site, 0 otherwise.
+                                // Merge-site independent because both of eye[k-1]'s
+                                // neighbours are known (the site IS eye[k]).
+    double segSumC      = 0.0;  // camera connections from eye[k-1] inward  (segSumC[k-1])
+    double segSumM      = 0.0;  // camera merges from eye[k-2] inward, both kinds already
+                                // scaled by their kappas       (segSumM[k-1])
+    int    camVert      = 0;    // k
+    int    maxDepth     = 0;
+
+    double operator()(const SurfMis& lm, double pdfDirRev, double pdfDirFwd) const {
+        // THE DEPTH CAP, exactly as BeamMergeWeight's and for the same reason — but at j+k,
+        // not j+k+1: this merge adds no vertex. Past the cap the merged path is one no
+        // connection strategy builds, so its energy would have nothing to MIS against.
+        if ((int)lm.vert + camVert > maxDepth) return 0.0;
+        const double etaS = kappaS * lm.pdfFwdA;      // THIS merge, as a ratio against C1
+        if (!(etaS > 0.0)) return 0.0;
+        // pdfRev(y_{j-1})/pdfFwd(y_{j-1}) — the light loop's first (and only patched) step.
+        // rCoef carries the cosine, the inverse-square and the remapped 1/pdfFwd, all fixed
+        // when the photon was stored; only the directional density had to wait for a gather.
+        const double R = pdfDirRev * (double)lm.rCoef;
+        // pl_j/pc_k: the camera loop's first step. remap0 on both, as misWeight does.
+        const double D1 = misRemap0(lm.pdfFwdA) * invPdfFwdK;
+        // pdfRev(eye[k-1]) in the MERGED path, and with it the camera loop's second step.
+        const double pdfRevKm1 = pdfDirFwd * cosPrev * invDistPrev2;
+        const double D2 = pdfRevKm1 * invPdfFwdKm1;
+        const double den = (double)lm.gateC1                     // C1 itself (ratio 1)
+                         + R * (lm.sumC                          // light-side connections
+                                + kappaB * lm.sumMb              // light-side merges, both
+                                + kappaS * lm.sumMs)             //   kinds, scaled here
+                         + etaS                                  // this merge
+                         + D1 * (gateD1                          // connect eye[k]<->eye[k-1]
+                                 + etaKm1Coef * pdfRevKm1        // merge at eye[k-1]
+                                 + D2 * (segSumC + segSumM));    // everything further in
         if (!(den > 0.0)) return 0.0;
         return etaS / den;
     }
@@ -3092,6 +3447,17 @@ struct BdptRenderer {
     // then dead — which is the point, and is gate (1) of the UPBP validation plan in
     // known-issues.md: an absent (or empty) beam map must leave mode D BIT-IDENTICAL.
     const BeamMap* beams = nullptr;
+
+    // MODE J, the SECOND merge kind: the view-independent SURFACE photon map (surfmerge.h)
+    // to merge camera surface vertices against — VCM's vertex merging, which mode J did not
+    // have and mode U existed to provide. Null means beams only, exactly as `beams` null
+    // means mode D, and the same gate applies: with it null the arithmetic below must be
+    // bit-identical to the beams-only mode J that preceded it.
+    //
+    // The two maps are INDEPENDENT: a scene with no media gets `photons` and no `beams`
+    // (that is mode U's job, done here), a scene of pure fog gets `beams` and an empty
+    // `photons`, and a scene with both gets both — which is the whole point of folding U in.
+    const SurfMap* photons = nullptr;
 
     // `sampleBase` = absolute index of the first sample rendered here; each
     // (pixel, absolute sample) seeds its own stream via seedUnit(), so the
@@ -3128,11 +3494,26 @@ struct BdptRenderer {
         // Weighted and unweighted merges must move together: weighting the connections down
         // while the merges are still raw would darken the volume as surely as the reverse
         // brightens it, so ONE flag gates both.
-        const double mergeKappa = (mergeOn && !beams->mis.empty())
-                                ? (double)beams->nEmitted * 2.0 * beams->radRef() : 0.0;
+        MergeK mk;
+        if (mergeOn && !beams->mis.empty())
+            mk.beam = (double)beams->nEmitted * 2.0 * beams->radRef();
+        // ...and the SURFACE merge kind's, when a photon map was built alongside the beams.
+        // Both constants are shared by every weight in the frame, and both must be visible to
+        // every weight: the two techniques compete for the same paths.
+        // The MIS array is part of the gate here, unlike the beam case: a beam map without
+        // partials still renders (weight 1, i.e. mode M's estimator, over-bright but a
+        // picture), while an unweighted point merge would be added on top of a COMPLETE BDPT
+        // sum and double-count every path it touches. No weights, no point merges — and then
+        // `mk.surf` must stay 0 too, or every other technique's denominator would carry terms
+        // for a strategy that is not running.
+        const bool surfOn = photons && !photons->empty() && !photons->mis.empty() &&
+                            photons->nEmitted > 0 && photons->radius > 0.0;
+        if (surfOn)
+            mk.surf = (double)photons->nEmitted * PI * photons->radius * photons->radius;
+        const double mergeKappa = mk.beam;
         // FTRACE_J_HALF (diagnostic): 1 = connections only, 2 = merges only. Deliberately
-        // does NOT touch mergeKappa — both halves keep the SAME MIS weights they have in a
-        // full render, so the two images sum to the full one.
+        // does NOT touch the merge constants — both halves keep the SAME MIS weights they
+        // have in a full render, so the two images sum to the full one.
         const int jHalf = jHalfMode();
         for (int py = y0; py < y1; ++py)
             for (int px = 0; px < camFilm.resX; ++px) {
@@ -3222,7 +3603,7 @@ struct BdptRenderer {
                             int nUpConn = 0;
                             double c = connectBDPT(scene, cam, mats, light, eye, s, t, hb,
                                                    rng, spx, spy, isSplat, Lsec, nUpConn,
-                                                   mergeKappa);
+                                                   mk);
                             if (nUpConn <= 0) continue;
                             double mx = c;
                             for (int i = 0; i + 1 < nUpConn; ++i)
@@ -3267,16 +3648,24 @@ struct BdptRenderer {
                     // stream is re-seeded per (pixel, sample) at the top of this loop — so
                     // "turn the merges off and mode J is mode D bit-for-bit" survives even
                     // though the two halves share a generator.
-                    if (mergeOn && jHalf != 1) {
+                    if ((mergeOn || surfOn) && jHalf != 1) {
                         // The camera half of every merge weight, replayed ONCE for the whole
                         // subpath. misWeight's camera loop telescopes inward from the merge
                         // point; everything it accumulates strictly camera-side of eye[k] is
                         // independent of where along the segment a beam is hit, so it is
                         // summed here and read off per segment. (The recurrences mirror the
                         // light-side ones in traceLightBeamPass; see BeamMergeWeight.)
+                        //
+                        // ONE pair of accumulators serves BOTH merge kinds, and must: a beam
+                        // merge and a point merge on the same camera subpath compete for the
+                        // same paths, so each one's denominator has to see the other's
+                        // camera-side terms. That is also why `segSumM` is pre-scaled here by
+                        // both kappas rather than left primed the way the light side leaves
+                        // its two sums — the camera pass knows both constants, the light pass
+                        // knows neither.
                         const double lamCam = hb.lam[0];
                         const PatTables tabs = scene.patTables();
-                        if (mergeKappa > 0.0) {
+                        if (mk.any()) {
                             segSumC.assign((size_t)nE, 0.0);
                             segSumM.assign((size_t)nE, 0.0);
                             for (int k = 1; k < nE; ++k) {
@@ -3289,7 +3678,7 @@ struct BdptRenderer {
                                 const double eK = (k >= 2)
                                     ? mergeEtaPrime(scene, eye[(size_t)k].p, eye[(size_t)k - 1],
                                                     eye[(size_t)k - 2].p,
-                                                    eye[(size_t)k - 1].pdfRev, lamCam)
+                                                    eye[(size_t)k - 1].pdfRev, lamCam).scale(mk)
                                     : 0.0;
                                 double carry = 0.0, carryM = 0.0;
                                 if (k >= 2) {
@@ -3306,10 +3695,12 @@ struct BdptRenderer {
                         }
                         TrRay camTr;
                         for (const PathSeg& sg : segs) {
+                            if (!mergeOn) break;
                             if (!(sg.beta > 0.0)) continue;
                             BeamMergeWeight w1;
                             w1.scene = &scene; w1.bm = beams; w1.sg = &sg;
                             w1.lamCam = lamCam; w1.kappa = mergeKappa;
+                            w1.kappaS = mk.surf;
                             w1.tabs = &tabs;
                             w1.raw = (jHalf == 3);
                             if (jHalf) { w1.diag = &jDiag(); jDiag().segs.fetch_add(1, std::memory_order_relaxed); }
@@ -3321,7 +3712,7 @@ struct BdptRenderer {
                             // `mergeKappa == 0 => misOf() is null` coupling stops holding.
                             camTr.build(scene, sg.o, sg.d, sg.tMax, lamCam, tabs);
                             w1.camTr = &camTr;
-                            if (mergeKappa > 0.0) {
+                            if (mk.any()) {
                                 const size_t k = (size_t)sg.vert;
                                 const Vertex& vk = eye[k < (size_t)nE ? k : (size_t)nE - 1];
                                 w1.gateS1     = vk.delta ? 0.0 : 1.0;
@@ -3357,11 +3748,102 @@ struct BdptRenderer {
                                             w1.etaKCoef = std::sqrt(s2) / (sT * tr);
                                     }
                                 }
+                                // ...and the POINT merge at eye[k], for the case the segment
+                                // leaves a SURFACE into the medium. Its eta is kappaS *
+                                // pdfRev(eye[k]) outright (mergeEtaPrimeSurf), so unlike its
+                                // beam twin above there is no geometry to gather: the whole
+                                // merge-point-independent coefficient IS kappaS. Mutually
+                                // exclusive with etaKCoef — a vertex is a medium point or a
+                                // surface, never both — but summed rather than branched so
+                                // the day a third kind appears nothing here has to change.
+                                if (k >= 1 && k < (size_t)nE && surfMergeSite(vk))
+                                    w1.etaKSurf = mk.surf;
                             }
                             Vec3 m = gatherPhotonBeamsW(scene, mats, *beams, sg.o, sg.d,
                                                         sg.tMax, sg.aGlass, rng, w1);
                             if (m.x != 0.0 || m.y != 0.0 || m.z != 0.0)
                                 camFilm.add(px, py, m * sg.beta);
+                        }
+
+                        // ---- POINT MERGES (the half folded in from mode U) --------------
+                        // The same estimator mode U calls vertex merging, now MIS-combined
+                        // with mode J's connections AND its beam merges in one denominator —
+                        // which is the whole reason for folding U in here rather than running
+                        // the two modes side by side. A camera path that crosses a cloud and
+                        // lands on a wall is competed for by all three, and only a single
+                        // weight can partition that unity.
+                        //
+                        // Per VERTEX, not per segment: a point merge happens where the camera
+                        // walk actually landed, so there is no ray to march and no rng draw —
+                        // which also keeps the "merges off == mode D bit-for-bit" gate intact
+                        // for free.
+                        if (surfOn) {
+                            const double vmNorm = 1.0 / mk.surf;
+                            for (int k = 1; k < nE; ++k) {
+                                const Vertex& vk = eye[(size_t)k];
+                                // The site predicate is `surfMergeSite` and MUST be, because
+                                // the light pass stored photons by exactly it: a site gathered
+                                // here but never stored under-weights every competing
+                                // technique, and one stored but not gathered double-counts.
+                                if (!surfMergeSite(vk) || !(vk.beta > 0.0) || !vk.mat) continue;
+                                const Vertex& vp = eye[(size_t)k - 1];
+                                Vec3 woCam = vp.p - vk.p;          // toward the camera side
+                                const double d2 = dot(woCam, woCam);
+                                if (!(d2 > 0.0)) continue;
+                                woCam = woCam * (1.0 / std::sqrt(d2));
+                                SurfMergeWeight sw;
+                                sw.kappaB       = mk.beam;
+                                sw.kappaS       = mk.surf;
+                                sw.invPdfFwdK   = 1.0 / misRemap0(vk.pdfFwd);
+                                sw.gateD1       = vp.delta ? 0.0 : 1.0;
+                                sw.cosPrev      = vp.onSurface()
+                                                ? std::fabs(dot(vp.ns, woCam)) : 1.0;
+                                sw.invDistPrev2 = 1.0 / d2;
+                                sw.invPdfFwdKm1 = 1.0 / misRemap0(vp.pdfFwd);
+                                // The merge AT eye[k-1], less its pdfRev. Passing pLight = 1
+                                // is what turns `mergeEtaPrime`'s primed eta into the bare
+                                // coefficient — legitimate here (and not in the beam gather)
+                                // because BOTH of eye[k-1]'s neighbours are known: the merge
+                                // site is eye[k] itself, so there is no per-photon geometry.
+                                sw.etaKm1Coef   = (k >= 2)
+                                    ? mergeEtaPrime(scene, vk.p, vp, eye[(size_t)k - 2].p,
+                                                    1.0, lamCam).scale(mk)
+                                    : 0.0;
+                                sw.segSumC      = segSumC[(size_t)k - 1];
+                                sw.segSumM      = segSumM[(size_t)k - 1];
+                                sw.camVert      = k;
+                                sw.maxDepth     = maxDepth;
+                                const Vec3 ngo = (dot(vk.ng, vk.ns) >= 0.0) ? vk.ng
+                                                                            : vk.ng * -1.0;
+                                Vec3 mergeXYZ{0, 0, 0};
+                                photons->query(vk.p, [&](int idx) {
+                                    const SurfPhoton& ph = photons->pts[(size_t)idx];
+                                    const SurfMis* lm = photons->misOf((size_t)idx);
+                                    if (!lm) return;      // no weight: refuse (see misOf)
+                                    const double lam = (double)ph.lambda;
+                                    double fCam = bsdfF(*vk.mat, vk.ns, woCam, ph.wo, lam,
+                                                        scene, &vk.hit);
+                                    if (!(fCam > 0.0)) return;
+                                    // Gather-side shading-normal correction: the density
+                                    // estimate reads flux per GEOMETRIC area while every
+                                    // strategy it is MIS-combined with integrates against the
+                                    // shading cosine. Exactly 1 on flat geometry.
+                                    fCam *= vmGatherCorr(ph.wo, vk.ns, ngo);
+                                    const double pdfDirRev = bsdfPdf(*vk.mat, vk.ns, woCam,
+                                                                     ph.wo, lam, scene,
+                                                                     &vk.hit);
+                                    const double pdfDirFwd = bsdfPdf(*vk.mat, vk.ns, ph.wo,
+                                                                     woCam, lam, scene,
+                                                                     &vk.hit);
+                                    const double w = sw(*lm, pdfDirRev, pdfDirFwd);
+                                    if (!(w > 0.0)) return;
+                                    mergeXYZ = mergeXYZ + Vec3(ph.cx, ph.cy, ph.cz) *
+                                                          (w * fCam * (double)ph.beta);
+                                });
+                                if (mergeXYZ.x != 0.0 || mergeXYZ.y != 0.0 ||
+                                    mergeXYZ.z != 0.0)
+                                    camFilm.add(px, py, mergeXYZ * (vk.beta * vmNorm));
+                            }
                         }
                     }
                 }

@@ -5,6 +5,89 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### UPBP-VM — OPEN (2026-09-06, v0.258.0): mode `J`'s surface point merges (`-jsurf`, the half folded in from mode `U`) are **opt-in and CPU-only**, so mode `U` cannot be retired yet and a `-jsurf` render cannot use the GPU
+
+**What shipped in v0.258.0.** Mode `J` now has a *second* merge kind. The same light subpaths that
+deposit photon beams into the medium also deposit **surface photons** at every non-delta surface
+vertex (`bdpt::surfMergeSite`), into `bdpt::SurfMap` (`src/surfmerge.h`), and the camera pass
+gathers them per camera vertex with `bdpt::SurfMergeWeight`. That is exactly mode `U`'s vertex
+merging, except MIS-combined with mode `J`'s BDPT connections **and** its beam×ray merges under a
+single balance-heuristic denominator instead of `U`'s two-technique one. A camera path that crosses
+a cloud and lands on a wall is competed for by all three techniques, and only one weight can
+partition that unity — which is the whole reason for folding `U` in here rather than shipping two
+modes that each solve half the problem.
+
+The two merge kinds cannot share a `kappa` (`n_m·2r_b` for a beam, `n_m·π r_s²` for a point), so the
+light pass carries **two** primed accumulators (`SurfMis::sumMb` / `sumMs`, `BeamMis::sumMb` /
+`sumMs`) and each gather scales the other kind by its own constant. Both denominators mention both
+kinds; neither is complete without the other.
+
+**Why it is still opt-in.** `-jsurf` is off by default and `VERSION` 0.258.0 ships it that way on
+purpose. Mode `J`'s default has to stay the estimator the existing validation suite measured until
+three gates pass:
+
+1. **Gate 1 (identity) — GREEN.** `-mode J -nobeams -nojsurf` must be **bit-identical** to `-mode D`
+   on the same command line. Preserved by construction — the point-merge loop draws no RNG at all
+   and `mk.surf == 0` zeroes every new denominator term — but it had to be *measured*, not asserted.
+   Measured three ways, all `cmp`-identical byte for byte:
+
+   | scene | flags | vs |
+   |---|---|---|
+   | `cornell` (built-in), 96², spp 4 | `-mode J` | `-mode D -device cpu` |
+   | `cornell` (built-in), 96², spp 4 | `-mode J -nojsurf` | `-mode D -device cpu` |
+   | `_fog_cornell.ftsl`, 96², spp 4 | `-mode J -nobeams` | `-mode D -device cpu` |
+
+2. **Gate 2 (vs mode `U`) — GREEN, and it moved the design.** A surfaces-only scene
+   (`scenes/_cornell_diffuse.ftsl`) under `-mode J -jsurf` must converge to the same radiance as
+   `-mode U` at the same radius. `-jsurf-radius` defaults to the same `-pmradius` / `-pmradiusfrac`
+   modes `M`/`S`/`U` use precisely so this is a comparison of *estimators*, not of radii — and mode
+   `U` confirmed the shared default, reporting `R0=0.01732` against `-jsurf`'s `r=0.01732`. All at
+   128², 1024 spp on the CPU, against an **8192 spp mode-`D` reference** (1.10 % noise):
+
+   | run | energy bias | rel-RMS @8×8 | wall |
+   |---|---|---|---|
+   | `-mode D` (same 1024 spp, as a noise floor) | +0.03 % | 0.25 % | 53.5 s |
+   | `-mode U` | +0.32 % | 1.52 % | 1:39 |
+   | `-mode J -jsurf` (fixed `r`, as first shipped) | −0.45 % | 3.20 % | **1:09** |
+   | `-mode J -jsurf -jsurf-radius 0.005` | **−0.11 %** | **0.74 %** | 1:04 |
+   | `-mode J -jsurf -jsurf-radius 0.035` | −0.52 % | 4.67 % | 1:48 |
+
+   Two things fell out of this, and both were acted on rather than filed:
+
+   * **The radius sweep is the `O(r²)` merge bias, not an error in the weight** — −0.11 / −0.45 /
+     −0.52 % is monotone in `r` and heading for zero. But mode `U` shrinks `R0` per pass and mode
+     `J` was holding `r` still, so `J` had a bias *floor* where `U` had none. That is the one
+     property `U` had that `J` lacked, and retiring `U` without it would have been a regression, so
+     `surfRadiusFor(epoch)` now applies mode `U`'s own Georgiev/SmallVCM schedule under the same
+     `-vcmalpha`, indexed by light-side refresh epoch. See `design.md`'s `surfmerge.h` entry.
+   * **The rel-RMS gap is cadence, not correctness.** It *grows* with `r`, which is backwards for a
+     density estimate (more photons gathered should mean less noise) — so it is measuring blur, and
+     under it `J` at `r=0.005` already beats `U` (0.74 % vs 1.52 %) while running faster. What
+     variance there is comes from `J` averaging only **54 independent light-side realizations** over
+     1024 spp against `U`'s 1024, since `J`'s refresh cadence was tuned for an expensive *beam* map.
+     Worth revisiting for the surfaces-only case; not a blocker, and folded into **UPBP-CONV**.
+
+3. **Gate 3 (three-way) — not yet run.** A scene with media *and* surfaces must not brighten or
+   darken against a long mode-`R` / mode-`D` reference — i.e. the three-technique denominator really
+   does sum to one. This is the only gate left before `-jsurf` flips to default-on. Note it is
+   entangled with the separately-tracked **+9…+17 % volume residual** in the beam-merge weight: gate
+   3 cannot be read cleanly until that is understood, since a three-way run inherits it.
+
+Until those are green, `-jsurf` stays opt-in; when they are, it flips to default-on and `-nojsurf`
+becomes the opt-out exactly as `-nobeams` is today, and mode `U` becomes a deprecated alias.
+
+**The CPU-only gate is a correctness gate, not a missing feature.** `render_cuda.cu`'s device
+`DBeamMis` carries a **single** merge kind. A `-jsurf` render on the GPU would therefore not merely
+skip the surface merges — it would also *under-weight the beam ones*, whose denominator now has to
+include the point-merge terms to sum to one. Silently rendering a different (and wrong) estimator on
+one backend is the failure mode this codebase refuses, so `-jsurf` forces `useGpu = false` and says
+so on stderr. Lifting it means porting `SurfMap` + `SurfMergeWeight` to the device and widening
+`DBeamMis` to both kinds; the host→device `BeamMis` copy carries the marker comment.
+
+**Related tech debt.** `SurfMap` uses the counting-sort uniform grid with `long long` cell arithmetic
+that *coarsens* rather than refusing on a huge scene — mode `U`'s own dense grid still has the
+`(int)(nCells + 1)` overflow logged further down this file. Retiring `U` also retires that bug.
+
 ### VOLCACHE — OPEN (2026-09-06, v0.257.0): the radiance cache covers diffuse *surfaces* only, so the volumetric gather — which is where ~all of a `gallery_rain` frame's time actually goes — is recomputed in full every frame of a flyby
 
 **The measurement that motivates this.** A flyby amortises the forward pass across frames, and

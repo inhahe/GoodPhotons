@@ -16489,7 +16489,11 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
         std::vector<gpu::DBeamMis> dm(bmap->mis.size());
         for (size_t i = 0; i < dm.size(); ++i) {
             const BeamMis& s = bmap->mis[i]; gpu::DBeamMis& d = dm[i];
-            d.sumC = s.sumC; d.sumM = s.sumM;
+            // `sumMb` only: the device twin has ONE merge kind (beams). Mode J's surface
+            // merges (surfmerge.h) are CPU-only for now, and the dispatcher refuses the GPU
+            // path when they are enabled — see main.cpp — so `s.sumMs`/`s.etaPrevS` being
+            // dropped here is unreachable rather than merely lossy. Port them with the map.
+            d.sumC = s.sumC; d.sumM = s.sumMb;
             d.pdfDir = s.pdfDir; d.rCoef = s.rCoef;
             d.etaPrev = s.etaPrev; d.leadIn = s.leadIn;
             d.gateC1 = (int)s.gateC1; d.vert = (int)s.vert;

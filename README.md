@@ -267,6 +267,14 @@ argument for standing a groom in a hall of polished objects.*
   Left to itself it beat every hand-picked `-n` on a thick-medium equal-time test. Its absolute
   radiance is validated against **closed-form single scattering** (`tools/slab_ss_ref.py` —
   matching to 0.3 %), not only against mode `D`.
+  Since 0.258.0 `-jsurf` folds in a **second merge kind** — the surface point merges mode `U`
+  (VCM) exists to provide — so one mode runs connections, beam merges *and* vertex merges under
+  one balance heuristic instead of two modes each solving half the problem. Its gather radius
+  shrinks per light-side epoch on mode `U`'s own schedule, so the point merges are *consistent*
+  rather than parked on an `O(r²)` bias floor. Against an 8192 spp reference on a diffuse Cornell
+  box it lands **−0.11 %** energy bias at 0.74 % rel-RMS, beating mode `U`'s 1.52 % while running
+  faster. Opt-in and CPU-only until the three-way media+surfaces gate lands; then it becomes the
+  default and `U` is retired. See [known-issues.md](known-issues.md) → UPBP-VM.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look

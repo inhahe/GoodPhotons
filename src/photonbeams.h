@@ -463,11 +463,13 @@ struct BeamBank {
 // here is PBRT's telescoped ratio form instead, because that is what bdpt.h's misWeight is.
 // See known-issues.md, "The shape the weight actually takes in bdpt.h".)
 //
-// The two sums are over the LIGHT-side hypothetical strategies of a path that merges on
+// The sums are over the LIGHT-side hypothetical strategies of a path that merges on
 // this beam. Writing y_0..y_{s-1} for the light subpath (the beam leaves y_{s-1}) and
 //     B_i = PROD_{u=i}^{s-2} pdfRev(y_u)/pdfFwd(y_u)      (B_{s-1} = 1, empty product)
-//     eta'_i = the merge/connection density ratio at y_i, less the constant n_m * 2r
-// they are  sumC = SUM_{i<=s-1} gate_i * B_i  and  sumM = SUM_{i<=s-2} B_i * eta'_i.
+//     eta'_i = the merge/connection density ratio at y_i, less that KIND's constant
+// they are  sumC = SUM_{i<=s-1} gate_i * B_i  and  sumM* = SUM_{i<=s-2} B_i * eta'_i, one
+// merge sum per kind (beam merges in a medium, point merges at a stored surface photon) —
+// see bdpt::MergeK for why the constants cannot be folded in here.
 // Everything that depends on the merge POINT — which is not known until the gather — is
 // left out and supplied there: hence the raw scalars below rather than a finished weight.
 //
@@ -480,12 +482,17 @@ struct BeamMis {
     // Doubles: these are products/sums of density RATIOS over a whole subpath, so they run
     // to whatever dynamic range the path has. The rest are geometry and fit in a float.
     double sumC = 0.0;      // light-side connection accumulator (see above)
-    double sumM = 0.0;      // light-side merge accumulator, without the n_m * 2r factor
+    double sumMb = 0.0;     // light-side BEAM-merge accumulator, without its n_m*2r factor
+    double sumMs = 0.0;     // light-side POINT-merge accumulator, without its n_m*pi r_s^2
     float  pdfDir = 0.0f;   // solid-angle pdf of the beam's direction at y_{s-1}
     float  rCoef  = 0.0f;   // cos(y_{s-1}) / pdfFwd(y_{s-1}); the cos is 1 off a surface
-    float  etaPrev = 0.0f;  // sin(theta) * pdfFwd(y_{s-1}) / sigma_t(y_{s-1}) — the merge
+    float  etaPrev = 0.0f;  // sin(theta) * pdfFwd(y_{s-1}) / sigma_t(y_{s-1}) — the BEAM merge
                             // AT y_{s-1}, still missing only its Tr; 0 if y_{s-1} is not a
-                            // medium vertex (i.e. no merge technique exists there)
+                            // medium vertex (i.e. no beam-merge technique exists there)
+    float  etaPrevS = 0.0f; // pdfFwd(y_{s-1}) — the POINT merge AT y_{s-1}, complete but for
+                            // its n_m*pi r_s^2; 0 unless y_{s-1} is a stored-photon site.
+                            // Mutually exclusive with etaPrev: a vertex is in a medium or on
+                            // a surface, and this is the surface case (a beam leaving a wall)
     float  leadIn = 0.0f;   // distance from y_{s-1} to THIS beam's clipped origin `o`, so
                             // the gather can turn BeamHit::sBeam into the full y_{s-1}->x
                             // distance the light-side density is measured over
