@@ -18,6 +18,7 @@
 #include "camera.h"
 #include "render.h"   // EnergyReport, Film
 #include "render_progress.h"   // SppProgress (chunked progress for modes R/D)
+namespace bdpt { struct SurfMap; }   // surfmerge.h: mode J's point x point merge map
 
 // True if a usable CUDA device is present (driver + at least one device). Cheap to
 // call; result is cached after the first query.
@@ -315,13 +316,16 @@ bool cudaBdptSupported(const Scene& scene);
 // its MIS partials and MIS-combined with the connections inside the kernel. Null is mode D,
 // and then the kernel is bit-for-bit the mode-D one (no segment recording, no merge terms —
 // the merge machinery is a template parameter, not a runtime branch, so mode D does not even
+// `smap` is mode J's OTHER merge kind, the point x point surface merges of `-jsurf` (surfmerge.h);
+// null or empty leaves the estimator exactly two-technique, which is validation gate 1's premise.
 // pay the occupancy). A non-null but EMPTY map (`-nobeams`) also degenerates to exactly mode
 // D, which is validation gate 1. `stage` reports progress during the (potentially very long)
 // host-to-device conversion of a multi-million-sub-beam map.
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction,
                     const SppProgress* prog = nullptr, int heroC = 1,
-                    const BeamMap* bmap = nullptr, const StageProgress* stage = nullptr);
+                    const BeamMap* bmap = nullptr, const StageProgress* stage = nullptr,
+                    const bdpt::SurfMap* smap = nullptr);
 
 // True if this scene + camera can be rendered by the GPU backward reference megakernel
 // (mode R), including the physical (mesh-lens) camera as a ray-generation front-end.

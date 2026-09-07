@@ -83,6 +83,7 @@
 #include "pattern_device.cuh"   // DPattern / DPatEnvT / dPatternEval — shared with raster_cuda.cu
 #include "stochtile.h"    // O7: the host/device-shared histogram-preserving tiling operator
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
+#include "surfmerge.h"   // SurfMap/SurfPhoton/SurfMis: mode J's point x point merges
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
 #include "allocreport.h"  // OOM that names the buffer, its size and the flag that sizes it
 #include "photonmap_io.h" // -savemap / -loadmap, shared with the CPU mode-M path in main.cpp
@@ -5531,6 +5532,36 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
 // spot by kWfBeamHits. The result is the same estimator summed in a different order (per-hit
 // atomics, and a per-hit RNG stream for the stochastic transmittance of heterogeneous media),
 // so it is validated statistically: parity against the inline path (FTRACE_NOWAVEFRONT=1).
+// ---- mode J's SECOND merge kind on the device: point x point surface merges (`-jsurf`) ------
+// Device twin of surfmerge.h. The host map is already a DENSE uniform lattice (`cellStart` +
+// `order`, cell == gather radius), so it is uploaded as it stands rather than rebuilt as the
+// hashed lattice mode M's photon map uses: the gather has to bin EXACTLY the way the light pass
+// stored, and two transcriptions of one binning rule is two chances to disagree -- a
+// disagreement that does not crash, it silently gathers nothing (cf. dPmNeighborhood's note).
+struct DSurfPhoton {
+    DVec3 p, wo;                              // wo: unit, toward the PREVIOUS light vertex
+    float lambda, beta, cx, cy, cz;           // cie{X,Y,Z}(lambda), cached at store time
+    unsigned misIdx;
+};
+struct DSurfMis {                             // the light-side half of the merge's MIS weight
+    double sumC, sumMb, sumMs, pdfFwdA;
+    float  rCoef;
+    unsigned char  gateC1;
+    unsigned short vert;                      // j, for the depth cap (merge depth = j + k)
+};
+struct DSurfMap {
+    const DSurfPhoton* pts;
+    const DSurfMis*    mis;
+    const int*         cellStart;             // size nx*ny*nz + 1
+    const int*         order;                 // photon indices, cell-contiguous
+    DVec3  lo;
+    Real   cell;                              // == radius
+    int    nx, ny, nz;
+    Real   radius;
+    double kappaS;                            // n_m * pi r_s^2 -- this technique's constant
+    long long nPts;
+};
+
 struct DWfSeg {
     DVec3  o, d;
     double tMax, beta, aGlass;
@@ -16700,6 +16731,44 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
 // MIS pair. The three travel together on purpose: a null `mis` makes DBeamMap::misOf return
 // null, which the gather reads as "weight 1", and a zero `mergeKappa` deletes every merge
 // term inside dMisWeight. Uploading one without the other would double-count or under-count.
+// Upload of the surface photon map (`-jsurf`). Mirrors uploadBeamMapCuda's shape: convert the
+// host vectors into device layouts, hand the pointers over in a DSurfMap, and let `up` own the
+// allocations. An empty or absent map leaves `dsm.nPts == 0`, which every gather reads as "no
+// surface merges" -- the two-technique estimator, unchanged.
+static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurfMap& dsm) {
+    if (!smap || smap->pts.empty() || smap->cellStart.empty() || smap->nEmitted <= 0) return;
+    const size_t n = smap->pts.size();
+    std::vector<gpu::DSurfPhoton> pts(n);
+    for (size_t i = 0; i < n; ++i) {
+        const bdpt::SurfPhoton& q = smap->pts[i];
+        gpu::DSurfPhoton& d = pts[i];
+        d.p  = gpu::DVec3{(gpu::Real)q.p.x,  (gpu::Real)q.p.y,  (gpu::Real)q.p.z};
+        d.wo = gpu::DVec3{(gpu::Real)q.wo.x, (gpu::Real)q.wo.y, (gpu::Real)q.wo.z};
+        d.lambda = q.lambda; d.beta = q.beta;
+        d.cx = q.cx; d.cy = q.cy; d.cz = q.cz;
+        d.misIdx = q.misIdx;
+    }
+    std::vector<gpu::DSurfMis> mis(smap->mis.size());
+    for (size_t i = 0; i < smap->mis.size(); ++i) {
+        const bdpt::SurfMis& m = smap->mis[i];
+        gpu::DSurfMis& d = mis[i];
+        d.sumC = m.sumC; d.sumMb = m.sumMb; d.sumMs = m.sumMs; d.pdfFwdA = m.pdfFwdA;
+        d.rCoef = m.rCoef; d.gateC1 = m.gateC1; d.vert = m.vert;
+    }
+    dsm.pts       = (const gpu::DSurfPhoton*)up.keep(uploadVec(pts));
+    dsm.mis       = (const gpu::DSurfMis*)up.keep(uploadVec(mis));
+    dsm.cellStart = (const int*)up.keep(uploadVec(smap->cellStart));
+    dsm.order     = (const int*)up.keep(uploadVec(smap->order));
+    dsm.lo     = gpu::DVec3{(gpu::Real)smap->lo.x, (gpu::Real)smap->lo.y, (gpu::Real)smap->lo.z};
+    dsm.cell   = (gpu::Real)smap->cell;
+    dsm.nx = (int)smap->nx; dsm.ny = (int)smap->ny; dsm.nz = (int)smap->nz;
+    dsm.radius = (gpu::Real)smap->radius;
+    // n_m * pi r_s^2, the constant the estimator divides by and the weight scales its own
+    // technique with -- the exact twin of the beam map's mergeKappa = n_m * 2 r_b.
+    dsm.kappaS = (double)smap->nEmitted * PI * (double)smap->radius * (double)smap->radius;
+    dsm.nPts   = (long long)n;
+}
+
 static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& dbm,
                               const StageProgress* stage, bool withMis) {
     if (!bmap || bmap->beams.empty() || bmap->bvh.nodes.empty() || bmap->nEmitted <= 0) return;
@@ -16813,7 +16882,8 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
 
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction, const SppProgress* prog,
-                    int heroC, const BeamMap* bmap, const StageProgress* stage) {
+                    int heroC, const BeamMap* bmap, const StageProgress* stage,
+                    const bdpt::SurfMap* smap) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
@@ -16867,6 +16937,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // MERGE=true kernel reads as "no merges" — so `-nobeams` degenerates to mode D exactly.
     DBeamMap dbm{};
     if (bmap) uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/true);
+    // `-jsurf`'s map (increment 1: uploaded and handed to the kernel; the gather itself lands
+    // in the next step, so an uploaded map changes nothing yet).
+    DSurfMap dsm{};
+    if (smap) uploadSurfMapCuda(smap, up, dsm);
     const bool mergeOn = (dbm.nNodes > 0);
     // WAVEFRONT gather queue (UPBP-CONV): sized for one wave of camera paths; the chunk is run
     // as consecutive waves. FTRACE_NOWAVEFRONT=1 forces the inline gather (the A/B control).
