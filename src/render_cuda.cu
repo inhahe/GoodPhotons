@@ -1218,6 +1218,7 @@ struct DScene {
     const LightTreeNode* lightTree; int lightTreeRoot;
     const int*       lightTreeAlways; int nLightTreeAlways;
     int              bkLightTree;    // 0 = -no-lighttree: exact all-emitters splitting
+    int              bkGlossyNee;    // 0 = -no-glossy-nee: no connection at a D_GLOSSY vertex
     double           bkLightSplit;   // -light-split
     int              bkLightSamples; // -light-samples
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
@@ -9407,7 +9408,7 @@ __device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
         DHit h = dVertHit(vt);
         double r = clamp01(dReflectSlot(sc, m, h, lambda));
         double e = dGlossyExp((double)dMatRoughness(sc, m, h));
-        DVec3 mdir = reflectv(wo * (Real)-1, ns);
+        DVec3 mdir = reflectv(wo * (Real)(-1), ns);
         double cosLobe = ddot(wi, mdir);
         if (cosLobe <= 0) return 0.0;
         double lobe = (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
@@ -9436,7 +9437,7 @@ __device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
         if (cosWi <= 0 || cosWo <= 0) return 0.0;
         DHit h = dVertHit(vt);
         double e = dGlossyExp((double)dMatRoughness(sc, m, h));
-        DVec3 mdir = reflectv(wo * (Real)-1, ns);
+        DVec3 mdir = reflectv(wo * (Real)(-1), ns);
         double cosLobe = ddot(wi, mdir);
         if (cosLobe <= 0) return 0.0;
         return (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
@@ -9780,6 +9781,119 @@ __device__ static void dGenRay(const DCamera& cam, int px, int py, Real jx, Real
     rd = normalize(cam.w * (Real)cos(th) + radial * (Real)sin(th));
 }
 
+// kDMaxLightPick is deliberately half the CPU's 32: the LtSample array and ltSample's
+// traversal stack are per-thread local-memory frames in a megakernel that is already
+// register-starved, so every slot is paid by every thread. 16 connections per vertex is
+// far past the point where more splitting improves the image.
+#define kDMaxLightPick 16
+// (Hoisted above the GLOSSY-NEE block below, which needs the same bound: dLightPickExact has to
+// scan exactly the prefix of lightTreeAlways that dPickEmitters draws, or the two halves of the
+// MIS weight disagree about which emitters were connected. Its original home is DEmitterDraw,
+// a few hundred lines down.)
+
+// ---- GLOSSY-NEE on the device ---------------------------------------------------------------
+// `dBsdfF` / `dBsdfPdf` above take a DVertex, which the BDPT path has and the backward shade
+// loop has not; these are the same two expressions on a DHit. Glossy only, because Glossy is the
+// only lobe the hook is ever handed -- a diffuse vertex already goes through `rho/PI`, which is
+// the same number by a shorter route.
+__device__ static inline double dGlossyFHit(const DScene& sc, const DMaterial& m, const DHit& h,
+                                            const DVec3& wo, const DVec3& wi, Real lambda) {
+    const double cosWi = ddot(wi, h.n), cosWo = ddot(wo, h.n);
+    if (cosWi <= 0 || cosWo <= 0) return 0.0;
+    const double r = clamp01(dReflectSlot(sc, m, h, lambda));
+    const double e = dGlossyExp((double)dMatRoughness(sc, m, h));
+    const DVec3 mdir = reflectv(wo * (Real)(-1), h.n);
+    const double cosLobe = ddot(wi, mdir);
+    if (cosLobe <= 0) return 0.0;
+    return r * ((e + 1.0) / (2.0 * DPI) * pow(cosLobe, e)) / cosWi;
+}
+__device__ static inline double dGlossyPdfHit(const DScene& sc, const DMaterial& m, const DHit& h,
+                                              const DVec3& wo, const DVec3& wi) {
+    const double cosWi = ddot(wi, h.n), cosWo = ddot(wo, h.n);
+    if (cosWi <= 0 || cosWo <= 0) return 0.0;
+    const double e = dGlossyExp((double)dMatRoughness(sc, m, h));
+    const DVec3 mdir = reflectv(wo * (Real)(-1), h.n);
+    const double cosLobe = ddot(wi, mdir);
+    if (cosLobe <= 0) return 0.0;
+    return (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
+}
+
+// The evaluable lobe handed to bkNeeLight; `wo` points toward the previous vertex.
+struct DNeeBsdf { const DMaterial* m; DVec3 wo; };
+
+// The other half of the weight, carried one bounce forward: how likely the lobe was to produce
+// the continuation, and where it left from. `pdf > 0` is the flag, and every delta bounce
+// leaves it clear -- so a mirror or dielectric chain keeps full-weight emission as before.
+struct DGlossyMis {
+    double pdf;
+    DVec3  from;
+    __device__ void clear() { pdf = 0.0; }
+};
+
+// Host twin: BackwardRenderer::lightPickExact. Is emitter `e`'s SELECTION probability exactly 1
+// at every vertex? Both halves of the MIS weight must answer identically, and one of them asks
+// a bounce later from a ray hit, so it has to be a property of the emitter and the settings.
+__device__ static inline bool dLightPickExact(const DScene& sc, int e) {
+    if (!sc.bkLightTree || sc.bkWhitted || sc.lightTreeRoot < 0 || !sc.lightTree) return true;
+    // Only the prefix dPickEmitters draws (it stops at kDMaxLightPick) -- host twin's note.
+    const int nAlw = (sc.nLightTreeAlways < kDMaxLightPick) ? sc.nLightTreeAlways : kDMaxLightPick;
+    for (int i = 0; i < nAlw; ++i) if (sc.lightTreeAlways[i] == e) return true;
+    return false;
+}
+
+// Host twin: BackwardRenderer::lightPdfW -- the density that WOULD have produced direction `wi`
+// from `from`, for the BSDF-sampling side of the weight. 0 = not covered (delta, env, outside
+// the coverage rule, degenerate), which the callers read as "full weight".
+//
+// The device samples spheres and cylinders by uniform AREA (bkEmitterGeom), unlike the host's
+// cone / visible-arc importance sampling, so the area form below is the right one for BOTH here.
+__device__ static inline double dLightPdfWAt(const DScene& sc, int e, const DVec3& from,
+                                             const DVec3& wi, const DVec3* hitP,
+                                             const DVec3* hitN) {
+    if (e < 0 || e >= sc.nEmitters) return 0.0;
+    if (!dLightPickExact(sc, e)) return 0.0;
+    const DEmitter& em = sc.emitters[e];
+    if (em.collimated) return 0.0;
+    if (em.shape == 6) {                       // Sun (DEmitter::shape; 2 = spot, 3 = env)
+        if (!dInSunCone(em, wi)) return 0.0;                   // outside the solar cone
+        return (em.spotOmega > 0) ? 1.0 / (double)em.spotOmega : 0.0;
+    }
+    if (em.shape == 2 || em.shape == 3) return 0.0;            // Spot (delta) / Env (own MIS)
+    if (!hitP || !hitN || !(em.area > 0)) return 0.0;
+    const DVec3 d = *hitP - from;
+    const double dist2 = (double)ddot(d, d);
+    const double cosLight = (double)ddot(*hitN, wi * (Real)(-1));
+    if (!(dist2 > 0.0) || !(cosLight > 0.0)) return 0.0;
+    return dist2 / ((double)em.area * cosLight);
+}
+
+// Balance-heuristic weight for an emitter reached by the CONTINUATION; 1 when the previous
+// bounce was not a MIS'd glossy one, or when the light is not covered.
+__device__ static inline double dGlossyHitWeight(const DScene& sc, const DGlossyMis& gm, int e,
+                                                 const DVec3& wi, const DVec3* hitP,
+                                                 const DVec3* hitN) {
+    if (!(gm.pdf > 0.0)) return 1.0;
+    const double pL = dLightPdfWAt(sc, e, gm.from, wi, hitP, hitN);
+    if (!(pL > 0.0)) return 1.0;
+    const double sum = gm.pdf + pL;
+    return (sum > 0.0) ? gm.pdf / sum : 1.0;
+}
+
+// dSunRadiance with the weight applied PER SUN -- the weight depends on which cone the
+// direction fell in, so the sum cannot be weighted after the fact.
+__device__ static inline double dSunRadianceMis(const DScene& sc, const DGlossyMis& gm,
+                                                const DVec3& d, Real lambda) {
+    if (sc.sunCount == 0) return 0.0;
+    if (!(gm.pdf > 0.0)) return dSunRadiance(sc, d, lambda);
+    double L = 0.0;
+    for (int i = 0; i < sc.nEmitters; ++i) {
+        const DEmitter& em = sc.emitters[i];
+        if (em.shape != 6 || !dInSunCone(em, d)) continue;
+        L += (double)specLookup(em.emitSpd, lambda) * dGlossyHitWeight(sc, gm, i, d, nullptr, nullptr);
+    }
+    return L;
+}
+
 // Surface next-event estimation (port of backward.h neeLight, v1 scope). Uniform
 // area-measure connection to each area/sphere/cylinder emitter (device emitterSample-
 // Point matches the BDPT device path; unbiased, an independent noise realization vs
@@ -9802,6 +9916,13 @@ struct BkNeeGeom {
     bool  spot;      // point-spot emitter (deterministic connect, draws no rng)
     bool  sun;       // distant-sun emitter (cone NEE in solid-angle measure)
     Real  wSun;      // sun only: the complete λ-independent weight cosSurf*Omega*stG
+    // GLOSSY-NEE: the SOLID-ANGLE density this connection was sampled with -- what the balance
+    // heuristic weighs the lobe's density against. 0 means DELTA (a spot): no BSDF sample can
+    // reach it, so its NEE weight is 1 and there is nothing to weigh. Note the device samples
+    // spheres and cylinders by UNIFORM AREA where the host cone-samples them, so this is the
+    // device's own density and not a copy of the host's -- which is correct: MIS only requires
+    // each side to report the density IT used.
+    Real  pdfW;
 };
 // Does this emitter consume its two sample coordinates? A collimated beam and a point-spot
 // are deterministic connections and draw nothing; every area shape (and the sun's cone)
@@ -9859,6 +9980,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
                : occludedTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist, 2 * RAY_EPS)) return false;
         g.G = (Real)0; g.spot = true; g.sun = false;
+        g.pdfW = (Real)0;                                   // delta: no lobe sample can reach it
         return true;
     }
     if (em.shape == 6) {
@@ -9882,6 +10004,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
                : occluded(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist)) return false;
         g.wSun = (Real)((double)g.cosSurf * em.spotOmega * (double)g.stG);
         g.G = (Real)0; g.fall = (Real)1; g.spot = false; g.sun = true;
+        g.pdfW = (em.spotOmega > 0) ? (Real)(1.0 / em.spotOmega) : (Real)0;   // uniform in cone
         return true;
     }
     Real u1 = su1, u2 = su2;
@@ -9915,6 +10038,10 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     g.G = g.cosSurf * cosLight / g.dist2;
     if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
     g.fall = (Real)1; g.spot = false; g.sun = false;
+    // Uniform over em.area, so pdf_W = pdf_A * dist^2 / cos(light). `epat` is a radiance
+    // profile folded into G, not a change of density, so it does not appear here.
+    g.pdfW = (em.area > 0) ? (Real)((double)g.dist2 / ((double)em.area * (double)cosLight))
+                           : (Real)0;
     return true;
 }
 
@@ -9927,11 +10054,6 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
 // identical 6.25 % noise. The draw below replaces the loop bound: it returns the emitters
 // to connect to plus 1/p(e) for each, turning `sum_e w_e` into `sum_selected w_e / p(e)`.
 //
-// kDMaxLightPick is deliberately half the CPU's 32: the LtSample array and ltSample's
-// traversal stack are per-thread local-memory frames in a megakernel that is already
-// register-starved, so every slot is paid by every thread. 16 connections per vertex is
-// far past the point where more splitting improves the image.
-#define kDMaxLightPick 16
 
 struct DEmitterDraw {
     int  n;             // number of connections to make
@@ -9977,7 +10099,8 @@ __device__ static void dPickEmitters(const DScene& sc, const DVec3& p, const DVe
 // the exact CPU neeLight convention (backward.h).
 __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                                     double invPdfLambda, Real lambda, DRng& rng,
-                                    int giDepth = 0, const DHairShade* hs = nullptr) {
+                                    int giDepth = 0, const DHairShade* hs = nullptr,
+                                    const DNeeBsdf* nb = nullptr) {
     double total = 0.0;
     Real f = rho / (Real)DPI;                         // Lambertian BRDF
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
@@ -9989,6 +10112,10 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnv)
+        // GLOSSY-NEE: connect only where the MIS pair can agree on the selection probability.
+        // Host twin: neeLight's COVERAGE note. Elsewhere the lobe keeps the emitter to itself,
+        // at full weight, exactly as before this existed.
+        if (nb && !dLightPickExact(sc, k)) continue;
         const bool uv = dEmitterNeedsUV(em);
         // Whitted: G x G deterministic shadow rays per area light, averaged. A
         // deterministic emitter (spot/beam) has nothing to stratify, so it stays at 1.
@@ -10004,11 +10131,39 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
             else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
             BkNeeGeom g;
             if (!bkEmitterGeom(sc, h, ngo0, em, u1, u2, g, hs)) continue;
-            double contrib = g.sun
-                ? (double)(f * g.wSun) * emitW
-                : g.spot
-                ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
-                : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+            // `rho/PI` IS the glossy f by a shorter route for a diffuse vertex, so the two arms
+            // are one estimator; the branch exists so the default path's float expression --
+            // and on the device that matters, `Real` is fp32 by default -- is untouched.
+            double contrib;
+            if (nb) {
+                const double fv = dGlossyFHit(sc, *nb->m, h, nb->wo, g.wi, lambda);
+                if (!(fv > 0.0)) continue;
+                double wMis = 1.0;
+                if (g.pdfW > (Real)0) {          // 0 = delta light: nothing to weigh against
+                    const double pLobe = dGlossyPdfHit(sc, *nb->m, h, nb->wo, g.wi);
+                    const double sum = (double)g.pdfW + pLobe;
+                    if (sum > 0.0) wMis = (double)g.pdfW / sum;
+                }
+                // The glossy arm stays in DOUBLE end to end, unlike the default one. `Real` is
+                // fp32 by default here, and dGlossyFHit's value is r*lobe/cos(wi) while `g`
+                // carries cos(surf) -- the same cosine -- so the product cancels it. In fp32
+                // that cancellation loses most of the mantissa at a grazing connection, which
+                // is exactly where a narrow lobe puts its energy. The default arm's fp32
+                // expression below is left textually alone so it stays bit-identical.
+                const double fw = fv * wMis;
+                contrib = g.sun
+                    ? fw * (double)g.wSun * emitW
+                    : g.spot
+                    ? fw * (double)g.fall * (double)g.cosSurf / (double)g.dist2
+                         * (double)g.stG * emitW
+                    : fw * (double)g.G * emitW * (double)em.area * (double)g.stG;
+            } else {
+                contrib = g.sun
+                    ? (double)(f * g.wSun) * emitW
+                    : g.spot
+                    ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
+                    : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+            }
             // Shadow-ray transmittance through any participating media (superposition;
             // homogeneous = exact exp with no rng draw, heterogeneous = ratio tracking).
             // Matches the forward connectVolume / device volume-NEE transmittance so
@@ -10030,7 +10185,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
 __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Real* rho,
                                       double* L, const double* thr, const Real* lam,
                                       const double* invPdf, int nUp, DRng& rng,
-                                      int giDepth = 0) {
+                                      int giDepth = 0, const DNeeBsdf* nb = nullptr) {
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     const bool whitted = (sc.bkWhitted != 0);
     DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
@@ -10040,6 +10195,7 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
         if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;
+        if (nb && !dLightPickExact(sc, k)) continue;    // GLOSSY-NEE coverage, as in bkNeeLight
         const bool uv = dEmitterNeedsUV(em);
         const int G = (whitted && uv) ? (giDepth ? sc.bkGiGrid : sc.bkGrid) : 1;
         const int nS = G * G;
@@ -10052,14 +10208,35 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
             else if (uv) { su1 = rng.uniform(); su2 = rng.uniform(); }
             BkNeeGeom g;
             if (!bkEmitterGeom(sc, h, ngo0, em, su1, su2, g)) continue;
+            // GLOSSY-NEE: the lobe geometry -- and therefore the balance-heuristic weight -- is
+            // wavelength-free, which is the same fact that lets the bundle survive a glossy
+            // vertex at all. Computed once, shared by every member.
+            double wMisG = 1.0;
+            if (nb && g.pdfW > (Real)0) {
+                const double pLobe = dGlossyPdfHit(sc, *nb->m, h, nb->wo, g.wi);
+                const double sum = (double)g.pdfW + pLobe;
+                if (sum > 0.0) wMisG = (double)g.pdfW / sum;
+            }
             for (int i = 0; i < nUp; ++i) {
-                Real f = rho[i] / (Real)DPI;
                 double emitW = (double)specLookup(em.emitSpd, lam[i]) * invPdf[i];
-                double contrib = g.sun
-                    ? (double)(f * g.wSun) * emitW
-                    : g.spot
-                    ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
-                    : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+                double contrib;
+                if (nb) {   // double end to end -- see the note in bkNeeLight
+                    const double fw = dGlossyFHit(sc, *nb->m, h, nb->wo, g.wi, lam[i]) * wMisG;
+                    if (!(fw > 0.0)) continue;
+                    contrib = g.sun
+                        ? fw * (double)g.wSun * emitW
+                        : g.spot
+                        ? fw * (double)g.fall * (double)g.cosSurf / (double)g.dist2
+                             * (double)g.stG * emitW
+                        : fw * (double)g.G * emitW * (double)em.area * (double)g.stG;
+                } else {
+                    Real f = rho[i] / (Real)DPI;
+                    contrib = g.sun
+                        ? (double)(f * g.wSun) * emitW
+                        : g.spot
+                        ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
+                        : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+                }
                 L[i] += thr[i] * contrib * invS;
             }
         }
@@ -10379,8 +10556,12 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                                   DVec3& ro, DVec3& rd, Real& lambda, double& invPdfLambda,
                                   double& thr, double& L, bool& specularArrival,
                                   double& contBsdfPdf, DMediumStack& stk, DRng& rng,
-                                  DGiCtx gi) {
+                                  DGiCtx gi, DGlossyMis* gm = nullptr) {
     const bool whitted = (sc.bkWhitted != 0);
+    // Cleared here rather than per delta branch, so the invariant is structural: `gm->pdf > 0`
+    // can only mean "the LAST bounce was a MIS'd glossy one". A mirror or dielectric leaving a
+    // stale value behind would silently halve the emission on the far side of the chain.
+    if (gm) gm->clear();
     switch (mp->type) {
         case D_DIELECTRIC: {
             // Mode W: dominant Fresnel branch weighted into the throughput instead of a coin
@@ -10468,9 +10649,23 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 if (dot(o, h.n) <= 0) return false;
                 rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
             }
+            // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE; host twin backward.h
+            // ~1489). Without it the only route to this material's light is a lobe sample
+            // landing on the emitter -- ~1/115 against a 0.53-degree sun for a roughness-0.05
+            // lobe. Taken BEFORE the Russian roulette, whose coin governs the continuation
+            // only; the connection carries `r` inside dGlossyFHit.
+            if (gm) {
+                const DNeeBsdf nb{mp, rd * (Real)(-1)};
+                L += thr * bkNeeLight(sc, h, (Real)1, invPdfLambda, lambda, rng, gi.depth,
+                                      nullptr, &nb);
+            }
             if (rng.uniform() >= r) return false;
             DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
             if (dot(o, h.n) <= 0) return false;
+            if (gm) {                    // the other half of the weight, for whatever `o` hits
+                gm->pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
+                gm->from = h.p;
+            }
             rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
         }
         case D_DIFFUSETRANSMIT: {
@@ -10629,6 +10824,11 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                                     Real lambda, double invPdfLambda, DRng& rng,
                                     DGiCtx gi) {
     double L = 0.0, thr = 1.0;
+    // GLOSSY-NEE: the lobe density of a glossy continuation, carried to whichever emitter site
+    // it reaches. Null when the estimator is off, which turns every site below back into its
+    // pre-0.266 form, rng draws included.
+    DGlossyMis gmis; gmis.clear();
+    DGlossyMis* const gmp = sc.bkGlossyNee ? &gmis : nullptr;
     bool specularArrival = (gi.depth == 0);            // camera ray may see a light directly; a
                                                        // gather ray must NOT (the vertex's own
                                                        // NEE already counted that emitter)
@@ -10736,7 +10936,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             // (bkEmitterGeom / bkNeeVolume) and sets specularArrival = false, so this is
             // a clean single-strategy split, not a missing MIS weight (host twin: backward.h).
             if (sc.sunCount > 0 && specularArrival)
-                L += thr * dSunRadiance(sc, rd, lambda) * invPdfLambda;
+                L += thr * dSunRadianceMis(sc, gmis, rd, lambda) * invPdfLambda;
             // Escaped gather ray -> the far-field `ambient` fill. This is what makes -gi and
             // -ambient compose: in an empty scene every direction escapes and the normalised
             // gather collapses exactly back to rho * ambient, so switching -gi on never
@@ -10771,14 +10971,19 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             const double* eSpd = (li >= 0)          ? sc.emitters[li].emitSpd
                                : (mp->matIsLight)   ? mp->matEmit
                                                     : nullptr;
-            if (eSpd)
+            if (eSpd) {
+                // GLOSSY-NEE's lobe-sampling half; 1 -- and this expression bit-identical to
+                // its pre-0.266 form -- unless the previous bounce was a MIS'd glossy one.
+                const double wMis = (gmis.pdf > 0.0)
+                    ? dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n) : 1.0;
                 L += thr * (double)specLookup(eSpd, lambda) * invPdfLambda
-                         * dEmitPatMul(sc, mp->emitPat, h);
+                         * dEmitPatMul(sc, mp->emitPat, h) * wMis;
+            }
         }
 
         if (!bkInteract<GiDepth == 0>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
                                       invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk,
-                                      rng, gi))
+                                      rng, gi, gmp))
             return L;                                   // path terminated in the interaction
     }
     return L;
@@ -10837,6 +11042,9 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                           int bounce0, double* Lout, DRng& rng, DGiCtx gi) {
     Real   lam[hero::kHeroMax];
     double invPdf[hero::kHeroMax], thr[hero::kHeroMax];
+    // GLOSSY-NEE: the hero twin of bkRadiance's carrier. Cleared just before the material
+    // switch (see the note there), never at the top of the loop.
+    DGlossyMis gmis; gmis.clear();
     // Copy only the LIVE entries: a monochromatic sub-path spawned by the split fills only
     // slot 0 of its lamIn/invPdfIn/thrIn, so reading all C would read indeterminate values
     // (harmless while nUp == 1 ignores them, but still UB).
@@ -10896,7 +11104,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
             }
             if (sc.sunCount > 0 && specularArrival)     // directly-viewed solar disc
                 for (int i = 0; i < nUp; ++i)
-                    L[i] += thr[i] * dSunRadiance(sc, rd, lam[i]) * invPdf[i];
+                    L[i] += thr[i] * dSunRadianceMis(sc, gmis, rd, lam[i]) * invPdf[i];
             // Escaped GATHER ray -> the far-field `ambient` fill, which is what makes -gi and
             // -ambient compose instead of compete (see the scalar twin bkRadiance).
             if (whitted && gi.depth && sc.bkAmbient > 0.0)
@@ -10922,10 +11130,19 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                                   : nullptr;
             if (eSpd) {
                 double ep = dEmitPatMul(sc, mp->emitPat, h);
+                if (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the scalar loop
+                    ep *= dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n);
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * (double)specLookup(eSpd, lam[i]) * invPdf[i] * ep;
             }
         }
+
+        // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
+        // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so
+        // a clear at the loop top erases it a few lines before its only consumer -- leaving the
+        // connection in place with the compensating weight silently pinned at 1, i.e. double
+        // counting. Invisible on a small light and worth ~1 % on a big one; see the host twin.
+        gmis.clear();
 
         switch (mp->type) {
             case D_DIFFUSETRANSMIT: {
@@ -11006,6 +11223,14 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                                   : clamp01(dReflectSlot(sc, *mp, h, lam[i]));
                     if ((double)c[i] > q) q = (double)c[i];
                 }
+                // GLOSSY-NEE: a Glossy lobe is the one member of this achromatic group with a
+                // FINITE value, so it is the one that can be connected to a light; a mirror and
+                // a gel are delta and stay exactly as they were. Before the Russian roulette,
+                // whose coin governs the continuation only.
+                if (sc.bkGlossyNee && !whitted && mp->type == D_GLOSSY) {
+                    const DNeeBsdf gnb{mp, rd * (Real)(-1)};
+                    bkNeeLightHero(sc, h, c, L, thr, lam, invPdf, nUp, rng, gi.depth, &gnb);
+                }
                 if (whitted) {
                     // Deterministic: carry every live λ's coefficient as weight (no coin, no
                     // c_i/q reweight) and stop only once the WHOLE bundle has fallen under the
@@ -11033,6 +11258,8 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 } else {
                     DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                     if (dot(o, h.n) <= 0) return;
+                    if (sc.bkGlossyNee)      // the other half of the weight, for what `o` hits
+                        { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o); gmis.from = h.p; }
                     rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
                 }
                 specularArrival = true;
@@ -12611,10 +12838,10 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             DVec3 toL = em.origin - pt.p; double dist2 = ddot(toL, toL);
             if (dist2 <= 0.0) return 0.0;
             dist = sqrt(dist2); wi = toL * (Real)(1.0 / dist);
-            double fall = spotFalloff(ddot(wi * (Real)-1, em.beamDir),
+            double fall = spotFalloff(ddot(wi * (Real)(-1), em.beamDir),
                                       em.spotCosInner, em.spotCosOuter);
             if (fall <= 0.0) return 0.0;               // outside the cone
-            y = em.origin; nOut = wi * (Real)-1;
+            y = em.origin; nOut = wi * (Real)(-1);
             Wgeom = fall / (dist2 * pdfChoice);        // emitSpd is an INTENSITY (W/sr)
         } else if (em.shape == 6) {
             // Distant sun: sample a direction inside the solar cone (pdfW = 1/Omega) and
@@ -12623,7 +12850,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             wi = dSunSampleCone(em, em.beamDir * (Real)-1, (double)u1, (double)u2);
             dist = (double)length(sc.sceneCenter - pt.p) + sc.sceneRadius;
             occlEps = 0.0;
-            y = pt.p + wi * (Real)dist; nOut = wi * (Real)-1;
+            y = pt.p + wi * (Real)dist; nOut = wi * (Real)(-1);
             Wgeom = em.spotOmega / pdfChoice;
         } else {
             // The sampled point's `emit pattern:` factor scales the radiance this strategy
@@ -12633,7 +12860,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             DVec3 toL = y - pt.p; double dist2 = ddot(toL, toL);
             if (dist2 <= 0.0) return 0.0;
             dist = sqrt(dist2); wi = toL * (Real)(1.0 / dist);
-            double cosLight = ddot(nOut, wi * (Real)-1);
+            double cosLight = ddot(nOut, wi * (Real)(-1));
             if (cosLight <= 0.0) return 0.0;           // emitter stays one-sided
             if (em.area <= 0.0) return 0.0;
             Wgeom = cosLight * em.area / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
@@ -14127,7 +14354,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
                                    bool* keepBundle = nullptr) {
     DVertex vt = dVertFromHit(h, matId);
     const DVec3& ns = h.n;
-    DVec3 wo = normalize(rd * (Real)-1);
+    DVec3 wo = normalize(rd * (Real)(-1));
     wi = DVec3(0, 0, 0); betaFactor = 0; pdfW = 0; pdfRevW = 0; cosThetaOut = 0;
     delta = false; terminate = false;
     const int nSec = (secF && lamAll && nUp > 1) ? nUp - 1 : 0;   // secondaries to fill
@@ -16221,6 +16448,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                                                        : (const int*)keep(uploadVec(scene.lightTreeAlways));
     sc.nLightTreeAlways = (int)scene.lightTreeAlways.size();
     sc.bkLightTree     = lt::gEnabled ? 1 : 0;
+    sc.bkGlossyNee     = lt::gGlossyNee ? 1 : 0;   // GLOSSY-NEE (known-issues.md)
     sc.bkLightSplit    = lt::gSplit;
     sc.bkLightSamples  = lt::gSamples;
     sc.lightCdfAll = d_cdfAll;

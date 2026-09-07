@@ -82,6 +82,14 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
     // straight past it, and the lens rendered flat.
     const bool grinAny = grin::sceneHasGrin(scene);
 
+    // GLOSSY-NEE (known-issues.md): mode S's camera walk had the same hole as mode R's and mode
+    // M's -- a Glossy vertex multiplied by the reflectance and continued, so its light was found
+    // only when a lobe sample happened to land on the emitter. `bwNee` is the shared estimator;
+    // `gmis` carries the continuation's lobe density to the two sites that can reach a light.
+    BackwardRenderer bwNee; bwNee.diffraction = diffraction;
+    const bool gneeOn = BackwardRenderer::glossyNeeOn();
+    BackwardRenderer::GlossyMis gmis;
+
     for (int b = 0; b < maxBounce; ++b) {
         if (grinAny) {
             double arc = 0.0;
@@ -109,7 +117,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             // vertex stores a hit point and returns before it can reach here).
             if (scene.sunCount > 0)
                 directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                           * (thr * scene.sunRadiance(ray.d, lambda) * invPdfL);
+                           * (thr * bwNee.sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfL);
             return;
         }
         const Material* mp = &scene.mats[h.matId];
@@ -125,10 +133,22 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
         const Material& m = *mp;
 
         if (m.isLight) {
+            // GLOSSY-NEE's lobe-sampling half; 1, and this expression bit-identical to its
+            // pre-0.266 form, unless the previous bounce was a MIS'd glossy one.
+            const double wMis = (gmis.pdf > 0.0)
+                ? bwNee.glossyHitWeight(scene, gmis, BackwardRenderer::emitterIndexOfResolved(scene, m),
+                                        ray.d, &h.p, &h.n)
+                : 1.0;
             directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                       * (thr * emitSlot(scene, m, h, lambda) * invPdfL);
+                       * (thr * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
             return;
         }
+
+        // GLOSSY-NEE: cleared HERE, after the two sites that read it and before the branch that
+        // writes it -- a clear at the loop top would erase the previous bounce's value a few
+        // lines before its only consumer, leaving the connection with no compensating weight.
+        // See the twin note in backward.h.
+        gmis.clear();
 
         switch (m.type) {
             case MatType::Diffuse:
@@ -142,9 +162,23 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 break;
             }
             case MatType::Glossy: {
+                // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX. Taken before `thr *= r`: the
+                // connection carries `r` inside bsdfF. See backward.h's twin for why this is
+                // MIS rather than the single-estimator split used elsewhere on this walk.
+                if (gneeOn) {
+                    const BackwardRenderer::NeeBsdf nb{&m, ray.d * -1.0};
+                    directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                             * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
+                                                     BackwardRenderer::GiCtx{}, nullptr, nullptr,
+                                                     &nb));
+                }
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return;
+                if (gneeOn) {
+                    gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
+                    gmis.from = h.p;
+                }
                 ray = Ray{h.p + h.n * 1e-6, o};
                 break;
             }

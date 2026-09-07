@@ -447,7 +447,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             // a glossy one that already connected to this emitter.
             const double wMis = (gmis.pdf > 0.0)
                 ? bwNee.glossyHitWeight(scene, gmis,
-                        BackwardRenderer::emitterIndexForMat(scene, h.matId), ray.d, &h.p, &h.n)
+                        BackwardRenderer::emitterIndexOfResolved(scene, m), ray.d, &h.p, &h.n)
                 : 1.0;
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
@@ -752,7 +752,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         if (m.isLight && dot(ray.d, h.ng) < 0.0) {
             const double wMis = (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the sub-walk
                 ? bwNee.glossyHitWeight(scene, gmis,
-                        BackwardRenderer::emitterIndexForMat(scene, h.matId), ray.d, &h.p, &h.n)
+                        BackwardRenderer::emitterIndexOfResolved(scene, m), ray.d, &h.p, &h.n)
                 : 1.0;
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * (thr * emitSlot(scene, m, h, lambda) * invPdfL * wMis);

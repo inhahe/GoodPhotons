@@ -878,7 +878,15 @@ struct BackwardRenderer {
     bool lightPickExact(const Scene& scene, int e) const {
         if (!lightTree || whitted || scene.lightTreeRoot < 0 || scene.lightTree.empty())
             return true;                                  // EmitterDraw::all -- weight 1
-        for (int a : scene.lightTreeAlways) if (a == e) return true;
+        // Only the PREFIX pickEmitters actually draws: it breaks out of the always-loop at
+        // kMaxLightPick, so an emitter past that point is never connected, and treating it as
+        // covered would down-weight a hit that nothing paid for.
+        int n = 0;
+        for (int a : scene.lightTreeAlways) {
+            if (n >= kMaxLightPick) break;
+            if (a == e) return true;
+            ++n;
+        }
         return false;
     }
 
@@ -950,6 +958,16 @@ struct BackwardRenderer {
     static int emitterIndexForMat(const Scene& scene, int matId) {
         const Emitter* e = scene.emitterForMat(matId);
         return e ? (int)(e - scene.emitters.data()) : -1;
+    }
+    // The EMITTER index for a hit, keyed on the RESOLVED material rather than on `h.matId`.
+    // A Mix/Layered hit resolves to a child before the emission test, and if the emitter is
+    // registered against that CHILD then `h.matId` -- the parent -- misses it. NEE would then
+    // connect to the light and the hit would still be taken at full weight: a double count.
+    // The device twin already used its resolved `matId`; this is the host saying the same
+    // thing, via the pointer-difference trick interactMaterial uses to recover a Mix child's
+    // true index for the nested-dielectric stack.
+    static int emitterIndexOfResolved(const Scene& scene, const Material& m) {
+        return emitterIndexForMat(scene, (int)(&m - scene.mats.data()));
     }
 
     // Scene::sunRadiance, but with the glossy MIS weight applied PER SUN -- the weight depends
@@ -2140,7 +2158,7 @@ struct BackwardRenderer {
                 // already connected to this same emitter.
                 double wMis = 1.0;
                 if (gmis.pdf > 0.0)
-                    wMis = glossyHitWeight(scene, gmis, emitterIndexForMat(scene, h.matId),
+                    wMis = glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m),
                                            ray.d, &h.p, &h.n);
                 L += thr * emitSlot(scene, m, h, lambda) * invPdfLambda * wMis;
             }
@@ -2459,7 +2477,7 @@ struct BackwardRenderer {
                 // The lobe-sampling half of the glossy MIS weight; 1 (and bit-identical to the
                 // old expression) unless the last bounce was a MIS'd glossy one.
                 if (gmis.pdf > 0.0)
-                    ep *= glossyHitWeight(scene, gmis, emitterIndexForMat(scene, h.matId),
+                    ep *= glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m),
                                           ray.d, &h.p, &h.n);
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i];
