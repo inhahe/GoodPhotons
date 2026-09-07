@@ -122,7 +122,16 @@ The cause is structural and would never have been found by reading the estimator
 
 **Validated.** On `_cornell_diffuse` against a 3.1 M-spp mode-`R` reference: the merge half agrees CPU-to-GPU to **mean −0.01 %, median ratio 0.9998**, and the full three-technique render reads **−0.73 / −0.44 / +0.62 %** against ground truth where the CPU reads −0.87 / −0.46 / +0.62 %. Both bit-for-bit gates still hold exactly (`-nobeams -nojsurf` is mode `D`; the beams-only path is byte-identical to before the port). `-jsurf` is now the default on **both** backends.
 
-**What remains before mode `U` can retire** is no longer a correctness question but a comparison: mode `J -jsurf` against mode `U` head-to-head on a scene `U` is good at, at equal time and stated depth (see UPBP-CONV (4) for why the depth must be stated).
+**And that comparison has now been run — mode `U` should NOT be retired.** `_cornell_diffuse` (surfaces only, diffuse GI: mode `U`'s home turf), both on the GPU, 300 s each, `-max-bounce 8`, scored against the 3.1 M-spp mode-`R` reference:
+
+| mode | spp | mean relSE | trimmed 99.9 % | median | worst pixel | bias |
+|---|---|---|---|---|---|---|
+| `J` (+`-jsurf`) | 70 886 | 0.01243 | 0.01205 | 0.000495 | 0.389 | −0.39 % |
+| `U` (VCM) | 57 939 | **0.00197** | **0.00191** | **0.000113** | **0.0593** | +0.38 % |
+
+**Mode `U` is 4–6× better at equal time** (U/J = 0.16 mean, 0.16 trimmed, 0.23 median) while rendering *fewer* samples, and both are unbiased to ±0.4 %, so the gap is pure variance rather than an error in either. The plan of record — fold `U`'s technique into `J` and retire `U` — is therefore **not supported by measurement**: mode `J`'s point merges are now provably correct (above) but far less effective than mode `U`'s on the workload `U` exists for.
+
+The likely reason is the **light-side budget, not the estimator**: mode `U` traces one light subpath *per pixel* on the device every pass, while mode `J`'s light side is a CPU-traced map of a few thousand subpaths per epoch (2514 on this scene) that the whole frame gathers from. If that is right, `J` could close the gap by tracing its light side on the device at `U`'s density rather than by any change to the weights — which is a much larger piece of work than this port was, and wants its own entry. Until then, **mode `U` stays**, and the honest statement is that mode `J` subsumes `U`'s *technique* but not its *performance*.
 ### VOLCACHE — OPEN (2026-09-06, v0.257.0): the radiance cache covers diffuse *surfaces* only, so the volumetric gather — which is where ~all of a `gallery_rain` frame's time actually goes — is recomputed in full every frame of a flyby
 
 **The measurement that motivates this.** A flyby amortises the forward pass across frames, and
