@@ -5403,6 +5403,13 @@ to have: it changes variance, not the mean.
 It is close to free: on `gallery_rain` at 240 s mode `R` went from 348–410 spp to 366–461, i.e.
 inside the run-to-run spread; on the small rig it costs a few percent.
 
+On `gallery_rain` itself the difference is not subtle. At 1015 spp on a GPU, with the estimator
+**off** the gold gyroid renders a dull olive-brown speckled with black holes and the chrome ring
+behind it is barely visible; with it **on**, at the same sample count, the gyroid is saturated
+gold with clean highlights across every lobe and the ring reads as metal. Nothing about the
+scene changed — that is the whole of what a 6.8e-5 sr sun costs a lobe that has to find it by
+chance.
+
 | Flag | Meaning |
 |---|---|
 | `-no-glossy-nee` | Restore the pre-0.266 estimator exactly — rng draw order included, so it is a valid same-binary A/B arm. Use it to measure what the connection is buying, or to check that a difference you are chasing is not this. |
