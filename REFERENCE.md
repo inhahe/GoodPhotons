@@ -1513,6 +1513,10 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   *slice* (sample range + samples/s), which exposes the per-scanline-band cost structure
   inside a single spp — on a scene with a dense participating-medium band the sky and the
   cloud can differ by more than 10x, and only the slice trace shows it.
+- **`FTRACE_NOBOWGPU=1` (diagnostic, mode `M` on the GPU).** Turns off the device's gather-time
+  spectral fold, so a rainbow beam is demoted to its monochromatic `CIE(λ)` record the way it was
+  before 0.264.0. The A/B control for that fold; on `gallery_rain` the fold changes 63 % of pixels and
+  is ~10 % faster.
 - **`FTRACE_NOWAVEFRONT=1` (diagnostic, mode `J` on the GPU).** Since 0.261.0 mode `J`'s device
   camera pass runs its beam gather as a *wavefront* — segments are queued, candidates are
   enumerated one thread per segment, and evaluated one thread per candidate — instead of one

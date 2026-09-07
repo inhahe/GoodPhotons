@@ -1098,6 +1098,39 @@ struct DEmissiveVolume {
     double        lamStep;  // bin width in nm
 };
 
+// ---- GATHER-TIME SPECTRAL FOLD on the device (FOLD-GPU (2)) ---------------------------------
+// Device twin of Scene::BowLut. One table per (emitter, medium) pair that is eligible
+// (`Scene::bowLutEligible`), each kBowBins entries uniform in cos(theta) over [-1, 1], holding
+// the effective colour and the effective scalar phase. `off[em * nMed + med]` is the entry
+// offset, or -1 where the pair has no table -- which is the same question `Scene::bowLut`
+// answers with a null pointer.
+enum { kBowBins = 8192 };
+struct DBowTab {
+    const float4* tab;   // xyz = Bow(cos)/phaseLum(cos), w = phaseLum(cos)
+    const int*    off;   // size nEm * nMed; -1 = no table for that pair
+    int nEm, nMed;
+};
+__device__ static inline bool dBowEval(const DBowTab& bt, int em, int med, double cosTheta,
+                                       double& cx, double& cy, double& cz, double& phase) {
+    if (!bt.tab || em < 0 || med < 0 || em >= bt.nEm || med >= bt.nMed) return false;
+    const int base = bt.off[em * bt.nMed + med];
+    if (base < 0) return false;
+    // Same clamp and same lerp as Scene::BowLut::eval -- the tables are shared, so the
+    // interpolation has to be too or the two backends disagree by a bin.
+    double u = (cosTheta + 1.0) * 0.5 * (double)(kBowBins - 1);
+    if (!(u > 0.0)) u = 0.0;
+    if (u > (double)(kBowBins - 1)) u = (double)(kBowBins - 1);
+    const int i = (int)u;
+    const int j = (i + 1 < kBowBins) ? i + 1 : i;
+    const double f = u - (double)i;
+    const float4 a = bt.tab[base + i], b = bt.tab[base + j];
+    cx = (double)a.x * (1.0 - f) + (double)b.x * f;
+    cy = (double)a.y * (1.0 - f) + (double)b.y * f;
+    cz = (double)a.z * (1.0 - f) + (double)b.z * f;
+    phase = (double)a.w * (1.0 - f) + (double)b.w * f;
+    return true;
+}
+
 struct DScene {
     // Per-vertex colours (Scene::vertColors), three linear-RGB floats per entry, indexed
     // by DTri::vcol; and the shared Jakob-Hanika RGB -> coefficient table that turns an
@@ -1205,6 +1238,7 @@ struct DScene {
     const double*    emitSamplerCdf; int emitSamplerN; double emitSamplerStep;
     double           emitG;
     const DMedium*   media;    // participating media array (superposed); null if none
+    DBowTab bow;   // gather-time spectral fold tables (FOLD-GPU (2)); bow.tab null = none
     int              mediaN;   // number of media (0 => vacuum)
     // Volumetric blackbody emission ("fire", ROADMAP C3). Photon birth splits emitter-
     // vs-fire by power: grandTotal = totalPower + totalEmissionPower. Null/0 => no fire.
@@ -5135,6 +5169,10 @@ struct DBeamRec {
     float s0, len;          // this sub-segment's [s0, s0+len] range along the beam
     float pX, pY, pZ;       // cie{X,Y,Z}(lambda) * power / (nEmitted * nLam)
     float lambda;           // HERO wavelength (nm) — sigma_s / phase / Tr all need it
+    float pw;               // power / (nEmitted * nLam), WITHOUT the colour — the gather-time
+                            // fold supplies its own colour, so it cannot use pX/pY/pZ
+    short emIdx;            // emitter this beam came from; -1 = unknown (a GPU-traced map)
+    short achro;            // 2 = the gather-time fold applies (scene.h PhotonBeam::achro)
     float absorb;           // sigma_a of the enclosing dielectric (0 in air)
     float invRad;           // 1 / kernel half-width of THIS beam's medium
     int   med;              // index into DScene::media
@@ -5418,7 +5456,16 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         const double ss = (double)specLookup(md.sigma_s, lam) * dens;
         if (!(ss > 0.0)) return;
         // connectVolume's convention: phase(dot(wIn, wToCamera)), wIn = b.d, wToCam = -dc.
-        const double phase = (double)dMedPhase(md, -cosT, lam);
+        // THE GATHER-TIME SPECTRAL FOLD (FOLD-GPU (2), host twin: beamgather.h). Gated on
+        // `mw == nullptr` -- i.e. no merge weight, i.e. mode M -- which is the device's way of
+        // asking what `WeightFn::kFoldGatherTime` asks on the host: mode J's weight sets it
+        // false, because its MIS ratios are built from the monochromatic phase and a folded
+        // colour cannot be paired with them.
+        double bowX = 0.0, bowY = 0.0, bowZ = 0.0, bowPhase = 0.0;
+        const bool folded = (mw == nullptr) && b.achro == 2 &&
+                            dBowEval(sc.bow, (int)b.emIdx, b.med, (double)(-cosT),
+                                     bowX, bowY, bowZ, bowPhase);
+        const double phase = folded ? bowPhase : (double)dMedPhase(md, -cosT, lam);
         if (!(phase > 0.0)) return;
         // 1D Epanechnikov kernel, normalised so its integral over [-r, r] is 1.
         const double kk = 1.0 - x2;
@@ -5446,7 +5493,12 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         if (s > (Real)0) w *= (double)dMediaTransmittance(sc, b.o, b.d, s, lam, rng);
         if (t > (Real)0) w *= (double)dMediaTransmittance(sc, oc, dc, t, lam, rng);
         if (!(w > 0.0)) return;
-        oX += (double)b.pX * w; oY += (double)b.pY * w; oZ += (double)b.pZ * w;
+        // A folded beam takes its colour from the bow table (already divided by the phase it
+        // carries, exactly as the host's `bowCie`), scaled by the colourless power; every other
+        // beam uses the record's baked colour.
+        if (folded) { const double pwf = (double)b.pw * w;
+                      oX += bowX * pwf; oY += bowY * pwf; oZ += bowZ * pwf; }
+        else        { oX += (double)b.pX * w; oY += (double)b.pY * w; oZ += (double)b.pZ * w; }
         // SECONDARY wavelengths of the spectral bundle (host twin: gatherPhotonBeams).
         // They share this beam's geometry, its kernel weight and — decisively — BOTH
         // transmittance marches, which are the whole cost of the loop above and are
@@ -16291,6 +16343,41 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         }
         sc.media  = dmeds.empty() ? nullptr : (const DMedium*)keep(uploadVec(dmeds));
         sc.mediaN = (int)dmeds.size();
+        // GATHER-TIME SPECTRAL FOLD tables (FOLD-GPU (2), host: Scene::bowLuts). One
+        // kBowBins-entry table per eligible (emitter, medium) pair, flattened into one buffer
+        // with an offset table; -1 marks a pair the host has no table for, which is the same
+        // question `Scene::bowLut()` answers with a null pointer. A scene with no rainbow
+        // medium uploads nothing and leaves `sc.bow.tab` null.
+        sc.bow = gpu::DBowTab{nullptr, nullptr, 0, 0};
+        {
+            const int nEm = (int)scene.emitters.size(), nMed = (int)scene.media.size();
+            if (nEm > 0 && nMed > 0 && !scene.bowLuts.empty()) {
+                std::vector<int> off((size_t)nEm * nMed, -1);
+                std::vector<float4> tab;
+                for (int e = 0; e < nEm; ++e)
+                    for (int m2 = 0; m2 < nMed; ++m2) {
+                        const Scene::BowLut* L = scene.bowLut(e, m2);
+                        if (!L || (int)L->cie.size() != (int)Scene::BowLut::kBins) continue;
+                        off[(size_t)e * nMed + m2] = (int)tab.size();
+                        for (int i = 0; i < (int)Scene::BowLut::kBins; ++i)
+                            tab.push_back(make_float4((float)L->cie[i].x, (float)L->cie[i].y,
+                                                      (float)L->cie[i].z, L->phaseLum[i]));
+                    }
+                const char* noBow = std::getenv("FTRACE_NOBOWGPU");
+                if (noBow && std::atoi(noBow) != 0) tab.clear();   // A/B control: demote instead
+                if (!tab.empty()) {
+                    sc.bow.tab  = (const float4*)keep(uploadVec(tab));
+                    sc.bow.off  = (const int*)keep(uploadVec(off));
+                    sc.bow.nEm  = nEm;
+                    sc.bow.nMed = nMed;
+                    std::fprintf(stderr, "[gpu] gather-time spectral fold: %zu bow tables uploaded "
+                                         "(%.1f MB) — a rainbow beam keeps its folded colour instead "
+                                         "of being demoted to CIE(lambda)\n",
+                                 tab.size() / (size_t)Scene::BowLut::kBins,
+                                 tab.size() * sizeof(float4) / 1048576.0);
+                }
+            }
+        }
         sc.hasGrin = grin::sceneHasGrin(scene) ? 1 : 0;   // gate for dGrinMarch (host twin)
         // Emissive "fire" volumes (ROADMAP C3): upload the AABB/meanKe/power + the per-
         // volume Planck-at-emitKelvin wavelength CDF, and the total emission power for the
@@ -16983,6 +17070,14 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
         const double invC = 1.0 / (double)b.nLam();
         const double w = (double)b.power * invN * invC;
         r.pX = (float)(ci.x * w); r.pY = (float)(ci.y * w); r.pZ = (float)(ci.z * w);
+        // ...and the colourless weight beside it, for the gather-time fold (FOLD-GPU (2)): a
+        // folded beam takes its colour from the bow table at the crossing angle, so it needs
+        // the power without a colour baked in. `pX/pY/pZ` stay exactly as they were, and are
+        // still what a beam with no table uses -- the demotion above is now the FALLBACK
+        // rather than the only choice.
+        r.pw = (float)w;
+        r.emIdx = (short)b.emIdx;
+        r.achro = (short)b.achro;
         r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
         r.nSec = (unsigned char)b.nSec; r.pad = 0;
         for (int k = 0; k < 3; ++k) {

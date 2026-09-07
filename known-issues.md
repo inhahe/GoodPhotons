@@ -463,7 +463,7 @@ python scraps/_referr.py png/barsdiag/REF_D.pfm png/barsdiag/J.pfm
 ```
 Swap `-beamspec 1` / `-beamachro off` to reproduce the other rows.
 
-### FOLD-GPU — OPEN (2026-09-05, v0.256.0): the device forward tracer and the device beam gather implement **neither** of the two spectral folds, so a `-device gpu` mode-`M` beams render is correct but visibly grainier than the CPU one
+### FOLD-GPU — HALF DONE (part 2 landed 2026-09-07, v0.264.0; filed v0.256.0): the device forward tracer and the device beam gather implement **neither** of the two spectral folds, so a `-device gpu` mode-`M` beams render is correct but visibly grainier than the CPU one
 
 **What the CPU has and the GPU does not.** Two separate mechanisms, both in the
 `-beamachro` family (see `design.md`, "The SPECTRAL FOLD" and "The GATHER-TIME SPECTRAL
@@ -490,15 +490,13 @@ FOLD"):
   correctness.
 - So both backends converge to the same image; only the rate differs. Nothing here is a bias.
 
-**The proper fix** is to port both to the device:
-- For (1), mirror `Emitter::foldCie/foldLam/foldN` and `foldWorthIt` into the device emitter
-  table and carry `foldT[kFoldBins]` in the device photon state. The quadrature is 12 doubles
-  per bounce — cheap in flops, but it widens the per-thread state, which is what needs
-  measuring before committing to it.
-- For (2), upload `Scene::BowLut` as a 2-D texture (8192 × nEmitter×nMedium, 4 channels:
-  `cie.xyz` + `phaseLum`) and have the device gather sample it when `achro == 2`, exactly as
-  `beamgather.h` does. This is the easier of the two and the bigger win on a rainbow scene —
-  it is a texture fetch replacing a `phaseValue` evaluation, so it may even be *faster*.
+**Part (2) is done (v0.264.0): the device has the bow tables.** `Scene::bowLuts` is uploaded as one flat `float4` buffer (xyz = the effective colour, w = the effective scalar phase) with a per-(emitter, medium) offset table, `-1` marking a pair the host has no table for — the same question `Scene::bowLut()` answers with a null pointer. `dBeamHitEval` evaluates it with the same clamp and the same lerp as `BowLut::eval`, gated on `mw == nullptr`, which is the device's way of asking what `WeightFn::kFoldGatherTime` asks on the host (mode `M` yes, mode `J` no — its MIS ratios are built from the monochromatic phase). The beam record gained the colourless power `pw` beside `pX/pY/pZ`, since a folded beam takes its colour from the table rather than from the record. The demotion stays as the fallback for any beam whose pair has no table, so nothing regressed; `FTRACE_NOBOWGPU=1` is the A/B control.
+
+**Measured** on `gallery_rain` (160×90, a CPU-traced map `-loadmap`'d and gathered on the GPU, against a 300 s CPU gather of the *same* map): 63 % of pixels change, the fold is **~10 % faster** (194 against 177 spp in 120 s — a table fetch replacing a `phaseValue` evaluation, as predicted), and median relative squared error falls 6 % on Y and Z (0.0126 against 0.0134; 0.0147 against 0.0157) — which at 10 % more samples is within noise, so the honest claim is *same estimator as the CPU, slightly faster*, not *less noisy*. On this scene only 7.2 % of the rain medium's beams carry `achro == 2`, which bounds what the fold can do here.
+
+**What part (2) still does not reach, and it is the common case.** A **GPU-traced** map cannot fold at all, because the device photon state carries the emitter's mean CIE rather than its INDEX (`DBeamSpec::cie`, “carried so the deposit needs no emitter index”) and the download therefore writes `emIdx = -1`. So the tables only help a CPU-traced map gathered on the GPU (`-loadmap`, or the shared pass). Making `-device gpu` mode `M` benefit needs the deposit side: carry a 2-byte emitter index in the device photon state, add the host's `bowLutEligible` test as a per-medium device flag, and set `achro = 2` at deposit under exactly the host's condition. That is small and well-defined, and it is the next thing here.
+
+**Part (1) — the deposit-time fold across diffuse surfaces — is untouched.**
 
 **Reproduce**: `ftrace -in scenes/gallery_rain.ftsl -camera cam -mode M -beams -device gpu
 -r 640 360 -time 300 -seed 7 -hdr -o png/barsdiag/gpu.png` and compare
