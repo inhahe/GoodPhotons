@@ -1517,7 +1517,18 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   thread per camera path doing everything inline, which was warp-divergent (measured 11× more
   spp at equal time on `_fog_thick`). Both paths are the same estimator summed in a different
   order. Setting this forces the old inline gather, which is the A/B control for any parity
-  question; the render reports its queue use in a `[gpu] mode J wavefront gather:` line.
+  question; the render reports its queue use in a `[gpu] mode J wavefront gather:` line and where its
+  seconds went — GPU time of the walk, the beam-hit search and the hit evaluation, and the host gaps
+  between waves — in a `[gpu] mode J wave loop:` line. `FTRACE_WAVE_DEBUG=1` prints one `[wave]` line per
+  wave (paths, segments, hits, spills, and the three kernel times) for finer diagnosis.
+- **`FTRACE_WFSTRAT=1` (diagnostic, mode `J` on the GPU).** Orders the wavefront gather’s waves as
+  stratified samples of the whole image (32-pixel runs permuted by a golden-ratio stride) instead of
+  horizontal bands. It makes the adaptive wave size exact — on `_fog_cornell` it cuts the
+  on-the-spot spill from 59 M to 8.4 M hits at 256² / 60 s — but it costs about 7 % of the paths on
+  `_fog_thick`, because a stratified wave is as heterogeneous as the image allows and the beam-tree
+  walk diverges across a warp; a spilled candidate is evaluated in place and costs nothing
+  measurable, so bands are the default. The image is the same either way (per-pixel sample streams
+  are seeded by pixel); this is the A/B for the ordering itself.
 - **`FTRACE_J_HALF` / `FTRACE_BEAM_DIAG` (mode-J diagnostics).** Mode `J` combines BDPT
   connections with the beam×ray merge, and when its image comes out at the wrong brightness
   the two halves are indistinguishable from the outside — a broken MIS weight and a beam map

@@ -5537,10 +5537,35 @@ struct DWfSeg {
     unsigned long long seed;
 };
 struct DWfHit { int seg; int beam; float t, s; };
+// One band of the wave-schedule PROFILE (see renderBdptCuda): what the paths of pixel slots
+// [px0, px1) produced. Kept across calls, so the first chunk of every epoch is sized right.
+struct WfBand { long long px0, px1; double hitsPerPath, segsPerPath; };
+static std::vector<WfBand> g_wfProfile;
+static int g_wfProfileResX = -1, g_wfProfileResY = -1, g_wfProfileDepth = -1;
 struct DWfQueue {
     DWfSeg* segs;  int* nSegs; int segCap;
     DWfHit* hits;  int* nHits; int hitCap;
     int*    overflow;   // [0] segments gathered inline (queue full), [1] hits evaluated on the spot
+    // WAVE ORDER (0.261.1). runMul == 0 -- the default, and every non-wavefront launch -- makes a
+    // wave a contiguous range of pixels, i.e. a horizontal band. FTRACE_WFSTRAT=1 sets runMul
+    // to an odd golden-ratio multiplier on a power-of-two run domain (runMask + 1 >= nRuns):
+    // the kernel then enumerates the chunk's pixels in 32-pixel runs permuted by
+    // (run * runMul) & runMask -- a bijection with no division -- so every wave covers the
+    // whole image like a Fibonacci lattice and is a sample of the same distribution. That makes
+    // the adaptive wave size exact (on _fog_cornell it cut the on-the-spot spill from 59 M to
+    // 8.4 M hits at 256^2 / 60 s), but it costs 7 % of _fog_thick's paths (4430 against 4765
+    // spp / 60 s through the same code): the segment queue is filled by grid-wide atomics, so a
+    // kWfBeamHits warp holds 32 segments from random paths OF THE WAVE, and a band's paths are
+    // alike while a stratified wave's are as unalike as the image allows -- warp divergence in
+    // the beam-tree walk. A spilled candidate is evaluated in place and costs nothing
+    // measurable, so the band order is the default, and the jumps its last-wave estimate cannot
+    // see -- the chunk boundary (bottom band to top band) and the doubling at a light's edge --
+    // are sized from the previous chunk's per-band PROFILE instead (see the wave loop).
+    // Under FTRACE_WFSTRAT=1 the index space is padded to whole runs of the power-of-two
+    // domain; a run >= nRuns, or a slot past its row's width, is skipped. A warp still traces
+    // 32 adjacent pixels either way, and the per-pixel sample streams, seeded by pixel, are the
+    // same in both orders.
+    unsigned runsPerRow, nRuns, runMask, runMul;
 };
 
 __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX) {
@@ -12679,7 +12704,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 // occupancy for storage it never writes. Mode J only ever instantiates NS == 0: the hero
 // bundle is gated off for any scene with a participating medium, and mode J without one has
 // nothing to merge.
-template <int NS, int MAXD, bool MERGE>
+template <int NS, int MAXD, bool MERGE, bool STRAT>
 __global__ void __launch_bounds__(128, 3)
 kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                       long long totalSamples, long long chunkSpp, long long sppTotal,
@@ -12705,8 +12730,18 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
     // [idxBegin, idxEnd) is the wave the host is running (the whole chunk when the
     // wavefront gather is off); idxEnd <= totalSamples.
     for (long long idx = idxBegin + g; idx < idxEnd; idx += G) {
-        long long pix = idx / chunkSpp;
-        long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
+        const long long slot = idx / chunkSpp;   // pixel slot (padded to whole runs when stratified)
+        long long pix = slot;
+        if (STRAT) {                             // stratified waves: see DWfQueue (compile-time:
+                                                 // the default kernel carries none of this)
+            const unsigned run = ((unsigned)(slot >> 5) * wq.runMul) & wq.runMask;
+            if (run >= wq.nRuns) continue;       // padding run of the power-of-two domain
+            const unsigned row = run / wq.runsPerRow;
+            const int px0 = (int)(run - row * wq.runsPerRow) * 32 + (int)(slot & 31);
+            if (px0 >= resX) continue;           // padding slot of a partial run
+            pix = (long long)row * (long long)resX + px0;
+        }
+        long long gidx = pix * sppTotal + sampleBase + (idx - slot * chunkSpp);
         DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
@@ -16845,8 +16880,42 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         wq.segCap = segCap; wq.hitCap = hitCap;
         waveSamples = (long long)segCap / (long long)(maxDepth + 3);   // SEGN = MAXV = depth + 3
         if (waveSamples < 1) waveSamples = 1;
+        // wave order (see DWfQueue): bands by default; FTRACE_WFSTRAT=1 = stratified, 32-pixel
+        // runs on a power-of-two domain permuted by an odd golden-ratio multiplier under the mask
+        wq.runsPerRow = ((unsigned)resX + 31u) / 32u;
+        wq.nRuns = wq.runsPerRow * (unsigned)resY;
+        {
+            unsigned dom = 1u;
+            while (dom < wq.nRuns) dom <<= 1;
+            wq.runMask = dom - 1u;
+            const char* e = std::getenv("FTRACE_WFSTRAT");
+            wq.runMul = (e && std::atoi(e) != 0) ? ((unsigned)(0.6180339887498949 * (double)dom) | 1u) : 0u;
+        }
     }
     long long wfWaves = 0, wfSpillSegs = 0, wfSpillHits = 0;
+    // Where a mode-J render's seconds go: CUDA-event time of the three wave kernels and the wall
+    // time around each wave (the wave already syncs on the counter copy, so the elapsed-time
+    // queries are free). Reported with the queue use at the end of the render.
+    cudaEvent_t wfEv[4] = {nullptr, nullptr, nullptr, nullptr};
+    double wfMsWalk = 0.0, wfMsHits = 0.0, wfMsEval = 0.0, wfMsWall = 0.0;
+    if (wq.segs) for (auto& e : wfEv) CUDA_CHECK(cudaEventCreate(&e));
+    // The PROFILE: what every band of the previous chunk produced, in hits per path and segments
+    // per path, keyed by pixel slot so chunks of different spp line up. Stationary across chunks
+    // (same map, same camera), so it is the right estimate for a wave about to cover those
+    // bands -- including the top band a new chunk starts on, and the doubling at the light's
+    // edge that the last wave cannot see coming (_fog_cornell spilled 94.6 M hits at 256^2 /
+    // 60 s sized from the last wave alone, with the chunk's densest wave carried across).
+    // It lives ACROSS calls: the progressive loop re-enters this function once per epoch
+    // (~17 times a minute on _fog_thick), and an epoch whose first chunk had to relearn from a
+    // 1024-path wave both spilled on a dense map and, through the epoch rule that scales the
+    // epoch by its own setup time, ran shorter epochs -- 3 % fewer paths a minute against the
+    // 0.261.0 schedule, all of it in the extra map rebuilds. Reset when the frame changes shape.
+    if (g_wfProfileResX != resX || g_wfProfileResY != resY || g_wfProfileDepth != maxDepth) {
+        g_wfProfile.clear();
+        g_wfProfileResX = resX; g_wfProfileResY = resY; g_wfProfileDepth = maxDepth;
+    }
+    std::vector<WfBand>& wfProfilePrev = g_wfProfile;
+    std::vector<WfBand> wfProfileCur;
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
         // Mode J only ever instantiates the scalar (NS == 0) kernel: `useHero` is already
@@ -16862,53 +16931,117 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             // on-the-spot path before any measurement exists. The adaptive rule then grows the
             // wave, up to the segment-sized ceiling. Each wave advances by the range it actually
             // ran (b0 = b1) -- NOT by the wave size, which changes inside the loop.
-            long long wave = wq.segs ? ((waveSamples < 4096) ? waveSamples : 4096) : totalSamples;
-            for (long long b0 = 0; b0 < totalSamples; ) {
-                const long long b1 = (b0 + wave < totalSamples) ? b0 + wave : totalSamples;
-                if (wq.segs) CUDA_CHECK(cudaMemsetAsync(d_wfCounters, 0, 4 * sizeof(int)));
-                if (deep)
-                    kBdptT<0, BDPT_DEEPDEPTH, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                                   resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
+            // A wave's size is an estimate of its hits from what is known: the last wave (bands
+            // are neighbours), and from the second chunk on the previous chunk's PROFILE -- the
+            // hits per path every band produced. The size is the largest that keeps the densest
+            // band the wave would cover at ~70% of the hit queue; that is a fixed point (a
+            // smaller wave reaches fewer bands), reached by shrinking from the last-wave size.
+            // So a band gets the size its own density allows, and the two jumps the last wave
+            // cannot see -- the chunk boundary (bottom band -> top band) and the light's edge
+            // inside every chunk -- are simply entries in the profile. The render's first wave
+            // is 1024 paths: 4096 already overflowed the hit queue on _fog_cornell. Under
+            // FTRACE_WFSTRAT=1 the index space is padded to whole runs of the power-of-two
+            // domain, and the profile, keyed by slot, sees stationary waves -- harmless.
+            const long long waveTotal = (wq.runMul != 0u) ? ((long long)wq.runMask + 1) * 32 * c : totalSamples;
+            wfProfileCur.clear();
+            auto sizeFor = [&](double hitsPerPath, double segsPerPath) -> long long {
+                long long n = waveSamples;
+                if (segsPerPath > 0.0) {
+                    const double byHits = (hitsPerPath > 0.0) ? 0.7 * (double)wq.hitCap / hitsPerPath : (double)waveSamples;
+                    const double bySegs = 0.9 * (double)wq.segCap / segsPerPath;
+                    n = (long long)((byHits < bySegs) ? byHits : bySegs);
+                }
+                if (n < 256) n = 256;
+                if (n > waveSamples) n = waveSamples;   // the segment-sized wave is the ceiling
+                return n;
+            };
+            auto profiled = [&](long long from, long long cand, double hpp, double spp) -> long long {
+                if (wfProfilePrev.empty()) return cand;
+                for (int it = 0; it < 8; ++it) {
+                    const long long p0 = from / c, p1 = (from + cand + c - 1) / c;   // slots the wave would cover
+                    double h = hpp, sg = spp;
+                    for (const WfBand& w : wfProfilePrev)
+                        if (w.px1 > p0 && w.px0 < p1) {
+                            if (w.hitsPerPath > h) h = w.hitsPerPath;
+                            if (w.segsPerPath > sg) sg = w.segsPerPath;
+                        }
+                    const long long n = sizeFor(h, sg);
+                    if (n >= cand) return cand;
+                    cand = n;
+                }
+                return cand;
+            };
+            long long wave = !wq.segs ? waveTotal
+                           : profiled(0, wfProfilePrev.empty() ? ((waveSamples < 1024) ? waveSamples : 1024) : waveSamples, 0.0, 0.0);
+            for (long long b0 = 0; b0 < waveTotal; ) {
+                const long long b1 = (b0 + wave < waveTotal) ? b0 + wave : waveTotal;
+                const auto wfT0 = std::chrono::steady_clock::now();
+                if (wq.segs) {
+                    CUDA_CHECK(cudaMemsetAsync(d_wfCounters, 0, 4 * sizeof(int)));
+                    CUDA_CHECK(cudaEventRecord(wfEv[0]));
+                }
+                if (deep && wq.runMul != 0u)
+                    kBdptT<0, BDPT_DEEPDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
+                else if (deep)
+                    kBdptT<0, BDPT_DEEPDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                                          resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
+                else if (wq.runMul != 0u)
+                    kBdptT<0, BDPT_MAXDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                                        resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
                 else
-                    kBdptT<0, BDPT_MAXDEPTH, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                                  resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
+                    kBdptT<0, BDPT_MAXDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
                 if (wq.segs) {
                     cudaCheckKernel("bdpt");
+                    CUDA_CHECK(cudaEventRecord(wfEv[1]));
                     kWfBeamHits<<<2048, 128>>>(up.sc, dbm, wq, d_cam, resX);
                     cudaCheckKernel("wf-hits");
+                    CUDA_CHECK(cudaEventRecord(wfEv[2]));
                     kWfBeamEval<<<4096, 128>>>(up.sc, dbm, wq, d_cam, resX);
                     cudaCheckKernel("wf-eval");
+                    CUDA_CHECK(cudaEventRecord(wfEv[3]));
                     ++wfWaves;
                     int cnt[4] = {0, 0, 0, 0};
                     CUDA_CHECK(cudaMemcpy(cnt, d_wfCounters, sizeof cnt, cudaMemcpyDeviceToHost));
+                    {
+                        float ms = 0.f;
+                        CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[0], wfEv[1])); wfMsWalk += ms;
+                        CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[1], wfEv[2])); wfMsHits += ms;
+                        CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[2], wfEv[3])); wfMsEval += ms;
+                        const double wallMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wfT0).count();
+                        wfMsWall += wallMs;
+                        static const bool waveDebug = std::getenv("FTRACE_WAVE_DEBUG") != nullptr;   // per-wave diagnostic
+                        if (waveDebug) {
+                            float w0 = 0.f, w1 = 0.f, w2 = 0.f;
+                            cudaEventElapsedTime(&w0, wfEv[0], wfEv[1]); cudaEventElapsedTime(&w1, wfEv[1], wfEv[2]); cudaEventElapsedTime(&w2, wfEv[2], wfEv[3]);
+                            std::fprintf(stderr, "[wave] c=%lld paths %lld..%lld (%lld) segs %d hits %d spill %d/%d walk %.2f hits %.2f eval %.2f wall %.2f ms\n",
+                                         c, b0, b1, b1 - b0, cnt[0], cnt[1], cnt[2], cnt[3], w0, w1, w2, wallMs);
+                        }
+                    }
                     wfSpillSegs += cnt[2]; wfSpillHits += cnt[3];
                     const long long paths = b1 - b0;
                     const double segsPerPath = (paths > 0) ? (double)cnt[0] / (double)paths : (double)(maxDepth + 3);
                     const double hitsPerSeg  = (cnt[0] > 0) ? ((double)cnt[1] + (double)cnt[3]) / (double)cnt[0] : 0.0;
-                    long long next = waveSamples;
-                    if (hitsPerSeg > 0.0 && segsPerPath > 0.0) {
-                        const double byHits = 0.7 * (double)wq.hitCap / (hitsPerSeg * segsPerPath);
-                        const double bySegs = 0.9 * (double)wq.segCap / segsPerPath;
-                        next = (long long)((byHits < bySegs) ? byHits : bySegs);
-                    }
-                    if (next < 256) next = 256;
-                    if (next > waveSamples) next = waveSamples;   // the segment-sized wave is the ceiling
-                    wave = next;
+                    const double hitsPerPath = hitsPerSeg * segsPerPath;
+                    wfProfileCur.push_back(WfBand{b0 / c, (b1 + c - 1) / c, hitsPerPath, segsPerPath});
+                    wave = profiled(b1, sizeFor(hitsPerPath, segsPerPath), hitsPerPath, segsPerPath);
                 }
                 b0 = b1;
             }
+            if (wq.segs && !wfProfileCur.empty()) wfProfilePrev.swap(wfProfileCur);   // this chunk's bands size the next
         }
         else if (useHero && deep)
-            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                              resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, DWfQueue{}, 0, totalSamples);
         else if (useHero)
-            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, DWfQueue{}, 0, totalSamples);
         else if (deep)
-            kBdptT<0, BDPT_DEEPDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+            kBdptT<0, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                      resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, DWfQueue{}, 0, totalSamples);
         else
-            kBdptT<0, BDPT_MAXDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+            kBdptT<0, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, DWfQueue{}, 0, totalSamples);
         cudaCheckKernel("bdpt");
     };
@@ -16923,9 +17056,14 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         std::fprintf(stderr, "[gpu] mode J wavefront gather: %lld waves (first up to %lld paths, adaptive after); "
                              "last wave %d segments / %d hits; spilled over the whole render: %lld segments "
                              "gathered inline, %lld hits evaluated on the spot (FTRACE_NOWAVEFRONT=1 forces "
-                             "the inline path)\n",
+                             "the inline path)\n"
+                             "[gpu] mode J wave loop: GPU time walk %.1f s, beam hits %.1f s, hit eval %.1f s; "
+                             "wall %.1f s (host gaps %.1f s)\n",
                      wfWaves, waveSamples, ov[0] < wq.segCap ? ov[0] : wq.segCap,
-                     ov[1] < wq.hitCap ? ov[1] : wq.hitCap, wfSpillSegs, wfSpillHits);
+                     ov[1] < wq.hitCap ? ov[1] : wq.hitCap, wfSpillSegs, wfSpillHits,
+                     wfMsWalk / 1e3, wfMsHits / 1e3, wfMsEval / 1e3, wfMsWall / 1e3,
+                     (wfMsWall - wfMsWalk - wfMsHits - wfMsEval) / 1e3);
+        for (auto& e : wfEv) cudaEventDestroy(e);
         cudaFree(wq.segs); cudaFree(wq.hits); cudaFree(d_wfCounters);
     }
     cudaFree(d_cam); cudaFree(d_splat);
@@ -16987,13 +17125,13 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
         // render start and then thrash on host memory over PCIe).
         const bool deep = (maxDepth > BDPT_MAXDEPTH);
         const bool hero = (heroC > 1);
-        if (hero && deep)      fn = (const void*)kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false>;
-        else if (hero)         fn = (const void*)kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false>;
-        else if (deep)         fn = (const void*)kBdptT<0, BDPT_DEEPDEPTH, false>;
-        else                   fn = (const void*)kBdptT<0, BDPT_MAXDEPTH, false>;
+        if (hero && deep)      fn = (const void*)kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false>;
+        else if (hero)         fn = (const void*)kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false>;
+        else if (deep)         fn = (const void*)kBdptT<0, BDPT_DEEPDEPTH, false, false>;
+        else                   fn = (const void*)kBdptT<0, BDPT_MAXDEPTH, false, false>;
         if (mode == 'J') {
-            const void* mfn = deep ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, true>
-                                   : (const void*)kBdptT<0, BDPT_MAXDEPTH, true>;
+            const void* mfn = deep ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, true, false>
+                                   : (const void*)kBdptT<0, BDPT_MAXDEPTH, true, false>;
             cudaFuncAttributes fm{}, fc{};
             if (cudaFuncGetAttributes(&fm, mfn) == cudaSuccess &&
                 cudaFuncGetAttributes(&fc, fn)  == cudaSuccess &&
