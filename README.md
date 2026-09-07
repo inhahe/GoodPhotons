@@ -273,10 +273,11 @@ argument for standing a groom in a hall of polished objects.*
   shrinks per light-side epoch on mode `U`'s own schedule, so the point merges are *consistent*
   rather than parked on an `O(r²)` bias floor. Against an 8192 spp reference on a diffuse Cornell
   box it lands **−0.11 %** energy bias at 0.74 % rel-RMS, beating mode `U`'s 1.52 % while running
-  faster. **On by default on the CPU since 0.260.0** — the three-way media+surfaces gate is green
-  (X −0.86 % / Y −0.27 % / Z +0.12 % mean, per-pixel medians within 0.1 %); the GPU keeps the two-technique estimator until the surface merges get a device
-  twin, which is what still stands between `U` and retirement. See
-  [known-issues.md](known-issues.md) → UPBP-VM.
+  faster. **On by default since 0.260.0, and on the GPU too since 0.263.0** — the three-way
+  media+surfaces gate is green (X −0.86 % / Y −0.27 % / Z +0.12 % mean, per-pixel medians within
+  0.1 %), and the device renders the same three-technique estimator rather than quietly dropping
+  to two. What still stands between `U` and retirement is the head-to-head comparison against it.
+  See [known-issues.md](known-issues.md) → UPBP-VM.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look
