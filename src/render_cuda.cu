@@ -5547,6 +5547,11 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
 // hashed lattice mode M's photon map uses: the gather has to bin EXACTLY the way the light pass
 // stored, and two transcriptions of one binning rule is two chances to disagree -- a
 // disagreement that does not crash, it silently gathers nothing (cf. dPmNeighborhood's note).
+// Device twin of bdpt.h's FTRACE_J_HALF (0 = both halves, 1 = connections only, 2 = merges
+// only). Both halves keep the SAME MIS weights they have in a full render, so the two sum to
+// it -- which is what makes a CPU-vs-GPU comparison of ONE half a clean measurement.
+__constant__ int c_jHalf = 0;
+
 struct DSurfPhoton {
     DVec3 p, wo;                              // wo: unit, toward the PREVIOUS light vertex
     float lambda, beta, cx, cy, cz;           // cie{X,Y,Z}(lambda), cached at store time
@@ -12963,7 +12968,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 if ((s == 1 && t == 1) || depth < 0 || depth > maxDepth) continue;
                 int spx = 0, spy = 0, isSplat = 0, nUpConn = 0;
                 double Lsec[SECN];
-                double c = dConnectBDPT(sc, cam, light, eye, lightSec, eyeSec, NS,
+                double c = (c_jHalf == 2) ? 0.0 : dConnectBDPT(sc, cam, light, eye, lightSec, eyeSec, NS,
                                         s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn,
                                         mergeKappa, kappaSurf);
                 if (nUpConn <= 0) continue;
@@ -13022,7 +13027,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
         // Either merge kind opens this region. `mergeOn` needs a BEAM map, so gating the
         // whole block on it silently dropped the point merges on any scene without media --
         // exactly the scene the point merges exist for.
-        if (mergeOn || kappaSurf > 0.0) {
+        if ((mergeOn || kappaSurf > 0.0) && c_jHalf != 1) {
             // The camera half of every merge weight, replayed ONCE for the whole subpath.
             // dMisWeight's camera loop telescopes inward from the merge point; everything it
             // accumulates strictly camera-side of eye[k] is independent of WHERE along the
@@ -17108,6 +17113,15 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // in the next step, so an uploaded map changes nothing yet).
     DSurfMap dsm{};
     if (smap) uploadSurfMapCuda(smap, up, dsm);
+    {   // the half-render diagnostic, mirrored from the host so one half can be compared
+        // backend to backend (bdpt::jHalfMode: 1 = connections only, 2 = merges only)
+        // Same strings bdpt.h's jHalfMode() reads -- that function is the source of truth, but
+        // it lives in a header this translation unit does not include.
+        const char* e = std::getenv("FTRACE_J_HALF");
+        const int jh = !e ? 0 : (!std::strcmp(e, "connections") ? 1
+                              : (!std::strcmp(e, "merges") || !std::strcmp(e, "merges-raw")) ? 2 : 0);
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jHalf, &jh, sizeof(int)));
+    }
     const bool mergeOn = (dbm.nNodes > 0);
     // WAVEFRONT gather queue (UPBP-CONV): sized for one wave of camera paths; the chunk is run
     // as consecutive waves. FTRACE_NOWAVEFRONT=1 forces the inline gather (the A/B control).
