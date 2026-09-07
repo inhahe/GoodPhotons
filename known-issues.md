@@ -578,9 +578,26 @@ the volumetrics `cloud_base` +2.9 % / `cloud` −5.1 % / `cloud_limb` −0.1 %, 
 −1.7 %. A global normalisation error would have moved those too, so the whole-frame −22 % (−34 %
 on the masked mean) is a *sum of two localised defects*, not one scale factor.
 
-**Measurement (a) is in, and it rules out the gather radius (2026-09-07).** A consistent
-estimator's finite-radius bias must shrink as the radius does. Swept `-pmradiusfrac` over a
-factor of **8** (0.02 → 0.0025), 300 s each, same reference:
+**Measurement (a) — RETRACTED, the sweep swept nothing (2026-09-07).** The table below is
+recorded because the *readings* are real, but its conclusion is not: **`-pmradiusfrac` does not
+change the radius mode `M` gathers at.** Auto-radius is on by default (`g_pmAutoRadius = true`,
+main.cpp 11872) and `-pmradiusfrac` only rescales the value handed to `PhotonMap::buildAuto` as
+a *starting* point — which the solve then cancels out. `buildAuto` measures the median neighbour
+count `n0` **at `r0`** and returns
+
+    r1 = r0 * sqrt(k / n0),      k = 200 * cbrt(stored / 1e6)
+
+and since photons lie on surfaces, `n0` grows as `r0`², so `r0` divides out and `r1 → sqrt(k/c)`
+— the radius that holds `k` photons, *whatever you started from*. The only way `r0` survives is
+through the deliberate two-octave clamp `[r0/64, r0*4]`, which an 8× spread does not reach. So
+all four runs gathered at essentially one radius, and reading their agreement as
+"radius-independent" was reading the same measurement four times. The real sweep needs
+`-pmradius <absolute>` (which sets `g_pmAutoRadius = false`) or `-nopmauto`; it is redone below.
+The lesson generalises: **a knob documented as "the starting radius" is not a radius knob**, and
+main.cpp 18544 says so in a comment I had not read — *"-pmradiusfrac only rescales the STARTING
+radius, so it leaves adaptation on."*
+
+Swept `-pmradiusfrac` over a nominal factor of **8** (0.02 → 0.0025), 300 s each, same reference:
 
 | element | 0.02 | 0.01 | 0.005 | 0.0025 |
 |---|---|---|---|---|
@@ -590,11 +607,10 @@ factor of **8** (0.02 → 0.0025), 300 s each, same reference:
 | `cap_gyroid` (textured diffuse) | −32.5 % | −33.9 % | −32.7 % | −28.8 % |
 | `grid_ground` (flat diffuse — control) | +0.8 % | +1.2 % | +0.9 % | +1.5 % |
 
-**Not one of them moves.** The deficit is radius-independent to within noise across an 8×
-change, while the diffuse control stays correct throughout. So mode `M` is not *blurring* this
-energy — it is not collecting it, and **M-GATHERAREA is not the explanation for these
-elements**, whatever it explains elsewhere (its own targets, `alice_hair` and `alice_dress`, are
-not in this sweep).
+**Not one of them moves** — which, given the retraction above, is exactly what four repeats of
+one measurement look like. It says only that the run-to-run noise on these ROIs is under a
+percent at 300 s (useful in itself: it makes a genuine radius effect easy to see once the radius
+actually varies), and it says **nothing** about the radius. The `-nopmauto` sweep replaces it.
 
 **What the three worst have in common is that they are specular**, which the ROI comments make
 explicit: `gyroid` is "gold gyroid, the central piece" (a glossy metal, `preset gold roughness
