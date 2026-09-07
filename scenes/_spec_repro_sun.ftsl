@@ -1,0 +1,53 @@
+# GLOSSY-NEE regression rig: the SUN-LIT twin of _spec_repro.ftsl.
+#
+# The two scenes are identical except for the light. _spec_repro.ftsl uses a 1.6 x 1.6 m area
+# panel at 2.6 m -- about 0.2 sr -- and under it mode M matches a 2.22 M-spp mode R to within
+# 1 % on EVERY band, glossy metal included:
+#
+#     diffuse -0.3 %   glossy -0.7 %   dielectric -0.1 %   mirror -0.4 %
+#
+# This file swaps that panel for `light sun { angle 0.53 }`, a disc of 6.8e-5 sr -- 3000x
+# smaller -- carrying the same illuminance on the floor. Nothing else changes. Since no
+# unidirectional mode does next-event estimation at a MatType::Glossy vertex (backward.h ~1489,
+# photonmap_render.h ~783), the sun can only be found by a sampleGlossy direction landing inside
+# that disc: odds ~1/1500 for the gold sphere's 0.104 sr lobe and ~1/115 for the chrome one's
+# 0.0079 sr lobe. So the glossy and mirror bands should collapse here while the diffuse band --
+# which does have NEE -- stays exact, and the gap between the two files is the whole of the
+# defect, with no photon map, no gather radius and no 13-exhibit scene anywhere near it.
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "floor"  { type diffuse  reflect whitewall 0.70 }
+material "back"   { type diffuse  reflect whitewall 0.55 }
+material "grey"   { type diffuse  reflect whitewall 0.60 }
+material "gold"   { preset gold   roughness 0.18 }
+material "glass"  { type dielectric  ior glass:crystal }
+material "mirror" { preset chrome }
+
+quad { origin -2 0 -2   u 4 0 0   v 0 0 4   material floor }   # floor
+# NO BACK WALL, deliberately -- this is the one structural difference from the area-light twin.
+# A metal's brightness is whatever its lobe points AT, so a wall filling the lobe with bright
+# diffuse bounce light hides the defect: with the wall in place the gold sphere read only -6 %
+# with the estimator missing, because most of what it reflected was the wall, not the sun. Take
+# the wall away and the upper hemisphere is empty sky, so the sun is nearly ALL of the light on
+# the metals -- which is the condition `gallery_rain`'s gyroid is actually in ("with the walls
+# and ceiling gone the gyroid's outer edge points at an empty black sky"). The diffuse sphere
+# and the floor keep their NEE and stay the control.
+
+# Four spheres in a row, left to right: diffuse, glossy, dielectric, mirror.
+sphere { center -1.35 0.45 0.0   radius 0.45   material grey   }
+sphere { center -0.45 0.45 0.0   radius 0.45   material gold   }
+sphere { center  0.45 0.45 0.0   radius 0.45   material glass  }
+sphere { center  1.35 0.45 0.0   radius 0.45   material mirror }
+
+# Straight overhead-ish, matching the panel's direction so the shading geometry is the same.
+# `angle 0.53` is the real solar disc: 6.8e-5 sr, versus the panel's ~0.2 sr.
+light sun { dir 0 0.94 0.34   angle 0.53   spd blackbody 6500   intensity 1.30e-1 }
+
+camera "cam" {
+    eye 0 1.15 4.6   look_at 0 0.5 0   up 0 1 0   fov_y 42
+    mode B
+    film { res 320 180 }
+}

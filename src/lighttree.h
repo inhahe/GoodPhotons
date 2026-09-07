@@ -58,6 +58,14 @@ namespace lt {
 inline bool   gEnabled = true;   // false = the exact all-emitters splitting estimator
 inline double gSplit   = 1.0;    // adaptive-splitting threshold, (node radius / distance)^2
 inline int    gSamples = 8;      // cap on emitters connected per shading vertex
+
+// GLOSSY-NEE (known-issues.md): connect a MatType::Glossy vertex to the lights and balance-
+// heuristic it against the lobe-sampling strategy, instead of hoping a lobe sample lands on the
+// emitter. Lives here beside the light-tree switches because it is the same kind of thing -- a
+// direct-lighting estimator setting that several translation units have to agree on -- and for
+// the same reason: an `inline` variable in a header is one object across the CUDA TU and the
+// host TU, where a `static` in main.cpp would silently be two.
+inline bool   gGlossyNee = true;  // -no-glossy-nee: the pre-0.266 estimator, rng order included
 }
 
 // One node of the light BVH. Interior nodes carry two child indices; leaves carry

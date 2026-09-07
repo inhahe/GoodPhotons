@@ -52,6 +52,7 @@
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
 #include "fur_volume.h"   // -fur-volume: the aggregate far-tier fur medium
 #include "radcache.h" // -radcache: biased early termination into a world-space irradiance cache
+#include "bsdf_eval.h" // bdpt::bsdfF / bsdfPdf — the evaluable BSDF, for glossy NEE
 
 struct BackwardRenderer {
     // --- Participating media: the WHOLE `scene.media` vector, superposed ----------------
@@ -455,11 +456,19 @@ struct BackwardRenderer {
     // its own sample point inside here, and the caller needs the direction to evaluate the
     // shadow leg's MEDIA TRANSMITTANCE — which is wavelength-dependent and so cannot live
     // in the lambda-independent `w`.
+    //
+    // `pdfWOut` (optional) reports the SOLID-ANGLE density this branch sampled `wiOut` with --
+    // the light-sampling strategy's pdf, which MIS weighs the BSDF lobe's pdf against
+    // (GLOSSY-NEE). Every branch already knows it; until now nothing needed `w` split back
+    // into cos/pdfW. **0 means delta**: a Spot is a point, so no BSDF sample can ever hit it,
+    // its NEE weight is 1 and there is nothing to weigh it against.
     bool emitterGeom(const Scene& scene, const Hit& h, const Vec3& ngo,
                      const Emitter& em, double u1, double u2, double& dist, double& w,
                      Vec3& wiOut,
                      const HairShade* hs = nullptr,
-                     const HairDualCtx* dctx = nullptr) const {
+                     const HairDualCtx* dctx = nullptr,
+                     double* pdfWOut = nullptr) const {
+        if (pdfWOut) *pdfWOut = 0.0;                     // delta unless a branch says otherwise
         // Dual scattering (P3 stage 4) makes the shadow ray part of the SHADING: what it
         // counts on the way to the light is the forward-scattering transmittance, so the
         // response and the visibility test stop being separable. `response` therefore
@@ -541,6 +550,7 @@ struct BackwardRenderer {
             if (!response(wi, cosSurf, stG)) return false;
             if (blocked(wi, dist, 0.0)) return false;
             w = cosSurf * em.spotOmega * stG;
+            if (pdfWOut) *pdfWOut = (em.spotOmega > 0.0) ? 1.0 / em.spotOmega : 0.0;
             wiOut = wi;
             return true;
         }
@@ -566,6 +576,7 @@ struct BackwardRenderer {
             if (!response(wi, cosSurf, stG)) return false;
             if (blocked(wi, dist, 2e-6)) return false;
             w = cosSurf / pdfW * stG;                        // solid-angle measure
+            if (pdfWOut) *pdfWOut = pdfW;                    // already in solid-angle measure
             wiOut = wi;
             return true;
         }
@@ -589,6 +600,10 @@ struct BackwardRenderer {
         double G = cosSurf * cosLight / dist2;           // geometry term
         w = G * effArea * stG;                           // pdf_area = 1/effArea (visible area for cylinder)
         if (epat != 1.0) w *= epat;                      // no-op (and bit-identical) without a pattern
+        // Area measure -> solid angle: pdf_W = pdf_A * dist^2 / cos(light). `epat` is a
+        // RADIANCE profile folded into `w`, not a change of density, so it does not appear.
+        if (pdfWOut && effArea > 0.0 && cosLight > 0.0)
+            *pdfWOut = dist2 / (effArea * cosLight);
         wiOut = wi;
         return true;
     }
@@ -806,6 +821,13 @@ struct BackwardRenderer {
     // absent (one light, mode W's deterministic grid, -no-lighttree) it reports "all
     // emitters, weight 1", i.e. literally the old loop, drawing the rng in the old
     // order so those scenes stay bit-identical.
+    // GLOSSY-NEE: connect glossy vertices to lights (balance-heuristic MIS against the lobe).
+    // On by default since 0.266.0. `-no-glossy-nee` restores the pre-0.266 estimator exactly,
+    // rng draws included, which is what the A/B measurements in known-issues.md compare.
+    bool   glossyNee = lt::gGlossyNee;
+    // Free function form, for callers that are not building a BackwardRenderer of their own
+    // (mode M's gather walks ask before paying for one).
+    static bool glossyNeeOn() { return lt::gGlossyNee; }
     bool   lightTree = lt::gEnabled;   // -no-lighttree: force the exact all-emitters estimator
     double lightSplit = lt::gSplit;    // adaptive-splitting threshold, (node radius / distance)^2
     int    lightSamples = lt::gSamples;// cap on emitters connected per vertex
@@ -848,13 +870,121 @@ struct BackwardRenderer {
         return d;
     }
 
+    // Is emitter `e`'s SELECTION probability exactly 1 at every vertex? Both halves of the
+    // glossy MIS weight need the same answer, and the light-sampling half computes it at a
+    // shading point while the BSDF-sampling half computes it one bounce later from a ray hit,
+    // so it must be a property of the EMITTER and the settings -- never of the draw. See the
+    // COVERAGE note on neeLight.
+    bool lightPickExact(const Scene& scene, int e) const {
+        if (!lightTree || whitted || scene.lightTreeRoot < 0 || scene.lightTree.empty())
+            return true;                                  // EmitterDraw::all -- weight 1
+        for (int a : scene.lightTreeAlways) if (a == e) return true;
+        return false;
+    }
+
+    // An evaluable, non-Lambertian lobe at a NEE vertex (today: MatType::Glossy). `wo` points
+    // toward the previous vertex, which is the convention bsdfF/bsdfPdf are written in.
+    struct NeeBsdf {
+        const Material* m = nullptr;
+        Vec3 wo{0, 0, 0};
+    };
+
+    // The other half of the glossy MIS weight, carried forward one bounce: how likely the lobe
+    // was to produce the continuation direction, and the point it left. `pdf > 0` is the flag —
+    // a delta bounce (mirror, dielectric, filter) clears it, because nothing connected to a
+    // light on its behalf and its emitter hits keep full weight, exactly as before.
+    struct GlossyMis {
+        double pdf = 0.0;      // solid-angle density of the lobe sample, at `from`
+        Vec3   from{0, 0, 0};  // the glossy vertex the continuation left
+        void clear() { pdf = 0.0; }
+    };
+
+    // The light-sampling density that WOULD have produced direction `wi` from `from` toward
+    // emitter `e` — the reverse of emitterGeom, for the BSDF-sampling side of the weight.
+    // Returns 0 where the pair is not MIS-covered (an emitter the NEE side skips, a delta
+    // light, a degenerate geometry), which the callers read as "full weight".
+    //
+    //   Sun     cone-sampled, pdf 1/spotOmega inside the cone (`hitP` unused: it is at infinity)
+    //   Sphere  cone-sampled toward the visible cap when the receiver is outside it, so
+    //           1/(2 PI (1-cosMax)) with sin^2(max) = r^2/d^2 — the same expression
+    //           sampleSphereCone returns. A receiver INSIDE the sphere falls back to area
+    //           sampling there, and so does this.
+    //   others  uniform over `em.area`, so pdf_A * dist^2 / cos(light).
+    //
+    // The CYLINDER's visible-arc sampling (sampleCylinderVisible) narrows the area measure to
+    // the front-facing arc; reproducing that here needs its pdf_A, which is not exposed, so a
+    // cylinder emitter reports 0 and keeps today's estimator. Logged with the entry.
+    double lightPdfW(const Scene& scene, int e, const Vec3& from, const Vec3& wi,
+                     const Vec3* hitP, const Vec3* hitN) const {
+        if (e < 0 || e >= (int)scene.emitters.size()) return 0.0;
+        if (!lightPickExact(scene, e)) return 0.0;
+        const Emitter& em = scene.emitters[e];
+        if (em.collimated) return 0.0;                       // not area-samplable at all
+        switch (em.shape) {
+            case EmitterShape::Sun:
+                return (em.inCone(wi) && em.spotOmega > 0.0) ? 1.0 / em.spotOmega : 0.0;
+            case EmitterShape::Spot:  return 0.0;             // delta: unhittable by a lobe
+            case EmitterShape::Env:   return 0.0;             // has its own MIS (envPdfDir)
+            case EmitterShape::Cylinder: return 0.0;          // see the note above
+            case EmitterShape::Sphere: {
+                const Vec3 toC = em.origin - from;
+                const double dc2 = dot(toC, toC), r2 = em.radius * em.radius;
+                if (dc2 <= r2) break;                         // inside: area-sampled, fall through
+                const double cosMax = std::sqrt(std::max(0.0, 1.0 - r2 / dc2));
+                const double omega = 2.0 * PI * (1.0 - cosMax);
+                return (omega > 0.0) ? 1.0 / omega : 0.0;
+            }
+            default: break;
+        }
+        if (!hitP || !hitN || em.area <= 0.0) return 0.0;     // area measure needs the point
+        const Vec3 d = *hitP - from;
+        const double dist2 = dot(d, d);
+        const double cosLight = dot(*hitN, -wi);
+        if (!(dist2 > 0.0) || !(cosLight > 0.0)) return 0.0;
+        return dist2 / (em.area * cosLight);
+    }
+
+    // Index of the emitter that owns an emissive surface material, or -1. Scene::emitterForMat
+    // returns the record; the balance heuristic needs the INDEX, because `lightPickExact` and
+    // `lightPdfW` are both keyed on it.
+    static int emitterIndexForMat(const Scene& scene, int matId) {
+        const Emitter* e = scene.emitterForMat(matId);
+        return e ? (int)(e - scene.emitters.data()) : -1;
+    }
+
+    // Scene::sunRadiance, but with the glossy MIS weight applied PER SUN -- the weight depends
+    // on the cone the direction fell in, so the sum cannot be weighted after the fact.
+    double sunRadianceMis(const Scene& scene, const GlossyMis& gm, const Vec3& d,
+                          double lambda) const {
+        if (scene.sunCount == 0) return 0.0;
+        if (!(gm.pdf > 0.0)) return scene.sunRadiance(d, lambda);   // unweighted, as before
+        double Lsun = 0.0;
+        for (size_t i = 0; i < scene.emitters.size(); ++i) {
+            const Emitter& e = scene.emitters[i];
+            if (e.shape != EmitterShape::Sun || !e.inCone(d)) continue;
+            Lsun += e.spdFn(lambda) * glossyHitWeight(scene, gm, (int)i, d, nullptr, nullptr);
+        }
+        return Lsun;
+    }
+
+    // Balance-heuristic weight for an emitter reached by the CONTINUATION. 1 when the vertex
+    // it left was not a MIS'd glossy bounce, or when the light is not MIS-covered.
+    double glossyHitWeight(const Scene& scene, const GlossyMis& gm, int e, const Vec3& wi,
+                           const Vec3* hitP, const Vec3* hitN) const {
+        if (!(gm.pdf > 0.0)) return 1.0;
+        const double pL = lightPdfW(scene, e, gm.from, wi, hitP, hitN);
+        if (!(pL > 0.0)) return 1.0;
+        const double sum = gm.pdf + pL;
+        return (sum > 0.0) ? gm.pdf / sum : 1.0;
+    }
+
     // `hs` non-null routes the connection through the fiber BCSDF (see emitterGeom); the
     // caller then passes rho == 1, because the strand's colour is already inside the BCSDF
     // (its sigma_a) and the PI in emitterGeom's response cancels the rho/PI below.
     double neeLight(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
                     double lambda, Pcg32& rng, const SpdCache* spdCache = nullptr,
                     GiCtx gi = GiCtx{}, const HairShade* hs = nullptr,
-                    const HairDualCtx* dctx = nullptr) const {
+                    const HairDualCtx* dctx = nullptr, const NeeBsdf* nb = nullptr) const {
         double total = 0.0;
         // Geometric normal on the shading-normal side: every light connection must lie
         // in this hemisphere too, else a smoothed shading normal would leak light in
@@ -874,6 +1004,10 @@ struct BackwardRenderer {
             const int e = draw.emitter(di);
             const double selW = draw.weight(di);
             if (selW <= 0.0) continue;
+            // Glossy NEE only where the MIS pair can agree on the selection probability;
+            // elsewhere the lobe-sampling strategy keeps the emitter to itself, at full
+            // weight, exactly as before this existed.
+            if (nb && !lightPickExact(scene, e)) continue;
             const Emitter& em = scene.emitters[e];
             const bool uv = emitterNeedsUV(em);
             // Whitted: G x G deterministic shadow rays per area light, averaged. A
@@ -903,13 +1037,32 @@ struct BackwardRenderer {
                     // render bit-identical rather than merely equal in expectation.
                     if (dc.grid) dc.u3 = rng.uniform();
                 }
+                double pdfWLight = 0.0;
                 if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, wiConn, hs,
-                                 dctx ? &dc : nullptr)) continue;
+                                 dctx ? &dc : nullptr, nb ? &pdfWLight : nullptr)) continue;
                 if (!haveSpd) {   // evaluated at most once per emitter, as before
                     spdV = cached ? spdCache->at(e, 0) : em.spdFn(lambda);
                     haveSpd = true;
                 }
-                double contrib = (rho / PI) * (spdV * invPdfLambda) * w;
+                // `rho/PI` IS bsdfF for a Diffuse vertex, so the two arms are the same
+                // estimator; the branch exists so the default path keeps its exact float
+                // expression and every existing render stays bit-identical.
+                double fVal;
+                if (nb) {
+                    fVal = bdpt::bsdfF(*nb->m, h.n, nb->wo, wiConn, lambda, scene, &h);
+                    if (!(fVal > 0.0)) continue;
+                    // Balance heuristic against the lobe-sampling strategy. pdfWLight == 0
+                    // is a delta light (a Spot): unhittable by a BSDF sample, weight 1.
+                    if (pdfWLight > 0.0) {
+                        const double pLobe = bdpt::bsdfPdf(*nb->m, h.n, nb->wo, wiConn,
+                                                           lambda, scene, &h);
+                        const double sum = pdfWLight + pLobe;
+                        if (sum > 0.0) fVal *= pdfWLight / sum;
+                    }
+                } else {
+                    fVal = rho / PI;
+                }
+                double contrib = fVal * (spdV * invPdfLambda) * w;
                 // Media transmittance on the shadow leg, over the WHOLE superposed media
                 // vector and each medium's own bounds/density field (see mediaTr). The
                 // shadow ray starts at the same offset point `blocked` used, so the two
@@ -931,7 +1084,7 @@ struct BackwardRenderer {
     void neeLightHero(const Scene& scene, const Hit& h, const double* rho, double* L,
                       const double* thr, const double* lam, const double* invPdf,
                       int nUp, Pcg32& rng, const SpdCache* spdCache,
-                      GiCtx gi = GiCtx{}) const {
+                      GiCtx gi = GiCtx{}, const NeeBsdf* nb = nullptr) const {
         const Vec3 ngo = orientedGeoN(h);
         const bool cached = spdCache && spdCache->matches(lam, nUp);
         const EmitterDraw draw = pickEmitters(scene, h.p, &h.n, rng);
@@ -939,6 +1092,7 @@ struct BackwardRenderer {
             const int e = draw.emitter(di);
             const double selW = draw.weight(di);
             if (selW <= 0.0) continue;
+            if (nb && !lightPickExact(scene, e)) continue;   // see neeLight's COVERAGE note
             const Emitter& em = scene.emitters[e];
             const bool uv = emitterNeedsUV(em);
             const int G = (whitted && uv) ? (gi.depth ? giGrid : lightGrid) : 1;
@@ -948,12 +1102,34 @@ struct BackwardRenderer {
                 double u1 = 0.0, u2 = 0.0;
                 if (whitted) { if (uv) gridUV(s, G, u1, u2); }
                 else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
-                double dist = 0.0, w = 0.0;
-                Vec3 wiConn{0, 0, 0};   // unused here: the hero path is gated on a vacuum scene
-                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, wiConn)) continue;
+                double dist = 0.0, w = 0.0, pdfWLight = 0.0;
+                Vec3 wiConn{0, 0, 0};   // the glossy hook needs it; otherwise unused, since the
+                                        // hero path is gated on a vacuum scene
+                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, wiConn, nullptr, nullptr,
+                                 nb ? &pdfWLight : nullptr)) continue;
                 double ws = (nS > 1) ? w * invS : w;
                 ws *= selW;                       // no-op (bit-exact) on the exact path
-                if (cached) {
+                // GLOSSY-NEE. The lobe's GEOMETRY is wavelength-free -- which is the same fact
+                // that lets the bundle survive a glossy vertex at all -- so the balance-heuristic
+                // weight is computed once and shared, and only the coefficient inside bsdfF
+                // varies per member.
+                if (nb) {
+                    double wMis = 1.0;
+                    if (pdfWLight > 0.0) {
+                        const double pLobe = bdpt::bsdfPdf(*nb->m, h.n, nb->wo, wiConn,
+                                                           lam[0], scene, &h);
+                        const double sum = pdfWLight + pLobe;
+                        if (sum > 0.0) wMis = pdfWLight / sum;
+                    }
+                    const double wsMis = ws * wMis;
+                    for (int i = 0; i < nUp; ++i) {
+                        const double f = bdpt::bsdfF(*nb->m, h.n, nb->wo, wiConn,
+                                                     lam[i], scene, &h);
+                        if (!(f > 0.0)) continue;
+                        const double spd = cached ? spdCache->at(e, i) : em.spdFn(lam[i]);
+                        L[i] += thr[i] * f * (spd * invPdf[i]) * wsMis;
+                    }
+                } else if (cached) {
                     for (int i = 0; i < nUp; ++i)
                         L[i] += thr[i] * (rho[i] / PI) * (spdCache->at(e, i) * invPdf[i]) * ws;
                 } else {
@@ -1341,7 +1517,13 @@ struct BackwardRenderer {
                           Ray& ray, double& lambda, double& invPdfLambda, double& thr, double& L,
                           bool& specularArrival, double& contBsdfPdf, MediumStack& stk,
                           Pcg32& rng, const SpdCache* spdCache = nullptr,
-                          GiCtx gi = GiCtx{}) const {
+                          GiCtx gi = GiCtx{},
+                          GlossyMis* gm = nullptr) const {
+        // Cleared here rather than per delta branch, so the invariant is
+        // structural: `gm->pdf > 0` can only mean "the LAST bounce was a MIS'd
+        // glossy one". A mirror or dielectric leaving a stale value behind would
+        // silently halve the emission on the far side of the chain.
+        if (gm) gm->clear();
         switch (m.type) {
             case MatType::Dielectric: {
                 // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002). The
@@ -1486,9 +1668,30 @@ struct BackwardRenderer {
                     ray = Ray{h.p + h.n * 1e-6, o};
                     specularArrival = true; return true;
                 }
+                // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE). Without it the only
+                // way to this material's light is a lobe sample that happens to land on the
+                // emitter -- odds of ~1/115 against a 0.53-degree sun for a roughness-0.05
+                // lobe, which cost `gallery_rain`'s chrome ring 91 % of its energy and its
+                // gold gyroid 64 %, in mode R as much as in mode M. `bsdfF` supplies the lobe
+                // value, and neeLight balance-heuristics it against the lobe-sampling
+                // strategy, because unlike diffuse a glossy lobe can be far NARROWER than the
+                // light (the same scene's 20x14 m sky panel) and neither strategy dominates.
+                //
+                // Taken BEFORE the Russian roulette below: the survival coin governs the
+                // CONTINUATION, while the connection carries `r` inside bsdfF.
+                if (gm) {
+                    const NeeBsdf nb{&m, ray.d * -1.0};
+                    L += thr * neeLight(scene, h, /*rho unused*/1.0, invPdfLambda, lambda, rng,
+                                        spdCache, gi, nullptr, nullptr, &nb);
+                }
                 if (rng.uniform() >= r) return false;
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0) return false;
+                // The other half of the weight, for whatever this direction goes on to hit.
+                if (gm) {
+                    gm->pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
+                    gm->from = h.p;
+                }
                 ray = Ray{h.p + h.n * 1e-6, o};
                 specularArrival = true; return true;
             }
@@ -1689,6 +1892,12 @@ struct BackwardRenderer {
         bool specularArrival = (gi.depth == 0);
         const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
         double contBsdfPdf = 0.0;      // solid-angle pdf of the current continuation
+        // GLOSSY-NEE: set by a glossy bounce, cleared by every other interaction, so the two
+        // emitter sites below can tell "a light this vertex already connected to" from "a light
+        // nothing connected to". Null when the feature is off, which turns every site back into
+        // its pre-0.266 form including the rng draw order.
+        GlossyMis gmis;
+        GlossyMis* const gmp = glossyNee ? &gmis : nullptr;
                                        // ray (for env-miss MIS after a diffuse/volume
                                        // bounce; unused while specularArrival)
         Renderer mats;                 // shared material sampling (stateless)
@@ -1864,7 +2073,7 @@ struct BackwardRenderer {
                 // NEE (emitterGeom / neeVolume) and sets specularArrival = false, so
                 // this is a clean single-strategy split, not a missing MIS weight.
                 if (scene.sunCount > 0 && specularArrival)
-                    L += thr * scene.sunRadiance(ray.d, lambda) * invPdfLambda;
+                    L += thr * sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfLambda;
                 // Escaped gather ray → the far-field `ambient` fill (see radianceHero).
                 if (gi.depth && ambient > 0.0) L += thr * ambient;
                 return L;
@@ -1925,11 +2134,19 @@ struct BackwardRenderer {
             // emitSlot applies any `emit pattern:` at this hit; the NEE side below
             // applies the SAME profile via emitterSamplePoint, which is what keeps the
             // two estimators consistent (see Material::emitPat).
-            if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0)
-                L += thr * emitSlot(scene, m, h, lambda) * invPdfLambda;
+            if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0) {
+                // The lobe-sampling half of the glossy MIS weight. 1 (and bit-identical to the
+                // old expression) unless the previous bounce was a MIS'd glossy one that
+                // already connected to this same emitter.
+                double wMis = 1.0;
+                if (gmis.pdf > 0.0)
+                    wMis = glossyHitWeight(scene, gmis, emitterIndexForMat(scene, h.matId),
+                                           ray.d, &h.p, &h.n);
+                L += thr * emitSlot(scene, m, h, lambda) * invPdfLambda * wMis;
+            }
 
             if (!interactMaterial(scene, m, h, mats, ray, lambda, invPdfLambda, thr, L,
-                                  specularArrival, contBsdfPdf, stk, rng, spdCache, gi))
+                                  specularArrival, contBsdfPdf, stk, rng, spdCache, gi, gmp))
                 return L;                                 // path terminated in the interaction
         }
         return L;
@@ -1994,6 +2211,10 @@ struct BackwardRenderer {
             lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = thrIn[i]; L[i] = 0.0;
         }
         for (int i = nLive; i < C; ++i) { lam[i] = 0.0; invPdf[i] = 0.0; thr[i] = 0.0; L[i] = 0.0; }
+        // GLOSSY-NEE, the hero twin of radiance()'s carrier. Cleared at the top of every bounce
+        // and set only by the Glossy branch, so a stale lobe density can never survive a
+        // mirror, a dielectric or a de-hero'd interaction and halve the emission behind it.
+        GlossyMis gmis;
         // Gather rays are bounce-capped (see giBounce) so a highly reflective lattice
         // cannot turn one gather direction into a 60-deep ricochet.
         const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
@@ -2050,6 +2271,7 @@ struct BackwardRenderer {
         };
 
         for (int b = bounce0; b < maxB; ++b) {
+            gmis.clear();     // set below only by a MIS'd glossy bounce (see the note above)
             int nUp = secAlive ? C : 1;   // wavelengths still being propagated
             gi.bounce = b;                // see the scalar twin: mode W's per-vertex lattice
             // The scalar twin's tier roll. Sticky through GiCtx, which is what makes a
@@ -2115,7 +2337,7 @@ struct BackwardRenderer {
                 }
                 if (scene.sunCount > 0 && specularArrival)   // directly-viewed solar disc
                     for (int i = 0; i < nUp; ++i)
-                        L[i] += thr[i] * scene.sunRadiance(ray.d, lam[i]) * invPdf[i];
+                        L[i] += thr[i] * sunRadianceMis(scene, gmis, ray.d, lam[i]) * invPdf[i];
                 // A GATHER ray that escaped the scene picks up `ambient` as the far-field
                 // fill. This is what makes -ambient and -gi compose instead of compete:
                 // the gather supplies the near field (occlusion + bleeding) and the
@@ -2235,6 +2457,11 @@ struct BackwardRenderer {
             // bundle rather than per-wavelength inside emitSlot.
             if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0) {
                 double ep = (m.emitPat < 0) ? 1.0 : slotPatMul(scene, m.emitPat, h);
+                // The lobe-sampling half of the glossy MIS weight; 1 (and bit-identical to the
+                // old expression) unless the last bounce was a MIS'd glossy one.
+                if (gmis.pdf > 0.0)
+                    ep *= glossyHitWeight(scene, gmis, emitterIndexForMat(scene, h.matId),
+                                          ray.d, &h.p, &h.n);
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i];
             }
@@ -2313,6 +2540,15 @@ struct BackwardRenderer {
                     for (int i = 0; i < nUp; ++i)
                         c[i] = (m.type == MatType::Filter) ? clamp01(transmitSlot(scene, m, h, lam[i]))
                                                            : clamp01(reflectSlot(scene, m, h, lam[i]));
+                    // GLOSSY-NEE: a Glossy lobe is the one member of this achromatic group with
+                    // a FINITE value, so it is the one that can be connected to a light. A
+                    // mirror and a gel are delta and stay exactly as they were. Taken before the
+                    // Russian roulette, whose coin governs only the continuation.
+                    if (glossyNee && !whitted && m.type == MatType::Glossy) {
+                        const NeeBsdf nb{&m, ray.d * -1.0};
+                        neeLightHero(scene, h, /*rho unused*/c, L, thr, lam, invPdf, nUp, rng,
+                                     spdCache, gi, &nb);
+                    }
                     const double q = hero::maxOf(c, nUp);
                     if (whitted) {
                         // Deterministic: carry every live λ's coefficient as weight (no
@@ -2337,6 +2573,10 @@ struct BackwardRenderer {
                     } else {
                         Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                         if (dot(o, h.n) <= 0) { finish(); return; }
+                        if (glossyNee) {
+                            gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lam[0], scene, &h);
+                            gmis.from = h.p;
+                        }
                         ray = Ray{h.p + h.n * 1e-6, o};
                     }
                     specularArrival = true;

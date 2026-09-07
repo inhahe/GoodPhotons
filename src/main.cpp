@@ -18484,6 +18484,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-raystats")) { g_rayStats = true; }
         // Many-lights importance sampling (light BVH). See the lt:: knobs above.
         else if (!std::strcmp(argv[i], "-no-lighttree")) { lt::gEnabled = false; }
+        else if (!std::strcmp(argv[i], "-no-glossy-nee")) { lt::gGlossyNee = false; }
+        else if (!std::strcmp(argv[i], "-glossy-nee"))    { lt::gGlossyNee = true;  }
         else if (!std::strcmp(argv[i], "-lighttree"))    { lt::gEnabled = true; }
         else if (!std::strcmp(argv[i], "-light-split") && i + 1 < argc) {
             lt::gSplit = std::max(0.0, std::atof(argv[++i]));

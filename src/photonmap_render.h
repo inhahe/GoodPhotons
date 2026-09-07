@@ -388,7 +388,16 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     MediumStack stk;                                     // nested-dielectric medium stack
     const bool grinAny = grin::sceneHasGrin(scene);      // final-gather rays bend too
 
+    // GLOSSY-NEE. `bwNee` is the shared direct-lighting estimator (its `neeLight` is what the
+    // final gather already uses); `gmis` carries the lobe density of a glossy continuation to
+    // whichever emitter site it reaches, and is cleared at the top of every bounce so a mirror
+    // or a dielectric can never inherit one and halve the emission behind it.
+    BackwardRenderer bwNee; bwNee.diffraction = diffraction;
+    const bool gneeOn = BackwardRenderer::glossyNeeOn();
+    BackwardRenderer::GlossyMis gmis;
+
     for (int b = 0; b < maxBounce; ++b) {
+        gmis.clear();
         if (grinAny) {
             double arc = 0.0;
             grin::marchSegments(scene, ray,
@@ -435,8 +444,14 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         // estimate below. See photonGather for the measurement.
         if (m.isLight && specularSeen && dot(ray.d, h.ng) < 0.0) {
             double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
+            // GLOSSY-NEE's lobe-sampling half; 1 (and bit-identical) unless the last bounce was
+            // a glossy one that already connected to this emitter.
+            const double wMis = (gmis.pdf > 0.0)
+                ? bwNee.glossyHitWeight(scene, gmis,
+                        BackwardRenderer::emitterIndexForMat(scene, h.matId), ray.d, &h.p, &h.n)
+                : 1.0;
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                 * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL);
+                 * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
         }
 
         switch (m.type) {
@@ -481,9 +496,24 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 break;
             }
             case MatType::Glossy: {
+                // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE). The gather ray folds
+                // the VISIBLE point's reflectance into everything it reports, so `rhoV`
+                // multiplies the connection exactly as it multiplies the emission above.
+                // Taken before `thr *= r`: the connection carries `r` inside bsdfF.
+                if (gneeOn) {
+                    const double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
+                    const BackwardRenderer::NeeBsdf nb{&m, ray.d * -1.0};
+                    L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                         * (thr * rhoV * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng,
+                                                        nullptr, BackwardRenderer::GiCtx{}, nullptr, nullptr, &nb));
+                }
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return L;
+                if (gneeOn) {
+                    gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
+                    gmis.from = h.p;
+                }
                 ray = Ray{h.p + h.n * 1e-6, o};
                 break;
             }
@@ -619,7 +649,16 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     // its own geometry.
     const bool grinAny = grin::sceneHasGrin(scene);
 
+
+    // GLOSSY-NEE. `bwNee` is the shared direct-lighting estimator (its `neeLight` is what the
+    // final gather already uses); `gmis` carries the lobe density of a glossy continuation to
+    // whichever emitter site it reaches, and is cleared at the top of every bounce so a mirror
+    // or a dielectric can never inherit one and halve the emission behind it.
+    BackwardRenderer bwNee; bwNee.diffraction = diffraction;
+    const bool gneeOn = BackwardRenderer::glossyNeeOn();
+    BackwardRenderer::GlossyMis gmis;
     for (int b = 0; b < maxBounce; ++b) {
+        gmis.clear();
         const int    cmIdx  = stk.topMat();
         const double aGlass = (cmIdx >= 0) ? scene.mats[cmIdx].absorb(lambda) : 0.0;
         // Curved pre-pass. The volume estimator runs PER STRAIGHT SUB-SEGMENT of the curve:
@@ -678,7 +717,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             // the map / NEE already credited with the sun.
             if (scene.sunCount > 0)
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                     * (thr * scene.sunRadiance(ray.d, lambda) * invPdfL);
+                     * (thr * bwNee.sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfL);
             return L;
         }
         const Material* mp = &scene.mats[h.matId];
@@ -705,8 +744,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         // taken and the grid vanished) — two mode-M paths disagreeing with each other and
         // both disagreeing with modes R and D. Measured on scraps/mini_grid.ftsl.
         if (m.isLight && dot(ray.d, h.ng) < 0.0) {
+            const double wMis = (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the sub-walk
+                ? bwNee.glossyHitWeight(scene, gmis,
+                        BackwardRenderer::emitterIndexForMat(scene, h.matId), ray.d, &h.p, &h.n)
+                : 1.0;
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                 * (thr * emitSlot(scene, m, h, lambda) * invPdfL);
+                 * (thr * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
         }
 
         switch (m.type) {
@@ -782,9 +825,22 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             }
             case MatType::Glossy: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
+                // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE). See backward.h's twin
+                // for why this is MIS and not the single-estimator split the rest of mode M's
+                // walk uses: a glossy lobe can be narrower than the light as easily as wider.
+                if (gneeOn) {
+                    const BackwardRenderer::NeeBsdf nb{&m, ray.d * -1.0};
+                    L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                         * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng,
+                                                 nullptr, BackwardRenderer::GiCtx{}, nullptr, nullptr, &nb));
+                }
                 thr *= r;
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return L;
+                if (gneeOn) {
+                    gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
+                    gmis.from = h.p;
+                }
                 ray = Ray{h.p + h.n * 1e-6, o};
                 break;
             }

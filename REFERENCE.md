@@ -5370,6 +5370,39 @@ light.
 | `-light-samples <n>` | Cap on how many emitters one vertex may connect to (default `8`). `1` is the cheapest, pure importance-sampled selection; raising it trades time for less selection noise. Emitters with no usable spatial bound (a distant sun, an environment light) sit outside the tree and are always connected, on top of this budget. |
 | `-light-split <v>` | Adaptive-splitting threshold, as `(node radius / distance)²` (default `1.0`). A node subtending more than this is traversed into **both** children instead of choosing one, which is what stops a nearby cluster of lights from being resolved by a single random pick. Raising it selects more aggressively (faster, noisier); `0` disables splitting; a very large value degenerates back to the all-emitters estimator. |
 
+**Glossy next-event estimation** — a rough metal is the one common material whose light the
+renderer used to find only *by accident*. A `glossy` lobe is a power cosine about the mirror
+direction with solid angle `≈ 2π/(e+1)`, `e = 2/roughness² − 2` — 0.104 sr at `roughness 0.18`,
+0.0079 sr at the metal presets' default 0.05 — and until 0.266.0 no unidirectional mode
+connected such a vertex to a light: it multiplied by the reflectance and walked on, so a
+`light sun { angle 0.53 }` (a disc of **6.8e-5 sr**) was collected only when a lobe sample
+happened to land inside it. Odds of about 1 in 1500 for the gold case, 1 in 115 for chrome, with
+every hit arriving as a spike that many times the mean. On `gallery_rain` that cost the gold
+gyroid **64 %** of its energy and the chrome ring **91 %** at ~120 spp — in mode `R` exactly as
+much as in mode `M`, since both used the same estimator. (Modes `D`/`J`/`U` were never affected;
+BDPT has always connected glossy vertices.)
+
+Glossy vertices now connect, weighted against the lobe-sampling strategy by the **balance
+heuristic** rather than replaced by it — because unlike a diffuse vertex a glossy lobe can be
+much *narrower* than the light (the same scene's 20 m × 14 m sky panel), so neither strategy
+wins everywhere. Measured on `scenes/_spec_repro_sun.ftsl` (four spheres under a real solar
+disc, anchored to mode `D`): the gold sphere goes from **−6.3 % to −0.1 %** in mode `R` and
+**−3.8 % to −1.1 %** in mode `M`, the diffuse control does not move, and mode `M`'s worst
+firefly drops from 2486× the mean to 1623×.
+
+| Flag | Meaning |
+|---|---|
+| `-no-glossy-nee` | Restore the pre-0.266 estimator exactly — rng draw order included, so it is a valid same-binary A/B arm. Use it to measure what the connection is buying, or to check that a difference you are chasing is not this. |
+| `-glossy-nee` | Force it back on (it already is — for overriding an earlier `-no-glossy-nee` in a shared argument list). |
+
+The connection is made only for emitters whose light-tree **selection probability is exactly 1**
+— the all-emitters draw (one light, `-no-lighttree`, mode `W`) and the emitters that sit outside
+the tree because they have no usable spatial bound, which is where a distant `light sun` lives.
+Both halves of the MIS weight consult the same predicate, so they cannot disagree; a
+tree-selected emitter keeps exactly the old estimator, which is unbiased, just as slow as it was.
+Reversing `ltSample`'s adaptive splitting into a selection *density* is what would lift that, and
+is logged in `known-issues.md` → **GLOSSY-NEE**.
+
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
 the composite `P`, and the photon modes `M`/`S`/`U`), on both CPU and GPU. `-resume` /
