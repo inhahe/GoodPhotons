@@ -556,6 +556,63 @@ are the reverse on surfaces. So there is currently no single best mode for `gall
 this entry plus mode `J`'s volume residual (its X-channel part was `UPBP-CHROMA`, fixed in 0.259.3; the colour-neutral remainder is UPBP-CONV / UPBP-W) are the two things standing between the engine
 and one.
 
+
+**Attempted and REVERTED (2026-09-07, on 0.261.1): the covariance-ellipse footprint. The
+photon cloud cannot tell geometry from illumination, and that is fatal to the whole family of
+photon-statistic fixes.** The obvious form of option (2) above was implemented on both host and
+device — during the query, accumulate the accepted photons' tangent-plane moments, and scale the
+disc normalisation by `disc / (4π√det Σ)`, the covariance-ellipse footprint (exact for a
+uniformly filled disc or ellipse, within ~6 % for a half disc or a strand), clamped to [1, 64],
+skipped under 8 photons. On `gallery_rain` (`-camera cam -r 640 360 -mode M -beams`, 900 s per
+variant, luminance-mean deviation per ROI from the mean of the five mode-`R` anchors, anchor
+seed spread in brackets) it did exactly what it was designed to do on truncated geometry — and
+an equal amount of damage elsewhere:
+
+| element | disc (before) | ellipse | + truncation gate | anchor spread |
+|---|---|---|---|---|
+| `cap_gyroid` | −33.3 % | **−3.4 %** | −11.8 % | [0.3 %] |
+| `alice_dress` | −38.4 % | **+7.4 %** | −20.2 % | [0.9 %] |
+| `alice_hair` | −69.6 % | **−4.3 %** | −28.3 % | [0.5 %] |
+| `klein` | +0.9 % | **+16.1 %** | +6.0 % | [0.4 %] |
+| `creature` (fur) | +13.9 % | **+135.7 %** | +41.7 % | [1.4 %] |
+| `grid_ground` | +0.3 % | **+2.2 %** | +1.6 % | [0.4 %] |
+| `cloud`, `cloud_base`, `rain_column`, `rainbow` | ±0.2–4.7 % | within noise | within noise | [0.6–2.7 %] |
+
+A second round gated the correction on a *truncation signature* — anisotropy (σ_major ≥ 2 σ_minor)
+or an off-centre cloud (|μ| ≥ 0.2 r), plus σ_major ≥ 0.3 r — reasoning that a half disc's
+centroid sits 4r/3π ≈ 0.42 r off-centre and a strand is anisotropic. It softened both columns
+(third column above) instead of separating them: it is a weaker correction everywhere, not a
+correction that fires only where it belongs.
+
+**Why no photon statistic can work**, from the per-material instrumentation (a 150 s
+`gallery_rain` render dumping, per material, the mean σ_major/r, σ_minor/r, |μ|/r, gate-fire
+rate, applied ratio, and the accepted photons' normal agreement |mean n|):
+
+* `gridground` is a **flat plane** — `|mean n| = 1.000`, the strongest possible "no truncation"
+  signal — and the gate still fires on **35 %** of its gathers with mean ratio 1.18. The floor is
+  a *striped emissive grid*: the photons lie in stripes because the LIGHT is striped, and a
+  covariance fit cannot know that.
+* Normal dispersion, the last candidate discriminator, does not separate the two populations
+  either: `alice` (mat 45) sits at `|mean n| = 0.860` and is where the correction is a big win,
+  while `creature`'s fur (mats 38–41) sits at 0.798–0.830 and is where it is a big loss.
+
+The information needed — *how much same-facing surface area lies within `r` of the gather point*
+— is a property of the GEOMETRY, and the photons only ever report the product of that with the
+illumination. So the correct fix is a geometric footprint: a BVH sphere query at the gather
+point, each same-facing primitive clipped to the tangent-plane disc and its area summed (cacheable
+per primitive, and only worth doing when the gather is near a silhouette or a small-feature
+primitive). The `k`-nearest-photon local radius is NOT a substitute — it adapts to photon
+density, which is the illumination we are trying to measure, so it would flatten exactly what the
+estimate is for.
+
+What stands: the darkening is real and one-sided (−33 % on a cap edge, −70 % on hair), the
+direction of the correction was right on every truncated element, and a correct footprint should
+recover 30–65 % there. The experiment lives in `scraps/fix_gatherarea.py`,
+`scraps/fix_gatherarea2.py` and the instrumentation in `scraps/fix_gadbg*.py`; the measurements
+are `scraps/gatherarea_check_v1.log` (ellipse), `scraps/gatherarea_check.log` (gated) and
+`scraps/gadbg.log` (per-material clouds).
+
+
 ### M-FROZEN — FIXED (2026-09-05, v0.252.0 + v0.253.0): mode `M` showed **coloured bars through the rain and cloud that got worse the longer it rendered**, because its photon / caustic / beam maps were built once and every camera sample gathered from that one realization
 
 **Symptom, as reported.** "The view for the ftrace instance that was running mode M on
