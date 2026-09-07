@@ -16163,35 +16163,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // rather than claiming a single "on N CPU threads" that would be a lie about half the
         // render.
         //
-        // ...with ONE exception, and it is a correctness gate rather than a missing feature:
-        // `-jsurf` (the point x point merges folded in from mode U) has no device twin. The
-        // kernel's DBeamMis carries a single merge kind, so a GPU run would not merely skip
-        // the surface merges — it would also under-weight the BEAM ones, whose denominator
-        // has to include the point-merge terms to sum to one. Silently rendering a different
-        // (and wrong) estimator on one backend is exactly the failure mode this codebase
-        // refuses, so the flag forces the CPU and says so. Lift this when the surface map is
-        // ported (render_cuda.cu's host->device BeamMis copy has the marker).
-        if (g_jSurf && useGpu) {
-            // Decided HERE, before the light pass: the device merge weight carries one merge
-            // kind, so a GPU run must not deposit surface photons at all (a light pass that did
-            // would under-weight the beam merges in the device gather). The default (on since
-            // 0.260.0) yields to the two-technique estimator on the GPU; an explicit -jsurf is a
-            // request for the three-way one and forces the CPU. UPBP-VM tracks the device twin.
-            if (g_jSurfExplicit) {
-                std::fprintf(stderr, "[device] mode J: -jsurf (surface point merges) is CPU-only "
-                                     "— the device merge weight carries one merge kind. Using the "
-                                     "CPU; pass -nojsurf to render the beams-only estimator on "
-                                     "the GPU.\n");
-                useGpu = false;
-            } else {
-                std::fprintf(stderr, "[device] mode J on the GPU renders the two-technique "
-                                     "estimator (connections + beam merges): the surface point "
-                                     "merges that are on by default on the CPU have no device twin "
-                                     "yet (known-issues UPBP-VM). Pass -jsurf to force the CPU "
-                                     "three-way estimator.\n");
-                g_jSurf = false;
-            }
-        }
+        // Since 0.263.0 there is no exception left: `-jsurf`'s point x point merges have a
+        // device twin (dSurfMergeAt), and the device weight carries both merge kinds, so the
+        // two backends render the SAME three-technique estimator rather than the GPU quietly
+        // rendering a two-technique one.
         const std::string camWhere =
             useGpu ? std::string("GPU") : (std::to_string(nThreads) + " CPU threads");
         // The merge half needs a beam map, and a beam map needs media. A media-free scene
@@ -16479,7 +16454,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // ones (their denominator would be missing the point-merge terms). The gate is
             // above, at `useGpu`, rather than a comment here — see the -jsurf block.
             if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth,
-                                              diffraction, p, g_heroC, beamsPtr, &stageProg);
+                                              diffraction, p, g_heroC, beamsPtr, &stageProg,
+                                              photonsPtr);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {

@@ -12722,6 +12722,76 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     return L * mis;
 }
 
+// ---- mode J's point x point merges on the device (`-jsurf`) --------------------------------
+// Device twin of surfmerge.h's vmGatherCorr: the density estimate reads flux per GEOMETRIC
+// area while every strategy it is MIS-combined with integrates against the SHADING cosine.
+// Exactly 1 on flat geometry.
+__device__ static inline double dVmGatherCorr(const DVec3& wp, const DVec3& ns, const DVec3& ng) {
+    const double den = fabs(ddot(wp, ng));
+    if (den <= 1e-8) return 1.0;
+    return fabs(ddot(wp, ns)) / den;
+}
+
+// Device twin of bdpt.h's SurfMergeWeight. Every field is a constant of the GATHER SITE, so it
+// is built once per camera vertex and the per-photon call is the three lines at the bottom.
+struct DSurfMergeW {
+    double kappaB = 0.0, kappaS = 0.0;
+    double invPdfFwdK = 1.0, gateD1 = 0.0, cosPrev = 1.0, invDistPrev2 = 0.0;
+    double invPdfFwdKm1 = 1.0, etaKm1Coef = 0.0, segSumC = 0.0, segSumM = 0.0;
+    int camVert = 0, maxDepth = 0;
+
+    __device__ double operator()(const DSurfMis& lm, double pdfDirRev, double pdfDirFwd) const {
+        if ((int)lm.vert + camVert > maxDepth) return 0.0;   // merge depth is j + k here
+        const double etaS = kappaS * lm.pdfFwdA;
+        if (!(etaS > 0.0)) return 0.0;
+        const double R  = pdfDirRev * (double)lm.rCoef;
+        const double D1 = dMisRemap0(lm.pdfFwdA) * invPdfFwdK;
+        const double pdfRevKm1 = pdfDirFwd * cosPrev * invDistPrev2;
+        const double D2 = pdfRevKm1 * invPdfFwdKm1;
+        const double den = (double)lm.gateC1
+                         + R * (lm.sumC + kappaB * lm.sumMb + kappaS * lm.sumMs)
+                         + etaS
+                         + D1 * (gateD1 + etaKm1Coef * pdfRevKm1 + D2 * (segSumC + segSumM));
+        if (!(den > 0.0)) return 0.0;
+        return etaS / den;
+    }
+};
+
+// One camera vertex's gather. Mirrors SurfMap::query's 3x3x3 walk EXACTLY -- same clamped cell
+// coordinate, same dense index, same `<= r^2` test -- because the map was binned by that rule on
+// the host and a second transcription of it is a second chance to disagree.
+__device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const DVertex& vk,
+                                    const DVec3& woCam, const DSurfMergeW& sw,
+                                    double& gX, double& gY, double& gZ) {
+    const double r2 = (double)sm.radius * (double)sm.radius;
+    const int ix = (int)fmin(fmax(floor(((double)vk.p.x - (double)sm.lo.x) / (double)sm.cell), 0.0), (double)(sm.nx - 1));
+    const int iy = (int)fmin(fmax(floor(((double)vk.p.y - (double)sm.lo.y) / (double)sm.cell), 0.0), (double)(sm.ny - 1));
+    const int iz = (int)fmin(fmax(floor(((double)vk.p.z - (double)sm.lo.z) / (double)sm.cell), 0.0), (double)(sm.nz - 1));
+    const DVec3 ngo = (ddot(vk.ng, vk.ns) >= 0.0) ? vk.ng : DVec3{-vk.ng.x, -vk.ng.y, -vk.ng.z};
+    for (int dz = -1; dz <= 1; ++dz) { const int cz = iz + dz; if (cz < 0 || cz >= sm.nz) continue;
+    for (int dy = -1; dy <= 1; ++dy) { const int cy = iy + dy; if (cy < 0 || cy >= sm.ny) continue;
+    for (int dx = -1; dx <= 1; ++dx) { const int cx = ix + dx; if (cx < 0 || cx >= sm.nx) continue;
+        const long long c = ((long long)cz * sm.ny + cy) * sm.nx + cx;
+        for (int q = sm.cellStart[c]; q < sm.cellStart[c + 1]; ++q) {
+            const int idx = sm.order[q];
+            const DSurfPhoton& ph = sm.pts[idx];
+            const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
+            if (ddot(dd, dd) > r2) continue;
+            const DSurfMis& lm = sm.mis[ph.misIdx];
+            const Real lam = (Real)ph.lambda;
+            double fCam = dBsdfF(sc, vk, woCam, ph.wo, lam);
+            if (!(fCam > 0.0)) continue;
+            fCam *= dVmGatherCorr(ph.wo, vk.ns, ngo);
+            const double pdfDirRev = dBsdfPdf(sc, vk, woCam, ph.wo, lam);
+            const double pdfDirFwd = dBsdfPdf(sc, vk, ph.wo, woCam, lam);
+            const double w = sw(lm, pdfDirRev, pdfDirFwd);
+            if (!(w > 0.0)) continue;
+            const double cf = w * fCam * (double)ph.beta;
+            gX += (double)ph.cx * cf; gY += (double)ph.cy * cf; gZ += (double)ph.cz * cf;
+        }
+    }}}
+}
+
 // BDPT megakernel: one thread renders one (pixel,sample), grid-stride over all
 // res*res*spp samples. t>=2 connections land on the sample's own pixel (camFilm);
 // t==1 splats land on the projected raster pixel (splatFilm). Both are normalised by
@@ -13051,6 +13121,55 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                         atomicAdd(&camFilm[o + 0], mX * sg.beta);
                         atomicAdd(&camFilm[o + 1], mY * sg.beta);
                         atomicAdd(&camFilm[o + 2], mZ * sg.beta);
+                    }
+                }
+            }
+
+            // ---- POINT MERGES (`-jsurf`): the half folded in from mode U ------------------
+            // Per VERTEX, not per segment -- a point merge happens where the camera walk
+            // actually landed, so there is no ray to march and no rng draw, which is also why
+            // "merges off == mode D bit-for-bit" survives this for free.
+            if (kappaSurf > 0.0 && sm.nPts > 0) {
+                const double vmNorm = 1.0 / kappaSurf;
+                for (int k = 1; k < nE; ++k) {
+                    const DVertex& vk = eye[k];
+                    if (!dSurfMergeSite(sc, vk) || !(vk.beta > 0.0)) continue;
+                    const DVertex& vp = eye[k - 1];
+                    DVec3 woCam{vp.p.x - vk.p.x, vp.p.y - vk.p.y, vp.p.z - vk.p.z};
+                    const double d2 = ddot(woCam, woCam);
+                    if (!(d2 > 0.0)) continue;
+                    const double invD = 1.0 / sqrt(d2);
+                    woCam = woCam * (Real)invD;
+                    DSurfMergeW sw;
+                    sw.kappaB       = mergeKappa;
+                    sw.kappaS       = kappaSurf;
+                    sw.invPdfFwdK   = 1.0 / dMisRemap0(vk.pdfFwd);
+                    sw.gateD1       = vp.delta ? 0.0 : 1.0;
+                    sw.cosPrev      = dOnSurface(vp) ? fabs(ddot(vp.ns, woCam)) : 1.0;
+                    sw.invDistPrev2 = 1.0 / d2;
+                    sw.invPdfFwdKm1 = 1.0 / dMisRemap0(vp.pdfFwd);
+                    // The merge AT eye[k-1], less its pdfRev. pLight = 1 turns the primed eta
+                    // into the bare coefficient, which is legitimate HERE (and not in the beam
+                    // gather) because both of eye[k-1]'s neighbours are known: the merge site
+                    // is eye[k] itself, so there is no per-photon geometry.
+                    sw.etaKm1Coef   = 0.0;
+                    if (k >= 2) {
+                        sw.etaKm1Coef = mergeKappa * dMergeEtaPrime(sc, vk.p, vp, eye[k - 2].p,
+                                                                    1.0, lambda, dPatEnvOf(sc));
+                        if (dSurfMergeSite(sc, vp)) sw.etaKm1Coef += kappaSurf;
+                    }
+                    sw.segSumC      = (k - 1 < (int)SEGN) ? segSumC[k - 1] : 0.0;
+                    sw.segSumM      = (k - 1 < (int)SEGN) ? segSumM[k - 1] : 0.0;
+                    sw.camVert      = k;
+                    sw.maxDepth     = maxDepth;
+                    double gX = 0.0, gY = 0.0, gZ = 0.0;
+                    dSurfMergeAt(sc, sm, vk, woCam, sw, gX, gY, gZ);
+                    if (gX != 0.0 || gY != 0.0 || gZ != 0.0) {
+                        const double f = vk.beta * vmNorm;
+                        const size_t o = ((size_t)py * resX + px) * 3;
+                        atomicAdd(&camFilm[o + 0], gX * f);
+                        atomicAdd(&camFilm[o + 1], gY * f);
+                        atomicAdd(&camFilm[o + 2], gZ * f);
                     }
                 }
             }
