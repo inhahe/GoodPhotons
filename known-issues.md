@@ -578,13 +578,38 @@ the volumetrics `cloud_base` +2.9 % / `cloud` −5.1 % / `cloud_limb` −0.1 %, 
 −1.7 %. A global normalisation error would have moved those too, so the whole-frame −22 % (−34 %
 on the masked mean) is a *sum of two localised defects*, not one scale factor.
 
-**What this does NOT yet establish.** Mode `M` is biased by construction (a finite gather
-radius), so a gap to `R` is expected; the open question is whether 34 % is that expected bias or
-a defect. Three things would decide it, none of them done: (a) shrink the radius (`-pmradius`)
-and watch whether the gap closes proportionally — a consistent estimator's gap must go to zero;
-(b) split the comparison by element with `scraps/gallery_rain.rois`, since the campaign anchors
-already exist and would say *where* the energy is missing; (c) check mode `S` (SPPM), which
-shrinks its radius per pixel and should converge to `R` if the estimator is sound.
+**Measurement (a) is in, and it rules out the gather radius (2026-09-07).** A consistent
+estimator's finite-radius bias must shrink as the radius does. Swept `-pmradiusfrac` over a
+factor of **8** (0.02 → 0.0025), 300 s each, same reference:
+
+| element | 0.02 | 0.01 | 0.005 | 0.0025 |
+|---|---|---|---|---|
+| `gyroid` (gold, glossy metal) | −92.7 % | −92.6 % | −92.8 % | −92.7 % |
+| `gem_diamond` (crystal) | −45.4 % | −45.8 % | −45.3 % | −45.2 % |
+| `glass_orb` (dielectric) | −40.2 % | −39.9 % | −40.5 % | −40.0 % |
+| `cap_gyroid` (textured diffuse) | −32.5 % | −33.9 % | −32.7 % | −28.8 % |
+| `grid_ground` (flat diffuse — control) | +0.8 % | +1.2 % | +0.9 % | +1.5 % |
+
+**Not one of them moves.** The deficit is radius-independent to within noise across an 8×
+change, while the diffuse control stays correct throughout. So mode `M` is not *blurring* this
+energy — it is not collecting it, and **M-GATHERAREA is not the explanation for these
+elements**, whatever it explains elsewhere (its own targets, `alice_hair` and `alice_dress`, are
+not in this sweep).
+
+**What the three worst have in common is that they are specular**, which the ROI comments make
+explicit: `gyroid` is "gold gyroid, the central piece" (a glossy metal, `preset gold roughness
+0.18`), `glass_orb` is "solid glass orb", `gem_diamond` is "crystal gyroid". Every element that
+reads correctly is diffuse or volumetric.
+
+**It is not a missing case in the code.** `photonmap_render.h`'s gather walk handles both:
+`MatType::Glossy` multiplies by the reflectance and continues along a `sampleGlossy` direction,
+`MatType::Dielectric` does the full nested-priority refraction. So the paths exist and are
+followed; what is wrong is quantitative, not structural, and the next step is a **minimal
+reproduction** — a glossy sphere and a dielectric sphere over a diffuse floor under one light,
+where `M` and `R` can be compared without a 13-exhibit scene in the way. That isolates whether
+the loss is in the glossy weighting (`thr *= reflectSlot` alone, which is only correct if
+`sampleGlossy` importance-samples the lobe exactly), in the walk's bounce budget, or in
+something the dielectric path does on exit.
 
 **Where it bites:** `src/photonmap_render.h` (the estimate and its normalisation),
 `scenes/gallery_rain.ftsl`, `scraps/mbeamk.log` and `scraps/mbias.log` (the measurements).
