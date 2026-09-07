@@ -5209,6 +5209,7 @@ struct DBeamMap {
     // property of the MAP (nEmitted x radRef), so it travels with the map rather than as a
     // separate kernel argument that could be forgotten at one of the call sites.
     double          mergeKappa = 0.0;
+    double          sinMin = 0.0;   // twin of BeamMap::sinMin (`-beamsinmin`); 0 = unbounded
 
     // The MIS partials of sub-beam `i`, or null when the map carries none.
     __device__ const DBeamMis* misOf(int i) const {
@@ -5412,7 +5413,10 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         // 1D Epanechnikov kernel, normalised so its integral over [-r, r] is 1.
         const double kk = 1.0 - x2;
         const double K1 = 0.75 * (double)b.invRad * kk;
-        const double sinT = (double)sqrt((double)den);
+        // Bounded at `bm.sinMin` (`-beamsinmin`, UPBP-CONV (3)): the same clamp the host applies
+        // in BeamMap::hitBeam, and applied at the same place -- before the MIS weight below
+        // reads it -- so the technique and its pdf stay one function.
+        const double sinT = fmax((double)sqrt((double)den), bm.sinMin);
         double w = K1 / sinT * ss * phase;
         // MIS (mode J); exactly absent in mode M. `dens` and `phase` are handed over
         // rather than recomputed: the merge weight needs sigma_t(x) and the phase
@@ -16788,6 +16792,7 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
         if (!bmap->misIdx.empty())
             dbm.misIdx = (const int*)up.keep(uploadVec(bmap->misIdx));
         dbm.mergeKappa = (double)bmap->nEmitted * 2.0 * bmap->radRef();
+        dbm.sinMin = bmap->sinMin;
     }
     double rlo = bmap->radius;
     for (float rm : bmap->radMed) if (rm > 0.f) rlo = std::min(rlo, (double)rm);

@@ -594,6 +594,10 @@ struct BeamHit {
 // occlusion traversal into "visit every intersected leaf primitive" — exactly the all-hits
 // traversal a density estimate needs, with no new traversal code to keep in sync.
 struct BeamMap {
+    // Lower bound on the sin(theta) of a beam x ray merge -- see hitBeam. 0 = unbounded (the
+    // literal estimator); a small positive value trades a bounded bias at grazing angles for a
+    // bounded contribution. Set from `-beamsinmin`.
+    double sinMin = 0.0;
     std::vector<PhotonBeam> beams;
     std::vector<Vec3>       cie;      // per-beam CIE XYZ at beams[i].lambda, precomputed by
                                       // build() for the same reason PhotonMap::cie exists:
@@ -1205,7 +1209,12 @@ struct BeamMap {
         if (d2 >= r * r) { beamDiag().bump(beamDiag().rejR); return false; }
         out.idx = i; out.tCam = t; out.sBeam = s;
         out.dPerp = std::sqrt(d2);
-        out.sinT = std::sqrt(den); out.cosT = cosT;
+        // sin(theta) is the 1D-blur Jacobian's DENOMINATOR, so it is also the estimator's
+        // singularity: a beam parallel to the camera ray gives an unbounded contribution
+        // (UPBP-CONV (3)). `sinMin` bounds it. Clamping HERE and not at the estimator is
+        // deliberate -- the MIS weight (bdpt.h, etaS) reads the same `bh.sinT`, so the
+        // technique and the pdf it is weighted by stay the same function.
+        out.sinT = std::max(std::sqrt(den), sinMin); out.cosT = cosT;
         return true;
     }
 

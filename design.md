@@ -1007,6 +1007,8 @@ for the merges to rescue. Mode `J` also inherits the beam×ray estimator's `1/si
 its peak pixel is ~1.9× mode `D`'s on the same scene: brighter fireflies, in exchange for reaching
 paths mode `D` cannot.
 
+  **The `1/sinθ` singularity is bounded now (0.262.0, `-beamsinmin`, default 0.3).** The beam×ray kernel's Jacobian denominator is `sinθ` between the camera ray and the beam, so a near-parallel merge contributes without bound — and the MIS weight does not suppress it, because such a configuration is genuinely one the connections sample badly and the balance heuristic correctly hands the merge a large weight. It is clamped where `sinθ` is *computed* (`BeamMap::hitBeam`; `dBeamHitEval` on the device), not at the estimator, because the MIS weight reads the same value — so the merge stays one function, a technique whose kernel saturates at grazing angles, rather than an estimator weighted by a pdf it no longer has. Measured on `_fog_thick` at 180 s: no resolvable bias (−0.61 % of the image mean against the unbounded estimator's own −0.57 %), worst pixel 4350× → 1690× the reference, mean relative squared error 1.219 → 0.836, and no cost in samples. `-beamsinmin 0` restores the literal estimator; past ~0.5 the bias is real, and at 1.0 the Jacobian is gone (−12 %).
+
 **And on a thick medium (0.219.1) — the merges work, the estimator is too expensive.** Measured on
 `scenes/_fog_thick.ftsl` (`sigma_t 20 / albedo 0.95`) against a converged mode-`D` reference, mode
 `J`'s **per-sample** variance is **2.4–8.8× lower** than mode `D`'s, and the margin *grows* with

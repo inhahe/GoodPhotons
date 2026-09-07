@@ -12136,6 +12136,13 @@ static bool      g_beamFreeze    = false;
 // ~2.6 %, mode M ~0.35 % — both are dominated by the gather, see UPBP-CONV), so a 10 % budget
 // affords many rebuilds without being felt.
 static double    g_beamRefreshFrac = 0.10;
+// UPBP-CONV (3): lower bound on a merge's sin(theta) -- the beam x ray kernel's Jacobian
+// denominator, and its singularity. 0 = the literal, unbounded estimator. The default 0.3 (the
+// clamp binds when a beam lies within ~17.5 deg of the camera ray) is measured, not chosen: on
+// _fog_thick at 180 s it costs -0.61 % of the image mean against the unbounded estimator's own
+// -0.57 % -- no resolvable bias -- while cutting the worst pixel from 4350x to 1690x the
+// reference and the mean relative squared error from 1.219 to 0.836. See BeamMap::sinMin.
+static double    g_beamSinMin    = 0.3;
 static long long g_beamSplitMax  = 8000000;
 static double    g_beamSplitLen  = 0.0;
 
@@ -12250,6 +12257,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
         return out;
     };
     const size_t splitBudget = g_beamSplitMax > 0 ? (size_t)g_beamSplitMax : 0;
+    bm.sinMin = g_beamSinMin;   // UPBP-CONV (3): the 1/sin(theta) bound, on both build paths
     if (g_beamRadiusAbs > 0.0) {
         // Explicit radius: one value for every medium, but still split by the same
         // area-optimal rule buildAuto uses. The rule keys off the radius, so an explicit one
@@ -17604,6 +17612,7 @@ static void printHelp(const char* prog) {
 "                        -n and -spp genuinely reduce volume noise (before 0.201.0 the radius\n"
 "                        was sized to a fixed gathered count, i.e. r ~ 1/n, and they did not)\n"
 "  -beamk <k>            FLOOR on mode-M beams gathered per camera segment (default 32).\n"
+"  -beamsinmin <v>       bound a beam x ray merge's 1/sin(theta) at 1/v (default 0.3; 0 = unbounded).\n"
 "                        Scales the radii up only if a sparse map would gather fewer, which\n"
 "                        is what stops a thin volume rendering as individual streaks\n"
 "  -beamareaslack <f>    ceiling: fraction by which the kernel may inflate the total sub-beam\n"
@@ -18775,6 +18784,7 @@ static int run(int argc, char** argv) {
             g_jSurf = true;      // naming the ceiling is asking for the merges
         }
         else if (!std::strcmp(argv[i], "-beamk") && i + 1 < argc) g_beamK = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamsinmin") && i + 1 < argc) g_beamSinMin = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamblur") && i + 1 < argc) g_beamBlur = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamareaslack") && i + 1 < argc) g_beamAreaSlack = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamsplitmax") && i + 1 < argc) g_beamSplitMax = (long long)std::atof(argv[++i]);

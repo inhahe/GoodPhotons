@@ -1544,12 +1544,45 @@ What *can* decouple coverage from cost is already in the renderer: **the light s
 
 **The wave schedule, settled by measurement (0.261.1).** A wave is a contiguous range of sample indices — a horizontal band of the image — and its size is chosen so the densest band it covers fills ~70 % of the hit queue. Three things were measured, each as a **same-binary alternating A/B** (this machine drifts up to 8 % over an evening, so cross-binary readings taken hours apart are worthless — an earlier round of them showed a 3–8 % "regression" that does not exist): (a) sizing every wave from the previous chunk’s **per-band profile**, and carrying that profile across the progressive loop’s epochs, beats 0.261.0’s relearn-from-4096-each-chunk by **+2.2 %** on `_fog_thick` (4534 vs 4434 spp/60 s), with waves 36 % larger (65 k vs 48 k paths) and 0.727 vs 0.753 ms per 1000 paths; (b) the **carry across epochs** is what keeps a dense map out of the on-the-spot path — `_fog_cornell` 128² spills **28.2 M hits without it and none with it**, at the same 21 spp — and is worth +0.6 % on `_fog_thick`; (c) **stratified** waves (`FTRACE_WFSTRAT=1`, 32-pixel runs permuted by a golden-ratio stride, so every wave samples the whole image) make the size estimate exact — `_fog_cornell` 256² spill 59 M → 8.4 M — but cost ~7 % of `_fog_thick`’s paths, because a `kWfBeamHits` warp then holds 32 segments from maximally unlike paths and diverges in the beam-tree walk. Bands win; the stride stays as the diagnostic. The render prints where its seconds went (`[gpu] mode J wave loop:`), and `FTRACE_WAVE_DEBUG=1` one line per wave.
 
-**(3) Mode `J` fireflies harder than mode `D`.** Peak pixel 3.13e13 against 1.61e13 on the same
-scene — the beam×ray estimator's `1/sin(theta)` factor is unbounded as a beam becomes parallel to
-the camera ray, and the MIS weight does not suppress it (a near-parallel merge is *also* a
-technique the connections sample badly, so the balance heuristic correctly gives it a large
-weight). UPBP's own paper handles this; ftrace does not yet. The standard remedy is to cap the
-merge contribution or to fold a `sin(theta)`-aware term into the kernel.
+**(3) Mode `J` fireflies harder than mode `D` — FIXED (2026-09-07, v0.262.0, `-beamsinmin`).**
+Peak pixel 3.13e13 against 1.61e13 on the same scene — the beam×ray estimator's `1/sin(theta)`
+factor is unbounded as a beam becomes parallel to the camera ray, and the MIS weight does not
+suppress it (a near-parallel merge is *also* a technique the connections sample badly, so the
+balance heuristic correctly gives it a large weight).
+
+**The fix is the standard UPBP one, bounding the kernel, and it is applied where `sin(theta)` is
+COMPUTED** — `BeamMap::hitBeam` on the host, `dBeamHitEval` on the device — rather than at the
+estimator, because the MIS weight (`bdpt.h`, `etaS`) reads the same value: clamping at the source
+keeps the technique and the pdf it is weighted by one function, so the merge simply becomes a
+technique whose kernel saturates at grazing angles. `-beamsinmin <v>`, default **0.3** (the clamp
+binds inside ~17.5° of the camera ray); `0` restores the literal estimator.
+
+The default is measured, not chosen. `_fog_thick` 128², `-beamk 8`, against the 600 s mode-`D`
+reference, Y channel:
+
+| `-beamsinmin` | mean relSE | trimmed 99.9 % | trimmed 99 % | median | worst pixel | mean bias |
+|---|---|---|---|---|---|---|
+| 0 (60 s) | 4.757 | 0.523 | 0.222 | 0.0233 | 21 200 | −1.38 % |
+| 0.03 (60 s) | 1.465 | 0.468 | 0.224 | 0.0232 | 4 850 | −2.23 % |
+| 0.30 (60 s) | 1.213 | 0.394 | 0.200 | 0.0219 | 3 090 | −1.85 % |
+| 0.50 (60 s) | 0.964 | 0.382 | 0.197 | 0.0247 | 2 000 | −3.47 % |
+| 1.00 (60 s) | 0.987 | 0.313 | 0.155 | 0.0387 | 2 740 | −13.15 % |
+| **0 (180 s)** | 1.219 | 0.312 | 0.174 | 0.0170 | 4 350 | **−0.57 %** |
+| **0.30 (180 s)** | **0.836** | **0.301** | 0.171 | 0.0168 | **1 690** | **−0.61 %** |
+| 1.00 (180 s) | 1.010 | 0.228 | 0.121 | 0.0293 | 3 190 | −11.99 % |
+
+At 180 s, where the image mean is resolved, **0.3 costs −0.61 % against the unbounded estimator's
+own −0.57 % — no resolvable bias** — while more than halving the worst pixel and improving every
+robust statistic as well; and it costs nothing in samples (7382 against 7389 spp / 60 s). Past
+~0.5 the bias becomes real (−3.5 %) and at 1.0 the Jacobian is gone altogether (−12 %), which is
+why the safe zone ends well below it.
+
+**What it does not fix:** on `_fog_cornell` (dense map, glass) the clamp is neutral — the peak
+pixel is 3.48e13 unclamped and 3.62e13 clamped, unmoved — so that scene's extremes come from
+somewhere else (a caustic path through the glass, or a surface merge), and finding them is its
+own investigation. CPU and GPU behave alike under the clamp: the GPU/CPU means on `_fog_thick`
+64² move from −1.93 / −1.03 / −3.69 % to −0.89 / +0.16 / −4.06 %, i.e. the pre-existing gap at
+2327 against 43 148 spp, not a new one.
 
 ### UPBP-THICK — FIXED (2026-09-04, v0.247.0): mode `J` had a **noise floor `-spp` could not touch**, frozen into a beam map built once. It now redraws the light side every epoch and averages, cutting the error spread **13×** at the same `-n` and the same wall clock
 
