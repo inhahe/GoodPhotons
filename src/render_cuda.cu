@@ -4821,6 +4821,7 @@ struct DBeamDep {
     float lambda;             // HERO wavelength (nm)
     float absorb;             // sigma_a of the enclosing dielectric (0 in air)
     int   med;                // index into DScene::media
+    int   bowEm;              // emitter index for the GATHER-time fold, or -1 (FOLD-GPU (2))
     // SPECTRAL BUNDLE (photonbeams.h). The stratified SECONDARY wavelengths this same chord
     // also carries; every wavelength in the bundle carries power/(nSec+1). Plain floats here,
     // unlike the packed form in the gather-side DBeamRec, because this buffer is at most
@@ -4858,9 +4859,12 @@ struct DBeamSpec {
     // scatters where the bundle cannot, which is the whole reason it exists — see the
     // measurement in known-issues.md, where the bundle reached ~1 beam in 278.
     //
-    // `cie` is the emitter's Emitter::cieMean, carried so the deposit needs no emitter index.
+    // `cie` is the emitter's Emitter::cieMean, so an ACHROMATIC-path deposit needs no emitter
+    // index -- but the GATHER-time fold does: its colour is a function of the scattering angle,
+    // read from a per-(emitter, medium) table at gather time. Two bytes, set at birth.
     DVec3 cie{0, 0, 0};
     int   achro = 0;
+    int   emIdx = -1;   // emitter this photon was born on; -1 = unknown (no gather-time fold)
 };
 
 // ---- AIMED CAUSTIC EMISSION (device twin of caim::AimMap, causticaim.h) ------------------
@@ -5892,13 +5896,28 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
             // crossing gallery_rain's achromatic cloud and its chromatic rainbow rain in the
             // same step deposits one beam of each kind, and only the cloud one may fold.
             const int achro = (spec && spec->achro && sc.media[i].achro) ? 1 : 0;
+            // GATHER-TIME FOLD (host twin: render.h's `bowEm`). The medium's coefficients are
+            // flat but its phase is a rainbow table, so `achro` above correctly refused the
+            // deposit-time fold -- the colour is not decidable without the scattering angle. It
+            // IS decidable at gather time from the bow table, provided the path carried no
+            // spectral weight of its own. Asking the uploaded offset table whether the pair has
+            // one keeps both backends' notion of "eligible" identical by construction.
+            int bowEm = -1;
+            if (!achro && spec && spec->achro && spec->emIdx >= 0 && sc.bow.tab &&
+                spec->emIdx < sc.bow.nEm && i < sc.bow.nMed &&
+                sc.bow.off[spec->emIdx * sc.bow.nMed + i] >= 0)
+                bowEm = spec->emIdx;
+            bd.bowEm  = bowEm;
             bd.achro  = achro;
-            bd.cieA[0] = achro ? (float)spec->cie.x : 0.f;
-            bd.cieA[1] = achro ? (float)spec->cie.y : 0.f;
-            bd.cieA[2] = achro ? (float)spec->cie.z : 0.f;
+            // `cieA` is the fallback colour for BOTH folds: the achromatic-path one uses it
+            // outright, and the gather-time one falls back to it wherever no table applies.
+            const int wantCie = (achro || bowEm >= 0) ? 1 : 0;
+            bd.cieA[0] = wantCie ? (float)spec->cie.x : 0.f;
+            bd.cieA[1] = wantCie ? (float)spec->cie.y : 0.f;
+            bd.cieA[2] = wantCie ? (float)spec->cie.z : 0.f;
             // The bundle is redundant against the mean it was approximating: suppress it so
             // the record's power is not also divided by nLam (photonbeams.h push()).
-            bd.nSec   = (spec && !achro) ? spec->n : 0;
+            bd.nSec   = (spec && !achro && bowEm < 0) ? spec->n : 0;
             for (int j = 0; j < 3; ++j) bd.lamS[j] = (j < bd.nSec) ? (float)spec->lam[j] : 0.f;
             cs.beamOut[k] = bd;
         }
@@ -7742,7 +7761,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
                                  int camMode, DRng& rng,
                                  DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted,
                                  DBeamSpec* spec = nullptr, Real* causticW = nullptr) {
-    if (spec) { spec->n = 0; spec->achro = 0; spec->cie = DVec3{0, 0, 0}; }
+    if (spec) { spec->n = 0; spec->achro = 0; spec->cie = DVec3{0, 0, 0}; spec->emIdx = -1; }
     if (causticW) *causticW = (Real)1;
     // ROADMAP C3: split birth between surface/point/env emitters and volumetric "fire"
     // emission by power. grandTotal = totalPower + totalEmissionPower; the volumeBirth
@@ -7938,6 +7957,14 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     if (spec && cs.beamAchroOK && cs.beamCount && !envImage && !sc.hasGrin) {
         const DVec3 cm = em.cieMean;
         if (cm.x > 0 || cm.y > 0 || cm.z > 0) { spec->cie = cm; spec->achro = 1; }
+    }
+    // The emitter index travels whenever the path is still wavelength-independent, whether or
+    // not THIS medium can fold at deposit time: the gather-time fold's question is asked per
+    // deposited beam, and a photon can cross an achromatic cloud and a rainbow curtain in one
+    // step. Kept separate from `achro` for exactly that reason.
+    if (spec && cs.beamAchroOK && cs.beamCount && !envImage && !sc.hasGrin) {
+        const DVec3 cm = em.cieMean;
+        if (cm.x > 0 || cm.y > 0 || cm.z > 0) spec->emIdx = (ei <= 32767) ? (int)ei : -1;
     }
 
     // Connect the emitter itself to the camera (makes the source visible): model
@@ -18580,11 +18607,17 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 // Achromatic-path fold (`-beamachro`): the emitter's mean CIE, used by
                 // BeamMap::build in place of CIE(lambda). Mutually exclusive with the bundle.
                 b.achro = d.achro ? 1 : 0;
-                for (int k = 0; k < 3; ++k) b.cieA[k] = b.achro ? d.cieA[k] : 0.0f;
-                // GATHER-time fold (achro == 2, scene.h Scene::BowLut): the device tracer does
-                // not implement it, so it can never deposit one. -1 says so explicitly instead
-                // of leaving the field to whatever the allocation held.
-                b.emIdx = -1;
+                // `cieA` is the fallback colour for the GATHER-time fold as well as the payload
+                // of the achromatic-path one, so it must survive a beam whose `achro` is about
+                // to become 2 below -- otherwise BeamMap::build would give it a black cieMean.
+                const bool wantCieA = d.achro || d.bowEm >= 0;
+                for (int k = 0; k < 3; ++k) b.cieA[k] = wantCieA ? d.cieA[k] : 0.0f;
+                // GATHER-time fold (achro == 2, scene.h Scene::BowLut). Since 0.264.1 the device
+                // tracer decides this exactly as render.h does, so a GPU-traced map carries it
+                // too -- which is what makes the device bow tables worth having on the common
+                // path rather than only for a `-loadmap`'d CPU map.
+                if (d.bowEm >= 0) { b.achro = 2; b.emIdx = (short)d.bowEm; }
+                else                b.emIdx = -1;
             }
         }
         bmap->nEmitted   = pm.nEmitted;      // same pass, same normalisation
