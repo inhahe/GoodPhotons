@@ -513,7 +513,51 @@ FOLD"):
 -r 640 360 -time 300 -seed 7 -hdr -o png/barsdiag/gpu.png` and compare
 `python scraps/_streak.py` against the CPU render at the same budget.
 
-### M-VS-R-GALLERY — OPEN (2026-09-07, v0.265.0): mode `M` reads **34 % darker than mode `R`** on `gallery_rain`, and the beam count barely moves it
+### M-VS-R-GALLERY — **RESOLVED** (2026-09-07, v0.265.0): the “34 % darker” was a firefly artifact. On a robust statistic mode `M` and mode `R` **agree** on every specular element, and what is left is exactly M-GATHERAREA
+
+> **Read this first; the rest of the entry is the trail that led here and several of its
+> intermediate conclusions are wrong.** Two findings close it:
+>
+> 1. **The image mean was never a valid statistic on this scene.** In the 34 781-spp mode-`R`
+>    reference the brightest single pixel is **824× the mean**, the top 0.1 % of pixels carry
+>    **17.6 %** of the total energy and the top 1 % carry **39.4 %**. At 120 spp it is far worse:
+>    four seeds of mode `R` gave whole-image means of **0.113 / 0.0537 / 0.0325 / 0.0381** — a
+>    **3.5× spread** — with one seed's brightest pixel alone holding 17.5 % of the image. The
+>    “−34 %” headline compared two outlier-dominated means. The entry's own −8.8 % *median* was
+>    the tell, and it was not followed.
+> 2. **At matched sample count mode `R` shows the same specular deficit mode `M` does.** Scored
+>    on a 5 %-trimmed mean per ROI, against the same 34 781-spp reference trimmed the same way:
+>
+> | element | px | `M` s1 | `M` s2 | `R` @120 spp, median of 8 seeds | verdict |
+> |---|---|---|---|---|---|
+> | `chrome_ring` (glossy 0.05) | 27 | −91.9 % | −92.2 % | **−90.7 %** | **not a mode-`M` defect** |
+> | `brass` (glossy 0.05) | 9 | −91.0 % | −90.9 % | **−90.7 %** | **not a mode-`M` defect** |
+> | `gyroid` (glossy 0.18) | 1369 | −64.5 % | −64.2 % | **−64.3 %** | **not a mode-`M` defect** |
+> | `glass_orb` (dielectric) | 225 | +0.8 % | −6.4 % | −1.5 % | fine |
+> | `gem_diamond` (dielectric) | 210 | −9.0 % | −16.9 % | −4.3 % | fine |
+> | `rainbow` | 76 | −0.0 % | −7.3 % | −3.2 % | fine |
+> | `cloud_base` | 95 | +0.2 % | +1.4 % | −1.6 % | fine |
+> | `grid_ground` | 600 | −5.3 % | −4.3 % | −2.0 % | fine |
+> | `rain_column` | 114 | −19.6 % | −16.7 % | −5.1 % | small residual |
+> | **`cap_gyroid`** | 56 | **−31.8 %** | **−35.6 %** | −1.7 % | **real mode-`M` defect** |
+> | **`alice_dress`** | 90 | **−41.6 %** | **−52.0 %** | −0.2 % | **real mode-`M` defect** |
+> | **`alice_hair`** | 27 | **−71.8 %** | **−71.0 %** | **+0.3 %** | **real mode-`M` defect** |
+> | whole frame | 57600 | −21.7 % | −21.7 % | −4.3 % | |
+>
+> **Mode `M` and mode `R` agree to 1–2 pp on all three glossy metals.** Their shared deficit
+> against the converged reference is a *convergence* failure both modes have, not a mode-`M`
+> bias — see **GLOSSY-NEE** below for the mechanism and the fix. The dielectrics, the rainbow,
+> the cloud and the ground are all fine once the outliers are trimmed; their −40 %/−47 % in the
+> per-element table above was firefly artifact.
+>
+> **And the three that survive are exactly `M-GATHERAREA`'s list, at exactly its magnitudes**:
+> `alice_hair` (that entry predicted −70 %; measured −71 % against an estimator that reads
+> +0.3 %), `alice_dress` (−38…−44 % predicted; −42…−52 % measured), `cap_gyroid` (−38 % predicted;
+> −32…−36 % measured). This is the first time those numbers have been checked against an
+> estimator that is *independently* known to be right on the same pixels at the same sample
+> count. **M-GATHERAREA is the whole of what is actually wrong with mode `M` on this scene.**
+>
+> Measured by `scraps/sunspike.sh` (8 seeds of mode `R` at 120 spp) and `scraps/robust_roi.py`.
 
 **Found while asking a different question.** `-mstats` (§VOLCACHE) showed 81 % of a
 mode-`M` frame is the beam gather, and the renderer's own log suggests fewer beams would be
@@ -673,12 +717,106 @@ something the dielectric path does on exit.
 **Where it bites:** `src/photonmap_render.h` (the estimate and its normalisation),
 `scenes/gallery_rain.ftsl`, `scraps/mbeamk.log` and `scraps/mbias.log` (the measurements).
 
+### GLOSSY-NEE — OPEN (2026-09-07, v0.265.0): **no unidirectional mode does next-event estimation at a `MatType::Glossy` vertex**, so a rough metal under a small light is found only by chance — a 6.8e-5 sr sun costs a gold gyroid 64 % of its energy at 120 spp and a chrome ring 91 %
+
+**Found by M-VS-R-GALLERY**, which spent a day attributing a specular deficit to mode `M`
+before the matched-sample control showed mode `R` has the identical deficit. It is not a
+mode-`M` defect at all; it is a missing estimator that every unidirectional path in the
+renderer shares.
+
+**The code.** At a glossy vertex both walks multiply by the reflectance and continue along a
+`sampleGlossy` direction, and neither connects to a light:
+
+| site | what it does at `MatType::Glossy` |
+|---|---|
+| `backward.h` ~1483 (mode `R`, and `A`/`B`/`C`/`P` through the same helper) | `if (rng.uniform() >= r) return false;` then `sampleGlossy`, `specularArrival = true` — **no `neeLight`** |
+| `photonmap_render.h` ~783 and ~483 (mode `M`'s camera and gather walks) | `thr *= reflectSlot`, then `sampleGlossy` — **no NEE, and no photons are stored on a Glossy surface either** (the four `depositPhoton` sites in `render.h` are all diffuse-family), so a glossy pixel is 100 % walk |
+| `bdpt.h` `bsdfF` / `isConnectibleMat` | **does** connect Glossy — modes `D`/`J`/`U` are unaffected |
+
+So on a glossy surface the light is collected only when a lobe sample lands on the emitter.
+
+**The arithmetic, and why it is catastrophic rather than merely noisy.** The power-cosine lobe
+has exponent `e = 2/r² − 2` and solid angle `≈ 2π/(e+1)`:
+
+| material | roughness | `e` | lobe Ω | odds of hitting a 6.8e-5 sr sun | measured loss at ~120 spp |
+|---|---|---|---|---|---|
+| `preset gold  roughness 0.18` | 0.18 | 59.7 | 0.104 sr | ~1 / 1500 | **−64 %** |
+| `preset chrome` (preset default) | 0.05 | 798 | 0.0079 sr | ~1 / 115 | **−91 %** |
+| `preset brass` (preset default) | 0.05 | 798 | 0.0079 sr | ~1 / 115 | **−91 %** |
+
+Each hit therefore arrives as a spike 115–1500× the local mean, which is why the *whole-image*
+mean on `gallery_rain` is worthless: at 120 spp four seeds of mode `R` differ by **3.5×**, one
+seed's brightest pixel carries 17.5 % of the entire image, and even at 34 781 spp the top 0.1 %
+of pixels still hold 17.6 % of the energy.
+
+**Why this is not just “render longer”.** The estimator is unbiased, so it does converge — the
+34 781-spp reference is roughly right. But mode `M` gets ~70 spp where mode `R` gets ~7000 in
+the same wall-clock, and the target is 6.8e-5 sr; “converge” here means hours for a picture that
+NEE would resolve in seconds. The renderer already refuses this bargain everywhere else: a
+**diffuse** vertex does NEE, and a **volume** vertex does NEE against the phase function
+(`neeVolume`, `backward.h` ~1094, with the same `w = cos × spotOmega` shape a glossy vertex
+needs). Glossy is the one connectible lobe left out.
+
+**The fix, and why it must be MIS and not the single-estimator split.** Everywhere else the
+codebase uses the clean split — NEE at the vertex, and the continuation's emitter hit is
+dropped (`specularArrival = false`; see the `scene.h` note at `sunRadiance`). That is right when
+the outgoing lobe is broad. It is **wrong for glossy**, because a glossy lobe can be far
+*narrower* than the light: `gallery_rain` also has a 20 m × 14 m sky panel, and area-sampling
+that panel from a chrome vertex whose lobe is 0.0079 sr would be as bad as the sun case is
+today, only reversed. Glossy genuinely needs both strategies, weighted:
+
+* light-sampling side: `w = p_L / (p_L + p_lobe)`, with `p_lobe = (e+1)/(2π)·cos^e θ_m` — already
+  available as `bdpt.h`'s `bsdfPdf`, and the BSDF value as `bsdfF` (whose Glossy branch already
+  returns exactly `r·lobe/cosθ_i`, so `f·cos = r·lobe`);
+* BSDF-sampling side, when the continuation hits an emitter: `w = p_lobe / (p_lobe + p_L)`.
+
+`neeLight`'s `contrib = (rho/PI) · SPD · invPdfλ · w` generalises by substituting `bsdfF` for
+`rho/PI` — they are the same quantity for a Diffuse vertex, so the existing path can stay
+bit-identical behind a null hook. `emitterGeom` already returns `w = cos(surf)/pdf_W` per shape
+(the Sun branch is literally `w = cosSurf * em.spotOmega`), so `p_L` is one reciprocal away.
+
+**What is genuinely missing** and is the bulk of the work:
+
+1. **`p_L(e, x, ω)` for an arbitrary emitter and direction**, needed on the BSDF-sampling side
+   where the emitter is discovered by a ray hit rather than chosen. One case per
+   `EmitterShape` (Area/quad, Sphere, Sun, Spot — delta, so no MIS —, Env — which already has
+   `envPdfDir` and its own MIS at `backward.h` ~1857, the exact idiom to copy).
+2. **A light-tree selection pdf `ltPdf(e | x, n)`**, the reverse of `ltSample`'s `e.pdf`: walk
+   root→leaf multiplying the same `ltImportance` ratios. Complicated by `ltShouldSplit`, which
+   makes the density a sum over the split set rather than a single path.
+3. **The GPU twins** in `render_cuda.cu` for whichever modes get it, or the two backends
+   disagree on every glossy surface.
+
+**Where it bites:** `src/backward.h` (`neeLight`, `emitterGeom`, `interactMaterial`'s Glossy
+case, the emitter-hit accounting in `pathTrace`), `src/photonmap_render.h` (both gather walks),
+`src/bdpt.h` (`bsdfF` / `bsdfPdf`, already correct — reuse), `src/lighttree.h` (the missing
+pdf), `src/render_cuda.cu`. Measured by `scraps/sunspike.sh` + `scraps/robust_roi.py`;
+`scenes/_spec_repro.ftsl` is the four-sphere isolation rig.
+
 ### M-GATHERAREA — OPEN (2026-09-05, v0.253.0): mode `M`'s direct density estimate divides by the area of a **full disc** while gathering from only the part of it that is real, on-cone surface — so it is dark in proportion to how much of the disc misses: flat ground 0 %, a cap edge −38 %, Alice's dress −44 %, her hair −70 %
 
 **Found by** the `gallery_rain` accuracy campaign (5 seeds × {R, D, J, M}, 640×360, anchor =
 mode `R`; `scraps/_modecmp_acc.bat`, `scraps/roi_stats.py`, ROIs in `scraps/gallery_rain.rois`).
 Run against **refreshed** mode `M` (v0.252.0+), so this is not M-FROZEN in disguise — the frozen
 frames are archived under `png/modecmp/acc/frozenM/`.
+
+> **INDEPENDENTLY CONFIRMED, 2026-09-07 (v0.265.0).** M-VS-R-GALLERY set out to find something
+> *else* wrong with mode `M` and ended up validating this entry instead. On a 5 %-trimmed mean
+> — which removes the fireflies that made every earlier whole-image comparison meaningless —
+> and against mode `R` **at matched sample count**, so that the anchor's own convergence is not
+> doing the work, exactly three ROIs separate:
+>
+> | element | this entry predicted | mode `M`, two seeds | mode `R` @120 spp, median of 8 |
+> |---|---|---|---|
+> | `alice_hair` | −70 % | −71.8 % / −71.0 % | **+0.3 %** |
+> | `alice_dress` | −38…−44 % | −41.6 % / −52.0 % | **−0.2 %** |
+> | `cap_gyroid` | −38 % | −31.8 % / −35.6 % | **−1.7 %** |
+>
+> Every other element of that scene — including the glossy metals whose −64…−91 % was blamed on
+> mode `M` for a day — shows the **same** deficit in mode `R` at the same sample count, i.e. it
+> belongs to GLOSSY-NEE, not here. So this entry is not one contributor among several: **it is
+> the whole of what is actually wrong with mode `M` on `gallery_rain`**, and its predicted
+> magnitudes are right to within a few points. Measured by `scraps/robust_roi.py`.
 
 **Measured**, mean over 5 seeds, deviation from the mode-`R` anchor (worst channel, σ in brackets):
 
