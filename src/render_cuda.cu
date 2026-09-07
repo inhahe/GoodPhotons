@@ -5179,10 +5179,13 @@ struct DBeamRec {
 // field-by-field at upload, so there is no memcpy to keep in step.
 struct DBeamMis {
     double sumC;          // light-side connection accumulator
-    double sumM;          // light-side merge accumulator, without the n_m * 2r factor
+    double sumM;          // light-side BEAM-merge accumulator, without the n_m * 2r factor
+    double sumMs;         // light-side POINT-merge accumulator, without its n_m * pi r_s^2
     float  pdfDir;        // solid-angle pdf of the beam's direction at y_{s-1}
     float  rCoef;         // cos(y_{s-1}) / pdfFwd(y_{s-1}); the cos is 1 off a surface
-    float  etaPrev;       // the merge AT y_{s-1}, still missing only its Tr; 0 if not a medium
+    float  etaPrev;       // the BEAM merge AT y_{s-1}, still missing only its Tr; 0 off a medium
+    float  etaPrevS;      // the POINT merge AT y_{s-1}, complete but for its kappaS; 0 off a
+                          // storable surface site
     float  leadIn;        // distance from y_{s-1} to THIS beam's clipped origin
     int    gateC1;        // is "connect x to y_{s-1}" a legal strategy? (y_{s-1} not delta)
     int    vert;          // the light subpath vertex index j of y_{s-1} (so s = j+1) — the
@@ -5225,7 +5228,11 @@ struct DBeamMap {
 // Everything here is independent of WHERE along the segment a beam is hit, which is exactly
 // why it is hoisted: a dense medium hands one segment hundreds of hits.
 struct DBeamMergeW {
-    double kappa      = 0.0;  // == DBeamMap::mergeKappa, copied in for locality
+    double kappa      = 0.0;  // == DBeamMap::mergeKappa (n_m * 2r), copied in for locality
+    double kappaS     = 0.0;  // == DSurfMap::kappaS (n_m * pi r_s^2): the OTHER merge kind's,
+                              // for the denominator. 0 without `-jsurf`.
+    double etaKSurf   = 0.0;  // kappaS if eye[k] is a storable photon site, else 0 -- the POINT
+                              // merge AT eye[k], the twin of etaKCoef's beam merge there
     double lamCam     = 0.0;  // the CAMERA path's wavelength (see the spectral note below)
     double pdfDirCam  = 0.0;  // PathSeg::pdfDir: solid-angle density of the segment direction
     double gateS1     = 0.0;  // is the reference connection C1 legal? (eye[k] not delta)
@@ -5357,7 +5364,7 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
     const double C1 = dMisRemap0(gL) / dMisRemap0(gC);
     const double pdfRevK = phase * mw.cosFacK * invT2;   // pdfRev(eye[k]) in the merged path
     const double C2   = pdfRevK * mw.invPdfFwdK;
-    const double etaK = mw.kappa * mw.etaKCoef * pdfRevK;  // merge AT eye[k]
+    const double etaK = (mw.kappa * mw.etaKCoef + mw.etaKSurf) * pdfRevK;  // merge AT eye[k]
     // The merge AT y_{s-1}. Its sin(theta) and p_L were known when the beam was deposited
     // (its outgoing direction IS the beam); only the transmittance over the now-known
     // y_{s-1} -> x span is left.
@@ -5367,14 +5374,16 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
         const double trP = dTrDet(sc, yPrev, b.d, rhoL, b.lambda, env);
         if (trP > 0.0) etaPrevTerm = mw.kappa * (double)lm.etaPrev / trP;
     }
+    const double etaPrevS = mw.kappaS * (double)lm.etaPrevS;
     const double den = (double)lm.gateC1                     // C1 itself (ratio 1)
                      + R * lm.sumC                           // light-side connections
                      + mw.gateS1 * C1                        // the t-1 camera connection
                      + C1 * C2 * mw.segSumC                  // camera-side connections
-                     + R * (mw.kappa * lm.sumM + etaPrevTerm)  // light-side merges
+                     + R * (mw.kappa * lm.sumM + mw.kappaS * lm.sumMs
+                            + etaPrevTerm + etaPrevS)        // light-side merges, BOTH kinds
                      + etaS                                  // this merge
                      + C1 * etaK                             // merge at eye[k]
-                     + C1 * C2 * mw.kappa * mw.segSumM;      // camera-side merges
+                     + C1 * C2 * mw.segSumM;                 // camera-side merges (pre-scaled)
     if (!(den > 0.0)) return 0.0;
     return etaS / den;
 }
@@ -9196,6 +9205,15 @@ __device__ static inline bool dConnectibleType(int tp) {
 // hypothetical and has d_perp = 0, where the kernel is at its maximum and nothing like what
 // a real merge sees. The balance heuristic needs a consistent partition, not the pointwise
 // kernel; 1/(2r) is the mean of K1 over its support.
+// Device twin of bdpt.h's surfMergeSite: could the light pass have STORED a photon here? The
+// gather and the weight must ask the same question the store did -- a site the weight counts but
+// the map never fills under-weights every competing technique, and one the map fills but the
+// weight ignores double-counts.
+__device__ static inline bool dSurfMergeSite(const DScene& sc, const DVertex& v) {
+    if (v.type != BV_SURFACE || v.delta || v.matId < 0) return false;
+    return dConnectibleType(sc.mats[v.matId].type);
+}
+
 __device__ static double dMergeEtaPrime(const DScene& sc, const DVec3& pPrev, const DVertex& v,
                                         const DVec3& pNext, double pLight, Real lambda,
                                         const DPatEnv& env) {
@@ -12745,7 +12763,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                       long long totalSamples, long long chunkSpp, long long sppTotal,
                       long long sampleBase, int resX, int maxDepth,
                       int diffraction, unsigned long long seedBase, int heroC,
-                      DBeamMap bm, DWfQueue wq, long long idxBegin, long long idxEnd) {
+                      DBeamMap bm, DSurfMap sm, DWfQueue wq, long long idxBegin, long long idxEnd) {
     enum { SECN = (NS > 0 ? NS : 1), MAXV = BDPT_MAXV_OF(MAXD),
            SEGN = (MERGE ? BDPT_MAXV_OF(MAXD) : 1) };
     // `bm.beams == nullptr` is the dispatcher's own "-nobeams / empty map" signal, so this
@@ -12758,6 +12776,10 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
     // must move together: weighting the connections down while the merges are still raw
     // would darken the volume as surely as the reverse brightens it, so ONE value gates both.
     const double mergeKappa = mergeOn ? bm.mergeKappa : 0.0;
+    // The point x point kind's constant. Zero unless `-jsurf` filled a surface map, and that
+    // zero is what makes every surface term in the weight vanish -- the same gate mergeKappa is
+    // for the beams.
+    const double kappaSurf = (sm.nPts > 0) ? sm.kappaS : 0.0;
     if (maxDepth > MAXD) maxDepth = MAXD;   // device array bound (host picks the variant)
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
@@ -12922,7 +12944,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
             // accumulates strictly camera-side of eye[k] is independent of WHERE along the
             // segment a beam is hit, so it is summed here and read off per segment.
             double segSumC[SEGN], segSumM[SEGN];
-            if (mergeKappa > 0.0) {
+            if (mergeKappa > 0.0 || kappaSurf > 0.0) {
                 for (int k = 0; k < nE && k < (int)SEGN; ++k) segSumC[k] = segSumM[k] = 0.0;
                 for (int k = 1; k < nE && k < (int)SEGN; ++k) {
                     const double gate = (!eye[k].delta && !eye[k - 1].delta) ? 1.0 : 0.0;
@@ -12930,10 +12952,18 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                     // at k = 2. Its pdfRev is the RECORDED one: moving the light-side
                     // neighbour of eye[k] along the same ray does not change the direction
                     // arriving at eye[k-1].
-                    const double eK = (k >= 2)
-                        ? dMergeEtaPrime(sc, eye[k].p, eye[k - 1], eye[k - 2].p,
-                                         eye[k - 1].pdfRev, lambda, dPatEnvOf(sc))
-                        : 0.0;
+                    // Both kinds, each scaled by its OWN kappa here rather than factored
+                    // out of the sum (bdpt.h: mergeEtaPrime(...).scale(mk)) -- with two kinds
+                    // there is no single kappa to factor. A vertex is a medium point or a
+                    // surface, never both, so exactly one of these is non-zero.
+                    double eK = 0.0;
+                    if (k >= 2) {
+                        eK = mergeKappa * dMergeEtaPrime(sc, eye[k].p, eye[k - 1], eye[k - 2].p,
+                                                         eye[k - 1].pdfRev, lambda, dPatEnvOf(sc));
+                        if (kappaSurf > 0.0 && dSurfMergeSite(sc, eye[k - 1]) &&
+                            eye[k - 1].pdfRev > 0.0)
+                            eK += kappaSurf * eye[k - 1].pdfRev;
+                    }
                     double carry = 0.0, carryM = 0.0;
                     if (k >= 2) {
                         // No ratio exists at the camera vertex itself, which is why the
@@ -12967,6 +12997,10 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                     mw.invPdfFwdK = 1.0 / dMisRemap0(vk.pdfFwd);
                     mw.segSumC    = (k >= 0 && k < (int)SEGN) ? segSumC[k] : 0.0;
                     mw.segSumM    = (k >= 0 && k < (int)SEGN) ? segSumM[k] : 0.0;
+                    mw.kappaS     = kappaSurf;
+                    // The POINT merge AT eye[k]: unlike its beam twin there is no geometry to
+                    // gather, so the whole merge-point-independent coefficient IS kappaS.
+                    mw.etaKSurf   = (kappaSurf > 0.0 && dSurfMergeSite(sc, vk)) ? kappaSurf : 0.0;
                     // The depth cap, the same one the connection loop above applies: a merge
                     // at light vertex j on this segment makes a path of depth j + k + 1.
                     mw.camVert    = k;
@@ -16846,11 +16880,11 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
         std::vector<gpu::DBeamMis> dm(bmap->mis.size());
         for (size_t i = 0; i < dm.size(); ++i) {
             const BeamMis& s = bmap->mis[i]; gpu::DBeamMis& d = dm[i];
-            // `sumMb` only: the device twin has ONE merge kind (beams). Mode J's surface
-            // merges (surfmerge.h) are CPU-only for now, and the dispatcher refuses the GPU
-            // path when they are enabled — see main.cpp — so `s.sumMs`/`s.etaPrevS` being
-            // dropped here is unreachable rather than merely lossy. Port them with the map.
-            d.sumC = s.sumC; d.sumM = s.sumMb;
+            // BOTH merge kinds since 0.263.0: `sumMs` and `etaPrevS` are the point x point
+            // half, zero unless `-jsurf` filled a surface map, and every term they feed is
+            // multiplied by kappaS -- which is itself zero without one. So an unused surface
+            // map costs exactly the two loads and nothing else.
+            d.sumC = s.sumC; d.sumM = s.sumMb; d.sumMs = s.sumMs;
             d.pdfDir = s.pdfDir; d.rCoef = s.rCoef;
             d.etaPrev = s.etaPrev; d.leadIn = s.leadIn;
             d.gateC1 = (int)s.gateC1; d.vert = (int)s.vert;
@@ -17061,16 +17095,16 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 }
                 if (deep && wq.runMul != 0u)
                     kBdptT<0, BDPT_DEEPDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
+                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 else if (deep)
                     kBdptT<0, BDPT_DEEPDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                                          resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
+                                                                          resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 else if (wq.runMul != 0u)
                     kBdptT<0, BDPT_MAXDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                                        resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
+                                                                        resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 else
                     kBdptT<0, BDPT_MAXDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
+                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 if (wq.segs) {
                     cudaCheckKernel("bdpt");
                     CUDA_CHECK(cudaEventRecord(wfEv[1]));
@@ -17112,16 +17146,16 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         }
         else if (useHero && deep)
             kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, DWfQueue{}, 0, totalSamples);
+                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else if (useHero)
             kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                            resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, DWfQueue{}, 0, totalSamples);
+                                                            resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else if (deep)
             kBdptT<0, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, DWfQueue{}, 0, totalSamples);
+                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else
             kBdptT<0, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                    resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, DWfQueue{}, 0, totalSamples);
+                                                    resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples);
         cudaCheckKernel("bdpt");
     };
 
