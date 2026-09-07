@@ -12288,10 +12288,10 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
 __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
                                     const DVertex* light, const DVertex* eye,
                                     const DVertex& sampled, int s, int t, Real lambda,
-                                    double mergeKappa = 0.0) {
+                                    double mergeKappa = 0.0, double kappaSurf = 0.0) {
     if (s + t == 2) return 1.0;
     const int si = s - 1, ti = t - 1, sMi = s - 2, tMi = t - 2;
-    const bool merges = mergeKappa > 0.0;
+    const bool merges = mergeKappa > 0.0 || kappaSurf > 0.0;
     const DPatEnv env = merges ? dPatEnvOf(sc) : dPatEnvNone();
     double sumMg = 0.0;
 
@@ -12329,7 +12329,13 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
             const double pRev = (i - 1 == tMi) ? (double)ptMPdfRev : eye[i - 1].pdfRev;
             const double e = dMergeEtaPrime(sc, eye[i].p, eye[i - 1], eye[i - 2].p,
                                             pRev, lambda, env);
-            if (e > 0.0) sumMg += (double)ri * e * mergeKappa;
+            // ...and the POINT merge at the same vertex. A vertex is a medium point or a
+            // surface, never both, so at most one of these is non-zero -- but BOTH have to be
+            // here, or a connection keeps a weight that ignores a technique competing for its
+            // paths and the weights stop summing to one (measured: +15 % on `_cornell_diffuse`).
+            const double eS = (kappaSurf > 0.0 && dSurfMergeSite(sc, eye[i - 1]) && pRev > 0.0)
+                            ? pRev : 0.0;
+            if (e > 0.0 || eS > 0.0) sumMg += (double)ri * (e * mergeKappa + eS * kappaSurf);
         }
     }
     ri = 1.f;
@@ -12352,7 +12358,9 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
             const DVec3 pNext = (i + 1 <= s - 1) ? light[i + 1].p : PtP->p;
             const double e = dMergeEtaPrime(sc, light[i - 1].p, light[i], pNext,
                                             light[i].pdfFwd, lambda, env);
-            if (e > 0.0) sumMg += (double)ri * e * mergeKappa;
+            const double eS = (kappaSurf > 0.0 && dSurfMergeSite(sc, light[i]) &&
+                               light[i].pdfFwd > 0.0) ? (double)light[i].pdfFwd : 0.0;
+            if (e > 0.0 || eS > 0.0) sumMg += (double)ri * (e * mergeKappa + eS * kappaSurf);
         }
     }
     // The merge at the connection vertex pt itself. Its own connection strategy IS this one,
@@ -12360,7 +12368,9 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
     if (merges && s >= 1 && t >= 2) {
         const double e = dMergeEtaPrime(sc, QsP->p, *PtP, eye[tMi].p,
                                         (double)ptPdfRev, lambda, env);
-        if (e > 0.0) sumMg += e * mergeKappa;
+        const double eS = (kappaSurf > 0.0 && dSurfMergeSite(sc, *PtP) && ptPdfRev > 0.0)
+                        ? (double)ptPdfRev : 0.0;
+        if (e > 0.0 || eS > 0.0) sumMg += e * mergeKappa + eS * kappaSurf;
     }
     return 1.0 / (1.0 + (double)sumRi + sumMg);
 }
@@ -12380,7 +12390,8 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
                                       const double* lightSec, const double* eyeSec, int secStride,
                                       int s, int t, const DHeroBundle& hb, DRng& rng,
                                       int& outPx, int& outPy, int& isSplat,
-                                      double* Lsec, int& nUpConn, double mergeKappa = 0.0) {
+                                      double* Lsec, int& nUpConn, double mergeKappa = 0.0,
+                                      double kappaSurf = 0.0) {
     const Real lambda = hb.lam[0];
     const double invPdfLambda = hb.invPdf[0];
     isSplat = 0;
@@ -12716,7 +12727,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     double mx = L;
     for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mx) mx = Lsec[i];
     if (!(mx > 0.0)) return 0.0;
-    const double mis = dMisWeight(sc, cam, light, eye, sampled, s, t, lambda, mergeKappa);
+    const double mis = dMisWeight(sc, cam, light, eye, sampled, s, t, lambda, mergeKappa, kappaSurf);
     for (int i = 0; i + 1 < nUp; ++i) Lsec[i] *= mis;
     nUpConn = nUp;
     return L * mis;
@@ -12954,7 +12965,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 double Lsec[SECN];
                 double c = dConnectBDPT(sc, cam, light, eye, lightSec, eyeSec, NS,
                                         s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn,
-                                        mergeKappa);
+                                        mergeKappa, kappaSurf);
                 if (nUpConn <= 0) continue;
                 // Reject a non-positive — and, critically, a NON-FINITE — contribution before
                 // it reaches the film, exactly as BdptRenderer::renderRows does. Negated form
@@ -13008,7 +13019,10 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
         // the next sample either, because the stream is re-seeded per (pixel,sample) at the
         // top of this loop — so "turn the merges off and mode J is mode D bit-for-bit"
         // survives even though the two halves share a generator. Host twin: renderRows.
-        if (mergeOn) {
+        // Either merge kind opens this region. `mergeOn` needs a BEAM map, so gating the
+        // whole block on it silently dropped the point merges on any scene without media --
+        // exactly the scene the point merges exist for.
+        if (mergeOn || kappaSurf > 0.0) {
             // The camera half of every merge weight, replayed ONCE for the whole subpath.
             // dMisWeight's camera loop telescopes inward from the merge point; everything it
             // accumulates strictly camera-side of eye[k] is independent of WHERE along the
@@ -13047,7 +13061,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                     segSumM[k] = eK + carryM;
                 }
             }
-            for (int i = 0; i < nSegs; ++i) {
+            for (int i = 0; mergeOn && i < nSegs; ++i) {
                 const DPathSeg& sg = segs[i];
                 if (!(sg.beta > 0.0)) continue;
                 // Hoisted out of the per-hit weight: the ray/bounds clip and the spectral
