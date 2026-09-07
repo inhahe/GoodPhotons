@@ -1577,10 +1577,16 @@ robust statistic as well; and it costs nothing in samples (7382 against 7389 spp
 ~0.5 the bias becomes real (−3.5 %) and at 1.0 the Jacobian is gone altogether (−12 %), which is
 why the safe zone ends well below it.
 
-**What it does not fix:** on `_fog_cornell` (dense map, glass) the clamp is neutral — the peak
-pixel is 3.48e13 unclamped and 3.62e13 clamped, unmoved — so that scene's extremes come from
-somewhere else (a caustic path through the glass, or a surface merge), and finding them is its
-own investigation. CPU and GPU behave alike under the clamp: the GPU/CPU means on `_fog_thick`
+**What it does not fix, and why that turned out to be nothing:** on `_fog_cornell` the clamp looked
+neutral — peak pixel 3.48e13 unclamped, 3.62e13 clamped. Chased with mode `R` at matching depth
+(291 480 spp, 0.19 % noise) as the arbiter: the bright pixels are not a firefly tail at all but a
+**resolved feature** — every mode puts its top five values in the same 11×11 window at (67, 105) —
+and **mode `D` matches `R` there to +1.0 %, and to +0.44 % over the whole image**, another
+cross-validation. Mode `J`'s 3× peak is simply that it reaches **22 spp in 60 s on that scene against
+mode `D`'s 7358**: its window mean is 13–21 % *below* `R` while its peak is 3× above, which is what an
+unconverged image looks like, not a second singularity. `_fog_cornell` is thin fog whose scattering
+points the camera reaches easily — the merges have nothing to rescue there (design.md says as much) —
+so it is the wrong scene to read mode-`J` tail statistics from. CPU and GPU behave alike under the clamp: the GPU/CPU means on `_fog_thick`
 64² move from −1.93 / −1.03 / −3.69 % to −0.89 / +0.16 / −4.06 %, i.e. the pre-existing gap at
 2327 against 43 148 spp, not a new one.
 
