@@ -1584,6 +1584,20 @@ own investigation. CPU and GPU behave alike under the clamp: the GPU/CPU means o
 64² move from −1.93 / −1.03 / −3.69 % to −0.89 / +0.16 / −4.06 %, i.e. the pre-existing gap at
 2327 against 43 148 spp, not a new one.
 
+**(4) Every measurement in this entry is of a TRUNCATED problem, and at equal depth the three estimators agree (2026-09-07).** Chasing what looked like a ~5.6 % per-pixel bias in mode `J` (measured by splitting error into run-to-run noise and the rest with two seeds: mode `J`'s noise is **2.3× lower than mode `D`'s at equal time**, 0.0026 against 0.0060, so its total error is not variance-limited) turned up something more basic. `-max-bounce` defaults to **8 for `D`/`U`/`J`** but **32 for the unidirectional tracers including `R`** — and `_fog_thick` is `sigma_t 20, albedo 0.95`, where the energy lives far past 8 scatters. Against a 600 s mode-`R` render at its default 32 bounces, everything measured here is missing **88.1 % of the image mean** and ~99.7 % of the dim quartile.
+
+Capping `R` at 8 bounces lands it exactly on the other two, which both confirms the explanation and is the strongest cross-validation this mode has had — three estimators with different machinery (backward path tracing, BDPT connections, beam×ray merges) agreeing on a thick medium:
+
+| image (median ratio to `R` at 32 bounces) | Q1 dim | Q2 | Q3 | Q4 bright | whole-image mean |
+|---|---|---|---|---|---|
+| `R` depth 8 | −99.82 % | −99.47 % | −97.88 % | −91.99 % | **−88.1 %** |
+| `D` depth 8 | −99.72 % | −99.24 % | −97.11 % | −91.26 % | **−88.1 %** |
+| `J` depth 8 | −99.55 % | −99.09 % | −97.27 % | −91.22 % | **−88.1 %** |
+| `D` depth 32 (300 s, 13 157 spp) | +45.3 % | +13.7 % | +9.1 % | +4.5 % | +2.1 % |
+| `J` depth 32 (300 s, 1 022 spp) | +81.8 % | +11.0 % | +3.5 % | +1.7 % | −0.6 % |
+
+So the “bias” was mode `J` recovering slightly more of the truncated tail than mode `D` at the same depth (in Q1, 0.41 % of the true value against 0.26 % — 1.6× more), which is the merge technique doing exactly what it is for, not an error. Two consequences. **First, the comparisons above stay valid as like-for-like but they are not the scene's physics**: any future mode-`J` benchmark on a thick medium should state its depth, and `_fog_thick` wants `-max-bounce 32` to be about the medium rather than about the truncation. **Second, mode `J`'s equal-time advantage does not automatically survive the depth the scene needs**: at 32 bounces it renders 1 022 spp to mode `D`'s 13 157 in the same 300 s (12.9×), because the connection cost grows ~depth² and the merges are on top of it. Whether the merges' lower variance pays for that is an open measurement — and it is the one that matters, since it is the configuration a thick medium is actually rendered in.
+
 ### UPBP-THICK — FIXED (2026-09-04, v0.247.0): mode `J` had a **noise floor `-spp` could not touch**, frozen into a beam map built once. It now redraws the light side every epoch and averages, cutting the error spread **13×** at the same `-n` and the same wall clock
 
 > **THE FIX (v0.247.0): a light-side refresh, on by default.** The render is split into epochs;
