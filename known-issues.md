@@ -1598,6 +1598,18 @@ Capping `R` at 8 bounces lands it exactly on the other two, which both confirms 
 
 So the “bias” was mode `J` recovering slightly more of the truncated tail than mode `D` at the same depth (in Q1, 0.41 % of the true value against 0.26 % — 1.6× more), which is the merge technique doing exactly what it is for, not an error. Two consequences. **First, the comparisons above stay valid as like-for-like but they are not the scene's physics**: any future mode-`J` benchmark on a thick medium should state its depth, and `_fog_thick` wants `-max-bounce 32` to be about the medium rather than about the truncation. **Second, mode `J`'s equal-time advantage does not automatically survive the depth the scene needs**: at 32 bounces it renders 1 022 spp to mode `D`'s 13 157 in the same 300 s (12.9×), because the connection cost grows ~depth² and the merges are on top of it. Whether the merges' lower variance pays for that is an open measurement — and it is the one that matters, since it is the configuration a thick medium is actually rendered in.
 
+**(5) It pays — mode `J` wins at equal time by 3× once the depth is the one the medium needs (2026-09-07). This entry's central claim is now the opposite of what it was.** Same 300 s, same `-max-bounce 32`, scored against the 600 s mode-`R` reference at the same depth:
+
+| depth 32, 300 s each | mean relSE | trimmed 99.9 % | trimmed 99 % | median | worst pixel |
+|---|---|---|---|---|---|
+| `-mode D` (13 157 spp) | 16.41 | 5.721 | 1.759 | 0.0766 | 49 000 |
+| `-mode J` (1 022 spp) | **5.485** | **3.097** | **1.270** | **0.0719** | **9 660** |
+| **D/J** | **2.99×** | **1.85×** | **1.38×** | 1.07× | — |
+
+**Mode `J` wins on every statistic while rendering 12.9× fewer samples**, and its worst pixel is now 5× *darker* than mode `D`'s rather than brighter (the `-beamsinmin` bound of (3) doing its work). The mechanism is the one the technique was invented for: at depth 32 in `sigma_t 20, albedo 0.95` the energy is in long multiple-scattering paths, which is exactly what connections sample badly and merges capture — and the merge's cost is dominated by the beam gather, which does not grow with depth the way the connection cost's ~depth² does. At depth 8 the same comparison had mode `J` 1.4× *behind*; the crossover is the depth, not the estimator.
+
+So the arc of this entry, on `_fog_thick`: **~19× behind** (2b, CPU, 2026-09-03) → **2.8× behind** (2c, the GPU port) → **1.4× behind** (2e/2g, the wavefront gather + robust scoring, at depth 8) → **3× ahead** at the depth a thick medium is actually rendered at. What remains is not “is mode `J` worth it” but the two things above it: `_fog_cornell`'s fireflies have an origin the `sin θ` bound does not touch, and the beam map's coverage is still bought together with the gather's cost.
+
 ### UPBP-THICK — FIXED (2026-09-04, v0.247.0): mode `J` had a **noise floor `-spp` could not touch**, frozen into a beam map built once. It now redraws the light side every epoch and averages, cutting the error spread **13×** at the same `-n` and the same wall clock
 
 > **THE FIX (v0.247.0): a light-side refresh, on by default.** The render is split into epochs;

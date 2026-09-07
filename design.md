@@ -998,7 +998,7 @@ needed. Two shared structs carry the epoch discipline across the host/device lin
 `g_gpuQuietRebuild` (`render_progress.h`) is the device twin of `buildBeamMap(..., quiet)` — mode
 `J` sets it too, since `renderBdptCuda` re-uploads and re-reports the beam map every epoch.
 
-**What it costs and what it buys here — honestly, nothing yet.** On `_fog_cornell` mode `J` at
+**What it costs and what it buys here — nothing on *this* scene; 3× on a thick one at the depth it needs (see the end of this paragraph).** On `_fog_cornell` mode `J` at
 43 spp measures 15.25 % noise; mode `D`'s 4.42 % at 512 spp is 15.25 % when scaled by `sqrt`. The
 two are *identical*, for ~25× the time. That is the expected result on this scene and not a
 failure of the weights: `_fog_cornell` is a thin fog whose scattering points the camera's
@@ -1006,6 +1006,8 @@ free-flight sampling reaches easily, so the connections were never starved and t
 for the merges to rescue. Mode `J` also inherits the beam×ray estimator's `1/sin(theta)` tail, so
 its peak pixel is ~1.9× mode `D`'s on the same scene: brighter fireflies, in exchange for reaching
 paths mode `D` cannot.
+
+  **Where it does pay, measured (0.262.0).** On `_fog_thick` (`sigma_t 20, albedo 0.95`) at `-max-bounce 32` — the depth that medium actually needs, since `D`/`J` default to 8 while the unidirectional tracers default to 32, and at 8 all three modes miss 88 % of the image — mode `J` beats mode `D` at equal time by **3× on mean relative squared error** (1.85× trimmed, 1.38× at the 99th percentile) against a 600 s mode-`R` reference, while rendering 12.9× fewer samples. That is the technique's own mechanism: long multiple-scattering paths are what connections sample badly and merges capture, and the merge's cost is the beam gather, which does not grow with depth the way the connection cost's ~depth² does. At depth 8 the same comparison has mode `J` 1.4× behind — the crossover is the depth, not the estimator. See `known-issues.md` → UPBP-CONV (4)/(5).
 
   **The `1/sinθ` singularity is bounded now (0.262.0, `-beamsinmin`, default 0.3).** The beam×ray kernel's Jacobian denominator is `sinθ` between the camera ray and the beam, so a near-parallel merge contributes without bound — and the MIS weight does not suppress it, because such a configuration is genuinely one the connections sample badly and the balance heuristic correctly hands the merge a large weight. It is clamped where `sinθ` is *computed* (`BeamMap::hitBeam`; `dBeamHitEval` on the device), not at the estimator, because the MIS weight reads the same value — so the merge stays one function, a technique whose kernel saturates at grazing angles, rather than an estimator weighted by a pdf it no longer has. Measured on `_fog_thick` at 180 s: no resolvable bias (−0.61 % of the image mean against the unbounded estimator's own −0.57 %), worst pixel 4350× → 1690× the reference, mean relative squared error 1.219 → 0.836, and no cost in samples. `-beamsinmin 0` restores the literal estimator; past ~0.5 the bias is real, and at 1.0 the Jacobian is gone (−12 %).
 
