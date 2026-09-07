@@ -276,8 +276,9 @@ argument for standing a groom in a hall of polished objects.*
   faster. **On by default since 0.260.0, on both backends since 0.263.1** — the three-way
   media+surfaces gate is green (X −0.86 % / Y −0.27 % / Z +0.12 % mean, per-pixel medians within
   0.1 %), and the GPU renders the same three-technique estimator, validated to −0.7 / −0.4 /
-  +0.6 % against a 3.1 M-spp mode-`R` reference. What stands between `U` and retirement is now only
-  the head-to-head comparison against it.
+  +0.6 % against a 3.1 M-spp mode-`R` reference. That comparison has now been run, and it says
+  **mode `U` stays**: on its own home turf `U` is 4–6× better at equal time, so mode `J` subsumes
+  `U`'s technique but not its performance.
   See [known-issues.md](known-issues.md) → UPBP-VM.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —

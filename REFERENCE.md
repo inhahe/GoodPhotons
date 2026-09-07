@@ -1247,7 +1247,7 @@ that converges to the same physical image.
   > and not a fault in the weight. Because the render reports the plain **mean** of its epochs, the
   > total bias is the Cesàro mean of the per-epoch biases and goes to zero with them, so plain
   > averaging suffices and no reweighting is needed. This is also precisely the property mode `U`
-  > has that mode `J` had to acquire before `U` could be retired.
+  > has that mode `J` had to acquire. (It has it now — but the measured head-to-head says `U` still wins its own workload by 4–6× at equal time, so `U` is not going anywhere; see UPBP-VM.)
   >
   > `-jsurf-count <n>` (default `4e6`) caps the **stored surface photons**, as `-beamcount` caps
   > beams. It is a memory bound, so it clamps the subpath count **downward only**, after the beam
@@ -1266,7 +1266,7 @@ that converges to the same physical image.
    > so the device now renders the same three-technique estimator the CPU does; the port is gated
    > bit-for-bit in both directions (merges off is still mode `D` exactly, and the beams-only path
    > is byte-identical to before it). Tracked as **UPBP-VM** in `known-issues.md`, which also
-   > carries what is still owed: the comparison against mode `U` that would retire `U`.
+   > carries the head-to-head against mode `U`, which came out the other way: `U` is 4–6× better at equal time on diffuse GI, so it stays.
 
 The **image-forming modes are all progressive** — the forward camera models
 (`A`/`B`/`C`), the backward reference (`R`), the bidirectional tracer (`D`), UPBP (`J`),

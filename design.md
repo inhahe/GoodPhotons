@@ -3361,7 +3361,7 @@ as the one at fault.
   weight. Consistency then follows from plain averaging: epoch bias `~C·r_e² ~ e^(α−1) → 0`, and the
   render reports the unweighted mean of its epochs, so the total bias is the Cesàro mean of a null
   sequence. This was the one thing mode `U` had that mode `J` lacked, and it had to be acquired
-  before `U` could be retired. Only one plumbing fact makes it a two-line change: `mk.surf` is
+  before `U` could be retired — though the measured head-to-head has since said `U` wins its own workload by 4–6× at equal time and stays (UPBP-VM). Only one plumbing fact makes it a two-line change: `mk.surf` is
   derived from `SurfMap::radius` at gather time and the light pass's `κ_s` from the same field, so
   handing `build()` a different radius retunes the estimator *and* its MIS weight together, per
   epoch, with no second source of truth. Epoch 0 gets `r_0` exactly.
