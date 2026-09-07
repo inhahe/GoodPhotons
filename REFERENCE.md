@@ -859,7 +859,7 @@ that converges to the same physical image.
 | `M` | Many cameras sharing one lighting solution (flythroughs); reusable/persistable map | Fast per frame *(after one shared pass)* | ✓ *(walks to diffuse)* | — | ✓ | ✓ *(direct query)* | Direct query blurs contact shadows (use `-pmfg`); media need `-beams` (full multiple scattering since 0.199.0) |
 | `S` | **Caustics / SDS**; progressive, bounded memory | Slow *(many passes)* | ✓ | ✓ | ✓✓ | ✓ *(resident session; pinhole only)* | Many passes to converge |
 | `U` | Robust "have it all" (diffuse GI + caustics), no per-scene mode picking | Heaviest / pass | ✓ | ✓ | ✓ | ✓ *(resident session; pinhole only, no media)* | Heaviest per-pass cost |
-| `J` | **Thick / deep participating media** — `D`'s paths plus `M`'s beams under one MIS weight | `D` + one shared beam pass | ✓ | ✓ *(physical lens)* | ✓ | ✗ *(CPU only so far)* | Inherits `D`'s scope (no fluorescence / env / collimated); the beam pass is a fixed up-front cost |
+| `J` | **Thick / deep participating media** — `D`'s paths plus `M`'s beams under one MIS weight | `D` + one shared beam pass | ✓ | ✓ *(physical lens)* | ✓ | ✓ *(camera pass on the GPU with the wavefront beam gather; only the `-jsurf` surface merges are CPU-only)* | Inherits `D`'s scope (no fluorescence / env / collimated); the beam pass is a fixed up-front cost |
 
 - **`B` — pinhole splat (default, fastest).** Every photon that hits a
   camera-visible surface splats to the pinhole, so essentially no photons are
@@ -1511,6 +1511,13 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   *slice* (sample range + samples/s), which exposes the per-scanline-band cost structure
   inside a single spp — on a scene with a dense participating-medium band the sky and the
   cloud can differ by more than 10x, and only the slice trace shows it.
+- **`FTRACE_NOWAVEFRONT=1` (diagnostic, mode `J` on the GPU).** Since 0.261.0 mode `J`'s device
+  camera pass runs its beam gather as a *wavefront* — segments are queued, candidates are
+  enumerated one thread per segment, and evaluated one thread per candidate — instead of one
+  thread per camera path doing everything inline, which was warp-divergent (measured 11× more
+  spp at equal time on `_fog_thick`). Both paths are the same estimator summed in a different
+  order. Setting this forces the old inline gather, which is the A/B control for any parity
+  question; the render reports its queue use in a `[gpu] mode J wavefront gather:` line.
 - **`FTRACE_J_HALF` / `FTRACE_BEAM_DIAG` (mode-J diagnostics).** Mode `J` combines BDPT
   connections with the beam×ray merge, and when its image comes out at the wrong brightness
   the two halves are indistinguishable from the outside — a broken MIS weight and a beam map

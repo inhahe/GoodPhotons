@@ -1433,6 +1433,27 @@ from evaluation). At 2.8× against a ~19× deficit, mode `J` on the GPU is still
 on the GPU at equal time; the port is a correctness and infrastructure win, not yet a performance
 one. Do not treat UPBP-CONV as closed.
 
+**(2d) The wavefront gather landed (2026-09-06, 0.261.0) — and it is the lever (2c) named.** The
+device gather was one thread per *camera path* walking the beam BVH and evaluating every
+surviving beam in place, so lanes in a warp serialised against each other's beam lists. Mode
+`J`'s device camera pass now runs the gather as three uniform phases: `kBdptT` writes each segment
+— with the per-segment weight state (`DBeamMergeW`, `DTrRay`) it already built — to a queue
+(`DWfSeg`); `kWfBeamHits`, one thread per segment, walks the BVH and appends `(segment, beam, t,
+s)` candidates; `kWfBeamEval`, one thread per candidate, runs the estimator and adds into the film
+with atomics. The estimator itself was hoisted into `dBeamHitEval`, which the inline path (mode
+`M`'s gather, and the fallbacks) calls too — one copy, two schedules. Nothing is lost on overflow:
+a segment the queue cannot take is gathered inline by `kBdptT` as before, a candidate the hit
+queue cannot take is evaluated on the spot by `kWfBeamHits`. `FTRACE_NOWAVEFRONT=1` forces the
+inline path, which is the A/B control. Measured on the RTX 4090, mode `J`, 60 s:
+
+| scene | inline spp | wavefront spp | gain |
+|---|---|---|---|
+| `_fog_thick` 128², default `-beamk 32` | 380 | 4905 | **12.9×** |
+| `_fog_thick` 128², `-beamk 1` (the walk-bound control) | 5813 | 8355 | 1.44× |
+
+Parity (wavefront vs inline, per channel, mean / median): `_fog_thick` trimmed whole-image means against a 120 s mode-D reference (20 479 spp): wavefront +1.68 %, inline +1.01 %; per row band, the five bands that carry the energy agree with D within ±4 % for both paths (the three darkest bands are 10³–10⁵× dimmer noise floors where ratios mean nothing — 34 % of this scene’s pixels are exactly zero in all three images); `_fog_cornell`
+128² (90 s each; 41 vs 13 spp, 3.2× on this dense map — its early waves still spill ~70 M hits into the on-the-spot path, so there is headroom): means against a 90 s mode-D reference, wavefront −0.1 / −5.6 / +4.9 %, inline −2.2 / −0.4 / +1.8 % — both inside the ±5 % scatter mode J shows at 41 / 13 spp, with no consistent sign. The device reports the queue use at the end of a render (`[gpu] mode J wavefront gather: N waves (first up to P paths, adaptive after); last wave S segments / H hits; spilled over the whole render: A segments gathered inline, B hits evaluated on the spot`).
+
 **(3) Mode `J` fireflies harder than mode `D`.** Peak pixel 3.13e13 against 1.61e13 on the same
 scene — the beam×ray estimator's `1/sin(theta)` factor is unbounded as a beam becomes parallel to
 the camera ray, and the MIS weight does not suppress it (a near-parallel merge is *also* a
@@ -7941,6 +7962,14 @@ image and the direct half returning ~0, and the control scenes closed it: `corne
 `scraps/_sun_cornell.ftsl` have **no media** (so the term was skipped entirely — ratios 1.0001
 and 1.0017), and `_fog_cornell`'s thin fog in a 1 m room is negligible. `-pmfg` is the standard
 remedy for **M-GATHERAREA**, so this also unblocks that entry.
+
+**Verified fixed (2026-09-06, 0.260.1)** on `gallery_rain` itself, against the no-FG image
+`png/fgdiag/M_noFG.pfm`: `-camera cam -r 640 360 -mode M -beams -pmfg 8` (900 s), per element
+using the campaign's own ROI boxes — `grid_ground` FG/no-FG luminance **0.990** (X 0.923, Z 0.998)
+and `cap_gyroid` 1.40 (X 1.47, Z 1.95, mode `M`'s firefly tail at unequal budgets), where the bug
+read 0.01–0.08. Whole-frame medians +4.8 / +11.1 / +4.9 %. One trap for anyone re-running it:
+without `-camera cam` the scene renders its `camera_curve "fly"` flypath frame by frame and
+never produces a comparable still.
 
 **Symptom (as filed).** `scenes/gallery_rain.ftsl -mode W` rendered the ceiling cloud, the mesh-bound
 raincloud and a full spectral **rainbow** from the `phase rainbow { droplet_um 500 }` curtain on

@@ -5382,6 +5382,80 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
 // M, and then not one line below changes — the gather is bit-for-bit the pre-mode-J one.
 // `camTr` is the caller's per-segment deterministic-transmittance cache (unused when `mw` is
 // null, and built by the caller precisely because it is a constant of the SEGMENT).
+// THE ESTIMATOR, BEAM x RAY, for ONE surviving candidate (photonbeams.h's twin) -- hoisted out
+// of dGatherPhotonBeams so that the inline gather below and the WAVEFRONT gather (kWfBeamEval)
+// run the identical code: one copy of what a beam contributes, two ways of scheduling it.
+// `t`/`s` are the closest-approach parameters along the camera segment / the beam, `cosT` and
+// `den` (= sin^2 theta) the pair's geometry, `x2` the squared normalised kernel offset (< 1).
+__device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const DBeamRec& b,
+                                    int beamIdx, const DVec3& oc, const DVec3& dc,
+                                    Real t, Real s, Real cosT, Real den, double x2,
+                                    double aGlassCam, DRng& rng,
+                                    const DBeamMergeW* mw, const DTrRay* camTr,
+                                    const DPatEnv& env,
+                                    double& oX, double& oY, double& oZ) {
+        if (b.med < 0 || b.med >= sc.mediaN) return;
+        const DMedium& md = sc.media[b.med];
+        const Real lam = b.lambda;
+        const DVec3 xc = oc + dc * t;
+        // sigma_s AT the gather point — density field and all, so a heterogeneous
+        // cloud shapes the bow instead of a uniform slab of it. The DENSITY is
+        // wavelength-independent (it is a scalar field), so this one evaluation — the
+        // expensive half, since it runs a compiled pattern program — serves the whole
+        // spectral bundle below.
+        const double dens = dMedDensityAt(md, xc, env);
+        const double ss = (double)specLookup(md.sigma_s, lam) * dens;
+        if (!(ss > 0.0)) return;
+        // connectVolume's convention: phase(dot(wIn, wToCamera)), wIn = b.d, wToCam = -dc.
+        const double phase = (double)dMedPhase(md, -cosT, lam);
+        if (!(phase > 0.0)) return;
+        // 1D Epanechnikov kernel, normalised so its integral over [-r, r] is 1.
+        const double kk = 1.0 - x2;
+        const double K1 = 0.75 * (double)b.invRad * kk;
+        const double sinT = (double)sqrt((double)den);
+        double w = K1 / sinT * ss * phase;
+        // MIS (mode J); exactly absent in mode M. `dens` and `phase` are handed over
+        // rather than recomputed: the merge weight needs sigma_t(x) and the phase
+        // value at the merge point, and both are one multiply away from what the
+        // lines above just built. Applied BEFORE the `w > 0` reject so a technique
+        // the weight kills costs no transmittance marches — the host's order too.
+        if (mw) {
+            const DBeamMis* lm = bm.misOf(beamIdx);
+            // A null entry means the map carries no MIS data for this beam, which is
+            // the gather's signal to fall back to weight 1 (mode M's estimator).
+            if (lm) w *= dBeamMergeWeight(sc, *mw, *lm, b, *camTr, oc, dc,
+                                          (double)t, (double)s, sinT, dens, phase, env);
+        }
+        if (!(w > 0.0)) return;
+        if (b.absorb > 0.f)  w *= exp(-(double)b.absorb * (double)s);   // glass, beam side
+        if (aGlassCam > 0.0) w *= exp(-aGlassCam * (double)t);          // glass, camera side
+        if (s > (Real)0) w *= (double)dMediaTransmittance(sc, b.o, b.d, s, lam, rng);
+        if (t > (Real)0) w *= (double)dMediaTransmittance(sc, oc, dc, t, lam, rng);
+        if (!(w > 0.0)) return;
+        oX += (double)b.pX * w; oY += (double)b.pY * w; oZ += (double)b.pZ * w;
+        // SECONDARY wavelengths of the spectral bundle (host twin: gatherPhotonBeams).
+        // They share this beam's geometry, its kernel weight and — decisively — BOTH
+        // transmittance marches, which are the whole cost of the loop above and are
+        // wavelength-independent whenever the bundle is allowed at all (the extinction
+        // is achromatic; see beamSpectralOK). So all that differs per wavelength is
+        // sigma_s * phase * CIE. `w / (ss * phase)` recovers the shared factor with one
+        // division instead of rebuilding the chain; both terms are known positive here.
+        if (b.nSec) {
+            const double wShared = w / (ss * phase);
+            for (int k = 0; k < (int)b.nSec; ++k) {
+                const Real li = b.lamSec(k);
+                const double ssi = (double)specLookup(md.sigma_s, li) * dens;
+                if (!(ssi > 0.0)) continue;
+                const double phi = (double)dMedPhase(md, -cosT, li);
+                if (!(phi > 0.0)) continue;
+                const double wi = wShared * (double)b.pwSec[k] * ssi * phi;
+                oX += (double)cieX(li) * wi;
+                oY += (double)cieY(li) * wi;
+                oZ += (double)cieZ(li) * wi;
+            }
+        }
+}
+
 __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DVec3& oc, const DVec3& dc, Real tMax,
                                           double aGlassCam, DRng& rng,
@@ -5426,72 +5500,137 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 // (d_perp / r_med)^2, with r_med this beam's own medium's half-width.
                 const double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
                 if (!(x2 < 1.0)) continue;
-                // --- the estimator (photonbeams.h, THE ESTIMATOR: BEAM x RAY) -------
-                if (b.med < 0 || b.med >= sc.mediaN) continue;
-                const DMedium& md = sc.media[b.med];
-                const Real lam = b.lambda;
-                const DVec3 xc = oc + dc * t;
-                // sigma_s AT the gather point — density field and all, so a heterogeneous
-                // cloud shapes the bow instead of a uniform slab of it. The DENSITY is
-                // wavelength-independent (it is a scalar field), so this one evaluation — the
-                // expensive half, since it runs a compiled pattern program — serves the whole
-                // spectral bundle below.
-                const double dens = dMedDensityAt(md, xc, env);
-                const double ss = (double)specLookup(md.sigma_s, lam) * dens;
-                if (!(ss > 0.0)) continue;
-                // connectVolume's convention: phase(dot(wIn, wToCamera)), wIn = b.d, wToCam = -dc.
-                const double phase = (double)dMedPhase(md, -cosT, lam);
-                if (!(phase > 0.0)) continue;
-                // 1D Epanechnikov kernel, normalised so its integral over [-r, r] is 1.
-                const double kk = 1.0 - x2;
-                const double K1 = 0.75 * (double)b.invRad * kk;
-                const double sinT = (double)sqrt((double)den);
-                double w = K1 / sinT * ss * phase;
-                // MIS (mode J); exactly absent in mode M. `dens` and `phase` are handed over
-                // rather than recomputed: the merge weight needs sigma_t(x) and the phase
-                // value at the merge point, and both are one multiply away from what the
-                // lines above just built. Applied BEFORE the `w > 0` reject so a technique
-                // the weight kills costs no transmittance marches — the host's order too.
-                if (mw) {
-                    const DBeamMis* lm = bm.misOf(bm.primIdx[n.first + i]);
-                    // A null entry means the map carries no MIS data for this beam, which is
-                    // the gather's signal to fall back to weight 1 (mode M's estimator).
-                    if (lm) w *= dBeamMergeWeight(sc, *mw, *lm, b, *camTr, oc, dc,
-                                                  (double)t, (double)s, sinT, dens, phase, env);
-                }
-                if (!(w > 0.0)) continue;
-                if (b.absorb > 0.f)  w *= exp(-(double)b.absorb * (double)s);   // glass, beam side
-                if (aGlassCam > 0.0) w *= exp(-aGlassCam * (double)t);          // glass, camera side
-                if (s > (Real)0) w *= (double)dMediaTransmittance(sc, b.o, b.d, s, lam, rng);
-                if (t > (Real)0) w *= (double)dMediaTransmittance(sc, oc, dc, t, lam, rng);
-                if (!(w > 0.0)) continue;
-                oX += (double)b.pX * w; oY += (double)b.pY * w; oZ += (double)b.pZ * w;
-                // SECONDARY wavelengths of the spectral bundle (host twin: gatherPhotonBeams).
-                // They share this beam's geometry, its kernel weight and — decisively — BOTH
-                // transmittance marches, which are the whole cost of the loop above and are
-                // wavelength-independent whenever the bundle is allowed at all (the extinction
-                // is achromatic; see beamSpectralOK). So all that differs per wavelength is
-                // sigma_s * phase * CIE. `w / (ss * phase)` recovers the shared factor with one
-                // division instead of rebuilding the chain; both terms are known positive here.
-                if (b.nSec) {
-                    const double wShared = w / (ss * phase);
-                    for (int k = 0; k < (int)b.nSec; ++k) {
-                        const Real li = b.lamSec(k);
-                        const double ssi = (double)specLookup(md.sigma_s, li) * dens;
-                        if (!(ssi > 0.0)) continue;
-                        const double phi = (double)dMedPhase(md, -cosT, li);
-                        if (!(phi > 0.0)) continue;
-                        const double wi = wShared * (double)b.pwSec[k] * ssi * phi;
-                        oX += (double)cieX(li) * wi;
-                        oY += (double)cieY(li) * wi;
-                        oZ += (double)cieZ(li) * wi;
-                    }
-                }
+                dBeamHitEval(sc, bm, b, bm.primIdx[n.first + i], oc, dc, t, s, cosT, den, x2,
+                             aGlassCam, rng, mw, camTr, env, oX, oY, oZ);
             }
         } else {
             Real tc;
             if (boxHit(bm.nodes[n.left],  oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.left;
             if (boxHit(bm.nodes[n.right], oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.right;
+        }
+    }
+}
+
+// ---- WAVEFRONT beam gather for mode J (UPBP-CONV) ----------------------------------------
+// The inline gather above is one thread per CAMERA PATH walking the beam BVH and evaluating every
+// surviving beam in place. Measured on _fog_thick (128^2, 60 s, RTX 4090, 0.260.1): 382 spp with
+// a segment gathering 32 beams against 6513 spp gathering ~1. That 17x is warp divergence, not
+// arithmetic -- each lane walks its own beam list and each hit runs its own weight and marches,
+// so lanes in a warp serialise against each other's lists. So mode J's camera pass SEPARATES the
+// three phases: kBdptT writes each segment, with the per-segment weight state it already builds,
+// to a queue; kWfBeamHits (one thread per segment) walks the BVH and appends (segment, beam, t, s)
+// candidates; kWfBeamEval (one thread per candidate) runs the estimator -- dBeamHitEval, the same
+// function the inline path calls -- and accumulates into the film. Each phase is uniform work.
+//
+// Nothing is dropped on overflow: a segment that does not fit the queue is gathered inline by
+// kBdptT exactly as before, and a candidate that does not fit the hit queue is evaluated on the
+// spot by kWfBeamHits. The result is the same estimator summed in a different order (per-hit
+// atomics, and a per-hit RNG stream for the stochastic transmittance of heterogeneous media),
+// so it is validated statistically: parity against the inline path (FTRACE_NOWAVEFRONT=1).
+struct DWfSeg {
+    DVec3  o, d;
+    double tMax, beta, aGlass;
+    DBeamMergeW mw;
+    DTrRay      tr;
+    int    px, py;
+    float  lambda;
+    unsigned long long seed;
+};
+struct DWfHit { int seg; int beam; float t, s; };
+struct DWfQueue {
+    DWfSeg* segs;  int* nSegs; int segCap;
+    DWfHit* hits;  int* nHits; int hitCap;
+    int*    overflow;   // [0] segments gathered inline (queue full), [1] hits evaluated on the spot
+};
+
+__global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX) {
+    const int nS = min(*q.nSegs, q.segCap);
+    const DPatEnv env = dPatEnvOf(sc);
+    for (int si = blockIdx.x * blockDim.x + threadIdx.x; si < nS; si += gridDim.x * blockDim.x) {
+        const DWfSeg& sg = q.segs[si];
+        const DVec3 oc = sg.o, dc = sg.d;
+        const Real tMax = (Real)sg.tMax;
+        if (bm.nNodes == 0) continue;
+        const DVec3 invD{(Real)1 / dc.x, (Real)1 / dc.y, (Real)1 / dc.z};
+        Real tRoot;
+        if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) continue;
+        int stack[64]; int sp = 0; stack[sp++] = 0;
+        int stopPoll = 0;
+        DRng rng; rng.seed(sg.seed * 2 + 1, sg.seed ^ 0x9E3779B97F4A7C15ull);   // on-the-spot fallback only
+        double fX = 0.0, fY = 0.0, fZ = 0.0;
+        while (sp) {
+            if ((++stopPoll & 63) == 0 && dGatherStopped()) break;
+            const DNode& n = bm.nodes[stack[--sp]];
+            if (n.count > 0) {
+                for (int i = 0; i < n.count; ++i) {
+                    const int bi = bm.primIdx[n.first + i];
+                    const DBeamRec& b = bm.beams[bi];
+                    const Real cosT = dot(dc, b.d);
+                    const DVec3 cr  = cross(dc, b.d);
+                    const Real den  = dot(cr, cr);
+                    if (den < (Real)1e-9) continue;
+                    const DVec3 w0 = oc - b.o;
+                    const Real dd = dot(dc, w0), ee = dot(b.d, w0);
+                    const Real t = (cosT * ee - dd) / den;
+                    const Real s = (ee - cosT * dd) / den;
+                    if (t < (Real)0 || t > tMax) continue;
+                    if (s < b.s0 || s > b.s0 + b.len) continue;
+                    const DVec3 diff = (oc + dc * t) - (b.o + b.d * s);
+                    const Real d2 = dot(diff, diff);
+                    const double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
+                    if (!(x2 < 1.0)) continue;
+                    const int h = atomicAdd(q.nHits, 1);
+                    if (h < q.hitCap) {
+                        q.hits[h] = DWfHit{si, bi, (float)t, (float)s};
+                    } else {
+                        atomicAdd(&q.overflow[1], 1);
+                        dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
+                                     &sg.mw, &sg.tr, env, fX, fY, fZ);
+                    }
+                }
+            } else {
+                Real tc;
+                if (boxHit(bm.nodes[n.left],  oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.left;
+                if (boxHit(bm.nodes[n.right], oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.right;
+            }
+        }
+        if (fX != 0.0 || fY != 0.0 || fZ != 0.0) {
+            const size_t o = ((size_t)sg.py * resX + sg.px) * 3;
+            atomicAdd(&camFilm[o + 0], fX * sg.beta);
+            atomicAdd(&camFilm[o + 1], fY * sg.beta);
+            atomicAdd(&camFilm[o + 2], fZ * sg.beta);
+        }
+    }
+}
+
+__global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX) {
+    const int nH = min(*q.nHits, q.hitCap);
+    const DPatEnv env = dPatEnvOf(sc);
+    for (int hi = blockIdx.x * blockDim.x + threadIdx.x; hi < nH; hi += gridDim.x * blockDim.x) {
+        const DWfHit h = q.hits[hi];
+        const DWfSeg& sg = q.segs[h.seg];
+        const DBeamRec& b = bm.beams[h.beam];
+        const DVec3 oc = sg.o, dc = sg.d;
+        const Real cosT = dot(dc, b.d);
+        const DVec3 cr  = cross(dc, b.d);
+        const Real den  = dot(cr, cr);
+        if (den < (Real)1e-9) continue;
+        const Real t = (Real)h.t, s = (Real)h.s;
+        const DVec3 diff = (oc + dc * t) - (b.o + b.d * s);
+        const Real d2 = dot(diff, diff);
+        double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
+        if (x2 >= 1.0) x2 = 0.999999;   // the candidate passed x2 < 1 in kWfBeamHits; keep it
+        DRng rng;
+        rng.seed((sg.seed ^ ((unsigned long long)h.beam * 0x9E3779B97F4A7C15ull)) * 2 + 1,
+                 sg.seed + (unsigned long long)hi);
+        double oX = 0.0, oY = 0.0, oZ = 0.0;
+        dBeamHitEval(sc, bm, b, h.beam, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
+                     &sg.mw, &sg.tr, env, oX, oY, oZ);
+        if (oX != 0.0 || oY != 0.0 || oZ != 0.0) {
+            const size_t o = ((size_t)sg.py * resX + sg.px) * 3;
+            atomicAdd(&camFilm[o + 0], oX * sg.beta);
+            atomicAdd(&camFilm[o + 1], oY * sg.beta);
+            atomicAdd(&camFilm[o + 2], oZ * sg.beta);
         }
     }
 }
@@ -12546,7 +12685,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                       long long totalSamples, long long chunkSpp, long long sppTotal,
                       long long sampleBase, int resX, int maxDepth,
                       int diffraction, unsigned long long seedBase, int heroC,
-                      DBeamMap bm) {
+                      DBeamMap bm, DWfQueue wq, long long idxBegin, long long idxEnd) {
     enum { SECN = (NS > 0 ? NS : 1), MAXV = BDPT_MAXV_OF(MAXD),
            SEGN = (MERGE ? BDPT_MAXV_OF(MAXD) : 1) };
     // `bm.beams == nullptr` is the dispatcher's own "-nobeams / empty map" signal, so this
@@ -12563,7 +12702,9 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     const int C = (NS > 0) ? heroC : 1;
-    for (long long idx = g; idx < totalSamples; idx += G) {
+    // [idxBegin, idxEnd) is the wave the host is running (the whole chunk when the
+    // wavefront gather is off); idxEnd <= totalSamples.
+    for (long long idx = idxBegin + g; idx < idxEnd; idx += G) {
         long long pix = idx / chunkSpp;
         long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
         DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
@@ -12781,14 +12922,32 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                         }
                     }
                 }
-                double mX = 0.0, mY = 0.0, mZ = 0.0;
-                dGatherPhotonBeams(sc, bm, sg.o, sg.d, (Real)sg.tMax, sg.aGlass, rng,
-                                   mX, mY, mZ, &mw, &camTr);
-                if (mX != 0.0 || mY != 0.0 || mZ != 0.0) {
-                    size_t o = ((size_t)py * resX + px) * 3;
-                    atomicAdd(&camFilm[o + 0], mX * sg.beta);
-                    atomicAdd(&camFilm[o + 1], mY * sg.beta);
-                    atomicAdd(&camFilm[o + 2], mZ * sg.beta);
+                // WAVEFRONT (UPBP-CONV): hand the segment -- and the weight state just built for
+                // it -- to the queue; kWfBeamHits / kWfBeamEval do the gather after this kernel.
+                // A full queue means this segment is gathered inline, right here, as before.
+                bool queued = false;
+                if (wq.segs) {
+                    const int si = atomicAdd(wq.nSegs, 1);
+                    if (si < wq.segCap) {
+                        DWfSeg& ws = wq.segs[si];
+                        ws.o = sg.o; ws.d = sg.d; ws.tMax = sg.tMax; ws.beta = sg.beta; ws.aGlass = sg.aGlass;
+                        ws.mw = mw; ws.tr = camTr; ws.px = px; ws.py = py; ws.lambda = (float)lambda;
+                        ws.seed = (unsigned long long)gidx * 1315423911ull + (unsigned long long)i * 2654435761ull;
+                        queued = true;
+                    } else {
+                        atomicAdd(&wq.overflow[0], 1);
+                    }
+                }
+                if (!queued) {
+                    double mX = 0.0, mY = 0.0, mZ = 0.0;
+                    dGatherPhotonBeams(sc, bm, sg.o, sg.d, (Real)sg.tMax, sg.aGlass, rng,
+                                       mX, mY, mZ, &mw, &camTr);
+                    if (mX != 0.0 || mY != 0.0 || mZ != 0.0) {
+                        size_t o = ((size_t)py * resX + px) * 3;
+                        atomicAdd(&camFilm[o + 0], mX * sg.beta);
+                        atomicAdd(&camFilm[o + 1], mY * sg.beta);
+                        atomicAdd(&camFilm[o + 2], mZ * sg.beta);
+                    }
                 }
             }
         }
@@ -16669,29 +16828,88 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     DBeamMap dbm{};
     if (bmap) uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/true);
     const bool mergeOn = (dbm.nNodes > 0);
+    // WAVEFRONT gather queue (UPBP-CONV): sized for one wave of camera paths; the chunk is run
+    // as consecutive waves. FTRACE_NOWAVEFRONT=1 forces the inline gather (the A/B control).
+    DWfQueue wq{};
+    int* d_wfCounters = nullptr;
+    long long waveSamples = 0;
+    if (mergeOn && !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
+        const int segCap = 1 << 20;          // ~270 B each (~280 MB)
+        const int hitCap = 1 << 25;          // 16 B each  (512 MB): a dense map yields thousands of
+                                             // candidates per segment (_fog_cornell: ~2000), and a
+                                             // spilled candidate is evaluated divergently, on the spot
+        CUDA_CHECK(cudaMalloc(&wq.segs, (size_t)segCap * sizeof(DWfSeg)));
+        CUDA_CHECK(cudaMalloc(&wq.hits, (size_t)hitCap * sizeof(DWfHit)));
+        CUDA_CHECK(cudaMalloc(&d_wfCounters, 4 * sizeof(int)));
+        wq.nSegs = d_wfCounters; wq.nHits = d_wfCounters + 1; wq.overflow = d_wfCounters + 2;
+        wq.segCap = segCap; wq.hitCap = hitCap;
+        waveSamples = (long long)segCap / (long long)(maxDepth + 3);   // SEGN = MAXV = depth + 3
+        if (waveSamples < 1) waveSamples = 1;
+    }
+    long long wfWaves = 0, wfSpillSegs = 0, wfSpillHits = 0;
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
         // Mode J only ever instantiates the scalar (NS == 0) kernel: `useHero` is already
         // false for any scene with a participating medium, and a mode-J scene without one
         // has nothing to merge.
-        if (mergeOn && deep)
-            kBdptT<0, BDPT_DEEPDEPTH, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                           resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm);
-        else if (mergeOn)
-            kBdptT<0, BDPT_MAXDEPTH, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                          resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm);
+        if (mergeOn) {
+            // ADAPTIVE WAVES: the first wave is sized by segments alone; every later wave is sized
+            // so that the previous wave's observed hits-per-segment would fill ~70% of the hit
+            // queue, and never more than the segment queue allows. One synchronous 4-int copy per
+            // wave buys a schedule that never spills on a stationary scene.
+            // The FIRST wave is small: a dense map yields thousands of candidates per segment,
+            // and a segment-sized first wave would spill millions of them into the divergent
+            // on-the-spot path before any measurement exists. The adaptive rule then grows the
+            // wave, up to the segment-sized ceiling. Each wave advances by the range it actually
+            // ran (b0 = b1) -- NOT by the wave size, which changes inside the loop.
+            long long wave = wq.segs ? ((waveSamples < 4096) ? waveSamples : 4096) : totalSamples;
+            for (long long b0 = 0; b0 < totalSamples; ) {
+                const long long b1 = (b0 + wave < totalSamples) ? b0 + wave : totalSamples;
+                if (wq.segs) CUDA_CHECK(cudaMemsetAsync(d_wfCounters, 0, 4 * sizeof(int)));
+                if (deep)
+                    kBdptT<0, BDPT_DEEPDEPTH, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                                   resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
+                else
+                    kBdptT<0, BDPT_MAXDEPTH, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                                  resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, wq, b0, b1);
+                if (wq.segs) {
+                    cudaCheckKernel("bdpt");
+                    kWfBeamHits<<<2048, 128>>>(up.sc, dbm, wq, d_cam, resX);
+                    cudaCheckKernel("wf-hits");
+                    kWfBeamEval<<<4096, 128>>>(up.sc, dbm, wq, d_cam, resX);
+                    cudaCheckKernel("wf-eval");
+                    ++wfWaves;
+                    int cnt[4] = {0, 0, 0, 0};
+                    CUDA_CHECK(cudaMemcpy(cnt, d_wfCounters, sizeof cnt, cudaMemcpyDeviceToHost));
+                    wfSpillSegs += cnt[2]; wfSpillHits += cnt[3];
+                    const long long paths = b1 - b0;
+                    const double segsPerPath = (paths > 0) ? (double)cnt[0] / (double)paths : (double)(maxDepth + 3);
+                    const double hitsPerSeg  = (cnt[0] > 0) ? ((double)cnt[1] + (double)cnt[3]) / (double)cnt[0] : 0.0;
+                    long long next = waveSamples;
+                    if (hitsPerSeg > 0.0 && segsPerPath > 0.0) {
+                        const double byHits = 0.7 * (double)wq.hitCap / (hitsPerSeg * segsPerPath);
+                        const double bySegs = 0.9 * (double)wq.segCap / segsPerPath;
+                        next = (long long)((byHits < bySegs) ? byHits : bySegs);
+                    }
+                    if (next < 256) next = 256;
+                    if (next > waveSamples) next = waveSamples;   // the segment-sized wave is the ceiling
+                    wave = next;
+                }
+                b0 = b1;
+            }
+        }
         else if (useHero && deep)
             kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm);
+                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, DWfQueue{}, 0, totalSamples);
         else if (useHero)
             kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                            resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm);
+                                                            resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, DWfQueue{}, 0, totalSamples);
         else if (deep)
             kBdptT<0, BDPT_DEEPDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm);
+                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, DWfQueue{}, 0, totalSamples);
         else
             kBdptT<0, BDPT_MAXDEPTH, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                    resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm);
+                                                    resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, DWfQueue{}, 0, totalSamples);
         cudaCheckKernel("bdpt");
     };
 
@@ -16699,6 +16917,17 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     else gpuSppChunks(spp, *prog, out, launch, download);
 
     freeUpload(up);
+    if (wq.segs) {
+        int ov[4] = {0, 0, 0, 0};
+        cudaMemcpy(ov, d_wfCounters, sizeof ov, cudaMemcpyDeviceToHost);
+        std::fprintf(stderr, "[gpu] mode J wavefront gather: %lld waves (first up to %lld paths, adaptive after); "
+                             "last wave %d segments / %d hits; spilled over the whole render: %lld segments "
+                             "gathered inline, %lld hits evaluated on the spot (FTRACE_NOWAVEFRONT=1 forces "
+                             "the inline path)\n",
+                     wfWaves, waveSamples, ov[0] < wq.segCap ? ov[0] : wq.segCap,
+                     ov[1] < wq.hitCap ? ov[1] : wq.hitCap, wfSpillSegs, wfSpillHits);
+        cudaFree(wq.segs); cudaFree(wq.hits); cudaFree(d_wfCounters);
+    }
     cudaFree(d_cam); cudaFree(d_splat);
     return out;
 }

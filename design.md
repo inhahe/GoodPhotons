@@ -599,6 +599,19 @@ Four consequences worth knowing:
     wrong one" and removes the `spd_em/p_comb` weight-ratio variance — measurably: it took the
     **cloud** crop's chroma noise *further* down (saturation 0.0560 → 0.0390) even though the
     cloud was already folding.
+  - **Wavefront beam gather on the device (0.261.0 — `UPBP-CONV`).** The device gather was one
+    thread per camera path walking the beam BVH and evaluating every surviving beam in place —
+    warp-divergent by construction, which is what a 17× gap between `-beamk 32` and `-beamk 1`
+    looked like. Mode `J`'s camera pass now separates the phases: `kBdptT` queues each segment
+    with the weight state it already builds (`DWfSeg` = segment + `DBeamMergeW` + `DTrRay` +
+    pixel/λ/seed), `kWfBeamHits` (one thread per segment) enumerates `(segment, beam, t, s)`
+    candidates, `kWfBeamEval` (one thread per candidate) runs the estimator — `dBeamHitEval`,
+    hoisted so the inline path calls the same function — and accumulates with atomics. The host
+    runs a chunk as consecutive waves — the first 4096 paths, each later one sized from the previous wave’s hits per segment to fill ~70 % of the hit queue, up to the segment-sized ceiling `segCap / (depth + 3)`; overflow
+    degrades to the inline gather (segments) or on-the-spot evaluation (hits), never to a drop.
+    The per-hit RNG stream is derived from the segment seed and beam index, so heterogeneous
+    transmittance stays stochastic and unbiased. `FTRACE_NOWAVEFRONT=1` is the A/B control.
+    Measured: `_fog_thick` 128² at `-beamk 32`, 60 s: 380 → 4905 spp (**12.9×**).
   - **Weighted bundles, and one shared surface rule (0.257.0 — `UPBP-BOWFOLD`).** Both claims used
     to die at the **first surface interaction of any kind**, which is what capped mode `J` at
     36.2 % bundled / 47.0 % folded: a subpath that so much as grazed a diffuse wall deposited the
