@@ -162,7 +162,7 @@ wins at equal time) and is arguably the better attack on it: caching removes the
 optimising it. Do the profiling half of `UPBP-CONV` first — an exact per-frame split of light
 pass vs surface gather vs beam gather — since it sizes both.
 
-### FOLD-GLOSSY — OPEN (2026-09-06, v0.257.0): `Glossy` still retires the spectral claim in both forward tracers even though its lobe *geometry* is wavelength-free, so a λ-dependent glossy albedo drops a beam to monochromatic where a diffuse one would now fold
+### FOLD-GLOSSY — DONE (2026-09-06, v0.260.1; filed at v0.257.0): `Glossy` still retires the spectral claim in both forward tracers even though its lobe *geometry* is wavelength-free, so a λ-dependent glossy albedo drops a beam to monochromatic where a diffuse one would now fold
 
 Fallout from `UPBP-BOWFOLD`. 0.257.0 established the right rule — retire only on wavelength-
 **divergence**, absorb mere wavelength-**dependence** into `foldT[]` / `beamW[]` — and applied it
@@ -189,6 +189,29 @@ rain crops — the fold's residual there is already attributed to `chroma-medium
 `specular` (1.35 %), and only part of that 1.35 % is glossy. Measure with `FTRACE_FOLDDIAG=1`
 first to size it, on a scene with a coloured glossy surface in the volume (Alice's dress would
 do). If it is worth <0.5 % coverage, log that and close it as not worth the divergence risk.
+
+**Done (0.260.1).** Sized first, as the entry asked: a fog Cornell with a coloured glossy sphere
+(`scraps/_fogc_gloss.ftsl`, `reflect rgb 0.85 0.30 0.15 roughness 0.25`) under
+`FTRACE_FOLDDIAG=1` in mode `M -beams` reported **9.7 % of foldable deposits retired as
+"specular"** with the sphere the only specular-group object present — far above the 0.5 %
+closure threshold — so the change went in, in both tracers in one commit exactly as the
+constraint above requires. `tracePhoton` (render.h) takes `Glossy` out of the specular group:
+it evaluates the lobe's albedo on the fold quadrature and the bundle, runs `foldWorthIt`, and
+applies the ratio after `interactPhotonSpecular`'s survival roulette at `r(λ_hero)` — Diffuse's
+arithmetic exactly (`E[r_hero · F_k r_k / r_hero] = F_k r_k`). `randomWalk` (bdpt.h) mirrors it
+in its `Glossy` case with the same `fldOK` / `fldHero` handoff Diffuse uses. A new retirement
+reason, `FK_DeclineGlossy` ("decline-glossy"), records the cases the second-moment guard turns
+down. Validation on the same scene:
+
+| check | result |
+|---|---|
+| A. fold diagnostic after the change | folded 93.70 % (was 84.49 %), decline-diffuse 6.30 %, **specular 0 % (was 9.68 %)**, no `decline-glossy` (the guard accepted every glossy bounce on this sphere) |
+| B. mode `M -beams`: fold on vs `-beamachro off`, mean X / Y / Z | −0.02 % / +0.07 % / −0.09 % (identical within noise: the fold is energy-neutral) |
+| C. mode `J` vs a mode-`D` reference, mean X / Y / Z | +0.59 % / +10.07 % / +5.17 % |
+| C2. same with `-beamachro off` (the no-fold control) | +0.61 % / +10.08 % / +5.37 % — the same channel by channel; the shared +10 % Y mean / −30 % median is the merge estimator’s convergence tail (UPBP-CONV), not chroma |
+
+The fold is exact in expectation, so B and C–C2 agreeing within their noise is the correctness
+statement; a chroma error would have shown as a channel-dependent shift, as `UPBP-CHROMA`'s did.
 
 ### RASTER-PBR — OPEN (2026-09-06, v0.257.0): `-explore` / `-raster` cannot show a glossy material at all, so an asset whose look depends on its specular lobe (Alice's dress) previews flat — where a web viewer like Meshy shows it correctly in real time
 

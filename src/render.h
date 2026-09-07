@@ -51,13 +51,14 @@ enum FoldKill {
     FK_Specular,        // dispersive refraction / grating / thin film / fluorescence / hair
     FK_DeclineTransmit, // DiffuseTransmit: foldWorthIt said the fold would cost variance
     FK_DeclineDiffuse,  // Diffuse albedo:  foldWorthIt said the fold would cost variance
+    FK_DeclineGlossy,   // Glossy albedo:   foldWorthIt said the fold would cost variance
     FK_ZeroWeight,      // rho == 0 at the surviving lobe: T would divide by zero
     FK_COUNT
 };
 inline const char* foldKillName(int k) {
     static const char* n[FK_COUNT] = {"folded", "never-born", "chroma-medium", "glass-absorb",
                                       "grin", "layered", "specular", "decline-transmit",
-                                      "decline-diffuse", "zero-weight"};
+                                      "decline-diffuse", "decline-glossy", "zero-weight"};
     return (k >= 0 && k < FK_COUNT) ? n[k] : "?";
 }
 // Set by tracePhoton at each retirement, read by emitBeams at the deposit. Thread-local, so
@@ -3215,13 +3216,54 @@ struct Renderer {
             // near-delta BSDF -> ~zero connection pdf; the SDS limitation).
             switch (m.type) {
                 case MatType::Dielectric:
+                case MatType::Glossy: {
+                    // SPECTRAL FOLD (FOLD-GLOSSY, 0.260.1): a glossy lobe's GEOMETRY is
+                    // wavelength-free -- sampleGlossy reads the roughness and nothing else -- so
+                    // every wavelength still travels the same chord out of this vertex, which is
+                    // the actual test for keeping the claim (retire on wavelength DIVERGENCE,
+                    // absorb wavelength DEPENDENCE into the per-bin ratios). Only its albedo
+                    // varies with lambda, and that is exactly what foldT[] was built to carry,
+                    // the same way Diffuse carries its reflectance. So: evaluate the albedo on
+                    // the fold quadrature and the bundle, let foldWorthIt decline the saturated
+                    // cases, and apply the ratio AFTER interactPhotonSpecular's survival roulette
+                    // at r(lambda_hero) -- E[ r_hero * F_k r_k / r_hero ] = F_k r_k, Diffuse's
+                    // arithmetic exactly. Measured before this on a fog Cornell with a coloured
+                    // glossy sphere: 9.7 % of foldable beam deposits were retired as "specular".
+                    // Mirrored in bdpt.h's randomWalk: the two tracers fill one PhotonBeam bank
+                    // and must agree on what power / cieA / wS mean.
+                    int    gK = 0, gS = specSec;
+                    double gR[kFoldBins + kBeamSecMax];
+                    bool   gFold = false;
+                    if (achroPath || gS > 0) {
+                        gK = foldEm->foldN;
+                        for (int k = 0; k < gK + gS; ++k)
+                            gR[k] = clamp01(reflectSlot(scene, m, h,
+                                                        (k < gK) ? foldEm->foldLam[k] : specLam[k - gK]));
+                        bool ok = gK > 0 && foldWorthIt(*foldEm, gR, gK);
+                        for (int i = 0; i < gS && ok; ++i) ok = gR[gK + i] > 0.0;
+                        if (ok) gFold = true;
+                        else { retireSpectral(FK_DeclineGlossy); gS = 0; }
+                    }
+                    switch (photonVertexKind(scene, m, h)) {
+                        case PV_FOCUS:   sawFocus   = true; break;
+                        case PV_SCATTER: sawScatter = true; break;
+                        default: break;
+                    }
+                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e))
+                        return;
+                    if (gFold) {
+                        const double rH = clamp01(reflectSlot(scene, m, h, lambda));
+                        if (rH > 0.0) foldApply(rH, gR, gK, gS);
+                        else retireSpectral(FK_ZeroWeight);
+                    }
+                    continue;
+                }
                 case MatType::ThinFilm:
                 case MatType::Multilayer:
                 case MatType::Mirror:
                 case MatType::Grating:
                 case MatType::HalfMirror:
                 case MatType::Filter:
-                case MatType::Glossy:
                 case MatType::Hair:
                 case MatType::Fluorescent: {
                     // Specular / wavelength-switching lobes, all handled by the shared

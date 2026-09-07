@@ -146,6 +146,15 @@ changes the sampling *probability* and the probability is what the analog roulet
 | GRIN | The arc's *geometry* is a function of λ. |
 | Scatter in a chromatic medium (`phase rainbow`) | Same: the direction sampling diverges per λ. Measured at 8.53 % of the cloud's foldable deposits after the surface case was absorbed (see the ceiling section below), and it is **correct** that it does not fold — folding the rain would kill the bow. The lever there is the `-beamspec` bundle, which since 0.257.0 **does** carry per-wavelength weights on the record (`float PhotonBeam::wS[]`) and so survives arbitrarily many λ-dependent transport steps instead of dying at the first one. Note this is *scattering* in such a medium; merely **depositing** in one is handled by the gather-time fold (0.256.0), which resolves the colour once the angle is known. |
 
+**No longer retires (0.260.1, `FOLD-GLOSSY`):** `Glossy`. It sat in the specular group by
+inheritance from the 0.210.0 all-or-nothing rule, but its lobe *geometry* is wavelength-free —
+`sampleGlossy` reads the roughness and nothing else — so the chord test passes and only the
+albedo varies with λ, which is exactly what `foldT[]` carries. Both forward tracers now fold
+it like Diffuse (albedo on the quadrature + bundle, `foldWorthIt` guard, ratio applied after
+the survival roulette), with `FK_DeclineGlossy` for the cases the guard turns down. Sized on
+a fog Cornell with a coloured glossy sphere: 9.7 % of foldable deposits had been retiring
+under "specular" for it.
+
 **Cost.** `kFoldBins` reflectance evaluations per Lambertian bounce, gated on `achroPath`, which
 is only ever set when the render is actually depositing beams. A photon that never reaches a
 surface pays nothing: `foldT[]` is left uninitialised until the first spectral factor arrives

@@ -1136,6 +1136,20 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
+                // FOLD-GLOSSY (0.260.1): the lobe's direction is wavelength-free, so the claim
+                // survives; the albedo is folded exactly as Diffuse's is above (render.h's
+                // tracePhoton does the same -- one PhotonBeam bank, one rule).
+                if (achroPath) {
+                    fldK = foldEm ? foldEm->foldN : 0;
+                    for (int k = 0; k < fldK + specN; ++k) {
+                        const double lk = (k < fldK) ? foldEm->foldLam[k] : bs->lam[k - fldK];
+                        fldF[k] = clamp01(reflectSlot(scene, *mp, h, lk));
+                    }
+                    bool ok = fldK > 0 && r > 0.0 && foldWorthIt(*foldEm, fldF, fldK);
+                    for (int i = 0; i < specN && ok; ++i) ok = fldF[fldK + i] > 0.0;
+                    if (ok) { fldOK = true; fldHero = r; }
+                    else fldWhy = (r > 0.0) ? FK_DeclineGlossy : FK_ZeroWeight;
+                }
                 pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
                 pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
                 betaFactor = r;                       // f*cos/pdf = r
