@@ -397,7 +397,6 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     BackwardRenderer::GlossyMis gmis;
 
     for (int b = 0; b < maxBounce; ++b) {
-        gmis.clear();
         if (grinAny) {
             double arc = 0.0;
             grin::marchSegments(scene, ray,
@@ -453,6 +452,14 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
         }
+
+        // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
+        // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so
+        // a clear at the loop top erases it a few lines before the only code that wants it --
+        // which leaves the connection in place with no compensating weight on the lobe-sampling
+        // side, i.e. double counting wherever both strategies reach the same light. See the
+        // twin note in backward.h.
+        gmis.clear();
 
         switch (m.type) {
             case MatType::Diffuse:
@@ -658,7 +665,6 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     const bool gneeOn = BackwardRenderer::glossyNeeOn();
     BackwardRenderer::GlossyMis gmis;
     for (int b = 0; b < maxBounce; ++b) {
-        gmis.clear();
         const int    cmIdx  = stk.topMat();
         const double aGlass = (cmIdx >= 0) ? scene.mats[cmIdx].absorb(lambda) : 0.0;
         // Curved pre-pass. The volume estimator runs PER STRAIGHT SUB-SEGMENT of the curve:
@@ -751,6 +757,14 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * (thr * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
         }
+
+        // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
+        // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so
+        // a clear at the loop top erases it a few lines before the only code that wants it --
+        // which leaves the connection in place with no compensating weight on the lobe-sampling
+        // side, i.e. double counting wherever both strategies reach the same light. See the
+        // twin note in backward.h.
+        gmis.clear();
 
         switch (m.type) {
             case MatType::Diffuse:

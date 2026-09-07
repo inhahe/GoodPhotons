@@ -2271,7 +2271,6 @@ struct BackwardRenderer {
         };
 
         for (int b = bounce0; b < maxB; ++b) {
-            gmis.clear();     // set below only by a MIS'd glossy bounce (see the note above)
             int nUp = secAlive ? C : 1;   // wavelengths still being propagated
             gi.bounce = b;                // see the scalar twin: mode W's per-vertex lattice
             // The scalar twin's tier roll. Sticky through GiCtx, which is what makes a
@@ -2465,6 +2464,18 @@ struct BackwardRenderer {
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i];
             }
+
+                // GLOSSY-NEE: cleared HERE and not at the top of the loop, which is the whole
+                // subtlety. `gmis` is written by the PREVIOUS bounce's glossy branch and read by
+                // THIS bounce's emitter/sun sites above, so a clear at the loop top would erase
+                // it a few lines before the only code that wants it -- leaving the connection in
+                // place with no compensating weight on the lobe-sampling side, i.e. double
+                // counting wherever both strategies can reach the same light. (Measured as a
+                // +0.9 % brightening of scenes/_spec_repro.ftsl at 1500 spp before this moved.)
+                // Everything past this point either sets it (the Glossy branch) or leaves it
+                // clear, and every path that skips the switch entirely -- a volume scatter, a
+                // fur collision -- sets specularArrival = false, which gates those sites off.
+                gmis.clear();
 
             switch (m.type) {
                 case MatType::DiffuseTransmit: {
