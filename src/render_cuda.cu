@@ -17175,13 +17175,19 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         g_wfProfileResX = resX; g_wfProfileResY = resY; g_wfProfileDepth = maxDepth;
     }
     std::vector<WfBand>& wfProfilePrev = g_wfProfile;
+    const bool mergeAny = mergeOn || dsm.nPts > 0;   // either kind wants MERGE=true
     std::vector<WfBand> wfProfileCur;
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
         // Mode J only ever instantiates the scalar (NS == 0) kernel: `useHero` is already
         // false for any scene with a participating medium, and a mode-J scene without one
         // has nothing to merge.
-        if (mergeOn) {
+        // EITHER merge kind needs the MERGE=true instantiation, not just the beams: SEGN --
+        // the size of the camera-side MIS sum arrays -- is `MERGE ? MAXV : 1`, so launching the
+        // MERGE=false kernel for a media-free `-jsurf` render left those sums structurally
+        // absent (always index 0, always zero). The surface merges then ran with a denominator
+        // missing its whole camera-side term, i.e. weights too large: +15 % on _cornell_diffuse.
+        if (mergeAny) {
             // ADAPTIVE WAVES: the first wave is sized by segments alone; every later wave is sized
             // so that the previous wave's observed hits-per-segment would fill ~70% of the hit
             // queue, and never more than the segment queue allows. One synchronous 4-int copy per

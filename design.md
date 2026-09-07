@@ -3304,16 +3304,19 @@ as the one at fault.
   half folded in from mode `U`. Three things live here and nowhere else:
   **On by default on the CPU since 0.260.0** — all three UPBP-VM gates green (gate 3: switching the
   third technique in on `_fog_cornell` moved the image by X −0.86 % / Y −0.27 % / Z +0.12 % mean,
-  medians within 0.1 %). **On the GPU since 0.263.0, opt-in there** — the device carries the same three-technique
+  medians within 0.1 %). **On the GPU too since 0.263.1** — the device carries the same three-technique
   estimator: `DSurfMap` (the host's dense lattice uploaded as it stands, so both sides bin by
   one rule), `dSurfMergeAt` gathering per camera *vertex*, and a device weight that finally
   carries BOTH merge kinds. That last part is the reason the port could not be partial: with a
   single kappa the camera-side `segSumM` could be left unscaled and multiplied once in the
   denominator, which no longer works when two kinds compete, so the device adopted the host's
-  convention of scaling each kind at accumulation time. Gated bit-for-bit both ways — merges
-  off is still mode `D` exactly, and the beams-only path is byte-identical to before the port — but
-  the three-technique device estimator still reads ~2.5 % bright against a mode-`R` reference where
-  the CPU sits at −0.6 %, so the GPU default stays two-technique until that closes (UPBP-VM).
+  convention of scaling each kind at accumulation time. Gated bit-for-bit both ways — merges off is still
+  mode `D` exactly, and the beams-only path is byte-identical to before the port — and validated
+  against a 3.1 M-spp mode-`R` reference: the merge half matches the CPU's to a median ratio of
+  0.9998, the full render to −0.7 / −0.4 / +0.6 % of ground truth. One trap worth keeping in mind:
+  `SEGN`, the size of the camera-side MIS sum arrays, is `MERGE ? MAXV : 1`, so the merging kernel
+  must be selected for EITHER merge kind — selecting it from the beam map alone left a media-free
+  `-jsurf` render weighting every merge by a denominator missing its camera-side term (UPBP-VM).
 
   * **`SurfPhoton`** — a light-subpath vertex on a surface: position, `wo` toward the previous
     (light-side) vertex, λ, β, the precomputed CIE triple (the same trick that bought mode `M`

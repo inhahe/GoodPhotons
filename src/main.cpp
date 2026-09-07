@@ -16163,20 +16163,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // rather than claiming a single "on N CPU threads" that would be a lie about half the
         // render.
         //
-        // `-jsurf` has a device twin since 0.263.0 (dSurfMergeAt, and a device weight that
-        // carries both merge kinds) -- but it is NOT the GPU default yet, because it does not
-        // agree with an independent reference on a scene with BOTH media and surfaces:
-        // `_fog_cornell` at 96^2 reads +14.3 / +12.2 / +10.8 % of the mean against a 1.69 M-spp
-        // mode-R render at matching depth, where the same run with `-nojsurf` sits on it
-        // (-0.9 / -2.9 / +3.1 %). Until that is understood the GPU default stays two-technique
-        // and an explicit `-jsurf` opts in to the device three-way estimator. UPBP-VM.
-        if (g_jSurf && useGpu && !g_jSurfExplicit) {
-            std::fprintf(stderr, "[device] mode J on the GPU renders the two-technique estimator "
-                                 "(connections + beam merges): the device surface merges are built "
-                                 "but not yet validated on a media+surfaces scene (known-issues "
-                                 "UPBP-VM). Pass -jsurf to opt in.\n");
-            g_jSurf = false;
-        }
+        // Since 0.263.1 there is no exception left: `-jsurf`'s point x point merges have a
+        // device twin (dSurfMergeAt), the device weight carries both merge kinds, and the
+        // MERGE=true kernel is selected for EITHER kind -- so both backends render the same
+        // three-technique estimator. Validated against a 3.1M-spp mode-R reference: the merge
+        // half agrees CPU-to-GPU to a median ratio of 0.9998, and the full render reads
+        // -0.73 / -0.44 / +0.62 % against ground truth where the CPU reads -0.87 / -0.46 / +0.62.
         const std::string camWhere =
             useGpu ? std::string("GPU") : (std::to_string(nThreads) + " CPU threads");
         // The merge half needs a beam map, and a beam map needs media. A media-free scene

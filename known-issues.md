@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### UPBP-VM — OPEN, narrowed (2026-09-06, v0.260.0): mode `J`'s surface point merges (`-jsurf`) are **on by default on the CPU** since 0.260.0 — all three gates green — but have **no device twin**, so a GPU mode-`J` run is still the two-technique estimator and mode `U` cannot be retired yet
+### UPBP-VM — DONE (2026-09-07, v0.263.1; the CPU half filed 2026-09-06, v0.260.0): mode `J`'s surface point merges (`-jsurf`) are **on by default on the CPU** since 0.260.0 — all three gates green — but have **no device twin**, so a GPU mode-`J` run is still the two-technique estimator and mode `U` cannot be retired yet
 
 **What shipped in v0.258.0.** Mode `J` now has a *second* merge kind. The same light subpaths that
 deposit photon beams into the medium also deposit **surface photons** at every non-delta surface
@@ -116,17 +116,13 @@ that *coarsens* rather than refusing on a huge scene — mode `U`'s own dense gr
 1. *The merge region was gated on `mergeOn`, which needs a BEAM map* — so on a scene with no media the point merges silently did not run at all. That is exactly the scene they exist for, and it produced a memorably misleading result: mode `J -jsurf` on the GPU matched a 3.1 M-spp mode-`R` reference to **+0.01 %** on `_cornell_diffuse`, which looked like a triumphant validation and was in fact plain BDPT being validated against ground truth.
 2. *The device's CONNECTION weight never learned the second kind.* `dMisWeight` built its merge sum from `dMergeEtaPrime × mergeKappa` alone, where the host uses `mergeEtaPrime(...).scale(mk)` — both kinds. With surface merges on, the connections therefore kept weights that ignored a technique competing for their paths, the weights stopped summing to one, and the image gained roughly the merge share: **+14.0 / +18.0 / +11.9 %** on `_fog_cornell` and **+15.6 / +15.3 / +13.2 %** on `_cornell_diffuse`, against a CPU that moves by −1.0 / −2.2 / −0.4 % when the same technique is switched on. Fixed at all three merge sites of the connection weight; the gap fell to **+2.7 / +0.6 / +1.4 %** on `_fog_cornell`.
 
-**What is still owed — and it is now narrowed to a depth-dependent term.** The device grew a twin of `FTRACE_J_HALF` (0.263.0: `connections` / `merges` render one half with the full-render MIS weights, so one half can be compared backend to backend), and with it the residual localises cleanly. On `_cornell_diffuse`, light side FROZEN (`-beamfreeze`) and the radius pinned (`-jsurf-radius 0.02`) so both backends gather from the *same map with the same kernel*:
+**Resolved (v0.263.1) — the third bug, and the device now matches ground truth.** The device grew a twin of `FTRACE_J_HALF` (render one half with the full-render MIS weights), which made one half comparable backend to backend, and with the light side frozen and the radius pinned the merge halves agreed **exactly at `-max-bounce 2` (ratio 1.0001)** and diverged with depth (+3.5 % at 3, +12.0 % at 8). Zeroing one weight term at a time on BOTH backends then named it outright: with the camera-side sums zeroed the two agreed to 0.9999, so `segSumC`/`segSumM` were the culprit — and an instrumented run showed the device's were **identically zero**.
 
-| | GPU vs CPU, merge half only |
-|---|---|
-| `-max-bounce 2` | **−0.03 % mean, median ratio 1.0001** |
-| `-max-bounce 3` | +3.54 %, ratio 1.064 |
-| `-max-bounce 8` | +11.99 %, ratio 1.196 |
+The cause is structural and would never have been found by reading the estimator, which is where I had been looking: `SEGN`, the size of the camera-side MIS sum arrays, is `MERGE ? MAXV : 1`, and the host chose the kernel instantiation from `mergeOn` — *which requires a BEAM map*. A media-free `-jsurf` render therefore ran the `MERGE=false` kernel, where those arrays do not exist, so every surface merge was weighted by a denominator missing its whole camera-side term. The launch now keys off either merge kind.
 
-and the connection half agrees to ~1 % (CPU noise at 6 289 spp) at every depth. So the gather, the per-photon math, the kernel and the normalisation are all **exact** — at depth 2 the two estimators agree to one part in ten thousand. What differs is a term that only exists once the camera subpath has two or more vertices, which is the `etaKm1Coef` / camera-side-sum family (`segSumC` / `segSumM` at `[k-1]`, and the merge AT `eye[k-1]`): every one of those was re-read against `bdpt.h` and matches term for term, so the next step is to dump those four numbers per path on both backends at `-max-bounce 3` — the smallest depth that shows the gap — and diff them. The excess is also brightness-graded (ratio 1.05 in the brightest quartile, 1.39 in the dimmest), which is what a denominator term missing from deep paths looks like.
+**Validated.** On `_cornell_diffuse` against a 3.1 M-spp mode-`R` reference: the merge half agrees CPU-to-GPU to **mean −0.01 %, median ratio 0.9998**, and the full three-technique render reads **−0.73 / −0.44 / +0.62 %** against ground truth where the CPU reads −0.87 / −0.46 / +0.62 %. Both bit-for-bit gates still hold exactly (`-nobeams -nojsurf` is mode `D`; the beams-only path is byte-identical to before the port). `-jsurf` is now the default on **both** backends.
 
-Until that closes, **the GPU default stays two-technique** (`-jsurf` opts in explicitly, with a notice), which is the same policy the CPU-only era had and for the same reason. Mode `U` stays until it does.
+**What remains before mode `U` can retire** is no longer a correctness question but a comparison: mode `J -jsurf` against mode `U` head-to-head on a scene `U` is good at, at equal time and stated depth (see UPBP-CONV (4) for why the depth must be stated).
 ### VOLCACHE — OPEN (2026-09-06, v0.257.0): the radiance cache covers diffuse *surfaces* only, so the volumetric gather — which is where ~all of a `gallery_rain` frame's time actually goes — is recomputed in full every frame of a flyby
 
 **The measurement that motivates this.** A flyby amortises the forward pass across frames, and
