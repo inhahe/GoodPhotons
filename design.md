@@ -3304,9 +3304,14 @@ as the one at fault.
   half folded in from mode `U`. Three things live here and nowhere else:
   **On by default on the CPU since 0.260.0** — all three UPBP-VM gates green (gate 3: switching the
   third technique in on `_fog_cornell` moved the image by X −0.86 % / Y −0.27 % / Z +0.12 % mean,
-  medians within 0.1 %). On the GPU the default yields to the two-technique estimator, because the
-  device merge weight carries one merge kind and the choice has to be made before the light pass;
-  an explicit `-jsurf` forces the CPU. The device twin is what remains before mode `U` retires.
+  medians within 0.1 %). **On the GPU too since 0.263.0** — the device carries the same three-technique
+  estimator: `DSurfMap` (the host's dense lattice uploaded as it stands, so both sides bin by
+  one rule), `dSurfMergeAt` gathering per camera *vertex*, and a device weight that finally
+  carries BOTH merge kinds. That last part is the reason the port could not be partial: with a
+  single kappa the camera-side `segSumM` could be left unscaled and multiplied once in the
+  denominator, which no longer works when two kinds compete, so the device adopted the host's
+  convention of scaling each kind at accumulation time. Gated bit-for-bit both ways — merges
+  off is still mode `D` exactly, and the beams-only path is byte-identical to before the port.
 
   * **`SurfPhoton`** — a light-subpath vertex on a surface: position, `wo` toward the previous
     (light-side) vertex, λ, β, the precomputed CIE triple (the same trick that bought mode `M`
