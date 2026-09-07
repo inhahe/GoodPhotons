@@ -513,6 +513,39 @@ FOLD"):
 -r 640 360 -time 300 -seed 7 -hdr -o png/barsdiag/gpu.png` and compare
 `python scraps/_streak.py` against the CPU render at the same budget.
 
+### M-VS-R-GALLERY — OPEN (2026-09-07, v0.265.0): mode `M` reads **34 % darker than mode `R`** on `gallery_rain`, and the beam count barely moves it
+
+**Found while asking a different question.** `-mstats` (§VOLCACHE) showed 81 % of a
+mode-`M` frame is the beam gather, and the renderer's own log suggests fewer beams would be
+"FASTER for the same noise". A two-seed sweep confirmed the noise half — relative noise is flat
+across `-beamk` 8 / 32 / 128 (0.0721 / 0.0729 / 0.0741) — but showed the *means* moving 6 %
+(0.0656 / 0.0673 / 0.0696), i.e. on this scene `-beamk` is a bias knob rather than a variance
+knob. Arbitrating that against mode `R` (900 s, 34 781 spp, depth 32 on both) produced a much
+larger finding:
+
+| `-beamk` | mean vs `R` | median vs `R` |
+|---|---|---|
+| 8 | −34.08 % | −8.79 % |
+| 32 (default) | −34.17 % | −8.81 % |
+| 128 | −34.66 % | −9.02 % |
+
+**Mode `M` is ~34 % darker than the independent reference on the image mean, at every beam
+count.** The 6 % the beam count moves is second-order inside that. The median gap is only
+−8.8 %, so the deficit is concentrated in the *bright* regions — which is what a kernel-radius
+blur does to small bright features, and is consistent with `M-GATHERAREA` (the disc
+normalisation) being one contributor, but 34 % is far too large to be only that.
+
+**What this does NOT yet establish.** Mode `M` is biased by construction (a finite gather
+radius), so a gap to `R` is expected; the open question is whether 34 % is that expected bias or
+a defect. Three things would decide it, none of them done: (a) shrink the radius (`-pmradius`)
+and watch whether the gap closes proportionally — a consistent estimator's gap must go to zero;
+(b) split the comparison by element with `scraps/gallery_rain.rois`, since the campaign anchors
+already exist and would say *where* the energy is missing; (c) check mode `S` (SPPM), which
+shrinks its radius per pixel and should converge to `R` if the estimator is sound.
+
+**Where it bites:** `src/photonmap_render.h` (the estimate and its normalisation),
+`scenes/gallery_rain.ftsl`, `scraps/mbeamk.log` and `scraps/mbias.log` (the measurements).
+
 ### M-GATHERAREA — OPEN (2026-09-05, v0.253.0): mode `M`'s direct density estimate divides by the area of a **full disc** while gathering from only the part of it that is real, on-cone surface — so it is dark in proportion to how much of the disc misses: flat ground 0 %, a cap edge −38 %, Alice's dress −44 %, her hair −70 %
 
 **Found by** the `gallery_rain` accuracy campaign (5 seeds × {R, D, J, M}, 640×360, anchor =
