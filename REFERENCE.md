@@ -5386,9 +5386,22 @@ Glossy vertices now connect, weighted against the lobe-sampling strategy by the 
 heuristic** rather than replaced by it — because unlike a diffuse vertex a glossy lobe can be
 much *narrower* than the light (the same scene's 20 m × 14 m sky panel), so neither strategy
 wins everywhere. Measured on `scenes/_spec_repro_sun.ftsl` (four spheres under a real solar
-disc, anchored to mode `D`): the gold sphere goes from **−6.3 % to −0.1 %** in mode `R` and
-**−3.8 % to −1.1 %** in mode `M`, the diffuse control does not move, and mode `M`'s worst
-firefly drops from 2486× the mean to 1623×.
+disc, anchored to mode `D`, which has connected glossy vertices all along), the gold sphere's
+band moves from
+
+| | mode `R` | mode `M` | mode `S` | GPU (`R`) |
+|---|---|---|---|---|
+| glossy gold, estimator off | −6.2 % | −3.8 % | −4.0 % | — |
+| glossy gold, estimator **on** | **−0.3 %** | **−1.1 %** | **−1.1 %** | **+6.7 % vs its own off** |
+
+with the diffuse control unmoved in all of them, and mode `M`'s worst firefly dropping from
+1302× the image mean to 807×. **CPU and GPU agree to ±0.11 %** on every band of both rigs, and
+on the *area*-light rig — where both strategies can reach the light, so a wrong weight would
+show — turning the estimator on moves nothing (±0.04 %), which is the property MIS is supposed
+to have: it changes variance, not the mean.
+
+It is close to free: on `gallery_rain` at 240 s mode `R` went from 348–410 spp to 366–461, i.e.
+inside the run-to-run spread; on the small rig it costs a few percent.
 
 | Flag | Meaning |
 |---|---|

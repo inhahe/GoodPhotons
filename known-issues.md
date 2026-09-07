@@ -558,6 +558,30 @@ FOLD"):
 > count. **M-GATHERAREA is the whole of what is actually wrong with mode `M` on this scene.**
 >
 > Measured by `scraps/sunspike.sh` (8 seeds of mode `R` at 120 spp) and `scraps/robust_roi.py`.
+>
+> **A caveat on the instrument, found afterwards and worth more than the table it qualifies.**
+> The 5 %-trimmed mean above is robust for every ROI in it *except `gyroid`*, and the reason is
+> arithmetic rather than bad luck. A trimmed mean removes the top 5 % of the ROI's **pixels**;
+> it is only robust while the spikes fit inside that 5 %. On the gyroid a lobe sample finds the
+> sun about once in 1500, so at `n` spp the fraction of its 1369 pixels carrying at least one
+> spike is `1 - (1 - 1/1500)^n` — **8 % at 120 spp and 23 % at 400** — i.e. already past the trim
+> at the sample counts anybody actually renders at, and further past it the *longer* you run.
+> The statistic degrades with more samples, which is the opposite of the property it was chosen
+> for.
+>
+> It showed up as an absurdity: a CPU mode-`R` A/B at 400 spp scored the gyroid at **+176 %** of
+> the same reference the 120-spp GPU runs scored at **−64 %**, identically in both arms, with a
+> seed spread of only 9–11 pp — stable, repeatable, and meaningless. Every other element in that
+> run agreed with the reference to about a percent, including `alice_hair` (+0.3 %) and
+> `grid_ground` (+0.6 %), so the frame was fine and one ROI was not.
+>
+> **So `gallery_rain` is not an instrument for a glossy metal at any practical sample count, in
+> any mode, under any simple statistic**, and the conclusions this entry draws about the glossy
+> elements rest on the four-sphere rig with a mode-`D` anchor (`scenes/_spec_repro_sun.ftsl`)
+> rather than on the gallery. The gallery's diffuse and volumetric ROIs — where the M-GATHERAREA
+> confirmation lives — carry no spikes and remain sound; that is why those two groups separate
+> so cleanly above. What the gallery would need to be scored on a metal is a per-pixel MEDIAN
+> over many independent seeds, not a per-ROI trim of one.
 
 **Found while asking a different question.** `-mstats` (§VOLCACHE) showed 81 % of a
 mode-`M` frame is the beam gather, and the renderer's own log suggests fewer beams would be
@@ -754,20 +778,29 @@ something the dielectric path does on exit.
 > **−0.05 %** once fixed. That is why `scraps/gnee_unbiased.sh` keeps a big-light scene in the
 > sweep: *the rig that shows the problem cannot show the fix's mistakes.*
 >
+> **The GPU and mode `S` followed in the same version.** `-device gpu` agrees with `-device cpu`
+> to **±0.11 %** on every band of both rigs at 2500 spp, so the backend divergence the CPU-only
+> landing opened is closed; on the device the sun rig's glossy band moves **+6.69 %** with the
+> estimator on and the area rig moves **±0.04 %** (unbiased). Mode `S`'s glossy band goes
+> **−4.0 % → −1.1 %**. Two divergences were found by inspection while porting, both host-side:
+> the emitter lookup was keyed on `h.matId`, the *parent* of a resolved `Mix`/`Layered` hit,
+> where the device used its resolved `matId`; and `lightPickExact` scanned all of
+> `lightTreeAlways` while `pickEmitters` only draws its first `kMaxLightPick` entries, so past
+> that cut an emitter would be reported covered, skipped by the NEE side and down-weighted by
+> the hit side.
+>
+> **Cost:** on `gallery_rain` at 240 s, mode `R` went from 348–410 spp to 366–461 spp with the
+> estimator on — i.e. inside the run-to-run spread. On the sun rig it is a few percent
+> (mode `R` 3918 → 3370 spp at 60 s, mode `M` 887 → 823).
+>
 > **STILL OPEN, in priority order:**
 >
-> 1. **The GPU has none of it** (`src/render_cuda.cu` is untouched), so since 0.266.0 `-device
->    gpu` and `-device cpu` **disagree** on any scene with a glossy material under a small light
->    — they agreed before. The device already has `dBsdfF` / `dBsdfPdf` (the BDPT/VCM path uses
->    them), so what is missing is the same three edits: a `pdfW` out-param on the device emitter
->    sampler, the hook on `dNeeLight` / its hero twin, and the carrier through the megakernel's
->    shade loop. **This is the biggest single gap and the next thing to do.**
-> 2. **Light-tree-selected emitters are not covered** — see COVERAGE below. A many-light scene's
+> 1. **Light-tree-selected emitters are not covered** — see COVERAGE below. A many-light scene's
 >    glossy surfaces keep the old estimator.
-> 3. **Cylinder emitters report no density** (`lightPdfW` returns 0), because
+> 2. **Cylinder emitters report no density** (`lightPdfW` returns 0), because
 >    `sampleCylinderVisible`'s front-facing-arc area pdf is not exposed. They keep the old
 >    estimator, which is unbiased; exposing `pdfAreaCyl` would close it.
-> 4. **Environment lights are not connected from a glossy vertex.** `neeEnv` is a separate
+> 3. **Environment lights are not connected from a glossy vertex.** `neeEnv` is a separate
 >    estimator from `neeLight` and only the latter took the hook, so a rough metal under an env
 >    map with a small bright feature (a sun in an HDRI) has exactly the original problem. The env
 >    already carries `envPdfDir` and its own balance heuristic at `backward.h` ~1857, so the
