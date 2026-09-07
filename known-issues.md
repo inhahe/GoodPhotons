@@ -717,7 +717,61 @@ something the dielectric path does on exit.
 **Where it bites:** `src/photonmap_render.h` (the estimate and its normalisation),
 `scenes/gallery_rain.ftsl`, `scraps/mbeamk.log` and `scraps/mbias.log` (the measurements).
 
-### GLOSSY-NEE — OPEN (2026-09-07, v0.265.0): **no unidirectional mode does next-event estimation at a `MatType::Glossy` vertex**, so a rough metal under a small light is found only by chance — a 6.8e-5 sr sun costs a gold gyroid 64 % of its energy at 120 spp and a chrome ring 91 %
+### GLOSSY-NEE — **FIXED ON THE CPU** (2026-09-07, v0.266.0; filed the same day at v0.265.0), **GPU still open**: no unidirectional mode did next-event estimation at a `MatType::Glossy` vertex, so a rough metal under a small light is found only by chance — a 6.8e-5 sr sun costs a gold gyroid 64 % of its energy at 120 spp and a chrome ring 91 %
+
+> **FIXED on the CPU in v0.266.0.** Glossy vertices now connect to lights, balance-heuristic
+> weighted against the lobe-sampling strategy. Measured on `scenes/_spec_repro_sun.ftsl` — four
+> spheres (diffuse, glossy gold `roughness 0.18`, dielectric, mirror chrome `roughness 0.05`)
+> over a diffuse floor under a real solar disc, **no back wall** so the metals point at empty sky
+> as `gallery_rain`'s gyroid does — 60 s per arm, same binary, anchored to **mode `D`**, which
+> has connected glossy vertices all along and is therefore the one estimator that was never
+> affected:
+>
+> | band | `R` NEE off | `R` NEE **on** | `M` NEE off | `M` NEE **on** |
+> |---|---|---|---|---|
+> | diffuse (control) | −0.5 % | **+0.0 %** | −0.6 % | −0.8 % |
+> | **glossy gold** | **−6.4 %** | **−0.2 %** | **−3.8 %** | **−1.1 %** |
+> | dielectric | −3.2 % | −1.1 % | +0.1 % | +0.1 % |
+> | mirror chrome | −1.6 % | −0.5 % | −1.1 % | −1.0 % |
+> | worst firefly (max/mean) | 484× | 726× | **1242×** | **814×** |
+>
+> `_cornell_diffuse`, `_mirror_sphere_fwd`, `_glass_tint` and `_deltalight_mix` are
+> **bit-identical** with the estimator on and off — the connection is guarded so it does not even
+> draw from the rng — and `-no-glossy-nee` restores the pre-0.266 path exactly, which is what
+> makes the table above a same-binary A/B. Implementation: `src/bsdf_eval.h` (new; `bsdfF` /
+> `bsdfPdf` lifted out of `bdpt.h` unchanged so `backward.h` and `photonmap_render.h` can
+> evaluate a lobe without pulling in mode `J`), `emitterGeom` reporting its solid-angle density,
+> the hook on `neeLight` / `neeLightHero`, and `GlossyMis` carrying the continuation's lobe
+> density one bounce to the emitter sites.
+>
+> **The one bug worth remembering** — the carrier has to be cleared *just before the material
+> switch*, not at the top of the bounce loop. It is written by the PREVIOUS bounce and read by
+> THIS one's emitter sites, so a loop-top clear erases it a few lines before its only consumer,
+> leaving the connection in place with the compensating weight silently pinned at 1, i.e. double
+> counting. It is **invisible on the sun rig**, where the lobe-sampling strategy never reaches
+> the light and there is nothing to double count; only the AREA-light twin
+> (`scenes/_spec_repro.ftsl`) can see it, as a **+0.91 %** brightening at 1500 spp that became
+> **−0.05 %** once fixed. That is why `scraps/gnee_unbiased.sh` keeps a big-light scene in the
+> sweep: *the rig that shows the problem cannot show the fix's mistakes.*
+>
+> **STILL OPEN, in priority order:**
+>
+> 1. **The GPU has none of it** (`src/render_cuda.cu` is untouched), so since 0.266.0 `-device
+>    gpu` and `-device cpu` **disagree** on any scene with a glossy material under a small light
+>    — they agreed before. The device already has `dBsdfF` / `dBsdfPdf` (the BDPT/VCM path uses
+>    them), so what is missing is the same three edits: a `pdfW` out-param on the device emitter
+>    sampler, the hook on `dNeeLight` / its hero twin, and the carrier through the megakernel's
+>    shade loop. **This is the biggest single gap and the next thing to do.**
+> 2. **Light-tree-selected emitters are not covered** — see COVERAGE below. A many-light scene's
+>    glossy surfaces keep the old estimator.
+> 3. **Cylinder emitters report no density** (`lightPdfW` returns 0), because
+>    `sampleCylinderVisible`'s front-facing-arc area pdf is not exposed. They keep the old
+>    estimator, which is unbiased; exposing `pdfAreaCyl` would close it.
+> 4. **Environment lights are not connected from a glossy vertex.** `neeEnv` is a separate
+>    estimator from `neeLight` and only the latter took the hook, so a rough metal under an env
+>    map with a small bright feature (a sun in an HDRI) has exactly the original problem. The env
+>    already carries `envPdfDir` and its own balance heuristic at `backward.h` ~1857, so the
+>    pieces are there.
 
 **Found by M-VS-R-GALLERY**, which spent a day attributing a specular deficit to mode `M`
 before the matched-sample control showed mode `R` has the identical deficit. It is not a
