@@ -612,6 +612,49 @@ one measurement look like. It says only that the run-to-run noise on these ROIs 
 percent at 300 s (useful in itself: it makes a genuine radius effect easy to see once the radius
 actually varies), and it says **nothing** about the radius. The `-nopmauto` sweep replaces it.
 
+**The seed spread rewrites the question (2026-09-07).** The six mode-`M` renders the `-beamk`
+sweep already produced are **two independent seeds at each of three beam counts** — so they
+measure run-to-run spread for free, which nothing above had done. Re-scored on luminance against
+the same reference:
+
+| element | k8 s1 | k8 s2 | k32 s1 | k32 s2 | k128 s1 | k128 s2 | worst same-`k` seed gap |
+|---|---|---|---|---|---|---|---|
+| `chrome_ring` (glossy, roughness **0.05**) | −96.1 % | −96.3 % | −96.1 % | −96.1 % | −96.1 % | −96.2 % | **0.1 pp** |
+| `brass` (glossy, roughness **0.05**) | −91.2 % | −91.0 % | −91.0 % | −90.9 % | −90.4 % | −91.1 % | **0.7 pp** |
+| `gyroid` (glossy, roughness **0.18**) | −87.4 % | −61.5 % | −88.7 % | −65.9 % | −88.1 % | −72.9 % | **26.0 pp** |
+| `gem_diamond` (dielectric) | −43.7 % | −49.2 % | −44.4 % | −49.0 % | −44.1 % | −49.0 % | 5.5 pp |
+| `glass_orb` (dielectric) | −37.0 % | −41.7 % | −37.3 % | −41.4 % | −37.4 % | −41.5 % | 4.7 pp |
+| `cap_gyroid` (diffuse, textured) | −32.3 % | −37.2 % | −33.4 % | −37.0 % | −33.1 % | −37.0 % | 4.9 pp |
+| `grid_ground` (flat diffuse — control) | −0.2 % | +0.5 % | −0.1 % | +0.4 % | +1.5 % | +0.6 % | 0.9 pp |
+| `cloud_base` (volumetric — control) | +3.9 % | +5.2 % | +2.1 % | +3.7 % | +2.2 % | +3.5 % | 1.6 pp |
+
+**`gyroid` swings 26 percentage points between two seeds.** Every "stable" reading elsewhere in
+this entry was taken at the DEFAULT seed — `-seed 0` — so the retracted radius sweep was not
+merely four repeats of one radius, it was four repeats of one *realization*. The gold gyroid's
+deficit is dominated by an estimator with a very heavy tail, and no single-run number for it
+means anything.
+
+**The lobe width orders both columns, which names the mechanism.** `preset gold  roughness 0.18`
+overrides the preset's polish; `preset chrome` and `preset brass` take the preset default,
+`roughness = 0.05` (materials.h 103). The power-cosine exponent is `e = 2/r² − 2`, so the lobe
+solid angle `≈ 2π/(e+1)` is **0.104 sr** for gold and **0.0079 sr** for chrome — 13× tighter. And
+`gallery_rain`'s dominant light is `light sun { angle 0.53 }`, a disc of **6.8e-5 sr**. Neither
+renderer does next-event estimation at a glossy vertex: mode `M`'s gather walk multiplies by the
+reflectance and continues along a `sampleGlossy` direction (`photonmap_render.h` ~783), and mode
+`R`'s does **exactly the same** (`backward.h` ~1489 — no `neeLight` call, just `specularArrival =
+true`). So on a glossy metal the sun is collected *only* by a lobe sample that happens to land
+inside that 6.8e-5 sr disc, at odds of ~1/1500 for gold and ~1/115 for chrome, each hit carrying
+that many times the mean. That predicts precisely the pattern above: the wide lobe finds the sun
+sometimes and swings 26 pp between seeds, the tight lobes almost never find it and sit dead
+still at −91 % / −96 %.
+
+**And `preset gold` is `MatType::Glossy`, which stores no photons** (`materials.h`
+`resolveMaterialPreset` → Glossy; the four `depositPhoton` call sites in `render.h` are all
+diffuse-family). So the gyroid's pixels are 100 % gather-*walk* in both modes — there is no
+density estimate on its surface at all, and **M-GATHERAREA cannot be its explanation** whatever
+the radius does. That conclusion survives the retraction above; it just rests on the code rather
+than on the sweep.
+
 **What the three worst have in common is that they are specular**, which the ROI comments make
 explicit: `gyroid` is "gold gyroid, the central piece" (a glossy metal, `preset gold roughness
 0.18`), `glass_orb` is "solid glass orb", `gem_diamond` is "crystal gyroid". Every element that
