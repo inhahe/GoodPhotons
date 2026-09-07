@@ -181,6 +181,15 @@ single scatter to the existing per-frame beam gather, and gate it on the same co
 Keep it **opt-in and biased-by-declaration** like the surface cache — mode `R` must stay
 bit-for-bit unbiased with no `-radcache` on the command line.
 
+**The split it asked for, measured (2026-09-07, v0.265.0, `FTRACE_MSTATS=1`).** The table above stopped at “camera gather ~300 s”; the question that sizes a volume cache is what is *inside* that, since only the beam half is what such a cache would remove. `gallery_rain` at 320×180, CPU, 180 s (a probe ray gathers 86.4 beams here):
+
+| phase | thread-seconds | calls |
+|---|---|---|
+| surface density estimate | 126.8 | 3 722 774 |
+| **beam gather** | **535.7** | 5 106 424 probes |
+
+**81 % of the camera gather is the beam gather**, and the camera gather is ~97 % of the frame (the forward pass deposited 879 410 photons from 2 M emitted in 4.42 s). So a volumetric cache is aimed at roughly **four fifths of a `gallery_rain` frame**, which is what makes it the better attack than optimising the gather — and it is a far larger target than the under-2 % a flyby can amortise. The surface cache that already exists (`-radcache`) addresses the other fifth.
+
 **Sequencing note.** This overlaps `UPBP-CONV` (making the beam gather cheap enough that mode `J`
 wins at equal time) and is arguably the better attack on it: caching removes the work rather than
 optimising it. Do the profiling half of `UPBP-CONV` first — an exact per-frame split of light

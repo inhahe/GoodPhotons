@@ -16780,9 +16780,17 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             "the gather noise\n", (unsigned long long)epoch, sppAll);
             return acc;
         };
-        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
-                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
-                                 renderChunked, res, resY);
+        {   // The phase split VOLCACHE asks for (`FTRACE_MSTATS=1`): surface estimate against
+            // beam gather inside the camera pass. Printed after the render so it covers every
+            // epoch, and silent unless asked for.
+            const auto tM0 = std::chrono::steady_clock::now();
+            const auto out = runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                         timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                         renderChunked, res, resY);
+            mStats().report(std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - tM0).count());
+            return out;
+        }
     }
 
     // --- Stochastic progressive photon mapping (mode S) — ROADMAP item 2 ----------

@@ -1513,6 +1513,11 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   *slice* (sample range + samples/s), which exposes the per-scanline-band cost structure
   inside a single spp — on a scene with a dense participating-medium band the sky and the
   cloud can differ by more than 10x, and only the slice trace shows it.
+- **`FTRACE_MSTATS=1` (diagnostic, mode `M`).** Prints one `[mstats]` line at the end of the render
+  splitting the camera gather into the **surface density estimate** and the **beam gather**, with the
+  call counts and the beam share. Thread-seconds, so on N threads the two sum to more than the wall
+  clock. This is the measurement that sizes a volumetric cache: on `gallery_rain` 81 % of the gather
+  is beams (see **VOLCACHE** in `known-issues.md`).
 - **`FTRACE_NOBOWGPU=1` (diagnostic, mode `M` on the GPU).** Turns off the device's gather-time
   spectral fold, so a rainbow beam is demoted to its monochromatic `CIE(λ)` record the way it was
   before 0.264.0. The A/B control for that fold; on `gallery_rain` the fold changes 63 % of pixels and

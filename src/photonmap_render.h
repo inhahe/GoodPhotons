@@ -44,6 +44,48 @@
 
 #include <chrono>
 
+// ---- MODE-M PHASE PROFILE (`-mstats`) -------------------------------------------------------
+// VOLCACHE asks for the split inside a mode-M frame's camera gather: how much is the SURFACE
+// density estimate and how much is the BEAM gather, since only the latter is what a volumetric
+// radiance cache would remove. Per-thread accumulators, summed and printed once.
+struct MStats {
+    std::atomic<long long> surfNs{0}, beamNs{0};
+    std::atomic<long long> surfN{0}, beamN{0};
+    void report(double wallSec) const {
+        const double s = (double)surfNs.load() * 1e-9, b = (double)beamNs.load() * 1e-9;
+        if (s <= 0.0 && b <= 0.0) return;
+        std::fprintf(stderr,
+            "[mstats] camera gather: surface estimate %.2f s over %lld calls | beam gather %.2f s "
+            "over %lld probes | %.0f%% of the gather is beams | wall %.1f s (thread-seconds, so "
+            "the two sum to more than the wall on %d threads)\n",
+            s, surfN.load(), b, beamN.load(), (s + b) > 0.0 ? 100.0 * b / (s + b) : 0.0,
+            wallSec, (int)std::thread::hardware_concurrency());
+    }
+};
+inline MStats& mStats() { static MStats m; return m; }
+inline bool mStatsOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_MSTATS");
+        return e && std::atoi(e) != 0;
+    }();
+    return on;
+}
+struct MStatTimer {          // RAII: adds its lifetime to one accumulator, only when enabled
+    std::atomic<long long>* ns; std::atomic<long long>* n;
+    std::chrono::steady_clock::time_point t0;
+    MStatTimer(std::atomic<long long>* nsAcc, std::atomic<long long>* nAcc)
+        : ns(mStatsOn() ? nsAcc : nullptr), n(nAcc) {
+        if (ns) t0 = std::chrono::steady_clock::now();
+    }
+    ~MStatTimer() {
+        if (!ns) return;
+        ns->fetch_add((long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t0).count(),
+                      std::memory_order_relaxed);
+        n->fetch_add(1, std::memory_order_relaxed);
+    }
+};
+
 // ---- Forward photon pass: deposit into the map, no camera splat ---------------------
 // Traces N photons across nThreads, each depositing into a private bank, then
 // concatenates into pm.photons and records pm.nEmitted (= N). Does NOT build the grid;
@@ -407,6 +449,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 // at a PER-QUERY radius (PhotonMap::adaptiveRadius — the caustic map does),
                 // in which case 1/(pi r_q^2 N) is recomputed for this query's own radius.
                 auto est = [&](const PhotonMap& M, double normFixed, double& nrmOut) {
+                    MStatTimer _t(&mStats().surfNs, &mStats().surfN);
                     const double rq = M.adaptiveRadius(h.p, h.n);
                     nrmOut = normFixed;
                     if (rq != M.radius) {
@@ -590,7 +633,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             grin::marchSegments(scene, ray,
                 [&](const Vec3& so, const Vec3& sd, double slen, double&) -> bool {
                     if (volOn) {
-                        L += gatherPhotonBeams(scene, mats, *bm, so, sd, slen, aGlass, rng) * thr;
+                        { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
+                          L += gatherPhotonBeams(scene, mats, *bm, so, sd, slen, aGlass, rng) * thr; }
                         thr *= mats.mediaTransmittance(scene, so, sd, slen, lambda, rng);
                     }
                     if (aGlass > 0.0) thr *= std::exp(-aGlass * slen);
@@ -613,8 +657,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         // needs the transmittance to ITS OWN closest-approach point, not to the segment end.
         if (volOn) {
             const double dSeg = h.valid ? h.t : 1e30;
-            L += gatherPhotonBeams(scene, mats, *bm, ray.o, ray.d, dSeg, aGlass, rng)
-                 * thr;
+            { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
+              L += gatherPhotonBeams(scene, mats, *bm, ray.o, ray.d, dSeg, aGlass, rng)
+                   * thr;
+              }
             // Extinction along the camera segment: what is behind the fog gets dimmed.
             thr *= mats.mediaTransmittance(scene, ray.o, ray.d, dSeg, lambda, rng);
             if (thr <= 0.0) return L;
@@ -706,6 +752,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 // Per-query adaptive radius on any map that asks for one (the caustic map);
                 // see the twin in photonGatherSub and PhotonMap::adaptiveRadius.
                 auto est = [&](const PhotonMap& M, double normFixed, double& nrmOut) {
+                    MStatTimer _t(&mStats().surfNs, &mStats().surfN);
                     const double rq = M.adaptiveRadius(h.p, h.n);
                     nrmOut = normFixed;
                     if (rq != M.radius) {
