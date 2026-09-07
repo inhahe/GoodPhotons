@@ -535,6 +535,49 @@ count.** The 6 % the beam count moves is second-order inside that. The median ga
 blur does to small bright features, and is consistent with `M-GATHERAREA` (the disc
 normalisation) being one contributor, but 34 % is far too large to be only that.
 
+**Split by element (2026-09-07) — the deficit is NOT global, and that changes what it is.**
+Measurement (b) of the three below, done against the same 900 s mode-`R` render using the
+campaign ROIs. Scored on **luminance**, because the PFM holds scene-linear *sRGB* and a
+spectrally pure colour in a rainbow scene lies outside that gamut: 10–13 % of pixels carry a
+negative channel in *both* modes (mode `R` has more of them than mode `M`), which is expected
+and not a defect — luminance has **zero** negatives in either. An earlier per-channel version of
+this table produced nonsense ratios (`gyroid` −136 %, `compote` +470 %) precisely because a
+channel that straddles zero has no meaningful mean ratio.
+
+| element | M/R (luminance) | px | reading |
+|---|---|---|---|
+| `chrome_ring` | −96.1 % | 27 | noise-dominated (anchor spread ±232 %) |
+| `brass` | −90.9 % | 9 | noise-dominated (anchor spread ±369 %) |
+| **`gyroid`** | **−77.3 %** | **1369** | the largest real contributor |
+| `alice_hair` | −71.2 % | 27 | matches M-GATHERAREA's −70 % |
+| `alice_dress` | −47.0 % | 90 | matches M-GATHERAREA's −38 % |
+| `gem_diamond` | −46.7 % | 210 | dielectric |
+| `glass_orb` | −39.4 % | 225 | dielectric |
+| `cap_gyroid` | −35.2 % | 56 | matches M-GATHERAREA's −38 % |
+| `rain_column` | −16.3 % | 114 | |
+| `cap_axicon`, `cap_diamond`, `cloud`, `klein`, `rainbow`, `cloud_limb` | −9 % … −0.1 % | 25–399 | |
+| `grid_ground` | **+0.2 %** | 600 | flat diffuse: exact |
+| `cloud_base` | +2.9 % | 95 | volumetric: correct |
+| `creature` | +8.8 % | 36 | |
+| `compote` | +271.6 % | 25 | 25 px at 1/20th the scene level; noise |
+
+**So mode `M` is not uniformly dark — it is *correct* on the content photon mapping is supposed
+to be good at, and loses most of the energy on two specific classes:**
+
+1. **Thin / high-curvature geometry** — `gyroid` (−77 %, and 1369 px, so this alone is most of
+   the whole-frame gap), `alice_hair`, `alice_dress`, `cap_gyroid`. These are exactly the
+   elements **M-GATHERAREA** identified, and this is the first time they have been measured
+   against an *independent* estimator rather than against mode `R` anchors from the same
+   campaign. It confirms that entry's diagnosis and its magnitude.
+2. **Dielectrics** — `glass_orb` −39 %, `gem_diamond` −47 %. Not explained by the disc
+   normalisation; the suspect is the specular walk's coverage at the gather (how far a chain of
+   refractions is followed before the estimate gives up).
+
+**And the content it is supposed to be good at is exact:** flat diffuse `grid_ground` +0.2 %,
+the volumetrics `cloud_base` +2.9 % / `cloud` −5.1 % / `cloud_limb` −0.1 %, the `rainbow`
+−1.7 %. A global normalisation error would have moved those too, so the whole-frame −22 % (−34 %
+on the masked mean) is a *sum of two localised defects*, not one scale factor.
+
 **What this does NOT yet establish.** Mode `M` is biased by construction (a finite gather
 radius), so a gap to `R` is expected; the open question is whether 34 % is that expected bias or
 a defect. Three things would decide it, none of them done: (a) shrink the radius (`-pmradius`)
