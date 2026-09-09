@@ -131,7 +131,42 @@ The cause is structural and would never have been found by reading the estimator
 
 **Mode `U` is 4–6× better at equal time** (U/J = 0.16 mean, 0.16 trimmed, 0.23 median) while rendering *fewer* samples, and both are unbiased to ±0.4 %, so the gap is pure variance rather than an error in either. The plan of record — fold `U`'s technique into `J` and retire `U` — is therefore **not supported by measurement**: mode `J`'s point merges are now provably correct (above) but far less effective than mode `U`'s on the workload `U` exists for.
 
-The likely reason is the **light-side budget, not the estimator**: mode `U` traces one light subpath *per pixel* on the device every pass, while mode `J`'s light side is a CPU-traced map of a few thousand subpaths per epoch (2514 on this scene) that the whole frame gathers from. If that is right, `J` could close the gap by tracing its light side on the device at `U`'s density rather than by any change to the weights — which is a much larger piece of work than this port was, and wants its own entry. Until then, **mode `U` stays**, and the honest statement is that mode `J` subsumes `U`'s *technique* but not its *performance*.
+~~The likely reason is the light-side budget, not the estimator~~ — **MEASURED AND REJECTED
+(2026-09-09, v0.266.1).** The hypothesis was that mode `U` traces one light subpath per pixel
+every pass while mode `J`'s light side is a much sparser map the whole frame gathers from, so
+`J` could close the gap by tracing its light side on the device at `U`'s density — "a much
+larger piece of work than this port was". **It would not have paid off, and the measurement that
+says so cost 13 minutes.**
+
+Reading mode `J`'s own banner first sharpened it: on a 96² render `J` traces **9216 subpaths —
+exactly one per pixel, already `U`'s density**. What differs is how often it *redraws* them. So
+the testable form is the refresh rate, and `-beamrefresh` (the share of wall clock spent
+rebuilding the light side) is the knob. `_cornell_diffuse`, 150 s per arm, depth 8, GPU, against
+the same 3.1 M-spp mode-`R` reference:
+
+| arm | light-side realizations | mean relSE | median | bias |
+|---|---|---|---|---|
+| `J -beamrefresh 0.10` (default) | 237 | 0.01550 | 0.000630 | −0.49 % |
+| `J -beamrefresh 0.25` | 469 | 0.01183 | 0.000427 | −0.51 % |
+| `J -beamrefresh 0.50` | 445 | 0.01196 | 0.000468 | −0.36 % |
+| `J -beamrefresh 0.75` | 543 | 0.01132 | 0.000405 | −0.35 % |
+| **`U` (VCM)** | one per pass | **0.00253** | **0.000129** | +0.36 % |
+
+**2.3× the light-side realizations buys 27 % of the variance, and `J`'s best arm is still
+4.47× worse than `U`.** The default is not even badly chosen — it is 6.13× and the whole
+reachable range is 4.5–6×. Whatever `U`'s advantage is, it is not light-side density and not
+refresh rate, and porting the light pass to the device would have chased it in the wrong place.
+
+**So the gap is per-sample variance in the estimator or its weight** — both arms are unbiased to
+±0.5 % and render comparable spp (33 907 vs 31 331), so it is neither bias nor throughput. The
+live suspect is now **UPBP-W**, which lists three deliberate approximations inside mode `J`'s
+merge weight and describes all three as *weight-QUALITY only* — which is precisely a statement
+about variance rather than bias. `FTRACE_J_HALF=merges|connections` splits `J` into its two
+techniques and can say whether the loss is in the merge estimator or in the MIS combination;
+that measurement is the next step.
+
+Until then, **mode `U` stays**, and the honest statement is that mode `J` subsumes `U`'s
+*technique* but not its *performance*.
 ### SPHERELIGHT-EPS — **FIXED** (2026-09-09, v0.266.1; filed the same day as "GPU-SPHERELIGHT", whose name and diagnosis were both wrong): a **`light sphere` rendered 0.6–1.2 % DARK on the CPU** — its shadow rays were hitting the emitter's own geometry
 
 **Found by closing an old gate.** `GPU-NEE-EPS` (DONE, 0.259.0) was fixed but never validated.
