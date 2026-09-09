@@ -132,6 +132,68 @@ The cause is structural and would never have been found by reading the estimator
 **Mode `U` is 4–6× better at equal time** (U/J = 0.16 mean, 0.16 trimmed, 0.23 median) while rendering *fewer* samples, and both are unbiased to ±0.4 %, so the gap is pure variance rather than an error in either. The plan of record — fold `U`'s technique into `J` and retire `U` — is therefore **not supported by measurement**: mode `J`'s point merges are now provably correct (above) but far less effective than mode `U`'s on the workload `U` exists for.
 
 The likely reason is the **light-side budget, not the estimator**: mode `U` traces one light subpath *per pixel* on the device every pass, while mode `J`'s light side is a CPU-traced map of a few thousand subpaths per epoch (2514 on this scene) that the whole frame gathers from. If that is right, `J` could close the gap by tracing its light side on the device at `U`'s density rather than by any change to the weights — which is a much larger piece of work than this port was, and wants its own entry. Until then, **mode `U` stays**, and the honest statement is that mode `J` subsumes `U`'s *technique* but not its *performance*.
+### GPU-SPHERELIGHT — OPEN (2026-09-09, v0.266.0): a **`light sphere` renders 0.6–1.2 % brighter on the GPU than on the CPU**, and it is not noise — 12× the samples does not move it. A `light area` at the same place is exact to −0.00 %
+
+**Found by closing an old gate, not by looking for it.** `GPU-NEE-EPS` (DONE, 0.259.0) was
+fixed but never validated. Re-running its own acceptance test in mode `R` at 512 spp, GPU vs
+CPU, per channel:
+
+| scene | X | Y | Z | mean | was, before the fix |
+|---|---|---|---|---|---|
+| `rbnm_d1` (sphere light 6.4 km out) | +0.67 % | +0.63 % | +0.62 % | **+0.64 %** | **−23.67 %** |
+| `rbnm_d2` | +0.71 % | +0.67 % | +0.66 % | +0.68 % | −1.64 % |
+| `rbnm_d4` | +0.78 % | +0.75 % | +0.74 % | +0.76 % | −0.20 % |
+| `rbnm_d8` | +0.94 % | +0.91 % | +0.90 % | +0.92 % | −0.36 % |
+| `rbnm_d16` | +1.23 % | +1.22 % | +1.22 % | +1.22 % | — |
+| `_cornell_diffuse` (control) | +0.05 % | +0.09 % | +0.15 % | +0.09 % | +0.02 % |
+
+**The gate passes** — the −23.67 % collapse is gone, the distance-threshold structure that
+bracketed the predicted ~3360 boundary has vanished entirely, and the stock Cornell control is
+unregressed. What is left is a *new* and much smaller effect the old measurement could not have
+seen underneath a 24 % error.
+
+**It is a bias, not noise.** At 6000 spp — 12× the samples — `rbnm_d1` reads +0.62 % (was
++0.64 %) and `rbnm_d16` reads +1.22 % (was +1.22 %). A Monte-Carlo difference would have fallen
+by ~3.5×; this did not move.
+
+**It is the light SHAPE, not the distance or the scene.** `scraps/rbnm_area.ftsl` is the same
+scene with the sphere replaced by a quad of the same size in the same place:
+
+| light | GPU / CPU at 6000 spp |
+|---|---|
+| `light area` (quad) | **−0.00 %** |
+| `light sphere` | **+1.22 %** |
+
+**Mechanism, partly identified.** The two backends sample a sphere emitter by *different
+strategies*, which is deliberate and documented — `bkNeeLight`'s header says the device uses
+"uniform area sampling (an independent noise realization vs the CPU's cone/arc importance
+sampling, same expectation)". The device's `emitterSamplePoint` draws `z = 1 - 2*u1`, i.e.
+**uniformly over the whole sphere**, and `bkEmitterGeom` then keeps every sample with
+`cosLight > 0`. The host's `Emitter::sampleSphereCone` instead samples **only the cap inside the
+tangent cone**, which is what is actually visible: a point that faces the receiver but lies
+beyond the tangent circle is hidden by the sphere's own bulge. If nothing occludes it — and a
+`light sphere` with no registered geometry has nothing to occlude with — the device counts an
+annulus the host never generates, and comes out **brighter**. That predicts the sign and the
+direction of the trend, both of which hold.
+
+**What it does NOT predict is the magnitude, and that is the open question.** The annulus
+argument makes the error scale as `r/d`, which over this sweep varies **12.3×** (0.0093 →
+0.1143) while the measured error varies only **2.0×** (0.62 % → 1.22 %). Fitting the five
+points gives `offset ≈ 0.59 % + 5.5 % × (r/d)` — a linear term consistent with the annulus, plus
+a **distance-independent 0.59 % floor that the annulus cannot explain**. The quad control rules
+out a generic GPU mode-`R` offset, since it sits at 0.00 % at the same distance where the sphere
+sits at +0.62 %. So there are likely *two* things here, and only one of them is understood.
+
+**Why it matters more than 1 % sounds.** It is a silent CPU/GPU disagreement on one of the most
+common light types, it is invisible to every existing gate (Cornell uses a quad), and it is
+exactly the kind of small stable offset that gets mistaken for a real finding when it turns up
+inside somebody else's A/B — which is how `M-VS-R-GALLERY` cost a day.
+
+**Where it bites:** `src/render_cuda.cu` (`emitterSamplePoint`'s `shape == 1` branch,
+`bkEmitterGeom`, `bkNeeLight`), `src/scene.h` (`Emitter::sampleSphereCone`, the host strategy
+this is measured against), `scraps/rbnm_d{1,2,4,8,16}.ftsl` and `scraps/rbnm_area.ftsl`,
+`scraps/gate_neeeps.sh`.
+
 ### VOLCACHE — OPEN (2026-09-06, v0.257.0): the radiance cache covers diffuse *surfaces* only, so the volumetric gather — which is where ~all of a `gallery_rain` frame's time actually goes — is recomputed in full every frame of a flyby
 
 **The measurement that motivates this.** A flyby amortises the forward pass across frames, and
@@ -11186,7 +11248,7 @@ deferred. Repro: render `scraps/grin_lin.ftsl -mode R` on `-device gpu` and `-de
 `python scraps/grin_residual.py png/grin_lin_gpu.png png/grin_lin_cpu.png` (watch disc rel-err
 vs spp).
 
-### BUG — DONE (2026-09-06, 0.259.0) [GPU-NEE-EPS]: GPU NEE/camera shadow rays lost their end-shortening past ~3360 scene units, so any DISTANT light came out too dark — logged for six weeks as a "participating-media" disagreement, which it never was
+### BUG — DONE (2026-09-06, 0.259.0; **validated 2026-09-09, v0.266.0** — see GPU-SPHERELIGHT for what the validation turned up) [GPU-NEE-EPS]: GPU NEE/camera shadow rays lost their end-shortening past ~3360 scene units, so any DISTANT light came out too dark — logged for six weeks as a "participating-media" disagreement, which it never was
 
 Filed 2026-07-23 as "GPU vs CPU participating-media brightness disagree systematically
 across modes (phase-independent, pre-existing)", with a headline 2.41x mode-D gap and a
