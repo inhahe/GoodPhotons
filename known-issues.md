@@ -132,67 +132,87 @@ The cause is structural and would never have been found by reading the estimator
 **Mode `U` is 4–6× better at equal time** (U/J = 0.16 mean, 0.16 trimmed, 0.23 median) while rendering *fewer* samples, and both are unbiased to ±0.4 %, so the gap is pure variance rather than an error in either. The plan of record — fold `U`'s technique into `J` and retire `U` — is therefore **not supported by measurement**: mode `J`'s point merges are now provably correct (above) but far less effective than mode `U`'s on the workload `U` exists for.
 
 The likely reason is the **light-side budget, not the estimator**: mode `U` traces one light subpath *per pixel* on the device every pass, while mode `J`'s light side is a CPU-traced map of a few thousand subpaths per epoch (2514 on this scene) that the whole frame gathers from. If that is right, `J` could close the gap by tracing its light side on the device at `U`'s density rather than by any change to the weights — which is a much larger piece of work than this port was, and wants its own entry. Until then, **mode `U` stays**, and the honest statement is that mode `J` subsumes `U`'s *technique* but not its *performance*.
-### GPU-SPHERELIGHT — OPEN (2026-09-09, v0.266.0): a **`light sphere` renders 0.6–1.2 % brighter on the GPU than on the CPU**, and it is not noise — 12× the samples does not move it. A `light area` at the same place is exact to −0.00 %
+### SPHERELIGHT-EPS — **FIXED** (2026-09-09, v0.266.1; filed the same day as "GPU-SPHERELIGHT", whose name and diagnosis were both wrong): a **`light sphere` rendered 0.6–1.2 % DARK on the CPU** — its shadow rays were hitting the emitter's own geometry
 
-**Found by closing an old gate, not by looking for it.** `GPU-NEE-EPS` (DONE, 0.259.0) was
-fixed but never validated. Re-running its own acceptance test in mode `R` at 512 spp, GPU vs
-CPU, per channel:
+**Found by closing an old gate.** `GPU-NEE-EPS` (DONE, 0.259.0) was fixed but never validated.
+Its own acceptance test passed — `rbnm_d1` went from **−23.67 %** to **+0.64 %**, the
+distance-threshold structure vanished, Cornell unregressed — and underneath it was a 0.6–1.2 %
+CPU/GPU disagreement that a 24 % error had been hiding.
 
-| scene | X | Y | Z | mean | was, before the fix |
-|---|---|---|---|---|---|
-| `rbnm_d1` (sphere light 6.4 km out) | +0.67 % | +0.63 % | +0.62 % | **+0.64 %** | **−23.67 %** |
-| `rbnm_d2` | +0.71 % | +0.67 % | +0.66 % | +0.68 % | −1.64 % |
-| `rbnm_d4` | +0.78 % | +0.75 % | +0.74 % | +0.76 % | −0.20 % |
-| `rbnm_d8` | +0.94 % | +0.91 % | +0.90 % | +0.92 % | −0.36 % |
-| `rbnm_d16` | +1.23 % | +1.22 % | +1.22 % | +1.22 % | — |
-| `_cornell_diffuse` (control) | +0.05 % | +0.09 % | +0.15 % | +0.09 % | +0.02 % |
+**Two wrong turns, both worth recording, because each was killed by a cheap test that should
+have come first.**
 
-**The gate passes** — the −23.67 % collapse is gone, the distance-threshold structure that
-bracketed the predicted ~3360 boundary has vanished entirely, and the stock Cornell control is
-unregressed. What is left is a *new* and much smaller effect the old measurement could not have
-seen underneath a 24 % error.
+1. *"The device over-counts an annulus."* The device area-samples the whole sphere and keeps
+   every `cosLight > 0` sample; the host cone-samples the visible cap. I assumed the device was
+   therefore counting points hidden by the sphere's own bulge. **It is not**: putting the
+   receiver at distance `d` and a point at polar angle `t`, `n·(P−y) = d·cos t − r`, so
+   `cosLight > 0` ⇔ `cos t > r/d` — which *is* the tangent cone. The two sample exactly the same
+   set. Three lines of algebra, and it also predicted an `r/d` scaling that the data rejected
+   (12.3× predicted against 2.0× measured).
+2. *"Then the device's estimator is biased."* Re-implementing **both** estimators from scratch
+   in 20 lines of NumPy — host cone-sampling and device area-sampling, same integral — gave
+   agreement to ±0.07 % at every `r`/`d`. So neither estimator is wrong and the bug was in
+   ftrace's *implementation*, not its mathematics.
 
-**It is a bias, not noise.** At 6000 spp — 12× the samples — `rbnm_d1` reads +0.62 % (was
-+0.64 %) and `rbnm_d16` reads +1.22 % (was +1.22 %). A Monte-Carlo difference would have fallen
-by ~3.5×; this did not move.
+**What settled it was a ground truth, which neither of the above had.** A full-cone `light spot`
+is a delta light: a deterministic connect, no emitter sampling at all, identical on both
+backends. Its intensity is `P/spotOmega = P/4π`, which is exactly a point-like sphere's
+`L·πr² = P/4π`. So the two must agree, and whichever backend disagrees is the broken one:
 
-**It is the light SHAPE, not the distance or the scene.** `scraps/rbnm_area.ftsl` is the same
-scene with the sphere replaced by a quad of the same size in the same place:
+| | CPU | GPU | GPU/CPU |
+|---|---|---|---|
+| full-cone spot (**ground truth**) | 0.00108856 | 0.00108853 | −0.00 % |
+| sphere, r = 0.6, same power | 0.00108222 | 0.00108842 | +0.57 % |
+| | **−0.58 % vs truth** | **−0.01 % vs truth** | |
 
-| light | GPU / CPU at 6000 spp |
-|---|---|
-| `light area` (quad) | **−0.00 %** |
-| `light sphere` | **+1.22 %** |
+**The host was wrong, not the device.** The entry was filed as a GPU bug on the strength of
+"CPU-R and CPU-D agree, both GPU arms are high" — which is true, and which means nothing,
+because both CPU modes share the one buggy host routine.
 
-**Mechanism, partly identified.** The two backends sample a sphere emitter by *different
-strategies*, which is deliberate and documented — `bkNeeLight`'s header says the device uses
-"uniform area sampling (an independent noise realization vs the CPU's cone/arc importance
-sampling, same expectation)". The device's `emitterSamplePoint` draws `z = 1 - 2*u1`, i.e.
-**uniformly over the whole sphere**, and `bkEmitterGeom` then keeps every sample with
-`cosLight > 0`. The host's `Emitter::sampleSphereCone` instead samples **only the cap inside the
-tangent cone**, which is what is actually visible: a point that faces the receiver but lies
-beyond the tangent circle is hidden by the sphere's own bulge. If nothing occludes it — and a
-`light sphere` with no registered geometry has nothing to occlude with — the device counts an
-annulus the host never generates, and comes out **brighter**. That predicts the sign and the
-direction of the trend, both of which hold.
+**The cause.** `light sphere` drops a **real emissive sphere into the geometry**
+(`ftsl.h` ~6112), so a shadow ray aimed at a sampled point on it ends *on that surface* and must
+be shortened to avoid reporting itself occluded. The host shortened by a flat **2e-6**. Near the
+silhouette the connection is a nearly-tangent ray/sphere intersection — `thc = sqrt(r² − d2)`
+with `d2 → r²` — which the *sampler* (`sampleSphereCone`) and the *intersector* reach by
+different routes and so disagree on by `O(r·sqrt(ε))`, ~9e-7 at r = 60, on top of what the
+origin push has already eaten. Those samples come back "occluded" and are thrown away. A flat
+quad's intersection is exact, which is exactly why quad lights never showed it.
 
-**What it does NOT predict is the magnitude, and that is the open question.** The annulus
-argument makes the error scale as `r/d`, which over this sweep varies **12.3×** (0.0093 →
-0.1143) while the measured error varies only **2.0×** (0.62 % → 1.22 %). Fitting the five
-points gives `offset ≈ 0.59 % + 5.5 % × (r/d)` — a linear term consistent with the annulus, plus
-a **distance-independent 0.59 % floor that the annulus cannot explain**. The quad control rules
-out a generic GPU mode-`R` offset, since it sits at 0.00 % at the same distance where the sphere
-sits at +0.62 %. So there are likely *two* things here, and only one of them is understood.
+The device had already grown the fix — `connMaxT`, a **relative** shortening — for
+`GPU-NEE-EPS`, and gated its relative term to the fp32 build with the comment *"the fp64 build
+sets the relative term to zero so it stays bit-identical to the CPU reference."* **The CPU
+reference was the thing that was wrong.** fp64 removes the fp32 jitter that motivated
+`connMaxT`; it does not make an ill-conditioned tangent intersection well-conditioned.
 
-**Why it matters more than 1 % sounds.** It is a silent CPU/GPU disagreement on one of the most
-common light types, it is invisible to every existing gate (Cornell uses a quad), and it is
-exactly the kind of small stable offset that gets mistaken for a real finding when it turns up
-inside somebody else's A/B — which is how `M-VS-R-GALLERY` cost a day.
+**The fix** (`backward.h`, `BackwardRenderer::hostConnMaxT`) gives the host the same relative
+shortening, `max(dist × 1e-5, absEps)`, with `absEps == 0` still meaning "do not shorten at
+all" (the distant sun's far end is the scene exit, not a sampled point). After it:
 
-**Where it bites:** `src/render_cuda.cu` (`emitterSamplePoint`'s `shape == 1` branch,
-`bkEmitterGeom`, `bkNeeLight`), `src/scene.h` (`Emitter::sampleSphereCone`, the host strategy
-this is measured against), `scraps/rbnm_d{1,2,4,8,16}.ftsl` and `scraps/rbnm_area.ftsl`,
-`scraps/gate_neeeps.sh`.
+| scene | CPU before | CPU after | vs GPU |
+|---|---|---|---|
+| sphere r = 0.6, d = 6453 | 0.00108222 | 0.00108851 | **−0.01 %** |
+| sphere r = 0.6, d = 525 | 0.620455 | 0.625046 | **+0.00 %** |
+| sphere r = 60, d = 525 | 0.617502 | 0.625045 | **+0.00 %** |
+| sphere r = 60, d = 6453 | 0.00469166 | 0.00472088 | **−0.01 %** |
+| full-cone spot (control) | 0.00108856 | 0.00108856 | bit-identical |
+| quad light (control) | 0.00413111 | 0.00413111 | bit-identical |
+
+and the CPU now matches the spot ground truth. A second, independent confirmation falls out of
+the table: the illuminance from a Lambertian sphere of fixed **power** is independent of its
+radius, and after the fix `r = 0.6` and `r = 60` at the same distance agree to **six significant
+figures** (0.625046 / 0.625045) where before they were 0.48 % apart. `scenes/_distant_light`,
+`_distant_light_near` and `_distant_geometry` — the stock sphere-light scenes — all go to
+**−0.01 %** CPU-vs-GPU.
+
+**Noticed in passing, NOT investigated:** `scenes/_deltalight_mix.ftsl` sits at **+0.79 %**
+GPU-vs-CPU. It has no sphere light (area + spot + sun), and both controls above are
+bit-identical under this change, so it is a separate pre-existing thing. Logged here so it is
+not re-found from scratch.
+
+**Where it bites:** `src/backward.h` (`hostConnMaxT`, the `blocked` lambda in `emitterGeom`),
+`src/render_cuda.cu` (`connMaxT`, the device twin whose fp64 gate encoded the wrong assumption),
+`src/scene.h` (`Emitter::sampleSphereCone`), `src/ftsl.h` ~6112 (where the emissive sphere joins
+the geometry). Measured by `scraps/gate_neeeps.sh`.
 
 ### VOLCACHE — OPEN (2026-09-06, v0.257.0): the radiance cache covers diffuse *surfaces* only, so the volumetric gather — which is where ~all of a `gallery_rain` frame's time actually goes — is recomputed in full every frame of a flyby
 
@@ -11287,7 +11307,7 @@ deferred. Repro: render `scraps/grin_lin.ftsl -mode R` on `-device gpu` and `-de
 `python scraps/grin_residual.py png/grin_lin_gpu.png png/grin_lin_cpu.png` (watch disc rel-err
 vs spp).
 
-### BUG — DONE (2026-09-06, 0.259.0; **validated 2026-09-09, v0.266.0** — see GPU-SPHERELIGHT for what the validation turned up) [GPU-NEE-EPS]: GPU NEE/camera shadow rays lost their end-shortening past ~3360 scene units, so any DISTANT light came out too dark — logged for six weeks as a "participating-media" disagreement, which it never was
+### BUG — DONE (2026-09-06, 0.259.0; **validated 2026-09-09, v0.266.0** — see SPHERELIGHT-EPS for what the validation turned up) [GPU-NEE-EPS]: GPU NEE/camera shadow rays lost their end-shortening past ~3360 scene units, so any DISTANT light came out too dark — logged for six weeks as a "participating-media" disagreement, which it never was
 
 Filed 2026-07-23 as "GPU vs CPU participating-media brightness disagree systematically
 across modes (phase-independent, pre-existing)", with a headline 2.41x mode-D gap and a

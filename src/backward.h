@@ -505,7 +505,10 @@ struct BackwardRenderer {
         };
         auto blocked = [&](const Vec3& wi, double d, double shorten) -> bool {
             if (hs && dctx) return dualBlocked;     // already walked, inside response()
-            if (!hs) return scene.occluded(h.p + ngo * 1e-6, wi, d - shorten);
+            // GPU-SPHERELIGHT / hostConnMaxT: shorten by a RELATIVE amount with the caller's
+            // absolute epsilon as a floor. `shorten == 0` still means "do not shorten at all"
+            // (the distant sun's far end is the scene EXIT, not a sampled surface point).
+            if (!hs) return scene.occluded(h.p + ngo * 1e-6, wi, hostConnMaxT(d, shorten));
             const double off = hairExitOffset(*hs, h.n, wi);
             const double len = d - off - 1e-6;
             if (len <= 0.0) return true;
@@ -994,6 +997,31 @@ struct BackwardRenderer {
         if (!(pL > 0.0)) return 1.0;
         const double sum = gm.pdf + pL;
         return (sum > 0.0) ? gm.pdf / sum : 1.0;
+    }
+
+    // Far-end shortening for a shadow ray that ENDS ON a sampled emitter surface, so the ray
+    // stops just short of the light instead of hitting it and reporting itself occluded.
+    //
+    // This used to be a flat 2e-6, on the reasoning that fp64 needs no scale-relative slack --
+    // the device grew `connMaxT` for exactly this and gated its relative term to the fp32 build
+    // "so it stays bit-identical to the CPU reference". Measured 2026-09-09, the CPU reference
+    // was the one that was wrong: against a full-cone SPOT of matched intensity (a delta light,
+    // deterministic connect, no emitter sampling at all, so it is ground truth on both
+    // backends) the host's SPHERE light came in **0.58 % dark** for a point-like sphere and
+    // **1.2 %** at r/d = 0.11, while the device -- which already had the relative term -- matched
+    // the spot to 0.01 %. A `light sphere` drops a real emissive sphere into the geometry
+    // (ftsl.h ~6112), and a shadow ray aimed at a point near its silhouette is a NEARLY TANGENT
+    // ray/sphere intersection: `thc = sqrt(r^2 - d2)` with d2 -> r^2, whose value the sampler
+    // and the intersector reach by different routes and so disagree on by O(r*sqrt(eps)) --
+    // 9e-7 at r = 60, which a flat 2e-6 does not cover once the origin push has eaten into it.
+    // A flat quad's intersection is exact, which is why quad lights never showed this.
+    //
+    // Relative, so it tracks every scene scale; the absolute floor keeps near geometry safe.
+    static constexpr double kConnRelEps = 1e-5;      // ~10 um at 1 m, 4 mm at 400 m
+    static double hostConnMaxT(double dist, double absEps) {
+        if (absEps <= 0.0) return dist;              // 0 = do not shorten (sun: far end is the exit)
+        const double e = dist * kConnRelEps;
+        return dist - (e > absEps ? e : absEps);
     }
 
     // `hs` non-null routes the connection through the fiber BCSDF (see emitterGeom); the
