@@ -966,6 +966,17 @@ frames are archived under `png/modecmp/acc/frozenM/`.
 > belongs to GLOSSY-NEE, not here. So this entry is not one contributor among several: **it is
 > the whole of what is actually wrong with mode `M` on `gallery_rain`**, and its predicted
 > magnitudes are right to within a few points. Measured by `scraps/robust_roi.py`.
+>
+> **There is a WORKAROUND, found while verifying M-FGDARK (2026-09-09).** The Jensen final
+> gather (`-pmfg K`) moves the density estimate one bounce away from the visible surface, so
+> that surface stops paying this entry's full-disc normalisation at all. On `gallery_rain`,
+> `-pmfg 24` against `-pmfg 0` brightens `cap_gyroid` by **+46 %** and `alice_dress` by **+65 %**
+> — against the **+61 %** and **+79 %** a full recovery of this entry's own −38 % / −44 % would be
+> — while flat `grid_ground`, which has nothing to recover, moves −6.4 %. So the final gather is
+> most of a cure, and the shortfall is this same defect one bounce further out, where it is much
+> weaker because a gather ray lands on whatever is nearby rather than on the thin geometry
+> itself. It costs ~10× the time (45 spp against 462 in 240 s), which is why it is not the fix
+> — but it is the thing to reach for on a scene where this bites.
 
 **Measured**, mean over 5 seeds, deviation from the mode-`R` anchor (worst channel, σ in brackets):
 
@@ -8582,6 +8593,34 @@ without touching the rng so every media-free render stays bit-identical). Concre
   marched arc, which the forward tracer always did and the backward one silently did not;
 * the two `useHero` gates (`backward.h`, `bdpt.h`) and `whittedDeHeroes` test `scene.media.empty()`;
 * `Scene::backwardMedium()`, `mediaNeedForward` and the whole `[medium] …` warning are **deleted**.
+
+> **M-FGDARK VERIFIED FIXED on `gallery_rain`, 2026-09-09 (v0.266.0).** The fix landed here in
+> 0.254.0 but the scene that showed it was never re-run. Mode `M`, CPU, 240 s per arm, final
+> gather off vs on (`-pmfg 0` / `-pmfg 24`), trimmed mean:
+>
+> | element | | `-pmfg 0` | `-pmfg 24` | on/off |
+> |---|---|---|---|---|
+> | `grid_ground` | flat diffuse | 0.030894 | 0.028928 | −6.4 % |
+> | `cap_gyroid` | diffuse, cap edge | 0.046775 | 0.068355 | +46.1 % |
+> | `alice_dress` | diffuse, folded cloth | 0.22776 | 0.3766 | +65.3 % |
+> | `gyroid`, `glass_orb` | specular — never enter the FG branch | | | −9 %, −17 % (45 spp vs 462; noise) |
+>
+> **The 12–77× collapse is gone** — that is the verification, and the item is closed.
+>
+> **But the residual is not noise, and it is not a defect either — it is M-GATHERAREA being
+> cured.** The final gather moves the density estimate one bounce AWAY from the visible surface,
+> so the visible surface stops paying the full-disc normalisation error. That predicts the final
+> gather should brighten *exactly* the thin/high-curvature elements M-GATHERAREA names and leave
+> flat ground alone, which is what the table says. The magnitudes line up too: that entry
+> measures the direct estimate at −38 % on `cap_gyroid` and −44 % on `alice_dress`, so recovering
+> them is **+61 %** and **+79 %** — against **+46 %** and **+65 %** measured. Both a little short
+> of a full cure, as expected, since the gather's own estimate one bounce away still uses a disc.
+>
+> (`cloud_base` reads 0 in both arms: this run passed no `-beams`, so there is no volumetric in
+> either. A void ROI, not a finding.)
+>
+> Cost: `-pmfg 24` is ~10× slower (45 spp against 462 in the same 240 s). Measured by
+> `scraps/gate_fgdark.sh`.
 
 **Its most expensive consequence was not in modes R/W/V at all — it was M-FGDARK.** Mode `M`'s
 Jensen final gather (`-pmfg <K>`) borrows `BackwardRenderer::neeLight` for its direct term, so it
