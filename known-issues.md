@@ -199,8 +199,65 @@ something else.*
 
 **A valid experiment** needs (a) variance scored seed-to-seed rather than against a reference,
 (b) the merge radius held equal between `U` and `J` rather than left to two schedules, and
-(c) a scene where merging earns its keep. Until that exists, **mode `U` stays** — now for want
-of evidence rather than because of it.
+(c) a scene where merging earns its keep.
+
+---
+
+**THE VALID EXPERIMENT, AND THE ANSWER (2026-09-09, v0.266.1).** All three fixed at once.
+(a) two seeds per arm, variance = seed-to-seed, systematic = what is left against the reference;
+(b) `-vcmalpha 1` freezes BOTH shrink schedules and `-pmradius 0.02` gives both the same fixed
+radius, so blur is identical *by construction*; (c) **`scenes/_caustic_box.ftsl`** (new) — a
+solid crystal ball over a diffuse floor under a small panel, so the floor carries a focused
+caustic: a light→**specular**→diffuse path a connection cannot make, which is what merging is
+for. 120 s per arm, 128², depth 8, GPU, against a 600 s / 94 698-spp mode-`D` reference.
+
+| mode | variance | systematic | bias |
+|---|---|---|---|
+| `D` (BDPT, no merges) | 0.000147 | 0.000056 | +0.00 % |
+| **`U` (VCM)** | **0.000097** | 0.112023 | −1.10 % |
+| **`J` (+`-jsurf`)** | **0.001563** | 0.098100 | −1.53 % |
+
+**Both built-in controls passed, which is what makes the rest of it worth reading.**
+`J systematic / U systematic = 0.88` — ≈1, so the radius really is equalised and blur can no
+longer masquerade as efficiency (and this is the direct proof that the old "4–6×" *was* blur).
+`D variance / U variance = 1.51` — merging finally beats BDPT on variance, where on
+`_cornell_diffuse` that ratio was ~0.005; the new scene discriminates and the old one could not.
+
+**At equal blur, mode `J`'s merge variance is 16× mode `U`'s.** So UPBP-VM's *conclusion* (keep
+`U`) was right all along even though its *reasoning* measured the wrong quantity — and the true
+gap is far larger than the blur comparison suggested.
+
+**And that finally makes the light-side hypothesis testable, because it is now the only confound
+left.** With the radius frozen, `J` still redraws its light side ~150 times while `U` draws a
+fresh subpath per pixel every pass (~8500). Sweeping `-beamrefresh` with the radius pinned and
+scoring **variance only**:
+
+| arm | light-side realizations | variance | vs `U` |
+|---|---|---|---|
+| `J -beamrefresh 0.10` | 148 | 0.001476 | 15.2× |
+| `J -beamrefresh 0.40` | 339 | 0.001145 | 11.8× |
+| `J -beamrefresh 0.80` | 756 | 0.000645 | **6.7×** |
+
+Monotone, and steeply: **variance ≈ N^−0.51 over a 5.1× increase in realizations** — measured
+*while losing 1.53× of the camera samples* (9458 → 6175 spp), which pushes variance the other
+way, so the light-side term alone falls faster than that fit. Extrapolated to `U`'s density the
+16× becomes **~2×**.
+
+**So the entry's original plan of record was right, and my rejection of it was wrong.** The
+sequence is worth keeping intact: the hypothesis was sound; my first experiment could not test
+it (blur-dominated metric, and a knob that moved the radius as well); the retraction correctly
+killed *that experiment* but I over-read it as killing the hypothesis too. Removing both
+confounds supports the hypothesis it was originally filed with.
+
+**The fix is therefore the port the entry already named** — trace mode `J`'s light side on the
+device at mode `U`'s density. `-beamrefresh` cannot get there from here: the light pass is
+CPU-traced, so buying realizations costs camera samples (1.53× over this sweep alone), and that
+trade runs out long before 8500. The residual **~2×** after extrapolation is the size of what
+would be left for **UPBP-W**'s three merge-weight approximations to explain — real, but an order
+of magnitude smaller than the thing worth fixing first.
+
+Until that port exists, **mode `U` stays**, and it stays *for a measured reason*: at equal blur
+its merge estimator is 16× more efficient, and ~14× of that is light-side density.
 ### SPHERELIGHT-EPS — **FIXED** (2026-09-09, v0.266.1; filed the same day as "GPU-SPHERELIGHT", whose name and diagnosis were both wrong): a **`light sphere` rendered 0.6–1.2 % DARK on the CPU** — its shadow rays were hitting the emitter's own geometry
 
 **Found by closing an old gate.** `GPU-NEE-EPS` (DONE, 0.259.0) was fixed but never validated.

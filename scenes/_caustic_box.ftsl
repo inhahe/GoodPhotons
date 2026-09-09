@@ -1,0 +1,52 @@
+# A scene where MERGING EARNS ITS KEEP — the control _cornell_diffuse never was.
+#
+# UPBP-VM's retire-mode-U decision rests on a head-to-head run on scenes/_cornell_diffuse.ftsl,
+# described there as "mode U's home turf (surfaces only, diffuse GI)". It is not. On plain
+# diffuse GI, BDPT connections are near-exact and a merge can only add its finite-radius blur:
+# measured 2026-09-09, mode D beats both U and J by two to three orders of magnitude there and
+# is 95 % noise-limited, while U and J are 97-99 % SYSTEMATIC (blur). A comparison run on that
+# scene ranks merge estimators by how much they blur, which is not the question anyone is asking.
+#
+# Merging exists for the paths a connection cannot make: light -> SPECULAR -> diffuse, where the
+# specular vertex has no finite BSDF to connect through, so BDPT must find the caustic by chance
+# and vertex merging finds it by proximity. This scene is that and nothing else:
+#
+#   * a solid glass sphere sitting just above a diffuse floor, lit by a small ceiling panel, so
+#     the floor carries a real focused caustic (the SDS-adjacent path merging is FOR);
+#   * everything else kept deliberately plain — matte walls, one light, no media, no textures —
+#     so the caustic dominates the image and the measurement is about one thing.
+#
+# Small (128^2 renders in seconds) because it is a measurement rig, not a picture.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse    reflect whitewall 0.75 }
+material "red"   { type diffuse    reflect redwall }
+material "green" { type diffuse    reflect greenwall }
+material "glass" { type dielectric ior glass:crystal }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# The caustic generator: a solid crystal ball with a short focal length, held clear of the
+# floor so its focus lands ON the floor rather than inside the glass.
+sphere { center 0.5 0.42 0.5   radius 0.18   material glass }
+
+# A SMALL, high panel — a compact source is what makes the caustic tight enough that BDPT has
+# to hunt for it, which is the whole point of the rig.
+light area {
+    origin 0.42 0.999 0.42   u 0.16 0 0   v 0 0 0.16
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.42 2.4   look_at 0.5 0.22 0.5   up 0 1 0   fov_y 34
+    mode B
+    film { res 128 128 }
+}
