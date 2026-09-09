@@ -152,21 +152,55 @@ the same 3.1 M-spp mode-`R` reference:
 | `J -beamrefresh 0.75` | 543 | 0.01132 | 0.000405 | −0.35 % |
 | **`U` (VCM)** | one per pass | **0.00253** | **0.000129** | +0.36 % |
 
-**2.3× the light-side realizations buys 27 % of the variance, and `J`'s best arm is still
-4.47× worse than `U`.** The default is not even badly chosen — it is 6.13× and the whole
-reachable range is 4.5–6×. Whatever `U`'s advantage is, it is not light-side density and not
-refresh rate, and porting the light pass to the device would have chased it in the wrong place.
+2.3× the realizations moved relSE from 0.01550 to 0.01132, and I wrote that up as "the
+light-side hypothesis is rejected". **That conclusion was wrong, and so was the experiment.
+Retracted an hour later by the measurement below.**
 
-**So the gap is per-sample variance in the estimator or its weight** — both arms are unbiased to
-±0.5 % and render comparable spp (33 907 vs 31 331), so it is neither bias nor throughput. The
-live suspect is now **UPBP-W**, which lists three deliberate approximations inside mode `J`'s
-merge weight and describes all three as *weight-QUALITY only* — which is precisely a statement
-about variance rather than bias. `FTRACE_J_HALF=merges|connections` splits `J` into its two
-techniques and can say whether the loss is in the merge estimator or in the MIS combination;
-that measurement is the next step.
+**The metric was measuring BLUR, not efficiency — and the knob moved the radius too.** Two
+confounds, either of which alone invalidates the sweep:
 
-Until then, **mode `U` stays**, and the honest statement is that mode `J` subsumes `U`'s
-*technique* but not its *performance*.
+* *The metric.* Rendering each mode at **two seeds** separates variance (seed-to-seed spread)
+  from systematic error (what is left over against the reference). `_cornell_diffuse`, 90 s,
+  depth 8, GPU:
+
+  | mode | vs reference | seed 1 vs seed 2 | **systematic share** |
+  |---|---|---|---|
+  | `D` (BDPT, no merges) | 0.000015 | 0.000014 | **5.2 %** |
+  | `U` (VCM) | 0.003168 | 0.000024 | **99.2 %** |
+  | `J` (+`-jsurf`) | 0.014037 | 0.000364 | **97.4 %** |
+
+  Mode `D`'s error is essentially all noise. **Both merge estimators are 97–99 % systematic** —
+  the finite-radius merge blur, which a temporal noise metric cannot see at all (the renderer's
+  own reading for these three runs was 0.59 % / 0.75 % / 0.73 %, i.e. "comparable"). So relSE
+  against a path-traced reference ranks merge estimators by **how much they blur**, and the
+  sweep above was ~97 % insensitive to the variance the hypothesis is about.
+* *The knob.* Mode `J`'s merge radius shrinks **indexed by the light-side refresh epoch**
+  (`main.cpp` ~16217, `r = r0 * (epoch+1)^((alpha-1)/2)`) — deliberately, so it follows mode
+  `U`'s Georgiev schedule. So `-beamrefresh` changes the number of realizations *and* the
+  radius schedule together. The 27 % "improvement" is almost certainly the radius shrinking,
+  which is the one thing the sweep was not trying to vary.
+
+**So the light-side-budget hypothesis is UNTESTED, not rejected.** Recorded because the wrong
+version of this was committed first, and because the failure mode is general: *a metric that
+cannot see the quantity your hypothesis is about will happily return a confident number about
+something else.*
+
+**What the two-seed split does establish**, and this is the bigger finding:
+
+1. **The comparison that keeps mode `U` alive is a blur comparison.** `U`/`J` = 0.0032/0.0140 =
+   0.23 on a quantity that is 97–99 % systematic, so "mode `U` is 4–6× better at equal time"
+   means *`U`'s radius schedule blurs 4–6× less on this scene* — not that its estimator is more
+   efficient. The retire-`U` decision rests on it and should be re-derived.
+2. **`_cornell_diffuse` is the wrong scene for the question.** Mode `D`, which does no merging
+   at all, beats both by two to three orders of magnitude on this metric and is 95 % noise-
+   limited. Merging exists for caustics, SDS and media; on plain diffuse GI it can only add
+   blur, so a surfaces-only diffuse Cornell cannot show either merge mode at its best. Calling
+   it "mode `U`'s home turf" was the original error.
+
+**A valid experiment** needs (a) variance scored seed-to-seed rather than against a reference,
+(b) the merge radius held equal between `U` and `J` rather than left to two schedules, and
+(c) a scene where merging earns its keep. Until that exists, **mode `U` stays** — now for want
+of evidence rather than because of it.
 ### SPHERELIGHT-EPS — **FIXED** (2026-09-09, v0.266.1; filed the same day as "GPU-SPHERELIGHT", whose name and diagnosis were both wrong): a **`light sphere` rendered 0.6–1.2 % DARK on the CPU** — its shadow rays were hitting the emitter's own geometry
 
 **Found by closing an old gate.** `GPU-NEE-EPS` (DONE, 0.259.0) was fixed but never validated.
