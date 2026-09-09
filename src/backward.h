@@ -1397,10 +1397,14 @@ struct BackwardRenderer {
     // shadow-terminator gate, the shadow ray, and the balance-heuristic MIS weight
     // against the cosine-sampled continuation. All λ-independent. Returns false to
     // skip; on success fills `wi`, `cosSurf`, `stG`, `pdfW`, `wMis`, `farDist`.
+    // `nb` non-null = a GLOSSY vertex (GLOSSY-NEE): the MIS partner is then the lobe's own
+    // density rather than the cosine hemisphere's, exactly as the fiber case below already
+    // swaps in the BCSDF's. Without it a narrow lobe would be weighed against a density it
+    // never samples from, and the balance heuristic would hand the sky to the wrong technique.
     bool envGeom(const Scene& scene, const Hit& h, Pcg32& rng, Vec3& wi,
                  double& cosSurf, double& stG, double& pdfW, double& wMis,
                  double& farDist, const HairShade* hs = nullptr,
-                 const HairDualCtx* dctx = nullptr) const {
+                 const HairDualCtx* dctx = nullptr, const NeeBsdf* nb = nullptr) const {
         wi = scene.sampleEnvDir(rng, pdfW);
         if (pdfW <= 0.0) return false;
         if (hs && dctx) {
@@ -1442,14 +1446,18 @@ struct BackwardRenderer {
         if (stG <= 0.0) return false;                           // behind true geometry: hard shadow
         farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
         if (scene.occluded(h.p + ngo * 1e-6, wi, farDist)) return false;
-        double pdfBsdf = cosSurf / PI;                          // cosine-hemisphere pdf for wi
-        wMis = pdfW / (pdfW + pdfBsdf);                         // balance heuristic
+        // The density the CONTINUATION would have sampled `wi` with: the lobe's at a glossy
+        // vertex, the cosine hemisphere's otherwise. This is the quantity the env-escape site
+        // carries forward in `gmis.pdf`, so the two halves see one number.
+        double pdfBsdf = nb ? bdpt::bsdfPdf(*nb->m, h.n, nb->wo, wi, /*lambda*/0.0, scene, &h)
+                            : cosSurf / PI;
+        wMis = (pdfW + pdfBsdf > 0.0) ? pdfW / (pdfW + pdfBsdf) : 1.0;   // balance heuristic
         return true;
     }
 
     double neeEnv(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
                   double lambda, Pcg32& rng, const HairShade* hs = nullptr,
-                  const HairDualCtx* dctx = nullptr) const {
+                  const HairDualCtx* dctx = nullptr, const NeeBsdf* nb = nullptr) const {
         Vec3 wi; double cosSurf, stG, pdfW, wMis, farDist;
         // As in neeLight: the one forward-spread draw is taken unconditionally, so the rng
         // stream does not depend on how many strands this particular shadow ray crossed.
@@ -1463,10 +1471,15 @@ struct BackwardRenderer {
             if (dc.grid) dc.u3 = rng.uniform();
         }
         if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist, hs,
-                     dctx ? &dc : nullptr)) return 0.0;
+                     dctx ? &dc : nullptr, nb)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
-        double contrib = (rho / PI) * Lenv * cosSurf * invPdfLambda / pdfW * wMis * stG;
+        // `rho/PI` IS bsdfF at a diffuse vertex; the branch keeps the default path's float
+        // expression untouched so every existing render stays bit-identical.
+        const double fVal = nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lambda, scene, &h)
+                               : (rho / PI);
+        if (!(fVal > 0.0)) return 0.0;
+        double contrib = fVal * Lenv * cosSurf * invPdfLambda / pdfW * wMis * stG;
         if (!scene.media.empty())        // media attenuation out to the scene exit
             contrib *= mediaTr(scene, h.p + orientedGeoN(h) * 1e-6, wi, farDist, lambda, rng);
         return contrib;
@@ -1476,13 +1489,19 @@ struct BackwardRenderer {
     // all `nUp` active wavelengths (fog-free hero fast path, no transmittance term).
     void neeEnvHero(const Scene& scene, const Hit& h, const double* rho, double* L,
                     const double* thr, const double* lam, const double* invPdf,
-                    int nUp, Pcg32& rng) const {
+                    int nUp, Pcg32& rng, const NeeBsdf* nb = nullptr) const {
         Vec3 wi; double cosSurf, stG, pdfW, wMis, farDist;
-        if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist)) return;
+        if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist,
+                     nullptr, nullptr, nb)) return;
         for (int i = 0; i < nUp; ++i) {
             double Lenv = scene.envRadiance(wi, lam[i]);
             if (Lenv <= 0.0) continue;
-            L[i] += thr[i] * (rho[i] / PI) * Lenv * cosSurf * invPdf[i] / pdfW * wMis * stG;
+            // The lobe's GEOMETRY is wavelength-free, so `wMis` is shared and only the
+            // coefficient inside bsdfF varies per member (same argument as neeLightHero).
+            const double fVal = nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lam[i], scene, &h)
+                                   : (rho[i] / PI);
+            if (!(fVal > 0.0)) continue;
+            L[i] += thr[i] * fVal * Lenv * cosSurf * invPdf[i] / pdfW * wMis * stG;
         }
     }
 
@@ -1744,6 +1763,12 @@ struct BackwardRenderer {
                     const NeeBsdf nb{&m, ray.d * -1.0};
                     L += thr * neeLight(scene, h, /*rho unused*/1.0, invPdfLambda, lambda, rng,
                                         spdCache, gi, nullptr, nullptr, &nb);
+                    // ...and to the SKY, which is a light like any other and was the last thing
+                    // a glossy vertex could only find by chance (a sun baked into an HDRI is
+                    // exactly the 6.8e-5 sr target this entry is about).
+                    if (scene.envIndex >= 0)
+                        L += thr * neeEnv(scene, h, 1.0, invPdfLambda, lambda, rng,
+                                          nullptr, nullptr, &nb);
                 }
                 if (rng.uniform() >= r) return false;
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
@@ -2120,8 +2145,16 @@ struct BackwardRenderer {
             if (!h.valid) {
                 if (scene.envIndex >= 0) {
                     double Lenv = scene.envRadiance(ray.d, lambda) * invPdfLambda;
-                    if (specularArrival) {
-                        L += thr * Lenv;
+                    if (specularArrival && !(gmis.pdf > 0.0)) {
+                        L += thr * Lenv;               // delta chain: nothing connected for it
+                    } else if (gmis.pdf > 0.0) {
+                        // GLOSSY-NEE: the lobe-sampling half of the env weight. The connection
+                        // above used `pdfW / (pdfW + pdfLobe)`; this is its complement, and both
+                        // are gated on the SAME `gmis.pdf > 0` so a case cannot appear in one
+                        // and not the other (the cylinder bug of 0.266.2 was exactly that).
+                        const double pdfEnv = scene.envPdfDir(ray.d);
+                        const double sum = gmis.pdf + pdfEnv;
+                        L += thr * Lenv * ((sum > 0.0) ? gmis.pdf / sum : 1.0);
                     } else {
                         double pdfEnv = scene.envPdfDir(ray.d);
                         double wMis = (contBsdfPdf + pdfEnv > 0.0)
@@ -2384,9 +2417,15 @@ struct BackwardRenderer {
 
             if (!h.valid) {              // env-miss (full weight on specular arrival, else MIS)
                 if (scene.envIndex >= 0) {
-                    if (specularArrival) {
+                    if (specularArrival && !(gmis.pdf > 0.0)) {
                         for (int i = 0; i < nUp; ++i)
                             L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i];
+                    } else if (gmis.pdf > 0.0) {       // GLOSSY-NEE — see the scalar twin
+                        const double pdfEnv = scene.envPdfDir(ray.d);
+                        const double sum = gmis.pdf + pdfEnv;
+                        const double w = (sum > 0.0) ? gmis.pdf / sum : 1.0;
+                        for (int i = 0; i < nUp; ++i)
+                            L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i] * w;
                     } else {
                         double pdfEnv = scene.envPdfDir(ray.d);
                         double wMis = (contBsdfPdf + pdfEnv > 0.0)
@@ -2620,6 +2659,8 @@ struct BackwardRenderer {
                         const NeeBsdf nb{&m, ray.d * -1.0};
                         neeLightHero(scene, h, /*rho unused*/c, L, thr, lam, invPdf, nUp, rng,
                                      spdCache, gi, &nb);
+                        if (scene.envIndex >= 0)      // the sky too — see the scalar twin
+                            neeEnvHero(scene, h, c, L, thr, lam, invPdf, nUp, rng, &nb);
                     }
                     const double q = hero::maxOf(c, nUp);
                     if (whitted) {

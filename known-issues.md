@@ -1023,11 +1023,24 @@ something the dielectric path does on exit.
 >    `scenes/_spec_repro_tube.ftsl` (new) is the rig that can see it — the four spheres under an
 >    **uncapped tube**, the one shape that takes the visible-arc sampler. On/off at 3000 spp:
 >    diffuse +0.10 %, glossy gold −0.04 %, dielectric +0.20 %, mirror chrome −0.17 %. Unbiased.
-> 3. **Environment lights are not connected from a glossy vertex.** `neeEnv` is a separate
->    estimator from `neeLight` and only the latter took the hook, so a rough metal under an env
->    map with a small bright feature (a sun in an HDRI) has exactly the original problem. The env
->    already carries `envPdfDir` and its own balance heuristic at `backward.h` ~1857, so the
->    pieces are there.
+> 3. ~~Environment lights are not connected from a glossy vertex~~ — **DONE (2026-09-09,
+>    v0.266.3), CPU.** The env path needed less than the emitter path did: `envGeom` already
+>    computed a balance heuristic, and only two things were wrong for a glossy vertex — its
+>    `pdfBsdf` was hardcoded to the *cosine hemisphere's* `cosSurf/PI` rather than the lobe's,
+>    and the caller multiplied by `rho/PI` rather than the lobe's value. Both now take the same
+>    `NeeBsdf` hook `neeLight` takes.
+>
+>    The half that is easy to forget is the other one: the env-escape site added the sky at
+>    **full weight** on any `specularArrival`, which after a glossy bounce would double-count
+>    against the new connection. Both halves are now gated on the single test `gmis.pdf > 0` —
+>    deliberately one expression, because the cylinder bug earlier the same day (0.266.2) was
+>    exactly this shape: a case present in one half of a weight and absent from the other.
+>
+>    Verified on `scenes/_spec_repro_env.ftsl` (new — the four spheres under an env light), 3000
+>    spp, on vs off: diffuse −0.00 %, glossy gold +0.03 %, dielectric −0.07 %, mirror chrome
+>    −0.00 %. Unbiased, as MIS must be. `_env_cornell` — an env scene with no glossy material —
+>    stays **bit-identical**, alongside the other four. **Device twin still to do**, so `-device
+>    gpu` and `-device cpu` disagree on a glossy-under-env scene until it lands.
 
 **Found by M-VS-R-GALLERY**, which spent a day attributing a specular deficit to mode `M`
 before the matched-sample control showed mode `R` has the identical deficit. It is not a
