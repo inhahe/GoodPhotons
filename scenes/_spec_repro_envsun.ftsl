@@ -1,0 +1,46 @@
+# Minimal reproduction for M-VS-R-GALLERY: mode M loses most of the energy on SPECULAR
+# objects, radius-independently, while diffuse surfaces read exact.
+#
+# On gallery_rain the three worst elements were a glossy gold isosurface (-93 %), a crystal
+# (-45 %) and a glass orb (-40 %), and the flat diffuse floor was correct to +1 %. That scene
+# has 13 exhibits, volumetrics, a rainbow and an emissive grid in the way. This one has four
+# objects and one light, so mode M and mode R can be compared per object with nothing else
+# moving:
+#
+#   * a GLOSSY metal sphere      — the `gyroid` case (preset gold, the same roughness)
+#   * a DIELECTRIC sphere        — the `glass_orb` case
+#   * a MIRROR sphere            — the delta-specular control the gallery has no clean ROI for
+#   * a DIFFUSE sphere + floor   — the control that must stay exact
+#
+# Each sphere sits over its own patch of floor, so a per-object ROI is just a vertical band.
+# Deliberately no media, no textures, no spectral tricks: if mode M is dark here, the cause is
+# in the gather's specular walk and nothing else.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "floor"  { type diffuse  reflect whitewall 0.70 }
+material "back"   { type diffuse  reflect whitewall 0.55 }
+material "grey"   { type diffuse  reflect whitewall 0.60 }
+material "gold"   { preset gold   roughness 0.18 }
+material "glass"  { type dielectric  ior glass:crystal }
+material "mirror" { preset chrome }
+
+quad { origin -2 0 -2   u 4 0 0   v 0 0 4   material floor }   # floor
+quad { origin -2 0 -2   u 4 0 0   v 0 3 0   material back  }   # back wall
+
+# Four spheres in a row, left to right: diffuse, glossy, dielectric, mirror.
+sphere { center -1.35 0.45 0.0   radius 0.45   material grey   }
+sphere { center -0.45 0.45 0.0   radius 0.45   material gold   }
+sphere { center  0.45 0.45 0.0   radius 0.45   material glass  }
+sphere { center  1.35 0.45 0.0   radius 0.45   material mirror }
+
+light env { file "textures/_env_hotspot.hdr"  intensity 2.6e-14 }
+
+camera "cam" {
+    eye 0 1.15 4.6   look_at 0 0.5 0   up 0 1 0   fov_y 42
+    mode B
+    film { res 320 180 }
+}

@@ -10335,8 +10335,11 @@ struct BkEnvGeom {
     double wMis;      // balance heuristic vs. the cosine-sampled continuation
     double farDist;   // shadow-ray length to the scene exit
 };
+// `nb` non-null = a GLOSSY vertex (GLOSSY-NEE): the MIS partner is then the lobe's density
+// rather than the cosine hemisphere's, exactly as the fiber branch already swaps in the BCSDF's.
 __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkEnvGeom& g,
-                                 const DHairShade* hs = nullptr) {
+                                 const DHairShade* hs = nullptr,
+                                 const DNeeBsdf* nb = nullptr) {
     // Sample an incoming env direction: image env importance-samples the luminance CDF
     // (dEnvSample gives dir + solid-angle pdfW), constant env is uniform on the sphere
     // (pdf 1/4pi). Both draw exactly two uniforms in the same order as the CPU
@@ -10374,21 +10377,31 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
     if (g.stG <= (Real)0) return false;                     // behind true geometry: hard shadow
     g.farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
     if (occluded(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, (Real)g.farDist)) return false;
-    double pdfBsdf = (double)g.cosSurf / DPI;               // cosine-hemisphere pdf for wi
-    g.wMis = g.pdfW / (g.pdfW + pdfBsdf);                   // balance heuristic
+    // The density the CONTINUATION would have sampled wi with: the lobe's at a glossy vertex,
+    // the cosine hemisphere's otherwise. Same number the env-escape site carries in gmis.pdf.
+    double pdfBsdf = nb ? dGlossyPdfHit(sc, *nb->m, h, nb->wo, g.wi)
+                        : (double)g.cosSurf / DPI;
+    g.wMis = (g.pdfW + pdfBsdf > 0.0) ? g.pdfW / (g.pdfW + pdfBsdf) : 1.0;   // balance heuristic
     return true;
 }
 
 __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
                                   double invPdfLambda, Real lambda, DRng& rng,
-                                  const DHairShade* hs = nullptr) {
+                                  const DHairShade* hs = nullptr,
+                                  const DNeeBsdf* nb = nullptr) {
     if (sc.envIndex < 0) return 0.0;
     BkEnvGeom g;
-    if (!bkEnvGeom(sc, h, rng, g, hs)) return 0.0;
+    if (!bkEnvGeom(sc, h, rng, g, hs, nb)) return 0.0;
     double Lenv = (sc.env.scale != nullptr) ? dEnvRadiance(sc.env, g.wi, lambda)
                                             : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
     if (Lenv <= 0.0) return 0.0;
-    double contrib = ((double)rho / DPI) * Lenv * (double)g.cosSurf * invPdfLambda / g.pdfW
+    // The glossy arm in DOUBLE end to end, for the reason bkNeeLight gives: f is r*lobe/cos(wi)
+    // and the geometry carries cos(surf), the same cosine, so fp32 would lose the mantissa
+    // exactly where a narrow lobe puts its energy.
+    const double fVal = nb ? dGlossyFHit(sc, *nb->m, h, nb->wo, g.wi, lambda)
+                           : ((double)rho / DPI);
+    if (!(fVal > 0.0)) return 0.0;
+    double contrib = fVal * Lenv * (double)g.cosSurf * invPdfLambda / g.pdfW
                      * g.wMis * (double)g.stG;
     if (sc.mediaN > 0)                                      // Beer-Lambert to the scene exit
         contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, (Real)g.farDist, lambda, rng);
@@ -10400,16 +10413,20 @@ __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
 // path, so no transmittance term.
 __device__ static void bkNeeEnvHero(const DScene& sc, const DHit& h, const Real* rho,
                                     double* L, const double* thr, const Real* lam,
-                                    const double* invPdf, int nUp, DRng& rng) {
+                                    const double* invPdf, int nUp, DRng& rng,
+                                    const DNeeBsdf* nb = nullptr) {
     if (sc.envIndex < 0) return;
     BkEnvGeom g;
-    if (!bkEnvGeom(sc, h, rng, g)) return;
+    if (!bkEnvGeom(sc, h, rng, g, nullptr, nb)) return;
     const bool imageEnv = (sc.env.scale != nullptr);
     for (int i = 0; i < nUp; ++i) {
         double Lenv = imageEnv ? dEnvRadiance(sc.env, g.wi, lam[i])
                                : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lam[i]);
         if (Lenv <= 0.0) continue;
-        L[i] += thr[i] * (((double)rho[i] / DPI) * Lenv * (double)g.cosSurf * invPdf[i]
+        const double fVal = nb ? dGlossyFHit(sc, *nb->m, h, nb->wo, g.wi, lam[i])
+                               : ((double)rho[i] / DPI);
+        if (!(fVal > 0.0)) continue;
+        L[i] += thr[i] * (fVal * Lenv * (double)g.cosSurf * invPdf[i]
                           / g.pdfW * g.wMis * (double)g.stG);
     }
 }
@@ -10658,6 +10675,8 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 const DNeeBsdf nb{mp, rd * (Real)(-1)};
                 L += thr * bkNeeLight(sc, h, (Real)1, invPdfLambda, lambda, rng, gi.depth,
                                       nullptr, &nb);
+                // ...and the SKY, which is a light like any other (host twin: backward.h).
+                L += thr * bkNeeEnv(sc, h, (Real)1, invPdfLambda, lambda, rng, nullptr, &nb);
             }
             if (rng.uniform() >= r) return false;
             DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
@@ -10922,8 +10941,14 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 double Lenv = (imageEnv ? dEnvRadiance(sc.env, rd, lambda)
                                         : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda))
                               * invPdfLambda;
-                if (specularArrival) {
-                    L += thr * Lenv;
+                if (specularArrival && !(gmis.pdf > 0.0)) {
+                    L += thr * Lenv;                 // delta chain: nothing connected for it
+                } else if (gmis.pdf > 0.0) {
+                    // GLOSSY-NEE: complement of the weight the connection above used. Gated on
+                    // the SAME test, so a case cannot appear in one half and not the other.
+                    const double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
+                    const double sum = gmis.pdf + pdfEnv;
+                    L += thr * Lenv * ((sum > 0.0) ? gmis.pdf / sum : 1.0);
                 } else {
                     double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
                     double wMis = (contBsdfPdf + pdfEnv > 0.0)
@@ -11091,7 +11116,14 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
             if (sc.envIndex >= 0) {
                 const bool imageEnv = (sc.env.scale != nullptr);
                 double wMis = 1.0;
-                if (!specularArrival) {                // MIS against the env-NEE at the last vertex
+                if (gmis.pdf > 0.0) {
+                    // GLOSSY-NEE: the lobe-sampling half, complementing the connection the
+                    // glossy branch below now makes to the sky. Tested FIRST because a glossy
+                    // bounce also sets specularArrival, and this is the more specific case.
+                    const double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
+                    const double sum = gmis.pdf + pdfEnv;
+                    wMis = (sum > 0.0) ? gmis.pdf / sum : 1.0;
+                } else if (!specularArrival) {         // MIS against the env-NEE at the last vertex
                     double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
                     wMis = (contBsdfPdf + pdfEnv > 0.0) ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
                 }
@@ -11230,6 +11262,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 if (sc.bkGlossyNee && !whitted && mp->type == D_GLOSSY) {
                     const DNeeBsdf gnb{mp, rd * (Real)(-1)};
                     bkNeeLightHero(sc, h, c, L, thr, lam, invPdf, nUp, rng, gi.depth, &gnb);
+                    bkNeeEnvHero(sc, h, c, L, thr, lam, invPdf, nUp, rng, &gnb);   // the sky too
                 }
                 if (whitted) {
                     // Deterministic: carry every live λ's coefficient as weight (no coin, no

@@ -1039,8 +1039,39 @@ something the dielectric path does on exit.
 >    Verified on `scenes/_spec_repro_env.ftsl` (new — the four spheres under an env light), 3000
 >    spp, on vs off: diffuse −0.00 %, glossy gold +0.03 %, dielectric −0.07 %, mirror chrome
 >    −0.00 %. Unbiased, as MIS must be. `_env_cornell` — an env scene with no glossy material —
->    stays **bit-identical**, alongside the other four. **Device twin still to do**, so `-device
->    gpu` and `-device cpu` disagree on a glossy-under-env scene until it lands.
+>    stays **bit-identical**, alongside the other four.
+>
+>    **Device twin landed the same day (v0.266.4).** CPU vs GPU, both on, agree to ±0.32 % across
+>    all three rigs (`_spec_repro_env` ±0.11 %, `_spec_repro_sun` ±0.32 %, `_spec_repro`
+>    ±0.23 %), and GPU on-vs-off is ±0.02 % on the uniform-env rig (unbiased) while still
+>    showing the +6.1 % glossy recovery on the sun rig. The device needed one site the host did
+>    not: `bkRadianceHeroLoop`'s env escape is written as `wMis = 1; if (!specularArrival) {...}`
+>    rather than as an if/else on the arrival, so the glossy case has to be tested **first** or
+>    it falls through to full weight. That is the third instance today of one half of a weight
+>    living somewhere the other half does not.
+>
+>    **And the benefit is measured, not assumed — which took a third rig and a fourth metric.**
+>    A *uniform* env cannot show it: there is nothing to find by chance, so the connection can
+>    only prove itself harmless. `textures/_env_hotspot.hdr` + `scenes/_spec_repro_envsun.ftsl`
+>    (both new) put a 3° spot at 4000× the background — an HDRI's baked sun — and 6 seeds per
+>    arm at 2000 spp, scored as RMS against a **4.05 M-spp `-no-glossy-nee` reference** (the old
+>    estimator is unbiased, just slow, so a long run of it is ground truth independent of the
+>    code under test):
+>
+>    | band | on | off | improvement |
+>    |---|---|---|---|
+>    | diffuse | 0.404 % | 0.518 % | 1.28× |
+>    | **glossy gold** | **0.684 %** | **1.557 %** | **2.28×** |
+>    | dielectric | 2.711 % | 3.275 % | 1.21× |
+>    | mirror chrome | 0.654 % | 0.911 % | 1.39× |
+>
+>    **The metric had to be got right, and the first one lied.** Seed spread alone said the
+>    connection made the glossy band *worse* (SD 0.519 % on against 0.348 % off, "0.67×"). It
+>    does not: the OFF arm has low spread because every seed misses the same hot spot the same
+>    way. **An under-converged estimator can look precise — it is consistently wrong**, and seed
+>    spread cannot tell that from convergence. Only error against a converged reference sees
+>    both. That is the same failure that cost a day on `M-VS-R-GALLERY` and an hour on `UPBP-VM`,
+>    in its third costume.
 
 **Found by M-VS-R-GALLERY**, which spent a day attributing a specular deficit to mode `M`
 before the matched-sample control showed mode `R` has the identical deficit. It is not a
