@@ -936,7 +936,22 @@ struct BackwardRenderer {
                 return (em.inCone(wi) && em.spotOmega > 0.0) ? 1.0 / em.spotOmega : 0.0;
             case EmitterShape::Spot:  return 0.0;             // delta: unhittable by a lobe
             case EmitterShape::Env:   return 0.0;             // has its own MIS (envPdfDir)
-            case EmitterShape::Cylinder: return 0.0;          // see the note above
+            case EmitterShape::Cylinder: {
+                // An UNCAPPED tube is visible-arc sampled, so its density is over that arc and
+                // not over `em.area`. Capped ones fall through to the uniform area form, which
+                // is what emitterSamplePoint uses for them. Getting this wrong is not a small
+                // error: the NEE side connects either way, so a wrong (or zero) density here
+                // hands the hit full weight and DOUBLE COUNTS the light.
+                if (em.caps) break;
+                const double va = em.cylinderVisibleArea(from);
+                if (!(va > 0.0)) return 0.0;
+                if (!hitP || !hitN) return 0.0;
+                const Vec3 d = *hitP - from;
+                const double dist2 = dot(d, d);
+                const double cosLight = dot(*hitN, -wi);
+                if (!(dist2 > 0.0) || !(cosLight > 0.0)) return 0.0;
+                return dist2 / (va * cosLight);
+            }
             case EmitterShape::Sphere: {
                 const Vec3 toC = em.origin - from;
                 const double dc2 = dot(toC, toC), r2 = em.radius * em.radius;

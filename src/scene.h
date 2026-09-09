@@ -1104,6 +1104,24 @@ struct Emitter {
     // front-facing (no wasted back-side samples). `pdfArea` = 1/visibleArea.
     // Returns false when `ref` is within the tube radius (rho <= r), where the arc
     // is undefined; the caller then falls back to the uniform samplePoint().
+    // The area `sampleCylinderVisible` samples over, as a function of the receiver alone --
+    // its front-facing arc, `2*radius*len*phiMax`. Split out so the MIS partner can ask for the
+    // density WITHOUT drawing a sample: GLOSSY-NEE's BSDF-sampling side meets this emitter as a
+    // ray HIT and has to reconstruct the pdf the light-sampling side would have used. Returns 0
+    // where that sampler declines (receiver inside the tube), which the caller reads as
+    // "not MIS-covered, take the hit at full weight".
+    double cylinderVisibleArea(const Vec3& ref) const {
+        const double len = length(v);
+        if (len <= 0.0) return 0.0;
+        const Vec3 a = v / len;
+        const Vec3 p = ref - origin;
+        const Vec3 pPerp = p - a * dot(p, a);
+        const double rho = length(pPerp);
+        if (rho <= radius) return 0.0;                 // ref inside tube radius: sampler declines
+        const double phiMax = std::acos(std::min(1.0, radius / rho));
+        return 2.0 * radius * len * phiMax;
+    }
+
     bool sampleCylinderVisible(const Vec3& ref, double u1, double u2,
                                Vec3& y, Vec3& nOut, double& pdfArea) const {
         double len = length(v);

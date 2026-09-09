@@ -1005,9 +1005,24 @@ something the dielectric path does on exit.
 >
 > 1. **Light-tree-selected emitters are not covered** — see COVERAGE below. A many-light scene's
 >    glossy surfaces keep the old estimator.
-> 2. **Cylinder emitters report no density** (`lightPdfW` returns 0), because
->    `sampleCylinderVisible`'s front-facing-arc area pdf is not exposed. They keep the old
->    estimator, which is unbiased; exposing `pdfAreaCyl` would close it.
+> 2. ~~Cylinder emitters report no density~~ — **FIXED (2026-09-09, v0.266.2), and it was not
+>    the harmless gap it was filed as.** The note said cylinders "keep the old estimator, which
+>    is unbiased". That was wrong: the NEE side connects to a cylinder regardless, so a zero
+>    density on the BSDF-sampling side handed the hit **full weight on top of the connection** —
+>    a double count, not an omission. The asymmetry is the danger in this whole design: the two
+>    halves of the weight are written in different places and only agree if every shape either
+>    appears in both or neither.
+>
+>    The pdf turned out to be trivially invertible — `sampleCylinderVisible`'s arc
+>    `2·radius·len·phiMax` depends only on the *receiver*, so
+>    `Emitter::cylinderVisibleArea(ref)` reconstructs it with no sample drawn. Capped tubes are
+>    uniform-area sampled and fall through to the ordinary area form. (The device was already
+>    correct here by accident of a different choice: it samples cylinders uniformly by area, so
+>    its area form matched.)
+>
+>    `scenes/_spec_repro_tube.ftsl` (new) is the rig that can see it — the four spheres under an
+>    **uncapped tube**, the one shape that takes the visible-arc sampler. On/off at 3000 spp:
+>    diffuse +0.10 %, glossy gold −0.04 %, dielectric +0.20 %, mirror chrome −0.17 %. Unbiased.
 > 3. **Environment lights are not connected from a glossy vertex.** `neeEnv` is a separate
 >    estimator from `neeLight` and only the latter took the hook, so a rough metal under an env
 >    map with a small bright feature (a sun in an HDRI) has exactly the original problem. The env
