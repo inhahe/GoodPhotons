@@ -1456,10 +1456,38 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   to see. A correct version would need a *permuted* stratum order (van der Corput or a coprime
   stride) so the early-out's first probes still span the disc; the Jensen bias it would buy back
   is small next to the risk, which is why it is not there.
-* **`alice_dress`'s residual −13.6 %.** The probe takes the NEAREST hit along −n, so a fold of
-  cloth hides the surface behind it and the area is under-counted — which is the remaining
-  one-sided error, and folded cloth is exactly the case. Marching several hits per probe is the
-  obvious next move.
+* **`alice_dress`'s residual (−12.7 % as shipped).** The stated cause — "the probe takes the
+  NEAREST hit, so a fold of cloth hides the surface behind it" — was **tested and is wrong**
+  (2026-09-10). Marching up to four same-facing layers per probe, with the acceptance tightened
+  from the `2r` cylinder to the estimator's actual ball (`|y − p| ≤ r`) and the early-out gate
+  switched from accumulated area to probes-that-landed so a multi-layer probe could not trip it,
+  made everything **worse**:
+
+  | element | shipped (nearest hit) | marching 4 layers |
+  |---|---|---|
+  | `alice_hair` | −7.1 % | −26.7 % |
+  | `alice_dress` | −12.7 % | −42.1 % |
+  | `cap_gyroid` | −6.1 % | −31.6 % |
+
+  — `cap_gyroid` barely corrects at all. Reverted.
+
+  **Why counting the hidden layer is wrong, which is the useful part.** The hidden layer's area
+  is real and its photons *are* accepted by the query (two parallel folds pass the 60° normal
+  test), so counting it makes the estimate the average radiance over BOTH layers. But the
+  visible point is on the *front* one, and its radiance is what the pixel wants. Dividing the
+  front layer's photons by the front-plus-back area dilutes exactly the surface being shaded.
+  The single-hit probe is not an approximation of the layered case — it is the right question
+  for a visible surface.
+
+  So the residual has some other cause, and the leading suspect is now the **photon query
+  itself**: `dot(ph.n, h.n) < 0.5` cannot reject a photon on a parallel fold a few millimetres
+  behind, so cloth gathers cross-layer photons the footprint is right not to count. That is a
+  defect in the estimator's acceptance rule rather than in its normalisation, and it wants its
+  own entry rather than another footprint patch.
+
+  Recorded at length because the null control passed throughout (**+0.003 %** on the flat rig —
+  one layer, nothing to march) while the targets collapsed. Fourth time in two days that a
+  change was invisible to its control and only the targets could see it.
 * ~~Device twin~~ **DONE (v0.268.0)** — both backends recover the same and the correction is on
   by default; see the table above.
 * **Mode `S` does NOT need this, and that is a real difference rather than an omission
