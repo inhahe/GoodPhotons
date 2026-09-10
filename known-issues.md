@@ -1856,6 +1856,28 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   Nearest-hit remains the better default: it is right on four ROIs of five, and wrong only on the
   densest tangle. Reverted.
 
+  **And the coverage value itself is provably not the discriminating variable (2026-09-10).**
+  Isolating the correction factor each ROI actually receives — the on/off ratio, measured at
+  `-max-bounce` 2 / 4 / 32 to check whether it compounds across bounces (**it does not**: 1.493 /
+  1.489 / 1.481 on `creature`, flat) — gives:
+
+  | ROI | correction applied | is it wanted? |
+  |---|---|---|
+  | `grid_ground` | 1.01× | no, and it correctly does nothing (flat) |
+  | `alice_dress` | 1.49× | **yes** — takes it −38.7 % → −11.0 % |
+  | `creature` | **1.48×** | **no** — takes it −3.9 % → +48.2 % |
+  | `alice_hair` | 2.91× | yes — takes it −68.6 % → −11.4 % |
+
+  **Cloth and fur receive the same correction to within 1 %, and one is right while the other is
+  a 48 % error.** So no rule that reads only the measured coverage — not a floor, not a cap, not
+  a reweighting — can separate them, because the input is identical. That is the bracketing
+  result restated in a form that closes the *parameter-tuning* line as well as the geometric one.
+  It also corrects a number in this entry: the quoted fur coverage of 0.798–0.830 is a per-
+  material figure, while the ROI as shaded receives 1.48×, i.e. an effective coverage near 0.68.
+
+  Note in passing that a 2.91× correction on `alice_hair` is *correct* — large corrections are
+  not the problem, and clamping the magnitude would break the case that works.
+
   **Rig note, because the first run of this looked like a clean confirmation and was entirely
   artefact.** The ROI file is `name x0 y0 x1 y1`; parsing it as `y0 y1 x0 x1` collapses every box
   to a single pixel, which is why `alice_dress` and `alice_hair` — three rows apart — reported
