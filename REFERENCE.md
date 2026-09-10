@@ -5423,6 +5423,37 @@ tree-selected emitter keeps exactly the old estimator, which is unbiased, just a
 Reversing `ltSample`'s adaptive splitting into a selection *density* is what would lift that, and
 is logged in `known-issues.md` → **GLOSSY-NEE**.
 
+**Gather footprint (mode `M`)** — photon mapping's density estimate divides the photons it finds
+by the area of the gather disc, `πr²`. On a flat wall that is exactly right. On anything the disc
+*overhangs* — the edge of a tabletop, a fold of cloth, a strand of hair — the photons only land on
+the part of the disc that is real surface, while the divisor still assumes the whole thing, so the
+estimate comes out dark in proportion to how much of the disc missed. Measured on
+`scenes/gallery_rain.ftsl` against a 34 781-spp mode-`R` reference: flat ground 0 %, a cap edge
+**−32 %**, a fold of cloth **−40 %**, hair **−68 %**.
+
+Since 0.268.0 the estimate divides by the area it actually gathered from. The footprint is
+measured geometrically, by probing points of the disc and asking what same-facing surface lies
+under them — which works for triangles, isosurfaces, CSG solids and fur alike, where clipping
+primitives analytically would only work for triangles. Same scene, same reference:
+
+| element | before | after |
+|---|---|---|
+| `alice_hair` | −68.2 % | **−7.1 %** |
+| `alice_dress` | −40.0 % | **−12.7 %** |
+| `cap_gyroid` | −32.0 % | **−6.1 %** |
+| `grid_ground` (flat — nothing to correct) | −0.6 % | +0.5 % |
+
+CPU and GPU agree. The remaining error on cloth is a fold hiding surface behind it from the
+probe; see `known-issues.md` → **M-GATHERAREA**.
+
+| Flag | Meaning |
+|---|---|
+| `-gatherarea <M>` | Probe samples per gather (default `8`). `0` restores the pre-0.267 estimator exactly. Raising it past 8 buys a few points on hair and costs proportionally; **lowering it is not a speed/accuracy trade** — at 4 the correction is biased *bright* and only looks better on cloth, where the bias cancels a different error. |
+
+It costs 1.3–1.7× the gather on `gallery_rain`, which is nearly all complex geometry, and ~4 %
+on a scene of flat surfaces: a cheap early-out skips the probe entirely wherever the first few
+samples land flat-on, which is most of a typical frame.
+
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
 the composite `P`, and the photon modes `M`/`S`/`U`), on both CPU and GPU. `-resume` /

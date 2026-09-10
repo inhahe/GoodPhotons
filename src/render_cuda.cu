@@ -1219,6 +1219,8 @@ struct DScene {
     const int*       lightTreeAlways; int nLightTreeAlways;
     int              bkLightTree;    // 0 = -no-lighttree: exact all-emitters splitting
     int              bkGlossyNee;    // 0 = -no-glossy-nee: no connection at a D_GLOSSY vertex
+    int              gatherArea;     // -gatherarea <M>: probe samples for the M-GATHERAREA
+                                     // footprint (0 = off, the default)
     double           bkLightSplit;   // -light-split
     int              bkLightSamples; // -light-samples
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
@@ -4971,6 +4973,50 @@ struct DGatherPhoton {
     float pX, pY, pZ;       // cie{X,Y,Z}(lambda) * power * norm / pi (see above)
     float lambda;           // wavelength (nm) — rho(lambda_p) still varies per photon
 };
+
+// ---- GATHER FOOTPRINT (M-GATHERAREA), device twin of photonmap_render.h ----------------------
+// The density estimate divides by pi*r^2, the area of the whole gather disc, while collecting
+// only from the part of that disc that is real, same-facing surface. Where the disc overhangs --
+// a cap edge, a fold of cloth, a hair strand -- the divisor is too big and the estimate is dark
+// in proportion (measured on gallery_rain: flat ground 0 %, cap edge -33 %, hair -68 %).
+//
+// Measured by probing M points of the tangent-plane disc along -n. Three details are load-
+// bearing, all of them learned the hard way on the host and none of them optional here:
+//
+//   * the 1/cos JACOBIAN. The probe samples the tangent PLANE, so it measures projected area
+//     while the estimator needs surface area (dA = dq/cos). Without it the correction overshoots
+//     on exactly the geometry it is for -- hair went -68 % to +31 %, past zero.
+//   * the early-out GATE, which is also the silhouette test: if the first M/4 probes all land
+//     flat-on, this disc is inside a plane and the rest can only agree. Four rays instead of
+//     sixteen over most of a frame.
+//   * INDEPENDENT samples, not stratified. Stratifying the radius walks the rings centre-
+//     outwards, so the gate's first probes all land in the middle of the disc -- which is
+//     covered by definition -- and the gate then fires on nearly every gather and the
+//     correction stops happening. Measured: cap_gyroid -16.9 % stratified against -4.3 %
+//     independent. Do not "improve" this without re-reading the host comment.
+__device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
+                                         Real r, DRng& rng, int M) {
+    if (M <= 0 || !(r > (Real)0)) return 1.0;
+    DVec3 t, b; onb(n, t, b);
+    double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
+    const int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
+    for (int i = 0; i < M; ++i) {
+        if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;
+        const double rr = (double)r * sqrt((double)rng.uniform());
+        const double ph = 2.0 * DPI * (double)rng.uniform();
+        const DVec3 q = p + t * (Real)(rr * cos(ph)) + b * (Real)(rr * sin(ph));
+        // `2r` of travel: within the disc a curved surface deviates from the tangent plane by
+        // at most ~r^2/(2R), far inside this window for any radius worth gathering at.
+        const DHit h = closestHit(sc, q + n * r, n * (Real)(-1), RAY_EPS, (Real)2 * r, false);
+        if (!h.valid) continue;
+        const double c = (double)dot(h.n, n);
+        if (c >= 0.5) area += 1.0 / c;       // same 60-degree acceptance the photon query uses
+    }
+    return area / (double)M;
+}
+__device__ static inline double dGatherAreaScale(double cov) {
+    return (cov >= 0.05) ? 1.0 / cov : 1.0;  // one stray probe must not become a firefly
+}
 
 // A view-independent photon-map query structure on the device (device twin of PhotonMap
 // in photonmap.h): a uniform hash grid (cell size == gather radius) over cell-contiguous
@@ -13654,7 +13700,26 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                     cx += w * ph.pX; cy += w * ph.pY; cz += w * ph.pZ;
                 });
                 const float aw = (r2q > (Real)0) ? (float)((double)r2C / (double)r2q) : 0.f;
-                gx += cx * aw; gy += cy * aw; gz += cz * aw;
+                // M-GATHERAREA: the caustic map has its OWN radius, so its own coverage --
+                // matching the host, where the correction lives inside each `est` call keyed
+                // on that map's rq. One shared coverage would be cheaper and wrong.
+                double cs = 1.0;
+                if (sc.gatherArea)
+                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea));
+                gx += cx * (float)(aw * cs);
+                gy += cy * (float)(aw * cs);
+                gz += cz * (float)(aw * cs);
+            }
+            // ...and the MAIN map's, at its own radius. The device folds norm/pi into every
+            // photon record at UPLOAD time (see DGatherPhoton), so unlike the host there is no
+            // per-gather normalisation to scale -- the correction multiplies the accumulated
+            // sum instead. Same estimator, different place to put the multiply.
+            if (sc.gatherArea) {
+                const double ms = dGatherAreaScale(
+                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea));
+                gx = (float)((double)gx * ms);
+                gy = (float)((double)gy * ms);
+                gz = (float)((double)gz * ms);
             }
             oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
@@ -13913,7 +13978,26 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     cz += rho * ph.pZ;
                 });
                 const float aw = (r2q > (Real)0) ? (float)((double)r2C / (double)r2q) : 0.f;
-                gx += cx * aw; gy += cy * aw; gz += cz * aw;
+                // M-GATHERAREA: the caustic map has its OWN radius, so its own coverage --
+                // matching the host, where the correction lives inside each `est` call keyed
+                // on that map's rq. One shared coverage would be cheaper and wrong.
+                double cs = 1.0;
+                if (sc.gatherArea)
+                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea));
+                gx += cx * (float)(aw * cs);
+                gy += cy * (float)(aw * cs);
+                gz += cz * (float)(aw * cs);
+            }
+            // ...and the MAIN map's, at its own radius. The device folds norm/pi into every
+            // photon record at UPLOAD time (see DGatherPhoton), so unlike the host there is no
+            // per-gather normalisation to scale -- the correction multiplies the accumulated
+            // sum instead. Same estimator, different place to put the multiply.
+            if (sc.gatherArea) {
+                const double ms = dGatherAreaScale(
+                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea));
+                gx = (float)((double)gx * ms);
+                gy = (float)((double)gy * ms);
+                gz = (float)((double)gz * ms);
             }
             oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
@@ -16482,6 +16566,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.nLightTreeAlways = (int)scene.lightTreeAlways.size();
     sc.bkLightTree     = lt::gEnabled ? 1 : 0;
     sc.bkGlossyNee     = lt::gGlossyNee ? 1 : 0;   // GLOSSY-NEE (known-issues.md)
+    {   // M-GATHERAREA footprint budget, same environment channel and same default (8) the host
+        // uses -- the two MUST agree or -device gpu and -device cpu diverge on truncated geometry.
+        const char* e = std::getenv("FTRACE_GATHERAREA");
+        sc.gatherArea = e ? std::atoi(e) : 8;
+    }
     sc.bkLightSplit    = lt::gSplit;
     sc.bkLightSamples  = lt::gSamples;
     sc.lightCdfAll = d_cdfAll;

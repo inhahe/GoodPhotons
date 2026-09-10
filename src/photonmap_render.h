@@ -59,10 +59,14 @@
 // to the disc, which is exact for triangles and IMPOSSIBLE for everything else in this scene --
 // fur (the biggest single loss, mats 38-41), isosurfaces, CSG solids. One intersector call
 // handles them all, and it is the same intersector the render already trusts.
+// ON BY DEFAULT at 8 probes since v0.268.0. `-gatherarea 0` restores the pre-0.267 estimator.
+// 8 is where the sweep plateaus: it recovers 91 % of `alice_hair`'s -68 % for 1.3-1.7x the
+// gather cost, and 16 buys only a few more points. Lower is NOT better despite scoring well on
+// cloth -- see the Jensen note in known-issues.md.
 inline int gatherAreaSamples() {
     static const int m = [] {
         const char* e = std::getenv("FTRACE_GATHERAREA");
-        return e ? std::atoi(e) : 0;
+        return e ? std::atoi(e) : 8;
     }();
     return m;
 }
