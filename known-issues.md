@@ -11500,11 +11500,31 @@ the ~90 s I had assumed from watching wall-clock on 120 s renders.
   way): the `singleNode` path reuses the trial rather than rebuilding, exactly as the code
   comment says. Not a multiplier.
 
-**Still unattributed:** the remaining ~15 s. The candidates are the 15 `fur` coats, the
-isosurface polygonisation, and the BVH over the 683 k surviving triangles. **Do not guess at it
-again** — three probes have now been spent on plausible-looking causes and all three came back
-negative. The next step is a real per-phase timer in the loader (one site, at the top-level
-block dispatch, so every block type is covered), not another hypothesis.
+**Attributed at last, by instrument rather than hypothesis (v0.270.5).** `ftsl::LoadTiming` —
+`msParse` / `msBuild` / `msAssets` / `msAccel`, filled by `detail::PhaseTimer` around the mesh
+loaders and the BVH builds — **already existed and was already populated**, but every call site
+passed the default `nullptr`, so the numbers were computed into a discarded struct. Wiring it to
+`FTRACE_LOADSTATS=1` cost a struct and a printf:
+
+| scene | parse | assets | accel | other (remainder) | total |
+|---|---|---|---|---|---|
+| `gallery` | 36 ms | 307 | 338 | 755 | 1436 ms |
+| `gallery_rain` | 94 ms | **12 223** | 2 269 | 3 454 | 18 041 ms |
+
+**Two thirds of the load is reading mesh files.** Not the fur (15 coats), not the volumetrics,
+not the BVH — the three things the load log makes conspicuous and the three things I guessed.
+`other`, which contains every one of them, is 19 %.
+
+Assets on disk: `cloud1.glb` 111.6 MB, `alice.glb` 32.7 MB, `compote_with_gems.glb` 4.4 MB
+(referenced 13×), `klein_bottle_full.obj` 1.6 MB. But ~150 MB in 12.2 s is 12 MB/s, while the
+standalone rig read the 111.6 MB `cloud1.glb` in **1.65 s total** (68 MB/s) — so bytes alone do
+not explain it, and the difference between the two is that the rig used `import_materials no`
+while `alice.glb` imports materials and their textures. Image decoding inside the glTF loader is
+therefore the leading candidate.
+
+**That is a hypothesis, and it is written down as one.** The next step is a per-asset timer
+inside the loader splitting parse from texture decode — the same instrument-don't-guess move
+that produced this table, applied one level down.
 
 **Where it actually is, after checking each:**
 

@@ -18356,7 +18356,15 @@ static int run(int argc, char** argv) {
         }
     } else if (inFile) {
         std::string ferr;
-        if (!ftsl::load(inFile, ftslScene, ferr, supportFn)) {
+        // FTRACE_LOADSTATS=1 prints the per-phase load breakdown. The numbers were always
+        // computed (ftsl::LoadTiming, filled by detail::PhaseTimer around the mesh loaders and
+        // the BVH builds); every caller just passed nullptr, so they were thrown away.
+        static const bool loadStats = [] {
+            const char* e = std::getenv("FTRACE_LOADSTATS");
+            return e && std::atoi(e) != 0;
+        }();
+        ftsl::LoadTiming ltim;
+        if (!ftsl::load(inFile, ftslScene, ferr, supportFn, loadStats ? &ltim : nullptr)) {
             // A clean stop that landed mid-load is not a scene error. Say so plainly
             // rather than printing a diagnostic that points the finger at the .ftsl —
             // but still exit non-zero: no scene was built, so nothing can be rendered.
@@ -18366,6 +18374,18 @@ static int run(int argc, char** argv) {
             else
                 std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
             return 1;
+        }
+        if (loadStats) {
+            // `other` is what is left after the two measured phases -- fur grooms, isosurface
+            // polygonisation, medium voxelisation, pattern/SDF bakes. It is a REMAINDER, not a
+            // phase, and is labelled so: if it dominates, the next step is to time those
+            // sites, not to guess which of them it is.
+            const double other = ltim.msBuild - ltim.msAssets - ltim.msAccel;
+            std::fprintf(stderr,
+                "[loadstats] parse %.0f ms | build %.0f ms = assets %.0f + accel %.0f + other "
+                "%.0f | total %.0f ms\n",
+                ltim.msParse, ltim.msBuild, ltim.msAssets, ltim.msAccel, other,
+                ltim.msParse + ltim.msBuild);
         }
         fromFtsl = true;
         std::printf("[ftsl] loaded scene from %s\n", inFile);

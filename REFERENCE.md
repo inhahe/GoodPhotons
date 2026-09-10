@@ -1513,6 +1513,15 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   *slice* (sample range + samples/s), which exposes the per-scanline-band cost structure
   inside a single spp — on a scene with a dense participating-medium band the sky and the
   cloud can differ by more than 10x, and only the slice trace shows it.
+- **`FTRACE_LOADSTATS=1` (diagnostic).** Prints one `[loadstats]` line after the scene loads,
+  splitting the cost into **parse** (source text → block tree), **assets** (mesh files read and
+  parsed from disk), **accel** (BVH construction), and **other** — the last being a *remainder*,
+  not a measured phase, covering fur grooms, isosurface polygonisation, medium voxelisation and
+  pattern/SDF bakes. `assets` and `accel` are timed where the work happens rather than by
+  subtraction, so only `other` carries the error of the rest. Useful when a scene takes longer
+  to open than to render: `gallery_rain` reports `assets 12223 + accel 2269 + other 3454` of an
+  18.0 s load, i.e. **two thirds of it is reading mesh files**, which is not what its
+  conspicuous fur and volumetrics suggest.
 - **`FTRACE_MSTATS=1` (diagnostic, mode `M`).** Prints one `[mstats]` line at the end of the render
   splitting the camera gather into the **surface density estimate** and the **beam gather**, with the
   call counts and the beam share. Thread-seconds, so on N threads the two sum to more than the wall
