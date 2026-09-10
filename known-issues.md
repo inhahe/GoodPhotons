@@ -12340,6 +12340,28 @@ float geometry queries, and the same queries on the *straight-ray* periphery sho
 separate pre-existing global ~1.2× mode-R float-GPU vs double-CPU exposure difference exists
 even with NO medium and is folded into this (both are the device-float regime).
 
+> **CORRECTION (2026-09-10, v0.270.8): the "even with NO medium" half of that is wrong, and it
+> was the alarming half.** Measured on two medium-free mode-`R` scenes: `cornell` GPU/CPU =
+> **1.0018**, `_spec_repro` = **0.9997**. There is no global backend exposure difference. The
+> claim dates from 2026-07-23, *before* `GPU-NEE-EPS` (fixed 0.259.0) — the shadow-ray
+> end-shortening bug documented in the very next entry, which had been mis-filed as a
+> "participating-media disagreement" for six weeks and showed as a 2.41× mode-`D` gap. The
+> mode-`R` 1.2× was almost certainly the same bug; nobody cleared the aside once the cause was
+> found. **The ~1.1–1.2× factor is real but GRIN-SPECIFIC** — `grin_lin` still needs 1.11×
+> (400 spp) to 1.23× (1600 spp) to exposure-match — so it belongs to this entry's lens
+> amplification, not to the backend at large.
+>
+> **The rest of the entry re-validates as written**: at the scene's own `film { res 160 120 }`,
+> 400 spp, disc **3.06 %**, periphery **1.63 %**, SSIM **0.9872**, disc/periphery **1.88**.
+>
+> **Two repro hazards, both of which cost a wrong conclusion here.** (a) `scraps/grin_lin.ftsl`
+> was **untracked** — a known-issue whose repro scene is gitignored cannot be re-validated at
+> all, and there is no way to tell whether it drifted. Now copied to `scenes/_grin_lin.ftsl`.
+> (b) `grin_residual.py`'s statistic is **not resolution-invariant**: its blur kernel is a fixed
+> 11 px while the lens features scale with the film, so rendering the same scene at 256² instead
+> of 160×120 reports disc 18.5 % / SSIM 0.757 and looks exactly like a 7× regression. Render at
+> the scene's own resolution, or the number means nothing.
+
 Not a correctness bug (both backends bend correctly and agree structurally); it is the accepted
 GPU float-precision envelope showing up amplified in the bent region. **Proper fix (if ever
 warranted):** run the device geometry/BLAS intersection for GRIN-marched rays in double, or
