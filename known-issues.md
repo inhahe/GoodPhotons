@@ -11589,7 +11589,33 @@ that a sampling test needs its own power analysis before it is trusted to gate a
 
 Reverted. The dedup earns its keep; the estimator, done right, would have to count collisions
 (`N_u ≈ m²/2c`) rather than distinctness — and since the dedup wins even at high uniqueness,
-there is no threshold worth having. **Do not retry this.** The real target is the fit itself.
+there is no threshold worth having. **Do not retry this.**
+
+**And the failed experiment turns out to size the remaining cost.** Fitting all 8.4 M texels
+took 6.9 s, so the fit runs at ~0.82 µs/texel across 12 threads. Back-solving the dedup path
+(5.2 s including ~1 s of serial probing) puts the unique count near **5 M of 8.4 M — 61 %
+distinct**, exactly what a photograph should give. So the dedup saves ~2.7 s of fitting for ~1 s
+of probing, a genuine ~1.7 s net, and what is left is the fits themselves.
+
+**That makes ~4.6 s close to irreducible without changing something other than the schedule.**
+The remaining levers all cost accuracy or add machinery:
+
+* **Use `coeffLut()` on the CPU** (the 3D Jakob-Hanika table) instead of exact fits. Rejected:
+  the device does **not** have its own texture path to converge with — it uploads the host's
+  per-texel `coeff` array verbatim (`render_cuda.cu` ~360), and `jhLut` is for vertex colours
+  and stochastic textures. So this would be a pure accuracy regression with no CPU/GPU-agreement
+  benefit to pay for it.
+* **Quantise the colour key** to cut the unique count. Straight accuracy trade, and the header
+  is explicit that the current dedup is bit-exact precisely *because* it does not quantise.
+* **Cache fitted coefficients on disk**, keyed on (file identity, `maxDim`, encoding). The only
+  lever that costs no accuracy, and worth ~4.6 s on *every* reload of a textured scene — but it
+  is a new on-disk format with its own invalidation and failure modes, so it wants to be a
+  deliberate feature rather than a perf patch.
+
+**Load-time thread closed here.** It ran five iterations and returned one shipped win (the 8-bit
+decode table, 22 % off the whole load, bit-identical), a working diagnostic (`FTRACE_LOADSTATS`),
+and five refuted hypotheses. The cost is now fully attributed and the only untried lever is the
+disk cache above.
 
 **Where it actually is, after checking each:**
 
