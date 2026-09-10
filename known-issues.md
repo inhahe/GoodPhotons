@@ -2307,7 +2307,12 @@ Verified across PLY / OBJ / glTF on the CPU rasterizer, the GPU rasterizer (bit-
 to the CPU one) and the path tracer; a mesh with no vertex colours is untouched, and the
 G-buffer channel is not even allocated for one.
 
-### VCOL-GPU — OPEN (2026-09-03, v0.226.0): the GPU **tracer** has no per-vertex colour, so a vertex-coloured scene falls back to the CPU
+### VCOL-GPU — **DONE** (v0.226.0 → fixed in `132e6b1`; entry never updated, found by audit 2026-09-10): the GPU **tracer** had no per-vertex colour, so a vertex-coloured scene fell back to the CPU
+
+**Resolved by `132e6b1` ("vcol: port per-vertex colour to the GPU tracer, and keep it through
+instancing").** `DScene::vertColors` / `DTri::vcol` exist and are uploaded; the only remaining
+`vertColors.empty()` test in `render_cuda.cu` is the *upload* branch, not a support gate, so
+nothing falls back any more.
 
 **What happens.** `cudaForwardSupported` now returns false when `Scene::vertColors` is
 non-empty, which drops modes R/W/D onto the CPU for any vertex-coloured mesh. Without the
@@ -2328,7 +2333,13 @@ barycentrics lying around.
 **Cost of leaving it.** A vertex-coloured scene renders correctly but without GPU
 acceleration.
 
-### VCOL-BLAS — OPEN (2026-09-03, v0.226.0): `mesh_asset` instances drop per-vertex colour
+### VCOL-BLAS — **DONE** (v0.226.0 → fixed in `132e6b1`; entry never updated, found by audit 2026-09-10): `mesh_asset` instances dropped per-vertex colour
+
+**Resolved by `132e6b1`, and NOT by the fix this entry proposed.** The entry asked for `Blas` to
+carry its own `vertColors`; what shipped instead threads the scene-wide table through
+`intersectLocal`/`occludedLocal` as a `vcolTable` argument, because a BLAS's triangles already
+hold `Tri::vcol` indices into it (`scene.h` ~1182). Worth recording the divergence: the entry's
+prescription would have duplicated the table per asset for no gain.
 
 **What happens.** A BLAS is a shared instanced asset with its own triangle array, and it
 has no colour table of its own — `intersectLocal`/`occludedLocal` pass `nullptr` where the
@@ -10572,7 +10583,12 @@ v0.113.x — the original symptom). CPU↔GPU at 1 spp still PASSes the block-me
 n3 max \|dLuma\| 0.253, n3b 0.144, n3d 0.144, n3d2 0.144, grate 0.144, and the four dye beds
 0.044 / 0.003 / 0.065 / 0.002. All nine physics self-tests PASS.
 
-### DEBT — OPEN (2026-07-30, v0.113.1): the GPU cannot do material emission-on-hit at all
+### DEBT — **DONE** (v0.113.1 → fixed in `67d5129`; entry never updated, found by audit 2026-09-10): the GPU could not do material emission-on-hit at all
+
+**Resolved by `67d5129` ("cuda: honour a material's own `emit` on geometry with no registered
+emitter").** `DMaterial::matEmit[SPEC_N]` is the device twin of `Material::emit`, consulted as
+the fallback when a primitive carries an `emit` spectrum but no `DEmitter` was registered — so
+a non-mesh emissive primitive is no longer black on the GPU and elastic-only.
 
 `src/render_cuda.cu` ~608 notes plainly that *"DMaterial carries no emit spectrum"*. Only meshes
 get registered as emitters (via `addMesh`), so any **non-mesh primitive** (a `quad`, `sphere`,
@@ -10586,7 +10602,12 @@ the device light list so NEE can see them too. Until then, emissive non-mesh geo
 either be documented as CPU-only or rejected at upload time with a clear message rather than
 silently rendering differently.
 
-### DEBT — OPEN (2026-07-30, v0.113.1): `Fluorescent`'s `neeLight` calls omit the `gi` argument
+### DEBT — **DONE** (fixed in `0c2d93c` the same day it was filed; entry never updated, found by audit 2026-09-10): `Fluorescent`'s `neeLight` calls omitted the `gi` argument
+
+**Resolved by `0c2d93c` ("feat: the -gi one-bounce gather runs on the GPU, so mode W is fully on
+the device", 2026-07-30 06:30) — hours after this was filed.** Its diff adds `gi` to both sites
+verbatim (`rhoEl` and `rhoFluo`). Every `neeLight` / `neeLightHero` call in `backward.h` now
+passes it, so a fluorescent surface at a `-gi` gather vertex uses `giGrid²` like its neighbours.
 
 `src/backward.h` ~927 and ~953 call `neeLight(scene, h, rho…, invPdf…, lambda…, rng, spdCache)`
 without the trailing `gi` that the `Diffuse` (~1019) and `DiffuseTransmit` (~986/990) cases pass.
@@ -11032,7 +11053,12 @@ keeps every scene that omits `intensity` bit-identical (verified on `_env_cornel
 work: the scale is applied to the `Spectrum` before `addEnvLight`, so both backends see it
 (CPU 0.849074 vs GPU 0.849019, −0.01 %).
 
-### TECH-DEBT / DOC — OPEN (2026-07-28): a field leaf's `center` is applied *before* its `rotate`
+### TECH-DEBT / DOC — **DONE** (documented in `dbeb6ab`; entry never updated, found by audit 2026-09-10): a field leaf's `center` is applied *before* its `rotate`
+
+**The documentation this entry asked for already exists**, in `FTSL.md` §10.1: "Note `center` is
+applied *inside* the rotation and `translate` *outside* it, so to rotate a leaf in place,
+position it with `translate`." That is exactly the prescribed fix — the behaviour stays as it
+is (reversing it would break existing scenes) and the surprise is now written down.
 
 `addFieldLeaf` composes the leaf transform as `authoredXf . TRS(center)`, i.e. `center` sits on
 the *inside*. So `cylinder { center 0 -0.169 0.363   rotate 115 0 0  ... }` does **not** place a
@@ -11400,7 +11426,12 @@ keep the children as the persistent list they already are and materialise
 and loom's mirror. Worth doing only if scene load shows up again — 42 ms on the single
 largest scene, with the median scene well under 5 ms, is no longer near the top.
 
-### TECH-DEBT — OPEN (2026-07-26): `GraphParser/cpp/scannerless.{hpp,cpp}` still throws bare `std::runtime_error`, not the rich `ParseError`
+### TECH-DEBT — **MOOT** (found by audit 2026-09-10): `GraphParser/cpp/scannerless.{hpp,cpp}` threw bare `std::runtime_error`, not the rich `ParseError`
+
+**Not actionable in this repo.** `GraphParser/` is not on disk and has never been tracked by git
+here (`git log --all -- '*scannerless*'` is empty). Whatever this referred to lives elsewhere or
+was removed before the tree was imported; keeping it OPEN only advertises work that cannot be
+done from here.
 
 The tokenized engine (the one ftrace uses) throws a `ParseError` carrying line/col, the
 exact accepted-continuation set, and the enclosing rule chain — that diagnostic quality is
