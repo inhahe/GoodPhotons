@@ -3,6 +3,16 @@
 Running log of unsolved bugs and accumulated tech debt. Fix items here as soon
 as practical; this file is the fallback for what can't be addressed immediately.
 
+**A repro scene for an OPEN entry must be TRACKED** (`scenes/`, not `scraps/`). `scraps/` is
+git-ignored, so an entry whose repro lives there cannot be re-validated and its drift cannot be
+detected — on 2026-09-10 that nearly produced a false "7× regression" report against the GRIN
+entry, whose numbers turned out to be fine once the scene's own film resolution was restored.
+Audited the same day: of the ~165 scenes this file references, **84 are untracked, but only one
+belonged to an open entry** (`grin_lin`, now `scenes/_grin_lin.ftsl`). The rest are cited by
+closed entries, where the cost is a broken historical link rather than a blocked investigation.
+Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
+name files that no longer exist at all, all in closed entries.
+
 ## Open issues
 
 ### UPBP-VM — DONE (2026-09-07, v0.263.1; the CPU half filed 2026-09-06, v0.260.0): mode `J`'s surface point merges (`-jsurf`) are **on by default on the CPU** since 0.260.0 — all three gates green — but have **no device twin**, so a GPU mode-`J` run is still the two-technique estimator and mode `U` cannot be retired yet
@@ -12366,9 +12376,10 @@ Not a correctness bug (both backends bend correctly and agree structurally); it 
 GPU float-precision envelope showing up amplified in the bent region. **Proper fix (if ever
 warranted):** run the device geometry/BLAS intersection for GRIN-marched rays in double, or
 supersample the bent region on GPU — high cost for a sub-pixel edge placement difference, so
-deferred. Repro: render `scraps/grin_lin.ftsl -mode R` on `-device gpu` and `-device cpu`, then
-`python scraps/grin_residual.py png/grin_lin_gpu.png png/grin_lin_cpu.png` (watch disc rel-err
-vs spp).
+deferred. Repro: render **`scenes/_grin_lin.ftsl`** (tracked; `scraps/grin_lin.ftsl` was the original and
+is git-ignored) `-mode R` on `-device gpu` and `-device cpu` **at the scene's own
+`film { res 160 120 }` — do not override `-r`**, then `python scraps/grin_residual.py
+png/grin_lin_gpu.png png/grin_lin_cpu.png` (watch disc rel-err vs spp).
 
 ### BUG — DONE (2026-09-06, 0.259.0; **validated 2026-09-09, v0.266.0** — see SPHERELIGHT-EPS for what the validation turned up) [GPU-NEE-EPS]: GPU NEE/camera shadow rays lost their end-shortening past ~3360 scene units, so any DISTANT light came out too dark — logged for six weeks as a "participating-media" disagreement, which it never was
 
