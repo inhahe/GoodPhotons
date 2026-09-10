@@ -839,8 +839,13 @@ struct BackwardRenderer {
     struct EmitterDraw {
         int n = 0;                       // number of connections to make
         bool all = false;                // true: entries are emitters 0..n-1, each pdf 1
+        // false = ltSample declined a split for want of room, so its pdfs are NOT the reverse
+        // walk's values and the glossy MIS weight has to walk after all. See lightSelPdf.
+        bool selExact = true;
         LtSample s[kMaxLightPick];
         int emitter(int i) const { return all ? i : s[i].emitter; }
+        // The selection probability, which the draw already knows: the weight's numerator.
+        double selPdf(int i) const { return all ? 1.0 : s[i].pdf; }
         // 1/p(e) — the weight that makes selection unbiased against the old sum.
         double weight(int i) const { return all ? 1.0 : (s[i].pdf > 0.0 ? 1.0 / s[i].pdf : 0.0); }
     };
@@ -867,8 +872,10 @@ struct BackwardRenderer {
             const double pp[3] = {p.x, p.y, p.z};
             double nn[3] = {0, 0, 0};
             if (nrm) { nn[0] = nrm->x; nn[1] = nrm->y; nn[2] = nrm->z; }
+            bool limited = false;
             d.n += ltSample(scene.lightTree.data(), scene.lightTreeRoot, pp, nn,
-                            nrm != nullptr, lightSplit, budget, d.s + d.n, rng);
+                            nrm != nullptr, lightSplit, budget, d.s + d.n, rng, &limited);
+            d.selExact = !limited;
         }
         return d;
     }
@@ -1094,7 +1101,9 @@ struct BackwardRenderer {
             // exact pdf through selW.
             double selP = 1.0;
             if (nb) {
-                selP = lightSelPdf(scene, e, h.p, h.n);
+                // ltSample already multiplied these ratios on the way down; re-walking the tree
+                // for them cost 5.1 % of the frame (scraps/selpdf_cost.sh) and bought nothing.
+                selP = draw.selExact ? draw.selPdf(di) : lightSelPdf(scene, e, h.p, h.n);
                 if (!(selP > 0.0)) continue;
             }
             const Emitter& em = scene.emitters[e];
@@ -1184,7 +1193,7 @@ struct BackwardRenderer {
             if (selW <= 0.0) continue;
             double selP = 1.0;                              // see neeLight's COVERAGE note
             if (nb) {
-                selP = lightSelPdf(scene, e, h.p, h.n);
+                selP = draw.selExact ? draw.selPdf(di) : lightSelPdf(scene, e, h.p, h.n);
                 if (!(selP > 0.0)) continue;
             }
             const Emitter& em = scene.emitters[e];

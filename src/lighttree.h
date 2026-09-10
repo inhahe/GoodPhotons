@@ -235,7 +235,13 @@ LT_FN double ltSelectPdf(const LightTreeNode* nodes, int root, const int* parent
             const double iR = ltImportance(nodes[ri], p, n, hasN);
             const double sum = iL + iR;
             if (!(sum > 0.0)) return 0.0;       // ltSample would have abandoned this walk
-            pdf *= (nxt == li) ? (iL / sum) : (iR / sum);
+            // EXACTLY ltSample's arithmetic, including taking the right child as `1 - pL`
+            // rather than `iR/sum`. Those differ in the last bits, and the whole point of this
+            // function is that the two halves of the weight produce the SAME number -- which
+            // also makes "reusing ltSample's pdf instead of walking" a bit-identity claim that
+            // can be tested rather than argued.
+            const double pL = iL / sum;
+            pdf *= (nxt == li) ? pL : (1.0 - pL);
         }
         cur = nxt;
     }
@@ -261,10 +267,14 @@ LT_FN double ltSelectPdf(const LightTreeNode* nodes, int root, const int* parent
 // array is a per-thread local-memory frame in the megakernel, and 64 entries of
 // {int,double} is a kilobyte per thread that would be paid by every thread whether it
 // touches a light tree or not.
+// `roomLimited` (optional out) reports whether any split was declined for want of output/stack
+// room rather than because ltShouldSplit said no. When it comes back false, every pdf written to
+// `out` is exactly what ltSelectPdf would return for that leaf -- which is what lets the caller
+// skip the reverse walk entirely. See scraps/fix_selpdf_reuse.py.
 template <class RNG, int STACK = 64>
 LT_FN int ltSample(const LightTreeNode* nodes, int root, const double p[3],
                    const double n[3], bool hasN, double splitThresh,
-                   int maxOut, LtSample* out, RNG& rng) {
+                   int maxOut, LtSample* out, RNG& rng, bool* roomLimited = nullptr) {
     if (!nodes || root < 0 || maxOut <= 0) return 0;
     struct Entry { int node; double pdf; };
     Entry stack[STACK];
@@ -282,8 +292,12 @@ LT_FN int ltSample(const LightTreeNode* nodes, int root, const double p[3],
         if (ri < 0) { stack[sp++] = Entry{li, e.pdf}; continue; }
         // Room to split? Need a free stack slot AND a free output slot, since a
         // split can only pay off if both halves can still be reported.
-        const bool canSplit = (sp + 2 <= STACK) && (nOut + sp + 2 <= maxOut) &&
-                              ltShouldSplit(nd, p, splitThresh);
+        // Split into two tests (value-identical -- ltShouldSplit is pure and draws no rng, so
+        // evaluation order cannot matter) so a split declined purely for ROOM can be reported.
+        const bool wantSplit = ltShouldSplit(nd, p, splitThresh);
+        const bool haveRoom  = (sp + 2 <= STACK) && (nOut + sp + 2 <= maxOut);
+        if (wantSplit && !haveRoom && roomLimited) *roomLimited = true;
+        const bool canSplit = wantSplit && haveRoom;
         if (canSplit) {
             stack[sp++] = Entry{li, e.pdf};
             stack[sp++] = Entry{ri, e.pdf};

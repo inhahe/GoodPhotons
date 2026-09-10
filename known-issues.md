@@ -1109,9 +1109,34 @@ something the dielectric path does on exit.
 >      actually unbiased for — the same data gives −0.089 % ± 0.158 %. **Never bias-test two arms
 >      with a robust statistic when the thing that differs between them is the tail.**
 >
->    **Next, if the cost matters:** the weight is fully known *before* the shadow ray is traced,
->    so Russian roulette on it (`q = min(1, w/w0)`, contribution ÷ `q`) would skip most of the
->    low-weight connections unbiasedly and recover much of the 12 %. Untried.
+>    **Cost, revisited (v0.270.1) — two thirds of it was redundant work.** Decomposed with one
+>    binary and three env-selected arms (`FTRACE_SELPDF_MODE`, since removed; the technique is
+>    the durable part — matched arms through identical code beat two builds you hope are
+>    comparable), the +12 % split almost exactly in half: shadow rays ~5 %, tree walks ~5 %. The
+>    guess that shadow rays dominated was wrong, and the walk half bought *nothing* — `ltSample`
+>    multiplies exactly those `ltImportance` ratios on its way down and returns their product as
+>    `LtSample::pdf`. The NEE side was recomputing a number it already had.
+>
+>    It only re-walked to guarantee both halves agree about the room condition. Cheaper: have
+>    `ltSample` **say** whether room ever bound (`roomLimited` out-param). When it did not, its
+>    pdf *is* the walk's value, so the NEE side takes it directly and the hit side's walk still
+>    agrees; when it did (rare), the NEE side walks too. Either way both halves produce the same
+>    number, which is all a weight owes.
+>
+>    Making that a *bit-identity* claim rather than an argument needed one fix: `ltSample` takes
+>    the right child as `1 - iL/sum` while `ltSelectPdf` used `iR/sum`, which differ in the last
+>    bits. `ltSelectPdf` now mirrors `ltSample`'s arithmetic exactly, and the reuse is verified
+>    bit-identical to the walk on **both** backends — so there is no variance question to ask.
+>
+>    Drift-controlled cost (interleaved by seed, 16 seeds): baseline → **+7.2 % walking, +2.3 %
+>    reusing**. Three *blocked* runs of the same measurement had put the walk arm at +10.1 %,
+>    +26.7 % and +10.8 % while both walk-free arms read +4–5 % every time — thermal/turbo drift
+>    landing on whichever arm holds the middle of a long saturating run. **Interleave arms by
+>    seed; do not block them.**
+>
+>    **Next, if the remaining ~2 % matters:** the weight is fully known *before* the shadow ray
+>    is traced, so Russian roulette on it (`q = min(1, w/w0)`, contribution ÷ `q`) would skip
+>    most low-weight connections unbiasedly. Untried, and now a much smaller prize.
 >
 >    The reasoning that blocked the first attempt was wrong, and that is worth keeping in the
 >    record:

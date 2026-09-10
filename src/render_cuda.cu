@@ -10124,18 +10124,23 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
 struct DEmitterDraw {
     int  n;             // number of connections to make
     bool all;           // true: entries are emitters 0..n-1, each with weight 1 (the old loop)
+    // false = ltSample declined a split for want of room, so its pdfs are NOT the reverse
+    // walk's values and the glossy MIS weight has to walk after all. Host twin: EmitterDraw.
+    bool selExact;
     LtSample s[kDMaxLightPick];
     __device__ int emitter(int i) const { return all ? i : s[i].emitter; }
     __device__ double weight(int i) const {
         return all ? 1.0 : (s[i].pdf > 0.0 ? 1.0 / s[i].pdf : 0.0);
     }
+    // The selection probability the draw already knows -- the weight's numerator.
+    __device__ double selPdf(int i) const { return all ? 1.0 : s[i].pdf; }
 };
 
 // `nrm` is the receiver normal, or null at a volume vertex (which has none to bound with).
 // Mode W keeps the exact path: its deterministic G x G lattice has no variance to trade.
 __device__ static void dPickEmitters(const DScene& sc, const DVec3& p, const DVec3* nrm,
                                      DRng& rng, DEmitterDraw& d) {
-    d.n = 0; d.all = false;
+    d.n = 0; d.all = false; d.selExact = true;
     if (!sc.bkLightTree || sc.bkWhitted || sc.lightTreeRoot < 0 || !sc.lightTree) {
         d.all = true; d.n = sc.nEmitters; return;
     }
@@ -10150,9 +10155,11 @@ __device__ static void dPickEmitters(const DScene& sc, const DVec3& p, const DVe
         const double pp[3] = {(double)p.x, (double)p.y, (double)p.z};
         double nn[3] = {0.0, 0.0, 0.0};
         if (nrm) { nn[0] = (double)nrm->x; nn[1] = (double)nrm->y; nn[2] = (double)nrm->z; }
+        bool limited = false;
         d.n += ltSample<DRng, kDMaxLightPick + 2>(
                    sc.lightTree, sc.lightTreeRoot, pp, nn, nrm != nullptr,
-                   sc.bkLightSplit, budget, d.s + d.n, rng);
+                   sc.bkLightSplit, budget, d.s + d.n, rng, &limited);
+        d.selExact = !limited;
     }
 }
 
@@ -10185,7 +10192,9 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         // already divides by ltSample's own exact pdf through selW.
         double selP = 1.0;
         if (nb) {
-            selP = dLightSelPdf(sc, k, h.p, h.n);
+            // ltSample already multiplied these ratios on the way down (host twin measured the
+            // re-walk at 5.1 % of a frame), so take them when they are exact.
+            selP = draw.selExact ? draw.selPdf(di) : dLightSelPdf(sc, k, h.p, h.n);
             if (!(selP > 0.0)) continue;
         }
         const bool uv = dEmitterNeedsUV(em);
@@ -10270,7 +10279,7 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
         if (em.collimated || em.shape == 3) continue;
         double selP = 1.0;                             // GLOSSY-NEE coverage, as in bkNeeLight
         if (nb) {
-            selP = dLightSelPdf(sc, k, h.p, h.n);
+            selP = draw.selExact ? draw.selPdf(di) : dLightSelPdf(sc, k, h.p, h.n);
             if (!(selP > 0.0)) continue;
         }
         const bool uv = dEmitterNeedsUV(em);
