@@ -11560,8 +11560,36 @@ verifiable by bit-comparison, and it is — `gallery_rain` renders to the same m
 its per-texel path deliberately: its `maxv` is read from the header rather than fixed at 255, so
 a table would need building per image and the exactness argument would not hold for free.
 
-What is left: `assets` is still 8.0 s of 15.1 s, and the ~6.7 s that is not texture decode is
-mesh parsing across the four files, still unattributed.
+**Attributed per asset (v0.270.8).** One `[loadstats] asset` line per glTF load, splitting each
+call into image decode and spectral fit:
+
+| asset | total | decode | spectral fit | tris | size |
+|---|---|---|---|---|---|
+| `alice.glb` | **6547 ms** | 1289 | **4581** | 407 792 | 32.7 MB |
+| `cloud1.glb` | 1035 ms | 0 | 0 | 1 852 454 | 111.6 MB |
+| `compote_with_gems.glb` ×13 | 72 ms + 12×~10 ms | 0 | 0 | 250 000 + 12×62 | 4.4 MB |
+
+`cloud1.glb` carries **4.5× the triangles and 3.4× the bytes of `alice.glb` in a sixth of the
+time**, and it is the one that runs neither decode nor fit (`import_materials no`) — so the
+whole difference is the material-import path, and `upsample::fitMany`'s Jakob-Hanika spectral
+upsampling is **4.6 s of a 13.3 s load, the largest single identifiable item in it.**
+
+**An attempt to fix it, and why it failed — the failure is the useful part.** `fitMany` dedups
+colours through a hash map before fitting the uniques in parallel. For a photograph that looked
+like a pure loss: nearly every texel distinct, so the map saves few fits while costing a probe
+per texel, and *that pass is serial while the fit it guards is not*. The change sampled 4096
+texels and skipped the map when over half were distinct.
+
+It measured **33 % SLOWER** (fit 5223 → 6932 ms), bit-identical as designed. The estimator was
+the problem: **4096 samples drawn from an 8.4 M-texel image come back ~99.6 % distinct even when
+the image holds only ~500 k unique colours**, because collisions in a sample of `m` drawn from
+`N` uniques do not appear until `m ≈ √N ≈ 700`. The probe therefore answers "skip the dedup"
+in exactly the case where the dedup saves 16×. A textbook birthday-paradox error, and a reminder
+that a sampling test needs its own power analysis before it is trusted to gate anything.
+
+Reverted. The dedup earns its keep; the estimator, done right, would have to count collisions
+(`N_u ≈ m²/2c`) rather than distinctness — and since the dedup wins even at high uniqueness,
+there is no threshold worth having. **Do not retry this.** The real target is the fit itself.
 
 **Where it actually is, after checking each:**
 

@@ -1520,7 +1520,9 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   not a measured phase, covering fur grooms, isosurface polygonisation, medium voxelisation and
   pattern/SDF bakes. `assets` and `accel` are timed where the work happens rather than by
   subtraction, so only `other` carries the error of the rest. Useful when a scene takes longer
-  to open than to render: `gallery_rain` reports `assets 8025 (of which texture decode 1307)
+  to open than to render. With it enabled each glTF asset also reports its own line, split into
+  image decode and spectral fit, which is what localises a slow load to one file: `gallery_rain`
+  reports `assets 8025 (of which texture decode 1307)
   + accel 2721 + other 4091` of a 15.1 s load, i.e. **over half of it is reading mesh files**,
   which is not what its conspicuous fur and volumetrics suggest.
 - **`FTRACE_MSTATS=1` (diagnostic, mode `M`).** Prints one `[mstats]` line at the end of the render

@@ -8195,6 +8195,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     detail::g_assetMs = 0.0;
     detail::g_accelMs = 0.0;
     gltfimpl::g_texDecodeMs = 0.0;
+    gltfimpl::g_texFitMs = 0.0;
     auto phaseT0 = PhaseClock::now();
     auto phaseLap = [&phaseT0]() {
         auto now = PhaseClock::now();

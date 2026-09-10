@@ -316,6 +316,10 @@ inline Affine nodeLocalAffine(const minijson::Value& node) {
 // very different fixes. thread_local for the same reason ftsl.h's asset/accel timers are:
 // a parallel loader must not cross-contaminate. Reset by ftsl.h at the top of each load.
 inline thread_local double g_texDecodeMs = 0.0;
+// ...and the per-texel spectral upsampling that follows it (Texture::buildReflCoeff ->
+// upsample::fitMany). A separate counter because the two have entirely different fixes: one is
+// an image codec, the other a Jakob-Hanika fit whose dedup pass is serial.
+inline thread_local double g_texFitMs = 0.0;
 
 inline bool decodeGltfImage(const Doc& doc, const minijson::Value* imagesArr,
                             int imageIdx, const std::string& baseDir,
@@ -364,10 +368,24 @@ inline bool decodeGltfImage(const Doc& doc, const minijson::Value* imagesArr,
 // material NAME contains one of the given substrings (case-insensitive) -- see the
 // filter block below for why. Returns the number of triangles added (0 on failure,
 // with a message in `err`). Call before Scene::build().
+// FTRACE_LOADSTATS=1: one `[loadstats] asset` line per glTF load. The aggregate `assets` phase
+// cannot say WHICH file it is spending its time in, and this scene's four assets span 1.6 MB to
+// 111.6 MB, so the aggregate is not actionable on its own.
+inline bool gltfLoadStatsOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_LOADSTATS");
+        return e && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
 inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& xf,
                     bool importMaterials, std::string& err,
                     const std::vector<std::string>& skipMaterials = {}) {
     using namespace gltfimpl;
+    const auto _gltfT0 = std::chrono::steady_clock::now();
+    const double _gltfTex0 = gltfimpl::g_texDecodeMs;   // running total; differenced at the end
+    const double _gltfFit0 = gltfimpl::g_texFitMs;
     // Resolve the document ONCE, up front: `dirOf(spath)` below becomes the base for
     // every external buffer/image URI, so it has to be the directory the document was
     // actually found in, not the one the scene happened to name it relative to.
@@ -564,7 +582,13 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
         } else if (role == TexRole::Color) {
             if (p0 != 1.0 || p1 != 1.0 || p2 != 1.0)
                 for (Vec3& c : tex.rgb) c = Vec3{c.x * p0, c.y * p1, c.z * p2};
-            if (!tex.buildReflCoeff()) { texStopped = true; return -1; }
+            {
+                const auto _fitT0 = std::chrono::steady_clock::now();
+                const bool okFit = tex.buildReflCoeff();
+                g_texFitMs += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - _fitT0).count();
+                if (!okFit) { texStopped = true; return -1; }
+            }
         }
 
         tex.name = authored + "#tex" + std::to_string(ti) +
@@ -857,6 +881,13 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
         else std::snprintf(matNote, sizeof matNote, " [glTF materials, %d textures]",
                            (int)texCache.size());
     }
+    if (gltfLoadStatsOn())
+        std::fprintf(stderr, "[loadstats] asset %s: %.0f ms (decode %.0f, spectral fit %.0f), %d tris\n",
+                     path,
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - _gltfT0).count(),
+                     gltfimpl::g_texDecodeMs - _gltfTex0,
+                     gltfimpl::g_texFitMs - _gltfFit0, added);
     std::printf("loadGltf: %s -> %d tris%s%s%s\n", path, added, matNote,
                 skippedNonTri ? " (skipped non-triangle primitives)" : "", skipNote);
     if (added == 0 && err.empty()) err = "no triangles loaded (unsupported primitive layout?)";
