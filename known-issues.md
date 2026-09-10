@@ -1718,6 +1718,51 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   Recorded at length because the null control passed throughout (**+0.003 %** on the flat rig —
   one layer, nothing to march) while the targets collapsed. Fourth time in two days that a
   change was invisible to its control and only the targets could see it.
+* **THE FOOTPRINT MEASURES A CYLINDER WHERE THE QUERY GATHERS A BALL (2026-09-10).** Found by
+  asking which *direction* each error mode pushes: the probe's nearest-hit rule, the Jensen bias
+  at M = 8, and hidden back-layer photons all make the estimate **brighter**, yet the residual is
+  **dark** — so it cannot be a coverage under-correction. Exactly one mechanism runs the other
+  way. `gatherCoverage` accepts any hit with `h.t <= 2r`, a cylinder of radius `r` and
+  half-height `r`, while the photon query collects from a **ball** of radius `r`: a hit at
+  tangential offset `rr` and depth `dN = r - h.t` sits at `sqrt(rr² + dN²)`, out to `r√2`.
+  Counting that as covered area measures a footprint the estimator never gathers from, so
+  coverage reads high and the estimate dark — **zero where the surface is flat (`dN = 0`) and
+  worst where it curves hardest**, which is the residual's shape.
+
+  Measured, two seeds, equal spp, against the 34781-spp mode-`R` reference:
+
+  | ROI | cyl (shipped) | ball | cyl | ball |
+  |---|---|---|---|---|
+  | | *seed 1* | | *seed 4* | |
+  | `grid_ground` (null) | −4.4 % | −4.6 % | −4.5 % | −4.8 % |
+  | `alice_dress` | −11.0 % | **−0.8 %** | −13.2 % | **−4.3 %** |
+  | `alice_hair` | −11.4 % | **−5.1 %** | −15.1 % | **−6.4 %** |
+  | `creature` (fur) | +48.2 % | **+82.3 %** | +61.7 % | **+102.6 %** |
+
+  **So the mechanism is real and large — and NOT SHIPPABLE ALONE**, because it amplifies an
+  over-correction on fur by ~35 pp. Reverted.
+
+  A follow-up hypothesis was tested and is also wrong: that fur starves because the probe reports
+  only its NEAREST hit, typically a strand *above* the tangent plane and outside the ball, while
+  a gatherable strand lies deeper inside it. Marching to the first hit inside the ball (one
+  sample per probe still — **not** the reverted area-summing march) moved `creature` only
+  +82.3 → +78.9 and +102.6 → +99.5, and made `alice_dress` worse. Whatever starves fur under the
+  ball test, it is not nearest-hit occlusion.
+
+  **The finding that matters most here was incidental: the SHIPPED correction over-corrects the
+  fur creature by +48–62 %.** That is larger than every dark residual this entry is written
+  around, and it is not in any table above — the entry was framed on "too dark" and nobody
+  scored the ROI that is far too bright. The next attempt should start there, and the obvious
+  first lever is the coverage floor (`gatherAreaScale` clamps at `cov >= 0.05`, so `1/cov` runs
+  to 20×); a tighter floor would bound the fur over-correction under both acceptances.
+
+  **Rig note, because the first run of this looked like a clean confirmation and was entirely
+  artefact.** The ROI file is `name x0 y0 x1 y1`; parsing it as `y0 y1 x0 x1` collapses every box
+  to a single pixel, which is why `alice_dress` and `alice_hair` — three rows apart — reported
+  byte-identical values. And the arms were compared at equal TIME, so they finished different
+  sample counts. Both were caught only by `grid_ground`, which is flat and therefore identical
+  under the two acceptances **by construction**: it moved, so the rig was wrong. Score a null
+  control that is provably invariant, or a broken rig will confirm whatever you brought to it.
 * ~~Device twin~~ **DONE (v0.268.0)** — both backends recover the same and the correction is on
   by default; see the table above.
 * **Mode `S` does NOT need this, and that is a real difference rather than an omission
