@@ -1313,6 +1313,12 @@ estimate is for.
 
 That beats this entry's own prediction of 30–65 %.
 
+**The control really is still.** Three seeds per arm at 150 s: `grid_ground` reads **+0.1 % ± 1.0**
+off against **+0.3 % ± 2.6** on — means 0.2 pp apart against those spreads, so the +1.3 pp of the
+single-seed run was noise. The same three seeds put `alice_hair` at −71.0 ± 0.9 → −9.3 ± 3.5 and
+`alice_dress` at −45.0 ± 5.5 → −22.7 ± 8.6, so the recovery reproduces; the ON arm's wider
+spread is simply its 2.5× smaller sample count, not instability in the correction.
+
 **Why a probe rather than the analytic clip prescribed above.** The prescription — BVH sphere
 query, each same-facing primitive clipped to the tangent-plane disc — is right about *what* to
 measure and impossible for *this scene*: the instrumentation below names `creature`'s fur
@@ -1339,10 +1345,22 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
 
 **What is not done.**
 
-* **Cost: 2.5×** on `gallery_rain` (615 → 246 spp at 240 s), against only +4 % on the null rig —
-  the difference is that scene's BVH depth. The gate this entry already proposed ("only worth
-  doing when the gather is near a silhouette or a small-feature primitive") is not optional
-  before this goes on by default.
+* **Cost: 2.5× → 1.81× with the gate (v0.267.1), still not 1×.** The gate this entry proposed
+  ("only worth doing when the gather is near a silhouette or a small-feature primitive") is
+  implemented as an **adaptive early-out** rather than a separate heuristic: probe a quarter of
+  the budget first, and if every one of those lands flat-on (`cos ≈ 1`), the disc is in the
+  interior of a plane and the rest can only confirm it. Four rays instead of sixteen on the
+  ground and the caps; a truncated disc shows a miss almost at once and pays full price.
+  `gallery_rain` 240 s: 546 → 301 spp, with quality unmoved (hair 99 %, `cap_gyroid` 88 %,
+  dress 60 % — all inside the seed spread below). It also made the null control *better*,
+  +0.016 % → **+0.004 %**, because the early-out returns exactly 1.0 on a flat interior instead
+  of a 16-sample estimate of it: the correction now adds no noise where it has nothing to do.
+
+  Deliberately **not** gated on photon count, though that is the cheapest signal available —
+  this entry already establishes that no photon statistic separates geometry from illumination,
+  so such a gate would skip exactly the dim truncated gathers that most need correcting.
+
+  1.81× is still too much for default-on; the open question is the sample budget `M` itself.
 * **`alice_dress`'s residual −13.6 %.** The probe takes the NEAREST hit along −n, so a fold of
   cloth hides the surface behind it and the area is under-counted — which is the remaining
   one-sided error, and folded cloth is exactly the case. Marching several hits per probe is the

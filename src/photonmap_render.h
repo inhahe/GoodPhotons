@@ -71,7 +71,22 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
     if (M <= 0 || !(r > 0.0)) return 1.0;
     Vec3 t, b; onb(n, t, b);
     double area = 0.0;                 // in units of the full disc, so 1.0 == fully covered
+    // THE SILHOUETTE GATE, as an adaptive early-out rather than a separate heuristic. The entry
+    // proposes "only worth doing when the gather is near a silhouette or a small-feature
+    // primitive", and the honest way to know that is to ask the same estimator with fewer
+    // samples: probe a quarter of the budget first, and if every one of them lands on surface
+    // that is flat-on (cos ~ 1), this disc is in the interior of a plane and the remaining
+    // probes can only confirm it. That costs 4 rays instead of 16 on the ground plane and the
+    // caps -- which is most of a frame -- while any disc that is actually truncated shows a
+    // miss almost immediately and pays the full budget.
+    //
+    // Deliberately NOT a photon-count test: this entry already establishes that no photon
+    // statistic can separate geometry from illumination, and a gate built on one would skip
+    // exactly the dim truncated gathers that need correcting most.
+    const int probe0 = (M >= 8) ? (M / 4) : M;
     for (int i = 0; i < M; ++i) {
+        if (i == probe0 && area >= (double)probe0 * 0.995)
+            return 1.0;                // interior of a flat patch: nothing to correct
         // Uniform in the disc: sqrt(u) puts equal expected samples per unit AREA, which is what
         // an area fraction needs -- a linear radius would over-weight the middle and report a
         // truncated disc as fuller than it is.
