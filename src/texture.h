@@ -426,11 +426,25 @@ struct Texture {
                   " (" + what + ")";
             return false;
         }
+        // An 8-bit source has only 256 distinct values per channel, so this table is EXACT:
+        // entry i is srgbToLinear(i * (1/255)), the same expression the per-texel path used,
+        // and every texel gets back the identical double. What it removes is the pow() -- a
+        // 4096^2 colour map is ~50 M of them, and the decode phase measured 5.7 s of
+        // gallery_rain's 18.2 s load before this (FTRACE_LOADSTATS=1).
+        static const double* const kLut8 = [] {
+            static double t[512];
+            for (int i = 0; i < 256; ++i) {
+                const double v = (double)i * (1.0 / 255.0);
+                t[i]       = v;                  // TexEncoding::Linear
+                t[256 + i] = srgbToLinear(v);    // TexEncoding::sRGB
+            }
+            return t;
+        }();
+        const double* const lut = kLut8 + (encoding == TexEncoding::sRGB ? 256 : 0);
         rgb.clear();
-        rgb.reserve((size_t)w * h);
-        const double inv = 1.0 / 255.0;
+        rgb.resize((size_t)w * h);
         for (size_t i = 0; i < (size_t)w * h; ++i)
-            storeLinear(px[i * 3] * inv, px[i * 3 + 1] * inv, px[i * 3 + 2] * inv);
+            rgb[i] = Vec3{lut[px[i * 3]], lut[px[i * 3 + 1]], lut[px[i * 3 + 2]]};
         stbi_image_free(px);
         return true;
     }

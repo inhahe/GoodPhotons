@@ -11539,12 +11539,29 @@ So texture decoding is *half* of the asset phase and about a third of the load �
 concurrently caps at roughly **1.3×** of the 5.7 s, bounded by the larger one; it is not the win
 it would be for a scene with a dozen maps. Worth knowing before writing a thread pool for it.
 
-**The open question is why 21.3 MB of JPEG costs 5.7 s at all** — that is ~3.7 MB/s, and stb's
-JPEG decoder runs an order of magnitude faster than that. Candidates: the decode is not the cost
-and the post-decode `maxDim` area-average is (gltf.h ~164 downsamples *after* a full-resolution
-decode); or the same image is decoded more than once because the cache key is (texture, role,
-factor) and one image is wanted in two roles. Both are cheap to distinguish with a counter, and
-neither should be guessed at — the last four load-cost hypotheses split two-and-two.
+**Answered (v0.270.7): the decode was never the cost — a per-texel `pow()` was.** 21.3 MB of
+JPEG at ~3.7 MB/s is an order of magnitude under stb, and `Texture::loadMemory` follows stb with
+a conversion that calls `srgbToLinear` on every channel of every texel — i.e. `std::pow(x, 2.4)`
+tens of millions of times for one colour map. Neither of the two candidates guessed above was
+right; the third possibility, that the work *after* the decode inside the same function was the
+cost, is what it turned out to be.
+
+An 8-bit source has only **256 distinct values per channel**, so a 256-entry table is *exact*
+rather than an approximation: entry `i` is `srgbToLinear(i * (1/255))`, the same expression the
+per-texel path evaluated, so every texel gets the identical double back. That makes the change
+verifiable by bit-comparison, and it is — `gallery_rain` renders to the same md5.
+
+| | texture decode | total load |
+|---|---|---|
+| before | 5982 ms | 19356 ms |
+| after | **1307 ms** | **15056 ms** |
+
+**4.6× on the decode phase and 22 % off the whole scene load, bit-identical.** `loadPPM` keeps
+its per-texel path deliberately: its `maxv` is read from the header rather than fixed at 255, so
+a table would need building per image and the exactness argument would not hold for free.
+
+What is left: `assets` is still 8.0 s of 15.1 s, and the ~6.7 s that is not texture decode is
+mesh parsing across the four files, still unattributed.
 
 **Where it actually is, after checking each:**
 
