@@ -11458,6 +11458,41 @@ it updates the control and raises `EN_CHANGE` by itself, with nothing to synthes
 `scraps/bindtest.ps1` carries this note inline so the next harness doesn't repeat it. The
 `chans:` box itself was never broken (`[anim] channels 4 → 7 → 5 → 3` all verified).
 
+### PERF — OPEN (2026-09-10, v0.270.4): a mesh-bound medium's **voxelisation** is 86 % of `gallery_rain`'s load, and its triangle pass is still serial
+
+Measured because `gallery_rain` had been costing minutes per measurement all session — and the
+first thing the measurement did was correct my own estimate of it. The build is **20.5 s**, not
+the ~90 s I had assumed from watching wall-clock on 120 s renders.
+
+| scene | build |
+|---|---|
+| `gallery.ftsl` | 2.5 s |
+| `gallery_rain.ftsl` | 18.3 s |
+
+So **86 % of the load is what the rain adds**: `meshvox::voxelizeSolid` turning 1 852 454
+triangles into a 195×122×191 lattice, `featherGrid`'s distance transform over its 4.5 M cells,
+and two majorant grids.
+
+**Where it actually is, after checking each:**
+
+* `buildMajorantGrid` — **already parallel** (`majorant.h` ~128/156).
+* `featherGrid` — **was serial, now parallel (v0.270.4)**, worth **0.9 s** of the 15.8 s. The
+  separable EDT runs independent 1-D scans, so the lines within a pass parallelise
+  bit-identically (no reduction, no re-association); the three passes stay sequential. Verified
+  bit-identical on `gallery_rain`. Small, but free and correct.
+* `voxelizeSolid` — **still serial, and is the remaining bulk.** Its scanline fill is
+  independent per (k, j) row and should parallelise as cleanly as the EDT did. Its triangle
+  pass is a scatter into shared per-column crossing lists, so that one needs per-thread buckets
+  or a different decomposition, and is the only part with a real race.
+
+**A negative result worth keeping, because it looked like an obvious win.** The load log shows
+`meshes/compote_with_gems.glb` (4.5 MB) parsed **13 times**, once at 250 000 tris and twelve
+times at 62. Caching parsed glTF documents by path is the obvious fix and buys **nothing**: 13
+loads that each keep ~62 tris cost 335 ms against 329 ms for one, because the loader already
+skips decoding primitives the `skip_material` list drops. The 66 ms/load marginal a first rig
+showed was *geometry* (250 k tris and their BVH), not parsing — the rig had to be built to match
+the real skip lists before it measured the right thing.
+
 ### PERF — OPEN (2026-07-27): scene loading is down 5×, but the graph walk (not the lexer) is what's left
 
 The 0.68 front-end flip made loading measurably slower than the hand-written parser —
