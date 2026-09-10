@@ -35,6 +35,8 @@
 #include "assetbytes.h"
 #include "third_party/json.h"
 
+#include <chrono>
+
 namespace gltfimpl {
 
 // Read an entire file into a byte vector. Returns false on open failure.
@@ -309,9 +311,20 @@ inline Affine nodeLocalAffine(const minijson::Value& node) {
 // inside the BIN chunk, which is already resolved into doc.buffers) or as a URI, which
 // may itself be a base64 data payload or an external file beside the document. All three
 // end in Texture::loadMemory, so there is one decode path and no temporary files.
+// TEXTURE-DECODE ACCOUNTING (FTRACE_LOADSTATS=1). `assets` in the load profile covers both
+// reading/parsing a mesh file and decoding the images its materials reference, and those have
+// very different fixes. thread_local for the same reason ftsl.h's asset/accel timers are:
+// a parallel loader must not cross-contaminate. Reset by ftsl.h at the top of each load.
+inline thread_local double g_texDecodeMs = 0.0;
+
 inline bool decodeGltfImage(const Doc& doc, const minijson::Value* imagesArr,
                             int imageIdx, const std::string& baseDir,
                             TexEncoding enc, Texture& out, std::string& err) {
+    // Whole-function scope: the decode is the body, and an early-out costs nothing to time.
+    const auto _texT0 = std::chrono::steady_clock::now();
+    struct TexT { const std::chrono::steady_clock::time_point& t0;
+                  ~TexT() { g_texDecodeMs += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count(); } } _texT{_texT0};
     if (!imagesArr || !imagesArr->isArray() ||
         imageIdx < 0 || imageIdx >= (int)imagesArr->arr.size()) {
         err = "glTF image index " + std::to_string(imageIdx) + " out of range";

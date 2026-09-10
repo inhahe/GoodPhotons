@@ -616,6 +616,7 @@ struct LoadTiming {
     double msBuild  = 0.0;  // Block tree -> Scene, INCLUDING msAssets and msAccel below
     double msAssets = 0.0;  // of msBuild: mesh files read+parsed from disk (obj/gltf/fbx)
     double msAccel  = 0.0;  // of msBuild: BVH construction (per-asset Blas + Scene::build)
+    double msTexture = 0.0; // of msAssets: decoding images referenced by imported materials
 };
 
 namespace detail {
@@ -8193,6 +8194,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     using PhaseClock = std::chrono::steady_clock;
     detail::g_assetMs = 0.0;
     detail::g_accelMs = 0.0;
+    gltfimpl::g_texDecodeMs = 0.0;
     auto phaseT0 = PhaseClock::now();
     auto phaseLap = [&phaseT0]() {
         auto now = PhaseClock::now();
@@ -8211,6 +8213,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
             if (!t) return;
             t->msAssets = detail::g_assetMs;
             t->msAccel  = detail::g_accelMs;
+            t->msTexture = gltfimpl::g_texDecodeMs;
             t->msBuild  = std::chrono::duration<double, std::milli>(
                               PhaseClock::now() - *from).count();
         }

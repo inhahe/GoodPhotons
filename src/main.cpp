@@ -18382,9 +18382,9 @@ static int run(int argc, char** argv) {
             // sites, not to guess which of them it is.
             const double other = ltim.msBuild - ltim.msAssets - ltim.msAccel;
             std::fprintf(stderr,
-                "[loadstats] parse %.0f ms | build %.0f ms = assets %.0f + accel %.0f + other "
-                "%.0f | total %.0f ms\n",
-                ltim.msParse, ltim.msBuild, ltim.msAssets, ltim.msAccel, other,
+                "[loadstats] parse %.0f ms | build %.0f ms = assets %.0f (of which texture "
+                "decode %.0f) + accel %.0f + other %.0f | total %.0f ms\n",
+                ltim.msParse, ltim.msBuild, ltim.msAssets, ltim.msTexture, ltim.msAccel, other,
                 ltim.msParse + ltim.msBuild);
         }
         fromFtsl = true;

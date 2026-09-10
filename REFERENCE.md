@@ -1515,7 +1515,8 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   cloud can differ by more than 10x, and only the slice trace shows it.
 - **`FTRACE_LOADSTATS=1` (diagnostic).** Prints one `[loadstats]` line after the scene loads,
   splitting the cost into **parse** (source text → block tree), **assets** (mesh files read and
-  parsed from disk), **accel** (BVH construction), and **other** — the last being a *remainder*,
+  parsed from disk, with the part spent **decoding textures** for imported materials called out
+  separately), **accel** (BVH construction), and **other** — the last being a *remainder*,
   not a measured phase, covering fur grooms, isosurface polygonisation, medium voxelisation and
   pattern/SDF bakes. `assets` and `accel` are timed where the work happens rather than by
   subtraction, so only `other` carries the error of the rest. Useful when a scene takes longer

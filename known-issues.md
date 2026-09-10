@@ -11522,9 +11522,29 @@ not explain it, and the difference between the two is that the rig used `import_
 while `alice.glb` imports materials and their textures. Image decoding inside the glTF loader is
 therefore the leading candidate.
 
-**That is a hypothesis, and it is written down as one.** The next step is a per-asset timer
-inside the loader splitting parse from texture decode — the same instrument-don't-guess move
-that produced this table, applied one level down.
+**Hypothesis confirmed, and quantified (v0.270.6).** `g_texDecodeMs` now wraps
+`decodeGltfImage`, the single point every glTF image decode passes through, and rides out
+through the same `LoadTiming`:
+
+| scene | assets | of which texture decode | share of total load |
+|---|---|---|---|
+| `gallery` | 450 ms | **0 ms** | — (imports no materials: a built-in null control) |
+| `gallery_rain` | 12 243 ms | **5 731 ms** | **31 % of the whole 18.2 s load** |
+
+So texture decoding is *half* of the asset phase and about a third of the load — and the other
+~6.5 s of `assets` is mesh parsing proper, which is still unattributed between the four files.
+
+**What the next step is NOT.** `alice.glb` — the only asset in the scene that imports materials
+— contains exactly **2 images** (18.13 MB and 3.19 MB, both JPEG). So decoding them
+concurrently caps at roughly **1.3×** of the 5.7 s, bounded by the larger one; it is not the win
+it would be for a scene with a dozen maps. Worth knowing before writing a thread pool for it.
+
+**The open question is why 21.3 MB of JPEG costs 5.7 s at all** — that is ~3.7 MB/s, and stb's
+JPEG decoder runs an order of magnitude faster than that. Candidates: the decode is not the cost
+and the post-decode `maxDim` area-average is (gltf.h ~164 downsamples *after* a full-resolution
+decode); or the same image is decoded more than once because the cache key is (texture, role,
+factor) and one image is wanted in two roles. Both are cheap to distinguish with a counter, and
+neither should be guessed at — the last four load-cost hypotheses split two-and-two.
 
 **Where it actually is, after checking each:**
 
