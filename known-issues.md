@@ -412,6 +412,70 @@ bit-for-bit unbiased with no `-radcache` on the command line.
 
 **81 % of the camera gather is the beam gather**, and the camera gather is ~97 % of the frame (the forward pass deposited 879 410 photons from 2 M emitted in 4.42 s). So a volumetric cache is aimed at roughly **four fifths of a `gallery_rain` frame**, which is what makes it the better attack than optimising the gather — and it is a far larger target than the under-2 % a flyby can amortise. The surface cache that already exists (`-radcache`) addresses the other fifth.
 
+**Sized (2026-09-10, v0.270.1) — the ceiling is ~30 % of a frame, not ~80 %.** The 81 % above is
+the beam gather as a whole; only the *cacheable* part of it is order >= 2, and `-beams-order 1`
+measures that with no code written, since keeping single scatter alone is very nearly what a
+perfect order->=2 cache would remove. `gallery_rain`, `-camera cam -mode M -beams`, CPU, 320x180,
+120 s, seed 1:
+
+| | beams stored | after split | beams per probe | beam gather | per probe | spp in 120 s |
+|---|---|---|---|---|---|---|
+| unlimited order | 26 402 | 626 276 | 87.8 | 361.1 s (69 % of gather) | **53.3 us** | 81 |
+| `-beams-order 1` | 14 127 | 342 538 | 50.8 | 353.9 s (58 % of gather) | **36.8 us** | 115 |
+
+So order->=2 adds **31 % to the per-probe beam gather**, and dropping it outright buys **1.42x the
+samples**. A cache that made order->=2 free is worth up to ~30 % of a `-beams` frame — real, and
+worth having, but a third of what this entry's framing implies. Plan accordingly: it does not
+justify unbounded complexity.
+
+**Two scoping facts the entry did not state.**
+
+* **It is an opt-in-flag win only.** Mode `M` runs no volumetric gather at all without `-beams`:
+  the first attempt at the measurement above came back `beam gather 0.00 s over 0 probes`, and
+  the two arms still differed by 167 vs 171 spp — a 2 % gap that would have read perfectly
+  plausibly as "multiple scatter is nearly free". A null result is evidence only once the rig is
+  shown able to produce a non-null one; here the probe COUNT is what exposed it, not the time.
+* **The multiple scatter being cached is not a minor wash.** It is +13.2 % of the trimmed frame
+  mean overall, but **+282 % in the top third** and −0.3 % in the bottom third: it is the
+  dominant signal exactly where it lives (the rain volume above the set), and essentially absent
+  on the ground. So this is not a marginal term that could simply be dropped — but it also means
+  any flattening of its structure shows up in the one region where nothing else contributes.
+
+**Per order, measured the same way** (`-beams-order 2` and `3`, same rig). Scored on the TOP
+THIRD, because that is where multiple scatter is the signal rather than a correction:
+
+| cap | top-third mean | vs previous | beams/probe added |
+|---|---|---|---|
+| order 1 | 0.002648 | — | — |
+| order 2 | 0.005085 | **+92 %** | +16.4 |
+| order 3 | 0.006869 | +35 % | +9.3 |
+| unlimited | 0.010127 | +47 % | +11.3 |
+
+**Order 2 is only 33 % of all multiple scatter** — it is a long tail, not a second term, with
+67 % arriving at order >= 3. That is the opposite of what the isotropy worry assumed, and it
+settles the representation question in the cache's favour: the bulk of what would be cached has
+been through three or more scattering events, which is exactly the regime where the radiance
+field smooths out regardless of how forward-peaked a single droplet is.
+
+**It also names a better design point than the entry's.** Cost and benefit are not proportional
+across orders — order 2 costs 16.4 beams/probe for 33 % of the energy, while orders >= 4 give
+43 % for 11.3. So:
+
+| design | MS energy cached | MS cost removed | of a `-beams` frame | isotropy risk |
+|---|---|---|---|---|
+| cache order >= 2 (as filed) | 100 % | 100 % (37 beams/probe) | ~30 % | on the *least* isotropic order |
+| **cache order >= 3** | 67 % | 56 % (20.6 beams/probe) | **~17 %** | low — 3+ scatters |
+
+Caching order >= 3 and leaving orders 1–2 exact keeps the sharp, view-dependent part of the
+volumetric answer in the per-frame estimator by construction rather than by hoping a cell is
+isotropic enough. **Build that first**; order 2 can be folded in later if the extra ~13 % is
+worth re-opening the question, and by then the cache will exist to test it against.
+
+Note also the engine's own advice in the same logs: "past the -beamk floor (87.8 > 32), so the
+gather now pays for every extra beam. Fewer beams here is likely FASTER for the same error —
+lower -beamcount." A beam-count sweep is far cheaper than this feature and should be tried
+first, if only to establish what the cache is really competing against.
+
 **Sequencing note.** This overlaps `UPBP-CONV` (making the beam gather cheap enough that mode `J`
 wins at equal time) and is arguably the better attack on it: caching removes the work rather than
 optimising it. Do the profiling half of `UPBP-CONV` first — an exact per-frame split of light
