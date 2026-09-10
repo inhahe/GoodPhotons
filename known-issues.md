@@ -493,7 +493,9 @@ drops far enough (the log says `[floor raised the radii]`), which is a real blur
 `bc <= 6500` and confounds any count sweep taken past it. And the bias column read
 −6.9 / −10.5 / −12.1 % on TRIMMED means and −3.8 / −9.6 / −3.7 % (±1–6) on RAW ones: the same
 trimmed-mean-versus-tail artifact this file already documents under GLOSSY-NEE, walked into a
-second time. Only the arm where the floor had raised the radii is genuinely biased.
+second time. Only the arm where the floor had raised the radii is genuinely biased. **Use
+`tools/roi_score.py`** — it reproduces this sweep and flags all six discrepancies without being
+asked, which is the point: a rule you have to remember is not a control.
 
 **Sequencing note.** This overlaps `UPBP-CONV` (making the beam gather cheap enough that mode `J`
 wins at equal time) and is arguably the better attack on it: caching removes the work rather than
@@ -1195,7 +1197,10 @@ something the dielectric path does on exit.
 >      estimator of a skewed distribution's mean, so an arm with fewer fireflies has *less*
 >      energy trimmed away and reads higher. On raw means — the statistic the estimator is
 >      actually unbiased for — the same data gives −0.089 % ± 0.158 %. **Never bias-test two arms
->      with a robust statistic when the thing that differs between them is the tail.**
+>      with a robust statistic when the thing that differs between them is the tail.** Since
+>      writing that down did not stop it happening again (see the `-beamcount` sweep under
+>      VOLCACHE), `tools/roi_score.py` now applies both checks itself: bias on raw means, and a
+>      loud warning whenever the trimmed number disagrees by more than the standard error.
 >
 >    **Cost, revisited (v0.270.1) — two thirds of it was redundant work.** Decomposed with one
 >    binary and three env-selected arms (`FTRACE_SELPDF_MODE`, since removed; the technique is
