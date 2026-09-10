@@ -468,7 +468,7 @@ down. Validation on the same scene:
 The fold is exact in expectation, so B and C–C2 agreeing within their noise is the correctness
 statement; a chroma error would have shown as a channel-dependent shift, as `UPBP-CHROMA`'s did.
 
-### RASTER-PBR — **HALF DONE** (CPU rasterizer 2026-09-10, v0.269.0; filed 2026-09-06, v0.257.0): `-explore` / `-raster` cannot show a glossy material at all, so an asset whose look depends on its specular lobe (Alice's dress) previews flat — where a web viewer like Meshy shows it correctly in real time
+### RASTER-PBR — **DONE** (both rasterizers, 2026-09-10, v0.269.1; filed 2026-09-06, v0.257.0): `-explore` / `-raster` cannot show a glossy material at all, so an asset whose look depends on its specular lobe (Alice's dress) previews flat — where a web viewer like Meshy shows it correctly in real time
 
 **The gap, in the code's own words.** `src/raster.h`'s header: *"There is NO transparency,
 refraction, reflection, shadows, caustics or global illumination… **Glossy lobes do not exist
@@ -509,13 +509,29 @@ reflectance: a gold highlight has to be gold, and a white one is the most obviou
 max/mean 1.536; at 0.90, 158.30 and 1.611. Smoother is brighter and more concentrated, rougher
 is dimmer and flatter — which is what a lobe does and what a flat shade cannot do.
 
-**NOT DONE, and the reason this is filed as half rather than closed: `-raster` defaults to the
-CUDA rasterizer, which is untouched.** The first version of the sweep above ran on the default
-path and returned *byte-identical* numbers across an 18× roughness range — the change was inert,
-and only forcing `-device cpu` revealed it working. `raster_cuda.cu` ~1051 carries the identical
-`ambient + keyScale*lit + fill*head` line and needs the same forty lines. Until it does, the two
-rasterizers disagree on any glossy material, which is exactly the class of divergence the rest
-of this file spent two days removing — so **`REFERENCE.md` does not advertise this yet**.
+**The CUDA rasterizer followed in v0.269.1, and it had to.** `-raster` DEFAULTS to it, so the
+CPU work alone was invisible to almost everybody — the first version of the sweep above ran on
+the default path and returned *byte-identical* numbers across an 18× roughness range. **That
+looked exactly like a broken feature and was a rig pointed at the wrong backend**; only forcing
+`-device cpu` revealed it working. Worth keeping because it is the inverse of the day's other
+measurement failures: this one would have made me discard working code rather than ship broken
+code.
+
+The device port is not a copy-paste of forty lines: the material payload rides **three** structs
+there where the host has one — the per-triangle `DPTri`, the mix-loser `DMixShade` and the
+near-clip `DAttr` — so `rough`/`f0` had to go in all three, or a clipped or mix-resolved fragment
+would silently lose its lobe. Same rule this file has been applying to MIS weights for two days:
+every case appears in every place, or in none.
+
+**Both backends now agree exactly.** Gold sphere band, `-raster`, roughness 0.05 against 0.90:
+
+| device | r = 0.05 | r = 0.90 | GPU/CPU |
+|---|---|---|---|
+| CPU | 166.05 | 158.30 | — |
+| GPU | 166.05 | 158.30 | **+0.00 %** |
+
+and the diffuse control (`_cornell_diffuse`, no glossy material) is **+0.000 %** between
+backends — `rough < 0` skips the whole block, so nothing without a lobe moved.
 
 **Proposed work.**
 1. Build an irradiance representation for diffuse (SH9 is ample) and a roughness-mipped

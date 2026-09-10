@@ -152,6 +152,14 @@ struct DPTri {
     int    reflectPat;      // scalar `pattern` scaling the albedo, or -1
     int    emitPat;         // scalar `pattern` masking the emission, or -1
     int    mix;             // index into the DMix table for a per-hit mix, else -1
+    // RASTER-PBR (host twin: raster.h PShade). `rough < 0` = no specular lobe, which shades
+    // byte-for-byte as before, so every diffuse scene is untouched. `f0` is normal-incidence
+    // reflectance -- for a metal preset that IS its measured reflectance, which is why a gold
+    // highlight must come out gold.
+    float  rough;
+    float3 f0;
+    int    roughPat;        // `roughness pattern:`, or -1
+    int    roughTex;        // `roughness texture:`, or -1
 };
 
 // Device twin of raster.h's PMix: the LOSING half of a two-child `mix` whose blend is
@@ -173,6 +181,10 @@ struct DMix {
     float  normalStrength;
     int    reflectPat;
     int    emitPat;
+    float  rough;           // RASTER-PBR: a mix child carries its own lobe, or -1 for none
+    float3 f0;
+    int    roughPat;
+    int    roughTex;
 };
 
 // A device image texture (linear RGB), mirroring raster.h's use of Texture::sampleRgb /
@@ -262,6 +274,10 @@ struct DAttr {
     float  normalStrength;
     int    reflectPat;      // scalar `pattern` scaling the albedo, or -1
     int    emitPat;         // scalar `pattern` masking the emission, or -1
+    float  rough;           // RASTER-PBR: carried through the near clip like every other slot
+    float3 f0;
+    int    roughPat;
+    int    roughTex;
 };
 // Per-slot flags array values (kProject writes, classify/raster/shade/clear probe).
 constexpr int kSlotValid   = 1;   // bit0: slot holds a projected sub-triangle
@@ -526,6 +542,8 @@ __device__ inline void emitSlot(DGeo* geos, DAttr* attrs, int* flags, int idx,
         a.emissive = t.emissive;
         a.normalTex = t.normalTex; a.normalStrength = t.normalStrength;
         a.reflectPat = t.reflectPat; a.emitPat = t.emitPat;
+        a.rough = t.rough; a.f0 = t.f0;          // RASTER-PBR: survive the near clip
+        a.roughPat = t.roughPat; a.roughTex = t.roughTex;
         attrs[idx] = a;
     }
     flags[idx] = kSlotValid | (t.clear ? kSlotClear : 0) | (clipped ? kSlotClipped : 0)
@@ -877,6 +895,30 @@ __device__ inline double dRasterFw(const DCam& cam, float3 wpos, float3 wn) {
 // Pass C: resolve + shade each pixel once. Decode the winning slot, recompute barycentrics
 // at the pixel centre (same float math as kRaster, so the winner's 1/depth reproduces),
 // interpolate world pos/normal, and shade with the same model as raster.h Pass 3.
+// RASTER-PBR, device twins of raster.h's envBrdfApprox / ggxSpec. Kept numerically identical to
+// the host so the two previews agree: same Karis fit, same Smith height-correlated visibility.
+__device__ static inline void envBrdfApproxD(float NoV, float rough, float& A, float& B) {
+    const float x = 1.0f - rough;
+    B = exp2f(-9.28f * NoV) * x * x * x;
+    A = x * x * x * x;
+}
+__device__ static inline float ggxSpecD(const float3& N, const float3& V, const float3& L,
+                                        float rough) {
+    const float3 H = normalize3(V + L);
+    const float NoV = fmaxf(1e-4f, dot3(N, V));
+    const float NoL = fmaxf(0.0f,  dot3(N, L));
+    if (NoL <= 0.0f) return 0.0f;
+    const float NoH = fmaxf(0.0f, dot3(N, H));
+    const float a  = fmaxf(1e-3f, rough * rough);
+    const float a2 = a * a;
+    const float d  = NoH * NoH * (a2 - 1.0f) + 1.0f;
+    const float D  = a2 / (3.14159265358979f * d * d);
+    const float lv = NoL * sqrtf(NoV * NoV * (1.0f - a2) + a2);
+    const float ll = NoV * sqrtf(NoL * NoL * (1.0f - a2) + a2);
+    const float Vis = (lv + ll > 0.0f) ? 0.5f / (lv + ll) : 0.0f;
+    return D * Vis * NoL;
+}
+
 __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
                        const int* flags, const unsigned long long* vis,
                        const DLight* lights, int nLights,
@@ -912,6 +954,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     float3 wp0, wp1, wp2, wn0, wn1, wn2, color;
     float2 uv0, uv1, uv2;
     int tex, emissive, nrmTex, rPat, ePat; float tps, nrmS;
+    float shRough; float3 shF0;    // RASTER-PBR: the lobe, carried down every unpack path
     // Vertex colour comes from the SOURCE triangle either way: a near-clipped slot lerps
     // position/normal/UV into DAttr, but a clipped triangle's colours are still the
     // original three, and the barycentrics below are expressed against them.
@@ -924,6 +967,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         color = a.color; tex = a.tex; tps = a.triplanarScale; emissive = a.emissive;
         nrmTex = a.normalTex; nrmS = a.normalStrength;
         rPat = a.reflectPat; ePat = a.emitPat;
+        shRough = a.rough; shF0 = a.f0;
     } else {
         const DPTri& s = tris[slot >> 1];
         wp0 = s.p0; wn0 = s.n0; uv0 = s.uv0;
@@ -932,6 +976,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         color = s.color; tex = s.tex; tps = s.triplanarScale; emissive = s.emissive;
         nrmTex = s.normalTex; nrmS = s.normalStrength;
         rPat = s.reflectPat; ePat = s.emitPat;
+        shRough = s.rough; shF0 = s.f0;
     }
     if (flags[slot] & kSlotBack) {           // two-sided: the whole triangle faces away
         wn0 = wn0 * -1.0f; wn1 = wn1 * -1.0f; wn2 = wn2 * -1.0f;
@@ -978,6 +1023,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             color = mx.color; tex = mx.tex; tps = mx.triplanarScale;
             nrmTex = mx.normalTex; nrmS = mx.normalStrength;
             rPat = mx.reflectPat; ePat = mx.emitPat;
+            shRough = mx.rough; shF0 = mx.f0;   // a mix child brings its own lobe
         }
     }
 
@@ -1033,6 +1079,12 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         }
     }
     float3 V  = normalize3(cam.eye - wpos);
+    // RASTER-PBR: the surface's own lobe. `rough < 0` skips the whole specular block, so a
+    // diffuse scene shades exactly as it did.
+    float rough = shRough;
+    if (rough >= 0.0f) rough = fminf(1.0f, fmaxf(0.02f, rough));
+    const bool spec = (rough >= 0.0f);
+    float3 specAcc = make_float3(0.0f, 0.0f, 0.0f);
     float lit = 0.0f;
     for (int li = 0; li < nLights; ++li) {
         const DLight& lp = lights[li];
@@ -1045,11 +1097,30 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         if (lp.falloff2 > 0.0f) atten = lp.falloff2 / (lp.falloff2 + dist2);
         float cone = 1.0f;
         if (lp.spot) cone = spotFalloffD(dot3(lp.dir, Ld * -1.0f), lp.cosInner, lp.cosOuter);
-        lit += lp.weight * ndl * atten * cone;
+        const float w = lp.weight * atten * cone;
+        lit += w * ndl;
+        if (spec) {
+            const float gg = ggxSpecD(N3, V, Ld, rough) * w;
+            if (gg > 0.0f) {
+                const float f = powf(1.0f - fmaxf(0.0f, dot3(V, normalize3(V + Ld))), 5.0f);
+                specAcc = specAcc + make_float3(shF0.x + (1.0f - shF0.x) * f,
+                                                shF0.y + (1.0f - shF0.y) * f,
+                                                shF0.z + (1.0f - shF0.z) * f) * gg;
+            }
+        }
     }
     float head = fmaxf(0.0f, dot3(N3, V));
     float k = ambient + keyScale * lit + fill * head;
     accum[i] = col * k;
+    if (spec) {
+        // The environment half. This renderer's environment is the single scalar `ambient`,
+        // so prefiltered(R, roughness) collapses to it exactly (host twin explains why that is
+        // split-sum over a uniform environment rather than an approximation of one).
+        float A = 0.0f, B = 0.0f;
+        envBrdfApproxD(fmaxf(1e-4f, dot3(N3, V)), rough, A, B);
+        specAcc = specAcc + make_float3(shF0.x * A + B, shF0.y * A + B, shF0.z * A + B) * ambient;
+        accum[i] = accum[i] + specAcc * keyScale;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1531,6 +1602,9 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         d.normalTex = t.normalTex;
         d.normalStrength = (float)t.normalStrength;
         d.reflectPat = t.reflectPat;
+        d.rough = (float)t.rough;                // RASTER-PBR (host twin: raster.h PShade)
+        d.f0 = make_float3((float)t.f0.x, (float)t.f0.y, (float)t.f0.z);
+        d.roughPat = t.roughPat; d.roughTex = t.roughTex;
         d.emitPat    = t.emitPat;
         d.mix        = t.mix;
     });
@@ -1548,6 +1622,9 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         d.normalTex      = m.b.normalTex;
         d.normalStrength = (float)m.b.normalStrength;
         d.reflectPat     = m.b.reflectPat;
+        d.rough          = (float)m.b.rough;     // a mix child carries its own lobe
+        d.f0             = make_float3((float)m.b.f0.x, (float)m.b.f0.y, (float)m.b.f0.z);
+        d.roughPat       = m.b.roughPat; d.roughTex = m.b.roughTex;
         d.emitPat        = m.b.emitPat;
     }
     sc->nMixes = (int)hmix.size();

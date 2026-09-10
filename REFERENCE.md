@@ -5423,6 +5423,21 @@ tree-selected emitter keeps exactly the old estimator, which is unbiased, just a
 Reversing `ltSample`'s adaptive splitting into a selection *density* is what would lift that, and
 is logged in `known-issues.md` → **GLOSSY-NEE**.
 
+**Preview specular (`-raster` / `-explore`)** — the preview rasterizer used to shade diffuse
+only: its own header said "glossy lobes do not exist here either, so roughness/film-thickness
+maps are ignored by design", so an asset whose look depends on its specular lobe — a satin
+fabric, any metal — previewed flat, and a browser glTF viewer showed it better than we did.
+
+Since 0.269.1 `glossy` materials shade through the **split-sum** approximation that real-time
+viewers use: a normalised GGX lobe with Smith masking and Schlick Fresnel for each key light,
+plus the environment term with Karis' analytic BRDF fit (no lookup texture ships). `roughness
+pattern:` and `roughness texture:` are honoured. The highlight is tinted by the material's own
+normal-incidence reflectance, so gold looks like gold rather than white-hot.
+
+Both rasterizer backends agree exactly, and a scene with no glossy material is untouched. It is
+a *preview*: there is still no reflection, refraction, shadow or global illumination here — see
+the mode table for what renders those.
+
 **Gather footprint (mode `M`)** — photon mapping's density estimate divides the photons it finds
 by the area of the gather disc, `πr²`. On a flat wall that is exactly right. On anything the disc
 *overhangs* — the edge of a tabletop, a fold of cloth, a strand of hair — the photons only land on
