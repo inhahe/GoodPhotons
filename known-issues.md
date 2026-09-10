@@ -1063,12 +1063,58 @@ something the dielectric path does on exit.
 > estimator on — i.e. inside the run-to-run spread. On the sun rig it is a few percent
 > (mode `R` 3918 → 3370 spp at 60 s, mode `M` 887 → 823).
 >
-> **STILL OPEN, in priority order:**
+> **THE THREE GAPS THIS ENTRY LEFT OPEN — ALL NOW CLOSED** (v0.266.2 / v0.266.3 /
+> v0.270.0). Kept in full, because two of them were misdiagnosed first and the misdiagnoses are
+> the useful part:
 >
-> 1. **Light-tree-selected emitters are not covered** — see COVERAGE below. A many-light scene's
->    glossy surfaces keep the old estimator. **Attempted 2026-09-10, unbiased, and REVERTED for
->    want of a benefit** — but the reasoning that blocked it was wrong, which is worth fixing in
->    the record:
+> 1. ~~**Light-tree-selected emitters are not covered**~~ — **FIXED 2026-09-10, v0.270.0**, on
+>    the second attempt. `ltSelectPdf` (lighttree.h) walks root→leaf and multiplies the factor
+>    each step contributed — 1 at a split, the child's `ltImportance` share at a stochastic step
+>    — and **both halves of the MIS weight call it**, so a glossy vertex in a many-light scene
+>    now connects to tree-selected emitters at a weight that reflects what the NEE strategy
+>    actually does. `Scene::lightTreeParent` / `lightTreeLeaf` are the reverse indices it needs,
+>    derived from the finished node array in one linear pass (the recursive builder is untouched,
+>    so every existing selection pdf is unchanged).
+>
+>    **Measured** on `_spec_repro_many.ftsl`, 16 seeds × 2 arms at equal spp, CPU:
+>
+>    | band | per-sample var | × cost 1.121 | equal-cost |
+>    |---|---|---|---|
+>    | diffuse (null control) | 0.986× | | **1.106×** |
+>    | glossy gold | 0.723× | | **0.811×** |
+>    | dielectric | 0.954× | | 1.069× |
+>    | mirror chrome | 0.798× | | **0.895×** |
+>    | whole frame | 0.841× | | **0.942×** |
+>
+>    Unbiased: raw 16-seed means agree to within 0.6σ on every band (whole frame −0.009 % ±
+>    0.120 %). Bit-identical on both backends for any scene that builds no tree. The +12.1 % cost
+>    is the shadow rays a glossy vertex used to skip, and it falls only on glossy vertices in
+>    tree scenes — which is why the diffuse band, which cannot benefit, still pays 10.6 %: it
+>    shares the frame's sample budget. Ported to the device in the same commit, because a
+>    host-only version measurably split the two backends (host-only: glossy −0.18 % GPU-vs-CPU
+>    against the baseline's +0.31 %; both ported: +0.41 %, back in family).
+>
+>    **Two measurement traps this went through, both worth keeping:**
+>
+>    * The first A/B compared arms at equal TIME and threw away the sample counts. The new arm
+>      does strictly more work, so it should have had fewer samples and more variance; it showed
+>      *less* on three bands. The tell was the DIFFUSE band at 0.905× — glossy NEE cannot touch a
+>      directly-lit diffuse sphere, so that band is a built-in null control, and a null control
+>      that is not 1.00× is measuring something other than its label. At equal spp with the cost
+>      reported separately it reads 0.986×.
+>    * The bias test first used TRIMMED means and showed mirror chrome shifted +0.181 % at 4.5σ,
+>      which looks exactly like a broken weight. It is not: a trimmed mean is not an unbiased
+>      estimator of a skewed distribution's mean, so an arm with fewer fireflies has *less*
+>      energy trimmed away and reads higher. On raw means — the statistic the estimator is
+>      actually unbiased for — the same data gives −0.089 % ± 0.158 %. **Never bias-test two arms
+>      with a robust statistic when the thing that differs between them is the tail.**
+>
+>    **Next, if the cost matters:** the weight is fully known *before* the shadow ray is traced,
+>    so Russian roulette on it (`q = min(1, w/w0)`, contribution ÷ `q`) would skip most of the
+>    low-weight connections unbiasedly and recover much of the 12 %. Untried.
+>
+>    The reasoning that blocked the first attempt was wrong, and that is worth keeping in the
+>    record:
 >
 >    The COVERAGE note assumes the MIS weight needs the *true* selection pdf, which `ltSample`'s
 >    adaptive splitting makes hard to invert. **It does not.** MIS is unbiased for any weights
@@ -1078,12 +1124,19 @@ something the dielectric path does on exit.
 >    have to agree with each other. So the restriction was never a correctness requirement.
 >
 >    Widening it (weight by the solid-angle density alone) is therefore exact, and was measured
->    on `scenes/_spec_repro_many.ftsl` (new — 48 panels ringing the four spheres, so every
->    emitter is tree-selected at `p_sel ≈ 1/48`; the older rigs have ONE light and never build a
->    tree at all). Means agreed to ±0.11 %, confirming unbiasedness — and the **seed spread got
->    worse on the band it targets**: glossy gold 0.228 % on against 0.085 % off. Adding a
->    power-proportional stand-in for `p_sel` recovered part of it (0.179 % on, so 0.47× rather
->    than 0.37×) but still lost, while helping the dielectric and chrome bands. Reverted.
+>    on `scenes/_spec_repro_many.ftsl` (48 panels ringing the four spheres, so every emitter is
+>    tree-selected at `p_sel ≈ 1/48`; the older rigs have ONE light and never build a tree at
+>    all). Means agreed to ±0.11 %, confirming unbiasedness — and the **seed spread got worse on
+>    the band it targets**: glossy gold 0.228 % on against 0.085 % off. Adding a power-
+>    proportional stand-in for `p_sel` recovered part of it (0.179 % on, so 0.47× rather than
+>    0.37×) but still lost. Reverted at the time.
+>
+>    **What that measured, in hindsight:** exactness is not the property a weight needs, but
+>    *representativeness* is. The NEE strategy's density is `p_select · p_light`; weighting with
+>    `p_light` alone over-credits the NEE arm by roughly the light count — 48× here — so the
+>    balance heuristic loads the noisier of the two strategies. The power-proportional proxy
+>    recovered half the loss because it is right in kind and wrong in value: on a ring of lights
+>    around a subject the *spatial* term is the only one that discriminates. Hence the walk.
 >
 >    **Why the proxy is not good enough, which names the real next step.** The tree selects by
 >    *importance* — power, distance and orientation — and on a ring of lights around a subject
@@ -1226,11 +1279,17 @@ bit-identical behind a null hook. `emitterGeom` already returns `w = cos(surf)/p
    where the emitter is discovered by a ray hit rather than chosen. One case per
    `EmitterShape` (Area/quad, Sphere, Sun, Spot — delta, so no MIS —, Env — which already has
    `envPdfDir` and its own MIS at `backward.h` ~1857, the exact idiom to copy).
-2. **A light-tree selection pdf `ltPdf(e | x, n)`**, the reverse of `ltSample`'s `e.pdf`: walk
-   root→leaf multiplying the same `ltImportance` ratios. Complicated by `ltShouldSplit`, which
-   makes the density a sum over the split set rather than a single path.
-3. **The GPU twins** in `render_cuda.cu` for whichever modes get it, or the two backends
-   disagree on every glossy surface.
+2. ~~**A light-tree selection pdf `ltPdf(e | x, n)`**~~ — **DONE (v0.270.0)**, as
+   `ltSelectPdf` in `lighttree.h`. The worry about `ltShouldSplit` turned out to be misplaced:
+   the root→leaf path is UNIQUE in a tree, so a split contributes a factor of exactly 1 and
+   there is no sum to take. What is genuinely irreproducible one bounce later is `ltSample`'s
+   *room* condition (a split it declined, or a leaf it dropped, only because its output was
+   full), which depends on the traversal order and so on the rng — and the resolution is not to
+   chase it but to have BOTH halves call the same function, so whatever it returns they return
+   the same thing and the weights still sum to one.
+3. ~~**The GPU twins**~~ — **DONE**; modes `R`/`M`/`S` and the hero path all have them, and the
+   selection pdf was ported in the same commit as the host (v0.270.0) for exactly the stated
+   reason.
 
 **Where it bites:** `src/backward.h` (`neeLight`, `emitterGeom`, `interactMaterial`'s Glossy
 case, the emitter-hit accounting in `pathTrace`), `src/photonmap_render.h` (both gather walks),

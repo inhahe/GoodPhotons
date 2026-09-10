@@ -189,6 +189,59 @@ LT_FN bool ltShouldSplit(const LightTreeNode& nd, const double p[3], double thre
     return r2 / d2 > thresh;
 }
 
+// ---- REVERSE SELECTION PDF (GLOSSY-NEE's other half) -----------------------------
+// The probability ltSample would reach emitter `leaf` from this vertex -- the number
+// the BSDF-sampling half of a glossy MIS weight needs, one bounce after the light-
+// sampling half already had it for free.
+//
+// The path root->leaf is UNIQUE in a tree, so there is nothing to integrate: walk it
+// and multiply the factor each step contributed. A SPLIT contributes 1 (both children
+// are taken, with certainty); a stochastic step contributes that child's importance
+// share. Both are pure functions of the vertex, so this reproduces ltSample's own
+// arithmetic rather than approximating it.
+//
+// WHAT THIS DELIBERATELY DOES NOT REPRODUCE is ltSample's *room* condition: a split
+// that ltSample declined only because its output/stack was full, or a leaf it dropped
+// for the same reason. Those depend on the traversal order and therefore on the RNG,
+// so they are not recoverable one bounce later. The resolution is not to try -- it is
+// that BOTH halves of the MIS weight call THIS function, so whatever it returns, they
+// return the same thing and the weights still sum to one. ltSample's exact pdf is
+// still what divides the ESTIMATOR (EmitterDraw::weight); only the WEIGHT uses this,
+// and a weight has to be consistent, not correct. Getting that backwards is what made
+// the first attempt at this entry unbiased-but-noisier (known-issues.md).
+//
+// Returns 0 when the leaf is unreachable (zero importance on the way, or a tree deeper
+// than DEPTH), which every caller reads as "not MIS-covered, keep full weight".
+template <int DEPTH = 64>
+LT_FN double ltSelectPdf(const LightTreeNode* nodes, int root, const int* parent,
+                         int leaf, const double p[3], const double n[3], bool hasN,
+                         double splitThresh) {
+    if (!nodes || !parent || root < 0 || leaf < 0) return 0.0;
+    // Climb to the root recording the path, then replay it downwards -- the factors
+    // have to be evaluated at the PARENT, which the upward pass visits last.
+    int path[DEPTH];
+    int d = 0;
+    for (int k = leaf; k != root; k = parent[k]) {
+        if (k < 0 || d >= DEPTH) return 0.0;
+        path[d++] = k;
+    }
+    double pdf = 1.0;
+    int cur = root;
+    for (int i = d - 1; i >= 0; --i) {
+        const LightTreeNode& nd = nodes[cur];
+        const int li = nd.left, ri = nd.right, nxt = path[i];
+        if (li >= 0 && ri >= 0 && !ltShouldSplit(nd, p, splitThresh)) {
+            const double iL = ltImportance(nodes[li], p, n, hasN);
+            const double iR = ltImportance(nodes[ri], p, n, hasN);
+            const double sum = iL + iR;
+            if (!(sum > 0.0)) return 0.0;       // ltSample would have abandoned this walk
+            pdf *= (nxt == li) ? (iL / sum) : (iR / sum);
+        }
+        cur = nxt;
+    }
+    return pdf;
+}
+
 // Walk the tree and fill `out` with the emitters to connect to this vertex, each
 // with the probability the walk had of reaching it. Returns how many were written.
 //

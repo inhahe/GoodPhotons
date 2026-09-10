@@ -178,6 +178,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 if (gneeOn) {
                     gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
                     gmis.from = h.p;
+                    gmis.n = h.n;
                 }
                 ray = Ray{h.p + h.n * 1e-6, o};
                 break;

@@ -873,24 +873,39 @@ struct BackwardRenderer {
         return d;
     }
 
-    // Is emitter `e`'s SELECTION probability exactly 1 at every vertex? Both halves of the
-    // glossy MIS weight need the same answer, and the light-sampling half computes it at a
-    // shading point while the BSDF-sampling half computes it one bounce later from a ray hit,
-    // so it must be a property of the EMITTER and the settings -- never of the draw. See the
-    // COVERAGE note on neeLight.
-    bool lightPickExact(const Scene& scene, int e) const {
+    // The probability pickEmitters SELECTS emitter `e` at vertex (p, n). This is the factor
+    // that turns lightPdfWShape's per-emitter density into the density the NEE strategy ACTUALLY
+    // has: p_select * p_light. Both halves of the glossy MIS weight call this one function --
+    // the light-sampling half at the shading point, the BSDF-sampling half one bounce later from
+    // a ray hit -- so they cannot disagree and the weights still sum to one.
+    //
+    // Leaving the factor out is not a small approximation. It over-credits the NEE arm by roughly
+    // the light count (48x on _spec_repro_many), dragging the balance heuristic onto the
+    // higher-variance strategy: measured 0.37x worse on the glossy band, with a power-
+    // proportional proxy recovering only half of it. Unbiased both times -- which is exactly why
+    // nothing but a variance measurement could detect it.
+    //
+    // 0 means "not MIS-covered": an emitter past the always-list prefix pickEmitters reaches, or
+    // one the walk proves is never selected. Both halves read that as full weight to the lobe.
+    double lightSelPdf(const Scene& scene, int e, const Vec3& p, const Vec3& n) const {
         if (!lightTree || whitted || scene.lightTreeRoot < 0 || scene.lightTree.empty())
-            return true;                                  // EmitterDraw::all -- weight 1
+            return 1.0;                                   // EmitterDraw::all -- every light, pdf 1
         // Only the PREFIX pickEmitters actually draws: it breaks out of the always-loop at
         // kMaxLightPick, so an emitter past that point is never connected, and treating it as
         // covered would down-weight a hit that nothing paid for.
-        int n = 0;
+        int n0 = 0;
         for (int a : scene.lightTreeAlways) {
-            if (n >= kMaxLightPick) break;
-            if (a == e) return true;
-            ++n;
+            if (n0 >= kMaxLightPick) break;
+            if (a == e) return 1.0;
+            ++n0;
         }
-        return false;
+        if (lightSamples <= 0 || n0 >= kMaxLightPick) return 0.0;   // no budget left for the tree
+        if (e < 0 || e >= (int)scene.lightTreeLeaf.size()) return 0.0;
+        const double pp[3] = {p.x, p.y, p.z};
+        const double nn[3] = {n.x, n.y, n.z};
+        return ltSelectPdf(scene.lightTree.data(), scene.lightTreeRoot,
+                           scene.lightTreeParent.data(), scene.lightTreeLeaf[e],
+                           pp, nn, true, lightSplit);
     }
 
     // An evaluable, non-Lambertian lobe at a NEE vertex (today: MatType::Glossy). `wo` points
@@ -907,6 +922,7 @@ struct BackwardRenderer {
     struct GlossyMis {
         double pdf = 0.0;      // solid-angle density of the lobe sample, at `from`
         Vec3   from{0, 0, 0};  // the glossy vertex the continuation left
+        Vec3   n{0, 0, 0};     // its shading normal -- lightSelPdf re-walks the tree from there
         void clear() { pdf = 0.0; }
     };
 
@@ -925,10 +941,16 @@ struct BackwardRenderer {
     // The CYLINDER's visible-arc sampling (sampleCylinderVisible) narrows the area measure to
     // the front-facing arc; reproducing that here needs its pdf_A, which is not exposed, so a
     // cylinder emitter reports 0 and keeps today's estimator. Logged with the entry.
-    double lightPdfW(const Scene& scene, int e, const Vec3& from, const Vec3& wi,
-                     const Vec3* hitP, const Vec3* hitN) const {
+    double lightPdfW(const Scene& scene, int e, const Vec3& from, const Vec3& fromN,
+                     const Vec3& wi, const Vec3* hitP, const Vec3* hitN) const {
+        const double selP = lightSelPdf(scene, e, from, fromN);
+        if (!(selP > 0.0)) return 0.0;
+        return lightPdfWShape(scene, e, from, wi, hitP, hitN) * selP;
+    }
+    // The per-emitter half: the density of sampling `wi` GIVEN that this emitter was chosen.
+    double lightPdfWShape(const Scene& scene, int e, const Vec3& from, const Vec3& wi,
+                          const Vec3* hitP, const Vec3* hitN) const {
         if (e < 0 || e >= (int)scene.emitters.size()) return 0.0;
-        if (!lightPickExact(scene, e)) return 0.0;
         const Emitter& em = scene.emitters[e];
         if (em.collimated) return 0.0;                       // not area-samplable at all
         switch (em.shape) {
@@ -1008,7 +1030,7 @@ struct BackwardRenderer {
     double glossyHitWeight(const Scene& scene, const GlossyMis& gm, int e, const Vec3& wi,
                            const Vec3* hitP, const Vec3* hitN) const {
         if (!(gm.pdf > 0.0)) return 1.0;
-        const double pL = lightPdfW(scene, e, gm.from, wi, hitP, hitN);
+        const double pL = lightPdfW(scene, e, gm.from, gm.n, wi, hitP, hitN);
         if (!(pL > 0.0)) return 1.0;
         const double sum = gm.pdf + pL;
         return (sum > 0.0) ? gm.pdf / sum : 1.0;
@@ -1066,9 +1088,15 @@ struct BackwardRenderer {
             const double selW = draw.weight(di);
             if (selW <= 0.0) continue;
             // Glossy NEE only where the MIS pair can agree on the selection probability;
-            // elsewhere the lobe-sampling strategy keeps the emitter to itself, at full
-            // weight, exactly as before this existed.
-            if (nb && !lightPickExact(scene, e)) continue;
+            // elsewhere the lobe-sampling strategy keeps the emitter to itself, at full weight,
+            // exactly as before this existed. `selP` is that probability, and it belongs in the
+            // WEIGHT below -- never in the estimator, which already divides by ltSample's own
+            // exact pdf through selW.
+            double selP = 1.0;
+            if (nb) {
+                selP = lightSelPdf(scene, e, h.p, h.n);
+                if (!(selP > 0.0)) continue;
+            }
             const Emitter& em = scene.emitters[e];
             const bool uv = emitterNeedsUV(em);
             // Whitted: G x G deterministic shadow rays per area light, averaged. A
@@ -1117,8 +1145,9 @@ struct BackwardRenderer {
                     if (pdfWLight > 0.0) {
                         const double pLobe = bdpt::bsdfPdf(*nb->m, h.n, nb->wo, wiConn,
                                                            lambda, scene, &h);
-                        const double sum = pdfWLight + pLobe;
-                        if (sum > 0.0) fVal *= pdfWLight / sum;
+                        const double pNee = pdfWLight * selP;   // the strategy's REAL density
+                        const double sum = pNee + pLobe;
+                        if (sum > 0.0) fVal *= pNee / sum;
                     }
                 } else {
                     fVal = rho / PI;
@@ -1153,7 +1182,11 @@ struct BackwardRenderer {
             const int e = draw.emitter(di);
             const double selW = draw.weight(di);
             if (selW <= 0.0) continue;
-            if (nb && !lightPickExact(scene, e)) continue;   // see neeLight's COVERAGE note
+            double selP = 1.0;                              // see neeLight's COVERAGE note
+            if (nb) {
+                selP = lightSelPdf(scene, e, h.p, h.n);
+                if (!(selP > 0.0)) continue;
+            }
             const Emitter& em = scene.emitters[e];
             const bool uv = emitterNeedsUV(em);
             const int G = (whitted && uv) ? (gi.depth ? giGrid : lightGrid) : 1;
@@ -1179,8 +1212,9 @@ struct BackwardRenderer {
                     if (pdfWLight > 0.0) {
                         const double pLobe = bdpt::bsdfPdf(*nb->m, h.n, nb->wo, wiConn,
                                                            lam[0], scene, &h);
-                        const double sum = pdfWLight + pLobe;
-                        if (sum > 0.0) wMis = pdfWLight / sum;
+                        const double pNee = pdfWLight * selP;   // the strategy's REAL density
+                        const double sum = pNee + pLobe;
+                        if (sum > 0.0) wMis = pNee / sum;
                     }
                     const double wsMis = ws * wMis;
                     for (int i = 0; i < nUp; ++i) {
@@ -1777,6 +1811,7 @@ struct BackwardRenderer {
                 if (gm) {
                     gm->pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
                     gm->from = h.p;
+                    gm->n = h.n;
                 }
                 ray = Ray{h.p + h.n * 1e-6, o};
                 specularArrival = true; return true;
@@ -2689,6 +2724,7 @@ struct BackwardRenderer {
                         if (glossyNee) {
                             gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lam[0], scene, &h);
                             gmis.from = h.p;
+                            gmis.n = h.n;
                         }
                         ray = Ray{h.p + h.n * 1e-6, o};
                     }

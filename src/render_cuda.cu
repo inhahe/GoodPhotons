@@ -1217,6 +1217,11 @@ struct DScene {
     // spatial bound (distant suns) that are connected unconditionally.
     const LightTreeNode* lightTree; int lightTreeRoot;
     const int*       lightTreeAlways; int nLightTreeAlways;
+    // Reverse indices for ltSelectPdf (GLOSSY-NEE's BSDF-sampling half). Host twin:
+    // Scene::lightTreeParent / lightTreeLeaf, both plain int arrays derived from the node
+    // array, so they upload with no remap like everything else here.
+    const int*       lightTreeParent;
+    const int*       lightTreeLeaf;  int nLightTreeLeaf;
     int              bkLightTree;    // 0 = -no-lighttree: exact all-emitters splitting
     int              bkGlossyNee;    // 0 = -no-glossy-nee: no connection at a D_GLOSSY vertex
     int              gatherArea;     // -gatherarea <M>: probe samples for the M-GATHERAREA
@@ -9873,18 +9878,26 @@ struct DNeeBsdf { const DMaterial* m; DVec3 wo; };
 struct DGlossyMis {
     double pdf;
     DVec3  from;
+    DVec3  n;        // the glossy vertex's shading normal -- dLightSelPdf re-walks from there
     __device__ void clear() { pdf = 0.0; }
 };
 
-// Host twin: BackwardRenderer::lightPickExact. Is emitter `e`'s SELECTION probability exactly 1
-// at every vertex? Both halves of the MIS weight must answer identically, and one of them asks
-// a bounce later from a ray hit, so it has to be a property of the emitter and the settings.
-__device__ static inline bool dLightPickExact(const DScene& sc, int e) {
-    if (!sc.bkLightTree || sc.bkWhitted || sc.lightTreeRoot < 0 || !sc.lightTree) return true;
+// Host twin: BackwardRenderer::lightSelPdf -- the probability dPickEmitters SELECTS emitter `e`
+// at vertex (p, n). Both halves of the glossy MIS weight call this, so they cannot disagree; the
+// ESTIMATOR keeps ltSample's own exact pdf. See the host comment for why leaving the factor out
+// is unbiased and measurably noisier.
+__device__ static inline double dLightSelPdf(const DScene& sc, int e, const DVec3& p,
+                                             const DVec3& nrm) {
+    if (!sc.bkLightTree || sc.bkWhitted || sc.lightTreeRoot < 0 || !sc.lightTree) return 1.0;
     // Only the prefix dPickEmitters draws (it stops at kDMaxLightPick) -- host twin's note.
     const int nAlw = (sc.nLightTreeAlways < kDMaxLightPick) ? sc.nLightTreeAlways : kDMaxLightPick;
-    for (int i = 0; i < nAlw; ++i) if (sc.lightTreeAlways[i] == e) return true;
-    return false;
+    for (int i = 0; i < nAlw; ++i) if (sc.lightTreeAlways[i] == e) return 1.0;
+    if (sc.bkLightSamples <= 0 || nAlw >= kDMaxLightPick) return 0.0;
+    if (!sc.lightTreeParent || !sc.lightTreeLeaf || e < 0 || e >= sc.nLightTreeLeaf) return 0.0;
+    const double pp[3] = {(double)p.x, (double)p.y, (double)p.z};
+    const double nn[3] = {(double)nrm.x, (double)nrm.y, (double)nrm.z};
+    return ltSelectPdf<32>(sc.lightTree, sc.lightTreeRoot, sc.lightTreeParent,
+                           sc.lightTreeLeaf[e], pp, nn, true, (double)sc.bkLightSplit);
 }
 
 // Host twin: BackwardRenderer::lightPdfW -- the density that WOULD have produced direction `wi`
@@ -9893,11 +9906,10 @@ __device__ static inline bool dLightPickExact(const DScene& sc, int e) {
 //
 // The device samples spheres and cylinders by uniform AREA (bkEmitterGeom), unlike the host's
 // cone / visible-arc importance sampling, so the area form below is the right one for BOTH here.
-__device__ static inline double dLightPdfWAt(const DScene& sc, int e, const DVec3& from,
-                                             const DVec3& wi, const DVec3* hitP,
-                                             const DVec3* hitN) {
+__device__ static inline double dLightPdfWShape(const DScene& sc, int e, const DVec3& from,
+                                                const DVec3& wi, const DVec3* hitP,
+                                                const DVec3* hitN) {
     if (e < 0 || e >= sc.nEmitters) return 0.0;
-    if (!dLightPickExact(sc, e)) return 0.0;
     const DEmitter& em = sc.emitters[e];
     if (em.collimated) return 0.0;
     if (em.shape == 6) {                       // Sun (DEmitter::shape; 2 = spot, 3 = env)
@@ -9912,6 +9924,14 @@ __device__ static inline double dLightPdfWAt(const DScene& sc, int e, const DVec
     if (!(dist2 > 0.0) || !(cosLight > 0.0)) return 0.0;
     return dist2 / ((double)em.area * cosLight);
 }
+// ...and the whole NEE density: p_select * p_light. Host twin: lightPdfW.
+__device__ static inline double dLightPdfWAt(const DScene& sc, int e, const DVec3& from,
+                                             const DVec3& fromN, const DVec3& wi,
+                                             const DVec3* hitP, const DVec3* hitN) {
+    const double selP = dLightSelPdf(sc, e, from, fromN);
+    if (!(selP > 0.0)) return 0.0;
+    return dLightPdfWShape(sc, e, from, wi, hitP, hitN) * selP;
+}
 
 // Balance-heuristic weight for an emitter reached by the CONTINUATION; 1 when the previous
 // bounce was not a MIS'd glossy one, or when the light is not covered.
@@ -9919,7 +9939,7 @@ __device__ static inline double dGlossyHitWeight(const DScene& sc, const DGlossy
                                                  const DVec3& wi, const DVec3* hitP,
                                                  const DVec3* hitN) {
     if (!(gm.pdf > 0.0)) return 1.0;
-    const double pL = dLightPdfWAt(sc, e, gm.from, wi, hitP, hitN);
+    const double pL = dLightPdfWAt(sc, e, gm.from, gm.n, wi, hitP, hitN);
     if (!(pL > 0.0)) return 1.0;
     const double sum = gm.pdf + pL;
     return (sum > 0.0) ? gm.pdf / sum : 1.0;
@@ -10161,7 +10181,13 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         // GLOSSY-NEE: connect only where the MIS pair can agree on the selection probability.
         // Host twin: neeLight's COVERAGE note. Elsewhere the lobe keeps the emitter to itself,
         // at full weight, exactly as before this existed.
-        if (nb && !dLightPickExact(sc, k)) continue;
+        // `selP` is that probability. It belongs in the WEIGHT, never in the estimator, which
+        // already divides by ltSample's own exact pdf through selW.
+        double selP = 1.0;
+        if (nb) {
+            selP = dLightSelPdf(sc, k, h.p, h.n);
+            if (!(selP > 0.0)) continue;
+        }
         const bool uv = dEmitterNeedsUV(em);
         // Whitted: G x G deterministic shadow rays per area light, averaged. A
         // deterministic emitter (spot/beam) has nothing to stratify, so it stays at 1.
@@ -10186,9 +10212,10 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                 if (!(fv > 0.0)) continue;
                 double wMis = 1.0;
                 if (g.pdfW > (Real)0) {          // 0 = delta light: nothing to weigh against
+                    const double pNee = (double)g.pdfW * selP;   // the strategy's REAL density
                     const double pLobe = dGlossyPdfHit(sc, *nb->m, h, nb->wo, g.wi);
-                    const double sum = (double)g.pdfW + pLobe;
-                    if (sum > 0.0) wMis = (double)g.pdfW / sum;
+                    const double sum = pNee + pLobe;
+                    if (sum > 0.0) wMis = pNee / sum;
                 }
                 // The glossy arm stays in DOUBLE end to end, unlike the default one. `Real` is
                 // fp32 by default here, and dGlossyFHit's value is r*lobe/cos(wi) while `g`
@@ -10241,7 +10268,11 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
         if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;
-        if (nb && !dLightPickExact(sc, k)) continue;    // GLOSSY-NEE coverage, as in bkNeeLight
+        double selP = 1.0;                             // GLOSSY-NEE coverage, as in bkNeeLight
+        if (nb) {
+            selP = dLightSelPdf(sc, k, h.p, h.n);
+            if (!(selP > 0.0)) continue;
+        }
         const bool uv = dEmitterNeedsUV(em);
         const int G = (whitted && uv) ? (giDepth ? sc.bkGiGrid : sc.bkGrid) : 1;
         const int nS = G * G;
@@ -10259,9 +10290,10 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
             // vertex at all. Computed once, shared by every member.
             double wMisG = 1.0;
             if (nb && g.pdfW > (Real)0) {
+                const double pNee = (double)g.pdfW * selP;       // the strategy's REAL density
                 const double pLobe = dGlossyPdfHit(sc, *nb->m, h, nb->wo, g.wi);
-                const double sum = (double)g.pdfW + pLobe;
-                if (sum > 0.0) wMisG = (double)g.pdfW / sum;
+                const double sum = pNee + pLobe;
+                if (sum > 0.0) wMisG = pNee / sum;
             }
             for (int i = 0; i < nUp; ++i) {
                 double emitW = (double)specLookup(em.emitSpd, lam[i]) * invPdf[i];
@@ -10730,6 +10762,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             if (gm) {                    // the other half of the weight, for whatever `o` hits
                 gm->pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                 gm->from = h.p;
+                gm->n = h.n;
             }
             rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
         }
@@ -11338,7 +11371,8 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                     if (dot(o, h.n) <= 0) return;
                     if (sc.bkGlossyNee)      // the other half of the weight, for what `o` hits
-                        { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o); gmis.from = h.p; }
+                        { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
+                          gmis.from = h.p; gmis.n = h.n; }
                     rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
                 }
                 specularArrival = true;
@@ -16564,6 +16598,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.lightTreeAlways = scene.lightTreeAlways.empty() ? nullptr
                                                        : (const int*)keep(uploadVec(scene.lightTreeAlways));
     sc.nLightTreeAlways = (int)scene.lightTreeAlways.size();
+    sc.lightTreeParent = scene.lightTreeParent.empty() ? nullptr
+                                                       : (const int*)keep(uploadVec(scene.lightTreeParent));
+    sc.lightTreeLeaf   = scene.lightTreeLeaf.empty() ? nullptr
+                                                     : (const int*)keep(uploadVec(scene.lightTreeLeaf));
+    sc.nLightTreeLeaf  = (int)scene.lightTreeLeaf.size();
     sc.bkLightTree     = lt::gEnabled ? 1 : 0;
     sc.bkGlossyNee     = lt::gGlossyNee ? 1 : 0;   // GLOSSY-NEE (known-issues.md)
     {   // M-GATHERAREA footprint budget, same environment channel and same default (8) the host

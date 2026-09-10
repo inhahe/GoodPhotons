@@ -2099,6 +2099,11 @@ struct Scene {
     std::vector<LightTreeNode> lightTree;
     std::vector<int> lightTreeAlways;
     int lightTreeRoot = -1;
+    // Reverse indices, for ltSelectPdf (GLOSSY-NEE's BSDF-sampling half, which knows an
+    // emitter and needs the path back up to the root). Derived from `lightTree` by one
+    // linear pass, so the builder is untouched and every selection pdf stays identical.
+    std::vector<int> lightTreeParent;   // node -> parent node, root = -1
+    std::vector<int> lightTreeLeaf;     // emitter -> its leaf node, or -1 if not in the tree
 
     // Describe one emitter to the builder: a box that contains its emitting surface,
     // a cone that contains every normal it can emit along, and its flux.
@@ -2190,6 +2195,8 @@ struct Scene {
     void buildLightTree() {
         lightTree.clear();
         lightTreeAlways.clear();
+        lightTreeParent.clear();
+        lightTreeLeaf.clear();
         lightTreeRoot = -1;
         std::vector<LtEmitterBound> items;
         items.reserve(emitters.size());
@@ -2209,6 +2216,17 @@ struct Scene {
         }
         lightTreeRoot = ltBuild(items, lightTree);
         std::sort(lightTreeAlways.begin(), lightTreeAlways.end());
+        // The reverse indices. A leaf's `emitter` is its own key, so both fall out of one
+        // pass with no extra bookkeeping in the recursive builder.
+        lightTreeParent.assign(lightTree.size(), -1);
+        lightTreeLeaf.assign(emitters.size(), -1);
+        for (size_t i = 0; i < lightTree.size(); ++i) {
+            const LightTreeNode& nd = lightTree[i];
+            if (nd.left  >= 0) lightTreeParent[(size_t)nd.left]  = (int)i;
+            if (nd.right >= 0) lightTreeParent[(size_t)nd.right] = (int)i;
+            if (nd.emitter >= 0 && (size_t)nd.emitter < lightTreeLeaf.size())
+                lightTreeLeaf[(size_t)nd.emitter] = (int)i;
+        }
     }
 
     // Select an emitter index for the power-weighted CDF. For a single emitter
