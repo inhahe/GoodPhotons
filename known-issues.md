@@ -1425,7 +1425,17 @@ case, the emitter-hit accounting in `pathTrace`), `src/photonmap_render.h` (both
 pdf), `src/render_cuda.cu`. Measured by `scraps/sunspike.sh` + `scraps/robust_roi.py`;
 `scenes/_spec_repro.ftsl` is the four-sphere isolation rig.
 
-### M-GATHERAREA — OPEN (2026-09-05, v0.253.0): mode `M`'s direct density estimate divides by the area of a **full disc** while gathering from only the part of it that is real, on-cone surface — so it is dark in proportion to how much of the disc misses: flat ground 0 %, a cap edge −38 %, Alice's dress −44 %, her hair −70 %
+### M-GATHERAREA — OPEN (2026-09-05, v0.253.0; **reframed 2026-09-10** — it is not a one-directional error): mode `M`'s direct density estimate divides by the area of a **full disc**, which is wrong in BOTH directions — too dark where the disc is partly empty (cloth, hair, marble), too bright where a tangle **overfills** it (dense fur)
+
+> **Read the reframing before adding an experiment.** This entry was written as "mode `M` is too
+> dark", and that framing selected its own evidence for a year: every ROI anyone chose was one
+> that was too dark, so the `creature` fur coat — which is **correct without the correction and
+> +48 % with it** — was never scored by *any* of the four attempts recorded below. The shipped
+> correction fixes four large dark errors and creates one large bright one. Two further
+> consequences, both measured and both in the sections below: the default `M = 8`'s apparent
+> accuracy is **two biases cancelling**, so evaluate at `M >= 32`; and cloth and fur receive the
+> **same** correction factor to within 1 %, so no rule reading only the coverage can separate
+> them. The geometric and parameter-tuning lines are both closed. — so it is dark in proportion to how much of the disc misses: flat ground 0 %, a cap edge −38 %, Alice's dress −44 %, her hair −70 %
 
 **Found by** the `gallery_rain` accuracy campaign (5 seeds × {R, D, J, M}, 640×360, anchor =
 mode `R`; `scraps/_modecmp_acc.bat`, `scraps/roi_stats.py`, ROIs in `scraps/gallery_rain.rois`).
