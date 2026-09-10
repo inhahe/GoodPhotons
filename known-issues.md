@@ -471,10 +471,29 @@ volumetric answer in the per-frame estimator by construction rather than by hopi
 isotropic enough. **Build that first**; order 2 can be folded in later if the extra ~13 % is
 worth re-opening the question, and by then the cache will exist to test it against.
 
-Note also the engine's own advice in the same logs: "past the -beamk floor (87.8 > 32), so the
-gather now pays for every extra beam. Fewer beams here is likely FASTER for the same error —
-lower -beamcount." A beam-count sweep is far cheaper than this feature and should be tried
-first, if only to establish what the cache is really competing against.
+**The `-beamcount` alternative, swept (2026-09-10, v0.270.2) — it is not one.** The logs advise
+"fewer beams here is likely FASTER for the same error"; a sweep on `gallery_rain` (320x180, 60 s,
+2 seeds, per-pixel variance pooled per band, `-beamcount` 0 / 13000 / 6500 / 3200) says that
+depends entirely on which region you score:
+
+| band | bc 13000 | bc 6500 | bc 3200 |
+|---|---|---|---|
+| top third (rain volume) | **1.403x** | **1.235x** | **1.475x** |
+| bottom third (ground) | 0.852x | 0.803x | 0.764x |
+| whole frame | 0.809x | 0.776x | 0.757x |
+
+Fewer beams trades volumetric variance for sample count, so the frame improves while **the
+medium — the only reason `-beams` is on — gets 1.24–1.48x worse**. There is no free tuning win
+here, and VOLCACHE's ~17 % is not competing against one. The advisory wording was corrected in
+v0.270.2 to say WHOLE-FRAME and to point at the counterexample; its own `_fog_cornell` evidence
+stands, because that scene is fog edge to edge and there whole-frame error *is* the medium's.
+
+Two method notes from the sweep. The `-beamk` floor silently widens the radii once the count
+drops far enough (the log says `[floor raised the radii]`), which is a real blur mechanism at
+`bc <= 6500` and confounds any count sweep taken past it. And the bias column read
+−6.9 / −10.5 / −12.1 % on TRIMMED means and −3.8 / −9.6 / −3.7 % (±1–6) on RAW ones: the same
+trimmed-mean-versus-tail artifact this file already documents under GLOSSY-NEE, walked into a
+second time. Only the arm where the floor had raised the radii is genuinely biased.
 
 **Sequencing note.** This overlaps `UPBP-CONV` (making the beam gather cheap enough that mode `J`
 wins at equal time) and is arguably the better attack on it: caching removes the work rather than

@@ -12355,10 +12355,23 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
         // and 0.410 relative RMSE; 300033 (probeK0 36.2, floor no longer binding) fell to 4 spp
         // and 0.887. The cliff is here, so name it — it is otherwise invisible in a line that
         // reports probeK0 as a bare number.
+        //
+        // BUT THE ERROR IT PROMISES IS WHOLE-FRAME, and `_fog_cornell` is fog edge to edge, so
+        // there the two are the same thing. Where the medium is only PART of the frame they come
+        // apart, and this note points the wrong way. Measured 2026-09-10 on `gallery_rain`
+        // (320x180, 60 s, 2 seeds, per-pixel variance pooled per band) taking beams/probe from
+        // 82.9 to 43.2 with -beamcount: whole frame 0.81x and the ground third 0.85x — both
+        // better, as promised — while the rain volume in the top third went to **1.40x worse**,
+        // which is the one thing `-beams` was turned on for. Fewer beams trades volumetric
+        // variance for sample count, and only a frame that is mostly medium wins that trade.
+        // So the wording below says whole-frame, and tells the reader to score the medium's own
+        // region before acting on it.
         else if (ai.targetK > 0.0 && ai.probeK0 > ai.targetK && ai.rawBeams)
             say("%s   note: past the -beamk floor (%.1f > %.0f), so the gather now pays "
-                        "for every extra beam. Fewer beams here is likely FASTER for the same "
-                        "error — lower -beamcount%s.\n",
+                        "for every extra beam. Lowering -beamcount%s usually cuts WHOLE-FRAME "
+                        "error here — but score the medium's own region first: on gallery_rain "
+                        "halving beams/probe took the frame to 0.81x variance and the rain "
+                        "volume to 1.40x.\n",
                         tag, ai.probeK0, ai.targetK,
                         g_nFromCli ? " (or -n, which is currently sizing this map)" : "");
     }
