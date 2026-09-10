@@ -1087,10 +1087,15 @@ something the dielectric path does on exit.
 >    | whole frame | 0.841× | | **0.942×** |
 >
 >    Unbiased: raw 16-seed means agree to within 0.6σ on every band (whole frame −0.009 % ±
->    0.120 %). Bit-identical on both backends for any scene that builds no tree. The +12.1 % cost
->    is the shadow rays a glossy vertex used to skip, and it falls only on glossy vertices in
->    tree scenes — which is why the diffuse band, which cannot benefit, still pays 10.6 %: it
->    shares the frame's sample budget. Ported to the device in the same commit, because a
+>    0.120 %). Bit-identical on both backends for any scene that builds no tree.
+>
+>    **The ×1.121 column above is wrong and is kept only to date the correction.** It was
+>    measured blocked *and* across two binaries, so it carried the drift documented below;
+>    drift-controlled the walk costs ×1.072, and after v0.270.1 removes the redundant walk,
+>    **×1.023**. At that cost every band improves or is neutral — diffuse (which cannot benefit)
+>    1.009×, glossy gold **0.740×**, dielectric 0.976×, mirror chrome 0.816×, whole frame
+>    **0.860×** — instead of the 10.6 % penalty the inflated number implied for diffuse
+>    content. Ported to the device in the same commit, because a
 >    host-only version measurably split the two backends (host-only: glossy −0.18 % GPU-vs-CPU
 >    against the baseline's +0.31 %; both ported: +0.41 %, back in family).
 >
