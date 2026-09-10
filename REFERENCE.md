@@ -5475,7 +5475,7 @@ probe; see `known-issues.md` → **M-GATHERAREA**.
 
 | Flag | Meaning |
 |---|---|
-| `-gatherarea <M>` | Probe samples per gather (default `8`). `0` restores the pre-0.267 estimator exactly. Raising it past 8 buys a few points on hair and costs proportionally; **lowering it is not a speed/accuracy trade** — at 4 the correction is biased *bright* and only looks better on cloth, where the bias cancels a different error. |
+| `-gatherarea <M>` | Probe samples per gather (default `8`). `0` restores the pre-0.267 estimator exactly. **`M` is not a quality dial in either direction** (measured 2026-09-10 on `gallery_rain` against a 34781-spp mode-`R` reference): raising it makes hair and cloth *worse*, not better — `alice_hair` −11.4 % at `M = 8` against −22.1 % at `M = 64`, `alice_dress` −11.0 % against −17.8 % — because the default's apparent accuracy is partly Jensen's upward bias at low `M` offsetting a residual dark bias, and more probes remove the offset without removing the residual. **Pass `-gatherarea 0` for fur-dominated scenes:** the correction is right on cloth, hair and marble (it turns −40 %/−69 %/−33 % into −11 %/−11 %/−6 %) but *creates* a large error on dense fur, which is accurate without it — the `creature` coat measures −3.9 % uncorrected and **+48 %** corrected. See `known-issues.md` → `M-GATHERAREA` for why a tangle inverts the correction and why no coverage threshold separates the two cases. |
 
 It costs 1.3–1.7× the gather on `gallery_rain`, which is nearly all complex geometry, and ~4 %
 on a scene of flat surfaces: a cheap early-out skips the probe entirely wherever the first few
