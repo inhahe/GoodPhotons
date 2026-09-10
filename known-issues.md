@@ -11461,17 +11461,50 @@ it updates the control and raises `EN_CHANGE` by itself, with nothing to synthes
 ### PERF — OPEN (2026-09-10, v0.270.4): a mesh-bound medium's **voxelisation** is 86 % of `gallery_rain`'s load, and its triangle pass is still serial
 
 Measured because `gallery_rain` had been costing minutes per measurement all session — and the
-first thing the measurement did was correct my own estimate of it. The build is **20.5 s**, not
+first thing the measurement did was correct my own estimate of it. The build is **~18.5 s**, not
 the ~90 s I had assumed from watching wall-clock on 120 s renders.
 
-| scene | build |
-|---|---|
-| `gallery.ftsl` | 2.5 s |
-| `gallery_rain.ftsl` | 18.3 s |
+> **CORRECTION (same day).** This entry first said "86 % of the load is what the rain adds",
+> from timing `gallery.ftsl` (2.5 s) against `gallery_rain.ftsl` (18.3 s). **That comparison was
+> worthless**: `gallery.ftsl` is 463 lines and `gallery_rain.ftsl` is 3022, and they differ by
+> 15 fur coats and a set of isosurfaces as well as by the rain. The difference was never the
+> rain's — it was "small scene vs large scene". The raincloud was simply the most conspicuous
+> thing in the load log, and I attributed the gap to it. Two of the three probes below were
+> spent finding that out.
 
-So **86 % of the load is what the rain adds**: `meshvox::voxelizeSolid` turning 1 852 454
-triangles into a 195×122×191 lattice, `featherGrid`'s distance transform over its 4.5 M cells,
-and two majorant grids.
+**What is actually established.**
+
+* **The mesh-bound voxel pipeline is not the cost, and its lattice work is negligible.** A
+  standalone rig containing only the raincloud mesh and its medium builds in **1.65 s**, and
+  sweeping `voxels` 192 → 96 → 48 → 24 (a 512× reduction in cells: 195×122×191 down to
+  27×18×27) moves that by **under 3 %**: 1681 / 1655 / 1638 / 1649 ms. The cost is loading
+  `cloud1.glb`, which is **117 MB**, not building the lattice. Any future work on
+  `voxelizeSolid` should start from that number, not from the whole-scene delta.
+* `featherGrid` was ~0.9 s of it and is now parallel (below) — a real fraction of the *voxel
+  pipeline* (~36 % of 2.5 s as it stood), but ~5 % of the scene load. The change is
+  bit-identical and free; its value was overstated by the bad attribution, not by the
+  measurement.
+
+**Two hypotheses tested and refuted, each of which looked obvious:**
+
+* **Caching parsed glTF documents.** The log shows `compote_with_gems.glb` (4.5 MB) parsed 13
+  times. Caching by path buys **nothing**: 13 loads that each keep ~62 tris cost 335 ms against
+  329 ms for one, because the loader already skips decoding primitives the `skip_material` list
+  drops. A first rig showed 66 ms/load — but its loads each kept 250 k tris, so it was timing
+  *geometry and BVH*, not parsing. The rig had to be rebuilt to match the real skip lists before
+  it measured the thing it was named after.
+* **`prefer {} else {}` building the scene twice.** `tryBuild` constructs a whole trial scene per
+  branch, and `gallery_rain` reports `[prefer] using branch 1 of 2`, so branch 0 is built and
+  discarded first — which reads like a 2× multiplier on every load. Collapsing the block to its
+  `else` branch saves **1.4 s of 18.7 s**, and the glTF load count is *identical* (15 either
+  way): the `singleNode` path reuses the trial rather than rebuilding, exactly as the code
+  comment says. Not a multiplier.
+
+**Still unattributed:** the remaining ~15 s. The candidates are the 15 `fur` coats, the
+isosurface polygonisation, and the BVH over the 683 k surviving triangles. **Do not guess at it
+again** — three probes have now been spent on plausible-looking causes and all three came back
+negative. The next step is a real per-phase timer in the loader (one site, at the top-level
+block dispatch, so every block type is covered), not another hypothesis.
 
 **Where it actually is, after checking each:**
 
