@@ -468,7 +468,7 @@ down. Validation on the same scene:
 The fold is exact in expectation, so B and C–C2 agreeing within their noise is the correctness
 statement; a chroma error would have shown as a channel-dependent shift, as `UPBP-CHROMA`'s did.
 
-### RASTER-PBR — OPEN (2026-09-06, v0.257.0): `-explore` / `-raster` cannot show a glossy material at all, so an asset whose look depends on its specular lobe (Alice's dress) previews flat — where a web viewer like Meshy shows it correctly in real time
+### RASTER-PBR — **HALF DONE** (CPU rasterizer 2026-09-10, v0.269.0; filed 2026-09-06, v0.257.0): `-explore` / `-raster` cannot show a glossy material at all, so an asset whose look depends on its specular lobe (Alice's dress) previews flat — where a web viewer like Meshy shows it correctly in real time
 
 **The gap, in the code's own words.** `src/raster.h`'s header: *"There is NO transparency,
 refraction, reflection, shadows, caustics or global illumination… **Glossy lobes do not exist
@@ -484,6 +484,38 @@ specular ≈ `prefiltered(R, roughness) · (F0·A + B)` — two texture fetches.
 idea* as the radiance cache in `VOLCACHE` above: prefilter a light field over direction so the
 runtime only does a lookup, accepting view-independence of the *environment* (not of the view
 vector) as the price.
+
+**What landed (v0.269.0), and what it deliberately is not.** The CPU rasterizer (`raster.h`) now
+shades `Glossy` through the split sum. Two halves:
+
+* **The direct lobe** — normalised GGX, Smith height-correlated masking, Schlick Fresnel, per key
+  light. This is the half a preview cannot fake: the moving highlight is what reads as *satin*
+  rather than *chalk*, and it is view-dependent by definition.
+* **The environment term** — `prefiltered(R, roughness) · (F0·A + B)` with Karis' analytic
+  `EnvBRDFApprox` for `(A, B)`, so no LUT texture ships. **The prefilter is not approximated
+  away; it degenerates.** This renderer's environment is a *single scalar* (`PLights::ambient`,
+  one of three constants) — there is no directional environment anywhere in the file — so
+  `prefiltered(R, roughness)` collapses to that constant exactly. This is split-sum over a
+  uniform environment, not a reduced version of split-sum, and it makes no assumption the
+  existing diffuse shading does not already make.
+
+`roughness pattern:` and `roughness texture:` are honoured, through the same per-pixel machinery
+the albedo patterns use — undoing the header's "roughness/film-thickness maps are ignored by
+design". `f0` comes from `reflect`, which for a metal preset *is* its normal-incidence
+reflectance: a gold highlight has to be gold, and a white one is the most obvious tell there is.
+
+**Verified live, not just compiled.** Sweeping the gold sphere's roughness in
+`scenes/_spec_repro.ftsl` through the CPU rasterizer: at 0.05 the band reads mean 166.05 with
+max/mean 1.536; at 0.90, 158.30 and 1.611. Smoother is brighter and more concentrated, rougher
+is dimmer and flatter — which is what a lobe does and what a flat shade cannot do.
+
+**NOT DONE, and the reason this is filed as half rather than closed: `-raster` defaults to the
+CUDA rasterizer, which is untouched.** The first version of the sweep above ran on the default
+path and returned *byte-identical* numbers across an 18× roughness range — the change was inert,
+and only forcing `-device cpu` revealed it working. `raster_cuda.cu` ~1051 carries the identical
+`ambient + keyScale*lit + fill*head` line and needs the same forty lines. Until it does, the two
+rasterizers disagree on any glossy material, which is exactly the class of divergence the rest
+of this file spent two days removing — so **`REFERENCE.md` does not advertise this yet**.
 
 **Proposed work.**
 1. Build an irradiance representation for diffuse (SH9 is ample) and a roughness-mipped

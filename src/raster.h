@@ -76,6 +76,14 @@ struct PShade {
     double normalStrength = 1.0;
     bool emissive = false;
     bool clear    = false;   // dielectric/thin-film/filter surface (see-through mode dims/hazes it)
+    // RASTER-PBR. `rough < 0` means "no specular lobe" and shades exactly as before, so every
+    // diffuse material in every existing scene is untouched. `f0` is the normal-incidence
+    // reflectance -- for a metal that IS its measured reflectance (which is why a gold preview
+    // must tint its highlight gold, not white), for a dielectric a small achromatic value.
+    double rough  = -1.0;
+    Vec3   f0{0, 0, 0};
+    int    roughPat = -1;    // `roughness pattern:` — the map the header says is ignored today
+    int    roughTex = -1;    // `roughness texture:`
     // Per-CROSSING RGB transmittance of a clear surface, from the material itself (see
     // clearTintOf). White for anything that states no colour, so a plain window behaves
     // exactly as it did when this was one global scalar. Meaningless unless `clear`.
@@ -285,6 +293,38 @@ struct PLight {
 };
 
 // The scene's lights distilled for shading: every positional/spot emitter shades
+// ---- RASTER-PBR: the split-sum specular ------------------------------------------------------
+// Karis' analytic fit to the split-sum DFG term (SIGGRAPH 2013 "Real Shading in Unreal Engine
+// 4"), so the preview needs no LUT texture shipped alongside it. Returns the (A, B) that
+// multiply F0: specular_env = prefiltered * (F0*A + B).
+inline void envBrdfApprox(double NoV, double rough, double& A, double& B) {
+    // c0/c1 are the published constants; the fit is accurate to well under a preview's
+    // 8-bit output over the whole (NoV, roughness) square.
+    const double x = 1.0 - rough;
+    const double bias  = std::exp2(-9.28 * NoV) * x * x * x;
+    const double scale = x * x * x * x;
+    A = scale; B = bias;
+}
+// Normalised GGX with Smith height-correlated masking and Schlick Fresnel, evaluated for one
+// key light. This is the half of the split-sum a preview cannot fake: the moving highlight is
+// the cue that says "satin" rather than "chalk", and it is view-dependent by definition.
+inline double ggxSpec(const Vec3& N, const Vec3& V, const Vec3& L, double rough) {
+    const Vec3 H = normalize(V + L);
+    const double NoV = std::max(1e-4, dot(N, V));
+    const double NoL = std::max(0.0,  dot(N, L));
+    if (NoL <= 0.0) return 0.0;
+    const double NoH = std::max(0.0, dot(N, H));
+    const double a  = std::max(1e-3, rough * rough);
+    const double a2 = a * a;
+    const double d  = NoH * NoH * (a2 - 1.0) + 1.0;
+    const double D  = a2 / (PI * d * d);
+    // Smith height-correlated visibility, which already folds in the 1/(4 NoL NoV).
+    const double lv = NoL * std::sqrt(NoV * NoV * (1.0 - a2) + a2);
+    const double ll = NoV * std::sqrt(NoL * NoL * (1.0 - a2) + a2);
+    const double Vis = (lv + ll > 0.0) ? 0.5 / (lv + ll) : 0.0;
+    return D * Vis * NoL;
+}
+
 // from its own real direction, plus flat ambient + a subtle camera-headlight fill.
 struct PreviewLight {
     std::vector<PLight> lights;  // one entry per positional/spot emitter
@@ -444,6 +484,18 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             s.color = Vec3{s.color.x * s.clearTint.x,
                            s.color.y * s.clearTint.y,
                            s.color.z * s.clearTint.z};
+        }
+        // RASTER-PBR: the specular description. Only Glossy has a lobe the preview can show;
+        // Mirror is a delta the rasterizer has no reflection to fill it with, and the clear
+        // family is already handled by see-through. `reflect` IS the normal-incidence
+        // reflectance for a metal preset, which is why the highlight has to be tinted by it
+        // rather than white -- a white highlight on gold is the single most obvious tell.
+        if (!m.isLight && m.type == MatType::Glossy) {
+            s.rough = (m.roughness > 0.0) ? m.roughness : 0.2;
+            bool dummy = false;
+            s.f0 = materialColor(m, dummy);
+            s.roughPat = m.roughnessPat;
+            s.roughTex = m.roughnessTex;
         }
         // An image skin: a diffuse-albedo texture bound via `reflect texture:<name>`.
         // The preview shades from the texture's linear RGB (Texture::sampleRgb), so no
@@ -2065,6 +2117,22 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                 }
             }
             Vec3 V = normalize(cam.eye - g.wpos[i]);     // toward camera
+            // RASTER-PBR: the surface's own roughness, honouring the maps the header used to
+            // say were "ignored by design". `rough < 0` = no lobe, and the whole specular block
+            // below is skipped, so a diffuse scene shades byte-for-byte as it always did.
+            double rough = sh ? sh->rough : -1.0;
+            if (rough >= 0.0 && sh) {
+                // Honour `roughness pattern:` / `roughness texture:` through the same per-pixel
+                // machinery the albedo patterns already use -- the header's "roughness maps are
+                // ignored by design" is exactly what this entry exists to undo.
+                if (scenePtr && sh->roughPat >= 0 && sh->roughPat < (int)scenePtr->patterns.size())
+                    rough = scenePtr->patterns[sh->roughPat].eval(ctx());
+                else if (scenePtr && sh->roughTex >= 0 && sh->roughTex < (int)scenePtr->textures.size())
+                    rough = scenePtr->textures[sh->roughTex].scalarAt(g.uv[i].x, g.uv[i].y);
+                rough = (rough < 0.02) ? 0.02 : (rough > 1.0 ? 1.0 : rough);
+            }
+            const bool spec = (rough >= 0.0);
+            Vec3 specAcc{0, 0, 0};
             double lit = 0.0;
             for (const auto& lp : light.lights) {
                 Vec3 d = lp.pos - g.wpos[i];
@@ -2076,11 +2144,35 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                 if (lp.falloff2 > 0.0) atten = lp.falloff2 / (lp.falloff2 + dist2);
                 double cone = 1.0;
                 if (lp.spot) cone = spotFalloff(dot(lp.dir, -Ld), lp.cosInner, lp.cosOuter);
-                lit += lp.weight * ndl * atten * cone;
+                const double w = lp.weight * atten * cone;
+                lit += w * ndl;
+                if (spec) {
+                    // The direct lobe: this is the half of the split-sum a preview cannot fake,
+                    // because the moving highlight is what reads as "satin" rather than "chalk".
+                    const double gg = ggxSpec(N3, V, Ld, rough) * w;
+                    if (gg > 0.0) {
+                        const double f = std::pow(1.0 - std::max(0.0, dot(V, normalize(V + Ld))), 5.0);
+                        specAcc = specAcc + Vec3{sh->f0.x + (1.0 - sh->f0.x) * f,
+                                                 sh->f0.y + (1.0 - sh->f0.y) * f,
+                                                 sh->f0.z + (1.0 - sh->f0.z) * f} * gg;
+                    }
+                }
             }
             double head = std::max(0.0, dot(N3, V));     // headlight fill
             double k = light.ambient + light.keyScale * lit + light.fill * head;
             accum[i] = col * k;
+            if (spec) {
+                // The ENVIRONMENT half of the split-sum. This renderer's environment is one
+                // scalar (light.ambient) -- there is no directional env anywhere in this file --
+                // so `prefiltered(R, roughness)` degenerates to that constant exactly, and the
+                // DFG factor is all that remains. No approximation beyond the one the diffuse
+                // shading above already makes.
+                double A = 0.0, B = 0.0;
+                envBrdfApprox(std::max(1e-4, dot(N3, V)), rough, A, B);
+                const double amb = light.ambient;
+                specAcc = specAcc + Vec3{sh->f0.x * A + B, sh->f0.y * A + B, sh->f0.z * A + B} * amb;
+                accum[i] = accum[i] + specAcc * light.keyScale;
+            }
         }
     });
 
