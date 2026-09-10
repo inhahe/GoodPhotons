@@ -1066,7 +1066,36 @@ something the dielectric path does on exit.
 > **STILL OPEN, in priority order:**
 >
 > 1. **Light-tree-selected emitters are not covered** — see COVERAGE below. A many-light scene's
->    glossy surfaces keep the old estimator.
+>    glossy surfaces keep the old estimator. **Attempted 2026-09-10, unbiased, and REVERTED for
+>    want of a benefit** — but the reasoning that blocked it was wrong, which is worth fixing in
+>    the record:
+>
+>    The COVERAGE note assumes the MIS weight needs the *true* selection pdf, which `ltSample`'s
+>    adaptive splitting makes hard to invert. **It does not.** MIS is unbiased for any weights
+>    forming a partition of unity — the combined estimator is `Σ_t w_t f/p_t` sampled from `p_t`,
+>    whose expectation is `∫f · Σ_t w_t`. The true selection pdf enters the **estimator**, through
+>    the `selW` that `ltSample` already returns exactly, and never the weight. Both halves only
+>    have to agree with each other. So the restriction was never a correctness requirement.
+>
+>    Widening it (weight by the solid-angle density alone) is therefore exact, and was measured
+>    on `scenes/_spec_repro_many.ftsl` (new — 48 panels ringing the four spheres, so every
+>    emitter is tree-selected at `p_sel ≈ 1/48`; the older rigs have ONE light and never build a
+>    tree at all). Means agreed to ±0.11 %, confirming unbiasedness — and the **seed spread got
+>    worse on the band it targets**: glossy gold 0.228 % on against 0.085 % off. Adding a
+>    power-proportional stand-in for `p_sel` recovered part of it (0.179 % on, so 0.47× rather
+>    than 0.37×) but still lost, while helping the dielectric and chrome bands. Reverted.
+>
+>    **Why the proxy is not good enough, which names the real next step.** The tree selects by
+>    *importance* — power, distance and orientation — and on a ring of lights around a subject
+>    the spatial term is precisely what varies; a power-proportional guess throws away the only
+>    part that discriminates. So the informed version is a root-to-leaf walk multiplying the
+>    tree's own `ltImportance` ratios, ignoring the adaptive splitting (which costs weight
+>    quality, not correctness). That needs a parent chain or per-node emitter ranges, neither of
+>    which `LightTreeNode` currently carries.
+>
+>    Evidence caveat: three seeds gives an sd with two degrees of freedom, so these numbers are
+>    weak individually. They are consistent with the theory and none of them shows a win, which
+>    together is enough to not ship — but not enough to call the approach dead.
 > 2. ~~Cylinder emitters report no density~~ — **FIXED (2026-09-09, v0.266.2), and it was not
 >    the harmless gap it was filed as.** The note said cylinders "keep the old estimator, which
 >    is unbiased". That was wrong: the NEE side connects to a cylinder regardless, so a zero
