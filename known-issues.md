@@ -1479,11 +1479,35 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   The single-hit probe is not an approximation of the layered case — it is the right question
   for a visible surface.
 
-  So the residual has some other cause, and the leading suspect is now the **photon query
-  itself**: `dot(ph.n, h.n) < 0.5` cannot reject a photon on a parallel fold a few millimetres
-  behind, so cloth gathers cross-layer photons the footprint is right not to count. That is a
-  defect in the estimator's acceptance rule rather than in its normalisation, and it wants its
-  own entry rather than another footprint patch.
+  The suspicion then moved to the **photon query itself** — `dot(ph.n, h.n) < 0.5` cannot reject
+  a photon on a parallel fold a few millimetres behind — and **that was tested too, and also
+  fails.** The classical remedy is a FLATTENED kernel: keep the tangential radius, limit the
+  normal offset, so the gather region is a disc of thickness `k·r` rather than a ball. Sweeping
+  `k`:
+
+  | element | k = 0 (ball) | 0.5 | 0.25 | 0.1 |
+  |---|---|---|---|---|
+  | `alice_dress` | −11.8 % | −14.7 % | −31.0 % | −64.2 % |
+  | `alice_hair` | −3.5 % | −18.7 % | −36.5 % | −61.1 % |
+  | `grid_ground` (control) | +0.4 % | +0.4 % | +0.5 % | +0.4 % |
+
+  Monotonically worse, and worst on hair. Reverted; the knob is not kept, because leaving a
+  refuted dial in a hot loop only invites someone to turn it.
+
+  **Why it fails, which is the same reason the marching failed and is worth stating once
+  properly.** Both fixes assume the gather neighbourhood is *locally flat surface plus
+  intruders*, so the intruders can be separated by depth. On cloth and hair at gather scale
+  that premise is false: the SAME surface extends far off its own tangent plane, because the
+  gather radius is comparable to the feature size. `|z| ≈ d²/2R` is only small when `r ≪ R`,
+  and here `r ~ R`. A plane-distance test therefore rejects the surface itself before it rejects
+  anything else — which is exactly what the table shows, hair falling fastest because it is the
+  most curved thing in the frame.
+
+  So the honest position is: **at gather scale, cloth and fur are not layered surfaces, they are
+  tangles**, and no test built on local flatness — not normals, not depth, not photon statistics
+  (already established above) — will separate "another layer" from "this layer curving away".
+  The remaining −12 % is left standing, with two named dead ends, rather than patched by a
+  third variation on the same assumption.
 
   Recorded at length because the null control passed throughout (**+0.003 %** on the flat rig —
   one layer, nothing to march) while the targets collapsed. Fourth time in two days that a
