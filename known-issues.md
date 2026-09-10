@@ -2381,7 +2381,7 @@ is guarded by `hazeCap < 1.0`; measured identical). A genuinely six-deep stack o
 glass really is muddy, so this is a legibility choice the operator makes rather than a
 correction applied for them. On `compote_with_gems.glb`, `0.3` is the readable setting.
 
-### RASTER-GPU-DIFF — OPEN (2026-09-03, v0.223.0): the preview rasterizer's two backends **disagree on which triangle owns a shared edge**, so a wall/ceiling seam renders green on the CPU and white on the GPU
+### RASTER-GPU-DIFF — OPEN / **WONTFIX-AS-SPECIFIED** (2026-09-03, v0.223.0; diagnosis confirmed 2026-09-10, v0.270.3): the preview rasterizer's two backends **disagree on which triangle owns a shared edge**, so a wall/ceiling seam renders green on the CPU and white on the GPU
 
 **What happens.** `raster.h`'s header and design.md's *GPU raster pipeline* both state the
 GPU frames are "verified byte-identical to the CPU path's frames". They are not:
@@ -2433,7 +2433,70 @@ either be repaired or downgraded to what is actually true.
 
 **Reproducing the analysis.** Render both, then diff with the signed per-pixel values —
 the diagonal-run structure is what identifies it as coverage rather than shading, and it
-is invisible in a scalar "N pixels differ" summary.
+is invisible in a scalar "N pixels differ" summary. `scraps/rastdiff.py` does the diff.
+
+**Watch out: `-raster` plus `-window-min` opens the interactive VIEWER and blocks** until the
+window is closed — on *both* backends, not just the GPU (checked, having first assumed
+otherwise). A batch comparison must therefore omit `-window-min` or background each render and
+`ftrace -stop` it. Getting this wrong once let a foreground render hit the tool timeout, which
+force-kills the process — with a CUDA context live, the one thing this repo forbids. The driver
+survived, and the lesson is cheap to write down and expensive to relearn.
+
+---
+
+**Re-measured 2026-09-10 at v0.270.3, and the diagnosis is now confirmed rather than inferred.**
+
+At 512² the numbers are *exactly* those first reported at v0.223.0 — 89 differing pixels, 88 of
+them beyond one LSB, worst case 120/255 — so nothing since (including RASTER-PBR, which rewrote
+the shading in both backends) has touched it. Sweeping resolution discriminates a coverage tie
+from a shading difference without instrumenting anything, because the two have different
+signatures: a tie lives on a seam, so its count grows like **R**; a shading difference is
+everywhere the material is, so its count grows like **R²** and its *fraction* stays constant.
+
+| resolution | differing | of pixels | rows touched | worst |
+|---|---|---|---|---|
+| 256² | 41 | 0.063 % | 41 | 120 |
+| 384² | 57 | 0.039 % | 57 | 120 |
+| 512² | 89 | 0.034 % | 89 | 120 |
+| 640² | 183 | 0.045 % | 176 | 121 |
+| 800² | 248 | 0.039 % | 236 | 121 |
+
+`rows ≈ count` at every resolution: one pixel per row, a one-dimensional structure. The count
+grows roughly like R (not R²), and the worst-case magnitude is **pinned at 120–121/255
+independent of resolution** — that is the colour gap between the two triangles, which is what a
+coverage *swap* produces and a shading *drift* cannot.
+
+**Root cause, stated plainly.** `raster.h`'s `EdgeFn` holds `double Px, Py, dx, dy` and
+evaluates in double; `raster_cuda.cu`'s `DEdge` holds `float` and evaluates in float. Both
+implement the same *rule* — and the device implements it very carefully (canonical endpoint
+order, anchoring at P, explicit `__fmul_rn`/`__fsub_rn` so nvcc cannot contract an FMA and leave
+a rounding residual). The rule is not the problem. The problem is that the rule is keyed on
+`v == 0.0`, so it inherits the precision of `v`: where the exact edge value is a tiny non-zero,
+double resolves it *by sign* and float rounds it *to the tie*. On top of that the two backends
+project independently, so their screen coordinates differ by an ulp before the edge function
+even runs.
+
+**So byte-identity is not reachable at acceptable cost, and the claim should say so.** Getting
+it would mean making one backend mirror the other's arithmetic through the entire projection
+chain — either fp64 on the device (slow, and this is a preview) or rewriting the host raster in
+float with operation-for-operation ordering matched to `kProject`. Both are large, fragile
+changes to a preview whose output is never a render result.
+
+What is true, and is the useful invariant to check instead:
+
+* each backend is individually **watertight** — no pixel on a shared edge is claimed by both or
+  by neither (this is what the canonicalisation and the `__fmul_rn` fix were *for*, and a hole
+  at the cornell box's corner is what exposed the FMA issue originally);
+* inter-backend differences are confined to **coverage ties on shared edges**: ~1 pixel per row
+  along a seam, bounded in magnitude by the shading difference of the two triangles that share
+  it, and never in the interior of a face.
+
+A regression check should assert *that*, not byte-identity — a diff confined to seam pixels is
+the pre-existing condition, and a diff anywhere else means a shading change broke a backend.
+Note the surviving "verified byte-identical" in `raster.h` (~1472) is about the **expose /
+tonemap** stage only (same p99 order statistic, same double tonemap, same LUT) and is not
+contradicted by any of this; the frame-level claim the original report quoted is no longer in
+`design.md`.
 
 ### BDPT-MIS-TR — OPEN (2026-09-02, v0.217.0): mode `D`'s MIS weights approximate every **connection edge's transmittance as 1** in a participating medium
 
