@@ -1749,12 +1749,40 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   +82.3 → +78.9 and +102.6 → +99.5, and made `alice_dress` worse. Whatever starves fur under the
   ball test, it is not nearest-hit occlusion.
 
-  **The finding that matters most here was incidental: the SHIPPED correction over-corrects the
-  fur creature by +48–62 %.** That is larger than every dark residual this entry is written
-  around, and it is not in any table above — the entry was framed on "too dark" and nobody
-  scored the ROI that is far too bright. The next attempt should start there, and the obvious
-  first lever is the coverage floor (`gatherAreaScale` clamps at `cov >= 0.05`, so `1/cov` runs
-  to 20×); a tighter floor would bound the fur over-correction under both acceptances.
+  **The finding that matters most here was incidental, and it is a REGRESSION IN SHIPPED,
+  DEFAULT-ON CODE.** The `creature` ROI — the fur coat — is *correct without the correction* and
+  badly over-bright with it. Two seeds, equal spp, against the same reference:
+
+  | ROI | off (s1 / s4) | shipped (s1 / s4) |
+  |---|---|---|
+  | `alice_hair` | −68.6 % / −69.7 % | −11.4 % / −15.1 % |
+  | `alice_dress` | −38.7 % / −41.7 % | −11.0 % / −13.2 % |
+  | `cap_gyroid` | −32.6 % / −37.0 % | −6.0 % / −13.6 % |
+  | `cap_axicon` | −11.6 % / −10.0 % | −2.0 % / +0.4 % |
+  | **`creature`** | **−3.9 % / +3.6 %** | **+48.2 % / +61.7 %** |
+
+  So the correction fixes four large dark errors and **creates a +55 % one where none existed**.
+  It was never seen because **no experiment on this entry has ever scored `creature`** — the
+  entry was framed on "mode M is too dark", so every ROI chosen was one that was too dark.
+
+  **Why a tangle inverts the correction.** The model is "the disc is partly empty, so scale up".
+  For dense fur the opposite holds: the gatherable strand surface inside the ball **exceeds**
+  `πr²`, so the honest coverage is *greater than 1* — and a nearest-hit probe cannot report that,
+  since it takes one hit per ray and the `1/cos` Jacobian caps each at 2. Coverage is therefore
+  under-measured exactly where the tangle is densest, and dividing by it over-brightens. This is
+  the same "cloth and fur are tangles, not layered surfaces" fact the reverted attempts ran into,
+  seen from the other side: a tangle does not partially fill the disc, it **overfills** it.
+
+  That also explains why the two failure modes cannot be fixed by one rule. Counting multiple
+  layers (the reverted march) pushes coverage above 1 and would fix `creature` — and it measured
+  −7.1 → −26.7 on `alice_hair`, because for a sparse groom it dilutes the front layer that the
+  pixel is actually shading. Sparse and dense tangles want opposite treatment from the same probe.
+
+  **Standing instruction for this entry: score `creature` in every future experiment.** It is
+  the discriminating ROI, it is the only one that reveals the correction's failure direction, and
+  it was absent from all of them. The coverage floor (`cov >= 0.05`, so `1/cov` reaches 20×) is
+  *not* the lever it looked like — measured coverage on the creature's fur is 0.80–0.83, nowhere
+  near the clamp.
 
   **Rig note, because the first run of this looked like a clean confirmation and was entirely
   artefact.** The ROI file is `name x0 y0 x1 y1`; parsing it as `y0 y1 x0 x1` collapses every box
