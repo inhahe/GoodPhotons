@@ -18485,6 +18485,16 @@ static int run(int argc, char** argv) {
         // Many-lights importance sampling (light BVH). See the lt:: knobs above.
         else if (!std::strcmp(argv[i], "-no-lighttree")) { lt::gEnabled = false; }
         else if (!std::strcmp(argv[i], "-no-glossy-nee")) { lt::gGlossyNee = false; }
+        // M-GATHERAREA prototype: probe samples for the gather footprint (0 = off, the default).
+        // Routed through the environment because gatherCoverage is reached from a header with no
+        // access to main.cpp's statics, exactly as -mstats is.
+        else if (!std::strcmp(argv[i], "-gatherarea") && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GATHERAREA", argv[++i]);
+#else
+            setenv("FTRACE_GATHERAREA", argv[++i], 1);
+#endif
+        }
         else if (!std::strcmp(argv[i], "-glossy-nee"))    { lt::gGlossyNee = true;  }
         else if (!std::strcmp(argv[i], "-lighttree"))    { lt::gEnabled = true; }
         else if (!std::strcmp(argv[i], "-light-split") && i + 1 < argc) {

@@ -1301,9 +1301,57 @@ primitive). The `k`-nearest-photon local radius is NOT a substitute — it adapt
 density, which is the illumination we are trying to measure, so it would flatten exactly what the
 estimate is for.
 
-What stands: the darkening is real and one-sided (−33 % on a cap edge, −70 % on hair), the
-direction of the correction was right on every truncated element, and a correct footprint should
-recover 30–65 % there. The experiment lives in `scraps/fix_gatherarea.py`,
+**ATTEMPT 2 WORKS — the footprint measured by RAY PROBE (2026-09-09, v0.267.0, opt-in
+`-gatherarea <M>`).** Against the 34 781-spp mode-`R` reference, trimmed mean, 240 s per arm:
+
+| element | off | **on (M = 16)** | recovered |
+|---|---|---|---|
+| `alice_hair` | −68.1 % | **+1.0 %** | **98 %** |
+| `alice_dress` | −40.5 % | **−13.6 %** | **66 %** |
+| `cap_gyroid` | −32.0 % | **−0.5 %** | **98 %** |
+| `grid_ground` (control) | −0.5 % | +0.8 % | — |
+
+That beats this entry's own prediction of 30–65 %.
+
+**Why a probe rather than the analytic clip prescribed above.** The prescription — BVH sphere
+query, each same-facing primitive clipped to the tangent-plane disc — is right about *what* to
+measure and impossible for *this scene*: the instrumentation below names `creature`'s fur
+(mats 38–41) as the biggest single loss, and fur is curve primitives, not triangles; `gallery_rain`
+is also full of isosurfaces and CSG solids, none of which a triangle clip can touch. Sampling M
+points in the disc and probing along −n measures the same quantity through one intersector the
+render already trusts, in ~40 lines rather than ~300.
+
+**The one thing that made it work, and the test that could NOT have found it.** The probe samples
+uniformly in the tangent plane, so it measures **projected** area while the estimator needs
+**surface** area: `dA = dq / cos(tilt)`. Omitting that Jacobian, the correction *overshot* —
+`alice_hair` went −68.0 % → **+31.1 %**, straight past zero, because hair is almost entirely
+steeply-tilted surface counted at its shadow's size. Adding `1/cos` took the same ROI to +1.0 %.
+Flat ground has `cos = 1`, so **the null control is blind to this term** — which is the argument
+for measuring the targets and the controls in the same run rather than gating on the control
+first.
+
+**And the null control that IS worth having** is not a Cornell box. `scenes/_ga_null.ftsl` (new)
+is one 12 m quad, camera on the middle, no edge within reach of any gather: coverage must read 1
+and the correction must vanish, and it does (**+0.016 %** on the mean, per-pixel median 0.24 %).
+A Cornell box is *not* this test — its walls meet, so a gather near a corner has a disc that
+genuinely runs onto a perpendicular wall and a correction there is right. Using Cornell as the
+null control (my first attempt, +0.30 %) would have condemned a working estimator.
+
+**What is not done.**
+
+* **Cost: 2.5×** on `gallery_rain` (615 → 246 spp at 240 s), against only +4 % on the null rig —
+  the difference is that scene's BVH depth. The gate this entry already proposed ("only worth
+  doing when the gather is near a silhouette or a small-feature primitive") is not optional
+  before this goes on by default.
+* **`alice_dress`'s residual −13.6 %.** The probe takes the NEAREST hit along −n, so a fold of
+  cloth hides the surface behind it and the area is under-counted — which is the remaining
+  one-sided error, and folded cloth is exactly the case. Marching several hits per probe is the
+  obvious next move.
+* **Device and mode-`S` twins**, so `-device gpu` and mode `S` do not diverge once it is default.
+
+What stands from attempt 1: the darkening is real and one-sided (−33 % on a cap edge, −70 % on
+hair), the direction of the correction was right on every truncated element, and a correct
+footprint should recover 30–65 % there. The experiment lives in `scraps/fix_gatherarea.py`,
 `scraps/fix_gatherarea2.py` and the instrumentation in `scraps/fix_gadbg*.py`; the measurements
 are `scraps/gatherarea_check_v1.log` (ellipse), `scraps/gatherarea_check.log` (gated) and
 `scraps/gadbg.log` (per-material clouds).

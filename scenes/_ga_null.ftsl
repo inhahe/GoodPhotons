@@ -1,0 +1,20 @@
+# NULL CONTROL for M-GATHERAREA's footprint probe: one enormous flat quad, camera looking at the
+# middle of it, light well inside. Every gather disc lies wholly on one same-facing surface with
+# no edge within reach, so the measured coverage must be 1.0 and the correction must be a no-op.
+#
+# A Cornell box is NOT this control, which is the mistake worth recording: its walls MEET, so a
+# gather near a corner has a disc that genuinely runs off onto a perpendicular wall. A correction
+# there is correct behaviour, not a bug, and using Cornell as a null control would have condemned
+# a working estimator.
+scene { units meters  spectral 360 830 1 }
+material "white" { type diffuse reflect whitewall 0.75 }
+quad { origin -6 0 -6   u 12 0 0   v 0 0 12   material white }
+light area {
+    origin -1 3 -1   u 2 0 0   v 0 0 2   normal 0 -1 0
+    spd preset:bb6500
+}
+camera "cam" {
+    eye 0 2.2 3.2   look_at 0 0 0   up 0 1 0   fov_y 40
+    mode B
+    film { res 96 96 }
+}

@@ -44,6 +44,68 @@
 
 #include <chrono>
 
+// ---- GATHER FOOTPRINT (M-GATHERAREA, `-gatherarea <M>`) --------------------------------------
+// The direct density estimate divides by pi*r^2, the area of the full gather disc, while
+// collecting only from the part of that disc that is real, same-facing surface. Where the disc
+// overhangs -- a cap edge, a fold of cloth, a hair strand -- the divisor is too big and the
+// estimate is dark in proportion. Measured on `gallery_rain`: flat ground 0 %, a cap edge -33 %,
+// Alice's dress -42 %, her hair -71 %.
+//
+// `gatherCoverage` measures the fraction of the tangent-plane disc that has same-facing surface
+// under it, by probing M points along -n. Returns 1.0 when the feature is off, so the estimate
+// is bit-identical then.
+//
+// WHY A PROBE AND NOT AN ANALYTIC CLIP: the entry prescribes clipping each same-facing primitive
+// to the disc, which is exact for triangles and IMPOSSIBLE for everything else in this scene --
+// fur (the biggest single loss, mats 38-41), isosurfaces, CSG solids. One intersector call
+// handles them all, and it is the same intersector the render already trusts.
+inline int gatherAreaSamples() {
+    static const int m = [] {
+        const char* e = std::getenv("FTRACE_GATHERAREA");
+        return e ? std::atoi(e) : 0;
+    }();
+    return m;
+}
+inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
+                             double r, Pcg32& rng, int M) {
+    if (M <= 0 || !(r > 0.0)) return 1.0;
+    Vec3 t, b; onb(n, t, b);
+    double area = 0.0;                 // in units of the full disc, so 1.0 == fully covered
+    for (int i = 0; i < M; ++i) {
+        // Uniform in the disc: sqrt(u) puts equal expected samples per unit AREA, which is what
+        // an area fraction needs -- a linear radius would over-weight the middle and report a
+        // truncated disc as fuller than it is.
+        const double rr = r * std::sqrt(rng.uniform());
+        const double ph = 2.0 * PI * rng.uniform();
+        const Vec3 q = p + t * (rr * std::cos(ph)) + b * (rr * std::sin(ph));
+        // Probe from r ABOVE the tangent plane straight down. `2r` of travel is what lets a
+        // curved surface still count: within the disc it deviates from the plane by at most
+        // ~r^2/(2R), far inside this window for any radius worth gathering at.
+        const Hit h = scene.closestHit(Ray{q + n * r, n * -1.0});
+        // Same 60-degree acceptance the photon query uses (dot(ph.n, h.n) < 0.5 rejects), so the
+        // footprint and the estimator agree on what surface is "here".
+        if (h.valid && h.t <= 2.0 * r) {
+            const double c = dot(h.n, n);
+            // THE PROJECTION JACOBIAN, and it is not a refinement -- without it the correction
+            // overshoots badly on exactly the geometry it is for. The probe samples uniformly in
+            // the TANGENT PLANE, so it measures PROJECTED area; the estimator needs SURFACE
+            // area, and dA = dq / cos(tilt). A patch tilted 60 degrees carries twice the surface
+            // its shadow suggests. Measured on gallery_rain without this term: alice_hair went
+            // from -68.0 % to +31.1 % -- past zero, because hair is nearly all steeply-tilted
+            // surface and every bit of it was counted at its projected size. Flat ground has
+            // cos = 1 and is untouched either way, which is why the null control could not have
+            // caught this and the truncated elements could.
+            if (c >= 0.5) area += 1.0 / c;
+        }
+    }
+    return area / (double)M;
+}
+// Never divide by a coverage so small that one stray probe inflates a pixel into a firefly. A
+// gather that finds under a twentieth of its disc is not a measurement worth rescaling.
+inline double gatherAreaScale(double cov) {
+    return (cov >= 0.05) ? 1.0 / cov : 1.0;
+}
+
 // ---- MODE-M PHASE PROFILE (`-mstats`) -------------------------------------------------------
 // VOLCACHE asks for the split inside a mode-M frame's camera gather: how much is the SURFACE
 // density estimate and how much is the BEAM gather, since only the latter is what a volumetric
@@ -479,6 +541,11 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                         nrmOut = (M.nEmitted > 0 && a > 0.0)
                                      ? 1.0 / (a * (double)M.nEmitted) : 0.0;
                     }
+                    // M-GATHERAREA: divide by the area actually gathered from, not by the whole
+                    // disc. `gatherAreaSamples() == 0` (the default) returns coverage 1 and
+                    // leaves nrmOut untouched, so every existing render is bit-identical.
+                    if (const int gaM = gatherAreaSamples())
+                        nrmOut *= gatherAreaScale(gatherCoverage(scene, h.p, h.n, rq, rng, gaM));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
                         if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
@@ -817,6 +884,11 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                         nrmOut = (M.nEmitted > 0 && a > 0.0)
                                      ? 1.0 / (a * (double)M.nEmitted) : 0.0;
                     }
+                    // M-GATHERAREA: divide by the area actually gathered from, not by the whole
+                    // disc. `gatherAreaSamples() == 0` (the default) returns coverage 1 and
+                    // leaves nrmOut untouched, so every existing render is bit-identical.
+                    if (const int gaM = gatherAreaSamples())
+                        nrmOut *= gatherAreaScale(gatherCoverage(scene, h.p, h.n, rq, rng, gaM));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
                         if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
