@@ -1412,7 +1412,16 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   cloth hides the surface behind it and the area is under-counted — which is the remaining
   one-sided error, and folded cloth is exactly the case. Marching several hits per probe is the
   obvious next move.
-* **Device and mode-`S` twins**, so `-device gpu` and mode `S` do not diverge once it is default.
+* ~~Device twin~~ **DONE (v0.268.0)** — both backends recover the same and the correction is on
+  by default; see the table above.
+* **Mode `S` does NOT need this, and that is a real difference rather than an omission
+  (established 2026-09-10).** The mechanism is identical — `sppm_render.h`'s estimate divides by
+  `πr²` too — but the *consequence* is not, because **only mode `M` holds its radius still**.
+  SPPM shrinks per pass (`P.radius *= sqrt(ratio2)`, `ratio2 = (nAcc + αM)/(nAcc + M) < 1`), so
+  its truncation bias goes to zero with the render: mode `S` is **consistent** here and mode `M`
+  is not. The same arithmetic that makes the disc overhang a permanent floor for `M` makes it a
+  transient for `S`. Correcting `S` would buy convergence *rate*, not correctness, which puts it
+  far below the rest of this list rather than beside the device twin as originally filed.
 
 What stands from attempt 1: the darkening is real and one-sided (−33 % on a cap edge, −70 % on
 hair), the direction of the correction was right on every truncated element, and a correct
