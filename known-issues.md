@@ -1360,7 +1360,40 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   this entry already establishes that no photon statistic separates geometry from illumination,
   so such a gate would skip exactly the dim truncated gathers that most need correcting.
 
-  1.81× is still too much for default-on; the open question is the sample budget `M` itself.
+  **The budget is settled: `M = 8`, 1.30×.** Sweeping M at 200 s per arm against the same
+  reference:
+
+  | element | M=0 | M=4 | M=8 | M=16 |
+  |---|---|---|---|---|
+  | `alice_hair` | −68.0 % | −35.5 % | **−5.9 %** | −0.5 % |
+  | `alice_dress` | −40.3 % | −7.7 % | **−13.0 %** | −15.8 % |
+  | `cap_gyroid` | −33.3 % | +1.9 % | **−6.3 %** | −4.3 % |
+  | `grid_ground` (control) | +0.1 % | +1.5 % | +0.7 % | +0.6 % |
+  | cost | 1.00× | 1.12× | **1.30×** | 1.70× |
+
+  **`alice_dress` and `cap_gyroid` score BETTER at M = 4, and that is the Jensen bias, not
+  accuracy.** The estimate divides by measured coverage and `E[1/cov] > 1/E[cov]`, so a noisier
+  `cov` biases the correction *bright* — which happens to cancel the layering under-count on
+  cloth. `alice_hair` is the discriminator that exposes it: at M = 4 it is still −35.5 %,
+  because four probes cannot resolve a coverage as low as hair's. Picking the default on the
+  cloth numbers would have shipped the least accurate setting for the most flattering reason.
+
+  Still **opt-in**, despite 1.30× being affordable: there is no device or mode-`S` twin yet, and
+  turning it on by default would make `-device gpu` disagree with `-device cpu` on every scene
+  with truncated geometry — precisely the class of bug the rest of this file spent the day
+  removing.
+* **Stratified sampling was tried twice and REVERTED both times — do not retry it without
+  reading this.** It was aimed at the Jensen bias above, and it is incompatible with the gate.
+  (a) Stratifying *both* dimensions off one index (`u1 = u2 = (i + ξ)/M`) correlates radius with
+  angle and puts every sample on a spiral: `cap_gyroid` −32.9 %, i.e. almost no correction.
+  (b) Stratifying the radius alone still fails, because `u1 = (i + ξ)/M` walks the rings
+  centre-outwards, so the gate's first `M/4` probes all land in the MIDDLE of the disc — which
+  is covered by definition — the gate fires on nearly every gather and the correction stops:
+  `cap_gyroid` −16.9 %, `alice_hair` −14.8 %, against −4.3 % and −0.5 % independent. Independent
+  samples are spread over the whole disc by construction, which is exactly what the gate needs
+  to see. A correct version would need a *permuted* stratum order (van der Corput or a coprime
+  stride) so the early-out's first probes still span the disc; the Jensen bias it would buy back
+  is small next to the risk, which is why it is not there.
 * **`alice_dress`'s residual −13.6 %.** The probe takes the NEAREST hit along −n, so a fold of
   cloth hides the surface behind it and the area is under-counted — which is the remaining
   one-sided error, and folded cloth is exactly the case. Marching several hits per probe is the

@@ -83,13 +83,37 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
     // Deliberately NOT a photon-count test: this entry already establishes that no photon
     // statistic can separate geometry from illumination, and a gate built on one would skip
     // exactly the dim truncated gathers that need correcting most.
-    const int probe0 = (M >= 8) ? (M / 4) : M;
+    // `max(2, M/4)` and never M itself: at M = 4 the old form set probe0 = 4, so the check sat
+    // at an index the loop never reaches and the early-out silently never fired -- which is why
+    // M = 4 cost as much as M = 8 in the first sweep.
+    const int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995)
             return 1.0;                // interior of a flat patch: nothing to correct
-        // Uniform in the disc: sqrt(u) puts equal expected samples per unit AREA, which is what
-        // an area fraction needs -- a linear radius would over-weight the middle and report a
-        // truncated disc as fuller than it is.
+        // STRATIFIED in the disc, and the stratification is not a refinement -- it attacks a
+        // BIAS. The estimate divides by the measured coverage, and E[1/cov] > 1/E[cov] by
+        // Jensen, so noise in `cov` makes the correction too BRIGHT, the more so the fewer
+        // samples. Measured: `alice_dress` reads -5.9 % at M = 4 against -15.2 % at M = 16, and
+        // the M = 4 figure is not the better one -- it is a bias cancelling the layering
+        // under-count below. Cutting the variance of `cov` at fixed M shrinks that bias for
+        // free, and a disc stratifies exactly: equal-area rings x equal angle sectors, jittered
+        // inside each cell so it stays unbiased.
+        //
+        // sqrt(u) within the ring puts equal expected samples per unit AREA; a linear radius
+        // would over-weight the middle and report a truncated disc as fuller than it is.
+        // INDEPENDENT, not stratified, and that is a decision with a measurement behind it.
+        // Stratifying the radius to fight the Jensen bias below is incompatible with the
+        // early-out above: `u1 = (i + xi)/M` walks the rings from the centre outwards, so the
+        // gate's first M/4 probes all land in the MIDDLE of the disc, which is covered almost
+        // by definition -- the gate then fires on nearly every gather and the correction stops
+        // happening. Measured at M = 16: `cap_gyroid` -4.3 % independent against -16.9 %
+        // radius-stratified, `alice_hair` +1.5 % against -14.8 %. (Stratifying BOTH dimensions
+        // off one index is worse still, -32.9 %, because it correlates radius with angle and
+        // puts every sample on a spiral.) Independent samples are spread over the whole disc by
+        // construction, which is exactly what the gate needs to see.
+        //
+        // sqrt(u) puts equal expected samples per unit AREA; a linear radius would over-weight
+        // the middle and report a truncated disc as fuller than it is.
         const double rr = r * std::sqrt(rng.uniform());
         const double ph = 2.0 * PI * rng.uniform();
         const Vec3 q = p + t * (rr * std::cos(ph)) + b * (rr * std::sin(ph));
