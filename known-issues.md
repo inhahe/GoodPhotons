@@ -330,10 +330,24 @@ figures** (0.625046 / 0.625045) where before they were 0.48 % apart. `scenes/_di
 `_distant_light_near` and `_distant_geometry` — the stock sphere-light scenes — all go to
 **−0.01 %** CPU-vs-GPU.
 
-**Noticed in passing, NOT investigated:** `scenes/_deltalight_mix.ftsl` sits at **+0.79 %**
-GPU-vs-CPU. It has no sphere light (area + spot + sun), and both controls above are
-bit-identical under this change, so it is a separate pre-existing thing. Logged here so it is
-not re-found from scratch.
+**Noticed in passing, then chased and CLOSED — it was my own measurement, not a bug
+(2026-09-09).** `scenes/_deltalight_mix.ftsl` was logged here at **+0.79 %** GPU-vs-CPU as "a
+separate pre-existing thing". It is not a thing at all. Three seeds per device at 4000 spp:
+
+| scene | raw mean | seed sd | **trimmed mean** | trimmed sd |
+|---|---|---|---|---|
+| sun only | +1.42 % | 1.19–2.90 % | **−0.01 %** | 0.01 % |
+| all three lights | −0.12 % | 0.59–1.44 % | **+0.00 %** | 0.01 % |
+
+The CPU and GPU agree to a hundredth of a percent. The +0.79 % was a **single-seed raw image
+mean** on a scene with a mirror sphere and a 0.53° sun — in the isolated sun scene the top 0.1 %
+of pixels carry **100 %** of the CPU/GPU difference — so it was one firefly, read as a finding.
+
+Worth recording because of *when*: this file spent the same morning establishing that a
+firefly-dominated image mean is not a statistic (M-VS-R-GALLERY), and the phantom was generated
+hours later by a regression sweep of mine that still scored raw means. **The lesson does not
+transfer by being written down; it transfers by being built into the harness.**
+`scraps/gnee_gpu_ab.sh` and the CPU-vs-GPU sweep now trim.
 
 **Where it bites:** `src/backward.h` (`hostConnMaxT`, the `blocked` lambda in `emitterGeom`),
 `src/render_cuda.cu` (`connMaxT`, the device twin whose fp64 gate encoded the wrong assumption),
