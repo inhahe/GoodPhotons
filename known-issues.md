@@ -1813,6 +1813,39 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   honest converged baseline is `alice_hair −22 %`, `alice_dress −18 %`, `cap_gyroid +2 %`,
   `creature +44 %` — that is what a fix has to beat, not the flattering `−11 / −11 / −6 / +48`.
 
+* **THE TWO REGIMES BRACKET THE ANSWER, AND NO GEOMETRIC PROBE SEPARATES THEM (2026-09-10).**
+  The overfill model says a tangle's gatherable area exceeds `πr²`, so the probe should SUM every
+  same-facing hit rather than take the nearest, letting coverage exceed 1. The reverted layer
+  march did sum — over the CYLINDER — so the standing theory was that the ball bound would make
+  summing safe, by excluding layers deeper than `r` that contribute no photons. **Tested at
+  converged `M = 32`, and that theory is wrong:**
+
+  | ROI | off | shipped (nearest hit) | **ball-bounded area sum** |
+  |---|---|---|---|
+  | `creature` | −3.9 % | +44.2 % | **−0.5 %** |
+  | `alice_hair` | −68.6 % | −21.3 % | −43.4 % |
+  | `alice_dress` | −38.7 % | −18.8 % | −41.6 % |
+  | `cap_gyroid` | −32.6 % | +0.3 % | −29.4 % |
+  | `grid_ground` (null) | −6.0 % | −3.9 % | −5.4 % |
+
+  Summing is **exactly right for fur** — `creature` lands at −0.5 % — and it neutralises the
+  correction everywhere else, collapsing each ROI back toward its uncorrected value. So the
+  dilution the march suffered happens **inside** the ball, not beyond it; bounding the sum does
+  not rescue it.
+
+  **What this establishes, and it is the useful part.** The two probes *bracket* the truth: for
+  every ROI the correct answer lies between "nearest hit only" and "sum all layers", and **which
+  end it sits at is not a geometric property**. `creature` wants the sum; `alice_hair`, itself a
+  groom of fibres, wants neither (−21 % vs −43 %); `cap_gyroid`, a smooth isosurface, wants the
+  nearest. The distinguishing fact is whether the extra layers actually **carried photons** —
+  a shadowed fold has area and no flux, a lit tangle has both — and that is a question about the
+  light, not the geometry. No probe over the surface can answer it, which is why the geometric
+  line is now closed: three geometric variants (covariance ellipse, cylinder march, ball-bounded
+  sum) have each failed for the same underlying reason.
+
+  Nearest-hit remains the better default: it is right on four ROIs of five, and wrong only on the
+  densest tangle. Reverted.
+
   **Rig note, because the first run of this looked like a clean confirmation and was entirely
   artefact.** The ROI file is `name x0 y0 x1 y1`; parsing it as `y0 y1 x0 x1` collapses every box
   to a single pixel, which is why `alice_dress` and `alice_hair` — three rows apart — reported
