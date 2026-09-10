@@ -1784,6 +1784,35 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   *not* the lever it looked like — measured coverage on the creature's fur is 0.80–0.83, nowhere
   near the clamp.
 
+* **THE DEFAULT `M = 8` IS TWO BIASES CANCELLING, NOT ONE FIX (2026-09-10).** Sweeping the probe
+  count tests whether the fur error is Jensen's inequality (`E[1/cov] > 1/E[cov]`, which biases
+  *bright* and shrinks as `M` grows) or something structural. It is structural — but the sweep
+  found something else on the way:
+
+  | ROI | off | **M = 8 (shipped)** | M = 32 | M = 64 |
+  |---|---|---|---|---|
+  | `alice_hair` | −68.6 % | **−11.4 %** | −21.3 % | −22.1 % |
+  | `alice_dress` | −38.7 % | **−11.0 %** | −18.8 % | −17.8 % |
+  | `cap_gyroid` | −32.6 % | −6.0 % | +0.3 % | +1.9 % |
+  | `creature` | −3.9 % | +48.2 % | +44.2 % | +43.7 % |
+  | `grid_ground` | −6.0 % | −4.4 % | −3.9 % | −4.2 % |
+
+  **`alice_hair` and `alice_dress` get roughly twice as bad as `M` rises**, converging near −22 %
+  and −18 %. The shipped default reads −11 % on both because Jensen's upward bias at `M = 8`
+  offsets a residual dark bias — the number is good, and it is good for the wrong reason. Only
+  ~4 pp of the fur's +48 % is Jensen (it plateaus at +43.7 %), which is why fur barely moves.
+
+  This is the same failure as the `creature` omission, one level down: **`M` was tuned on the
+  ROIs where the cancellation looks best.** A cancellation is not a fix — it depends on the
+  radius, the geometry and the scene, so it drifts, and it will silently stop working on content
+  nobody sweeps.
+
+  **Methodological consequence, and it applies to every future attempt on this entry: evaluate
+  at converged `M` (32 or more), not at the default.** At `M = 8` a real improvement to the
+  footprint can be masked by the loss of a sampling bias that was doing part of the work. The
+  honest converged baseline is `alice_hair −22 %`, `alice_dress −18 %`, `cap_gyroid +2 %`,
+  `creature +44 %` — that is what a fix has to beat, not the flattering `−11 / −11 / −6 / +48`.
+
   **Rig note, because the first run of this looked like a clean confirmation and was entirely
   artefact.** The ROI file is `name x0 y0 x1 y1`; parsing it as `y0 y1 x0 x1` collapses every box
   to a single pixel, which is why `alice_dress` and `alice_hair` — three rows apart — reported
