@@ -11004,13 +11004,33 @@ the estimator stays unbiased.
 Remaining limitation: past 64 the GPU still clamps. Going deeper needs another instantiation,
 and the per-thread local-memory footprint is already ~13 KB there.
 
-### BUG — OPEN (2026-07-28): `light env { spd ... intensity N }` silently ignores `intensity`
+### BUG — **FIXED** (2026-09-10, v0.270.3; filed 2026-07-28): `light env { spd ... intensity N }` silently ignored `intensity`
 
-In `ftsl.h` (~4563-4573) the env-light block parses `intensity` but only applies it on the
-`file`-based (image env map) path; the analytic-SPD path calls `addEnvLight(spd, binWidth_)`
-and drops the scale on the floor. An authored `intensity 40` therefore changes nothing, with no
-warning. Proper fix: scale the spectrum by `intensity` (or pass it through to `addEnvLight`) on
-the SPD path too, so both forms of `light env` mean the same thing.
+The env-light block parsed `intensity` but applied it only on the `file` (image env map) path;
+the analytic-SPD path called `addEnvLight(spd, binWidth_)` and dropped the scale on the floor.
+An authored `intensity 40` changed nothing, with no warning.
+
+**Worse than filed, for two reasons.**
+
+* The `power`/`lumens` rejection a few lines above *directs the user to this knob* — "absolute
+  `power`/`lumens` is not supported …; use `intensity` or scale the `spd` instead" — so the one
+  documented way to brighten a constant env was the one that did not work. `REFERENCE.md` also
+  documented it as applying to both forms, so the docs were right and the code was the liar.
+* **A rig in this repo was silently running on it.** `scenes/_spec_repro_env.ftsl` (built for
+  GLOSSY-NEE's env work) says `light env { spd preset:bb6500 intensity 2.6e-14 }`, and a
+  blackbody SPD in SI units is enormous: the scene was rendering at a mean of **3.3e13**, some
+  3.8e13× too bright, for as long as it has existed. Fixed, it renders at 0.849 — the ratio is
+  2.6e-14 to four figures, exactly the authored factor.
+
+  **The GLOSSY-NEE conclusions drawn on that rig still stand**, because every one of them is a
+  RATIO — on-vs-off and CPU-vs-GPU percentages — and a global scale cancels exactly in a ratio.
+  Worth stating rather than assuming, and worth remembering that it survived fp32 accumulation
+  on the device at 1e13 (the ±0.11 % CPU/GPU agreement was measured at that scale).
+
+Fixed with the same idiom the `sun` branch above already used, and the exact `== 1.0` compare
+keeps every scene that omits `intensity` bit-identical (verified on `_env_cornell`). No device
+work: the scale is applied to the `Spectrum` before `addEnvLight`, so both backends see it
+(CPU 0.849074 vs GPU 0.849019, −0.01 %).
 
 ### TECH-DEBT / DOC — OPEN (2026-07-28): a field leaf's `center` is applied *before* its `rotate`
 

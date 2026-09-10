@@ -6288,7 +6288,17 @@ private:
                 L.scene.addEnvLight(std::move(map), binWidth_);
                 return true;
             }
-            L.scene.addEnvLight(spd, binWidth_);
+            // `intensity` scales the analytic-SPD env exactly as it scales the `file` one.
+            // It used to be parsed here and dropped, so an authored `intensity 40` changed
+            // nothing, with no warning -- and the `power`/`lumens` rejection above *directs
+            // the user to this knob*, so the one documented way to brighten a constant env
+            // was the one that did not work. Same idiom as the sun branch above; the exact
+            // `== 1.0` keeps every scene that omits it bit-identical.
+            const double envInten = dblOf(b, "intensity", 1.0);
+            L.scene.addEnvLight(
+                envInten == 1.0 ? spd
+                                : Spectrum([spd, envInten](double w) { return spd(w) * envInten; }),
+                binWidth_);
             return true;
         }
         // Default: rectangular area light. Also add the emissive quad to geometry so
