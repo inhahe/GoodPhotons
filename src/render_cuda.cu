@@ -17629,8 +17629,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // MERGE=true kernel reads as "no merges" — so `-nobeams` degenerates to mode D exactly.
     DBeamMap dbm{};
     if (bmap) uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/true);
-    // `-jsurf`'s map (increment 1: uploaded and handed to the kernel; the gather itself lands
-    // in the next step, so an uploaded map changes nothing yet).
+    // `-jsurf`'s map. (The "increment 1: ... an uploaded map changes nothing yet" this comment
+    // used to carry was true for one version. The gather landed in 0.263.1 -- see `mergeAny`
+    // below, which launches the MERGE kernel for a surface map with no beams, and
+    // `dSurfMergeAt`.)
     DSurfMap dsm{};
     if (smap) uploadSurfMapCuda(smap, up, dsm);
     {   // the half-render diagnostic, mirrored from the host so one half can be compared

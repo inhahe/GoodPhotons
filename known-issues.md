@@ -321,6 +321,38 @@ the chunk. `dGenLightSubpath` already exists in `render_cuda.cu` (it feeds the c
 so the missing pieces are the **deposit** (beams, surface photons and their MIS partials) and a
 device-side **acceleration build** over them, per chunk.
 
+**AND THE PORT HAS A WORKING TEMPLATE IN THE TREE (2026-09-11).** It is not a from-scratch
+build. `render_cuda.cu` already contains two resident device sessions that do exactly the shape of
+thing mode `J` needs, per pass, with no host round trip:
+
+* **`VcmSession` / `vcmSessionPass` (mode `U`)** — `kVcmLight` traces one light subpath per
+  pixel on the device and stores its connectible vertices into a slab; the slab is compacted;
+  then the uniform grid is built **on the device** (`thrust::transform_reduce` for the bbox,
+  `kVcmCellKey`, `thrust::stable_sort_by_key`, `thrust::lower_bound` for `cellStart` — and the
+  comment notes the stable sort reproduces the host counting sort's order exactly, so the merge
+  sums stay bit-identical); then `kVcmCamera` gathers from it. One pass = one realization.
+* **`SppmSession` (mode `S`)** — the same pattern with a grow-only device photon buffer and
+  `ensureDevCap` scratch, explicitly "no photon ever round-trips to the host".
+
+**That is the whole reason mode `U` reaches ~8500 realizations and mode `J` reaches 126**, and it
+makes the mechanism concrete rather than inferred: `U`'s light side is *on the device, inside the
+per-pass loop*; `J`'s is on the host, outside a 0.15 s chunk. So the work is to give mode `J` a
+session of the same shape whose light kernel deposits `DSurfPhoton` / `DSurfMis` (the layouts
+already exist, as does the gather — `dSurfMergeAt`) instead of `DVcmLV`. The host deposit it must
+mirror is `bdpt.h` ~2080, and every device twin it needs is already written: `dGenLightSubpath`,
+`dSurfMergeSite`, `dMergeEtaPrime`, `dMisWeight`'s `kappaSurf` arm. The beam half comes second and
+is harder — a BVH, not a grid.
+
+**Three stale claims about `-jsurf` and the GPU, corrected the same day** (no version bump: all
+three were comments or dead code, and the fix is bit-identical, verified). `main.cpp` said "the
+device merge weight carries one merge kind ... an EXPLICIT `-jsurf` is a request for the three-way
+estimator and **forces the CPU as it always has**", and `render_cuda.cu` said the uploaded surface
+map "changes nothing yet". Both stopped being true when UPBP-VM's device half landed in **0.263.1**
+and neither was updated. `g_jSurfExplicit`, which existed to drive that CPU force, was **written by
+three argument handlers and read by none** — so the force never existed even when the comment was
+new. Worth logging because the false claim cost real time: it says the measurement two paragraphs
+up was taken on the CPU, when it was taken on the device with surface merges live.
+
 **Caveat on the scene.** `_caustic_box` has no media, so `beam BVH 0.00 s` says nothing about a
 media scene — and the `PERF` entry measured `_fog_cornell` at `-n 200000` as 8.84 s of which
 **8.69 s was the BVH build**. On a media scene the beam BVH is the dominant light-side cost and

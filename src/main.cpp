@@ -13108,14 +13108,16 @@ static bool g_noBeams = false;
 // no energy shift on a media+surfaces scene when the third technique is switched in (the
 // three-way balance heuristic sums to one). `-nojsurf` is the opt-out, exactly as `-nobeams`.
 //
-// WHERE IMPLEMENTED means the CPU: the device merge weight carries one merge kind, so a GPU
-// run cannot deposit surface photons at all (a light pass that did would under-weight the
-// beam merges in the device gather). The default therefore yields to the two-technique
-// estimator on the GPU, with a notice; an EXPLICIT -jsurf is a request for the three-way
-// estimator and forces the CPU as it always has. The device twin is what still stands
-// between mode U and retirement. Tracked in known-issues.md under UPBP-VM.
+// ON BOTH BACKENDS since 0.263.1 (UPBP-VM's device half). This comment used to say the
+// opposite -- "the device merge weight carries one merge kind ... an EXPLICIT -jsurf forces the
+// CPU as it always has" -- and was left standing when the device twin landed. It is wrong in a
+// way that costs time rather than correctness: `dMisWeight` takes BOTH `mergeKappa` and
+// `kappaSurf`, `renderBdptCuda` uploads the map through `uploadSurfMapCuda`, `mergeAny` launches
+// the MERGE kernel when either map is non-empty, and `dSurfMergeAt` gathers. There is no gate
+// forcing the CPU, and `g_jSurfExplicit` -- which existed to drive one -- was written by three
+// argument handlers and read by none, so it is gone. Do not re-add a flag to record an intent
+// nothing acts on.
 static bool g_jSurf = true;
-static bool g_jSurfExplicit = false;   // -jsurf / -jsurf-radius named on the command line
 // -jsurf-radius: the gather disc's radius r_s in world units. 0 = auto, meaning the same
 // `sceneRadius * g_pmRadiusFactor` (`-pmradiusfrac`) that modes M/S/U start from — mode J's
 // merges deliberately share the photon-map radius convention so a like-for-like comparison
@@ -16561,11 +16563,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // `stageProg` reports the host->device conversion of the beam map, which for a
             // multi-million-sub-beam map is long enough to look like a hang without it.
             //
-            // NOT when the point merges are on: the device twin of the merge weight
-            // (render_cuda.cu's DBeamMis / dMisWeight) carries ONE merge kind, so a GPU run
-            // with `-jsurf` would silently drop every surface merge AND under-weight the beam
-            // ones (their denominator would be missing the point-merge terms). The gate is
-            // above, at `useGpu`, rather than a comment here — see the -jsurf block.
+            // ...INCLUDING when the point merges are on. This comment used to describe a
+            // gate at `useGpu` that sent `-jsurf` to the CPU, on the grounds that the device
+            // merge weight carried one merge kind. Both halves stopped being true in 0.263.1:
+            // `dMisWeight` takes `mergeKappa` AND `kappaSurf`, and there is no such gate (nor
+            // was there one at the time this was written -- `g_jSurfExplicit` was never read).
+            // `photonsPtr` below is what carries the surface map to the device.
             if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth,
                                               diffraction, p, g_heroC, beamsPtr, &stageProg,
                                               photonsPtr);
@@ -18922,14 +18925,14 @@ static int run(int argc, char** argv) {
             g_beamTargetSet = true;   // mode J only mentions its knee fallback when this is absent
         }
         else if (!std::strcmp(argv[i], "-jsurf") || !std::strcmp(argv[i], "-jmerge-surf")) {
-            g_jSurf = true; g_jSurfExplicit = true;
+            g_jSurf = true;
         }
         else if (!std::strcmp(argv[i], "-nojsurf") || !std::strcmp(argv[i], "-no-jsurf")) {
-            g_jSurf = false; g_jSurfExplicit = false;
+            g_jSurf = false;
         }
         else if (!std::strcmp(argv[i], "-jsurf-radius") && i + 1 < argc) {
             g_jSurfRadius = std::atof(argv[++i]);
-            g_jSurf = true; g_jSurfExplicit = true;   // naming the radius is asking for the merges
+            g_jSurf = true;      // naming the radius is asking for the merges
         }
         else if ((!std::strcmp(argv[i], "-jsurf-count") ||
                   !std::strcmp(argv[i], "-jsurfcount")) && i + 1 < argc) {
