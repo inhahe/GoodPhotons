@@ -939,6 +939,31 @@ analogy put it — the surface half was a trace plus a grid, so the beam half "o
 trace ported, when it needed the tree; and now that the tree is done the remaining cost is the
 split, not the trace. Measure the split before writing the deposit.
 
+**AND THE KNOB THE PORT INVALIDATED, RETUNED (v0.272.4).** `-beamrefresh` trades realizations
+against camera samples, and 0.10 was chosen when a mode-`J` realization cost ~0.32 s. On the
+device it costs ~0.10 s. `_fog_thick`, 20 s, 4 seeds, interleaved:
+
+| region | f=0.10 (shipped) | **f=0.30** | f=0.60 |
+|---|---|---|---|
+| whole frame | 1.000x | **0.641x** | 0.806x |
+| brightest 2x2 | 1.000x | **0.722x** | 0.812x |
+
+**1.56x less variance for a constant change**, with 0.60 worse than 0.30 — an interior optimum,
+the same shape the in-chunk split showed and for the same reason.
+
+**Deliberately not a global default change.** `g_beamRefreshFrac` is shared with mode `M`, which
+does **not** get the device tree (`g_jDevBeamOk` is set only inside mode `J`'s dispatch, because
+the host tree is the only one a CPU gather can use). A mode-`M` realization still costs the full
+host SAH build, so raising the shared default would make it pay three times over for realizations
+it cannot get cheaply; the same argument excludes CPU mode `J`. The retune is scoped to exactly
+where the cost changed, and an explicit `-beamrefresh` wins everywhere. Verified on the shipped
+binary: GPU mode `J` reports 30 %, `-beamrefresh 0.10` reports 10 %, CPU mode `J` reports 10 %.
+
+**The general lesson, since this is the second instance today:** a tuned constant is a claim about
+a cost, and porting that cost somewhere else silently invalidates it. The in-chunk split and this
+knob both had interior optima that moved when the thing they were balancing got cheaper. After
+any port, re-sweep the knobs the port was supposed to relieve.
+
 **One edge to state before this is defaulted.** `buildBeamLbvhDevice` refuses `n <= 1` (Karras has
 no internal node for a single primitive), and with the host tree skipped there is then no tree at
 all -- `nNodes == 0`, which every entry point already reads as "no volume gather". For a one-beam

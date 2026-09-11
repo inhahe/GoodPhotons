@@ -12136,6 +12136,14 @@ static bool      g_beamFreeze    = false;
 // ~2.6 %, mode M ~0.35 % — both are dominated by the gather, see UPBP-CONV), so a 10 % budget
 // affords many rebuilds without being felt.
 static double    g_beamRefreshFrac = 0.10;
+// Was `-beamrefresh` named on the command line? An explicit value must win over the mode-J
+// device-light-side retune below, which is a DEFAULT and not an override.
+static bool      g_beamRefreshSet  = false;
+// The retuned value for a mode-J render whose light side is on the device (0.272.4). Measured
+// 1.56x better than 0.10 on `_fog_thick` whole-frame variance, with 0.60 worse than 0.30, so the
+// optimum is interior. NOT applied to mode M or to CPU mode J: neither gets the device tree, so
+// a realization still costs them the full host SAH build and their optimum has not moved.
+static constexpr double kBeamRefreshDevJ = 0.30;
 // UPBP-CONV (3): lower bound on a merge's sin(theta) -- the beam x ray kernel's Jacobian
 // denominator, and its singularity. 0 = the literal, unbounded estimator. The default 0.3 (the
 // clamp binds when a beam lies within ~17.5 deg of the camera ray) is measured, not chosen: on
@@ -16350,6 +16358,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             explicit JDevBeamScope(bool v) : prev(g_jDevBeamOk) { g_jDevBeamOk = v; }
             ~JDevBeamScope() { g_jDevBeamOk = prev; }
         } jdbScope(useGpu);
+        // ...and with the light side on the device, a realization costs ~3x less, so
+        // `-beamrefresh`'s balance point moves with it. Scoped for the same reason jdbScope is:
+        // the next camera of a batch may be a CPU one, where the old value is still right.
+        struct JRefreshScope {
+            double prev; bool active;
+            explicit JRefreshScope(bool on) : prev(g_beamRefreshFrac), active(on) {
+                if (on) g_beamRefreshFrac = kBeamRefreshDevJ;
+            }
+            ~JRefreshScope() { if (active) g_beamRefreshFrac = prev; }
+        } jrfScope(jSkipHostBvh() && !g_beamRefreshSet && !g_beamFreeze);
         const bool shareLight = (jcache != nullptr) && g_beamFreeze;
         JLightCache jlocal;
         JLightCache& jlc = shareLight ? *jcache : jlocal;
@@ -18934,6 +18952,7 @@ static int run(int argc, char** argv) {
         else if ((!std::strcmp(argv[i], "-beamrefresh") ||
                   !std::strcmp(argv[i], "-lightrefresh")) && i + 1 < argc) {
             g_beamRefreshFrac = std::atof(argv[++i]);
+            g_beamRefreshSet = true;
             if (g_beamRefreshFrac <= 0.0) g_beamFreeze = true;   // `-beamrefresh 0` == -beamfreeze
         }
         // Gate (2) of the UPBP plan: cross-check every CPU-BDPT MIS weight against an
