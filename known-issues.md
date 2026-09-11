@@ -12,7 +12,7 @@ method's limitation, worth knowing before trusting a future audit: grepping find
 features, not superseded reasoning.** The rest were checked individually and are real —
 `UPBP-W(a)` still uses a scalar `radRef()`, `BDPT-MIS-TR`'s `trDet`/`camTr` machinery belongs to
 mode `J`'s merge weight rather than mode `D`'s connections, `grid:`/`scatter:` are still absent
-from the four field sites, and the mode-`J` flyby still falls to `restIdx` at `main.cpp:23142`.
+from the four field sites, and the mode-`J` flyby still falls to `restIdx` at `main.cpp:23142` (it still does, and always will — v0.271.0 shared its light side *inside* that per-camera loop rather than by promoting mode `J` to a group).
 
 **A repro scene for an OPEN entry must be TRACKED** (`scenes/`, not `scraps/`). `scraps/` is
 git-ignored, so an entry whose repro lives there cannot be re-validated and its drift cannot be
@@ -3339,7 +3339,7 @@ the `achro`→`cieA` fold could apply — which made mode `J` need more beams th
 same chroma noise, and made this cap bite sooner. Both now apply (see the two FIXED entries
 below), so that particular pressure on the cap is gone; the cap itself is unchanged.
 
-### PERF — OPEN (2026-09-02, v0.214.0): a mode-`J` flyby rebuilds the beam map **once per frame**, when the map is view-independent and mode `M` already shares one across the whole flight
+### PERF — HALF DONE (2026-09-02, v0.214.0; `-beamfreeze` half fixed 2026-09-11, v0.271.0): a mode-`J` flyby rebuilds the beam map **once per frame**, when the map is view-independent and mode `M` already shares one across the whole flight
 
 **What happens.** `groupCameras` in `main.cpp` sorts a multi-camera render into a shared forward
 `A`/`B` group, a shared mode-`M` group, and `restIdx` — the per-camera fallback, which calls
@@ -3398,6 +3398,50 @@ block into a group driver, which is the same refactor `runSharedGroup` did for `
 behavioural consequence to document when it lands: frames would then **share one beam realisation**,
 so the merged component's noise becomes correlated frame-to-frame exactly as mode `M`'s radiance
 solution is — which is the accepted trade there and should be the accepted trade here.
+
+> **THE `-beamfreeze` HALF IS DONE (2026-09-11, v0.271.0).** `JLightCache` (`main.cpp`, just
+> above `runRender`) holds the three objects — `BeamMap`, `bdpt::SurfMap`, `bdpt::BeamBudgetInfo`
+> — plus a key; `runRender` takes one by pointer and mode `J` binds its three locals to it as
+> references when `-beamfreeze` is set, so a cache hit skips `buildLightSide(0)` entirely. The
+> per-camera loop in `run()` owns the cache and `clear()`s it when the batch ends, so a 659 MB
+> map is not held through the stereo/compositing tail.
+>
+> **This turned out to be a strictly stronger result than the entry predicted, and the
+> difference matters.** The entry closes with a warning that shared frames would then "share one
+> beam realisation, so the merged component's noise becomes correlated frame-to-frame … which is
+> the accepted trade there and should be the accepted trade here." **Under `-beamfreeze` there is
+> no trade at all**, because the frames already shared that realisation — they were each paying
+> to retrace it. Three facts that were already true force it:
+>
+> * the light pass seeds per **absolute subpath index** (`seedUnit(rng, salt + i, …)`, bdpt.h
+>   ~1900, commented "so the map is identical for any thread count"), so the map does not depend
+>   on the thread count, the chunking, or anything the camera does;
+> * the only per-pass salt is `RngSaltScope(epoch)`, and rng.h states epoch 0 is the identity;
+> * the beam budget's pilot has its own fixed seed, so `jbb` comes back the same too.
+>
+> So the correct claim is not "acceptably correlated" but **bit-identical**, and that is testable.
+> Measured on `scenes/_jfly.ftsl` (fog Cornell, 3-camera `camera_curve`), comparing the shared
+> batch against three separate single-camera runs of the same frames, `cmp` on the `.pfm`:
+>
+> | config | frame 0 | frame 1 | frame 2 |
+> |---|---|---|---|
+> | `-n 2000 -spp 4 -r 48`   | identical | identical | identical |
+> | `-n 200000 -spp 1 -r 32` | identical | identical | identical |
+>
+> — and every run logged the same `5758926 beams`, which is the determinism claim showing up
+> directly in the output. The control (no `-beamfreeze`) logs **zero** reuse lines and rebuilds
+> per camera, as it must.
+>
+> **What it buys.** `-n 200000`, 3 cameras, deliberately gather-light so the map cost is visible:
+> **86.2 s → 58.0 s (1.49×)**. The light side itself was 7.68 + 8.78 + 7.28 s unshared against
+> 6.12 s shared; the rest of the gap is the two scene loads the batch does not repeat. The
+> per-frame saving is exactly the number mode `J` already prints ("*N beams from M light subpaths
+> in T*"), so a 600-frame flyby of this scene saves 599 × 6.12 s ≈ **61 minutes**, and on
+> `gallery_rain`, where that line reads minutes rather than seconds, correspondingly more.
+>
+> **Still open: the refreshing case**, which is the default. It needs the loops transposed (build
+> a map, advance every camera's current epoch against it, rebuild) and that changes each frame's
+> write/checkpoint cadence, so it is a different change — see the scope note above.
 
 **Related:** the mode-`D` entry below (*"mode `D` has no resident multi-camera session, so a flyby
 re-uploads the whole scene once per frame"*) is the same shape of problem on the other half of mode

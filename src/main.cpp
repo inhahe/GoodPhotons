@@ -15669,6 +15669,62 @@ static int runCompositeProgressive(
     return writeOk ? 0 : 1;
 }
 
+// MODE J'S LIGHT SIDE, SHARED ACROSS THE CAMERAS OF ONE BATCH (-beamfreeze).
+//
+// The beam map and the surface photon map are VIEW-INDEPENDENT: `traceLightBeamPass` takes a
+// `Camera&` only to hand it to `generateLightSubpath`, whose `randomWalk` opens with
+// `(void)cam;   // cam reserved for future NEE-to-camera use`. Nothing downstream of it reads
+// the camera, so a flyby's twelfth frame retraces, to the bit, the map its first frame built.
+//
+// "To the bit" is not a hope here, it is forced by three things that already hold:
+//   * the light pass seeds per ABSOLUTE subpath index (`seedUnit(rng, salt + i, ...)` in
+//     bdpt.h), so the map does not depend on the thread count or on the chunking;
+//   * the only per-pass salt is `RngSaltScope(epoch)`, and epoch 0 is the identity
+//     (rng.h: "`k == 0` is the identity"), so every camera's epoch 0 draws one stream;
+//   * the budget pilot has its own fixed seed, so `jbb` comes back the same too.
+// So this cache changes the render's COST and not its pixels, and that is testable rather
+// than arguable -- see known-issues.md PERF.
+//
+// It is gated on `-beamfreeze` for a reason that is not conservatism. Without the freeze the
+// light side is REDRAWN between epochs under a fresh salt (UPBP-THICK), and which realization
+// a camera ends on then depends on how many epochs its own budget fitted -- so there is no one
+// map to share, and hoisting one would silently hand frame 2 whatever realization frame 1
+// happened to stop on. Transposing the loops (one epoch, all cameras, repeat) is the version
+// that shares a refreshing light side, and it is a different change.
+struct JLightCache {
+    BeamMap              bmap;
+    bdpt::SurfMap        smap;
+    bdpt::BeamBudgetInfo jbb;
+    // The key. Everything `buildLightSide(0)` reads that a second camera could differ in:
+    // `-n`, the film (which sizes `jreq.surfPaths` on a media-free -jsurf run AND, via
+    // res*resY*spp, buildBeamMap's split length), and the transport parameters. The rest of
+    // its inputs are command-line globals, fixed for the process, so they cannot vary between
+    // two cameras of one batch and are deliberately not copied here.
+    const Scene* scene = nullptr;
+    long long    N = 0, spp = 0;
+    int          res = 0, resY = 0, maxDepth = 0, nThreads = 0;
+    bool         diffraction = false, wantBeams = false, wantSurf = false;
+    double       surfRadius = 0.0;
+    bool         valid = false;
+
+    bool matches(const Scene* sc, long long n, long long sp, int rx, int ry, int md, int nt,
+                 bool diff, bool wb, bool ws, double sr) const {
+        return valid && scene == sc && N == n && spp == sp && res == rx && resY == ry &&
+               maxDepth == md && nThreads == nt && diffraction == diff &&
+               wantBeams == wb && wantSurf == ws && surfRadius == sr;
+    }
+    void stamp(const Scene* sc, long long n, long long sp, int rx, int ry, int md, int nt,
+               bool diff, bool wb, bool ws, double sr) {
+        scene = sc; N = n; spp = sp; res = rx; resY = ry; maxDepth = md; nThreads = nt;
+        diffraction = diff; wantBeams = wb; wantSurf = ws; surfRadius = sr; valid = true;
+    }
+    // Explicit rather than left to the destructor: the maps are hundreds of MB and the batch
+    // holds this object until every camera is done, so the caller drops it the moment the
+    // last mode-J frame is written rather than at scope exit.
+    void clear() { bmap = BeamMap{}; smap = bdpt::SurfMap{}; jbb = bdpt::BeamBudgetInfo{};
+                   valid = false; }
+};
+
 // Render one camera into `outPath`. Resolves the -device request for THIS mode,
 // runs the mode dispatch (R/V backward+validate, P composite, or A/B/C forward),
 // and writes the result. Factored out of main so any number of cameras (Phase 3a
@@ -15684,7 +15740,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      bool preview = false, double intervalSec = 15.0,
                      double noiseTarget = 0.0, bool wavefront = false,
                      double* exposureAnchor = nullptr, bool rgbBackward = false,
-                     int maxBounceOverride = -1, bool directOnly = false) {
+                     int maxBounceOverride = -1, bool directOnly = false,
+                     JLightCache* jcache = nullptr) {
     g_windowMode = modeLabel(mode);   // title bar shows the transport mode of this frame
     // Make sure the window is up (and naming this frame) before the first chunk rather than
     // after it — see liveWindowPlaceholder. Normally a no-op re-title, since run() already
@@ -16242,13 +16299,21 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         g_noBeams ? "-nobeams was given" : "no participating media",
                         surfRadius0, g_vcmAlpha);
         warnBeamsGrinMedia(scene, wantBeams);
-        BeamMap bmap;
-        bdpt::SurfMap smap;
+        // THE THREE OBJECTS THAT MOVE AS A UNIT (see JLightCache): the beam map, the surface
+        // photon map built from the SAME subpaths, and the budget the pilot settled on. They
+        // live in the batch's cache when this render can share one -- a flyby under
+        // `-beamfreeze` -- and in a local otherwise, so an unshared render still owns its map
+        // and releases it at the end of its own scope exactly as before.
+        const bool shareLight = (jcache != nullptr) && g_beamFreeze;
+        JLightCache jlocal;
+        JLightCache& jlc = shareLight ? *jcache : jlocal;
+        BeamMap&       bmap = jlc.bmap;
+        bdpt::SurfMap& smap = jlc.smap;
         StageProgress stageProg = makeStageProgress(res, resY);
         // Hoisted out of the build below because epoch 0 DECIDES the map size and every later
         // epoch reuses that decision: re-running the budget pilot per refresh would pay for it
         // over and over and let the subpath count wander between realizations for no benefit.
-        bdpt::BeamBudgetInfo jbb;
+        bdpt::BeamBudgetInfo& jbb = jlc.jbb;
         // THE LIGHT SIDE AS A FUNCTION OF THE EPOCH, rather than a one-off. Epoch 0 is the
         // original build bit-for-bit; every later epoch redraws the same map under a different
         // salt, so the render averages over INDEPENDENT light-side realizations instead of
@@ -16439,7 +16504,24 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             }
         };
         if (wantBeams || wantSurf) {
-            buildLightSide(0);
+            // A CACHE HIT IS THE WHOLE FLYBY WIN. `matches` is false by construction on the
+            // first camera and on any unshared render (`jlocal.valid` starts false), so this
+            // reduces to the historical single call everywhere except the case it is for.
+            if (jlc.matches(&scene, N, spp, res, resY, maxDepth, nThreads, diffraction,
+                            wantBeams, wantSurf, surfRadius0)) {
+                std::printf("mode J: UPBP at %dx%d — camera pass on %s (maxDepth=%d, "
+                            "light=%s) — reusing this batch's frozen light side: %zu beams"
+                            " / %zu surface photons from %lld subpaths. Retracing it for this"
+                            " camera would reproduce it bit-for-bit (-beamfreeze), so only the"
+                            " gather runs ...\n",
+                            res, resY, camWhere.c_str(), maxDepth, lightLabel,
+                            bmap.beams.size(), smap.size(), bmap.nEmitted);
+            } else {
+                buildLightSide(0);
+                if (shareLight)
+                    jlc.stamp(&scene, N, spp, res, resY, maxDepth, nThreads, diffraction,
+                              wantBeams, wantSurf, surfRadius0);
+            }
         } else {
             std::printf("mode J: UPBP at %dx%d on %s (maxDepth=%d, light=%s) ...\n",
                         res, resY, camWhere.c_str(), maxDepth, lightLabel);
@@ -23965,6 +24047,10 @@ static int run(int argc, char** argv) {
     };
     runSharedPhotonMap(groupM);
 
+    // Mode J's light side, shared across this batch's cameras when `-beamfreeze` makes one
+    // realization the right answer for all of them. Declared here rather than as a static
+    // inside runRender so its (large) maps are released when the batch ends, not at exit.
+    JLightCache jLightCache;
     for (size_t ri = 0; ri < restIdx.size(); ++ri) {
         const int i = restIdx[ri];
         // Poll the interrupt BETWEEN frames, exactly as the mode-M loop above does. A stop
@@ -23991,9 +24077,10 @@ static int run(int argc, char** argv) {
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
                            timeBudgetSec, resume, wantCheckpointFlag, runForever,
                            preview, intervalSec, noiseTarget, wavefront, anchor, rgbBackward,
-                           maxBounceOverride, directOnly);
+                           maxBounceOverride, directOnly, &jLightCache);
         if (rv != 0) return rv;
     }
+    jLightCache.clear();
 
     // --- Stereoscopic compositing (-stereo): fuse each eye pair into the -o image ------
     // Every eye rendered to its own PNG (sharing an exposure anchor for identical tone-

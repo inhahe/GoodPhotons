@@ -1,0 +1,40 @@
+# Mode-J flyby rig for the light-side sharing work (PERF, known-issues.md). TRACKED because
+# the PERF entry it belongs to is only half closed: `-beamfreeze` shares one map across the
+# batch (v0.271.0), the refreshing case still wants the loops transposed.
+# Foggy Cornell box (so there ARE beams) with a 3-camera curve, small enough to run a
+# batch and three single-camera renders inside a tick.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse    reflect whitewall 0.75 }
+material "red"   { type diffuse    reflect redwall }
+material "green" { type diffuse    reflect greenwall }
+material "glass" { type dielectric ior    glass:SF10 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+sphere { center 0.5 0.32 0.4   radius 0.25   material glass }
+
+medium { sigma_t 0.6   albedo 0.85   g 0.0 }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera_curve "fly" {
+    point 0.5 0.5 2.7
+    point 0.8 0.6 2.3
+    point 0.2 0.4 2.0
+
+    up 0 1 0   fov_y 40   mode J   frames 3
+    look_at 0.5 0.5 0.5
+    film { res 96 96 }
+}

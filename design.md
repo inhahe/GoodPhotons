@@ -961,6 +961,29 @@ render. `-beamfreeze` restores the old single-map behaviour bit-for-bit; `-beamr
 every epoch — stretches its epochs out and degrades gracefully toward `-beamfreeze` instead of
 thrashing.
 
+**…and `-beamfreeze` is what makes a mode-`J` FLYBY share one light side (0.271.0).** Mode `J`
+stays in the per-camera `restIdx` loop — its connection half is BDPT, whose frames are independent
+by construction — so it is not promoted to a shared group the way `A`/`B`/`M` are. Instead the
+three objects the light pass produces (`BeamMap`, `bdpt::SurfMap` and the `BeamBudgetInfo` the
+budget pilot settled on) move into a `JLightCache` owned by that loop, which `runRender` takes by
+pointer and mode `J` binds its locals to **as references**; a matching key skips
+`buildLightSide(0)` outright. The key is `(scene, -n, res, resY, spp, maxDepth, threads,
+diffraction, wantBeams, wantSurf, surfRadius)` — everything a second camera could differ in, since
+the rest of the pass's inputs are command-line globals fixed for the process. Two properties are
+worth stating because they are what make the change safe rather than merely plausible:
+
+* **It is bit-identical, not "acceptably correlated".** The light pass seeds per *absolute subpath
+  index* under a fixed estimator salt (`bdpt.h`), epoch 0's `RngSaltScope` is the identity
+  (`rng.h`), and the pilot has its own fixed seed — so every camera of a frozen flyby was already
+  building the *same* map and merely paying to rebuild it. Verified with `cmp` on
+  `scenes/_jfly.ftsl` at two map sizes; 3 cameras went 86.2 s → 58.0 s.
+* **It is gated on `-beamfreeze` for a real reason.** Without the freeze the light side is redrawn
+  between epochs, and which realization a camera *ends* on depends on how many epochs its own
+  budget fitted — so there is no single map to share, and hoisting one would silently hand frame 2
+  whatever frame 1 happened to stop on. Sharing a *refreshing* light side means transposing the
+  loops (one map, advance every camera's epoch, rebuild), which also changes each frame's
+  write/checkpoint cadence; that half of PERF is still open.
+
 **Mode `M` has the same disease, and got the same cure in 0.252.0** (M-FROZEN in known-issues.md).
 A single-camera mode-`M` render builds its photon map, caustic map and beam map once and then
 spends the whole budget growing camera spp, so the light-side half of its error is a floor — and
