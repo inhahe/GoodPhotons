@@ -872,7 +872,46 @@ FOLD"):
 
 **Measured, and the honest answer is `neutral on this scene`.** GPU renders of a GPU-traced map, 120 s each, against a 900 s CPU mode-`M` render (the same estimator, converged): fold on 440 spp with median relSE X 0.0211 / Y 0.0142 / Z 0.0169; fold off 501 spp with 0.0222 / 0.0139 / 0.0177. X and Z improve, Y does not, and fold-on took 12 % fewer samples — every difference is inside that. So what part (2) actually delivers is **estimator parity between the backends** (the GPU no longer silently renders the demoted monochromatic record where the CPU folds), at no measurable cost either way. That is worth having on its own terms in this codebase, and `FTRACE_NOBOWGPU=1` restores the old behaviour. A scene with a larger `achro == 2` population than `gallery_rain`'s is where the variance win the entry predicted would actually show; none is in the repo yet.
 
-**Part (1) — the deposit-time fold across diffuse surfaces — is untouched.**
+**Part (1) — the deposit-time fold across diffuse surfaces — is untouched, and MEASURED 2026-09-10
+to be worth less than its coverage gap suggests.**
+
+The entry sizes the gap at ~2 pp ("folds ~88 % where the CPU folds ~90 %") and says no scene in
+the repo can show the win. Both come from `gallery_rain`, where photons scatter inside the
+*medium* and rarely cross a diffuse surface before depositing — so the surface case the device
+lacks barely arises. **`scenes/_fog_cornell.ftsl` exercises it directly** (saturated coloured
+walls, then fog) and the same log line reads:
+
+| | folded achromatically |
+|---|---|
+| CPU | **93.2 %** (93.1 % by power) |
+| GPU | **50.2 %** (59.3 % by power) |
+
+**A 43-point coverage gap, not 2.** So the rig the entry says does not exist has been in
+`scenes/` all along, and the ~2 pp figure is a one-scene number that became a general claim.
+
+**And yet the gap costs nothing measurable.** Chroma high-pass energy (×1000) at 128², 16 spp,
+seed 3 — the streak metric this family is scored on:
+
+| | energy | |
+|---|---|---|
+| CPU (folds 93.2 %) | 2.470 | |
+| GPU (folds 50.2 %) | **2.368** | *lower, not higher* |
+| CPU `-beamachro off` (folds 0 %) | 3.903 | **1.59× — the metric works** |
+
+The on/off control is the point: the metric resolves the fold clearly when the fold is actually
+removed, so the CPU-vs-GPU null is a **real null** and not a blind rig. Turning off 93 % of the
+folding costs 59 %; missing 43 points of it costs nothing.
+
+**Mechanism not established** — two candidates, neither verified. The device's folded set is
+power-enriched (59.3 % of power from 50.2 % of beams, where the CPU's split is even at
+93.1/93.2), so what it fails to fold is the *weak* beams. And a beam cannot be both folded and a
+`-beamspec` bundle, so an unfolded beam may be collecting much of the same chroma reduction by
+the other route; `_fog_cornell` prints no `spectrally bundled` line, so that one is untested here.
+
+**Consequence for priority: part (1) stays low, but now for a measured reason rather than an
+assumed one.** The earlier "~2 pp, variance-only" assessment was wrong about the size and right
+about the value, which is worth separating — and it explains mechanistically why part (2)
+measured *neutral on this scene* after landing correctly.
 
 **Reproduce**: `ftrace -in scenes/gallery_rain.ftsl -camera cam -mode M -beams -device gpu
 -r 640 360 -time 300 -seed 7 -hdr -o png/barsdiag/gpu.png` and compare
