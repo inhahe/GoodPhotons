@@ -61,6 +61,35 @@ and it holds at ~1.7x across every robust statistic. **Second, the firefly tail 
 which localises UPBP-CONV's remaining problem away from the light side and onto the beam x ray
 kernel and the merge weight. That is worth more than the 1.7x: it removes the cheapest candidate.
 
+**AND THE TAIL IS THE CONNECTION HALF, NOT THE MERGES — which inverts where to look.**
+`FTRACE_J_HALF` splits the estimator with both halves keeping their full-render MIS weights.
+`_fog_thick` 96^2, 256 spp, seed 5, GPU, with **mode `D` rendered at identical settings as the
+control**:
+
+| image | mean | max | max/mean | p99.99/mean |
+|---|---|---|---|---|
+| mode `D` | 1.937e9 | 1.827e11 | **94.3** | 47.0 |
+| mode `J` (full) | 2.035e9 | 1.781e11 | **87.5** | 43.9 |
+| `J` connections only | 8.83e7 | 1.474e11 | **1669.3** | 378.8 |
+| `J` merges only | 1.946e9 | 7.91e10 | **40.6** | 31.7 |
+
+Three things fall out. **The merge half is the QUIET one** (40.6x against the connections'
+1669x), so the beam x ray kernel and its `sinMin` clamp are not where the spikes are. **The
+connection half carries 4.3 % of the energy and almost the whole peak** — which is what a working
+MIS partition should look like: the merges take the bulk, leaving connections to cover only the
+paths merges cannot reach, and those are rare and high-variance by construction. **And mode `J`'s
+full-image tail is not worse than mode `D`'s here at all** (87.5 against 94.3) — so (2g)'s
+"worst pixel 3 310 against 532", measured on relSE at `-beamk 8` over 60 s, does not generalise
+to this configuration.
+
+At the full image's worst pixel the split is 1.474e11 connections against 3.07e10 merges: the
+spike is **83 % connection**.
+
+*One scene, one seed, one spp setting* — this is an attribution, not a law, and the `-beamk 8` /
+relSE configuration where (2g) saw a 6x tail has not been re-run this way. But the lever it points
+at is a 4 %-energy, 1669x-peaked residual, which is a different and much more specific target
+than "the beam gather".
+
 The worst-pixel column is reported *because* it looks like a regression and is not one. A max
 over 9 000 lit pixels from 6 seeds is the noisiest statistic in this file, and 1.5 sigma from it
 is nothing — the same shape as four other "findings" earlier the same day that dissolved on more
