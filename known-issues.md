@@ -3354,6 +3354,23 @@ passes and builds 600 BVHs over identical data.
 `gallery_rain` beam pass is minutes. This is a pure multiplier on wall clock: 600 frames × one map
 each, where one map would do.
 
+> **SCOPE CHANGED BY A LATER FEATURE (noted 2026-09-11).** This entry predates mode `J`'s
+> **light-side refresh**, which deliberately redraws the subpaths under a fresh salt every ~10 %
+> of the wall clock and averages the realizations (`renderChunked` inside `if (mode == 'J')`,
+> `main.cpp` ~16161/16494; it prints *"the merge noise fell with the render, not just the
+> connection noise"*). Two consequences:
+>
+> * **The waste is worse than stated** — a flyby now builds *several* maps per frame, not one.
+> * **But there is no longer a single map to share.** Sharing one map across 600 frames and
+>   re-randomising it every 10 % of each frame are contradictory. Either the flyby runs
+>   `-beamfreeze` (one map, sharing is then the mechanical work this entry describes), or the
+>   loops must be **transposed** — build a map, advance every camera's current epoch against it,
+>   then rebuild — which is a different and much less mechanical change, and which also changes
+>   each frame's checkpoint/write cadence.
+>
+> So "nothing about it is subtle" is no longer true. The `-beamfreeze` case is still worth taking
+> on its own, and is the version to build first.
+
 **Why it wasn't done in Phase 1.** Nothing about it is subtle; it is mechanical work that would have
 been mixed into the commit that first makes mode `J` exist, and mode `J` cannot yet be judged worth
 optimising because its merge estimator isn't written (Phases 2–3). It is also *not* a correctness
