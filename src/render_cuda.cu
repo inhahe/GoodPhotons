@@ -17731,6 +17731,96 @@ static void buildJSurfMapDevice(JSurfDev& d, const gpu::DScene& sc, const gpu::D
     dsm.nPts   = (long long)n;
 }
 
+// ---- FTRACE_JDEVLIGHT=2: compare the host-traced and device-traced maps AS DATA ------
+//
+// The image A/B of these two arms is weak where it matters: the caustic is merge-dominated and
+// high-variance, so a seed-spread error bar from a handful of renders cannot separate "the
+// deposit is wrong" from "not enough seeds". The maps are the better instrument -- ~49 000
+// independent samples each of the same distribution, so their summary statistics agree to
+// ~1/sqrt(N), while every plausible transcription error is GROSS here: an off-by-one in the
+// accumulator index moves the whole sumC distribution by a step of the recurrence, a wrong
+// `vert` moves the depth histogram by a bin, a wrong site predicate moves the count and the
+// gateC1 fraction, a wrong cosPrev/rho2 moves rCoef's median by a factor.
+//
+// Medians as well as means, because pdfFwdA and rCoef are densities: their means are dominated
+// by a tail that two 49 000-sample draws will not agree on, and a mean that disagrees while the
+// median agrees is a statement about the tail, not about the transcription.
+static void compareJSurfMaps(const bdpt::SurfMap& host, const JSurfDev& dev) {
+    if (dev.stored <= 0 || host.pts.empty()) { std::printf("[jdevcmp] nothing to compare\n"); return; }
+    const size_t n = (size_t)dev.stored;
+    std::vector<gpu::DSurfPhoton> dp(n);
+    std::vector<gpu::DSurfMis>    dm(n);
+    CUDA_CHECK(cudaMemcpy(dp.data(), dev.pts, n * sizeof(gpu::DSurfPhoton), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(dm.data(), dev.mis, n * sizeof(gpu::DSurfMis), cudaMemcpyDeviceToHost));
+    auto med = [](std::vector<double> v) {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    auto mean = [](const std::vector<double>& v) {
+        double s = 0.0; for (double x : v) s += x; return v.empty() ? 0.0 : s / (double)v.size();
+    };
+    struct Col { const char* name; std::vector<double> h, d; };
+    Col cols[] = {
+        {"beta",    {}, {}}, {"pdfFwdA", {}, {}}, {"rCoef",  {}, {}},
+        {"sumC",    {}, {}}, {"sumMb",   {}, {}}, {"sumMs",  {}, {}},
+    };
+    for (size_t i = 0; i < host.pts.size(); ++i) {
+        const bdpt::SurfMis* m = host.misOf(i);
+        if (!m) continue;
+        cols[0].h.push_back((double)host.pts[i].beta);
+        cols[1].h.push_back(m->pdfFwdA);
+        cols[2].h.push_back((double)m->rCoef);
+        cols[3].h.push_back(m->sumC);
+        cols[4].h.push_back(m->sumMb);
+        cols[5].h.push_back(m->sumMs);
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const gpu::DSurfMis& m = dm[dp[i].misIdx < n ? dp[i].misIdx : i];
+        cols[0].d.push_back((double)dp[i].beta);
+        cols[1].d.push_back(m.pdfFwdA);
+        cols[2].d.push_back((double)m.rCoef);
+        cols[3].d.push_back(m.sumC);
+        cols[4].d.push_back(m.sumMb);
+        cols[5].d.push_back(m.sumMs);
+    }
+    std::printf("\n[jdevcmp] host %zu photons vs device %zu (%.2f%%)\n",
+                host.pts.size(), n,
+                100.0 * ((double)n / (double)host.pts.size() - 1.0));
+    std::printf("[jdevcmp] %-10s %14s %14s %9s | %14s %14s %9s\n",
+                "field", "host mean", "dev mean", "d/h", "host med", "dev med", "d/h");
+    for (const Col& c : cols) {
+        const double hm = mean(c.h), dmn = mean(c.d), hM = med(c.h), dM = med(c.d);
+        std::printf("[jdevcmp] %-10s %14.6g %14.6g %8.4fx | %14.6g %14.6g %8.4fx\n",
+                    c.name, hm, dmn, hm != 0.0 ? dmn / hm : 0.0,
+                    hM, dM, hM != 0.0 ? dM / hM : 0.0);
+    }
+    // gateC1 and the depth histogram: pure structure, no tail, so these are the columns that
+    // catch a predicate or an index error outright rather than statistically.
+    long long hg = 0, dg = 0;
+    long long hv[16] = {0}, dv[16] = {0};
+    for (size_t i = 0; i < host.pts.size(); ++i) {
+        const bdpt::SurfMis* m = host.misOf(i);
+        if (!m) continue;
+        hg += (m->gateC1 != 0);
+        if (m->vert < 16) ++hv[m->vert];
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const gpu::DSurfMis& m = dm[dp[i].misIdx < n ? dp[i].misIdx : i];
+        dg += (m.gateC1 != 0);
+        if (m.vert < 16) ++dv[m.vert];
+    }
+    std::printf("[jdevcmp] gateC1 on: host %.4f  dev %.4f\n",
+                (double)hg / (double)host.pts.size(), (double)dg / (double)n);
+    std::printf("[jdevcmp] vert histogram (fraction), host | dev:\n");
+    for (int v = 0; v < 12; ++v) {
+        if (!hv[v] && !dv[v]) continue;
+        std::printf("[jdevcmp]   vert %2d: %.5f | %.5f\n", v,
+                    (double)hv[v] / (double)host.pts.size(), (double)dv[v] / (double)n);
+    }
+    std::printf("\n");
+}
+
 // ---- upload a built photon-beam map to the device ------------------------------------
 //
 // Shared by mode M's volume gather and mode J's BDPT merges, which need the SAME device
@@ -17972,17 +18062,24 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // clean A/B of WHERE the light side runs. It cannot be bit-identical -- the two walks draw
     // from different RNG streams -- so the acceptance test is statistical, per ROI.
     JSurfDev jdev;
-    const bool jDevLight = smap && smap->nEmitted > 0 &&
-                           std::getenv("FTRACE_JDEVLIGHT") &&
-                           std::atoi(std::getenv("FTRACE_JDEVLIGHT")) != 0;
+    const int jdevLevel = std::getenv("FTRACE_JDEVLIGHT")
+                        ? std::atoi(std::getenv("FTRACE_JDEVLIGHT")) : 0;
+    const bool jDevLight = smap && smap->nEmitted > 0 && jdevLevel != 0;
     if (jDevLight) {
         buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, smap->nEmitted,
                             smap->radius, (long long)smap->pts.size() * 2 + 1024,
                             jSurfSalt(prog), dsm);
-        std::printf("[jdevlight] device light pass: %lld subpaths -> %lld surface photons "
-                    "(host traced %zu)%s\n", (long long)smap->nEmitted, jdev.stored,
-                    smap->pts.size(),
-                    jdev.dropped ? "  [CAP BOUND: some photons dropped]" : "");
+        // ONCE. A refreshing render rebuilds this every epoch -- 126 of them in 90 s -- and a
+        // line each would bury the -interval status lines that carry the actual progress.
+        static bool jdevSaid = false;
+        if (!jdevSaid || jdev.dropped) {
+            jdevSaid = true;
+            std::printf("[jdevlight] device light pass: %lld subpaths -> %lld surface photons "
+                        "(host traced %zu)%s\n", (long long)smap->nEmitted, jdev.stored,
+                        smap->pts.size(),
+                        jdev.dropped ? "  [CAP BOUND: some photons dropped]" : "");
+        }
+        if (jdevLevel >= 2) compareJSurfMaps(*smap, jdev);
     }
     {   // the half-render diagnostic, mirrored from the host so one half can be compared
         // backend to backend (bdpt::jHalfMode: 1 = connections only, 2 = merges only)

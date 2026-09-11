@@ -379,9 +379,71 @@ subpaths against the host's 48 896** (+0.18 %), which is the agreement two indep
 drawing one distribution should give. Over a refreshing 45 s run the device count fluctuates
 around the host's (48 625 … 49 047 across 62 epochs), confirming the per-epoch salt works.
 
-Still to come: the image-level A/B (raw means per region, the caustic floor as the sensitive
-region and the upper walls as the null control), then step 3 — redrawing inside the chunk loop,
-which is wall 2 and the actual win.
+**VALIDATING STEP 2 TOOK THREE INSTRUMENTS, AND THE FIRST TWO WERE THE WRONG ONES.** Worth the
+space because the sequence generalises.
+
+*(a) The arm-vs-arm image A/B — inconclusive, and its "null control" was not one.* Host-traced
+map vs device-traced map, `_caustic_box`, 45 s x 3 seeds: whole frame 1.0007x +-0.0008, caustic
+floor 0.9968x, upper walls 1.0035x. Two problems. The upper walls were labelled a null control
+on the grounds that they are connection-carried — but `-jsurf` merges deposit on **every**
+surface, so **no region of this scene is null for this change**. And the +-0.0008 is the spread
+of three seed means; on a merge-dominated region whose per-realization spread makes the true SEM
+about 0.3 %, that error bar is an estimate from n=3 of the very quantity in question. The test
+could not separate "the deposit is wrong" from "three seeds is not enough", and more seeds buy
+only sqrt(n) against something the render samples slowly.
+
+*(b) The maps compared AS DATA (`FTRACE_JDEVLIGHT=2`) — this is the instrument that works.* Two
+~49 000-sample draws of the same distribution, so summary statistics should agree to ~1/sqrt(N),
+and **every plausible transcription error is gross here rather than marginal**: an off-by-one in
+the accumulator index moves the whole `sumC` distribution by a step of the recurrence, a wrong
+`vert` moves the depth histogram by a bin, a wrong site predicate moves the count and the
+`gateC1` fraction, a wrong `cosPrev/rho2` moves `rCoef`'s median by a factor. Result, 4096
+subpaths:
+
+| | host | device |
+|---|---|---|
+| photons | 12 230 | 12 478 (+2.0 %) |
+| `gateC1` on | 1.0000 | 1.0000 |
+| `sumMb` (no media) | 0 | 0 |
+| `vert` histogram, bins 1–8 | .2396 .1783 .1383 .1195 .1011 .0868 .0742 .0622 | .2357 .1774 .1355 .1228 .1056 .0872 .0739 .0620 |
+| medians | `pdfFwdA` 0.2665, `rCoef` 2.842, `sumC` 1.582, `sumMs` 0.3478 | 0.9911x, 1.0196x, 1.0194x, 1.0317x |
+
+Every structural column matches. **The means do not** — `pdfFwdA` 0.0004x, `rCoef` 0.0005x,
+`sumC` 0.0006x, `sumMs` 0.0003x — which, next to medians at 1.00x, is a statement about the
+**tail** and not about the transcription. A density's mean over 12 000 samples is a statement
+about its largest one or two entries.
+
+*(c) Both arms against a converged mode-D reference (64 254 spp, 0.39 % noise)* — the test the
+arm-vs-arm one could not be, because D does no merging and is therefore ground truth, so a
+device-side error moves `dev/ref` and leaves `host/ref` alone:
+
+| region | host/ref | dev/ref | dev − host |
+|---|---|---|---|
+| whole frame | −1.685 % | −1.616 % | **+0.069 % +-0.077** |
+| caustic floor | −0.683 % | −0.998 % | −0.315 % +-0.092 |
+| upper half | −1.783 % | −1.477 % | +0.306 % +-0.074 |
+
+**Both arms carry the same −1.6 % offset**, which is mode `J`'s own merge bias (this entry
+measured −1.53 % for `J` before any of this), so the device deposit introduces no global error.
+The regional numbers are equal and opposite with the whole frame flat: a **redistribution**, not
+a bias. Per-seed the signs are 3/3 consistent in both regions (caustic −0.393/−0.208/−0.350,
+upper +0.135/+0.305/+0.494) while the whole frame flips sign (−0.107/+0.044/+0.272) as noise
+should — so the ~0.3 % redistribution is probably real.
+
+**The leading explanation is `using Real = float`, and it is PRE-EXISTING rather than introduced.**
+Device geometry (`DVertex::p/ns/ng`) is float; the host walks in double (`pdfFwd`/`pdfRev`/`beta`
+are double on both, so it is not those). Near-degenerate edges lose `rho2` precision in float,
+which is exactly where the enormous densities in (b)'s tail come from — and those live at
+specular->diffuse vertices, i.e. **at the caustic**, whose sign is the one that moved. The GPU
+BDPT *camera* walk has always had this; the light pass merely extends it to the merge half.
+
+So the acceptance bar is not "device light pass == host light pass". It is: **the device light
+pass should agree with the host one no worse than the device CAMERA pass already agrees with the
+host camera pass** — mode `J` CPU vs GPU with the same host-traced map on both sides. That
+control is what decides whether the 0.3 % is a bug or the existing float-geometry tolerance.
+
+Still to come after that: step 3 — redrawing inside the chunk loop, which is wall 2 and the
+actual win.
 
 **Three stale claims about `-jsurf` and the GPU, corrected the same day** (no version bump: all
 three were comments or dead code, and the fix is bit-identical, verified). `main.cpp` said "the
