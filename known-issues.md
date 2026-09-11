@@ -1628,7 +1628,7 @@ something the dielectric path does on exit.
 **Where it bites:** `src/photonmap_render.h` (the estimate and its normalisation),
 `scenes/gallery_rain.ftsl`, `scraps/mbeamk.log` and `scraps/mbias.log` (the measurements).
 
-### GLOSSY-NEE — **FIXED ON THE CPU** (2026-09-07, v0.266.0; filed the same day at v0.265.0), **GPU still open**: no unidirectional mode did next-event estimation at a `MatType::Glossy` vertex, so a rough metal under a small light is found only by chance — a 6.8e-5 sr sun costs a gold gyroid 64 % of its energy at 120 spp and a chrome ring 91 %
+### GLOSSY-NEE — **FIXED, CPU AND GPU** (CPU 2026-09-07 v0.266.0; GPU twins 2026-09-09 v0.266.4; filed the same day at v0.265.0). **One sub-item remains**: `p_L(e, x, omega)` for an arbitrary emitter and direction, needed on the BSDF-sampling side. (This heading said "**GPU still open**" until 2026-09-11, by which point its own sub-item 3 read "The GPU twins — DONE" and sub-item 2 the same. A heading is the only part of an entry most readers see, so a stale one is worse than a stale paragraph.): no unidirectional mode did next-event estimation at a `MatType::Glossy` vertex, so a rough metal under a small light is found only by chance — a 6.8e-5 sr sun costs a gold gyroid 64 % of its energy at 120 spp and a chrome ring 91 %
 
 > **FIXED on the CPU in v0.266.0.** Glossy vertices now connect to lights, balance-heuristic
 > weighted against the lobe-sampling strategy. Measured on `scenes/_spec_repro_sun.ftsl` — four
