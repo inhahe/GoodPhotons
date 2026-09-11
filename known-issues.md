@@ -1866,6 +1866,29 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   Nearest-hit remains the better default: it is right on four ROIs of five, and wrong only on the
   densest tangle. Reverted.
 
+  **THE ONE IDEA THE BRACKETING RESULT ACTUALLY LICENSES, and it is not geometric.** The
+  discriminator is whether the extra layers *carried photons*. The gather already walks every
+  collected photon, so the **power-weighted mean `|(y − p)·n| / r` of the contributors** costs
+  almost nothing and measures exactly that: on a surface they sit in a thin shell (near 0), in a
+  tangle they are spread through the ball. **This is not the photon statistic this entry
+  rejected** — that one estimated the footprint's EXTENT from photon positions (a covariance
+  ellipse in the tangent plane). This measures their distribution along the NORMAL, which is the
+  axis the two regimes differ on, and it is a property of the *light* rather than the geometry,
+  which is what the bracketing result says is required.
+
+  **Attempted 2026-09-10 and NOT LANDED — the diagnostic, not the idea, is what failed.** The
+  plan was to instrument first (`FTRACE_GASTATS=1`, per-material coverage + depth spread) and
+  only wire it into the estimator if fur and cloth actually separate on the number. The
+  instrument never recorded a sample, and the cause is worth writing down because it will catch
+  the next person too: **`photonmap_render.h` has TWO `est` lambdas carrying the same
+  `MStatTimer`** (the camera gather and `photonGatherSub`'s final-gather walk), so `[mstats]`
+  reporting 122 160 calls does *not* tell you which one you instrumented. Patch both, or verify
+  with a counter at the top of the lambda before trusting a zero.
+
+  Also note the entry's per-material coverage figures (mats 38–41) came from an ad-hoc probe
+  that no longer exists; restoring it is part of this work, not a prerequisite someone can
+  assume is already there.
+
   **And the coverage value itself is provably not the discriminating variable (2026-09-10).**
   Isolating the correction factor each ROI actually receives — the on/off ratio, measured at
   `-max-bounce` 2 / 4 / 32 to check whether it compounds across bounces (**it does not**: 1.493 /
