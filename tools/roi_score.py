@@ -2,7 +2,8 @@
 built in as checks rather than as advice.
 
     python tools/roi_score.py <dir> --arms base,other[,other2] --seeds 16 \
-        [--bands "name=y0:y1:x0:x1,..."] [--null <band>] [--cost <ratio>]
+        [--bands "name=y0:y1:x0:x1,..." | --rois <file.rois> [--only a,b]] \
+        [--null <band>] [--cost <ratio>] [--list]
 
 Files are expected as <dir>/<arm>_s<seed>.pfm.
 
@@ -32,7 +33,7 @@ COST. A per-sample variance win is not a win. Pass --cost <t_other/t_base> (meas
 INTERLEAVED by seed, never blocked by arm -- blocked runs of one such comparison drifted from
 +10.1 % to +26.7 % on thermal/turbo alone) and the equal-cost column is variance x cost.
 """
-import argparse, os, sys
+import argparse, io, os, re, sys
 import numpy as np
 
 
@@ -66,6 +67,9 @@ def main():
     ap.add_argument('--arms', required=True, help='comma-separated; the FIRST is the baseline')
     ap.add_argument('--seeds', type=int, default=16)
     ap.add_argument('--bands', default='', help='name=y0:y1:x0:x1,... in [0,1] fractions')
+    ap.add_argument('--rois', default='', help='a .rois file (format: name x0 y0 x1 y1)')
+    ap.add_argument('--only', default='', help='comma-separated ROI names to score')
+    ap.add_argument('--list', action='store_true', help='print the parsed boxes and exit')
     ap.add_argument('--null', default='', help='band the change provably cannot affect')
     ap.add_argument('--cost', type=float, default=1.0, help='t_other / t_base, interleaved')
     a = ap.parse_args()
@@ -83,7 +87,32 @@ def main():
     if len(set(ns.values())) > 1:
         print(f'! arms have different seed counts {ns} -- variance columns are not matched')
 
-    if a.bands:
+    if a.rois:
+        # FIELD ORDER IS `name x0 y0 x1 y1` -- fractions of width/height, x FIRST. Written here
+        # once because getting it wrong silently yields one-pixel boxes rather than an error:
+        # neighbouring ROIs then report identical numbers and a bad rig looks like a clean result.
+        bands = {}
+        want = set(f for f in a.only.split(',') if f) if a.only else None
+        for line in io.open(a.rois, encoding='utf-8'):
+            m = re.match(r'\s*([A-Za-z_][\w]*)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)', line)
+            if not m or line.lstrip().startswith('#'): continue
+            name = m.group(1)
+            if want is not None and name not in want: continue
+            x0, y0, x1, y1 = (float(m.group(i)) for i in (2, 3, 4, 5))
+            ys, ye = int(y0 * H), int(y1 * H)
+            xs, xe = int(x0 * W), int(x1 * W)
+            if ye - ys < 1 or xe - xs < 1:
+                print('! ROI "%s" is degenerate at %dx%d (%d x %d px) -- check the field order'
+                      % (name, W, H, xe - xs, ye - ys))
+                continue
+            bands[name] = (slice(ys, ye), slice(xs, xe))
+        if a.list:
+            for n, (sy, sx) in bands.items():
+                print('%-16s rows %4d..%-4d cols %4d..%-4d  (%d x %d px)'
+                      % (n, sy.start, sy.stop, sx.start, sx.stop,
+                         sx.stop - sx.start, sy.stop - sy.start))
+            return
+    elif a.bands:
         bands = {}
         for spec in a.bands.split(','):
             name, box = spec.split('=')
@@ -97,7 +126,7 @@ def main():
 
     base = arms[0]
     print(f'\nbaseline: {base}   seeds: {ns[base]}   cost ratio: {a.cost:.3f}\n')
-    hdr = '%-20s' % 'band'
+    hdr = '%-20s%8s' % ('band', 'px')
     for arm in arms[1:]:
         hdr += '%13s%13s%13s' % (f'{arm} var', 'equal-cost', f'{arm} bias')
     print(hdr)
@@ -105,7 +134,18 @@ def main():
 
     warnings = []
     for name, sl in bands.items():
-        row = '%-20s' % name
+        npx = ims[base][(slice(None),) + sl].shape[1] * ims[base][(slice(None),) + sl].shape[2]
+        # ROI SIZE IS PART OF THE RESULT. gallery_rain's `creature` is 6x6 px at 320x180 and
+        # `alice_hair` 9x3 -- a trimmed mean over ~30 pixels is a far weaker number than the
+        # column width suggests, and nothing else on the line says so.
+        # An ROI with no signal in the BASELINE is a misapplied .rois file (wrong scene, wrong
+        # camera) far more often than it is a legitimately black region -- and every ratio below
+        # would come out NaN and be read as "no change". Say so instead.
+        if not (ims[base][(slice(None),) + sl].mean() > 0.0):
+            print('%-20s%8d   ! no signal in the baseline -- wrong scene or camera for this .rois?'
+                  % (name, npx))
+            continue
+        row = '%-20s%8d' % (name, npx)
         for arm in arms[1:]:
             vb = tmean(ims[base][(slice(None),) + sl].var(axis=0, ddof=1))
             vo = tmean(ims[arm][(slice(None),) + sl].var(axis=0, ddof=1))
