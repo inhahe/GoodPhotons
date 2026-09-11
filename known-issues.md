@@ -998,6 +998,26 @@ sizes itself from `std::thread::hardware_concurrency()` and **ignores `-t` entir
 cannot be used to A/B anything that goes through `parallelFor`, and any past or future measurement
 that tried to would have been comparing a configuration against itself.
 
+**THE PAIRED LIGHT-SIDE NUMBER ON A MEDIA SCENE, and it corrects a looser one.** `-beamfreeze`
+with a fixed seed makes both arms trace **the same 1 666 015 beams from the same 23 323
+subpaths**, so only the tree differs. `_fog_cornell`, `-nojsurf`, 96^2:
+
+| | light-side build |
+|---|---|
+| host SAH (`-jhostlight`) | **2.33 s** |
+| device LBVH (default) | **1.17 s** |
+
+**2.0x**, i.e. the host tree was ~50 % of this scene's light side and the remaining 1.17 s is
+trace + split + CIE + boxes. Consistent with `_fog_thick`, where the tree was 72 % of a smaller
+map.
+
+**Not the 5.3x an earlier pair of runs suggested.** Those read `8.09 s` and `1.54 s`, but they
+were not a controlled comparison: different beam counts (7 667 722 against 7 485 309, i.e.
+different realizations) *and* different `-r`/`-spp`, which changes the `work` parameter and hence
+the split length and the beam count together. The uncontrolled pair flattered the change by 2.6x.
+Recorded because the mistake is the cheap kind to make when a number is already believed — both
+runs were real, both were of the right scene, and neither was of the same thing.
+
 **One edge to state before this is defaulted.** `buildBeamLbvhDevice` refuses `n <= 1` (Karras has
 no internal node for a single primitive), and with the host tree skipped there is then no tree at
 all -- `nNodes == 0`, which every entry point already reads as "no volume gather". For a one-beam
