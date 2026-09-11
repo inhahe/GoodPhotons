@@ -878,6 +878,32 @@ confirms the mechanism rather than the outcome: `host SAH tree had 0 nodes`.
 The residual 51 ms is not BVH; it is the split, the CIE table and the box pass that `build()`
 still does on the host, which is what a device deposit would remove next.
 
+**UNBIASED, tested with the realization count held fixed.** `-beamfreeze` makes both arms trace
+the *same* beams from the same seed, so the only difference left is the tree and any mean shift
+is traversal acceptance. `_fog_thick`, 256 spp, 4 seeds:
+
+| seed | host mean | LBVH mean | ratio | median rel. diff |
+|---|---|---|---|---|
+| 1 | 1.82514e9 | 1.82418e9 | 0.99947 | **0** |
+| 2 | 1.86308e9 | 1.86301e9 | 0.99996 | **0** |
+| 3 | 1.82547e9 | 1.82559e9 | 1.00007 | **0** |
+| 4 | 2.12217e9 | 2.12085e9 | 0.99938 | **0** |
+
+**−0.028 % +- 0.017 %** — 1.6 sigma, i.e. nothing — with the median relative difference **exactly
+zero on every seed**, so most rays find the identical beam set. For scale, the device camera pass
+agrees with the host camera pass to 0.02 % on this class of scene.
+
+**AND IT SCALES: 7 667 722 sub-beams in 27.7 ms** (`_fog_cornell`, `-nojsurf`). The host needs
+8.09 s for the same map and the earlier profile put `BVH in 5.01 s` at 5.15 M beams, so the tree
+alone is **~270x** faster here. Build time goes 265 k -> 2.5 ms and 7.67 M -> 27.7 ms: 29x the
+primitives for 11x the time, i.e. *better* than linear, because the radix sort amortises.
+
+**One edge to state before this is defaulted.** `buildBeamLbvhDevice` refuses `n <= 1` (Karras has
+no internal node for a single primitive), and with the host tree skipped there is then no tree at
+all -- `nNodes == 0`, which every entry point already reads as "no volume gather". For a one-beam
+map that is the right answer and not a loss, but it is a behaviour that only exists because the
+host build is skipped, so it is written down rather than left to be rediscovered.
+
 **A wrong turn worth recording, because the measurement is what caught it.** The first version
 wired `skipBvh` into `buildBeamMap`'s `-beamradius` branch only, and the default render goes
 through `buildAuto` — so it measured **no change at all** (`beam BVH 1.79 s` against 1.81 s).
