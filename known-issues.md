@@ -26,6 +26,29 @@ name files that no longer exist at all, all in closed entries.
 
 ## Open issues
 
+**WORKING-QUEUE AUDIT (2026-09-11, second of the day).** Of the nine items driving that day's
+autonomous session, **four were already finished** — GLOSSY-NEE's env-light gap (v0.266.3 CPU,
+v0.266.4 device), `_deltalight_mix`'s +0.79 % (closed 2026-09-09 as a single-seed raw-mean
+artifact, one firefly), RASTER-PBR (v0.269.1) and `ltPdf` (v0.270.0) — and **a fifth,
+FOLD-GPU part (1), is deprioritised by its own measurement**: a 43-point fold-coverage gap costs
+*nothing* on the streak metric, with a working on/off control (0 % folding costs 1.59x) proving
+the null is real rather than blind.
+
+What that leaves, and where each one's frontier actually is:
+
+| item | frontier |
+|---|---|
+| M-GATHERAREA | geometric footprint; a covariance-ellipse attempt was tried and reverted, and no photon statistic can work |
+| VOLCACHE | the volumetric gather, ~4/5 of a `gallery_rain` frame |
+| mode-`J` device light pass | the BEAM half — deposit + a device BVH; premise checked, worth ~12x on a thick medium |
+| UPBP-CONV | **fireflies, not speed** — see (2g): on every statistic not at the mercy of the tail mode `J` already beats mode `D` at equal time (1.37x / 1.28x / 1.52x), while its worst pixel is 3 310 against 532 |
+
+**The pattern worth naming.** Two audits in two days, eight stale entries the first time and four
+stale queue items the second. An entry's *conclusion* decays faster than its code does, and
+nothing in the process notices — so the audit has to be a scheduled activity, not a thing done
+when something feels off.
+
+
 ### UPBP-VM — DONE (2026-09-07, v0.263.1; the CPU half filed 2026-09-06, v0.260.0): mode `J`'s surface point merges (`-jsurf`) are **on by default on the CPU** since 0.260.0 — all three gates green — but have **no device twin**, so a GPU mode-`J` run is still the two-technique estimator and mode `U` cannot be retired yet
 
 **What shipped in v0.258.0.** Mode `J` now has a *second* merge kind. The same light subpaths that
