@@ -3370,6 +3370,19 @@ each, where one map would do.
 >
 > So "nothing about it is subtle" is no longer true. The `-beamfreeze` case is still worth taking
 > on its own, and is the version to build first.
+>
+> **View-independence VERIFIED (2026-09-11), because the call sites suggest otherwise.**
+> `traceLightBeamPass(scene, cam, …)` takes the camera and hands it to `generateLightSubpath`,
+> which hands it to `deltaLightSubpath` and `randomWalk` — three signatures deep, which reads
+> like a view-dependent light pass and would sink the whole idea. It is not: `randomWalk` opens
+> with **`(void)cam;   // cam reserved for future NEE-to-camera use`**, and neither of the other
+> two does anything with it but forward it. So the entry's premise holds and the map really is
+> shareable; the parameter is vestigial. Worth recording because the next person to scope this
+> will hit the same three signatures and may conclude the opposite.
+>
+> **What has to move as a unit** is all three pieces of light-side state the pass produces —
+> `BeamMap bmap`, `bdpt::SurfMap smap` and `bdpt::BeamBudgetInfo jbb` — not just the beam map.
+> They are per-render locals today (`main.cpp` ~16161 onward).
 
 **Why it wasn't done in Phase 1.** Nothing about it is subtle; it is mechanical work that would have
 been mixed into the commit that first makes mode `J` exist, and mode `J` cannot yet be judged worth
