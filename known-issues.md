@@ -588,6 +588,36 @@ caveat is the caustic column: it improves only 1.30x, so if the gap were caustic
 claim would be much weaker. Re-deriving the 16.1x against the current binary, with the ROI stated
 rather than assumed, is the work that would settle it.
 
+**AND THE 11.2x DOES NOT TRANSFER TO AN EXPENSIVE SCENE — the claim is bounded, measured on
+`_fog_cornell` with `-jsurf`.** Everything above is one media-free scene where the light pass is
+one subpath per pixel. With media the picture changes three ways, and the third one is fatal to
+the mechanism:
+
+1. The light pass is sized by the **beam budget**, not per pixel: 70 407 subpaths here (4.3x),
+   from a `-beamk` knee of 423 362 beams. The device deposit still agrees with the host —
+   143 821 photons against 143 681, **+0.10 %** — so correctness carries over.
+2. Only the **surface** map is redrawn per chunk. The beam map is still host-traced per epoch,
+   and it is the expensive half (7.65 M beams, 876 MB, **11.4 s** a rebuild). On a media scene
+   the beam merges dominate, so the surface half's realization count is not the binding term.
+3. **The chunk is already 1 spp.** Measured with `FTRACE_CHUNK_DEBUG=1`: `gpu 1 spp in 2.832 s`,
+   **14 chunks in 40 s**. `gpuSppChunks` cannot go below one sample per pixel, so per-chunk
+   redraw yields 14 realizations, and `FTRACE_JSPLIT` is **inert** — `c/k` is 0 for every
+   sub-batch after the first when `c == 1`, and the loop skips them.
+
+So the 11.2x is a **cheap-scene** number. Where a frame costs seconds per spp, the limiting
+quantity is samples per chunk rather than chunks, and neither knob can reach it.
+
+**The fix is visible in the existing structure, and it is complementary rather than a rewrite.**
+The wavefront path already splits a chunk **by pixel band** (`b0`/`b1` over `waveTotal` inside
+`launch`), and it is active exactly when `mergeOn` — i.e. on the media scenes where the spp split
+fails, and absent on the media-free ones where the spp split works. Redrawing the light side per
+BAND would give many realizations per spp precisely where spp is scarce. The subtlety to state
+when it lands: different bands would then gather from different light realizations within one
+spp, which stays unbiased per pixel (each pixel still averages over its own realizations) but
+stops the realization being shared across the image — plausibly an improvement, since
+band-correlated light-side noise is what shows up as streaks, but it is a change in the spatial
+noise structure and should be measured as one rather than assumed.
+
 **Two caveats stated rather than buried.** (a) The **caustic does not improve** (0.988x at k=4)
 and degrades badly at k=16: on this scene its variance is camera-dominated, so the win is in the
 diffuse and indirect regions. (b) **The bias does not move** across the sweep (−1.62 / −1.60 /
