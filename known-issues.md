@@ -466,6 +466,34 @@ subpath deposits 0..8 photons, so the variance is far above Poisson) as if it we
 **Four hypotheses, four refutations, and three of them were settled by data the runs had already
 produced.** Before modelling an error bar, look for repeated measurements already on disk.
 
+**AND THE FIFTH — the floor/wall residual itself — went the same way. STEP 2 IS VALIDATED.**
+Taking the seed count from 3 to 8:
+
+| region | n=3 | **n=8** | sigma |
+|---|---|---|---|
+| caustic (tight) | −0.038 % | **−0.054 % +-0.081** | −0.7 |
+| floor, no caustic | −0.663 % (3.1 sigma) | **+0.010 % +-0.249** | **0.0** |
+| ball + walls | +0.350 % (2.9 sigma) | **−0.095 % +-0.156** | −0.6 |
+| lit frame | +0.069 % | **−0.076 % +-0.086** | −0.9 |
+
+Every region is inside 1 sigma. **The device light pass agrees with the host one everywhere** —
+0.08 % whole-frame, 0.05 % on the caustic — alongside photon counts agreeing to 0.01 % over 153
+paired realizations, a `vert` histogram agreeing to 0.03–0.3 % per bin, `gateC1` exact, and
+`sumMb` exactly 0 on both.
+
+**A difference MAP had already said so, before the seeds landed.** `(dev − host) / ref` over 8x8
+blocks is salt-and-pepper at +-1–3 % with **no spatial structure** and a correlation with scene
+brightness of **0.024**. A real deposit error localises — it concentrates where a path type lands,
+or tracks geometry, or follows brightness. Averaging ~18 such blocks over the "floor" region
+gives ~0.5 %, which is exactly the "3 sigma" that then evaporated. **Looking at the picture is a
+better first test than any region average**, and it cost one numpy loop.
+
+*Five candidate defects — float geometry, the `pdfFwdA` tail, the depth mix, the photon count,
+the floor/wall split — and every one traced to small-sample statistics or a misplaced ROI, none
+to the code.* The recurring failure was not the arithmetic but the error bar: each time, a
+3-sample spread of a slowly-sampled quantity was used as if it estimated the quantity's own
+scale.
+
 **Two disciplines earned their place here, one of them the hard way.** "Check that the rig can
 see the effect" is normally read as *is the signal large enough*; this is the other failure mode
 — **the instrument was not pointed at it**, and it produced a confident 5.7 sigma number about a
