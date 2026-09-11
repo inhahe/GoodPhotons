@@ -15535,6 +15535,133 @@ __global__ void kVcmCellKey(const DVcmLV* lv, int n, DVec3 gLo, double cell,
     }
 }
 
+// ================== A DEVICE LBVH OVER PHOTON BEAMS (mode J, beam half) =================
+//
+// Karras 2012, emitted into the SAME `DNode` layout the host's SAH builder produces, so
+// `dGatherPhotonBeams` traverses either without knowing which built it. See the scraps note for
+// why the BVH (not the trace) is the thing worth porting: a host realization is 72 % BVH build.
+//
+// 30-bit Morton code from the sub-beam's AABB CENTROID, normalised into the map's bounds. The
+// centroid, not an endpoint: a beam is a segment and its two ends can be far apart, so keying on
+// an end would sort two halves of one chord into different branches.
+__device__ static inline unsigned dExpandBits10(unsigned v) {
+    v = (v * 0x00010001u) & 0xFF0000FFu;
+    v = (v * 0x00000101u) & 0x0F00F00Fu;
+    v = (v * 0x00000011u) & 0xC30C30C3u;
+    v = (v * 0x00000005u) & 0x49249249u;
+    return v;
+}
+__device__ static inline unsigned dMorton3D(float x, float y, float z) {
+    // Clamp before scaling: a centroid exactly on the upper bound would otherwise index 1024.
+    x = fminf(fmaxf(x * 1024.0f, 0.0f), 1023.0f);
+    y = fminf(fmaxf(y * 1024.0f, 0.0f), 1023.0f);
+    z = fminf(fmaxf(z * 1024.0f, 0.0f), 1023.0f);
+    return (dExpandBits10((unsigned)x) << 2) | (dExpandBits10((unsigned)y) << 1)
+         | dExpandBits10((unsigned)z);
+}
+
+// One Morton code per sub-beam. `lo`/`invExt` normalise the centroid into [0,1]^3.
+__global__ void kBeamMorton(const DBeamRec* beams, int n, DVec3 lo, DVec3 invExt,
+                            unsigned* code, int* idx) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        const DBeamRec& b = beams[i];
+        // The sub-beam's own extent: origin + s0*d to origin + (s0+len)*d.
+        const DVec3 a{b.o.x + b.d.x * b.s0, b.o.y + b.d.y * b.s0, b.o.z + b.d.z * b.s0};
+        const DVec3 e{a.x + b.d.x * b.len,  a.y + b.d.y * b.len,  a.z + b.d.z * b.len};
+        const float cx = (float)(((double)a.x + (double)e.x) * 0.5 - (double)lo.x) * (float)invExt.x;
+        const float cy = (float)(((double)a.y + (double)e.y) * 0.5 - (double)lo.y) * (float)invExt.y;
+        const float cz = (float)(((double)a.z + (double)e.z) * 0.5 - (double)lo.z) * (float)invExt.z;
+        code[i] = dMorton3D(cx, cy, cz);
+        idx[i]  = i;
+    }
+}
+
+// Length of the common prefix of codes i and j, with the INDEX appended as a tie-break so that
+// duplicate Morton codes (common: many beams inside one medium cell) still yield a strict
+// ordering. Without the tie-break Karras's range search does not terminate on duplicates -- the
+// single most common way this algorithm is got wrong.
+__device__ static inline int dLbvhDelta(const unsigned* code, int n, int i, int j) {
+    if (j < 0 || j >= n) return -1;
+    const unsigned ci = code[i], cj = code[j];
+    if (ci == cj) return 32 + __clz((unsigned)i ^ (unsigned)j);
+    return __clz(ci ^ cj);
+}
+
+// One thread per INTERNAL node (there are n-1). Determines the node's range by walking out from
+// its own index, finds the split, and wires children: an internal child is its own index, a leaf
+// child is offset by (n-1) into the shared node array.
+__global__ void kLbvhInternal(const unsigned* code, int n, DNode* nodes, int* parent) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n - 1; i += stride) {
+        // Direction of the range this node covers.
+        const int d = (dLbvhDelta(code, n, i, i + 1) - dLbvhDelta(code, n, i, i - 1)) >= 0 ? 1 : -1;
+        const int dMin = dLbvhDelta(code, n, i, i - d);
+        int lMax = 2;
+        while (dLbvhDelta(code, n, i, i + lMax * d) > dMin) lMax <<= 1;
+        int l = 0;
+        for (int t = lMax >> 1; t >= 1; t >>= 1)
+            if (dLbvhDelta(code, n, i, i + (l + t) * d) > dMin) l += t;
+        const int j = i + l * d;
+        const int dNode = dLbvhDelta(code, n, i, j);
+        int sp = 0;
+        for (int t = (l + 1) >> 1; ; t = (t + 1) >> 1) {
+            if (dLbvhDelta(code, n, i, i + (sp + t) * d) > dNode) sp += t;
+            if (t <= 1) break;
+        }
+        const int split = i + sp * d + (d < 0 ? -1 : 0);
+        const int left  = (min(i, j) == split)     ? (split + n - 1)     : split;
+        const int right = (max(i, j) == split + 1) ? (split + 1 + n - 1) : (split + 1);
+        nodes[i].left = left;
+        nodes[i].right = right;
+        nodes[i].first = 0;
+        nodes[i].count = 0;          // internal, per BvhNode::isLeaf()
+        parent[left] = i;
+        parent[right] = i;
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) parent[0] = -1;
+}
+
+// Leaves: one per sub-beam, its box set from the beam's own extent inflated by the kernel radius.
+__global__ void kLbvhLeaves(const DBeamRec* beams, const int* order, int n, float radMax,
+                            DNode* nodes) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        const DBeamRec& b = beams[order[i]];
+        const DVec3 a{b.o.x + b.d.x * b.s0, b.o.y + b.d.y * b.s0, b.o.z + b.d.z * b.s0};
+        const DVec3 e{a.x + b.d.x * b.len,  a.y + b.d.y * b.len,  a.z + b.d.z * b.len};
+        // The gather accepts a beam within its own medium's kernel radius, so the box has to be
+        // inflated by that radius or the traversal will reject hits the estimator would keep --
+        // a silent darkening rather than a crash, which is why it is stated here.
+        const float r = (b.invRad > 0.0f) ? (1.0f / b.invRad) : radMax;
+        DNode& nd = nodes[n - 1 + i];
+        nd.lo = {fminf(a.x, e.x) - r, fminf(a.y, e.y) - r, fminf(a.z, e.z) - r};
+        nd.hi = {fmaxf(a.x, e.x) + r, fmaxf(a.y, e.y) + r, fmaxf(a.z, e.z) + r};
+        nd.left = -1; nd.right = -1;
+        nd.first = i; nd.count = 1;
+    }
+}
+
+// Bottom-up refit. One thread per leaf walks to the root; an atomic counter per internal node
+// lets only the SECOND arriving child proceed, so each internal box is computed exactly once
+// and only after both children are final.
+__global__ void kLbvhRefit(const int* parent, int n, int* visited, DNode* nodes) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        int node = parent[n - 1 + i];
+        while (node >= 0) {
+            if (atomicAdd(&visited[node], 1) == 0) break;   // first child: leave it to the second
+            const DNode& L = nodes[nodes[node].left];
+            const DNode& R = nodes[nodes[node].right];
+            nodes[node].lo = {fminf(L.lo.x, R.lo.x), fminf(L.lo.y, R.lo.y), fminf(L.lo.z, R.lo.z)};
+            nodes[node].hi = {fmaxf(L.hi.x, R.hi.x), fmaxf(L.hi.y, R.hi.y), fmaxf(L.hi.z, R.hi.z)};
+            __threadfence();
+            if (node == 0) break;
+            node = parent[node];
+        }
+    }
+}
+
 // Cell id per deposited SURFACE photon (mode J). Same shape as kVcmCellKey; the positions are
 // DSurfPhoton's, which the gather bins with the identical expression in dSurfMergeAt -- and it
 // is that agreement, not agreement with the host build, that decides whether a merge is found.
@@ -17592,6 +17719,75 @@ static void ensureDevCap(T*& p, size_t& cap, size_t need) {
     cap = newCap;
 }
 
+// ---- a device LBVH over the beam map's sub-beams (FTRACE_JLBVH=1) --------------------
+//
+// Grow-only scratch, same discipline as JSurfDev: a per-chunk rebuild must not cudaMalloc four
+// buffers every 0.15 s. Kept separate from JSurfDev because the two maps have different
+// lifetimes -- the surface map is rebuilt per sub-launch, the beam map (for now) per epoch.
+struct JBeamDev {
+    unsigned* code  = nullptr;   size_t codeCap = 0;
+    int* order      = nullptr;   size_t orderCap = 0;
+    int* parent     = nullptr;   size_t parentCap = 0;
+    int* visited    = nullptr;   size_t visitedCap = 0;
+    gpu::DNode* nodes = nullptr; size_t nodesCap = 0;
+    ThrustArena arena;
+    void release() {
+        cudaFree(code); cudaFree(order); cudaFree(parent); cudaFree(visited); cudaFree(nodes);
+        code = nullptr; order = nullptr; parent = nullptr; visited = nullptr; nodes = nullptr;
+        codeCap = orderCap = parentCap = visitedCap = nodesCap = 0;
+        arena.release();
+    }
+    ~JBeamDev() { release(); }
+    JBeamDev() = default;
+    JBeamDev(const JBeamDev&) = delete;
+    JBeamDev& operator=(const JBeamDev&) = delete;
+};
+
+// Build an LBVH over `n` sub-beams already resident as `DBeamRec`s, and point `dbm` at it.
+// `lo`/`hi` are the map's world bounds -- taken from the host BVH's root box, which is exactly
+// the same set of primitives, so no device reduction is needed for them.
+static bool buildBeamLbvhDevice(JBeamDev& d, const gpu::DBeamRec* beams, int n,
+                                const Aabb& bounds, double radMax, gpu::DBeamMap& dbm) {
+    if (n <= 1) return false;                 // a 1-primitive LBVH has no internal node
+    const size_t nNodes = (size_t)(2 * n - 1);
+    ensureDevCap(d.code, d.codeCap, (size_t)n);
+    ensureDevCap(d.order, d.orderCap, (size_t)n);
+    ensureDevCap(d.parent, d.parentCap, nNodes);
+    ensureDevCap(d.visited, d.visitedCap, (size_t)(n - 1));
+    ensureDevCap(d.nodes, d.nodesCap, nNodes);
+    CUDA_CHECK(cudaMemset(d.visited, 0, (size_t)(n - 1) * sizeof(int)));
+
+    const gpu::DVec3 lo((gpu::Real)bounds.lo.x, (gpu::Real)bounds.lo.y, (gpu::Real)bounds.lo.z);
+    auto inv = [](double e) { return (e > 0.0) ? 1.0 / e : 0.0; };
+    const gpu::DVec3 invExt((gpu::Real)inv(bounds.hi.x - bounds.lo.x),
+                            (gpu::Real)inv(bounds.hi.y - bounds.lo.y),
+                            (gpu::Real)inv(bounds.hi.z - bounds.lo.z));
+    int blocks = (n + 127) / 128; if (blocks > 2048) blocks = 2048; if (blocks < 1) blocks = 1;
+    gpu::kBeamMorton<<<blocks, 128>>>(beams, n, lo, invExt, d.code, d.order);
+    cudaCheckKernel("lbvh-morton");
+
+    d.arena.reset();
+    ThrustArenaAlloc tal{&d.arena};
+    auto pol = FT_THRUST_PAR(tal);
+    thrust::device_ptr<unsigned> tk(d.code);
+    thrust::device_ptr<int> to(d.order);
+    // STABLE, so that equal Morton codes keep sub-beam order. `dLbvhDelta`'s index tie-break
+    // then makes the hierarchy deterministic, which is what lets this be A/B'd at all.
+    thrust::stable_sort_by_key(pol, tk, tk + n, to);
+
+    gpu::kLbvhInternal<<<blocks, 128>>>(d.code, n, d.nodes, d.parent);
+    cudaCheckKernel("lbvh-internal");
+    gpu::kLbvhLeaves<<<blocks, 128>>>(beams, d.order, n, (float)radMax, d.nodes);
+    cudaCheckKernel("lbvh-leaves");
+    gpu::kLbvhRefit<<<blocks, 128>>>(d.parent, n, d.visited, d.nodes);
+    cudaCheckKernel("lbvh-refit");
+
+    dbm.nodes = d.nodes;
+    dbm.primIdx = d.order;
+    dbm.nNodes = (int)nNodes;
+    return true;
+}
+
 // ---- mode J's surface photon map, TRACED AND GRIDDED ON THE DEVICE -------------------
 //
 // The point is FREQUENCY, not speed. Measured ([jstats], known-issues U-vs-J): mode J's whole
@@ -18091,6 +18287,27 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // MERGE=true kernel reads as "no merges" — so `-nobeams` degenerates to mode D exactly.
     DBeamMap dbm{};
     if (bmap) uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/true);
+    // FTRACE_JLBVH=1: rebuild the NODES on the device over the very same sub-beams. Same beams,
+    // same gather, a different tree -- so an image difference is a traversal-acceptance
+    // difference and a time difference is tree quality, with no third variable to blame.
+    JBeamDev jbvh;
+    if (dbm.nNodes > 0 && bmap && !bmap->bvh.nodes.empty() &&
+        std::getenv("FTRACE_JLBVH") && std::atoi(std::getenv("FTRACE_JLBVH")) != 0) {
+        const int nb = (int)bmap->beams.size();
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = buildBeamLbvhDevice(jbvh, dbm.beams, nb, bmap->bvh.nodes[0].box,
+                                            bmap->radius, dbm);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0).count();
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::printf("[jlbvh] device LBVH over %d sub-beams in %.1f ms (host SAH tree had %zu "
+                        "nodes; LBVH has %d)%s\n", nb, ms, bmap->bvh.nodes.size(), dbm.nNodes,
+                        ok ? "" : " -- REFUSED, too few beams; keeping the host tree");
+        }
+    }
     // `-jsurf`'s map. (The "increment 1: ... an uploaded map changes nothing yet" this comment
     // used to carry was true for one version. The gather landed in 0.263.1 -- see `mergeAny`
     // below, which launches the MERGE kernel for a surface map with no beams, and

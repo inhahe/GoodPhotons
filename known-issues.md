@@ -836,6 +836,37 @@ On the device an LBVH over 265 k beams plus a sub-millisecond trace is a few ms,
 goes from ~0.32 s to ~3 ms — about **100x** — which turns the light side from 9.6 % of the render
 into roughly the same fraction while carrying two orders of magnitude more realizations.
 
+**AND THE DEVICE LBVH IS BUILT AND MEASURED (v0.272.1, `FTRACE_JLBVH=1`).** Karras 2012 emitted
+into the host's own `DNode` layout — internal `[0..n-2]`, leaves `[n-1..2n-2]` with `count == 1`,
+which is exactly `BvhNode::isLeaf() == count > 0` — so `dGatherPhotonBeams` traverses either
+builder's output unchanged. The flag rebuilds **only the nodes**, over the very same `DBeamRec`s
+`uploadBeamMapCuda` already produced: same beams, same gather, a different tree, so an image
+difference can only be traversal acceptance and a time difference can only be tree quality.
+
+`_fog_thick`, 96^2, 128 spp, `-beamfreeze`, 242 646 sub-beams:
+
+| | host SAH | device LBVH |
+|---|---|---|
+| build | ~220 ms | **4.3 ms** — **~51x** |
+| nodes | 156 557 | 485 291 (one primitive per leaf) |
+| `beam hits` (gather) | 0.4 s | **0.4 s — unchanged** |
+| wall | 1.2 s | 1.1 s |
+| image mean | 2.2187e9 | 2.2192e9 — **1.000226x** |
+| lit-pixel rel. diff | — | **median exactly 0**, p99 2.5 %, 51 of 2 568 px differ >1 % |
+
+**The quality worry was over-priced and the prediction was wrong in the useful direction.** The
+`area^0.4` estimate from the `sah`/`nosplit` split measurement predicted a 1.1–1.2x gather
+penalty; the measured penalty is **none**. The LBVH has 3.1x the nodes but one primitive per
+leaf, so it trades deeper traversal against smaller leaf tests and comes out level. A median
+relative difference of **exactly zero** says most rays find the identical beam set; the 2 % that
+move are at the acceptance boundary, and the mean is unmoved at 0.02 %.
+
+**What this does and does not cover.** It replaces BVH *construction*, which the earlier profile
+showed is essentially all of `buildBeamMap` (`241186 stored -> 5154789 after split … BVH in
+5.01s`, against 0.07 s of trace). The deposit and the split are still host-side, so this is one
+of the three pieces a per-chunk beam redraw needs — but it is the piece that was 72 % of the
+cost, and it is now ~1.4 % of it.
+
 Extrapolated: a per-chunk beam redraw on this scene would go from 5 realizations to roughly
 167 chunks x 4 = ~670, and `670/5 = 134` at `N^-0.51` is a further **~12x**. That is the size of
 the prize, and it justifies the cost — a device beam deposit plus a device BVH over the split
