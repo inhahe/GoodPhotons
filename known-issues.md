@@ -14,6 +14,23 @@ features, not superseded reasoning.** The rest were checked individually and are
 mode `J`'s merge weight rather than mode `D`'s connections, `grid:`/`scatter:` are still absent
 from the four field sites, and the mode-`J` flyby still falls to `restIdx` at `main.cpp:23142` (it still does, and always will — v0.271.0 shared its light side *inside* that per-camera loop rather than by promoting mode `J` to a group).
 
+**TWO BUILD-HARNESS TRAPS, both hit on 2026-09-11 and both now guarded in `scraps/build.sh`**
+(which is git-ignored, so they are recorded *here* or nowhere):
+
+* **`grep` without `-a` hides the compile error.** MSVC/nvcc output contains bytes grep reads as
+  binary, so the failure report printed `Binary file scraps/build.log matches` *instead of* the
+  error. A diagnosable failure became a mystery for a whole iteration. The pattern is also
+  narrowed to `error C|error :|fatal|error D8` so it does not match the word "error" in ordinary
+  output.
+* **Two concurrent builds destroy each other.** MSBuild writes fixed object paths, so a second
+  build started while the first is live fails *both* with `Permission denied` on a `.obj` and
+  `error D8040: error creating or communicating with child process`. The trigger was reading an
+  empty background-task output as "the task died" — but the script prints **nothing** until it
+  finishes, because everything goes to `build.log`. **An empty output means "still running".**
+
+Both belong to the same family as the `cmd /c` failure this script was written for: the harness
+said nothing, and silence was read as information.
+
 **A repro scene for an OPEN entry must be TRACKED** (`scenes/`, not `scraps/`). `scraps/` is
 git-ignored, so an entry whose repro lives there cannot be re-validated and its drift cannot be
 detected — on 2026-09-10 that nearly produced a false "7× regression" report against the GRIN
