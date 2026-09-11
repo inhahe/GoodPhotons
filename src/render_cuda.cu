@@ -17655,12 +17655,21 @@ static void buildJSurfMapDevice(JSurfDev& d, const gpu::DScene& sc, const gpu::D
     gpu::DJSurfOut out{};
     out.pts = d.pts; out.mis = d.mis; out.count = d.count; out.cap = (int)cap;
     const bool deep = (maxDepth > BDPT_MAXDEPTH);
+    // GRID SIZED TO THE WORK, not copied from the megakernel. Each thread reserves
+    // `DVertex path[MAXV]` in local memory, so a fixed 2048x128 launch reserves hundreds of MB
+    // of local store to run one subpath per thread -- and a per-CHUNK rebuild pays that setup
+    // hundreds of times a render rather than once. The grid-stride loop is unchanged and every
+    // subpath is seeded by its ABSOLUTE index, so the launch geometry cannot alter the map:
+    // this is a pure setup-cost change, bit-identical by construction.
+    int blocks = (int)((nPaths + 127) / 128);
+    if (blocks < 1)    blocks = 1;
+    if (blocks > 2048) blocks = 2048;      // still saturate the card on a large -n
     if (deep)
-        gpu::kJSurfLightT<BDPT_DEEPDEPTH><<<2048, 128>>>(sc, cam, diffraction, maxDepth,
-                                                         nPaths, salt, out);
+        gpu::kJSurfLightT<BDPT_DEEPDEPTH><<<blocks, 128>>>(sc, cam, diffraction, maxDepth,
+                                                           nPaths, salt, out);
     else
-        gpu::kJSurfLightT<BDPT_MAXDEPTH><<<2048, 128>>>(sc, cam, diffraction, maxDepth,
-                                                        nPaths, salt, out);
+        gpu::kJSurfLightT<BDPT_MAXDEPTH><<<blocks, 128>>>(sc, cam, diffraction, maxDepth,
+                                                          nPaths, salt, out);
     cudaCheckKernel("jsurf-light");
     int n = 0;
     CUDA_CHECK(cudaMemcpy(&n, d.count, sizeof(int), cudaMemcpyDeviceToHost));
@@ -17704,8 +17713,11 @@ static void buildJSurfMapDevice(JSurfDev& d, const gpu::DScene& sc, const gpu::D
                          (gpu::Real)((double)bb.mnz - cell));
     ensureDevCap(d.cellKey, d.cellKeyCap, (size_t)n);
     ensureDevCap(d.order,   d.orderCap,   (size_t)n);
-    gpu::kJSurfCellKey<<<2048, 128>>>(d.pts, n, gLo, cell, (int)gnx, (int)gny, (int)gnz,
-                                      d.cellKey);
+    int ckBlocks = (n + 127) / 128;
+    if (ckBlocks < 1)    ckBlocks = 1;
+    if (ckBlocks > 2048) ckBlocks = 2048;
+    gpu::kJSurfCellKey<<<ckBlocks, 128>>>(d.pts, n, gLo, cell, (int)gnx, (int)gny, (int)gnz,
+                                          d.cellKey);
     cudaCheckKernel("jsurf-cellkey");
     thrust::device_ptr<int> tKey(d.cellKey), tOrd(d.order);
     thrust::sequence(pol, tOrd, tOrd + n);

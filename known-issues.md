@@ -522,7 +522,29 @@ assumed. The thrust work does not account for it (a 49 000-key stable sort is ~5
 lower_bound ~0.1 ms); the launch does. `kJSurfLightT` was launched `<<<2048, 128>>>`, copied from
 the megakernel, so 262 144 threads each reserving `DVertex path[MAXV]` — hundreds of MB of local
 store — to run 16 384 subpaths. A megakernel's grid is right for a megakernel and wrong for a
-pass that is one subpath per thread. The recurring failure was not the arithmetic but the error bar: each time, a
+pass that is one subpath per thread.
+
+**...and that diagnosis was WRONG, which the fix itself proved.** Sizing the grid to the work
+(128 blocks instead of 2048 for 16 384 subpaths) moved the 30 s realization count from 218 to
+**218** and `FTRACE_CHUNK_SPP=1` from 989 spp to 1010 — about 2 %. So the launch reservation was
+not the cost. The control that should have come first, `FTRACE_CHUNK_SPP=1` at three levels of
+the flag:
+
+| | spp in 20 s |
+|---|---|
+| `FTRACE_JDEVLIGHT=0` (no device light pass at all) | 665 |
+| `FTRACE_JDEVLIGHT=1` (device map once per epoch) | 713 |
+| `FTRACE_JDEVLIGHT=3` (device map per chunk) | 672 |
+
+All three the same inside the spread. **The per-chunk device rebuild is essentially free**; the
+~30 ms is the generic per-chunk machinery — kernel launch, film download, the progress report and
+its film merge — which level 0 pays identically. The ceiling on realizations is therefore the
+CHUNK, not the light side, and that reframes the next move: since a rebuild costs nothing,
+redraw *several times inside one chunk*, skipping the download and the report between
+sub-launches. At 14 spp per chunk that is up to 14x more realizations for the price of a kernel
+launch each. (The grid-size change is kept anyway — it is bit-identical by construction and stops
+reserving hundreds of MB of local store to run 6 % of its threads — but it is a tidiness fix, not
+a speed one, and is recorded here as such rather than as a win.) The recurring failure was not the arithmetic but the error bar: each time, a
 3-sample spread of a slowly-sampled quantity was used as if it estimated the quantity's own
 scale.
 
