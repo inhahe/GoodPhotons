@@ -279,6 +279,52 @@ of magnitude smaller than the thing worth fixing first.
 
 Until that port exists, **mode `U` stays**, and it stays *for a measured reason*: at equal blur
 its merge estimator is 16× more efficient, and ~14× of that is light-side density.
+
+**WHAT THE PORT HAS TO BE, MEASURED (2026-09-11, v0.271.1).** "Port the light pass to the device"
+was filed as though the light pass were *expensive*. It is not, and getting that backwards would
+have built the wrong thing. Mode `J` now prints a `[jstats]` line itemising the light side
+whenever it refreshes; on `scenes/_caustic_box.ftsl` under the U-vs-J settings (`-jsurf
+-vcmalpha 1 -pmradius 0.02 -max-bounce 8 -r 128 -device gpu`, 90 s):
+
+| `-beamrefresh` | realizations | trace | beam BVH | surf grid | gather | light side |
+|---|---|---|---|---|---|---|
+| 0.10 (default) | 126 | 3.38 s | 0.00 s | 0.20 s | 86.4 s | **4.0 %** |
+| 0.95 | 367 | 9.93 s | 0.00 s | 0.54 s | 79.4 s | **11.6 %** |
+
+**The light side is 4 % of the render.** Making it infinitely fast buys 4 % of the wall clock —
+nothing like the ~14× the variance gap is worth. So the port is not a *speed* fix. It is a
+**frequency** fix, and there are exactly two walls between 126 realizations and mode `U`'s ~8500,
+both now measured:
+
+1. **The CPU trace costs 27 ms per realization** (3.38 s / 126, and 9.93 s / 367 — the same
+   number twice, so it is a rate and not an artefact of one run). 8500 × 27 ms = **230 s**, inside
+   a 90 s budget. Even if every other cost were zero, the host trace caps this scene at ~3300
+   realizations. On the device a 16 384-subpath depth-8 walk is sub-millisecond work.
+2. **An epoch cannot be shorter than one GPU chunk**, and `gpuSppChunks` retargets chunks to
+   **~0.15 s** of kernel time. That alone caps a 90 s render at ~600 realizations, which is why
+   `-beamrefresh 0.95` bought only 367 and not the ~1500 its own arithmetic asks for
+   (`epochSec = (rebuild + setup)/frac` came to 62 ms against a measured 245 ms epoch). The
+   refresh knob has therefore already run out; it is not the lever the sweep treated it as.
+
+**And the cheap alternative is ruled out.** The suspicion that the per-epoch cost is really
+`renderBdptCuda` re-uploading the whole scene — which would make a *resident device scene* the fix,
+far cheaper than a light-pass port — is wrong here: `setup <= 4.09 s` over 126 epochs is **at most
+32 ms each**, and that bound already includes rendering, so the true figure is smaller. Worth
+recording as a negative result because the mode-`D` resident-session entry makes the same
+re-upload argument and it is *correct there*; it just is not what is capping this.
+
+**So the shape of the work is: make the light side a DEVICE-SIDE, PER-CHUNK redraw** — not a port
+of `traceLightBeamPass` that still hands a map back across PCIe once per epoch, which would fix
+wall 1 and leave wall 2 standing. Mode `U` reaches 8500 because its light side is drawn at the
+same granularity as its camera samples; mode `J` has to do the same thing, on the device, inside
+the chunk. `dGenLightSubpath` already exists in `render_cuda.cu` (it feeds the connection half),
+so the missing pieces are the **deposit** (beams, surface photons and their MIS partials) and a
+device-side **acceleration build** over them, per chunk.
+
+**Caveat on the scene.** `_caustic_box` has no media, so `beam BVH 0.00 s` says nothing about a
+media scene — and the `PERF` entry measured `_fog_cornell` at `-n 200000` as 8.84 s of which
+**8.69 s was the BVH build**. On a media scene the beam BVH is the dominant light-side cost and
+wall 1 is far worse than 27 ms. The two walls stand either way; their relative sizes do not.
 ### SPHERELIGHT-EPS — **FIXED** (2026-09-09, v0.266.1; filed the same day as "GPU-SPHERELIGHT", whose name and diagnosis were both wrong): a **`light sphere` rendered 0.6–1.2 % DARK on the CPU** — its shadow rays were hitting the emitter's own geometry
 
 **Found by closing an old gate.** `GPU-NEE-EPS` (DONE, 0.259.0) was fixed but never validated.

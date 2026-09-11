@@ -16314,6 +16314,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // epoch reuses that decision: re-running the budget pilot per refresh would pay for it
         // over and over and let the subpath count wander between realizations for no benefit.
         bdpt::BeamBudgetInfo& jbb = jlc.jbb;
+        // WHERE THE LIGHT-SIDE BUDGET GOES, split four ways, because the four have wildly
+        // different fixes and the totals are what decide which one is worth building: a device
+        // TRACE, a faster BVH, a cheaper surface grid, or a scene left RESIDENT on the device
+        // across epochs. See the [jstats] line at the end of the render.
+        double lsTraceSec = 0.0;    // the subpath trace itself (bdpt::traceLightBeamPass)
+        double lsBeamSec  = 0.0;    // buildBeamMap: split + SAH BVH over the chords
+        double lsSurfSec  = 0.0;    // SurfMap::build: the point-merge grid
+        double lsSetupSec = 0.0;    // per-epoch gap to the first sample (device scene re-upload)
+        double lsGatherSec = 0.0;   // the gather, i.e. what all of the above is overhead ON
         // THE LIGHT SIDE AS A FUNCTION OF THE EPOCH, rather than a one-off. Epoch 0 is the
         // original build bit-for-bit; every later epoch redraws the same map under a different
         // salt, so the render averages over INDEPENDENT light-side realizations instead of
@@ -16438,6 +16447,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             bdpt::traceLightBeamPass(scene, cam, Nepoch, nThreads, maxDepth, diffraction,
                                      bmap, &stageProg, jreq, &jbb,
                                      wantSurf ? &smap : nullptr);
+            const double traceSec =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
+            lsTraceSec += traceSec;
             // Say what the budget did, always. A pass that silently traced 3 % of the subpaths
             // the command line named would be exactly the kind of invisible surprise this whole
             // change is about — and the measured rate and knee are the numbers a user needs in
@@ -16471,6 +16483,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             }
             const double buildSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
+            lsBeamSec += buildSec - traceSec;   // buildBeamMap only: the trace is subtracted
             if (first && wantBeams)
                 std::printf("mode J: %zu beams from %lld light subpaths in %s "
                             "(%.2f beams/subpath, %.0f MB). Rendering connections + merges ...\n",
@@ -16489,7 +16502,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 // Per-EPOCH radius, not the fixed one: see surfRadiusFor above for why the
                 // schedule is what keeps the point merges consistent. Epoch 0 gets exactly
                 // surfRadius0 (pow(1, x) == 1), so the first realization is unchanged.
+                const auto tsb = std::chrono::steady_clock::now();
                 smap.build(surfRadiusFor(epoch));
+                lsSurfSec += std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - tsb).count();
                 if (first)
                     std::printf("mode J: %zu surface photons from the same %lld subpaths, "
                                 "r=%.4g (%.0f MB). Point merges ON (-jsurf).\n",
@@ -16630,6 +16646,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         const double setupSec =
                             std::chrono::duration<double>(clk::now() - tEpoch).count();
                         epochSec = (rebuildSec + setupSec) / g_beamRefreshFrac;
+                        // `setupSec` measures the gap to the FIRST report, which already
+                        // includes rendering, so it over-counts the true setup. Recorded
+                        // anyway and labelled as an upper bound: on the device it is the
+                        // per-epoch scene re-upload, and an upper bound that is already small
+                        // is enough to rule that fix out.
+                        lsSetupSec += setupSec;
                         // The floor was a full second, from when the only map here was an
                         // expensive BEAM map and the epoch count was purely a decorrelation
                         // knob. With `-jsurf` it is no longer only that: the surface radius
@@ -16672,7 +16694,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 // own `quiet` argument follows one screen up. Restored immediately after, so
                 // any later non-epoch caller narrates normally.
                 g_gpuQuietRebuild = (epoch != 0);
+                const auto tg = clk::now();
                 Film f = renderEpoch(sppTarget - sppAll, &inner);
+                lsGatherSec += std::chrono::duration<double>(clk::now() - tg).count();
                 g_gpuQuietRebuild = false;
                 if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
                 acc.merge(f);
@@ -16682,6 +16706,24 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 std::printf("mode J: averaged %llu independent light-side realizations "
                             "(%lld spp total) — the merge noise fell with the render, not just "
                             "the connection noise\n", (unsigned long long)epoch, sppAll);
+            // WHAT A REALIZATION COST, ITEMISED. Printed whenever the render actually
+            // refreshed, because the number of realizations is mode J's dominant remaining
+            // variance term (U-vs-J: mode U draws ~8500 to mode J's ~150 and is 16x better at
+            // equal blur, ~14x of it light-side density) and this line says which of the four
+            // costs is standing in the way of more of them. `setup` is an UPPER bound -- it is
+            // measured to the first progress report, which already includes rendering.
+            if (epoch > 1) {
+                const double tot = lsTraceSec + lsBeamSec + lsSurfSec + lsGatherSec;
+                const double pct = (tot > 0.0) ? 100.0 / tot : 0.0;
+                std::printf("[jstats] %llu epochs: trace %.2fs (%.1f%%), beam BVH %.2fs "
+                            "(%.1f%%), surf grid %.2fs (%.1f%%), gather %.2fs (%.1f%%); "
+                            "setup <= %.2fs. Light side = %.1f%% of the render\n",
+                            (unsigned long long)epoch,
+                            lsTraceSec, lsTraceSec * pct, lsBeamSec, lsBeamSec * pct,
+                            lsSurfSec, lsSurfSec * pct, lsGatherSec, lsGatherSec * pct,
+                            lsSetupSec,
+                            (lsTraceSec + lsBeamSec + lsSurfSec) * pct);
+            }
             return acc;
         };
         const bool ckpt = resume || wantCheckpointFlag ||
