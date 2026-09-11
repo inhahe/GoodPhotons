@@ -490,7 +490,39 @@ better first test than any region average**, and it cost one numpy loop.
 
 *Five candidate defects — float geometry, the `pdfFwdA` tail, the depth mix, the photon count,
 the floor/wall split — and every one traced to small-sample statistics or a misplaced ROI, none
-to the code.* The recurring failure was not the arithmetic but the error bar: each time, a
+to the code.*
+
+**STEP 3 (v0.271.3), `FTRACE_JDEVLIGHT=3`: ONE LIGHT-SIDE REALIZATION PER CHUNK, and it is worth
+5.1x.** `gpuSppChunks` already calls `launch(c, base)` once per chunk with `base` the absolute
+sample index, so rebuilding at the top of that lambda, salted by `base`, is a per-chunk redraw
+with no signature change anywhere — and `base` is the same quantity the camera side already uses
+to stay decorrelated across epoch boundaries.
+
+Realizations, `_caustic_box`, 30 s, GPU: **36 per epoch-driven run -> 218 per chunk-driven run**,
+a **6.1x** rise, with chunks landing at 14 spp / 0.138 s (`gpuSppChunks` targets 0.15 s).
+
+Variance, 6 seeds per arm, interleaved, seed-to-seed, trimmed over per-pixel variances:
+
+| region | per-epoch | per-chunk | ratio | bias shift |
+|---|---|---|---|---|
+| lit frame | 1.899e20 | 3.726e19 | **0.196x** | −0.035 % |
+| floor, no caustic | 1.322e20 | 2.541e19 | **0.192x** | −0.333 % |
+| caustic (tight) | 6.751e19 | 4.611e19 | 0.683x | −0.115 % |
+
+**And the sample counts are matched by measurement, not by assumption**: 2742/2635/2723/2689/
+2727/2734 spp against 2682/2496/2660/2669/2675/2672 — the per-chunk arm has **2.4 % FEWER**
+samples, so none of the win is extra sampling and the arm that wins is the handicapped one.
+Against the U-vs-J table's 16.1x (mode J's merge variance over mode U's at equal blur), a 5.1x
+cut takes mode J to roughly **3x** — most of the way, from the light-side term alone.
+
+**The ceiling, and where it is.** Pinning the chunk smaller buys realizations but costs samples:
+`FTRACE_CHUNK_SPP=4` gives 490 realizations for 1960 spp, `=1` gives 989 for 989 spp. At one spp
+per chunk that is **30 ms of overhead per chunk** — far above the sub-millisecond the design
+assumed. The thrust work does not account for it (a 49 000-key stable sort is ~50 us, the
+lower_bound ~0.1 ms); the launch does. `kJSurfLightT` was launched `<<<2048, 128>>>`, copied from
+the megakernel, so 262 144 threads each reserving `DVertex path[MAXV]` — hundreds of MB of local
+store — to run 16 384 subpaths. A megakernel's grid is right for a megakernel and wrong for a
+pass that is one subpath per thread. The recurring failure was not the arithmetic but the error bar: each time, a
 3-sample spread of a slowly-sampled quantity was used as if it estimated the quantity's own
 scale.
 

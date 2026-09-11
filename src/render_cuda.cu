@@ -18105,6 +18105,12 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         }
         if (jdevLevel >= 2) compareJSurfMaps(*smap, jdev);
     }
+    // Level 3 redraws per chunk (see the note above): remember what the rebuild needs, since the
+    // launch lambda has no `smap` of its own and must not reach for one that may be freed.
+    const bool jPerChunk   = jDevLight && jdevLevel >= 3;
+    const long long jPaths = jDevLight ? (long long)smap->nEmitted : 0;
+    const double    jRad   = jDevLight ? smap->radius : 0.0;
+    const long long jCap   = jDevLight ? ((long long)smap->pts.size() * 2 + 1024) : 0;
     {   // the half-render diagnostic, mirrored from the host so one half can be compared
         // backend to backend (bdpt::jHalfMode: 1 = connections only, 2 = merges only)
         // Same strings bdpt.h's jHalfMode() reads -- that function is the source of truth, but
@@ -18170,6 +18176,21 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     const bool mergeAny = mergeOn || dsm.nPts > 0;   // either kind wants MERGE=true
     std::vector<WfBand> wfProfileCur;
     auto launch = [&](long long c, long long base) {
+        // ONE LIGHT-SIDE REALIZATION PER CHUNK (FTRACE_JDEVLIGHT=3). `base` is the ABSOLUTE
+        // sample index this chunk starts at, so it advances every chunk and never repeats
+        // across a resume -- which makes it the right thing to salt with, and the same
+        // quantity the camera side already uses to stay decorrelated across epoch boundaries.
+        //
+        // The rebuild is unconditional in the chunk, not amortised: at ~16k subpaths it is
+        // sub-millisecond against a 0.15 s chunk, i.e. under 1 % -- which is the whole reason
+        // the trace had to move to the device before this was worth doing. On the host it was
+        // 27 ms and this loop would have cost 18 % of the render.
+        if (jPerChunk)
+            buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, jPaths, jRad, jCap,
+                                jSurfSalt(prog) ^ ((unsigned long long)base *
+                                                   0xD1B54A32D192ED03ULL),
+                                dsm);
+
         long long totalSamples = (long long)npix * c;
         // Mode J only ever instantiates the scalar (NS == 0) kernel: `useHero` is already
         // false for any scene with a participating medium, and a mode-J scene without one
