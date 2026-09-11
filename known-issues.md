@@ -85,8 +85,35 @@ to this configuration.
 At the full image's worst pixel the split is 1.474e11 connections against 3.07e10 merges: the
 spike is **83 % connection**.
 
-*One scene, one seed, one spp setting* — this is an attribution, not a law, and the `-beamk 8` /
-relSE configuration where (2g) saw a 6x tail has not been re-run this way. But the lever it points
+**SWEPT ACROSS `-beamk`, AND THE STRUCTURE IS EXACT: THERE IS NO MODE-`J`-SPECIFIC FIREFLY.**
+Same scene/seed/spp, halves at three beam budgets including the `-beamk 8` that (2g) used:
+
+| `-beamk` | connections' share of the mean | connections max/mean | merges max/mean | full max/mean |
+|---|---|---|---|---|
+| 8 | 12.4 % | 657 | 60.6 | 98.5 |
+| 32 (default) | 4.3 % | 1669 | 40.6 | 87.5 |
+| 128 | 2.1 % | 3745 | 42.7 | 93.4 |
+| mode `D` | — | — | — | **94.3** |
+
+Read the connection row as an ABSOLUTE peak rather than a ratio and it stops moving:
+**1.51e11, 1.47e11, 1.46e11** — constant to 4 % across a 16x change in beam budget. The max/mean
+blow-up from 657 to 3745 is entirely its *denominator* shrinking as the merges take over the mean
+(87.6 % -> 95.6 % -> 97.7 %). The connection half is not getting worse; it is getting smaller
+while its spike stays exactly where it was.
+
+And the full image's worst pixel is the same in every configuration **including mode `D`**:
+1.82e11, 1.78e11, 1.73e11, and mode `D` 1.83e11. **It is one path that BDPT connections find and
+nothing suppresses** — the same path, at the same value, whether or not merging is switched on.
+
+**So the merge technique adds no tail, and UPBP-CONV's firefly framing is about the SHARED BDPT
+tail.** There is no mode-`J`-specific firefly bug to look for; the MIS partition is behaving
+exactly as it should, with the merges absorbing the bulk and leaving the connections their
+spikes. Anything that fixes this fixes mode `D` too, which makes it a general path-tracing
+firefly problem (clamping, roulette, or a path-space filter) rather than anything in the merge
+estimator or its weight.
+
+*One scene, one seed, one spp setting* — this is an attribution, not a law, and (2g)'s relSE-based
+comparison has not been re-run this way. But the lever it points
 at is a 4 %-energy, 1669x-peaked residual, which is a different and much more specific target
 than "the beam gather".
 
