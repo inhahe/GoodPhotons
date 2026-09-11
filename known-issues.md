@@ -343,6 +343,25 @@ mirror is `bdpt.h` ~2080, and every device twin it needs is already written: `dG
 `dSurfMergeSite`, `dMergeEtaPrime`, `dMisWeight`'s `kappaSurf` arm. The beam half comes second and
 is harder — a BVH, not a grid.
 
+**STEP 1 IS IN (2026-09-11, no version bump).** `kJSurfLightT<MAXD>` in `render_cuda.cu` (just
+before `} // namespace gpu`) is the device twin of that `bdpt.h` ~2080 deposit: one thread per
+light subpath, `dGenLightSubpath` for the walk, `atomicAdd` append of `DSurfPhoton` + `DSurfMis`.
+It is **explicitly instantiated but referenced by no dispatch**, so it compiles and links and
+cannot move a pixel — verified bit-identical on `scenes/_jfly.ftsl`, `-device gpu`. The
+instantiation is deliberate: an unreferenced template is not compiled at all, so without it a
+step whose only claim is "it compiles" would prove nothing.
+
+Three things in it have to match the host exactly and each failure is silent, so they are called
+out in the kernel's own header comment: the **site predicate** (`dSurfMergeSite`, the same one
+the gather and the weight ask — a site the map fills but the weight ignores double-counts), the
+**accumulator index** (the stored partials are the recurrence at `u-1`, not `u`, because a point
+merge's reference connection splits after `y_{u-1}`), and **`nEmitted` counting attempts rather
+than successes** (the host increments `done` before its `pdfLam <= 0` continue, so counting only
+successful emissions would inflate `kappaS` and darken every merge).
+
+Still to come: the on-device grid build (copy `vcmSessionPass`'s bbox → cell key → stable sort →
+`lower_bound`), and the wiring that redraws it inside the chunk loop — which is wall 2.
+
 **Three stale claims about `-jsurf` and the GPU, corrected the same day** (no version bump: all
 three were comments or dead code, and the fix is bit-identical, verified). `main.cpp` said "the
 device merge weight carries one merge kind ... an EXPLICIT `-jsurf` is a request for the three-way

@@ -15590,6 +15590,134 @@ __global__ static void kPatOpProbe(const PatNode* prog, const PatNodeF* progF,
                                       (float)in->r, (float)in->u, (float)in->v, env, dF);
 }
 
+// ================ MODE J'S SURFACE-PHOTON LIGHT PASS, ON THE DEVICE ====================
+//
+// Device twin of the deposit inside bdpt.h's traceLightBeamPass (~line 2080) -- the SURFACE
+// half only; the beam half needs a BVH rather than a grid and comes second. One thread per
+// light subpath: sample a wavelength, walk the subpath with the SAME dGenLightSubpath the
+// connection half already uses, and append a DSurfPhoton + its DSurfMis partials at every
+// vertex the host would have stored one at.
+//
+// THE THREE THINGS THAT MUST MATCH THE HOST EXACTLY, because each failure is silent:
+//
+//  * THE SITE PREDICATE. `dSurfMergeSite` is the device twin of `surfMergeSite`, and the
+//    gather and the MIS weight both ask it too. A site the weight counts but the map never
+//    fills under-weights every competing technique; one the map fills but the weight ignores
+//    double-counts. Three call sites, one predicate.
+//  * THE ACCUMULATOR INDEX. `sumC/sumMb/sumMs` are the recurrence's value at u-1, NOT at u: a
+//    point merge's reference connection splits after y_{u-1}. The host keeps three arrays and
+//    indexes back; here they are three scalars read before they are advanced, which is the
+//    same thing and cheaper. Getting this off by one produces a plausible image with a wrong
+//    denominator.
+//  * `nEmitted` COUNTS ATTEMPTS, NOT SUCCESSES. The host increments `done` before the
+//    `pdfLam <= 0` continue, so its n_m is the subpath count it was asked for. Counting only
+//    the subpaths that emitted would inflate kappaS and darken every merge.
+//
+// Vertices beyond `cap` are DROPPED rather than wrapped, and the overflow is reported so the
+// caller can raise the cap: a wrapped write would corrupt a photon another thread is about to
+// gather from, which is a data race that reads as fireflies.
+struct DJSurfOut {
+    DSurfPhoton* pts;
+    DSurfMis*    mis;
+    int*         count;      // [0] photons appended (may exceed cap -- see overflow), [1] unused
+    int          cap;
+};
+
+template <int MAXD>
+__global__ void __launch_bounds__(128, 4)
+kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
+             long long nPaths, unsigned long long seedBase, DJSurfOut out) {
+    enum { MAXV = BDPT_MAXV_OF(MAXD) };
+    if (maxDepth > MAXD) maxDepth = MAXD;
+    const DPatEnv env = dPatEnvOf(sc);
+    const long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long G = (long long)gridDim.x * blockDim.x;
+    for (long long i = g; i < nPaths; i += G) {
+        // Seeded by ABSOLUTE subpath index, exactly as the host pass is ("so the map is
+        // identical for any thread count"), so the realization depends on (index, salt) and
+        // not on the launch geometry.
+        DRng rng; rng.seed((unsigned long long)(i * 2 + 1), seedBase ^ (unsigned long long)i);
+        DHeroBundle hb;
+        double pdfLam = 0.0;
+        hb.lam[0] = dSampleSceneLambda(sc, rng, pdfLam);
+        if (pdfLam <= 0.0) continue;
+        hb.invPdf[0] = dInvPdfLambda(sc, hb.lam[0]);
+        hb.C = 1;                       // single-lambda always: the host pass is too
+        const Real lambda = hb.lam[0];
+        DVertex path[MAXV];
+        double   pathSec[1];            // secStride 0: never written, never read
+        const int np = dGenLightSubpath(sc, cam, diffraction, hb, maxDepth + 1, rng,
+                                        path, pathSec, 0, MAXV);
+        if (np <= 0) continue;
+        const Real cx = cieX(lambda), cy = cieY(lambda), cz = cieZ(lambda);
+        // The recurrence, carried as scalars at index u-1 (see the note above).
+        double accC = 0.0, accMb = 0.0, accMs = 0.0;
+        for (int u = 0; u < np; ++u) {
+            const bool dPrev = (u > 0) ? (path[u - 1].delta != 0)
+                                       : (dIsDeltaLightVertex(sc, path[0]) != 0);
+            const double gate = (!path[u].delta && !dPrev) ? 1.0 : 0.0;
+            if (u == 0) { accC = gate; continue; }
+            const double rL = dMisRemap0(path[u - 1].pdfRev) / dMisRemap0(path[u - 1].pdfFwd);
+            // The merge AT y_{u-1}, which the recurrence would not fold in until the next
+            // iteration but which this vertex's stored partials need now. Both kinds, because
+            // a denominator that carries one is not a partition of unity; at most one is
+            // non-zero (a vertex is in a medium or on a surface, never both).
+            double eBeam = 0.0, eSurf = 0.0;
+            if (u >= 2) {
+                eBeam = dMergeEtaPrime(sc, path[u - 2].p, path[u - 1], path[u].p,
+                                       path[u - 1].pdfFwd, lambda, env);
+                if (dSurfMergeSite(sc, path[u - 1]) && path[u - 1].pdfFwd > 0.0)
+                    eSurf = path[u - 1].pdfFwd;
+            }
+            if (dSurfMergeSite(sc, path[u]) && path[u].pdfFwd > 0.0 && path[u].beta > 0.0) {
+                DVec3 dp = path[u - 1].p - path[u].p;
+                const double rho2 = ddot(dp, dp);
+                if (rho2 > 0.0) {
+                    const double rho = sqrt(rho2);
+                    dp = dp * (Real)(1.0 / rho);
+                    // The cosine of pdfRev*(y_{u-1}), at y_{u-1}, facing back along this same
+                    // edge; 1 at a medium vertex, which has no normal.
+                    const bool prevOnSurf = (path[u - 1].type == BV_SURFACE ||
+                                             path[u - 1].type == BV_LIGHT);
+                    const double cosPrev = prevOnSurf ? fabs(ddot(path[u - 1].ns, dp)) : 1.0;
+                    const int slot = atomicAdd(out.count, 1);
+                    if (slot < out.cap) {
+                        DSurfPhoton& ph = out.pts[slot];
+                        ph.p      = path[u].p;
+                        ph.wo     = dp;                 // unit, toward the previous vertex
+                        ph.lambda = (float)lambda;
+                        ph.beta   = (float)path[u].beta;
+                        ph.cx = (float)cx; ph.cy = (float)cy; ph.cz = (float)cz;
+                        ph.misIdx = (unsigned)slot;     // appended 1:1, so index == slot
+                        DSurfMis& sm = out.mis[slot];
+                        sm.sumC    = accC;
+                        sm.sumMb   = accMb + eBeam;
+                        sm.sumMs   = accMs + eSurf;
+                        sm.pdfFwdA = path[u].pdfFwd;
+                        sm.rCoef   = (float)(cosPrev /
+                                             (rho2 * dMisRemap0(path[u - 1].pdfFwd)));
+                        sm.gateC1  = (unsigned char)(gate > 0.0 ? 1 : 0);
+                        sm.vert    = (unsigned short)u;
+                    }
+                }
+            }
+            const double cPrev = accC, mbPrev = accMb, msPrev = accMs;
+            accC  = gate + rL * cPrev;
+            accMb = rL * (mbPrev + eBeam);
+            accMs = rL * (msPrev + eSurf);
+        }
+    }
+}
+
+// Forced instantiation of both depth variants (BDPT_MAXDEPTH / BDPT_DEEPDEPTH, the same pair
+// kBdptT ships). Without this an unreferenced template is not compiled at all, so the step
+// that "adds the kernel only" would compile trivially and prove nothing -- which is the exact
+// opposite of the point.
+template __global__ void kJSurfLightT<BDPT_MAXDEPTH>(
+    DScene, DCamera, int, int, long long, unsigned long long, DJSurfOut);
+template __global__ void kJSurfLightT<BDPT_DEEPDEPTH>(
+    DScene, DCamera, int, int, long long, unsigned long long, DJSurfOut);
+
 } // namespace gpu
 
 // ============================ host: bake + launch ============================
