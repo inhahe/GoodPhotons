@@ -618,6 +618,40 @@ stops the realization being shared across the image — plausibly an improvement
 band-correlated light-side noise is what shows up as streaks, but it is a change in the spatial
 noise structure and should be measured as one rather than assumed.
 
+**THE PER-BAND REDRAW REACHES THE MEDIA SCENE, AND IT BUYS ALMOST NOTHING. That is the useful
+result.** `FTRACE_JBAND=1` redraws per wavefront band; on `_fog_cornell` that is **88
+realizations in 25 s against ~9** for the per-chunk arm, and it is **free** — 9 / 9 / 10 spp for
+the epoch / chunk / band arms at equal time, with the wave loop reporting `host gaps 0.0 s`, i.e.
+all 88 device rebuilds fit in no measurable host time. Every part of the mechanism works. The
+variance does not move:
+
+| region (chosen from a block map of the baseline, not from the scene description) | per-chunk / per-epoch | per-band / per-epoch |
+|---|---|---|
+| brightest blocks (the lit fog) | 0.993x | 1.039x |
+| dimmest blocks | 1.014x | 0.922x |
+| whole frame | 0.943x | 0.960x |
+
+At 3 seeds none of that is distinguishable from 1.0. **Against 11.2x on the surfaces-only scene.**
+
+**The reason is structural and it says what to build next.** This port redraws the SURFACE map.
+On `_caustic_box` the surface merges are the entire merge half, so their realization count is the
+whole light-side variance term. On a media scene **the beam merges dominate** — the same run's
+profile puts *beam hits at 20.8 s of a 24.8 s frame*, against 2.0 s of walk and 2.1 s of hit
+evaluation — and the beam map is still **host-traced, once per epoch, at 11.4 s a rebuild**.
+Multiplying the realization count of the minor technique by ten cannot move an estimate the major
+one dominates.
+
+So the honest scope of the device light pass as it stands:
+
+| scene class | what it buys |
+|---|---|
+| surfaces-only (`-jsurf`, no media) — where mode `U` competes | **11.2x** less whole-frame variance |
+| with media — where beam merges dominate | no measurable change (0.94–0.96x at n=3) |
+
+and the next piece of work is the **beam** half: a device beam deposit and a device BVH over it.
+That is the harder half this entry always said was harder, and the measurement above is the first
+thing that makes it the *obvious* next one rather than merely the remaining one.
+
 **Two caveats stated rather than buried.** (a) The **caustic does not improve** (0.988x at k=4)
 and degrades badly at k=16: on this scene its variance is camera-dominated, so the win is in the
 diffuse and indirect regions. (b) **The bias does not move** across the sweep (−1.62 / −1.60 /

@@ -18132,6 +18132,20 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             std::printf("[jdevlight] splitting each chunk into %d sub-launches, one light-side "
                         "realization each (-FTRACE_JSPLIT)\n", jSplitN);
     }
+    // FTRACE_JBAND=1: redraw per WAVEFRONT BAND instead of (only) per chunk. The band loop
+    // subdivides a chunk by PIXEL, which is the only axis left once the chunk is down to 1 spp
+    // -- the case an expensive media scene is always in. Inert without a wavefront queue, where
+    // there is exactly one band per chunk and this reduces to the per-chunk redraw.
+    bool jPerBand = false;
+    if (jPerChunk) {
+        const char* e = std::getenv("FTRACE_JBAND");
+        jPerBand = e && std::atoi(e) != 0;
+        if (jPerBand)
+            std::printf("[jdevlight] one light-side realization per wavefront band "
+                        "(FTRACE_JBAND) — pixels in one frame may gather from different "
+                        "realizations; unbiased per pixel, but the realization is no longer "
+                        "shared across the image\n");
+    }
     const long long jPaths = jDevLight ? (long long)smap->nEmitted : 0;
     const double    jRad   = jDevLight ? smap->radius : 0.0;
     const long long jCap   = jDevLight ? ((long long)smap->pts.size() * 2 + 1024) : 0;
@@ -18291,6 +18305,18 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                            : profiled(0, wfProfilePrev.empty() ? ((waveSamples < 1024) ? waveSamples : 1024) : waveSamples, 0.0, 0.0);
             for (long long b0 = 0; b0 < waveTotal; ) {
                 const long long b1 = (b0 + wave < waveTotal) ? b0 + wave : waveTotal;
+                // A REALIZATION PER BAND (FTRACE_JBAND). Salted by the band's first path slot as
+                // well as by `base`, so two bands of one chunk draw different maps and two
+                // chunks never repeat a band's map. `dsm` is passed BY VALUE to the kernel
+                // below, so rebuilding here is all that is needed for the launch to see it.
+                if (jPerBand)
+                    buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, jPaths, jRad,
+                                        jCap,
+                                        jSurfSalt(prog)
+                                            ^ ((unsigned long long)base * 0xD1B54A32D192ED03ULL)
+                                            ^ ((unsigned long long)(b0 + 1) *
+                                               0x9E3779B97F4A7C15ULL),
+                                        dsm);
                 const auto wfT0 = std::chrono::steady_clock::now();
                 if (wq.segs) {
                     CUDA_CHECK(cudaMemsetAsync(d_wfCounters, 0, 4 * sizeof(int)));
