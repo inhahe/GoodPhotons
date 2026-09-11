@@ -1018,6 +1018,32 @@ the split length and the beam count together. The uncontrolled pair flattered th
 Recorded because the mistake is the cheap kind to make when a number is already believed — both
 runs were real, both were of the right scene, and neither was of the same thing.
 
+**MEASURED AT LAST, AND THE FOURTH GUESS WAS WRONG TOO.** `BeamMap::build` now times itself three
+ways and prints the breakdown:
+
+| scene | sub-beams | split | alloc | boxes+CIE | **build() total** | whole light side |
+|---|---|---|---|---|---|---|
+| `_fog_thick` | 95 599 | 3 ms | 2 ms | 2 ms | **7 ms** | **600 ms** |
+| `_fog_cornell` | 1 666 015 | 45 ms | 19 ms | 73 ms | **137 ms** | **1180 ms** |
+
+**`build()` is 1 % and 12 % of the light side.** So "the ~50 ms is `splitSah` building a
+265 k-element vector" was wrong in the same way the box/CIE guess was — and note the box/CIE loop
+is the *largest* of the three on the big scene (73 ms), which is exactly the component the
+parallelisation null already proved is not the bottleneck either. Neither is.
+
+**The first-epoch measurement is dominated by something else entirely: the BUDGET PILOT.** Both
+runs report `pilot of 62 500 subpaths`, and `_fog_thick` then traces **2 514**. The pilot does
+**25x the work of the pass it is sizing**. It runs only on epoch 0 (`jreq.maxBeams = (g_nFromCli
+|| !first) ? 0 : g_beamTarget`), so it is a fixed per-render cost rather than a per-realization
+one — which is why it never showed up in `[jstats]`, whose figures are averaged over epochs, and
+why a `-beamfreeze` probe like the one above sees almost nothing else.
+
+**Consequence for the deposit port.** `[jstats]`'s `beam BVH` column is `buildSec - traceSec`,
+i.e. *everything `buildBeamMap` does*, not `build()`. Since `build()` is only a small part of it,
+the remainder is `buildBeamMap`'s other O(n) passes — `mediumStats()`, `totalBoxArea()` (called
+**twice** in the log line), and the radius selection. Porting the deposit would not touch those.
+Measure them before writing any of it.
+
 **One edge to state before this is defaulted.** `buildBeamLbvhDevice` refuses `n <= 1` (Karras has
 no internal node for a single primitive), and with the host tree skipped there is then no tree at
 all -- `nNodes == 0`, which every entry point already reads as "no volume gather". For a one-beam

@@ -16554,6 +16554,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             bmap.beams.size(), bmap.nEmitted, humanDur(buildSec).c_str(),
                             bmap.nEmitted ? (double)bmap.beams.size() / (double)bmap.nEmitted : 0.0,
                             (double)(bmap.beams.size() * sizeof(PhotonBeam)) / (1024.0 * 1024.0));
+            // WHERE build() SPENT IT, once. Three separate guesses at this were wrong (BVH --
+            // right, and ported; the box/CIE loop -- parallelising it changed nothing; "the
+            // allocations" -- untested), so the breakdown is printed rather than reasoned about.
+            if (first && wantBeams)
+                std::printf("mode J:   light-side build: split %.0f ms, alloc %.0f ms, "
+                            "boxes+CIE %.0f ms%s\n",
+                            1000.0 * bmap.lastSplitSec, 1000.0 * bmap.lastAllocSec,
+                            1000.0 * bmap.lastBoxSec,
+                            jSkipHostBvh() ? " (host BVH skipped)" : "");
             if (first && wantBeams && bmap.empty())
                 std::fprintf(stderr, "[mode J] warning: the beam map is empty — no light "
                                      "subpath reached a medium. This render is mode D "

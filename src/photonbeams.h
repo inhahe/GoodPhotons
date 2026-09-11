@@ -981,6 +981,10 @@ struct BeamMap {
     // so swapping the tree cannot move the Morton normalisation.
     Aabb worldBounds;
 
+    // Where build() spent its time, in seconds, for the line buildBeamMap prints. Three guesses
+    // at this have been wrong (see known-issues, the device LBVH), so it is measured now.
+    double lastSplitSec = 0.0, lastAllocSec = 0.0, lastBoxSec = 0.0;
+
     // `skipBvh`: do not build the host tree. Only ever set when a device LBVH is about to be
     // built over the same sub-beams (see buildBeamLbvhDevice) -- the host tree is still the only
     // one a CPU gather can use, so this must stay false for mode M, -device cpu and -loadmap.
@@ -989,13 +993,16 @@ struct BeamMap {
         if (radMed.empty()) setUniformRadius(radius);
         const double kappaOverW = (work > 0.0) ? kSplitKappa / work : 0.0;
         double meanSplit;
+        const auto tSplit0 = std::chrono::steady_clock::now();
         if (explicitSplitLen > 0.0) { splitLong(explicitSplitLen); meanSplit = explicitSplitLen; }
         else                        { meanSplit = splitSah(splitBudget, kappaOverW); }
+        const auto tSplit1 = std::chrono::steady_clock::now();
         if (meanSplitOut) *meanSplitOut = meanSplit;
         ftalloc::resize(cie, beams.size(), "the beam CIE table", "-beamcount / -beamsplitmax");
         std::vector<Aabb> boxes;
         ftalloc::resize(boxes, beams.size(), "the beam BVH bounding boxes",
                         "-beamcount / -beamsplitmax");
+        const auto tAlloc1 = std::chrono::steady_clock::now();
         for (size_t i = 0; i < beams.size(); ++i) {
             const PhotonBeam& b = beams[i];
             const double r = radOf(b.med);
@@ -1018,6 +1025,10 @@ struct BeamMap {
         // The recursive SAH sort over every sub-beam -- ~0.22 s per realization on `_fog_thick`,
         // and 72 % of what a light-side realization costs. The device LBVH does the same tree in
         // 4.3 ms, so when it is going to run there is nothing here worth paying for.
+        const auto tBox1 = std::chrono::steady_clock::now();
+        lastSplitSec = std::chrono::duration<double>(tSplit1 - tSplit0).count();
+        lastAllocSec = std::chrono::duration<double>(tAlloc1 - tSplit1).count();
+        lastBoxSec   = std::chrono::duration<double>(tBox1 - tAlloc1).count();
         if (!skipBvh) bvh.build(boxes);
     }
 
