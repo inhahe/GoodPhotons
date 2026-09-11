@@ -964,6 +964,23 @@ a cost, and porting that cost somewhere else silently invalidates it. The in-chu
 knob both had interior optima that moved when the thing they were balancing got cheaper. After
 any port, re-sweep the knobs the port was supposed to relieve.
 
+**A NULL, AND IT IS REVERTED.** The obvious follow-up to "the split + CIE + box pass is now the
+biggest host cost" was that its loop is serial and embarrassingly parallel, so `ft::parallelFor`
+over the sub-beams should reclaim most of ~50 ms. Implemented (with the `worldBounds` reduction
+moved to its own sweep, since `parallelFor` hands the callback no thread id and a mutex would have
+serialised the loop it was parallelising) — and `[jstats]` read **53 ms against 54 ms**. No change.
+
+So the ~50 ms is **not** the box/CIE loop; it is `splitSah` building a 265 k-element `PhotonBeam`
+vector and the allocations around it. Reverted rather than kept, because this project's rule is to
+verify an optimisation before committing it and the verification came back null — a correct change
+that buys nothing is still complexity in a hot path.
+
+**And the attempted second test was invalid, which is worth more than the null.** `-t 1` against
+`-t 12` gave 0.89 s and 0.92 s, which looks like "the loop does not scale" — but `ft::parallelFor`
+sizes itself from `std::thread::hardware_concurrency()` and **ignores `-t` entirely**. So `-t`
+cannot be used to A/B anything that goes through `parallelFor`, and any past or future measurement
+that tried to would have been comparing a configuration against itself.
+
 **One edge to state before this is defaulted.** `buildBeamLbvhDevice` refuses `n <= 1` (Karras has
 no internal node for a single primitive), and with the host tree skipped there is then no tree at
 all -- `nNodes == 0`, which every entry point already reads as "no volume gather". For a one-beam
