@@ -446,12 +446,25 @@ plus the black rows below the scene**. Rescored on the caustic's actual footprin
 **The caustic — the region merging exists for — agrees to 0.04 %.** The −0.315 % that three
 separate hypotheses were built to explain was a misplaced box. What remains is a redistribution
 between the plain floor (−0.66 %) and the ball/walls (+0.35 %), ~3 sigma each, with the frame
-flat. That is a smaller and different problem from the one being chased, and the standing lead
-for it is the **photon count**: at 160 000 subpaths the device stores 479 725 photons to the
-host's 476 627, **+0.65 % at ~4.6 sigma**, with a `vert` histogram that now agrees to 0.03–0.3 %
-per bin (the apparent depth shift at 12 000 samples was noise). More photons per `nEmitted`
-brightens merges, and ~0.65 % of the merge share of the frame is ~+0.07 % — which is exactly the
-whole-frame number.
+flat. That is a smaller and different problem from the one being chased.
+
+**...and the photon-count lead, which looked like the answer, is dead as well.** At 160 000
+subpaths the device stored 479 725 photons to the host's 476 627 — **+0.65 %**, and ~4.6 sigma if
+the count is treated as Poisson. More photons per `nEmitted` brightens merges, and 0.65 % of the
+merge share of the frame is ~+0.07 %, which is exactly the whole-frame number: a tidy story. But
+the refreshing runs had already logged **153 paired realizations** at 16 384 subpaths each, free,
+in their `[jdevlight]` lines:
+
+    device 48 940.7 +- 331.9      host 48 945.9 +- 309.4
+    device - host = -5.2 +- 36.1   ->  -0.0105 %, 0.1 sigma
+
+The counts agree to **0.01 %**. The per-realization spread is 0.65 % of the mean — exactly the
+size of the claimed surplus — so the 4.6 sigma came from treating a *correlated* sum (each
+subpath deposits 0..8 photons, so the variance is far above Poisson) as if it were Poisson. The
+`vert` histogram agrees to 0.03–0.3 % per bin at that size too.
+
+**Four hypotheses, four refutations, and three of them were settled by data the runs had already
+produced.** Before modelling an error bar, look for repeated measurements already on disk.
 
 **Two disciplines earned their place here, one of them the hard way.** "Check that the rig can
 see the effect" is normally read as *is the signal large enough*; this is the other failure mode
