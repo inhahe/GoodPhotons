@@ -976,6 +976,20 @@ advantage. On the device the rebuild is free (a media frame fits 88 of them with
 0.0 s`), so the limit moves to the chunk, and splitting the chunk moves it again. Measured:
 **11.2x less whole-frame variance at equal wall clock** on a surfaces-only scene, bias unmoved.
 
+**AND THE BEAM TREE IS BUILT ON THE DEVICE TOO (0.272.3).** `kBeamMorton` / `kLbvhInternal` /
+`kLbvhLeaves` / `kLbvhRefit` are a Karras LBVH emitted into the host's own `DNode` layout —
+internal `[0..n-2]`, leaves `[n-1..2n-2]` with `count == 1`, which is exactly
+`BvhNode::isLeaf() == count > 0` — so `dGatherPhotonBeams` traverses either builder's output
+without knowing which ran. `BeamMap::build` gained `skipBvh` and `BeamMap::worldBounds` carries
+what `bvh.nodes[0].box` used to supply, since after the skip there is no root node to read.
+
+The measurement that justifies it: a host light-side realization is **72 % BVH build** (0.22 s of
+0.32 s on `_fog_thick`), so the tree — not the trace — was what capped the realization count.
+4.3 ms against 220 ms makes a realization 2.7x cheaper and buys 1.85x more of them at unchanged
+samples, for 0.719x the variance against a predicted 0.735x. The host tree remains the only one a
+CPU gather can use, so mode `M`, `-device cpu` and `-loadmap` all keep it; `-jhostlight` restores
+it for mode `J` as well.
+
 **Two boundaries are part of the design rather than defects.** The split has an **interior
 optimum** (k=16 is worse than k=4) because more realizations cut the merge half's variance while
 costing camera samples that raise the connection half's — so the knob is a trade, not a dial to

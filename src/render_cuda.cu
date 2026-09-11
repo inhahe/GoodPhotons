@@ -18291,8 +18291,13 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // freed with the rest of `up`. A null/empty map leaves `dbm.nNodes == 0`, which the
     // MERGE=true kernel reads as "no merges" — so `-nobeams` degenerates to mode D exactly.
     DBeamMap dbm{};
-    const bool wantLbvh = std::getenv("FTRACE_JLBVH") &&
-                          std::atoi(std::getenv("FTRACE_JLBVH")) != 0;
+    // Default on (0.272.3). Must agree EXACTLY with main.cpp's jSkipHostBvh(): if the host
+    // skipped its tree and this said no, the map would arrive with no tree at all and the
+    // volume would silently vanish. Two predicates, one condition -- so the condition is
+    // written the same way in both, and `g_jHostLight` is the single switch behind both.
+    const bool envOff = std::getenv("FTRACE_JLBVH") &&
+                        std::atoi(std::getenv("FTRACE_JLBVH")) == 0;
+    const bool wantLbvh = !g_jHostLight && !envOff;
     if (bmap) uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/true, wantLbvh);
     // FTRACE_JLBVH=1: rebuild the NODES on the device over the very same sub-beams. Same beams,
     // same gather, a different tree -- so an image difference is a traversal-acceptance

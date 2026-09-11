@@ -12180,6 +12180,15 @@ static double    g_beamSplitLen  = 0.0;
 // leaves it false and gets the host tree as before.
 static bool g_jDevBeamOk = false;
 
+// -jhostlight: keep mode J's whole light side on the host -- the surface map redrawn once per
+// epoch (pre-0.272.0 behaviour) AND the beam BVH built by the host SAH builder (pre-0.272.3).
+// One flag for both because they are one decision: "do not move mode J's light side onto the
+// device". Declared HERE rather than next to g_jSurf because jSkipHostBvh() below needs it, and
+// a flag used 900 lines before its definition is a compile error waiting for the next edit.
+// Forwarded to the device backend through cudaSetJHostLight rather than threaded through
+// renderBdptCuda, whose parameter list is already long and whose callers do not decide this.
+static bool g_jHostLight = false;
+
 // SKIP THE HOST TREE when a device LBVH is going to be built over the same sub-beams. ONE
 // definition, because `buildBeamMap` has two build branches (`-beamradius` and the auto one) and
 // the first version of this decided it at only one of them -- the one the default render does
@@ -12188,11 +12197,14 @@ static bool g_jDevBeamOk = false;
 // The env read is cached: this runs once per light-side epoch, and `getenv` is not free.
 // `g_jDevBeamOk` is what keeps a CPU gather safe -- it has no other tree to use.
 static bool jSkipHostBvh() {
-    static const bool devLbvh = [] {
+    // DEFAULT ON since 0.272.3. `-jhostlight` turns it off, and that is the right flag rather
+    // than a second one: it already means "keep mode J's light side on the host", and the beam
+    // tree is part of the light side. FTRACE_JLBVH=0 also forces the host tree, for bisecting.
+    static const bool envOff = [] {
         const char* e = std::getenv("FTRACE_JLBVH");
-        return e && std::atoi(e) != 0;
+        return e && std::atoi(e) == 0;
     }();
-    return devLbvh && g_jDevBeamOk;
+    return g_jDevBeamOk && !g_jHostLight && !envOff;
 }
 
 static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet = false) {
@@ -13140,11 +13152,7 @@ static bool g_noBeams = false;
 // argument handlers and read by none, so it is gone. Do not re-add a flag to record an intent
 // nothing acts on.
 static bool g_jSurf = true;
-// -jhostlight: keep mode J's surface light side on the host, redrawn once per epoch (pre-0.271.5
-// behaviour). Forwarded to the device backend through cudaSetJHostLight rather than threaded
-// through renderBdptCuda, whose parameter list is already long and whose every caller would
-// otherwise have to carry a flag none of them decide.
-static bool g_jHostLight = false;
+// -jhostlight is declared far above, next to g_jDevBeamOk, because jSkipHostBvh() needs it.
 // -jsurf-radius: the gather disc's radius r_s in world units. 0 = auto, meaning the same
 // `sceneRadius * g_pmRadiusFactor` (`-pmradiusfrac`) that modes M/S/U start from — mode J's
 // merges deliberately share the photon-map radius convention so a like-for-like comparison

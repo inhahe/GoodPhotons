@@ -898,6 +898,28 @@ agrees with the host camera pass to 0.02 % on this class of scene.
 alone is **~270x** faster here. Build time goes 265 k -> 2.5 ms and 7.67 M -> 27.7 ms: 29x the
 primitives for 11x the time, i.e. *better* than linear, because the radix sort amortises.
 
+**AND THE VARIANCE FOLLOWS THE FIT (v0.272.3, defaulted).** `_fog_thick` 96^2, 25 s, 5 seeds,
+interleaved:
+
+| | host SAH | device LBVH |
+|---|---|---|
+| realizations | 8, 8, 9, 8, 9 | **14, 16, 17, 16, 16** |
+| spp | 2807…2754 | **2853…2811** (slightly more) |
+| whole-frame variance | 6.179e16 | **4.443e16 — 0.719x** |
+| brightest blocks | 5.134e18 | 3.896e18 — 0.759x |
+
+1.85x the realizations at *more* samples, and `N^-0.51` predicts **0.735x** against a measured
+**0.719x**. The prediction landing is worth as much as the win: it says the model is right, not
+just the number.
+
+**The bias scare, and the two controls that settle it.** The whole-frame mean read **+1.86 % +-
+0.79 %**, an awkward 2.4 sigma. But (a) with `-beamfreeze` pinning both arms to the *same* beams
+the difference is **-0.028 % +- 0.017 %**, so the tree is not biased; and (b) on the **host tree
+alone**, moving 8 -> 38 realizations via `-beamrefresh` shifts the mean **-5.20 %** — opposite in
+sign and 2.8x larger. This scene's whole-frame mean at a 25 s budget simply wanders by several
+percent for reasons unrelated to the builder, and +1.86 % sits inside that. Control (b) cost
+nothing: the renders were already on disk.
+
 **One edge to state before this is defaulted.** `buildBeamLbvhDevice` refuses `n <= 1` (Karras has
 no internal node for a single primitive), and with the host tree skipped there is then no tree at
 all -- `nNodes == 0`, which every entry point already reads as "no volume gather". For a one-beam
