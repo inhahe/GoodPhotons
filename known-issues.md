@@ -817,6 +817,25 @@ suggestive, not decisive on its own. What makes the premise safe is that **UPBP-
 established the same thing at 8 seeds** (31.6 % -> 2.4 % s.d., i.e. ~173x in variance); this is a
 weaker replication of a stronger existing result, and it agrees with it.
 
+**THE COST MODEL FOR THAT PORT, MEASURED (2026-09-11).** `_fog_thick` 96^2, 25 s, `[jstats]`:
+
+| | realizations | trace | **beam BVH** | gather | light side | spp |
+|---|---|---|---|---|---|---|
+| `-beamrefresh 0.10` (default) | 8 | 0.72 s | **1.76 s** | 23.34 s | 9.6 % | 2811 |
+| `-beamrefresh 0.95` | 38 | 1.37 s | **9.05 s** | 15.30 s | 40.5 % | 1009 |
+
+Per realization that is **0.22 s and 0.24 s of BVH** against 0.09 s of trace — so a host
+realization costs ~0.32 s and is **72 % BVH build**, over a map of only 265 146 beams from 2 514
+subpaths. **The trace is not the thing to port; the BVH is.**
+
+It also prices the host-side alternative and rules it out: `-beamrefresh 0.95` buys 4.75x the
+realizations for **2.8x fewer samples**, which on the interior-optimum curve measured for the
+surface split is at best break-even. The knob cannot get there.
+
+On the device an LBVH over 265 k beams plus a sub-millisecond trace is a few ms, so a realization
+goes from ~0.32 s to ~3 ms — about **100x** — which turns the light side from 9.6 % of the render
+into roughly the same fraction while carrying two orders of magnitude more realizations.
+
 Extrapolated: a per-chunk beam redraw on this scene would go from 5 realizations to roughly
 167 chunks x 4 = ~670, and `670/5 = 134` at `N^-0.51` is a further **~12x**. That is the size of
 the prize, and it justifies the cost — a device beam deposit plus a device BVH over the split
