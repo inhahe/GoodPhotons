@@ -5963,7 +5963,34 @@ build.
 **Nothing is CPU-only any more** — see the follow-up entry below, which removed the GRIN
 fallback this port originally shipped with.
 
-### PERF — OPEN (2026-08-31, v0.194.0): the mode-`M` beam gather's cost is BVH traversal over overlapping beam AABBs, and is ~independent of how many beams it actually gathers
+### PERF — **RESOLVED** (2026-08-31, v0.194.0; both fixes landed and the open question answered 2026-09-11): the mode-`M` beam gather's cost is BVH traversal over overlapping beam AABBs, and is ~independent of how many beams it actually gathers
+
+> **BOTH PRIORITISED FIXES HAVE SHIPPED, and the question this entry says it cannot answer is
+> now answered.** `-beamsplit <len>` exists (fix 1, in `-help`: "pin a uniform split length
+> instead (expert; for measuring the rule)"), and the scene-scale rule is gone (fix 2): the split
+> is now SAH-derived, `sahSplitLen()` minimising total box area at `p* = 2r√(3/Q)`, which is
+> **O(r) with no scene-scale term** — exactly the density-driven rule this entry asked for.
+>
+> **Using fix 1 to settle fix 2's premise** (`_fog_cornell`, 64², 4 spp, CPU):
+>
+> | arm | total box area | beam gather |
+> |---|---|---|
+> | SAH split (default) | 2.899e6 m² (**0.110×**) | **691 s** |
+> | `-beamsplit 1e9` (no split) | 2.647e7 m² (1.000×) | **1676 s** |
+>
+> **The split is a 2.42× win on the gather, not the net loss this entry feared.** The fear was
+> well-founded when written — against the *old* `max(diag/64, S/3N)`, which measurably did not
+> move across a 10× beam-count sweep — and is obsolete against the rule that replaced it. Fix 2
+> repaired the thing fix 1 was built to diagnose, and nobody closed the loop.
+>
+> **One refinement to the entry's model.** It reasons that cost is proportional to total box
+> area (Cauchy). Measured, 9.1× less area buys only 2.42× less time, so the real shape is
+> `a + b·area` with a substantial fixed floor — per-hit work, traversal overhead, and the beams
+> genuinely gathered. That floor is what any further splitting effort would be fighting.
+>
+> Note also that at higher resolutions the default reports `[split limited by -beamsplitmax, not
+> by the rule]`, so the 0.110× above is a **floor** on what the area rule achieves unconstrained.
+
 
 **Superseded a wrong diagnosis.** This entry originally claimed the two per-hit
 `mediaTransmittance` marches dominated. **Measurement says that is false**, and the wrong
