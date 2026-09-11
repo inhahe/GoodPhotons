@@ -660,7 +660,40 @@ gain, would undo the point of validating any of this. Four gates checked against
 binary: the GPU default announces the device pass, `-jhostlight` silences it, and **`-device cpu`
 and mode `D` are both untouched** (0 device-pass lines each).
 
-And the next piece of work is the **beam** half: a device beam deposit and a device BVH over it.
+**AND THE BEAM HALF'S PREMISE WAS CHECKED BEFORE BUILDING IT, because it is a large job resting
+on an inference.** The media null was attributed to the beam map being refreshed only per epoch —
+a plausible mechanism, and the same *shape* of story as the five that collapsed earlier in this
+entry: one that explains the observation without ever being tested against "that term is not
+binding". `-beamfreeze` pins the beam map at exactly one realization, so the gap to the default
+is what refreshing it is worth today, and the `N^-0.5` extrapolation from that gap is the ceiling
+on a per-chunk beam redraw.
+
+Run on **`_fog_thick`** rather than `_fog_cornell`, deliberately: UPBP-THICK measured the frozen
+light side there at **31.6 % s.d. against 2.4 % refreshed**, so it is a scene where the effect is
+known to exist — the "can the rig see it" check applied before the build instead of after. 96^2,
+20 s, 4 seeds, 5 refresh epochs:
+
+| region | refreshed (5 realizations) | frozen (1) | frozen/refreshed |
+|---|---|---|---|
+| brightest 2x2 blocks | 8.00e18 | 2.45e19 | **3.05x** |
+| whole frame | 6.19e16 | 1.79e17 | **2.90x** |
+
+Seed-to-seed s.d. of the mean: 4.55 % refreshed against 6.02 % frozen. **The premise holds** —
+1 -> 5 beam realizations is worth ~2.9x, against the 2.3x the `N^-0.51` fit predicts.
+
+**Read the strength of that correctly.** At n=4 with a *shared* light realization every pixel
+moves together, so the effective sample size for a variance ratio is 4, not 9216 — this run is
+suggestive, not decisive on its own. What makes the premise safe is that **UPBP-THICK already
+established the same thing at 8 seeds** (31.6 % -> 2.4 % s.d., i.e. ~173x in variance); this is a
+weaker replication of a stronger existing result, and it agrees with it.
+
+Extrapolated: a per-chunk beam redraw on this scene would go from 5 realizations to roughly
+167 chunks x 4 = ~670, and `670/5 = 134` at `N^-0.51` is a further **~12x**. That is the size of
+the prize, and it justifies the cost — a device beam deposit plus a device BVH over the split
+sub-beams, which is a different order of work from the counting-sort grid the surface half
+needed. Note the scene dependence: `_fog_thick` builds from 2483 subpaths, while `gallery_rain`
+reaches 7.65 M beams, so per-chunk affordability has to be measured per scene rather than assumed
+from either end.
 That is the harder half this entry always said was harder, and the measurement above is the first
 thing that makes it the *obvious* next one rather than merely the remaining one.
 
