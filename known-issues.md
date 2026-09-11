@@ -3429,7 +3429,10 @@ solution is — which is the accepted trade there and should be the accepted tra
 > | `-n 200000 -spp 1 -r 32` | identical | identical | identical |
 >
 > — and every run logged the same `5758926 beams`, which is the determinism claim showing up
-> directly in the output. The control (no `-beamfreeze`) logs **zero** reuse lines and rebuilds
+> directly in the output. **The GPU camera pass is covered too** (`-device gpu`, same scene, same
+> three frames, all identical): the light side is CPU on both backends, and a cache hit still
+> re-uploads the map per camera exactly as a rebuild would have, so nothing about the device
+> route changes. The control (no `-beamfreeze`) logs **zero** reuse lines and rebuilds
 > per camera, as it must.
 >
 > **What it buys.** `-n 200000`, 3 cameras, deliberately gather-light so the map cost is visible:
