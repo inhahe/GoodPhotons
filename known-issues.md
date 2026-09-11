@@ -112,8 +112,36 @@ spikes. Anything that fixes this fixes mode `D` too, which makes it a general pa
 firefly problem (clamping, roulette, or a path-space filter) rather than anything in the merge
 estimator or its weight.
 
-*One scene, one seed, one spp setting* — this is an attribution, not a law, and (2g)'s relSE-based
-comparison has not been re-run this way. But the lever it points
+**AND WITH MATCHED SEEDS THE CLAIM IS SETTLED: MODE `J`'S TAIL IS MODE `D`'S TAIL.**
+The single-seed version above was not enough, and checking why is what produced the result.
+The peak **moves with `-seed`** — (15,46) / (16,43) / (16,51) — and is isolated, sitting
+**4.6x / 15.9x / 12.0x** above its own 8 neighbours, so it is a genuine firefly and not a bright
+feature. But its size varies **3.6x between seeds within mode `D` alone** (94x / 336x / 310x of
+the frame mean), which is larger than the between-mode gap anyone has claimed. A one-seed tail
+comparison cannot resolve this quantity at all.
+
+Matched seeds, equal **spp** (not equal time — the question is whether the estimator makes
+spikes, not which is faster):
+
+| seed | mode `D` max/mean | mode `J` max/mean | argmax |
+|---|---|---|---|
+| 5 | 94.3 | 87.5 | **(15,46) both** |
+| 11 | 336.0 | 329.0 | **(16,43) both** |
+| 23 | 309.9 | 311.1 | **(16,51) both** |
+| mean | 247 | 243 | **J/D = 0.98x** |
+
+**Identical to 2 %, and at literally the same pixel every time.** The firefly is a camera-side
+path that both modes find, and mode `J`'s MIS weighting neither amplifies nor suppresses it. So
+(2g)'s "worst pixel 3 310 against 532" is, on this evidence, a seed artifact of the same family
+as the `_deltalight_mix` +0.79 % — a single draw of a statistic whose own spread is several-fold.
+
+**Consequence: UPBP-CONV has no firefly sub-problem.** What remains of that entry is the equal-
+TIME cost question, which (2g) already answers in mode `J`'s favour on every robust statistic.
+
+*Worth recording about the process*: the two ticks before this one analysed seed 5 alone, which
+happens to be the **mildest** of the three (94x against 336x and 310x). The conclusion survived,
+but only by luck — the right move was to check the seed dependence of the statistic before
+building an argument on one value of it, and that check is three renders. But the lever it points
 at is a 4 %-energy, 1669x-peaked residual, which is a different and much more specific target
 than "the beam gather".
 
