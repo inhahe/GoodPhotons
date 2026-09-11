@@ -2881,6 +2881,26 @@ means a mode-`J` image that has stopped improving needs `-n`, not `-spp`. **A po
 rebuild the map every N spp and average, which trades the up-front build cost for genuine
 light-side convergence; mode `M` has the same property and the same option.
 
+> **(1) IS STALE — that fix shipped, for mode `J` as well as mode `M` (confirmed 2026-09-11).**
+> The light-side refresh redraws the subpaths under a fresh salt every ~10 % of the wall clock
+> and averages the realizations; mode `J`'s own log says so in as many words — *"so the **MERGE**
+> noise falls with the render too (`-beamfreeze` to opt out; `-beamrefresh` to retune)"* — and it
+> prints a closing tally: *"averaged 2 independent light-side realizations (27 spp total) — the
+> merge noise fell with the render, not just the connection noise"*. `renderChunked` inside
+> `if (mode == 'J')` sets `epochSec = (rebuildSec + setupSec) / g_beamRefreshFrac`, so the
+> mechanism is wall-clock-driven rather than `-spp`-driven, which means a longer render **does**
+> now buy light-side convergence. The headline's "`-spp` does not converge the merge half at all"
+> should be read as "`-spp` does not do it *directly*".
+>
+> What survives is the *cost* of that convergence, and it is measured elsewhere in this file:
+> buying realizations costs camera samples (1.53× over one sweep), which is why the U-vs-J entry
+> concludes the real fix is a **device light pass**, not more refresh epochs.
+>
+> **Rig note.** A first check of this printed nothing and looked like proof mode `J` does not
+> refresh. It does — the message only appears from the *second* epoch, and a 20 s run never
+> reached one. The code path (`main.cpp` ~16161/16494) is what settled it; the null was a blind
+> rig, not evidence.
+
 **(2) No win on the validation scene.** Mode `J` at 43 spp measures 15.25 % noise; mode `D`'s
 4.42 % at 512 spp is 15.25 % scaled by `sqrt`. Identical, for ~25× the wall clock. This is the
 right answer for `_fog_cornell` — a thin fog whose scattering points the camera's free-flight
