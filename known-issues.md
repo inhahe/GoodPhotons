@@ -3547,7 +3547,16 @@ solution is — which is the accepted trade there and should be the accepted tra
 > | `-n 200000 -spp 1 -r 32` | identical | identical | identical |
 >
 > — and every run logged the same `5758926 beams`, which is the determinism claim showing up
-> directly in the output. **The GPU camera pass is covered too** (`-device gpu`, same scene, same
+> directly in the output. **Re-verified in HDR (2026-09-11), because the first pass of this
+> table was not.** `-o <name>.pfm` does **not** write a PFM: `.pfm` is not a recognised output
+> extension, so the writer falls back to a tone-mapped 8-bit PPM under that name, and the
+> original comparison was therefore of quantised, auto-exposed bytes. Byte-identical PPMs are
+> real evidence, but they are a weaker claim than the one made. Redone with `-hdr` (which writes
+> a genuine `PF
+48 48
+-1.0` float32 sidecar beside `-o`), `-device cpu`: all three frames
+> bit-identical in **scene-linear radiance**. The lesson is the cheap one — when a comparison
+> tool rejects a file, check the FORMAT before patching the reader. **The GPU camera pass is covered too** (`-device gpu`, same scene, same
 > three frames, all identical): the light side is CPU on both backends, and a cache hit still
 > re-uploads the map per camera exactly as a rebuild would have, so nothing about the device
 > route changes. The control (no `-beamfreeze`) logs **zero** reuse lines and rebuilds
