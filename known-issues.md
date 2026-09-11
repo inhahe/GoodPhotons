@@ -1265,6 +1265,42 @@ and in how much merge coverage the technique gets — so two runs of one scene d
 `-seed` are not comparable in performance, and any past A/B on such a scene that did not hold the
 seed fixed was measuring partly this.
 
+**MECHANISM FOUND: `probeGatherCount`'s 96 probe chords.** The knee is
+`kneeBeams = pilotBeams * targetK / k0`, and `k0 = probeGatherCount(bounds)` is measured by
+**96** random chords through the scene AABB. That puts a low-count statistic in a **denominator**,
+which is how a ratio grows a heavy tail — and on a scene whose dielectric focuses light into
+clusters, most chords miss the cluster and `hits` is decided by the few that do.
+
+Confirmed by raising it. `_fog_cornell`, three seeds, knee in beams:
+
+| probe rays | seed 3 | seed 7 | seed 11 | spread |
+|---|---|---|---|---|
+| **96** (shipped) | 131 885 | 140 923 | 496 091 | **3.76x** |
+| 1 024 | 221 469 | 228 491 | 277 904 | 1.25x |
+| 2 048 | 257 190 | 247 987 | 296 231 | **1.19x** |
+
+**96 rays is biased as well as noisy**: the converged central value is ~267 k against the shipped
+~136 k, i.e. the knee it reports is about **half** the right one on this scene. On `_fog_thick`,
+which was already stable, 2 048 rays moves it a consistent **−12 %** (13 03x -> 11 5xx) — so the
+correction is real there too, just small.
+
+**AND THE SUBSAMPLING SUSPECT IS REFUTED.** Above `maxTests = 120 000` beams the loop takes every
+`stride`-th beam *in storage order* — per-thread bank concatenation, so a systematic subsample,
+not a random one — and it engages exactly where the spread explodes. It looked like the answer.
+Forcing stride to 1 (`FTRACE_JPROBE=96,4000000`) leaves seed 11 at **508 542** against 496 091.
+No effect. Rays matter; tests-per-ray do not.
+
+**But the naive fix costs too much to ship.** `probeGatherCount` is O(rays x beams) and is called
+again by `buildAuto`, up to four times in its radius-refinement loop. At 1 024 rays the light side
+on `_fog_cornell` goes **1.17 s -> 6.5 s**, a 5.7x regression, to fix a sizing estimate.
+
+**So the fix has to be a better ESTIMATOR, not a bigger sample.** The variance comes from uniform
+chords sampling a clustered set, so the directions to try are ones that cut variance at equal
+cost: stratifying the chords over the AABB instead of drawing them independently, or reusing the
+beams' own midpoints as probe origins with the appropriate reweighting. `FTRACE_JPROBE=<rays>,
+<maxTests>` is the hook for measuring any of them, and the three-seed table above is the
+acceptance test.
+
 **What not to do next.** Do not shrink the pilot on the `_fog_thick` evidence alone; that scene
 cannot see the problem. The 5.6x saving is real and worth having, but it is only safe once the
 knee's own variance is understood — shrinking the pilot on a scene where the estimate is already

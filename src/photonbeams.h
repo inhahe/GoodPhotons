@@ -1080,8 +1080,26 @@ struct BeamMap {
     double probeGatherCount(const Aabb& bb) const {
         if (beams.empty()) return 0.0;
         const Vec3 ext = bb.hi - bb.lo;
-        const size_t kProbeRays = 96;
-        const size_t maxTests   = 120000;
+        // FTRACE_JPROBE=<rays>,<maxTests> overrides both, to test J-KNEE-NOISE's two suspects:
+        //   * 96 chords is a SMALL sample of a clustered beam set. On a scene whose dielectric
+        //     focuses light, most chords miss the cluster and `hits` is decided by the few that
+        //     do -- a low-count statistic feeding a DENOMINATOR (`kneeBeams = pilotBeams *
+        //     targetK / k0`), which is how a ratio grows a heavy tail.
+        //   * above `maxTests` beams the loop below takes every `stride`-th beam IN STORAGE
+        //     ORDER and multiplies the count back up. Storage order is per-thread bank
+        //     concatenation, so that is a systematic subsample correlated with which thread
+        //     traced the beam, not a random one -- and it engages only above the threshold,
+        //     which is exactly where the measured spread explodes (pilot 62 500 -> ~375 k beams
+        //     -> stride 3 -> 3.76x spread, against 1.08x and 1.33x for the two pilot sizes that
+        //     stay under it at stride 1).
+        size_t kProbeRays = 96;
+        size_t maxTests   = 120000;
+        if (const char* e = std::getenv("FTRACE_JPROBE")) {
+            long long r = 0, m = 0;
+            if (std::sscanf(e, "%lld,%lld", &r, &m) == 2 && r > 0 && m > 0) {
+                kProbeRays = (size_t)r; maxTests = (size_t)m;
+            }
+        }
         const size_t stride     = std::max<size_t>(1, beams.size() / maxTests);
         Pcg32 prng; prng.seed(0x9E3779B97F4A7C15ULL, 0xBF58476D1CE4E5B9ULL);
         auto randPt = [&]() {
