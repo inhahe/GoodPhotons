@@ -1773,13 +1773,27 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   DEFAULT-ON CODE.** The `creature` ROI — the fur coat — is *correct without the correction* and
   badly over-bright with it. Two seeds, equal spp, against the same reference:
 
-  | ROI | off (s1 / s4) | shipped (s1 / s4) |
-  |---|---|---|
-  | `alice_hair` | −68.6 % / −69.7 % | −11.4 % / −15.1 % |
-  | `alice_dress` | −38.7 % / −41.7 % | −11.0 % / −13.2 % |
-  | `cap_gyroid` | −32.6 % / −37.0 % | −6.0 % / −13.6 % |
-  | `cap_axicon` | −11.6 % / −10.0 % | −2.0 % / +0.4 % |
-  | **`creature`** | **−3.9 % / +3.6 %** | **+48.2 % / +61.7 %** |
+  **Re-measured properly (2026-09-10): 6 seeds, RAW means, ±1 s.e., against the same reference.**
+  The first pass used trimmed means over two seeds, which is the wrong statistic for a bias
+  question (see GLOSSY-NEE) and gave numbers that differ by up to 12 pp — `alice_hair` reads
+  −11.4 % trimmed and −6.3 % raw. These are the figures to quote:
+
+  | ROI | px | off | on (shipped) |
+  |---|---|---|---|
+  | `grid_ground` (null, flat) | 600 | +0.1 % ± 0.7 | +1.0 % ± 0.7 |
+  | `cap_gyroid` | 56 | −37.2 % ± 2.5 | −11.5 % ± 3.3 |
+  | `alice_dress` | 90 | −45.6 % ± 2.4 | −19.0 % ± 3.0 |
+  | `alice_hair` | 27 | −67.2 % ± 3.0 | −6.3 % ± 7.0 |
+  | **`creature`** | 36 | **+2.7 % ± 4.7** | **+63.1 % ± 6.6** |
+
+  **The claim survives the error bars**: uncorrected fur is **0.6σ from exact**, corrected it is
+  **9.6σ** from it. Scored arm-against-arm the effect is tighter still — `creature` +58.7 % ± 7.9,
+  `alice_hair` +185.8 % ± 23.1, `alice_dress` +48.9 % ± 7.0 — with the flat null control at
+  +0.9 % ± 1.0, i.e. consistent with zero as it must be.
+
+  **Note the `px` column, because it is part of the result.** These ROIs are 27–90 pixels at
+  320×180; only `grid_ground` is large. Conclusions that rest on a 2 pp difference here are not
+  supportable, and the ones above are quoted precisely because they do not.
 
   So the correction fixes four large dark errors and **creates a +55 % one where none existed**.
   It was never seen because **no experiment on this entry has ever scored `creature`** — the
