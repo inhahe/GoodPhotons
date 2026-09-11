@@ -1225,6 +1225,52 @@ transfer by being written down; it transfers by being built into the harness.**
 `src/scene.h` (`Emitter::sampleSphereCone`), `src/ftsl.h` ~6112 (where the emissive sphere joins
 the geometry). Measured by `scraps/gate_neeeps.sh`.
 
+### J-KNEE-NOISE — OPEN (2026-09-11, v0.272.4): mode `J`'s **`-beamk` knee**, which sizes the entire beam map, varies by **3.8x between seeds** on a scene with a dielectric — so the same scene rendered twice picks maps differing several-fold in memory, gather cost and merge coverage
+
+**Found while asking a different question.** The budget pilot traces `clamp(nPaths/32, 2048,
+65536)` subpaths — 62 500 on a default `-n 2000000` — to size a pass that on `_fog_thick` then
+traces **2 514**. That is 25x the work of the thing it sizes, and the entry's own sizing note says
+the rate "is stable to a few percent" at `kPilotMin = 2048` and that 64k is "far past the point of
+usefulness". So the obvious move was to shrink it. Sweeping the size on `_fog_thick` supported
+that — the knee held to 1.2 % from 62 500 down to 4 096 while the light-side pass went
+**0.56 s -> 0.10 s**, a 5.6x cut in a fixed per-render cost.
+
+**Then the same sweep on `_fog_cornell` came back non-monotone**, and chasing *that* is what found
+this. Knee, in beams, three pilot sizes x three seeds:
+
+| pilot | seed 3 | seed 7 | seed 11 | spread |
+|---|---|---|---|---|
+| 62 500 (shipped) | 131 885 | 140 923 | **496 091** | **3.76x** |
+| 16 384 | 269 803 | 276 815 | 257 310 | 1.08x |
+| 4 096 | 192 948 | 144 659 | 192 302 | 1.33x |
+
+Two things are wrong here and the second is the entry.
+
+1. **The three pilot sizes do not agree with each other** — central values ~136 k, ~268 k, ~176 k.
+   A larger pilot is supposed to converge on the same answer, not a different one.
+2. **The LARGEST pilot has the WORST spread.** Seed 11 at 62 500 returns 496 091, 3.8x the other
+   two seeds at the same size. More samples making an estimate *less* stable means the quantity is
+   not a mean — it has a heavy tail or a threshold, and a bigger draw is more likely to find the
+   rare structure that moves it.
+
+**It is scene-dependent, and the contrast localises it.** `_fog_thick` — a plain homogeneous
+medium — is rock stable at the shipped pilot: 13 050 / 13 004 / 13 086 / 13 053 across four
+seeds, a **0.6 %** spread. `_fog_cornell` differs by having a **dielectric sphere** in the haze,
+so a light subpath can refract and deposit a wildly different number of chords. That is the
+suspect, and it is a suspect rather than a conclusion.
+
+**Why it matters beyond tidiness.** The knee sizes the whole beam map. A 3.8x swing is a 3.8x
+swing in map memory (191 MB at one seed), in BVH build time, in gather cost per camera segment,
+and in how much merge coverage the technique gets — so two runs of one scene differing only in
+`-seed` are not comparable in performance, and any past A/B on such a scene that did not hold the
+seed fixed was measuring partly this.
+
+**What not to do next.** Do not shrink the pilot on the `_fog_thick` evidence alone; that scene
+cannot see the problem. The 5.6x saving is real and worth having, but it is only safe once the
+knee's own variance is understood — shrinking the pilot on a scene where the estimate is already
+unstable would make the map size *more* random, not less. `FTRACE_JPILOT=<n>` overrides the size
+for exactly this investigation.
+
 ### VOLCACHE — OPEN (2026-09-06, v0.257.0): the radiance cache covers diffuse *surfaces* only, so the volumetric gather — which is where ~all of a `gallery_rain` frame's time actually goes — is recomputed in full every frame of a flyby
 
 **The measurement that motivates this.** A flyby amortises the forward pass across frames, and

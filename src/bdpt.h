@@ -2206,7 +2206,18 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // on a scene with no media at all (where `maxBeams` measures nothing) — hence the `||`
     // rather than a beams-only gate.
     if ((req.maxBeams > 0 || (smOut && req.maxSurfPhotons > 0)) && nPaths > 4 * kPilotMin) {
-        const long long nPilot = std::clamp(nPaths / 32, kPilotMin, kPilotMax);
+        // FTRACE_JPILOT overrides the size, for the sweep that decides whether `/32` is
+        // buying anything. The sizing is off the REQUESTED nPaths, which on a knee-bound scene
+        // is wildly larger than what the pass will actually trace: `-n 2000000` gives a 62 500
+        // subpath pilot to size a pass that then traces 2 514. The entry's own note says the
+        // rate is stable at kPilotMin and that 64k is "far past the point of usefulness", so
+        // the `/32` term may be paying 30x for nothing -- but that is a claim to measure, not
+        // to assume, and this hook is how.
+        long long nPilot = std::clamp(nPaths / 32, kPilotMin, kPilotMax);
+        if (const char* e = std::getenv("FTRACE_JPILOT")) {
+            const long long v = std::atoll(e);
+            if (v > 0) nPilot = v;
+        }
         std::vector<std::thread> ppool;
         for (int t = 0; t < nThreads; ++t)
             ppool.emplace_back(worker, t, nPilot, pilotSeed, /*pilot*/true);
