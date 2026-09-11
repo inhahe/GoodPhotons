@@ -430,17 +430,55 @@ a bias. Per-seed the signs are 3/3 consistent in both regions (caustic −0.393/
 upper +0.135/+0.305/+0.494) while the whole frame flips sign (−0.107/+0.044/+0.272) as noise
 should — so the ~0.3 % redistribution is probably real.
 
-**The leading explanation is `using Real = float`, and it is PRE-EXISTING rather than introduced.**
+*(d) ...AND THEN THE ROI TURNED OUT TO BE IN THE WRONG PLACE.* Both explanations above were
+built on a "caustic floor" box picked by eye from the scene description, never checked against
+the image. A block map of the reference says the caustic is at rows 80-96, cols 56-72 (2.9x the
+frame mean); the box being scored was rows 77-121 x cols 32-96, which is **mostly plain floor
+plus the black rows below the scene**. Rescored on the caustic's actual footprint:
+
+| region | ref/mean | host/ref | dev/ref | dev - host |
+|---|---|---|---|---|
+| **caustic (tight)** | 2.92x | −0.415 % | −0.453 % | **−0.038 % +-0.042** |
+| floor, no caustic | 1.10x | −0.469 % | −1.132 % | −0.663 % +-0.216 |
+| ball + walls | 1.41x | −1.513 % | −1.163 % | +0.350 % +-0.119 |
+| lit frame | 1.23x | −1.685 % | −1.616 % | +0.069 % +-0.108 |
+
+**The caustic — the region merging exists for — agrees to 0.04 %.** The −0.315 % that three
+separate hypotheses were built to explain was a misplaced box. What remains is a redistribution
+between the plain floor (−0.66 %) and the ball/walls (+0.35 %), ~3 sigma each, with the frame
+flat. That is a smaller and different problem from the one being chased, and the standing lead
+for it is the **photon count**: at 160 000 subpaths the device stores 479 725 photons to the
+host's 476 627, **+0.65 % at ~4.6 sigma**, with a `vert` histogram that now agrees to 0.03–0.3 %
+per bin (the apparent depth shift at 12 000 samples was noise). More photons per `nEmitted`
+brightens merges, and ~0.65 % of the merge share of the frame is ~+0.07 % — which is exactly the
+whole-frame number.
+
+**Two disciplines earned their place here, one of them the hard way.** "Check that the rig can
+see the effect" is normally read as *is the signal large enough*; this is the other failure mode
+— **the instrument was not pointed at it**, and it produced a confident 5.7 sigma number about a
+region that does not contain the thing it is named after. The block map that settled it costs
+one numpy loop and should have been the first command, not the tenth.
+
+**A DISCARDED EXPLANATION, `using Real = float`, and why the control mattered.**
 Device geometry (`DVertex::p/ns/ng`) is float; the host walks in double (`pdfFwd`/`pdfRev`/`beta`
 are double on both, so it is not those). Near-degenerate edges lose `rho2` precision in float,
 which is exactly where the enormous densities in (b)'s tail come from — and those live at
 specular->diffuse vertices, i.e. **at the caustic**, whose sign is the one that moved. The GPU
 BDPT *camera* walk has always had this; the light pass merely extends it to the merge half.
 
-So the acceptance bar is not "device light pass == host light pass". It is: **the device light
-pass should agree with the host one no worse than the device CAMERA pass already agrees with the
-host camera pass** — mode `J` CPU vs GPU with the same host-traced map on both sides. That
-control is what decides whether the 0.3 % is a bug or the existing float-geometry tolerance.
+The acceptance bar was: **the device light pass should agree with the host one no worse than the
+device CAMERA pass already agrees with the host camera pass** — mode `J` CPU vs GPU with the same
+host-traced map on both sides. **Measured, and the gap is essentially zero**: whole frame
+−0.001 %, caustic −0.000 %, upper half +0.018 %, per-seed +-0.05–0.10 %. So float geometry agrees
+with double geometry to ~0.02 % on this scene and **cannot** explain a 0.3 % shift. The
+hypothesis is dead; the control is what killed it, and without it a real difference would have
+been filed as a known tolerance.
+
+**The tail explanation died the same way.** `pdfFwdA` at p99.9 is *higher* on the device (2.55x),
+not lower; only the single largest sample is higher on the host (1.35e10 vs 1.25e6), and one
+sample of 1.35e10 among 12 230 contributes 1.1e6 to the mean — which **is** the host mean. The
+entire 2500x mean ratio was one draw. `beta`'s max agrees to four digits on both (1.43e15, the
+emitter's hard bound), which is the reassuring half of the same table.
 
 Still to come after that: step 3 — redrawing inside the chunk loop, which is wall 2 and the
 actual win.

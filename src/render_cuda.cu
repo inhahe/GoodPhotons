@@ -17787,13 +17787,37 @@ static void compareJSurfMaps(const bdpt::SurfMap& host, const JSurfDev& dev) {
     std::printf("\n[jdevcmp] host %zu photons vs device %zu (%.2f%%)\n",
                 host.pts.size(), n,
                 100.0 * ((double)n / (double)host.pts.size() - 1.0));
-    std::printf("[jdevcmp] %-10s %14s %14s %9s | %14s %14s %9s\n",
-                "field", "host mean", "dev mean", "d/h", "host med", "dev med", "d/h");
+    // MAX AND HIGH QUANTILES, not just mean and median. The first run of this comparator gave
+    // mean ratios of 4e-4 beside median ratios of 0.99, which says the draws differ in the
+    // TAIL and nothing about whether the transcription is right -- a density's mean over
+    // 12 000 samples is a statement about its largest one or two entries. These columns answer
+    // the question that one could not: is the device MISSING the tail, or has it merely not
+    // drawn it? It matters, because `pdfFwdA` is the merge technique's own density (eta =
+    // kappaS * pl_j), so a missing tail under-weights exactly the near-specular merges a
+    // caustic is made of -- which is the sign the reference comparison actually measured.
+    auto quant = [](std::vector<double> v, double q) {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        return v[(size_t)(q * (double)(v.size() - 1))];
+    };
+    std::printf("[jdevcmp] %-9s %11s %11s %8s | %11s %11s %8s | %10s %10s %7s\n",
+                "field", "host mean", "dev mean", "d/h", "host p99.9", "dev p99.9", "d/h",
+                "host max", "dev max", "d/h");
     for (const Col& c : cols) {
-        const double hm = mean(c.h), dmn = mean(c.d), hM = med(c.h), dM = med(c.d);
-        std::printf("[jdevcmp] %-10s %14.6g %14.6g %8.4fx | %14.6g %14.6g %8.4fx\n",
+        const double hm = mean(c.h), dmn = mean(c.d);
+        const double hq = quant(c.h, 0.999), dq = quant(c.d, 0.999);
+        const double hx = quant(c.h, 1.0),   dx = quant(c.d, 1.0);
+        std::printf("[jdevcmp] %-9s %11.4g %11.4g %7.4fx | %11.4g %11.4g %7.4fx | %10.4g %10.4g %6.4fx\n",
                     c.name, hm, dmn, hm != 0.0 ? dmn / hm : 0.0,
-                    hM, dM, hM != 0.0 ? dM / hM : 0.0);
+                    hq, dq, hq != 0.0 ? dq / hq : 0.0,
+                    hx, dx, hx != 0.0 ? dx / hx : 0.0);
+    }
+    std::printf("[jdevcmp] %-9s %11s %11s %8s | %11s %11s %8s\n",
+                "(median)", "", "", "", "host med", "dev med", "d/h");
+    for (const Col& c : cols) {
+        const double hM = med(c.h), dM = med(c.d);
+        std::printf("[jdevcmp] %-9s %11s %11s %8s | %11.4g %11.4g %7.4fx\n",
+                    c.name, "", "", "", hM, dM, hM != 0.0 ? dM / hM : 0.0);
     }
     // gateC1 and the depth histogram: pure structure, no tail, so these are the columns that
     // catch a predicate or an index error outright rather than statistically.
