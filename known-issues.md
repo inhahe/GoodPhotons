@@ -920,6 +920,25 @@ sign and 2.8x larger. This scene's whole-frame mean at a 25 s budget simply wand
 percent for reasons unrelated to the builder, and +1.86 % sits inside that. Control (b) cost
 nothing: the renders were already on disk.
 
+**AND THE COST ORDERING INVERTED, WHICH IS THE INPUT FOR WHOEVER PORTS THE DEPOSIT.** With the
+tree on the device, `[jstats]` on `_fog_thick` at `-beamrefresh 0.60` reads `beam BVH 3.02 s` over
+**56 epochs = 54 ms per realization** — but the LBVH itself is ~2.5 ms. The other ~52 ms is the
+**split + CIE table + box pass** that `BeamMap::build` still does on the host, and it is now the
+largest single light-side cost. At 265 k sub-beams that is ~200 ns each, i.e. memory-bound: ~26 MB
+of `PhotonBeam` copying plus a 265 k x 24 B CIE table.
+
+| | before the port | after |
+|---|---|---|
+| BVH | **72 %** (220 ms) | 3 % (2.5 ms) |
+| split + CIE + boxes | — (inside the 220 ms figure) | **~65 %** (52 ms) |
+| trace | 28 % (90 ms) | ~35 % (29–61 ms) |
+
+**"Port the trace" was the obvious-sounding next step before this port and still is, and it is
+still not the expensive one.** Twice now the cost has sat somewhere other than where reasoning by
+analogy put it — the surface half was a trace plus a grid, so the beam half "obviously" needed the
+trace ported, when it needed the tree; and now that the tree is done the remaining cost is the
+split, not the trace. Measure the split before writing the deposit.
+
 **One edge to state before this is defaulted.** `buildBeamLbvhDevice` refuses `n <= 1` (Karras has
 no internal node for a single primitive), and with the host tree skipped there is then no tree at
 all -- `nNodes == 0`, which every entry point already reads as "no volume gather". For a one-beam
