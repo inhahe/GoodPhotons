@@ -359,8 +359,29 @@ merge's reference connection splits after `y_{u-1}`), and **`nEmitted` counting 
 than successes** (the host increments `done` before its `pdfLam <= 0` continue, so counting only
 successful emissions would inflate `kappaS` and darken every merge).
 
-Still to come: the on-device grid build (copy `vcmSessionPass`'s bbox → cell key → stable sort →
-`lower_bound`), and the wiring that redraws it inside the chunk loop — which is wall 2.
+**STEP 2 IS IN (v0.271.2), behind `FTRACE_JDEVLIGHT=1`.** `buildJSurfMapDevice` traces the map
+with `kJSurfLightT` and grids it on the device — `thrust::transform_reduce` bbox, `kJSurfCellKey`,
+`stable_sort_by_key` (stable because the host's counting sort is, and the gather sums in visit
+order), `lower_bound` for `cellStart` — with the geometry math mirroring `SurfMap::build`'s
+cell-doubling budget loop, since `dSurfMergeAt` bins with `lo`/`cell`/`nx,ny,nz`. Scratch is
+grow-only (`ThrustArena` + `ensureDevCap`, hoisted earlier in the file so both this and the
+VCM/SPPM sessions can use them), because a per-chunk rebuild must not `cudaMalloc` six buffers
+every 0.15 s.
+
+Deliberately the **same** subpath count, radius and refresh cadence as the host map it replaces,
+so this step changes only WHERE the trace runs. The salt XORs in `prog->sampleBase`, without
+which a refreshing render would freeze the device map at epoch 0 while the host map beside it
+kept redrawing — the device arm would then silently be the `-beamfreeze` estimator wearing the
+refresh's name, and the two arms would not be comparable.
+
+First evidence, one frozen realization on `_caustic_box`: **48 986 device photons from 16 384
+subpaths against the host's 48 896** (+0.18 %), which is the agreement two independent streams
+drawing one distribution should give. Over a refreshing 45 s run the device count fluctuates
+around the host's (48 625 … 49 047 across 62 epochs), confirming the per-epoch salt works.
+
+Still to come: the image-level A/B (raw means per region, the caustic floor as the sensitive
+region and the upper walls as the null control), then step 3 — redrawing inside the chunk loop,
+which is wall 2 and the actual win.
 
 **Three stale claims about `-jsurf` and the GPU, corrected the same day** (no version bump: all
 three were comments or dead code, and the fix is bit-identical, verified). `main.cpp` said "the

@@ -15474,6 +15474,12 @@ struct PhToBboxF {
                      (float)p.pos.x, (float)p.pos.y, (float)p.pos.z};
     }
 };
+struct JSurfToBboxF {
+    HD BboxF operator()(const DSurfPhoton& p) const {
+        return BboxF{(float)p.p.x, (float)p.p.y, (float)p.p.z,
+                     (float)p.p.x, (float)p.p.y, (float)p.p.z};
+    }
+};
 struct BboxMergeF {
     HD BboxF operator()(const BboxF& a, const BboxF& b) const {
         return BboxF{fminf(a.mnx, b.mnx), fminf(a.mny, b.mny), fminf(a.mnz, b.mnz),
@@ -15522,6 +15528,23 @@ __global__ void kVcmCellKey(const DVcmLV* lv, int n, DVec3 gLo, double cell,
         int ix = (int)floor((lv[i].p.x - gLo.x) / cell);
         int iy = (int)floor((lv[i].p.y - gLo.y) / cell);
         int iz = (int)floor((lv[i].p.z - gLo.z) / cell);
+        ix = min(max(ix, 0), gnx - 1);
+        iy = min(max(iy, 0), gny - 1);
+        iz = min(max(iz, 0), gnz - 1);
+        key[i] = (iz * gny + iy) * gnx + ix;
+    }
+}
+
+// Cell id per deposited SURFACE photon (mode J). Same shape as kVcmCellKey; the positions are
+// DSurfPhoton's, which the gather bins with the identical expression in dSurfMergeAt -- and it
+// is that agreement, not agreement with the host build, that decides whether a merge is found.
+__global__ void kJSurfCellKey(const DSurfPhoton* pts, int n, DVec3 gLo, double cell,
+                              int gnx, int gny, int gnz, int* key) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        int ix = (int)floor(((double)pts[i].p.x - (double)gLo.x) / cell);
+        int iy = (int)floor(((double)pts[i].p.y - (double)gLo.y) / cell);
+        int iz = (int)floor(((double)pts[i].p.z - (double)gLo.z) / cell);
         ix = min(max(ix, 0), gnx - 1);
         iy = min(max(iy, 0), gny - 1);
         iz = min(max(iz, 0), gnz - 1);
@@ -17527,6 +17550,187 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     }
 }
 
+// ================= host: device-scratch reuse (VCM / SPPM sessions) =================
+// thrust algorithms allocate temporary device storage per call; by default that is a
+// cudaMalloc/cudaFree pair EVERY call, which (with the sessions' own per-pass buffer
+// churn) profiled at ~10% of per-pass API time. This bump arena keeps grow-only blocks
+// alive across passes: alloc() carves from existing blocks (first-fit) and cudaMallocs
+// only on a new high-water mark; deallocate is a no-op; reset() rewinds the offsets at
+// the start of each pass. Steady state: zero device malloc/free per pass.
+struct ThrustArena {
+    struct Block { char* p; size_t cap, off; };
+    std::vector<Block> blocks;
+    void reset() { for (Block& b : blocks) b.off = 0; }
+    char* alloc(size_t n) {
+        n = (n + 255) & ~(size_t)255;                    // 256-byte aligned carves
+        for (Block& b : blocks)
+            if (b.cap - b.off >= n) { char* r = b.p + b.off; b.off += n; return r; }
+        Block nb{}; nb.cap = n; nb.off = n;
+        CUDA_CHECK(cudaMalloc(&nb.p, nb.cap));
+        blocks.push_back(nb);
+        return nb.p;
+    }
+    void release() { for (Block& b : blocks) cudaFree(b.p); blocks.clear(); }
+};
+// Minimal Allocator facade over the arena for FT_THRUST_PAR(alloc).
+struct ThrustArenaAlloc {
+    using value_type = char;
+    ThrustArena* arena;
+    char* allocate(std::ptrdiff_t n) { return arena->alloc((size_t)n); }
+    void deallocate(char*, size_t) {}
+};
+
+// Grow-only device buffer: (re)allocates only when `need` exceeds the current capacity
+// (1.5x growth), so per-pass session buffers stop churning cudaMalloc/cudaFree.
+template <class T>
+static void ensureDevCap(T*& p, size_t& cap, size_t need) {
+    if (need <= cap) return;
+    if (p) { cudaFree(p); p = nullptr; }
+    size_t newCap = cap + cap / 2;
+    if (newCap < need) newCap = need;
+    CUDA_CHECK(cudaMalloc(&p, newCap * sizeof(T)));
+    cap = newCap;
+}
+
+// ---- mode J's surface photon map, TRACED AND GRIDDED ON THE DEVICE -------------------
+//
+// The point is FREQUENCY, not speed. Measured ([jstats], known-issues U-vs-J): mode J's whole
+// light side is 4 % of a render, so moving it buys 4 % of the wall clock and nothing else --
+// but it costs 27 ms per realization on the host, which is 230 s for the ~8500 realizations
+// mode U gets in 90 s. On the device the same walk is sub-millisecond, so the realization
+// count stops being budget-bound. `FTRACE_JDEVLIGHT=1` selects this path.
+//
+// Grow-only scratch, exactly as the VCM/SPPM sessions do it: a per-chunk rebuild (step 3) must
+// not cudaMalloc/cudaFree six buffers every 0.15 s.
+struct JSurfDev {
+    gpu::DSurfPhoton* pts = nullptr;   size_t ptsCap = 0;
+    gpu::DSurfMis*    mis = nullptr;   size_t misCap = 0;
+    int* count     = nullptr;
+    int* cellKey   = nullptr;          size_t cellKeyCap = 0;
+    int* order     = nullptr;          size_t orderCap = 0;
+    int* cellStart = nullptr;          size_t cellStartCap = 0;
+    ThrustArena arena;
+    long long dropped = 0;             // photons the cap refused, cumulative
+    long long stored  = 0;             // photons in the CURRENT map
+    void release() {
+        cudaFree(pts); cudaFree(mis); cudaFree(count);
+        cudaFree(cellKey); cudaFree(order); cudaFree(cellStart);
+        pts = nullptr; mis = nullptr; count = nullptr;
+        cellKey = nullptr; order = nullptr; cellStart = nullptr;
+        ptsCap = misCap = cellKeyCap = orderCap = cellStartCap = 0;
+        arena.release();
+    }
+    // A local of renderBdptCuda, so the destructor is the release: six device buffers, one of
+    // them the photon slab, must not survive the call that made them.
+    ~JSurfDev() { release(); }
+    JSurfDev() = default;
+    JSurfDev(const JSurfDev&) = delete;
+    JSurfDev& operator=(const JSurfDev&) = delete;
+};
+
+// The device light pass's salt. "JSURFDEL" as a base, XORed with `-seed` and with the
+// ABSOLUTE SAMPLE INDEX this call starts at -- which is what makes consecutive light-side
+// epochs draw INDEPENDENT realizations rather than the same one over and over. Without the
+// sampleBase term a refreshing render would freeze the device map at epoch 0's realization
+// while the host map beside it kept redrawing: the two arms would then not be comparable, and
+// the device one would silently be the -beamfreeze estimator wearing the refresh's name.
+static unsigned long long jSurfSalt(const SppProgress* prog) {
+    const unsigned long long base = (unsigned long long)(prog ? prog->sampleBase : 0);
+    return 0x4A5355524644454CULL ^ g_rngSalt ^ (base * 0x9E3779B97F4A7C15ULL);
+}
+
+static void buildJSurfMapDevice(JSurfDev& d, const gpu::DScene& sc, const gpu::DCamera& cam,
+                                int diffraction, int maxDepth, long long nPaths, double radius,
+                                long long maxPhotons, unsigned long long salt,
+                                gpu::DSurfMap& dsm) {
+    dsm = gpu::DSurfMap{};
+    d.stored = 0;
+    if (nPaths <= 0 || !(radius > 0.0)) return;
+    size_t cap = (maxPhotons > 0) ? (size_t)maxPhotons : (size_t)4000000;
+    if (cap > (size_t)2000000000) cap = (size_t)2000000000;   // the slot cursor is an int
+    ensureDevCap(d.pts, d.ptsCap, cap);
+    ensureDevCap(d.mis, d.misCap, cap);
+    if (!d.count) CUDA_CHECK(cudaMalloc(&d.count, 2 * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d.count, 0, 2 * sizeof(int)));
+    gpu::DJSurfOut out{};
+    out.pts = d.pts; out.mis = d.mis; out.count = d.count; out.cap = (int)cap;
+    const bool deep = (maxDepth > BDPT_MAXDEPTH);
+    if (deep)
+        gpu::kJSurfLightT<BDPT_DEEPDEPTH><<<2048, 128>>>(sc, cam, diffraction, maxDepth,
+                                                         nPaths, salt, out);
+    else
+        gpu::kJSurfLightT<BDPT_MAXDEPTH><<<2048, 128>>>(sc, cam, diffraction, maxDepth,
+                                                        nPaths, salt, out);
+    cudaCheckKernel("jsurf-light");
+    int n = 0;
+    CUDA_CHECK(cudaMemcpy(&n, d.count, sizeof(int), cudaMemcpyDeviceToHost));
+    // The cursor counts every ATTEMPT, so it overshoots when the cap binds; the writes past it
+    // were skipped, not wrapped. Clamp and remember, so the ceiling is reportable rather than
+    // a silent thinning of the map (which would darken the merges by an unknown factor).
+    if (n > (int)cap) { d.dropped += (long long)n - (long long)cap; n = (int)cap; }
+    if (n <= 0) return;
+    d.stored = n;
+
+    // --- the grid. surfmerge.h SurfMap::build's geometry, vcmSessionPass's machinery. ---
+    d.arena.reset();
+    ThrustArenaAlloc tal{&d.arena};
+    auto pol = FT_THRUST_PAR(tal);
+    const gpu::BboxF bb = thrust::transform_reduce(
+        pol, thrust::device_pointer_cast(d.pts), thrust::device_pointer_cast(d.pts + n),
+        gpu::JSurfToBboxF{}, gpu::BboxF{FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX},
+        gpu::BboxMergeF{});
+    double cell = radius;
+    long long gnx = 1, gny = 1, gnz = 1;
+    const long long maxCells = 64LL << 20;
+    // The host's doubling loop, verbatim in intent: grow the cell until the lattice fits the
+    // budget. It terminates fast (the count falls 8x a step) and keeps `cell >= radius`, which
+    // is the invariant the 3x3x3 query in dSurfMergeAt relies on -- coarsening only makes a
+    // query visit more photons, it can never make it miss one.
+    for (int guard = 0; guard < 64; ++guard) {
+        const double ex = (double)bb.mxx - (double)bb.mnx + 2.0 * cell;
+        const double ey = (double)bb.mxy - (double)bb.mny + 2.0 * cell;
+        const double ez = (double)bb.mxz - (double)bb.mnz + 2.0 * cell;
+        const long long ax = std::max(1LL, (long long)std::ceil(ex / cell));
+        const long long ay = std::max(1LL, (long long)std::ceil(ey / cell));
+        const long long az = std::max(1LL, (long long)std::ceil(ez / cell));
+        if (ax <= maxCells && ay <= maxCells && az <= maxCells &&
+            (double)ax * (double)ay * (double)az <= (double)maxCells) {
+            gnx = ax; gny = ay; gnz = az; break;
+        }
+        cell *= 2.0;
+        gnx = gny = gnz = 1;
+    }
+    const gpu::DVec3 gLo((gpu::Real)((double)bb.mnx - cell), (gpu::Real)((double)bb.mny - cell),
+                         (gpu::Real)((double)bb.mnz - cell));
+    ensureDevCap(d.cellKey, d.cellKeyCap, (size_t)n);
+    ensureDevCap(d.order,   d.orderCap,   (size_t)n);
+    gpu::kJSurfCellKey<<<2048, 128>>>(d.pts, n, gLo, cell, (int)gnx, (int)gny, (int)gnz,
+                                      d.cellKey);
+    cudaCheckKernel("jsurf-cellkey");
+    thrust::device_ptr<int> tKey(d.cellKey), tOrd(d.order);
+    thrust::sequence(pol, tOrd, tOrd + n);
+    // STABLE, because the host's counting sort is stable and the gather sums in visit order:
+    // an unstable sort would reorder a cell's photons and change the last bits of every merge.
+    thrust::stable_sort_by_key(pol, tKey, tKey + n, tOrd);
+    const long long nCells = gnx * gny * gnz;
+    ensureDevCap(d.cellStart, d.cellStartCap, (size_t)nCells + 1);
+    thrust::lower_bound(pol, tKey, tKey + n,
+                        thrust::counting_iterator<int>(0),
+                        thrust::counting_iterator<int>((int)(nCells + 1)),
+                        thrust::device_pointer_cast(d.cellStart));
+
+    dsm.pts = d.pts; dsm.mis = d.mis;
+    dsm.cellStart = d.cellStart; dsm.order = d.order;
+    dsm.lo = gLo; dsm.cell = (gpu::Real)cell;
+    dsm.nx = (int)gnx; dsm.ny = (int)gny; dsm.nz = (int)gnz;
+    dsm.radius = (gpu::Real)radius;
+    // n_m counts subpaths ASKED FOR, not photons stored -- the host pass counts the same way
+    // (it increments before its `pdfLam <= 0` continue), and getting it wrong scales every
+    // merge by a constant.
+    dsm.kappaS = (double)nPaths * PI * radius * radius;
+    dsm.nPts   = (long long)n;
+}
+
 // ---- upload a built photon-beam map to the device ------------------------------------
 //
 // Shared by mode M's volume gather and mode J's BDPT merges, which need the SAME device
@@ -17763,6 +17967,23 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // `dSurfMergeAt`.)
     DSurfMap dsm{};
     if (smap) uploadSurfMapCuda(smap, up, dsm);
+    // FTRACE_JDEVLIGHT=1: re-trace and re-grid that map ON THE DEVICE instead. Deliberately
+    // the same nPaths / radius / single realization as the host map it replaces, so this is a
+    // clean A/B of WHERE the light side runs. It cannot be bit-identical -- the two walks draw
+    // from different RNG streams -- so the acceptance test is statistical, per ROI.
+    JSurfDev jdev;
+    const bool jDevLight = smap && smap->nEmitted > 0 &&
+                           std::getenv("FTRACE_JDEVLIGHT") &&
+                           std::atoi(std::getenv("FTRACE_JDEVLIGHT")) != 0;
+    if (jDevLight) {
+        buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, smap->nEmitted,
+                            smap->radius, (long long)smap->pts.size() * 2 + 1024,
+                            jSurfSalt(prog), dsm);
+        std::printf("[jdevlight] device light pass: %lld subpaths -> %lld surface photons "
+                    "(host traced %zu)%s\n", (long long)smap->nEmitted, jdev.stored,
+                    smap->pts.size(),
+                    jdev.dropped ? "  [CAP BOUND: some photons dropped]" : "");
+    }
     {   // the half-render diagnostic, mirrored from the host so one half can be compared
         // backend to backend (bdpt::jHalfMode: 1 = connections only, 2 = merges only)
         // Same strings bdpt.h's jHalfMode() reads -- that function is the source of truth, but
@@ -19641,48 +19862,6 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
 
     freeUpload(up);
     return out;
-}
-
-// ================= host: device-scratch reuse (VCM / SPPM sessions) =================
-// thrust algorithms allocate temporary device storage per call; by default that is a
-// cudaMalloc/cudaFree pair EVERY call, which (with the sessions' own per-pass buffer
-// churn) profiled at ~10% of per-pass API time. This bump arena keeps grow-only blocks
-// alive across passes: alloc() carves from existing blocks (first-fit) and cudaMallocs
-// only on a new high-water mark; deallocate is a no-op; reset() rewinds the offsets at
-// the start of each pass. Steady state: zero device malloc/free per pass.
-struct ThrustArena {
-    struct Block { char* p; size_t cap, off; };
-    std::vector<Block> blocks;
-    void reset() { for (Block& b : blocks) b.off = 0; }
-    char* alloc(size_t n) {
-        n = (n + 255) & ~(size_t)255;                    // 256-byte aligned carves
-        for (Block& b : blocks)
-            if (b.cap - b.off >= n) { char* r = b.p + b.off; b.off += n; return r; }
-        Block nb{}; nb.cap = n; nb.off = n;
-        CUDA_CHECK(cudaMalloc(&nb.p, nb.cap));
-        blocks.push_back(nb);
-        return nb.p;
-    }
-    void release() { for (Block& b : blocks) cudaFree(b.p); blocks.clear(); }
-};
-// Minimal Allocator facade over the arena for FT_THRUST_PAR(alloc).
-struct ThrustArenaAlloc {
-    using value_type = char;
-    ThrustArena* arena;
-    char* allocate(std::ptrdiff_t n) { return arena->alloc((size_t)n); }
-    void deallocate(char*, size_t) {}
-};
-
-// Grow-only device buffer: (re)allocates only when `need` exceeds the current capacity
-// (1.5x growth), so per-pass session buffers stop churning cudaMalloc/cudaFree.
-template <class T>
-static void ensureDevCap(T*& p, size_t& cap, size_t need) {
-    if (need <= cap) return;
-    if (p) { cudaFree(p); p = nullptr; }
-    size_t newCap = cap + cap / 2;
-    if (newCap < need) newCap = need;
-    CUDA_CHECK(cudaMalloc(&p, newCap * sizeof(T)));
-    cap = newCap;
 }
 
 // ============================ GPU SPPM (mode S) ============================
