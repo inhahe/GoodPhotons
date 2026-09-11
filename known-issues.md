@@ -627,11 +627,14 @@ variance does not move:
 
 | region (chosen from a block map of the baseline, not from the scene description) | per-chunk / per-epoch | per-band / per-epoch |
 |---|---|---|
-| brightest blocks (the lit fog) | 0.993x | 1.039x |
-| dimmest blocks | 1.014x | 0.922x |
-| whole frame | 0.943x | 0.960x |
+| brightest blocks (the lit fog) | 1.007x | 1.055x |
+| dimmest blocks | 1.032x | 0.985x |
+| whole frame | 0.941x | 0.961x |
 
-At 3 seeds none of that is distinguishable from 1.0. **Against 11.2x on the surfaces-only scene.**
+None of that is distinguishable from 1.0. **Against 11.2x on the surfaces-only scene.** (Scored
+at n=3 first and then re-scored at n=4 — deliberately, after n=3 overturned three times today.
+Here the fourth seed *confirmed*: whole frame 0.943 -> 0.941 and 0.960 -> 0.961. A null that
+survives a sample-size increase is worth more than one that has not been tested that way.)
 
 **The reason is structural and it says what to build next.** This port redraws the SURFACE map.
 On `_caustic_box` the surface merges are the entire merge half, so their realization count is the
