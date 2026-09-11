@@ -3050,6 +3050,34 @@ as the one at fault.
   estimator. One light builds no tree at all (`lightTreeRoot < 0`), and mode `W` always
   takes the exact path, since its deterministic shadow grid has no variance to trade.
 
+  **The REVERSE walk, `ltSelectPdf()` (0.270.0).** `ltSample` answers "which emitters, and with
+  what probability"; the BSDF-sampling half of a glossy MIS weight needs the opposite — it has an
+  emitter, discovered one bounce later by a ray hit, and needs the probability the selector
+  *would* have chosen it. `ltSelectPdf` walks root→leaf and multiplies the factor each step
+  contributed: **1** at a split (both children taken with certainty), the child's `ltImportance`
+  share at a stochastic step. The path is **unique** in a tree, so there is nothing to integrate —
+  the worry that adaptive splitting makes this a sum over the split set is why the function did
+  not exist for a year, and it is unfounded. `Scene::lightTreeParent` (node → parent) and
+  `Scene::lightTreeLeaf` (emitter → its leaf node) are the indices it needs, derived from the
+  finished node array by **one linear pass** in `buildLightTree()`, so the recursive builder is
+  untouched and every pre-existing selection pdf is unchanged.
+
+  **What it deliberately does not reproduce, and why that is safe.** `ltSample` declines a split
+  when its output or stack is full; that depends on traversal order and therefore on the rng, and
+  is not recoverable a bounce later. The resolution is not to chase it but to have **both halves
+  of the weight call this one function** — a weight owes *consistency*, not correctness, since MIS
+  is unbiased for any weights forming a partition of unity, and the true selection pdf enters the
+  **estimator** (through `EmitterDraw::weight`, which `ltSample` returns exactly) rather than the
+  weight. Getting that backwards is what made the first attempt unbiased-but-noisier; see
+  `known-issues.md` → GLOSSY-NEE.
+
+  **And the walk is usually skipped (0.270.1).** `ltSample` gained a `roomLimited` out-param; when
+  it comes back false its returned pdf *is* what `ltSelectPdf` would produce, so the NEE side uses
+  the number it already has. `ltSelectPdf` mirrors `ltSample`'s arithmetic exactly — including
+  taking the right child as `1 − pL` rather than `iR/sum`, which differ in the last bits — so
+  "reuse instead of re-walk" is a **bit-identity** claim that is verified on both backends rather
+  than argued. Measured: the re-walk cost 4.8 % of a frame on a 48-light scene and bought nothing.
+
   **The second O(N) term, which only appeared once the shadow rays were gone.** The CPU
   refilled a per-sample table of every emitter's SPD at every sampled wavelength (1024
   Planck evaluations per sample at N=256, C=4) and then summed over emitters *again* to
