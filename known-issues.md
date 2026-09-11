@@ -3,6 +3,17 @@
 Running log of unsolved bugs and accumulated tech debt. Fix items here as soon
 as practical; this file is the fallback for what can't be addressed immediately.
 
+**Every OPEN entry was audited against the code on 2026-09-10/11**, so the list below is
+trustworthy as of then. Eight were not actually open: six had been fixed and never marked (audit
+1, by grepping for missing symbols), and two more were found only by *reading the claim* — the
+beam-gather `PERF` entry, whose two prioritised fixes had both shipped, and `UPBP-CONV`'s part (1),
+whose "possible fix" turned out to be a feature mode `J` announces in its own log. **That is the
+method's limitation, worth knowing before trusting a future audit: grepping finds unimplemented
+features, not superseded reasoning.** The rest were checked individually and are real —
+`UPBP-W(a)` still uses a scalar `radRef()`, `BDPT-MIS-TR`'s `trDet`/`camTr` machinery belongs to
+mode `J`'s merge weight rather than mode `D`'s connections, `grid:`/`scatter:` are still absent
+from the four field sites, and the mode-`J` flyby still falls to `restIdx` at `main.cpp:23142`.
+
 **A repro scene for an OPEN entry must be TRACKED** (`scenes/`, not `scraps/`). `scraps/` is
 git-ignored, so an entry whose repro lives there cannot be re-validated and its drift cannot be
 detected — on 2026-09-10 that nearly produced a false "7× regression" report against the GRIN
