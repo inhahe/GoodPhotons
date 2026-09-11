@@ -294,6 +294,12 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
 // than cudaForwardSupported: also requires no participating media and only area/sphere/
 // cylinder Lambertian emitters (no spot/env/collimated) — the BDPT scope. When false, the
 // caller must use the CPU BDPT renderer.
+// `-jhostlight`: keep mode J's surface light side on the HOST, redrawn once per epoch, which is
+// what it did before 0.272.0. The default is the device pass redrawn per chunk -- 11.2x less
+// whole-frame variance at equal wall clock on a surfaces-only scene, and inert where a frame is
+// already down to one sample per chunk. This is the switch for reproducing pre-0.272.0 output.
+void cudaSetJHostLight(bool on);
+
 bool cudaBdptSupported(const Scene& scene);
 
 // GPU bidirectional path trace (mode D). Renders `spp` samples per pixel at the given

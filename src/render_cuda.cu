@@ -17634,6 +17634,10 @@ struct JSurfDev {
 // sampleBase term a refreshing render would freeze the device map at epoch 0's realization
 // while the host map beside it kept redrawing: the two arms would then not be comparable, and
 // the device one would silently be the -beamfreeze estimator wearing the refresh's name.
+// `-jhostlight` (see render_cuda.h). Set once from argv, read per render.
+static bool g_jHostLight = false;
+void cudaSetJHostLight(bool on) { g_jHostLight = on; }
+
 static unsigned long long jSurfSalt(const SppProgress* prog) {
     const unsigned long long base = (unsigned long long)(prog ? prog->sampleBase : 0);
     return 0x4A5355524644454CULL ^ g_rngSalt ^ (base * 0x9E3779B97F4A7C15ULL);
@@ -18098,8 +18102,12 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // clean A/B of WHERE the light side runs. It cannot be bit-identical -- the two walks draw
     // from different RNG streams -- so the acceptance test is statistical, per ROI.
     JSurfDev jdev;
-    const int jdevLevel = std::getenv("FTRACE_JDEVLIGHT")
-                        ? std::atoi(std::getenv("FTRACE_JDEVLIGHT")) : 0;
+    // DEFAULT 3 -- the device light pass, redrawn per chunk. `-jhostlight` turns it off;
+    // FTRACE_JDEVLIGHT still overrides both, because level 1 (device map, once per epoch) and
+    // level 2 (that plus the host-vs-device map dump) are the two arms every measurement in
+    // known-issues was taken with and they have to stay reachable.
+    int jdevLevel = g_jHostLight ? 0 : 3;
+    if (const char* e = std::getenv("FTRACE_JDEVLIGHT")) jdevLevel = std::atoi(e);
     const bool jDevLight = smap && smap->nEmitted > 0 && jdevLevel != 0;
     if (jDevLight) {
         buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, smap->nEmitted,
@@ -18123,14 +18131,22 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // How many light-side realizations to draw INSIDE one chunk (FTRACE_JSPLIT). 1 = off.
     // Inert without jPerChunk: splitting a chunk that reuses one map buys nothing and costs
     // a kernel launch per split.
-    int jSplitN = 1;
+    // DEFAULT 4, the measured optimum: 0.390x whole-frame variance against k=1 for 8.6 % of the
+    // samples, where k=16 costs 53 % of them and comes back out at 0.503x. The two terms trade,
+    // so this knob has an interior optimum and 4 is where it sits on the scene it was measured
+    // on. Inert where the chunk is already 1 spp (an expensive media frame), which is exactly
+    // where a split would have bought nothing.
+    int jSplitN = 4;
     if (jPerChunk) {
         if (const char* e = std::getenv("FTRACE_JSPLIT")) jSplitN = std::atoi(e);
         if (jSplitN < 1)    jSplitN = 1;
         if (jSplitN > 1024) jSplitN = 1024;
-        if (jSplitN > 1)
-            std::printf("[jdevlight] splitting each chunk into %d sub-launches, one light-side "
-                        "realization each (-FTRACE_JSPLIT)\n", jSplitN);
+        static bool jSaidSplit = false;
+        if (jSplitN > 1 && !jSaidSplit) {
+            jSaidSplit = true;
+            std::printf("mode J: light side on the DEVICE, redrawn %d times per chunk "
+                        "(-jhostlight for the pre-0.272.0 host pass)\n", jSplitN);
+        }
     }
     // FTRACE_JBAND=1: redraw per WAVEFRONT BAND instead of (only) per chunk. The band loop
     // subdivides a chunk by PIXEL, which is the only axis left once the chunk is down to 1 spp

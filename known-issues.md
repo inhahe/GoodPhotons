@@ -651,7 +651,16 @@ So the honest scope of the device light pass as it stands:
 | surfaces-only (`-jsurf`, no media) — where mode `U` competes | **11.2x** less whole-frame variance |
 | with media — where beam merges dominate | no measurable change (0.94–0.96x at n=3) |
 
-and the next piece of work is the **beam** half: a device beam deposit and a device BVH over it.
+**SHIPPED AS THE DEFAULT IN v0.272.0.** GPU mode `J` now traces and grids `-jsurf`'s surface map
+on the device, redrawn 4x per chunk, with `-jhostlight` as the opt-out. `FTRACE_JBAND` is
+deliberately NOT defaulted: it works and is free, but it bought nothing measurable (0.961x at
+n=4) while changing the SPATIAL noise structure — pixels in one frame would gather from different
+realizations — and shipping an unmeasured change to how noise is distributed, for no measured
+gain, would undo the point of validating any of this. Four gates checked against the shipped
+binary: the GPU default announces the device pass, `-jhostlight` silences it, and **`-device cpu`
+and mode `D` are both untouched** (0 device-pass lines each).
+
+And the next piece of work is the **beam** half: a device beam deposit and a device BVH over it.
 That is the harder half this entry always said was harder, and the measurement above is the first
 thing that makes it the *obvious* next one rather than merely the remaining one.
 

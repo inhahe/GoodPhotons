@@ -13118,6 +13118,11 @@ static bool g_noBeams = false;
 // argument handlers and read by none, so it is gone. Do not re-add a flag to record an intent
 // nothing acts on.
 static bool g_jSurf = true;
+// -jhostlight: keep mode J's surface light side on the host, redrawn once per epoch (pre-0.271.5
+// behaviour). Forwarded to the device backend through cudaSetJHostLight rather than threaded
+// through renderBdptCuda, whose parameter list is already long and whose every caller would
+// otherwise have to carry a flag none of them decide.
+static bool g_jHostLight = false;
 // -jsurf-radius: the gather disc's radius r_s in world units. 0 = auto, meaning the same
 // `sceneRadius * g_pmRadiusFactor` (`-pmradiusfrac`) that modes M/S/U start from — mode J's
 // merges deliberately share the photon-map radius convention so a like-for-like comparison
@@ -18923,6 +18928,16 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-beamcount") && i + 1 < argc) {
             g_beamTarget = (long long)std::atof(argv[++i]);
             g_beamTargetSet = true;   // mode J only mentions its knee fallback when this is absent
+        }
+        else if (!std::strcmp(argv[i], "-jhostlight") ||
+                 !std::strcmp(argv[i], "-jhost-light")) {
+            g_jHostLight = true;
+#ifdef HAVE_CUDA
+            // Told to the device backend HERE rather than at render time: it is a process-wide
+            // decision, argv is parsed once, and a setter at the point of parse cannot be
+            // forgotten by a new call site the way a threaded parameter can.
+            cudaSetJHostLight(true);
+#endif
         }
         else if (!std::strcmp(argv[i], "-jsurf") || !std::strcmp(argv[i], "-jmerge-surf")) {
             g_jSurf = true;

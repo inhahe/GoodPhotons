@@ -961,6 +961,28 @@ render. `-beamfreeze` restores the old single-map behaviour bit-for-bit; `-beamr
 every epoch — stretches its epochs out and degrades gracefully toward `-beamfreeze` instead of
 thrashing.
 
+**MODE `J`'S SURFACE LIGHT SIDE RUNS ON THE DEVICE, PER CHUNK (0.272.0).** `-jsurf`'s surface
+photon map is traced by `kJSurfLightT` — the device twin of the deposit in `traceLightBeamPass` —
+and gridded on the device with the machinery `vcmSessionPass` already used (bbox reduce, cell
+key, stable sort, `lower_bound`). `buildJSurfMapDevice` is called from inside `launch()`, which
+`gpuSppChunks` invokes once per chunk, and the chunk is further split four ways, so a render
+draws a fresh light-side realization every sub-launch instead of once per refresh epoch.
+
+**The reason is frequency, not speed, and that distinction decides the design.** The light pass
+is ~4 % of a mode-`J` render, so moving it buys 4 % of the wall clock and nothing else. What it
+buys is *realizations*: on the host a realization costs 27 ms, so mode `J` managed ~126 in 90 s
+against mode `U`'s ~8500, and that gap — not the estimator — was most of `U`'s measured
+advantage. On the device the rebuild is free (a media frame fits 88 of them with `host gaps
+0.0 s`), so the limit moves to the chunk, and splitting the chunk moves it again. Measured:
+**11.2x less whole-frame variance at equal wall clock** on a surfaces-only scene, bias unmoved.
+
+**Two boundaries are part of the design rather than defects.** The split has an **interior
+optimum** (k=16 is worse than k=4) because more realizations cut the merge half's variance while
+costing camera samples that raise the connection half's — so the knob is a trade, not a dial to
+turn up. And the whole thing does nothing on a scene with **media**, where beam merges dominate
+and the beam map is still host-traced per epoch; the device *beam* deposit is the remaining
+piece. `-jhostlight` restores the host pass.
+
 **…and `-beamfreeze` is what makes a mode-`J` FLYBY share one light side (0.271.0).** Mode `J`
 stays in the per-camera `restIdx` loop — its connection half is BDPT, whose frames are independent
 by construction — so it is not promoted to a shared group the way `A`/`B`/`M` are. Instead the
