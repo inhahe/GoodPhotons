@@ -12174,6 +12174,27 @@ static double    g_beamSplitLen  = 0.0;
 // on it, because the BVH build is a one-time cost amortised over exactly that much gathering.
 // A 600-frame flythrough should split far finer than a single still of the same scene — see
 // BeamMap::sahSplitLen for the derivation and the measurements behind the constant.
+// Set by the mode-J dispatch just before it builds a light side, and false everywhere else:
+// "this map is going to be gathered on the device, so a host BVH over it is dead work". Anything
+// that can reach a CPU gather -- mode M, -device cpu, -loadmap, the shared photon-map path --
+// leaves it false and gets the host tree as before.
+static bool g_jDevBeamOk = false;
+
+// SKIP THE HOST TREE when a device LBVH is going to be built over the same sub-beams. ONE
+// definition, because `buildBeamMap` has two build branches (`-beamradius` and the auto one) and
+// the first version of this decided it at only one of them -- the one the default render does
+// not take, so it measured no change at all. A predicate used by both cannot drift.
+//
+// The env read is cached: this runs once per light-side epoch, and `getenv` is not free.
+// `g_jDevBeamOk` is what keeps a CPU gather safe -- it has no other tree to use.
+static bool jSkipHostBvh() {
+    static const bool devLbvh = [] {
+        const char* e = std::getenv("FTRACE_JLBVH");
+        return e && std::atoi(e) != 0;
+    }();
+    return devLbvh && g_jDevBeamOk;
+}
+
 static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet = false) {
     // `quiet` exists for mode J's light-side REFRESH (see g_beamFreeze): that rebuilds this
     // map once per progressive epoch, and re-printing the same four-line map description on
@@ -12265,7 +12286,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
         bm.setUniformRadius(g_beamRadiusAbs);
         const double areaBefore = bm.totalBoxArea();
         double meanSplit = 0.0;
-        bm.build(g_beamSplitLen, splitBudget, work, &meanSplit);
+        bm.build(g_beamSplitLen, splitBudget, work, &meanSplit, /*skipBvh*/ jSkipHostBvh());
         r = g_beamRadiusAbs;
         say("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g "
                     "(-beamradius), mean split %.4g, box area %.4g -> %.4g m^2 (%.2fx), "
@@ -12294,7 +12315,8 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
         }
     } else {
         const BeamMap::AutoInfo ai =
-            bm.buildAuto(g_beamBlur, g_beamK, g_beamAreaSlack, splitBudget, g_beamSplitLen, work);
+            bm.buildAuto(g_beamBlur, g_beamK, g_beamAreaSlack, splitBudget, g_beamSplitLen, work,
+                         /*skipBvh*/ jSkipHostBvh());
         r = bm.radius;
         // One line PER MEDIUM: the radius is per medium now, so a single number would hide
         // exactly the thing that makes a two-medium scene work. mfp is the measured mean stored
@@ -16311,6 +16333,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // live in the batch's cache when this render can share one -- a flyby under
         // `-beamfreeze` -- and in a local otherwise, so an unshared render still owns its map
         // and releases it at the end of its own scope exactly as before.
+        // "Every beam map built inside this mode-J render will be gathered on the device."
+        // Scoped rather than assigned, because runRender leaves this block through
+        // runSppProgressive and a bare assignment would leak the state into the next camera of
+        // a batch -- which on a CPU camera would hand it a map with no tree at all.
+        struct JDevBeamScope {
+            bool prev;
+            explicit JDevBeamScope(bool v) : prev(g_jDevBeamOk) { g_jDevBeamOk = v; }
+            ~JDevBeamScope() { g_jDevBeamOk = prev; }
+        } jdbScope(useGpu);
         const bool shareLight = (jcache != nullptr) && g_beamFreeze;
         JLightCache jlocal;
         JLightCache& jlc = shareLight ? *jcache : jlocal;

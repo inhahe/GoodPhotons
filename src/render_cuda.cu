@@ -18112,8 +18112,12 @@ static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurf
 }
 
 static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& dbm,
-                              const StageProgress* stage, bool withMis) {
-    if (!bmap || bmap->beams.empty() || bmap->bvh.nodes.empty() || bmap->nEmitted <= 0) return;
+                              const StageProgress* stage, bool withMis, bool lbvh = false) {
+    // `lbvh` means the host deliberately skipped its tree because a device one is coming, so an
+    // empty `bvh.nodes` is expected rather than a malformed map. Without that distinction the
+    // guard below would silently drop a perfectly good beam set and the volume would vanish.
+    if (!bmap || bmap->beams.empty() || bmap->nEmitted <= 0) return;
+    if (!lbvh && bmap->bvh.nodes.empty()) return;
     const double invN = 1.0 / (double)bmap->nEmitted;
     const size_t nb = bmap->beams.size();
     // The fourth and last silent stretch: converting millions of sub-beams and millions of
@@ -18173,7 +18177,8 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
         const double rm = bmap->radOf(b.med);
         r.invRad = (float)(rm > 0.0 ? 1.0 / rm : 0.0);
     }
-    std::vector<gpu::DNode> bnodes(bmap->bvh.nodes.size());
+    // With `lbvh` there is no host tree to convert; the device builds one straight after.
+    std::vector<gpu::DNode> bnodes(lbvh ? 0 : bmap->bvh.nodes.size());
     for (size_t i = 0; i < bnodes.size(); ++i) {
         if ((i & 0xFFFFF) == 0 && ft::stopRequested()) break;
         const BvhNode& s = bmap->bvh.nodes[i]; gpu::DNode& d = bnodes[i];
@@ -18286,16 +18291,17 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // freed with the rest of `up`. A null/empty map leaves `dbm.nNodes == 0`, which the
     // MERGE=true kernel reads as "no merges" — so `-nobeams` degenerates to mode D exactly.
     DBeamMap dbm{};
-    if (bmap) uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/true);
+    const bool wantLbvh = std::getenv("FTRACE_JLBVH") &&
+                          std::atoi(std::getenv("FTRACE_JLBVH")) != 0;
+    if (bmap) uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/true, wantLbvh);
     // FTRACE_JLBVH=1: rebuild the NODES on the device over the very same sub-beams. Same beams,
     // same gather, a different tree -- so an image difference is a traversal-acceptance
     // difference and a time difference is tree quality, with no third variable to blame.
     JBeamDev jbvh;
-    if (dbm.nNodes > 0 && bmap && !bmap->bvh.nodes.empty() &&
-        std::getenv("FTRACE_JLBVH") && std::atoi(std::getenv("FTRACE_JLBVH")) != 0) {
+    if (dbm.beams && bmap && !bmap->beams.empty() && wantLbvh) {
         const int nb = (int)bmap->beams.size();
         const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = buildBeamLbvhDevice(jbvh, dbm.beams, nb, bmap->bvh.nodes[0].box,
+        const bool ok = buildBeamLbvhDevice(jbvh, dbm.beams, nb, bmap->worldBounds,
                                             bmap->radius, dbm);
         CUDA_CHECK(cudaDeviceSynchronize());
         const double ms = std::chrono::duration<double, std::milli>(

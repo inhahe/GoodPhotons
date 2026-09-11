@@ -861,6 +861,32 @@ leaf, so it trades deeper traversal against smaller leaf tests and comes out lev
 relative difference of **exactly zero** says most rays find the identical beam set; the 2 % that
 move are at the acceptance boundary, and the mean is unmoved at 0.02 %.
 
+**AND THE HOST NOW SKIPS ITS OWN TREE WHEN THE DEVICE IS GOING TO BUILD ONE (v0.272.2).**
+`BeamMap::build` gained `skipBvh`, `buildAuto` forwards it, and `BeamMap::worldBounds` carries
+what `bvh.nodes[0].box` used to supply (the Morton normalisation needs it and there is no root
+node left to read it from). `_fog_thick` 96^2, 25 s, GPU:
+
+| | realizations | trace | beam BVH | light side | spp |
+|---|---|---|---|---|---|
+| host tree | 9 | 0.64 s (71 ms each) | 1.81 s (**201 ms** each) | 9.5 % | 2766 |
+| device LBVH | **17** | 0.86 s (51 ms each) | 0.87 s (**51 ms** each) | 6.7 % | **2821** |
+
+**2.7x cheaper per realization, 1.9x more realizations, at unchanged samples** (2821 against
+2766), with the image mean at 0.988x — inside the seed-to-seed spread of this scene. The log
+confirms the mechanism rather than the outcome: `host SAH tree had 0 nodes`.
+
+The residual 51 ms is not BVH; it is the split, the CIE table and the box pass that `build()`
+still does on the host, which is what a device deposit would remove next.
+
+**A wrong turn worth recording, because the measurement is what caught it.** The first version
+wired `skipBvh` into `buildBeamMap`'s `-beamradius` branch only, and the default render goes
+through `buildAuto` — so it measured **no change at all** (`beam BVH 1.79 s` against 1.81 s).
+That is "both halves of a decision in different places" in its plainest form. It surfaced only
+because `[jstats]` reports the MECHANISM (seconds of BVH) and not just the wall clock: a 25 s
+render that stayed 25 s would have read as "no win" rather than "no effect". Fixed structurally —
+one `jSkipHostBvh()` predicate for both branches, and `skipBvh` forwarded to both of `buildAuto`'s
+`build` calls — rather than by patching the second site.
+
 **What this does and does not cover.** It replaces BVH *construction*, which the earlier profile
 showed is essentially all of `buildBeamMap` (`241186 stored -> 5154789 after split … BVH in
 5.01s`, against 0.07 s of trace). The deposit and the split are still host-side, so this is one

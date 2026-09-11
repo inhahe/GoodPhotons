@@ -972,8 +972,20 @@ struct BeamMap {
     // sub-beams (0 = unbounded). `work` is the total pixel-samples every camera sharing this
     // map will gather — the term that decides how much BVH build is worth buying (0 = treat
     // the build as free, i.e. the pure area optimum). `meanSplitOut` gets the mean length used.
+    // World bounds of the split sub-beams, INCLUDING each one's kernel radius -- i.e. exactly
+    // what `bvh.nodes[0].box` used to be. Kept as its own field because the device LBVH needs
+    // it for the Morton normalisation, and after `skipBvh` there is no root node to read it
+    // from. Always filled, so nothing has to know which builder ran.
+    // NOT `bounds()`, which already exists and returns the ENDPOINT bbox without the kernel
+    // radius. This one is the radius-inflated box -- byte-for-byte what `bvh.nodes[0].box` was --
+    // so swapping the tree cannot move the Morton normalisation.
+    Aabb worldBounds;
+
+    // `skipBvh`: do not build the host tree. Only ever set when a device LBVH is about to be
+    // built over the same sub-beams (see buildBeamLbvhDevice) -- the host tree is still the only
+    // one a CPU gather can use, so this must stay false for mode M, -device cpu and -loadmap.
     void build(double explicitSplitLen = 0.0, size_t splitBudget = 0,
-               double work = 0.0, double* meanSplitOut = nullptr) {
+               double work = 0.0, double* meanSplitOut = nullptr, bool skipBvh = false) {
         if (radMed.empty()) setUniformRadius(radius);
         const double kappaOverW = (work > 0.0) ? kSplitKappa / work : 0.0;
         double meanSplit;
@@ -993,6 +1005,8 @@ struct BeamMap {
             a.lo = a.lo - Vec3(r, r, r);
             a.hi = a.hi + Vec3(r, r, r);
             boxes[i] = a;
+            worldBounds.expand(a.lo);
+            worldBounds.expand(a.hi);
             // ACHROMATIC-PATH BEAMS fold at the emitter's SPD-mean CIE instead of at one
             // sampled wavelength — the exact expectation of the thing the monochromatic beam
             // was sampling, so the chromatic variance is not reduced but REMOVED. Every other
@@ -1001,7 +1015,10 @@ struct BeamMap {
             const double lam = (double)b.lambda;
             cie[i] = Vec3(cieX(lam), cieY(lam), cieZ(lam));
         }
-        bvh.build(boxes);
+        // The recursive SAH sort over every sub-beam -- ~0.22 s per realization on `_fog_thick`,
+        // and 72 % of what a light-side realization costs. The device LBVH does the same tree in
+        // 4.3 ms, so when it is going to run there is nothing here worth paying for.
+        if (!skipBvh) bvh.build(boxes);
     }
 
     // Per-medium statistics of the RAW (pre-split) beam set: how many chords each medium
@@ -1087,13 +1104,16 @@ struct BeamMap {
     //   targetK    FLOOR on the gathered count (`-beamk`). Scales the radii UP, never down.
     //   areaSlack  ceiling: the fraction by which the kernel may inflate the total box area
     //              over the tight (r = 0) area (`-beamareaslack`). Wins over the floor.
+    // `skipBvh` forwards to both `build` calls below -- see BeamMap::build. It is a parameter
+    // rather than a member because the decision belongs to the CALLER (is this map going to be
+    // gathered on the device?), and a member would let two maps in one render disagree.
     AutoInfo buildAuto(double blur, double targetK, double areaSlack, size_t splitBudget = 0,
-                       double explicitSplitLen = 0.0, double work = 0.0) {
+                       double explicitSplitLen = 0.0, double work = 0.0, bool skipBvh = false) {
         AutoInfo info;
         info.blur     = blur;
         info.targetK  = targetK;
         info.rawBeams = beams.size();
-        if (beams.empty()) { build(explicitSplitLen, splitBudget, work); return info; }
+        if (beams.empty()) { build(explicitSplitLen, splitBudget, work, nullptr, skipBvh); return info; }
 
         const Aabb bb = bounds();
         const Vec3 ext = bb.hi - bb.lo;
@@ -1166,7 +1186,7 @@ struct BeamMap {
             info.budgetBit = want > (double)splitBudget;
         }
         double meanSplit = 0.0;
-        build(explicitSplitLen, splitBudget, work, &meanSplit);
+        build(explicitSplitLen, splitBudget, work, &meanSplit, skipBvh);
         info.splitLen  = meanSplit;
         info.outBeams  = beams.size();
         info.areaAfter = totalBoxArea();
