@@ -18120,6 +18120,18 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // Level 3 redraws per chunk (see the note above): remember what the rebuild needs, since the
     // launch lambda has no `smap` of its own and must not reach for one that may be freed.
     const bool jPerChunk   = jDevLight && jdevLevel >= 3;
+    // How many light-side realizations to draw INSIDE one chunk (FTRACE_JSPLIT). 1 = off.
+    // Inert without jPerChunk: splitting a chunk that reuses one map buys nothing and costs
+    // a kernel launch per split.
+    int jSplitN = 1;
+    if (jPerChunk) {
+        if (const char* e = std::getenv("FTRACE_JSPLIT")) jSplitN = std::atoi(e);
+        if (jSplitN < 1)    jSplitN = 1;
+        if (jSplitN > 1024) jSplitN = 1024;
+        if (jSplitN > 1)
+            std::printf("[jdevlight] splitting each chunk into %d sub-launches, one light-side "
+                        "realization each (-FTRACE_JSPLIT)\n", jSplitN);
+    }
     const long long jPaths = jDevLight ? (long long)smap->nEmitted : 0;
     const double    jRad   = jDevLight ? smap->radius : 0.0;
     const long long jCap   = jDevLight ? ((long long)smap->pts.size() * 2 + 1024) : 0;
@@ -18187,16 +18199,29 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     std::vector<WfBand>& wfProfilePrev = g_wfProfile;
     const bool mergeAny = mergeOn || dsm.nPts > 0;   // either kind wants MERGE=true
     std::vector<WfBand> wfProfileCur;
-    auto launch = [&](long long c, long long base) {
-        // ONE LIGHT-SIDE REALIZATION PER CHUNK (FTRACE_JDEVLIGHT=3). `base` is the ABSOLUTE
-        // sample index this chunk starts at, so it advances every chunk and never repeats
-        // across a resume -- which makes it the right thing to salt with, and the same
-        // quantity the camera side already uses to stay decorrelated across epoch boundaries.
-        //
-        // The rebuild is unconditional in the chunk, not amortised: at ~16k subpaths it is
-        // sub-millisecond against a 0.15 s chunk, i.e. under 1 % -- which is the whole reason
-        // the trace had to move to the device before this was worth doing. On the host it was
-        // 27 ms and this loop would have cost 18 % of the render.
+    auto launch = [&](long long cAll, long long baseAll) {
+      // ONE LIGHT-SIDE REALIZATION PER SUB-LAUNCH (FTRACE_JDEVLIGHT=3, FTRACE_JSPLIT=k).
+      //
+      // `base` is the ABSOLUTE sample index this sub-batch starts at, so it advances every
+      // sub-launch and never repeats across a resume -- which makes it the right thing to salt
+      // with, and the same quantity the camera side already uses to stay decorrelated across
+      // epoch boundaries.
+      //
+      // WHY THE SPLIT IS INSIDE `launch` RATHER THAN A SMALLER CHUNK. Measured: at
+      // FTRACE_CHUNK_SPP=1 the render manages 665 / 713 / 672 spp in 20 s at JDEVLIGHT 0 / 1 / 3
+      // -- indistinguishable -- so the rebuild is free and the ~30 ms per chunk is the generic
+      // chunk machinery: launch, film download, progress report, film merge. Shrinking the chunk
+      // pays all four per realization; splitting it pays only the launch and the rebuild.
+      //
+      // Each sub-launch is an independent, correctly-normalised estimate against its own valid
+      // map, accumulating into the same device film exactly as consecutive chunks already do.
+      // `kappaS` is unchanged across them (same nPaths, same radius), so the MIS weights stay
+      // consistent within and between sub-launches.
+      for (int jsp = 0; jsp < jSplitN; ++jsp) {
+        const long long cLo = cAll * jsp / jSplitN, cHi = cAll * (jsp + 1) / jSplitN;
+        const long long c = cHi - cLo;
+        if (c <= 0) continue;
+        const long long base = baseAll + cLo;
         if (jPerChunk)
             buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, jPaths, jRad, jCap,
                                 jSurfSalt(prog) ^ ((unsigned long long)base *
@@ -18335,6 +18360,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             kBdptT<0, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples);
         cudaCheckKernel("bdpt");
+      }
     };
 
     if (!prog || !prog->report) { launch(spp, sppBase); download(out); }   // single-shot

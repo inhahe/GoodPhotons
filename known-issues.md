@@ -542,7 +542,35 @@ its film merge — which level 0 pays identically. The ceiling on realizations i
 CHUNK, not the light side, and that reframes the next move: since a rebuild costs nothing,
 redraw *several times inside one chunk*, skipping the download and the report between
 sub-launches. At 14 spp per chunk that is up to 14x more realizations for the price of a kernel
-launch each. (The grid-size change is kept anyway — it is bit-identical by construction and stops
+launch each.
+
+**AND THAT WORKS — `FTRACE_JSPLIT=k` (v0.271.4), with an INTERIOR OPTIMUM at k=4.** The split
+loop lives inside `launch(cAll, baseAll)`, so each sub-launch gets its own map, its own `base`
+(no sample index drawn twice) and no download/report between. Sweep, `_caustic_box`, 20 s,
+5 seeds, interleaved, variance = trimmed mean of per-pixel seed-to-seed variances:
+
+| region | k=1 | k=4 | k=16 |
+|---|---|---|---|
+| lit frame | 1.000x | **0.390x** | 0.503x |
+| floor, no caustic | 1.000x | **0.458x** | 0.683x |
+| caustic (tight) | 1.000x | 0.988x | **2.425x** |
+
+| | k=1 | k=4 | k=16 |
+|---|---|---|---|
+| spp in 20 s | 1447 | 1323 (−8.6 %) | 683 (−53 %) |
+| bias vs the mode-D reference, lit frame | −1.622 % | −1.596 % | −1.569 % |
+
+**k=4 is the pick and k=16 is worse than k=4** — the two terms trade, exactly as they should:
+splitting cuts the merge half's variance by drawing more realizations and raises the connection
+half's by costing camera samples, and past k=4 the second wins. An interior optimum is the honest
+shape of this knob, and it is the reason the realization count on its own was never the thing to
+maximise.
+
+**Two caveats stated rather than buried.** (a) The **caustic does not improve** (0.988x at k=4)
+and degrades badly at k=16: on this scene its variance is camera-dominated, so the win is in the
+diffuse and indirect regions. (b) **The bias does not move** across the sweep (−1.62 / −1.60 /
+−1.57 %), which is the safety check that matters — the stratified pixel-run permutation and the
+per-sub-batch sample base were the two places a split could have introduced one. (The grid-size change is kept anyway — it is bit-identical by construction and stops
 reserving hundreds of MB of local store to run 6 % of its threads — but it is a tidiness fix, not
 a speed one, and is recorded here as such rather than as a win.) The recurring failure was not the arithmetic but the error bar: each time, a
 3-sample spread of a slowly-sampled quantity was used as if it estimated the quantity's own
