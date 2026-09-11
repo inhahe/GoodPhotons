@@ -566,6 +566,28 @@ half's by costing camera samples, and past k=4 the second wins. An interior opti
 shape of this knob, and it is the reason the realization count on its own was never the thing to
 maximise.
 
+**THE HEADLINE, MEASURED IN ONE SWEEP AT ONE BUDGET** rather than multiplied across two (the
+naive product of 5.1x and 2.6x said 13x; the measurement says 11.2x, and the measurement is what
+goes in the record). `_caustic_box`, 20 s, **6 seeds**, interleaved; arm A is one device
+realization per EPOCH — what mode `J` does today — and arm B is four per CHUNK:
+
+| region | A variance | B variance | B/A | A bias | B bias |
+|---|---|---|---|---|---|
+| **lit frame** | 2.405e20 | 2.150e19 | **0.089x** | −1.690 % | −1.538 % |
+| floor, no caustic | 1.578e20 | 1.837e19 | **0.116x** | −0.331 % | −0.482 % |
+| caustic (tight) | 1.168e20 | 9.003e19 | 0.771x | −0.419 % | −0.376 % |
+
+**11.2x less whole-frame variance at equal wall clock**, 8.6x on the indirect floor, 1.30x on the
+caustic. Bias unmoved.
+
+**What that means for retiring mode `U`, stated with its caveat.** This entry's own table put
+mode `J`'s variance at **16.1x** mode `U`'s at equal blur on this scene. If that number is
+whole-frame — which the table's D/U/J triple implies — an 11.2x cut takes mode `J` to roughly
+**1.4x mode `U`**, i.e. near parity, which is the condition UPBP-VM names for retiring `U`. The
+caveat is the caustic column: it improves only 1.30x, so if the gap were caustic-weighted the
+claim would be much weaker. Re-deriving the 16.1x against the current binary, with the ROI stated
+rather than assumed, is the work that would settle it.
+
 **Two caveats stated rather than buried.** (a) The **caustic does not improve** (0.988x at k=4)
 and degrades badly at k=16: on this scene its variance is camera-dominated, so the win is in the
 diffuse and indirect regions. (b) **The bias does not move** across the sweep (−1.62 / −1.60 /
