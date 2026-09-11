@@ -1092,8 +1092,20 @@ struct BeamMap {
         //     which is exactly where the measured spread explodes (pilot 62 500 -> ~375 k beams
         //     -> stride 3 -> 3.76x spread, against 1.08x and 1.33x for the two pilot sizes that
         //     stay under it at stride 1).
-        size_t kProbeRays = 96;
-        size_t maxTests   = 120000;
+        // 512 x 24 000 since 0.272.5, from 96 x 120 000 (J-KNEE-NOISE). The total work is
+        // roughly unchanged -- 12.3 M closest-approach tests against 11.5 M -- because the
+        // measurement says RAYS are what matter and tests-per-ray are not: forcing the stride
+        // to 1 left the worst seed at 508 542 against 496 091 (no effect), while going 96 ->
+        // 2 048 rays cut the knee's seed spread from 3.76x to 1.19x. So the budget is spent
+        // where it buys something.
+        //
+        // And it is FASTER, which is not a trade-off but a consequence. A wrong knee sizes the
+        // whole beam map, so the shipped 96-ray config's own cost swung 1.27 / 5.28 / 3.52 s
+        // across three seeds on `_fog_cornell` -- mean 3.36 s -- purely because one seed drew a
+        // 496 k-beam knee. At 512 rays the knees agree to 1.12x and the cost is 2.38 / 2.01 /
+        // 1.63 s, mean 2.01 s. Stabilising the estimate removes the occasional enormous map.
+        size_t kProbeRays = 512;
+        size_t maxTests   = 24000;
         if (const char* e = std::getenv("FTRACE_JPROBE")) {
             long long r = 0, m = 0;
             if (std::sscanf(e, "%lld,%lld", &r, &m) == 2 && r > 0 && m > 0) {

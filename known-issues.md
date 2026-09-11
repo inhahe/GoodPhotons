@@ -1294,7 +1294,30 @@ No effect. Rays matter; tests-per-ray do not.
 again by `buildAuto`, up to four times in its radius-refinement loop. At 1 024 rays the light side
 on `_fog_cornell` goes **1.17 s -> 6.5 s**, a 5.7x regression, to fix a sizing estimate.
 
-**So the fix has to be a better ESTIMATOR, not a bigger sample.** The variance comes from uniform
+**FIXED (v0.272.5): 512 x 24 000 instead of 96 x 120 000 — same total work, and FASTER.** The
+measurement said rays matter and tests-per-ray do not, so the budget moved from one to the other:
+512 rays x 24 000 tests is 12.3 M closest-approach tests against the shipped 11.5 M.
+
+| config | seed 3 | seed 7 | seed 11 | spread | light side (mean of 3) |
+|---|---|---|---|---|---|
+| **96 x 120 000** (shipped) | 131 885 | 140 923 | 496 091 | **3.76x** | 1.27 / 5.28 / 3.52 s = **3.36 s** |
+| 256 x 45 000 | 170 100 | 195 893 | 209 107 | 1.23x | 1.87 / 1.85 / 2.03 = 1.92 s |
+| **512 x 24 000** | 221 325 | 238 700 | 213 536 | **1.12x** | 2.38 / 2.01 / 1.63 = **2.01 s** |
+
+**It is faster, and that is a consequence rather than a trade.** A wrong knee sizes the whole beam
+map, so the shipped config's own cost swung **1.27 / 5.28 / 3.52 s** across three seeds — purely
+because one seed drew a 496 k-beam knee. Stabilising the estimate removes the occasional enormous
+map, so mean light-side time falls **3.36 s -> 2.01 s** while the spread falls 3.76x -> 1.12x.
+
+*This also corrects an earlier cost claim in this entry.* "1 024 rays takes the light side from
+1.17 s to 6.5 s, a 5.7x regression" compared a lucky seed against an unlucky one: with an unstable
+knee the baseline has no single cost. Both arms have to be averaged over the same seeds, which is
+what the table above does.
+
+`_fog_thick` — stable before and after — moves from ~13 03x to ~10 9xx and stays tight
+(11 026 / 10 815 / 10 931, **1.02x**), and the CPU path is unaffected.
+
+**The remaining idea, if the residual 1.12x ever matters:** The variance comes from uniform
 chords sampling a clustered set, so the directions to try are ones that cut variance at equal
 cost: stratifying the chords over the AABB instead of drawing them independently, or reusing the
 beams' own midpoints as probe origins with the appropriate reweighting. `FTRACE_JPROBE=<rays>,
