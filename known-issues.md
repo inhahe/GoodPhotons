@@ -43,6 +43,29 @@ What that leaves, and where each one's frontier actually is:
 | mode-`J` device light pass | the BEAM half — deposit + a device BVH; premise checked, worth ~12x on a thick medium |
 | UPBP-CONV | **fireflies, not speed** — see (2g): on every statistic not at the mercy of the tail mode `J` already beats mode `D` at equal time (1.37x / 1.28x / 1.52x), while its worst pixel is 3 310 against 532 |
 
+**AND THE TAIL IS NOT A LIGHT-SIDE PROBLEM — measured 2026-09-11, from data already on disk.**
+The obvious hope after v0.272.0 was that more light-side realizations would also thin the tail. It
+does not. Scoring relSE against the converged mode-`D` reference, `_caustic_box`, 20 s, 6 seeds,
+one realization per EPOCH against four per CHUNK:
+
+| statistic | chunk / epoch |
+|---|---|
+| mean relSE | **0.612x** |
+| 99.9 %-trimmed | **0.599x** |
+| 99 %-trimmed | **0.584x** |
+| worst pixel | 1.472x — **but +0.244 +- 0.165, i.e. 1.5 sigma at n=6 on a max statistic** |
+
+Two things come out of one table. **First, v0.272.0 is better than it was shipped as**: it was
+committed on seed-to-seed *variance*, and this is error against a reference — a stronger claim —
+and it holds at ~1.7x across every robust statistic. **Second, the firefly tail does not move**,
+which localises UPBP-CONV's remaining problem away from the light side and onto the beam x ray
+kernel and the merge weight. That is worth more than the 1.7x: it removes the cheapest candidate.
+
+The worst-pixel column is reported *because* it looks like a regression and is not one. A max
+over 9 000 lit pixels from 6 seeds is the noisiest statistic in this file, and 1.5 sigma from it
+is nothing — the same shape as four other "findings" earlier the same day that dissolved on more
+samples.
+
 **The pattern worth naming.** Two audits in two days, eight stale entries the first time and four
 stale queue items the second. An entry's *conclusion* decays faster than its code does, and
 nothing in the process notices — so the audit has to be a scheduled activity, not a thing done
