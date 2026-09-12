@@ -3147,16 +3147,48 @@ one command, every log verified at 64/64 spp), scoring the PAIRED difference ins
 | `cap_gyroid` | −0.5 | +0.0 | +0.4 | **−0.0 ± 0.2** |
 | `grid_ground` (null) | −0.3 | −0.0 | +0.0 | −0.1 ± 0.1 |
 
-**Fur −19.6 points against 1.6 points of total collateral, a 12.4 : 1 trade**, with `alice_hair`
-statistically indistinguishable from zero and `cap_gyroid` exactly zero. Better than either
-earlier figure, and the first one that is actually controlled.
+**Fur −19.6 points; collateral 1.6 points total** — but see the floor measurement below, which
+shows the collateral sits UNDER the run-to-run noise of this scene, so the apparent 12.4 : 1 ratio
+is not a measurable quantity.
 
-**Why the paired difference is trustworthy where the absolute values are not.** The gate is
-evaluated AFTER the probe loop and consumes no rng, so both arms trace an identical photon map
-with identical probe patterns; everything except the gate cancels in the difference. The numbers
-show it directly: absolute `creature on` is **+73.6 ± 11.2** while the paired difference is
-**±1.4**. Absolute ROI values also move with spp (`creature on` reads +73.6 at 64 spp and +61.6 at
-100 spp), which is the confound above — the paired difference does not.
+**THE "PAIRED" JUSTIFICATION WAS WRONG, AND THIS FILE ALREADY SAID SO.** The claim was that the
+gate is evaluated after the probe loop and consumes no rng, so both arms trace an identical photon
+map and everything but the gate cancels. That holds WITHIN a process. `on` and `gate30` are
+separate processes — and the entry *"the beam split is not reproducible run to run"* (2026-09-02,
+v0.209.0) records that `-beams` renders of an identical command line differ, because the split
+budget depends on a parallel reduction order: 264 022 deposited beams every time, but
+6 208 839 / 6 286 537 / 6 168 032 sub-beams across three runs. **So the two arms never shared a
+map.** The mechanism was asserted from plausibility while the answer was already written down two
+weeks earlier — the same failure as the `REFERENCE.md` sign error recorded in J-KNEE-NOISE.
+
+**The run-to-run floor, measured from two renders of the IDENTICAL command** (seed 1, `-spp 64`,
+`-gatherarea 8`):
+
+| ROI | px | run A | run B | **floor** | gate effect | verdict |
+|---|---|---|---|---|---|---|
+| `creature` | 36 | +61.1 % | +58.0 % | **3.1** | **−19.6** | **6.3x the floor — solid** |
+| `alice_hair` | 27 | −12.5 % | −8.3 % | **4.3** | −0.8 | **below the floor** |
+| `alice_dress` | 90 | −13.0 % | −10.7 % | **2.3** | −0.8 | **below the floor** |
+| `cap_gyroid` | 56 | −5.2 % | −5.8 % | 0.5 | −0.0 | below |
+| `grid_ground` | 600 | −4.0 % | −4.3 % | 0.3 | −0.1 | below |
+
+**So 12.4 : 1 is over-precise — its denominator is unmeasurable.** The defensible statement is:
+**the gate removes 19.6 points of fur overfill, 6.3x the run-to-run floor, and its collateral is
+below the measurement floor on every other ROI.** Stronger where it matters (the collateral cannot
+be detected at all) and weaker where the ratio overreached.
+
+It also explains the one discrepancy in the record: two runs of seed 1 gave the fur difference as
+−18.5 and −11.8. The fur ABSOLUTE carries a 3.1-point floor, so a DIFFERENCE of two of them
+carries ~4.4, and 6.7 points is ~1.5 sigma of that. The ±1.4 quoted from three seeds was
+optimistic because all three pairs shared the same unshared-map flaw.
+
+**What a genuinely paired measurement would need** is both arms inside ONE process against ONE
+beam map — an A/B switch evaluated per gather rather than per render. That does not exist today,
+and it is the only way to resolve an effect near this floor. Until then, treat **~4 points on the
+fur ROI as the resolution limit** of any `-beams` arm comparison on this scene. Fixing the
+underlying non-reproducibility — make the split a pure function of the beam and a
+deterministically-reduced scalar, as that entry prescribes — would lift the floor for every future
+measurement here, which makes it worth more than it looks.
 
 **Three attempts at one number, and each failed differently.** `-time` arms with absolute diffs
 gave 5.8 : 1 (spp confounded). A single matched-spp pair with absolute diffs gave 3.5 : 1 (n=1 on
@@ -3252,6 +3284,16 @@ quietly undo the thing it sits inside.
 > a single tripped gather marks its pixel. At fixed `-spp` the arms genuinely do differ on 4 115
 > floats. The *count* said "differs"; the *magnitude* said "by 0.047 %", and only the magnitude
 > answered the question. Report both when a diagnostic is a percentage of a large denominator.
+
+**PORTED TO THE DEVICE (v0.273.10), which is what could let it stop being opt-in.**
+`dGatherCoverage` now counts rejects and applies the same predicate, with the threshold carried as
+`DScene::gatherRejPct` read from the SAME `FTRACE_GAREJECT` channel the host reads — the invariant
+the neighbouring `gatherArea` field already states in as many words, *"the two MUST agree or
+`-device gpu` and `-device cpu` diverge"*. The backends now move together on the fur: paired gate
+effect **−11.8 (CPU) against −12.2 (GPU)**, agreeing to **0.4 points**, with the 600-px null
+agreeing to 0.4 as well; both verified at 64/64 spp. `FTRACE_GAREJW` and `FTRACE_GADEPTH` were
+deliberately NOT ported — each lost its own comparison, and carrying a defeated knob into a
+kernel's register budget is dead weight.
 
 **It is NOT a solution and stays opt-in.** `-gatherarea 0` still gives the fur +11.8 % against
 gate 30's +44.8 %, so a fur-dominated scene should still just turn the correction off. And it is

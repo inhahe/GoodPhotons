@@ -1226,6 +1226,11 @@ struct DScene {
     int              bkGlossyNee;    // 0 = -no-glossy-nee: no connection at a D_GLOSSY vertex
     int              gatherArea;     // -gatherarea <M>: probe samples for the M-GATHERAREA
                                      // footprint (0 = off, the default)
+    int              gatherRejPct;   // FTRACE_GAREJECT <pct>: the tangle gate. Suppress the
+                                     // footprint correction for a gather whose probes REJECT at
+                                     // least this share of their hits on the normal test, which
+                                     // is the dense-fur signature -- there the correction has the
+                                     // wrong SIGN. 0 = off.
     double           bkLightSplit;   // -light-split
     int              bkLightSamples; // -light-samples
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
@@ -5004,6 +5009,7 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
     if (M <= 0 || !(r > (Real)0)) return 1.0;
     DVec3 t, b; onb(n, t, b);
     double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
+    int    nRej = 0;                         // probes that FOUND geometry facing the wrong way
     const int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;
@@ -5016,7 +5022,14 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
         if (!h.valid) continue;
         const double c = (double)dot(h.n, n);
         if (c >= 0.5) area += 1.0 / c;       // same 60-degree acceptance the photon query uses
+        else          ++nRej;                // geometry IS here, facing the wrong way: a tangle
     }
+    // THE TANGLE GATE, host twin in photonmap_render.h. A high reject share means the disc is
+    // full of geometry pointing every which way rather than hanging over empty space, and there
+    // the correction is not merely weaker -- it points the wrong way, reading dense fur +48 %
+    // bright. Doing nothing is the measured-correct action. Must stay identical to the host
+    // predicate or the two backends diverge on fur.
+    if (sc.gatherRejPct > 0 && nRej * 100 >= sc.gatherRejPct * M) return 1.0;
     return area / (double)M;
 }
 __device__ static inline double dGatherAreaScale(double cov) {
@@ -16921,6 +16934,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // uses -- the two MUST agree or -device gpu and -device cpu diverge on truncated geometry.
         const char* e = std::getenv("FTRACE_GATHERAREA");
         sc.gatherArea = e ? std::atoi(e) : 8;
+        // The tangle gate rides the same channel for the same reason: read it anywhere else and
+        // the two backends can disagree about whether it is on.
+        const char* g = std::getenv("FTRACE_GAREJECT");
+        sc.gatherRejPct = g ? std::atoi(g) : 0;
     }
     sc.bkLightSplit    = lt::gSplit;
     sc.bkLightSamples  = lt::gSamples;
