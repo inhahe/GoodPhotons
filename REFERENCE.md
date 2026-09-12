@@ -1545,12 +1545,12 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   correction for a gather whose probes REJECT at least `pct` percent of their hits on the normal
   test — the dense-fur signature, where the correction has the wrong sign (see `FTRACE_GADIAG`).
   **`30` is the measured knee** (at the default `M = 8`, `15` and `25` are the same gate): on
-  `gallery_rain`, at fixed `-spp` over three seeds, it takes **19.6 points** off the fur overfill —
-  **6.3x the run-to-run floor** of this scene — while its collateral on `alice_hair`,
-  `alice_dress`, `cap_gyroid` and the flat-ground null all sit **below that floor**. Host and
-  device agree on the fur to 0.4 points. (`-beams` renders are not reproducible run to run, so
-  ~4 points on the 36-px fur ROI is the resolution limit of any arm comparison here; no ratio can
-  be quoted.) (Score these arms at fixed `-spp`, never
+  `gallery_rain`, at fixed `-spp` over four realizations, it takes **17.7 ± 2.2 points** off the
+  fur overfill (~8 sigma) while its collateral on `alice_hair`, `alice_dress`, `cap_gyroid` and
+  the flat-ground null each sits at or below ~1 point. Host and device agree on the fur to 0.4
+  points. **Score these arms in one batch on one binary at fixed `-spp`:** mode `M` is
+  bit-reproducible within a build but its realization diverges completely across builds, so arms
+  from different binaries are not comparable. (Score these arms at fixed `-spp`, never
   `-time`: a 15 % spread in sample count moves the 27-pixel `alice_hair` ROI by 17 points.) Paired by seed, since the gate consumes no rng and both arms share a photon map.
   It is **not** a replacement for `-gatherarea 0` on a fur-dominated scene (which reads +11.8 %),
   and it stays opt-in because it is host-only — defaulting it would split CPU from GPU.

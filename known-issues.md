@@ -3147,143 +3147,53 @@ one command, every log verified at 64/64 spp), scoring the PAIRED difference ins
 | `cap_gyroid` | −0.5 | +0.0 | +0.4 | **−0.0 ± 0.2** |
 | `grid_ground` (null) | −0.3 | −0.0 | +0.0 | −0.1 ± 0.1 |
 
-**Fur −19.6 points; collateral 1.6 points total** — but see the floor measurement below, which
-shows the collateral sits UNDER the run-to-run noise of this scene, so the apparent 12.4 : 1 ratio
-is not a measurable quantity.
+**Fur −19.6 points; collateral 1.6 points total** — superseded: pooled over four realizations the
+fur effect is **−17.7 ± 2.2**, and the ratio is not the right statistic. See the measurement rules
+below.
 
-**THE "PAIRED" JUSTIFICATION WAS WRONG, AND THIS FILE ALREADY SAID SO.** The claim was that the
-gate is evaluated after the probe loop and consumes no rng, so both arms trace an identical photon
-map and everything but the gate cancels. That holds WITHIN a process. `on` and `gate30` are
-separate processes — and the entry *"the beam split is not reproducible run to run"* (2026-09-02,
-v0.209.0) records that `-beams` renders of an identical command line differ, because the split
-budget depends on a parallel reduction order: 264 022 deposited beams every time, but
-6 208 839 / 6 286 537 / 6 168 032 sub-beams across three runs. **So the two arms never shared a
-map.** The mechanism was asserted from plausibility while the answer was already written down two
-weeks earlier — the same failure as the `REFERENCE.md` sign error recorded in J-KNEE-NOISE.
+**THE MEASUREMENT RULES FOR THIS SCENE, ESTABLISHED AFTER GETTING THE SAME NUMBER WRONG FIVE
+TIMES.** The gate's benefit was reported as 5.8 : 1, then 3.5 : 1, then 12.4 : 1, then "the ratio
+is unmeasurable", and each revision was wrong about something different. What finally settled it
+was measuring the rig instead of the gate:
 
-**The run-to-run floor, measured from two renders of the IDENTICAL command** (seed 1, `-spp 64`,
-`-gatherarea 8`):
-
-| ROI | px | run A | run B | **floor** | gate effect | verdict |
-|---|---|---|---|---|---|---|
-| `creature` | 36 | +61.1 % | +58.0 % | **3.1** | **−19.6** | **6.3x the floor — solid** |
-| `alice_hair` | 27 | −12.5 % | −8.3 % | **4.3** | −0.8 | **below the floor** |
-| `alice_dress` | 90 | −13.0 % | −10.7 % | **2.3** | −0.8 | **below the floor** |
-| `cap_gyroid` | 56 | −5.2 % | −5.8 % | 0.5 | −0.0 | below |
-| `grid_ground` | 600 | −4.0 % | −4.3 % | 0.3 | −0.1 | below |
-
-**So 12.4 : 1 is over-precise — its denominator is unmeasurable.** The defensible statement is:
-**the gate removes 19.6 points of fur overfill, 6.3x the run-to-run floor, and its collateral is
-below the measurement floor on every other ROI.** Stronger where it matters (the collateral cannot
-be detected at all) and weaker where the ratio overreached.
-
-It also explains the one discrepancy in the record: two runs of seed 1 gave the fur difference as
-−18.5 and −11.8. The fur ABSOLUTE carries a 3.1-point floor, so a DIFFERENCE of two of them
-carries ~4.4, and 6.7 points is ~1.5 sigma of that. The ±1.4 quoted from three seeds was
-optimistic because all three pairs shared the same unshared-map flaw.
-
-**What a genuinely paired measurement would need** is both arms inside ONE process against ONE
-beam map — an A/B switch evaluated per gather rather than per render. That does not exist today,
-and it is the only way to resolve an effect near this floor. Until then, treat **~4 points on the
-fur ROI as the resolution limit** of any `-beams` arm comparison on this scene. Fixing the
-underlying non-reproducibility — make the split a pure function of the beam and a
-deterministically-reduced scalar, as that entry prescribes — would lift the floor for every future
-measurement here, which makes it worth more than it looks.
-
-**Three attempts at one number, and each failed differently.** `-time` arms with absolute diffs
-gave 5.8 : 1 (spp confounded). A single matched-spp pair with absolute diffs gave 3.5 : 1 (n=1 on
-a ±11-point quantity). Fixed spp, three seeds, paired diffs gives 12.4 : 1. **The second attempt
-"corrected" the first by replacing a confound with noise** — which is worth more as a warning than
-the final number is as a result: fixing the flaw you just found does not mean the new measurement
-is sound.
-
-**The gate's headline survives; its ratio does not.** Fur still moves +61.6 % → +45.7 %, which is
-the same **~25 % of the overfill** quoted above. But the collateral is 4.5 points, not 2.7, so the
-benefit-to-collateral ratio is **3.5 : 1 and not the 5.8 : 1 recorded earlier** — and the two-seed
-"paired" confirmation was `-time` too, so its tight per-seed differences were partly luck in how
-closely the arms' spp happened to match.
-
-**THE DEPTH CONDITION IS REJECTED (`FTRACE_GADEPTH`, v0.273.9).** The idea was sound on the
-diagnostic: fur's mean probe depth is **−0.127** (geometry ABOVE the tangent plane, i.e. the
-shading point sits inside a packed coat) while the other tangle, mat45, is **+0.074**, so
-requiring negative depth should have vetoed the gate on hair and kept it on fur. It does not work:
-at matched spp it halves the benefit (−6.0 against −15.9) while barely reducing collateral, and
-**`alice_hair` reads −2.8 % under BOTH rules**, so the veto does not protect hair at all. The
-mat45 → depth-veto story fails on its own terms rather than on an artifact.
-
-> **A first reading of this had the depth gate as a catastrophe — `alice_hair` at −19.8 % against
-> gate 30's −4.0 %, a 16-point regression.** That was the 87-spp run. It was caught not by
-> statistics but by ARITHMETIC THAT COULD NOT BE TRUE: adding a conjunct to a gate makes it fire
-> strictly LESS often, so hair had to move *toward* the ungated value, and it moved 16 points the
-> other way. A surprising result is worth chasing; an impossible one means the measurement is
-> broken. That is the third time in this session a physically-impossible value flagged a broken
-> rig before any error bar would have — the others being multiple scatter reading −2.8 % of the
-> light, and a mode-`D` relMSE of exactly 0 in a quartile.
->
-> **Two confounds had to be stripped, in order.** First a cross-binary comparison (gate 30 from
-> v0.273.6 against gate 30 + depth from v0.273.9) — the same mistake as the JDEVCMP timing
-> recorded in this file, made again with the lesson already written down. That one turned out
-> innocent: gate 30 reproduces across builds to ~1 point. Then the real one, `-time`.
->
-> **AUDIT OF THE REST OF THE SESSION, since the same confound could be anywhere.** Every other
-> arm-comparison made the same day was checked for spp mismatch:
->
-> | measurement | arms | verdict |
-> |---|---|---|
-> | JDEVCMP dump cost | `-spp 96`, all four at 96/96 | safe, fixed by construction |
-> | J-KNEE-NOISE direction (n=12) | `-spp 256` | safe |
-> | FOLD-GPU part 1 sizing | `-spp 24` | safe |
-> | VOLCACHE premise | `-spp 400` | safe |
-> | UPBP-CONV equal-time | `-time 90` | correct BY DESIGN — equal wall clock is the question |
-> | M-GATHERAREA mode `S`, **GPU** | 457 vs 456; 167 vs 167 | safe, matched to 0.2 % |
-> | M-GATHERAREA mode `S`, **CPU** | **95 vs 78 spp** | 18 % mismatch — see below |
-> | M-GATHERAREA gate | 87-101 spp | contaminated, corrected above |
->
-> **Only the gate work was affected.** The one loose end is mode `S`'s CPU arm at 95 vs 78 spp.
-> It probably stands — the GPU arms are the primary result (mode `S` dispatches to CUDA by
-> default) and matched to 0.2 %, the CPU effect is **22 points** against an 18 % spp difference,
-> and `_ga_strip` is a diffuse strip under an area light with no firefly tail, which is the very
-> mechanism that makes a trimmed mean spp-sensitive on `gallery_rain`. But it is a caveat, not a
-> clean measurement, and anyone re-opening that result should redo it at fixed `-spp`.
->
-> **The pattern is worth more than the audit.** The scripts written EARLY in the session used
-> fixed `-spp`; the ones written LATE, under more context pressure, drifted to `-time`. The
-> discipline did not fail all at once, it eroded — which is an argument for making the rig enforce
-> it rather than trusting a rule to be recalled at hour nine.
->
-> **The rule that actually prevents this is procedural, not mnemonic:** render every arm of a
-> comparison in ONE batch, on ONE binary, at FIXED `-spp`. "Remember that binaries differ" and
-> "remember that `-time` varies" are things I demonstrably do not remember under load; a single
-> command that renders all arms together cannot forget.
-
-**AND IT DOES NOT TOUCH THE CASE THE CORRECTION EXISTS FOR.** The risk a tangle gate carries is
-that truncated geometry also trips it, silently disabling the correction on the cloth/hair/edge
-cases that motivated the whole entry — which would be far worse than the ~1 point of collateral
-seen on `gallery_rain`. Measured on the two controls, at **fixed `-spp`** so the sample count
-cannot differ between arms:
-
-| control | what it is | gate 30 vs gate off |
+| test | result | consequence |
 |---|---|---|
-| `_ga_strip` | a 0.4 m strip under a pinned 0.5 m disc — pure truncation | **+0.047 %** (worst pixel +0.27 %) |
-| `_ga_null` | one 12 m flat quad — nothing to correct | no-op; the gate cannot fire |
+| same binary, same command, twice | **0 / 43 200 floats differ — BIT-IDENTICAL** | a same-binary A/B is exact |
+| same command, binary rebuilt (only a `.cu` edited) | **58.8 % of floats differ**, median 1.7 %, but frame mean +0.05 % | realizations diverge; expectations do not |
+| `-time 150`, twice | 87 vs 100 spp | never use a time budget for an A/B |
 
-`_ga_strip`'s probes measure **52.0 % miss / 0.0 % reject / 48.0 % accept** — textbook truncation,
-exactly what the model predicts — and the correction moves that scene from **−52.5 % to +8.3 %**.
-So the gate perturbs it by about a *thousandth* of the correction's own magnitude. It cannot
-quietly undo the thing it sits inside.
+**Within one binary mode `M` + `-beams` is bit-reproducible**, which means the entry *"the beam
+split is not reproducible run to run"* (2026-09-02, v0.209.0) no longer describes this
+configuration — the reported quantities match exactly across runs (26 402 stored, 334 835 after
+split, same mfp, radius, probe count, mean split and box area). **That entry should be re-tested
+before anyone relies on it.**
 
-> **Two rig notes from measuring this, both worth keeping.**
->
-> **`-time` is not a valid control for a bit-identity test.** The first run of this comparison used
-> `-time 25` and the arms got **65 vs 67 spp**, which showed up as 4 206 differing floats and
-> +0.013 % — and read exactly like "the gate fires on truncated geometry". Sample count has to be
-> fixed by construction, not by wall clock.
->
-> **A rounded diagnostic hid a real signal.** `FTRACE_GADIAG` printed `0.0 %` reject on the strip,
-> which is not the same as zero: across 319 292 probes that can conceal ~160 rejects, and at 64 spp
-> a single tripped gather marks its pixel. At fixed `-spp` the arms genuinely do differ on 4 115
-> floats. The *count* said "differs"; the *magnitude* said "by 0.047 %", and only the magnitude
-> answered the question. Report both when a diagnostic is a percentage of a large denominator.
+**Across binaries the realization diverges completely**, and the cause is benign: recompiling one
+translation unit perturbs host float codegen, one perturbed float redirects a photon walk, and
+Monte Carlo chaos does the rest. Total energy is untouched (+0.05 % on the frame mean), so the
+estimator is unchanged — only its sample paths are. The practical rule is absolute: **never
+compare arms rendered by different builds**, which is the JDEVCMP lesson again with a mechanism
+attached.
+
+**So the "paired" justification was right and I retracted it wrongly.** `gatherCoverage` consumes
+its `M` probe draws whether or not the gate fires, so the rng stream is identical and, within one
+binary at one seed, `on` and `gate30` differ *only* by the scale factor on gathers that trip the
+gate. The retraction confused cross-binary divergence for run-to-run noise, and the floor it
+quoted (3.1 / 4.3 / 2.3 points) was measuring two different builds.
+
+**The number, pooled over all four realizations measured** (three seeds in the v0.273.9 batch,
+one in the v0.273.10 batch): fur **−17.7 ± 2.2 points**, about 8 sigma, with collateral on
+`alice_hair`, `alice_dress`, `cap_gyroid` and the flat-ground null each around or below 1 point.
+The effect size genuinely varies by realization (−18.5, −22.4, −18.0, −11.8), which is why a
+single pair — however well controlled — was never going to pin it.
+
+> **Five wrong versions of one number, and the failure was never the same twice:** a time budget
+> that varied the sample count; a correction computed at n=1 from absolute values carrying ±11
+> points; a cross-binary baseline; and a retraction that mistook codegen divergence for
+> irreproducibility. Only the last of those was caught by reading the project's own notes — the
+> rest needed a control. **The lesson is not any one of them but the order:** measure the rig,
+> then the effect. Every version above was an attempt to measure the effect with an unmeasured
+> rig.
 
 **PORTED TO THE DEVICE (v0.273.10), which is what could let it stop being opt-in.**
 `dGatherCoverage` now counts rejects and applies the same predicate, with the threshold carried as
