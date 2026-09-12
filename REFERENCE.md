@@ -5522,11 +5522,18 @@ across roughness 0.2–0.9, with mode `R` itself bit-identical across the change
 
 The same guard was hiding the opposite error at the other end: where the lobe's lattice direction
 *did* land on a light, it took that light's raw radiance at **full weight**, with no MIS partner to
-halve it. A glossy highlight in mode `W` was therefore **independent of roughness** — measured
-4.29× mode `R`'s peak at roughness 0.3 and 15.59× at 0.6, from the identical pre-fix peak value at
-both. With the connection in place the tile mean lands within 2.7-5.0 % of mode `R` (from −15.8 %
-and +70.7 %). The peak is still ~1.5× at `-spp 1`, which is the mode's own quadrature bias at the
-most sharply-resolved pixel rather than a weight error.
+halve it. A glossy highlight in mode `W` was therefore **independent of roughness** — the pre-fix
+peak measures identically (to four decimals) at roughness 0.05, 0.3 and 0.6, which is **59×** mode
+`R`'s peak at 0.6 and 14.5× at 0.3. With the connection in place the tile mean lands within 0.8-2.8 %
+of mode `R` there, from +163 % and +24 %.
+
+**It is not a strict improvement, though.** At **near-mirror** roughness (≈0.05), where the lattice
+direction already lands on the light unaided, the connection makes the mean *worse* — 1.13× → 1.30×
+of mode `R`, and 1.07× → 1.23× at the peak. Mode `W` integrates the emitter with a
+`lightGrid`×`lightGrid` deterministic quadrature, and a ~2° lobe covers only a few percent of a
+typical light's solid angle, so too few grid points land inside a very sharp BRDF spike. Raising
+`-whitted-grid` mitigates it. Logged in `known-issues.md`; a glossy floor or a satin metal (the
+common case, and the one that previewed black) is unaffected.
 
 **Preview specular (`-raster` / `-explore`)** — the preview rasterizer used to shade diffuse
 only: its own header said "glossy lobes do not exist here either, so roughness/film-thickness

@@ -20540,6 +20540,43 @@ preview bit-identically**, so the off-switch demonstrably reaches the code. That
 ceremony — an off-switch that silently does nothing is how the mode-`S` footprint twin once passed
 its null control while being inert.
 
+**HIGHLIGHT NUMBERS RE-TAKEN ON A VALID LIGHT (2026-09-12), and the finding STRENGTHENS — but it
+also exposes a REGRESSION at near-mirror roughness that the malformed light had masked.** The
+highlight table below used `scraps/_gw_hl.tpl`, whose panel declared an emission normal 45° out of
+its own plane (see the `light area` entry). Re-run with `cross(u,v)` equal to the declared normal
+(`scraps/_gwhc_*.ftsl`), mode `W` at `-spp 1`, default vs `-no-glossy-nee`:
+
+| material | mode `R` | `W` before | `W` after | before/`R` | after/`R` | peak before | peak after |
+|---|---|---|---|---|---|---|---|
+| diffuse (null) | 0.107980 | 0.105657 | 0.105657 | 0.9785 | 0.9785 | — | — |
+| mirror (null) | 24.064962 | 26.748646 | 26.748646 | 1.1115 | 1.1115 | — | — |
+| glossy r=0.05 | 7.593100 | 8.548880 | 9.839089 | 1.1259 | **1.2958** | 1.07x | **1.23x** |
+| glossy r=0.3 | 0.604848 | 0.752241 | 0.621984 | 1.2437 | **1.0283** | 14.54x | 1.90x |
+| glossy r=0.6 | 0.280846 | 0.738132 | 0.283100 | 2.6282 | **1.0080** | **59.23x** | 1.81x |
+
+**The core finding is confirmed and larger than first measured**: the pre-fix peak is again
+**identical across every roughness** (26.7486 to four decimals at r=0.05, 0.3 and 0.6), which is the
+roughness-independence signature, and the worst case is **59.2x** rather than 15.6x. Both nulls hold
+exactly (diffuse and mirror unchanged to the last digit).
+
+**But at r=0.05 the fix now makes it WORSE, 1.1259 -> 1.2958 in the mean and 1.07x -> 1.23x at the
+peak.** That is a real regression in v0.275.0, confined to a NEAR-MIRROR lobe whose lattice
+direction already lands on the light, and the malformed light had hidden it (it read
+1.0366 -> 1.0361 there, i.e. no change). Likely mechanism, to be confirmed: mode `W`'s connection
+walks a `lightGrid`x`lightGrid` deterministic quadrature over the emitter, and a 2 deg lobe covers
+only ~6 % of an 8 deg light's solid angle, so only a point or two of that grid lands inside a
+BRDF spike of peak density ~127 sr^-1 -- a quadrature that coarse cannot integrate a near-delta
+integrand, and MIS then adds its (small-weighted) error on top of a lattice term that was already
+nearly right. Candidate mitigations: decline the connection in whitted mode when
+`p_lobe >> p_light` (the lattice finds the light unaided there, which is exactly the regime where
+it is accurate), or raise `lightGrid` with lobe sharpness. **Not addressed in v0.275.0**; the fix
+is still a large net win (black -> correct at `-spp 1`, and 59x -> 1.8x on the highlight) but it is
+not a strict improvement, and the earlier claim that it was rested on the malformed rig.
+
+*Also visible now: mode `W` reads **1.1115** on a pure `mirror` highlight and **0.9785** on diffuse,
+neither touched by this change -- pre-existing quadrature bias, logged for whoever measures mode `W`
+against mode `R` next and wonders why the nulls are not 1.000.*
+
 **THE SAME GUARD WAS HIDING A SECOND, OPPOSITE BUG: the glossy HIGHLIGHT was 4-16x too bright.**
 The first rig put the light 53° off the lobe axis, so only the connection could contribute and the
 fix read as a pure gain. The complementary configuration is the one where the *mirror direction
@@ -20641,6 +20678,24 @@ particle-vertex *connection*. The acceptance test written below **before** the f
 | sign-flip, camera near-normal | **0.8517** | **1.0075** |
 | sign-flip, camera matched 45° | 1.0366 | 1.0105 |
 | sign-flip, camera grazing | 1.0169 | **0.9998** |
+
+**PROVENANCE CORRECTION: the three sign-flip rows above were measured on a light that was
+MALFORMED** — a horizontal panel with its emission normal declared 45° out of plane (see the
+`light area` entry). That configuration carries a bias of its own, so those numbers had to be
+re-taken. Re-measured on a geometrically consistent panel, with the fix emulated off by
+un-swapping `bsdfFAdjoint` and rebuilding, **the sign flip reproduces**:
+
+| camera | cos(wo)/cos(wcam) | predicted | pre-fix `D`/`R` | fixed `D`/`R` |
+|---|---|---|---|---|
+| near-normal | 0.708 | < 1 | **0.8394** | 0.9989 |
+| matched 45° | 1.000 | = 1 | 1.0231 | 0.9995 |
+| grazing | 2.571 | > 1 | 1.0016 | 1.0016 |
+
+0.8394 against the 0.8517 first reported — the same 16 %-too-dim result, so the diagnosis and the
+fix both stand. The load-bearing evidence never depended on that rig anyway: the **off-axis** rig
+(`scraps/_gw_*.ftsl`) has *no* `normal` override and is therefore well-formed, and it is what
+carries the +8.2/+15.9/+19.7 % → 1.0001/0.9998/1.0000 result, with the white furnace validating
+mode `R` independently.
 | off-axis rig, glossy r=0.2 | 1.0824 | **1.0001** |
 | off-axis rig, glossy r=0.6 | 1.1592 | **0.9998** |
 | off-axis rig, glossy r=0.9 | 1.1971 | **1.0000** |
@@ -20779,114 +20834,72 @@ camera angles**, the furnace must stay flat, and the `~+3.5 %` residual at the n
 configurations should be re-measured afterwards — it survives when the reciprocity term is
 neutral, so it is a **second, separate effect** and is not explained by any of the above.
 
-## OPEN (2026-09-12): mode `D` reads a few percent high on a glossy surface whose LOBE reaches the light
+## ~~OPEN~~ **RETRACTED (2026-09-12): mode `D` reads a few percent high on a glossy surface whose LOBE reaches the light** — it was my own malformed light, not a renderer bug
 
-Left over after the adjoint-BSDF fix above, which removed the connection-side error completely
-(off-axis rig 1.0824/1.1592/1.1971 → 1.0001/0.9998/1.0000). This is the other configuration, and a
-different mechanism. `scraps/_gwhl_*.ftsl` places camera and light symmetrically about the tile
-normal so the mirror direction lands **on** the light; mode `R` (furnace-validated) is the
-reference:
+**WITHDRAWN IN FULL. The rig's light was invalid, and that alone produced the entire effect.**
+`scraps/_gw_hl.tpl` declared `u 2 0 0  v 0 0 2  normal 0 -0.707 0.707`. But `cross(u,v)` for those
+edges is `(0,-4,0)` — a **horizontal** panel — so the declared emission normal sat **45° out of the
+panel's own plane**. `ftsl.h` accepts that silently (`normal` is a free override; see the separate
+entry below), and the result is an emitter whose **area measure and emission cosine disagree**.
 
-| material | `D`/`R` before the adjoint fix | after |
-|---|---|---|
-| diffuse | 0.9957 | 0.9957 |
-| mirror | 1.0002 | 1.0002 |
-| glossy r=0.05 | 1.0366 | **1.0361** |
-| glossy r=0.3 | 1.0372 | **1.0211** |
-| glossy r=0.6 | 1.0326 | **1.0073** |
+Rebuilt the same configuration with `cross(u,v)` *equal* to the declared normal (`u 1 0 0`,
+`v 0 0.7071 0.7071`, area 1.0, still facing the tile, still at the **peak** of the reported error
+curve, `p_lobe/p_light` = 2.54 where the curve said +4.9…+5.1 %):
 
-**It grows as the lobe narrows** — +3.6 % at roughness 0.05 against +0.7 % at 0.6 — which is the
-*opposite* trend from the adjoint bug (that one grew as the lobe widened, because the connection's
-MIS share grew). Diffuse and mirror are untouched, so it is again specific to a **finite** lobe.
+| | `D`/`R` |
+|---|---|
+| malformed panel, ratio 2.54 | 1.0491 |
+| **consistent panel, ratio 2.54** | **1.0000** |
 
-**THE MIS COMBINATION ARITHMETIC IS EXONERATED, and the null is trustworthy because the negative
-control fired.** `-misaudit` cross-checks every CPU bidirectional weight against a second,
-independently written implementation that builds each strategy's path density outright instead of
-telescoping ratios:
+`+0.00 %`. And across every consistent-light configuration measured since: 1.0000 / 0.9995 / 0.9989
+/ 1.0016 / 1.0237→1.0000. **Mode `D` is exact on glossy wherever the light is well-formed.**
 
-| run | weights checked | disagreed > 1e-9 | worst relative difference |
-|---|---|---|---|
-| roughness 0.05 | 499 360 | **0** | 1.67e-15 |
-| roughness 0.6 | 485 859 | **0** | 1.93e-15 |
-| **`-misaudit-poison`** | 499 360 | **352 167** | 9.999e-01 |
+**So the whole `p_lobe/p_light` curve — 16 points, the single hump peaking at ~5 %, the three
+matched-ratio pairs agreeing to 0.6 points — is a faithful measurement OF THE ARTIFACT.** The
+collapse onto that ratio was real and reproducible; it just was not measuring BDPT. It is exactly
+what an inconsistent emitter should do: the two strategies apply the emitter's cosine in different
+places, so they disagree most where MIS mixes them evenly and not at all where one dominates.
 
-The poison arm is the whole reason the clean arms mean anything — a cross-check that has only ever
-agreed is equally consistent with "both forms are right" and "the check is vacuous", and this
-entry's own parent bug was found only after a rig that *could not see the effect* was thrown out.
-1.7e-15 is float noise, so **the weights are combined correctly**; the residual is therefore in a
-**density fed to those weights** (a `pdfFwd`/`pdfRev`), or in an estimator's own value — not in the
-combination. Since `bsdfPdf`'s Glossy case is provably symmetric under the direction swap, the
-BSDF-side density is not it either, which leaves the **emitter-side** density.
+**What misled me, recorded because the reasoning looked airtight and was not.** I had proved
+"`Σ_j w_j(x) = 1` pointwise is necessary and sufficient for unbiasedness, both ends of the curve
+read ~0, therefore each strategy is individually unbiased, therefore the densities must disagree
+between strategies." Every step is correct. The conclusion is still wrong, because *"the densities
+disagree between strategies"* had a cause I never considered: not a bug in how a density is
+computed, but **a scene in which no consistent density exists**. A valid derivation over an invalid
+premise. The tell I walked past twice: my own light had `cos = 1.0` *identically* (the declared
+normal was exactly anti-parallel to the tile→light direction), so every one of those 16 points was
+blind to the emitter cosine — I even wrote that down as a "rig blind spot" and only then thought to
+tilt the panel, which is what exposed it.
 
-Where to look: in this geometry the dominant strategy is the unidirectional one — the camera
-subpath's own lobe sample landing on the emitter (`s=0`) — and its MIS share is largest exactly
-where the lobe is narrowest. So the suspect is that strategy's emitter-hit density, i.e. the
-area→solid-angle pdf conversion for "the lobe hit the light", rather than the BSDF value (which
-the furnace and the off-axis rig now both vindicate).
+## OPEN (2026-09-12): `light area` silently accepts a `normal` that is not perpendicular to `u`×`v`, and the emitter is then inconsistent
 
-**THE DISCRIMINATOR IS RUN, AND THE ERROR COLLAPSES ONTO ONE VARIABLE: `p_lobe / p_light`.**
-16 configurations — roughness 0.02 / 0.05 / 0.1 / 0.3 / 0.6 crossed with panels of 0.2 / 1 / 2 / 4 m,
-all at the same centre and power by construction, one batch, one binary, fixed `-spp`
-(`scraps/_gwsz_*.ftsl`, `scraps/szsweep*.sh`). Sorted by the pdf ratio:
+`src/ftsl.h` ~6309: `if (!vec3Of(b, "normal", nrm)) nrm = normalize(cross(u, v));`. So `normal` is a
+free override with **no perpendicularity check**, and `FTSL.md` documents it only as
+"`normal`(from u×v)" — which reads like a convenience default rather than a constraint.
 
-| `p_lobe/p_light` | roughness | panel | `D`/`R` | error |
-|---|---|---|---|---|
-| 0.0006 | 0.60 | 0.2 m | 0.9998 | **−0.02 %** |
-| 0.0145 | 0.60 | 1.0 m | 1.0017 | +0.17 % |
-| 0.0253 | 0.10 | 0.2 m | 1.0011 | +0.11 % |
-| 0.0580 | 0.60 | 2.0 m | 1.0072 | +0.72 % |
-| 0.1017 | 0.05 | 0.2 m | 1.0063 | +0.63 % |
-| 0.2320 | 0.60 | 4.0 m | 1.0209 | +2.09 % |
-| 0.6334 | 0.10 | 1.0 m | 1.0362 | +3.62 % |
-| 0.6365 | 0.02 | 0.2 m | 1.0420 | +4.20 % |
-| 2.5337 | 0.10 | 2.0 m | 1.0506 | **+5.06 %** |
-| 2.5433 | 0.05 | 1.0 m | 1.0491 | **+4.91 %** |
-| 10.135 | 0.10 | 4.0 m | 1.0328 | +3.28 % |
-| 10.173 | 0.05 | 2.0 m | 1.0356 | +3.56 % |
-| 15.912 | 0.02 | 1.0 m | 1.0266 | +2.66 % |
-| 40.693 | 0.05 | 4.0 m | 1.0143 | +1.43 % |
-| 63.649 | 0.02 | 2.0 m | 1.0102 | +1.02 % |
-| 254.60 | 0.02 | 4.0 m | 1.0038 | **+0.38 %** |
+Declare one that is not perpendicular and you get an emitter whose **rectangle lies in one plane
+while its emission axis points out of that plane**. Every area-measure quantity (the sampled point,
+`em.area`, the `pdf_A · dist²/cos` conversion) then disagrees with the emission cosine, so
+estimators that apply that cosine in different places disagree with each other. Measured cost, mode
+`D` against mode `R` on an otherwise identical scene (`scraps/_gwsz_*.ftsl`, 16 configurations):
 
-**It is a single-humped function of the ratio: ~0 at both ends, peaking near 5 % around ratio 2.5.**
-The collapse is the strong part — **three pairs matched in ratio but differing in BOTH roughness and
-light size agree to within 0.6 points** (0.633 vs 0.637 → 3.62/4.20 %; 2.534 vs 2.543 → 5.06/4.91 %;
-10.14 vs 10.17 → 3.28/3.56 %). Neither roughness nor solid angle controls this on its own — the two
-roughness series *cross* when plotted against solid angle — but their ratio does.
+| | `D`/`R` |
+|---|---|
+| panel 45° out of its own plane | up to **1.0506** |
+| same configuration, consistent normal | **1.0000** |
 
-*(Caveat on the axis: `p_lobe` here is the lobe's PEAK density `(e+1)/2π`, not its average over the
-light, so the ratio is a proxy that overstates the true mixing parameter. That is consistent with
-the peak landing at 2.5 rather than at 1.0, where a balance-heuristic 50/50 split would put it.)*
+The bias is a smooth single-humped function of `p_lobe/p_light`, peaking near **+5 %** where MIS
+mixes the two strategies evenly and vanishing at either extreme — so it looks exactly like a
+renderer bug, and it cost a full iteration to identify as a scene error. It is also **silent**:
+no warning, and the render looks entirely plausible.
 
-**WHAT THAT SHAPE PROVES, and it is sharper than it looks.** The combined estimator has expectation
-`E[Σ_j w_j f/p_j] = ∫ f(x) · Σ_j w_j(x) dx`, so it is unbiased **iff `Σ_j w_j(x) = 1` pointwise in
-the path `x`** — and for ANY weights meeting that, however badly chosen. Weights being "wrong but
-normalised" therefore cannot bias anything. Both ends of the table reading ~0 says each strategy is
-individually unbiased (when one weight → 1 you get that strategy alone, and it is right). So the
-only way to get a hump in the middle is **`Σ_j w_j(x) ≠ 1` for a given path** — the strategies
-computing **different densities for the same path**, so their weights do not complete.
-
-**AND THIS IS EXACTLY THE CASE `-misaudit` CANNOT SEE — by its own documentation.** That audit
-compares one call's weight against an independently written implementation *reading the same
-patched densities*: "the densities are not what is under test here, the combination arithmetic is."
-It also already warns that the naive version of the check is vacuous — "summing across calls sums
-weights belonging to *different sampled paths*". So a clean `-misaudit` (which this scene gives:
-499 360 weights, 0 disagreements, poison control firing on 352 167) and a density inconsistency are
-perfectly compatible. The two results together are what localise the bug.
-
-**THE TEST THAT WOULD FIND IT**, and it does not exist yet: take **one** path, reconstruct it from
-every `(s,t)` split, and assert the weights **sum to 1 for that path**. That is a different
-quantity from anything `misaudit` computes, and it is the only one whose failure is equivalent to
-the bias. Build it by generating a camera subpath, then for each `s` forming the same unified
-vertex list and calling the weight for that split — then compare `Σ_j w_j` against 1 per path
-rather than per call. Pick the scene at ratio ≈ 2.5 (roughness 0.05, 1 m panel), where the effect
-is largest.
-
-Discriminator already run, for the record: vary the light's **angular size** in this highlight geometry. The
-conversion is `pdf_A · dist²/cos`, so a pdf-conversion error scales with the light's solid angle
-while a BSDF error does not — the same test that cleanly exonerated solid angle for the adjoint
-bug (a 16× change moved it only 1.7 %). Also worth one arm: a light small enough that the narrow
-lobe *straddles* its edge, since a partially-covered emitter is where an area-measure slip shows.
+Worth fixing at load time, cheaply, in either of two ways: (a) **warn** when
+`|dot(normalize(normal), normalize(cross(u,v)))| < 1 - 1e-6`, naming the light, or (b) treat the
+declared `normal` as selecting the **side** only — keep its sign, take the axis from `cross(u,v)` —
+which is what an author who writes `normal 0 -1 0` on a horizontal panel actually means, and makes
+the override unable to create an inconsistent emitter at all. (b) plus a warning when the two
+differ by more than a hemisphere flip is probably the right combination; (a) alone is enough to
+stop the silent case.
 
 ## OPEN (2026-08-04): `phase rainbow` — the 2048-bin uniform-in-mu table under-resolves large droplets, and monodisperse supernumeraries read as a white arc
 
