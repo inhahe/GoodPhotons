@@ -137,6 +137,12 @@ struct GaDiagMat {
     // fur from mesh before anything is gated on it -- every statistic tried so far (reject rate,
     // depth, deep%) failed to. Per material, so the table shows the split directly.
     std::atomic<long long> fiber{0};
+    // Gather POINTS, not probes. `fiber` is incremented once per gatherCoverage call, so it must
+    // be normalised against this and not against miss+reject+accept -- each point fires up to M
+    // probes (and fewer when the adaptive early-out trips), so dividing by the probe total gives
+    // a number capped near 1/M that looks like a low rate and is not one. That mistake read
+    // "84 % of fur gather points are not fibers" off a ceiling of 12.5 %.
+    std::atomic<long long> points{0};
 };
 inline std::vector<GaDiagMat>& gaDiag() {
     static std::vector<GaDiagMat> t(1024);      // matId is small; 1024 is far past any scene
@@ -152,8 +158,10 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
     // no surface footprint for a disc to be clipped against, so skipping the correction there is
     // the right idea, but `cr_coat` (used by `fur` blocks and nothing else) reports fiberRadius > 0
     // on only 15.9 % of its probes, so the test cannot reach the other 84 %.
-    if (fiberR > 0.0 && gaDiagOn() && matId >= 0 && matId < (int)gaDiag().size())
-        gaDiag()[matId].fiber.fetch_add(1, std::memory_order_relaxed);
+    if (gaDiagOn() && matId >= 0 && matId < (int)gaDiag().size()) {
+        gaDiag()[matId].points.fetch_add(1, std::memory_order_relaxed);
+        if (fiberR > 0.0) gaDiag()[matId].fiber.fetch_add(1, std::memory_order_relaxed);
+    }
     Vec3 t, b; onb(n, t, b);
     double area = 0.0;                 // in units of the full disc, so 1.0 == fully covered
     int   nRej = 0;                    // probes that FOUND geometry facing the wrong way
@@ -272,7 +280,7 @@ inline void gaDiagReport(const Scene& scene) {
     for (const auto& mg : scene.meshGroups)
         if (mg.matId >= 0 && mg.matId < (int)nm.size() && nm[mg.matId].empty())
             nm[mg.matId] = mg.name;
-    struct Row { int id; long long mi, rj, ac, tot, dp, dm, fb; };
+    struct Row { int id; long long mi, rj, ac, tot, dp, dm, fb, pt; };
     std::vector<Row> rows;
     for (int i = 0; i < (int)gaDiag().size(); ++i) {
         const long long mi = gaDiag()[i].miss.load(), rj = gaDiag()[i].reject.load(),
@@ -280,7 +288,7 @@ inline void gaDiagReport(const Scene& scene) {
         if (mi + rj + ac > 0)
             rows.push_back({i, mi, rj, ac, mi + rj + ac,
                             gaDiag()[i].deep.load(), gaDiag()[i].depthMilli.load(),
-                            gaDiag()[i].fiber.load()});
+                            gaDiag()[i].fiber.load(), gaDiag()[i].points.load()});
     }
     if (rows.empty()) return;
     std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.tot > b.tot; });
@@ -302,7 +310,7 @@ inline void gaDiagReport(const Scene& scene) {
                      100.0 * (double)r.ac / (double)r.tot,
                      hits ? (double)r.dm / 1000.0 / (double)hits : 0.0,
                      hits ? 100.0 * (double)r.dp / (double)hits : 0.0,
-                     100.0 * (double)r.fb / (double)r.tot);
+                     r.pt ? 100.0 * (double)r.fb / (double)r.pt : 0.0);
     }
 }
 

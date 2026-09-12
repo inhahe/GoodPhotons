@@ -3297,36 +3297,42 @@ already available at the gather site, and the gather already passes `h.matId`, s
 `type diffuse`, so a material-type test would return false for it — and a geometric test is the
 better choice anyway, being independent of whatever material an author paints on the strands.
 
-**THE TYPE TEST WAS PROTOTYPED AND IT CANNOT CARRY THE GATE — because `fiberRadius` is missing on
-84 % of the hits it should be set on.** The tally is now a permanent `fiber%` column in the
-`FTRACE_GADIAG` table (v0.276.5, tally only, nothing gated on it), and it says:
+**THE TYPE TEST WORKS: it separates fur from mesh 100 % to 0 %.** The tally is a permanent
+`fiber%` column in the `FTRACE_GADIAG` table (v0.276.6), normalised per gather **point**:
 
-| material | probes | rej% | **fiber%** |
-|---|---|---|---|
-| `mat39` (`cr_coat`, the fur) | 3 732 | 16.7 % | **15.9 %** |
-| `mat45` (the mesh ROI) | 7 834 | 10.3 % | **0.0 %** |
-| every other material (14 of them) | — | — | **0.0 %** |
+| scene | material | probes | rej% | **fiber%** |
+|---|---|---|---|---|
+| `gallery_rain` | `mat39` (`cr_coat`, the fur) | 3 732 | 16.7 % | **100.0 %** |
+| `gallery_rain` | `mat45` (the mesh ROI) | 7 834 | 10.3 % | **0.0 %** |
+| `gallery_rain` | every other material (14) | — | — | **0.0 %** |
+| `fur_basics` | `mat3`, `mat4` (fur) | 23 596 / 19 818 | 8.9 / 11.7 % | **100.0 % / 100.0 %** |
+| `fur_basics` | `mat0`, `mat1`, `mat7` (meshes) | — | — | **0.0–0.1 %** |
+| `fur_basics` | `mat2` (curves *and* mesh) | 5 426 | 49.7 % | **12.8 %** |
 
-**Perfectly specific, hopelessly insensitive.** Only the fur material has fiber gather points at
-all, so the discriminator does separate fur from mesh with no false positives across fifteen
-materials — exactly what the entry asked for. But it reaches only 15.9 % of the fur's own probes, so
-gating on it would leave 84 % of the overfill uncorrected.
+So the discriminator is both perfectly specific and perfectly sensitive, on two scenes — which is
+what this entry asked for and what neither the reject rate (fur 16.7 %, mesh 10.3 %, a 7-point gap)
+nor the depth statistic (fur −0.127, mesh +0.074, but unrelated materials at −0.099 and −0.073)
+could do. `mat2` at 12.8 % is the honest case: a material carried by both curves and mesh, where a
+per-hit test is exactly right and a per-material rule could not work at all.
 
-**And that 84 % is an anomaly, not a property of the scene.** `cr_coat` is used by the fifteen `fur`
-blocks and **by nothing else** — no mesh carries it — so every one of those 3 732 probes is on
-strand geometry by construction. `-fur-volume` is opt-in and was not passed (the log shows real
-strands: 56 549 on the barrel alone), so the far tier is not swallowing them either. Yet
-`Hit::fiberRadius`, which `curve.h` ~372 sets on every curve hit, is zero for 84 % of them. So
-either that contract is not held on all curve paths, or mode `M`'s gather reconstructs its `Hit`
-somewhere that drops the field.
+**RETRACTION — MY OWN FIRST READING OF THIS TALLY WAS WRONG, and the "anomaly" it reported does not
+exist.** The first version of this section reported fur at **15.9 %** and concluded the test was
+"perfectly specific, hopelessly insensitive", then reasoned from there that `Hit::fiberRadius` must
+be silently zero on 84 % of curve hits — and flagged that as a bug affecting hair shadow-ray
+epsilons and `scene.h`'s connection stepping. **There is no such bug.** `fiber` is incremented once
+per gatherCoverage call while `miss+reject+accept` counts *probes*, and each gather point fires up
+to `M` of them, so dividing one by the other caps the result near **1/M = 12.5 %** at `-gatherarea 8`.
+The 15.9 / 17.5 / 20.3 % I read as "a low rate" were **at or above that ceiling** — the adaptive
+early-out fires fewer than `M` probes, which is the only reason they exceeded it. A rate that cannot
+exceed 12.5 % is not evidence about a fraction of hits, and the tell was there in the numbers: three
+independent materials all landing within a few points of 1/M is a denominator, not a coincidence.
+`GaDiagMat::points` now exists so the normalisation cannot be got wrong again, and it carries a
+comment saying why.
 
-**That is the thing to fix first, and it is worth more than this gate.** `fiberRadius` is not a
-diagnostic field: `scene.h` ~2854 uses it to decide whether a hair connection may step past the
-strand's own body, and `design.md` records a shadow-ray epsilon of `2.5 × Hit::fiberRadius` that
-"every shadow ray that uses it must also shorten its max-t by the same amount". A field that is
-silently zero on most curve hits affects those too. Once it is reliable, re-run this tally: if
-`fiber%` goes to ~100 % for `cr_coat`, the type test becomes both specific and sensitive and the
-gate is worth building.
+**So the gate is worth building after all**, and the acceptance test is the one this entry already
+specifies: skip the coverage correction where `fiberRadius > 0`, measure `alice_hair`, `alice_dress`,
+`cap_gyroid` and `creature` per-ROI on `gallery_rain` at fixed `-spp`, and expect the fur ROI to
+move and the other three not to.
 
 Not implemented: it would change mode `M`/`S` output on any scene with fur, so it wants its own
 change with the four-ROI measurement this entry already specifies, plus the device twin.
