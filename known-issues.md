@@ -20608,37 +20608,96 @@ existing lobe-sampled continuation, which already carries `contBsdfPdf`. That is
 structure `D_DIFFUSE` uses, just with a non-constant BRDF, and it fixes both the black preview
 and the (currently very high) variance of a glossy surface in mode R.
 
-## OPEN (2026-09-12): mode `D` (BDPT) over-estimates a glossy surface, and the error grows with roughness
+## OPEN (2026-09-12): mode `D` (BDPT) evaluates the glossy BSDF in the WRONG DIRECTION on light subpaths
 
-Found by the rig built for the glossy-`W` entry above (`scraps/_gw_*.ftsl`, `scraps/glossyw4.sh`),
-so the geometry, light and camera are identical across every row and the only variable is the
-material. One tile, one small overhead panel, ROI mean over the tile, mode `R` (512 spp) as the
-unbiased reference:
+**ROOT CAUSE FOUND, and confirmed by a signed prediction.** `bsdfF`'s Glossy case returns
+`r * lobe / cos(wi)` — deliberately, so that `f*cos/pdf` collapses to `r` — which makes it
+**non-reciprocal**: swapping `wo` and `wi` divides by a *different* cosine, because the `lobe`
+factor itself is symmetric (`dot(wi, reflect(-wo,ns)) == dot(wo, reflect(-wi,ns))`, algebraically)
+but the denominator is not. BDPT traverses every vertex in **both** directions, so the same
+physical path gets two different BSDF values depending on which subpath built it, and MIS then
+combines estimators that disagree. The `t=1` connection (`bdpt.h` ~2831, a **light**-subpath vertex
+joined to the camera) evaluates `bsdfF(qs.mat, qs.ns, wo, wcam)`, pre-dividing by `cos(wcam)`,
+where the camera-side convention divides by the incident-light cosine. Predicted error on that
+strategy: exactly **cos(wo)/cos(wcam)**.
 
-| material | `R` (ref) | `D` | `D`/`R` | `M` | `M`/`R` |
-|---|---|---|---|---|---|
-| diffuse | 0.197778 | 0.197796 | **1.000** | 0.197623 | 0.999 |
-| glossy r=0.2 | 0.022545 | 0.024403 | **1.082** | 0.022532 | 0.999 |
-| glossy r=0.6 | 0.157664 | 0.182767 | **1.159** | 0.158104 | 1.003 |
-| glossy r=0.9 | 0.125590 | 0.150345 | **1.197** | 0.125833 | 1.002 |
+**Which convention is right is settled by energy, not by preference.** Under uniform illumination
+`L`, a surface of reflectance `r` must return `r*L`. With `f = r*lobe/cos(w_incident)`:
+`∫ f cos(w_incident) dω = r ∫ lobe dω = r` ✓. With `f = r*lobe/cos(wcam)`:
+`(r/cos(wcam)) ∫ lobe cos dω ≠ r` ✗. So the camera-side convention is the energy-conserving one
+and the `t=1` site is the wrong one.
 
-**Why this is a real signal and not noise or a budget artifact.** The diffuse row agrees to
-**0.01 %**, so the rig, the ROI and the exposure are all sound; mode `M` agrees to **0.3 %** on
-the very same glossy materials, so the BRDF itself is fine and this is specific to `D`'s
-estimator; and the error is **monotone in roughness across three points** rather than scattered.
-`-max-bounce` cannot explain it either — the scene is a single quad with no inter-reflection, so
-there is no multi-bounce transport for `D`'s default of 8 to clip differently from `R`'s 32.
+**THE CONFIRMING TEST — a sign flip, which nothing else on the list could fake**
+(`scraps/_gwrec_*.ftsl`, `scraps/rec.sh`). Pin the light at 45° from the normal so `cos(wo)` is
+fixed at 0.707, then move **only** the camera:
 
-The shape of it (exact on a constant BRDF, high on a non-constant one, worse as the lobe widens)
-points at the glossy lobe's pdf/eval pair inside `bdpt.h` — either a weight that assumes a
-Lambertian cosine pdf, or an MIS weight over the BDPT connection strategies that uses a different
-`bsdfPdf` convention than the one the lobe was sampled with. **Not yet chased**, and deliberately
-logged rather than fixed in the same change as the mode-`W` connection: they are different
-estimators and folding them together would make either one's verification unreadable.
+| camera | cos(wcam) | cos(wo)/cos(wcam) | predicted | measured `D`/`R` |
+|---|---|---|---|---|
+| near-normal | 0.999 | 0.708 | **< 1** | **0.8517** |
+| 45°, matched | 0.707 | 1.000 | **= 1** | 1.0366 |
+| grazing | 0.275 | 2.571 | **> 1** | 1.0169 |
 
-Next step when someone picks this up: add a `mirror` arm (a delta lobe should be exact, which
-would localise it to the *finite* lobe path) and a second light size (which changes the
-solid-angle pdf without touching the BRDF, separating a pdf-convention bug from a BRDF bug).
+Mode `D` is **15 % too DIM** when the camera sits nearer the normal than the light. A bias that
+merely scaled with roughness, solid angle, or path length cannot change sign with geometry. (The
+grazing arm is only +1.7 % because the `t=1` strategy's MIS *share* shrinks there; the mechanism
+sets the sign, the share sets the magnitude.)
+
+**MY OWN CHARACTERISATION OF THIS ENTRY WAS WRONG, in two ways.**
+
+1. *"the error grows with roughness"* — **it tracks geometry, not roughness.** With camera and
+   light placed symmetrically about the normal (`cos(wo) == cos(wcam)`, so the mechanism is
+   neutral) the error is **flat** at +3.3 to +3.7 % across roughness 0.05 / 0.3 / 0.6. The
+   apparent roughness trend in the first table was the `t=1` strategy's MIS share growing, not the
+   error per path. The first rig happened to hold the *wrong* variable fixed.
+2. *"mode M is within 0.3 %, so D is the outlier of three estimators"* — **not independent.** Mode
+   `M`'s gather walks the camera path through `BackwardRenderer`, so `R` and `M` **share the
+   machinery under test**; their agreeing says nothing. Replaced with a **white-furnace test**
+   (`scraps/_gwf_*.ftsl`), which needs no reference render at all: one surface, one uniform
+   environment, near-orthographic view down the normal so the lobe loses no mass below the horizon,
+   and `tile / background` must equal `r` for **any** lobe shape. Mode `R`:
+
+   | material | tile / background | vs diffuse |
+   |---|---|---|
+   | diffuse | 0.58876 | — |
+   | glossy r=0.2 | 0.58864 | −0.02 % |
+   | glossy r=0.6 | 0.58865 | −0.02 % |
+   | glossy r=0.9 | 0.58855 | −0.04 % |
+
+   **Mode `R` is analytically correct on glossy to 0.04 %**, so the `D`-vs-`R` gap is `D`'s. (The
+   absolute 0.589 rather than 0.600 is the `rgb`→spectrum conversion of `reflect rgb 0.6`, shared
+   by every row and cancelled by the vs-diffuse column.) **Mode `D` cannot run this test itself** —
+   it refuses environment lights outright (`[mode D] camera 'cam' uses environment / collimated
+   lights, which that mode can't render`), which is why the furnace validates `R` and `R` then
+   serves as the reference for `D`.
+
+**Everything else that was ruled out**, so the next person does not re-run it:
+
+- **Delta lobes are exact.** A `mirror` tile reads `D`/`R` = **1.000**, and diffuse **0.996–1.000**.
+  Consistent with the diagnosis: a delta vertex cannot be connected at all, and `ρ/π` is
+  reciprocal so it has no wrong direction to be evaluated in.
+- **Not a solid-angle / pdf-convention error.** A **16×** change in light solid angle (1×1 → 2×2 →
+  4×4 m panels, same centre and power by construction) moves `D`/`R` only 1.164 → 1.159 → 1.144.
+- **Not spurious long paths.** `-max-bounce` 2, 3, 4, 8, 16 all give `D`/`R` = **1.1598**, bit-stable
+  on a repeat. A single flat quad cannot see itself, so the whole error is in the 2-bounce direct
+  lighting.
+- **Not the below-horizon rejection.** `sampleGlossy` terminates samples with `dot(wi,ns) <= 0`
+  while `bsdfPdf` reports the un-rejected density, which *is* a real inconsistency — but it
+  predicts ~0 % at roughness 0.2 and ~67 % at 0.9, against measured +8.2 % and +19.7 %. Rejected
+  quantitatively. (It also cannot bias `R`, which the furnace shows is exact.)
+- **Not a consistently-wrong pdf.** Balance-heuristic weights are `p_i / Σp_j` and partition unity
+  for *any* densities, so a uniformly wrong pdf cannot bias the result. Only an inconsistency
+  between the density used to *sample* and the one used in the *weight* can — which is what this is.
+
+**THE FIX, and how to know it worked.** Evaluate the adjoint BSDF at light-subpath vertices, i.e.
+swap the two direction arguments (`bsdfF(mat, ns, wcam, wo)`) so the pre-divided cosine is the
+incident-light one. The adjoint sites are **already marked** in the code — they are exactly the
+ones carrying `shadingAdjointCorr` for the shading-normal problem (`bdpt.h` ~2831 for `t=1`, ~3034
+for `fL` on an interior connection) — so the audit has a definite boundary rather than being a
+hunt. A reciprocal BSDF is unaffected by the swap, so diffuse/Lambertian must stay **bit-identical**;
+that is the null control. Acceptance: the sign-flip table above must go to **1.000 at all three
+camera angles**, the furnace must stay flat, and the `~+3.5 %` residual at the neutral
+configurations should be re-measured afterwards — it survives when the reciprocity term is
+neutral, so it is a **second, separate effect** and is not explained by any of the above.
 
 ## OPEN (2026-08-04): `phase rainbow` — the 2048-bin uniform-in-mu table under-resolves large droplets, and monodisperse supernumeraries read as a white arc
 
