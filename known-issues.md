@@ -3162,6 +3162,32 @@ mat45 → depth-veto story fails on its own terms rather than on an artifact.
 > recorded in this file, made again with the lesson already written down. That one turned out
 > innocent: gate 30 reproduces across builds to ~1 point. Then the real one, `-time`.
 >
+> **AUDIT OF THE REST OF THE SESSION, since the same confound could be anywhere.** Every other
+> arm-comparison made the same day was checked for spp mismatch:
+>
+> | measurement | arms | verdict |
+> |---|---|---|
+> | JDEVCMP dump cost | `-spp 96`, all four at 96/96 | safe, fixed by construction |
+> | J-KNEE-NOISE direction (n=12) | `-spp 256` | safe |
+> | FOLD-GPU part 1 sizing | `-spp 24` | safe |
+> | VOLCACHE premise | `-spp 400` | safe |
+> | UPBP-CONV equal-time | `-time 90` | correct BY DESIGN — equal wall clock is the question |
+> | M-GATHERAREA mode `S`, **GPU** | 457 vs 456; 167 vs 167 | safe, matched to 0.2 % |
+> | M-GATHERAREA mode `S`, **CPU** | **95 vs 78 spp** | 18 % mismatch — see below |
+> | M-GATHERAREA gate | 87-101 spp | contaminated, corrected above |
+>
+> **Only the gate work was affected.** The one loose end is mode `S`'s CPU arm at 95 vs 78 spp.
+> It probably stands — the GPU arms are the primary result (mode `S` dispatches to CUDA by
+> default) and matched to 0.2 %, the CPU effect is **22 points** against an 18 % spp difference,
+> and `_ga_strip` is a diffuse strip under an area light with no firefly tail, which is the very
+> mechanism that makes a trimmed mean spp-sensitive on `gallery_rain`. But it is a caveat, not a
+> clean measurement, and anyone re-opening that result should redo it at fixed `-spp`.
+>
+> **The pattern is worth more than the audit.** The scripts written EARLY in the session used
+> fixed `-spp`; the ones written LATE, under more context pressure, drifted to `-time`. The
+> discipline did not fail all at once, it eroded — which is an argument for making the rig enforce
+> it rather than trusting a rule to be recalled at hour nine.
+>
 > **The rule that actually prevents this is procedural, not mnemonic:** render every arm of a
 > comparison in ONE batch, on ONE binary, at FIXED `-spp`. "Remember that binaries differ" and
 > "remember that `-time` varies" are things I demonstrably do not remember under load; a single
