@@ -20517,6 +20517,46 @@ preview bit-identically**, so the off-switch demonstrably reaches the code. That
 ceremony — an off-switch that silently does nothing is how the mode-`S` footprint twin once passed
 its null control while being inert.
 
+**THE SAME GUARD WAS HIDING A SECOND, OPPOSITE BUG: the glossy HIGHLIGHT was 4-16x too bright.**
+The first rig put the light 53° off the lobe axis, so only the connection could contribute and the
+fix read as a pure gain. The complementary configuration is the one where the *mirror direction
+lands on the light* and both halves of the weight are live at once — `scraps/_gwhl_*.ftsl`, camera
+and light placed symmetrically about the tile normal, no enclosure and one light so that mode `W`'s
+missing diffuse indirect cannot contaminate the comparison. ROI mean over the tile, and the peak of
+the highlight itself:
+
+| material | mode `R` | before / `R` | after / `R` | peak before / `R` | peak after / `R` |
+|---|---|---|---|---|---|
+| diffuse (null) | 0.108205 | 0.981 | 0.981 | — | — |
+| glossy r=0.3 | 0.551205 | 0.842 | **1.050** | **4.29×** | 1.53× |
+| glossy r=0.6 | 0.271972 | **1.707** | **1.027** | **15.59×** | 1.45× |
+
+**The before-fix peak is 6.6871 at BOTH roughnesses — identical to seven digits.** That is the
+signature and the diagnosis in one number: with no MIS partner the lattice direction simply took
+the light's raw radiance at full weight, so a glossy highlight in mode `W` was *independent of
+roughness*. A satin surface and a near-mirror blew out identically. The connection supplies the
+partner weight, and the mean lands within 2.7-5.0 % of mode `R` instead of −15.8 % / +70.7 %. The
+diffuse arm is **bit-identical** across the change (0 floats differing), so the effect is confined
+to glossy.
+
+Residual, recorded rather than claimed as fixed: the *peak* is still 1.45-1.53× mode `R`. That is
+mode `W`'s own 1-spp quadrature bias at the one pixel where the lobe is most sharply resolved, not
+a weight error — the mean over the tile is within a few percent.
+
+**AND ONE REAL-SCENE ARM LOOKED NEGATIVE, WHICH IS WORTH RECORDING BECAUSE IT WAS NOT.** On
+`scenes/material_presets.ftsl` (mode `W`, `-spp 1`, default vs `-no-glossy-nee`) 227 400 of 230 400
+pixels came back bit-identical — a clean localisation, and the in-frame null control — but on the
+180 changed pixels that already carried a lattice contribution, median `|W−R|/R` moved 0.59 → 0.69.
+Read alone that is a regression. It is not supportable: that scene is an **enclosed box**, so mode
+`W`-vs-`R` there is dominated by mode `W`'s documented missing multi-bounce GI, and the baseline
+error was **already 59 % before the change** — a rig whose reference disagrees by 59 % for reasons
+unrelated to the estimator cannot attribute a 10-point move to the estimator. Its glossy surfaces
+are also near-delta metal presets, where the connection *correctly* contributes almost nothing
+(2820 of the 3000 changed pixels went from exactly zero to denormal-scale values, i.e. no visual
+change at all — the BRDF really is ~1e-39 that far off the lobe axis). The controlled rig above,
+built with no enclosure and a bit-identical diffuse null, is the one that can see the effect, and
+it says the highlight case improves by 3-10×.
+
 **TWO CLAIMS IN THE ORIGINAL TEXT BELOW ARE WRONG, and both were wrong in the same direction:**
 they overstated how well the *other* modes did, which is what made mode `W` look like the only
 offender.

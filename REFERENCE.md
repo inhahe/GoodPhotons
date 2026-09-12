@@ -5512,6 +5512,14 @@ shaded and previewing as a hole — `scenes/gallery_rain.ftsl`'s ground had to b
 diffuse` for exactly this reason. Measured over one tile: 0.000000 → 0.87–0.97× of mode `R`
 across roughness 0.2–0.9, with mode `R` itself bit-identical across the change.
 
+The same guard was hiding the opposite error at the other end: where the lobe's lattice direction
+*did* land on a light, it took that light's raw radiance at **full weight**, with no MIS partner to
+halve it. A glossy highlight in mode `W` was therefore **independent of roughness** — measured
+4.29× mode `R`'s peak at roughness 0.3 and 15.59× at 0.6, from the identical pre-fix peak value at
+both. With the connection in place the tile mean lands within 2.7-5.0 % of mode `R` (from −15.8 %
+and +70.7 %). The peak is still ~1.5× at `-spp 1`, which is the mode's own quadrature bias at the
+most sharply-resolved pixel rather than a weight error.
+
 **Preview specular (`-raster` / `-explore`)** — the preview rasterizer used to shade diffuse
 only: its own header said "glossy lobes do not exist here either, so roughness/film-thickness
 maps are ignored by design", so an asset whose look depends on its specular lobe — a satin
