@@ -3315,6 +3315,37 @@ the gather ball reaching across strands — a different defect), `cap_gyroid` **
 truncation at an edge, the original mechanism, and the one case the ball fix cannot help),
 `alice_hair` **-7.5** and `alice_dress` **-3.8**.
 
+**AND THE COST CLAIM NEEDED CORRECTING, WHICH IS WORTH RECORDING BECAUSE IT WAS MY OWN.** Three
+separate times above, "the probes are free" was used to justify a decision — dropping the
+`M = 8`-is-cheapest argument, disabling the early-out, and defaulting all three flags on. Every one
+of those measurements was made on `gallery_rain` **with `-beams`**, where `-mstats` puts **81 % of
+the camera gather in beams**, so the surface probes were being compared against a term four times
+their size. Re-measured on the *same scene without* `-beams`, where `-mstats` reports **0 % beams**
+and the surface estimate is the whole gather (mode `M`, 320x180, `-spp 16`, CPU, n = 3):
+
+| arm | surface gather (thread-s) | frame wall |
+|---|---|---|
+| `-gatherarea 0` (no correction at all) | **17.5** | **11.7 s** |
+| default (early-out disabled) | **54.2** | **19.1 s** |
+| `-gagate 0` (early-out restored) | 40.9 | 18.1 s |
+
+Two numbers fall out, and the second is the one that was being asserted without evidence:
+
+* **The footprint correction costs 3.1x the surface gather and ~1.6x the FRAME** on a
+  surfaces-only mode-`M` render. That was never stated anywhere, and it makes `-gatherarea 0` a
+  real speed/accuracy knob rather than only a correctness escape hatch.
+* **Disabling the early-out costs +24 % of surface-gather thread time, ~5 % of wall.** Not free.
+  It is still the right default — 5 % of a frame for an estimator that no longer depends on its
+  own sampling budget is a good trade, and the alternative (`-gagate 4`, a fixed threshold that
+  keeps part of the saving) has *unmeasured accuracy*, which on this entry is the specific way
+  every previous attempt went wrong. But the claim in the v0.278.0 notes should be read with this
+  qualification, and `REFERENCE.md` now carries it.
+
+The general lesson is the one this entry keeps re-teaching in new costumes: **a ratio measured
+where the denominator is dominated by something else is not a measurement of the numerator.** The
+81 %-beams figure was in `-mstats` output that had already been read, on this same scene, in the
+VOLCACHE entry.
+
 **What the residual is NOT.** It is not the fur path: `alice_hair` is *mesh* geometry, not curves,
 which is why the fiber gate leaves it alone — it moves -67.6 -> -10.0 under the coverage probe
 while `creature` does not move at all.
