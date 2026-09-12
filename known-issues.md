@@ -1318,7 +1318,67 @@ here because the levels read like a verbosity scale, where higher implying lower
 reading. They are not a scale. Naming them `arm` rather than `level` would have made `>=` look as
 wrong as it is.
 
-### J-KNEE-NOISE — OPEN (2026-09-11, v0.272.4): mode `J`'s **`-beamk` knee**, which sizes the entire beam map, varies by **3.8x between seeds** on a scene with a dielectric — so the same scene rendered twice picks maps differing several-fold in memory, gather cost and merge coverage
+### J-KNEE-NOISE — **the 3.8x headline is FIXED (v0.272.5); a ~15 % LOW BIAS remains** (re-measured 2026-09-12 at v0.276.1; filed 2026-09-11, v0.272.4)
+
+**RE-RAN THIS ENTRY'S OWN MATRIX on the current binary — 3 pilots × the same 3 seeds
+(`scraps/knee3.sh`). Both reported symptoms are largely gone**, because v0.272.5 raised the
+gather probe from 96 rays to 512 and the entry was never updated:
+
+| pilot | seed 3 | seed 7 | seed 11 | spread now | spread when filed |
+|---|---|---|---|---|---|
+| 4 096 | 206 549 | 247 717 | 235 752 | 1.20x | 1.33x |
+| 16 384 | 264 478 | 254 471 | 274 744 | **1.08x** | 1.08x |
+| 62 500 (shipped) | 221 325 | 238 700 | 213 536 | **1.12x** | **3.76x** |
+
+Pilot-to-pilot agreement, the entry's second complaint, improved too: medians 235 752 / 264 478 /
+221 325 — **1.19x**, against ~136 k / ~268 k / ~176 k (1.97x) when filed.
+
+**And the `beams/subpath` rate was never the unstable quantity**: it measures 6.01 / 6.02 / 5.98 at
+4 096 and 6.02 / 6.04 / 6.02 at 62 500 — a **1.003x** spread. Every bit of the instability was
+`k0` sitting in a DENOMINATOR (`kneeBeams = pilotBeams · targetK / k0`), exactly as the note above
+`probeGatherCount` suspected. The mean free path is not it either: 2.4900–2.5320 m over nine
+`_fog_cornell` logs, **1.017x**.
+
+**A STRUCTURAL FACT THAT KILLS THE OBVIOUS NEXT MOVE: the probe's RNG is FIXED-SEEDED**
+(`prng.seed(0x9E3779B97F4A7C15ULL, 0xBF58476D1CE4E5B9ULL)`), so the probe contributes **zero**
+seed-to-seed variance. The residual ~1.1x spread is the BEAM SET differing between seeds — real
+scene variation — and **no number of probe rays can reduce it**. Measured: 512 / 2048 / 8192 rays
+give spreads of 1.12x / 1.15x / 1.09x, i.e. flat.
+
+**WHAT MORE RAYS DO INSTEAD — and this is the live defect. The shipped 512-ray probe
+UNDER-ESTIMATES the knee by 12–20 %, on every scene.** Against an 8 192-ray reference:
+
+| probe rays | median knee (`_fog_cornell`) | wall clock |
+|---|---|---|
+| 512 (shipped) | 221 325 | 4 548 ms |
+| 2 048 | 260 358 | 11 323 ms |
+| 8 192 | 275 291 | 18 904 ms |
+
+| scene | 512 rays | 8 192 rays | ratio |
+|---|---|---|---|
+| `_fog_cornell` (dielectric, clustered) | 221 325 | 266 470 | **1.20x** |
+| `_fog_thick` (plain homogeneous) | 11 026 | 12 359 | **1.12x** |
+
+It is **converging** (increments of +18 % then +6 % per 4x rays, so the limit is ~285 k), it is
+**not** specific to the dielectric — a plain homogeneous fog is 12 % low too — and **cost is linear
+in rays** (4.2x for 16x rays). So brute force is the wrong lever. This matters because the code's
+own note says undershooting the knee is a **bias, not noise**: below it `buildAuto` widens the
+radii to hold the gathered count at the `-beamk` floor, so the map buys no time and pays in kernel
+blur. Every mode-`J` render today ships a map ~15 % smaller than its own knee intends.
+
+**THE FIX TO TRY, and how to judge it:** variance-reduce the probe instead of lengthening it.
+`randPt` draws both chord endpoints **uniformly at random** in the beam bbox, so `hits/rays` is a
+plain Monte Carlo mean with no stratification at all — jittered strata over the endpoint pair (or
+over direction and offset) should cut its variance several-fold at identical cost. The acceptance
+test is already built: the knee at 512 stratified rays must land on the **8 192-ray reference**
+(~275 k on `_fog_cornell`, ~12.4 k on `_fog_thick`) at 512-ray cost, and `_fog_thick`'s four-seed
+0.6 % stability must not regress. Note the fixed probe seed means this is a **deterministic**
+target, not a statistical one — the same scene must give the same answer, so the check is exact.
+
+*(Superseded framing, kept because the reasoning is still the record: the entry blamed a dielectric
+for letting a light subpath deposit a wildly varying number of chords. The chord COUNT does swing
+3.15x across seeds on `_fog_cornell` against 1.04x on `_fog_thick`, so that observation was right —
+but it is not what drove the knee spread, since the rate derived from it is stable to 0.3 %.)*
 
 **Found while asking a different question.** The budget pilot traces `clamp(nPaths/32, 2048,
 65536)` subpaths — 62 500 on a default `-n 2000000` — to size a pass that on `_fog_thick` then
