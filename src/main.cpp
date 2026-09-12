@@ -12430,7 +12430,12 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
     {
         size_t hist[8] = {0}, unknown = 0, known = 0;
         for (const PhotonBeam& b : bm.beams) {
-            if (b.order == kBeamOrderUnknown) { ++unknown; continue; }
+            // `0` is NOT a valid order -- the convention is 1 == single scatter -- so a chord
+            // carrying it did not track its order and belongs with the sentinel. Before
+            // 0.278.1 it counted as KNOWN and was then dropped by the `o = 1` loop below, so
+            // an untracked population sat in the DENOMINATOR while being invisible in the row,
+            // and the "did not track" note never fired. See BEAMORDER-GPU.
+            if (b.order == kBeamOrderUnknown || b.order == 0) { ++unknown; continue; }
             ++known;
             hist[b.order < 7 ? b.order : 7] += 1;
         }

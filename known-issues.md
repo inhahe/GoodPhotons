@@ -1717,7 +1717,7 @@ knee's own variance is understood — shrinking the pilot on a scene where the e
 unstable would make the map size *more* random, not less. `FTRACE_JPILOT=<n>` overrides the size
 for exactly this investigation.
 
-### BEAMORDER-GPU — OPEN (2026-09-12, found while starting VOLCACHE's `_fog_thick` check): `PhotonBeam::order` is **never set on the device**, so VOLCACHE's own order histogram is silently empty under `-device gpu` — and the report counts the untracked chords in its DENOMINATOR
+### BEAMORDER-GPU — ~~OPEN~~ **DONE (v0.278.1, 2026-09-12)** (found while starting VOLCACHE's `_fog_thick` check): `PhotonBeam::order` is **never set on the device**, so VOLCACHE's own order histogram is silently empty under `-device gpu` — and the report counts the untracked chords in its DENOMINATOR
 
 Same scene, same binary, same everything but the backend:
 
@@ -1762,8 +1762,28 @@ contributed to the numerator.**
    scatter counter (the host passes `beamScatters + 1`, and render_cuda.cu ~9067 already names
    `beamScatters` as its twin), and carry it through the download into `PhotonBeam`.
 
-**Workaround meanwhile: measure the order distribution with `-device cpu`,** which is what
-VOLCACHE's existing numbers used.
+**FIXED in v0.278.1, both parts.** `DBeamDep` gained `order`, `dEmitBeams` takes it as a
+parameter, the deposit passes `*beamScat + 1` — the device twin of the host's `beamScatters + 1` —
+and the download clamps it exactly as `BeamBank::push` does. Where the counter is **absent** (a
+null `beamScat`) the deposit passes `kBeamOrderUnknown` rather than 0, which is the rule the host's
+own comment already stated and the device path simply never followed; following it is what stops
+this recurring the next time a deposit path is added.
+
+Verified on `gallery_rain`, same scene and settings, one binary:
+
+    cpu: 1:60.4% 2:16.7% 3:9.1% 4:5.6% 5:3.3% 6:2.0% 7+:3.0%     order >= 2 = 39.6 %
+    gpu: 1:59.4% 2:16.7% 3:9.4% 4:5.5% 5:3.4% 6:2.2% 7+:3.5%     order >= 2 = 40.6 %
+
+Agreement to ~1 point across seven bins, and both reproduce this entry's recorded **40.7 %**. The
+backends trace different photon sequences, so exact equality would be a reason for suspicion rather
+than reassurance.
+
+**And the image is unchanged**, which was not a given: `DBeamDep` grew by 4 bytes and `beamCap` is
+`freeB / 4 / sizeof(DBeamDep)`, so a bigger record means fewer beams fit. Default GPU render
+against the 0.278.0 binary: median 0.00, **p99 8.71e-08**, i.e. the accumulation-order floor. That
+result is scene-dependent by nature — `gallery_rain` stores ~27 k chords against a cap in the
+millions, so the capacity loss cannot bite; a scene that actually saturates `beamCap` would lose
+~1 % of it.
 
 ### VOLCACHE — OPEN (2026-09-06, v0.257.0): the radiance cache covers diffuse *surfaces* only, so the volumetric gather — which is where ~all of a `gallery_rain` frame's time actually goes — is recomputed in full every frame of a flyby
 

@@ -4860,6 +4860,10 @@ struct DBeamDep {
     // the bundle above, which it supersedes exactly.
     float cieA[3];
     int   achro;
+    // Medium scattering order of this chord, 1 = single scatter; `kBeamOrderUnknown` when the
+    // depositing path does not track it. Host twin: PhotonBeam::order. Absent before 0.278.1,
+    // which left every device-deposited chord reading 0 on the host -- see BEAMORDER-GPU.
+    int   order;
 };
 
 // The photon's LIVE spectral bundle, carried down the path by the forward tracer and handed
@@ -5939,7 +5943,8 @@ __device__ static void depositPhoton(const DCamSet& cs, const DVec3& p,
 __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVec3& o,
                                   const DVec3& dir, Real dLen, Real lambda, Real beta,
                                   Real aGlass, DRng& rng, int offFilt = DMedStraight,
-                                  const DBeamSpec* spec = nullptr) {
+                                  const DBeamSpec* spec = nullptr,
+                                  int order = (int)kBeamOrderUnknown) {
     if (!cs.beamCount || !(beta > 0)) return;
     // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
     // 1e30-long box (host twin: Renderer::kBeamFarScale == 8). Applied PER MEDIUM and only to
@@ -5988,6 +5993,7 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
             bd.lambda = (float)lambda;
             bd.absorb = (float)aGlass;
             bd.med    = i;
+            bd.order  = order;          // see DBeamDep::order / BEAMORDER-GPU
             // ACHROMATIC-PATH FOLD, decided per DEPOSITED BEAM rather than per photon,
             // because the two conditions live in different places: the PATH being
             // wavelength-independent is a property of the photon (spec->achro), while the
@@ -8455,8 +8461,13 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         }
         // Mode M: store the crossing itself, so every camera of a flyby can gather from it
         // later without the photon knowing any camera exists.
+        // `beamScat` counts medium scatters already made, so the chord deposited now is order
+        // *beamScat + 1 -- the same convention the host passes as `beamScatters + 1`. A null
+        // counter means this path does not track order, and the SENTINEL says so explicitly
+        // rather than letting a 0 masquerade as a measurement (BEAMORDER-GPU).
         if (doBeamDeposit) dEmitBeams(sc, cs, ro, rd, dChord, lambda, betaPre, aC, *crng,
-                                      beamMS ? DMedAll : DMedStraight, spec);
+                                      beamMS ? DMedAll : DMedStraight, spec,
+                                      beamScat ? *beamScat + 1 : (int)kBeamOrderUnknown);
         if (!beamMS) {
             // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over the
             // whole crossing (single-scatter transmission) so surfaces behind the fog are
@@ -19963,6 +19974,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 // Achromatic-path fold (`-beamachro`): the emitter's mean CIE, used by
                 // BeamMap::build in place of CIE(lambda). Mutually exclusive with the bundle.
                 b.achro = d.achro ? 1 : 0;
+                // Scattering order (BEAMORDER-GPU). Clamped exactly as BeamBank::push does, so
+                // a device-traced map and a host-traced one report the same histogram.
+                b.order = (d.order < 0 || d.order >= (int)kBeamOrderUnknown)
+                              ? kBeamOrderUnknown : (unsigned char)d.order;
                 // `cieA` is the fallback colour for the GATHER-time fold as well as the payload
                 // of the achromatic-path one, so it must survive a beam whose `achro` is about
                 // to become 2 below -- otherwise BeamMap::build would give it a black cieMean.
