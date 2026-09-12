@@ -134,16 +134,14 @@
 #include <thread>
 #include <map>
 #include <set>
+#include <deque>               // makeStageProgress: trailing (time, done) rate window
+#include <utility>             // std::pair for the same
 #include <memory>
 #include <atomic>              // -stop: cross-thread flags for the external stop channel
+#include <mutex>               // guards the live-window title (the deposit monitor re-titles)
 #include <filesystem>          // -review: scan a directory of rendered frames
 
-// Baked in by CMake from the repo-root VERSION file (see CMakeLists.txt). The
-// fallback only fires for a hand-rolled compile outside the CMake build; a real
-// build.bat binary always carries the real number.
-#ifndef FTRACE_VERSION
-#define FTRACE_VERSION "unknown"
-#endif
+#include "version.h"          // ftraceVersion(): the repo-root VERSION string, baked into one tiny TU
 
 #include "scene.h"
 #include "parallel.h"           // ft::setStopProbe — lets load-time loops see the stop flag
@@ -163,6 +161,7 @@
 #include "vcm.h"                // mode U: vertex connection and merging (VCM/UPS, item 3)
 #include "lights.h"
 #include "mesh.h"
+#include "ndwarp.h"          // -nd: N-D lift/rotate/project of the loaded model
 #include "ftsl.h"
 #include "curvedrive.h"         // -anim: loom CurveDrive JSON sidecar (E2 channel a) read/write
 #include "animlive.h"           // -anim -loom: the live editor<->loom value channel (E2 channel b)
@@ -186,6 +185,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX               // keep std::min/std::max (windows.h else macro-clobbers them)
 #include <windows.h>          // -preview: enable ANSI VT processing in a plain console
+#include <psapi.h>            // ftalloc's memStat hook: this process's own commit charge
 #endif
 
 // stb_image_write encoders (implementation compiled once in stb_image_impl.cpp).
@@ -202,6 +202,8 @@ extern "C" {
     unsigned char* stbi_load(const char* filename, int* x, int* y, int* channels_in_file, int desired_channels);
     void           stbi_image_free(void* retval_from_stbi_load);
 }
+
+#include "duration.h"           // humanDur: "[[[dd:]hh:]mm:]ss" for every elapsed/ETA print
 
 // Case-insensitive test for a filename ending in `ext` (e.g. ".png").
 static bool endsWithCI(const std::string& s, const char* ext) {
@@ -2630,6 +2632,553 @@ static void bvhStats(const Scene& scene, long long rays) {
 //       excitation lambda and centred on the emission band.
 // It exercises the same fluoroInteract()/fluoEmitSampler used by the renderer, so a
 // bug in the transport math surfaces here without needing a full render.
+// -checknd: the N-D warp's algebra and combinatorics (ndwarp.h). Deterministic, no
+// scene and no GPU needed. The claims worth pinning down are the ones a reader would
+// otherwise have to take on trust:
+//
+//   * the Givens product really is a rotation (R R^T = I) for several dimensions;
+//   * a zero-filled lift + orthographic projection really IS one 3x3 matrix, and an x-w
+//     rotation really is "scale x by cos t" -- the fact the whole feature is designed
+//     around, and the one that decides whether a user needs a FILL;
+//   * 180 degrees in a mixed plane really does reach the MIRROR image (det = -1), which
+//     is the one thing 4-D rotation buys that 3-D cannot do;
+//   * the prism's 2-skeleton really has 2F + 2E triangles, so an extrusion's cost is
+//     predictable before it is built.
+// -checkpatops: every pattern opcode, through all THREE implementations of the VM.
+//
+// The VM exists three times — `patternEval` on the host, the fp64 device template
+// `dPatternEval`, and `dPatternEvalF`, an FP32 twin that is what the sphere-trace march
+// actually runs. None of their switches has a `default:`, so an opcode one of them has
+// never heard of is neither a compile error nor a crash: the node is skipped, the operand
+// stack is left one short, and the program returns the wrong slot. That is how adding
+// `d4` (0.230.0) left the GPU tracer rendering an isosurface as NOTHING — the field read 0
+// everywhere, and an invisible surface looks like an empty scene rather than a broken
+// shader. It cost a bisect across four backends to localise.
+//
+// So: build a minimal well-formed program per opcode, run it through all three, compare.
+// A skipped opcode changes what is on top of the stack, so it shows up as a mismatch
+// against the host rather than as silence.
+//
+// Arity comes from patOpStackEffect, the VM's own table, which also reports when an arity
+// is not knowable from the node alone (Grid/Scatter, whose arity is the named table's
+// dimensionality). Those are counted as SKIPPED rather than quietly passing — a check that
+// says "all clear" about opcodes it never exercised would be worse than no check.
+static const char* patOpLabel(PatOp op) {
+    // varName() names the VARIABLE opcodes (the ones this check exists for); anything
+    // else is identified by its enum index, which is all a failure report needs.
+    if (const char* v = varName(op)) if (v[0]) return v;
+    if (op == PatOp::Spec) return "spec:";
+    static char buf[24];
+    std::snprintf(buf, sizeof buf, "op#%d", (int)op);
+    return buf;
+}
+
+// Opcodes that are DELIBERATELY not in all three VMs, with the reason. Anything not listed
+// here is required to agree everywhere.
+//
+// This table is as much the point of the check as the comparison is. A VM that silently
+// drops an opcode and a VM that was never meant to have it look identical from the outside
+// -- both return 0 -- so the only thing that can tell them apart is a written-down decision.
+// Adding an opcode here is a deliberate edit that says "this divergence is intended";
+// leaving it out means the check fails until someone either implements it or explains it.
+enum PatOpWhere { PW_ALL, PW_HOST_ONLY, PW_NO_FP32 };
+
+static PatOpWhere patOpWhere(PatOp op, const char*& why) {
+    switch (op) {
+        case PatOp::Spec:
+            // `spec:<name>(w)` samples a named spectrum through a host std::function, and
+            // the compiler accepts it ONLY inside an `upsample` body -- which the loader
+            // evaluates on the host at load time to bake a Spectrum. No device VM can ever
+            // be handed a program containing it, so neither implements it.
+            why = "host-only: legal only in an `upsample` body, evaluated at load time";
+            return PW_HOST_ONLY;
+        case PatOp::VarCurv: case PatOp::VarCavity: case PatOp::VarFootprint:
+            // dPatternEvalF has no parameter for these: it is the FP32 VM the sphere-trace
+            // march runs, and a march samples a FIELD, not a surface -- there is no hit to
+            // measure curvature, cavity or a shading footprint at. The fp64 device VM does
+            // implement them (it also serves surface sites) and is checked normally.
+            why = "not in the FP32 VM: a field march has no surface to measure";
+            return PW_NO_FP32;
+        default:
+            why = nullptr;
+            return PW_ALL;
+    }
+}
+
+// -checkpatops: every pattern opcode, through all THREE implementations of the VM.
+//
+// The VM exists three times -- `patternEval` on the host, the fp64 device template
+// `dPatternEval`, and `dPatternEvalF`, an FP32 twin that is what the sphere-trace march
+// actually runs. None of their switches has a `default:`, so an opcode one of them has
+// never heard of is neither a compile error nor a crash: the node is skipped, the operand
+// stack is left one short, and the program returns the wrong slot. That is how adding
+// `d4` (0.230.0) left the GPU tracer rendering an isosurface as NOTHING -- the field read 0
+// everywhere, and an invisible surface looks like an empty scene rather than a broken
+// shader. It cost a bisect across four backends to localise.
+//
+// So: build a minimal well-formed program per opcode, run it through all three, compare.
+// A skipped opcode leaves a different value at the bottom of the stack -- `patternEval`
+// returns `sp > 0 ? st[0] : 0.0` -- so it surfaces as a mismatch rather than as silence.
+//
+// Arity comes from patOpStackEffect, the VM's own table, which also reports when an arity
+// is not knowable from the node alone (Grid/Scatter, whose arity is the named table's
+// dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
+// says "all clear" about opcodes it never exercised would be worse than no check.
+static int checkPatOps() {
+    struct Prog { PatOp op; int off, len; };
+    std::vector<PatNode> pool;
+    std::vector<Prog>    progs;
+    std::vector<int>     offs, lens;
+    int unknownArity = 0;
+
+    // Distinctive operand values: a degenerate 0/1 would make too many operators agree by
+    // accident, which is exactly what a coverage check must not do.
+    static const double kArgs[8] = {0.53, 0.31, 0.79, 0.17, 0.61, 0.43, 0.23, 0.71};
+
+    for (int i = 0; i <= (int)PatOp::VarFootprint; ++i) {
+        const PatOp op = (PatOp)i;
+        // `a` matters for the ops that read it. PovFn's id selects the function (and its
+        // arity); Tex/Grid/Scatter index tables that are deliberately absent here, so they
+        // return 0 on every backend -- equal, hence passing, which is honest: this check is
+        // about opcode COVERAGE, and the table samplers have their own tests.
+        double a = 0.0;
+        int pops = 0, pushes = 0;
+        if (!patOpStackEffect(op, a, pops, pushes)) { ++unknownArity; continue; }
+        if (pops > 8) { ++unknownArity; continue; }
+        // LdReg reads a register StReg never wrote in a one-op program; that is not a
+        // coverage question, so give it a program that writes first.
+        const int off = (int)pool.size();
+        if (op == PatOp::LdReg) {
+            pool.push_back(PatNode{PatOp::Const, kArgs[0]});
+            pool.push_back(PatNode{PatOp::StReg, 0.0});
+            pool.push_back(PatNode{PatOp::LdReg, 0.0});
+        } else {
+            for (int k = 0; k < pops; ++k) pool.push_back(PatNode{PatOp::Const, kArgs[k]});
+            pool.push_back(PatNode{op, a});
+        }
+        progs.push_back(Prog{op, off, (int)pool.size() - off});
+    }
+    for (const Prog& p : progs) { offs.push_back(p.off); lens.push_back(p.len); }
+
+    PatOpProbeIn in;
+    in.x = 0.37; in.y = -0.61; in.z = 0.83; in.f = 0.29;
+    in.nx = 0.21; in.ny = 0.47; in.nz = 0.86; in.r = 1.11;
+    in.u = 0.63; in.v = 0.19; in.curv = 0.41; in.cavity = 0.55; in.fw = 0.13;
+    for (int k = 0; k < 9; ++k) in.d[k] = 0.29 + 0.13 * k;   // d4..d12, all distinct
+
+    // Host reference, from the same inputs the device probe uses.
+    std::vector<double> host(progs.size(), 0.0);
+    {
+        PatCtx c;
+        c.x = in.x; c.y = in.y; c.z = in.z; c.f = in.f;
+        c.nx = in.nx; c.ny = in.ny; c.nz = in.nz; c.r = in.r;
+        c.u = in.u; c.v = in.v; c.curv = in.curv; c.cavity = in.cavity; c.fw = in.fw;
+        for (int k = 0; k < 9; ++k) c.d[k] = in.d[k];
+        for (size_t i = 0; i < progs.size(); ++i)
+            host[i] = patternEval(pool.data() + progs[i].off, progs[i].len, c);
+    }
+
+    std::vector<double> d64(progs.size(), 0.0), d32(progs.size(), 0.0);
+    bool haveDev = false;
+#ifdef HAVE_CUDA
+    haveDev = cudaPatOpProbe(pool.data(), offs.data(), lens.data(), (int)progs.size(),
+                             in, d64.data(), d32.data());
+#endif
+
+    int bad64 = 0, bad32 = 0, exempt = 0;
+    for (size_t i = 0; i < progs.size(); ++i) {
+        if (!haveDev) break;
+        const char* why = nullptr;
+        const PatOpWhere w = patOpWhere(progs[i].op, why);
+        if (w != PW_ALL) {
+            ++exempt;
+            std::printf("[checkpatops] EXEMPT   %-14s %s\n", patOpLabel(progs[i].op), why);
+            if (w == PW_HOST_ONLY) continue;
+        }
+        const double h = host[i];
+        // fp64 twin: should track the host closely. fp32 twin is a different precision by
+        // design, so it gets a loose tolerance -- the failure this catches is a SKIPPED
+        // opcode, which lands on a different stack slot entirely, not a last-digit drift.
+        const double tol64 = 1e-9 * (1.0 + std::fabs(h));
+        const double tol32 = 2e-3 * (1.0 + std::fabs(h));
+        const bool okA = !(std::fabs(d64[i] - h) > tol64) || (std::isnan(h) && std::isnan(d64[i]));
+        const bool okB = w == PW_NO_FP32 ||
+                         !(std::fabs(d32[i] - h) > tol32) || (std::isnan(h) && std::isnan(d32[i]));
+        if (!okA || !okB) {
+            if (!okA) ++bad64;
+            if (!okB) ++bad32;
+            std::printf("[checkpatops] MISMATCH %-14s host=%+.9g  fp64=%+.9g  fp32=%+.9g\n",
+                        patOpLabel(progs[i].op), h, d64[i], d32[i]);
+        }
+    }
+    std::printf("[checkpatops] %zu opcodes exercised, %d with an arity the VM cannot state "
+                "from the node alone (skipped), %d exempt by declaration\n",
+                progs.size(), unknownArity, exempt);
+    if (!haveDev) {
+        std::printf("[checkpatops] no CUDA device: host VM only, device twins SKIPPED\n");
+        std::printf("[checkpatops] PASS (host only)\n");
+        return 0;
+    }
+    std::printf("[checkpatops] device fp64 mismatches %d, fp32 mismatches %d\n", bad64, bad32);
+    std::printf("[checkpatops] %s\n", (bad64 || bad32) ? "FAIL" : "PASS");
+    return (bad64 || bad32) ? 1 : 0;
+}
+
+// -checkndgpu: the resident N-D complex re-projected on the GPU must agree with the warp
+// ndwarp::apply computes on the host.
+//
+// This is the pairing that makes the viewer's fast path safe. A drag only changes angles,
+// so the device can hold the complex and re-project it -- but that means the SAME geometry
+// is now derived by two independent implementations, and a divergence would show as the
+// preview quietly disagreeing with what an export or a real render produces. The whole
+// point of the fast path is that you can trust the picture, so it has to be pinned.
+//
+// Compared: every projected vertex position and every per-corner crease normal. The test
+// picks a rotation where nothing projects to zero area, so `apply`'s cull drops nothing and
+// its output triangles line up one-for-one with the complex's, in the same order.
+static int checkNdGpu() {
+#ifndef HAVE_CUDA
+    std::printf("[checkndgpu] built without CUDA — SKIPPED\n");
+    std::printf("[checkndgpu] PASS (skipped)\n");
+    return 0;
+#else
+    ndwarp::Model m;
+    {
+        const Vec3 c[8] = {{-1,-1,-1},{1,-1,-1},{1,1,-1},{-1,1,-1},
+                           {-1,-1, 1},{1,-1, 1},{1,1, 1},{-1,1, 1}};
+        const int q[6][4] = {{0,1,2,3},{5,4,7,6},{4,0,3,7},{1,5,6,2},{4,5,1,0},{3,2,6,7}};
+        for (const auto& f : q) {
+            Tri a; a.v0 = c[f[0]]; a.v1 = c[f[1]]; a.v2 = c[f[2]]; a.finalize(); m.base.push_back(a);
+            Tri b; b.v0 = c[f[0]]; b.v1 = c[f[2]]; b.v2 = c[f[3]]; b.finalize(); m.base.push_back(b);
+        }
+        m.center = Vec3{0, 0, 0};
+        m.radius = std::sqrt(3.0);
+        ndwarp::detail::weld(m.base, m.topo);
+        m.ok = true;
+    }
+    // EVERY fill mode, not one config. The resident path is the only geometry the live
+    // viewer shows once a drag is under way, and it is a second implementation of the warp
+    // -- so a mode it gets wrong would be invisible to any headless render, which always
+    // goes through the host path. That is exactly the class of divergence that has bitten
+    // this feature before.
+    struct Mode { const char* name; ndwarp::Fill fill; ndwarp::Emb src; double amp; };
+    static const Mode kModes[] = {
+        {"extrude:0.3",         ndwarp::Fill::Extrude, ndwarp::Emb::Curvature, 0.3},
+        {"extrude:1.0",         ndwarp::Fill::Extrude, ndwarp::Emb::Curvature, 1.0},
+        {"emboss:curvature",    ndwarp::Fill::Emboss,  ndwarp::Emb::Curvature, 0.7},
+        {"emboss:radius",       ndwarp::Fill::Emboss,  ndwarp::Emb::Radius,    0.7},
+        {"emboss:height",       ndwarp::Fill::Emboss,  ndwarp::Emb::Height,    0.7},
+        {"emboss:noise",        ndwarp::Fill::Emboss,  ndwarp::Emb::Noise,     0.7},
+        {"emboss:u",            ndwarp::Fill::Emboss,  ndwarp::Emb::U,         0.7},
+        {"emboss:v",            ndwarp::Fill::Emboss,  ndwarp::Emb::V,         0.7},
+        {"zero",                ndwarp::Fill::Zero,    ndwarp::Emb::Curvature, 0.0},
+    };
+    const double D2R = PI / 180.0;
+    int failures = 0, ran = 0;
+
+    for (const Mode& md : kModes) {
+        ndwarp::Config cfg; cfg.resize(5);
+        cfg.extra[0].fill = md.fill; cfg.extra[0].src = md.src; cfg.extra[0].amp = md.amp;
+        // A second, different fill on dimension 5 so the two extra axes are never
+        // interchangeable -- a kernel that mixed up the column order would still pass if
+        // both columns held the same thing.
+        cfg.extra[1].fill = ndwarp::Fill::Emboss;
+        cfg.extra[1].src  = ndwarp::Emb::Noise;
+        cfg.extra[1].amp  = 0.4;
+        // Angles chosen so nothing projects edge-on; then apply()'s cull drops nothing and
+        // its output is the complex's triangles in order, which is what lets us compare.
+        cfg.angle[(size_t)ndwarp::planeIndex(5, 0, 1)] = 13.0 * D2R;
+        cfg.angle[(size_t)ndwarp::planeIndex(5, 0, 3)] = 37.0 * D2R;
+        cfg.angle[(size_t)ndwarp::planeIndex(5, 2, 3)] = 21.0 * D2R;
+        cfg.angle[(size_t)ndwarp::planeIndex(5, 1, 4)] = 29.0 * D2R;
+
+        ndwarp::Model mm = m;
+        mm.groups.clear();
+        mm.groups.push_back(ndwarp::Source{"cube", 0, mm.base.size(), 0});
+        Scene scene;
+        scene.meshGroups.resize(1);
+        scene.meshGroups[0].name = "cube";
+        scene.meshGroups[0].triStart = 0;
+        scene.meshGroups[0].triCount = mm.base.size();
+        scene.tris = mm.base;
+        ndwarp::Cache cache;
+        const ndwarp::Stats st = ndwarp::apply(mm, cfg, scene, &cache);
+        if (st.dropped != 0 || cache.tmpl.empty() ||
+            (int)scene.tris.size() != (int)cache.tmpl.size()) {
+            std::printf("[checkndgpu] %-18s cannot pair up (%zu dropped) — SKIPPED\n",
+                        md.name, st.dropped);
+            continue;
+        }
+        const int ntri = (int)cache.tmpl.size(), nv = cache.c.nv, n = cfg.n;
+
+        const std::vector<double> R = ndwarp::rotationMatrix(cfg);
+        std::vector<double> R3n((size_t)3 * n);
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < n; ++j) R3n[(size_t)i * n + j] = R[(size_t)i * n + j];
+
+        raster_cuda::NdResident* nd = raster_cuda::ndUpload(
+            cache.c.pos.data(), nv, n, &cache.tvi[0][0], ntri,
+            cache.voff.data(), cache.vcorner.data(), cfg.creaseDeg);
+        if (!nd) {
+            std::printf("[checkndgpu] no usable CUDA device — SKIPPED\n");
+            std::printf("[checkndgpu] PASS (skipped)\n");
+            return 0;
+        }
+        std::vector<float> gproj((size_t)nv * 3), gnrm((size_t)ntri * 9);
+        const bool ok = raster_cuda::ndProbe(nd, R3n.data(), mm.center.x, mm.center.y,
+                                             mm.center.z, gproj.data(), gnrm.data());
+        raster_cuda::ndDestroy(nd);
+        if (!ok) {
+            std::printf("[checkndgpu] probe launch failed — SKIPPED\n");
+            std::printf("[checkndgpu] PASS (skipped)\n");
+            return 0;
+        }
+
+        const double tol = 2e-4 * mm.radius;
+        int badP = 0, badN = 0;
+        double worstP = 0.0, worstN = 0.0;
+        for (int i = 0; i < ntri; ++i) {
+            const Tri& t = scene.tris[(size_t)i];
+            const Vec3 hp[3] = {t.v0, t.v1, t.v2};
+            const Vec3 hn[3] = {t.n0, t.n1, t.n2};
+            for (int c = 0; c < 3; ++c) {
+                const int v = cache.tvi[(size_t)i][c];
+                const Vec3 gp{gproj[(size_t)v*3+0], gproj[(size_t)v*3+1], gproj[(size_t)v*3+2]};
+                const Vec3 dp = hp[c] - gp;
+                const double ep = std::sqrt(dot(dp, dp));
+                if (ep > worstP) worstP = ep;
+                if (ep > tol) ++badP;
+                const Vec3 gn{gnrm[(size_t)i*9+c*3+0], gnrm[(size_t)i*9+c*3+1],
+                              gnrm[(size_t)i*9+c*3+2]};
+                const Vec3 dn = hn[c] - gn;
+                const double en = std::sqrt(dot(dn, dn));
+                if (en > worstN) worstN = en;
+                if (en > 2e-3) ++badN;
+            }
+        }
+        ++ran;
+        if (badP || badN) ++failures;
+        std::printf("[checkndgpu] %-18s %6d tris  |dpos| %.2e  |dnrm| %.2e  %s\n",
+                    md.name, ntri, worstP, worstN,
+                    (badP || badN) ? "MISMATCH" : "ok");
+    }
+    std::printf("[checkndgpu] %d fill modes compared against the host warp, %d mismatched\n",
+                ran, failures);
+    std::printf("[checkndgpu] %s\n", failures ? "FAIL" : "PASS");
+    return failures ? 1 : 0;
+#endif
+}
+
+static int checkNd() {
+    int fails = 0;
+    auto ok = [&](bool cond, const char* what) {
+        std::printf("[checknd] %s  %s\n", cond ? "ok  " : "FAIL", what);
+        if (!cond) ++fails;
+    };
+    auto approx = [](double a, double b, double e = 1e-9) { return std::fabs(a - b) < e; };
+
+    // ---- plane bookkeeping ---------------------------------------------------
+    ok(ndwarp::planeCount(3) == 3 && ndwarp::planeCount(4) == 6 &&
+       ndwarp::planeCount(6) == 15, "n(n-1)/2 rotation planes (3, 6, 15 for n = 3, 4, 6)");
+    {
+        bool round = true;
+        for (int n = 3; n <= 12; ++n)
+            for (int k = 0; k < ndwarp::planeCount(n); ++k) {
+                int i, j; ndwarp::planeAxes(n, k, i, j);
+                if (ndwarp::planeIndex(n, i, j) != k) round = false;
+            }
+        ok(round, "planeAxes / planeIndex round-trip for n = 3..12");
+    }
+    ok(ndwarp::planeLabel(4, ndwarp::planeIndex(4, 0, 3)) == "xw" &&
+       ndwarp::planeLabel(5, ndwarp::planeIndex(5, 2, 4)) == "zv", "plane labels (xw, zv)");
+
+    // ---- the rotation matrix is orthogonal -----------------------------------
+    {
+        Pcg32 rng; rng.seed(4u, 17u);
+        bool ortho = true, contract = true;
+        for (int n = 4; n <= 8; ++n) {
+            ndwarp::Config cfg; cfg.resize(n);
+            for (double& a : cfg.angle) a = (rng.uniform() * 2.0 - 1.0) * PI;
+            const std::vector<double> R = ndwarp::rotationMatrix(cfg);
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < n; ++j) {
+                    double sum = 0.0;
+                    for (int k = 0; k < n; ++k) sum += R[(size_t)i * n + k] * R[(size_t)j * n + k];
+                    if (!approx(sum, (i == j) ? 1.0 : 0.0, 1e-12)) ortho = false;
+                }
+            if (std::fabs(ndwarp::topLeft3(R, n).det()) > 1.0 + 1e-12) contract = false;
+        }
+        ok(ortho, "R R^T = I for n = 4..8 at random angles");
+        ok(contract, "|det M| <= 1: the projected block can only ever contract");
+    }
+
+    // ---- THE claim the feature is designed around ----------------------------
+    {
+        ndwarp::Config cfg; cfg.resize(4);
+        const double t = 0.7;
+        cfg.angle[(size_t)ndwarp::planeIndex(4, 0, 3)] = t;
+        const ndwarp::Mat3 M = ndwarp::topLeft3(ndwarp::rotationMatrix(cfg), 4);
+        ok(approx(M.m[0], std::cos(t)) && approx(M.m[1], 0) && approx(M.m[2], 0) &&
+           approx(M.m[3], 0) && approx(M.m[4], 1) && approx(M.m[5], 0) &&
+           approx(M.m[6], 0) && approx(M.m[7], 0) && approx(M.m[8], 1),
+           "a zero-filled x-w rotation projects to exactly diag(cos t, 1, 1)");
+        ok(cfg.isLinear(), "a zero-filled config reports itself linear");
+    }
+    {
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.angle[(size_t)ndwarp::planeIndex(4, 0, 3)] = PI;
+        ok(approx(ndwarp::topLeft3(ndwarp::rotationMatrix(cfg), 4).det(), -1.0, 1e-12),
+           "180 deg in x-w gives det = -1: the model's MIRROR image");
+    }
+    {
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.angle[(size_t)ndwarp::planeIndex(4, 0, 3)] = PI * 0.5;
+        const ndwarp::Mat3 M = ndwarp::topLeft3(ndwarp::rotationMatrix(cfg), 4);
+        ndwarp::Mat3 NT;
+        ok(approx(M.det(), 0.0, 1e-12) && !ndwarp::inverseTranspose(M, NT),
+           "90 deg in x-w is singular: the model is edge-on, a flat sheet");
+    }
+    {
+        ndwarp::Config c4; c4.resize(4); c4.angle[(size_t)ndwarp::planeIndex(4, 0, 3)] = 0.6;
+        ndwarp::Config c5; c5.resize(5);
+        c5.angle[(size_t)ndwarp::planeIndex(5, 0, 3)] = 0.6;
+        c5.angle[(size_t)ndwarp::planeIndex(5, 1, 4)] = 0.6;
+        ok(approx(ndwarp::topLeft3(ndwarp::rotationMatrix(c4), 4).det(), std::cos(0.6)) &&
+           approx(ndwarp::topLeft3(ndwarp::rotationMatrix(c5), 5).det(), std::cos(0.6) * std::cos(0.6)),
+           "one squashed axis at n = 4, two at n = 5");
+    }
+
+    // ---- welding, the prism, and the emboss signals --------------------------
+    // A unit cube: V = 8, E = 18, F = 12 (Euler 8 - 18 + 12 = 2).
+    ndwarp::Model m;
+    {
+        const Vec3 c[8] = {{-1,-1,-1},{1,-1,-1},{1,1,-1},{-1,1,-1},
+                           {-1,-1, 1},{1,-1, 1},{1,1, 1},{-1,1, 1}};
+        const int q[6][4] = {{0,1,2,3},{5,4,7,6},{4,0,3,7},{1,5,6,2},{4,5,1,0},{3,2,6,7}};
+        for (const auto& f : q) {
+            Tri a; a.v0 = c[f[0]]; a.v1 = c[f[1]]; a.v2 = c[f[2]]; a.finalize(); m.base.push_back(a);
+            Tri b; b.v0 = c[f[0]]; b.v1 = c[f[2]]; b.v2 = c[f[3]]; b.finalize(); m.base.push_back(b);
+        }
+        m.center = Vec3{0, 0, 0};
+        m.radius = std::sqrt(3.0);
+        ndwarp::detail::weld(m.base, m.topo);
+        m.ok = true;
+    }
+    const size_t V = (size_t)m.topo.nv, E = m.topo.edge.size() / 2, F = m.base.size();
+    ok(V == 8 && E == 18 && F == 12 && V - E + F == 2,
+       "a cube welds to V=8, E=18, F=12 (Euler characteristic 2)");
+    {
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.extra[0].fill = ndwarp::Fill::Extrude; cfg.extra[0].amp = 0.5;
+        const ndwarp::Complex c = ndwarp::buildComplex(m, cfg);
+        // A CLOSED surface has no boundary, and the boundary of S x [0,h] is
+        // S u (S+h) u (dS x [0,h]) -- so with dS empty there are no side walls and the
+        // sweep is just the two lids. Emitting a wall per EDGE would build the CW
+        // 2-skeleton instead, which is a different object: correct as a complex, wrong as
+        // a surface, and every extra wall is a partition buried inside the solid that
+        // -see-through then charges a glass crossing for.
+        ok(ndwarp::projectedTriCount(m, cfg) == 24 && c.tri.size() / 3 == 24 &&
+           (size_t)c.nv == 2 * V && c.edge.size() / 2 == 2 * E + V,
+           "closed cube extrudes to 2F = 24 triangles (no side walls), 2V vertices");
+    }
+    {
+        // The OTHER sweep: `skeleton` keeps the full CW 2-skeleton, so every edge is swept
+        // whether it is on the rim or buried. That is the tesseract depiction -- a 4-cube
+        // is drawn as 24 squares, 12 of which are swept cube edges -- and it is what makes
+        // a prism read as one connected object instead of two copies drifting apart. On a
+        // triangulated cube the 18 edges include 6 face diagonals, so 2F + 2E = 60.
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.extra[0].fill = ndwarp::Fill::Skeleton; cfg.extra[0].amp = 0.5;
+        const ndwarp::Complex c = ndwarp::buildComplex(m, cfg);
+        ok(ndwarp::projectedTriCount(m, cfg) == 60 && c.tri.size() / 3 == 60 &&
+           (size_t)c.nv == 2 * V && c.edge.size() / 2 == 2 * E + V,
+           "skeleton sweeps EVERY edge: 2F + 2E = 60 triangles, 2V vertices");
+        bool centred = true;
+        for (int v = 0; v < c.nv; ++v)
+            if (!approx(std::fabs(c.pos[(size_t)v * 4 + 3]), 0.5 * 0.5 * m.radius, 1e-12))
+                centred = false;
+        ok(centred, "the sweep is centred on the original (+/- depth/2)");
+    }
+    {
+        // The other half of the rule, which a closed cube cannot exercise: an OPEN mesh
+        // does have a boundary, and sweeping it is what closes the prism. One quad =
+        // 2 triangles, 4 vertices, 5 edges, of which 4 are boundary (the diagonal is
+        // shared). So 2F + 2B = 4 + 8 = 12.
+        ndwarp::Model q;
+        const Vec3 p[4] = {{-1,-1,0},{1,-1,0},{1,1,0},{-1,1,0}};
+        Tri a; a.v0 = p[0]; a.v1 = p[1]; a.v2 = p[2]; a.finalize(); q.base.push_back(a);
+        Tri b; b.v0 = p[0]; b.v1 = p[2]; b.v2 = p[3]; b.finalize(); q.base.push_back(b);
+        q.center = Vec3{0, 0, 0}; q.radius = std::sqrt(2.0);
+        ndwarp::detail::weld(q.base, q.topo);
+        q.ok = true;
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.extra[0].fill = ndwarp::Fill::Extrude; cfg.extra[0].amp = 0.5;
+        ok(ndwarp::boundaryEdgeCount(q) == 4, "an open quad has 4 boundary edges of 5");
+        ok(ndwarp::projectedTriCount(q, cfg) == 12 &&
+           ndwarp::buildComplex(q, cfg).tri.size() / 3 == 12,
+           "open quad extrudes to 2F + 2B = 12 triangles (its boundary IS swept)");
+    }
+    {
+        ndwarp::Config cfg; cfg.resize(5);
+        cfg.extra[0].fill = ndwarp::Fill::Extrude; cfg.extra[0].amp = 0.5;
+        cfg.extra[1].fill = ndwarp::Fill::Extrude; cfg.extra[1].amp = 0.5;
+        ok(ndwarp::projectedTriCount(m, cfg) == 48 &&
+           ndwarp::buildComplex(m, cfg).tri.size() / 3 == 48,
+           "two extrusions compose: 12 -> 24 -> 48 (each sweep closes, so none add walls)");
+    }
+    {
+        // Two skeleton sweeps compose the way the 2-skeleton always has.
+        ndwarp::Config cfg; cfg.resize(5);
+        cfg.extra[0].fill = ndwarp::Fill::Skeleton; cfg.extra[0].amp = 0.5;
+        cfg.extra[1].fill = ndwarp::Fill::Skeleton; cfg.extra[1].amp = 0.5;
+        ok(ndwarp::projectedTriCount(m, cfg) == 208 &&
+           ndwarp::buildComplex(m, cfg).tri.size() / 3 == 208,
+           "two skeleton sweeps compose: 12 -> 60 -> 208 triangles");
+    }
+    {
+        bool normed = true;
+        for (ndwarp::Emb e : {ndwarp::Emb::Curvature, ndwarp::Emb::Radius,
+                              ndwarp::Emb::Height, ndwarp::Emb::Noise}) {
+            const std::vector<double>& sig = ndwarp::embossSignal(m, e, 4.0);
+            double mean = 0.0, peak = 0.0;
+            for (double v : sig) { mean += v; peak = std::max(peak, std::fabs(v)); }
+            mean /= (double)sig.size();
+            // A perfectly uniform signal (a cube has no curvature variation) normalizes to
+            // exactly zero, which is the honest answer rather than a divide by nothing.
+            if (!approx(mean, 0.0, 1e-9) || !(peak == 0.0 || approx(peak, 1.0, 1e-9))) normed = false;
+        }
+        ok(normed, "every emboss signal is zero-mean and unit-peak (or identically zero)");
+    }
+    {
+        ndwarp::Config cfg; cfg.resize(4);
+        cfg.extra[0].fill = ndwarp::Fill::Emboss;
+        cfg.extra[0].src  = ndwarp::Emb::Noise;
+        cfg.extra[0].amp  = 0.5;
+        const ndwarp::Complex c = ndwarp::buildComplex(m, cfg);
+        bool any4th = false;
+        for (int v = 0; v < c.nv; ++v)
+            if (std::fabs(c.pos[(size_t)v * 4 + 3]) > 1e-12) any4th = true;
+        ok(any4th && !cfg.isLinear(),
+           "an embossed lift puts real content in the 4th coordinate (so it is not affine)");
+    }
+    {
+        // The edge-on report: a filled axis contributes nothing until a plane containing
+        // it is turned, which is what makes an extrusion look like it did nothing.
+        ndwarp::Config cfg; cfg.resize(5);
+        cfg.extra[1].fill = ndwarp::Fill::Extrude; cfg.extra[1].amp = 0.5;   // dim 4 = v
+        std::vector<double> R = ndwarp::rotationMatrix(cfg);
+        const bool hidden = ndwarp::axisVisibility(R, 5, 4) < 1e-9;
+        cfg.angle[(size_t)ndwarp::planeIndex(5, 2, 4)] = 0.6;                // turn zv
+        R = ndwarp::rotationMatrix(cfg);
+        const bool shown = ndwarp::axisVisibility(R, 5, 4) > 0.5;
+        ok(hidden && shown, "an extruded axis is edge-on until a plane containing it turns");
+    }
+
+    std::printf("[checknd] %s (%d failure%s)\n", fails ? "FAILED" : "PASS",
+                fails, fails == 1 ? "" : "s");
+    return fails ? 1 : 0;
+}
+
 static int checkFluoro() {
     Material m = makeFluoroMaterial();
 
@@ -3110,6 +3659,169 @@ static int checkGrating() {
     return pass ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------------------
+// PHOTON-MAP GRID self-test  (-checkpmgrid; src/photonmap.h)
+//
+// The mode-M / SPPM gather is a radius query over a lattice, and a lattice bug does not
+// crash — it silently returns FEWER photons than it should, which reads as a dim or noisy
+// image, not as a failure. So the query is checked here against brute force, which is the
+// only reference that cannot share a bug with it.
+//
+// The configuration is chosen to be the one that used to be IMPOSSIBLE: a small radius over
+// a large, strongly anisotropic scene. Until 0.199.6 the lattice was dense — one int per
+// nx*ny*nz cell — so this case allocated an array in the tens of billions of entries and the
+// map defended itself by inflating the radius until the array fit. That inflation is exactly
+// what smeared caustics into grey veils. The test therefore also PRINTS the cell count the
+// dense lattice would have demanded, so the regression is visible as a number and not just as
+// a passing assertion.
+static int checkPmGrid() {
+    bool pass = true;
+    auto chk = [&](const char* what, bool ok) {
+        std::printf("[checkpmgrid] %-58s (%s)\n", what, ok ? "ok" : "BAD");
+        if (!ok) pass = false;
+    };
+
+    // A deliberately awkward scene: 60 m across in x/z, 3 m tall, photons concentrated on a
+    // warped sheet (as real photons are — they live on surfaces) plus a dense "caustic" blob
+    // that is 2000x tighter than the rest, so the density statistic has the bimodality the
+    // median-radius rule exists to cope with.
+    const int N = 120000;
+    PhotonMap pm;
+    pm.pos.resize(N); pm.photons.resize(N);
+    Pcg32 rng; rng.seed(0x9E3779B9u, 0x5BF03635u);
+    for (int i = 0; i < N; ++i) {
+        Vec3 p;
+        if (i % 10 == 0) {                                   // the tight caustic blob
+            p = Vec3{7.0 + (rng.uniform() - 0.5) * 0.06,
+                     1.0 + (rng.uniform() - 0.5) * 0.01,
+                     3.0 + (rng.uniform() - 0.5) * 0.06};
+        } else {                                             // the broad warped sheet
+            const double x = (rng.uniform() - 0.5) * 60.0, z = (rng.uniform() - 0.5) * 60.0;
+            p = Vec3{x, 0.4 * std::sin(0.3 * x) + 0.3 * std::cos(0.21 * z), z};
+        }
+        pm.pos[i] = p;
+        pm.photons[i] = Photon{Vec3{0, 1, 0}, (float)(0.5 + rng.uniform()),
+                               (float)(400.0 + 300.0 * rng.uniform())};
+    }
+    const std::vector<Vec3> posRef = pm.pos;   // brute force must not read the permuted array
+
+    // 1. EXACT AGREEMENT WITH BRUTE FORCE. Not "similar counts" — the same SET of photons.
+    // Identity is by position (the build permutes indices), and positions here are distinct
+    // draws, so a multiset of positions is a faithful stand-in for the set of photons.
+    const double r = 0.02;                    // 3 cm scene feature over a 60 m scene
+    pm.build(r);
+    std::printf("[checkpmgrid] %d photons, r=%g, bbox %dx%dx%d cells -> a DENSE lattice would "
+                "need %.3g ints (%.1f GB); hashed table holds %lld\n",
+                N, r, pm.nx, pm.ny, pm.nz,
+                (double)pm.nx * pm.ny * pm.nz, (double)pm.nx * pm.ny * pm.nz * 4.0 / 1e9,
+                pm.bucketCount());
+
+    // Vec3 has no operator==/< (it is a maths type, not a key), so canonicalise to a sorted
+    // vector of triples and compare that. Bit-exact on purpose: brute force and the grid read
+    // the same stored doubles, so anything but exact equality is a genuine disagreement.
+    auto sortedKeys = [](std::vector<Vec3> v) {
+        std::vector<std::array<double, 3>> k(v.size());
+        for (size_t i = 0; i < v.size(); ++i) k[i] = {v[i].x, v[i].y, v[i].z};
+        std::sort(k.begin(), k.end());
+        return k;
+    };
+    size_t mismatches = 0, totalFound = 0;
+    {
+        Pcg32 qr; qr.seed(0xC0FFEEu, 0x1234u);
+        for (int q = 0; q < 400; ++q) {
+            // Half the probes sit ON a photon (where a gather really lands), a quarter float
+            // freely in the box, and a quarter sit WELL OUTSIDE it — the outside case is the
+            // one the old clamped cellCoord got subtly wrong, folding the query onto the edge
+            // cell and dropping the far row of its neighbourhood.
+            Vec3 p;
+            if (q % 4 < 2)      p = posRef[(size_t)(qr.uniform() * (N - 1))];
+            else if (q % 4 == 2) p = Vec3{(qr.uniform() - 0.5) * 62.0, (qr.uniform() - 0.5) * 3.0,
+                                          (qr.uniform() - 0.5) * 62.0};
+            else                 p = Vec3{(qr.uniform() - 0.5) * 200.0, (qr.uniform() - 0.5) * 200.0,
+                                          (qr.uniform() - 0.5) * 200.0};
+            std::vector<Vec3> got, want;
+            pm.queryR(p, r, [&](const Photon&, double, int k) { got.push_back(pm.pos[k]); });
+            for (const Vec3& c : posRef) { Vec3 d = p - c; if (dot(d, d) <= r * r) want.push_back(c); }
+            totalFound += want.size();
+            if (sortedKeys(got) != sortedKeys(want)) ++mismatches;
+        }
+    }
+    chk("radius query == brute force (400 probes, exact photon sets)",
+        mismatches == 0 && totalFound > 0);
+    std::printf("[checkpmgrid] brute-force cross-check visited %zu photons across the probes\n",
+                totalFound);
+
+    // 2. THE PARTITION IS COMPLETE. Every photon lands in exactly one bucket run, and the
+    // runs tile [0, N) — a counting sort that drops or duplicates a photon would still pass
+    // most spot queries.
+    {
+        bool ok = (pm.cellStart.front() == 0) && (pm.cellStart.back() == N);
+        for (size_t b = 1; b < pm.cellStart.size() && ok; ++b)
+            if (pm.cellStart[b] < pm.cellStart[b - 1]) ok = false;
+        // and every photon is findable in the bucket its own coordinate hashes to
+        for (int i = 0; i < N && ok; ++i) {
+            int ix, iy, iz; pm.cellCoord(pm.pos[i], ix, iy, iz);
+            const unsigned c = pm.cellIndex(ix, iy, iz);
+            if (i < pm.cellStart[c] || i >= pm.cellStart[c + 1]) ok = false;
+        }
+        chk("bucket runs tile [0,N) and every photon sits in its own bucket", ok);
+    }
+
+    // 3. THE RADIUS THE DENSITY ASKS FOR IS THE RADIUS DELIVERED. This is the actual bug
+    // fix: buildAuto used to grow r1 back until a dense cell array fit, so on a scene this
+    // size the answer was set by the memory guard rather than by the photons. Ask for a very
+    // fine target and check we land on the analytic rescale (r0*sqrt(k/n0)) or on the
+    // deliberate two-octave clamp — never coarser.
+    {
+        const double r0 = 0.6547;                       // the gallery_rain starting radius
+        bool ok = true;
+        // Two targets: a mild one the old guard would also have allowed, and a fine one that
+        // lands on the deliberate r0/64 clamp — the second is the case the guard used to
+        // destroy, so the old lattice's answer is computed alongside for contrast.
+        for (double kAt1M : {4.0, 0.02}) {
+            double nProbe = 0, kTarget = 0;
+            PhotonMap pm2; pm2.pos = posRef; pm2.photons = pm.photons;
+            const double got = pm2.buildAuto(r0, kAt1M, &nProbe, &kTarget);
+            const double wanted = std::min(std::max(r0 * std::sqrt(kTarget / nProbe), r0 / 64.0),
+                                           r0 * 4.0);
+            // What the removed guard would have returned: grow by 1.25x until the dense cell
+            // array fits max(1.6e7, 2*N). The probe binning's padded bbox is the extent.
+            double old = wanted;
+            {
+                const double ex = 60.6, ey = 3.6, ez = 60.6;   // the generated scene's extent
+                const double cap = std::max(1.6e7, 2.0 * (double)N);
+                for (int g = 0; g < 64; ++g) {
+                    if (std::ceil(ex/old) * std::ceil(ey/old) * std::ceil(ez/old) <= cap) break;
+                    old *= 1.25;
+                }
+            }
+            std::printf("[checkpmgrid] buildAuto k@1M=%-5g: probe n0=%.0f target k=%.3g -> "
+                        "r=%.6g  (density asks %.6g; the removed guard would have forced "
+                        "%.6g, %.1fx too coarse)\n",
+                        kAt1M, nProbe, kTarget, got, wanted, old, old / wanted);
+            if (!(nProbe > 0 && std::abs(got / wanted - 1.0) < 1e-9)) ok = false;
+        }
+        chk("buildAuto delivers the density-chosen radius (no memory guard)", ok);
+    }
+
+    // 4. DETERMINISM. Same photons in, same lattice out — mode M's -savemap/-loadmap contract
+    // depends on a rebuild reproducing the original run, and the median probe is only
+    // order-independent if the binning is.
+    {
+        PhotonMap a, b;
+        a.pos = posRef; a.photons = pm.photons;
+        b.pos = posRef; b.photons = pm.photons;
+        std::reverse(b.pos.begin(), b.pos.end());       // feed the SAME set in a different order
+        std::reverse(b.photons.begin(), b.photons.end());
+        a.build(r); b.build(r);
+        chk("median neighbour count is independent of input order",
+            a.medianNeighborCount() == b.medianNeighborCount());
+    }
+
+    std::printf("[checkpmgrid] %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 // Deterministic RGB -> reflectance upsampling self-test (Jakob-Hanika sigmoid
 // fit, src/upsample.h). Each colour is fitted to sigmoid coefficients, the
 // resulting reflectance is integrated under D65 through the CIE observer, and
@@ -3459,7 +4171,79 @@ static int checkUpsample() {
                     img.size(), bad, done ? "" : " (STOPPED early)");
     }
 
-    bool pass = passA && passB && passW && passC && passD && passE && passF && passG && passH && passI;
+    // (j) OVER-UNITY TRIPLES ARE FACTORED, NOT CLAMPED.
+    //
+    // The five upsamplers above all model a reflectance, so each of them used to clamp its
+    // input to [0,1] — and that silently destroyed every FTSL spectral slot that is a
+    // physically unbounded COEFFICIENT rather than a reflectance (`absorb`, a medium's
+    // `sigma_a`/`sigma_s`, a hair's `sigma_a`, `substrate_k`, `ior`). `absorb rgb 22.3 79.3
+    // 70.6` became (1,1,1): a flat, colourless 1/m absorption, i.e. clear glass where a
+    // saturated gem was authored. upsample::gamutSplit now factors the magnitude out instead.
+    //
+    // Two properties are asserted, and they are the two the fix has to keep together:
+    //   * SCALE EQUIVARIANCE ABOVE THE GAMUT — for a triple whose largest component is already
+    //     1, upsampling m*(r,g,b) gives exactly m times the spectrum of (r,g,b), for every
+    //     head and every m >= 1. That is the whole point: hue and the relative depth between
+    //     channels survive an arbitrary magnitude instead of collapsing to flat white.
+    //   * IN-GAMUT INPUT IS UNTOUCHED — gamutSplit's magnitude is max(r,g,b,1), so a triple
+    //     that was already legal divides and multiplies by exactly 1.0 and no existing scene
+    //     moves. Asserted on gamutSplit directly with an exact `!=` rather than a tolerance,
+    //     because "1.0 is exact in IEEE" IS the argument, and asserted at the source rather
+    //     than through a head so a future head can't quietly opt out of it.
+    //
+    // NOTE ON WHY THE REFERENCE IS NORMALISED. Equivariance is a property of the OVER-UNITY
+    // regime only, and deliberately so: below 1 the upsamplers are still exactly the bounded
+    // reflectance solvers they always were, and f(0.5,0.5,0.5) is NOT half of f(1,1,1) — the
+    // fits are non-linear in the colour. gamutSplit's floor of 1.0 is what draws that line. So
+    // the reference for each colour is scaled to peak at 1 first; testing against an in-gamut
+    // reference would be asserting a linearity the solver never claimed.
+    bool passJ = true;
+    {
+        Spectrum (*const heads[])(double, double, double) = {
+            &rgbToReflectanceJH,
+            &rgbToReflectanceSmits,
+            &rgbToReflectanceBox,
+            &rgbToReflectanceMeng,
+        };
+        Vec3 cols[] = {{0.28, 1.00, 0.89}, {0.55, 0.30, 0.12}, {1.00, 0.20, 0.20},
+                       {0.10, 0.70, 1.00}, {0.50, 0.50, 0.50}};
+        for (Vec3& c : cols) {                       // normalise each reference to peak at 1
+            const double mx = std::max(c.x, std::max(c.y, c.z));
+            c.x /= mx; c.y /= mx; c.z /= mx;
+        }
+        const double mags[] = {1.0, 3.0, 79.3, 250.0};
+        double worst = 0.0;
+        for (auto f : heads) {
+            for (const Vec3& c : cols) {
+                Spectrum base = f(c.x, c.y, c.z);
+                for (double m : mags) {
+                    Spectrum scaled = f(c.x * m, c.y * m, c.z * m);
+                    for (double w = 400.0; w <= 700.0; w += 10.0) {
+                        const double a = m * base(w), b = scaled(w);
+                        const double d = std::abs(a - b) / std::max(1e-12, std::abs(a));
+                        if (d > worst) worst = d;
+                    }
+                }
+            }
+        }
+        if (worst > 1e-12) passJ = false;
+
+        // The in-gamut no-op, at the source.
+        bool noop = true;
+        const Vec3 inGamut[] = {{0.0, 0.0, 0.0}, {0.5, 0.5, 0.5}, {1.0, 1.0, 1.0},
+                                {0.28, 1.00, 0.89}, {0.7, 0.45, 0.2}, {1.0, 0.0, 0.0}};
+        for (const Vec3& c : inGamut) {
+            double r = c.x, g = c.y, b = c.z;
+            if (upsample::gamutSplit(r, g, b) != 1.0 || r != c.x || g != c.y || b != c.z)
+                noop = false;
+        }
+        if (!noop) passJ = false;
+        std::printf("[checkupsample] over-unity factoring: max relative error %.3g; "
+                    "in-gamut no-op %s\n", worst, noop ? "exact" : "BROKEN");
+    }
+
+    bool pass = passA && passB && passW && passC && passD && passE && passF && passG && passH
+             && passI && passJ;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
@@ -11088,18 +11872,169 @@ static double g_pmRadiusFactor = 0.02;
 static bool   g_pmAutoRadius = true;
 static double g_pmAutoCount  = 200.0;   // calibrated to today's look — see PhotonMap::buildAuto
 
+// CAUSTIC MAP (mode M; CLI -caustics / -nocaustics, -pmccount). Jensen's two-map scheme:
+// deposits whose path reads L·S⁺·D — focused by at least one specular/near-specular vertex
+// and never scattered since the light (see photonVertexKind in render.h) — go to a SECOND
+// map, gathered at its own radius, and the two estimates are summed.
+//
+// Why this is not optional polish. The adaptive radius above solves for one population, and a
+// scene with caustics has two that differ by orders of magnitude in density: a gem's focused
+// light lands as a thin bright filament, the ambient illumination as a broad wash. One radius
+// must serve both, and the answer it picks is set by the majority — the diffuse wash — so the
+// caustic gets convolved with a kernel far wider than the feature itself and disappears into
+// the background. Forcing that one radius down instead (`-pmcount 11`) does bring the caustic
+// back, and takes the entire rest of the image to grain with it. Two maps is the fix, and it
+// is exactly what Jensen's original scheme does.
+//
+// ON by default: it costs one extra map and strictly improves any scene that has caustics,
+// while a scene with none deposits an empty caustic map and gathers nothing extra.
+static bool   g_pmCaustics    = true;
+// Target gather population for the CAUSTIC map, the -pmcount analogue. Deliberately smaller
+// than the global 200: a caustic is a high-contrast feature where blur is far more
+// objectionable than noise (the reverse of ambient illumination), and its photons are much
+// denser per unit area, so a smaller k still lands a usable signal-to-noise ratio.
+static double g_pmCausticCount = 50.0;
+
+// PER-QUERY ADAPTIVE GATHER on the caustic map (CLI -pmadaptive / -nopmadaptive,
+// -pmadaptivek). ON by default. See PhotonMap::adaptiveRadius for the full argument; the
+// short version is that the two-map split above gives caustics their own radius but one
+// radius per MAP is still ONE radius, and a caustic map holds two populations — the focused
+// filament and the broad specular wash that any L·S⁺·D path deposits all over a gallery full
+// of glass and metal. buildAuto's median-density probe is decided by the wash, so on
+// gallery_rain the caustic radius pinned to the global map's 0.1775 m, 5-10x wider than the
+// caustics, and the axicon's caustic peaked at 2.9x its cap's median against the mode-D
+// reference's 9.7x — present, correctly coloured, and smeared flat. Shrinking the map-wide
+// radius instead recovers the peak (8.1x at r/8) and grains the rest of the frame into
+// chromatic speckle. Solving per query is what gets both.
+//
+// -pmadaptivek overrides the target population; <= 0 (default) means "the same k the map's
+// own radius was solved for", i.e. g_pmCausticCount * cbrt(stored/1e6).
+static bool   g_pmAdaptive  = true;
+static double g_pmAdaptiveK = 0.0;
+
+// ---- Aimed caustic emission (Jensen's projection map; src/causticaim.h) -------------------
+// The storage half of the two-map split above gives caustics their own radius; it does
+// nothing about the fact that hardly any photon ever reaches a dielectric in the first place
+// (0.12 % of deposits on gallery_rain). `-causticn` runs a SECOND photon pass whose emission
+// is importance-sampled towards the scene's focusing geometry, MIS-combined with the main
+// pass by the balance heuristic so it is a pure variance reduction, never a bias.
+//
+// -1 means "auto": a quarter of `-n`, spent where essentially all of the caustic signal is.
+// 0 turns it off, which is bit-for-bit the pre-0.203.0 render.
+static long long g_causticAimN = -1;
+// How many bounding spheres the focusing geometry is clustered into. More targets track the
+// geometry more tightly (fewer aimed photons land on empty space) at a linear cost in the
+// per-photon pdf evaluation, which is a handful of dot products over a cache-hot array.
+static int    g_causticAimK   = 64;
+
+// Build the aim map for this scene, or leave it empty when aiming is off / there is nothing
+// focusing to aim at. Says out loud what it found, because "the caustic pass did nothing" and
+// "the caustic pass found no dielectrics" look identical in the output otherwise.
+static caim::AimMap buildAimMap(const Scene& scene, long long N, long long& nAimedOut,
+                                const char* tag) {
+    caim::AimMap am;
+    nAimedOut = 0;
+    if (!g_pmCaustics || g_causticAimN == 0 || N <= 0) return am;
+    am = caim::build(scene, g_causticAimK);
+    if (am.empty()) {
+        std::printf("%s caustic aim: no focusing geometry — aimed pass skipped.\n", tag);
+        return am;
+    }
+    nAimedOut = (g_causticAimN > 0) ? g_causticAimN : N / 4;
+    if (nAimedOut <= 0) { am.targets.clear(); return am; }
+    std::printf("%s caustic aim: %lld focusing prim%s in %zu target sphere%s "
+                "(sum r^2 = %.4g), %lld aimed photons (%.0f%% of -n).\n",
+                tag, am.nPrims, am.nPrims == 1 ? "" : "s",
+                am.targets.size(), am.targets.size() == 1 ? "" : "s",
+                am.sumR2, nAimedOut, 100.0 * (double)nAimedOut / (double)N);
+    return am;
+}
+
 // Bin a freshly-deposited (or freshly-loaded) photon map, honouring the adaptive-radius
 // setting, and say out loud what radius it settled on — the radius printed before the
 // deposit is only the starting point, and a silently-different one would be baffling when
 // comparing renders. Returns the radius actually used.
-static double buildPhotonMap(PhotonMap& pm, double radius, const char* tag) {
-    if (!g_pmAutoRadius) { pm.build(radius); return radius; }
+//
+// `kAt1M` overrides the adaptive target; <= 0 means "use g_pmAutoCount" (the global map).
+// `rMax` caps the chosen radius; see PhotonMap::buildAuto (the caustic map passes the global
+// map's radius, because a blurrier caustic map is worse than no split at all).
+static double buildPhotonMap(PhotonMap& pm, double radius, const char* tag, double kAt1M = 0.0,
+                             double rMax = 0.0) {
+    if (!g_pmAutoRadius) { pm.build(rMax > 0.0 ? std::min(radius, rMax) : radius);
+                           return pm.radius; }
+    if (kAt1M <= 0.0) kAt1M = g_pmAutoCount;
     double nProbe = 0.0, kTarget = 0.0;
-    const double r = pm.buildAuto(radius, g_pmAutoCount, &nProbe, &kTarget);
+    const double r = pm.buildAuto(radius, kAt1M, &nProbe, &kTarget, rMax);
     std::printf("%s adaptive gather radius: %.4g -> %.4g (a typical gather saw %.0f photons "
                 "at the starting radius; target %.0f for %zu stored)\n",
                 tag, radius, r, nProbe, kTarget, pm.photons.size());
     return r;
+}
+
+// The caustic map's twin of buildPhotonMap. Separate because an EMPTY caustic map must not go
+// through buildAuto at all: with no photons the probe measures nothing, and the returned
+// radius would be meaningless noise printed as if it meant something.
+// `rGlobal` is the radius the GLOBAL map settled on, and caps this one (see buildAuto's rMax).
+static void buildCausticMap(PhotonMap& pmC, double radius, const char* tag, double rGlobal) {
+    if (pmC.photons.empty()) {
+        std::printf("%s caustic map: 0 photons (no L-S+-D path in this scene)\n", tag);
+        return;
+    }
+    char t2[96];
+    std::snprintf(t2, sizeof t2, "%s caustic map:", tag);
+    buildPhotonMap(pmC, radius, t2, g_pmCausticCount, rGlobal);
+    // Per-query adaptive gather (see g_pmAdaptive). The radius just chosen becomes a
+    // MAXIMUM: every gather tightens from it to whatever holds `k` photons locally, so a
+    // caustic filament is estimated at its own scale while the sparse wash around it keeps
+    // the wide kernel it needs to stay smooth. k matches buildAuto's own target so the two
+    // agree about what "a well-populated gather" means.
+    pmC.kGather = 0.0;
+    if (g_pmAdaptive) {
+        const double k = (g_pmAdaptiveK > 0.0)
+                             ? g_pmAdaptiveK
+                             : g_pmCausticCount * std::cbrt((double)pmC.photons.size() / 1.0e6);
+        if (k > 0.0) {
+            pmC.kGather = k;
+            std::printf("%s caustic map: per-query adaptive gather ON — target %.0f photons, "
+                        "radius %.4g down to %.4g as density allows\n",
+                        tag, k, pmC.radius, pmC.radius / 256.0);
+        }
+    }
+    // Stored flux per emitted path. This is the quantity the aimed pass (`-causticn`) is
+    // supposed to leave ALONE while changing only its variance, so printing it is the one
+    // cheap check that the MIS weighting is right: aim harder and this number must not move,
+    // only the photon count and the noise. Long double because a caustic map can hold a
+    // hundred million records whose powers span many orders of magnitude.
+    long double flux = 0.0L;
+    for (const Photon& p : pmC.photons) flux += (long double)p.power;
+    if (pmC.nEmitted > 0)
+        std::printf("%s caustic map: stored flux/emitted = %.6Lg (%zu photons)\n",
+                    tag, flux / (long double)pmC.nEmitted, pmC.photons.size());
+}
+
+// REFRESH rebuilds of the two photon maps (mode M's light-side refresh; see g_beamFreeze).
+// A refresh redraws the maps under a fresh salt and bins them at EXACTLY the radii epoch 0
+// settled on, silently. Both halves of that matter:
+//
+//   * PINNED RADIUS. Re-running buildAuto per epoch would re-answer a question already
+//     answered, with a fresh probe's noise on the answer. Worse, photon mapping is BIASED at
+//     a finite radius, so each epoch would then estimate a slightly DIFFERENT quantity and
+//     their average would not be an average of one estimator. Pinning the radius makes every
+//     epoch the same estimator, which is what makes averaging them plain variance reduction
+//     with the bias left exactly where epoch 0 put it.
+//   * SILENT. The adaptive-radius and stored-flux lines describe the map's SHAPE, which does
+//     not change across epochs — only the realization does. Re-printing them dozens of times
+//     would bury the -interval status lines under a description that never changes.
+static void rebuildPhotonMapAt(PhotonMap& pm, double r) {
+    if (r > 0.0) pm.build(r);
+}
+// The caustic map's twin. `kGather` is the per-query adaptive-gather target chosen at epoch 0
+// (0 when -pmadaptive is off); PhotonMap::build does not set it, so it is carried across by
+// hand or every refresh would silently drop mode M back to a fixed-radius caustic gather.
+static void rebuildCausticMapAt(PhotonMap& pmC, double r, double kGather) {
+    if (pmC.photons.empty() || !(r > 0.0)) return;
+    pmC.build(r);
+    pmC.kGather = kGather;
 }
 
 // Mode-M PHOTON BEAMS (CLI -beams, shared with the mode-A/B splat gather of the same name).
@@ -11115,13 +12050,29 @@ static double buildPhotonMap(PhotonMap& pm, double radius, const char* tag) {
 //   DO NOT reach for the photon map's radius here. A beam is a 1D object blurred in 1D, so a
 //   camera ray gathers (pi/2) * r * L_ray * S / V beams — LINEAR in r and in the total stored
 //   beam length S. At the surface map's radius that is tens of thousands of beams per ray on
-//   an ordinary fog box, and the render never finishes. buildAuto solves the same expression
-//   for r at a target population instead (r = K*A/(2 pi S)) and then probes to correct it.
-//   This file used to pass `pmRadius` and that is exactly the bug. See photonbeams.h.
+//   an ordinary fog box, and the render never finishes. This file used to pass `pmRadius` and
+//   that is exactly the bug. See photonbeams.h.
 //
-// `g_beamK` is that target population: beams gathered per camera segment. It plays the same
-// role for the volume estimate that `-pmcount` plays for the surface one — bigger is smoother
-// and slower, and the cost is strictly linear in it.
+// `g_beamBlur` sizes it instead, as a fraction of each MEDIUM'S OWN measured mean free path
+// (mfp_m = total stored chord length / chord count for that medium, which is exactly what the
+// beam records are). Per medium, because a dense cloud and a sparse rain curtain in one scene
+// have transport scales orders of magnitude apart and a single radius is simultaneously too
+// blurry for one and too noisy for the other.
+//
+//   THE RADIUS MUST NOT BE CHOSEN TO HIT A SAMPLE COUNT — that was the pre-0.201.0 rule
+//   (solve r = K*A/(2 pi S) for a fixed `-beamk` target) and it is a trap. S grows with the
+//   photon count, so r ~ 1/n and the gather averages the SAME K beams however much the user
+//   spends. Since each beam is monochromatic, that is a hard colour-noise floor no `-n` and no
+//   `-spp` can move — measured, 4x the samples and 4x the photons each moved the gallery_rain
+//   cloud's noise by nothing, while raising `-beamk` was the only thing that worked. And the
+//   bias it was buying does not exist: the `_beams_ms` invariant moves under one point across
+//   a 1000x radius sweep. See the long note in photonbeams.h for the numbers.
+//
+// `g_beamK` is now a FLOOR on that population rather than a target: buildAuto probes the
+// gathered count at the mfp radii and scales them UP only if a camera segment would gather
+// fewer than this, which is what stops a very sparse map rendering as individual streaks.
+// `g_beamAreaSlack` is the matching ceiling — the fraction by which the kernel is allowed to
+// inflate the total sub-beam AABB area (the gather's cost metric) over the tight r=0 area.
 //
 // `g_beamTarget` budgets the STORED beam count: a beam is ~72 B and lights a whole chord, so
 // keeping one per crossing on a 100 M-photon pass would cost gigabytes for variance nobody
@@ -11149,9 +12100,79 @@ static double buildPhotonMap(PhotonMap& pm, double radius, const char* tag) {
 //                        wants many.
 static double    g_beamRadiusAbs = 0.0;
 static long long g_beamTarget    = 1000000;
-static double    g_beamK         = 32.0;
+static bool      g_beamTargetSet = false;  // was -beamcount given? (mode J reports it differently)
+// Was `-n` given? File-scope rather than a `main()` local because the two flags are read
+// together, in the render helper, to settle which of the two knobs on mode J's map size wins:
+// explicit `-n` beats explicit `-beamcount` beats the scene's own measured knee.
+static bool      g_nFromCli      = false;
+static double    g_beamBlur      = 0.01;   // kernel half-width as a fraction of the mfp
+static double    g_beamK         = 32.0;   // FLOOR on the gathered count, not a target
+static double    g_beamAreaSlack = 1.0;    // ceiling: allowed box-area growth from the kernel
+// THE LIGHT-SIDE REFRESH — mode J (0.247.0, the UPBP-THICK fix) and mode M (0.252.0, M-FROZEN).
+//
+// Both modes' error is the sum of a camera-side term that `-spp` averages away and a light-side
+// term frozen into a cache built once — which `-spp` cannot touch at all, because every camera
+// sample gathers from that same cache. So both plateau at a noise floor that LOOKS converged,
+// and in fact gets MORE conspicuous as the render proceeds: the camera grain that was masking
+// it falls away and leaves the frozen pattern standing as apparent structure.
+//
+//   * mode J freezes its BEAM MAP. Measured floor: 5.0 % whole-frame on `_fog_thick.ftsl` at
+//     `-n 8192`; the frozen/refreshed error spread differs 13x at equal wall clock.
+//   * mode M freezes its PHOTON MAP, its CAUSTIC MAP and its BEAM MAP. On `gallery_rain` the
+//     visible symptom is coloured bars through the rain and cloud: `phase rainbow` is genuinely
+//     wavelength-dependent, so a beam that scatters in the rain must drop its spectral bundle
+//     and deposit monochromatically, and a beam is a LINE — one saturated single-wavelength
+//     deposit is a coloured STREAK down a whole chord. 50.5 % of that scene's rain chords
+//     (42.3 % of its power) are monochromatic and cannot be made otherwise, so un-freezing is
+//     the only fix; refreshed, the streaks average back to white as 1/sqrt(epochs).
+//
+// Each mode therefore rebuilds its light side under a fresh salt every epoch and averages over
+// independent realizations, turning the floor into a `1/sqrt(epochs)` decay. `-beamfreeze`
+// (alias `-lightfreeze`) restores the historical single cache, which is what reproduces
+// pre-refresh references and what measures the improvement.
+static bool      g_beamFreeze    = false;
+// Share of the wall clock allowed to go on light-side rebuilds. It buys the decorrelation
+// above; 0.10 is chosen because the light side is a small fraction of either render (mode J
+// ~2.6 %, mode M ~0.35 % — both are dominated by the gather, see UPBP-CONV), so a 10 % budget
+// affords many rebuilds without being felt.
+static double    g_beamRefreshFrac = 0.10;
+// Was `-beamrefresh` named on the command line? An explicit value must win over the mode-J
+// device-light-side retune below, which is a DEFAULT and not an override.
+static bool      g_beamRefreshSet  = false;
+// The retuned value for a mode-J render whose light side is on the device (0.272.4). Measured
+// 1.56x better than 0.10 on `_fog_thick` whole-frame variance, with 0.60 worse than 0.30, so the
+// optimum is interior. NOT applied to mode M or to CPU mode J: neither gets the device tree, so
+// a realization still costs them the full host SAH build and their optimum has not moved.
+static constexpr double kBeamRefreshDevJ = 0.30;
+// UPBP-CONV (3): lower bound on a merge's sin(theta) -- the beam x ray kernel's Jacobian
+// denominator, and its singularity. 0 = the literal, unbounded estimator. The default 0.3 (the
+// clamp binds when a beam lies within ~17.5 deg of the camera ray) is measured, not chosen: on
+// _fog_thick at 180 s it costs -0.61 % of the image mean against the unbounded estimator's own
+// -0.57 % -- no resolvable bias -- while cutting the worst pixel from 4350x to 1690x the
+// reference and the mean relative squared error from 1.219 to 0.836. See BeamMap::sinMin.
+static double    g_beamSinMin    = 0.3;
 static long long g_beamSplitMax  = 8000000;
 static double    g_beamSplitLen  = 0.0;
+
+// MODE J'S BEAM BUDGET, IN RAW (PRE-SPLIT) BEAMS -- see J-BEAMCOST and bdpt.h's long note.
+//
+// Mode M sizes its map with `-beamcount` directly, because its deposit is a photon pass whose
+// count IS the map. Mode J cannot: `-n` there counts LIGHT SUBPATHS, and how many beams a
+// subpath deposits is scene-dependent (well under 1 for a small cloud in a big room, up to
+// `maxDepth` for a global haze). So `-beamcount` names the map size in mode J too, and
+// bdpt::traceLightBeamPass converts it to a subpath count with a discarded pilot.
+//
+// WHY THERE IS NO FRAME TERM HERE, THOUGH J-BEAMCOST ASKED FOR ONE. The plausible rule was
+// that a beam map is a cache -- built once, paid back once per camera sample -- so the size
+// worth building should scale with res*resY*spp, exactly as buildBeamMap's split length does.
+// Measurement says no. Sweeping `-n` at a fixed 120 s budget against a converged mode-D
+// reference (scraps/_jn_sweep*.sh, scored by scraps/_jn_score.py) collapses at the same RAW
+// BEAM COUNT at 128x128 and at 256x256 -- four times the pixels, same knee. Only the BUILD is
+// amortised over the frame; the GATHER is per-sample and grows with the map, so the two scale
+// together and cancel. The knee is a property of the scene, and mode J therefore measures it
+// per scene in the pilot instead of predicting it from the frame.
+//
+// What is left here is a plain resource ceiling, which is what `-beamcount` already meant.
 
 // Bin the beam map and say what it settled on, mirroring buildPhotonMap's reporting: a
 // silently-different kernel radius would be baffling when comparing renders — and for beams
@@ -11161,7 +12182,47 @@ static double    g_beamSplitLen  = 0.0;
 // on it, because the BVH build is a one-time cost amortised over exactly that much gathering.
 // A 600-frame flythrough should split far finer than a single still of the same scene — see
 // BeamMap::sahSplitLen for the derivation and the measurements behind the constant.
-static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
+// Set by the mode-J dispatch just before it builds a light side, and false everywhere else:
+// "this map is going to be gathered on the device, so a host BVH over it is dead work". Anything
+// that can reach a CPU gather -- mode M, -device cpu, -loadmap, the shared photon-map path --
+// leaves it false and gets the host tree as before.
+static bool g_jDevBeamOk = false;
+
+// -jhostlight: keep mode J's whole light side on the host -- the surface map redrawn once per
+// epoch (pre-0.272.0 behaviour) AND the beam BVH built by the host SAH builder (pre-0.272.3).
+// One flag for both because they are one decision: "do not move mode J's light side onto the
+// device". Declared HERE rather than next to g_jSurf because jSkipHostBvh() below needs it, and
+// a flag used 900 lines before its definition is a compile error waiting for the next edit.
+// Forwarded to the device backend through cudaSetJHostLight rather than threaded through
+// renderBdptCuda, whose parameter list is already long and whose callers do not decide this.
+static bool g_jHostLight = false;
+
+// SKIP THE HOST TREE when a device LBVH is going to be built over the same sub-beams. ONE
+// definition, because `buildBeamMap` has two build branches (`-beamradius` and the auto one) and
+// the first version of this decided it at only one of them -- the one the default render does
+// not take, so it measured no change at all. A predicate used by both cannot drift.
+//
+// The env read is cached: this runs once per light-side epoch, and `getenv` is not free.
+// `g_jDevBeamOk` is what keeps a CPU gather safe -- it has no other tree to use.
+static bool jSkipHostBvh() {
+    // DEFAULT ON since 0.272.3. `-jhostlight` turns it off, and that is the right flag rather
+    // than a second one: it already means "keep mode J's light side on the host", and the beam
+    // tree is part of the light side. FTRACE_JLBVH=0 also forces the host tree, for bisecting.
+    static const bool envOff = [] {
+        const char* e = std::getenv("FTRACE_JLBVH");
+        return e && std::atoi(e) == 0;
+    }();
+    return g_jDevBeamOk && !g_jHostLight && !envOff;
+}
+
+static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet = false) {
+    // `quiet` exists for mode J's light-side REFRESH (see g_beamFreeze): that rebuilds this
+    // map once per progressive epoch, and re-printing the same four-line map description on
+    // every rebuild would bury the render's own status lines under a description that has not
+    // changed — only the realization has. Epoch 0 still reports everything.
+    const auto say = [quiet](const char* fmt, auto... args) {
+        if (!quiet) std::printf(fmt, args...);
+    };
     auto t0 = std::chrono::steady_clock::now();
     const size_t raw = bm.beams.size();
     double r;
@@ -11171,40 +12232,223 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work) {
     // 1e6?" into an observation, and makes a scene that never reaches its budget (small
     // bounded media in a large scene) visibly different from one that blows through it.
     if (bm.nDeposited > raw)
-        std::printf("%s photon beams: %zu collected, trimmed to %zu by -beamcount "
+        say("%s photon beams: %zu collected, trimmed to %zu by -beamcount "
                     "(survivors rescaled, unbiased)\n", tag, bm.nDeposited, raw);
+    // SPECTRAL COVERAGE OF THE STORED BEAMS (photonbeams.h): what fraction carry the
+    // achromatic fold (`-beamachro`), and what fraction carry a stratified wavelength bundle
+    // (`-beamspec`). The two are alternatives, not additions — BeamBank::push prefers the fold
+    // when a beam is offered both — so a beam falls in exactly one of three classes: folded,
+    // bundled, or plain monochromatic. Only the third one paints coloured streaks.
+    //
+    // Reported BY POWER as well as by count, and the power figure is the one that matters: a
+    // fold or a bundle removes the chromatic variance of the beams it covers and does nothing
+    // at all for the rest, so what is left in the image is set by how much ENERGY is still
+    // monochromatic, not by how many records are. A handful of bright unfolded beams is exactly
+    // what draws a saturated streak across an otherwise grey cloud, and a count-only figure
+    // would report that as a rounding error.
+    //
+    // Collected PER MEDIUM, and printed on the per-medium line below, because the fold's third
+    // condition IS per medium: a scene holding an achromatic cloud and a `phase rainbow` rain
+    // curtain has the cloud folding at ~90% and the rain structurally unable to fold at all —
+    // its scattering really is chromatic — while the rain still bundles. A single blended
+    // figure would read as "half broken" when both media are behaving exactly as designed. The
+    // split also localises the diagnosis: a cloud below ~90% folded means paths are arriving
+    // via surfaces or via the chromatic medium, which is a fact about the scene, not a fault.
+    std::vector<size_t> foldN, specN;
+    std::vector<double> foldP, specP, foldPT;
+    if (raw) {
+        for (const PhotonBeam& b : bm.beams) {
+            const size_t m = (size_t)(b.med < 0 ? 0 : b.med);
+            if (m >= foldN.size()) {
+                foldN.resize(m + 1, 0); specN.resize(m + 1, 0);
+                foldP.resize(m + 1, 0.0); specP.resize(m + 1, 0.0); foldPT.resize(m + 1, 0.0);
+            }
+            // Energy, not power: a long beam lays a long streak, so `power * len` is what the
+            // image actually sees and what a "% by power" figure has to weight by.
+            const double p = (double)b.power * (double)b.len;
+            foldPT[m] += p;
+            if (b.achro)         { ++foldN[m]; foldP[m] += p; }
+            else if (b.nSec > 0) { ++specN[m]; specP[m] += p; }
+        }
+    }
+    // "n/a" rather than "0.0%" for a medium the fold structurally cannot serve, so a rainbow
+    // curtain reads as out of scope instead of as a failure — but it still gets its bundle
+    // figure, which is the thing that is actually doing the work there. `-beamachro off` says
+    // nothing about the fold; a build with no bundles says nothing about bundles.
+    auto foldStr = [&](size_t m, size_t n) -> std::string {
+        if (m >= foldN.size() || !n) return std::string();
+        std::string out;
+        char buf[128];
+        if (pbeams::gAchro) {
+            if (!foldN[m]) out += ", achromatic fold n/a";
+            else {
+                std::snprintf(buf, sizeof buf,
+                              ", %.1f%% folded achromatically (%.1f%% by power)",
+                              100.0 * (double)foldN[m] / (double)n,
+                              foldPT[m] > 0 ? 100.0 * foldP[m] / foldPT[m] : 0.0);
+                out += buf;
+            }
+        }
+        if (specN[m]) {
+            std::snprintf(buf, sizeof buf, ", %.1f%% spectrally bundled (%.1f%% by power)",
+                          100.0 * (double)specN[m] / (double)n,
+                          foldPT[m] > 0 ? 100.0 * specP[m] / foldPT[m] : 0.0);
+            out += buf;
+        }
+        return out;
+    };
     const size_t splitBudget = g_beamSplitMax > 0 ? (size_t)g_beamSplitMax : 0;
+    bm.sinMin = g_beamSinMin;   // UPBP-CONV (3): the 1/sin(theta) bound, on both build paths
     if (g_beamRadiusAbs > 0.0) {
-        // Explicit radius: still split, by the same area-optimal rule buildAuto uses. The rule
-        // keys off the radius, so an explicit one feeds it directly — nothing scene-scale here.
-        const double areaBefore = bm.totalBoxArea(g_beamRadiusAbs);
+        // Explicit radius: one value for every medium, but still split by the same
+        // area-optimal rule buildAuto uses. The rule keys off the radius, so an explicit one
+        // feeds it directly — nothing scene-scale here.
+        bm.setUniformRadius(g_beamRadiusAbs);
+        const double areaBefore = bm.totalBoxArea();
         double meanSplit = 0.0;
-        bm.build(g_beamRadiusAbs, g_beamSplitLen, splitBudget, work, &meanSplit);
+        bm.build(g_beamSplitLen, splitBudget, work, &meanSplit, /*skipBvh*/ jSkipHostBvh());
         r = g_beamRadiusAbs;
-        std::printf("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g "
+        say("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g "
                     "(-beamradius), mean split %.4g, box area %.4g -> %.4g m^2 (%.2fx), "
-                    "BVH in %.1fs\n", tag, raw, bm.beams.size(), r, meanSplit,
-                    areaBefore, bm.totalBoxArea(r),
-                    areaBefore > 0 ? bm.totalBoxArea(r) / areaBefore : 1.0,
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                    "BVH in %s\n", tag, raw, bm.beams.size(), r, meanSplit,
+                    areaBefore, bm.totalBoxArea(),
+                    areaBefore > 0 ? bm.totalBoxArea() / areaBefore : 1.0,
+                    humanDur(std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0).count()).c_str());
+        // `-beamradius` has no per-medium line to hang the spectral coverage on, so report it
+        // summed. The per-medium breakdown is the informative one (see foldStr above); this
+        // branch is the expert override, and losing the breakdown is part of overriding.
+        if (!foldN.empty()) {
+            size_t nA = 0, nS = 0; double pA = 0, pS = 0, pT = 0;
+            for (size_t m = 0; m < foldN.size(); ++m) {
+                nA += foldN[m]; nS += specN[m];
+                pA += foldP[m]; pS += specP[m]; pT += foldPT[m];
+            }
+            if (nA)
+                say("%s photon beams: %zu of %zu folded achromatically (%.1f%% by count,"
+                            " %.1f%% by power) — -beamachro\n", tag, nA, raw,
+                            100.0 * (double)nA / (double)raw, pT > 0 ? 100.0 * pA / pT : 0.0);
+            if (nS)
+                say("%s photon beams: %zu of %zu spectrally bundled (%.1f%% by count,"
+                            " %.1f%% by power) — -beamspec\n", tag, nS, raw,
+                            100.0 * (double)nS / (double)raw, pT > 0 ? 100.0 * pS / pT : 0.0);
+        }
     } else {
-        const BeamMap::AutoInfo ai = bm.buildAuto(g_beamK, splitBudget, g_beamSplitLen, work);
-        r = ai.rFinal;
+        const BeamMap::AutoInfo ai =
+            bm.buildAuto(g_beamBlur, g_beamK, g_beamAreaSlack, splitBudget, g_beamSplitLen, work,
+                         /*skipBvh*/ jSkipHostBvh());
+        r = bm.radius;
+        // One line PER MEDIUM: the radius is per medium now, so a single number would hide
+        // exactly the thing that makes a two-medium scene work. mfp is the measured mean stored
+        // chord length, which is what the radius is a fraction of.
+        for (size_t m = 0; m < ai.med.size(); ++m) {
+            const BeamMap::MedStat& s = ai.med[m];
+            if (!s.n) continue;
+            say("%s photon beams: medium %zu: %zu chords, mean free path %.4g m "
+                        "-> kernel radius %.4g m (%.3g x mfp)%s\n",
+                        tag, m, s.n, s.mfp, s.r, s.mfp > 0 ? s.r / s.mfp : 0.0,
+                        foldStr(m, s.n).c_str());
+        }
+        // SPECTRAL-FOLD ATTRIBUTION (FTRACE_FOLDDIAG=1; render.h FoldKill). One row per
+        // medium that could fold at all, listing why the beams that DIDN'T fold lost it.
+        if (foldDiagOn()) {
+            for (int m = 0; m < 16; ++m) {
+                uint64_t tot = 0;
+                for (int k = 0; k < FK_COUNT; ++k)
+                    tot += g_foldKillHist[m][k].load(std::memory_order_relaxed);
+                if (!tot) continue;
+                std::string row;
+                char b[96];
+                for (int k = 0; k < FK_COUNT; ++k) {
+                    const uint64_t c = g_foldKillHist[m][k].load(std::memory_order_relaxed);
+                    if (!c) continue;
+                    std::snprintf(b, sizeof b, "%s%s %.2f%%", row.empty() ? "" : ", ",
+                                  foldKillName(k), 100.0 * (double)c / (double)tot);
+                    row += b;
+                }
+                say("%s [folddiag] medium %d: %llu foldable deposits: %s\n", tag, m,
+                    (unsigned long long)tot, row.c_str());
+            }
+        }
         // `box area` is the cost metric, not a curiosity: a camera ray's expected box-entry
         // count — which measurement showed IS the gather's cost, far more than the number of
         // beams it actually gathers — is proportional to it. Printing before/after is what
         // makes a change to the split rule verifiable instead of asserted.
-        std::printf("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g -> %.4g "
-                    "(a probe ray gathered %.1f beams at the analytic radius; target %.0f), "
-                    "mean split %.4g, box area %.4g -> %.4g m^2 (%.3fx)%s, BVH in %.1fs\n",
-                    tag, ai.rawBeams, ai.outBeams, ai.rAnalytic, ai.rFinal, ai.probeK,
-                    ai.targetK, ai.splitLen, ai.areaBefore, ai.areaAfter,
+        say("%s photon beams: %zu stored -> %zu after split, a probe ray gathers %.1f "
+                    "beams (%.1f at the raw mfp radii; -beamk floor %.0f)%s%s, mean split %.4g, "
+                    "box area %.4g -> %.4g m^2 (%.3fx)%s, BVH in %s\n",
+                    tag, ai.rawBeams, ai.outBeams, ai.probeK, ai.probeK0, ai.targetK,
+                    ai.floorScale > 1.0001 ? " [floor raised the radii]" : "",
+                    ai.slackScale < 0.9999 ? " [-beamareaslack capped them]" : "",
+                    ai.splitLen, ai.areaBefore, ai.areaAfter,
                     ai.areaBefore > 0 ? ai.areaAfter / ai.areaBefore : 1.0,
                     ai.budgetBit ? " [split limited by -beamsplitmax, not by the rule]" : "",
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                    humanDur(std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0).count()).c_str());
         if (ai.budgetBit)
-            std::printf("%s   raise -beamsplitmax for a tighter (faster) BVH at more memory, "
+            say("%s   raise -beamsplitmax for a tighter (faster) BVH at more memory, "
                         "or lower -beamcount to get there for free.\n", tag);
+        // THE KNEE. While the `-beamk` floor is binding (probeK0 < targetK) the floor is
+        // holding the GATHERED count at targetK by inflating the radii, so extra beams cost
+        // the gather nothing and buy a tighter kernel — strictly better. Once probeK0 passes
+        // targetK the floor lets go, the gather's cost becomes linear in the beam count, and
+        // every further beam is paid for in full. Measured on `_fog_cornell` at 128x128, 120 s:
+        // 18708 raw beams (probeK0 2.6) and 75288 (probeK0 25.9) both reached 15 spp, at 0.426
+        // and 0.410 relative RMSE; 300033 (probeK0 36.2, floor no longer binding) fell to 4 spp
+        // and 0.887. The cliff is here, so name it — it is otherwise invisible in a line that
+        // reports probeK0 as a bare number.
+        //
+        // BUT THE ERROR IT PROMISES IS WHOLE-FRAME, and `_fog_cornell` is fog edge to edge, so
+        // there the two are the same thing. Where the medium is only PART of the frame they come
+        // apart, and this note points the wrong way. Measured 2026-09-10 on `gallery_rain`
+        // (320x180, 60 s, 2 seeds, per-pixel variance pooled per band) taking beams/probe from
+        // 82.9 to 43.2 with -beamcount: whole frame 0.81x and the ground third 0.85x — both
+        // better, as promised — while the rain volume in the top third went to **1.40x worse**,
+        // which is the one thing `-beams` was turned on for. Fewer beams trades volumetric
+        // variance for sample count, and only a frame that is mostly medium wins that trade.
+        // So the wording below says whole-frame, and tells the reader to score the medium's own
+        // region before acting on it.
+        else if (ai.targetK > 0.0 && ai.probeK0 > ai.targetK && ai.rawBeams)
+            say("%s   note: past the -beamk floor (%.1f > %.0f), so the gather now pays "
+                        "for every extra beam. Lowering -beamcount%s usually cuts WHOLE-FRAME "
+                        "error here — but score the medium's own region first: on gallery_rain "
+                        "halving beams/probe took the frame to 0.81x variance and the rain "
+                        "volume to 1.40x.\n",
+                        tag, ai.probeK0, ai.targetK,
+                        g_nFromCli ? " (or -n, which is currently sizing this map)" : "");
+    }
+    // MEDIUM SCATTERING ORDER of the stored chords, which is the quantity VOLCACHE is
+    // sized by: only order >= 2 is cacheable, because single scatter is view-dependent
+    // (a rainbow's colour at a point depends on the angle to the sun) and must stay
+    // per-frame. Until PhotonBeam::order existed this could only be INFERRED, by rendering
+    // separate `-beams-order 1/2/3` arms and differencing them -- three renders and a
+    // subtraction to learn what one pass over the map now reports exactly.
+    //
+    // Silent when no stored chord tracks its order: mode `J` deposits kBeamOrderUnknown
+    // because it counts subpath vertices rather than medium scatters, and a histogram that
+    // invented a distribution for it would be worse than no line at all.
+    {
+        size_t hist[8] = {0}, unknown = 0, known = 0;
+        for (const PhotonBeam& b : bm.beams) {
+            if (b.order == kBeamOrderUnknown) { ++unknown; continue; }
+            ++known;
+            hist[b.order < 7 ? b.order : 7] += 1;
+        }
+        if (known > 0) {
+            std::string row;
+            char buf[64];
+            for (int o = 1; o < 8; ++o) {
+                if (!hist[o]) continue;
+                std::snprintf(buf, sizeof buf, "%s%d%s:%.1f%%", row.empty() ? "" : " ",
+                              o, o == 7 ? "+" : "",
+                              100.0 * (double)hist[o] / (double)known);
+                row += buf;
+            }
+            say("%s   scattering order of stored chords: %s%s  "
+                "(order >= 2 is the cacheable share -- see VOLCACHE)\n",
+                tag, row.c_str(),
+                unknown ? "  [some chords did not track order]" : "");
+        }
     }
     if (bm.beams.empty())
         std::fprintf(stderr, "[beams] warning: 0 beams stored — no photon crossed a "
@@ -11843,6 +13087,72 @@ static void warnWhittedHeroCollapse(const Scene& scene) {
                 "traversal-bound, not spectral.\n", what, hero::kHeroMax);
 }
 
+// ---- the mode-W low-spp MISTINT --------------------------------------------------------
+//
+// Mode W is "noise-free at 1 spp" only while the path stays in the hero BUNDLE, which
+// carries g_heroC wavelengths through one BVH walk. Three things drop it onto the SCALAR
+// path, which carries exactly ONE wavelength per sample: participating media, a GRIN
+// volume, and an explicit `-heroc 1`. (Dispersive glass and clearcoats used to be on that
+// list and no longer are -- mode W splits the bundle at those vertices instead.)
+//
+// One wavelength per sample would merely be NOISY if each pixel drew its own. It doesn't:
+// mode W's wavelength lattice is `dWhittedLambdaU(sIdx)` (and BackwardRenderer's host twin)
+// -- a scrambled radical inverse of the ABSOLUTE SAMPLE INDEX and nothing else -- so every
+// pixel in the frame uses the SAME wavelength on the same pass. That sharing is exactly
+// what makes the mode noise-free on a bundle scene, and it is exactly what makes a de-hero'd
+// one come out UNIFORMLY MISTINTED rather than grainy: an N-spp frame is the whole image
+// rendered at N wavelengths, shared. The error is a global colour cast, so it does not
+// average down per pixel -- it only goes away once N covers the spectrum.
+//
+// Measured on scenes/gallery_rain.ftsl (rain volume => scalar path), frame-mean B/G against
+// the converged 512-spp answer (0.705):
+//
+//     spp    1     2     4     8    16    32    64   512
+//     B/G  0.000 0.085 0.483 1.243 0.691 0.787 0.694 0.705
+//
+// 1 spp has NO BLUE AT ALL (one wavelength, and it was not a blue one); 8 spp overshoots
+// into magenta. It is within a couple of percent from 64 on -- hence kWhittedDeHeroSpp.
+// This is also why the live `-window` view of such a render CHANGES HUE between repaints
+// while it climbs through the first few dozen spp: each repaint is a different (still
+// incomplete) set of shared wavelengths. Expected, not a bug.
+static const int kWhittedDeHeroSpp = 64;
+
+// Which of the three, or nullptr if the bundle survives (so 1 spp really is exact).
+// `-heroc 1` is checked first because it is the one the user typed, and it makes the other
+// two moot. Kept as ONE predicate so the batch warning below and the viewer's pass floor
+// (kWSppCap, in the -explore loop) cannot drift apart.
+static const char* whittedDeHeroes(const Scene& scene) {
+    if (g_heroC <= 1)                   return "-heroc 1 (the hero bundle is off)";
+    if (!scene.media.empty())           return "participating media";
+    if (grin::sceneHasGrin(scene))      return "a GRIN volume";
+    return nullptr;
+}
+
+// Batch mode W only. The interactive viewer handles this by ACCUMULATING passes up to
+// kWSppCap while the camera holds still (see -explore), so it converges on its own and a
+// nag there would fire on every run; a batch render obeys -spp literally and has no such
+// escape, so the one thing it can do is say why the image is the wrong colour.
+static void warnWhittedDeHeroSpp(const Scene& scene, long long spp) {
+    const char* why = whittedDeHeroes(scene);
+    if (!why || spp >= kWhittedDeHeroSpp) return;
+    std::printf("[mode W] WARNING: -spp %lld with %s -- the path DE-HEROES onto ONE "
+                "wavelength\n"
+                "[mode W]   per sample, and mode W's wavelength lattice is a function of the "
+                "sample index\n"
+                "[mode W]   ALONE (shared by every pixel), so this frame is the whole image "
+                "rendered at\n"
+                "[mode W]   %lld wavelength%s. Expect a UNIFORM COLOUR CAST, not noise -- at "
+                "1 spp there is\n"
+                "[mode W]   literally one wavelength in the picture. It is a global error, so "
+                "it does not\n"
+                "[mode W]   average down per pixel; only more spp fixes it.\n"
+                "[mode W]   Raise -spp to >= %d (measured: within ~2%% of the converged hue "
+                "from there),\n"
+                "[mode W]   or drop the medium with -no-media if you only want the geometry "
+                "preview.\n",
+                spp, why, spp, spp == 1 ? "" : "s", kWhittedDeHeroSpp);
+}
+
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
 // segment, so a volumetric FLYBY (rainbow/fogbow/fog) gets independent per-frame noise
@@ -11851,6 +13161,68 @@ static void warnWhittedHeroCollapse(const Scene& scene) {
 // media-free scenes are byte-for-byte unchanged. Forces the CPU forward path (the GPU
 // shared kernel doesn't implement the per-camera resample yet).
 static bool g_beamGather = false;
+
+// -nobeams: the opt-OUT, which exists only because mode J opts IN by default.
+//
+// For modes A/B/M the beam map is an extra estimator layered on a render that is complete
+// without it, so it is off unless asked for. Mode J is the opposite: UPBP *is* connections
+// plus beam merges, and a mode-J render with no beam map is not a degraded UPBP, it is
+// literally mode D (the dispatch block says so in as many words). Requiring `-beams` there
+// would make the interesting half of the mode opt-in behind a flag whose absence silently
+// produces a different mode. So mode J defaults it on, and this flag turns it back off —
+// which is exactly what validation gate (1) needs to assert "J minus beams == D".
+static bool g_noBeams = false;
+
+// -jsurf / -nojsurf: mode J's SECOND merge kind, the point x point surface merge that mode U
+// (VCM) exists to provide. This is the flag that folds U into J — a mode-J render with it on
+// runs BDPT connections, beam x ray merges in the media AND vertex merges on the surfaces,
+// all under one balance heuristic, which is a strict superset of what either mode does alone.
+//
+// ON BY DEFAULT since 0.260.0, once all three UPBP-VM gates were green: bit-identity with
+// mode D when both merge kinds are off, agreement with mode U on a surfaces-only scene, and
+// no energy shift on a media+surfaces scene when the third technique is switched in (the
+// three-way balance heuristic sums to one). `-nojsurf` is the opt-out, exactly as `-nobeams`.
+//
+// ON BOTH BACKENDS since 0.263.1 (UPBP-VM's device half). This comment used to say the
+// opposite -- "the device merge weight carries one merge kind ... an EXPLICIT -jsurf forces the
+// CPU as it always has" -- and was left standing when the device twin landed. It is wrong in a
+// way that costs time rather than correctness: `dMisWeight` takes BOTH `mergeKappa` and
+// `kappaSurf`, `renderBdptCuda` uploads the map through `uploadSurfMapCuda`, `mergeAny` launches
+// the MERGE kernel when either map is non-empty, and `dSurfMergeAt` gathers. There is no gate
+// forcing the CPU, and `g_jSurfExplicit` -- which existed to drive one -- was written by three
+// argument handlers and read by none, so it is gone. Do not re-add a flag to record an intent
+// nothing acts on.
+static bool g_jSurf = true;
+// -jhostlight is declared far above, next to g_jDevBeamOk, because jSkipHostBvh() needs it.
+// -jsurf-radius: the gather disc's radius r_s in world units. 0 = auto, meaning the same
+// `sceneRadius * g_pmRadiusFactor` (`-pmradiusfrac`) that modes M/S/U start from — mode J's
+// merges deliberately share the photon-map radius convention so a like-for-like comparison
+// against mode U is a matter of the mode letter alone.
+//
+// FIXED, not shrinking. Mode U shrinks r per pass (Georgiev's r_i = R0 * i^((alpha-1)/2)) to
+// buy consistency; mode J's beam radius is already fixed and its light-side REFRESH is what
+// makes it converge (the map is redrawn under a fresh salt per epoch and the realizations
+// averaged — see g_beamFreeze), so the point merges use the same policy as the beam merges
+// rather than importing a second one into the same denominator.
+static double g_jSurfRadius = 0.0;
+// -jsurf-count: the resource ceiling on STORED surface photons, the point-merge counterpart of
+// `-beamcount`. It is a memory bound and nothing else — a SurfPhoton plus its SurfMis is 72 B,
+// so 4 M is ~288 MB, and the default `-n 2000000` on a scene with no media (where the beam
+// budget measures nothing and so never lowers the subpath count) asks for 7.3 M / 500 MB before
+// a single pixel is traced. That is the failure this exists to stop.
+//
+// It lowers the SUBPATH COUNT rather than thinning the map, deliberately: mode J cannot trim a
+// map after the fact, because Russian roulette's per-record survival probability is exactly the
+// quantity a MIS weight has no way to read — the same reason `-beamcount` is met by tracing
+// fewer subpaths (see J-BEAMCOST). And it only ever moves the count DOWN: with a fixed
+// `-jsurf-radius` a bigger surface map is strictly better, so this must never raise a count the
+// beam knee already chose.
+static long long g_jSurfCount = 4000000;
+
+// `-misaudit`: run bdpt.h's absolute-form reference MIS weight alongside the shipping
+// relative-form one and report the largest disagreement. Validation harness, not a
+// rendering option — it never changes a pixel, only what gets printed at the end.
+static bool g_misAudit = false;
 
 #ifdef _WIN32
 // The console's ORIGINAL output code page, kept so it can be put back. The setting is
@@ -12002,7 +13374,10 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
     for (int py = 0; py < film.resY; ++py)
         for (int px = 0; px < film.resX; ++px) {
             Ray r = cam.genRay(px, py, 0.5, 0.5);
-            Hit h = scene.closestHit(r);
+            // A pixel-centre CAMERA ray, so a `hide_camera` flat must not stand between
+            // the lens and the sky it is meant to let through (Material::hideCamera).
+            Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
+                                     /*skipCamHidden=*/true);
             if (!h.valid) {
                 Vec3 bg{0, 0, 0};
                 if (haveEnv) bg += scene.envXYZForDir(r.d);
@@ -12367,13 +13742,18 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
 // by the total light-subpath count (W*H*spp), matching mode B's splat convention. The
 // two normalised films sum to the final radiance; writeFilm(...,1.0) then only divides
 // by cieYIntegral for display, exactly like mode P's composite.
+// `beams` (mode J, UPBP) is the view-independent photon-beam cache to merge against; null
+// (mode D) is connections only and leaves every sample bit-identical.
 static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long spp, int nThreads, int maxDepth, bool diffraction = true,
-                       unsigned long long sampleBase = 0) {
+                       unsigned long long sampleBase = 0, const BeamMap* beams = nullptr,
+                       const bdpt::SurfMap* photons = nullptr) {
     std::vector<Film> camBands(nThreads), splatBands(nThreads);
     auto worker = [&](int tid) {
         bdpt::BdptRenderer br; br.maxDepth = maxDepth; br.diffraction = diffraction;
         br.heroC = g_heroC;   // renderRows applies the media/GRIN/lens gate itself
+        br.beams = beams;
+        br.photons = photons;   // mode J's point merges; null == beams only (or mode D)
         Film& cf = camBands[tid]; cf.resX = resX; cf.resY = resY; cf.alloc();
         Film& sf = splatBands[tid]; sf.resX = resX; sf.resY = resY; sf.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
@@ -12442,7 +13822,10 @@ static CompositeClass classifyComposite(const Scene& scene, const Camera& cam,
         for (int px = 0; px < resX; ++px) {
             size_t i = (size_t)py * resX + px;
             Ray r = cam.genRay(px, py, 0.5, 0.5);
-            Hit h = scene.closestHit(r);
+            // Pixel-centre camera ray again: a hidden flat classifies as whatever is
+            // BEHIND it, which is what the composite will actually show there.
+            Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
+                                     /*skipCamHidden=*/true);
             if (!h.valid) {
                 if (scene.envIndex >= 0) {
                     cc.cls[i] = CompositeClass::SKY;
@@ -12587,10 +13970,16 @@ static void onInterrupt(int sig) {
 //                              thread sees it within ~250 ms, deletes it, and raises
 //                              the very same g_stopRequested flag Ctrl-C raises.
 //                              Nothing is force-killed, ever.
+//   <temp>/ftrace/<pid>.ack    written by the target the moment it consumes the
+//                              sentinel: "I heard you, I am winding down". This is
+//                              what lets -stop tell "not listening" apart from "still
+//                              finishing a long chunk", which it previously could not
+//                              and so reported the second as a FAILURE. See the wait
+//                              loop in runStopCommand() for why that mattered.
 static std::atomic<bool>     g_extStopRequested{false};  // also breaks the -keepwindow hold
 static std::atomic<bool>     g_stopWatchQuit{false};
 static std::thread           g_stopWatchThread;
-static std::filesystem::path g_stopRunFile, g_stopSentinelFile;
+static std::filesystem::path g_stopRunFile, g_stopSentinelFile, g_stopAckFile;
 
 // <temp>/ftrace, created on demand. Empty path = no usable temp dir (channel disabled).
 static std::filesystem::path stopChannelDir() {
@@ -12631,10 +14020,13 @@ static void stopChannelStart(const std::string& what) {
     const long pid = ftraceCurrentPid();
     g_stopRunFile      = dir / (std::to_string(pid) + ".run");
     g_stopSentinelFile = dir / (std::to_string(pid) + ".stop");
+    g_stopAckFile      = dir / (std::to_string(pid) + ".ack");
     std::error_code ec;
     // A sentinel already sitting here belongs to a dead process whose pid we've been
-    // recycled into; clear it so we don't stop the instant we start.
+    // recycled into; clear it so we don't stop the instant we start. Same for a stale
+    // ack, which would otherwise make our first -stop look pre-acknowledged.
     std::filesystem::remove(g_stopSentinelFile, ec);
+    std::filesystem::remove(g_stopAckFile, ec);
     { std::ofstream f(g_stopRunFile); f << what << "\n"; }
     g_stopWatchQuit.store(false);
     g_stopWatchThread = std::thread([] {
@@ -12642,6 +14034,11 @@ static void stopChannelStart(const std::string& what) {
             std::error_code e;
             if (std::filesystem::exists(g_stopSentinelFile, e)) {
                 std::filesystem::remove(g_stopSentinelFile, e);
+                // Acknowledge BEFORE doing anything else. The waiting `-stop` reads this to
+                // learn that a real ftrace heard the request, which is what licenses it to
+                // keep waiting past its "is anything listening?" budget instead of declaring
+                // failure on a render that is merely mid-chunk.
+                { std::ofstream a(g_stopAckFile); a << "ack\n"; }
                 // Deliberately true whether a render is in flight (finish the chunk, write,
                 // exit) or the process is just holding a -keepwindow preview open.
                 std::printf("\n[stop] external stop requested — stopping cleanly "
@@ -12661,6 +14058,9 @@ static void stopChannelEnd() {
     if (g_stopWatchThread.joinable()) g_stopWatchThread.join();
     std::error_code ec;
     if (!g_stopRunFile.empty()) std::filesystem::remove(g_stopRunFile, ec);
+    // The ack has done its job once we are gone (the waiter keys off process liveness for
+    // the final verdict); leaving it would only be litter for the next -stop to reap.
+    if (!g_stopAckFile.empty()) std::filesystem::remove(g_stopAckFile, ec);
 }
 
 // Has a stop target actually gone? On Windows the process check is authoritative, so it
@@ -12701,11 +14101,11 @@ static int runStopCommand(const char* who) {
     std::error_code ec;
     for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
         const std::string ext = de.path().extension().string();
-        if (ext != ".run" && ext != ".stop") continue;
+        if (ext != ".run" && ext != ".stop" && ext != ".ack") continue;
         const long pid = std::strtol(de.path().stem().string().c_str(), nullptr, 10);
         if (pid <= 0) continue;
         if (!ftraceProcessAlive(pid)) { std::filesystem::remove(de.path(), ec); continue; }
-        if (ext != ".run") continue;                 // a live target's pending sentinel
+        if (ext != ".run") continue;                 // a live target's pending sentinel / ack
         std::string what;
         { std::ifstream f(de.path()); std::getline(f, what); }
         live.emplace_back(pid, what);
@@ -12759,28 +14159,85 @@ static int runStopCommand(const char* who) {
     }
     std::fflush(stdout);
 
-    // Wait for them to actually go. A render only notices at a chunk boundary and then
-    // still has to write its image + checkpoint, so this can legitimately take up to
-    // one -interval (default 15 s) plus the write; give it a generous ceiling and say
-    // so rather than leaving the caller guessing whether the stop took.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    // Wait for them to actually go — in two phases, because "not listening" and "listening
+    // but busy" need completely different budgets and used to be conflated.
+    //
+    //   Phase 1 (ACK_SECS): how long we are willing to wait for any sign of life. A target
+    //     that never writes its <pid>.ack either isn't an ftrace, or is wedged, or is in a
+    //     build old enough not to acknowledge — all cases where waiting longer is futile.
+    //   Phase 2 (BUSY_SECS): once a target HAS acknowledged, the sentinel is provably
+    //     consumed and the only thing left is the work between here and the next seam.
+    //     That can legitimately be minutes — a mode-M gather at high spp with -beams spends
+    //     a long time inside one launch — so the old flat 120 s ceiling reported a render
+    //     that was stopping perfectly correctly as a FAILURE, which is exactly the message
+    //     that talks somebody into a `taskkill /F` and a wedged display driver.
+    //
+    // Exit 0 still means *genuinely gone*, unconditionally: build.bat chains a copy off it,
+    // and a false 0 sends it at an exe that is still locked.
+    const auto ACK_SECS  = std::chrono::seconds(120);
+    const auto BUSY_SECS = std::chrono::seconds(900);
+    const auto t0 = std::chrono::steady_clock::now();
+
     std::vector<long> pending = targets;
+    std::set<long> acked;
+    auto deadline = t0 + ACK_SECS;
+    auto nextNote = t0 + std::chrono::seconds(30);
+
     while (!pending.empty() && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        std::error_code ec;
         std::vector<long> still;
-        for (long pid : pending)
-            if (!stopTargetGone(pid, dir)) still.push_back(pid);
+        for (long pid : pending) {
+            if (stopTargetGone(pid, dir)) continue;
+            still.push_back(pid);
+            // The ack appears the instant the watcher thread consumes the sentinel, well
+            // before the render reaches a seam — so it answers "did anyone hear me?"
+            // without waiting on "has it finished what it was doing?".
+            if (!acked.count(pid) &&
+                std::filesystem::exists(dir / (std::to_string(pid) + ".ack"), ec)) {
+                acked.insert(pid);
+                std::printf("[stop] pid %ld acknowledged — finishing its current chunk, then "
+                            "writing its image and checkpoint.\n", pid);
+                std::fflush(stdout);
+            }
+        }
         pending.swap(still);
+        // Any acknowledged target buys the whole wait the longer budget; an unacknowledged
+        // straggler alongside it is no reason to give up early on the one that answered.
+        if (!acked.empty()) deadline = t0 + BUSY_SECS;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!pending.empty() && now >= nextNote) {
+            const long long el =
+                std::chrono::duration_cast<std::chrono::seconds>(now - t0).count();
+            std::printf("[stop] still waiting (%llds) for:", el);
+            for (long pid : pending) std::printf(" %ld%s", pid, acked.count(pid) ? "" : "?");
+            std::printf("\n");
+            std::fflush(stdout);
+            nextNote = now + std::chrono::seconds(30);
+        }
     }
-    // Only claim a clean stop when every target is actually gone — this exit code is what
-    // build.bat and friends chain off, so a false 0 sends them at an exe that is still
-    // locked, which is precisely the dead end that tempts a `taskkill /F`.
+
     if (pending.empty()) { std::printf("[stop] done — stopped cleanly.\n"); return 0; }
-    std::printf("[stop] FAILED — still running after 120s:");
+
+    const long long waited = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::printf("[stop] FAILED — still running after %llds:", waited);
     for (long pid : pending) std::printf(" %ld", pid);
-    std::printf("\n[stop] it may be mid-write, or in a long non-chunked batch "
-                "(a bare -n render with no -window/-time/-noise budget writes only at the end),\n"
-                "       or it may not be an ftrace process at all. Nothing was force-killed.\n");
+    std::printf("\n");
+    bool anyAcked = false, anyMute = false;
+    for (long pid : pending) { if (acked.count(pid)) anyAcked = true; else anyMute = true; }
+    if (anyAcked)
+        std::printf("[stop] the acknowledged pid(s) above DID hear the request and are winding\n"
+                    "       down; they are just taking longer than %llds to reach a seam. They\n"
+                    "       will still exit on their own — re-run -stop to keep waiting.\n",
+                    (long long)BUSY_SECS.count());
+    if (anyMute)
+        std::printf("[stop] the pid(s) above never acknowledged: they may be mid-write, in a long\n"
+                    "       non-chunked batch (a bare -n render with no -window/-time/-noise\n"
+                    "       budget writes only at the end), running an older build that predates\n"
+                    "       acknowledgement, or not an ftrace process at all.\n");
+    std::printf("[stop] Nothing was force-killed.\n");
     return 2;
 }
 
@@ -12868,10 +14325,21 @@ static std::string liveTitle(const std::string& rest) {
     if (!g_windowBackend.empty()) t += "  \xE2\x80\x94  " + g_windowBackend;
     return t;
 }
+// Serialises the title state. Almost every caller is the main thread, but tracePhotonPass's
+// deposit monitor is NOT — the whole point of that thread is to report progress while the
+// main thread is blocked joining the photon workers — and g_windowRest is a std::string that
+// would otherwise be written from two threads at once. SetWindowTextW itself is already
+// cross-thread safe (it marshals a WM_SETTEXT to the window's own thread).
+static std::mutex g_titleMu;
 static void setLiveTitle(const std::string& rest) {
+    std::lock_guard<std::mutex> lk(g_titleMu);
     g_windowRest = rest;
     if (g_liveWin && !g_liveWin->closed()) g_liveWin->setTitle(liveTitle(rest));
 }
+// The thread that owns g_liveWin's lifetime. Re-titling from another thread is fine (above);
+// CREATING or destroying the unique_ptr from one is not, so liveWindowPlaceholder refuses to
+// do that off-thread and just re-titles instead.
+static const std::thread::id g_mainThreadId = std::this_thread::get_id();
 // Flip the title over to "finished". `why` is the stop cause in the user's own terms
 // ("noise target met", "time budget reached", ...) — the point of the feature is that the
 // window says *which* budget ended the render, not merely that something ended it.
@@ -12893,6 +14361,7 @@ static const char* modeLabel(char m) {
         case 'M': return "mode M (photon map)";
         case 'S': return "mode S (SPPM)";
         case 'U': return "mode U (VCM)";
+        case 'J': return "mode J (UPBP)";
         default:  return "";
     }
 }
@@ -12970,7 +14439,7 @@ static bool g_windowPainted = false;
 // frame should land the instant it exists rather than waiting out a window interval.
 static void liveWindowPlaceholder(int w, int h, const std::string& stage) {
     if (!g_showWindow || w <= 0 || h <= 0) return;
-    if (!g_liveWin) {
+    if (!g_liveWin && std::this_thread::get_id() == g_mainThreadId) {
         // Near-black rather than pure black so an empty window is visibly a window that is
         // waiting, not a dead rectangle or a hole punched in the desktop.
         std::vector<uint8_t> placeholder((size_t)w * h * 3);
@@ -13028,6 +14497,269 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
                      ++nPaint, N, cost * 1e3, firstPaint ? ", cold — not budgeted" : "");
         std::fflush(stderr);
     }
+}
+
+// --- mode M progress: the phases before the first pixel, and the gather ---------
+//
+// Every other driver assembles a progress line ("[time] 58.3s / 60s, 4096 spp, ~1.56%
+// noise") and puts it on the title bar via liveWindowUpdate's `status` argument. Mode M's
+// shared photon-map driver was the one that did not: the GPU branch passed NO status at
+// all, so the title read "ftrace live preview — mode M (photon map) — <device>" and never
+// changed, and the CPU branch passed only "frame k/n". So the one mode whose renders run
+// longest was also the one whose window could not answer "how far along is it?" or "is it
+// still going?". These two helpers close that.
+
+// Compact count: 4000000000 -> "4.00G". Photon counts in mode M are routinely billions, and
+// a 10-digit run of zeros in a title bar is unreadable at a glance.
+static std::string humanCount(double n) {
+    char b[32];
+    if (n >= 1e9)      std::snprintf(b, sizeof b, "%.2fG", n / 1e9);
+    else if (n >= 1e6) std::snprintf(b, sizeof b, "%.1fM", n / 1e6);
+    else if (n >= 1e3) std::snprintf(b, sizeof b, "%.1fk", n / 1e3);
+    else               std::snprintf(b, sizeof b, "%.0f",  n);
+    return b;
+}
+
+// The graininess estimate mode M reports everywhere else (the forward driver at ~14899):
+// Monte-Carlo relative error at an illuminated pixel falls as 1/sqrt(samples), and the
+// per-pixel hit count IS that sample count, so 100/sqrt(mean hits over LIT pixels) is an
+// honest ballpark. Unlit pixels are excluded — averaging them in would report a black
+// border as perfect convergence.
+static double filmNoisePct(const Film& f) {
+    double sum = 0.0; long long lit = 0;
+    for (double h : f.hits) if (h > 0.0) { sum += h; ++lit; }
+    if (!lit) return 0.0;
+    const double mean = sum / (double)lit;
+    return mean > 0.0 ? 100.0 / std::sqrt(mean) : 0.0;
+}
+
+// Progress text for one camera's mode-M gather. Mode M has no time or noise BUDGET to
+// count down against (the work is fixed: trace N photons, then gather `spp` samples), so
+// the line reports position rather than remaining budget — but it carries all three of the
+// quantities the user asked for: photons, elapsed time, and clarity.
+static std::string pmGatherStatus(const Film& f, long long sppDone, long long sppTotal,
+                                  size_t frame, size_t nFrames, long long photons,
+                                  double elapsed) {
+    std::string s;
+    if (nFrames > 1) {
+        char fb[48];
+        std::snprintf(fb, sizeof fb, "frame %zu/%zu  \xE2\x80\x94  ", frame, nFrames);
+        s = fb;
+    }
+    char b[220];
+    std::snprintf(b, sizeof b, "[gather] %lld / %lld spp (%.0f%%), %s photons, %s, ~%.2f%% noise",
+                  sppDone, sppTotal,
+                  sppTotal > 0 ? 100.0 * (double)sppDone / (double)sppTotal : 0.0,
+                  humanCount((double)photons).c_str(), humanDur(elapsed).c_str(),
+                  filmNoisePct(f));
+    return s + b;
+}
+
+// Wire a renderer's StageProgress (render_progress.h) to the title bar. These are the
+// phases BEFORE any pixel exists — the photon deposit and the map builds — which on a
+// showcase mode-M render are most of the wall clock and used to be a single frozen caption.
+//
+// Two cadences, for the same reason liveWindowUpdate and the -interval save have two: the
+// title is cheap and wants to look alive (window cadence), while stdout is as often a piped
+// log as a terminal and a 5 Hz progress line would be thousands of junk lines in a build
+// log (30 s).
+static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
+                                       bool absolute = false) {
+    using clk = std::chrono::steady_clock;
+    // `hist` is a TRAILING rate window held as a ring of real (time, done) samples: the rate
+    // is the slope between the newest sample and the oldest one still inside the window.
+    //
+    // It replaces a two-bucket (mark/prev) scheme that rolled one bucket into the other every
+    // kRateWin seconds. That was not wrong arithmetically — both buckets always held genuine
+    // samples — but its window was only ever kRateWin..2*kRateWin wide, and `done` advances
+    // once per gather SLICE, which on gallery_rain is ~12 s. A 15 s window was therefore one
+    // to two updates wide, so it did not average anything: it reported the cost of whichever
+    // scanline band the gather happened to be crossing. Measured on the baseline arm it
+    // printed 5.3k/s, 1.0k/s, 280/s, 916/s across four log lines whose segment averages were
+    // 759, 589 and 675/s. The flapping was real signal, not noise — and useless, because the
+    // question a progress line answers is "how long for the REST of the frame", which no
+    // single band can predict.
+    struct Ticker {
+        clk::time_point t0 = clk::now(), lastWin{}, lastLog{};
+        std::deque<std::pair<clk::time_point, long long>> hist;
+        long long lastDone = -1;
+        double rate = 0.0;      // last good trailing rate, held between advances
+        // Adaptive repaint gap — see kDuty below. Starts at the nominal 4 Hz and is widened
+        // to whatever keeps painting down to a fixed fraction of the work being reported on.
+        double winGap = 0.25;
+        clk::time_point probeT{};   // when wantFilm() last said yes; start of the draw's cost
+    };
+    // Wide enough to span several slices (and so several bands) even when a slice costs ~12 s,
+    // and still short enough to abandon the opening sky probe within a minute of leaving it.
+    constexpr double kRateWin = 60.0;
+    // Ceiling on the share of a phase's wall clock the live preview may consume.
+    //
+    // This exists because a progress display that changes what it displays is not a display,
+    // it is a tax. The mode-M gather calls report() once per SLICE and the slice loop is
+    // synchronous — kernel, sync, report, next kernel — so a repaint is not concurrent with
+    // the render, it is inserted into it. Drawing a partial film means a ~16 MB device->host
+    // copy of the film plus a full-frame tone-map, and at a fixed 4 Hz on a scene whose
+    // slices are shorter than that, essentially all of the loop's time went to painting:
+    // measured on gallery_rain at 960x540 with -pmcount 45, the first spp (the only one the
+    // partial preview runs during) took 129.5 s with -window-min against ~3 s headless, a 40x
+    // penalty on the phase, while the steady-state spp either side of it differed by 1.7x.
+    //
+    // So the cadence is set by COST, not by a constant: after each paint the next one is held
+    // off for kDuty times what that paint took. Cheap scenes still repaint at the full 4 Hz
+    // (the floor); expensive ones fall back automatically, and the preview can never cost
+    // more than 1/kDuty of the render whatever the resolution or the scene.
+    constexpr double kDuty    = 9.0;    // <= 10% of wall clock spent painting
+    constexpr double kGapMin  = 0.25;   // 4 Hz, the nominal cadence
+    constexpr double kGapMax  = 5.0;    // never leave the image untouched longer than this
+    auto tk = std::make_shared<Ticker>();
+    StageProgress sp;
+    // `g_showWindow` first: with no window there is nothing a partial film could be drawn
+    // ON, so a headless batch must never pay for the device->host copy assembling one costs.
+    sp.wantFilm = [tk]() {
+        if (!g_showWindow) return false;
+        const auto now = clk::now();
+        if (tk->lastWin.time_since_epoch().count() != 0 &&
+            std::chrono::duration<double>(now - tk->lastWin).count() < tk->winGap) return false;
+        tk->probeT = now;      // the caller's download counts toward this paint's cost
+        return true;
+    };
+    // The shared tail of `report` and `reportLive`: paint the window and/or emit the log line,
+    // and re-price the repaint cadence from what this paint cost. Factored out so the two
+    // entry points can differ ONLY in the text they compose and in whether they feed the rate
+    // window — everything about throttling, film-vs-placeholder and duty-cycling is identical
+    // and must stay that way.
+    auto emit = [tk, w, h, expComp, absolute](const char* b, bool wantWin, bool wantLog,
+                                              const Film* partial, double divisor,
+                                              clk::time_point now) {
+        if (wantWin) {
+            // Draw the image-so-far when the phase has one. The placeholder stays the answer
+            // for a deposit or a BVH build, which genuinely have no pixels to show.
+            const bool drewFilm = (partial && divisor > 0.0);
+            if (drewFilm) liveWindowUpdate(*partial, divisor, expComp, absolute, b);
+            else          liveWindowPlaceholder(w, h, b);
+            const auto painted = clk::now();
+            // Cost this paint and set the next gap from it. A film draw is charged from
+            // wantFilm()'s yes, so the caller's device->host copy is included — it is part of
+            // what showing the image cost and excluding it would under-price the paint by most
+            // of its actual expense. A placeholder is charged from the draw alone.
+            const auto from = (drewFilm && tk->probeT.time_since_epoch().count() != 0)
+                              ? tk->probeT : now;
+            const double cost = std::chrono::duration<double>(painted - from).count();
+            double gap = kDuty * cost;
+            if (gap < kGapMin) gap = kGapMin;
+            if (gap > kGapMax) gap = kGapMax;
+            tk->winGap = gap;
+            // FTRACE_PAINT_DEBUG=1: dump what each repaint cost and the gap it bought. This
+            // is how the 40x first-spp regression above was found — the cost is invisible in
+            // any render timing, because it hides inside the phase it inflates.
+            if (getenv("FTRACE_PAINT_DEBUG"))
+                std::printf("[paint] film=%d cost=%.3fs gap=%.3fs\n", (int)drewFilm, cost, gap);
+            tk->lastWin = painted;   // measure the gap from when the screen was actually ready
+        }
+        if (wantLog) { std::printf("[camera] %s\n", b); std::fflush(stdout); tk->lastLog = now; }
+    };
+    // Progress from inside one still-running unit of work: percentage and clock, no rate and
+    // no ETA, and deliberately NOT fed to the trailing rate window. See StageProgress::
+    // reportLive in render_progress.h for the measurement that says why an estimator here
+    // would be worse than none.
+    sp.reportLive = [tk, emit](const char* text, long long done, long long total) {
+        const auto now = clk::now();
+        const double elapsed = std::chrono::duration<double>(now - tk->t0).count();
+        const bool wantWin = tk->lastWin.time_since_epoch().count() == 0 ||
+                             std::chrono::duration<double>(now - tk->lastWin).count() >= tk->winGap;
+        const bool wantLog = total > 0 && done > 0 &&
+                             (tk->lastLog.time_since_epoch().count() == 0 ||
+                              std::chrono::duration<double>(now - tk->lastLog).count() >= 30.0);
+        if (!wantWin && !wantLog) return;
+        char b[220];
+        std::snprintf(b, sizeof b, "%s \xE2\x80\x94 %s / %s (%.0f%%), %s, in flight\xE2\x80\xA6",
+                      text, humanCount((double)done).c_str(), humanCount((double)total).c_str(),
+                      total > 0 ? 100.0 * (double)done / (double)total : 0.0,
+                      humanDur(elapsed).c_str());
+        emit(b, wantWin, wantLog, nullptr, 0.0, now);
+    };
+    sp.report = [tk, emit](const char* text, long long done, long long total,
+                           const Film* partial, double divisor) {
+        const auto now = clk::now();
+        const double elapsed = std::chrono::duration<double>(now - tk->t0).count();
+        const bool wantWin = tk->lastWin.time_since_epoch().count() == 0 ||
+                             std::chrono::duration<double>(now - tk->lastWin).count() >= tk->winGap;
+        const bool wantLog = total > 0 && done > 0 &&
+                             (tk->lastLog.time_since_epoch().count() == 0 ||
+                              std::chrono::duration<double>(now - tk->lastLog).count() >= 30.0);
+        // Sample the rate window BEFORE the throttles, not after. The window is a measurement
+        // and the throttles are a display cadence; letting a skipped repaint also skip a
+        // measurement would silently thin the history on any phase that reports faster than
+        // 4 Hz, for no benefit — recording one (time, done) pair costs nothing.
+        if (total > 0 && done != tk->lastDone) {
+            tk->lastDone = done;
+            tk->hist.emplace_back(now, done);
+            while (tk->hist.size() >= 2 &&
+                   std::chrono::duration<double>(now - tk->hist[1].first).count() >= kRateWin)
+                tk->hist.pop_front();
+            const double span = tk->hist.size() >= 2
+                ? std::chrono::duration<double>(now - tk->hist.front().first).count() : 0.0;
+            if (span > 1e-3 && done > tk->hist.front().second)
+                tk->rate = (double)(done - tk->hist.front().second) / span;
+        }
+        if (!wantWin && !wantLog) return;
+        char b[220];
+        if (total > 0) {
+            // Rate and ETA are the whole point of a progress line on a phase that can run
+            // for many minutes: "1.20G / 4.00G" alone still cannot answer "how long more?".
+            //
+            // Measured over a TRAILING WINDOW, not since the phase began. A cumulative
+            // done/elapsed is only honest when the rate is constant, and the phase this
+            // matters most for is the one where it is furthest from constant: a mode-M
+            // gather opens on a 1/16-spp probe slice, and because samples are laid out in
+            // scanline order that probe covers the top of frame, which on gallery_rain is
+            // empty sky where a ray gathers almost no beams. It clocked 12.6k/s; the true
+            // rate once the gather reached the cloud (3205 beams per probe ray) was 280/s,
+            // 45x slower. The cumulative average was still reporting 677/s six minutes in
+            // and its ETA had climbed 986s -> 17974s without converging, every value of it
+            // wrong and wrong in the flattering direction. A trailing window reaches the
+            // real number in about a minute and then tracks it.
+            //
+            // The window advances on DATA, not on wall clock. report() is called at the
+            // window cadence, but `done` only moves when a unit of work lands, so sampling on
+            // time alone would keep capturing spans with no progress in them at all. Recording
+            // only on an advance makes the window self-scaling: it is always at least one
+            // update wide however coarse the updates are, and the rate is HELD between
+            // advances rather than decaying toward zero while a slice is in flight.
+            //
+            // Trimming keeps the OLDEST sample that is still at least kRateWin old, so the
+            // window settles at kRateWin..kRateWin+one-update and never collapses to a single
+            // update. The front is dropped only while the sample behind it is old enough to
+            // take over, which is what guarantees that. (Sampled above, before the throttles.)
+            const double rate = tk->rate;
+            // Until two samples exist there is no trailing rate, and the honest thing to
+            // print is that there isn't one. Printing `0/s, ~0s left` would read as a stalled
+            // render, and printing the one-sample cumulative average instead would reinstate
+            // exactly the bias this window exists to remove -- on a mode-M gather that first
+            // sample IS the sky probe, the 5.3k/s that was never true of anything.
+            if (rate > 0.0)
+                std::snprintf(b, sizeof b,
+                              "%s \xE2\x80\x94 %s / %s (%.0f%%), %s, %s/s, ~%s left",
+                              text, humanCount((double)done).c_str(),
+                              humanCount((double)total).c_str(),
+                              100.0 * (double)done / (double)total,
+                              humanDur(elapsed).c_str(), humanCount(rate).c_str(),
+                              humanDur((double)(total - done) / rate).c_str());
+            else
+                std::snprintf(b, sizeof b,
+                              "%s \xE2\x80\x94 %s / %s (%.0f%%), %s, measuring\xE2\x80\xA6",
+                              text, humanCount((double)done).c_str(),
+                              humanCount((double)total).c_str(),
+                              100.0 * (double)done / (double)total, humanDur(elapsed).c_str());
+        } else {
+            std::snprintf(b, sizeof b, "%s\xE2\x80\xA6 %s", text, humanDur(elapsed).c_str());
+        }
+        emit(b, wantWin, wantLog, partial, divisor, now);
+    };
+    // Re-base the clock AND clear both throttles, so the phase that just started gets its
+    // first window title and its first log line immediately rather than up to 30 s in.
+    sp.reset = [tk]() { *tk = Ticker{}; };
+    return sp;
 }
 
 // --- Resumable-render checkpoint (.ftbuf sidecar) -----------------------------
@@ -13479,12 +15211,18 @@ static OnUnsupported g_onUnsupported = OnUnsupported::Error;
 
 // Core capability check: return a reason string if `mode` cannot render `scene` with a
 // camera of the given `projection`, else nullptr. Only modes with real restrictions (D
-// BDPT, U VCM) gate anything; the general modes (A/B/C/R/M/S/P) render everything here.
+// BDPT, J UPBP, U VCM) gate anything; the general modes (A/B/C/R/M/S/P) render everything.
 static const char* modeFeatureUnsupported(const Scene& scene, char mode, int projection) {
-    if (mode == 'D') {
+    // Mode J (UPBP) is mode D's transport plus beam merging, so it inherits D's scope
+    // EXACTLY — same connections, same MIS densities, same refusals. The beam half adds
+    // no capability of its own: a beam map is built by the same forward photon pass mode M
+    // uses, and a scene whose emitters or media BDPT cannot weight is one whose merges it
+    // cannot weight either.
+    if (mode == 'D' || mode == 'J') {
         if (const char* r = bdptUnsupportedFeature(scene)) return r;
         if (projection != CAM_RECTILINEAR)
-            return "a non-rectilinear (fisheye/panoramic) camera in mode D";
+            return (mode == 'J') ? "a non-rectilinear (fisheye/panoramic) camera in mode J"
+                                 : "a non-rectilinear (fisheye/panoramic) camera in mode D";
     } else if (mode == 'U') {
         if (const char* r = bdptUnsupportedFeature(scene)) return r;
         // Mirrors vcmUnsupportedFeature: spot / sun lights are supported in mode U too.
@@ -13636,6 +15374,19 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
         long long c = chunk; if (c > sppTarget - done) c = sppTarget - done;
         auto t0 = clk::now();
         Film f = renderOne(c, seedBias + (unsigned long long)done);
+        // A renderer may now ABANDON its chunk part-way when `-stop` / Ctrl-C arrives —
+        // mode D/J's camera pass polls per pixel (bdpt.h renderRows). Such a film covers
+        // only the pixels reached before the stop, so merging it while crediting the full
+        // `c` spp would divide a partial image by a whole sample count and bake a dark
+        // band in permanently. Throw it away instead: `acc` already holds a complete,
+        // correctly normalised render of `done` spp, which is exactly what should be
+        // written out. Report once more so the final image and checkpoint are flushed with
+        // the spp count that is genuinely in them (skipped at done == 0, where there is no
+        // image yet and reporting would write a black frame over nothing).
+        if (ft::stopRequested()) {
+            if (done > 0) prog->report(acc, done, /*final*/true);
+            break;
+        }
         acc.merge(f);
         done += c;
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
@@ -13751,17 +15502,18 @@ static int runSppProgressive(
             const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
             char st[220];
             if (runForever)
-                std::snprintf(st, sizeof st, "[forever] %.1fs, %lld spp, %s%s",
-                              elapsed, totalSpp, nz, why);
+                std::snprintf(st, sizeof st, "[forever] %s, %lld spp, %s%s",
+                              humanDur(elapsed).c_str(), totalSpp, nz, why);
             else if (timeBudgetSec > 0.0)
-                std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld spp, %s%s",
-                              elapsed, timeBudgetSec, totalSpp, nz, why);
+                std::snprintf(st, sizeof st, "[time] %s / %s, %lld spp, %s%s",
+                              humanDur(elapsed).c_str(), humanDur(timeBudgetSec).c_str(),
+                              totalSpp, nz, why);
             else if (noiseTarget > 0.0)
-                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld spp, %s%s",
-                              noiseTarget, elapsed, totalSpp, nz, why);
+                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %s, %lld spp, %s%s",
+                              noiseTarget, humanDur(elapsed).c_str(), totalSpp, nz, why);
             else
-                std::snprintf(st, sizeof st, "[spp] %lld / %lld, %.1fs, %s",
-                              totalSpp, baseSpp + sppReq, elapsed, nz);
+                std::snprintf(st, sizeof st, "[spp] %lld / %lld, %s, %s",
+                              totalSpp, baseSpp + sppReq, humanDur(elapsed).c_str(), nz);
             if (wantSave) {
                 // The converged/stopping frame owns the exposure anchor; intermediate frames
                 // auto-expose independently (they only refine, never lock the anchor).
@@ -13797,8 +15549,14 @@ static int runSppProgressive(
                    : metTime         ? "time budget reached"
                    : runForever      ? "stopped"
                                      : "sample target reached");
-    if (g_stopRequested)
+    if (g_stopRequested && finalSpp > 0)
         std::printf("\n[stop] interrupted at %lld spp — image saved.\n", finalSpp);
+    else if (g_stopRequested)
+        // Reachable now that the camera pass can be interrupted inside the FIRST chunk:
+        // no sample ever completed, so there is no image and claiming one was saved
+        // would send the user looking for a file that is not there.
+        std::printf("\n[stop] interrupted before the first sample completed — "
+                    "nothing was written.\n");
     else if (metNoise)
         std::printf("[noise] reached the ~%.2g%% target at %lld spp — image saved.\n",
                     noiseTarget, finalSpp);
@@ -13947,17 +15705,18 @@ static int runCompositeProgressive(
             const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
             char st[220];
             if (runForever)
-                std::snprintf(st, sizeof st, "[forever] %.1fs, %lld photons / %lld spp, ~%.2f%% noise%s",
-                              elapsed, acc.N, acc.spp, noisePct, why);
+                std::snprintf(st, sizeof st, "[forever] %s, %lld photons / %lld spp, ~%.2f%% noise%s",
+                              humanDur(elapsed).c_str(), acc.N, acc.spp, noisePct, why);
             else if (timeBudgetSec > 0.0)
-                std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld photons / %lld spp, ~%.2f%% noise%s",
-                              elapsed, timeBudgetSec, acc.N, acc.spp, noisePct, why);
+                std::snprintf(st, sizeof st, "[time] %s / %s, %lld photons / %lld spp, ~%.2f%% noise%s",
+                              humanDur(elapsed).c_str(), humanDur(timeBudgetSec).c_str(),
+                              acc.N, acc.spp, noisePct, why);
             else if (noiseTarget > 0.0)
-                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld photons / %lld spp, ~%.2f%% noise%s",
-                              noiseTarget, elapsed, acc.N, acc.spp, noisePct, why);
+                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %s, %lld photons / %lld spp, ~%.2f%% noise%s",
+                              noiseTarget, humanDur(elapsed).c_str(), acc.N, acc.spp, noisePct, why);
             else
-                std::snprintf(st, sizeof st, "[spp] %lld / %lld spp (%lld / %lld photons), %.1fs, ~%.2f%% noise",
-                              acc.spp, sppReq, acc.N, Nreq, elapsed, noisePct);
+                std::snprintf(st, sizeof st, "[spp] %lld / %lld spp (%lld / %lld photons), %s, ~%.2f%% noise",
+                              acc.spp, sppReq, acc.N, Nreq, humanDur(elapsed).c_str(), noisePct);
             if (wantSave) {
                 persist(comp, done);
                 lastSave = clk::now();
@@ -13988,6 +15747,62 @@ static int runCompositeProgressive(
     return writeOk ? 0 : 1;
 }
 
+// MODE J'S LIGHT SIDE, SHARED ACROSS THE CAMERAS OF ONE BATCH (-beamfreeze).
+//
+// The beam map and the surface photon map are VIEW-INDEPENDENT: `traceLightBeamPass` takes a
+// `Camera&` only to hand it to `generateLightSubpath`, whose `randomWalk` opens with
+// `(void)cam;   // cam reserved for future NEE-to-camera use`. Nothing downstream of it reads
+// the camera, so a flyby's twelfth frame retraces, to the bit, the map its first frame built.
+//
+// "To the bit" is not a hope here, it is forced by three things that already hold:
+//   * the light pass seeds per ABSOLUTE subpath index (`seedUnit(rng, salt + i, ...)` in
+//     bdpt.h), so the map does not depend on the thread count or on the chunking;
+//   * the only per-pass salt is `RngSaltScope(epoch)`, and epoch 0 is the identity
+//     (rng.h: "`k == 0` is the identity"), so every camera's epoch 0 draws one stream;
+//   * the budget pilot has its own fixed seed, so `jbb` comes back the same too.
+// So this cache changes the render's COST and not its pixels, and that is testable rather
+// than arguable -- see known-issues.md PERF.
+//
+// It is gated on `-beamfreeze` for a reason that is not conservatism. Without the freeze the
+// light side is REDRAWN between epochs under a fresh salt (UPBP-THICK), and which realization
+// a camera ends on then depends on how many epochs its own budget fitted -- so there is no one
+// map to share, and hoisting one would silently hand frame 2 whatever realization frame 1
+// happened to stop on. Transposing the loops (one epoch, all cameras, repeat) is the version
+// that shares a refreshing light side, and it is a different change.
+struct JLightCache {
+    BeamMap              bmap;
+    bdpt::SurfMap        smap;
+    bdpt::BeamBudgetInfo jbb;
+    // The key. Everything `buildLightSide(0)` reads that a second camera could differ in:
+    // `-n`, the film (which sizes `jreq.surfPaths` on a media-free -jsurf run AND, via
+    // res*resY*spp, buildBeamMap's split length), and the transport parameters. The rest of
+    // its inputs are command-line globals, fixed for the process, so they cannot vary between
+    // two cameras of one batch and are deliberately not copied here.
+    const Scene* scene = nullptr;
+    long long    N = 0, spp = 0;
+    int          res = 0, resY = 0, maxDepth = 0, nThreads = 0;
+    bool         diffraction = false, wantBeams = false, wantSurf = false;
+    double       surfRadius = 0.0;
+    bool         valid = false;
+
+    bool matches(const Scene* sc, long long n, long long sp, int rx, int ry, int md, int nt,
+                 bool diff, bool wb, bool ws, double sr) const {
+        return valid && scene == sc && N == n && spp == sp && res == rx && resY == ry &&
+               maxDepth == md && nThreads == nt && diffraction == diff &&
+               wantBeams == wb && wantSurf == ws && surfRadius == sr;
+    }
+    void stamp(const Scene* sc, long long n, long long sp, int rx, int ry, int md, int nt,
+               bool diff, bool wb, bool ws, double sr) {
+        scene = sc; N = n; spp = sp; res = rx; resY = ry; maxDepth = md; nThreads = nt;
+        diffraction = diff; wantBeams = wb; wantSurf = ws; surfRadius = sr; valid = true;
+    }
+    // Explicit rather than left to the destructor: the maps are hundreds of MB and the batch
+    // holds this object until every camera is done, so the caller drops it the moment the
+    // last mode-J frame is written rather than at scope exit.
+    void clear() { bmap = BeamMap{}; smap = bdpt::SurfMap{}; jbb = bdpt::BeamBudgetInfo{};
+                   valid = false; }
+};
+
 // Render one camera into `outPath`. Resolves the -device request for THIS mode,
 // runs the mode dispatch (R/V backward+validate, P composite, or A/B/C forward),
 // and writes the result. Factored out of main so any number of cameras (Phase 3a
@@ -14003,7 +15818,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      bool preview = false, double intervalSec = 15.0,
                      double noiseTarget = 0.0, bool wavefront = false,
                      double* exposureAnchor = nullptr, bool rgbBackward = false,
-                     int maxBounceOverride = -1, bool directOnly = false) {
+                     int maxBounceOverride = -1, bool directOnly = false,
+                     JLightCache* jcache = nullptr) {
     g_windowMode = modeLabel(mode);   // title bar shows the transport mode of this frame
     // Make sure the window is up (and naming this frame) before the first chunk rather than
     // after it — see liveWindowPlaceholder. Normally a no-op re-title, since run() already
@@ -14011,7 +15827,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // that dispatch.
     liveWindowPlaceholder(res, resY, g_windowMode + " \xE2\x80\x94 starting\xE2\x80\xA6");
     const bool refMode      = (mode == 'R' || mode == 'V');
-    const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
+    const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' ||
+                               mode == 'D' || mode == 'J' || refMode);
     const bool forwardCatch = (mode == 'C');
     const bool lensMode     = (mode == 'A');   // finite-lens next-event splat (physical camera)
 
@@ -14024,41 +15841,38 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // samples on top), and the composite mode P (dual-film checkpoint — forward SUM + backward
     // SUM). The persistent-state modes M/S/U (photon-map / SPPM / VCM) can't be
     // resumed from a film alone, so keep those gated with a warning.
+    //
+    // Mode J (UPBP) resumes like D, with one honest caveat: its beam map is rebuilt from
+    // the same seed, so the MERGE half of every resumed sample is bit-identical to the one
+    // already in the film. Averaging identical samples cannot shrink their error — which is
+    // not a bug and not a bias, it is simply mode M's view-independence showing through:
+    // extra spp decorrelate the CONNECTION half only. (A resumed render that wanted a fresh
+    // beam realization would have to re-trace the photon pass with a different seed, which
+    // would also throw away the map's whole reason for existing on a flyby.)
     if ((resume || wantCheckpointFlag) &&
-        !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' || mode == 'P')) {
+        !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' ||
+          mode == 'J' || mode == 'P')) {
         std::fprintf(stderr, "[render] -resume/-checkpoint apply only to modes A/B/C "
-                             "(forward), R/D (reference), and P (composite); ignoring for mode %c\n", mode);
+                             "(forward), R/D/J (reference), and P (composite); ignoring for mode %c\n", mode);
         resume = false; wantCheckpointFlag = false;
     }
     if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever) &&
         !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' ||
-          mode == 'P' || mode == 'M' || mode == 'S' || mode == 'U')) {
+          mode == 'J' || mode == 'P' || mode == 'M' || mode == 'S' || mode == 'U')) {
         std::fprintf(stderr, "[render] -time/-noise/-forever apply only to modes A/B/C (forward), "
-                             "R/D (reference/BDPT), P (composite), and M/S/U (photon map / SPPM / VCM); ignoring for mode %c\n", mode);
+                             "R/D/J (reference/BDPT/UPBP), P (composite), and M/S/U (photon map / SPPM / VCM); ignoring for mode %c\n", mode);
         timeBudgetSec = 0.0; noiseTarget = 0.0; runForever = false;
     }
     if (intervalSec <= 0.0) intervalSec = 15.0;
 
-    // Heterogeneous / bounded participating media (a `density` field or a `bounds`
-    // box on `medium`) are honored only by the FORWARD light tracer (modes A/B/C, and
-    // the forward layers of V/P) and by the DEVICE tracers. The *CPU* backward tracer
-    // (backward.h, used by modes R/W/V and the camera-side layer of P) still collapses
-    // the whole `scene.media` vector to `scene.backwardMedium()` — the FIRST authored
-    // medium, treated as a global homogeneous haze with its `density` and `bounds`
-    // ignored. `mediaNeedForward` records whether this scene would actually notice.
-    // Mode D (volumetric BDPT) is excluded: it handles multiple superposed,
-    // box/sphere/object-bounded AND heterogeneous media correctly on both devices —
-    // subpath medium vertices are placed by delta tracking and connections weighted by
-    // ratio-tracking transmittance. The GPU backward megakernel (render_cuda.cu
-    // dMediaSampleCollision / bkNeeVolume) likewise superposes the full media vector,
-    // per-medium phase function included, so a GPU R/W render is NOT degraded and must
-    // not be warned about — which is why the warning itself now lives AFTER the -device
-    // resolution below rather than here. (Tracked in known-issues.md: the CPU backward's
-    // single-haze limitation, and the CPU/GPU divergence it causes.)
-    bool mediaNeedForward = scene.media.size() > 1;   // >1 medium: only the CPU backward suffers
-    for (const Medium& m : scene.media)
-        if (m.heterogeneous() || m.bounded) mediaNeedForward = true;
-    mediaNeedForward = mediaNeedForward && scene.anyMedium();
+    // Participating media used to need a warning here: until 0.254.0 the CPU backward
+    // tracer (backward.h — modes R/W/V and the camera-side layer of P) collapsed the whole
+    // `scene.media` vector to `Scene::backwardMedium()`, the FIRST authored medium treated
+    // as an unbounded global homogeneous haze with `density` and `bounds` ignored, while
+    // the forward tracer and both device megakernels superposed the vector properly. The
+    // superposition is now shared verbatim (Renderer::sampleMediaCollision /
+    // mediaTransmittance, called from backward.h), so every tracer on both devices agrees
+    // and there is nothing left to warn about.
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and
@@ -14074,7 +15888,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // projection remap) for the pinhole-splat modes (B/V/P).
     const bool gpuForwardMode =
         (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
-    const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
+    // GPU BDPT megakernel (own support check). Mode J (UPBP) runs the SAME megakernel:
+    // its camera pass is mode D's connections plus the beam merges, so the device kernel
+    // is kBdptT<..., MERGE=true> with the already-built beam map uploaded alongside. The
+    // light/beam pass (tracing the photon beams and building their BVH + MIS partials)
+    // stays on the CPU either way -- the GPU flag only governs the camera pass.
+    const bool gpuBdptMode = (mode == 'D' || mode == 'J');
     // GPU backward reference megakernel (own check). -mode W runs here too: the device
     // megakernel carries a full twin of the deterministic estimators (the bkWhitted /
     // bkGrid / bkGi* / bkHeroSplit / bkAmbient DScene knobs + the dWhitted* lattice helpers
@@ -14090,10 +15909,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // BDPT's camera importance (bdpt.h cameraWe/cameraPdfDir) is the rectilinear
     // pinhole convention and feeds the MIS balance heuristic; a fisheye lens there
     // would give subtly-wrong weights, so mode D rejects it rather than lie.
-    if (fisheyeCam && mode == 'D') {
-        std::fprintf(stderr, "[camera] mode D (BDPT) does not support a fisheye/panoramic "
+    if (fisheyeCam && (mode == 'D' || mode == 'J')) {
+        std::fprintf(stderr, "[camera] mode %c (%s) does not support a fisheye/panoramic "
                              "lens; render this camera with mode B (forward pinhole) or R "
-                             "(reference) instead.\n");
+                             "(reference) instead.\n",
+                     mode, mode == 'J' ? "UPBP" : "BDPT");
         return 1;
     }
     // Model A/C image through a single rectilinear thin lens (lensImage uses
@@ -14133,16 +15953,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
         } else if (gpuBdptMode) {
-            // Mode D has its own (stricter) GPU support check: BDPT scope only. A realistic
-            // lens on the camera subpath (Plan B) is supported on-device too — the BDPT
-            // kernel generates the lens ray via dGenLensRay, exactly as the GPU mode-R
-            // backward megakernel does.
+            // Modes D and J share this (stricter) GPU support check: BDPT scope only — mode J
+            // is the same megakernel with the merges switched on, so anything mode D can run
+            // on the device, mode J can. A realistic lens on the camera subpath (Plan B) is
+            // supported on-device too — the BDPT kernel generates the lens ray via
+            // dGenLensRay, exactly as the GPU mode-R backward megakernel does.
             if (!cudaBdptSupported(scene)) {
                 const char* why = "scene has a BDPT-GPU-unsupported feature "
-                                  "(fluorescent/oversized-mix material, fog, "
-                                  "spot/sun/env/collimated light, an `emit pattern:` emission "
-                                  "profile, or a per-hit BSDF the GPU BDPT can't MIS: a "
-                                  "procedural pattern or frosted/colored glass)";
+                                  "(hair, GRIN media, env/collimated light, or a "
+                                  "GPU-unsupported material: layered, indexed-palette, "
+                                  "oversized multilayer/mix, or an emissive 'fire' volume)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -14225,7 +16045,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // the CPU path — merely slow — is strictly better than a GPU path that is 1000x slow.
     // So: measure, and say exactly what is wrong and who to blame.
     if (useGpu) {
-        const int hero = (mode == 'D') ? g_heroC : 1;
+        const int hero = (mode == 'D' || mode == 'J') ? g_heroC : 1;
         const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
         size_t needLocal = cudaMegakernelLocalBytes(mode, mdep, hero);
         size_t freeB = 0, totalB = 0;
@@ -14280,40 +16100,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // point where `useGpu` stops changing, so stamping here reports the device the frames
     // are really traced on rather than the one `-device` asked for.
     g_windowBackend = backendLabel(useGpu, nThreads);
-
-    // Now that the device is resolved, warn if this render's BACKWARD layer will actually
-    // run on the CPU tracer, which collapses `scene.media` to `backwardMedium()` (see the
-    // `mediaNeedForward` computation above). The GPU backward megakernel superposes the
-    // full media vector — bounds, density fields and per-medium phase functions included —
-    // so the same scene on the GPU renders the authored fog and gets no warning. Modes:
-    //   R/W — the whole image is the backward tracer; degraded iff !useGpu.
-    //   V   — its backward reference is CPU-by-design, so always degraded.
-    //   P   — only the camera-side (specular) layer is backward; it is on the GPU only when
-    //         the forward layer is too AND the scene is in backward-GPU scope.
-    if (mediaNeedForward) {
-        bool cpuBackward = false;
-        if      (mode == 'R') cpuBackward = !useGpu;
-        else if (mode == 'V') cpuBackward = true;
-#ifdef HAVE_CUDA
-        else if (mode == 'P') cpuBackward = !(useGpu && backwardOnGpuOk(scene, cam));
-#else
-        else if (mode == 'P') cpuBackward = true;
-#endif
-        if (cpuBackward) {
-            const char* layer = (mode == 'R')
-                ? "this render"
-                : (mode == 'V' ? "mode V's backward reference"
-                               : "mode P's camera-side layer");
-            std::fprintf(stderr,
-                "[medium] %s runs on the CPU backward tracer, which treats participating "
-                "media as a SINGLE global HOMOGENEOUS haze (the first authored medium); any "
-                "additional media, `density` fields and `bounds` regions (box/sphere/object) are "
-                "IGNORED here. The GPU backward megakernel does support them, so `-device gpu` "
-                "(mode %c) renders the authored fog; otherwise use a forward mode (A/B/C) or "
-                "volumetric BDPT (mode D).\n",
-                layer, g_whitted ? 'W' : mode);
-        }
-    }
 
     // Same "the device is now resolved" moment, for -radcache. The cache is read from
     // exactly ONE place -- BackwardRenderer::radianceHeroLoop, on the CPU -- so a
@@ -14482,6 +16268,579 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                  checkpointGuard(scene, mode, res, resY), mode);
     }
 
+    // --- UPBP (mode J) — BDPT connections MIS-combined with photon-beam merges ------
+    //
+    // Mode D and mode M each solve half of a volumetric scene and neither can borrow the
+    // other's half. Mode D is unbiased and resamples every path per spp, so its error is
+    // zero-mean grain that falls as 1/sqrt(spp) — but every one of those paths is traced
+    // from THIS camera, so a 600-frame flyby pays the whole cost 600 times. Mode M traces
+    // its photons once and reuses them for every frame, which is the only reason a flyby is
+    // affordable at all — but its beam gather is a blurred, view-independent CACHE, so extra
+    // spp re-gather the same beams and the error stops falling at a floor (measured on
+    // gallery_rain: speckle^2 = s0^2 + k/spp with s0 != 0).
+    //
+    // UPBP (Krivanek et al. 2014, "Unifying Points, Beams and Paths") is the estimator that
+    // takes both: the same camera sample carries BDPT connections AND merges against the
+    // mode-M beam map, combined by the multi-sample balance heuristic so the pair is still
+    // one unbiased estimator of the same integral. The technique with the lower variance for
+    // a given path wins the weight automatically — merging deep inside a thick medium where
+    // the camera's distance sampling never reaches, connections everywhere merging is blind
+    // (multiple scattering, which straight-deposited beams omit outright).
+    //
+    // The letter: 'U' is VCM and 'B' and 'P' are taken, so this is 'J' for Jarosz, whose
+    // beam x ray estimator (photonbeams.h) is precisely what distinguishes mode J from mode U.
+    //
+    // Scope is mode D's, exactly — see modeFeatureUnsupported. The derivation of the merge
+    // MIS density, the validation gates, and what this is and is not predicted to buy are all
+    // in known-issues.md under the UPBP entry.
+    if (mode == 'J') {
+        if (const char* unsupported = bdptUnsupportedFeature(scene)) {
+            std::fprintf(stderr, "[mode J] this scene uses %s, which UPBP (mode J) does not "
+                                 "support — its connection half is BDPT and inherits mode D's "
+                                 "scope; render it with mode B/P (forward) or mode R "
+                                 "(backward) instead.\n", unsupported);
+            return 1;
+        }
+        int maxDepth = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
+        // WHICH HALF RUNS WHERE. Mode J's camera pass is mode D's megakernel with the merges
+        // switched on (kBdptT<..., MERGE=true>), so it follows the same -device decision mode D
+        // does. The LIGHT pass — tracing the subpaths, splitting them into sub-beams, building
+        // the BVH and the per-beam MIS partials — stays on the CPU on both backends: it is a
+        // one-off build whose cost is independent of spp, and the map it produces is uploaded
+        // to the device once. So the two halves genuinely can differ, and the banner says so
+        // rather than claiming a single "on N CPU threads" that would be a lie about half the
+        // render.
+        //
+        // Since 0.263.1 there is no exception left: `-jsurf`'s point x point merges have a
+        // device twin (dSurfMergeAt), the device weight carries both merge kinds, and the
+        // MERGE=true kernel is selected for EITHER kind -- so both backends render the same
+        // three-technique estimator. Validated against a 3.1M-spp mode-R reference: the merge
+        // half agrees CPU-to-GPU to a median ratio of 0.9998, and the full render reads
+        // -0.73 / -0.44 / +0.62 % against ground truth where the CPU reads -0.87 / -0.46 / +0.62.
+        const std::string camWhere =
+            useGpu ? std::string("GPU") : (std::to_string(nThreads) + " CPU threads");
+        // The merge half needs a beam map, and a beam map needs media. A media-free scene
+        // is not an error — it is just mode D with extra words — so say so and carry on
+        // rather than refusing, which also makes "mode J == mode D here" a testable claim
+        // (validation gate 1) rather than a special case.
+        //
+        // Note the flag polarity, which is the REVERSE of modes A/B/M: they need `-beams` to
+        // opt in, mode J needs `-nobeams` to opt out. See g_noBeams for why.
+        const bool wantBeams = !g_noBeams && !scene.media.empty();
+        // THE SECOND MERGE KIND (-jsurf): point x point on surfaces, i.e. what mode U does.
+        // Independent of the beams in both directions — a media-free scene gets surface merges
+        // and no beams, a pure-fog scene beams and no surface photons, and a scene with both
+        // gets both under ONE denominator, which is the entire reason for folding mode U in
+        // here rather than leaving two modes that each solve half the problem.
+        const bool wantSurf = g_jSurf;
+        // The gather disc. Shares -pmradius/-pmradiusfrac's default with modes M/S/U on
+        // purpose: it makes "mode J -jsurf" against "mode U" a comparison of estimators
+        // rather than of radii.
+        const double surfRadius0 = (g_jSurfRadius > 0.0) ? g_jSurfRadius
+                                 : (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                                         : scene.sceneRadius * g_pmRadiusFactor;
+        // ...and it is only the STARTING radius, because a fixed one would make the point
+        // merges inconsistent — the one thing mode U has that mode J must not lose when U is
+        // retired. A merge estimator's bias is O(r^2); hold r still and that bias is a floor no
+        // amount of sampling gets under. Measured on _cornell_diffuse at 1024 spp against an
+        // 8192 spp mode-D reference, with the radius held fixed:
+        //
+        //     r = 0.005    energy bias -0.11%      r = 0.0173   -0.45%      r = 0.035   -0.52%
+        //
+        // — monotone in r and heading for zero, i.e. exactly the O(r^2) floor and not a bug in
+        // the weight. Mode U escapes it by shrinking R0 per iteration on Georgiev/SmallVCM's
+        // schedule, so here mode J shrinks on the SAME schedule under the SAME -vcmalpha,
+        // indexed by the light-side refresh epoch (mode J's analogue of a VCM iteration: one
+        // independent realization of the whole light-side map).
+        //
+        // Why uniform averaging over epochs still converges: epoch e's bias is ~C*r_e^2 with
+        // r_e^2 ~ r_0^2 * e^(alpha-1), and the render reports the plain mean of the epochs, so
+        // the total bias is the Cesaro mean (1/E)*sum_e C*r_e^2 ~ E^(alpha-1) -> 0. Consistency
+        // does not need a weighted average, only bias_e -> 0.
+        //
+        // Nothing else has to change to follow the schedule: `mk.surf` is derived from
+        // `SurfMap::radius` at gather time (bdpt.h ~3512) and the light pass's kappa_s comes
+        // from the same field, so handing build() a different radius retunes the estimator AND
+        // its MIS weight together, per epoch, with no second source of truth.
+        auto surfRadiusFor = [&](uint64_t epoch) {
+            const double it = (double)(epoch + 1);
+            const double r  = surfRadius0 * std::pow(it, 0.5 * (g_vcmAlpha - 1.0));
+            return (r > 0.0) ? r : surfRadius0;    // guards a pathological -vcmalpha
+        };
+        if (!wantBeams && !wantSurf)
+            std::printf("mode J: %s, so there is nothing to merge against; "
+                        "this render is mode D exactly (-jsurf adds surface merges).\n",
+                        g_noBeams ? "-nobeams was given" : "no participating media");
+        else if (!wantBeams)
+            std::printf("mode J: %s, so the merge half is surface point merges only "
+                        "(-jsurf, r=%.4g shrinking at -vcmalpha %.3g).\n",
+                        g_noBeams ? "-nobeams was given" : "no participating media",
+                        surfRadius0, g_vcmAlpha);
+        warnBeamsGrinMedia(scene, wantBeams);
+        // THE THREE OBJECTS THAT MOVE AS A UNIT (see JLightCache): the beam map, the surface
+        // photon map built from the SAME subpaths, and the budget the pilot settled on. They
+        // live in the batch's cache when this render can share one -- a flyby under
+        // `-beamfreeze` -- and in a local otherwise, so an unshared render still owns its map
+        // and releases it at the end of its own scope exactly as before.
+        // "Every beam map built inside this mode-J render will be gathered on the device."
+        // Scoped rather than assigned, because runRender leaves this block through
+        // runSppProgressive and a bare assignment would leak the state into the next camera of
+        // a batch -- which on a CPU camera would hand it a map with no tree at all.
+        struct JDevBeamScope {
+            bool prev;
+            explicit JDevBeamScope(bool v) : prev(g_jDevBeamOk) { g_jDevBeamOk = v; }
+            ~JDevBeamScope() { g_jDevBeamOk = prev; }
+        } jdbScope(useGpu);
+        // ...and with the light side on the device, a realization costs ~3x less, so
+        // `-beamrefresh`'s balance point moves with it. Scoped for the same reason jdbScope is:
+        // the next camera of a batch may be a CPU one, where the old value is still right.
+        struct JRefreshScope {
+            double prev; bool active;
+            explicit JRefreshScope(bool on) : prev(g_beamRefreshFrac), active(on) {
+                if (on) g_beamRefreshFrac = kBeamRefreshDevJ;
+            }
+            ~JRefreshScope() { if (active) g_beamRefreshFrac = prev; }
+        } jrfScope(jSkipHostBvh() && !g_beamRefreshSet && !g_beamFreeze);
+        const bool shareLight = (jcache != nullptr) && g_beamFreeze;
+        JLightCache jlocal;
+        JLightCache& jlc = shareLight ? *jcache : jlocal;
+        BeamMap&       bmap = jlc.bmap;
+        bdpt::SurfMap& smap = jlc.smap;
+        StageProgress stageProg = makeStageProgress(res, resY);
+        // Hoisted out of the build below because epoch 0 DECIDES the map size and every later
+        // epoch reuses that decision: re-running the budget pilot per refresh would pay for it
+        // over and over and let the subpath count wander between realizations for no benefit.
+        bdpt::BeamBudgetInfo& jbb = jlc.jbb;
+        // WHERE THE LIGHT-SIDE BUDGET GOES, split four ways, because the four have wildly
+        // different fixes and the totals are what decide which one is worth building: a device
+        // TRACE, a faster BVH, a cheaper surface grid, or a scene left RESIDENT on the device
+        // across epochs. See the [jstats] line at the end of the render.
+        double lsTraceSec = 0.0;    // the subpath trace itself (bdpt::traceLightBeamPass)
+        double lsBeamSec  = 0.0;    // buildBeamMap: split + SAH BVH over the chords
+        double lsSurfSec  = 0.0;    // SurfMap::build: the point-merge grid
+        double lsSetupSec = 0.0;    // per-epoch gap to the first sample (device scene re-upload)
+        double lsGatherSec = 0.0;   // the gather, i.e. what all of the above is overhead ON
+        // THE LIGHT SIDE AS A FUNCTION OF THE EPOCH, rather than a one-off. Epoch 0 is the
+        // original build bit-for-bit; every later epoch redraws the same map under a different
+        // salt, so the render averages over INDEPENDENT light-side realizations instead of
+        // freezing on one. That is the whole of the UPBP-THICK fix — see g_beamFreeze for the
+        // measurements, and rng.h's RngSaltScope for why the salt has to come back off before
+        // the camera pass runs.
+        auto buildLightSide = [&](uint64_t epoch) {
+            RngSaltScope saltScope(epoch);
+            const bool first = (epoch == 0);
+            if (!first) { bmap = BeamMap{}; smap = bdpt::SurfMap{}; }   // drop the old
+                                                       // realization before redrawing
+            // MODE J'S OWN LIGHT PASS (0.216.0), not tracePhotonPass. The beams have to be
+            // sampled by the same machinery as the connection half's `light[]` subpaths, or
+            // the merge weight would be a ratio between densities that are different
+            // FUNCTIONS — see bdpt::traceLightBeamPass and known-issues.md. `-n` therefore
+            // counts LIGHT SUBPATHS here, not photons; the two are the same quantity
+            // (emitter power per path) so the normalisation is unchanged.
+            //
+            // NOT the difference from mode M's map (this comment used to say so, and was
+            // wrong from the day it was written): both maps carry MULTIPLE scattering. Mode
+            // M's photon has run analog transport under `-beams` since 0.199.0, depositing
+            // one chord per scattering event with `beamOrderMax == 0` (unlimited) by default
+            // — see render.h's beamMSAllowed. `-beams-order 1` is what reduces it to the
+            // pre-0.199.0 single-scatter straight crossing, and it is off by default.
+            //
+            // The real difference is WHOSE density the beams are drawn from. Mode M's come
+            // from the forward photon pass and are reconstructed on their own; mode J's come
+            // from the BDPT light subpaths, which is the only reason the merge and the
+            // connection can be put under one MIS weight at all — a beam and a connection
+            // have to be two estimators of the same integral before their weights can sum
+            // to one.
+            // THE BEAM BUDGET (0.242.0, J-BEAMCOST). Off when the user gave an explicit `-n`:
+            // two knobs on one quantity, and the more specific one wins. `-beamcount` is a
+            // plain resource ceiling on the map; what actually sizes it is the scene's own
+            // `-beamk` knee, measured by a discarded pilot inside traceLightBeamPass. There is
+            // deliberately NO frame term -- see the note above buildBeamMap for the measurement
+            // that ruled one out -- and bdpt.h's note for why 0.243.0 aims at the knee itself
+            // rather than below it.
+            bdpt::BeamBudgetReq jreq;
+            jreq.maxBeams = (g_nFromCli || !first) ? 0 : g_beamTarget;
+            // Forwarded, not re-defaulted: the pilot's knee is only the real knee if it is
+            // measured at the radii buildBeamMap is about to build with.
+            jreq.blur     = g_beamBlur;
+            jreq.targetK  = g_beamK;
+            // THE SURFACE MAP'S HALF OF THE SAME DECISION (-jsurf). One subpath count feeds two
+            // maps, and the arbitration is made HERE because this is where the scene is known:
+            //
+            //  * When there ARE beams, they size the pass, because undershooting their knee is a
+            //    documented BIAS (buildAuto widens the kernel) while a surface map is merely
+            //    noisier for being smaller — its radius is fixed. So `surfPaths` stays 0 and the
+            //    surface side gets only its memory ceiling.
+            //  * When there are NO beams, the beam budget measures nothing and the pass would
+            //    otherwise inherit the inert `-n 2000000` default — 7 M photons / 500 MB for a
+            //    64x64 image, which is how this was first found. There the surface side names the
+            //    count, at mode U's convention of one light subpath per pixel per epoch, which is
+            //    also what makes "-mode J -jsurf" against "-mode U" a comparison of estimators.
+            //
+            // Both are off when the user gave an explicit `-n` (the more specific knob wins,
+            // exactly as for `maxBeams`) and on refresh epochs (the sizing question was answered
+            // at epoch 0; `Nepoch` below re-traces that answer).
+            if (wantSurf && !g_nFromCli && first) {
+                if (!wantBeams)
+                    jreq.surfPaths = (long long)res * (long long)resY;
+                jreq.maxSurfPhotons = g_jSurfCount;
+            }
+            // A refresh traces exactly the subpath count epoch 0 settled on, with no budget and
+            // therefore no pilot: the sizing question was answered once and re-asking it would
+            // cost a pilot per epoch to get the same answer with more noise on it.
+            const long long Nepoch = first ? N : (jbb.pathsUsed > 0 ? jbb.pathsUsed : N);
+            // WHAT EACH EPOCH SAYS. Epoch 0 announces how the map is being sized; epoch 1
+            // announces that refreshes are happening at all; every epoch after that is
+            // SILENT. That last clause is the point — a cheap scene refreshes every second
+            // or so, and a line per refresh would be hundreds of identical sentences
+            // drowning the -interval status lines that actually carry information. The
+            // realization count is reported once more at the end of the render.
+            //
+            // This used to be a single if/else-if/else chain keyed on `jreq.maxBeams`, which
+            // got epochs >= 2 wrong three ways at once (0.249.0): a refresh sets maxBeams=0
+            // by design — the sizing question was answered at epoch 0 — so it fell through to
+            // the `-n` branch and printed "(-n given: no beam budget)" on a command line with
+            // no -n, quoting `N` (the *default* 2000000) rather than the `Nepoch` it actually
+            // traces, once per refresh. Keying on the epoch instead of on a variable that
+            // merely correlates with it is what makes those three impossible rather than
+            // fixed: the `-n` sentence can now only be reached from epoch 0, where it is true.
+            if (!first) {
+                if (epoch == 1)
+                    std::printf("mode J: light-side refresh — redrawing %lld subpaths under a "
+                                "fresh salt every ~%.0f%% of the wall clock and averaging the "
+                                "realizations, so the MERGE noise falls with the render too "
+                                "(-beamfreeze to opt out; -beamrefresh to retune) ...\n",
+                                Nepoch, 100.0 * g_beamRefreshFrac);
+            }
+            // A media-free `-jsurf` run gets its OWN sentence rather than the beam one, because
+            // the beam sentence would be a lie there in the specific way that matters: it names
+            // `-beamcount` as the thing sizing the pass, when on a scene with no media the beam
+            // budget measures nothing and `-jsurf`'s per-pixel target is what actually decided.
+            else if (jreq.surfPaths > 0)
+                std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
+                            "threads (maxDepth=%d, light=%s) — no media, so the light pass is "
+                            "sized for the SURFACE map: %lld subpaths (one per pixel, mode U's "
+                            "convention), capped at %lld stored photons (-jsurf-count) ...\n",
+                            res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel,
+                            jreq.surfPaths, g_jSurfCount);
+            else if (jreq.maxBeams > 0)
+                std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
+                            "threads (maxDepth=%d, light=%s) — sizing the light pass to a beam "
+                            "map of at most %lld beams (-beamcount)%s ...\n",
+                            res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel,
+                            jreq.maxBeams,
+                            g_beamTargetSet ? "" : ", or this scene's -beamk knee if that is lower");
+            else
+                std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
+                            "threads (maxDepth=%d, light=%s) — tracing %lld light subpaths for "
+                            "the beam map (-n given: no beam budget) ...\n",
+                            res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel, Nepoch);
+            // Only epoch 0 blanks the window to a caption. A refresh happens with a partly
+            // converged image already on screen, and replacing it with "tracing light subpaths…"
+            // every epoch would make the live preview flash between the render and a placeholder
+            // for the whole run — the picture the user is watching is still perfectly valid.
+            if (first) liveWindowPlaceholder(res, resY, "tracing light subpaths\xE2\x80\xA6");
+            auto tp0 = std::chrono::steady_clock::now();
+            bdpt::traceLightBeamPass(scene, cam, Nepoch, nThreads, maxDepth, diffraction,
+                                     bmap, &stageProg, jreq, &jbb,
+                                     wantSurf ? &smap : nullptr);
+            const double traceSec =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
+            lsTraceSec += traceSec;
+            // Say what the budget did, always. A pass that silently traced 3 % of the subpaths
+            // the command line named would be exactly the kind of invisible surprise this whole
+            // change is about — and the measured rate and knee are the numbers a user needs in
+            // order to override the budget sensibly with `-beamcount`, `-beamk` or `-n`.
+            if (first && jbb.pilotPaths)
+                std::printf("mode J: beam budget: pilot of %lld subpaths measured %.2f raw "
+                            "beams/subpath, -beamk knee at ~%lld beams -> %lld beams from %lld "
+                            "subpaths (%s)%s\n",
+                            jbb.pilotPaths, jbb.beamsPerPath, jbb.kneeBeams, jbb.budget,
+                            jbb.pathsUsed, jbb.kneeBound ? "knee-bound" : "-beamcount-bound",
+                            jbb.applied ? "" : " [not binding: -n was already smaller]");
+            // The surface half of the same pilot, reported only when it actually LOWERED the
+            // count. Said unconditionally it would be noise on every media scene (where the
+            // beam knee normally lands far under the photon ceiling); said when it binds it is
+            // the one line that explains a subpath count neither `-n` nor `-beamcount` predicts.
+            if (first && jbb.surfBound)
+                std::printf("mode J: surface budget: %.2f surface photons/subpath -> the "
+                            "-jsurf-count ceiling of %lld photons lowered the pass to %lld "
+                            "subpaths (raise it if you have the RAM; it is a memory bound, not "
+                            "a quality target)\n",
+                            jbb.surfPerPath, g_jSurfCount, jbb.pathsUsed);
+            // Both of these are skipped outright on a media-free `-jsurf` run rather than run on
+            // an empty map: the build would announce a radius/split decision it did not make, and
+            // the line below would report "0 beams from N light subpaths" as though something had
+            // gone wrong, when the correct reading is that this scene has no volume to beam.
+            if (wantBeams) {
+                if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
+                buildBeamMap(bmap, "mode J:",
+                             (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
+                             /*quiet*/!first);
+            }
+            const double buildSec =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
+            lsBeamSec += buildSec - traceSec;   // buildBeamMap only: the trace is subtracted
+            if (first && wantBeams)
+                std::printf("mode J: %zu beams from %lld light subpaths in %s "
+                            "(%.2f beams/subpath, %.0f MB). Rendering connections + merges ...\n",
+                            bmap.beams.size(), bmap.nEmitted, humanDur(buildSec).c_str(),
+                            bmap.nEmitted ? (double)bmap.beams.size() / (double)bmap.nEmitted : 0.0,
+                            (double)(bmap.beams.size() * sizeof(PhotonBeam)) / (1024.0 * 1024.0));
+            // WHERE build() SPENT IT, once. Three separate guesses at this were wrong (BVH --
+            // right, and ported; the box/CIE loop -- parallelising it changed nothing; "the
+            // allocations" -- untested), so the breakdown is printed rather than reasoned about.
+            if (first && wantBeams)
+                std::printf("mode J:   light-side build: split %.0f ms, alloc %.0f ms, "
+                            "boxes+CIE %.0f ms%s\n",
+                            1000.0 * bmap.lastSplitSec, 1000.0 * bmap.lastAllocSec,
+                            1000.0 * bmap.lastBoxSec,
+                            jSkipHostBvh() ? " (host BVH skipped)" : "");
+            if (first && wantBeams && bmap.empty())
+                std::fprintf(stderr, "[mode J] warning: the beam map is empty — no light "
+                                     "subpath reached a medium. This render is mode D "
+                                     "exactly.\n");
+            // The point-merge map, gridded off the SAME subpaths the beams came from (see
+            // traceLightBeamPass: one pass, two outputs, one n_m). Built after the beam map so
+            // the two allocations do not overlap their peak.
+            if (wantSurf) {
+                if (first) liveWindowPlaceholder(res, resY, "building surface photon map\xE2\x80\xA6");
+                // Per-EPOCH radius, not the fixed one: see surfRadiusFor above for why the
+                // schedule is what keeps the point merges consistent. Epoch 0 gets exactly
+                // surfRadius0 (pow(1, x) == 1), so the first realization is unchanged.
+                const auto tsb = std::chrono::steady_clock::now();
+                smap.build(surfRadiusFor(epoch));
+                lsSurfSec += std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - tsb).count();
+                if (first)
+                    std::printf("mode J: %zu surface photons from the same %lld subpaths, "
+                                "r=%.4g (%.0f MB). Point merges ON (-jsurf).\n",
+                                smap.size(), smap.nEmitted, smap.radius,
+                                (double)(smap.size() * (sizeof(bdpt::SurfPhoton) +
+                                                        sizeof(bdpt::SurfMis))) /
+                                (1024.0 * 1024.0));
+                if (first && smap.empty())
+                    std::fprintf(stderr, "[mode J] warning: the surface photon map is empty — "
+                                         "no light subpath reached a connectible surface. "
+                                         "-jsurf is doing nothing here.\n");
+            }
+        };
+        if (wantBeams || wantSurf) {
+            // A CACHE HIT IS THE WHOLE FLYBY WIN. `matches` is false by construction on the
+            // first camera and on any unshared render (`jlocal.valid` starts false), so this
+            // reduces to the historical single call everywhere except the case it is for.
+            if (jlc.matches(&scene, N, spp, res, resY, maxDepth, nThreads, diffraction,
+                            wantBeams, wantSurf, surfRadius0)) {
+                std::printf("mode J: UPBP at %dx%d — camera pass on %s (maxDepth=%d, "
+                            "light=%s) — reusing this batch's frozen light side: %zu beams"
+                            " / %zu surface photons from %lld subpaths. Retracing it for this"
+                            " camera would reproduce it bit-for-bit (-beamfreeze), so only the"
+                            " gather runs ...\n",
+                            res, resY, camWhere.c_str(), maxDepth, lightLabel,
+                            bmap.beams.size(), smap.size(), bmap.nEmitted);
+            } else {
+                buildLightSide(0);
+                if (shareLight)
+                    jlc.stamp(&scene, N, spp, res, resY, maxDepth, nThreads, diffraction,
+                              wantBeams, wantSurf, surfRadius0);
+            }
+        } else {
+            std::printf("mode J: UPBP at %dx%d on %s (maxDepth=%d, light=%s) ...\n",
+                        res, resY, camWhere.c_str(), maxDepth, lightLabel);
+        }
+        // An empty map is passed as null, so the renderer's merge path is not merely skipped
+        // per-ray but never entered — which is what makes gate (1)'s "bit-identical to mode D"
+        // a property of the code rather than of floating-point luck. Same for the photons.
+        const BeamMap* beamsPtr = (wantBeams && !bmap.empty()) ? &bmap : nullptr;
+        const bdpt::SurfMap* photonsPtr =
+            (wantSurf && !smap.empty() && smap.nEmitted > 0) ? &smap : nullptr;
+        auto renderEpoch = [&](long long sppTarget, const SppProgress* p) -> Film {
+#ifdef HAVE_CUDA
+            // `g_heroC`, exactly as mode D passes it — NOT 1. The kernel applies the same
+            // hero gate the CPU BdptRenderer does (a medium, GRIN or a physical lens falls
+            // back to the single-λ walk), so a mode-J scene WITH a medium is scalar anyway
+            // and the merge kernel is the one that launches. What passing 1 here would break
+            // is the media-FREE case, which mode J states is "mode D exactly": mode D would
+            // run the hero bundle and mode J would not, and gate 1a — J == D bit-for-bit —
+            // fails on the wavelength sampling rather than on anything to do with merges.
+            // (Measured: it did, before this was g_heroC.)
+            // `stageProg` reports the host->device conversion of the beam map, which for a
+            // multi-million-sub-beam map is long enough to look like a hang without it.
+            //
+            // ...INCLUDING when the point merges are on. This comment used to describe a
+            // gate at `useGpu` that sent `-jsurf` to the CPU, on the grounds that the device
+            // merge weight carried one merge kind. Both halves stopped being true in 0.263.1:
+            // `dMisWeight` takes `mergeKappa` AND `kappaSurf`, and there is no such gate (nor
+            // was there one at the time this was written -- `g_jSurfExplicit` was never read).
+            // `photonsPtr` below is what carries the surface map to the device.
+            if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth,
+                                              diffraction, p, g_heroC, beamsPtr, &stageProg,
+                                              photonsPtr);
+#endif
+            return cpuSppChunks(sppTarget, p, res, resY,
+                [&](long long c, unsigned long long off) {
+                    return renderBdpt(scene, cam, res, resY, c, nThreads, maxDepth,
+                                      diffraction, off, beamsPtr, photonsPtr);
+                });
+        };
+        // ---------------------------------------------------------------------------------
+        // THE LIGHT-SIDE REFRESH LOOP (0.247.0) — what makes mode J converge instead of
+        // plateauing. Everything above renders against ONE beam map; this splits the render
+        // into epochs, redraws the map between them, and averages the epochs' films. See
+        // g_beamFreeze for the measurements that made it necessary.
+        //
+        // Two things have to be true for the average to be the right one:
+        //   * each epoch's camera samples must be NEW samples, not a re-draw of epoch 0's —
+        //     hence `sampleBase` advances by the spp already banked, which is exactly the
+        //     mechanism `-resume` uses to continue a checkpoint without correlating;
+        //   * the outer reporter must always see the WHOLE film, so the live image, the
+        //     noise estimate and the .ftbuf checkpoint stay in terms of total spp rather
+        //     than resetting to zero at every epoch boundary.
+        auto renderChunked = [&](long long sppTarget, const SppProgress* prog) -> Film {
+            // Nothing to decorrelate (no map => mode D exactly, and gate 1a requires that path
+            // stay bit-identical), or the user asked for the historical single map.
+            if ((!beamsPtr && !photonsPtr) || g_beamFreeze || !prog || !prog->report)
+                return renderEpoch(sppTarget, prog);
+            using clk = std::chrono::steady_clock;
+            Film acc; acc.resX = res; acc.resY = resY; acc.alloc();
+            long long sppAll = 0;
+            bool stopAll = false;
+            uint64_t epoch = 0;
+            for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
+                double rebuildSec = 0.0;
+                if (epoch > 0) {
+                    auto tr = clk::now();
+                    buildLightSide(epoch);
+                    rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
+                    // A refresh that came back empty would leave the gather pointing at an
+                    // empty map, which silently turns the rest of the render into mode D.
+                    // Cannot happen if epoch 0 was non-empty (same scene, same counts), but
+                    // "cannot happen" is exactly what a silent half-render looks like.
+                    //
+                    // Note what `break` does here and what it does NOT do: the previous
+                    // realization is already gone (buildLightSide drops it before redrawing),
+                    // so there is nothing to fall back ONTO. What is salvaged is `acc`, which
+                    // holds every completed epoch — a correct, correctly-normalised render of
+                    // `sppAll` spp. Stopping is therefore the right answer, not a compromise,
+                    // and the message says so rather than claiming a fallback that does not
+                    // exist (which is what it claimed through 0.251.0).
+                    // Each map is checked only if this render is actually using it: with
+                    // `-jsurf` on a media-free scene the beam map is legitimately empty every
+                    // epoch, and treating that as a failure would stop the render on its
+                    // first refresh.
+                    if ((beamsPtr && bmap.empty()) || (photonsPtr && smap.empty())) {
+                        std::fprintf(stderr, "[mode J] light-side refresh produced an empty "
+                                             "%s map; stopping here with the %lld spp already "
+                                             "averaged over %llu realization(s).\n",
+                                     (beamsPtr && bmap.empty()) ? "beam" : "surface photon",
+                                     sppAll, (unsigned long long)epoch);
+                        break;
+                    }
+                }
+                const auto tEpoch = clk::now();
+                // How long this epoch should run. The overhead being amortised is NOT just the
+                // subpath trace: renderBdptCuda re-uploads the whole scene on every call, so on
+                // a heavy scene the per-epoch cost is dominated by that instead. Measuring the
+                // real gap — rebuild, plus everything before the first sample lands — makes the
+                // rule self-correcting: a cheap scene refreshes often, an expensive one
+                // stretches its epochs out until, in the limit, it behaves like -beamfreeze.
+                double epochSec = 0.0;
+                long long epochSpp = 0;
+                SppProgress inner;
+                inner.sampleBase = prog->sampleBase + sppAll;
+                inner.report = [&](const Film& f, long long sppDone, bool final) -> bool {
+                    if (epochSec <= 0.0) {
+                        const double setupSec =
+                            std::chrono::duration<double>(clk::now() - tEpoch).count();
+                        epochSec = (rebuildSec + setupSec) / g_beamRefreshFrac;
+                        // `setupSec` measures the gap to the FIRST report, which already
+                        // includes rendering, so it over-counts the true setup. Recorded
+                        // anyway and labelled as an upper bound: on the device it is the
+                        // per-epoch scene re-upload, and an upper bound that is already small
+                        // is enough to rule that fix out.
+                        lsSetupSec += setupSec;
+                        // The floor was a full second, from when the only map here was an
+                        // expensive BEAM map and the epoch count was purely a decorrelation
+                        // knob. With `-jsurf` it is no longer only that: the surface radius
+                        // shrinks on the EPOCH INDEX (surfRadiusFor above), so anything capping
+                        // how many epochs fit in a render also caps how far down the shrink
+                        // schedule that render can travel — i.e. it caps CONSISTENCY, not
+                        // merely variance. Dropping the floor to 0.1 s is therefore right in
+                        // principle: the proportional rule on the line above is the actual
+                        // guard, spending 10x the measured rebuild+setup cost rendering at
+                        // `-beamrefresh 0.10` and so holding overhead near 9 % however cheap or
+                        // dear the map is, which leaves the floor with only one job — stopping
+                        // pathological churn when the measurement is near the clock's
+                        // resolution.
+                        //
+                        // BUT DO NOT READ THIS AS THE FIX FOR THE EPOCH COUNT; it was measured
+                        // and it is not. On `_cornell_diffuse` (128^2, 1024 spp, media-free, so
+                        // the light side rebuilds in milliseconds) it moved the run from 56
+                        // epochs to 59 — energy bias -0.36 % to -0.35 % — against mode U's 1024
+                        // iterations on the same schedule. The binding constraint is the
+                        // proportional rule itself, because `setupSec` measures the gap to the
+                        // FIRST REPORT, which already includes rendering; an epoch is thus
+                        // about ten report-intervals long no matter what this floor says.
+                        // Closing the remaining gap to mode U means revisiting the report
+                        // cadence or `-beamrefresh` for a cheap map, which is UPBP-CONV's
+                        // territory and wants its own measurements.
+                        if (epochSec < 0.1) epochSec = 0.1;
+                    }
+                    epochSpp = sppDone;
+                    Film comb = f; comb.merge(acc);
+                    const long long tot = sppAll + sppDone;
+                    if (prog->report(comb, tot, final && tot >= sppTarget)) { stopAll = true; return true; }
+                    // Not a stop — just the end of this epoch, so the next one draws a new map.
+                    return std::chrono::duration<double>(clk::now() - tEpoch).count() >= epochSec;
+                };
+                // On the GPU, renderEpoch re-enters renderBdptCuda, which re-uploads the beam
+                // map and reports its SHAPE (sub-beam count, BVH nodes, blur radius). That
+                // report is true of every epoch of the run, not just this one — the map is
+                // redrawn, not re-sized — so after the first it is a block of unchanging text
+                // wedged between every pair of progress lines. The same rule buildBeamMap's
+                // own `quiet` argument follows one screen up. Restored immediately after, so
+                // any later non-epoch caller narrates normally.
+                g_gpuQuietRebuild = (epoch != 0);
+                const auto tg = clk::now();
+                Film f = renderEpoch(sppTarget - sppAll, &inner);
+                lsGatherSec += std::chrono::duration<double>(clk::now() - tg).count();
+                g_gpuQuietRebuild = false;
+                if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
+                acc.merge(f);
+                sppAll += epochSpp;
+            }
+            if (epoch > 1)
+                std::printf("mode J: averaged %llu independent light-side realizations "
+                            "(%lld spp total) — the merge noise fell with the render, not just "
+                            "the connection noise\n", (unsigned long long)epoch, sppAll);
+            // WHAT A REALIZATION COST, ITEMISED. Printed whenever the render actually
+            // refreshed, because the number of realizations is mode J's dominant remaining
+            // variance term (U-vs-J: mode U draws ~8500 to mode J's ~150 and is 16x better at
+            // equal blur, ~14x of it light-side density) and this line says which of the four
+            // costs is standing in the way of more of them. `setup` is an UPPER bound -- it is
+            // measured to the first progress report, which already includes rendering.
+            if (epoch > 1) {
+                const double tot = lsTraceSec + lsBeamSec + lsSurfSec + lsGatherSec;
+                const double pct = (tot > 0.0) ? 100.0 / tot : 0.0;
+                std::printf("[jstats] %llu epochs: trace %.2fs (%.1f%%), beam BVH %.2fs "
+                            "(%.1f%%), surf grid %.2fs (%.1f%%), gather %.2fs (%.1f%%); "
+                            "setup <= %.2fs. Light side = %.1f%% of the render\n",
+                            (unsigned long long)epoch,
+                            lsTraceSec, lsTraceSec * pct, lsBeamSec, lsBeamSec * pct,
+                            lsSurfSec, lsSurfSec * pct, lsGatherSec, lsGatherSec * pct,
+                            lsSetupSec,
+                            (lsTraceSec + lsBeamSec + lsSurfSec) * pct);
+            }
+            return acc;
+        };
+        const bool ckpt = resume || wantCheckpointFlag ||
+                          timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked, res, resY, resume, ckpt,
+                                 checkpointGuard(scene, mode, res, resY), mode);
+    }
+
     // --- Photon-mapped final gather (mode M) — ROADMAP item 1 ---------------------
     // Build a view-independent photon map ONCE (forward light-trace with the camera
     // splat off, depositing a record at every diffuse vertex), then run a backward
@@ -14502,37 +16861,181 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         const bool wantBeams = g_beamGather && !scene.media.empty();
         warnModeMMedia(scene, wantBeams);
         warnBeamsGrinMedia(scene, wantBeams);
-        PhotonMap pm;
+        PhotonMap pm, pmC;
         BeamMap bmap;
         auto tp0 = std::chrono::steady_clock::now();
-        tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
-                        wantBeams ? &bmap : nullptr, g_beamTarget);
-        radius = buildPhotonMap(pm, radius, "mode M:");
-        // One camera, so the BVH build is amortised over exactly this frame's samples. A
-        // progressive budget (-time/-noise/-forever) has no spp up front; assume a modest
-        // number rather than 0, since 0 would mean "build is free" and over-split for a frame
-        // that might stop after one pass.
-        if (wantBeams)
-            buildBeamMap(bmap, "mode M:",
-                         (double)res * (double)resY * (double)(spp > 0 ? spp : 16));
+        // The deposit and the builds run before a single pixel exists, so the sample-driven
+        // progress the gather reports below cannot cover them. StageProgress does.
+        StageProgress stageProg = makeStageProgress(res, resY);
+        liveWindowPlaceholder(res, resY, "tracing photons\xE2\x80\xA6");
+        long long nAimed = 0;
+        const caim::AimMap aimMap = buildAimMap(scene, N, nAimed, "mode M:");
+        // The radii epoch 0 settles on. Every later epoch re-bins at exactly these, so all the
+        // epochs are the same estimator and averaging them is plain variance reduction — see
+        // rebuildPhotonMapAt for why re-adapting per epoch would not be.
+        const double radius0 = radius;
+        double radiusC = 0.0, kGatherC = 0.0;
+        // THE LIGHT SIDE AS A FUNCTION OF THE EPOCH, rather than a one-off (0.252.0). This is
+        // the same fix mode J got in 0.247.0 (UPBP-THICK), applied to the mode that needed it
+        // at least as badly — see g_beamFreeze and known-issues.md "M-FROZEN".
+        //
+        // Mode M's caches are built ONCE and then gathered from by every camera sample, so the
+        // light-side half of its error is a floor that `-spp` cannot touch: 155 spp of gather
+        // averages the CAMERA noise away and leaves the map's own noise standing, which is why
+        // the artifact gets MORE conspicuous as the render converges rather than less. On
+        // gallery_rain that floor is visible as coloured bars through the rain and cloud,
+        // because `phase rainbow` is genuinely wavelength-dependent — a beam that scatters in
+        // the rain must drop its spectral bundle (photonbeams.h) and deposit monochromatically,
+        // and a beam is a LINE, so one saturated single-wavelength deposit lays a coloured
+        // STREAK down its whole chord. Frozen, those streaks are structure; refreshed, they
+        // average back to white at 1/sqrt(epochs). (Measured on this scene: 50.5 % of rain
+        // chords carrying 42.3 % of the rain's power are monochromatic and cannot be made
+        // otherwise, so removing the FREEZE is the only available fix.)
+        //
+        // It is also nearly free here for a reason peculiar to mode M: the deposit is ~3 s of a
+        // 900 s render (the gather dominates completely), so a 10 % rebuild budget buys tens of
+        // independent realizations.
+        auto buildLightSide = [&](uint64_t epoch) {
+            RngSaltScope saltScope(epoch);
+            const bool first = (epoch == 0);
+            if (!first) { pm = PhotonMap{}; pmC = PhotonMap{}; bmap = BeamMap{}; }
+            tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
+                            wantBeams ? &bmap : nullptr, g_beamTarget,
+                            first ? &stageProg : nullptr,
+                            g_pmCaustics ? &pmC : nullptr, &aimMap, nAimed);
+            if (first) {
+                liveWindowPlaceholder(res, resY, "building photon map\xE2\x80\xA6");
+                radius = buildPhotonMap(pm, radius0, "mode M:");
+                if (g_pmCaustics) {
+                    buildCausticMap(pmC, radius, "mode M:", pm.radius);
+                    radiusC = pmC.radius; kGatherC = pmC.kGather;
+                }
+            } else {
+                rebuildPhotonMapAt(pm, radius);
+                rebuildCausticMapAt(pmC, radiusC, kGatherC);
+            }
+            // One camera, so the BVH build is amortised over exactly this frame's samples. A
+            // progressive budget (-time/-noise/-forever) has no spp up front; assume a modest
+            // number rather than 0, since 0 would mean "build is free" and over-split for a
+            // frame that might stop after one pass.
+            if (wantBeams) {
+                if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
+                buildBeamMap(bmap, "mode M:",
+                             (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
+                             /*quiet*/!first);
+            }
+        };
+        buildLightSide(0);
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
-        std::printf("mode M: deposited %zu photons from %lld emitted in %.1fs; "
+        std::printf("mode M: deposited %zu photons from %lld emitted in %s; "
                     "grid %dx%dx%d. Gathering camera pass at %dx%d ...\n",
-                    pm.photons.size(), pm.nEmitted, buildSec, pm.nx, pm.ny, pm.nz, res, resY);
+                    pm.photons.size(), pm.nEmitted, humanDur(buildSec).c_str(),
+                    pm.nx, pm.ny, pm.nz, res, resY);
         if (pm.photons.empty())
             std::fprintf(stderr, "[mode M] warning: 0 photons deposited — no diffuse "
                                  "surfaces reached? The image will be black.\n");
-        auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
+        auto renderEpoch = [&](long long sppTarget, const SppProgress* p) -> Film {
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
                                               diffraction, /*maxBounce*/32, off, g_pmFinalGather,
-                                              wantBeams ? &bmap : nullptr);
+                                              wantBeams ? &bmap : nullptr,
+                                              g_pmCaustics ? &pmC : nullptr);
                 });
         };
-        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
-                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
-                                 renderChunked, res, resY);
+        // ---------------------------------------------------------------------------------
+        // THE LIGHT-SIDE REFRESH LOOP — structurally identical to mode J's (see there for the
+        // two conditions the average has to satisfy: each epoch's camera samples must be NEW
+        // ones, via `sampleBase`; and the outer reporter must always see the WHOLE film so the
+        // live image, the noise estimate and the checkpoint stay in terms of total spp).
+        auto renderChunked = [&](long long sppTarget, const SppProgress* prog) -> Film {
+            if (g_beamFreeze || !prog || !prog->report) return renderEpoch(sppTarget, prog);
+            using clk = std::chrono::steady_clock;
+            Film acc; acc.resX = res; acc.resY = resY; acc.alloc();
+            long long sppAll = 0;
+            bool stopAll = false;
+            uint64_t epoch = 0;
+            for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
+                double rebuildSec = 0.0;
+                if (epoch > 0) {
+                    auto tr = clk::now();
+                    buildLightSide(epoch);
+                    rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
+                    // A refresh that came back empty would leave the gather pointing at empty
+                    // maps, which silently turns the rest of the render black (or, for the beam
+                    // map alone, silently deletes every participating medium from it). Cannot
+                    // happen if epoch 0 was non-empty — same scene, same counts — but "cannot
+                    // happen" is exactly what a silent half-render looks like.
+                    //
+                    // Note what `break` does here and what it does NOT do: the previous
+                    // realization is already gone (buildLightSide drops it before redrawing),
+                    // so there is nothing to fall back ONTO. What is salvaged is `acc`, which
+                    // holds every completed epoch — a correct, correctly-normalised render of
+                    // `sppAll` spp. Stopping is therefore the right answer, not a compromise,
+                    // and the message says so rather than claiming a fallback that does not
+                    // exist.
+                    const bool lost = pm.photons.empty() || (wantBeams && bmap.empty());
+                    if (lost) {
+                        std::fprintf(stderr, "[mode M] light-side refresh produced an empty "
+                                             "%s; stopping here with the %lld spp already "
+                                             "averaged over %llu realization(s).\n",
+                                     pm.photons.empty() ? "photon map" : "beam map",
+                                     sppAll, (unsigned long long)epoch);
+                        break;
+                    }
+                    if (epoch == 1)
+                        std::printf("mode M: light-side refresh — redrawing %lld photons under "
+                                    "a fresh salt every ~%.0f%% of the wall clock and averaging "
+                                    "the realizations, so the MAP noise falls with the render "
+                                    "too (-beamfreeze to opt out; -beamrefresh to retune) ...\n",
+                                    N, 100.0 * g_beamRefreshFrac);
+                }
+                const auto tEpoch = clk::now();
+                // How long this epoch should run. Measuring the real gap — rebuild, plus
+                // everything before the first sample lands — makes the rule self-correcting: a
+                // cheap scene refreshes often, an expensive one stretches its epochs out until,
+                // in the limit, it behaves like -beamfreeze.
+                double epochSec = 0.0;
+                long long epochSpp = 0;
+                SppProgress inner;
+                inner.sampleBase = prog->sampleBase + sppAll;
+                inner.report = [&](const Film& f, long long sppDone, bool final) -> bool {
+                    if (epochSec <= 0.0) {
+                        const double setupSec =
+                            std::chrono::duration<double>(clk::now() - tEpoch).count();
+                        epochSec = (rebuildSec + setupSec) / g_beamRefreshFrac;
+                        if (epochSec < 1.0) epochSec = 1.0;   // never thrash on a trivial scene
+                    }
+                    epochSpp = sppDone;
+                    Film comb = f; comb.merge(acc);
+                    const long long tot = sppAll + sppDone;
+                    if (prog->report(comb, tot, final && tot >= sppTarget)) { stopAll = true; return true; }
+                    // Not a stop — just the end of this epoch, so the next one draws new maps.
+                    return std::chrono::duration<double>(clk::now() - tEpoch).count() >= epochSec;
+                };
+                Film f = renderEpoch(sppTarget - sppAll, &inner);
+                if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
+                acc.merge(f);
+                sppAll += epochSpp;
+            }
+            if (epoch > 1)
+                std::printf("mode M: averaged %llu independent light-side realizations "
+                            "(%lld spp total) — the map noise fell with the render, not just "
+                            "the gather noise\n", (unsigned long long)epoch, sppAll);
+            return acc;
+        };
+        {   // The phase split VOLCACHE asks for (`FTRACE_MSTATS=1`): surface estimate against
+            // beam gather inside the camera pass. Printed after the render so it covers every
+            // epoch, and silent unless asked for.
+            const auto tM0 = std::chrono::steady_clock::now();
+            const auto out = runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                         timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                         renderChunked, res, resY);
+            mStats().report(std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - tM0).count());
+            gaDiagReport(scene);          // FTRACE_GADIAG=1; silent otherwise
+            return out;
+        }
     }
 
     // --- Stochastic progressive photon mapping (mode S) — ROADMAP item 2 ----------
@@ -14857,17 +17360,18 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                 : totalDone ? " (done)" : "";
                 char st[220];
                 if (chunkFixed)
-                    std::snprintf(st, sizeof st, "[live] %.1fs, %lld / %lld photons, ~%.1f%% noise%s",
-                                  elapsed, acc.N, N, noisePct, why);
+                    std::snprintf(st, sizeof st, "[live] %s, %lld / %lld photons, ~%.1f%% noise%s",
+                                  humanDur(elapsed).c_str(), acc.N, N, noisePct, why);
                 else if (runForever)
-                    std::snprintf(st, sizeof st, "[forever] %.1fs elapsed, %lld batches, %lld photons, ~%.1f%% noise%s",
-                                  elapsed, batches, acc.N, noisePct, why);
+                    std::snprintf(st, sizeof st, "[forever] %s elapsed, %lld batches, %lld photons, ~%.1f%% noise%s",
+                                  humanDur(elapsed).c_str(), batches, acc.N, noisePct, why);
                 else if (timeBudgetSec > 0.0)
-                    std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld batches, %lld photons, ~%.1f%% noise%s",
-                                  elapsed, timeBudgetSec, batches, acc.N, noisePct, why);
+                    std::snprintf(st, sizeof st, "[time] %s / %s, %lld batches, %lld photons, ~%.1f%% noise%s",
+                                  humanDur(elapsed).c_str(), humanDur(timeBudgetSec).c_str(),
+                                  batches, acc.N, noisePct, why);
                 else
-                    std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld batches, %lld photons, ~%.1f%% noise%s",
-                                  noiseTarget, elapsed, batches, acc.N, noisePct, why);
+                    std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %s, %lld batches, %lld photons, ~%.1f%% noise%s",
+                                  noiseTarget, humanDur(elapsed).c_str(), batches, acc.N, noisePct, why);
                 if (preview || wantWin) {
                     auto tPrep = clk::now();
                     Film disp = acc.film;
@@ -15266,8 +17770,9 @@ static bool stereoComposite(int mode, const std::string& left, const std::string
 // the exhaustive list (fog, thin-film, mesh export, physics diagnostics, …) lives in
 // README.md, which this points at rather than duplicating.
 static void printHelp(const char* prog) {
+    std::printf("ftrace %s", ftraceVersion());
     std::printf(
-"ftrace " FTRACE_VERSION " — spectral forward + backward photon raytracer\n"
+" — spectral forward + backward photon raytracer\n"
 "\n"
 "Usage:\n"
 "  %s -in <scene.ftsl> [options]         render a scene file\n"
@@ -15305,21 +17810,72 @@ static void printHelp(const char* prog) {
 "  -noise <pct>          stop at target graininess (progressive)\n"
 "  -forever              trace until Ctrl-C (progressive)\n"
 "  -spp <n>              samples/pixel for backward modes R/V\n"
+"  -seed <n>             draw a DIFFERENT realization of the same render. ftrace is otherwise\n"
+"                        deterministic, so a fixed set of flags gives one image bit-for-bit —\n"
+"                        which means one sample of every estimator, and no way to tell a bias\n"
+"                        from the luck of one draw. Re-render at a few seeds and compare.\n"
+"                        Salts every stream, CPU and GPU, all modes; -seed 0 (the default) is\n"
+"                        the historical stream, so old reference images still reproduce\n"
 "  -beams|-photonbeams   photon beams (single-scatter volumetrics). Modes A/B: decorrelated\n"
 "                        per-camera gather for shared flybys (CPU or GPU; kills frozen\n"
 "                        speckle). Mode M: stores a view-independent BEAM MAP, which is the\n"
-"                        only way mode M sees media at all (CPU only)\n"
-"  -beamk <k>            mode-M beams gathered per camera segment (default 32) — the beam\n"
-"                        kernel radius is sized to hit this; smoother and slower as it grows\n"
-"  -beamradius <r>       mode-M beam kernel half-width in world units, overriding -beamk\n"
-"                        (default: sized automatically; NOT the photon-map radius, which is\n"
-"                        larger by orders of magnitude and makes the gather never finish)\n"
+"                        only way mode M sees media at all (CPU only). Mode J: ON already —\n"
+"                        UPBP is connections + beam merges, so the map is the mode\n"
+"  -nobeams|-no-beams    turn the beam map OFF. Only meaningful for mode J, where it is on by\n"
+"                        default; a mode-J render without it is mode D exactly (validation)\n"
+"  -beamfreeze           modes J and M (alias -lightfreeze): build the light-side cache ONCE, as\n"
+"                        they did before 0.247.0 / 0.252.0. By default both redraw it under a\n"
+"                        fresh salt every few seconds and average the realizations, because the\n"
+"                        light-side error is frozen into the cache and -spp cannot reduce it —\n"
+"                        so a frozen render plateaus at a noise floor that LOOKS converged (mode\n"
+"                        J: 5%% whole-frame on a thick test scene at -n 8192; mode M: coloured\n"
+"                        bars through rainbow rain that get MORE visible as the gather smooths).\n"
+"                        Mode J redraws the beam map, mode M the photon, caustic and beam maps.\n"
+"                        Use this to reproduce pre-refresh output or to measure what the refresh\n"
+"                        is worth; it is not otherwise a good idea\n"
+"  -beamrefresh <frac>   share of a mode-J/M render's wall clock spent on those rebuilds\n"
+"                        (default 0.10; alias -lightrefresh). The epoch length adapts to the\n"
+"                        measured per-epoch overhead, so a heavy scene refreshes rarely and a\n"
+"                        cheap one often. 0 means -beamfreeze\n"
+"  -beamblur <frac>      mode-M beam kernel half-width, as a fraction of each MEDIUM'S OWN\n"
+"                        measured mean free path (default 0.01). This is the quality knob:\n"
+"                        the blur is a physical scale independent of the photon count, so\n"
+"                        -n and -spp genuinely reduce volume noise (before 0.201.0 the radius\n"
+"                        was sized to a fixed gathered count, i.e. r ~ 1/n, and they did not)\n"
+"  -beamk <k>            FLOOR on mode-M beams gathered per camera segment (default 32).\n"
+"  -beamsinmin <v>       bound a beam x ray merge's 1/sin(theta) at 1/v (default 0.3; 0 = unbounded).\n"
+"                        Scales the radii up only if a sparse map would gather fewer, which\n"
+"                        is what stops a thin volume rendering as individual streaks\n"
+"  -beamareaslack <f>    ceiling: fraction by which the kernel may inflate the total sub-beam\n"
+"                        AABB area, the gather's cost metric (default 1.0 = allow doubling)\n"
+"  -beamradius <r>       mode-M beam kernel half-width in world units, one value for every\n"
+"                        medium, overriding -beamblur / -beamk (default: sized automatically;\n"
+"                        NOT the photon-map radius, which is larger by orders of magnitude\n"
+"                        and makes the gather never finish)\n"
 "  -beamcount <n>        mode-M budget on stored beams (default 1000000; 0 = keep all)\n"
 "  -beamsplitmax <n>     ceiling on sub-beams after the BVH split (default 8000000). Beams are\n"
 "                        split at their own area-optimal length; this bounds the MEMORY that\n"
 "                        costs, not the quality. Raising it buys a tighter, faster BVH\n"
 "  -beamsplit <len>      pin a uniform split length instead (expert; for measuring the rule\n"
 "                        against a fixed baseline — the per-beam rule beats any one length)\n"
+"  -beamspec <n>         wavelengths carried by ONE stored beam, 1..4 (default 4; 1 = the\n"
+"                        classic monochromatic beam). A beam is a LINE, so a single wavelength\n"
+"                        paints a saturated coloured streak the eye reads as structure; the\n"
+"                        bundle shares the beam's geometry and both transmittance marches, so\n"
+"                        4 wavelengths cost ~1.1x the gather instead of 4x. Ignored in a scene\n"
+"                        whose media have chromatic extinction (the shared march would bias it)\n"
+"  -jsurf                mode J: ALSO merge camera surface vertices against surface photons\n"
+"                        (VCM's vertex merging, i.e. what mode U does), MIS-combined with the\n"
+"                        connections and the beam merges in one weight. Turns mode J into\n"
+"                        paths + beams + points; -nojsurf (default for now) leaves the\n"
+"                        beams-only estimator. CPU only\n"
+"  -jsurf-radius <r>     -jsurf gather disc radius in world units (default: the same\n"
+"                        -pmradius / -pmradiusfrac modes M/S/U use). Implies -jsurf\n"
+"  -jsurf-count <n>      ceiling on STORED surface photons (default 4000000; 0 = unbounded).\n"
+"                        The point-merge counterpart of -beamcount, and a MEMORY bound only:\n"
+"                        it is met by tracing fewer light subpaths, never by thinning the map\n"
+"                        (roulette's survival probability is what a MIS weight cannot read).\n"
+"                        Implies -jsurf\n"
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
 "  -rgb                  mode R fast RGB (non-spectral) backward preview on the GPU (much\n"
 "                        faster; drops dispersion/thin-film/fluorescence — Option B)\n"
@@ -15334,8 +17890,12 @@ static void printHelp(const char* prog) {
 "  -no-media             drop all participating media (haze/fog/volumes)\n"
 "  -no-env               remove the environment (sky/IBL) light\n"
 "  -no-fluoro            demote fluorescent materials to plain diffuse\n"
-"  -max-bounce <n>       set path depth to n bounces (default 32; modes D/U default 8,\n"
-"                        where raising it is what a mirror-lined cavity needs)\n"
+"  -max-bounce <n>       set path depth to n bounces (default 32; modes D/U/J default 8,\n"
+"                        where raising it is what a mirror-lined cavity needs). NOTE the\n"
+"                        two defaults differ, so COMPARING a D/U/J render against an R/B\n"
+"                        one requires passing -max-bounce explicitly to both: in a high-\n"
+"                        albedo medium bounces 9..32 carry most of the light, and an\n"
+"                        unmatched mode-R reference reads ~8x a mode-D render\n"
 "  -direct-only          Whitted: direct + specular recursion only, no diffuse indirect\n"
 "                        (near-1-spp preview; camera modes R/RGB and P's backward side)\n"
 "\n"
@@ -15529,6 +18089,29 @@ static void printHelp(const char* prog) {
 "  -anim <file.json>     edit a loom CurveDrive sidecar in the fly viewer (implies -explore);\n"
 "                        control points seed from it and Save writes the reshaped curve back\n"
 "  -see-through|-glass   render clear dielectrics as see-through; -glass-clarity <0..1>\n"
+"  -glass-haze <0..1>    cap how much of a pixel the see-through frost may take (default 1\n"
+"                        = uncapped); lower it to read a deep pile of glass\n"
+"  -flat | -no-color     shade the preview as neutral clay (form only, no albedo/skins);\n"
+"                        both of these are also live toggles in the viewer's control strip\n"
+"\n"
+"N-dimensional rotation (-nd): lift the model into N-D, rotate, project back to 3-D:\n"
+"  -nd <n>               enable; n = total dimensions (4..12). Opens the interactive\n"
+"                        viewer with one slider per rotation PLANE (n(n-1)/2 of them)\n"
+"                        unless a real render was asked for. Note: with every extra\n"
+"                        dimension left at `zero` an orthographic projection is provably\n"
+"                        just a 3x3 squash of the original (180 deg in a mixed plane\n"
+"                        gives its MIRROR image); the fills below make it non-affine.\n"
+"  -nd-fill <k>=<spec>   what fills dimension k (4-based, or its axis letter w/v/u/...):\n"
+"                          zero                      the classic lift (default)\n"
+"                          emboss:<src>[:amp[:freq]] x_k = amp * f(vertex); src is one of\n"
+"                                                    curvature|radius|height|noise|u|v\n"
+"                          extrude[:depth]           sweep the mesh into a real N-D prism\n"
+"                        amp/depth are fractions of the model radius. Repeatable.\n"
+"  -nd-angle <plane>=<deg>   seed one plane, e.g. -nd-angle xw=30 (repeatable)\n"
+"  -nd-object <name>     warp only this mesh object (default: every authored mesh)\n"
+"  -nd-crease <deg>      crease angle for re-derived normals (default 30)\n"
+"  -nd-budget <n>        refuse a config producing more than n triangles (default 8000000)\n"
+"  -nd-export <file>     write the projected model (.obj or .ftmesh) and exit\n"
 "\n"
 "Stereoscopic 3-D output:\n"
 "  -stereo sbs|cross|anaglyph|anaglyph-gm   stereo pair / anaglyph composite\n"
@@ -15590,7 +18173,7 @@ static int run(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-version") || !std::strcmp(argv[i], "--version") ||
             !std::strcmp(argv[i], "-V")) {
-            std::printf("ftrace %s\n", FTRACE_VERSION);
+            std::printf("ftrace %s\n", ftraceVersion());
             return 0;
         }
     }
@@ -15661,11 +18244,15 @@ static int run(int argc, char** argv) {
     bool checkCurveOnly = false;
     bool checkFurOnly = false;
     bool checkFurGridOnly = false;
+    bool checkPmGridOnly = false;
     bool checkFurVolOnly = false;
     bool checkContainerOnly = false;
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
     bool checkFluoroOnly = false;
+    bool checkNdOnly = false;     // -checknd: N-D warp algebra + prism combinatorics (ndwarp.h)
+    bool checkPatOpsOnly = false; // -checkpatops: every VM opcode across all three evaluators
+    bool checkNdGpuOnly = false;  // -checkndgpu: resident N-D re-projection vs the host warp
     const char* meshPath = nullptr;
     double meshScale = 1.0;
     const char* exportMeshPath = nullptr;  // -export-mesh <file.obj>: isosurface -> mesh
@@ -15751,8 +18338,23 @@ static int run(int argc, char** argv) {
     bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
     int  rasterBench = 0;         // -raster-bench <n>: render the first camera n times, report steady-state ms/frame (explorer metric)
     bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
+    bool rasterColor = true;      // -flat: re-shade the preview as neutral clay (viewer "Color" toggle)
     double rasterClarity  = 0.85; // -glass-clarity <0..1>: per-surface transmittance for see-through mode (higher = clearer)
+    // -glass-haze <0..1>: cap on the fraction of a pixel the see-through frost may take,
+    // however many clear surfaces the sight line crossed. 1 = uncapped (the accumulated
+    // product, as before). See RASTER-MILK in known-issues.md for why a cap is a
+    // legibility choice and therefore opt-in rather than a new default.
+    double rasterHaze     = 1.0;
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
+    // --- N-dimensional rotation (-nd; see ndwarp.h) ---
+    ndwarp::Config ndCfg;         // n == 3 means the warp is off
+    std::string    ndExportPath;  // -nd-export <file.obj|.ftmesh>
+    size_t         ndBudget = 8000000;   // -nd-budget: refuse a config exceeding this
+    // The fill/angle flags are collected as text and resolved AFTER the whole command
+    // line is read: both need the final dimension count (a plane's index is a function
+    // of n), and -nd may legally appear after them.
+    std::vector<std::string> ndFillArgs;    // "<dim>=<spec>"
+    std::vector<std::string> ndAngleArgs;   // "<plane>=<deg>"
     // --- Stereoscopic (3-D) output (-stereo) ---
     int    stereoMode    = STEREO_OFF; // -stereo sbs|cross|anaglyph|anaglyph-gm
     double stereoEyeSep  = 0.063;      // -eye-sep <m>: interocular distance (default 63 mm)
@@ -15795,7 +18397,8 @@ static int run(int argc, char** argv) {
         auto ends  = [](const std::string& t, const char* e){ size_t n = std::strlen(e); return t.size() >= n && t.compare(t.size()-n, n, e) == 0; };
         auto hasSceneExt = [&](const char* s){ std::string t = lower(s); return ends(t,".ftsl") || ends(t,".scene") || ends(t,".fts"); };
         auto hasMeshExt  = [&](const char* s){ std::string t = lower(s);
-            return ends(t,".obj") || ends(t,".gltf") || ends(t,".glb") || ends(t,".fbx") || ends(t,".stl") || ends(t,".ply"); };
+            return ends(t,".obj") || ends(t,".gltf") || ends(t,".glb") || ends(t,".fbx")
+                || ends(t,".stl") || ends(t,".ply") || ends(t,".ftmesh"); };
         auto looksLikeFile = [](const char* s){ std::string t = s; size_t sl = t.find_last_of("/\\");
             std::string base = (sl == std::string::npos) ? t : t.substr(sl + 1);
             return base.find('.') != std::string::npos || sl != std::string::npos; };
@@ -15985,7 +18588,15 @@ static int run(int argc, char** argv) {
         }
     } else if (inFile) {
         std::string ferr;
-        if (!ftsl::load(inFile, ftslScene, ferr, supportFn)) {
+        // FTRACE_LOADSTATS=1 prints the per-phase load breakdown. The numbers were always
+        // computed (ftsl::LoadTiming, filled by detail::PhaseTimer around the mesh loaders and
+        // the BVH builds); every caller just passed nullptr, so they were thrown away.
+        static const bool loadStats = [] {
+            const char* e = std::getenv("FTRACE_LOADSTATS");
+            return e && std::atoi(e) != 0;
+        }();
+        ftsl::LoadTiming ltim;
+        if (!ftsl::load(inFile, ftslScene, ferr, supportFn, loadStats ? &ltim : nullptr)) {
             // A clean stop that landed mid-load is not a scene error. Say so plainly
             // rather than printing a diagnostic that points the finger at the .ftsl —
             // but still exit non-zero: no scene was built, so nothing can be rendered.
@@ -15995,6 +18606,18 @@ static int run(int argc, char** argv) {
             else
                 std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
             return 1;
+        }
+        if (loadStats) {
+            // `other` is what is left after the two measured phases -- fur grooms, isosurface
+            // polygonisation, medium voxelisation, pattern/SDF bakes. It is a REMAINDER, not a
+            // phase, and is labelled so: if it dominates, the next step is to time those
+            // sites, not to guess which of them it is.
+            const double other = ltim.msBuild - ltim.msAssets - ltim.msAccel;
+            std::fprintf(stderr,
+                "[loadstats] parse %.0f ms | build %.0f ms = assets %.0f (of which texture "
+                "decode %.0f) + accel %.0f + other %.0f | total %.0f ms\n",
+                ltim.msParse, ltim.msBuild, ltim.msAssets, ltim.msTexture, ltim.msAccel, other,
+                ltim.msParse + ltim.msBuild);
         }
         fromFtsl = true;
         std::printf("[ftsl] loaded scene from %s\n", inFile);
@@ -16045,6 +18668,11 @@ static int run(int argc, char** argv) {
             const char* s = argv[++i];
             if (std::strpbrk(s, "eE.")) N = (long long)std::llround(std::atof(s));
             else                        N = std::atoll(s);
+            // Recorded, because in mode J `-n` and the beam budget are two knobs on the same
+            // quantity and only one of them can win. An explicit `-n` is an expert saying
+            // exactly how many light subpaths to trace, so it turns the budget OFF rather than
+            // being silently overridden by it. See bdpt::BeamBudgetReq.
+            g_nFromCli = true;
         }
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) {
             res = std::atoi(argv[++i]); resFromCli = true;
@@ -16121,6 +18749,18 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-raystats")) { g_rayStats = true; }
         // Many-lights importance sampling (light BVH). See the lt:: knobs above.
         else if (!std::strcmp(argv[i], "-no-lighttree")) { lt::gEnabled = false; }
+        else if (!std::strcmp(argv[i], "-no-glossy-nee")) { lt::gGlossyNee = false; }
+        // M-GATHERAREA prototype: probe samples for the gather footprint (0 = off, the default).
+        // Routed through the environment because gatherCoverage is reached from a header with no
+        // access to main.cpp's statics, exactly as -mstats is.
+        else if (!std::strcmp(argv[i], "-gatherarea") && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GATHERAREA", argv[++i]);
+#else
+            setenv("FTRACE_GATHERAREA", argv[++i], 1);
+#endif
+        }
+        else if (!std::strcmp(argv[i], "-glossy-nee"))    { lt::gGlossyNee = true;  }
         else if (!std::strcmp(argv[i], "-lighttree"))    { lt::gEnabled = true; }
         else if (!std::strcmp(argv[i], "-light-split") && i + 1 < argc) {
             lt::gSplit = std::max(0.0, std::atof(argv[++i]));
@@ -16184,6 +18824,30 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-pmauto")) g_pmAutoRadius = true;
         else if (!std::strcmp(argv[i], "-nopmauto")) g_pmAutoRadius = false;
         else if (!std::strcmp(argv[i], "-pmcount") && i + 1 < argc) { g_pmAutoCount = std::atof(argv[++i]); g_pmAutoRadius = true; }
+        else if (!std::strcmp(argv[i], "-caustics")) g_pmCaustics = true;
+        else if (!std::strcmp(argv[i], "-nocaustics")) g_pmCaustics = false;
+        else if (!std::strcmp(argv[i], "-pmccount") && i + 1 < argc) { g_pmCausticCount = std::atof(argv[++i]); g_pmCaustics = true; g_pmAutoRadius = true; }
+        else if (!std::strcmp(argv[i], "-pmadaptive")) g_pmAdaptive = true;
+        else if (!std::strcmp(argv[i], "-nopmadaptive")) g_pmAdaptive = false;
+        else if (!std::strcmp(argv[i], "-pmadaptivek") && i + 1 < argc) { g_pmAdaptiveK = std::atof(argv[++i]); g_pmAdaptive = true; }
+        else if (!std::strcmp(argv[i], "-causticn") && i + 1 < argc) {
+            // `auto` and `off` are spelled out because `atof("auto")` is 0, which is the
+            // OFF sentinel — so without this the documented spelling would silently mean
+            // the opposite of what it says. `-caustics` is implied: asking for an aimed
+            // caustic pass with the caustic map switched off is never what was meant.
+            const char* v = argv[++i];
+            if (!std::strcmp(v, "auto"))     g_causticAimN = -1;
+            else if (!std::strcmp(v, "off")) g_causticAimN = 0;
+            else {
+                g_causticAimN = (long long)std::atof(v);
+                if (g_causticAimN < 0) g_causticAimN = -1;   // any negative reads as "auto"
+            }
+            if (g_causticAimN != 0) g_pmCaustics = true;
+        }
+        else if (!std::strcmp(argv[i], "-causticaimk") && i + 1 < argc) {
+            g_causticAimK = std::atoi(argv[++i]);
+            if (g_causticAimK < 1) g_causticAimK = 1;
+        }
         else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
         else if (!std::strcmp(argv[i], "-savemap") && i + 1 < argc) g_pmapSave = argv[++i];
         else if (!std::strcmp(argv[i], "-loadmap") && i + 1 < argc) g_pmapLoad = argv[++i];
@@ -16228,15 +18892,24 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkcurve")) checkCurveOnly = true;
         else if (!std::strcmp(argv[i], "-checkfur")) checkFurOnly = true;
         else if (!std::strcmp(argv[i], "-checkfurgrid")) checkFurGridOnly = true;
+        else if (!std::strcmp(argv[i], "-checkpmgrid")) checkPmGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkfurvol")) checkFurVolOnly = true;
         else if (!std::strcmp(argv[i], "-checkcontainer")) checkContainerOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
         else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
+        else if (!std::strcmp(argv[i], "-checknd")) checkNdOnly = true;
+        else if (!std::strcmp(argv[i], "-checkpatops")) checkPatOpsOnly = true;
+        else if (!std::strcmp(argv[i], "-checkndgpu")) checkNdGpuOnly = true;
         else handled = false;
 
         // ---- segment 2 (see the nesting note at the top of the loop) ----------------
+        // `handled` is re-armed on entry and cleared again only by this chain's final
+        // `else`: a segment that matches must report the match, or the NEXT segment sees
+        // an unhandled flag and (being the one that owns the unknown-option error) kills
+        // a perfectly valid run.
         if (!handled) {
+        handled = true;
         if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-export-mesh") && i + 1 < argc) exportMeshPath = argv[++i];
@@ -16247,6 +18920,13 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-check-airtight-rays") && i + 1 < argc) airtightRays = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-mesh-decimate") && i + 1 < argc) { exportMeshDecimate = std::atof(argv[++i]); exportMeshAdaptive = true; }
         else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) spp = std::atoll(argv[++i]);
+        // Draw a DIFFERENT realization of the same render. Everything else about ftrace is
+        // deterministic, so without this there is exactly one sample of every estimator and
+        // no way to separate a bias from the luck of one draw — see the block comment over
+        // `setGlobalSeed` in src/rng.h, and UPBP-THICK in known-issues.md, which is the case
+        // that made it necessary. `-seed 0` is the historical stream, bit-for-bit.
+        else if (!std::strcmp(argv[i], "-seed") && i + 1 < argc)
+            setGlobalSeed((uint64_t)std::strtoull(argv[++i], nullptr, 10));
         else if (!std::strcmp(argv[i], "-fog") && i + 1 < argc) fogSigmaT = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-fogalbedo") && i + 1 < argc) fogAlbedo = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-fogg") && i + 1 < argc) fogG = std::atof(argv[++i]);
@@ -16299,7 +18979,42 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
-        else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) g_beamGather = true;
+        else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) { g_beamGather = true; g_noBeams = false; }
+        else if (!std::strcmp(argv[i], "-nobeams") || !std::strcmp(argv[i], "-no-beams")) { g_noBeams = true; g_beamGather = false; }
+        // Opt back OUT of the light-side refresh: one frozen light-side cache for the whole
+        // render, as mode J behaved before 0.247.0 and mode M before 0.252.0. Needed to
+        // reproduce older references and to measure what the refresh is worth; it is not
+        // otherwise a good idea (see g_beamFreeze).
+        //
+        // The `-light*` aliases exist because the `-beam*` names are now half a lie: mode M's
+        // refresh redraws its SURFACE photon map and its caustic map as well as its beam map,
+        // and freezes them all. Renaming outright would break every existing command line, so
+        // both spellings are accepted and the flag is documented under both.
+        else if (!std::strcmp(argv[i], "-beamfreeze") ||
+                 !std::strcmp(argv[i], "-lightfreeze")) g_beamFreeze = true;
+        else if ((!std::strcmp(argv[i], "-beamrefresh") ||
+                  !std::strcmp(argv[i], "-lightrefresh")) && i + 1 < argc) {
+            g_beamRefreshFrac = std::atof(argv[++i]);
+            g_beamRefreshSet = true;
+            if (g_beamRefreshFrac <= 0.0) g_beamFreeze = true;   // `-beamrefresh 0` == -beamfreeze
+        }
+        // Gate (2) of the UPBP plan: cross-check every CPU-BDPT MIS weight against an
+        // independently written absolute-form one (see bdpt.h). Validation only — it makes
+        // the weight several times more expensive and changes no pixel.
+        else if (!std::strcmp(argv[i], "-misaudit")) {
+            g_misAudit = true;
+            bdpt::misaudit::reset();                 // -serve re-parses per frame
+            bdpt::misaudit::enabled.store(true);
+        }
+        // The audit's NEGATIVE CONTROL: break the reference weight on purpose, so the alarm
+        // can be watched to fire. A run with this MUST report disagreements — if it reports
+        // none, the audit is not testing anything and its clean runs mean nothing either.
+        else if (!std::strcmp(argv[i], "-misaudit-poison")) {
+            g_misAudit = true;
+            bdpt::misaudit::reset();
+            bdpt::misaudit::enabled.store(true);
+            bdpt::misaudit::poison.store(true);
+        }
         // Highest scattering order the beam paths carry. 0 = unlimited (the default), 1 =
         // single scatter (the pre-0.199.0 behaviour, bit-identical). `-beams-single` is the
         // spelling you reach for when you want the old crisp-bow look back.
@@ -16311,10 +19026,59 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-beams-single") || !std::strcmp(argv[i], "-beams-ss"))
             pbeams::gOrderMax = 1;
         else if (!std::strcmp(argv[i], "-beamradius") && i + 1 < argc) g_beamRadiusAbs = std::atof(argv[++i]);
-        else if (!std::strcmp(argv[i], "-beamcount") && i + 1 < argc) g_beamTarget = (long long)std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamcount") && i + 1 < argc) {
+            g_beamTarget = (long long)std::atof(argv[++i]);
+            g_beamTargetSet = true;   // mode J only mentions its knee fallback when this is absent
+        }
+        else if (!std::strcmp(argv[i], "-jhostlight") ||
+                 !std::strcmp(argv[i], "-jhost-light")) {
+            g_jHostLight = true;
+#ifdef HAVE_CUDA
+            // Told to the device backend HERE rather than at render time: it is a process-wide
+            // decision, argv is parsed once, and a setter at the point of parse cannot be
+            // forgotten by a new call site the way a threaded parameter can.
+            cudaSetJHostLight(true);
+#endif
+        }
+        else if (!std::strcmp(argv[i], "-jsurf") || !std::strcmp(argv[i], "-jmerge-surf")) {
+            g_jSurf = true;
+        }
+        else if (!std::strcmp(argv[i], "-nojsurf") || !std::strcmp(argv[i], "-no-jsurf")) {
+            g_jSurf = false;
+        }
+        else if (!std::strcmp(argv[i], "-jsurf-radius") && i + 1 < argc) {
+            g_jSurfRadius = std::atof(argv[++i]);
+            g_jSurf = true;      // naming the radius is asking for the merges
+        }
+        else if ((!std::strcmp(argv[i], "-jsurf-count") ||
+                  !std::strcmp(argv[i], "-jsurfcount")) && i + 1 < argc) {
+            // atof, not atoi, so `-jsurf-count 4e6` works the way `-beamcount 1e6` does.
+            const double v = std::atof(argv[++i]);
+            g_jSurfCount = (v > 0.0) ? (long long)v : 0;   // 0 = unbounded, at your own risk
+            g_jSurf = true;      // naming the ceiling is asking for the merges
+        }
         else if (!std::strcmp(argv[i], "-beamk") && i + 1 < argc) g_beamK = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamsinmin") && i + 1 < argc) g_beamSinMin = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamblur") && i + 1 < argc) g_beamBlur = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamareaslack") && i + 1 < argc) g_beamAreaSlack = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamsplitmax") && i + 1 < argc) g_beamSplitMax = (long long)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamsplit") && i + 1 < argc) g_beamSplitLen = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamspec") && i + 1 < argc) {
+            // Clamped rather than rejected: the record's secondary array is a fixed
+            // kBeamSecMax, so a larger request cannot be honoured, and silently giving the
+            // most the format can carry is the useful reading of "as spectral as possible".
+            int c = std::atoi(argv[++i]);
+            pbeams::gSpecC = (c < 1) ? 1 : (c > kBeamSpecMax ? kBeamSpecMax : c);
+        }
+        // ACHROMATIC-PATH BEAMS (photonbeams.h). On by default; the argument is optional so
+        // both `-beamachro off` and a bare `-beamachro` read the way they look.
+        else if (!std::strcmp(argv[i], "-beamachro")) {
+            pbeams::gAchro = true;
+            if (i + 1 < argc && (!std::strcmp(argv[i + 1], "off") ||
+                                 !std::strcmp(argv[i + 1], "0"))) { pbeams::gAchro = false; ++i; }
+            else if (i + 1 < argc && (!std::strcmp(argv[i + 1], "on") ||
+                                      !std::strcmp(argv[i + 1], "1"))) ++i;
+        }
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-window-min") || !std::strcmp(argv[i], "-minimized")) {
             g_showWindow = true; g_minWindow = true;
@@ -16351,7 +19115,9 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-raster-curve-budget") && i + 1 < argc)
             rasterCurveBudget = (size_t)std::max(0LL, std::atoll(argv[++i]));
         else if (!std::strcmp(argv[i], "-see-through") || !std::strcmp(argv[i], "-seethrough") || !std::strcmp(argv[i], "-glass")) rasterSeeThrough = true;
+        else if (!std::strcmp(argv[i], "-flat") || !std::strcmp(argv[i], "-no-color")) rasterColor = false;
         else if (!std::strcmp(argv[i], "-glass-clarity") && i + 1 < argc) { rasterClarity = std::clamp(std::atof(argv[++i]), 0.0, 1.0); rasterSeeThrough = true; }
+        else if (!std::strcmp(argv[i], "-glass-haze") && i + 1 < argc) { rasterHaze = std::clamp(std::atof(argv[++i]), 0.0, 1.0); rasterSeeThrough = true; }
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-exposure-anchor") && i + 1 < argc) expAnchorArg = argv[++i];
         else if (!std::strcmp(argv[i], "-stereo") && i + 1 < argc) {
@@ -16394,6 +19160,30 @@ static int run(int argc, char** argv) {
         // Retired in 0.79.0 along with the hand-written parser they selected. Accepted so
         // an existing script does not hit the unknown-flag error, but SAID OUT LOUD — a
         // flag that quietly stopped doing anything is worse than one that is gone.
+        else handled = false;
+        }   // end segment 2
+
+        // ---- segment 3 (see the nesting note at the top of the loop) ----------------
+        // Segment 2 reached 107 links, past the ~100 the note asks for, so the N-D warp
+        // opened this one. The unknown-option error has to stay in the LAST segment or a
+        // valid flag defined further down would be rejected before it is ever tested.
+        if (!handled) {
+        handled = true;
+        if ((!std::strcmp(argv[i], "-nd") || !std::strcmp(argv[i], "-ndim")) && i + 1 < argc) {
+            const int d = std::atoi(argv[++i]);
+            if (d < 3 || d > 12) {
+                std::fprintf(stderr, "[nd] -nd %d: dimensions must be 3..12 "
+                                     "(3 = off; 12 already means 66 rotation planes)\n", d);
+                return 2;
+            }
+            ndCfg.resize(d);
+        }
+        else if (!std::strcmp(argv[i], "-nd-fill") && i + 1 < argc) ndFillArgs.push_back(argv[++i]);
+        else if (!std::strcmp(argv[i], "-nd-angle") && i + 1 < argc) ndAngleArgs.push_back(argv[++i]);
+        else if (!std::strcmp(argv[i], "-nd-object") && i + 1 < argc) ndCfg.object = argv[++i];
+        else if (!std::strcmp(argv[i], "-nd-crease") && i + 1 < argc) ndCfg.creaseDeg = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-nd-budget") && i + 1 < argc) ndBudget = (size_t)std::max(0LL, std::atoll(argv[++i]));
+        else if (!std::strcmp(argv[i], "-nd-export") && i + 1 < argc) ndExportPath = argv[++i];
         else if (!std::strcmp(argv[i], "-legacy-parser") ||
                  !std::strcmp(argv[i], "-validate-grammar")) {
             std::fprintf(stderr, "ftrace: %s was retired in 0.79.0 — the shared grammar "
@@ -16407,9 +19197,60 @@ static int run(int argc, char** argv) {
             std::fprintf(stderr, "ftrace: unknown option '%s' (try -h / --help)\n", argv[i]);
             return 2;
         }
-        }   // end segment 2
+        }   // end segment 3
     }
     if (nThreads < 1) nThreads = 1;
+
+    // ---- -nd: resolve the deferred fill / angle specs ---------------------------
+    // Both were collected as text during the option scan because a plane's index and a
+    // dimension's slot are functions of the FINAL dimension count, and `-nd` is allowed
+    // to appear after the flags that depend on it.
+    if (ndCfg.n >= 4) {
+        // A fill names its dimension either 1-based ("4" = the first extra one) or by the
+        // axis letter the sliders are labelled with ("w").
+        auto dimIndex = [&](const std::string& tok, int& out) -> bool {
+            if (!tok.empty() && std::isdigit((unsigned char)tok[0])) {
+                const int d1 = std::atoi(tok.c_str());
+                if (d1 >= 4 && d1 <= ndCfg.n) { out = d1 - 4; return true; }
+                return false;
+            }
+            for (int a = 3; a < ndCfg.n; ++a)
+                if (ndwarp::axisName(a) == tok) { out = a - 3; return true; }
+            return false;
+        };
+        for (const std::string& a : ndFillArgs) {
+            const size_t eq = a.find('=');
+            if (eq == std::string::npos) {
+                std::fprintf(stderr, "[nd] -nd-fill wants <dim>=<spec>, got '%s'\n", a.c_str());
+                return 2;
+            }
+            int slot = -1;
+            if (!dimIndex(a.substr(0, eq), slot)) {
+                std::fprintf(stderr, "[nd] -nd-fill '%s': dimension must be 4..%d "
+                                     "(or its axis letter)\n", a.substr(0, eq).c_str(), ndCfg.n);
+                return 2;
+            }
+            std::string ferr;
+            if (!ndwarp::parseDimSpec(a.substr(eq + 1), ndCfg.extra[(size_t)slot], ferr)) {
+                std::fprintf(stderr, "[nd] -nd-fill '%s': %s\n", a.c_str(), ferr.c_str());
+                return 2;
+            }
+        }
+        for (const std::string& a : ndAngleArgs) {
+            double deg = 0.0; std::string aerr;
+            const int k = ndwarp::parseAngleSpec(ndCfg.n, a, deg, aerr);
+            if (k < 0) {
+                std::fprintf(stderr, "[nd] -nd-angle '%s': %s\n", a.c_str(), aerr.c_str());
+                return 2;
+            }
+            ndCfg.angle[(size_t)k] = deg * PI / 180.0;
+        }
+    } else if (!ndFillArgs.empty() || !ndAngleArgs.empty() ||
+               !ndExportPath.empty() || !ndCfg.object.empty()) {
+        std::fprintf(stderr, "[nd] -nd-fill / -nd-angle / -nd-object / -nd-export need "
+                             "-nd <n> with n >= 4\n");
+        return 2;
+    }
 
     // Bare-invocation quick preview: `ftrace scene.ftsl` (double-click / drag-drop, no
     // other flags) defaults to a fast raster preview shown in a live window — no light
@@ -16432,10 +19273,13 @@ static int run(int argc, char** argv) {
             "-savemap","-loadmap","-wavefront"
         };
         bool explicitControl = false;
+        const char* controlFlag = nullptr;   // which one, so the hint below can name it
         auto scan = [&](const char* const* flags, size_t nflags) {
             for (int i = 1; i < argc && !explicitControl; ++i)
                 for (size_t k = 0; k < nflags; ++k)
-                    if (!std::strcmp(argv[i], flags[k])) { explicitControl = true; break; }
+                    if (!std::strcmp(argv[i], flags[k])) {
+                        explicitControl = true; controlFlag = flags[k]; break;
+                    }
         };
         if (positionalMesh) scan(kMeshRenderFlags, sizeof(kMeshRenderFlags)/sizeof(*kMeshRenderFlags));
         else                scan(kSceneRenderFlags, sizeof(kSceneRenderFlags)/sizeof(*kSceneRenderFlags));
@@ -16458,6 +19302,54 @@ static int run(int argc, char** argv) {
                 static std::string previewOut = std::string(tmp) + "/ftrace_preview_" + base + ".png";
                 out = previewOut.c_str();
             }
+        } else {
+            // The user asked for a real render, so the auto-preview steps aside -- but it
+            // has just printed "[viewer] quick-view scene for mesh ...", and then shows
+            // nothing. Say which flag turned the window off and how to get it back, at the
+            // exact moment the expectation is broken.
+            if (!g_showWindow)
+                std::printf("[viewer] %s asks for a real render, so the quick preview window "
+                            "is off; add -window-min -keepwindow to watch it converge\n",
+                            controlFlag ? controlFlag : "a render-control flag");
+            // ...and don't drop a `cornell.ppm` either. That is the BUILT-IN Cornell box's
+            // output name, and nothing named cornell is anywhere in this run: rendering
+            // `compote_with_gems.glb` should not leave a file named after a different
+            // scene. The preview path above already refuses to; so should this one.
+            if (!std::strcmp(out, "cornell.ppm")) {
+                std::string base = inFile;
+                size_t slash = base.find_last_of("/\\");
+                if (slash != std::string::npos) base = base.substr(slash + 1);
+                size_t dot = base.find_last_of('.');
+                if (dot != std::string::npos) base = base.substr(0, dot);
+                static std::string renderOut = base + ".ppm";
+                out = renderOut.c_str();
+            }
+        }
+    }
+
+    // ---- -nd implies the interactive viewer -------------------------------------
+    // The deliverable of `-nd` is the slider bank, and a slider needs a window to live
+    // in — so the warp opens the raster explorer the same way -explore does. A genuine
+    // light-transport request still wins: `-nd 4 -nd-angle xw=30 -mode D -n 1e8 -o x.png`
+    // path-traces the warped model once, headless. -nd-export is a write-and-exit job and
+    // wants no window either.
+    if (ndCfg.n >= 4 && ndExportPath.empty()) {
+        static const char* kNdRenderFlags[] = {
+            "-mode", "-n", "-time", "-noise", "-forever", "-preview", "-spp",
+            "-savemap", "-loadmap", "-wavefront", "-raster-bench",
+            // An EXPLICIT -raster is a batch still, not an exploration: `-nd 4 -raster
+            // -o png/x.png` should write the frame and exit rather than open a viewer.
+            // (The -raster the preview path turns on implicitly is set later, so it
+            // cannot be confused with this one.)
+            "-raster", "-raster-gpu"
+        };
+        bool realRender = false;
+        for (int i = 1; i < argc && !realRender; ++i)
+            for (const char* f : kNdRenderFlags)
+                if (!std::strcmp(argv[i], f)) { realRender = true; break; }
+        if (!realRender) {
+            exploreMode = true; doRaster = true;
+            g_showWindow = true; g_keepWindow = true; noMeter = true;
         }
     }
 
@@ -16472,10 +19364,14 @@ static int run(int argc, char** argv) {
     if (checkCurveOnly)    return checkCurve(200'000) == 0 ? 0 : 1;    // deterministic, no scene needed
     if (checkFurOnly)      return checkFur(50'000) == 0 ? 0 : 1;      // deterministic, no scene needed
     if (checkFurGridOnly)  return checkFurGrid() == 0 ? 0 : 1;        // deterministic, no scene needed
+    if (checkPmGridOnly)   return checkPmGrid();   // deterministic, no scene needed
     if (checkFurVolOnly)   return checkFurVol() == 0 ? 0 : 1;         // deterministic, no scene needed
     if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
+    if (checkNdOnly)       return checkNd();       // deterministic, no scene needed
+    if (checkPatOpsOnly)   return checkPatOps();   // deterministic, no scene needed
+    if (checkNdGpuOnly)    return checkNdGpu();    // deterministic, no scene needed
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed
     if (checkDenoiseOnly)  return checkDenoise();  // deterministic, no scene needed
     if (checkThinFilmOnly) return checkThinFilm(); // deterministic, no scene needed
@@ -16581,7 +19477,9 @@ static int run(int argc, char** argv) {
     // mode R as the primary validation; to exercise D on specular/glossy surfaces use
     // -scene materials (which builds the mirror+glossy scene for every mode).
     const bool refMode = (mode == 'R' || mode == 'V');
-    const bool diffuseScene = refMode || mode == 'D';
+    // Mode J (UPBP) takes the same built-in scene as D, so a built-in J render can be
+    // diffed straight against a built-in D render (validation gate 4).
+    const bool diffuseScene = refMode || mode == 'D' || mode == 'J';
     Scene scene = fromFtsl  ? std::move(ftslScene.scene)
                 : prism     ? buildPrism(res)
                 : grating   ? buildGrating(res, diffraction)
@@ -16617,6 +19515,117 @@ static int run(int argc, char** argv) {
         std::string removed = scene.applyIgnoreFlags(noMedia, noEnv, noFluoro);
         if (!removed.empty())
             std::printf("[ignore] stripped: %s\n", removed.c_str());
+    }
+
+    // ---- -nd: lift the model into N dimensions, rotate, project back to 3-D -------
+    // Applied to the real Scene rather than to the preview geometry, so the warped model
+    // is what EVERY consumer sees: the rasterizer previews it, any render mode path-traces
+    // it, and -nd-export writes it out. See ndwarp.h for what the fills mean and why a
+    // zero-filled lift is provably affine.
+    ndwarp::Model ndModel;
+    bool ndActive = false;
+    // Implicit fields take the OTHER N-D route, and take it whether or not the scene also
+    // has a mesh: the same rotation tilts the 3-D slice they are evaluated on.
+    bool ndSliced = false;
+    if (ndCfg.n >= 4 && !scene.implicits.empty()) {
+        scene.ndSlice = ndwarp::sliceOf(ndCfg);
+        ndSliced = true;
+        const bool readsExtra = ndwarp::anyFieldReadsExtraDims(scene);
+        std::printf("[nd] %zu implicit field(s) evaluated on a %d-D slice%s\n",
+                    scene.implicits.size(), ndCfg.n,
+                    readsExtra ? " (fields read d4.., so rotating MORPHS them)"
+                               : " — but no field reads d4.., so the slice can only remap "
+                                 "(x,y,z) affinely; add a d4 term to get a real morph");
+        std::fflush(stdout);
+    }
+    if (ndCfg.n >= 4) {
+        std::string note;
+        if (!ndwarp::capture(scene, ndCfg.object, ndModel, note) && !ndSliced) {
+            std::fprintf(stderr, "[nd] %s\n", note.c_str());
+            return 2;
+        }
+        if (!ndModel.ok)
+            std::printf("[nd] no mesh to warp; the field slice is doing the work\n");
+        if (!note.empty() && ndModel.ok) std::fprintf(stderr, "[nd] %s\n", note.c_str());
+        const size_t want = ndwarp::projectedTriCount(ndModel, ndCfg);
+        if (want > ndBudget) {
+            std::fprintf(stderr, "[nd] this configuration would build %zu triangles, over "
+                                 "the %zu budget — raise it with -nd-budget, cut an "
+                                 "extrusion, or decimate the model first\n", want, ndBudget);
+            return 2;
+        }
+        std::string fills;
+        for (int k = 3; k < ndCfg.n; ++k) {
+            if (!fills.empty()) fills += ", ";
+            fills += ndwarp::axisName(k) + "=" + ndwarp::dimSpecText(ndCfg.extra[(size_t)(k - 3)]);
+        }
+        std::printf("[nd] %d-D: %d rotation planes over %zu source triangles; %s\n",
+                    ndCfg.n, ndwarp::planeCount(ndCfg.n), ndModel.base.size(), fills.c_str());
+        const ndwarp::Stats st = ndwarp::apply(ndModel, ndCfg, scene);
+        scene.build();          // the warp moved geometry: BVH, bounds and lights all restale
+        ndActive = true;        // true for a slice-only scene too: the sliders drive it
+        std::string dropNote;
+        if (st.dropped)
+            dropNote = " (" + std::to_string(st.dropped) +
+                       " collapsed to zero area and were dropped)";
+        std::printf("[nd] projected to %zu triangles over %zu vertices%s\n",
+                    st.tris, st.verts, dropNote.c_str());
+        // A filled dimension that no rotation has turned into view contributes nothing, and
+        // an extrusion in that state loses every side wall to the degenerate cull — which
+        // reads as "extrude did nothing" unless it is said plainly.
+        {
+            const std::string eo = ndwarp::edgeOnNote(st, ndCfg.n);
+            if (!eo.empty()) std::printf("[nd] %s\n", eo.c_str());
+        }
+        if (st.linear) {
+            // Worth saying out loud every time: this is the case where all the N-D
+            // machinery is equivalent to one matrix, and the user can only find that out
+            // by being told or by deriving it.
+            std::printf("[nd] this warp is LINEAR — every extra dimension is `zero`, so the "
+                        "result is the\n"
+                        "     source model under a single 3x3 matrix (det %+.4f%s): it can "
+                        "rotate, shear,\n"
+                        "     squash and (past 180 deg in a mixed plane) MIRROR the model, "
+                        "but it cannot\n"
+                        "     add structure. Fill a dimension to get a warp that is not "
+                        "affine — try:\n"
+                        "       -nd-fill 4=emboss:curvature:1.0   spikes out of the "
+                        "high-curvature detail\n"
+                        "       -nd-fill 4=emboss:noise:1.0       crumples and folds it\n"
+                        "       -nd-fill 4=extrude:0.5            sweeps a real N-D prism "
+                        "(mesh grows ~3.5x)\n"
+                        "     ...then turn a plane containing that axis, e.g. -nd-angle "
+                        "xw=60.\n"
+                        "     In the viewer the same controls are the FILL box + amount "
+                        "slider per axis;\n"
+                        "     the amount is what decides whether you see anything (0.25 is "
+                        "subtle, 1.0 is not).\n",
+                        st.det, st.det < 0.0 ? ", MIRRORED" : "");
+            if (st.singular)
+                std::printf("[nd] the matrix is singular: the model has been squashed "
+                            "completely flat.\n");
+        }
+        std::fflush(stdout);
+    }
+
+    // ---- -nd-export: write the projected model and stop --------------------------
+    // Unless the viewer was ALSO asked for, in which case the path becomes the Save
+    // button's target instead: `-nd 5 -nd-export out.obj -explore` is "let me dial it in,
+    // then write it here", which is the workflow the button exists for.
+    if (!ndExportPath.empty() && !exploreMode) {
+        if (!ndActive) {
+            std::fprintf(stderr, "[nd] -nd-export needs -nd <n>\n");
+            return 2;
+        }
+        std::string eerr; size_t wrote = 0;
+        if (!ndwarp::exportModel(scene, ndModel, ndExportPath, eerr, &wrote)) {
+            std::fprintf(stderr, "[nd] export failed: %s\n", eerr.c_str());
+            return 1;
+        }
+        std::printf("[nd] wrote %zu triangles to %s\n", wrote, ndExportPath.c_str());
+        std::printf("[nd] render it with:  ftrace %s\n", ndExportPath.c_str());
+        std::fflush(stdout);
+        return 0;
     }
     // A scene may declare the path depth its GEOMETRY needs (`render { max_bounce N }`),
     // because that is not a matter of the operator's taste: mode D runs 8 path edges by
@@ -16672,6 +19681,10 @@ static int run(int argc, char** argv) {
     // (wNeedSpp), so its C=1 image converges rather than staying wrong, and nagging there
     // would fire on every explore run.
     if (g_whitted && !wPreview && g_heroC <= 1) warnWhittedHeroCollapse(scene);
+    // Same "only a real batch render" gate, for the OTHER way mode W stops being exact at
+    // low spp: a de-hero'd path plus a pixel-shared wavelength lattice = a global colour
+    // cast. See warnWhittedDeHeroSpp for the measurement this threshold comes from.
+    if (g_whitted && !wPreview) warnWhittedDeHeroSpp(scene, spp);
     // Kept out of the chain above: rejecting -gi is independent of whether the run is
     // also direct-only, and folding it in would swallow that notice when both are given.
     // Mode R already carries real multi-bounce GI; the gather is mode W's substitute for
@@ -17097,11 +20110,12 @@ static int run(int argc, char** argv) {
                 c.lens = cs->lens;
                 double flmm = cs->lens->focalLengthMM();
                 double fw = cs->lens->filmW_mm, fh = cs->lens->filmH_mm;
-                if (cmode == 'D') {
-                    std::printf("[camera] '%s' has a physical lens -> mode D (BDPT) with "
+                if (cmode == 'D' || cmode == 'J') {
+                    std::printf("[camera] '%s' has a physical lens -> mode %c (%s) with "
                                 "the lens on the camera subpath (Plan B; light-image splat "
                                 "disabled); f=%.1fmm, sensor %.1fx%.1fmm\n",
-                                cs->name.c_str(), flmm, fw, fh);
+                                cs->name.c_str(), cmode, cmode == 'J' ? "UPBP" : "BDPT",
+                                flmm, fw, fh);
                 } else if (cmode == 'P') {
                     // The composite's forward pass splats to a pinhole and can't be
                     // pushed through the lens, so route to the lens-aware BDPT (mode D)
@@ -17171,7 +20185,7 @@ static int run(int argc, char** argv) {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
         // uses the same camera frame; only the old contact-sensor diagnostic did not.
         const bool useCamera = (mode == 'A' || mode == 'B' || mode == 'C' ||
-                                mode == 'P' || mode == 'D' || mode == 'M' ||
+                                mode == 'P' || mode == 'D' || mode == 'J' || mode == 'M' ||
                                 mode == 'S' || mode == 'U' || refMode);
         int fresX = res, fresY = (resYCli > 0) ? resYCli : res;
         previewUpscale(fresX, fresY);   // big, readable raster preview (no-op for real renders)
@@ -17445,7 +20459,11 @@ static int run(int argc, char** argv) {
             if (cs.filmDist_m > 0.0) { m.cam.filmDist = cs.filmDist_m; m.cam.lensF = cs.lensF_m; }
             else                     { m.cam.setFocus(cs.focus); }
             m.mode = effMode(cs.mode);
-            if (cs.lens) { m.cam.lens = cs.lens; if (m.mode != 'D' && m.mode != 'P') m.mode = 'R'; }
+            // Mode J's camera subpath IS mode D's, lens included (Plan B), so it keeps the lens.
+            if (cs.lens) {
+                m.cam.lens = cs.lens;
+                if (m.mode != 'D' && m.mode != 'J' && m.mode != 'P') m.mode = 'R';
+            }
             m.name = cs.name;
             return m;
         };
@@ -17562,6 +20580,9 @@ static int run(int argc, char** argv) {
             std::printf("[raster] solid-shaded preview: tessellating scene (iso res %d) ...\n", rasterIso);
         if (rasterSeeThrough)
             std::printf("[raster] see-through: clear objects dim/haze what's behind them (clarity %.2f, no refraction)\n", rasterClarity);
+            if (rasterHaze < 1.0)
+                std::printf("[raster] see-through: frost capped at %.0f%% of a pixel "
+                            "(-glass-haze), so a deep pile stays readable\n", rasterHaze * 100.0);
         std::fflush(stdout);
 
         // Pop the live window up IMMEDIATELY (before the potentially-slow tessellation)
@@ -17606,9 +20627,14 @@ static int run(int argc, char** argv) {
                 }
             };
             prims = raster::tessellate(scene, rasterIso, tessProgress, rasterCurveBudget);
+            // "Color" off: re-shade to neutral clay. Done to the baked geometry, so the
+            // CPU and GPU rasterizers both get it without knowing the mode exists — which
+            // is also why toggling it has to re-tessellate rather than just re-render.
+            if (!rasterColor) raster::stripColor(prims);
             auto rt1 = std::chrono::steady_clock::now();
-            std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",
-                        prims.size(), std::chrono::duration<double>(rt1 - rt0).count(),
+            std::printf("[raster] %zu triangles in %s; rendering %zu camera(s) on %d threads%s\n",
+                        prims.size(),
+                        humanDur(std::chrono::duration<double>(rt1 - rt0).count()).c_str(),
                         toRender.size(), nThreads, g_showWindow ? " — live window" : "");
             std::fflush(stdout);
         };
@@ -17667,13 +20693,14 @@ static int run(int argc, char** argv) {
             if (gpuRaster) {
                 std::vector<uint8_t> img =
                     raster_cuda::renderFrame(gpuRaster, cam, W, H, nThreads, ev, autoExp, lock,
-                                             rasterSeeThrough, rasterClarity);
+                                             rasterSeeThrough, rasterClarity, rasterHaze);
                 if (!img.empty()) return img;
             }
 #endif
             ensurePrims();   // lazy fallback (also the sole path when the GPU is unavailable)
             return raster::renderFrame(prims, cam, W, H, plight, nThreads, ev, autoExp, lock,
-                                       rasterSeeThrough, rasterClarity, &scene, &rasterScratch);
+                                       rasterSeeThrough, rasterClarity, &scene, &rasterScratch,
+                                       rasterHaze);
         };
 
         // Exposure-lock meter pre-pass: for each locked group, raster its selected metering
@@ -17798,7 +20825,8 @@ static int run(int argc, char** argv) {
                         if (!raster_cuda::bindPresentTarget(gpuRaster, dev, tex, W, H)) return false;
                         return raster_cuda::renderFrameToTarget(gpuRaster, rc.cam, W, H, nThreads,
                                                                 ev, autoExp, nullptr,
-                                                                rasterSeeThrough, rasterClarity);
+                                                                rasterSeeThrough, rasterClarity,
+                                                                rasterHaze);
                     });
                     if (!ok) { zc.clear(); break; }   // no interop here: report it, don't fake it
                     zc.push_back(std::chrono::duration<double, std::milli>(
@@ -17924,8 +20952,9 @@ static int run(int argc, char** argv) {
         }
         auto ft1 = std::chrono::steady_clock::now();
         double secs = std::chrono::duration<double>(ft1 - ft0).count();
-        std::printf("[raster] done: %d frame(s) in %.2fs (%.1f fps).\n",
-                    frame, secs, frame > 0 ? frame / std::max(secs, 1e-6) : 0.0);
+        std::printf("[raster] done: %d frame(s) in %s (%.1f fps).\n",
+                    frame, humanDur(secs).c_str(),
+                    frame > 0 ? frame / std::max(secs, 1e-6) : 0.0);
 
         // ---------------------------------------------------------------------------
         // Interactive raster viewer. For a single still camera shown in a live window,
@@ -18125,6 +21154,49 @@ static int run(int argc, char** argv) {
             // buttons. Path playback rides the SAME camera-index cursor the timeline scrubs.
             int pathCount = (int)explorePath.size();   // mutable: the editor rebuilds the path
             g_liveWin->enablePanel(pathCount, explorePathFps, collideShort(collide));
+            // The render loop owns these two: -see-through / -flat may already have been
+            // asked for, so the checkboxes are seeded from the flags rather than guessing.
+            g_liveWin->setShadeToggles(rasterColor, rasterSeeThrough);
+            // ---- N-D rotation bank ---------------------------------------------------
+            // One slider per rotation PLANE of the n-D space the model was lifted into.
+            // Angles are held in DEGREES on the panel side and radians in the Config, so
+            // the slider reads as the number a person would say.
+            auto ndPlaneLabels = [&]() {
+                std::vector<std::string> lb;
+                for (int k = 0; k < ndwarp::planeCount(ndCfg.n); ++k)
+                    lb.push_back(ndwarp::planeLabel(ndCfg.n, k));
+                return lb;
+            };
+            auto ndAnglesDeg = [&]() {
+                std::vector<double> d(ndCfg.angle.size());
+                for (size_t k = 0; k < d.size(); ++k) d[k] = ndCfg.angle[k] * 180.0 / PI;
+                return d;
+            };
+            // The per-dimension FILL cells: what each extra dimension contains. Without
+            // these the viewer can only rotate and squash, because a lift whose extra
+            // coordinates are all zero collapses to a single 3x3 matrix.
+            auto ndDimLabels = [&]() {
+                std::vector<std::string> lb;
+                for (int k = 3; k < ndCfg.n; ++k) lb.push_back(ndwarp::axisName(k));
+                return lb;
+            };
+            auto ndFillSel = [&]() {
+                std::vector<int> f;
+                for (const ndwarp::DimSpec& d : ndCfg.extra) f.push_back(ndwarp::fillChoiceOf(d));
+                return f;
+            };
+            auto ndAmounts = [&]() {
+                std::vector<double> a;
+                for (const ndwarp::DimSpec& d : ndCfg.extra)
+                    a.push_back(std::clamp(d.amp, 0.0, 1.0));
+                return a;
+            };
+            auto ndBuildPanel = [&]() {
+                g_liveWin->enableNdPanel(ndCfg.n, ndPlaneLabels(), ndAnglesDeg(),
+                                         ndDimLabels(), ndwarp::fillChoices(),
+                                         ndFillSel(), ndAmounts());
+            };
+            if (ndActive) ndBuildPanel();
             bool   pathMode = false;    // locked to the camera path (orientation + travel follow it)
             bool   playing  = false;    // auto-advancing along the path
             double pathPos  = 0.0;      // fractional camera index (continuous; render uses the nearest)
@@ -18532,7 +21604,8 @@ static int run(int argc, char** argv) {
                     if (!raster_cuda::bindPresentTarget(gpuRaster, dev, tex, w, h)) return false;
                     return raster_cuda::renderFrameToTarget(gpuRaster, c, w, h, nThreads, expo,
                                                             autoExp_, nullptr,
-                                                            rasterSeeThrough, rasterClarity);
+                                                            rasterSeeThrough, rasterClarity,
+                                                            rasterHaze);
                 });
                 // Say which way the pixels are actually flowing — whether the interop engaged
                 // is invisible otherwise (both paths show the same image), and it can legitimately
@@ -18724,9 +21797,16 @@ static int run(int argc, char** argv) {
             // Dielectric -- see thinFilmInterface's whittedWeight.)
             // (No hasLens() term: the viewer builds its camera fresh from the pose each frame,
             // so the preview camera is always a plain one even if the scene authored a lens.)
-            const int kWSppCap = 16;
-            bool wNeedSpp = (g_heroC <= 1) || scene.backwardMedium().enabled ||
-                            grin::sceneHasGrin(scene);
+            // The floor is the SAME constant the batch warning quotes (kWhittedDeHeroSpp),
+            // and the same predicate (whittedDeHeroes) decides whether it applies -- two
+            // copies of this rule is how the viewer and the batch path came to disagree.
+            // It was 16 here, which the gallery_rain measurement in warnWhittedDeHeroSpp
+            // shows is still ~18% off in R/G; 64 lands within ~2%. The extra passes cost
+            // nothing in responsiveness because ANY camera movement abandons the unfinished
+            // refinement outright -- they only run while you are holding still, and every
+            // one of them is displayed as it lands.
+            const int kWSppCap = kWhittedDeHeroSpp;
+            bool wNeedSpp = whittedDeHeroes(scene) != nullptr;
             // Rough GLOSSY is deliberately NOT on that list, even though its lobe is likewise
             // resolved across samples (whittedGlossyDir) rather than within one. The difference
             // is what a single pass looks like: a de-hero'd dielectric is flatly WRONG (a green
@@ -18919,6 +21999,221 @@ static int run(int argc, char** argv) {
             // RGB-backward session (which bakes the scene at begin() — setCamera only
             // re-aims, so a swap needs a full End/Begin). The user's POSE is deliberately
             // untouched: the scene changed under them, they did not move.
+            // ---- N-D re-warp -------------------------------------------------------
+            // A slider move rebuilds the model from the PRISTINE captured copy (never from
+            // the last warp — angles are absolute, and composing them would drift), then
+            // re-tessellates and re-uploads exactly as a loom scene swap does.
+            //
+            // What it deliberately does NOT do is rebuild the BVH. The rasterizer does not
+            // use one, and rebuilding it on a 2 M-triangle extrusion would cost seconds per
+            // slider tick; instead the tree is marked stale and rebuilt lazily, once, if a
+            // traced preview actually needs it.
+            bool ndBvhStale = false;
+            ndwarp::Stats ndLastStats;
+            // The angle-independent half of the warp, held across slider events. A drag
+            // only changes angles, and buildComplex never reads one, so this turns each
+            // event from "rebuild the model" into "re-project it". Keyed on the Model and
+            // the FILLS, so editing a fill rebuilds it while moving any slider -- in any
+            // plane, including ones that swing an extra dimension into view -- reuses it.
+            ndwarp::Cache ndCache;
+            // GPU-resident complex. While this is live a slider event never touches host
+            // geometry at all: the topology is already on the device, so a drag uploads a
+            // 3xN matrix and runs three kernels straight into the DPTri array.
+            //
+            // The cost is that Scene::tris then goes STALE -- it still holds the previous
+            // rotation. Anything that reads host geometry (an export, the path-traced
+            // preview, the CPU rasterizer) has to force a real rebuild first, which is what
+            // ndHostStale tracks. Getting that wrong would mean the preview and the
+            // exported model quietly disagreeing, which is the one failure this whole path
+            // must not have.
+            raster_cuda::NdResident* ndRes = nullptr;
+            bool   ndHostStale = false;     // Scene::tris is behind the displayed rotation
+            int    ndWarpStart = 0;         // where warped triangles begin in Scene::tris
+            auto ndDropResident = [&]() {
+#ifdef HAVE_CUDA
+                if (ndRes) { raster_cuda::ndDestroy(ndRes); ndRes = nullptr; }
+#endif
+                ndHostStale = false;
+            };
+            auto ndRows3 = [&]() {          // the first three rows of the rotation
+                const std::vector<double> R = ndwarp::rotationMatrix(ndCfg);
+                std::vector<double> r3((size_t)3 * ndCfg.n);
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < ndCfg.n; ++j)
+                        r3[(size_t)i * ndCfg.n + j] = R[(size_t)i * ndCfg.n + j];
+                return r3;
+            };
+            auto ndReapply = [&]() {
+                if (!ndActive) return;
+                // Retilt the field slice first: it is the whole N-D story for an
+                // isosurface, and unlike the mesh path it costs nothing to update -- no
+                // re-projection, no re-tessellation of the SOURCE, just a new 3x n matrix
+                // the field sampler reads. (The isosurface still has to be re-marched for
+                // the preview, which ensurePrims below does.)
+                if (!scene.implicits.empty()) scene.ndSlice = ndwarp::sliceOf(ndCfg);
+                const size_t want = ndwarp::projectedTriCount(ndModel, ndCfg);
+                if (want > ndBudget) {
+                    std::fprintf(stderr, "[nd] %zu triangles would exceed the %zu budget; "
+                                         "leaving the last configuration in place\n",
+                                 want, ndBudget);
+                    return;
+                }
+                // Every slider event rebuilds the whole warp from the pristine copy, re-shades
+                // it, re-tessellates and re-uploads to the GPU. That is instant on the source
+                // mesh and seconds once a fill has multiplied it -- and `extrude` multiplies
+                // HARD, because the prism 2-skeleton takes F -> 2F+E. Extruding two dimensions
+                // applies that twice: a 250k-triangle model becomes 4.3M, ~17x, and a drag then
+                // stalls for seconds per event with no indication that anything is happening.
+                // Say so ONCE, when the config first gets heavy, instead of letting the viewer
+                // read as broken.
+                static bool warnedHeavy = false;
+                if (!warnedHeavy && want > 2000000) {
+                    warnedHeavy = true;
+                    std::printf("[nd] this fill makes %zu triangles from %zu source (%.1fx) — "
+                                "each slider move now\n"
+                                "     rebuilds all of them, so expect a pause of seconds per "
+                                "drag. `extrude` is the\n"
+                                "     expensive one (F -> 2F+E per dimension, so two extrudes "
+                                "square it); `emboss`\n"
+                                "     reshapes just as much and adds NO triangles. Lower the "
+                                "amount, extrude one\n"
+                                "     dimension instead of two, or decimate the model first.\n",
+                                want, ndModel.base.size(),
+                                ndModel.base.empty() ? 0.0
+                                                     : (double)want / (double)ndModel.base.size());
+                    std::fflush(stdout);
+                }
+#ifdef HAVE_CUDA
+                // Angle-only change with the complex already resident: nothing about the
+                // topology moved, so re-project on the device and skip the entire host
+                // rebuild. ndCache.matches() is the same test that decides whether the
+                // complex can be reused, so the two can never disagree about what changed.
+                if (ndRes && gpuRaster && ndCache.matches(ndModel, ndCfg)) {
+                    const std::vector<double> r3 = ndRows3();
+                    const auto tR = std::chrono::steady_clock::now();
+                    if (raster_cuda::ndReproject(gpuRaster, ndRes, r3.data(),
+                                                 ndModel.center.x, ndModel.center.y,
+                                                 ndModel.center.z, ndWarpStart)) {
+                        ndLastStats.det    = ndwarp::topLeft3(ndwarp::rotationMatrix(ndCfg),
+                                                              ndCfg.n).det();
+                        ndLastStats.linear = ndCfg.isLinear();
+                        ndHostStale = true;
+                        traceDirty  = true;
+                        const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - tR).count();
+                        // Say so the FIRST time, then only if it ever gets slow. Whether
+                        // the fast path engaged is otherwise invisible -- both routes draw
+                        // the same picture -- and "it silently did nothing" looks exactly
+                        // like "it worked" from outside.
+                        static bool saidResident = false;
+                        if (!saidResident) {
+                            saidResident = true;
+                            std::printf("[nd] complex is resident on the GPU: a slider now "
+                                        "uploads a 3x%d matrix and re-projects there "
+                                        "(%.1f ms for %zu triangles)\n",
+                                        ndCfg.n, ms, ndCache.tmpl.size());
+                            std::fflush(stdout);
+                        } else if (ms > 250.0) {
+                            std::printf("[nd] gpu re-project %.0f ms\n", ms);
+                            std::fflush(stdout);
+                        }
+                        return;
+                    }
+                    ndDropResident();   // it failed: fall through and rebuild honestly
+                }
+#endif
+                using rclock = std::chrono::steady_clock;
+                const auto tA = rclock::now();
+                auto msSince = [](rclock::time_point a) {
+                    return std::chrono::duration<double, std::milli>(rclock::now() - a).count();
+                };
+                // Keep zero-area triangles when the GPU rasterizer is in play, so the
+                // slot layout the resident path writes into cannot shift under it.
+                const bool keepDegen = (gpuRaster != nullptr);
+                ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache, keepDegen);
+                ndWarpStart = (int)ndModel.keep.size();
+                ndHostStale = false;
+                const double msWarp = msSince(tA);
+                ndBvhStale = true;
+                plight = raster::deriveLight(scene);
+                prims.clear();
+                tessellated = false;
+                double msTess = 0, msUp = 0;
+#ifdef HAVE_CUDA
+                if (gpuRaster) {
+                    const auto tD = rclock::now();
+                    raster_cuda::destroy(gpuRaster);
+                    gpuRaster = nullptr;
+                    ensurePrims();
+                    msTess = msSince(tD);
+                    const auto tU = rclock::now();
+                    gpuRaster = raster_cuda::upload(prims, plight, &scene);
+                    msUp = msSince(tU);
+                    if (!gpuRaster)
+                        std::fprintf(stderr, "[nd] GPU re-upload failed; using the CPU rasterizer\n");
+                    // Hand the (angle-independent) topology to the device so the NEXT
+                    // slider move can skip all of this.
+                    ndDropResident();
+                    if (gpuRaster && !ndCache.tmpl.empty())
+                        ndRes = raster_cuda::ndUpload(
+                            ndCache.c.pos.data(), ndCache.c.nv, ndCfg.n,
+                            &ndCache.tvi[0][0], (int)ndCache.tmpl.size(),
+                            ndCache.voff.data(), ndCache.vcorner.data(), ndCfg.creaseDeg);
+                }
+                if (traceSess) { backwardRGBSessionEnd(traceSess); traceSess = nullptr; }
+#endif
+                traceDirty = true;
+                // One line per rebuild once it is slow enough to feel, so whoever optimises
+                // this next starts from a measurement rather than an assumption.
+                if (msWarp + msTess + msUp > 250.0) {
+                    std::printf("[nd] rebuild %.0f ms  (warp %.0f, tessellate %.0f, gpu-upload %.0f)\n",
+                                msWarp + msTess + msUp, msWarp, msTess, msUp);
+                    std::fflush(stdout);
+                }
+            };
+            // The readout under the sliders: what the warp costs, and — when it applies —
+            // the fact that the whole bank is equivalent to one 3x3 matrix.
+            auto ndStatus = [&]() {
+                char b[256];
+                std::string fills;
+                for (int k = 3; k < ndCfg.n; ++k) {
+                    if (!fills.empty()) fills += " ";
+                    fills += ndwarp::axisName(k) + "=" +
+                             (ndCfg.extra[(size_t)(k - 3)].fill == ndwarp::Fill::Zero ? "zero"
+                              : ndCfg.extra[(size_t)(k - 3)].fill == ndwarp::Fill::Extrude ? "extrude"
+                              : ndCfg.extra[(size_t)(k - 3)].fill == ndwarp::Fill::Skeleton ? "skeleton"
+                              : ndwarp::embName(ndCfg.extra[(size_t)(k - 3)].src));
+                }
+                std::snprintf(b, sizeof b, "%zu tris  |  %s%s",
+                              ndLastStats.tris, fills.c_str(),
+                              ndLastStats.linear
+                                  ? (ndLastStats.det < 0.0
+                                         ? "  |  linear, MIRRORED - set a FILL below (+ raise "
+                                           "its amount) to morph"
+                                         : "  |  linear: rotating can only squash - set a FILL "
+                                           "below (+ raise its amount) to morph")
+                                  : "");
+                std::string line = b;
+                // A slice-only scene has no triangles and no fills to report; what the
+                // sliders are actually doing there is tilting the field's slice.
+                if (!ndModel.ok && !scene.implicits.empty()) {
+                    line = std::to_string(scene.implicits.size()) + " field(s) on a " +
+                           std::to_string(ndCfg.n) + "-D slice";
+                    if (!ndwarp::anyFieldReadsExtraDims(scene))
+                        line += "  |  no d4.. term: affine only";
+                }
+                // The edge-on note matters most HERE: in the viewer the user has just
+                // dragged a slider and is looking for the change it made.
+                const std::string eo = ndwarp::edgeOnNote(ndLastStats, ndCfg.n);
+                if (!eo.empty()) line += "  |  " + eo;
+                return line;
+            };
+            if (ndActive) {
+                ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache);   // seed the readout
+                g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
+                                      ndStatus().c_str());
+            }
+
             auto animAdoptScene = [&](const std::string& path, std::string& aerr) -> bool {
                 ftsl::Loaded nl;
                 if (!ftsl::load(path, nl, aerr, supportFn)) return false;
@@ -18957,6 +22252,166 @@ static int run(int argc, char** argv) {
                       std::fflush(stdout);
                   } }
                 NavInput nav = g_liveWin->drainNav();
+
+                // ---- Preview-shading toggles -------------------------------------
+                // See-through is read per frame by rasterOne, so flipping it costs one
+                // re-render. Colour is baked into the tessellation (so that both
+                // backends get it for nothing), so flipping THAT costs a re-tessellate
+                // and, on the GPU path, a re-upload — the same work a scene swap does.
+                if (nav.clearOn != rasterSeeThrough) {
+                    rasterSeeThrough = nav.clearOn;
+                    std::printf("[viewer] see-through %s\n", rasterSeeThrough ? "on" : "off");
+                    std::fflush(stdout);
+                    traceDirty = true;
+                    changed = true;
+                }
+                if (nav.colorOn != rasterColor) {
+                    rasterColor = nav.colorOn;
+                    std::printf("[viewer] colour %s\n", rasterColor ? "on" : "off (neutral clay)");
+                    std::fflush(stdout);
+                    prims.clear();
+                    tessellated = false;
+#ifdef HAVE_CUDA
+                    if (gpuRaster) {
+                        raster_cuda::destroy(gpuRaster);
+                        gpuRaster = nullptr;
+                        ensurePrims();
+                        gpuRaster = raster_cuda::upload(prims, plight, &scene);
+                        if (!gpuRaster)
+                            std::fprintf(stderr, "[viewer] GPU re-upload failed; using the CPU rasterizer\n");
+                    }
+#endif
+                    changed = true;
+                }
+
+                // ---- N-D panel ---------------------------------------------------
+                if (ndActive) {
+                    // A dimension change rebuilds the whole bank: n(n-1)/2 planes is a
+                    // different number of sliders, and the angles that survive are the
+                    // ones whose PLANE still exists (the plane order is a prefix as n
+                    // grows, so xw stays xw rather than silently becoming xv).
+                    if (nav.ndDims >= 3 && nav.ndDims != ndCfg.n) {
+                        const int oldN = ndCfg.n;
+                        std::vector<double> keep = ndCfg.angle;
+                        ndCfg.resize(nav.ndDims);
+                        for (int k = 0; k < ndwarp::planeCount(ndCfg.n); ++k) {
+                            int i, j; ndwarp::planeAxes(ndCfg.n, k, i, j);
+                            const int old = ndwarp::planeIndex(oldN, i, j);
+                            ndCfg.angle[(size_t)k] =
+                                (old >= 0 && old < (int)keep.size()) ? keep[(size_t)old] : 0.0;
+                        }
+                        std::printf("[nd] %d-D: %d rotation planes\n",
+                                    ndCfg.n, ndwarp::planeCount(ndCfg.n));
+                        std::fflush(stdout);
+                        ndReapply();
+                        ndBuildPanel();
+                        g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
+                                              ndStatus().c_str());
+                        changed = true;
+                    } else if (nav.ndReset) {
+                        std::fill(ndCfg.angle.begin(), ndCfg.angle.end(), 0.0);
+                        ndReapply();
+                        g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
+                                              ndStatus().c_str());
+                        changed = true;
+                    } else if (nav.ndFillMoved &&
+                               nav.ndFill.size() == ndCfg.extra.size() &&
+                               nav.ndAmount.size() == ndCfg.extra.size()) {
+                        // A fill combo or amount slider moved. This is the control that
+                        // decides whether the warp can do anything beyond rotate and
+                        // squash, so it also carries the two assists below.
+                        const std::vector<ndwarp::DimSpec> before = ndCfg.extra;
+                        for (size_t k = 0; k < ndCfg.extra.size(); ++k) {
+                            ndwarp::applyFillChoice(nav.ndFill[k], ndCfg.extra[k]);
+                            ndCfg.extra[k].amp = nav.ndAmount[k];
+                            // Switching a dimension ON at amount 0 would look exactly like
+                            // leaving it at `zero`, so give it a starting amount the first
+                            // time — the slider is then mirrored back so the two agree.
+                            if (nav.ndFill[k] != 0 && ndwarp::fillChoiceOf(before[k]) == 0 &&
+                                ndCfg.extra[k].amp <= 0.0)
+                                ndCfg.extra[k].amp = ndwarp::defaultAmountFor(nav.ndFill[k]);
+                        }
+                        // An extra dimension only reaches the image through its column of
+                        // the rotation's first three rows. Turn a fill on while every plane
+                        // containing that axis is at zero and the result is invisible (an
+                        // extrusion loses every side wall to the degenerate cull), which
+                        // reads as "the control does nothing". So when a fill is switched on
+                        // into a completely edge-on axis, turn it into view: the slider
+                        // visibly moves, and the user sees what they just asked for.
+                        for (int k = 3; k < ndCfg.n; ++k) {
+                            const size_t e = (size_t)(k - 3);
+                            if (nav.ndFill[e] == 0 || ndwarp::fillChoiceOf(before[e]) != 0) continue;
+                            bool anyTurned = false;
+                            for (int j = 0; j < ndCfg.n; ++j) {
+                                if (j == k) continue;
+                                const int pk = ndwarp::planeIndex(ndCfg.n, std::min(j, k), std::max(j, k));
+                                if (pk >= 0 && ndCfg.angle[(size_t)pk] != 0.0) anyTurned = true;
+                            }
+                            if (anyTurned) continue;
+                            const int pk = ndwarp::planeIndex(ndCfg.n, 2, k);   // the z-<axis> plane
+                            if (pk < 0) continue;
+                            ndCfg.angle[(size_t)pk] = 30.0 * PI / 180.0;
+                            std::printf("[nd] %s was edge-on, so %s is turned to 30 deg to bring "
+                                        "it into view\n", ndwarp::axisName(k).c_str(),
+                                        ndwarp::planeLabel(ndCfg.n, pk).c_str());
+                            std::fflush(stdout);
+                        }
+                        ndReapply();
+                        g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
+                                              ndStatus().c_str());
+                        changed = true;
+                    } else if (nav.ndMoved && nav.ndAngles.size() == ndCfg.angle.size()) {
+                        for (size_t k = 0; k < ndCfg.angle.size(); ++k)
+                            ndCfg.angle[k] = nav.ndAngles[k] * PI / 180.0;
+                        ndReapply();
+                        // STATUS ONLY. The angles came from the panel, so pushing them back
+                        // tells it what it already knows -- and ndReapply() can take seconds
+                        // on a heavy fill, by which time the user has dragged further. The
+                        // old full push then set the thumb back to the angle this rebuild
+                        // used, i.e. roughly where the drag began, which read as "the slider
+                        // snaps back to centre and nothing I do sticks". The panel owns the
+                        // positions while the user is driving them; we only own the readout.
+                        g_liveWin->setNdStatus(ndStatus().c_str());
+                        changed = true;
+                    }
+                    if (nav.ndSave) {
+                        // The GPU-resident path leaves Scene::tris one rotation behind, and
+                        // it also carries the zero-area triangles the device needs stable
+                        // slots for. Neither belongs in a file, so re-run the real warp --
+                        // culled, on the host -- before writing anything out.
+                        if (ndHostStale) {
+                            ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache, false);
+                            ndHostStale = false;
+                            ndBvhStale  = true;
+                            prims.clear();
+                            tessellated = false;
+                        }
+                        // Where to write: the -nd-export path when one was given, else a
+                        // `_nd` sibling of the source model, which is where someone looking
+                        // for "the thing I just made" would look first.
+                        std::string path = ndExportPath;
+                        if (path.empty()) {
+                            path = inFile ? inFile : "model";
+                            const size_t dot = path.find_last_of('.');
+                            const size_t sl  = path.find_last_of("/\\");
+                            if (dot != std::string::npos && (sl == std::string::npos || dot > sl))
+                                path = path.substr(0, dot);
+                            path += "_nd.obj";
+                        }
+                        std::string eerr; size_t wrote = 0;
+                        if (ndwarp::exportModel(scene, ndModel, path, eerr, &wrote)) {
+                            std::printf("[nd] wrote %zu triangles to %s\n", wrote, path.c_str());
+                            std::printf("[nd] render it with:  ftrace %s\n", path.c_str());
+                            g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
+                                                  ("saved " + path).c_str());
+                        } else {
+                            std::fprintf(stderr, "[nd] export failed: %s\n", eerr.c_str());
+                            g_liveWin->setNdState(ndAnglesDeg(), ndFillSel(), ndAmounts(),
+                                                  ("save FAILED: " + eerr).c_str());
+                        }
+                        std::fflush(stdout);
+                    }
+                }
 
                 // Fold in whatever loom finished since the last iteration. The editor
                 // never blocks on an emit: it keeps flying the scene it already has and
@@ -19287,6 +22742,15 @@ static int run(int argc, char** argv) {
                 // this idle pose; it suppresses the raster warm-frame and the idle sleep so the
                 // image keeps converging (the accumulate() launch already holds the GPU warm).
                 bool tracingNow = false;
+                // A traced preview (mode W or the GPU path tracer) is the only consumer
+                // that needs the acceleration structure the N-D re-warp deliberately left
+                // stale. Pay for it here, once, on the first traced frame after a slider
+                // move — never on the raster path, which is what the sliders drive.
+                if (ndBvhStale && pvMode != PV_RASTER) {
+                    scene.build();
+                    ndBvhStale = false;
+                    traceDirty = true;
+                }
                 if (pvMode == PV_WHITTED) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
@@ -19398,6 +22862,18 @@ static int run(int argc, char** argv) {
                 }
 #ifdef HAVE_CUDA
                 if (pvMode == PV_PT && traceAvail) {
+                    // The path-traced preview reads the HOST scene, which the resident
+                    // re-projection deliberately leaves behind. Sync before it bakes, or
+                    // the traced image would show a different rotation from the raster one
+                    // it replaced on screen.
+                    if (ndHostStale) {
+                        ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache, false);
+                        ndHostStale = false;
+                        ndBvhStale  = true;
+                        prims.clear();
+                        tessellated = false;
+                        if (traceSess) { backwardRGBSessionEnd(traceSess); traceSess = nullptr; }
+                    }
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
                     // (Re)create the resident session on first use or after a resize.
@@ -19568,7 +23044,7 @@ static int run(int argc, char** argv) {
     // fog / rain / cloud scene is usually its brightest subject. Same reasoning as the
     // -beams carve-out on the GPU meter below; that one falls back to here, so here it must
     // actually be right.
-    PhotonMap meterPmap; bool meterPmapBuilt = false;
+    PhotonMap meterPmap, meterPmapC; bool meterPmapBuilt = false;
     BeamMap   meterBmap;
 #ifdef HAVE_CUDA
     // Meter on the device the run asked for. The meter is a REAL reduced render, so when
@@ -19591,7 +23067,7 @@ static int run(int argc, char** argv) {
         char mode = mc.mode;
         // A scene outside BDPT's transport scope can't meter in mode D (the real render
         // will itself refuse it later, loudly) — meter it with the general forward pass.
-        if (mode == 'D' && bdptUnsupportedFeature(scene)) mode = 'B';
+        if ((mode == 'D' || mode == 'J') && bdptUnsupportedFeature(scene)) mode = 'B';
         Film mf; double eAuto = 0.0;
         switch (mode) {
             case 'A': case 'B': case 'C': {
@@ -19618,7 +23094,12 @@ static int run(int argc, char** argv) {
                 filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
                 break;
             }
-            case 'D': {
+            // Mode J meters as mode D on purpose. The meter only needs an EXPOSURE ANCHOR,
+            // and under a correct MIS combination both estimate the same integral — so the
+            // connection half alone is a legitimate (merely noisier) estimate of the very
+            // image mode J will produce, at a fraction of the cost of building a beam map
+            // per metered frame.
+            case 'D': case 'J': {
                 bool onGpu = false;
 #ifdef HAVE_CUDA
                 if (meterGpu && cudaBdptSupported(scene)) {
@@ -19648,8 +23129,14 @@ static int run(int argc, char** argv) {
                                                         / std::max(1.0, (double)N)))
                             : 0;
                     tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap, g_heroC, 0,
-                                    meterBeams ? &meterBmap : nullptr, meterBeamTarget);
+                                    meterBeams ? &meterBmap : nullptr, meterBeamTarget, nullptr,
+                                    g_pmCaustics ? &meterPmapC : nullptr);
                     buildPhotonMap(meterPmap, radius, "[meter]");
+                    // The meter exists to pick an exposure, so it has to gather what the real
+                    // render will gather — a caustic is bright, and metering without it would
+                    // anchor the exposure to a dimmer image than the one finally produced.
+                    if (g_pmCaustics)
+                        buildCausticMap(meterPmapC, meterPmap.radius, "[meter]", meterPmap.radius);
                     // The meter map is thrown away after the anchor converges, so its work is
                     // only the metered frames — at most `cams.size()` of them at meterSpp, and
                     // the adaptive early-stop usually takes far fewer. Under-stating work makes
@@ -19662,7 +23149,8 @@ static int run(int argc, char** argv) {
                 }
                 mf = renderPhotonCamera(scene, mc.cam, W, H, meterPmap, meterSpp, nThreads,
                                         diffraction, /*maxBounce*/32, 0, g_pmFinalGather,
-                                        meterBeams ? &meterBmap : nullptr);
+                                        meterBeams ? &meterBmap : nullptr,
+                                        g_pmCaustics ? &meterPmapC : nullptr);
                 filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
                 break;
             }
@@ -19745,10 +23233,14 @@ static int run(int argc, char** argv) {
                             g, cudaDeviceName(), kmx);
                 std::fflush(stdout);
                 EnergyReport e;
-                std::function<bool(int, const Film&)> onFrame =
-                    [&](int, const Film& f) -> bool {
+                std::function<bool(int, const Film&, long long)> onFrame =
+                    [&](int, const Film& f, long long sppDone) -> bool {
                         double eAuto = 0.0;
-                        filmToRgb8(f, (double)meterSpp, 1.0, false, nullptr, &eAuto);
+                        // Normalise by what LANDED, not by what was asked for: a metering
+                        // frame cut short by a stop would otherwise read darker than it is
+                        // and anchor the whole group's exposure too hot.
+                        filmToRgb8(f, (double)(sppDone > 0 ? sppDone : meterSpp), 1.0, false,
+                                   nullptr, &eAuto);
                         return conv.add(eAuto) || g_stopRequested != 0;
                     };
                 // Same beam pass the real render gets, at a budget scaled down with the
@@ -19773,7 +23265,15 @@ static int run(int argc, char** argv) {
                                           diffraction, meterSpp, nullptr, &onFrame,
                                           nullptr, nullptr, g_heroC, g_pmFinalGather,
                                           g_pmAutoRadius ? g_pmAutoCount : 0.0,
-                                          meterBeamsGpu ? &mBeamPass : nullptr);
+                                          meterBeamsGpu ? &mBeamPass : nullptr, nullptr,
+                                          // The meter must gather exactly what the render
+                                          // gathers: metering with the caustic map OFF anchors
+                                          // the exposure to a dimmer image than the one that
+                                          // gets written, and every render comes out hot.
+                                          g_pmCaustics ? g_pmCausticCount : 0.0,
+                                          nullptr, 0,
+                                          g_pmAdaptive ? (g_pmAdaptiveK > 0.0 ? g_pmAdaptiveK
+                                                                              : -1.0) : 0.0);
                 metered = true;   // a black meter falls into the no-anchor warning below
             }
         }
@@ -19897,6 +23397,25 @@ static int run(int argc, char** argv) {
     // is the ONLY GPU route for mode M and it handles a single camera fine. Keep even one
     // plain mode-M camera here so `-camera #N`/`near=`/name can aim the live window at one
     // frame of a long camera_curve and still render it on the GPU.
+    //
+    // ... with ONE exception, added in 0.253.0 for the light-side refresh (M-FROZEN). A lone
+    // mode-M camera shares nothing, and the ONLY thing the shared path does for it that
+    // runRender's mode-M branch does not is hand it the GPU gather. When that gather is not
+    // actually available — no CUDA build, `-device cpu`, a lens camera, an unsupported scene —
+    // staying here buys a CPU gather off a FROZEN map, while runRender's branch gives the same
+    // CPU gather off a map that is redrawn between epochs. That is strictly worse on both axes,
+    // so fold it back. `-savemap` / `-loadmap` pin it here regardless: they are implemented
+    // only on this path, and a LOADED map is a stored realization with no trace to refresh.
+    if (groupM.size() == 1 && !g_beamFreeze && g_pmapLoad.empty() && g_pmapSave.empty()) {
+        bool gpuRoute = false;
+#ifdef HAVE_CUDA
+        // Mirrors runSharedPhotonMap's own gate exactly; if that changes, this must too.
+        gpuRoute = (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
+                   !toRender[groupM[0]].cam.hasLens() &&
+                   cudaAvailable() && cudaPhotonMapSupported(scene);
+#endif
+        if (!gpuRoute) { restIdx.push_back(groupM[0]); groupM.clear(); }
+    }
     std::sort(restIdx.begin(), restIdx.end());
 
     bool sharedWriteFail = false;
@@ -20105,17 +23624,18 @@ static int run(int argc, char** argv) {
                                     : totalDone ? " (done)" : "";
                     char st[240];
                     if (chunkFixed)
-                        std::snprintf(st, sizeof st, "[live] %.1fs, %lld / %lld photons, %d cams, ~%.1f%% noise%s",
-                                      elapsed, accN, N, nc, noisePct, why);
+                        std::snprintf(st, sizeof st, "[live] %s, %lld / %lld photons, %d cams, ~%.1f%% noise%s",
+                                      humanDur(elapsed).c_str(), accN, N, nc, noisePct, why);
                     else if (runForever)
-                        std::snprintf(st, sizeof st, "[forever] %.1fs, %lld batches, %lld photons, %d cams, ~%.1f%% noise%s",
-                                      elapsed, batches, accN, nc, noisePct, why);
+                        std::snprintf(st, sizeof st, "[forever] %s, %lld batches, %lld photons, %d cams, ~%.1f%% noise%s",
+                                      humanDur(elapsed).c_str(), batches, accN, nc, noisePct, why);
                     else if (timeBudgetSec > 0.0)
-                        std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld photons, %d cams, ~%.1f%% noise%s",
-                                      elapsed, timeBudgetSec, accN, nc, noisePct, why);
+                        std::snprintf(st, sizeof st, "[time] %s / %s, %lld photons, %d cams, ~%.1f%% noise%s",
+                                      humanDur(elapsed).c_str(), humanDur(timeBudgetSec).c_str(),
+                                      accN, nc, noisePct, why);
                     else
-                        std::snprintf(st, sizeof st, "[noise] ~%.2g%% target, %.1fs, %lld photons, %d cams, ~%.1f%% noise%s",
-                                      noiseTarget, elapsed, accN, nc, noisePct, why);
+                        std::snprintf(st, sizeof st, "[noise] ~%.2g%% target, %s, %lld photons, %d cams, ~%.1f%% noise%s",
+                                      noiseTarget, humanDur(elapsed).c_str(), accN, nc, noisePct, why);
                     if (preview || wantWin) {
                         auto tPrep = clk::now();
                         Film disp = acc[0];
@@ -20245,34 +23765,93 @@ static int run(int argc, char** argv) {
                             cudaDeviceName(), cams.size(), N, radius, lightLabel,
                             g_pmFinalGather > 0 ? " [final gather]" : "");
                 EnergyReport e;
+                const int titleWg = toRender[idx[0]].res, titleHg = toRender[idx[0]].resY;
                 // Drive the live window (per the always-`-window` rule): the shared gather
                 // reports each frame's converging film here so the window shows it build up
                 // and, on a flythrough, flips through the frames as they complete. Only armed
                 // when a window is open so a headless batch pays no extra device->host copies.
+                //
+                // The status text used to be omitted here, which is why mode M's title bar
+                // alone showed no progress: liveWindowUpdate falls back to the bare mode name
+                // when `status` is null, so the caption never changed for the whole render.
+                // `gatherFrame` counts completed frames (the device gather reports a film and
+                // an spp, not which camera they belong to) and writeFrame below advances it.
                 SppProgress liveProg;
+                auto gStart = std::chrono::steady_clock::now();
+                size_t gatherFrame = 0;
+                // Hoisted out of the `if` below because the gather's StageProgress needs it
+                // too, to tone-map the partial-film preview exactly as the live view does.
+                const double liveExp = toRender[idx[0]].exposure;
                 if (g_showWindow) {
-                    const double liveExp = toRender[idx[0]].exposure;
-                    liveProg.report = [&, liveExp](const Film& f, long long sppDone, bool) -> bool {
-                        liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute);
+                    // Echo the same caption to stdout on a slow cadence. The window is the
+                    // only place this text went, so a backgrounded showcase render — the one
+                    // that runs for hours and is read from its log — had nothing at all in it
+                    // between the map build and the frame-written line, and a gather that
+                    // spends a quarter of an hour per spp is indistinguishable in a log from
+                    // one that has wedged. 30 s matches the StageProgress log cadence.
+                    auto lastEcho = std::make_shared<std::chrono::steady_clock::time_point>();
+                    liveProg.report = [&, liveExp, lastEcho](const Film& f, long long sppDone, bool) -> bool {
+                        const auto now = std::chrono::steady_clock::now();
+                        const double el = std::chrono::duration<double>(now - gStart).count();
+                        const std::string st = pmGatherStatus(f, sppDone, spp, gatherFrame + 1,
+                                                              cams.size(), N, el);
+                        liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute, st.c_str());
+                        if (lastEcho->time_since_epoch().count() == 0 ||
+                            std::chrono::duration<double>(now - *lastEcho).count() >= 30.0) {
+                            std::printf("[camera] %s\n", st.c_str());
+                            std::fflush(stdout);
+                            *lastEcho = now;
+                        }
                         return g_stopRequested != 0;   // window closed -> stop after this chunk
                     };
                 }
+                // The phases before the first pixel — the photon deposit and the map build.
+                // Passed UNCONDITIONALLY, not only when a window is open, for two reasons:
+                // its periodic stdout line is worth as much to a headless batch as to a
+                // watched render (liveWindowPlaceholder inside it is already a no-op with no
+                // window), and passing it is also what CHUNKS the device deposit — which
+                // changes the RNG realization, so gating it on `-window` would make the same
+                // command produce a different image depending on whether anyone was looking.
+                // The exposure/absolute pair is what lets the GATHER phase hand back a
+                // partially-filled film to draw (see StageProgress::report's `partial`)
+                // rather than a placeholder — it has to tone-map it the same way the
+                // per-chunk live view above does, or the image would jump when the first
+                // complete chunk takes over.
+                StageProgress stageProg = makeStageProgress(titleWg, titleHg, liveExp,
+                                                            scene.absolute);
                 // Write each frame to disk the instant its gather completes (crash-safe
                 // incremental output, same as the CPU mode-M path below): a flythrough of
                 // hundreds of frames can run for many minutes, and batching every write to
                 // the very end means an interrupt / crash / power loss throws away ALL of it.
                 // Writing per frame also lets the device path free each film as it goes, so a
                 // long render stays near one-frame of host RAM instead of ~3 GB of films.
-                std::function<bool(int, const Film&)> writeFrame =
-                    [&](int k, const Film& f) -> bool {
+                //
+                // `midEpoch` is set by the light-side refresh loop below while it writes the
+                // running AVERAGE between epochs. Such a write is a healthy progressive
+                // checkpoint, not a truncated frame, so it must not announce itself as one
+                // ("stopped at N / spp"), must not re-announce the output path, and must not
+                // advance the title's frame counter past the one frame there is.
+                bool midEpoch = false;
+                std::function<bool(int, const Film&, long long)> writeFrame =
+                    [&](int k, const Film& f, long long sppDone) -> bool {
                         const RenderCam& rc = toRender[idx[k]];
                         std::string op = outFor(rc.name);
-                        if (toRender.size() > 1)
+                        if (toRender.size() > 1 && !midEpoch)
                             std::printf("[camera] '%s' (mode M/GPU, %dx%d) -> %s\n",
                                         rc.name.c_str(), rc.res, rc.resY, op.c_str());
                         double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
-                        if (!writeFilm(op.c_str(), f, (double)spp, rc.exposure, false, anchor, scene.absolute))
+                        // The film is a SUM over the samples that actually landed. A frame an
+                        // `ftrace -stop` interrupted holds fewer than `spp` of them, so
+                        // normalising by `spp` here wrote it darkened by exactly the fraction
+                        // it never gathered — the one frame of a stopped flythrough that a
+                        // viewer is most likely to look at, and the one that used to be wrong.
+                        if (sppDone < spp && !midEpoch)
+                            std::printf("[camera] '%s' stopped at %lld / %lld spp — writing "
+                                        "what gathered.\n", rc.name.c_str(), sppDone, spp);
+                        if (!writeFilm(op.c_str(), f, (double)sppDone, rc.exposure, false, anchor, scene.absolute))
                             sharedWriteFail = true;
+                        if (!midEpoch)
+                            gatherFrame = (size_t)k + 1;   // advances the title's "frame k/n"
                         return g_stopRequested != 0;   // window closed / Ctrl-C -> stop after this frame
                     };
                 // The photon-beam volume pass. THE work term, and the case it exists for:
@@ -20283,6 +23862,12 @@ static int run(int argc, char** argv) {
                 // split rule must not depend on which device runs the gather.)
                 BeamMap  bmapGpu;
                 BeamPass beamPass;
+                // Which light-side realization is being built. Only epoch 0 narrates itself:
+                // the adaptive-radius / stored-flux / sub-beam lines describe the map's SHAPE,
+                // which every epoch shares — only the draw changes — so reprinting them per
+                // epoch would bury the actual progress lines under a description that never
+                // moves. (Exactly the rule the CPU mode-M and mode-J refreshes follow.)
+                uint64_t lightEpoch = 0;
                 if (wantBeams) {
                     double work = 0.0;
                     for (int i : idx)
@@ -20294,19 +23879,175 @@ static int run(int argc, char** argv) {
                     // Name the stage in the title bar: the beam BVH on a big scene is minutes
                     // of silence between the deposit and the first gathered frame, and without
                     // this the window sits on the previous caption looking wedged.
-                    beamPass.build  = [work, tw, th](BeamMap& bm) {
-                        liveWindowPlaceholder(tw, th, "building beam map\xE2\x80\xA6");
-                        buildBeamMap(bm, "[camera]", work);
+                    beamPass.build  = [work, tw, th, &lightEpoch](BeamMap& bm) {
+                        if (lightEpoch == 0)
+                            liveWindowPlaceholder(tw, th, "building beam map\xE2\x80\xA6");
+                        buildBeamMap(bm, "[camera]", work, /*quiet*/lightEpoch != 0);
                     };
                 }
-                renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e,
-                                          diffraction, spp,
-                                          g_showWindow ? &liveProg : nullptr, &writeFrame,
-                                          g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
-                                          g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC,
-                                          g_pmFinalGather,
-                                          g_pmAutoRadius ? g_pmAutoCount : 0.0,
-                                          wantBeams ? &beamPass : nullptr);
+                // Aimed caustic emission (-causticn), the exact twin of the CPU call below.
+                // Skipped when the map is being LOADED: -loadmap replays a stored deposit, so
+                // there is no emission pass for a second sampler to join.
+                long long nAimedGpu = 0;
+                const caim::AimMap aimMapGpu =
+                    g_pmapLoad.empty() ? buildAimMap(scene, N, nAimedGpu, "[camera]")
+                                       : caim::AimMap{};
+                // One realization of the light side plus `sppWant` camera samples gathered
+                // from it. The whole device pass — scene upload, deposit, map builds, beam
+                // BVH, gather, teardown — lives in here, which is what makes the epoch loop
+                // below a loop over *complete independent renders* rather than a partial
+                // rebuild of something held across calls.
+                // `stageProg` is passed on EVERY pass, refresh epochs included. It is not
+                // merely narration: `splitDeposit = (stage && stage->report)` in the device
+                // path, so dropping it on later epochs would turn each refresh deposit back
+                // into one monolithic launch — minutes long at a showcase `-n`, and exactly
+                // what the Windows TDR watchdog shoots at. The captions it drives ("tracing
+                // photons…", "building photon map…") are also true again on every epoch, so
+                // there is nothing to suppress; what does get suppressed is buildBeamMap's
+                // shape report, via `lightEpoch` above.
+                // The gather radii the epochs share. Epoch 0 adapts and RECORDS into this;
+                // every later epoch re-bins its fresh photons at exactly those radii. Not
+                // cosmetic: a photon-map estimate is BIASED at a finite radius, so letting
+                // each epoch re-adapt would average estimators that are not the same
+                // estimator, and the average would converge to none of them. (Observed
+                // drifting 0.05781 -> 0.05794 across two epochs before this was pinned.)
+                // Left at its zeros by the no-refresh call below, which therefore adapts
+                // exactly as it always did. See PmRadiiPin in render_cuda.h.
+                PmRadiiPin radiiPin;
+                auto runPass = [&](long long sppWant, const SppProgress* p,
+                                   const std::function<bool(int, const Film&, long long)>* onF,
+                                   PmRadiiPin* pin) {
+                    renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e,
+                                              diffraction, sppWant, p, onF,
+                                              g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
+                                              g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC,
+                                              g_pmFinalGather,
+                                              g_pmAutoRadius ? g_pmAutoCount : 0.0,
+                                              wantBeams ? &beamPass : nullptr, &stageProg,
+                                              g_pmCaustics ? g_pmCausticCount : 0.0,
+                                              &aimMapGpu, nAimedGpu,
+                                              g_pmAdaptive ? (g_pmAdaptiveK > 0.0 ? g_pmAdaptiveK
+                                                                                  : -1.0) : 0.0,
+                                              pin);
+                };
+                // ---------------------------------------------------------------------------
+                // THE LIGHT-SIDE REFRESH, ON THE DEVICE, FOR A LONE CAMERA (0.253.0).
+                //
+                // Everything above builds ONE photon/caustic/beam realization and gathers every
+                // camera sample from it, which is precisely the M-FROZEN floor that 0.252.0
+                // removed from runRender's mode-M branch — and this path is reached by the most
+                // ordinary mode-M command line there is. `plainRender` (a fixed `-spp`, no
+                // -time/-noise/-forever/-preview) routes even a SINGLE mode-M camera here, so
+                // `ftrace scene.ftsl -mode M -beams -spp 400` kept the frozen maps and the
+                // coloured bars that come with them, while the same render with `-time` did not.
+                // Two paths, same mode, opposite behaviour, decided by a flag that has nothing
+                // to do with the light side: that is the gap this closes.
+                //
+                // A MULTI-camera group deliberately does NOT refresh. There the single map is
+                // the FEATURE — amortising one forward pass across every frame of a flythrough
+                // is the entire reason mode M has a shared path — and refreshing would both
+                // destroy that amortisation and hand consecutive frames different realizations,
+                // which is temporal flicker rather than convergence.
+                //
+                // Camera-side decorrelation comes from the salt too, NOT from `sampleBase`.
+                // On the CPU paths the salt is deliberately dropped before the camera pass and
+                // the camera side decorrelates by absolute sample index (see RngSaltScope's
+                // note), but the device gather derives its stream from (camera index, salt) and
+                // restarts its sample index at 0 on every call, so `sampleBase` has no device
+                // analogue here. Leaving the salt applied across the gather gives each epoch an
+                // independent camera stream as well as an independent map, which is what the
+                // average needs; and within an epoch the salt is constant, so an epoch's own
+                // realization is still independent of how it was chunked.
+                //
+                // -savemap / -loadmap opt out, for the same reasons they do everywhere else: a
+                // LOADED map is a stored realization with no trace to refresh, and a SAVED one
+                // has to be the map that was actually gathered from.
+                const bool refreshGpu = (cams.size() == 1) && !g_beamFreeze &&
+                                        g_pmapLoad.empty() && g_pmapSave.empty();
+                if (!refreshGpu) {
+                    runPass(spp, g_showWindow ? &liveProg : nullptr, &writeFrame, nullptr);
+                } else {
+                    using clk = std::chrono::steady_clock;
+                    Film acc; acc.resX = rxs[0]; acc.resY = rys[0]; acc.alloc();
+                    Film epochFilm;
+                    long long sppAll = 0, epochSpp = 0;
+                    bool stopAll = false;
+                    // Captures this epoch's finished film. The device path MOVES its film out
+                    // after calling onFrame (so a flythrough runs in one frame of host RAM), so
+                    // the copy has to be taken here rather than from the returned vector.
+                    std::function<bool(int, const Film&, long long)> grabFrame =
+                        [&](int, const Film& f, long long sppDone) -> bool {
+                            epochFilm = f; epochSpp = sppDone;
+                            return g_stopRequested != 0;
+                        };
+                    for (; !stopAll && sppAll < spp && !ft::stopRequested(); ++lightEpoch) {
+                        RngSaltScope saltScope(lightEpoch);
+                        // Everything the device prints about the map's SHAPE — the adaptive
+                        // radius it settled on, the caustic-map population, the sub-beam /
+                        // BVH summary — is a property epoch 0 already reported and the pin
+                        // now holds fixed, so a refresh epoch has nothing new to say and
+                        // would only bury the progress lines. Restored below the loop.
+                        g_gpuQuietRebuild = (lightEpoch != 0);
+                        if (lightEpoch > 0) {
+                            // Drop the previous realization outright. The device path clears
+                            // the raw crossings itself but the built split/BVH is host state,
+                            // and appending a second epoch's beams to a first epoch's tree is
+                            // the one failure mode here that would look like a working render.
+                            bmapGpu = BeamMap{};
+                            if (lightEpoch == 1)
+                                std::printf("[camera] light-side refresh — redrawing %lld "
+                                            "photons under a fresh salt every ~%.0f%% of the "
+                                            "wall clock and averaging the realizations, so the "
+                                            "MAP noise falls with the render too (-beamfreeze "
+                                            "to opt out; -beamrefresh to retune) ...\n",
+                                            N, 100.0 * g_beamRefreshFrac);
+                        }
+                        const auto tEpoch = clk::now();
+                        double epochSec = 0.0;
+                        epochSpp = 0;
+                        // How long this epoch should run. The overhead being amortised is the
+                        // WHOLE per-pass preamble — scene upload, deposit, both map builds, the
+                        // beam BVH and its host->device conversion — so it is measured rather
+                        // than assumed: whatever elapsed before the first sample landed IS the
+                        // overhead, and the epoch runs 1/frac of it. Self-correcting, so a
+                        // heavy scene stretches its epochs out until it behaves like
+                        // -beamfreeze and a cheap one refreshes often.
+                        SppProgress inner;
+                        inner.report = [&](const Film& f, long long sppDone, bool final) -> bool {
+                            if (epochSec <= 0.0) {
+                                epochSec = std::chrono::duration<double>(clk::now() - tEpoch).count()
+                                         / g_beamRefreshFrac;
+                                if (epochSec < 1.0) epochSec = 1.0;
+                            }
+                            // The live view must always see the WHOLE render, not this epoch's
+                            // slice, or the window would reset to a black frame every refresh.
+                            if (liveProg.report) {
+                                Film comb = f; comb.merge(acc);
+                                if (liveProg.report(comb, sppAll + sppDone, final)) {
+                                    stopAll = true; return true;
+                                }
+                            }
+                            return std::chrono::duration<double>(clk::now() - tEpoch).count()
+                                   >= epochSec;
+                        };
+                        runPass(spp - sppAll, &inner, &grabFrame, &radiiPin);
+                        if (epochSpp <= 0) break;          // stopped before a complete sample
+                        acc.merge(epochFilm);
+                        sppAll += epochSpp;
+                        epochFilm = Film{};
+                        // Crash-safe: write the running average after every epoch, exactly as
+                        // the un-refreshed path writes after its one and only gather.
+                        midEpoch = (sppAll < spp) && !stopAll && !ft::stopRequested();
+                        if (writeFrame(0, acc, sppAll)) stopAll = true;
+                        midEpoch = false;
+                    }
+                    g_gpuQuietRebuild = false;
+                    if (lightEpoch > 1)
+                        std::printf("[camera] averaged %llu independent light-side realizations "
+                                    "(%lld spp total) — the map noise fell with the render, not "
+                                    "just the gather noise\n",
+                                    (unsigned long long)lightEpoch, sppAll);
+                }
                 if (wantBeams && beamPass.loadedMissing)
                     std::fprintf(stderr,
                         "[loadmap] warning: %s has no beam data (saved without -beams, or its\n"
@@ -20317,6 +24058,11 @@ static int run(int argc, char** argv) {
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,
                                 (e.absorbed + e.sensor + e.escaped + e.residual) / e.emitted);
+                // Mode M's budget is fixed work, so there is no time/noise target to name —
+                // but the title bar still has to say WHY it stopped, and without this the
+                // shared path fell through to main()'s generic "render complete" even after a
+                // window close or a `-stop`.
+                noteFinishReason(g_stopRequested ? "stopped early" : "all frames gathered");
                 return;
             }
         }
@@ -20325,7 +24071,7 @@ static int run(int argc, char** argv) {
                     "radius %.4g on %d CPU threads (light=%s)%s ...\n",
                     idx.size(), N, radius, nThreads, lightLabel,
                     g_pmFinalGather > 0 ? " [final gather]" : "");
-        PhotonMap pm;
+        PhotonMap pm, pmC;
         BeamMap bmap;
         auto tp0 = std::chrono::steady_clock::now();
         // -savemap / -loadmap on the CPU path. These used to be GPU-only purely because the
@@ -20341,11 +24087,12 @@ static int run(int argc, char** argv) {
         if (!g_pmapLoad.empty()) {
             bool beamsMissing = false;
             mapLoaded = loadPhotonMap(g_pmapLoad.c_str(), pm, pmE, mapGuard,
-                                      wantBeams ? &bmap : nullptr, &beamsMissing);
+                                      wantBeams ? &bmap : nullptr, &beamsMissing,
+                                      g_pmCaustics ? &pmC : nullptr);
             if (mapLoaded) {
-                std::printf("[camera] -loadmap %s: %zu photons, %zu beams — skipping the "
-                            "photon trace.\n", g_pmapLoad.c_str(), pm.photons.size(),
-                            bmap.beams.size());
+                std::printf("[camera] -loadmap %s: %zu photons (+%zu caustic), %zu beams — "
+                            "skipping the photon trace.\n", g_pmapLoad.c_str(),
+                            pm.photons.size(), pmC.photons.size(), bmap.beams.size());
                 if (wantBeams && beamsMissing)
                     std::fprintf(stderr,
                         "[loadmap] warning: %s has no beam data (saved without -beams, or its\n"
@@ -20363,20 +24110,29 @@ static int run(int argc, char** argv) {
         // from a wedged one. `liveWindowPlaceholder` re-titles an existing window and creates
         // one only if the meter above did not.
         const int titleW = toRender[idx[0]].res, titleH = toRender[idx[0]].resY;
+        StageProgress stageProg = makeStageProgress(titleW, titleH);
         if (!mapLoaded) {
             liveWindowPlaceholder(titleW, titleH, "tracing photons\xE2\x80\xA6");
+            // ... and, since 0.199.4, with a photon COUNT and an ETA in it rather than a
+            // caption that names the phase and then never moves again.
+            long long nAimed = 0;
+            const caim::AimMap aimMap = buildAimMap(scene, N, nAimed, "[camera]");
             tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
-                            wantBeams ? &bmap : nullptr, g_beamTarget);
+                            wantBeams ? &bmap : nullptr, g_beamTarget, &stageProg,
+                            g_pmCaustics ? &pmC : nullptr, &aimMap, nAimed);
         }
         // Written BEFORE the builds, so the file holds the raw trace and one cache can later
         // be re-gathered at any -pmradius / -beamk.
         if (!g_pmapSave.empty() && !mapLoaded) {
-            if (savePhotonMap(g_pmapSave.c_str(), pm, pmE, mapGuard, wantBeams ? &bmap : nullptr))
-                std::printf("[camera] -savemap %s: %zu photons + %zu beams written.\n",
-                            g_pmapSave.c_str(), pm.photons.size(), bmap.beams.size());
+            if (savePhotonMap(g_pmapSave.c_str(), pm, pmE, mapGuard, wantBeams ? &bmap : nullptr,
+                              g_pmCaustics ? &pmC : nullptr))
+                std::printf("[camera] -savemap %s: %zu photons + %zu caustic + %zu beams written.\n",
+                            g_pmapSave.c_str(), pm.photons.size(), pmC.photons.size(),
+                            bmap.beams.size());
         }
         liveWindowPlaceholder(titleW, titleH, "building photon map\xE2\x80\xA6");
         radius = buildPhotonMap(pm, radius, "[camera]");
+        if (g_pmCaustics) buildCausticMap(pmC, radius, "[camera]", pm.radius);
         if (wantBeams) {
             liveWindowPlaceholder(titleW, titleH, "building beam map\xE2\x80\xA6");
             // THE work term, and the case it exists for: every camera in this group gathers off
@@ -20390,9 +24146,10 @@ static int run(int argc, char** argv) {
             buildBeamMap(bmap, "[camera]", work);
         }
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
-        std::printf("[camera] photon map: %zu photons from %lld emitted in %.1fs, "
-                    "grid %dx%dx%d — gathering %zu cameras ...\n",
-                    pm.photons.size(), pm.nEmitted, buildSec, pm.nx, pm.ny, pm.nz, idx.size());
+        std::printf("[camera] photon map: %zu photons (+%zu caustic) from %lld emitted in %s, "
+                    "radius %.4g (caustic %.4g) — gathering %zu cameras ...\n",
+                    pm.photons.size(), pmC.photons.size(), pm.nEmitted,
+                    humanDur(buildSec).c_str(), pm.radius, pmC.radius, idx.size());
         if (pm.photons.empty())
             std::fprintf(stderr, "[mode M] warning: 0 photons deposited — images "
                                  "will be black.\n");
@@ -20420,16 +24177,15 @@ static int run(int argc, char** argv) {
             // the split into chunks cannot change the realization, and cpuSppChunks degrades
             // to exactly `renderOne(spp, 0)` when no progress hook is armed (headless runs are
             // untouched).
-            // `frameLabel` is declared in the SAME scope as liveProg, not inside the `if`:
-            // the lambda outlives that block (it runs inside cpuSppChunks below), so a buffer
-            // scoped to the `if` would be a dangling reference by the time it is read.
             SppProgress liveProg;
-            char frameLabel[64];
-            std::snprintf(frameLabel, sizeof frameLabel, "frame %zu/%zu", k + 1, idx.size());
+            const auto gStart = std::chrono::steady_clock::now();
             if (g_showWindow) {
                 const double liveExp = rc.exposure;
                 liveProg.report = [&, liveExp](const Film& pf, long long sppDone, bool) -> bool {
-                    liveWindowUpdate(pf, (double)sppDone, liveExp, scene.absolute, frameLabel);
+                    const double el = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - gStart).count();
+                    liveWindowUpdate(pf, (double)sppDone, liveExp, scene.absolute,
+                        pmGatherStatus(pf, sppDone, spp, k + 1, idx.size(), N, el).c_str());
                     return g_stopRequested != 0;   // window closed / -stop -> stop after this chunk
                 };
             }
@@ -20437,7 +24193,8 @@ static int run(int argc, char** argv) {
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, c, nThreads,
                                               diffraction, /*maxBounce*/32, off,
-                                              g_pmFinalGather, wantBeams ? &bmap : nullptr);
+                                              g_pmFinalGather, wantBeams ? &bmap : nullptr,
+                                              g_pmCaustics ? &pmC : nullptr);
                 });
             std::string op = outFor(rc.name);
             if (toRender.size() > 1)
@@ -20447,9 +24204,14 @@ static int run(int argc, char** argv) {
             if (!writeFilm(op.c_str(), f, (double)spp, rc.exposure, false, anchor, scene.absolute))
                 sharedWriteFail = true;
         }
+        noteFinishReason(g_stopRequested ? "stopped early" : "all frames gathered");
     };
     runSharedPhotonMap(groupM);
 
+    // Mode J's light side, shared across this batch's cameras when `-beamfreeze` makes one
+    // realization the right answer for all of them. Declared here rather than as a static
+    // inside runRender so its (large) maps are released when the batch ends, not at exit.
+    JLightCache jLightCache;
     for (size_t ri = 0; ri < restIdx.size(); ++ri) {
         const int i = restIdx[ri];
         // Poll the interrupt BETWEEN frames, exactly as the mode-M loop above does. A stop
@@ -20476,9 +24238,10 @@ static int run(int argc, char** argv) {
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
                            timeBudgetSec, resume, wantCheckpointFlag, runForever,
                            preview, intervalSec, noiseTarget, wavefront, anchor, rgbBackward,
-                           maxBounceOverride, directOnly);
+                           maxBounceOverride, directOnly, &jLightCache);
         if (rv != 0) return rv;
     }
+    jLightCache.clear();
 
     // --- Stereoscopic compositing (-stereo): fuse each eye pair into the -o image ------
     // Every eye rendered to its own PNG (sharing an exposure anchor for identical tone-
@@ -20581,6 +24344,30 @@ int main(int argc, char** argv) {
     // running-render list -- which contains an em dash -- and then returns without ever
     // reaching the render setup where this used to be called.
     enableAnsiTerminal();
+    // Teach allocreport.h how to read the machine's memory state, so an out-of-memory can
+    // say whether the buffer that failed was the problem or the machine was already full
+    // (see the header comment there). Installed here because main.cpp is the one TU that
+    // already owns <windows.h>; the four headers/TUs that *use* ftalloc must not pull it in.
+    ftalloc::memStat = []() -> ftalloc::MemStat {
+        ftalloc::MemStat m;
+#ifdef _WIN32
+        MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms;
+        if (!GlobalMemoryStatusEx(&ms)) return m;
+        m.availCommit = (double)ms.ullAvailPageFile;
+        m.totalCommit = (double)ms.ullTotalPageFile;
+        m.availPhys   = (double)ms.ullAvailPhys;
+        m.totalPhys   = (double)ms.ullTotalPhys;
+        // PrivateUsage is the process's COMMIT charge, which is what the limit above counts
+        // — not the working set, which can be a small fraction of it under memory pressure
+        // and would make a 6 GiB render look like a 1 GiB one.
+        PROCESS_MEMORY_COUNTERS_EX pmc{}; pmc.cb = sizeof pmc;
+        if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                 (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof pmc))
+            m.procBytes = (double)pmc.PrivateUsage;
+        m.ok = true;
+#endif
+        return m;
+    };
     // Where ftrace.exe itself lives — the last resort of the asset search path, and the
     // fallback root for engine data (`data/glass/*` and friends ship beside the binary,
     // so they must resolve from any working directory). Taken from the module path, not
@@ -20713,8 +24500,11 @@ int main(int argc, char** argv) {
         // scale with the command line now report themselves (see allocreport.h); this catch
         // is the backstop for every allocation that does not, and at least points at the
         // knobs instead of at nothing.
+        // -1: this catch never learns how big the failed request was, so the verdict rests
+        // on our share of the system's committed memory alone (see memAdvice).
+        const std::string memNote = ftalloc::memAdvice(-1.0);
         std::fprintf(stderr,
-            "error: out of HOST memory (in an allocation the renderer does not size itself).\n"
+            "error: out of HOST memory (in an allocation the renderer does not size itself).%s\n"
             "       The buffers that grow with the command line are, in rough order of size:\n"
             "         -n <photons>        the photon map: ~%zu bytes per DEPOSITED photon\n"
             "         -beamcount <n>      the photon-beam map: ~%zu bytes per stored beam\n"
@@ -20723,13 +24513,37 @@ int main(int argc, char** argv) {
             "         -res / -spp         the film, and one film per selected camera\n"
             "       Halving -n is the usual first move; -beamcount / -beamsplitmax bound the\n"
             "       beam side independently of how many photons were traced.\n",
-            sizeof(Photon) + sizeof(Vec3), sizeof(PhotonBeam));
+            memNote.c_str(), sizeof(Photon) + sizeof(Vec3), sizeof(PhotonBeam));
         rc = 1;
         noteFinishReason("stopped by an error");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         rc = 1;
         noteFinishReason("stopped by an error");
+    }
+    // Gate (2) verdict. Printed here rather than in the render driver so it survives every
+    // exit path a render can take (budget reached, -stop, an exception), and so a run that
+    // audited zero weights says so instead of silently looking like a pass.
+    if (g_misAudit) {
+        const long long nChk = bdpt::misaudit::nChecked.load();
+        const long long nBad = bdpt::misaudit::nBad.load();
+        const double    wrst = bdpt::misaudit::worst.load();
+        const bool poisoned = bdpt::misaudit::poison.load();
+        std::printf("[misaudit]%s %lld MIS weights cross-checked against the absolute form: "
+                    "%lld disagreed by more than %.0e; worst relative difference %.3e",
+                    poisoned ? " (POISONED reference — disagreements are the PASS)" : "",
+                    nChk, nBad, bdpt::misaudit::kTol, wrst);
+        if (wrst > 0.0)
+            std::printf(" (at s=%d, t=%d)", bdpt::misaudit::worstS.load(),
+                        bdpt::misaudit::worstT.load());
+        std::printf(".\n");
+        if (nChk == 0)
+            std::printf("[misaudit] NOTHING WAS CHECKED — the audit only instruments the CPU "
+                        "BDPT weight, so it needs -mode D -device cpu or -mode J.\n");
+        else if (poisoned && nBad == 0)
+            std::printf("[misaudit] FAILED: the poisoned reference agreed anyway, so the audit "
+                        "is vacuous and its clean runs prove nothing. Fix the harness.\n");
+        std::fflush(stdout);
     }
     // Say so in the title bar. Rendering is over the moment run() returns, whether the
     // window is about to be torn down or (with -keepwindow) held open for inspection —

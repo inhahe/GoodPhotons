@@ -65,8 +65,13 @@ scripting language (overkill, unsafe). The model to imitate is Mitsuba/PBRT:
 typed blocks with named parameters, references by name, `#` comments. It parses
 with a ~300-line hand-written tokenizer + recursive descent — no dependency.
 
+> *As built:* the hand-written parser was replaced in 0.79.0 by the shared EPEG
+> grammar (`tools/loom/loom/grammar/ftsl_scene.epeg`), and 0.248.0 added `//` as a
+> second line-comment marker alongside `#`. See [`FTSL.md`](../FTSL.md) for the
+> language as it actually is.
+
 ```
-# a line comment
+# a line comment            // …or this marker, since 0.248.0
 blocktype "optional-name" {
     key   value
     key   value value value      # vectors are just space-separated numbers

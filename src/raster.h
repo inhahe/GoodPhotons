@@ -50,6 +50,7 @@
 #include <array>
 #include <string>
 #include <cstdio>
+#include "parallel.h"
 #include "scene.h"
 #include "camera.h"
 #include "color.h"
@@ -75,6 +76,18 @@ struct PShade {
     double normalStrength = 1.0;
     bool emissive = false;
     bool clear    = false;   // dielectric/thin-film/filter surface (see-through mode dims/hazes it)
+    // RASTER-PBR. `rough < 0` means "no specular lobe" and shades exactly as before, so every
+    // diffuse material in every existing scene is untouched. `f0` is the normal-incidence
+    // reflectance -- for a metal that IS its measured reflectance (which is why a gold preview
+    // must tint its highlight gold, not white), for a dielectric a small achromatic value.
+    double rough  = -1.0;
+    Vec3   f0{0, 0, 0};
+    int    roughPat = -1;    // `roughness pattern:` — the map the header says is ignored today
+    int    roughTex = -1;    // `roughness texture:`
+    // Per-CROSSING RGB transmittance of a clear surface, from the material itself (see
+    // clearTintOf). White for anything that states no colour, so a plain window behaves
+    // exactly as it did when this was one global scalar. Meaningless unless `clear`.
+    Vec3 clearTint{1, 1, 1};
 };
 
 // A two-child `mix` whose blend is driven per hit by `weight_map pattern:` /
@@ -108,6 +121,13 @@ struct PTri : PShade {
     // UV parameterisation is degenerate/absent — the shade pass then falls back to a
     // stable frame about the shading normal, exactly as the old per-pixel path did.
     Vec3 tanRaw{0, 0, 0};
+    // Per-vertex COLOUR (linear RGB), or hasVcol=false. The rasterizer is an RGB pipeline,
+    // so it consumes the mesh's vertex colours directly — no Jakob-Hanika lift, which is
+    // the whole reason Scene::vertColors stores RGB rather than fitted coefficients: the
+    // two backends want different things from the same numbers, and RGB is what both can
+    // start from.
+    bool hasVcol = false;
+    Vec3 vc0{1, 1, 1}, vc1{1, 1, 1}, vc2{1, 1, 1};
 };
 
 // Tessellated preview geometry plus the side tables its triangles index. Bundled so the
@@ -116,7 +136,12 @@ struct PTri : PShade {
 struct PreviewGeom {
     std::vector<PTri> tris;
     std::vector<PMix> mixes;
-    void clear() { tris.clear(); mixes.clear(); }
+    // Half-diagonal of the tessellated bounds. The see-through pass integrates absorption
+    // over PATH LENGTH, so it needs a length scale, and taking it from the geometry itself
+    // means the CPU and GPU backends cannot disagree about it (a Scene pointer is optional
+    // on the render entry points; this is not) and a 2 cm ring behaves like a 40 m building.
+    double radius = 1.0;
+    void clear() { tris.clear(); mixes.clear(); radius = 1.0; }
     bool empty() const { return tris.empty(); }
     size_t size() const { return tris.size(); }
 };
@@ -165,6 +190,76 @@ inline Vec3 spectrumToLinearRgb(const Spectrum& s) {
 // Solid preview colour for a material. Diffuse/glossy/fluorescent/etc. use their
 // reflectance colour; specular materials (mirror/glass/thin-film) get a light tint
 // so they read as a solid object instead of vanishing to black.
+// The RGB transmittance ONE crossing of a clear surface applies, derived from the
+// material rather than from a single global dial — so a red filter tints what is behind
+// it red, and a dense one darkens it more than a clear window does.
+//
+// Where the number comes from depends on what the material actually states:
+//
+//   * `Filter` / `DiffuseTransmit` carry `transmit`, a DIMENSIONLESS T(lambda) in [0,1].
+//     That is a transmittance already, so both the hue and the magnitude are real and are
+//     used as-is.
+//   * `Dielectric` / `ThinFilm` colour their interior with `absorb`, a Beer-Lambert
+//     coefficient per unit LENGTH. Turning that into a transmittance needs a thickness,
+//     and an order-independent rasterizer never pairs a front face with the back face it
+//     belongs to — there is no thickness to raise it to. So only the HUE is taken
+//     (normalised so the strongest channel is 1) and `-glass-clarity` goes on setting how
+//     much each crossing dims. Glass with no absorption is colourless, which is the
+//     physically honest answer rather than a guess.
+//
+// The exponential is taken in WAVELENGTH space and converted afterwards, not the other
+// way round: exp() of an RGB-collapsed coefficient is not the RGB of the exponential, and
+// the difference is exactly the saturation of a strongly absorbing glass.
+inline Vec3 clearTintOf(const Material& m) {
+    // WHITE BALANCE. spectrumToLinearRgb of a FLAT spectrum is not neutral: the CIE
+    // integral of an equal-energy stimulus lands at linear sRGB ~(1.198, 0.950, 0.908),
+    // which is why ftrace's own self-test prints that number. Feeding a transmittance
+    // through it raw would give a perfectly colourless window a warm cast — the tint of
+    // the illuminant model, not of the glass. Dividing by the flat response measures
+    // every transmittance AGAINST no absorption, so `absorb 0` comes out exactly white
+    // and a 0.5 grey gel comes out exactly 0.5 grey.
+    static const Vec3 kFlat = spectrumToLinearRgb(constantSpectrum(1.0));
+    auto balance = [](const Vec3& v) {
+        return Vec3{kFlat.x > 1e-9 ? v.x / kFlat.x : v.x,
+                    kFlat.y > 1e-9 ? v.y / kFlat.y : v.y,
+                    kFlat.z > 1e-9 ? v.z / kFlat.z : v.z};
+    };
+    auto clamp01 = [](Vec3 v) {
+        v.x = std::min(1.0, std::max(0.0, v.x));
+        v.y = std::min(1.0, std::max(0.0, v.y));
+        v.z = std::min(1.0, std::max(0.0, v.z));
+        return v;
+    };
+    if (m.type == MatType::Filter || m.type == MatType::DiffuseTransmit) {
+        const Vec3 t = clamp01(balance(spectrumToLinearRgb(m.transmit)));
+        // A material that transmits nothing at all is not tinted glass, it is opaque —
+        // leave it white and let the (unchanged) clarity dial dim it, rather than
+        // compositing a black hole over the background.
+        if (t.x + t.y + t.z <= 1e-6) return Vec3{1, 1, 1};
+        return t;
+    }
+    // If the asset stated the thickness its absorption was authored against
+    // (Material::absorbRefDist — glTF's KHR_materials_volume attenuationDistance), believe
+    // it: the transmittance is then a real number, not just a hue, and a dense onyx reads
+    // near-black instead of white. HALF the distance goes into each crossing, because the
+    // authored figure describes light traversing the body once and a closed solid is
+    // crossed twice — front and back — so splitting it means the pair multiplies back to
+    // what was authored.
+    const double d = (m.absorbRefDist > 0.0) ? m.absorbRefDist * 0.5 : 0.0;
+    if (d > 0.0) {
+        return clamp01(balance(spectrumToLinearRgb(
+            [&m, d](double lam) { return std::exp(-std::max(0.0, m.absorb(lam)) * d); })));
+    }
+    // Nobody said how thick: take the hue only and leave the magnitude to -glass-clarity.
+    const Vec3 raw = balance(spectrumToLinearRgb(
+        [&m](double lam) { return std::exp(-std::max(0.0, m.absorb(lam))); }));
+    // Normalise BEFORE clamping: clipping first would distort the hue of a strongly
+    // coloured glass by flattening whichever channel ran over.
+    const double mx = std::max({raw.x, raw.y, raw.z});
+    if (!(mx > 1e-6)) return Vec3{1, 1, 1};      // opaque or unset: no hue to take
+    return clamp01(raw * (1.0 / mx));             // hue only; magnitude stays with clarity
+}
+
 inline Vec3 materialColor(const Material& m, bool& emissive) {
     emissive = m.isLight;
     if (m.isLight) {
@@ -198,6 +293,38 @@ struct PLight {
 };
 
 // The scene's lights distilled for shading: every positional/spot emitter shades
+// ---- RASTER-PBR: the split-sum specular ------------------------------------------------------
+// Karis' analytic fit to the split-sum DFG term (SIGGRAPH 2013 "Real Shading in Unreal Engine
+// 4"), so the preview needs no LUT texture shipped alongside it. Returns the (A, B) that
+// multiply F0: specular_env = prefiltered * (F0*A + B).
+inline void envBrdfApprox(double NoV, double rough, double& A, double& B) {
+    // c0/c1 are the published constants; the fit is accurate to well under a preview's
+    // 8-bit output over the whole (NoV, roughness) square.
+    const double x = 1.0 - rough;
+    const double bias  = std::exp2(-9.28 * NoV) * x * x * x;
+    const double scale = x * x * x * x;
+    A = scale; B = bias;
+}
+// Normalised GGX with Smith height-correlated masking and Schlick Fresnel, evaluated for one
+// key light. This is the half of the split-sum a preview cannot fake: the moving highlight is
+// the cue that says "satin" rather than "chalk", and it is view-dependent by definition.
+inline double ggxSpec(const Vec3& N, const Vec3& V, const Vec3& L, double rough) {
+    const Vec3 H = normalize(V + L);
+    const double NoV = std::max(1e-4, dot(N, V));
+    const double NoL = std::max(0.0,  dot(N, L));
+    if (NoL <= 0.0) return 0.0;
+    const double NoH = std::max(0.0, dot(N, H));
+    const double a  = std::max(1e-3, rough * rough);
+    const double a2 = a * a;
+    const double d  = NoH * NoH * (a2 - 1.0) + 1.0;
+    const double D  = a2 / (PI * d * d);
+    // Smith height-correlated visibility, which already folds in the 1/(4 NoL NoV).
+    const double lv = NoL * std::sqrt(NoV * NoV * (1.0 - a2) + a2);
+    const double ll = NoV * std::sqrt(NoL * NoL * (1.0 - a2) + a2);
+    const double Vis = (lv + ll > 0.0) ? 0.5 / (lv + ll) : 0.0;
+    return D * Vis * NoL;
+}
+
 // from its own real direction, plus flat ambient + a subtle camera-headlight fill.
 struct PreviewLight {
     std::vector<PLight> lights;  // one entry per positional/spot emitter
@@ -286,6 +413,47 @@ constexpr size_t kDefaultCurveBudget = 12u * 1000u * 1000u;
 // is by far the slow part of tessellation, so this drives the "tessellating N/M" UI.
 // `curveBudget` (0 = kDefaultCurveBudget) caps the triangles spent on curve/fiber
 // strands; see section (2b).
+// Re-shade a tessellation to NEUTRAL CLAY — the viewer's "Color" toggle off.
+//
+// Done to the baked geometry rather than as a flag inside the shade pass, so both
+// backends get it for free: the CPU rasterizer reads these fields directly and the GPU
+// one uploads them, and neither needs to know the mode exists. Everything that could
+// re-introduce a colour has to go with the albedo, not just the albedo itself — an image
+// skin, a triplanar projection, a `reflect`/`emit` pattern drive, a normal map (which is
+// shape, but shape read out of a coloured texture), and both children of a per-hit mix
+// plus the mask that chooses between them. What is left is form and lighting alone,
+// which is what you want when the question is "what shape is this?" rather than "what
+// does it look like?" — and, for an N-D warp, the shape is the whole question.
+inline void stripColor(PreviewGeom& g, const Vec3& neutral = Vec3{0.72, 0.72, 0.72}) {
+    auto flatten = [&](PShade& s) {
+        s.color          = neutral;
+        s.tex            = -1;
+        s.triplanarScale = 0.0;
+        s.reflectPat     = -1;
+        s.emitPat        = -1;
+        s.normalTex      = -1;
+        // A clear surface never reaches the shade pass at all — see-through hands it to
+        // the clear-accumulation pass, which reads ONLY this tint. Leaving it coloured
+        // meant "Color off" did nothing whatsoever on an all-glass model: every triangle
+        // took the clear path, so the two renders came out bit-identical.
+        s.clearTint      = Vec3{1, 1, 1};
+    };
+    for (PTri& t : g.tris) {
+        flatten(t);
+        // A per-vertex colour is a colour like any other: leaving it multiplied in would
+        // let a vertex-coloured scan keep its tint with "Color" off, which is exactly the
+        // question the toggle exists to answer.
+        t.hasVcol = false;
+    }
+    for (PMix& m : g.mixes) {
+        // Both children are now the same colour, so the mask decides nothing; dropping it
+        // also spares the shade pass a per-pixel pattern/texture evaluation per hit.
+        m.weightPat = -1;
+        m.weightTex = -1;
+        flatten(m.b);
+    }
+}
+
 inline PreviewGeom tessellate(const Scene& sc, int isoRes,
                               const std::function<void(int, int)>& progress = {},
                               size_t curveBudget = 0) {
@@ -306,6 +474,29 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         s.color    = materialColor(m, em);
         s.emissive = em;
         s.clear    = (!m.isLight && isClearPreviewType(m.type));
+        if (s.clear) {
+            s.clearTint = clearTintOf(m);
+            // Tint the SOLID ghost by the same glass colour. Without see-through a clear
+            // material previews from `reflect`, which for imported glass is routinely pure
+            // white — so a tray of differently coloured gems came out as a tray of
+            // identical pale balls. The tint is hue-normalised, so this colours the ghost
+            // without darkening it.
+            s.color = Vec3{s.color.x * s.clearTint.x,
+                           s.color.y * s.clearTint.y,
+                           s.color.z * s.clearTint.z};
+        }
+        // RASTER-PBR: the specular description. Only Glossy has a lobe the preview can show;
+        // Mirror is a delta the rasterizer has no reflection to fill it with, and the clear
+        // family is already handled by see-through. `reflect` IS the normal-incidence
+        // reflectance for a metal preset, which is why the highlight has to be tinted by it
+        // rather than white -- a white highlight on gold is the single most obvious tell.
+        if (!m.isLight && m.type == MatType::Glossy) {
+            s.rough = (m.roughness > 0.0) ? m.roughness : 0.2;
+            bool dummy = false;
+            s.f0 = materialColor(m, dummy);
+            s.roughPat = m.roughnessPat;
+            s.roughTex = m.roughnessTex;
+        }
         // An image skin: a diffuse-albedo texture bound via `reflect texture:<name>`.
         // The preview shades from the texture's linear RGB (Texture::sampleRgb), so no
         // Jakob-Hanika coefficient precompute is needed (that's only for spectral hits).
@@ -391,13 +582,33 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
     };
 
     // (1) World triangles.
+    // Per-vertex colour, flat triangles and instanced BLAS triangles alike. A BLAS keeps
+    // its own triangle array but indexes the SCENE's colour table (see Blas::intersectLocal),
+    // so one helper serves both -- and having one is the point: the instanced path is
+    // exactly where an attribute added to the flat path gets forgotten.
+    auto copyVcol = [&](PTri& p, const Tri& t) {
+        if (t.vcol < 0) return;
+        const size_t i = (size_t)t.vcol * 3;
+        if (i + 8 >= sc.vertColors.size()) return;
+        const float* c = sc.vertColors.data() + i;
+        p.hasVcol = true;
+        p.vc0 = Vec3{c[0], c[1], c[2]};
+        p.vc1 = Vec3{c[3], c[4], c[5]};
+        p.vc2 = Vec3{c[6], c[7], c[8]};
+    };
     out.reserve(sc.tris.size() + 4096);
+    // Per scene triangle, in order. Tried threading this (resize + index fill) and it came
+    // out SLOWER -- 604 ms to ~750 -- because vector::resize value-initialises 4.26M PTri
+    // before the fill overwrites every field, and that zeroing costs more than the loop it
+    // was meant to save. Left serial deliberately; if this is ever worth revisiting it needs
+    // uninitialised storage, not a resize.
     for (const auto& t : sc.tris) {
         PTri p;
         p.p0 = t.v0; p.p1 = t.v1; p.p2 = t.v2;
         p.n0 = t.n0; p.n1 = t.n1; p.n2 = t.n2;
         applyMat(p, t.matId);
         p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;
+        copyVcol(p, t);
         out.push_back(p);
     }
 
@@ -711,6 +922,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             p.n2 = normalize(inst.toWorld.applyNormal(t.n2));
             applyMat(p, matId);
             p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;   // UVs are instance-invariant
+            copyVcol(p, t);                                // so are vertex colours
             out.push_back(p);
         }
     }
@@ -725,6 +937,19 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             (p.mix >= 0 && p.mix < (int)geom.mixes.size() &&
              geom.mixes[p.mix].b.normalTex >= 0);
         if (wantTan) p.tanRaw = triTangentRaw(p);
+    }
+    // Length scale for the see-through path integral, from the geometry actually built.
+    {
+        Vec3 lo{1e300, 1e300, 1e300}, hi{-1e300, -1e300, -1e300};
+        for (const PTri& p : out) {
+            for (const Vec3& v : {p.p0, p.p1, p.p2}) {
+                lo = Vec3{std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+                hi = Vec3{std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+            }
+        }
+        const Vec3 d = (hi - lo) * 0.5;
+        const double r = std::sqrt(dot(d, d));
+        geom.radius = (r > 1e-12 && std::isfinite(r)) ? r : 1.0;
     }
     return geom;   // `out` aliases geom.tris; geom.mixes was filled during the material bake
 }
@@ -751,6 +976,10 @@ struct VtxScreen {
 // near-plane clipping happen a single time per triangle instead of once per thread.
 struct STri {
     VtxScreen v0, v1, v2;
+    // NB the vertex COLOURS are read from the source PTri in the raster pass rather than
+    // copied here: STri is written once per visible triangle per frame and read by every
+    // covered scanline, so it stays as small as the `src` indirection allows (the same
+    // reason it holds `src` instead of a copy of the shading attributes).
     // Index of the SOURCE PTri rather than a copy of its shading attributes. The shade
     // pass is deferred, so it can fetch colour / texture / pattern / normal-map bindings
     // straight from tris[src] for the one winning fragment. That keeps the rasterizer's
@@ -762,6 +991,7 @@ struct STri {
     bool   needUV;     // interpolate UVs for this triangle (a skin, pattern or normal map reads them)
     bool   emissive;
     bool   clear;      // see-through transmissive surface (handled by the clear-accumulation pass)
+    bool   vcol;       // interpolate this triangle's per-vertex colour into the albedo
     int    iy0, iy1;   // inclusive pixel-row span the triangle can touch
 };
 
@@ -774,6 +1004,11 @@ struct GBuffer {
     std::vector<int>     tri;     // index of the winning source PTri, or -1 (background)
     std::vector<uint8_t> emis;    // 1 where the winning triangle is an emitter
     std::vector<Vec3>    uv;      // interpolated texture coords of the winning surface
+    // Interpolated per-vertex colour. Left EMPTY (and untouched by the raster pass)
+    // unless the tessellation actually contains a vertex-coloured triangle, so a scene
+    // without any pays neither the 24 B/pixel nor the per-pixel write — which is why
+    // this is a separate channel rather than another field on a fat per-pixel struct.
+    std::vector<Vec3>    vcol;
 };
 
 // A persistent band pool: N workers that sleep on a condition variable and execute one
@@ -849,7 +1084,11 @@ struct RasterScratch {
     std::vector<Vec3>              accum;    // HDR shade target (bg written by the shade pass)
     std::vector<STri>              stris;    // projected triangles (capacity reused)
     std::vector<std::vector<STri>> parts;    // per-thread projection buffers
-    std::vector<float>             clearT, milkT;   // see-through products
+    // clearT is SIX floats per pixel while accumulating (signed optical depth + the
+    // open-surface fallback); clearRGB is the folded 3-float transmittance the composite
+    // reads. They must be separate buffers: folding 6->3 in place races, because writing
+    // slot 3i lands on slot 6(i/2), which another thread may not have consumed yet.
+    std::vector<float>             clearT, clearRGB, milkT;
     std::unique_ptr<BandPool>      pool;     // persistent workers (created on first frame)
 };
 
@@ -922,7 +1161,8 @@ inline EdgeFn makeEdge(double Px, double Py, double Qx, double Qy, double s) {
 // Only geometry/albedo is stored here — shading is deferred to a single later pass so
 // each covered pixel is shaded exactly once regardless of overdraw. Attributes are
 // interpolated perspective-correctly via invd.
-inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& g) {
+inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& g,
+                          const PTri* srcTris = nullptr) {
     const VtxScreen& A = t.v0; const VtxScreen& B = t.v1; const VtxScreen& C = t.v2;
     double minx = std::floor(std::min({A.sx, B.sx, C.sx}));
     double maxx = std::ceil (std::max({A.sx, B.sx, C.sx}));
@@ -942,6 +1182,11 @@ inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& 
     const EdgeFn E1 = makeEdge(C.sx, C.sy, A.sx, A.sy, s);
     const EdgeFn E2 = makeEdge(A.sx, A.sy, B.sx, B.sy, s);
     const uint8_t triEmis = t.emissive ? 1 : 0;
+    // Vertex colour is read off the source PTri once per triangle, not per pixel.
+    const bool wantVcol = t.vcol && srcTris && !g.vcol.empty();
+    const Vec3 C0 = wantVcol ? srcTris[t.src].vc0 : Vec3{1, 1, 1};
+    const Vec3 C1 = wantVcol ? srcTris[t.src].vc1 : Vec3{1, 1, 1};
+    const Vec3 C2 = wantVcol ? srcTris[t.src].vc2 : Vec3{1, 1, 1};
     for (int y = ylo; y <= yhi; ++y) {
         const double py = y + 0.5;
         const double r0 = E0.dx * (py - E0.Py);   // row constants: identical for both sharers
@@ -968,6 +1213,8 @@ inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& 
             g.tri[row]   = t.src;
             if (t.needUV)
                 g.uv[row] = (A.uv * (w0 * A.invd) + B.uv * (w1 * B.invd) + C.uv * (w2 * C.invd)) * d;
+            if (wantVcol)
+                g.vcol[row] = (C0 * (w0 * A.invd) + C1 * (w1 * B.invd) + C2 * (w2 * C.invd)) * d;
         }
     }
 }
@@ -979,9 +1226,13 @@ inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& 
 // product form is order-independent (commutative), so no depth sort of the transparent
 // fragments is needed — N crossed surfaces just give clarity^N dimming and a growing haze.
 // A grazing-angle (Fresnel-like) term adds extra milk at silhouettes so glass edges read.
+// `clearT` holds THREE floats per pixel (the running RGB transmittance product), `milkT`
+// one (the haze is untinted — it is frosting, not glass colour). `tint` is this surface's
+// own per-crossing transmittance; `clarity` is the master dial that still multiplies it.
 inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, int y0, int y1,
                               const GBuffer& g, std::vector<float>& clearT, std::vector<float>& milkT,
-                              double clarity, double milkPerSurface, double rimStrength) {
+                              double clarity, const Vec3& tint,
+                              double milkPerSurface, double rimStrength, double invL0) {
     const VtxScreen& A = t.v0; const VtxScreen& B = t.v1; const VtxScreen& C = t.v2;
     double minx = std::floor(std::min({A.sx, B.sx, C.sx}));
     double maxx = std::ceil (std::max({A.sx, B.sx, C.sx}));
@@ -1000,7 +1251,22 @@ inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, in
     const EdgeFn E0 = makeEdge(B.sx, B.sy, C.sx, C.sy, s);
     const EdgeFn E1 = makeEdge(C.sx, C.sy, A.sx, A.sy, s);
     const EdgeFn E2 = makeEdge(A.sx, A.sy, B.sx, B.sy, s);
-    const float tau = (float)clarity;
+    // Rounded to float and multiplied IN float, which is what the device twin does
+    // (kClearAccum takes a float clarity and a float3 tint). Doing the product in double
+    // and rounding once would land a ULP away from the GPU on some pixels, and the two
+    // backends are supposed to agree bit for bit.
+    const float tauR = (float)clarity * (float)tint.x;
+    const float tauG = (float)clarity * (float)tint.y;
+    const float tauB = (float)clarity * (float)tint.z;
+    // BEER-LAMBERT, NOT PER-SURFACE. `tau` used to be applied once per crossed triangle,
+    // which makes the result depend on how finely the glass happens to be tessellated --
+    // two panes and one finely-diced pane absorbed differently for no physical reason. The
+    // physical quantity is optical depth over the PATH LENGTH through the medium, so keep
+    // the same `tau` but reinterpret it as the transmittance of one reference length L0
+    // and accumulate sigma * length. `g = -ln(tau)` is that sigma, times L0.
+    const float gR = -std::log(std::max(tauR, 1e-6f));
+    const float gG = -std::log(std::max(tauG, 1e-6f));
+    const float gB = -std::log(std::max(tauB, 1e-6f));
     for (int y = ylo; y <= yhi; ++y) {
         const double py = y + 0.5;
         const double r0 = E0.dx * (py - E0.Py);
@@ -1026,10 +1292,47 @@ inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, in
             Vec3 V  = normalize(cam.eye - wpos);
             double ndv = std::fabs(dot(Nn, V));
             double graze = 1.0 - ndv;                 // 0 head-on, ->1 at the silhouette
-            double perMilk = milkPerSurface + rimStrength * graze * graze * graze;
-            if (perMilk > 0.95) perMilk = 0.95;
-            clearT[row] *= tau;
-            milkT[row]  *= (float)(1.0 - perMilk);
+            // THE RIM IS A CUE, NOT AN OPTICAL DEPTH. The grazing term exists so a glass
+            // object's SILHOUETTE reads; it is a screen-space hint, not a physical
+            // quantity, and physical thickness is already accounted for by the clearT
+            // product (more glass = more crossings = darker). Multiplying (1 - 0.55) into
+            // the haze for every grazing surface therefore double-counts, and worse, it
+            // compounds: a sphere crosses 2 surfaces and gets the intended rim, but an -nd
+            // extrude crosses 20+ whose side walls are edge-on for GEOMETRIC reasons --
+            // they are interior sweeps parallel to the view, not silhouettes -- so after
+            // ~10 of them the haze saturates and every pixel of the model turns to flat
+            // frost. Combine the rim by MAX instead (stored as 1-max, so a min, which is
+            // as order-independent as the product it replaces) and let only the physical
+            // per-surface milk compound.
+            double rim = rimStrength * graze * graze * graze;
+            if (rim > 0.95) rim = 0.95;
+            // Front or back? The normal's sign against the view direction says which side
+            // of the medium this fragment is, and the signed sum of depths over a CLOSED
+            // surface is exactly the path length inside it -- order-independent, like the
+            // product it replaces, so still no depth sort.
+            // Geometric normal, not the shading one: see the device twin. The winding is
+            // a fact about the surface; a shading normal is authored data.
+            const Vec3 fnG = cross(B.wpos - A.wpos, C.wpos - A.wpos);
+            const float sgn = (dot(fnG, cam.eye - wpos) > 0.0) ? -1.0f : 1.0f;
+            const float sd  = sgn * (float)d;
+            const float k   = sd * (float)invL0;
+            const size_t NPX = (size_t)W * H;
+            clearT[row * 6 + 0] += k * gR;
+            clearT[row * 6 + 1] += k * gG;
+            clearT[row * 6 + 2] += k * gB;
+            // Open-surface fallback: a single-sided sheet (a `filter` gel, a one-quad
+            // window) has a front and no back, so there is no path length to integrate.
+            // Accumulating the FRONT faces' -ln(tau) reproduces the old per-crossing model
+            // exactly, and the fold below uses it whenever the signed depth came out empty.
+            if (sgn < 0.0f) {
+                clearT[row * 6 + 3] += gR;
+                clearT[row * 6 + 4] += gG;
+                clearT[row * 6 + 5] += gB;
+            }
+            milkT[row] += sd;                       // signed thickness
+            float& r = milkT[NPX + row];
+            if ((float)(1.0 - rim) < r) r = (float)(1.0 - rim);
+            (void)milkPerSurface;
         }
     }
 }
@@ -1175,6 +1478,7 @@ inline std::vector<uint8_t> exposeAndEncodeT(
         FetchVec3&& pixel, const float* zbuf, const uint8_t* emis,
         int W, int H, int nThreads,
         double expComp, bool autoExpose, double* lockAnchor,
+        // `clearT` is THREE floats per pixel (RGB transmittance product), `milkT` one.
         bool seeThrough, const float* clearT, const float* milkT,
         const Vec3& milkColor, BandPool* pool = nullptr) {
     const size_t N = (size_t)W * H;
@@ -1302,9 +1606,53 @@ inline std::vector<uint8_t> exposeAndEncodeT(
             Vec3 c = pixel(i);
             if (zbuf[i] > 0.0f) c = c * finalExp;   // hit pixels get the exposure
             if (seeThrough) {                          // composite clear glass (display-linear)
-                float T = clearT[i], mt = milkT[i];
-                if (T < 1.0f || mt < 1.0f)
-                    c = c * (double)T + milkColor * (1.0 - (double)mt);
+                const float Tr = clearT[i * 3 + 0], Tg = clearT[i * 3 + 1], Tb = clearT[i * 3 + 2];
+                const float mt = milkT[i];
+                if (Tr < 1.0f || Tg < 1.0f || Tb < 1.0f || mt < 1.0f) {
+                    const double m = 1.0 - (double)mt;
+                    // TINT THE HAZE BY THE GLASS IT IS IN. The haze stands for light
+                    // scattered inside the crossed surfaces, so it is seen through the
+                    // same tint the background is — an untinted one is white light
+                    // arriving from nowhere. On a single window this changes almost
+                    // nothing (T is near white); on a deep pile of coloured glass it is
+                    // the difference between reading the colours and reading a white
+                    // veil, because the haze is what dominates there.
+                    //
+                    // The HUE of the accumulated transmittance, not its magnitude:
+                    // scaling by T itself would multiply the haze by the same absorption
+                    // twice, and dark glass would lose its frost entirely.
+                    const double tmax = std::max({(double)Tr, (double)Tg, (double)Tb});
+                    // When the stack is too DENSE to carry a hue, the haze must survive on its own.
+                    // `hz` tints the frost by the HUE of the accumulated transmittance, which
+                    // needs T normalized by its own max. Falling back to inv = 1 when tmax is
+                    // ~0 does not do that -- it leaves hz = milkColor * T, i.e. ~0 -- so both
+                    // terms of the composite vanish and the pixel comes out EXACTLY black.
+                    // That is wrong in precisely the case the haze exists for: it stands for
+                    // light scattered inside the glass, so it is what is left when you can no
+                    // longer see through. A deep stack (an -nd extrude multiplies the crossed
+                    // surfaces several-fold) turned the whole model into a black silhouette.
+                    // With no hue to take, take none: untinted frost.
+                    // The threshold is deliberately near the bottom of the double range, not a
+                    // comfortable epsilon. `inv` only ever divides T by its own largest
+                    // channel, so the result is a hue in [0,1] for ANY strictly positive
+                    // tmax, and the division is done in double -- a tmax of 1e-30 is as
+                    // safe as one of 0.5. Using 1e-6 threw the hue away far too early: a
+                    // ruby glass crossed ~130 times has tmax ~ 0.9^130 = 1e-6, which is
+                    // nothing unusual once an -nd extrude multiplies the crossed surfaces,
+                    // and the model then jumped from ruby frost to a flat untinted white
+                    // while less-crossed parts of the same image (the gems) stayed
+                    // coloured. Only a genuine underflow to zero has no hue left to take.
+                    const bool   hasHue = tmax > 1e-300;
+                    const double inv = hasHue ? 1.0 / tmax : 1.0;
+                    const Vec3 hz = hasHue
+                        ? Vec3{milkColor.x * (double)Tr * inv,
+                               milkColor.y * (double)Tg * inv,
+                               milkColor.z * (double)Tb * inv}
+                        : milkColor;
+                    c = Vec3{c.x * (double)Tr + hz.x * m,
+                             c.y * (double)Tg + hz.y * m,
+                             c.z * (double)Tb + hz.z * m};
+                }
             }
             img[i * 3 + 0] = encode(c.x);
             img[i * 3 + 1] = encode(c.y);
@@ -1355,7 +1703,8 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                                         bool autoExpose = true, double* lockAnchor = nullptr,
                                         bool seeThrough = false, double glassClarity = 0.85,
                                         const Scene* scenePtr = nullptr,
-                                        RasterScratch* scratch = nullptr) {
+                                        RasterScratch* scratch = nullptr,
+                                        double hazeCap = 1.0) {
     // Geometry and its side tables arrive together (a PTri's `mix` index is only meaningful
     // against the mixes built alongside it), then are aliased for the passes below.
     const std::vector<PTri>& tris  = geom.tris;
@@ -1422,7 +1771,8 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
             int iy0 = std::max(0, (int)std::floor(lo));
             int iy1 = std::min(H - 1, (int)std::ceil(hi));
             if (iy0 > iy1) return;
-            out.push_back(STri{s0, s1, s2, src, needUV, emis, clr, iy0, iy1});
+            out.push_back(STri{s0, s1, s2, src, needUV, emis, clr,
+                               tris[(size_t)src].hasVcol, iy0, iy1});
         };
         for (size_t ti = a; ti < b; ++ti) {
             const PTri& t = tris[ti];
@@ -1519,6 +1869,13 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     // and the opaque background dims what's behind it by `glassClarity` (transmittance) and
     // adds a little milky haze; both accumulate with the number of clear surfaces crossed.
     const double kMilkPerSurface = std::max(0.0, (1.0 - glassClarity)) * 0.55; // haze per surface
+    // The reference length the per-crossing dials are reinterpreted against: a slab this
+    // thick absorbs and hazes exactly as one crossing used to, so existing scenes keep
+    // their look while the result stops depending on tessellation. Tied to the scene so a
+    // 2 cm ring and a 40 m building behave the same.
+    const double L0    = (geom.radius > 0.0 ? geom.radius : 1.0) * 0.05;
+    const double invL0 = 1.0 / L0;
+    const double milkPer = kMilkPerSurface;
     const double kRimStrength    = 0.55;                     // extra silhouette milk (Fresnel-ish)
     const Vec3   kMilkColor{0.52, 0.55, 0.60};               // display-space haze tint
 
@@ -1550,14 +1907,27 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     g.tri.resize(N);
     g.emis.resize(N);
     g.uv.resize(N);
+    // The vertex-colour channel is allocated only when the geometry has one, so a scene
+    // without vertex colours pays nothing for the feature: no buffer, no per-pixel write,
+    // and the shade pass's `g.vcol.empty()` test folds away to a single predictable branch.
+    {
+        bool anyVcol = false;
+        for (const PTri& t : tris) if (t.hasVcol) { anyVcol = true; break; }
+        if (anyVcol) { g.vcol.resize(N); }
+        else if (!g.vcol.empty()) g.vcol.clear();     // scratch is reused across frames
+    }
     parallelFor(N, [&](size_t a, size_t b) {
         std::fill(g.zbuf.begin() + a, g.zbuf.begin() + b, 0.0f);
     });
+    if (!g.vcol.empty())
+        parallelFor(N, [&](size_t a, size_t b) {
+            std::fill(g.vcol.begin() + a, g.vcol.begin() + b, Vec3{1, 1, 1});
+        });
     dispatchBands([&](int y0, int y1) {
         for (const STri& s : stris) {
             if (s.iy1 < y0 || s.iy0 >= y1) continue;   // triangle can't touch this band
             if (seeThrough && s.clear) continue;       // clear surfaces handled in Pass 2b
-            fillTriangleG(s, W, H, y0, y1, g);
+            fillTriangleG(s, W, H, y0, y1, g, tris.data());
         }
     });
 
@@ -1568,20 +1938,69 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     // reusing the scratch allocation).
     std::vector<float>& clearT = S.clearT;
     std::vector<float>& milkT  = S.milkT;
-    if (!seeThrough) { clearT.clear(); milkT.clear(); }
+    std::vector<float>& clearRGB = S.clearRGB;
+    if (!seeThrough) { clearT.clear(); clearRGB.clear(); milkT.clear(); }
     if (seeThrough) {
-        clearT.resize(N);
-        milkT.resize(N);
+        // clearT holds SIX floats while accumulating: [0,3) the signed optical depth over
+        // path length, [3,6) the front-face-only per-crossing depth used when the geometry
+        // turns out to be open. The fold below collapses it back to the three
+        // transmittances everything downstream expects, in place.
+        clearT.resize(N * 6);
+        clearRGB.resize(N * 3);
+        // milkT: [0,N) signed thickness (a SUM, so it starts at 0), [N,2N) the silhouette
+        // rim as (1 - max), which starts at 1.
+        milkT.resize(N * 2);
         parallelFor(N, [&](size_t a, size_t b) {
-            std::fill(clearT.begin() + a, clearT.begin() + b, 1.0f);
-            std::fill(milkT.begin() + a, milkT.begin() + b, 1.0f);
+            std::fill(clearT.begin() + a * 6, clearT.begin() + b * 6, 0.0f);
+            std::fill(milkT.begin() + a, milkT.begin() + b, 0.0f);
+            std::fill(milkT.begin() + N + a, milkT.begin() + N + b, 1.0f);
         });
         dispatchBands([&](int y0, int y1) {
             for (const STri& s : stris) {
                 if (!s.clear) continue;
                 if (s.iy1 < y0 || s.iy0 >= y1) continue;
+                // The tint rides on the source PTri, so it costs no G-buffer channel and
+                // no extra STri field — the same reason STri carries `src` and not a copy
+                // of the shading attributes.
+                const Vec3& tint = (s.src >= 0 && s.src < (int)tris.size())
+                                 ? tris[(size_t)s.src].clearTint : Vec3{1, 1, 1};
                 fillTriangleClear(s, cam, W, H, y0, y1, g, clearT, milkT,
-                                  glassClarity, kMilkPerSurface, kRimStrength);
+                                  glassClarity, tint, kMilkPerSurface, kRimStrength, invL0);
+            }
+        });
+        // -glass-haze: cap how much of a pixel the frost may take, however many surfaces
+        // were crossed. The per-surface term is a product, so a sight line through a
+        // dozen faceted gems drives it to 1 and the cluster whites out however dark or
+        // colourful the glass is.
+        //
+        // Applied here, once, on the finished product rather than inside the accumulation:
+        // clamping a decreasing product at every step and clamping it at the end give
+        // exactly the same number (once it is at the floor, further multiplies clamp back
+        // to the floor), and doing it here keeps the hot inner loop and the atomics on the
+        // device twin untouched. Costs one pass over the buffer, and only when asked for.
+        // Fold: optical depth -> transmittance, thickness -> haze, rim applied, all
+        // collapsed into the 3-float clearT and 1-float milkT the composite reads. Writing
+        // clearT[i*3+c] from clearT[i*6+c] is safe in place because 3i <= 6i.
+        const float floorT = (hazeCap < 1.0) ? (float)std::max(0.0, 1.0 - hazeCap) : 0.0f;
+        const double kHaze = (milkPer > 0.0 && milkPer < 1.0)
+                           ? -std::log(1.0 - milkPer) * invL0 : 0.0;
+        parallelFor(N, [&](size_t a, size_t b) {
+            for (size_t i = a; i < b; ++i) {
+                // Blend rather than branch -- see the device twin's note. The thickness is
+                // a sum whose exact value near zero is order-dependent, so a hard
+                // threshold there would flip pixels between the two models.
+                const float L  = milkT[i];
+                const float w  = std::min(std::max(L / (0.02f * (float)L0), 0.0f), 1.0f);
+                const double Lh = std::max((double)L, 0.02 * L0);
+                for (int c = 0; c < 3; ++c) {
+                    float tauP = clearT[i * 6 + c] * (float)invL0 * (float)L0;
+                    if (!(tauP > 0.0f)) tauP = 0.0f;
+                    const float tauO = clearT[i * 6 + 3 + c];
+                    clearRGB[i * 3 + c] = std::exp(-(w * tauP + (1.0f - w) * tauO));
+                }
+                float m = (float)std::exp(-kHaze * Lh) * milkT[N + i];
+                if (m < floorT) m = floorT;
+                milkT[i] = m;
             }
         });
     }
@@ -1657,6 +2076,12 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     col = col * (p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p));
                 }
             }
+            // Per-vertex colour multiplies the material albedo, the same rule the
+            // spectral path uses in diffuseReflectance (and glTF's rule for COLOR_0).
+            if (!g.vcol.empty()) {
+                const Vec3& vc = g.vcol[i];
+                col = Vec3{col.x * vc.x, col.y * vc.y, col.z * vc.z};
+            }
             if (g.emis[i]) { accum[i] = col * EMIS_BOOST; continue; }  // raw emitter radiance
             // No two-sided flip here: it is decided ONCE PER TRIANGLE at projection time
             // (see projectRange). Testing the smoothly-interpolated normal per pixel used
@@ -1692,6 +2117,22 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                 }
             }
             Vec3 V = normalize(cam.eye - g.wpos[i]);     // toward camera
+            // RASTER-PBR: the surface's own roughness, honouring the maps the header used to
+            // say were "ignored by design". `rough < 0` = no lobe, and the whole specular block
+            // below is skipped, so a diffuse scene shades byte-for-byte as it always did.
+            double rough = sh ? sh->rough : -1.0;
+            if (rough >= 0.0 && sh) {
+                // Honour `roughness pattern:` / `roughness texture:` through the same per-pixel
+                // machinery the albedo patterns already use -- the header's "roughness maps are
+                // ignored by design" is exactly what this entry exists to undo.
+                if (scenePtr && sh->roughPat >= 0 && sh->roughPat < (int)scenePtr->patterns.size())
+                    rough = scenePtr->patterns[sh->roughPat].eval(ctx());
+                else if (scenePtr && sh->roughTex >= 0 && sh->roughTex < (int)scenePtr->textures.size())
+                    rough = scenePtr->textures[sh->roughTex].scalarAt(g.uv[i].x, g.uv[i].y);
+                rough = (rough < 0.02) ? 0.02 : (rough > 1.0 ? 1.0 : rough);
+            }
+            const bool spec = (rough >= 0.0);
+            Vec3 specAcc{0, 0, 0};
             double lit = 0.0;
             for (const auto& lp : light.lights) {
                 Vec3 d = lp.pos - g.wpos[i];
@@ -1703,11 +2144,35 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                 if (lp.falloff2 > 0.0) atten = lp.falloff2 / (lp.falloff2 + dist2);
                 double cone = 1.0;
                 if (lp.spot) cone = spotFalloff(dot(lp.dir, -Ld), lp.cosInner, lp.cosOuter);
-                lit += lp.weight * ndl * atten * cone;
+                const double w = lp.weight * atten * cone;
+                lit += w * ndl;
+                if (spec) {
+                    // The direct lobe: this is the half of the split-sum a preview cannot fake,
+                    // because the moving highlight is what reads as "satin" rather than "chalk".
+                    const double gg = ggxSpec(N3, V, Ld, rough) * w;
+                    if (gg > 0.0) {
+                        const double f = std::pow(1.0 - std::max(0.0, dot(V, normalize(V + Ld))), 5.0);
+                        specAcc = specAcc + Vec3{sh->f0.x + (1.0 - sh->f0.x) * f,
+                                                 sh->f0.y + (1.0 - sh->f0.y) * f,
+                                                 sh->f0.z + (1.0 - sh->f0.z) * f} * gg;
+                    }
+                }
             }
             double head = std::max(0.0, dot(N3, V));     // headlight fill
             double k = light.ambient + light.keyScale * lit + light.fill * head;
             accum[i] = col * k;
+            if (spec) {
+                // The ENVIRONMENT half of the split-sum. This renderer's environment is one
+                // scalar (light.ambient) -- there is no directional env anywhere in this file --
+                // so `prefiltered(R, roughness)` degenerates to that constant exactly, and the
+                // DFG factor is all that remains. No approximation beyond the one the diffuse
+                // shading above already makes.
+                double A = 0.0, B = 0.0;
+                envBrdfApprox(std::max(1e-4, dot(N3, V)), rough, A, B);
+                const double amb = light.ambient;
+                specAcc = specAcc + Vec3{sh->f0.x * A + B, sh->f0.y * A + B, sh->f0.z * A + B} * amb;
+                accum[i] = accum[i] + specAcc * light.keyScale;
+            }
         }
     });
 
@@ -1716,7 +2181,7 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     // !seeThrough and simply ignored by the helper in that case. Rides the same worker pool
     // as the passes above (its three scans used to spawn their own threads each).
     return exposeAndEncode(accum, g.zbuf, g.emis, W, H, nThreads, expComp, autoExpose,
-                           lockAnchor, seeThrough, clearT, milkT, kMilkColor, pool);
+                           lockAnchor, seeThrough, clearRGB, milkT, kMilkColor, pool);
 }
 
 // Draw a red look-at crosshair at world point `target` onto an already-rendered RGB

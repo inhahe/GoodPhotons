@@ -26,7 +26,24 @@ start scene_file
 
 # ---- skips + terminals (mirror ftrace's tokenize) -------------------
 WS      = /[ \t\r]+/ @skip          # inter-token whitespace (ftrace skips \r too)
-COMMENT = /#[^\n]*/ @skip           # `# …` to end of line
+# `# …` OR `// …` to end of line.  `#` is the original and canonical marker; `//` was
+# added in 0.248.0 because it is what everyone reaches for first — a scene author (human
+# or LLM) who has written any C-family language types `//` without thinking, and until
+# 0.248.0 that rejected the WHOLE FILE with a message that never said the word "comment"
+# (`//` lexed as a WORD, the next word became a block name, and the parser then demanded
+# a `{`).  Accepting both costs nothing and removes a trap whose error message gave no
+# route back.
+#
+# It is safe because the marker is only recognised at a TOKEN START.  Rule order plus
+# longest-match does the work: `// foo` is 6 chars of COMMENT against 2 of WORD, so
+# COMMENT wins; but in `a//b` no rule *starts* at the slashes at all — WORD begins at `a`
+# and runs to the end — so an embedded `//` inside a bareword or an unquoted path is
+# untouched.  (This is a slight but deliberate difference from `#`, which IS excluded
+# from the WORD character class and therefore splits `a#b`.)  Paths are quoted and lex as
+# STRING, so the one construct genuinely at risk — a bare `//server/share` UNC path — is
+# already written the safe way everywhere in the corpus; a grep of every .ftsl in the
+# tree found no `//` at a token start, so nothing that parsed before parses differently.
+COMMENT = /(?:#|\/\/)[^\n]*/ @skip
 NEWLINE = /\n/                      # significant: delimits statements / blocks
 
 STRING  = /"[^"]*"/                                 # quoted name / path / expression

@@ -40,6 +40,12 @@ extern "C" {
     void           stbi_image_free(void* retval_from_stbi_load);
     int            stbi_is_hdr(const char* filename);
     const char*    stbi_failure_reason(void);
+    // glTF/GLB embed their images IN the file (a bufferView of the BIN chunk, or a
+    // base64 data URI), so there is no path to hand stbi_load. Writing them out to
+    // temporary files first would be both slower and observable; decoding in place is
+    // the only sane seam. See Texture::loadMemory and gltfimpl::decodeGltfImage.
+    unsigned char* stbi_load_from_memory(const unsigned char* buffer, int len,
+                                         int* x, int* y, int* channels, int desired);
 }
 
 enum class TexEncoding { sRGB, Linear };
@@ -398,6 +404,49 @@ struct Texture {
         if (m0 == 'P' && (m1 == 'F' || m1 == 'f')) { f.seekg(0); return loadPFM(f, err); }
         f.close();
         return loadSTB(path, err);   // PNG / JPG / BMP / TGA / HDR via stb_image
+    }
+
+    // Decode an ALREADY-IN-MEMORY compressed image (PNG/JPEG/...). Used by the glTF
+    // loader for images embedded in a GLB's BIN chunk or in a base64 data URI, which
+    // have no filename to give `load` above. `what` only ever appears in the error
+    // message, so it can be any label the caller finds useful ("glTF image 0").
+    //
+    // LDR only, deliberately: glTF cannot reference a Radiance .hdr, and stb's HDR
+    // decode returns floats through a different entry point that would need its own
+    // branch here for a case that cannot occur.
+    bool loadMemory(const unsigned char* data, size_t n, const std::string& what,
+                    std::string& err) {
+        if (!data || n == 0) { err = "empty image payload (" + what + ")"; return false; }
+        if (n > (size_t)INT32_MAX) { err = "image too large to decode (" + what + ")"; return false; }
+        int nc = 0;
+        unsigned char* px = stbi_load_from_memory(data, (int)n, &w, &h, &nc, 3);
+        if (!px) {
+            err = "stb_image: " + std::string(stbi_failure_reason() ? stbi_failure_reason()
+                                                                   : "decode failed") +
+                  " (" + what + ")";
+            return false;
+        }
+        // An 8-bit source has only 256 distinct values per channel, so this table is EXACT:
+        // entry i is srgbToLinear(i * (1/255)), the same expression the per-texel path used,
+        // and every texel gets back the identical double. What it removes is the pow() -- a
+        // 4096^2 colour map is ~50 M of them, and the decode phase measured 5.7 s of
+        // gallery_rain's 18.2 s load before this (FTRACE_LOADSTATS=1).
+        static const double* const kLut8 = [] {
+            static double t[512];
+            for (int i = 0; i < 256; ++i) {
+                const double v = (double)i * (1.0 / 255.0);
+                t[i]       = v;                  // TexEncoding::Linear
+                t[256 + i] = srgbToLinear(v);    // TexEncoding::sRGB
+            }
+            return t;
+        }();
+        const double* const lut = kLut8 + (encoding == TexEncoding::sRGB ? 256 : 0);
+        rgb.clear();
+        rgb.resize((size_t)w * h);
+        for (size_t i = 0; i < (size_t)w * h; ++i)
+            rgb[i] = Vec3{lut[px[i * 3]], lut[px[i * 3 + 1]], lut[px[i * 3 + 2]]};
+        stbi_image_free(px);
+        return true;
     }
 
   private:

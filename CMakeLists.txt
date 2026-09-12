@@ -27,7 +27,17 @@ if(MSVC)
     # command line, so scope them to the CXX compile with a generator expression.
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4>
                         $<$<COMPILE_LANGUAGE:CXX>:/permissive->
-                        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>)
+                        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+                        $<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
+    # /bigobj: a COFF object file may hold only 65,279 sections, and main.cpp had reached
+    # that ceiling by 0.215.0 -- the mode-J template instantiation of gatherPhotonBeamsW was
+    # merely the straw that broke it (`error C1128: number of sections exceeded object file
+    # format limit`). Every COMDAT -- each inline function, each template instantiation, each
+    # string literal -- costs a section, and main.cpp transitively includes essentially the
+    # whole renderer, so the count only ever goes up. /bigobj raises the limit to 2^32 and
+    # costs nothing but a slightly larger .obj; it changes no generated code. Applied to all
+    # C++ TUs rather than just main.cpp because viewer_gui.cpp pulls in the same headers and
+    # is the next one that would hit the wall.
     # Fast math is NOT enabled: physical correctness matters more than speed for now.
 endif()
 
@@ -57,7 +67,19 @@ add_executable(ftrace
     src/third_party/imnodes/imnodes.cpp
 )
 target_include_directories(ftrace PRIVATE src src/gpda src/third_party/imgui src/third_party/implot src/third_party/imnodes)
-target_compile_definitions(ftrace PRIVATE FTRACE_VERSION="${FTRACE_VERSION}")
+# The version string lives in ONE tiny translation unit. It used to be a target-wide
+# definition, which made every VERSION bump -- and this project bumps on every observable
+# change -- dirty all twenty-odd TUs including the 18k-line render_cuda.cu: a full rebuild
+# for a one-line change. Now a bump recompiles version.cpp and relinks.
+target_sources(ftrace PRIVATE src/version.cpp)
+set_source_files_properties(src/version.cpp PROPERTIES
+    COMPILE_DEFINITIONS "FTRACE_VERSION=\"${FTRACE_VERSION}\"")
+# Host TUs compile in parallel: MSBuild's CL task runs one cl.exe with /MP over the dirty
+# items. Matters on a full rebuild, where the 24k-line main.cpp used to queue behind the
+# dozen vendored ImGui/ImPlot/imnodes files on a single core.
+if(MSVC)
+    target_compile_options(ftrace PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/MP>)
+endif()
 
 # The vendored GPDA engine + generated grammar are third-party/generated code;
 # don't hold them to ftrace's /W4 /permissive- bar (keeps the build-warning
@@ -134,6 +156,18 @@ if(CMAKE_CUDA_COMPILER)
     # lets compute-sanitizer / cuda-gdb map GPU faults back to file:line — the
     # difference between "an OOB happened somewhere" and "OOB at render_cuda.cu:1234".
     target_compile_options(ftrace PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    # nvcc's optimiser (cicc) and assembler (ptxas) are single-threaded per translation unit,
+    # and render_cuda.cu is one 18k-line TU. --split-compile partitions its device code so
+    # those phases use every core. Measured 2026-09-06 (i7-8700K, ~3 cores of other load):
+    # ptxas 52.6 s -> 21.1 s, cicc 64.3 s -> 43.2 s, the whole TU 2:49 -> 1:50. NVIDIA
+    # documents "minimal (if any)" effect on the generated code; checked here by an A/B of
+    # render speed on the same scenes (design.md, Build & release).
+    # Constraint this adds: every __device__ function must have INTERNAL linkage (static).
+    # A plain `inline` template in a header (dPatternEval, before 0.259.2) can be partitioned
+    # away from a __launch_bounds__-capped kernel, and nvlink then refuses the link when the
+    # callee's own register allocation exceeds the cap (169 vs kBdptT's 168). A global
+    # -maxrregcount is NOT the answer: 35 kernels legitimately use up to 255 registers.
+    target_compile_options(ftrace PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>)
     # CCCL 3.x (the thrust/cub shipped with CUDA 13) requires MSVC's standard-conforming
     # preprocessor; without it the thrust headers #error out. Scoped to the CUDA host
     # pass-through so plain C++ TUs keep their default flags.

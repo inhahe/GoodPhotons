@@ -29,6 +29,22 @@
 #include "color.h"
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 
+// ---- Caustic split: the one tunable of the FOCUS/SCATTER classification ---------------
+// Mode M partitions its deposits into a global map and a caustic map by the classic L·S⁺·D
+// rule; the classifier itself is photonVertexKind (render.h) and its device twin
+// dPhotonVertexBit (render_cuda.cu). This threshold is the only judgement call in it, and it
+// lives HERE, in the one header both of them include, because a CPU and a GPU render that
+// disagreed about which glossy surfaces can focus would produce two different images from one
+// scene — a discrepancy with no symptom other than "the GPU looks wrong".
+//
+// `roughness` is the Phong-lobe width used by glossyDirUV (0 = perfect mirror). 0.15 is about
+// where the lobe stops being able to hold a caustic together over a scene-scale throw: the
+// exponent is 2/r^2 - 2 ~= 87, i.e. a ~12 degree lobe. Anything broader produces a diffuse
+// glow that the global map already represents perfectly well — and folding that broad
+// population into the caustic map would drag ITS density estimate back up, which is exactly
+// what the split exists to prevent.
+inline constexpr double kCausticGlossRoughness = 0.15;
+
 // One deposited photon's PAYLOAD — everything the gather reads *after* a candidate has
 // passed the distance test. The deposit POSITION deliberately lives in a separate
 // `PhotonMap::pos` array (see below); this struct is what `pos[k]` indexes into.
@@ -47,6 +63,57 @@ struct Photon {
 // A per-thread deposit bank: the split (position, payload) pair that a photon pass appends
 // to, mirroring PhotonMap's own split layout so the concatenation into the map is a plain
 // append of both arrays. The two vectors are always the same length.
+// Host/device annotation for the one function the CPU grid and the CUDA gather kernels MUST
+// agree on bit for bit — the cell hash. If the two ever disagreed, a GPU gather would look in
+// a different bucket than the host counting sort filled and silently return black.
+#ifdef __CUDACC__
+  #define PM_HD __host__ __device__
+#else
+  #define PM_HD
+#endif
+
+// Bucket index for an integer cell coordinate, in a table of (mask+1) buckets.
+//
+// WHY THE GRID IS HASHED AND NOT DENSE. A dense grid indexes cells as (iz*ny+iy)*nx+ix and
+// therefore has to ALLOCATE nx*ny*nz ints, which grows as (L/r)^3 in the scene size L over the
+// gather radius r — while the photons themselves live on surfaces, a 2-D sheet whose occupancy
+// only grows as (L/r)^2. So on any large scene the empty cells, not the photons, set the memory
+// bill, and the map had to defend itself with a guard that GREW r back until the cell array fit
+// (kMaxCells, removed in 0.199.6). That guard is what made small radii unreachable exactly where
+// they matter: on gallery_rain (scene radius 32.7 m) a requested r of 0.031 m was inflated to
+// 0.094 m, and a ~3 cm caustic under a ~10 cm kernel is smeared into a colourless grey veil —
+// the reported "no colourful caustics anywhere" (2026-09-01).
+//
+// Hashing removes the volume term completely: the table is sized from the PHOTON COUNT, so the
+// cost per photon is a constant ~8 B no matter how fine the cells are, and r is free to follow
+// the measured density wherever it leads. Cells that collide into one bucket are not a
+// correctness problem — the query already distance-tests every candidate it visits, so an
+// aliased photon is simply rejected. With the table at 2x the photon count the expected number
+// of aliased candidates is ~0.5 per bucket, i.e. ~13 extra distance tests across the whole
+// 3x3x3 neighbourhood, against the hundreds of genuine candidates a tuned gather visits.
+//
+// The mix is a 64-bit multiply-xorshift (SplitMix64's finaliser over three odd-constant
+// products), not the classic XOR-of-three-primes: the XOR form leaves neighbouring cells
+// correlated in the low bits, and a gather visits 27 NEIGHBOURING cells at once — precisely the
+// pattern that clusters them into the same few buckets.
+PM_HD inline unsigned int pmCellHash(int ix, int iy, int iz, unsigned int mask) {
+    unsigned long long h = (unsigned long long)(unsigned int)ix * 0x9E3779B97F4A7C15ull;
+    h ^= (unsigned long long)(unsigned int)iy * 0xC2B2AE3D27D4EB4Full;
+    h ^= (unsigned long long)(unsigned int)iz * 0x165667B19E3779F9ull;
+    h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 27; h *= 0x94D049BB133111EBull;
+    h ^= h >> 31;
+    return (unsigned int)h & mask;
+}
+
+// Smallest power of two >= n, at least 1024 (a floor so a tiny map still has slack).
+inline unsigned int pmTableSize(size_t n) {
+    unsigned long long want = 2ull * (unsigned long long)n;
+    unsigned int t = 1024;
+    while ((unsigned long long)t < want && t < (1u << 31)) t <<= 1;
+    return t;
+}
+
 struct PhotonBank {
     std::vector<Vec3>   pos;
     std::vector<Photon> payload;
@@ -86,25 +153,40 @@ struct PhotonMap {
     long long nEmitted = 0;        // total photons EMITTED in the pass (normalization)
     double    radius   = 0.02;     // gather radius (world units); == grid cell size
 
+    // PER-QUERY ADAPTIVE GATHER (0 = off; see adaptiveRadius below). When > 0 this is the
+    // number of photons a single gather wants to see, and `radius` becomes a MAXIMUM rather
+    // than the radius actually used. Set by buildAuto to the same k it solved the global
+    // radius for; only the CAUSTIC map turns it on (see main.cpp -pmadaptive).
+    double    kGather  = 0.0;
+
     // grid geometry
-    Vec3   lo{0, 0, 0};
+    Vec3   lo{0, 0, 0};            // cell-lattice origin (padded bbox min)
     double cellSize = 0.02;
+    // Padded bbox cell dims. PURELY DIAGNOSTIC since 0.199.6 — the lattice is hashed, so
+    // nothing indexes through these and their product is never formed (it overflows a long
+    // long on a fine grid over a large scene, which is the whole reason the dense grid went).
+    // buildAuto still reads them as the measured bbox EXTENT in cells, and the mode-M log
+    // prints them so "how fine is the lattice" stays visible.
     int    nx = 1, ny = 1, nz = 1;
-    std::vector<int> cellStart;    // size nCells+1; cell c occupies [cellStart[c], cellStart[c+1])
+    // Bucket runs: bucket b occupies [cellStart[b], cellStart[b+1]). Size tableMask+2.
+    std::vector<int> cellStart;
+    unsigned int tableMask = 0;    // tableSize - 1; tableSize is a power of two
 
-    long long cellCount() const { return (long long)nx * ny * nz; }
+    long long bucketCount() const { return (long long)tableMask + 1; }
 
-    int cellIndex(int ix, int iy, int iz) const {
-        return (iz * ny + iy) * nx + ix;
+    // Bucket for an integer cell coordinate.
+    unsigned int cellIndex(int ix, int iy, int iz) const {
+        return pmCellHash(ix, iy, iz, tableMask);
     }
-    // Clamp a world point to a valid grid cell coordinate.
+    // Integer cell coordinate of a world point. NOT clamped to the bbox: with a hashed
+    // lattice there is no "outside the array" to defend against, and clamping was actively
+    // slightly wrong — a query point just beyond the bbox got folded onto the edge cell, so
+    // its 3x3x3 neighbourhood lost the far row. Unclamped, the neighbourhood straddles the
+    // boundary correctly and the extra cells are simply empty.
     void cellCoord(const Vec3& p, int& ix, int& iy, int& iz) const {
         ix = (int)std::floor((p.x - lo.x) / cellSize);
         iy = (int)std::floor((p.y - lo.y) / cellSize);
         iz = (int)std::floor((p.z - lo.z) / cellSize);
-        ix = std::min(std::max(ix, 0), nx - 1);
-        iy = std::min(std::max(iy, 0), ny - 1);
-        iz = std::min(std::max(iz, 0), nz - 1);
     }
 
     // Bin the deposited photons into a uniform grid of cell size `r` (== gather radius,
@@ -119,32 +201,44 @@ struct PhotonMap {
     void buildGrid(double r) {
         radius = r;
         cellSize = (r > 0.0) ? r : 1e-6;
-        if (photons.empty()) { nx = ny = nz = 1; cellStart.assign(2, 0); cie.clear(); pos.clear(); return; }
+        if (photons.empty()) {
+            nx = ny = nz = 1; tableMask = 0; cellStart.assign(2, 0);
+            cie.clear(); pos.clear(); return;
+        }
 
         Vec3 mn = pos[0], mx = pos[0];
         for (const Vec3& p : pos) {
             mn.x = std::min(mn.x, p.x); mn.y = std::min(mn.y, p.y); mn.z = std::min(mn.z, p.z);
             mx.x = std::max(mx.x, p.x); mx.y = std::max(mx.y, p.y); mx.z = std::max(mx.z, p.z);
         }
-        // Pad by half a cell so floor() never underflows at the low edge.
+        // Pad by half a cell so the lattice origin sits strictly below every photon (the
+        // integer coords stay non-negative, which is not required by the hash but keeps the
+        // diagnostic dims below meaningful).
         lo = mn - Vec3{cellSize, cellSize, cellSize} * 0.5;
         Vec3 ext = (mx - lo) + Vec3{cellSize, cellSize, cellSize} * 0.5;
-        nx = std::max(1, (int)std::ceil(ext.x / cellSize));
-        ny = std::max(1, (int)std::ceil(ext.y / cellSize));
-        nz = std::max(1, (int)std::ceil(ext.z / cellSize));
-        const long long nCells = cellCount();
+        // Diagnostic only, and clamped into int: a fine lattice over a large scene can want
+        // billions of cells per axis, which is exactly the situation the hash exists to make
+        // affordable — it must not overflow the number we merely PRINT.
+        auto dim = [](double e, double c) {
+            const double d = std::ceil(e / c);
+            return (int)std::min(std::max(d, 1.0), 2.0e9);
+        };
+        nx = dim(ext.x, cellSize); ny = dim(ext.y, cellSize); nz = dim(ext.z, cellSize);
 
-        // Pass 1: count photons per cell.
+        // Pass 1: count photons per BUCKET.
+        const unsigned int tableSize = pmTableSize(photons.size());
+        tableMask = tableSize - 1;
         std::vector<int> cellOf(photons.size());
-        cellStart.assign((size_t)nCells + 1, 0);
+        ftalloc::resize(cellStart, (size_t)tableSize + 1, "the photon grid bucket table", "-n");
+        std::fill(cellStart.begin(), cellStart.end(), 0);
         for (size_t i = 0; i < photons.size(); ++i) {
             int ix, iy, iz; cellCoord(pos[i], ix, iy, iz);
-            int c = cellIndex(ix, iy, iz);
+            int c = (int)cellIndex(ix, iy, iz);
             cellOf[i] = c;
             ++cellStart[c + 1];
         }
-        // Prefix sum -> cellStart[c] = begin offset of cell c.
-        for (long long c = 0; c < nCells; ++c) cellStart[c + 1] += cellStart[c];
+        // Prefix sum -> cellStart[b] = begin offset of bucket b.
+        for (unsigned int c = 0; c < tableSize; ++c) cellStart[c + 1] += cellStart[c];
 
         // Pass 2: scatter into cell-contiguous order. pos[] and photons[] are permuted by
         // the SAME cursor walk, so index k keeps addressing one photon across both.
@@ -200,24 +294,30 @@ struct PhotonMap {
     // `-savemap` run that wrote the file. (Caught 2026-07-26: 1401 vs 1402 median, r
     // 0.008981 vs 0.008977, images differed.)
     //
-    // So sample by CELL — cells are fixed by the bbox and cell size, i.e. by geometry alone —
-    // striding over occupied cells, and inside each take the lexicographically smallest
-    // position as the representative. That is a set-minimum, so it names the same photon no
-    // matter how the array is ordered (coincident positions would tie, but then the neighbour
-    // count is identical anyway). Querying an actual photon rather than the cell centre
-    // matters: a cell the surface merely clips at a corner has its centre off the surface and
-    // would report a spuriously empty neighbourhood.
+    // So sample by BUCKET — bucket membership is a pure function of the bbox, the cell size and
+    // the hash, i.e. of geometry alone — striding over occupied buckets, and inside each take
+    // the lexicographically smallest position as the representative. That is a set-minimum, so
+    // it names the same photon no matter how the array is ordered (coincident positions would
+    // tie, but then the neighbour count is identical anyway). Querying an actual photon rather
+    // than the cell centre matters: a cell the surface merely clips at a corner has its centre
+    // off the surface and would report a spuriously empty neighbourhood.
+    //
+    // (Before 0.199.6 a bucket WAS a cell, one-to-one. Hashing lets a bucket hold photons from
+    // a few unrelated cells, which changes only which photons are sampled, not the
+    // order-independence the note above is about — and the statistic is a median over
+    // thousands of samples, so it is insensitive to that reshuffle.)
     //
     // Cell-striding also makes the statistic area-weighted rather than photon-weighted, which
     // is if anything the better match: camera gathers land on visible surface points, spread
     // over area, not in proportion to local photon density.
     double medianNeighborCount(int sampleTarget = 4096) const {
-        const long long nCells = cellCount();
+        const long long nCells = bucketCount();
         if (photons.empty() || nCells <= 0) return 0.0;
 
-        // How many cells actually hold photons — needed to pick a stride that lands near
-        // sampleTarget. O(nCells) over a flat int array (~20 ms at 22M cells, against a
-        // build that already costs seconds at that size).
+        // How many buckets actually hold photons — needed to pick a stride that lands near
+        // sampleTarget. O(tableSize) over a flat int array, and since 0.199.6 the table is
+        // sized from the photon count rather than the cell volume, so this walk no longer
+        // grows with how fine the lattice is.
         long long occupied = 0;
         for (long long c = 0; c < nCells; ++c)
             if (cellStart[c + 1] > cellStart[c]) ++occupied;
@@ -284,9 +384,20 @@ struct PhotonMap {
     // The win is in the growth: those same four points become ~237 / 377 / 598 / 949, so the
     // population is roughly preserved where people actually render and only the runaway tail
     // is cut. Equal-time quality is strictly better even at the small end (see README).
+    //
+    // `rMax` > 0 caps the chosen radius. Its one caller is the CAUSTIC map of the two-map
+    // split, which passes the GLOBAL map's radius — because a caustic map that ends up
+    // blurrier than the map it was separated from is strictly worse than not splitting at
+    // all. That happens whenever the caustic population is very sparse (a scene where only a
+    // thousandth of the flux reaches a diffuse surface through glass): k(M) shrinks with the
+    // count, the probe sees almost nothing, and sqrt(k/n) asks to GROW the radius — smearing
+    // the one thing the split exists to keep sharp. Capped, the worst case degenerates to
+    // "same radius as before, just estimated from two disjoint sets", which is exactly the
+    // unsplit answer.
     double buildAuto(double r0, double kAt1M = 200.0, double* nProbeOut = nullptr,
-                     double* kTargetOut = nullptr) {
-        if (photons.empty()) { build(r0); return radius; }
+                     double* kTargetOut = nullptr, double rMax = 0.0) {
+        if (photons.empty()) { build(r0 > 0.0 && rMax > 0.0 ? std::min(r0, rMax) : r0);
+                               return radius; }
         buildGrid(r0);
         const double n0 = medianNeighborCount();
         const double k  = kAt1M * std::cbrt((double)photons.size() / 1.0e6);
@@ -299,29 +410,16 @@ struct PhotonMap {
         // a median over a sample, and a pathological scene (all photons in one caustic, or
         // a single lit texel) shouldn't be allowed to pick an absurd grid.
         r1 = std::min(std::max(r1, r0 / 64.0), r0 * 4.0);
-        // Hard memory guard: cellStart is one int per cell and cellIndex() is int math, so
-        // the cell count has to stay well inside 2^31 regardless of what the probe wants.
-        // Grow r1 back until the predicted grid fits.
-        {
-            // The probe binning already measured the padded bbox: nx*cellSize etc. is it
-            // (rounded up), so no second pass over 10s of millions of positions is needed.
-            const double ex = nx * cellSize, ey = ny * cellSize, ez = nz * cellSize;
-            // Budget the cell array against the MAP, not against an absolute number: photons
-            // live on surfaces (a 2-D sheet through a 3-D grid), so most cells are empty and
-            // the count runs as (L/r)^3 while the useful occupancy runs as (L/r)^2 — an
-            // absolute cap therefore binds at exactly the large-map sizes this function
-            // exists to serve. 2 cells/photon is 8 B/photon of cellStart against 56 B/photon
-            // of map (~14% overhead), with a floor so small maps can still refine freely.
-            // At the calibrated default this guard never binds; it is here for -pmcount
-            // extremes and for pathological (near-planar, one-caustic) scenes.
-            const double kMaxCells = std::max(1.6e7, 2.0 * (double)photons.size());
-            for (int guard = 0; guard < 64; ++guard) {
-                const double cells = std::ceil(ex / r1) * std::ceil(ey / r1)
-                                   * std::ceil(ez / r1);
-                if (cells <= kMaxCells) break;
-                r1 *= 1.25;
-            }
-        }
+        if (rMax > 0.0 && r1 > rMax) r1 = rMax;   // see the rMax note above
+        // NO MEMORY GUARD ANY MORE (removed 0.199.6). While the lattice was dense, cellStart
+        // held one int per CELL, so a fine radius over a large scene asked for an array that
+        // grew as (L/r)^3 and had to be defended by growing r1 back until the grid fit. That
+        // guard was the binding constraint on every large scene — on gallery_rain it inflated
+        // a requested 0.031 m to 0.094 m, three times too coarse to resolve a caustic — and it
+        // bound hardest exactly where a fine radius was most wanted. The hashed lattice
+        // (pmCellHash) sizes the table from the PHOTON COUNT instead, so r is now free to be
+        // whatever the measured density asks for and the only limit left is the deliberate
+        // two-octave clamp above.
         if (std::abs(r1 / r0 - 1.0) > 0.05) buildGrid(r1);   // else keep the probe binning
         fillCie();
         return radius;
@@ -341,13 +439,16 @@ struct PhotonMap {
         if (photons.empty()) return;
         int ix, iy, iz; cellCoord(p, ix, iy, iz);
         const double r2 = r * r;
+        // No per-axis bounds tests: the lattice is hashed, so an out-of-bbox cell coordinate is
+        // a legal bucket lookup that simply finds no photon within r (or finds an aliased one
+        // and rejects it on distance, below).
         for (int dz = -1; dz <= 1; ++dz) {
-            int cz = iz + dz; if (cz < 0 || cz >= nz) continue;
+            int cz = iz + dz;
             for (int dy = -1; dy <= 1; ++dy) {
-                int cy = iy + dy; if (cy < 0 || cy >= ny) continue;
+                int cy = iy + dy;
                 for (int dx = -1; dx <= 1; ++dx) {
-                    int cx = ix + dx; if (cx < 0 || cx >= nx) continue;
-                    int c = cellIndex(cx, cy, cz);
+                    int cx = ix + dx;
+                    int c = (int)cellIndex(cx, cy, cz);
                     // The reject scan reads ONLY pos[] (see the layout note on PhotonMap):
                     // ~85% of the candidates in this 3x3x3 box fail the test, and for those
                     // the fat payload record is never touched at all.
@@ -360,5 +461,87 @@ struct PhotonMap {
                 }
             }
         }
+    }
+
+    // ------------------------- PER-QUERY ADAPTIVE GATHER RADIUS -------------------------
+    // Returns the radius this particular gather should use: the radius of the smallest disc
+    // around `p` that holds `kGather` photons facing the same way as `n`, capped at `radius`.
+    // `kGather <= 0` returns `radius` unchanged, so every caller is bit-identical when the
+    // feature is off.
+    //
+    // WHY. A single map-wide radius cannot serve a scene whose photon density spans orders of
+    // magnitude, and a CAUSTIC map is exactly that scene: a gem's focused light lands as a thin
+    // filament thousands of times denser than the specular wash covering the rest of the room.
+    // The two-map split (see main.cpp) was supposed to fix this by giving caustics their own
+    // radius — but one radius per MAP is still one radius, and buildAuto's median-density probe
+    // is dominated by the wash, so on gallery_rain the caustic map's chosen radius pinned to
+    // the global map's (0.1775 m) — 5-10x wider than the features it exists to preserve. The
+    // measured consequence: the axicon cap's caustic peaked at 2.9x its own median where the
+    // mode-D reference peaks at 9.7x, i.e. the caustic was still there, still the right colour,
+    // and smeared into a flat pastel wash. Forcing the map-wide radius down instead recovers
+    // the peak (8.1x at r/8) and turns the whole rest of the image into chromatic speckle,
+    // because each sparse-region gather then catches one or two SPECTRAL photons and paints a
+    // random saturated hue. Adapting PER QUERY is the only thing that gets both: the filament
+    // shrinks its own kernel to its own scale, the wash keeps the wide one it needs.
+    //
+    // HOW, in ONE neighbourhood walk. A kNN search would need a heap (and a heap per thread is
+    // exactly what a GPU gather cannot afford), and iterating "count, shrink, recount" costs a
+    // full 3x3x3 walk per iteration. Instead the single walk histograms each candidate's
+    // squared distance into geometric shells t = d^2/r^2 in (2^-(i+1), 2^-i], so the suffix sum
+    // C_i = sum_{j>=i} hist[j] is the population inside radius r*2^(-i/2) — a whole radius
+    // profile from one pass over the same candidates the gather was going to visit anyway.
+    // Take the tightest shell that still holds k, then interpolate inside it under the local
+    // uniform-density assumption (count grows as r^2): r_q^2 = r_i^2 * k / C_i.
+    //
+    // The normal test is applied HERE and not only in the caller's sum, deliberately. Counting
+    // a wall's photons while gathering the floor beside it would shrink the radius for a
+    // population the sum then rejects, and the estimate is divided by pi*r_q^2 either way — so
+    // the mismatch would print a dark seam along every surface junction.
+    static const int kAdaptBins = 16;   // covers r down to r * 2^-8 = r/256
+
+    double adaptiveRadius(const Vec3& p, const Vec3& n) const {
+        if (kGather <= 0.0 || photons.empty() || radius <= 0.0) return radius;
+        int hist[kAdaptBins] = {0};
+        const double r2 = radius * radius;
+        const double invR2 = 1.0 / r2;
+        int ix, iy, iz; cellCoord(p, ix, iy, iz);
+        for (int dz = -1; dz <= 1; ++dz) {
+            const int cz = iz + dz;
+            for (int dy = -1; dy <= 1; ++dy) {
+                const int cy = iy + dy;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int c = (int)cellIndex(ix + dx, cy, cz);
+                    const Vec3* __restrict pp = pos.data();
+                    for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
+                        Vec3 d = p - pp[k];
+                        const double d2 = dot(d, d);
+                        if (d2 > r2) continue;
+                        if (dot(photons[k].n, n) < 0.5) continue;
+                        // Shell index: t in (2^-(i+1), 2^-i] -> i. ilogb(t) is the exponent e
+                        // with t = m*2^e, m in [1,2), so i = -e-1. d2 == 0 lands in the
+                        // innermost shell (ilogb(0) is FP_ILOGB0, clamped below).
+                        const double t = d2 * invR2;
+                        int i = (t > 0.0) ? -std::ilogb(t) - 1 : (kAdaptBins - 1);
+                        if (i < 0) i = 0;
+                        if (i >= kAdaptBins) i = kAdaptBins - 1;
+                        ++hist[i];
+                    }
+                }
+            }
+        }
+        // Largest i (smallest shell) whose cumulative population still reaches k.
+        long long C = 0;
+        for (int i = kAdaptBins - 1; i >= 0; --i) {
+            C += hist[i];
+            if ((double)C >= kGather) {
+                // r_i^2 = r^2 * 2^-i; interpolate to exactly k photons inside it.
+                double rq2 = r2 * std::ldexp(1.0, -i) * (kGather / (double)C);
+                if (rq2 >= r2) return radius;
+                const double rMin = radius * (1.0 / 256.0);
+                double rq = std::sqrt(rq2);
+                return (rq < rMin) ? rMin : rq;
+            }
+        }
+        return radius;   // fewer than k photons in the whole disc — nothing to tighten
     }
 };

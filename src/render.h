@@ -16,12 +16,15 @@
 // counted as energy sinks, so the conservation test stays valid in both modes.
 #pragma once
 #include <cstdint>
+#include <cstdlib>
+#include <atomic>
 #include <algorithm>
 #include <complex>
 #include "scene.h"
 #include "camera.h"
 #include "photonmap.h"
 #include "photonbeams.h"   // view-independent volume cache for mode M (photon beams)
+#include "causticaim.h"    // Jensen projection map: aimed emission for the caustic pass
 #include "medium_stack.h"
 #include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
@@ -31,7 +34,117 @@ struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
 };
 
+// ---- SPECTRAL-FOLD DIAGNOSTICS (temporary; FTRACE_FOLDDIAG=1) --------------------------
+// Attributes every beam that COULD have folded (its medium is achromatic, so the gather-time
+// tail is flat) but did not, to the exact event that retired the path's fold. The question
+// these counters answer is which of two things makes up the residual after 0.255.0: paths
+// that lost the fold to something genuinely chromatic (correct, and only a weighted bundle
+// can help), or surface folds that `foldWorthIt` DECLINED (a tunable guard). Those two land
+// in different rows, so one render separates them.
+enum FoldKill {
+    FK_None = 0,        // still folded when it reached the deposit
+    FK_NeverBorn,       // the path never had a fold to lose
+    FK_ChromaMedium,    // scattered in a medium whose sigma_t/phase is wavelength-dependent
+    FK_GlassAbsorb,     // Beer-Lambert inside a dielectric: beta itself became spectral
+    FK_Grin,            // gradient-index arc: the GEOMETRY is a function of lambda
+    FK_Layered,         // coat: peaked Airy/Fresnel, iridescence is the point
+    FK_Specular,        // dispersive refraction / grating / thin film / fluorescence / hair
+    FK_DeclineTransmit, // DiffuseTransmit: foldWorthIt said the fold would cost variance
+    FK_DeclineDiffuse,  // Diffuse albedo:  foldWorthIt said the fold would cost variance
+    FK_DeclineGlossy,   // Glossy albedo:   foldWorthIt said the fold would cost variance
+    FK_ZeroWeight,      // rho == 0 at the surviving lobe: T would divide by zero
+    FK_COUNT
+};
+inline const char* foldKillName(int k) {
+    static const char* n[FK_COUNT] = {"folded", "never-born", "chroma-medium", "glass-absorb",
+                                      "grin", "layered", "specular", "decline-transmit",
+                                      "decline-diffuse", "decline-glossy", "zero-weight"};
+    return (k >= 0 && k < FK_COUNT) ? n[k] : "?";
+}
+// Set by tracePhoton at each retirement, read by emitBeams at the deposit. Thread-local, so
+// the histogram is the only shared state.
+inline thread_local int g_foldKill = FK_None;
+inline std::atomic<uint64_t> g_foldKillHist[16][FK_COUNT];
+inline bool foldDiagOn() {
+    static const bool on = [] {
+        const char* s = std::getenv("FTRACE_FOLDDIAG");
+        return s && *s && *s != '0';
+    }();
+    return on;
+}
+// FTRACE_FOLDFORCE=1 makes `foldWorthIt` always say yes, so a single render measures how much
+// of the residual the variance guard is responsible for. Diagnostic only — the guard exists
+// because an unguarded fold fireflies on a peaked albedo.
+inline bool foldForceOn() {
+    static const bool on = [] {
+        const char* s = std::getenv("FTRACE_FOLDFORCE");
+        return s && *s && *s != '0';
+    }();
+    return on;
+}
+// FTRACE_NOSURFFOLD=1 makes `foldWorthIt` always say NO, which retires the spectral claim at
+// every surface and so restores the pre-0.255.0 (mode `M`) / pre-0.257.0 (mode `J`) rule
+// exactly. It is the A/B switch the surface fold is measured with: one binary, one seed, one
+// `-spp`, two runs, so the only thing that differs between the two images is the fold itself.
+// Without it the arms have to be two binaries or two `-time` budgets, and a `-time` budget
+// varies the sample count run to run by more than the effect being measured.
+inline bool foldNoSurfOn() {
+    static const bool on = [] {
+        const char* s = std::getenv("FTRACE_NOSURFFOLD");
+        return s && *s && *s != '0';
+    }();
+    return on;
+}
+
 inline double clamp01(double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+
+// ---- IS FOLDING THIS FACTOR WORTH IT? --------------------------------------------------
+//
+// Folding removes the chromatic variance of CIE(lambda_h) but introduces a 1/f(lambda_h)
+// in its place, and for a strongly PEAKED factor — a saturated red wall sampled at a green
+// hero wavelength — that trade is a loss: the surviving photon carries a huge T and turns
+// into a firefly. Both second moments are computable in closed form from the quadrature we
+// already have, so decide by comparing them rather than by a hand-tuned threshold:
+//
+//   unfolded  E[X^2] = E_lam[ f(lam) |CIE(lam)|^2 ]      ~  K * sum_k f_k |F_k|^2
+//   folded    E[Y^2] = E_lam[1/f] * |E_lam[CIE f]|^2     ~ (1/K sum_k 1/f_k)
+//                                                          * | sum_k f_k F_k |^2
+//
+// with F_k = em.foldCie[k] (which already carries the bin's 1/K of the emission mass).
+// For a CONSTANT f, Cauchy-Schwarz makes E[Y^2] <= E[X^2] unconditionally, so a neutral
+// surface always folds — which is the case the artifact lives in.
+//
+// THE VERDICT MUST NOT DEPEND ON lambda_hero. If it did, the fold/no-fold split would
+// correlate with the wavelength and the mixture would stop being unbiased (P(fold) *
+// E[CIE f] != integral over the folded subset). Everything the test reads — the per-bin
+// factors and the emitter's table — is a function of the surface and the emitter alone,
+// never of lambda_h, which is what keeps the estimator exact.
+//
+// A FREE FUNCTION rather than a lambda inside one tracer, because BOTH forward tracers
+// need the identical verdict: `tracePhoton` below (mode M) and `randomWalk` in bdpt.h
+// (mode J's beam pass) deposit into the same `PhotonBeam` records, read back by the same
+// gather. If their fold/no-fold rules could drift apart, two beams in one bank would
+// disagree about what `power`, `cieA` and `wS` mean. One definition is the only way that
+// stays true.
+inline bool foldWorthIt(const Emitter& em, const double* fk, int K) {
+    if (foldNoSurfOn()) return false;      // diagnostics: restore the retire-at-any-surface rule
+    double A = 0.0, invF = 0.0;
+    Vec3 M{0, 0, 0};
+    for (int k = 0; k < K; ++k) {
+        if (!(fk[k] > 0.0)) return false;     // a zero bin makes E[1/f] infinite
+        const Vec3& F = em.foldCie[k];
+        A += fk[k] * (F.x * F.x + F.y * F.y + F.z * F.z);
+        invF += 1.0 / fk[k];
+        M += F * fk[k];
+    }
+    A *= (double)K;
+    const double B = (invF / (double)K) * (M.x * M.x + M.y * M.y + M.z * M.z);
+    // FTRACE_FOLDFORCE (diagnostics): say yes unless the fold is UNDEFINED — the zero bin
+    // above still returns false — so a single render measures how much of the residual
+    // "coloured bars" the variance guard itself is responsible for.
+    if (foldForceOn()) return true;
+    return B <= A;
+}
 
 // Power-cosine lobe around a mirror direction (rough specular), from two CANONICAL
 // uniforms rather than an rng. roughness in [0,1]: 0 -> sharp mirror, 1 -> broad.
@@ -62,6 +175,55 @@ inline Vec3 sampleGlossy(const Vec3& mdir, double roughness, Pcg32& rng) {
     // leave the draw order unspecified and desynchronise the stream.
     double u1 = rng.uniform(), u2 = rng.uniform();
     return glossyDirUV(mdir, roughness, u1, u2);
+}
+
+// --- Caustic classification: what a photon vertex does to a beam of light -------------
+//
+// Mode M splits its deposit into a GLOBAL map and a CAUSTIC map (Jensen's two-map scheme),
+// because the two populations want completely different gather radii: diffuse illumination
+// is smooth and low-density and wants a wide kernel; a caustic is a thin, high-contrast
+// concentration and a kernel sized for the former erases it. Which map a deposit lands in
+// is decided by the path that reached it — the classic L·S⁺·D regular expression, i.e. "at
+// least one FOCUSING vertex and no SCATTERING one since the light".
+//
+// So every non-diffuse interaction is classified into three kinds:
+//
+//   FOCUS    — a deterministic (or near-deterministic) deflection that PRESERVES the beam's
+//              coherence and can therefore concentrate it: refraction through a gem,
+//              a mirror, a thin-film/multilayer interface, a grating order, a beam
+//              splitter, and a glossy lobe tight enough to still focus.
+//   SCATTER  — a wide, memory-destroying redirect. Any focus the beam had is gone, so a
+//              subsequent deposit is ordinary indirect light, not a caustic: a rough glossy
+//              lobe, a fluorescent re-emission (cosine-distributed, and wavelength-shifted
+//              on top), a hair BCSDF, an analog medium collision, and of course any diffuse
+//              vertex.
+//   NEUTRAL  — no deflection at all, so the classification is unchanged either way: a
+//              `filter` gel is a coloured absorber the photon passes straight through.
+//
+// The glossy threshold is the one judgement call; it is kCausticGlossRoughness, and it lives
+// in photonmap.h (with the argument for its value) so that the CUDA translation unit — which
+// does not include this header — reads the SAME number. Two threshold constants would mean a
+// CPU and a GPU render of one scene classify glossy vertices differently and disagree on the
+// image, with no symptom beyond "the GPU looks wrong".
+enum PhotonVertexKind { PV_NEUTRAL = 0, PV_FOCUS = 1, PV_SCATTER = 2 };
+
+inline int photonVertexKind(const Scene& scene, const Material& m, const Hit& h) {
+    switch (m.type) {
+        case MatType::Dielectric:
+        case MatType::Mirror:
+        case MatType::ThinFilm:
+        case MatType::Multilayer:
+        case MatType::Grating:
+        case MatType::HalfMirror:
+            return PV_FOCUS;
+        case MatType::Glossy:
+            return (materialRoughness(scene, m, h) <= kCausticGlossRoughness) ? PV_FOCUS
+                                                                              : PV_SCATTER;
+        case MatType::Filter:
+            return PV_NEUTRAL;                  // straight through: direction untouched
+        default:
+            return PV_SCATTER;                  // Fluorescent, Hair, and the diffuse family
+    }
 }
 
 // --- Fluorescence interaction (shared by the forward tracer and -checkfluoro) --
@@ -359,12 +521,153 @@ struct Renderer {
     // A/B/C, so their splat behaviour is byte-for-byte unchanged.
     PhotonBank* photonDeposit = nullptr;
 
+    // CAUSTIC map deposit (mode M, Jensen's two-map scheme). When non-null, a deposit whose
+    // path matches L·S⁺·D — at least one PV_FOCUS vertex and no PV_SCATTER vertex since the
+    // light, see photonVertexKind above — goes HERE INSTEAD OF `photonDeposit`. The split is
+    // strict, so the two maps partition the deposits and the gather is their plain sum: no
+    // photon is counted twice and none is dropped. Null (the pre-0.199.7 behaviour) puts
+    // everything in the global map, which is what mode S and any caller that does not want
+    // the split get.
+    PhotonBank* causticDeposit = nullptr;
+
+    // ---- DEDICATED CAUSTIC PASS (Jensen's projection map; see causticaim.h) --------------
+    // Non-null enables aimed emission and the balance-heuristic weighting that pairs with it.
+    // Bound on BOTH passes: the main pass needs it to down-weight the caustic deposits the
+    // aimed pass is also making, and it changes nothing else about the main pass (a photon
+    // that lands nowhere near focusing geometry has rho = 0 and weight exactly 1).
+    const caim::AimMap* aimMap = nullptr;
+    // True only in the dedicated caustic pass: emission is drawn from the aim map instead of
+    // from the emitter's own distribution. Costs the main pass no RNG draws at all, so a
+    // render with the feature bound but the pass switched off stays bit-identical.
+    bool aimEmission = false;
+    // N_c / N_m — the caustic pass's photon count over the main pass's. The balance
+    // heuristic's only free parameter, and it is not free: it is exactly the ratio the two
+    // passes were actually run at.
+    double aimMisRatio = 0.0;
+    // Caustic-deposit weight for the photon currently being traced, w(x) in causticaim.h.
+    // Mutable because every tracer here is const and this is per-photon scratch, exactly
+    // like the RNG the callers thread through.
+    mutable double causticW = 1.0;
+    // Cross media STRAIGHT without storing beams. The caustic pass must transport photons by
+    // the same rules as the main pass or the two are not estimating the same integrand and
+    // the MIS combination is meaningless — and with `-beams` the main pass crosses media
+    // straight. It must not store beams though: the beam map is the main pass's, normalised
+    // by the main pass's nEmitted.
+    bool beamStraightOnly = false;
+
     // Append a photon record at a diffuse/translucent vertex (no-op when the map is off).
     // The photon's incident direction is deliberately NOT stored: the density estimate is
     // Lambertian, so no gather has ever read it (see Photon in photonmap.h).
-    void depositPhoton(const Vec3& p, const Vec3& n, double lambda, double beta) const {
-        if (!photonDeposit) return;
-        photonDeposit->push(p, n, (float)beta, (float)lambda);
+    // `caustic` routes the record to the caustic bank when one is bound (see above), and
+    // applies this photon's caustic MIS weight — 1.0 unless a dedicated caustic pass is
+    // running alongside, in which case the two passes share the deposit between them.
+    void depositPhoton(const Vec3& p, const Vec3& n, double lambda, double beta,
+                       bool caustic = false) const {
+        PhotonBank* bank = (caustic && causticDeposit) ? causticDeposit : photonDeposit;
+        if (!bank) return;
+        if (bank == causticDeposit && causticW != 1.0) {
+            beta *= causticW;
+            if (!(beta > 0.0)) return;
+        }
+        bank->push(p, n, (float)beta, (float)lambda);
+    }
+
+    // ---- Aimed emission + caustic MIS weight -------------------------------------------
+    // Called once per photon, straight after the ordinary emission sample has been drawn.
+    // In the MAIN pass it only *measures* that sample — computing rho = p_a/p_u and storing
+    // the balance-heuristic weight in `causticW` — and draws no randomness, so the main
+    // pass's photon set is untouched. In the AIMED pass it additionally RESAMPLES the half
+    // of the emission the target actually constrains (the upstream disc point for a distant
+    // emitter, the direction for a local one), overwriting `origin` / `dir` / `spotW`.
+    //
+    // `em == nullptr` means a volumetric blackbody birth: an isotropic direction from a point
+    // inside the fire, which is the cone case with p_u = 1/(4*pi).
+    //
+    // Returns false when the sample carries no light — an aimed direction outside a spot's
+    // outer cone, below an area emitter's horizon, or outside the upstream disc that IS a
+    // distant emitter's entire phase space. Those are not rejections that need compensating:
+    // p_u is genuinely zero there, so the contribution being discarded is zero.
+    bool applyCausticAim(const Scene& scene, const Emitter* em, Vec3& origin, Vec3& dir,
+                         const Vec3& emitN, double& spotW, Pcg32& rng) const {
+        causticW = 1.0;
+        if (!aimMap || aimMap->empty()) return true;
+        // rho = p_a/p_u. The default is 1, not 0: an emitter that CANNOT be aimed (a
+        // collimated one — its direction is a delta) is emitted by the caustic pass with the
+        // ordinary sampler, so there the two strategies are identical and rho is exactly 1.
+        // The balance heuristic then degenerates to splitting the deposit between two equal
+        // passes, which is still exact.
+        double rho = 1.0;
+        const bool distant = em && (em->shape == EmitterShape::Env ||
+                                    em->shape == EmitterShape::Sun);
+        const bool collimated = em && em->collimated && !distant;
+        if (collimated) {
+            // nothing to aim: rho stays 1
+        } else if (distant) {
+            // --- upstream origin disc -------------------------------------------------
+            Vec3 t, b; onb(dir, t, b);
+            const Vec3 base = scene.sceneCenter - dir * scene.sceneRadius;
+            const caim::DiscAim da = caim::discAim(*aimMap);
+            if (!(da.sumR2 > 0.0)) return true;
+            double x, y;
+            if (aimEmission) {
+                if (!caim::discSample(*aimMap, da, scene.sceneCenter, t, b,
+                                      rng.uniform(), rng.uniform(), rng.uniform(), x, y))
+                    return true;
+                origin = base + t * x + b * y;
+            } else {
+                const Vec3 off = origin - base;
+                x = dot(off, t); y = dot(off, b);
+            }
+            const double R = scene.sceneRadius;
+            if (x * x + y * y > R * R) {
+                // Outside the disc the emitter delivers nothing at all, so p_u = 0 and the
+                // whole contribution is zero — not a lost sample, a zero one. (Reachable
+                // only from the aimed pass, and only when a target's bounding sphere pokes
+                // marginally past the scene's own.)
+                return !aimEmission;
+            }
+            int n = caim::discCount(*aimMap, scene.sceneCenter, t, b, x, y);
+            if (aimEmission && n < 1) n = 1;   // we drew it from a disc, so it is in one
+            rho = (double)n * R * R / da.sumR2;
+        } else {
+            // --- direction cone -------------------------------------------------------
+            const caim::ConeAim ca = caim::coneAim(*aimMap, origin);
+            if (!(ca.sumOmega > 0.0)) return true;
+            if (aimEmission) {
+                Vec3 w;
+                if (!caim::coneSample(*aimMap, ca, origin,
+                                      rng.uniform(), rng.uniform(), rng.uniform(), w))
+                    return true;
+                dir = w;
+                if (em && em->shape == EmitterShape::Spot) {
+                    const double ct = dot(dir, em->beamDir);
+                    if (ct <= em->spotCosOuter) return false;     // outside the cone: p_u = 0
+                    const double omegaOuter = 2.0 * PI * (1.0 - em->spotCosOuter);
+                    spotW = spotFalloff(ct, em->spotCosInner, em->spotCosOuter)
+                          * omegaOuter / em->spotOmega;
+                } else if (em && dot(dir, emitN) <= 0.0) {
+                    return false;                                 // below the horizon: p_u = 0
+                }
+            }
+            double pu;
+            if (em && em->shape == EmitterShape::Spot) {
+                const double ct = dot(dir, em->beamDir);
+                pu = (ct > em->spotCosOuter) ? 1.0 / (2.0 * PI * (1.0 - em->spotCosOuter)) : 0.0;
+            } else if (em) {
+                const double c = dot(dir, emitN);
+                pu = (c > 0.0) ? c / PI : 0.0;                    // cosine hemisphere
+            } else {
+                pu = 1.0 / (4.0 * PI);                            // isotropic volumetric birth
+            }
+            if (!(pu > 0.0)) return !aimEmission;
+            int n = caim::coneCount(*aimMap, origin, dir);
+            if (aimEmission && n < 1) n = 1;
+            rho = ((double)n / ca.sumOmega) / pu;
+        }
+        // Balance heuristic: w = N_m p_u / (N_m p_u + N_c p_a). See causticaim.h for why the
+        // SAME weight is right for a photon from either pass.
+        causticW = 1.0 / (1.0 + aimMisRatio * rho);
+        return true;
     }
 
     // Photon-BEAM deposit (mode M with -beams). The surface map above cannot represent a
@@ -375,6 +678,34 @@ struct Renderer {
     // any camera can later gather from. See photonbeams.h for the estimator and for why the
     // segment — not a point — is the right record. Null in every other mode.
     BeamBank* beamDeposit = nullptr;
+
+    // SPECTRAL BEAMS (CLI -beamspec N). How many stratified wavelengths one deposited beam
+    // carries. 1 = the classic monochromatic beam, bit-for-bit. See the long note above
+    // PhotonBeam (photonbeams.h) for why a monochromatic LINE is so much worse than a
+    // monochromatic point, and Renderer::tracePhoton for the (deliberately conservative)
+    // rule that keeps a bundle alive only while the path is provably wavelength-independent.
+    // The driver sets this to 1 for any scene whose media have chromatic extinction, since a
+    // bundle's shared transmittance would then be wrong for its secondaries.
+    int beamSpecC = 1;
+
+    // ACHROMATIC-PATH BEAMS (CLI -beamachro, photonbeams.h). Scene-wide permission for the
+    // mean-CIE fold: every medium's extinction is wavelength-independent, so a free flight
+    // samples the same distance for every wavelength and the path's GEOMETRY — not merely its
+    // colour — is lambda-invariant. Same predicate the driver applies to beamSpecC above, but
+    // kept separately because this fold needs no `-beamspec > 1`: it stores no extra
+    // wavelengths, so a `-beamspec 1` render gets it too. Set by the driver, not per photon
+    // (beamSpectralOK scans every medium's spectra and must not run inside the trace).
+    bool beamAchroOK = false;
+
+    // The SAME scene-wide predicate, stated positively and independently of either CLI flag,
+    // for the one caller that needs it when both are off: bdpt.h's light-beam pass. Mode J
+    // draws lambda from the scene-wide emitSampler rather than from the chosen emitter's own
+    // SPD, so before it can deposit a beam at all it has to convert its beta into the one
+    // render.h's photon would have carried (bdpt.h, BeamSpectral) -- and that conversion rests
+    // on the same claim these two flags rest on, that no free flight in this scene depends on
+    // lambda. Mode M has no use for it: its photon is already born at the right density, so it
+    // reads the predicate through `beamSpecC > 1` / `beamAchroOK` and never needs it alone.
+    bool beamSpecOK = false;
 
     // Longest beam we will store when the photon escapes to infinity through an UNBOUNDED
     // medium, as a multiple of the scene radius. An unbounded medium clips to [0, 1e30], and
@@ -396,20 +727,79 @@ struct Renderer {
     // These cover the homogeneous, bounded-homogeneous, and heterogeneous (density-
     // field) media in one place. A homogeneous medium keeps the exact analytic
     // behaviour and draws exactly the same RNG as before (bit-identical to the
-    // pre-heterogeneous engine); a density field switches to delta / ratio tracking
-    // with the majorant sigma_max = sigmaT(lambda) * densityMax.
+    // pre-heterogeneous engine); a density field switches to delta / residual-ratio
+    // tracking against the per-cell majorant grid (majorant.h) when the medium has one,
+    // and to the single global majorant sigma_max = sigmaT(lambda) * densityMax when it
+    // does not (an unbounded density field).
+    //
+    // WALKING THE MAJORANT GRID. Both estimators below step the ray cell by cell with a
+    // 3D DDA and run their per-cell tracking loop over [tEnter, tExit] with THAT cell's
+    // coefficients. The two share `majorantWalk`, which calls `body(cellIndex, t0, t1)`
+    // for each cell the segment crosses and stops early when the body returns false. The
+    // walk is in the grid's own AABB, which is the medium bound's AABB, so `clipToBounds`
+    // has already trimmed the segment to it — but a ray can still start on/outside a face
+    // by an epsilon, so the entry cell is clamped rather than assumed in range.
+    template <class Body>
+    static void majorantWalk(const MajorantGrid& g, const Vec3& o, const Vec3& dir,
+                             double ta, double tb, Body&& body) {
+        auto cellOf = [&](double t, int a[3]) {
+            Vec3 p = o + dir * t;
+            double f[3] = {(p.x - g.wmin.x) * g.invCell.x,
+                           (p.y - g.wmin.y) * g.invCell.y,
+                           (p.z - g.wmin.z) * g.invCell.z};
+            int n[3] = {g.nx, g.ny, g.nz};
+            for (int k = 0; k < 3; ++k) {
+                int i = (int)std::floor(f[k]);
+                a[k] = i < 0 ? 0 : (i >= n[k] ? n[k] - 1 : i);
+            }
+        };
+        int c[3]; cellOf(ta, c);
+        const double d[3] = {dir.x, dir.y, dir.z};
+        const double cs[3] = {g.cell.x, g.cell.y, g.cell.z};
+        const double lo[3] = {g.wmin.x, g.wmin.y, g.wmin.z};
+        const int    nn[3] = {g.nx, g.ny, g.nz};
+        int step[3]; double tNext[3], tDelta[3];
+        for (int k = 0; k < 3; ++k) {
+            if (d[k] > 1e-12) {
+                step[k] = 1;
+                tNext[k] = (lo[k] + (c[k] + 1) * cs[k] - (k == 0 ? o.x : k == 1 ? o.y : o.z)) / d[k];
+                tDelta[k] = cs[k] / d[k];
+            } else if (d[k] < -1e-12) {
+                step[k] = -1;
+                tNext[k] = (lo[k] + c[k] * cs[k] - (k == 0 ? o.x : k == 1 ? o.y : o.z)) / d[k];
+                tDelta[k] = -cs[k] / d[k];
+            } else {
+                step[k] = 0; tNext[k] = 1e300; tDelta[k] = 1e300;
+            }
+        }
+        double t0 = ta;
+        for (;;) {
+            int axis = (tNext[0] < tNext[1]) ? ((tNext[0] < tNext[2]) ? 0 : 2)
+                                             : ((tNext[1] < tNext[2]) ? 1 : 2);
+            double t1 = std::min(tNext[axis], tb);
+            if (t1 > t0 && !body(g.idx(c[0], c[1], c[2]), t0, t1)) return;
+            if (t1 >= tb) return;
+            t0 = t1;
+            c[axis] += step[axis];
+            if (c[axis] < 0 || c[axis] >= nn[axis]) return;   // left the grid
+            tNext[axis] += tDelta[axis];
+        }
+    }
 
     // Sample the next real collision along (o,dir) within [0,dMax]. Returns true and
     // sets tHit at a real scattering/absorption event; false if the photon reaches
     // dMax first. Delta (Woodcock) tracking for a heterogeneous medium: candidate
     // collisions at rate sigma_max, accepted as real with prob sigmaT(x)/sigma_max
     // (a rejected "null collision" just continues) — unbiased, throughput unchanged.
+    // The majorant may be ANY upper bound on the local extinction, so the per-cell sup
+    // (ctrl + res) is used where a grid exists: same answer, far fewer null collisions,
+    // and a vacuum cell is skipped outright with no RNG draw at all.
     // `tabs` are the scene's grid:/scatter: tables, required (not defaulted) so a
     // density program that samples a measured volume can never be silently evaluated
     // without them — the two wrappers below are the only callers and both have a Scene.
-    bool sampleMediumCollision(const Medium& med, const Vec3& o, const Vec3& dir,
-                               double dMax, double lambda, Pcg32& rng, double& tHit,
-                               const PatTables* tabs) const {
+    static bool sampleMediumCollision(const Medium& med, const Vec3& o, const Vec3& dir,
+                                      double dMax, double lambda, Pcg32& rng, double& tHit,
+                                      const PatTables* tabs) {
         double stBase = med.sigmaT(lambda);
         if (stBase <= 0.0) return false;
         double ta, tb;
@@ -418,6 +808,22 @@ struct Renderer {
             double t = ta - std::log(1.0 - rng.uniformOpen()) / stBase;
             if (t < tb) { tHit = t; return true; }
             return false;
+        }
+        if (med.majorant && med.majorant->valid()) {
+            const MajorantGrid& g = *med.majorant;
+            bool hit = false;
+            majorantWalk(g, o, dir, ta, tb, [&](size_t ci, double t0, double t1) {
+                double sigMax = stBase * ((double)g.ctrl[ci] + (double)g.res[ci]);
+                if (sigMax <= 0.0) return true;           // vacuum cell: skip, no RNG draw
+                double t = t0;
+                for (;;) {
+                    t += -std::log(1.0 - rng.uniformOpen()) / sigMax;
+                    if (t >= t1) return true;
+                    double sigT = stBase * med.densityAt(o + dir * t, tabs);
+                    if (rng.uniform() * sigMax < sigT) { tHit = t; hit = true; return false; }
+                }
+            });
+            return hit;
         }
         double sigMax = stBase * med.densityMax;
         if (sigMax <= 0.0) return false;
@@ -431,17 +837,46 @@ struct Renderer {
     }
 
     // Unbiased transmittance along [o, o+dir*dist] through the medium. Exact exp for a
-    // homogeneous medium (clipped to its bound); ratio tracking otherwise (candidate
-    // collisions at rate sigma_max, each scaling the estimate by 1 - sigmaT(x)/sigma_max).
-    double mediumTransmittance(const Medium& med, const Vec3& o, const Vec3& dir,
-                               double dist, double lambda, Pcg32& rng,
-                               const PatTables* tabs) const {
+    // homogeneous medium (clipped to its bound); RESIDUAL ratio tracking against the
+    // per-cell majorant grid otherwise, falling back to plain ratio tracking against the
+    // global majorant when the medium has no grid.
+    //
+    // Residual ratio tracking (Novak et al. 2014) splits each cell's extinction into a
+    // constant CONTROL term integrated analytically and a residual tracked stochastically:
+    //     Tr_cell = exp(-sigma_c * L) * PROD (1 - (sigma(x_i) - sigma_c)/sigma_r)
+    // with candidates at rate sigma_r >= sup|sigma - sigma_c| over the cell. The residual
+    // factors sit near 1 instead of near 0, which is the whole difference between an
+    // optically thick volume converging and not — see majorant.h for the measured
+    // variance reduction (~1100x at tau = 8). Note the factors may exceed 1 (the residual
+    // is signed); that is correct and is what keeps the estimator unbiased.
+    static double mediumTransmittance(const Medium& med, const Vec3& o, const Vec3& dir,
+                                      double dist, double lambda, Pcg32& rng,
+                                      const PatTables* tabs) {
         double stBase = med.sigmaT(lambda);
         if (stBase <= 0.0) return 1.0;
         double ta, tb;
         if (!med.clipToBounds(o, dir, 0.0, dist, ta, tb)) return 1.0;   // ray never enters fog
         if (!med.heterogeneous())
             return std::exp(-stBase * (tb - ta));
+        if (med.majorant && med.majorant->valid()) {
+            const MajorantGrid& g = *med.majorant;
+            double Tr = 1.0;
+            majorantWalk(g, o, dir, ta, tb, [&](size_t ci, double t0, double t1) {
+                const double sigC = stBase * (double)g.ctrl[ci];
+                const double sigR = stBase * (double)g.res[ci];
+                if (sigC > 0.0) Tr *= std::exp(-sigC * (t1 - t0));       // control, analytic
+                if (sigR <= 0.0) return Tr > 0.0;                        // uniform cell: exact
+                double t = t0;
+                for (;;) {
+                    t += -std::log(1.0 - rng.uniformOpen()) / sigR;
+                    if (t >= t1) return true;
+                    double sigT = stBase * med.densityAt(o + dir * t, tabs);
+                    Tr *= 1.0 - (sigT - sigC) / sigR;
+                    if (Tr == 0.0) return false;
+                }
+            });
+            return Tr > 0.0 ? Tr : 0.0;
+        }
         double sigMax = stBase * med.densityMax;
         if (sigMax <= 0.0) return 1.0;
         double Tr = 1.0, t = ta;
@@ -496,9 +931,9 @@ struct Renderer {
     // sample the scene's `grid:`/`scatter:` tables (`density "grid:rho(x, y, z)"`), which
     // live beside the media in the Scene. Deriving the tables here means no caller can
     // forget to pass them — and every caller already had the Scene in hand.
-    bool sampleMediaCollision(const Scene& scene, const Vec3& o,
-                              const Vec3& dir, double dMax, double lambda, Pcg32& rng,
-                              double& tHit, int& whichMed, MedFilter filt = MedAll) const {
+    static bool sampleMediaCollision(const Scene& scene, const Vec3& o,
+                                     const Vec3& dir, double dMax, double lambda, Pcg32& rng,
+                                     double& tHit, int& whichMed, MedFilter filt = MedAll) {
         const std::vector<Medium>& media = scene.media;
         const PatTables tabs = scene.patTables();
         double best = dMax; int which = -1;
@@ -514,9 +949,9 @@ struct Renderer {
     }
 
     // Combined transmittance through all media = product of per-medium transmittances.
-    double mediaTransmittance(const Scene& scene, const Vec3& o,
-                              const Vec3& dir, double dist, double lambda, Pcg32& rng,
-                              MedFilter filt = MedAll) const {
+    static double mediaTransmittance(const Scene& scene, const Vec3& o,
+                                     const Vec3& dir, double dist, double lambda, Pcg32& rng,
+                                     MedFilter filt = MedAll) {
         const PatTables tabs = scene.patTables();   // see sampleMediaCollision
         double Tr = 1.0;
         for (const Medium& m : scene.media) {
@@ -547,16 +982,37 @@ struct Renderer {
     // the analog collision, so applying it again here would double-count. Under MULTIPLE
     // scatter nothing is carried stochastically (the beam runs the whole chord to the surface
     // and the gather integrates Tr analytically), so every medium must be charged: MedAll.
+    //
+    // `lamS`/`nSec` are the photon's live SPECTRAL BUNDLE — extra stratified wavelengths that
+    // this same chord also carries (photonbeams.h), and `specW` their relative throughputs
+    // T(lamS[i])/T(lambda). They ride along untouched: the chord's GEOMETRY and its
+    // transmittance are wavelength-independent wherever the bundle is still alive, which is
+    // exactly the condition tracePhoton maintains; only the members' accumulated spectral
+    // weights may differ, and that is what `specW` carries.
+    // `order` = medium scattering order of this chord, 1 = single scatter. REQUIRED, not
+    // defaulted -- see BeamBank::push. Pass `kBeamOrderUnknown` if the caller genuinely does
+    // not track it, so the gap is explicit at the call site instead of invisible.
     void emitBeams(const Scene& scene, const Vec3& o, const Vec3& dir, double dLen,
-                   double lambda, double beta, double aGlass, Pcg32& rng,
-                   MedFilter offFilt = MedStraight) const {
+                   double lambda, double beta, double aGlass, Pcg32& rng, int order,
+                   MedFilter offFilt = MedStraight,
+                   const double* lamS = nullptr, int nSec = 0,
+                   const Vec3* achroCie = nullptr, int foldEmIdx = -1,
+                   const double* specW = nullptr) const {
         if (!beamDeposit || !(beta > 0.0)) return;
         // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
         // 1e30-long box (see kBeamFarScale).
         // (named `farLimit`, not `far`: `far` is a legacy Windows SDK keyword macro)
+        //
+        // Applied PER MEDIUM, and only to the unbounded ones. A bounded medium already hands
+        // `clipToBounds` a finite exit, so the clamp can only ever cut a beam SHORT of the
+        // region it is supposed to fill — which is what it did on `scenes/_slab_ss.ftsl`: the
+        // clamp is a multiple of `sceneRadius`, and until this was fixed alongside it
+        // sceneRadius did not count media at all, so a big fog box lit by a small emitter
+        // truncated every beam to a stub. Clamping the whole call up front also meant one
+        // unbounded haze could shorten the beams of an unrelated bounded cloud it happened to
+        // overlap. (Device twin: dEmitBeams in render_cuda.cu.)
         const double farLimit = kBeamFarScale * std::max(scene.sceneRadius, 1e-3);
-        const double dBeam = std::min(dLen, farLimit);
-        if (!(dBeam > 0.0)) return;
+        if (!(dLen > 0.0)) return;
         const double keep = beamDeposit->keepProb;
         for (int i = 0; i < (int)scene.media.size(); ++i) {
             const Medium& md = scene.media[i];
@@ -568,6 +1024,7 @@ struct Renderer {
             // photon has no segment to store.
             if (md.grin()) continue;
             double ta, tb;
+            const double dBeam = md.bounded ? dLen : std::min(dLen, farLimit);
             if (!md.clipToBounds(o, dir, 0.0, dBeam, ta, tb)) continue;
             if (!(tb > ta)) continue;
             // Russian roulette on the beam count (photonbeams.h): a beam lights a whole
@@ -585,7 +1042,37 @@ struct Renderer {
             // GRIN transmittance to s. Applying it here as well would count it twice.
             if (ta > 0.0) p *= mediaTransmittance(scene, o, dir, ta, lambda, rng, offFilt);
             if (!(p > 0.0)) continue;
-            beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i);
+            // ACHROMATIC-PATH FOLD, decided per DEPOSITED BEAM, because its two halves live in
+            // different places: the PATH being wavelength-independent is a property of the
+            // photon (the caller's `achroPath`), while the gather-time tail being flat is a
+            // property of THIS medium. A photon crossing gallery_rain's achromatic cloud and
+            // its `phase rainbow` rain curtain in one step deposits one beam of each kind, and
+            // only the cloud's may fold. (Device twin: dEmitBeams in render_cuda.cu.)
+            const double ca[3] = {achroCie ? achroCie->x : 0.0,
+                                  achroCie ? achroCie->y : 0.0,
+                                  achroCie ? achroCie->z : 0.0};
+            const bool useAchro = achroCie && mediumAchromatic(md);
+            // GATHER-TIME FOLD (scene.h, Scene::BowLut). The medium's coefficients are flat but
+            // its phase is a rainbow table, so `useAchro` above correctly refused the fold — the
+            // colour is not decidable without the scattering angle. It IS decidable at gather
+            // time, from a per-(emitter, medium) table, provided the path carried no spectral
+            // weight of its own (`foldEmIdx >= 0` is the caller's assertion that T == 1). This
+            // is what stops a rain curtain being drawn as saturated single-wavelength streaks.
+            const int bowEm = (!useAchro && achroCie && foldEmIdx >= 0 &&
+                               scene.bowLut(foldEmIdx, i)) ? foldEmIdx : -1;
+            // Fold diagnostics. Row FK_None counts the beams whose PATH was still
+            // wavelength-independent at the deposit; the rest attribute the ones that were not
+            // to the event that retired them. Deliberately keyed off `achroCie`, NOT
+            // `useAchro`: in a CHROMATIC medium the path can be perfectly foldable and still
+            // be refused, because it is the medium's gather-time tail that is not flat. That
+            // gap is exactly the population a gather-time fold would serve, so it has to be
+            // visible rather than hidden behind the same zero as a genuinely divergent path.
+            if (foldDiagOn() && i < 16)
+                g_foldKillHist[i][achroCie ? FK_None : g_foldKill].fetch_add(
+                    1, std::memory_order_relaxed);
+            beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i, order,
+                              lamS, nSec, (useAchro || bowEm >= 0) ? ca : nullptr, bowEm,
+                              specW);
         }
     }
 
@@ -626,7 +1113,8 @@ struct Renderer {
             if (!cam.project(p, g.px, g.py, cosCamH, dist2H)) return false;
             const double off = hairExitOffset(*hs, n, g.wdir);
             if (off >= g.dist) return false;
-            if (scene.occluded(p + g.wdir * off, g.wdir, g.dist - off - 1e-6)) return false;
+            if (scene.occluded(p + g.wdir * off, g.wdir, g.dist - off - 1e-6, 1e-6,
+                               /*camLeg=*/true)) return false;
             g.denom = dist2H * cam.pixelSolidAngle(cosCamH);
             return true;
         }
@@ -642,7 +1130,7 @@ struct Renderer {
         if (g.stG <= 0.0) return false;                 // camera behind true geometry: hard cutoff
         double cosCam, dist2;
         if (!cam.project(p, g.px, g.py, cosCam, dist2)) return false;
-        if (scene.occluded(p + ng * 1e-6, g.wdir, g.dist - 2e-6)) return false;
+        if (scene.occluded(p + ng * 1e-6, g.wdir, g.dist - 2e-6, 1e-6, /*camLeg=*/true)) return false;
         double omega = cam.pixelSolidAngle(cosCam);
         // Veach shading-normal adjoint correction for this particle connection
         // (wi = toward the previous/light-side vertex, wo = wdir toward the camera).
@@ -707,7 +1195,7 @@ struct Renderer {
         Vec3 wdir = toCam / dist;
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
 
         double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
@@ -762,7 +1250,8 @@ struct Renderer {
         if (!cam.lensImage(A, wdir, px, py)) return;
         const double off = hs ? hairExitOffset(*hs, n, wdir) : 1e-6;
         if (off >= dist) return;
-        if (scene.occluded(p + (hs ? wdir : ng) * off, wdir, dist - off - 1e-6)) return;
+        if (scene.occluded(p + (hs ? wdir : ng) * off, wdir, dist - off - 1e-6, 1e-6,
+                           /*camLeg=*/true)) return;
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
         // cosSurf carries the Veach shading-normal adjoint correction (see connect()).
@@ -815,7 +1304,7 @@ struct Renderer {
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
         double corr = shadingAdjointCorr(wi, wdir, n, ng);
         double cellNorm = 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         for (int i = 0; i < nUp; ++i) {
@@ -845,7 +1334,7 @@ struct Renderer {
         if (cosLens <= 1e-6) return;
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
 
         double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
@@ -873,7 +1362,7 @@ struct Renderer {
         Vec3 wdir = toCam / dist;
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
         double omega = cam.pixelSolidAngle(cosCam);
         double contrib = beta * (1.0 / (4.0 * PI)) / (dist2 * omega);
         contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
@@ -897,7 +1386,7 @@ struct Renderer {
         if (cosLens <= 1e-6) return;
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
         double contrib = beta * (1.0 / (4.0 * PI)) * cosLens * (PI * R * R) / (dist * dist);
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
@@ -1196,7 +1685,7 @@ struct Renderer {
             // surface is excluded by shortening maxDist just short of the endpoint).
             if (scene.occluded(p + wP * 1e-6, wP, dP2 - 2e-6)) continue;
             Vec3 wE = eye - ch.P1; double dE = length(wE); wE = wE * (1.0 / dE);
-            if (scene.occluded(ch.P1 + wE * 1e-6, wE, dE - 2e-6)) continue;
+            if (scene.occluded(ch.P1 + wE * 1e-6, wE, dE - 2e-6, 1e-6, /*camLeg=*/true)) continue;
 
             // Fog transmittance on the two outer (vacuum-side) segments only; the
             // interior segment is solid glass (its absorption is the Beer-Lambert above).
@@ -1417,7 +1906,11 @@ struct Renderer {
     // the exact texel/pattern value the surface has there.
     static bool mirrorSeenAt(const Scene& scene, const Vec3& eye, const Vec3& wE,
                              double dE, Hit& hm) {
-        hm = scene.closestHit(Ray{eye, wE});
+        // This leg starts AT THE EYE, so it is a camera ray and a `hide_camera` flat must
+        // not answer either of the two questions it asks — it is neither the mirror nor a
+        // legitimate blocker of the view. See Material::hideCamera.
+        hm = scene.closestHit(Ray{eye, wE}, 1e-6, nullptr, /*skipHair=*/false,
+                              /*skipCamHidden=*/true);
         if (!hm.valid) return false;
         if (std::fabs(hm.t - dE) > 1e-4 * (1.0 + dE)) return false;   // something in front
         if (hm.matId < 0 || hm.matId >= (int)scene.mats.size()) return false;
@@ -1946,6 +2439,71 @@ struct Renderer {
         if (grandTotal <= 0.0) return;
         Vec3 origin, dir;
         double lambda, beta;
+        // SPECTRAL BEAM BUNDLE (photonbeams.h). The extra stratified wavelengths this photon's
+        // beam deposits will carry alongside `lambda`, and how many are still live. Filled at
+        // birth for a plain SPD-sampled emitter, and dropped to zero — collapsing the beam back
+        // to the classic monochromatic record — the instant the path does something the
+        // wavelengths would not SHARE A CHORD through. Untouched (and therefore free) when
+        // beamSpecC == 1.
+        //
+        // `specW[i]` is member i's running spectral weight T(specLam[i]) / T(lambda), i.e.
+        // EXACTLY the quantity `foldT[k]` below carries, on a different grid: the bundle's own
+        // wavelengths instead of the emitter's quadrature bins. Before 0.257.0 there was no such
+        // array and the bundle had to be retired every transport iteration, because a member
+        // whose weight had diverged could not be represented; every site that folds a spectral
+        // factor into `foldT` now folds the same factor into `specW` in the same breath, so the
+        // bundle lives exactly as long as the achromatic-path claim does.
+        double specLam[kBeamSecMax];
+        double specW[kBeamSecMax];
+        int specSec = 0;
+        // ACHROMATIC-PATH STATE (photonbeams.h, ACHROMATIC-PATH BEAMS; device twin:
+        // DBeamSpec::achro/cie). The stronger, longer-lived claim beside the bundle: that
+        // NOTHING on this path has depended on lambda, so the beam may be folded at the
+        // emitter's mean CIE and carry no chromatic noise at all. Unlike `specSec` it is not
+        // retired every step — only by an event that is itself wavelength-dependent, which a
+        // scatter in an achromatic medium is not.
+        Vec3 achroCie{0, 0, 0};
+        bool achroPath = false;
+        // SPECTRAL FOLD (scene.h: kFoldBins, Emitter::foldCie/foldLam/foldN).
+        //
+        // The plain achromatic fold above is all-or-nothing: the instant the path touches
+        // ANYTHING wavelength-dependent the claim dies and the beam reverts to a single noisy
+        // CIE(lambda_hero) sample — which is the streak-painter behind the "coloured bars".
+        // Measurement on gallery_rain: 87.8% of unfolded deposits had lost the fold to a
+        // SURFACE event (a diffuse albedo), 12.2% to a chromatic medium, 0% to anything else.
+        // So the surface case is the whole artifact, and it does not have to be fatal.
+        //
+        // Generalise the fold from E_lam[CIE(lam)] to E_lam[CIE(lam) * T(lam)], where
+        //
+        //     T(lam) = prod_j f_j(lam) / prod_j f_j(lambda_hero)
+        //
+        // is the running ratio of the path's spectral factors at `lam` versus at the hero
+        // wavelength the photon is actually being traced at. `foldT[k]` holds T evaluated at
+        // bin k's representative wavelength `foldEm->foldLam[k]`.
+        //
+        // WHY THAT IS THE RIGHT QUANTITY, and why it is unbiased. A deposited beam's
+        // contribution is CIE(lambda_h) * beta * G, with beta = P_emit * prod f_j(lambda_h) /
+        // prod p_j. Direction pdfs are wavelength-independent on an achromatic path, so the
+        // p_j factor out and the only lambda-dependence left in the whole estimator is
+        // CIE * prod f_j. Replacing CIE(lambda_h) by E_lam[CIE(lam) T(lam)] therefore gives
+        // E_lam[CIE(lam) prod f_j(lam)] * G / prod p_j, which is exactly the spectral integral
+        // the monochromatic estimator only reaches in expectation. T(lambda_h) == 1 by
+        // construction, so a path with no spectral factors folds to sum_k foldCie[k] ==
+        // cieMean and reproduces the old achromatic fold BIT-FOR-BIT.
+        //
+        // The concrete factor at a Lambertian vertex is the albedo, which this tracer applies
+        // as an ANALOG Russian roulette: survive with probability rho(lambda_h), beta
+        // unchanged. Conditional on survival the fold must therefore carry
+        // T_k *= rho(lam_k)/rho(lambda_h), whose expectation over the roulette is
+        // rho(lambda_h) * (rho(lam_k)/rho(lambda_h)) = rho(lam_k) — the value the spectral
+        // integral wants, with the survival lottery cancelled out.
+        //
+        // `foldEm` is the emitter whose quadrature table foldT indexes; foldT is left
+        // UNINITIALISED until the first spectral factor actually arrives (foldChroma), so a
+        // photon that never hits a surface pays nothing for any of this.
+        const Emitter* foldEm = nullptr;
+        double foldT[kFoldBins];
+        bool   foldChroma = false;
         const bool volumeBirth = !scene.emissiveVolumes.empty() &&
                                  (rng.uniform() * grandTotal < scene.totalEmissionPower);
         if (volumeBirth) {
@@ -1982,6 +2540,14 @@ struct Renderer {
             double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
             double phi = 2.0 * PI * rng.uniform();
             dir = Vec3{ sr * std::cos(phi), sr * std::sin(phi), z };
+            // Aimed caustic emission (causticaim.h). A fire birth point is already fixed, so
+            // it is the DIRECTION that gets aimed; p_u for an isotropic birth is 1/(4pi),
+            // which is the `em == nullptr` case. No-op (and no RNG draw) unless an aim map
+            // is bound.
+            {
+                Vec3 emitNv = dir; double spotWv = 1.0;   // unread when em == nullptr
+                if (!applyCausticAim(scene, nullptr, origin, dir, emitNv, spotWv, rng)) return;
+            }
             // Direct-visibility emission splat (the flame seen directly by the camera).
             if (nCam > 0 && !forwardCatch)
                 camSplatEmissionAll(scene, cams, nCam, origin, lambda, beta, rng);
@@ -2060,8 +2626,19 @@ struct Renderer {
             emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         }
+        // Aimed caustic emission (causticaim.h). Placed here, after the shape branch has
+        // produced an ordinary sample and BEFORE `beta *= spotW`, because the aimed pass
+        // resamples the direction and therefore recomputes spotW. In the main pass this
+        // only measures the sample (no RNG draw, so every existing render stays
+        // bit-for-bit) and stores the caustic MIS weight.
+        if (!applyCausticAim(scene, &em, origin, dir, emitN, spotW, rng)) return;
         double pdfL = 0.0;
-        lambda = em.spd.sample(rng, pdfL);
+        // Drawn through sampleAt rather than sample() so the SAME uniform variate can seed the
+        // stratified secondaries below. `sample()` is literally `sampleAt(rng.uniform(), pdf)`,
+        // so this consumes the identical rng draw and returns the identical wavelength — every
+        // existing render stays bit-for-bit.
+        const double uLam = rng.uniform();
+        lambda = em.spd.sampleAt(uLam, pdfL);
         if (pdfL <= 0) return;
         // Single emitter (no fire): beta = its own power (== old lightEmitIntegral*
         // area*PI). Multiple emitters: beta = totalPower. When fire volumes coexist the
@@ -2085,6 +2662,65 @@ struct Renderer {
         // the energy report matches what actually leaves the surface.
         if (emitPatW != 1.0) beta *= emitPatW;
         e.emitted += beta;
+
+        // --- Spectral bundle for the beam deposit (photonbeams.h) --------------------------
+        // Hero policy (1): the C wavelengths come from ONE uniform variate, secondary i taking
+        // `u + i/C` wrapped into [0,1) through the same emission CDF, so the bundle is
+        // stratified over the emitter's own spectrum rather than clumped.
+        //
+        // Every wavelength carries the SAME power, which is why no per-wavelength weight is
+        // stored anywhere. The emission sampler's pdf is p(lam) = spd(lam)/integral, and the
+        // photon's beta is the emitter's total power — i.e. spd(lam)/p(lam) == integral, a
+        // constant. So the C-wavelength estimate is simply beta/C at each of the C
+        // wavelengths, and the beam record needs only the wavelengths themselves.
+        //
+        // An IMAGE environment is excluded because its beta carries the directional factor
+        // L(dir,lam)/(4*pi*pdfW*spd(lam)), which is genuinely per-wavelength; so is a
+        // volumetric blackbody birth, whose beta carries kappa_e(x,lam). Both keep C == 1
+        // rather than being reweighted, which costs those scenes nothing they had before.
+        // ONE PRECONDITION FOR BOTH (0.257.0). The bundle and the achromatic-path fold rest on
+        // the same two facts — that `beta` is wavelength-independent, and that this emitter has
+        // a quadrature table to decide a fold's variance against — so they are decided from one
+        // predicate rather than two that drifted apart. An IMAGE environment fails it because
+        // its beta carries L(dir,lam)/(4*pi*pdfW*spd(lam)); a volumetric blackbody birth never
+        // reaches here at all (it takes the other branch), and its beta carries kappa_e(x,lam).
+        // `foldN > 0` and a non-black cieMean are what make `foldWorthIt` answerable: without a
+        // table the bundle could still be BORN but could never be REWEIGHTED, so it would have
+        // to die at the first spectral factor — which is the pre-0.257.0 behaviour this change
+        // exists to remove. Refusing it up front keeps one rule instead of two.
+        const bool specBirthOK = beamDeposit && em.foldN > 0 &&
+                                 !(em.shape == EmitterShape::Env && scene.envMap) &&
+                                 (em.cieMean.x > 0.0 || em.cieMean.y > 0.0 || em.cieMean.z > 0.0);
+        // The emitter whose quadrature table `foldT` indexes and whose bins `foldWorthIt`
+        // reads. Set for EITHER consumer, not just the achromatic one: `-beamachro off
+        // -beamspec 4` is a supported combination and its bundle needs the same table.
+        if (specBirthOK) foldEm = &em;
+        if (beamSpecC > 1 && specBirthOK) {
+            const int C = (beamSpecC > kBeamSpecMax) ? kBeamSpecMax : beamSpecC;
+            for (int i = 1; i < C; ++i) {
+                double uu = uLam + (double)i / (double)C;
+                if (uu >= 1.0) uu -= 1.0;
+                double pI = 0.0;
+                const double lI = em.spd.sampleAt(uu, pI);
+                // A zero-density secondary would have to be given weight 0 while the survivors
+                // kept 1/C, so drop the WHOLE bundle instead of renormalising over the
+                // survivors, which would over-count them. (`wS` could express the zero, but the
+                // member would then contribute nothing while still consuming one of the C
+                // shares of the chord's power — a silent energy loss, not a reweighting.
+                // Inverting a CDF at a uniform variate cannot land in a zero-mass bin, so this
+                // is a guard, not a path.)
+                if (!(pI > 0.0)) { specSec = 0; break; }
+                specW[specSec] = 1.0;   // relative to the hero, which starts at parity
+                specLam[specSec++] = lI;
+            }
+        }
+        // ACHROMATIC-PATH STATE at birth. Same precondition, minus the `-beamspec` count —
+        // this fold stores no extra wavelengths, so it applies at `-beamspec 1`.
+        if (beamAchroOK && specBirthOK) {
+            achroCie = em.cieMean;
+            achroPath = true;
+        }
+        g_foldKill = achroPath ? FK_None : FK_NeverBorn;   // fold diagnostics
 
         // Direct light -> camera: makes the source itself visible. The Lambertian
         // emitter term is 1/pi, i.e. connect() with rho=1 using the light normal.
@@ -2112,6 +2748,57 @@ struct Renderer {
             return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
         };
 
+        // --- SPECTRAL FOLD helpers (see the foldT declaration above) ------------------------
+        //
+        // The verdict itself is `foldWorthIt(*foldEm, fk, K)`, a free function at the top of
+        // this header — bdpt.h's randomWalk deposits into the same beam bank and must reach
+        // exactly the same decision, so there is one definition rather than one per tracer.
+        //
+        // Multiply the per-bin ratios f(lam_k)/f(lambda_h) into the running fold. The caller
+        // has already established that every fk[k] > 0 (via foldWorthIt) and that fHero > 0.
+        //
+        // `fk` is TWO grids in one array: entries [0, K) are the emitter's quadrature bins and
+        // feed `foldT`, entries [K, K+S) are the live bundle's own wavelengths and feed `specW`.
+        // They share an array — and a caller — because they share every expensive thing: one
+        // texture fetch / pattern evaluation per wavelength, one energy guard, one verdict. The
+        // alternative was a second evaluation loop over the same material at three more
+        // wavelengths, which is the same work done twice and two places to keep in step.
+        //
+        // NOTE that the VERDICT (`foldWorthIt`) is deliberately taken over the [0, K) half only.
+        // The bundle's wavelengths are drawn from the same uniform variate as the hero, so a
+        // test that read them would correlate the fold/no-fold decision with lambda_h and bias
+        // the mixture — the exact failure the long note above foldWorthIt exists to prevent.
+        // The quadrature bins are a function of the emitter alone, so they are safe to test and
+        // their verdict governs both grids.
+        // `K` is where the bundle's entries START in `fk`, whether or not the achromatic claim
+        // is still live — the caller fills the array the same way either way, so the two halves
+        // cannot drift apart when only one consumer is switched on (`-beamachro off -beamspec 4`
+        // is exactly that case). Whether `foldT` is touched is read from `achroPath` here rather
+        // than encoded in `K`, so there is one place that knows the layout.
+        auto foldApply = [&](double fHero, const double* fk, int K, int S) {
+            const double inv = 1.0 / fHero;
+            if (achroPath) {
+                if (!foldChroma) { for (int k = 0; k < K; ++k) foldT[k] = 1.0; foldChroma = true; }
+                for (int k = 0; k < K; ++k) foldT[k] *= fk[k] * inv;
+            }
+            for (int i = 0; i < S; ++i) specW[i] *= fk[K + i] * inv;
+        };
+        // Retire BOTH spectral claims. Every event that ends the achromatic-path fold also ends
+        // the bundle, because the two now live or die by the same rule: a wavelength-DIVERGENT
+        // event (one after which the wavelengths no longer share a chord) kills them, and a
+        // merely wavelength-DEPENDENT one is folded into `foldT`/`specW` instead. The decline
+        // cases go through here too — a factor whose fold `foldWorthIt` judged a firefly risk
+        // is exactly as much of a risk in `specW`, which carries the same 1/f(lambda_h).
+        //
+        // `g_foldKill` is only stamped while the fold was actually live, so the diagnostic
+        // histogram keeps attributing each loss to the event that caused it rather than to
+        // whatever came after. `specSec` is cleared unconditionally: with `-beamachro off`
+        // there is no `achroPath` to guard it, and the bundle must still retire.
+        auto retireSpectral = [&](FoldKill why) {
+            if (achroPath) { g_foldKill = why; achroPath = false; }
+            specSec = 0;
+        };
+
         // PHOTON-BEAMS gather (CLI -beams, shared multi-camera pass only): a per-photon
         // RNG used ONLY to resample an INDEPENDENT medium-collision point for each camera's
         // volume splat (see the mediumEvent block below). Seeded from the main stream so it
@@ -2127,6 +2814,14 @@ struct Renderer {
         // the backward/BDPT tracers use, so all transport paths agree. Gated so ordinary
         // scenes stay bit-identical (the marcher is never entered).
         const bool grinAny = grin::sceneHasGrin(scene);
+        // A GRIN region bends the photon along a wavelength-dependent path and charges glass
+        // absorption over the arc, so nothing downstream of a march is a shared chord. Rather
+        // than reason about where the marcher was and was not entered, refuse the spectral
+        // bundle for the whole photon in any GRIN scene — those scenes cannot deposit beams
+        // inside the bending medium anyway (emitBeams skips it per medium).
+        // The achromatic-path claim dies for the same reason and more strongly: a GRIN arc IS
+        // a function of lambda, so the path's geometry differs per wavelength.
+        if (grinAny) retireSpectral(FK_Grin);
 
         // PHOTON-BEAM deposit (mode M with -beams): store the crossed segment in the
         // view-independent beam map instead of splatting it to a camera list. GRIN media are
@@ -2137,12 +2832,26 @@ struct Renderer {
         const bool doBeamDeposit = (beamDeposit != nullptr) && !scene.media.empty();
         // Either beam path makes the photon cross media STRAIGHT: skip the analog free-flight
         // redirect below and attenuate by the crossing's transmittance instead.
-        const bool doBeamStraight = doBeamGather || doBeamDeposit;
+        // `beamStraightOnly` is the aimed caustic pass, which must cross media by the SAME
+        // rule as the main pass it is being MIS-combined with (an analog collision would set
+        // sawScatter and destroy the L.S+.D classification the caustic map is defined by) —
+        // but must NOT store beams, because the beam map belongs to the main pass and is
+        // normalised by the main pass's nEmitted.
+        const bool doBeamStraight = doBeamGather || doBeamDeposit ||
+                                    (beamStraightOnly && !scene.media.empty());
 
         // MULTIPLE SCATTERING in the beam media (0.199.0; -beams-order). How many times this
         // photon has already scattered inside a beam-carried (non-GRIN) medium, so the order
         // cap can send it back to the single-scatter rule once it is spent.
         int beamScatters = 0;
+
+        // CAUSTIC classification state (mode M's two-map split; see photonVertexKind above).
+        // A deposit is a caustic iff the path so far reads L·S⁺·D — at least one FOCUS vertex
+        // and no SCATTER vertex since the light. Both flags are monotone along the path: once
+        // a wide scatter has destroyed the beam's coherence nothing downstream restores it, so
+        // `sawScatter` is never cleared — and a diffuse deposit sets it itself, because the
+        // bounce that continues past a diffuse vertex is indirect light by definition.
+        bool sawFocus = false, sawScatter = false;
 
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
             double dEvent;
@@ -2256,7 +2965,17 @@ struct Renderer {
             double betaPre = beta;
             {
                 double a = curAbsorb(lambda);
-                if (a > 0.0) beta *= std::exp(-a * dEvent);
+                // Glass absorption is spectral (that is what makes coloured glass coloured), and
+                // this is one wavelength-DEPENDENT factor that is nonetheless NOT foldable into
+                // `specW`, for a reason that lives downstream rather than here: `PhotonBeam`
+                // stores a single scalar `absorb`, and the gather Beer-Lamberts every member of
+                // the bundle with it, at the hero's coefficient, over the beam's own lead-in. A
+                // reweighted bundle would therefore be right about the glass it has already
+                // crossed and wrong about the glass it is still inside. Collapse both claims
+                // here, BEFORE the deposit below reads them. (Making this foldable means giving
+                // the record a per-member `absorb`, which is a second widening for a case — a
+                // beam deposited inside coloured glass — that no scene in the suite exercises.)
+                if (a > 0.0) { beta *= std::exp(-a * dEvent); retireSpectral(FK_GlassAbsorb); }
             }
 
             // PHOTON-BEAMS single-scatter gather (CLI -beams, shared multi-camera pass).
@@ -2319,9 +3038,38 @@ struct Renderer {
                 }
                 // Mode M: store the crossing itself, so every camera of a flyby can gather
                 // from it later without the photon knowing any camera exists.
-                if (doBeamDeposit)
-                    emitBeams(scene, ray.o, ray.d, dChord, lambda, betaPre, curAbsorb(lambda), rng,
-                              beamMS ? MedAll : MedStraight);
+                if (doBeamDeposit) {
+                    // SPECTRAL FOLD: collapse the running per-bin ratios into the single CIE
+                    // triple this beam is stored with, sum_k foldCie[k] * T_k. When the path
+                    // has picked up NO spectral factor (foldChroma false) this is skipped and
+                    // `achroCie` is still the emitter's cieMean, so an achromatic scene stores
+                    // bit-for-bit the beams it stored before the spectral fold existed.
+                    Vec3 cieF = achroCie;
+                    if (achroPath && foldChroma) {
+                        cieF = Vec3{0, 0, 0};
+                        for (int k = 0; k < foldEm->foldN; ++k)
+                            cieF += foldEm->foldCie[k] * foldT[k];
+                    }
+                    // The GATHER-time fold (scene.h, Scene::BowLut) needs the emitter's
+                    // identity, and needs T == 1 — a path carrying per-bin weights has a
+                    // spectrum the per-emitter table cannot describe. `foldChroma` is exactly
+                    // that predicate, so an unweighted path names its emitter and a weighted
+                    // one passes -1 and keeps the deposit-time behaviour.
+                    int foldEmIdx = -1;
+                    if (achroPath && !foldChroma && foldEm && !scene.emitters.empty()) {
+                        const ptrdiff_t k = foldEm - &scene.emitters[0];
+                        if (k >= 0 && k < (ptrdiff_t)scene.emitters.size() && k <= 32767)
+                            foldEmIdx = (int)k;
+                    }
+                    // `beamScatters` counts medium scatters already made, so the chord being deposited
+            // now is order beamScatters + 1: zero prior scatters is single scatter. Same
+            // convention `-beams-order` uses -- `beamMSAllowed(n)` asks whether order n+2 is
+            // still permitted, so the chord at n is order n+1.
+            emitBeams(scene, ray.o, ray.d, dChord, lambda, betaPre, curAbsorb(lambda), rng,
+                      beamScatters + 1,
+                              beamMS ? MedAll : MedStraight, specLam, specSec,
+                              achroPath ? &cieF : nullptr, foldEmIdx, specW);
+                }
                 if (!beamMS) {
                     // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over
                     // the whole crossing (single-scatter transmission) so surfaces behind the
@@ -2344,6 +3092,48 @@ struct Renderer {
                     e.absorbed += (before - beta);
                 }
             }
+            // BOTH SPECTRAL CLAIMS NOW USE THE SAME RULE: only a wavelength-DIVERGENT event
+            // retires them. This is where the bundle used to be killed unconditionally, once
+            // per transport iteration, and that line is gone (0.257.0).
+            //
+            // The old rule was conservative for a real reason — the record carried no
+            // per-wavelength weight, so a bundle whose members' throughputs had begun to
+            // diverge could not be represented at all, and the only sound thing to do was throw
+            // it away before the first event that could diverge them. `PhotonBeam::wS` is that
+            // missing weight, and `specW` is the tracer-side accumulator that fills it, so the
+            // bundle can now do exactly what `achroPath` already did: survive an event that is
+            // merely wavelength-DEPENDENT by folding its ratio in, and retire only at one that
+            // is wavelength-DIVERGENT — one after which the members no longer share a chord, so
+            // there is no single beam left to store them on.
+            //
+            // What that is worth, measured on gallery_rain: the old rule reached the light's
+            // DIRECT crossing of a medium and nothing after it, which is most of a SHAFT's flux
+            // but almost none of a CLOUD's — at albedo 0.9964 a photon scatters of the order of
+            // 278 times inside that cloud, so one-chord-in-278 carried a bundle (36.2% of
+            // deposits overall) while `achroPath`'s weaker rule reached 83.9%. The two now
+            // coincide.
+            //
+            // A scatter in an ACHROMATIC medium is the archetypal survivable event: achromatic
+            // sigma_t for the free flight that reached it, a flat albedo for the roulette
+            // below, and an HG direction that depends only on `g`. A CHROMATIC one is the
+            // archetypal fatal one, and not merely because its coefficients differ — its
+            // `phaseSample` draws a DIRECTION as a function of lambda, so after it the
+            // wavelengths are on different rays and no per-member weight could reconcile them.
+            //
+            // A SURFACE event is not decided here. It used to be — a pre-emptive catch-all that
+            // retired the fold before the material was even known — and measurement showed that
+            // single line was 87.8% of the residual "coloured bars". A diffuse albedo is
+            // wavelength-dependent but not wavelength-divergent: it leaves the geometry
+            // identical for every wavelength and only rescales the weight, which is exactly what
+            // `foldT`/`specW` absorb. So the decision lives in the material switch, where the
+            // albedo can be folded instead of thrown away. Everything in that switch which this
+            // file does not explicitly fold still retires, so nothing became less conservative
+            // by accident. (Device twin: render_cuda.cu, same position — still on the old
+            // one-iteration rule, which is why a device-traced bundle is always equal-weight;
+            // see known-issues.md, FOLD-GPU.)
+            if ((achroPath || specSec > 0) && mediumEvent &&
+                !mediumAchromatic(scene.media[scatterMed]))
+                retireSpectral(FK_ChromaMedium);
 
             if (mediumEvent) {
                 const Medium& sm = scene.media[scatterMed];
@@ -2368,6 +3158,13 @@ struct Renderer {
                 if (rng.uniform() >= sm.albedo(lambda)) { e.absorbed += beta; return; }
                 double phPdf;   // sample the scatter direction from HG or the rainbow droplet phase
                 ray = Ray{mp, sm.phaseSample(ray.d, lambda, rng, phPdf)};
+                // An ANALOG collision redirects the photon by the phase function, which is wide
+                // enough (even for a forward-peaked HG) that whatever focus the beam had is not
+                // recoverable — so anything deposited downstream is ordinary indirect light.
+                // A `-beams` STRAIGHT crossing never reaches here and correctly stays neutral:
+                // it does not deflect the photon at all, so a gem seen through fog still writes
+                // its caustic to the caustic map.
+                sawScatter = true;
                 continue;
             }
 
@@ -2387,11 +3184,26 @@ struct Renderer {
             // vertex exactly as that child. Energy-consistent per-photon lobe selection.
             if (matp->type == MatType::Layered) {
                 const Material& cm = *matp;
+                // SPECTRAL FOLD: a coat's Fresnel/Airy reflectance is exactly the kind of
+                // sharply-peaked spectral factor the fold must NOT absorb — a thin-film
+                // interference lobe can be near-zero at the hero wavelength and near-one two
+                // bins away, so the 1/R(lambda_h) it would put into the weight is an outright
+                // firefly generator. (Its iridescence is also the POINT of the material, and
+                // a fold would smear the very colour it is there to produce.) Retire, exactly
+                // as this vertex did before the spectral fold existed. The bundle goes with it,
+                // and for a reason the fold's variance argument does not even have to reach:
+                // the coat's roughness lobe is sampled once, so a reflected bundle would be
+                // riding a direction chosen for the hero alone.
+                retireSpectral(FK_Layered);
                 double R = layeredCoatReflectance(scene, cm, h, ray.d, lambda);
                 if (rng.uniform() < R) {                    // coat reflection
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
+                    double cr = materialRoughness(scene, cm, h);
+                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; }
                     ray = Ray{h.p + h.n * 1e-6, o};
+                    // A clearcoat reflection is a mirror lobe: it focuses when tight (the
+                    // highlight a polished coat throws IS a caustic), scatters when rough.
+                    (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;
                     continue;                               // lossless; beta unchanged
                 }
                 int child = mixPickChild(cm, rng.uniform());  // body lobe (leftover absorbs)
@@ -2412,13 +3224,54 @@ struct Renderer {
             // near-delta BSDF -> ~zero connection pdf; the SDS limitation).
             switch (m.type) {
                 case MatType::Dielectric:
+                case MatType::Glossy: {
+                    // SPECTRAL FOLD (FOLD-GLOSSY, 0.260.1): a glossy lobe's GEOMETRY is
+                    // wavelength-free -- sampleGlossy reads the roughness and nothing else -- so
+                    // every wavelength still travels the same chord out of this vertex, which is
+                    // the actual test for keeping the claim (retire on wavelength DIVERGENCE,
+                    // absorb wavelength DEPENDENCE into the per-bin ratios). Only its albedo
+                    // varies with lambda, and that is exactly what foldT[] was built to carry,
+                    // the same way Diffuse carries its reflectance. So: evaluate the albedo on
+                    // the fold quadrature and the bundle, let foldWorthIt decline the saturated
+                    // cases, and apply the ratio AFTER interactPhotonSpecular's survival roulette
+                    // at r(lambda_hero) -- E[ r_hero * F_k r_k / r_hero ] = F_k r_k, Diffuse's
+                    // arithmetic exactly. Measured before this on a fog Cornell with a coloured
+                    // glossy sphere: 9.7 % of foldable beam deposits were retired as "specular".
+                    // Mirrored in bdpt.h's randomWalk: the two tracers fill one PhotonBeam bank
+                    // and must agree on what power / cieA / wS mean.
+                    int    gK = 0, gS = specSec;
+                    double gR[kFoldBins + kBeamSecMax];
+                    bool   gFold = false;
+                    if (achroPath || gS > 0) {
+                        gK = foldEm->foldN;
+                        for (int k = 0; k < gK + gS; ++k)
+                            gR[k] = clamp01(reflectSlot(scene, m, h,
+                                                        (k < gK) ? foldEm->foldLam[k] : specLam[k - gK]));
+                        bool ok = gK > 0 && foldWorthIt(*foldEm, gR, gK);
+                        for (int i = 0; i < gS && ok; ++i) ok = gR[gK + i] > 0.0;
+                        if (ok) gFold = true;
+                        else { retireSpectral(FK_DeclineGlossy); gS = 0; }
+                    }
+                    switch (photonVertexKind(scene, m, h)) {
+                        case PV_FOCUS:   sawFocus   = true; break;
+                        case PV_SCATTER: sawScatter = true; break;
+                        default: break;
+                    }
+                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e))
+                        return;
+                    if (gFold) {
+                        const double rH = clamp01(reflectSlot(scene, m, h, lambda));
+                        if (rH > 0.0) foldApply(rH, gR, gK, gS);
+                        else retireSpectral(FK_ZeroWeight);
+                    }
+                    continue;
+                }
                 case MatType::ThinFilm:
                 case MatType::Multilayer:
                 case MatType::Mirror:
                 case MatType::Grating:
                 case MatType::HalfMirror:
                 case MatType::Filter:
-                case MatType::Glossy:
                 case MatType::Hair:
                 case MatType::Fluorescent: {
                     // Specular / wavelength-switching lobes, all handled by the shared
@@ -2426,6 +3279,27 @@ struct Renderer {
                     // rather than with Diffuse because it does its own camera splat (its
                     // projection factor is the strand's longitudinal cosine, not dot(n,w))
                     // and its own Russian roulette on the exact lobe attenuation.
+                    //
+                    // Classify the vertex for the caustic split HERE rather than inside the
+                    // helper: the caller is the one that holds `m`/`h`, and the helper is
+                    // shared with tracePhotonHero (which does its own bookkeeping over C
+                    // wavelengths), so keeping the classification out of it leaves exactly one
+                    // definition of the rule (photonVertexKind) and no hidden state in the
+                    // helper's signature.
+                    switch (photonVertexKind(scene, m, h)) {
+                        case PV_FOCUS:   sawFocus   = true; break;
+                        case PV_SCATTER: sawScatter = true; break;
+                        default: break;                       // PV_NEUTRAL: `filter` passes through
+                    }
+                    // SPECTRAL FOLD: every lobe in this group either bends the path as a
+                    // function of lambda (dispersive refraction, a grating's diffraction
+                    // order), interferes (thin film, multilayer), or switches the wavelength
+                    // outright (fluorescence). In all three the wavelengths no longer share a
+                    // chord at all, so there is no T(lam) to carry — the fold is not merely
+                    // unprofitable here, it is undefined. Retire, and the bundle with it: this
+                    // is the textbook wavelength-DIVERGENT vertex, the one case no per-member
+                    // weight could ever rescue.
+                    retireSpectral(FK_Specular);
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e))
                         return;
                     continue;
@@ -2442,10 +3316,51 @@ struct Renderer {
                     double rhoT = clamp01(transmitSlot(scene, m, h, lambda));
                     double sum = rhoR + rhoT;
                     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }  // energy guard
+                    // SPECTRAL FOLD (see foldWorthIt / foldApply). Both lobes are analog
+                    // roulettes with beta unchanged, so each is foldable as
+                    // T_k *= rho(lam_k)/rho(lambda_h) — but WHICH lobe is taken depends on
+                    // lambda_h, and a verdict that depended on the lobe would therefore depend
+                    // on lambda_h and bias the estimator. So test BOTH lobes up front and fold
+                    // only if both are worth it; then apply the chosen lobe's ratios below.
+                    // The energy guard is re-applied per bin because the guard changes the
+                    // sampling PROBABILITY, and the probability is what the analog roulette
+                    // actually uses — so it is the guarded value, not the raw slot, that the
+                    // ratio has to be taken of.
+                    //
+                    // The SPECTRAL BUNDLE rides the same evaluation: entries [foldK, foldK+foldS)
+                    // hold the same two slots at the bundle's own live wavelengths, so one pass
+                    // over the material serves both grids (see foldApply). `foldS` is snapshot
+                    // before the verdict because a decline retires the bundle, and the loop that
+                    // filled the array must not disagree with the loop that consumes it.
+                    int    foldK = 0, foldS = specSec;
+                    double foldR[kFoldBins + kBeamSecMax], foldTr[kFoldBins + kBeamSecMax];
+                    if (achroPath || foldS > 0) {
+                        foldK = foldEm->foldN;
+                        for (int k = 0; k < foldK + foldS; ++k) {
+                            const double lk = (k < foldK) ? foldEm->foldLam[k]
+                                                          : specLam[k - foldK];
+                            double a = clamp01(diffuseReflectance(scene, m, h, lk));
+                            double b = clamp01(transmitSlot(scene, m, h, lk));
+                            const double s = a + b;
+                            if (s > 1.0) { a /= s; b /= s; }
+                            foldR[k] = a; foldTr[k] = b;
+                        }
+                        // One verdict, over the quadrature half only, governing both grids —
+                        // and a decline retires both, because `specW` carries the very
+                        // 1/f(lambda_h) whose firefly risk the verdict just weighed.
+                        // `foldWorthIt` also rejects a zero bin, so the loops below can divide.
+                        bool ok = foldK > 0 && foldWorthIt(*foldEm, foldR, foldK) &&
+                                  foldWorthIt(*foldEm, foldTr, foldK);
+                        if (ok)
+                            for (int i = 0; i < foldS && ok; ++i)
+                                ok = foldR[foldK + i] > 0.0 && foldTr[foldK + i] > 0.0;
+                        if (!ok) { retireSpectral(FK_DeclineTransmit); foldS = 0; }
+                    }
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Photon-map deposit: incident flux at this translucent vertex.
-                    depositPhoton(h.p, h.n, lambda, beta);
+                    depositPhoton(h.p, h.n, lambda, beta, sawFocus && !sawScatter);
+                    sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng);
                         camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, wi, lambda, beta, rhoT, rng);
@@ -2458,10 +3373,18 @@ struct Renderer {
                     // factor makes it lobe-agnostic, so (h.n, ngo) serve both lobes.
                     double u = rng.uniform();
                     if (u < rhoR) {
+                        if (achroPath || foldS > 0) {
+                            if (rhoR > 0.0) foldApply(rhoR, foldR, foldK, foldS);
+                            else retireSpectral(FK_ZeroWeight);
+                        }
                         Vec3 wo = cosineHemisphere(h.n, rng);
                         beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
                         ray = Ray{h.p + h.n * 1e-6, wo}; continue;
                     } else if (u < sum) {
+                        if (achroPath || foldS > 0) {
+                            if (rhoT > 0.0) foldApply(rhoT, foldTr, foldK, foldS);
+                            else retireSpectral(FK_ZeroWeight);
+                        }
                         Vec3 wo = cosineHemisphere(Vec3{-h.n.x, -h.n.y, -h.n.z}, rng);
                         beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
                         ray = Ray{h.p - h.n * 1e-6, wo}; continue;
@@ -2471,12 +3394,40 @@ struct Renderer {
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
+                    // SPECTRAL FOLD — the vertex that the whole mechanism exists for. A
+                    // Lambertian albedo is applied below as an ANALOG roulette (survive with
+                    // probability rho(lambda_h), beta unchanged), so conditional on survival
+                    // the fold carries T_k *= rho(lam_k)/rho(lambda_h) and its expectation
+                    // over the roulette is rho(lam_k) — precisely the per-wavelength weight
+                    // the spectral integral wants. Decided BEFORE the roulette so the verdict
+                    // is a property of the surface rather than of this photon's luck.
+                    // The SPECTRAL BUNDLE rides the same evaluation: entries [foldK, foldK+foldS)
+                    // are the same albedo at the bundle's own live wavelengths (see foldApply),
+                    // so a `-beamspec 4` bundle now survives a diffuse bounce carrying
+                    // rho(lam_i)/rho(lambda_h) instead of being thrown away.
+                    int    foldK = 0, foldS = specSec;
+                    double foldRho[kFoldBins + kBeamSecMax];
+                    if (achroPath || foldS > 0) {
+                        foldK = foldEm->foldN;
+                        for (int k = 0; k < foldK + foldS; ++k)
+                            foldRho[k] = clamp01(diffuseReflectance(
+                                scene, m, h, (k < foldK) ? foldEm->foldLam[k] : specLam[k - foldK]));
+                        // One verdict, over the quadrature half only (it must not depend on
+                        // lambda_h, and the bundle's wavelengths share the hero's variate), and
+                        // a decline retires both grids — `specW` carries the same 1/rho(lambda_h)
+                        // whose firefly risk the verdict just weighed.
+                        bool ok = foldK > 0 && foldWorthIt(*foldEm, foldRho, foldK);
+                        if (ok)
+                            for (int i = 0; i < foldS && ok; ++i) ok = foldRho[foldK + i] > 0.0;
+                        if (!ok) { retireSpectral(FK_DeclineDiffuse); foldS = 0; }
+                    }
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Photon-map deposit: incident flux at this diffuse vertex. Stored
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
                     // the arriving power (direct on the first hit, indirect thereafter).
-                    depositPhoton(h.p, h.n, lambda, beta);
+                    depositPhoton(h.p, h.n, lambda, beta, sawFocus && !sawScatter);
+                    sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
@@ -2485,6 +3436,10 @@ struct Renderer {
                     // with beta unchanged. Unbiased; average path length ~1/(1-rho)
                     // bounces instead of running to the maxBounce cap.
                     if (rng.uniform() >= rho) { e.absorbed += beta; return; }
+                    if (achroPath || foldS > 0) {
+                        if (rho > 0.0) foldApply(rho, foldRho, foldK, foldS);
+                        else retireSpectral(FK_ZeroWeight);
+                    }
                     Vec3 wo = cosineHemisphere(h.n, rng);
                     beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
                     ray = Ray{h.p + h.n * 1e-6, wo};
@@ -2555,6 +3510,9 @@ struct Renderer {
             emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         }
+        // Aimed caustic emission — see the scalar tracer. Before `base *= spotW` for the
+        // same reason (the aimed pass recomputes spotW).
+        if (!applyCausticAim(scene, &em, origin, dir, emitN, spotW, rng)) return;
 
         // Hero + stratified secondary wavelengths from this emitter's SPD (hero.h policy 1:
         // one base draw, C-1 wrapped strata). The hero must have a valid pdf; a dead
@@ -2605,10 +3563,16 @@ struct Renderer {
     // `secAlive == false`, and the split branch is guarded on `secAlive`, so a sub-path
     // can never split again — recursion is at most one level deep and the per-frame
     // footprint (a MediumStack plus two kHeroMax double arrays) is bounded.
+    // `sawFocus`/`sawScatter` carry the caustic classification of the path that REACHED
+    // (ray, stk) — see the same pair in tracePhoton. They are parameters rather than locals
+    // precisely because a -herosplit sub-path resumes mid-path: it is spawned at a dispersive
+    // interface, so it must inherit that vertex's FOCUS (and any earlier scatter), or every
+    // split caustic would land in the wrong map.
     void tracePhotonHeroLoop(const Scene& scene, const CamTarget* cams, int nCam,
                              Film* sensorFilm, Ray ray, MediumStack stk,
                              const double* lamIn, const double* betaIn, bool secAlive,
-                             int bounce0, Pcg32& rng, EnergyReport& e) const {
+                             int bounce0, Pcg32& rng, EnergyReport& e,
+                             bool sawFocus = false, bool sawScatter = false) const {
         const int C = heroC;
         double lam[hero::kHeroMax], beta[hero::kHeroMax];
         // Copy only the LIVE entries: a monochromatic sub-path spawned by -herosplit only
@@ -2686,9 +3650,11 @@ struct Renderer {
                 for (int i = 1; i < nUp; ++i)
                     if ((uCoat < Rl[i]) != refl0) { deHero(); nUp = 1; break; }
                 if (refl0) {
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
+                    double cr = materialRoughness(scene, cm, h);
+                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
                     ray = Ray{h.p + h.n * 1e-6, o};
+                    (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;  // see scalar twin
                     continue;
                 }
                 int child = mixPickChild(cm, rng.uniform());
@@ -2720,8 +3686,12 @@ struct Renderer {
                     // photon record (the gather keys off each photon's own λ). C records
                     // of base/C sum to base, and nEmitted counts PATHS, so the estimator
                     // stays energy-consistent with the scalar single-λ deposit.
-                    for (int i = 0; i < nUp; ++i)
-                        depositPhoton(h.p, h.n, lam[i], beta[i]);
+                    {
+                        const bool caus = sawFocus && !sawScatter;
+                        for (int i = 0; i < nUp; ++i)
+                            depositPhoton(h.p, h.n, lam[i], beta[i], caus);
+                        sawScatter = true;   // past a diffuse vertex it is indirect light
+                    }
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, wi, lam, beta, rhoR, nUp, rng);
                         camSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, wi, lam, beta, rhoT, nUp, rng);
@@ -2765,6 +3735,11 @@ struct Renderer {
                 case MatType::Mirror:
                 case MatType::Filter:
                 case MatType::Glossy: {
+                    switch (photonVertexKind(scene, m, h)) {      // caustic split; see tracePhoton
+                        case PV_FOCUS:   sawFocus   = true; break;
+                        case PV_SCATTER: sawScatter = true; break;
+                        default: break;
+                    }
                     // ACHROMATIC delta lobes (mirrors the backward tracer's radianceHero):
                     // specular — so no camera connect, exactly like the scalar path — but the
                     // outgoing DIRECTION does not depend on λ, so the bundle keeps riding and
@@ -2802,6 +3777,11 @@ struct Renderer {
                 case MatType::HalfMirror:
                 case MatType::Hair:
                 case MatType::Fluorescent: {
+                    switch (photonVertexKind(scene, m, h)) {      // caustic split; see tracePhoton
+                        case PV_FOCUS:   sawFocus   = true; break;
+                        case PV_SCATTER: sawScatter = true; break;
+                        default: break;
+                    }
                     // Dispersive / wavelength-switching: the outgoing direction (and, for a
                     // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
                     // cannot keep riding one shared direction past this interface. A fiber
@@ -2829,7 +3809,7 @@ struct Renderer {
                                                        cl[0], cstk, rng, e))
                                 tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, cray, cstk,
                                                     cl, cb, /*secAlive=*/false, bounce + 1,
-                                                    rng, e);
+                                                    rng, e, sawFocus, sawScatter);
                             beta[i] = 0.0;                  // its energy is now that sub-path's
                         }
                         secAlive = false;                   // hero carries on alone, UNBOOSTED
@@ -2856,8 +3836,12 @@ struct Renderer {
                     // photon record (the gather keys off each photon's own λ). C records
                     // of base/C sum to base, and nEmitted counts PATHS, so the estimator
                     // stays energy-consistent with the scalar single-λ deposit.
-                    for (int i = 0; i < nUp; ++i)
-                        depositPhoton(h.p, h.n, lam[i], beta[i]);
+                    {
+                        const bool caus = sawFocus && !sawScatter;
+                        for (int i = 0; i < nUp; ++i)
+                            depositPhoton(h.p, h.n, lam[i], beta[i], caus);
+                        sawScatter = true;   // past a diffuse vertex it is indirect light
+                    }
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, wi, lam, beta, rho, nUp, rng);
                         camSpecularSplatAllHero(scene, cams, nCam, h.p, h.n, lam, beta, rho, nUp, rng);

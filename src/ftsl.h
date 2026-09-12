@@ -6,7 +6,8 @@
 // already renders) plus Phase 1e (full mesh transforms).
 //
 // Grammar (informal):
-//   # line comment
+//   # line comment                             // …also works; both run to end of line
+//                                              // (no /* … */ — see ftsl_frontend.hpp)
 //   spectrum "name" = <spectrum-expr>          # named reusable spectrum
 //   material "name" { key value ...  key value }
 //   material "name" { type mix  layer "child" w  layer "child2" w  ... }  # stochastic blend
@@ -615,6 +616,7 @@ struct LoadTiming {
     double msBuild  = 0.0;  // Block tree -> Scene, INCLUDING msAssets and msAccel below
     double msAssets = 0.0;  // of msBuild: mesh files read+parsed from disk (obj/gltf/fbx)
     double msAccel  = 0.0;  // of msBuild: BVH construction (per-asset Blas + Scene::build)
+    double msTexture = 0.0; // of msAssets: decoding images referenced by imported materials
 };
 
 namespace detail {
@@ -4422,6 +4424,11 @@ private:
             // NOTE: the `rgb` tag is required — a bare triple (`absorb 3 0.5 0.3`) is NOT
             // a valid spectrum expression; only a scalar, a tagged colour (`rgb`/`xyz`/…),
             // or a named/ref spectrum parse. See evalSpectrum below.
+            // THIS SLOT IS UNBOUNDED — a strongly absorbing gem is tens or hundreds of
+            // inverse metres, and the example above already exceeds 1. That is why the
+            // reflectance upsamplers factor an over-unity triple into a magnitude and an
+            // in-gamut colour instead of clamping it (upsample::gamutSplit); through
+            // 0.199.4 they clamped, and every `absorb` above 1 came out flat and colourless.
             m.absorb = spectrumParam(b, "absorb", constantSpectrum(0.0));
         } else if (type == "mirror") {
             m.type = MatType::Mirror;
@@ -5187,7 +5194,10 @@ private:
             std::string ferr;
             {
                 detail::AssetTimer _at;
-                if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
+                // FBX imports its materials by default, like the OBJ (.mtl) and glTF
+                // paths; `import_materials no` opts out of all three.
+                if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr,
+                            strOf(b, "import_materials") != "no") == 0 && !ferr.empty()) {
                     fail("mesh: " + ferr); return false;
                 }
             }
@@ -5255,13 +5265,16 @@ private:
             {
                 detail::AssetTimer _at;
                 const MtlResolver* res = useNames ? &resolver : nullptr;
+                // OBJ now imports its companion .mtl by default, the same way the
+                // glTF path imports its materials; `import_materials no` opts out of both.
+                const bool objImportMats = (strOf(b, "import_materials") != "no");
                 int n = 0;
                 if (const std::string* mb = assetBytes(file))
                     n = loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
-                                     uvProj, uvAxis, creaseAngleDeg);
+                                     uvProj, uvAxis, creaseAngleDeg, objImportMats);
                 else
                     n = loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
-                                uvProj, uvAxis, creaseAngleDeg);
+                                uvProj, uvAxis, creaseAngleDeg, objImportMats);
                 // A mesh that loaded nothing is an error, not an empty object. This
                 // return value used to be discarded, which is precisely how an
                 // unsupported format (.ply/.stl fell through to this OBJ branch)
@@ -5437,7 +5450,10 @@ private:
             std::string ferr;
             {
                 detail::AssetTimer _at;
-                if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
+                // FBX imports its materials by default, like the OBJ (.mtl) and glTF
+                // paths; `import_materials no` opts out of all three.
+                if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr,
+                            strOf(b, "import_materials") != "no") == 0 && !ferr.empty()) {
                     fail("mesh_asset: " + ferr); return false;
                 }
             }
@@ -5492,13 +5508,16 @@ private:
             {
                 detail::AssetTimer _at;
                 const MtlResolver* res = useNames ? &resolver : nullptr;
+                // OBJ now imports its companion .mtl by default, the same way the
+                // glTF path imports its materials; `import_materials no` opts out of both.
+                const bool objImportMats = (strOf(b, "import_materials") != "no");
                 int n = 0;
                 if (const std::string* mb = assetBytes(file))
                     n = loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
-                                     UvProjection::None, 1, creaseAngleDeg);
+                                     UvProjection::None, 1, creaseAngleDeg, objImportMats);
                 else
                     n = loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
-                                UvProjection::None, 1, creaseAngleDeg);
+                                UvProjection::None, 1, creaseAngleDeg, objImportMats);
                 // Same guard as the `mesh` block above — the empty-blas check below
                 // would catch this, but only after losing which FILE was at fault
                 // (a mesh_asset may name several).
@@ -6270,7 +6289,17 @@ private:
                 L.scene.addEnvLight(std::move(map), binWidth_);
                 return true;
             }
-            L.scene.addEnvLight(spd, binWidth_);
+            // `intensity` scales the analytic-SPD env exactly as it scales the `file` one.
+            // It used to be parsed here and dropped, so an authored `intensity 40` changed
+            // nothing, with no warning -- and the `power`/`lumens` rejection above *directs
+            // the user to this knob*, so the one documented way to brighten a constant env
+            // was the one that did not work. Same idiom as the sun branch above; the exact
+            // `== 1.0` keeps every scene that omits it bit-identical.
+            const double envInten = dblOf(b, "intensity", 1.0);
+            L.scene.addEnvLight(
+                envInten == 1.0 ? spd
+                                : Spectrum([spd, envInten](double w) { return spd(w) * envInten; }),
+                binWidth_);
             return true;
         }
         // Default: rectangular area light. Also add the emissive quad to geometry so
@@ -6288,6 +6317,20 @@ private:
         spd = absPower(b, spd, length(cross(us, vs)) * PI, L);
         Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
         lm.emitPat = spdPat;
+        // `hide_camera on` — primary visibility off. The emitter is untouched (it lights,
+        // it is sampled by NEE, its power keeps the same share of the selection CDF) and so
+        // is the geometry (it still occludes, still shadows, still shows up in a specular
+        // reflection); only the bounce-0 camera ray passes through it. That is what a studio
+        // fill flat wants: it is placed to be SEEN IN a rim, never to be seen directly, and
+        // it is otherwise a large solid rectangle that any later camera move can swing into
+        // frame. See Material::hideCamera and Scene::closestHit's `skipCamHidden`.
+        {
+            const std::string hc = strOf(b, "hide_camera", "off");
+            lm.hideCamera = (hc == "on" || hc == "true" || hc == "yes" || hc == "1");
+            // Set the scene-wide gate here as well as in finalizeEmitters(), so no load
+            // path can leave the fast-path bool disagreeing with the materials.
+            if (lm.hideCamera) L.scene.camHiddenAny = true;
+        }
         int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
         Vec3 a = os, bb = os + us, cc = os + us + vs, dd = os + vs;
         // UVs must equal the emitter's own (u,v) parameterisation — Emitter::samplePoint
@@ -6307,8 +6350,8 @@ private:
     // ---- medium ----
     // Each `medium { }` block appends one independent region to Scene::media. Several
     // may be authored (overlapping or disjoint boxes/spheres/heterogeneous blobs) and
-    // the forward tracer superposes them (extinction adds). Backward/BDPT modes use
-    // only the first as a global homogeneous haze (see Scene::backwardMedium()).
+    // every transport layer superposes them (extinction adds): the forward tracer, BDPT
+    // (D/J), the CPU backward tracer (R/W/V/P/M's final gather) and both device kernels.
     bool addMedium(const Block& b, Loaded& L) {
         Medium med;
         med.enabled = true;
@@ -6803,10 +6846,68 @@ private:
                 rp->build(prm);
                 med.rainbowPhase = rp;
             } else if (kind == "hg" || kind.empty()) {
-                // explicit HG (or `phase` with no argument): default lobe, nothing to do.
+                // Explicit HG (or `phase` with no argument). The lobe's ONE parameter is `g`,
+                // which is also a medium-level key (read at the top of addMedium), so both
+                // spellings must work:
+                //
+                //     medium { sigma_t 2  g 0.46 }                  # the original form
+                //     medium { sigma_t 2  phase hg { g 0.46 } }     # the form `phase rainbow` teaches
+                //
+                // Only the first used to be honoured. The second parsed, warned `unknown key
+                // 'g'`, and then rendered ISOTROPIC — a silently wrong image, which is exactly
+                // the failure mode the used-key audit exists to prevent. It is an easy mistake
+                // to make because `phase rainbow { .. }` DOES take its parameters in the block,
+                // so the block form looks like the general shape of a phase statement.
+                // (Found via scraps/rb_val_hg.ftsl, which authors `phase hg { g 0.0 }` — that
+                // scene happened to ask for the default, so the bug cost it nothing; a scene
+                // asking for a forward lobe would have lost it.)
+                //
+                // Reading it here also clears the warning, since `find` marks the statement
+                // used. A block-level `g` OVERRIDES the medium-level one: it is the more
+                // specific spelling, and naming both is a contradiction the author should see
+                // resolved in favour of the phase block they wrote it in.
+                if (const Block* pb = ph->val.block.get())
+                    med.g = dblOf(*pb, "g", med.g);
             } else {
                 fail("medium `phase " + kind + "` is not a known phase model (use `hg` or `rainbow`)");
                 return false;
+            }
+        }
+
+        // ---- Local majorant grid (control + residual) ----------------------------
+        // The single global `densityMax` is a legal majorant but a terrible one: plain
+        // ratio tracking against it has a relative standard deviation that grows like
+        // e^(tau/2), which is what made gallery_rain's cloud render as saturated RGB
+        // speckle (majorant.h documents the measurement). Refine it into a per-cell
+        // control/residual split so transmittance can integrate the bulk analytically and
+        // only track the small residual stochastically. Bounded media only — an unbounded
+        // density field has no finite region to grid, and keeps the global majorant.
+        if (med.heterogeneous() && med.bounded && med.densityMax > 0.0) {
+            const PatTables tabs = L.scene.patTables();
+            auto grid = std::make_shared<MajorantGrid>();
+            // densityAt (not densityFieldAt): unlike the global peak estimate, this grid
+            // WANTS the membership carve — a cell outside an implicit/mesh bound really is
+            // vacuum, and the dilation in buildMajorantGrid is what makes reading it as
+            // vacuum safe.
+            if (!buildMajorantGrid(*grid, med.bmin, med.bmax,
+                                   [&](const Vec3& p) { return med.densityAt(p, &tabs); })) {
+                fail("stopped while building the medium majorant grid");
+                return false;
+            }
+            if (grid->valid()) {
+                double sumC = 0.0, sumR = 0.0, maxR = 0.0; size_t empty = 0;
+                for (size_t k = 0; k < grid->cells(); ++k) {
+                    sumC += grid->ctrl[k]; sumR += grid->res[k];
+                    maxR = std::max(maxR, (double)grid->res[k]);
+                    if (grid->ctrl[k] + grid->res[k] <= 0.0f) ++empty;
+                }
+                const double inv = 1.0 / (double)grid->cells();
+                std::fprintf(stderr,
+                    "[medium] majorant grid: %dx%dx%d cells (%.3g m), %.1f%% vacuum, "
+                    "mean control %.3f, mean residual %.4f (peak %.3f) vs global majorant %.3f\n",
+                    grid->nx, grid->ny, grid->nz, grid->cell.x,
+                    100.0 * (double)empty * inv, sumC * inv, sumR * inv, maxR, med.densityMax);
+                med.majorant = grid;
             }
         }
 
@@ -8093,6 +8194,8 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     using PhaseClock = std::chrono::steady_clock;
     detail::g_assetMs = 0.0;
     detail::g_accelMs = 0.0;
+    gltfimpl::g_texDecodeMs = 0.0;
+    gltfimpl::g_texFitMs = 0.0;
     auto phaseT0 = PhaseClock::now();
     auto phaseLap = [&phaseT0]() {
         auto now = PhaseClock::now();
@@ -8111,6 +8214,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
             if (!t) return;
             t->msAssets = detail::g_assetMs;
             t->msAccel  = detail::g_accelMs;
+            t->msTexture = gltfimpl::g_texDecodeMs;
             t->msBuild  = std::chrono::duration<double, std::milli>(
                               PhaseClock::now() - *from).count();
         }

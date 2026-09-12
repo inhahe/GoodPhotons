@@ -9,6 +9,7 @@
 #include <cfloat>
 #include "linalg.h"
 #include "geometry.h"
+#include "parallel.h"    // ft::stopRequested — cooperative `-stop` during a long build
 
 // Branch-free component fetch (Vec3 is standard-layout with x,y,z contiguous —
 // same trick as Vec3::operator[]); the old two-branch ternary showed up in
@@ -86,10 +87,17 @@ struct Bvh {
 
     struct BuildPrim { Aabb box; Vec3 centroid; int idx; };
 
+    // Set when a `-stop` landed mid-build, so the caller can tell a finished tree from an
+    // abandoned one without inspecting it. The tree is still STRUCTURALLY VALID either way
+    // (see buildRecursive) — this says only that it is coarse, not that it is unusable.
+    bool stopped = false;
+
     void build(const std::vector<Aabb>& boxes) {
         int n = (int)boxes.size();
         nodes.clear();
         primIdx.clear();
+        stopped = false;
+        m_pollTick = 0;
         if (n == 0) return;
         std::vector<BuildPrim> bp(n);
         for (int i = 0; i < n; ++i) { bp[i].box = boxes[i]; bp[i].centroid = boxes[i].center(); bp[i].idx = i; }
@@ -98,6 +106,8 @@ struct Bvh {
         primIdx.resize(n);
         for (int i = 0; i < n; ++i) primIdx[i] = bp[i].idx;
     }
+
+    unsigned m_pollTick = 0;   // stop-poll divider for buildRecursive; reset by build()
 
     int buildRecursive(std::vector<BuildPrim>& bp, int start, int end) {
         int nodeIdx = (int)nodes.size();
@@ -111,6 +121,25 @@ struct Bvh {
             node.box = bounds; node.first = start; node.count = count; node.left = node.right = -1;
         };
         if (count <= LEAF_SIZE) { makeLeaf(); return nodeIdx; }
+
+        // Cooperative `-stop` seam. A beam-map BVH over millions of sub-beams is tens of
+        // seconds of one thread doing nothing observable, and it used to be the last block in
+        // the pre-gather region that a stop could not touch.
+        //
+        // Bailing turns the CURRENT range into a leaf instead of abandoning the tree half
+        // written, which matters: the result is a perfectly VALID BVH — every primitive is
+        // still reachable, every node still has correct bounds — merely a coarse one that
+        // would traverse slowly. So there is no window in which a partially built tree can be
+        // traversed and give a wrong answer, and callers that discard on stop (the beam upload
+        // in render_cuda.cu) and callers that do not are both safe. Unwinding costs O(depth)
+        // further calls, each of which takes this same exit.
+        //
+        // Polled every 256 nodes rather than every node because `stopRequested` is an indirect
+        // call through a relaxed atomic slot, and a 5M-node build would make five million of
+        // them. Each poll is amortised over at least 256 * LEAF_SIZE primitives of binning
+        // work, so the interval is free and the latency is still sub-millisecond.
+        if (!stopped && (++m_pollTick & 255) == 0 && ft::stopRequested()) stopped = true;
+        if (stopped) { makeLeaf(); return nodeIdx; }
 
         int axis = cbounds.largestAxis();
         double cLo = vget(cbounds.lo, axis), cHi = vget(cbounds.hi, axis);

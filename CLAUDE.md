@@ -209,9 +209,11 @@ The user-facing docs are split into three files. Know which one a change belongs
   with an observable change.** `VERSION` is a single `MAJOR.MINOR.PATCH` line and is the
   single source of truth for the release tag. Whenever you run `build.bat` to produce a
   new binary that changes anything observable, increment `VERSION` in the *same commit*
-  as the change — **patch** for fixes, **minor** for new features, **major** for
-  breaking changes — so every built binary maps to a distinct version. (No observable
-  change → no bump.)
+  as the change — **patch** for fixes, **minor** for new features, **major** for breaking
+  changes *or* for a milestone overhaul (a reworked renderer architecture, scene/CLI
+  redesign, or output-quality leap you would call a new generation of `ftrace`, even when
+  old scenes still render) — so every built binary maps to a distinct version. (No
+  observable change → no bump.)
 - **`release.bat` publishes a GitHub release** of the current repo-root `ftrace.exe` to
   `inhahe/goodphotons`, tagged `v<VERSION>`, using the GitHub CLI (`gh`). It **refuses to
   publish if a release for the current version already exists**, so the workflow is:

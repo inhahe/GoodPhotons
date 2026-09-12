@@ -18,6 +18,7 @@
 #include "vdbgrid.h"
 #include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
 #include "record.h"      // parametric records (§records): named per-channel LUTs
+#include "majorant.h"    // per-cell control/residual majorant grid (Medium::majorant)
 #include "lighttree_build.h"  // Conty-Kulla light BVH: node layout + host builder
 
 // ---- ray-query telemetry (-raystats) --------------------------------------------------
@@ -97,6 +98,17 @@ struct Material {
     // attenuating glass; also the `absorb` target a field_material can drive). 0 =
     // colorless (default, bit-identical to before). Only consulted for Dielectric.
     Spectrum absorb  = constantSpectrum(0.0);
+    // The characteristic THICKNESS `absorb` was authored against, in scene units, or 0
+    // when nobody said. Beer-Lambert absorption is a coefficient per unit length, so on
+    // its own it cannot say how dark a piece of this glass looks — that needs a distance,
+    // and the ray tracer gets one by measuring the actual path through the solid. The
+    // preview rasterizer cannot: its clear pass is order-independent (that is why it needs
+    // no depth sort) and so never pairs a front face with its own back face. glTF's
+    // KHR_materials_volume states exactly this distance (`attenuationDistance`), so when
+    // an importer knows it, recording it here lets the preview show a deep ruby as deep
+    // ruby instead of merely reddish. Read only by raster.h's clearTintOf; the tracer
+    // ignores it and integrates the real path length.
+    double absorbRefDist = 0.0;
     // Diffuse TRANSMISSION albedo vs lambda (MatType::DiffuseTransmit only). The
     // translucent material is a two-lobe Lambertian: `reflect` scatters cosine-
     // distributed into the FRONT hemisphere (+n), `transmit` into the BACK hemisphere
@@ -110,6 +122,25 @@ struct Material {
     double roughness = 0.1;                    // glossy lobe width [0,1]; on a Dielectric it
                                                // roughens the reflected+refracted lobes (frosted)
     bool isLight = false;
+    // Invisible to CAMERA (primary) rays only — the standard "primary visibility off"
+    // of a production renderer, and the reason it exists here: an `light area` is not an
+    // abstract emitter, it is two real triangles in the BVH (ftsl.h), so a studio fill
+    // flat placed to be seen in a specular rim is also a large solid rectangle that will
+    // eventually swing into frame. `gallery_rain`'s left fill panel did exactly that the
+    // moment the flyby camera (fov_y 70, yawing) replaced the still one (fov_y 52, fixed)
+    // its out-of-frame clearance had been hand-derived for.
+    //
+    // Semantics, deliberately narrow: ONLY the bounce-0 ray leaving the camera passes
+    // through. Every other ray — reflection, refraction, shadow/NEE, photon, light
+    // subpath — sees the surface exactly as before, so the flat still lights the scene,
+    // still occludes, and still appears in the gold rim it was placed for. Seen THROUGH
+    // glass it is visible too, which matches PBRT/Cycles/Arnold: a refracted ray is not a
+    // camera ray. The one thing you lose is the direct view, which is the whole point.
+    //
+    // Enforced in Scene::closestHit(..., skipCamHidden) by rejecting the primitive BEFORE
+    // it is intersected — every prim type carries `matId`, so the test is a load and a
+    // compare, and a hidden surface costs strictly less than a visible one.
+    bool hideCamera = false;
     // Spatially-varying diffuse albedo: index into Scene::textures (-1 = use the
     // constant `reflect` spectrum). When set, the reflectance at a hit is the
     // texture's per-texel Jakob-Hanika reflectance sampled at the surface (u,v).
@@ -436,6 +467,49 @@ struct Medium {
     std::shared_ptr<rainbow::RainbowPhase> rainbowPhase;
     bool rainbow() const { return (bool)rainbowPhase; }
 
+    // ---- ACHROMATIC? (photonbeams.h, ACHROMATIC-PATH BEAMS) ------------------------------
+    // 1 when NOTHING about this medium depends on wavelength: flat sigma_s, flat sigma_t, and
+    // an HG rather than a rainbow phase. Two consumers, asking two different questions of the
+    // same fact:
+    //   * the beam GATHER — its per-wavelength tail is exactly sigma_s * phase * CIE, so a
+    //     flat medium contributes colour through CIE alone and a beam in it can be folded at
+    //     the emitter's mean CIE with zero chromatic variance;
+    //   * the forward TRACER — a scatter here is a wavelength-independent event (the free
+    //     flight that reached it, the albedo roulette and the HG direction are all flat), so
+    //     the achromatic-path claim survives it.
+    // Cached rather than computed on demand because the tracer asks it at EVERY medium
+    // scatter, and answering honestly means scanning two Spectrum objects across the band —
+    // which inside a cloud at albedo 0.9964 would be ~278 whole-band scans per photon.
+    // Scene::build() fills it via computeAchromatic(); the default of 0 is the safe answer
+    // (classic monochromatic beams) for any medium that somehow never reaches it.
+    int achro = 0;
+    bool computeAchromatic() const { return !rainbow() && computeAchromaticSigma(); }
+
+    // ---- ACHROMATIC in its COEFFICIENTS only (the phase may still be a rainbow) -----------
+    // `achro` above is the conjunction of two independent facts, and 0.256.0 needs them apart.
+    // A medium whose sigma_s / sigma_t are flat but whose PHASE is a rainbow table is not
+    // achromatic — a beam in it cannot be folded at the emitter's mean CIE, because the phase
+    // would then be evaluated at one wavelength and the bow would collapse. But it is also not
+    // hopeless: the ONLY wavelength-dependent factor left in the gather is p(cos, lambda), and
+    // that is a function of a single scalar the gather already has. So the fold can move from
+    // DEPOSIT time to GATHER time — see Scene::bowLut — and a beam whose path was
+    // wavelength-independent can paint the whole spectral bow at its own angle instead of one
+    // saturated sample of it. Measured on gallery_rain: 83.9% of the rain's beams qualify.
+    int achroSigma = 0;
+    bool computeAchromaticSigma() const {
+        double sLo = 1e300, sHi = -1e300, tLo = 1e300, tHi = -1e300;
+        for (int i = 0; i <= 32; ++i) {
+            const double lam = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * (double)i / 32.0;
+            const double ss = sigma_s(lam), st = sigma_a(lam) + sigma_s(lam);
+            sLo = std::min(sLo, ss); sHi = std::max(sHi, ss);
+            tLo = std::min(tLo, st); tHi = std::max(tHi, st);
+        }
+        // A coefficient that is zero across the whole band has no colour to get wrong.
+        if (sHi > 0.0 && (sHi - sLo) > 1e-4 * sHi) return false;
+        if (tHi > 0.0 && (tHi - tLo) > 1e-4 * tHi) return false;
+        return true;
+    }
+
     // Phase value p(cos) at wavelength lambda (nm) — equals the solid-angle pdf when
     // the scatter direction is importance-sampled from the phase (both models below).
     double phaseValue(double cosTheta, double lambda) const {
@@ -459,6 +533,16 @@ struct Medium {
     // is 1 everywhere (the classic homogeneous medium; unchanged behaviour).
     std::vector<PatNode> density;
     double densityMax = 1.0;   // majorant: sup of density over `bmin..bmax` (delta/ratio tracking)
+
+    // Per-cell control + residual majorant over the bound AABB (majorant.h). Present for
+    // any BOUNDED heterogeneous medium; null falls back to the single global `densityMax`,
+    // which is what an unbounded density field still uses. Transmittance runs RESIDUAL
+    // ratio tracking against it (the deterministic exp(-control) carries the bulk of the
+    // attenuation, which is what makes an optically thick cloud converge at all — see the
+    // header comment in majorant.h for the measured numbers), and collision sampling uses
+    // the tight per-cell sup `ctrl + res` instead of the global majorant. Shared so Medium
+    // copies stay cheap, like `vdb` / `boundGrid`.
+    std::shared_ptr<MajorantGrid> majorant;
 
     // --- Optional gradient-index (GRIN) refractive field n(x,y,z) ------------
     // When `ior` is non-empty, this region is a GRADIENT-INDEX medium: light
@@ -730,6 +814,24 @@ struct Sensor {
 // baked into an HDRI produces fireflies (see known-issues, K2 follow-up).
 enum class EmitterShape { Quad, Sphere, Spot, Env, Cylinder, Mesh, Sun };
 
+// SPECTRAL FOLD QUADRATURE (Emitter::foldCie / foldLam; used by render.h's photon tracer
+// and photonbeams.h's beam records). The achromatic fold replaces a beam's noisy
+// CIE(lambda_hero) sample with the emitter's mean response cieMean = E_lam[CIE(lam)]; the
+// SPECTRAL fold generalises it to E_lam[CIE(lam) * T(lam)], where T is the running ratio of
+// the path's spectral throughput at lam versus at the hero wavelength. That expectation
+// needs a QUADRATURE over lambda, and this is its bin count: the band is split into
+// kFoldBins intervals of EQUAL SPD MASS, so every bin carries the same 1/K of the emission
+// probability and the sum of the per-bin CIE means is exactly cieMean (the unweighted case
+// therefore stays bit-identical to the plain achromatic fold).
+//
+// 12 is chosen because the thing being integrated is a product of two smooth curves — the
+// CIE observer and a surface reflectance — over ~360 nm. Reflectance spectra in this engine
+// are either constants, blackbody/measured curves, or RGB-upsampled Jakob-Hanika sigmoids,
+// none of which carry structure narrower than ~30 nm, which is what 12 bins resolve. Going
+// higher costs a per-bin reflectance evaluation on every diffuse bounce of every photon for
+// no visible gain; going lower starts to alias the observer's sharp blue lobe.
+static constexpr int kFoldBins = 12;
+
 // Smoothstep spotlight falloff as a function of cos(angle-off-axis). 1 inside the
 // inner cone, 0 outside the outer cone, cubic-smooth (3t^2-2t^3) in the penumbra.
 inline double spotFalloff(double ct, double cosInner, double cosOuter) {
@@ -787,6 +889,44 @@ struct Emitter {
     // Precomputed in build() because the direct-view path (a camera/specular ray that
     // escapes into the sun's cone) is evaluated per pixel and must not re-integrate.
     Vec3 viewXYZ{0, 0, 0};
+    // THE SPD-WEIGHTED MEAN CIE RESPONSE of this emitter:
+    //
+    //     cieMean = integral CIE(lam) * SPD(lam) dlam / integral SPD(lam) dlam
+    //
+    // i.e. the EXPECTED value of CIE(lambda) when lambda is drawn from this emitter's own
+    // emission sampler, whose pdf is proportional to SPD. That expectation is the exact
+    // colour a monochromatic estimator converges to along any path whose transport is
+    // wavelength-INDEPENDENT, because such a path leaves the photon's carried power equal
+    // for every wavelength in the band (spd(lam)/pdf(lam) is the SPD's integral for all of
+    // them alike) — so the only per-wavelength factor left in the fold is CIE itself.
+    //
+    // Photon beams use it to replace a single noisy CIE(lambda_hero) sample with its own
+    // mean, which is what removes the chromatic speckle from an achromatic medium outright
+    // rather than merely averaging it down (photonbeams.h, ACHROMATIC-PATH BEAMS). Set for
+    // EVERY emitter in finalizeEmitters(), unlike viewXYZ which only suns need.
+    Vec3 cieMean{0, 0, 0};
+    // THE SPECTRAL FOLD TABLE (kFoldBins above). `foldCie[k]` is the CIE response integrated
+    // over bin k against the emitter's own emission pdf,
+    //
+    //     foldCie[k] = integral_{bin k} CIE(lam) * SPD(lam) dlam / integral SPD(lam) dlam
+    //
+    // and `foldLam[k]` is that bin's SPD-weighted mean wavelength — the single lambda at
+    // which a path factor is evaluated to stand for the whole bin. The bins are cut at
+    // EQUAL SPD MASS, so each holds 1/K of the emission probability and, by construction,
+    //
+    //     sum_k foldCie[k] == cieMean
+    //
+    // exactly. That identity is what makes the generalisation free: a path with no spectral
+    // factors folds to sum_k foldCie[k]*1 = cieMean, reproducing the achromatic fold
+    // bit-for-bit, while a path that has picked up factors folds to sum_k foldCie[k]*T_k,
+    // the quadrature of E_lam[CIE(lam)*T(lam)]. Filled for EVERY emitter in
+    // finalizeEmitters(), on the same 1 nm grid as cieMean.
+    // `foldN` is how many of the kFoldBins entries are LIVE, compacted to the front. A
+    // broadband SPD fills all of them; a laser line fills one. Loops run to foldN, so a
+    // narrow emitter pays only for the bins it actually occupies.
+    Vec3   foldCie[kFoldBins] = {};
+    double foldLam[kFoldBins] = {};
+    int    foldN = 0;
     std::vector<EmitTri> meshTris; // Mesh: per-triangle area CDF for uniform sampling
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
@@ -964,6 +1104,24 @@ struct Emitter {
     // front-facing (no wasted back-side samples). `pdfArea` = 1/visibleArea.
     // Returns false when `ref` is within the tube radius (rho <= r), where the arc
     // is undefined; the caller then falls back to the uniform samplePoint().
+    // The area `sampleCylinderVisible` samples over, as a function of the receiver alone --
+    // its front-facing arc, `2*radius*len*phiMax`. Split out so the MIS partner can ask for the
+    // density WITHOUT drawing a sample: GLOSSY-NEE's BSDF-sampling side meets this emitter as a
+    // ray HIT and has to reconstruct the pdf the light-sampling side would have used. Returns 0
+    // where that sampler declines (receiver inside the tube), which the caller reads as
+    // "not MIS-covered, take the hit at full weight".
+    double cylinderVisibleArea(const Vec3& ref) const {
+        const double len = length(v);
+        if (len <= 0.0) return 0.0;
+        const Vec3 a = v / len;
+        const Vec3 p = ref - origin;
+        const Vec3 pPerp = p - a * dot(p, a);
+        const double rho = length(pPerp);
+        if (rho <= radius) return 0.0;                 // ref inside tube radius: sampler declines
+        const double phiMax = std::acos(std::min(1.0, radius / rho));
+        return 2.0 * radius * len * phiMax;
+    }
+
     bool sampleCylinderVisible(const Vec3& ref, double u1, double u2,
                                Vec3& y, Vec3& nOut, double& pdfArea) const {
         double len = length(v);
@@ -1021,20 +1179,28 @@ struct Blas {
     }
     // Closest hit in local space. `h.t` carries the running (world==local) tMax on
     // entry; intersectTri only accepts a closer hit. Returns true if `h` was updated.
-    bool intersectLocal(const Ray& lr, double tmin, Hit& h) const {
+    // `vcolTable` is the SCENE's Scene::vertColors. A BLAS keeps its own triangle array
+    // but not its own colour table, and it does not need one: mesh_asset loads through
+    // the ordinary loaders into Scene::tris first and only then copies the run into the
+    // BLAS, so the Tri::vcol indices already point into the scene-wide table — and that
+    // table is append-only, so slicing the triangles out cannot invalidate them. The
+    // caller passes it down because a Blas has no back-pointer to its Scene.
+    bool intersectLocal(const Ray& lr, double tmin, Hit& h,
+                        const float* vcolTable = nullptr) const {
         bool found = false;
         double tMax = h.t;
         const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
         bvh.traverseClosest(lr, tmin, tMax, [&](int prim, double& tm) {
-            if (intersectTri(sh, lr, tris[prim], tmin, h)) { tm = h.t; found = true; }
+            if (intersectTri(sh, lr, tris[prim], tmin, h, vcolTable)) { tm = h.t; found = true; }
         });
         return found;
     }
-    bool occludedLocal(const Ray& lr, double tmin, double maxDist) const {
+    bool occludedLocal(const Ray& lr, double tmin, double maxDist,
+                       const float* vcolTable = nullptr) const {
         const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
         return bvh.traverseAny(lr, tmin, maxDist, [&](int prim) {
             Hit h; h.t = maxDist;
-            return intersectTri(sh, lr, tris[prim], tmin, h);
+            return intersectTri(sh, lr, tris[prim], tmin, h, vcolTable);
         });
     }
 };
@@ -1096,6 +1262,11 @@ struct Scene {
     std::vector<Blas> blasList;        // shared instanced mesh assets (local space)
     std::vector<MeshInstance> instances; // placements of blasList into the world
     std::vector<MeshGroup> meshGroups;   // named mesh objects (for -check-watertight)
+    // Per-vertex COLOURS, three linear-RGB floats per entry, indexed by Tri::vcol (which
+    // names the first of the triangle's three consecutive entries). Empty for the
+    // overwhelming majority of scenes; see Tri::vcol for why this is a side table.
+    std::vector<float> vertColors;
+    const float* vcolData() const { return vertColors.empty() ? nullptr : vertColors.data(); }
     std::vector<Material> mats;
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)
@@ -1113,8 +1284,16 @@ struct Scene {
     // build once per ray/traversal, which is the ONLY correct lifetime: a Scene is
     // copied and moved (buildCornell returns by value), so a stored PatTables would
     // dangle. Never cache it in a member — pass it as a parameter.
+    // The N-D slice `-nd` evaluates implicit fields on. `dims == 0` (the default) is the
+    // ordinary 3-D case and every evaluator skips the transform, so a scene without -nd is
+    // untouched. Unlike the mesh path, which has to be given extra-dimensional content by
+    // `emboss`/`extrude`, a FIELD already exists everywhere in N-space: tilting the slice
+    // is enough to make its cross-section genuinely change.
+    PatSlice ndSlice;
+
     PatTables patTables() const {
         PatTables t;
+        t.slice = (ndSlice.dims > 3) ? &ndSlice : nullptr;
         t.grids     = grids.empty()    ? nullptr : grids.data();
         t.nGrids    = (int)grids.size();
         t.scatters  = scatters.empty() ? nullptr : scatters.data();
@@ -1147,26 +1326,12 @@ struct Scene {
     // point), so transmittance is the product of per-medium transmittances and a
     // collision is the earliest of the media's independent free-flight samples (with
     // the scattering medium chosen by the Poisson superposition theorem). Empty =>
-    // vacuum. BDPT (mode D, both devices) and the GPU backward megakernel superpose the
-    // full vector too; only the CPU backward tracer still degrades to backwardMedium().
+    // vacuum. EVERY transport layer superposes the full vector: the forward tracer, BDPT
+    // (mode D/J, both devices), both device megakernels, and — since 0.254.0 — the CPU
+    // backward tracer, which until then collapsed it to a single unbounded homogeneous
+    // haze via a `backwardMedium()` accessor that no longer exists.
     std::vector<Medium> media;
 
-    // The CPU backward tracer (src/backward.h — modes R/W/V and the P composite's
-    // camera-side layer) supports only a single GLOBAL HOMOGENEOUS haze and ignores
-    // density/bounds. This returns the medium it uses as that haze — the first authored
-    // medium — or a disabled default if there is none.
-    //
-    // NOTE this is now a CPU-only limitation, and a source of CPU/GPU divergence: the
-    // device backward megakernel (render_cuda.cu dMediaSampleCollision / bkNeeVolume)
-    // superposes the whole `media` vector, bounds + density fields + per-medium phase
-    // functions included, so a GPU mode-R/W render of a multi-medium scene looks different
-    // (and more correct) than the CPU one. main.cpp warns when a render's backward layer
-    // actually lands on this degraded path. Tracked in known-issues.md; the fix is to port
-    // the superposition into backward.h and delete this accessor.
-    const Medium& backwardMedium() const {
-        static const Medium none;   // disabled (enabled=false) sentinel
-        return media.empty() ? none : media.front();
-    }
     bool anyMedium() const { return !media.empty(); }
 
     // Emitters. Forward tracing selects one per photon with probability
@@ -1210,6 +1375,132 @@ struct Scene {
     };
     std::vector<EmissiveVolume> emissiveVolumes;
     double totalEmissionPower = 0.0;
+
+    // ================= THE SPECTRAL BOW LUT (gather-time fold, 0.256.0) =====================
+    //
+    // The deposit-time fold (Emitter::cieMean, and the SPECTRAL FOLD that carries T(lambda)
+    // through surfaces) can only fire when the beam's medium has a FLAT gather-time tail,
+    // because folding throws the wavelength away and the gather then has nothing to evaluate
+    // sigma_s / phase / CIE at. A `phase rainbow` medium fails that test, so every beam in
+    // gallery_rain's rain curtain is stored monochromatic — and a beam is a LINE, so each one
+    // paints a saturated streak down its whole length. Measured: 83.9% of the rain's beams sit
+    // on a path that was wavelength-independent the whole way and are refused for this reason
+    // alone.
+    //
+    // But look at what is actually left. For a medium whose sigma_s and sigma_t are flat and
+    // whose ONLY chromatic term is the phase table, the gather's per-wavelength factor is
+    //
+    //     CIE(lambda) * p(cosTheta, lambda)
+    //
+    // and cosTheta is a scalar the gather already computed. So the fold does not have to
+    // happen at deposit time at all: store the beam with its emitter's identity, and let the
+    // GATHER integrate
+    //
+    //     Bow(cosTheta) = integral over lambda of  spd_e(lambda) * CIE(lambda)
+    //                                              * p(cosTheta, lambda)  d lambda
+    //                     / integral spd_e
+    //
+    // which is a function of ONE variable per (emitter, medium) pair and can be tabulated once
+    // at build time. The beam then paints the ENTIRE spectral bow at its own scattering angle,
+    // exactly, with no chromatic variance — instead of one sample of it. The bow gets sharper
+    // and cleaner at the same time, because the tabulated integral is the answer the many
+    // monochromatic beams were converging to.
+    //
+    // Two properties worth being explicit about:
+    //   * It is NOT the 12-bin `Emitter::foldCie` quadrature. That grid exists to carry a
+    //     smooth product of two smooth curves through a surface; a bow at a fixed angle is
+    //     sharply peaked IN lambda (that is what makes it a bow), and 12 bins would alias it
+    //     into visible colour steps. The table below integrates on the 1 nm grid, so the
+    //     quadrature error is the same as everywhere else in the renderer.
+    //   * It needs the path's spectral throughput to be flat, i.e. T(lambda) == 1. A beam that
+    //     picked up a surface albedo carries per-bin weights that this table cannot know, so
+    //     it does not qualify and falls back to the monochromatic record.
+    //
+    // `phaseLum` is the same integral against luminance alone, normalised by the emitter's
+    // cieMean.y. It is what the gather uses as the SCALAR phase value — for the >0 guard and
+    // for mode J's MIS weight — so that `cie * w` reproduces the spectral integral exactly
+    // while every other factor in the chain stays where it was.
+    struct BowLut {
+        static constexpr int kBins = 8192;   // uniform in cosTheta over [-1, 1]
+        std::vector<Vec3>   cie;             // Bow(cos) / phaseLum(cos): the effective colour
+        std::vector<float>  phaseLum;        // the effective scalar phase
+        bool valid() const { return !cie.empty(); }
+        // Nearest-lower bin with linear interpolation; cosTheta is clamped, never wrapped.
+        void eval(double cosTheta, Vec3& cieOut, double& phaseOut) const {
+            double u = (cosTheta + 1.0) * 0.5 * (double)(kBins - 1);
+            if (!(u > 0.0)) u = 0.0;
+            if (u > (double)(kBins - 1)) u = (double)(kBins - 1);
+            const int   i = (int)u;
+            const int   j = (i + 1 < kBins) ? i + 1 : i;
+            const double f = u - (double)i;
+            cieOut   = cie[i] * (1.0 - f) + cie[j] * f;
+            phaseOut = (double)phaseLum[i] * (1.0 - f) + (double)phaseLum[j] * f;
+        }
+    };
+    // Row-major [emitter * media.size() + medium]. Entries for ineligible pairs are left
+    // empty (`valid() == false`), so the lookup is a single bounds-checked index.
+    std::vector<BowLut> bowLuts;
+    const BowLut* bowLut(int em, int med) const {
+        if (em < 0 || med < 0 || media.empty()) return nullptr;
+        const size_t k = (size_t)em * media.size() + (size_t)med;
+        if (k >= bowLuts.size() || !bowLuts[k].valid()) return nullptr;
+        return &bowLuts[k];
+    }
+    // A medium qualifies when its coefficients are flat but its phase is not: that is exactly
+    // the case the deposit-time fold must refuse and this table can serve.
+    static bool bowLutEligible(const Medium& m) { return m.achroSigma != 0 && m.rainbow(); }
+
+    void finalizeBowLuts() {
+        bowLuts.clear();
+        if (media.empty() || emitters.empty()) return;
+        bool any = false;
+        for (const auto& m : media) if (bowLutEligible(m)) { any = true; break; }
+        if (!any) return;
+        bowLuts.resize(emitters.size() * media.size());
+        // Pre-tabulate each emitter's normalised SPD * CIE on the 1 nm grid once, so the
+        // per-(emitter, medium) loop below is `kBins * nLam` phase lookups and nothing else.
+        const int nLam = (int)(LAMBDA_MAX - LAMBDA_MIN) + 1;
+        std::vector<double> lam((size_t)nLam);
+        for (int i = 0; i < nLam; ++i) lam[(size_t)i] = LAMBDA_MIN + (double)i;
+        for (size_t e = 0; e < emitters.size(); ++e) {
+            const Emitter& em = emitters[e];
+            std::vector<Vec3> wCie((size_t)nLam);
+            double den = 0.0;
+            for (int i = 0; i < nLam; ++i) {
+                const double s = em.spdFn(lam[(size_t)i]);
+                wCie[(size_t)i] = Vec3(cieX(lam[(size_t)i]), cieY(lam[(size_t)i]),
+                                       cieZ(lam[(size_t)i])) * s;
+                den += s;
+            }
+            if (!(den > 0.0)) continue;
+            const double invDen = 1.0 / den;
+            for (int i = 0; i < nLam; ++i) wCie[(size_t)i] = wCie[(size_t)i] * invDen;
+            // cieMean.y is the normaliser that makes `cie * phaseLum` reproduce the integral;
+            // an emitter with no luminous response has no bow to tabulate.
+            const double yMean = em.cieMean.y;
+            if (!(yMean > 0.0)) continue;
+            for (size_t mi = 0; mi < media.size(); ++mi) {
+                const Medium& md = media[mi];
+                if (!bowLutEligible(md)) continue;
+                BowLut& L = bowLuts[e * media.size() + mi];
+                L.cie.assign((size_t)BowLut::kBins, Vec3{0, 0, 0});
+                L.phaseLum.assign((size_t)BowLut::kBins, 0.0f);
+                for (int b = 0; b < BowLut::kBins; ++b) {
+                    const double c = -1.0 + 2.0 * (double)b / (double)(BowLut::kBins - 1);
+                    Vec3 sum{0, 0, 0};
+                    for (int i = 0; i < nLam; ++i) {
+                        const double p = md.phaseValue(c, lam[(size_t)i]);
+                        if (p > 0.0) sum += wCie[(size_t)i] * p;
+                    }
+                    const double pl = sum.y / yMean;
+                    L.phaseLum[(size_t)b] = (float)pl;
+                    // Factor the scalar back out so the gather's arithmetic chain is untouched:
+                    // it multiplies `cie` by a `w` that already contains `phaseLum`.
+                    L.cie[(size_t)b] = (pl > 0.0) ? sum * (1.0 / pl) : Vec3{0, 0, 0};
+                }
+            }
+        }
+    }
 
     // Estimate each emissive medium's mean emission and selection power. Called by
     // build() after finalizeEmitters(). Cheap Monte-Carlo over the grid AABB × band.
@@ -1267,6 +1558,12 @@ struct Scene {
     // sun-aware hot path (ray miss, background pass) tests this first so a scene
     // without a sun pays one integer compare.
     int sunCount = 0;
+    // Does ANY material carry `hideCamera`? Recounted by finalizeEmitters() (and set
+    // directly by the loader the moment the flag is authored, so it can never be missed
+    // by a scene path that skips finalisation). Exists purely so the overwhelmingly
+    // common scene — no hidden material anywhere — pays one bool test per camera ray
+    // instead of a per-primitive material lookup inside the BVH leaf.
+    bool camHiddenAny = false;
 
     // Environment radiance from direction `d` at wavelength lambda (0 if no env).
     // Constant env ignores `d`; an image env samples the lat-long map.
@@ -1508,6 +1805,68 @@ struct Scene {
         // path that rebuilds the emitter list, including applyIgnoreFlags' filtering.
         sunCount = 0;
         for (const auto& e : emitters) if (e.shape == EmitterShape::Sun) ++sunCount;
+        // Same reasoning for the camera-hidden flag: recount here so every path that
+        // rebuilds materials/emitters leaves the fast-path gate consistent with `mats`.
+        camHiddenAny = false;
+        for (const auto& m : mats) if (m.hideCamera) { camHiddenAny = true; break; }
+        // The SPD-weighted mean CIE of every emitter (see Emitter::cieMean). Both integrals
+        // run over the SAME 1 nm grid so the quadrature step cancels in the ratio and the
+        // result does not depend on `stepNm` or on how `spd` was built. An emitter with no
+        // energy in the visible band keeps {0,0,0}, which is the correct fold for it.
+        for (auto& e : emitters) {
+            Vec3 num{0, 0, 0};
+            double den = 0.0;
+            for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0) {
+                const double s = e.spdFn(lam);
+                if (!(s > 0.0)) continue;
+                num += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * s;
+                den += s;
+            }
+            e.cieMean = (den > 0.0) ? num * (1.0 / den) : Vec3{0, 0, 0};
+            // THE SPECTRAL FOLD TABLE (Emitter::foldCie/foldLam). Same grid, second pass:
+            // split the band into kFoldBins intervals of EQUAL SPD MASS and record each
+            // one's CIE integral and its SPD-weighted mean wavelength.
+            //
+            // A grid sample is assigned WHOLE to the bin its own mass MIDPOINT falls into,
+            // never split across two bins. That is what makes sum_k foldCie[k] == cieMean an
+            // exact identity rather than an approximate one (every sample is counted once,
+            // in exactly one bin), which in turn is what makes an unweighted spectral fold
+            // reproduce the plain achromatic fold bit-for-bit. Equal-MASS rather than
+            // equal-WIDTH bins are the right cut because the weight each bin carries in the
+            // final sum is then uniform, so the quadrature spends its 12 reflectance
+            // evaluations where the emitter actually emits — a 5800 K sun puts none of them
+            // in the far red where the SPD has fallen off, and a narrow LED puts all of them
+            // inside its line instead of 11 on empty band and 1 on the peak.
+            for (int k = 0; k < kFoldBins; ++k) { e.foldCie[k] = Vec3{0, 0, 0}; e.foldLam[k] = 0.0; }
+            e.foldN = 0;
+            if (den > 0.0) {
+                Vec3   bCie[kFoldBins] = {};
+                double bMass[kFoldBins] = {}, bLam[kFoldBins] = {};
+                double acc = 0.0;
+                for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0) {
+                    const double s = e.spdFn(lam);
+                    if (!(s > 0.0)) continue;
+                    int k = (int)(((acc + 0.5 * s) / den) * kFoldBins);
+                    if (k < 0) k = 0;
+                    if (k >= kFoldBins) k = kFoldBins - 1;
+                    bCie[k] += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * s;
+                    bMass[k] += s;
+                    bLam[k] += s * lam;
+                    acc += s;
+                }
+                // Compact the live bins to the front. A well-behaved broadband SPD fills all
+                // twelve (equal mass guarantees it whenever the band has at least kFoldBins
+                // non-zero grid samples), but a laser line or a single-sample SPD leaves most
+                // empty — and an empty bin would otherwise cost a reflectance evaluation at a
+                // meaningless wavelength for a guaranteed-zero contribution.
+                for (int k = 0; k < kFoldBins; ++k) {
+                    if (!(bMass[k] > 0.0)) continue;
+                    e.foldCie[e.foldN] = bCie[k] * (1.0 / den);
+                    e.foldLam[e.foldN] = bLam[k] / bMass[k];
+                    ++e.foldN;
+                }
+            }
+        }
         emitterCdf.assign(emitters.size(), 0.0);
         for (size_t i = 0; i < emitters.size(); ++i) {
             // Area/sphere keep the exact emitIntegral*area*PI expression so those
@@ -1740,6 +2099,11 @@ struct Scene {
     std::vector<LightTreeNode> lightTree;
     std::vector<int> lightTreeAlways;
     int lightTreeRoot = -1;
+    // Reverse indices, for ltSelectPdf (GLOSSY-NEE's BSDF-sampling half, which knows an
+    // emitter and needs the path back up to the root). Derived from `lightTree` by one
+    // linear pass, so the builder is untouched and every selection pdf stays identical.
+    std::vector<int> lightTreeParent;   // node -> parent node, root = -1
+    std::vector<int> lightTreeLeaf;     // emitter -> its leaf node, or -1 if not in the tree
 
     // Describe one emitter to the builder: a box that contains its emitting surface,
     // a cone that contains every normal it can emit along, and its flux.
@@ -1831,6 +2195,8 @@ struct Scene {
     void buildLightTree() {
         lightTree.clear();
         lightTreeAlways.clear();
+        lightTreeParent.clear();
+        lightTreeLeaf.clear();
         lightTreeRoot = -1;
         std::vector<LtEmitterBound> items;
         items.reserve(emitters.size());
@@ -1850,6 +2216,17 @@ struct Scene {
         }
         lightTreeRoot = ltBuild(items, lightTree);
         std::sort(lightTreeAlways.begin(), lightTreeAlways.end());
+        // The reverse indices. A leaf's `emitter` is its own key, so both fall out of one
+        // pass with no extra bookkeeping in the recursive builder.
+        lightTreeParent.assign(lightTree.size(), -1);
+        lightTreeLeaf.assign(emitters.size(), -1);
+        for (size_t i = 0; i < lightTree.size(); ++i) {
+            const LightTreeNode& nd = lightTree[i];
+            if (nd.left  >= 0) lightTreeParent[(size_t)nd.left]  = (int)i;
+            if (nd.right >= 0) lightTreeParent[(size_t)nd.right] = (int)i;
+            if (nd.emitter >= 0 && (size_t)nd.emitter < lightTreeLeaf.size())
+                lightTreeLeaf[(size_t)nd.emitter] = (int)i;
+        }
     }
 
     // Select an emitter index for the power-weighted CDF. For a single emitter
@@ -1920,15 +2297,37 @@ struct Scene {
         // = half the box diagonal (the box circumradius, guaranteed to enclose all
         // geometry). Sizes forward environment photon emission (disk radius) and
         // the env phase-space weight envGeom = 4*PI^2*R^2.
-        if (!bvh.nodes.empty()) {
-            Aabb b = bvh.nodes[0].box;
+        {
+            Aabb b;
+            if (!bvh.nodes.empty()) b = bvh.nodes[0].box;
             // Geometry summarised into a medium and deleted (a `-fur-volume` coat) is still
             // physically there — it just isn't traced. Put its extent back so the bounding
             // sphere, and therefore environment emission, is the one the strands would have
             // produced. No-op when droppedBounds is empty.
             if (droppedBounds.lo.x <= droppedBounds.hi.x) b.expand(droppedBounds);
-            sceneCenter = b.center();
-            sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
+            // BOUNDED PARTICIPATING MEDIA COUNT AS EXTENT. A fog box is part of the scene even
+            // though it is not in the geometry BVH: light has to reach it, photon beams have to
+            // cross it, and a sun's emission disc has to cover it. Leaving it out made
+            // `sceneRadius` a property of the *props* rather than of the world, which is wrong
+            // in exactly the direction that is hardest to see — it under-reports. The failure
+            // that found this: `scenes/_slab_ss.ftsl` is a 4x2x2 m fog box lit by one 2 cm
+            // sphere and nothing else, so the BVH root was a 4 cm box, sceneRadius was 0.0346 m,
+            // and `Renderer::emitBeams`' escape clamp (kBeamFarScale * sceneRadius) truncated
+            // EVERY photon beam at 0.277 m. The beam map became a stub cloud around the emitter
+            // that never reached the camera's view of the box, so mode J's merges returned
+            // exactly zero while its MIS weights still divided the connections down by the
+            // density those merges were supposed to have — a 44x too-dark image. bmin/bmax is
+            // the region's AABB for every bound shape (box, sphere and implicit alike), so one
+            // union covers all three.
+            for (const Medium& md : media)
+                if (md.bounded && md.bmin.x <= md.bmax.x) {
+                    b.expand(md.bmin);
+                    b.expand(md.bmax);
+                }
+            if (b.lo.x <= b.hi.x) {
+                sceneCenter = b.center();
+                sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
+            }
         }
         // Distant suns are sized by the same bounding sphere: a photon is born on a
         // disc of radius R perpendicular to its (cone-sampled) travel direction, so the
@@ -1948,8 +2347,18 @@ struct Scene {
                 envXYZ += Vec3(cieX(lam), cieY(lam), cieZ(lam))
                           * emitters[envIndex].spdFn(lam);
         }
+        // Bake each medium's achromaticity (Medium::achro) once, here, because the forward
+        // tracer reads it at every medium scatter and computing it honestly is a whole-band
+        // scan of two Spectrum objects. Done for DISABLED media too: `enabled` is a render
+        // flag that can be flipped by applyIgnoreFlags after build(), and a stale -1 would be
+        // worse than a computed answer nobody reads.
+        for (auto& m : media) {
+            m.achroSigma = m.computeAchromaticSigma() ? 1 : 0;
+            m.achro      = m.computeAchromatic()      ? 1 : 0;
+        }
         finalizeEmitters();
         finalizeEmissiveVolumes();
+        finalizeBowLuts();
     }
     void finalizeTris() { build(); }   // kept for existing call sites
 
@@ -2198,8 +2607,17 @@ struct Scene {
     // the strands are summarised by the density grid, and hitting one as geometry would
     // count it twice — once as a surface and once as optical depth. As there, only
     // `MatType::Hair` curves are skipped: grass and wire are curves too and stay solid.
+    //
+    // `skipCamHidden` does the same for `Material::hideCamera` — see that field. Renderers
+    // pass it as `bounce == 0` on the CAMERA path only, which is what makes it mean
+    // "primary visibility off" rather than "invisible": a reflection or refraction spawned
+    // at bounce 0 is traced at bounce 1 and sees the surface normally. `occluded()` has the
+    // same switch under the name `camLeg`, for the forward/bidirectional modes whose camera
+    // ray is a connection segment rather than a traced ray — but it is off by default there,
+    // because an ordinary NEE shadow ray must still be blocked by a hidden flat or turning
+    // off primary visibility would silently change the lighting.
     Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr,
-                   bool skipHair = false) const {
+                   bool skipHair = false, bool skipCamHidden = false) const {
         ++raystats::tls;
         Hit h;
         double tMax = DBL_MAX;
@@ -2220,20 +2638,40 @@ struct Scene {
         // One leaf body, indexed by GLOBAL prim, so both trees decode the same way. The
         // leaf-level hair rejection stays as the fallback for when no no-hair tree was
         // built; when there is one, the fibers are simply not in it and the test never fires.
+        // Hoisted out of the leaf: a scene with no camera-hidden material (all but a
+        // handful) collapses this to a compile-time-constant false and the per-prim test
+        // below is never reached. `hidden()` is checked BEFORE the intersection, not after,
+        // so a hidden primitive costs a matId load and a bool test rather than a full
+        // ray-triangle test whose result is then thrown away.
+        const bool camHide = skipCamHidden && camHiddenAny;
+        const auto hidden = [&](int matId) {
+            return camHide && matId >= 0 && matId < (int)mats.size() && mats[matId].hideCamera;
+        };
         const auto leaf = [&](int prim, double& tm) {
-            if (prim < (int)nT)            { if (intersectTri(sh, r, tris[prim], tmin, h)) tm = h.t; }
-            else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
-            else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs)) tm = h.t; }
+            if (prim < (int)nT)            { const Tri& t = tris[prim];
+                                             if (hidden(t.matId)) return;
+                                             if (intersectTri(sh, r, t, tmin, h, vcolData())) tm = h.t; }
+            else if (prim < (int)(nT + nS)){ const Sphere& s = spheres[prim - nT];
+                                             if (hidden(s.matId)) return;
+                                             if (intersectSphere(r, s, tmin, h)) tm = h.t; }
+            else if (prim < (int)(nT + nS + nI)) { const Implicit& im = implicits[prim - nT - nS];
+                                             if (hidden(im.matId)) return;
+                                             if (intersectImplicit(r, im, tmin, h, &tabs)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
                 if (skipHair && isHairCurve(cs)) return;
+                if (hidden(cs.matId)) return;
                 if (intersectCurveSeg(cray, r, cs, tmin, h)) tm = h.t;
             }
             else {
+                // Instanced meshes are NOT covered: their materials live per-BLAS-triangle,
+                // below this decode, and nothing that can carry `hideCamera` today (an
+                // `light area`'s two world tris) is ever instanced. If a future `hide_camera`
+                // on a mesh block needs it, the test belongs inside Blas::intersectLocal.
                 const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
                 Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
                 Hit lh; lh.t = h.t;                    // running world tMax == local tMax
-                if (blasList[inst.blasId].intersectLocal(lr, tmin, lh)) {
+                if (blasList[inst.blasId].intersectLocal(lr, tmin, lh, vcolData())) {
                     instanceHitToWorld(inst, r, lh);
                     h = lh; tm = h.t;
                 }
@@ -2253,7 +2691,14 @@ struct Scene {
     // NOTE: dielectrics block connections (can't connect through specular) — the
     // SDS limitation. Glass therefore appears dark in model B; caustics it casts
     // onto diffuse surfaces still render, since those diffuse vertices connect.
-    bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
+    //
+    // `camLeg` says this segment IS the camera leg of a connection — a photon-to-pinhole
+    // or vertex-to-camera shadow ray in a forward / bidirectional mode. In those modes the
+    // camera leg plays the part `closestHit`'s primary ray plays in a backward mode, so it
+    // is where `Material::hideCamera` has to apply and the only place it may. Pass it false
+    // (the default) for an NEE / light-connection segment: a hidden flat still shadows.
+    bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6,
+                  bool camLeg = false) const {
         ++raystats::tls;
         Ray r{o, dir};
         const size_t nT = tris.size();
@@ -2264,16 +2709,26 @@ struct Scene {
         const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
         const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};   // see closestHit
         const PatTables tabs = patTables();      // see closestHit
+        const bool camHide = camLeg && camHiddenAny;      // see closestHit's `camHide`
+        const auto hidden = [&](int matId) {
+            return camHide && matId >= 0 && matId < (int)mats.size() && mats[matId].hideCamera;
+        };
         return bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
-            if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
-            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
-            if (prim < (int)(nT + nS + nI + nC))
-                return intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], tmin, h, /*anyHit=*/true);
+            if (prim < (int)nT)             { const Tri& t = tris[prim];
+                                              return !hidden(t.matId) && intersectTri(sh, r, t, tmin, h, vcolData()); }
+            if (prim < (int)(nT + nS))      { const Sphere& s = spheres[prim - nT];
+                                              return !hidden(s.matId) && intersectSphere(r, s, tmin, h); }
+            if (prim < (int)(nT + nS + nI)) { const Implicit& im = implicits[prim - nT - nS];
+                                              return !hidden(im.matId) &&
+                                                     intersectImplicit(r, im, tmin, h, &tabs, /*anyHit=*/true); }
+            if (prim < (int)(nT + nS + nI + nC)) {
+                const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
+                return !hidden(cs.matId) && intersectCurveSeg(cray, r, cs, tmin, h, /*anyHit=*/true);
+            }
             const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
-            return blasList[inst.blasId].occludedLocal(lr, tmin, seg);  // world seg == local seg
+            return blasList[inst.blasId].occludedLocal(lr, tmin, seg, vcolData());  // world seg == local seg
         });
     }
 
@@ -2299,7 +2754,7 @@ struct Scene {
         const PatTables tabs = patTables();
         const auto leaf = [&](int prim) {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
+            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h, vcolData());
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
             if (prim < (int)(nT + nS + nI + nC)) {
@@ -2367,7 +2822,7 @@ struct Scene {
         int crossed = 0;
         const bool blocked = bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
+            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h, vcolData());
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI))
                 return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
@@ -2477,7 +2932,7 @@ struct Scene {
     Hit closestHitLinear(const Ray& r, double tmin = 1e-6) const {
         Hit h;
         const TriShear sh = makeTriShear(r.d);
-        for (const auto& t : tris)     intersectTri(sh, r, t, tmin, h);
+        for (const auto& t : tris)     intersectTri(sh, r, t, tmin, h, vcolData());
         for (const auto& s : spheres)  intersectSphere(r, s, tmin, h);
         const PatTables tabs = patTables();
         for (const auto& im : implicits) intersectImplicit(r, im, tmin, h, &tabs);
@@ -2502,6 +2957,68 @@ struct Scene {
         return h;
     }
 };
+
+// ---- Is a SPECTRAL BEAM BUNDLE valid in this scene? ---------------------------------------
+// A photon beam that carries several wavelengths (photonbeams.h, `-beamspec`) shares ONE
+// geometry and — decisively — ONE pair of transmittance marches between all of them, because
+// those marches are the dominant cost of the beam gather. That sharing is exact only when
+// every medium's EXTINCTION is wavelength-independent: Tr = exp(-integral sigma_t) is then the
+// same number for the hero and for every secondary, and all that differs per wavelength is the
+// cheap `sigma_s * phase * CIE` tail, which the gather does evaluate per wavelength.
+//
+// If some medium's sigma_t is chromatic — a coloured absorber, say — the shared march would
+// hand a secondary the HERO's attenuation, which is simply the wrong number: a wavelength-
+// dependent BIAS, not noise. There is no cheap repair (a per-wavelength march is exactly the
+// cost the bundle exists to avoid), so the honest answer is to refuse the bundle in such a
+// scene and deposit classic monochromatic beams, which are unbiased there and always were.
+//
+// The test SAMPLES sigma_t across the visible band rather than inspecting the spectra's
+// representation, because a Medium's sigma_a/sigma_s can each be any Spectrum — constant, RGB,
+// tabulated, blackbody — and only their SUM has to be flat; two chromatic halves that cancel
+// are a perfectly good achromatic extinction. The tolerance is relative and generous: a
+// rounding-level ripple in a tabulated grey spectrum must not disqualify a scene.
+//
+// Lives in scene.h, next to the Medium it interrogates, because BOTH deposit paths need it —
+// the CPU one in photonmap_render.h and the CUDA one in render_cuda.cu, which cannot include
+// the former.
+// ---- Is THIS MEDIUM's gather-time spectral tail wavelength-independent? -------------------
+// The beam gather's per-wavelength factors are exactly three: sigma_s at the gather point, the
+// phase function at the scattering angle, and CIE. A medium for which the first two are FLAT
+// across the band contributes nothing to the colour of a beam except through CIE — which means
+// a beam lying in it, on a wavelength-independent path, can be folded at the emitter's mean CIE
+// (Emitter::cieMean) instead of at one sampled wavelength, with NO chromatic variance at all.
+// See photonbeams.h, ACHROMATIC-PATH BEAMS.
+//
+// Two things disqualify a medium, and both are real cases in the same scene:
+//   * a RAINBOW phase table — the whole point of it is that the phase IS a function of
+//     wavelength, so the bow only exists if each beam keeps its own lambda;
+//   * a chromatic sigma_s — a medium that scatters blue more than red genuinely colours the
+//     light it scatters, and the mean CIE would erase that.
+// Extinction is NOT tested here: it enters through the two transmittance marches, which are
+// shared across the whole segment (all media, not just this one), so the scene-wide
+// beamSpectralOK below is what guards it.
+//
+// Per MEDIUM rather than per scene on purpose. gallery_rain holds an achromatic HG cloud and a
+// chromatic rainbow rain curtain at once; the cloud must get the noise-free fold and the rain
+// must not, and a scene-wide test would have to refuse both.
+// Reader for the flag Scene::build() baked (Medium::achro). A free function so the two beam
+// files can ask for it by the name the design talks about, without either of them having to
+// know that the answer is cached rather than computed.
+inline bool mediumAchromatic(const Medium& m) { return m.achro != 0; }
+
+inline bool beamSpectralOK(const Scene& scene) {
+    for (const Medium& m : scene.media) {
+        double lo = 1e300, hi = -1e300;
+        for (int i = 0; i <= 32; ++i) {
+            const double lam = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * (double)i / 32.0;
+            const double st = m.sigmaT(lam);
+            lo = std::min(lo, st); hi = std::max(hi, st);
+        }
+        if (hi <= 0.0) continue;                  // a medium that never extinguishes is fine
+        if ((hi - lo) > 1e-4 * hi) return false;  // chromatic extinction: no bundle
+    }
+    return true;
+}
 
 // PatOp::Tex sampler: the LINEAR grayscale value of one of the Scene's image
 // textures (Texture::scalarAt — the same sampler roughness / film-thickness maps
@@ -2662,6 +3179,34 @@ inline double reflectSlot(const Scene& scene, const Material& m,
     return m.reflectPat < 0 ? v : v * reflectPatMul(scene, m, h);
 }
 
+// Spectral reflectance of a hit's interpolated VERTEX COLOUR, at one wavelength.
+//
+// The file gave RGB and the tracer needs reflect(lambda), so this is the RGB -> spectrum
+// lift every other colour in ftrace already goes through — the difference being that the
+// colour here exists at no vertex and no texel. It is invented per hit by the barycentric
+// blend, so the usual answer (fit it once at load, like an FTSL `rgb` or a texture's
+// texels) has nothing to attach itself to.
+//
+// That is the same predicament stochastic tiling is in — it blends three crops and then
+// owes the renderer a spectrum for a colour nobody authored — and it is already solved:
+// upsample::coeffLut() tabulates the Jakob-Hanika sigmoid coefficients over the RGB cube
+// on a sqrt-warped grid, and stochJhCoeff does the trilinear lookup. Reusing it means
+//
+//   * the COLOUR is what gets interpolated across the face, which is the quantity that
+//     actually varies linearly there — interpolating pre-fitted coefficients instead
+//     would be an approximation, and a worse one near black where they move fastest;
+//   * nothing is fitted at load, so a 2 M-vertex scan costs no Gauss-Newton at all;
+//   * the GPU tracer needs no separate path, since stochJhCoeff is STOCH_HD and the
+//     device already carries the same table for tiling.
+//
+// Accuracy is the table's, measured in upsample.h: mean |dR| 1.4e-4, worst 4.3e-3.
+inline double vertexColorReflectance(const Hit& h, double lambda) {
+    double c[3];
+    stochJhCoeff(upsample::coeffLut().data(), h.vcolR, h.vcolG, h.vcolB, c);
+    const std::array<double, 3> cc{c[0], c[1], c[2]};
+    return upsample::reflAt(cc, lambda);
+}
+
 // Diffuse albedo at a hit: a bound parametric record (highest priority), else the
 // material's spatially-varying texture reflectance if one is bound (Phase 3b), else
 // its constant `reflect` spectrum — and then scaled by a bound reflect pattern, which
@@ -2680,6 +3225,11 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
             rv = m.reflect(lambda);
         }
     }
+    // Vertex colour MULTIPLIES the material's albedo, which is glTF's rule for COLOR_0
+    // and degrades sensibly everywhere else: against a white material it IS the vertex
+    // colour, and against a tinted one it tints further rather than overriding what the
+    // scene asked for.
+    if (h.hasVcol) rv *= vertexColorReflectance(h, lambda);
     return m.reflectPat < 0 ? rv : rv * reflectPatMul(scene, m, h);
 }
 

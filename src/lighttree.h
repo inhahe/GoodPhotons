@@ -58,6 +58,14 @@ namespace lt {
 inline bool   gEnabled = true;   // false = the exact all-emitters splitting estimator
 inline double gSplit   = 1.0;    // adaptive-splitting threshold, (node radius / distance)^2
 inline int    gSamples = 8;      // cap on emitters connected per shading vertex
+
+// GLOSSY-NEE (known-issues.md): connect a MatType::Glossy vertex to the lights and balance-
+// heuristic it against the lobe-sampling strategy, instead of hoping a lobe sample lands on the
+// emitter. Lives here beside the light-tree switches because it is the same kind of thing -- a
+// direct-lighting estimator setting that several translation units have to agree on -- and for
+// the same reason: an `inline` variable in a header is one object across the CUDA TU and the
+// host TU, where a `static` in main.cpp would silently be two.
+inline bool   gGlossyNee = true;  // -no-glossy-nee: the pre-0.266 estimator, rng order included
 }
 
 // One node of the light BVH. Interior nodes carry two child indices; leaves carry
@@ -181,6 +189,65 @@ LT_FN bool ltShouldSplit(const LightTreeNode& nd, const double p[3], double thre
     return r2 / d2 > thresh;
 }
 
+// ---- REVERSE SELECTION PDF (GLOSSY-NEE's other half) -----------------------------
+// The probability ltSample would reach emitter `leaf` from this vertex -- the number
+// the BSDF-sampling half of a glossy MIS weight needs, one bounce after the light-
+// sampling half already had it for free.
+//
+// The path root->leaf is UNIQUE in a tree, so there is nothing to integrate: walk it
+// and multiply the factor each step contributed. A SPLIT contributes 1 (both children
+// are taken, with certainty); a stochastic step contributes that child's importance
+// share. Both are pure functions of the vertex, so this reproduces ltSample's own
+// arithmetic rather than approximating it.
+//
+// WHAT THIS DELIBERATELY DOES NOT REPRODUCE is ltSample's *room* condition: a split
+// that ltSample declined only because its output/stack was full, or a leaf it dropped
+// for the same reason. Those depend on the traversal order and therefore on the RNG,
+// so they are not recoverable one bounce later. The resolution is not to try -- it is
+// that BOTH halves of the MIS weight call THIS function, so whatever it returns, they
+// return the same thing and the weights still sum to one. ltSample's exact pdf is
+// still what divides the ESTIMATOR (EmitterDraw::weight); only the WEIGHT uses this,
+// and a weight has to be consistent, not correct. Getting that backwards is what made
+// the first attempt at this entry unbiased-but-noisier (known-issues.md).
+//
+// Returns 0 when the leaf is unreachable (zero importance on the way, or a tree deeper
+// than DEPTH), which every caller reads as "not MIS-covered, keep full weight".
+template <int DEPTH = 64>
+LT_FN double ltSelectPdf(const LightTreeNode* nodes, int root, const int* parent,
+                         int leaf, const double p[3], const double n[3], bool hasN,
+                         double splitThresh) {
+    if (!nodes || !parent || root < 0 || leaf < 0) return 0.0;
+    // Climb to the root recording the path, then replay it downwards -- the factors
+    // have to be evaluated at the PARENT, which the upward pass visits last.
+    int path[DEPTH];
+    int d = 0;
+    for (int k = leaf; k != root; k = parent[k]) {
+        if (k < 0 || d >= DEPTH) return 0.0;
+        path[d++] = k;
+    }
+    double pdf = 1.0;
+    int cur = root;
+    for (int i = d - 1; i >= 0; --i) {
+        const LightTreeNode& nd = nodes[cur];
+        const int li = nd.left, ri = nd.right, nxt = path[i];
+        if (li >= 0 && ri >= 0 && !ltShouldSplit(nd, p, splitThresh)) {
+            const double iL = ltImportance(nodes[li], p, n, hasN);
+            const double iR = ltImportance(nodes[ri], p, n, hasN);
+            const double sum = iL + iR;
+            if (!(sum > 0.0)) return 0.0;       // ltSample would have abandoned this walk
+            // EXACTLY ltSample's arithmetic, including taking the right child as `1 - pL`
+            // rather than `iR/sum`. Those differ in the last bits, and the whole point of this
+            // function is that the two halves of the weight produce the SAME number -- which
+            // also makes "reusing ltSample's pdf instead of walking" a bit-identity claim that
+            // can be tested rather than argued.
+            const double pL = iL / sum;
+            pdf *= (nxt == li) ? pL : (1.0 - pL);
+        }
+        cur = nxt;
+    }
+    return pdf;
+}
+
 // Walk the tree and fill `out` with the emitters to connect to this vertex, each
 // with the probability the walk had of reaching it. Returns how many were written.
 //
@@ -200,10 +267,14 @@ LT_FN bool ltShouldSplit(const LightTreeNode& nd, const double p[3], double thre
 // array is a per-thread local-memory frame in the megakernel, and 64 entries of
 // {int,double} is a kilobyte per thread that would be paid by every thread whether it
 // touches a light tree or not.
+// `roomLimited` (optional out) reports whether any split was declined for want of output/stack
+// room rather than because ltShouldSplit said no. When it comes back false, every pdf written to
+// `out` is exactly what ltSelectPdf would return for that leaf -- which is what lets the caller
+// skip the reverse walk entirely. See scraps/fix_selpdf_reuse.py.
 template <class RNG, int STACK = 64>
 LT_FN int ltSample(const LightTreeNode* nodes, int root, const double p[3],
                    const double n[3], bool hasN, double splitThresh,
-                   int maxOut, LtSample* out, RNG& rng) {
+                   int maxOut, LtSample* out, RNG& rng, bool* roomLimited = nullptr) {
     if (!nodes || root < 0 || maxOut <= 0) return 0;
     struct Entry { int node; double pdf; };
     Entry stack[STACK];
@@ -221,8 +292,12 @@ LT_FN int ltSample(const LightTreeNode* nodes, int root, const double p[3],
         if (ri < 0) { stack[sp++] = Entry{li, e.pdf}; continue; }
         // Room to split? Need a free stack slot AND a free output slot, since a
         // split can only pay off if both halves can still be reported.
-        const bool canSplit = (sp + 2 <= STACK) && (nOut + sp + 2 <= maxOut) &&
-                              ltShouldSplit(nd, p, splitThresh);
+        // Split into two tests (value-identical -- ltShouldSplit is pure and draws no rng, so
+        // evaluation order cannot matter) so a split declined purely for ROOM can be reported.
+        const bool wantSplit = ltShouldSplit(nd, p, splitThresh);
+        const bool haveRoom  = (sp + 2 <= STACK) && (nOut + sp + 2 <= maxOut);
+        if (wantSplit && !haveRoom && roomLimited) *roomLimited = true;
+        const bool canSplit = wantSplit && haveRoom;
         if (canSplit) {
             stack[sp++] = Entry{li, e.pdf};
             stack[sp++] = Entry{ri, e.pdf};

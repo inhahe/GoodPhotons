@@ -41,6 +41,10 @@ struct DPatEnvT {
     const PatGrid*    grids;    int nGrids;
     const PatScatter* scatters; int nScatters;
     const float*      dataPool; int dataPoolN;
+    // N-D slice (host PatTables::slice). Uploaded by value rather than by pointer: it is
+    // 40 doubles at the 12-dimension cap and is read by every field sample, so it rides in
+    // the env the sampler already has instead of costing a global load per evaluation.
+    PatSlice          slice;
 };
 
 template <class TexT>
@@ -49,6 +53,7 @@ __host__ __device__ inline DPatEnvT<TexT> dPatEnvNoneT() {
     e.tex = nullptr; e.nTex = 0;
     e.grids = nullptr; e.nGrids = 0;
     e.scatters = nullptr; e.nScatters = 0;
+    e.slice.dims = 0;
     e.dataPool = nullptr; e.dataPoolN = 0;
     return e;
 }
@@ -73,11 +78,15 @@ __device__ static inline double dPatValueNoise(double x, double y, double z) {
 // density/ior) — the host compiler rejects `tex:`/`grid:` at those sites, so such a node
 // can never actually appear.
 template <class TexT>
-__device__ inline double dPatternEval(const PatNode* nodes, int n,
+__device__ static inline double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
                                       double u, double v, double curv, double cavity,
-                                      double fw, const DPatEnvT<TexT>& env) {
+                                      double fw, const DPatEnvT<TexT>& env,
+                                      // Extra spatial dimensions (d4..), or null. Only the
+                                      // implicit-field caller has any; every pattern site
+                                      // leaves it null and pays one predictable branch.
+                                      const double* dext = nullptr) {
     double st[64]; int sp = 0;
     double reg[PAT_CSE_REGS];   // CSE registers; StReg always precedes LdReg, so no init
     for (int i = 0; i < n; ++i) {
@@ -85,6 +94,10 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
         switch (nd.op) {
             case PatOp::Const:    st[sp++] = nd.a; break;
             case PatOp::VarX:     st[sp++] = x;  break;
+            case PatOp::VarD4: case PatOp::VarD5:  case PatOp::VarD6:
+            case PatOp::VarD7: case PatOp::VarD8:  case PatOp::VarD9:
+            case PatOp::VarD10: case PatOp::VarD11: case PatOp::VarD12:
+                st[sp++] = dext ? dext[(int)nd.op - (int)PatOp::VarD4] : 0.0;  break;
             case PatOp::VarY:     st[sp++] = y;  break;
             case PatOp::VarZ:     st[sp++] = z;  break;
             case PatOp::VarF:     st[sp++] = f;  break;

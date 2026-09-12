@@ -99,8 +99,13 @@ inline double fieldLeafSDF(const FieldNode& nd, const Vec3& pl, const PatNode* e
             // field, not a distance — the marcher's Lipschitz bound keeps steps safe.
             PatCtx c;
             c.x = pl.x; c.y = pl.y; c.z = pl.z;
-            c.r = std::sqrt(pl.x * pl.x + pl.y * pl.y + pl.z * pl.z);
             patBindTables(c, tabs);
+            // N-D slice (`-nd`): rewrite the sample onto the slice through N-space before
+            // the field sees it, so x/y/z are the first three components of the N-D point
+            // and d4.. the rest. A no-op without -nd. `r` is taken AFTER, so it stays the
+            // radius of the point the field is actually evaluated at.
+            patApplySlice(c, tabs);
+            c.r = std::sqrt(c.x * c.x + c.y * c.y + c.z * c.z);
             return exprPool ? patternEval(exprPool + nd.exprOff, nd.exprN, c) : DBL_MAX;
         }
         case FieldOp::Box: {

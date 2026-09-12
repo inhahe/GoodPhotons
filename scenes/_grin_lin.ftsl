@@ -1,0 +1,28 @@
+# Discriminator: LINEAR-gradient GRIN (ior depends only on y, via subtract+multiply — no
+# sqrt/x*x/nested-div). If GPU backward matches CPU here but NOT on the radial sqrt
+# expression, the device pattern-VM mis-evaluates the complex expr (not the marcher).
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+pattern "checkerpat" { type checker  size 0.18 }
+material "cdark"   { type diffuse reflect rgb 0.04 0.04 0.30 }
+material "clight"  { type diffuse reflect rgb 0.90 0.90 0.90 }
+material "checker" { type mix  layer "clight" 0.5  layer "cdark" 0.5  weight_map pattern:checkerpat }
+
+quad { origin -3 -3 0   u 6 0 0   v 0 6 0   material checker }
+
+medium {
+    bounds { center 0 0 2   radius 0.9 }
+    ior "1.35 - 0.35 * y"
+}
+
+light sphere { center -2.5 2.0 4.0   radius 0.5   spd blackbody 6500 }
+light sphere { center  2.5 2.0 4.0   radius 0.5   spd blackbody 6500 }
+
+camera "cam" {
+    eye 0 0 5   look_at 0 0 0   up 0 1 0   fov_y 45
+    mode R
+    film { res 160 120 }
+}

@@ -18,6 +18,7 @@
 #include "camera.h"
 #include "render.h"   // EnergyReport, Film
 #include "render_progress.h"   // SppProgress (chunked progress for modes R/D)
+namespace bdpt { struct SurfMap; }   // surfmerge.h: mode J's point x point merge map
 
 // True if a usable CUDA device is present (driver + at least one device). Cheap to
 // call; result is cached after the first query.
@@ -162,9 +163,15 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // chunk (e.g. the live window was closed). A null `prog` renders silently as before.
 //
 // `onFrame` (when non-null) is called ONCE per camera, right after that camera's gather
-// fully completes, with its local index and finished film — so the host can write that
-// frame to disk IMMEDIATELY (crash-safe incremental output, matching the CPU mode-M path
-// which writes each frame as it finishes) instead of holding all films to the end. When
+// completes, with its local index, its film, and the samples-per-pixel that ACTUALLY landed
+// in it — so the host can write that frame to disk IMMEDIATELY (crash-safe incremental
+// output, matching the CPU mode-M path which writes each frame as it finishes) instead of
+// holding all films to the end. `sppDone` is normally the requested spp, and is less on the
+// frame an `ftrace -stop` / a closed window interrupts; the film is a SUM over samples, so
+// the host must normalise by `sppDone` and not by the requested count or an interrupted
+// frame is written darkened by exactly the fraction it never gathered. `sppDone == 0` means
+// the stop landed before a single complete sample existed: there is nothing to write, and
+// the callback is NOT invoked at all in that case. When
 // `onFrame` is supplied the returned vector's films are RELEASED as they are handed off
 // (each returned Film[c] is left empty after the callback), so the whole render runs in
 // roughly one-frame of host memory rather than accumulating every frame — the caller must
@@ -201,6 +208,40 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // area-optimal split and the BVH (BeamMap::buildAuto). That reasoning has no place in a kernel
 // and is shared with the CPU path verbatim rather than reimplemented. After the callback
 // returns, the built map is uploaded once and every camera's gather sees it.
+//
+// `stage` (when non-null) reports the phases that precede the first pixel — chiefly the
+// photon deposit, with a running photon count — so the live window's title bar keeps moving
+// through them instead of freezing on one caption for minutes. It is also what makes the
+// deposit CHUNKED: with no reporter the whole `-n` goes out as a single kernel launch (the
+// historical, bit-identical path), while a reporter splits it into adaptively-sized launches
+// so a count can be read between them. See the deposit loop in render_cuda.cu for why
+// chunking is safe (photon power is absolute, so the normalisation does not depend on the
+// split; the atomic deposit cursor accumulates across launches; and each chunk draws its own
+// seed, with chunk 0 reproducing the single-shot stream exactly).
+//
+// `causticK` > 0 turns on the Jensen two-map CAUSTIC SPLIT: every deposit reached by an
+// L.S+.D path (at least one focusing vertex, no scattering one — see dPhotonVertexBit) is
+// partitioned into a SECOND photon map, built at its own adaptive radius targeting `causticK`
+// photons per gather. That is the whole point of the split: a single radius is sized by the
+// majority population, which is the broad ambient wash, and it convolves a caustic — a thin,
+// high-contrast concentration — into a flat smear. The two sets are disjoint and share
+// nEmitted, so the gather simply adds their density estimates. 0 = off (one map, as before).
+//
+// `aim` + `nAimed` add Jensen's PROJECTION-MAP half on top of that split (causticaim.h): a
+// SECOND deposit launch of `nAimed` photons whose emission is importance-sampled towards the
+// scene's focusing geometry, storing into the caustic map only. It is a pure variance
+// reduction and not a replacement — both launches' caustic deposits carry the same
+// balance-heuristic weight, computed at emission from the ratio nAimed/N, and the caustic
+// map's nEmitted stays at the MAIN launch's count — so an incomplete or over-eager target set
+// costs efficiency, never correctness, and `nAimed == 0` leaves every deposit bit-for-bit what
+// it was. Host twin: the aimed pass in tracePhotonPass (photonmap_render.h).
+//
+// `causticAdaptK` switches the caustic map's gather from one radius per MAP to one radius PER
+// QUERY (PhotonMap::adaptiveRadius / dPmAdaptiveRadius): 0 = off (fixed radius, as before),
+// < 0 = on with the same target `causticK` implies, > 0 = on with this explicit target. The
+// split alone is not enough on a scene whose caustic map ALSO holds a broad specular wash —
+// the map-wide probe is decided by the wash and the filament is smeared anyway. Host twin:
+// buildCausticMap in main.cpp.
 struct BeamPass {
     BeamMap*  map    = nullptr;   // receives the deposited (or -loadmap'd) beams, then built
     long long target = 0;         // -beamcount: exact unbiased trim; <= 0 keeps every crossing
@@ -208,20 +249,57 @@ struct BeamPass {
     bool      loadedMissing = false;       // out: -loadmap succeeded but the file held no beams
 };
 
+// PINNED GATHER RADII FOR THE LIGHT-SIDE REFRESH (main.cpp's mode-M epoch loop, 0.253.0).
+//
+// Default-constructed and handed to the FIRST pass: that pass adapts its radii exactly as it
+// always did and records what it settled on here. Every later pass is given the same struct
+// back, sees non-zero radii, and re-bins at them instead of re-probing.
+//
+// This is a correctness requirement, not a tidiness one. Photon mapping is BIASED at a finite
+// radius, so epochs that each re-adapt would be estimating slightly DIFFERENT quantities and
+// their average would be a mixture of estimators rather than variance reduction on one. Pinned,
+// every epoch is the same estimator, the bias stays exactly where the first pass put it, and
+// the average is plain 1/sqrt(epochs). (Host twin: rebuildPhotonMapAt / rebuildCausticMapAt in
+// main.cpp, which pin the CPU mode-M path for the same reason.)
+//
+// `kGather` has to travel too: it is the caustic map's per-query adaptive target, PhotonMap
+// does not derive it from the radius, and a re-bin that dropped it would silently return the
+// caustic gather to a fixed radius.
+struct PmRadiiPin {
+    double radius  = 0.0;   // global map gather radius (0 = not decided yet: adapt and record)
+    double radiusC = 0.0;   // caustic map gather radius
+    double kGather = 0.0;   // caustic per-query adaptive target (0 = fixed radius)
+};
+
+// (g_gpuQuietRebuild — the refresh-epoch narration gate — lives in render_progress.h, because
+// mode J's epoch loop sets it from code that is not inside #ifdef HAVE_CUDA.)
+
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
                                             bool diffraction, long long spp,
                                             const SppProgress* prog = nullptr,
-                                            const std::function<bool(int, const Film&)>* onFrame = nullptr,
+                                            const std::function<bool(int, const Film&, long long)>* onFrame = nullptr,
                                             const char* mapLoad = nullptr, const char* mapSave = nullptr,
                                             int heroC = 1, int fgRays = 0, double autoK = 0.0,
-                                            BeamPass* beams = nullptr);
+                                            BeamPass* beams = nullptr,
+                                            const StageProgress* stage = nullptr,
+                                            double causticK = 0.0,
+                                            const caim::AimMap* aim = nullptr,
+                                            long long nAimed = 0,
+                                            double causticAdaptK = 0.0,
+                                            PmRadiiPin* pin = nullptr);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/
 // cylinder Lambertian emitters (no spot/env/collimated) — the BDPT scope. When false, the
 // caller must use the CPU BDPT renderer.
+// `-jhostlight`: keep mode J's surface light side on the HOST, redrawn once per epoch, which is
+// what it did before 0.272.0. The default is the device pass redrawn per chunk -- 11.2x less
+// whole-frame variance at equal wall clock on a surfaces-only scene, and inert where a frame is
+// already down to one sample per chunk. This is the switch for reproducing pre-0.272.0 output.
+void cudaSetJHostLight(bool on);
+
 bool cudaBdptSupported(const Scene& scene);
 
 // GPU bidirectional path trace (mode D). Renders `spp` samples per pixel at the given
@@ -239,9 +317,21 @@ bool cudaBdptSupported(const Scene& scene);
 // chroma noise). It is clamped to hero::kHeroMax and silently dropped to 1 for scenes the
 // hero walk does not cover (participating media, GRIN, a physical lens) — the same gate the
 // CPU BDPT applies. heroC <= 1 reproduces the original single-λ kernel bit-for-bit.
+//
+// `bmap` non-null is MODE J (UPBP): the caller's already-built photon-beam map, uploaded with
+// its MIS partials and MIS-combined with the connections inside the kernel. Null is mode D,
+// and then the kernel is bit-for-bit the mode-D one (no segment recording, no merge terms —
+// the merge machinery is a template parameter, not a runtime branch, so mode D does not even
+// `smap` is mode J's OTHER merge kind, the point x point surface merges of `-jsurf` (surfmerge.h);
+// null or empty leaves the estimator exactly two-technique, which is validation gate 1's premise.
+// pay the occupancy). A non-null but EMPTY map (`-nobeams`) also degenerates to exactly mode
+// D, which is validation gate 1. `stage` reports progress during the (potentially very long)
+// host-to-device conversion of a multi-million-sub-beam map.
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction,
-                    const SppProgress* prog = nullptr, int heroC = 1);
+                    const SppProgress* prog = nullptr, int heroC = 1,
+                    const BeamMap* bmap = nullptr, const StageProgress* stage = nullptr,
+                    const bdpt::SurfMap* smap = nullptr);
 
 // True if this scene + camera can be rendered by the GPU backward reference megakernel
 // (mode R), including the physical (mesh-lens) camera as a ray-generation front-end.
@@ -476,6 +566,36 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
 // fails; the caller then reports the device half as SKIPPED rather than failed.
 #include "lattice_probe.h"
 bool cudaLatticeProbe(const unsigned long long* idx, int n, double* out);
+
+// Run a batch of pattern programs through BOTH device VMs and hand the results back for
+// the host to compare against its own `patternEval` — the parity check behind `-checkpatops`.
+//
+// It exists because the pattern VM is implemented THREE times: `patternEval` on the host,
+// the fp64 template `dPatternEval`, and `dPatternEvalF`, an FP32 twin that is what the
+// sphere-trace march actually runs. Their switches have no `default:`, so an opcode one of
+// them has never heard of is not a compile error and not a crash — the node is skipped, the
+// stack is left short, and the program quietly returns the wrong slot. When that happened to
+// an isosurface field it read 0 everywhere and the surface simply was not there, which looks
+// like an empty scene rather than a broken shader. This turns that into a named failure.
+//
+// `prog` is a flat pool of `nProg` one-opcode programs described by `off`/`len`; `outF64`
+// and `outF32` each receive `nProg` doubles. Returns false (leaving both untouched) if
+// there is no usable CUDA device or the launch fails, so the caller reports SKIPPED rather
+// than failed — the same contract cudaLatticeProbe keeps.
+// The probe's inputs, in one struct so the host reference and the two device twins cannot
+// drift apart: a check whose three sides disagree about what `y` is would report mismatches
+// that mean nothing. Every value is distinctive and non-zero on purpose — an opcode a VM has
+// never heard of is SKIPPED, which leaves the stack one short, and `patternEval` returns 0.0
+// for an empty stack. Zero inputs would make "skipped" and "evaluated" look identical.
+struct PatOpProbeIn {
+    double x, y, z, f;
+    double nx, ny, nz, r;
+    double u, v, curv, cavity, fw;
+    double d[9];              // d4..d12, the N-D slice coordinates
+};
+
+bool cudaPatOpProbe(const PatNode* prog, const int* off, const int* len, int nProg,
+                    const PatOpProbeIn& in, double* outF64, double* outF32);
 
 // `sizeof(Real)` — the device's working float width (4 with the default FTRACE_GPU_FP32,
 // 8 in an exact-FP64 build). The lattice helpers are `double` either way, but `gridUV`

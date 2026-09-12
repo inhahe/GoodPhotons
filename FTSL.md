@@ -12,12 +12,20 @@ This is the complete reference; the loader lives in `src/ftsl.h`.
 
 ## 1. Lexical structure
 
-- **Comments**: `#` to end of line (anywhere).
+- **Comments**: `#` **or** `//`, to end of line (anywhere). There is no `/* … */`:
+  newlines are significant here (they end statements), so a comment able to cross a
+  line would delete the separators it crossed. A `/*` in a scene that fails to parse
+  is diagnosed by name rather than left as a mystery syntax error.
+  A marker is only recognised at the **start of a token**, so `a//b` stays one
+  bareword — quote paths (`"…"`) as everything in the corpus already does and `//`
+  inside them is untouched.
 - **Whitespace**: spaces / tabs / newlines separate tokens. Newlines terminate
   statements, but several `key value` pairs may share one line.
 - **Strings**: `"double quoted"` — used for block names and quoted expressions.
 - **Braces**: `{ … }` open a block body or a nested sub-block.
-- **Barewords**: any run of non-space, non-brace, non-quote, non-`#` characters. A
+- **Barewords**: any run of non-space, non-brace, non-quote, non-`#` characters (a
+  `//` *inside* one does not split it — only a `//` that begins a token starts a
+  comment). A
   bareword is a *number* iff `strtod` consumes all of it (`-1`, `0.999`, `1e30`).
 
 ### 1.1 Statements and value continuations
@@ -206,9 +214,24 @@ turns and wraps, s/v/l in `[0,1]`).
 | `rgbline` | dominant-wavelength line | near-monochromatic emission, so glass will disperse it into a spectrum (`rgbline r g b [sigma]`) |
 | `rgb:<name>` | your own — see §3.6 | none of the above is what the scene means |
 
-The first five are reflectances (bounded in `[0,1]`); `rgbillum` and `rgbline` are
-emission forms. Every head is accepted everywhere a spectrum expression is, *and* as a
-record channel's inline-colour tag (§9.2) — one shared list, so the two can't drift.
+The first five are reflectances; `rgbillum` and `rgbline` are emission forms. Every head
+is accepted everywhere a spectrum expression is, *and* as a record channel's inline-colour
+tag (§9.2) — one shared list, so the two can't drift.
+
+**A component may exceed 1.** The five reflectance heads model a curve that is bounded by
+1 by definition, but the `rgb` head is not reserved for reflectances — the same head fills
+spectral slots that are physically **unbounded coefficients**: a dielectric's `absorb`
+(Beer-Lambert σₐ in 1/m), a `medium`'s `sigma_a`/`sigma_s`, a `hair`'s `sigma_a`, a metal's
+`substrate_k`, an `ior`. So an over-unity triple is **factored**, not clamped: the largest
+component is divided out as a scalar magnitude, the remaining in-gamut colour is upsampled
+by whichever method the head names, and the magnitude multiplies the result. Hue and the
+relative depth between channels — the whole content of the number — survive, and a triple
+already inside `[0,1]` is untouched (bit for bit). Negative components still floor to 0.
+
+> Through 0.199.4 these were **clamped to `[0,1]`**, silently. `absorb rgb 22.3 79.3 70.6`
+> became `(1,1,1)`, i.e. a flat, colourless 1/m absorption — 95% transmittance across a
+> 5 cm stone — so a deeply saturated gem rendered as *clear glass*. If a scene of yours
+> leaned on that clamp (wrote a value above 1 and expected white), divide it down.
 
 ### 3.6 `upsample` — supplying your own
 
@@ -2054,7 +2077,7 @@ scene to fixed-exposure output (`power` wins if both given). Env lights reject
 
 | subtype | keys (defaults) |
 |---|---|
-| `area` (default) | `origin` `u` `v` `normal`(from u×v) `spd`, `spd_map` — a rectangle |
+| `area` (default) | `origin` `u` `v` `normal`(from u×v) `spd`, `spd_map`, `hide_camera`(off) — a rectangle |
 | `collimated` | `dir`(0,0,-1) `origin`(0.5,0.5,0.95) `spd` — a thin pencil beam |
 | `sphere` | `center` `radius`(0.1) `spd` — a glowing ball (also dropped into geometry) |
 | `cylinder` | `center` `axis`(0,1,0) `length`(0.5) `radius`(0.05) `segments`(48) `caps`(off) `spd` — a tube/fluorescent |
@@ -2076,6 +2099,42 @@ The default rectangular `area` light also accepts an **emission profile** over i
 surface — `spd pattern:<n>` (the pattern *is* the profile, greyscale) or
 `spd_map pattern:<n>` (modulate the authored SPD). Only this subtype and mesh emitters
 can carry one; see §7.2 for why, and for the `power`/`lumens` interaction.
+
+### 11.1 `hide_camera` — primary visibility off
+
+An `area` light is **real geometry**: the loader pushes two opaque, black-reflectance
+triangles into the BVH, so the rectangle occludes, casts shadows, and *renders as a
+visible slab* whenever it falls inside the frame. That is fine for a practical light
+you meant to see, and wrong for a studio fill flat — a panel placed off to one side to
+put a highlight on something, whose out-of-frame-ness is a property of one particular
+camera and silently breaks the moment the camera moves or widens.
+
+```
+light area {
+    origin -7 0 2   u 0 0 8   v 0 6 0   normal 1 0 0
+    spd preset:d65   power 900
+    hide_camera on           # emits and reflects; never seen directly
+}
+```
+
+`hide_camera on` (also `true` / `yes` / `1`) turns off **primary visibility only** —
+the deliberately narrow meaning it has in Cycles, Arnold and PBRT:
+
+- The **bounce-0 camera ray** passes straight through. The panel is not drawn.
+- **Everything else sees it unchanged.** It still emits at full power and keeps the
+  same share of the light-selection CDF; NEE still samples it; it still **occludes**
+  and still **casts shadows**; and it still appears in a **specular reflection**, which
+  is normally the whole reason a fill flat exists — a mirror or glossy rim ray is
+  traced at bounce 1, so it hits the rectangle and reflects it as before.
+- Seen **through glass** it is visible, because a refracted ray is not a camera ray.
+
+The flag costs nothing when unused: a scene with no `hide_camera` anywhere takes one
+uniform compare per camera ray, and a hidden primitive is rejected *before* it is
+intersected, so it is strictly cheaper than a visible one.
+
+Supported on every render mode and on both the CPU and CUDA backends. Not applied by
+the raster preview (`-raster` / the positional-scene viewport), which keeps showing
+hidden flats so you can still see where they are — the usual viewport convention.
 
 ---
 
@@ -2119,7 +2178,17 @@ medium {
 block. `rain_mm_h 1` ≈ 366 µm (drizzle), `5` ≈ 514 µm, `25` ≈ 723 µm (downpour).
 
 - `phase hg` (or no `phase` statement) is the default Henyey-Greenstein lobe — nothing
-  changes; a bare `phase hg` is only for making the choice explicit.
+  changes; a bare `phase hg` is only for making the choice explicit. Its one parameter is
+  the anisotropy `g`, which may be written **either** as a medium-level key **or** inside
+  the block, so both of these are the same medium:
+
+  ```
+  medium { sigma_t 2  g 0.46 }
+  medium { sigma_t 2  phase hg { g 0.46 } }
+  ```
+
+  (Before 0.259.0 only the first form worked: the second warned `unknown key 'g'` and then
+  rendered isotropic. A `g` in the block now overrides a medium-level one.)
 - **`phase rainbow { .. }`** replaces the lobe with a physically-tabulated **water-droplet
   phase** (Airy theory of the rainbow, `rainbow.h`). A fog/rain medium then shows a real
   **primary bow (~42°) + secondary bow (~51°)**, wavelength dispersion (red outer / violet
@@ -2159,7 +2228,7 @@ a faint global haze). The forward tracer superposes them physically: extinction 
 so total transmittance is the *product* of the per-medium transmittances, and each
 collision is drawn from the *earliest* of the media's independent free-flights (with
 the winning medium's albedo/`g` driving the scatter). A scene with a single `medium`
-is bit-identical to before. *(Superposition is a forward-mode feature — see the mode
+is bit-identical to before. *(Since 0.254.0 every render mode superposes — see the mode
 note at the end of §12.1.)*
 
 ### 12.1 Bounded and heterogeneous fog (blobs)
@@ -2311,10 +2380,12 @@ to before.
 > connections weighted by ratio-tracking transmittance, exactly as the forward tracer
 > samples them. (The MIS weights omit the heterogeneous transmittance — a variance-only
 > PBRT-v3 simplification; the balance heuristic is a partition of unity, so the estimator
-> stays unbiased regardless.) The backward reference (R/V) and the camera-side layer of the
-> P composite treat the medium as a single global homogeneous haze and **ignore** `density`
-> and `bounds` (the renderer warns when you do this). Render heterogeneous fog for those
-> modes with a forward mode instead.
+> stays unbiased regardless.) **Since 0.254.0 the backward reference (R/W/V), the camera-side
+> layer of the P composite and mode M's `-pmfg` final gather superpose the media too**, each
+> region with its own `bounds`, `density` field and phase function, on both devices — so every
+> mode now renders the fog you authored. (Before 0.254.0 the CPU backward tracer collapsed the
+> list to the *first* medium as an unbounded homogeneous haze and warned when it did; there is
+> no longer any reason to prefer a forward mode or `-device gpu` for heterogeneous fog.)
 
 ### Volumetric blackbody emission ("fire")
 

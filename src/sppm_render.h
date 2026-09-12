@@ -82,16 +82,28 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
     // straight past it, and the lens rendered flat.
     const bool grinAny = grin::sceneHasGrin(scene);
 
+    // GLOSSY-NEE (known-issues.md): mode S's camera walk had the same hole as mode R's and mode
+    // M's -- a Glossy vertex multiplied by the reflectance and continued, so its light was found
+    // only when a lobe sample happened to land on the emitter. `bwNee` is the shared estimator;
+    // `gmis` carries the continuation's lobe density to the two sites that can reach a light.
+    BackwardRenderer bwNee; bwNee.diffraction = diffraction;
+    const bool gneeOn = BackwardRenderer::glossyNeeOn();
+    BackwardRenderer::GlossyMis gmis;
+
     for (int b = 0; b < maxBounce; ++b) {
         if (grinAny) {
             double arc = 0.0;
             grin::marchSegments(scene, ray,
-                [&](const Vec3&, const Vec3&, double slen, double&) { arc += slen; return false; });
+                [&](const Vec3&, const Vec3&, double slen, double&) { arc += slen; return false; },
+                // b == 0 is the camera ray; see Material::hideCamera.
+                /*camHide=*/(b == 0));
             int cm = stk.topMat();                       // Beer-Lambert over the marched arc
             double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
             if (a > 0.0 && arc > 0.0) thr *= std::exp(-a * arc);
         }
-        Hit h = scene.closestHit(ray);
+        // b == 0 is the camera ray this function was handed; see Material::hideCamera.
+        Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
+                                 /*skipCamHidden=*/(b == 0));
         if (h.valid) {
             int cm = stk.topMat();
             double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
@@ -105,7 +117,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             // vertex stores a hit point and returns before it can reach here).
             if (scene.sunCount > 0)
                 directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                           * (thr * scene.sunRadiance(ray.d, lambda) * invPdfL);
+                           * (thr * bwNee.sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfL);
             return;
         }
         const Material* mp = &scene.mats[h.matId];
@@ -121,10 +133,22 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
         const Material& m = *mp;
 
         if (m.isLight) {
+            // GLOSSY-NEE's lobe-sampling half; 1, and this expression bit-identical to its
+            // pre-0.266 form, unless the previous bounce was a MIS'd glossy one.
+            const double wMis = (gmis.pdf > 0.0)
+                ? bwNee.glossyHitWeight(scene, gmis, BackwardRenderer::emitterIndexOfResolved(scene, m),
+                                        ray.d, &h.p, &h.n)
+                : 1.0;
             directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                       * (thr * emitSlot(scene, m, h, lambda) * invPdfL);
+                       * (thr * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
             return;
         }
+
+        // GLOSSY-NEE: cleared HERE, after the two sites that read it and before the branch that
+        // writes it -- a clear at the loop top would erase the previous bounce's value a few
+        // lines before its only consumer, leaving the connection with no compensating weight.
+        // See the twin note in backward.h.
+        gmis.clear();
 
         switch (m.type) {
             case MatType::Diffuse:
@@ -138,9 +162,24 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 break;
             }
             case MatType::Glossy: {
+                // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX. Taken before `thr *= r`: the
+                // connection carries `r` inside bsdfF. See backward.h's twin for why this is
+                // MIS rather than the single-estimator split used elsewhere on this walk.
+                if (gneeOn) {
+                    const BackwardRenderer::NeeBsdf nb{&m, ray.d * -1.0};
+                    directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                             * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
+                                                     BackwardRenderer::GiCtx{}, nullptr, nullptr,
+                                                     &nb));
+                }
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return;
+                if (gneeOn) {
+                    gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
+                    gmis.from = h.p;
+                    gmis.n = h.n;
+                }
                 ray = Ray{h.p + h.n * 1e-6, o};
                 break;
             }
@@ -243,6 +282,9 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                      double alpha, int maxBounce, uint64_t passSeed,
                      int heroC = hero::kHeroC) {
     if (nThreads < 1) nThreads = 1;
+    // `-seed`: this pass's streams all descend from `passSeed`, so salting it once here is
+    // the whole of the flag for mode `S` (0 by default, so XOR is the identity).
+    passSeed ^= g_rngSalt;
     const int W = st.resX, H = st.resY;
 
     // (1) Camera pass — fresh visible point + direct sample per pixel this pass.
@@ -299,6 +341,33 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     phi += pm.cie[k] * (f * (double)ph.power);        // == cie(lambda_p), precomputed
                     M += 1.0;
                 });
+                // M-GATHERAREA, mode `S`'s twin of the mode-`M` correction. The query above
+                // rejects photons whose normal disagrees with the hit's, and nothing clips the
+                // disc to the surface, yet `sppmResolve` divides by the area of a FULL disc --
+                // so a gather on thin or truncated geometry is normalised by an area it never
+                // collected from. Measured on `scenes/_ga_strip.ftsl` (a 0.4 m strip under a
+                // 0.5 m pinned radius) mode `S` read -21.9 % against a mode-`D` anchor, where
+                // uncorrected mode `M` read -52.5 % and corrected mode `M` read +8.3 %.
+                //
+                // APPLIED HERE, AT ACCUMULATION, AND NOT AT RESOLVE. `sppmResolve` divides the
+                // accumulated `tau` by `pi R^2` at the FINAL radius, which is correct only
+                // because every pass's contribution has been rescaled by the `ratio2` chain --
+                // the product of later ratios is exactly `R_final^2 / R_i^2`, so the sum
+                // telescopes into `sum_i phi_i / (pi R_i^2)`. Coverage is a property of the
+                // radius that was actually gathered at, and SPPM's radius shrinks every pass,
+                // so a single coverage measured at `R_final` would misprice every earlier pass.
+                // Scaling `phi` before it enters `tau` puts each pass's flux over its own
+                // footprint, which is the quantity the telescoping sum then carries.
+                //
+                // The RNG is seeded per PIXEL and per PASS rather than per thread, so the
+                // probe pattern -- and hence the image -- does not depend on `-t`.
+                if (const int gaM = gatherAreaSamples()) {
+                    Pcg32 grng;
+                    grng.seed(((uint64_t)y << 20) ^ (uint64_t)x,
+                              0x9e3779b97f4a7c15ULL ^ (uint64_t)st.passes);
+                    phi = phi * gatherAreaScale(
+                        gatherCoverage(scene, h.p, h.n, P.radius, grng, gaM));
+                }
                 // Progressive radius / flux update (shared-statistics PPM).
                 double Nnew = P.nAcc + alpha * M;
                 double denom = P.nAcc + M;

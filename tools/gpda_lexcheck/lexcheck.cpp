@@ -100,7 +100,47 @@ int main(int argc, char** argv) {
                     excluded);
     }
 
-    // 2. Token-stream equivalence + throughput on a real scene.
+    // 2. COMMENT-MARKER SEMANTICS, asserted against the real table.
+    //
+    // FTSL takes both `#` and `//` as line comments (0.248.0; `//` was added because it
+    // is what everyone types by reflex, and before then it rejected the whole file with
+    // an error that never used the word "comment").  Nothing else in this program would
+    // catch a regression there: section 1 checks the fast paths against their own
+    // patterns, and section 3 checks the fast lexer against a reference loop over the
+    // SAME table — so a wrong table passes both.  These are the properties that make
+    // `//` safe to have added, and they are stated as token streams so they cannot drift:
+    //
+    //   * a marker only opens a comment at a TOKEN START, so `a//b` stays one WORD.
+    //     That is what stops `//` cutting a bareword (or an unquoted path) in half the
+    //     way `#` does — `#` is excluded from WORD's character class, `/` is not.
+    //   * a comment stops at the newline, and the NEWLINE survives.  It has to: NEWLINE
+    //     is significant here (it ends a statement), so a marker that ate it would turn
+    //     a comment into a structural edit.  This is also why there is no `/* … */`.
+    {
+        gpda_lex::Lexer lex(rules);
+        struct Case { const char* src; const char* want; };
+        // `want` is the token stream as "TYPE:value" joined by '|', EOF omitted.
+        const Case cases[] = {
+            {"// c\n",      "COMMENT:// c|NEWLINE:\n"},
+            {"# c\n",       "COMMENT:# c|NEWLINE:\n"},
+            {"a//b\n",      "WORD:a//b|NEWLINE:\n"},
+            {"a#b\n",       "WORD:a|COMMENT:#b|NEWLINE:\n"},
+            {"a // b\n",    "WORD:a|WS: |COMMENT:// b|NEWLINE:\n"},
+            {"//\n",        "COMMENT://|NEWLINE:\n"},   // tie with WORD -> earlier rule
+        };
+        for (const auto& c : cases) {
+            std::string got;
+            for (const auto& t : lex.tokenize(c.src)) {
+                if (t.type == "EOF") break;
+                if (!got.empty()) got += '|';
+                got += t.type + ":" + t.value;
+            }
+            check(got == c.want, std::string("lexing \"") + c.src + "\" gave " + got +
+                                 ", expected " + c.want);
+        }
+    }
+
+    // 3. Token-stream equivalence + throughput on a real scene.
     if (argc > 1) {
         std::ifstream f(argv[1], std::ios::binary);
         std::ostringstream ss; ss << f.rdbuf();

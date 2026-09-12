@@ -94,6 +94,14 @@ struct NavInput {
     // (reset the painted speed track to uniform).
     bool   paintMode  = false;           // "Paint" checkbox: wheel=speed, mouse=orientation on the path (persistent)
     bool   speedReset = false;           // "Flat" button: reset painted speed to uniform (one-shot)
+    // ---- Preview-shading toggles (persistent checkbox state, not edges) ----
+    // `colorOn` shows each surface's real albedo/skins; off re-shades the preview as
+    // neutral clay so only form and lighting remain. `clearOn` is the -see-through /
+    // -glass mode: clear dielectrics dim and haze what is behind them instead of showing
+    // as solid ghosts. Seeded by setShadeToggles (the render loop owns the defaults, and
+    // -see-through may already have been asked for on the command line).
+    bool   colorOn = true;               // "Color" checkbox (persistent)
+    bool   clearOn = false;              // "See-through" checkbox (persistent)
     // ---- Loom BIND-row outputs (only meaningful when `-anim ... -loom scene.py` is live) ----
     // The bind row edits which DRIVE CHANNEL feeds which named scene variable (a loom `Slot`),
     // plus how many channels the drive has. `bindChannel`/`bindTarget` are the row's CURRENT
@@ -106,10 +114,31 @@ struct NavInput {
     bool        bindApply = false;       // "Bind" button: bind bindChannel -> bindTarget (one-shot)
     bool        bindClear = false;       // "Unbind" button: drop any binding on bindChannel (one-shot)
     int         dimsReq   = 0;           // channel-count box (current value; 0 = unchanged/absent)
+    // ---- N-D ROTATION panel outputs (only meaningful when `-nd <n>` is live) ----
+    // One angle per rotation PLANE of the n-D space, in DEGREES, in ndwarp's canonical
+    // plane order. `ndAngles` is persistent state (the sliders' current positions), not an
+    // accumulator, and is only filled in when the panel exists; `ndMoved` is the one-shot
+    // "a slider actually moved" edge, so a render loop can tell a real change from the
+    // steady state it already drew. `ndDims` is the dimension box (0 = unchanged), and the
+    // two button edges reset every angle to zero / write the projected model out.
+    std::vector<double> ndAngles;        // current per-plane angles in degrees (empty = no panel)
+    // Per EXTRA dimension (4th, 5th, ...): what fills it, as an index into the pick-list
+    // handed to enableNdPanel, and how much of it (0..1). Persistent state like ndAngles;
+    // `ndFillMoved` is the one-shot edge saying one of them actually changed. These are
+    // what make the viewer able to do something other than rotate and squash: with every
+    // dimension left at the first entry (`zero`) the whole warp is one 3x3 matrix.
+    std::vector<int>    ndFill;          // per extra dim: index into the fill pick-list
+    std::vector<double> ndAmount;        // per extra dim: emboss amplitude / extrude depth, 0..1
+    bool   ndFillMoved = false;          // a fill combo or amount slider changed (one-shot)
+    bool   ndMoved = false;              // a plane slider moved since the last drain (one-shot)
+    int    ndDims  = 0;                  // dimension box (current value; 0 = unchanged/absent)
+    bool   ndReset = false;              // "Reset" button: zero every angle (one-shot)
+    bool   ndSave  = false;              // "Save" button: export the projected model (one-shot)
     bool   any() const { return lookX || lookY || wheel || wheelSpeed || fwd || back || reset || print
                                 || cycleCollide || toggleTrace || togglePath || togglePlay || scrubTo >= 0
                                 || recToggle || addPoint || insPoint || delPoint || saveCurve || speedReset
-                                || bindApply || bindClear; }
+                                || bindApply || bindClear || ndMoved || ndFillMoved
+                                || ndReset || ndSave; }
 };
 
 class LiveWindow {
@@ -202,6 +231,52 @@ public:
     // error). Marshalled to the UI thread; setting these never re-emits a NavInput edge. No-op if
     // the bind row isn't shown.
     void setBindState(const std::vector<std::string>& targets, const char* status);
+
+    // Reveal the N-D ROTATION panel — the slider bank for `-nd <n>`. One trackbar per
+    // rotation plane of an n-D space (n(n-1)/2 of them, so 6 at n=4 and 45 at n=10),
+    // labelled with the plane it turns ("xw", "zv"), wrapped into as many rows as the
+    // window width needs; plus a dimension box and Reset / Save buttons. The window grows
+    // by the rows the bank needs so the image area is unchanged. `labels` must have one
+    // entry per plane and `anglesDeg` one starting angle per plane. Calling it again with
+    // a different plane count REBUILDS the bank in place, which is what changing the
+    // dimension box has to do. Marshalled to the UI thread; no-op if the panel isn't
+    // enabled, or on non-Windows / stub builds.
+    // `planeLabels`/`anglesDeg` are one per rotation plane. `dimLabels` names each EXTRA
+    // dimension (one per dim past the third), `fillChoices` is the pick-list every fill
+    // combo offers (the window knows nothing about what the entries mean — it reports the
+    // selected index), and `fillSel`/`amounts` are their starting values.
+    void enableNdPanel(int dims,
+                       const std::vector<std::string>& planeLabels,
+                       const std::vector<double>& anglesDeg,
+                       const std::vector<std::string>& dimLabels,
+                       const std::vector<std::string>& fillChoices,
+                       const std::vector<int>& fillSel,
+                       const std::vector<double>& amounts);
+
+    // Mirror the warp's state onto the N-D panel: `anglesDeg` moves the sliders (e.g.
+    // after Reset) and `status` is the readout line under them (triangle counts, or the
+    // "this warp is linear" note). Marshalled to the UI thread; setting these never
+    // re-emits the corresponding NavInput edge. No-op if the N-D panel isn't shown.
+    // Status text ONLY, leaving every slider and combo exactly where the user has it.
+    //
+    // setNdState below pushes positions too, which is right when WE changed them (a reset,
+    // a dims resize, the edge-on assist) and wrong when the USER did: a re-warp can take
+    // seconds on a heavy fill, and by the time it finishes the drag has moved on, so
+    // echoing back the angles we just applied yanks the slider to where the drag STARTED.
+    // A handler reacting to the user's own input wants this one.
+    void setNdStatus(const char* status);
+
+    void setNdState(const std::vector<double>& anglesDeg,
+                    const std::vector<int>& fillSel,
+                    const std::vector<double>& amounts,
+                    const char* status);
+
+    // Seed / mirror the two preview-shading checkboxes ("Color" and "See-through"). The
+    // render loop owns their truth — the command line can turn see-through on before the
+    // window exists — so it pushes the state here rather than the panel inventing it.
+    // Marshalled to the UI thread; setting these never re-emits a NavInput change. No-op
+    // if the panel isn't enabled.
+    void setShadeToggles(bool colorOn, bool clearOn);
 
     // Update the panel's painted-speed readout (the "Paint" mode shows the local traversal-speed
     // multiplier at the current scrub position, e.g. "1.35x"). Marshalled to the UI thread; no

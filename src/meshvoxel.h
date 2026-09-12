@@ -267,27 +267,50 @@ inline void featherGrid(VdbGrid& g, double featherVox) {
     for (size_t t = 0; t < n; ++t) dist[t] = g.data[t] ? UNREACH : 0.0;
 
     const int nmax = std::max(nx, std::max(ny, nz));
-    std::vector<double> f((size_t)nmax), d((size_t)nmax), z((size_t)nmax + 1);
-    std::vector<int> v((size_t)nmax);
 
-    for (int k = 0; k < nz; ++k)                                   // along x
-        for (int j = 0; j < ny; ++j) {
-            for (int i = 0; i < nx; ++i) f[i] = dist[idx(i, j, k)];
-            edt1d(f, d, nx, v, z);
-            for (int i = 0; i < nx; ++i) dist[idx(i, j, k)] = d[i];
+    // The EDT is SEPARABLE, so within one pass every 1-D scan reads and writes only its own
+    // line: no reduction, no shared accumulator, no floating-point re-association. Running the
+    // lines in parallel therefore produces a BIT-IDENTICAL grid, not merely an equivalent one.
+    // The three passes stay sequential — each reads what the previous wrote.
+    //
+    // The scratch (f/d/z/v) was the only thing shared, and is the only real race here; it goes
+    // thread_local rather than per-line, because allocating four vectors per scan line would
+    // hand back the win. It only ever grows, so a later, larger grid reuses the same buffers.
+    struct EdtScratch { std::vector<double> f, d, z; std::vector<int> v; };
+    auto scratch = [nmax]() -> EdtScratch& {
+        thread_local EdtScratch s;
+        if ((int)s.f.size() < nmax) {
+            s.f.assign((size_t)nmax, 0.0); s.d.assign((size_t)nmax, 0.0);
+            s.z.assign((size_t)nmax + 1, 0.0); s.v.assign((size_t)nmax, 0);
         }
-    for (int k = 0; k < nz; ++k)                                   // along y
-        for (int i = 0; i < nx; ++i) {
-            for (int j = 0; j < ny; ++j) f[j] = dist[idx(i, j, k)];
-            edt1d(f, d, ny, v, z);
-            for (int j = 0; j < ny; ++j) dist[idx(i, j, k)] = d[j];
-        }
-    for (int j = 0; j < ny; ++j)                                   // along z
-        for (int i = 0; i < nx; ++i) {
-            for (int k = 0; k < nz; ++k) f[k] = dist[idx(i, j, k)];
-            edt1d(f, d, nz, v, z);
-            for (int k = 0; k < nz; ++k) dist[idx(i, j, k)] = d[k];
-        }
+        return s;
+    };
+    // grain 1: a single k-slab is ny full scan lines of work, far more than the thread setup,
+    // and nz is only ~120-190 here so a larger grain would leave threads idle.
+    if (!ft::parallelFor((size_t)nz, 1, [&](size_t kk) {           // along x
+            const int k = (int)kk; EdtScratch& t = scratch();
+            for (int j = 0; j < ny; ++j) {
+                for (int i = 0; i < nx; ++i) t.f[i] = dist[idx(i, j, k)];
+                edt1d(t.f, t.d, nx, t.v, t.z);
+                for (int i = 0; i < nx; ++i) dist[idx(i, j, k)] = t.d[i];
+            }
+        })) return;
+    if (!ft::parallelFor((size_t)nz, 1, [&](size_t kk) {           // along y
+            const int k = (int)kk; EdtScratch& t = scratch();
+            for (int i = 0; i < nx; ++i) {
+                for (int j = 0; j < ny; ++j) t.f[j] = dist[idx(i, j, k)];
+                edt1d(t.f, t.d, ny, t.v, t.z);
+                for (int j = 0; j < ny; ++j) dist[idx(i, j, k)] = t.d[j];
+            }
+        })) return;
+    if (!ft::parallelFor((size_t)ny, 1, [&](size_t jj) {           // along z
+            const int j = (int)jj; EdtScratch& t = scratch();
+            for (int i = 0; i < nx; ++i) {
+                for (int k = 0; k < nz; ++k) t.f[k] = dist[idx(i, j, k)];
+                edt1d(t.f, t.d, nz, t.v, t.z);
+                for (int k = 0; k < nz; ++k) dist[idx(i, j, k)] = t.d[k];
+            }
+        })) return;
 
     // Smoothstep rather than a linear ramp: a linear ramp leaves a visible crease where it
     // reaches 1, which on a cloud edge reads as a second, softer silhouette.

@@ -234,6 +234,52 @@ argument for standing a groom in a hall of polished objects.*
   limit of the representation, refused identically on both backends and per medium, so an
   ordinary fog elsewhere in a GRIN scene still works.) See
   [Mode `M` and participating media](REFERENCE.md#mode-m-and-participating-media---beams).
+- **UPBP (mode `J`) — BDPT paths and photon beams under one MIS weight** *(correct as of
+  0.219.0 on the CPU: both estimators run, both are MIS-weighted, and merged paths obey the
+  same `-depth` cap the connections do, so a mode-`J` image is a correct estimate of the same
+  integral mode `D` estimates — `J/D` mean **1.0006** on `_fog_cornell` and **0.9973** on the
+  thick `_fog_thick`, against **2.0374** and **1.654** before the weights and the depth cap.
+  It is not yet a **win**, though: per sample its variance is **2.4–8.8× lower** than mode
+  `D`'s and the margin grows with `-n` — the merges really do reach paths the connections
+  cannot — but a sample costs 45–250× more, so at equal time it loses by ~19×. **It runs on
+  the GPU as of 0.244.0** (`-device gpu`) — the camera pass is mode `D`'s megakernel with the
+  merges switched on, worth **2.8×** when the beam gather dominates and **15×** when it does
+  not, while the light/beam pass stays on the CPU on both backends. See
+  [known-issues.md](known-issues.md) → UPBP-CONV, and UPBP-THICK for a brightness bias on
+  optically thick multi-bounce scenes that predates the port and is identical on both
+  backends.)*
+  Mode
+  `D` and mode `M -beams` each solve half of a thick-medium scene and fail where the other
+  succeeds: a BDPT connection needs the camera's free-flight distance sampling to *reach*
+  the scattering point, which deep inside an optically thick medium it essentially never
+  does; a photon beam reaches there easily (it is a whole *line* of deposited power) but is
+  deposited **straight**, so a light path that scattered in the medium before the merge is
+  invisible to it. Mode `J` runs both on the same camera sample and combines them with the
+  multiple-sample balance heuristic — the volumetric counterpart of what VCM (`U`) does for
+  surfaces. Beams are **on by default** here (a UPBP render without them is literally mode
+  `D`); `-nobeams` turns them off, which reduces mode `J` to mode `D` bit-for-bit. Mode `J`
+  builds its beam map from its **own BDPT light subpaths** (0.216.0), so there `-n` counts
+  light subpaths and `-beamcount` does not apply. (`-beamspec` and `-beamachro` *do* apply,
+  since 0.251.0 / 0.250.0; 0.257.0 made the bundle survive a diffuse bounce, taking mode `J`'s
+  rain-curtain coverage from 36 % to 75 %.) **Leave `-n` off** (0.242.0): the map now
+  sizes *itself* from a discarded pilot that measures where this scene's `-beamk` knee is —
+  the beam count past which extra beams stop being free — and passing `-n` disables that.
+  Left to itself it beat every hand-picked `-n` on a thick-medium equal-time test. Its absolute
+  radiance is validated against **closed-form single scattering** (`tools/slab_ss_ref.py` —
+  matching to 0.3 %), not only against mode `D`.
+  Since 0.258.0 `-jsurf` folds in a **second merge kind** — the surface point merges mode `U`
+  (VCM) exists to provide — so one mode runs connections, beam merges *and* vertex merges under
+  one balance heuristic instead of two modes each solving half the problem. Its gather radius
+  shrinks per light-side epoch on mode `U`'s own schedule, so the point merges are *consistent*
+  rather than parked on an `O(r²)` bias floor. Against an 8192 spp reference on a diffuse Cornell
+  box it lands **−0.11 %** energy bias at 0.74 % rel-RMS, beating mode `U`'s 1.52 % while running
+  faster. **On by default since 0.260.0, on both backends since 0.263.1** — the three-way
+  media+surfaces gate is green (X −0.86 % / Y −0.27 % / Z +0.12 % mean, per-pixel medians within
+  0.1 %), and the GPU renders the same three-technique estimator, validated to −0.7 / −0.4 /
+  +0.6 % against a 3.1 M-spp mode-`R` reference. That comparison has now been run, and it says
+  **mode `U` stays**: on its own home turf `U` is 4–6× better at equal time, so mode `J` subsumes
+  `U`'s technique but not its performance.
+  See [known-issues.md](known-issues.md) → UPBP-VM.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look
@@ -337,6 +383,15 @@ quietly produce a **wrong image** instead of a complaint. See FTSL.md §1.3.
 > (`-window`, `-o`, `-r`, `-camera`, `-view`) keep it a preview; to render the same
 > auto-lit scene with real light transport instead, pass a transport flag —
 > `ftrace model.glb -mode D -n 100000000 -o png/model.png`.
+>
+> **N-dimensional rotation.** Add `-nd <n>` and the same viewer lifts the model into
+> `n`-dimensional space, giving you one slider per rotation **plane** (`n(n-1)/2` of them)
+> and projecting the result back to 3-D live. `-nd-fill` gives the extra dimensions real
+> content — a per-vertex `emboss`, or an `extrude` that sweeps the mesh into a genuine N-D
+> prism — and the projection is a real mesh you can save with `-nd-export` and render for
+> real afterwards. Worth reading
+> [why a zero-filled lift is only a 3x3 matrix](REFERENCE.md#why-a-zero-filled-lift-is-only-a-3x3-matrix)
+> before reaching for a large `n`.
 
 ---
 
@@ -360,6 +415,7 @@ stays something you can actually read end to end.
 | Fog and volumes: homogeneous, bounded, heterogeneous density fields, OpenVDB / NanoVDB import | [Participating media](REFERENCE.md#participating-media--fog) |
 | Reusing computed indirect light across paths — the opt-in world-space radiance cache | [Radiance cache](REFERENCE.md#radiance-cache--radcache--mode-r-cpu) |
 | A tour of the scene language, and stereoscopic / animation workflows | [Scene language](REFERENCE.md#scene-language-ftsl) |
+| Rotating a model in N dimensions and projecting it back to 3-D | [N-dimensional rotation](REFERENCE.md#n-dimensional-rotation--nd) |
 | Every command-line flag | [Command-line reference](REFERENCE.md#command-line-reference) |
 | Output formats, `.ftbuf` checkpoints, resuming, tone mapping | [Output](REFERENCE.md#output) |
 

@@ -1,3 +1,4 @@
+#include "viewerhelp.h"
 #include "livewindow.h"
 
 // Shared by both builds: on a headless build there is no window to minimize, but the
@@ -22,8 +23,14 @@ void LiveWindow::setPanelState(int, bool, bool, const char*) {}
 void LiveWindow::setPathCount(int) {}
 void LiveWindow::setEditState(bool, int) {}
 void LiveWindow::setSpeedLabel(double) {}
+void LiveWindow::setShadeToggles(bool, bool) {}
 void LiveWindow::enableBindRow(const std::vector<std::string>&, int) {}
 void LiveWindow::setBindState(const std::vector<std::string>&, const char*) {}
+void LiveWindow::enableNdPanel(int, const std::vector<std::string>&, const std::vector<double>&,
+                               const std::vector<std::string>&, const std::vector<std::string>&,
+                               const std::vector<int>&, const std::vector<double>&) {}
+void LiveWindow::setNdState(const std::vector<double>&, const std::vector<int>&,
+                            const std::vector<double>&, const char*) {}
 
 #else
 // ------------------------------- Win32 GDI window ----------------------------------
@@ -441,21 +448,51 @@ bool LivePresenter::readbackBgra(std::vector<uint8_t>& bgra, int& w, int& h) {
 // Child-window command IDs (WM_COMMAND LOWORD) + the trackbar. Kept out of the low
 // range Windows reserves for standard dialog buttons.
 enum {
-    ID_CLIP = 1001, ID_RESET, ID_PATH, ID_PLAY,
+    ID_CLIP = 1001, ID_RESET, ID_HELP, ID_PATH, ID_PLAY,
     ID_TIMELINE, ID_STRIDE, ID_RATE, ID_SW_UPDATE, ID_SW_SEC,
     // ---- curve-editor row ----
     ID_REC, ID_ADDPT, ID_INSPT, ID_DELPT, ID_SAVE, ID_TOL, ID_RAW,
     // ---- paint-mode controls (speed + orientation painting) ----
     ID_PAINT, ID_FLAT,
+    // ---- preview-shading toggles ----
+    ID_COLOR, ID_SEETHRU,
     // ---- loom bind row (drive channel -> named scene variable) ----
-    ID_BCH, ID_BSLOT, ID_BIND, ID_BCLEAR, ID_BDIMS
+    ID_BCH, ID_BSLOT, ID_BIND, ID_BCLEAR, ID_BDIMS,
+    // ---- N-D rotation panel ----
+    ID_NDDIMS, ID_NDRESET, ID_NDSAVE,
+    // One id per plane slider, allocated from a base so WM_HSCROLL can map an HWND back to
+    // its plane by subtracting. 12 dimensions is the CLI's cap and gives 66 planes; the
+    // range is sized generously past that so the ids can never collide with anything above.
+    ID_NDSLIDER_BASE = 1200, ID_NDSLIDER_END = ID_NDSLIDER_BASE + 128,
+    // Per-extra-dimension fill controls: a pick-list and an amount slider each. 12
+    // dimensions (the CLI cap) means at most 9 of them, so 32 apiece is ample.
+    ID_NDFILL_BASE = 1400, ID_NDFILL_END = ID_NDFILL_BASE + 32,
+    ID_NDAMT_BASE  = 1440, ID_NDAMT_END  = ID_NDAMT_BASE + 32
 };
 static const int kRowH   = 28;              // one panel row: button height (24) + 4px gap
+// N-D slider bank geometry. One cell is a caption plus its trackbar; the bank greedily
+// wraps to as many rows as the window width needs, so a 4-D run (6 planes) is one row and
+// a 10-D one (45 planes) is several rather than 45 unusable slivers.
+static const int kNdCellW = 168;            // one slider cell: caption (56) + trackbar (112)
+// One FILL cell: axis caption + a what-fills-it pick-list + an amount slider. Wider than a
+// plane cell because the pick-list has to show "emboss curvature" without eliding it.
+static const int kNdFillCellW = 250;
+static size_t ndFillPerRow(int clientW) {
+    const int per = (clientW - 10) / kNdFillCellW;
+    return (size_t)(per < 1 ? 1 : per);
+}
+static int ndBankRows(int clientW, int planes) {
+    if (planes <= 0) return 0;
+    const int perRow = std::max(1, (clientW - 10) / kNdCellW);
+    return (planes + perRow - 1) / perRow;
+}
 static const int kPanelH = 92;              // control-strip height (px) WITHOUT the bind row: buttons + timeline + editor rows
 // Marshal cross-thread panel ops onto the window's own message-pump thread.
 #define WM_MKPANEL      (WM_APP + 1)        // build the control panel (params staged in Impl)
 #define WM_SETPATHCOUNT (WM_APP + 2)        // retune the timeline range/visibility (wParam = new count)
 #define WM_MKBINDROW    (WM_APP + 3)        // build + reveal the loom bind row (params staged in Impl)
+#define WM_MKNDPANEL    (WM_APP + 4)        // build/rebuild the N-D slider bank (params staged in Impl)
+#define WM_SETNDSTATE   (WM_APP + 5)        // push slider positions + status text (staged in Impl)
 
 struct LiveWindow::Impl {
     std::thread          ui;
@@ -507,7 +544,14 @@ struct LiveWindow::Impl {
     // ---- Control panel (optional strip below the image) ----
     std::atomic<bool>    hasPanel{false};           // panel built & child HWNDs valid (release/acquire)
     int                  panelH = 0;                // reserved strip height (0 = no panel); UI thread
+    // The FIXED part of that height (button/timeline/editor rows, plus the bind row once it
+    // exists). The N-D bank's contribution is not fixed — it wraps to as many rows as the
+    // current width allows — so panelH is re-derived from this base on every layout rather
+    // than accumulated, which is what keeps a resize honest.
+    int                  panelBaseH = 0;
     int                  pathCount = 0;             // cameras on the timeline (0 = no path controls)
+    HWND hColor=nullptr, hSeeThru=nullptr;   // preview-shading toggles (Color / See-through)
+    HWND hHelp=nullptr;
     HWND hClip=nullptr, hReset=nullptr, hPath=nullptr, hPlay=nullptr, hTimeline=nullptr,
          hStrideLbl=nullptr, hStride=nullptr, hRateLbl=nullptr, hRate=nullptr,
          hSwUpdate=nullptr, hSwSec=nullptr;         // child controls (set on UI thread pre-hasPanel)
@@ -540,6 +584,8 @@ struct LiveWindow::Impl {
     double               tolVal = -1.0;             // simplify tolerance (world units; <0 = unset/unchanged)
     bool                 rawVal = false;            // "raw" checkbox: keep every sample vs. simplify
     bool                 paintVal = false;          // "Paint" checkbox: speed/orientation painting on (persistent)
+    bool                 colorVal = true;           // "Color" checkbox (persistent)
+    bool                 clearVal = false;          // "See-through" checkbox (persistent)
     bool                 flatReq = false;           // "Flat" button: reset painted speed (one-shot)
     // ---- Bind-row outputs (guarded by inMtx) ----
     bool                 bindReq = false, bclearReq = false;   // Bind / Unbind edges (one-shot)
@@ -551,6 +597,37 @@ struct LiveWindow::Impl {
     std::string          bindSlotVal;               // slot combo selection ("" = the "(none)" entry)
     // Staged enableBindRow() params (set under inMtx before WM_MKBINDROW is sent).
     std::vector<std::string> reqSlots; int reqDims = 0;
+    // ---- N-D rotation panel ----
+    // The slider bank is DYNAMIC (its size is a function of the dimension count, which the
+    // user can change at runtime), so unlike every other control here the handles live in a
+    // vector and are destroyed and recreated by buildNdPanel.
+    std::atomic<bool>    hasNdPanel{false};
+    std::vector<HWND>    hNdSlider;              // one trackbar per rotation plane
+    std::vector<HWND>    hNdLabel;               // its "xw" caption + live angle readout
+    std::vector<std::string> ndLabels;           // plane names, as handed to enableNdPanel
+    // Per extra dimension: caption, fill pick-list, amount slider, amount readout.
+    std::vector<HWND>    hNdDimLbl, hNdFill, hNdAmt, hNdAmtLbl;
+    std::vector<std::string> ndDimLabels, ndFillChoices;
+    HWND hNdDimsLbl = nullptr, hNdDims = nullptr, hNdReset = nullptr,
+         hNdSave = nullptr, hNdStat = nullptr;
+    int  ndRows = 0;                             // rows of sliders the bank occupies
+    // Angles are cached on the UI thread as the sliders move (a trackbar's position is an
+    // int; the cache is the degrees the render loop reads) — drainNav must not SendMessage
+    // into the UI thread once per frame just to read them back.
+    std::vector<double>  ndAngleVal;             // current per-plane angles, degrees
+    std::vector<int>     ndFillVal;              // current per-extra-dim fill selection
+    std::vector<double>  ndAmtVal;               // current per-extra-dim amount, 0..1
+    bool                 ndFillMovedReq = false; // one-shot "a fill or amount changed"
+    bool                 ndMovedReq = false;     // one-shot "a slider moved"
+    bool                 ndResetReq = false, ndSaveReq = false;
+    int                  ndDimsVal = 0;          // dimension box (current value)
+    // Staged enableNdPanel() / setNdState() params.
+    std::vector<std::string> reqNdLabels, reqNdDimLabels, reqNdFillChoices;
+    bool                 reqNdStatusOnly = false;   // push the status line, not the controls
+    std::vector<double>      reqNdAngles, reqNdAmounts;
+    std::vector<int>         reqNdFill;
+    int                      reqNdDims = 0;
+    std::string              reqNdStatus;
 
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     static LRESULT CALLBACK ViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
@@ -565,6 +642,11 @@ struct LiveWindow::Impl {
     void applyPathCount(int pc);                    // retune/show/hide the timeline group (UI thread)
     void showPathGroup(bool vis);                   // toggle visibility of the path (timeline) controls
     void buildBindRow(HWND h);                      // create the loom bind row + grow window (UI thread)
+    void buildNdPanel(HWND h);                      // create/rebuild the N-D slider bank (UI thread)
+    int  ndStripH(int clientW) const;               // strip height the bank needs at this width
+    void applyNdState(HWND h);                      // push staged angles + status onto the bank (UI thread)
+    void setNdLabelText(int k);                     // refresh one slider's "xw 30" caption (UI thread)
+    void setNdAmtText(int k);                       // refresh one fill's amount readout (UI thread)
     void setChannelCombo(int dims);                 // repopulate the channel combo for `dims` (UI thread)
 };
 
@@ -588,8 +670,9 @@ void LiveWindow::Impl::buildPanel(HWND h) {
     InitCommonControlsEx(&icc);                     // register msctls_trackbar32
     int pc; double defFps; std::string collide;
     { std::lock_guard<std::mutex> lk(inMtx); pc = reqPathCount; defFps = reqDefFps; collide = reqCollide; }
-    pathCount = pc;
-    panelH    = kPanelH;
+    pathCount  = pc;
+    panelBaseH = kPanelH;
+    panelH     = kPanelH;
     panelFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(h, GWLP_HINSTANCE);
     auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD style, int id) -> HWND {
@@ -601,6 +684,16 @@ void LiveWindow::Impl::buildPanel(HWND h) {
     std::wstring clipTxt = utf8ToWide("Clip: " + collide);
     hClip  = mk(L"BUTTON", clipTxt.c_str(), BS_PUSHBUTTON, ID_CLIP);
     hReset = mk(L"BUTTON", L"Reset", BS_PUSHBUTTON, ID_RESET);
+    // Every other control in this strip is a verb with no label explaining it, and
+    // the N-D bank in particular is a wall of sliders whose meaning is not guessable
+    // from looking at it. One button that opens a written page costs a few pixels and
+    // removes the guessing.
+    hHelp  = mk(L"BUTTON", L"Help", BS_PUSHBUTTON, ID_HELP);
+    // Preview-shading toggles. Push-like checkboxes rather than buttons because both are
+    // STATES you need to be able to read off the panel, not actions.
+    hColor   = mk(L"BUTTON", L"Color",       BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_COLOR);
+    hSeeThru = mk(L"BUTTON", L"See-through", BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_SEETHRU);
+    SendMessageW(hColor, BM_SETCHECK, BST_CHECKED, 0);   // colour is the default view
     // Path/timeline group is ALWAYS created (so authoring a curve can reveal it later via
     // setPathCount), then hidden when there is no path yet (pathCount < 2).
     // Path (lock-to-path) toggle doubles as the timeline enable — same option, per spec.
@@ -642,7 +735,14 @@ void LiveWindow::Impl::buildPanel(HWND h) {
     RECT wr; GetWindowRect(h, &wr);
     SetWindowPos(h, nullptr, 0, 0, wr.right - wr.left, (wr.bottom - wr.top) + panelH,
                  SWP_NOMOVE | SWP_NOZORDER);
+    // layoutView too, not just layoutPanel: growing the window normally fires WM_SIZE,
+    // which lays out both. But the growth is CLAMPED when the window would exceed the
+    // work area — and a clamped SetWindowPos changes nothing, so no WM_SIZE arrives and
+    // the D3D child keeps a rect that is now taller than the image area. The swap chain
+    // then presents the frame offset and cropped (the model slides off to the bottom
+    // right), until some unrelated resize happens to fix it.
     layoutPanel(h);
+    layoutView(h);
     hasPanel.store(true);                           // publish: children are all valid now
     InvalidateRect(h, nullptr, TRUE);
 }
@@ -705,7 +805,8 @@ void LiveWindow::Impl::buildBindRow(HWND h) {
     setChannelCombo(dims);
     { std::lock_guard<std::mutex> lk(inMtx); bindDimsVal = dims; }
     // Grow by one row so the image area is unchanged (same contract as buildPanel).
-    panelH += kRowH;
+    panelBaseH += kRowH;
+    panelH     += kRowH;
     // Publish BEFORE laying out: layoutPanel skips row 4 unless hasBindRow is set, so storing it
     // afterwards (the order buildPanel uses for hasPanel) would leave every bind-row control
     // parked at its 10x10 creation rect in the window's top-left corner. Safe here for the same
@@ -716,7 +817,221 @@ void LiveWindow::Impl::buildBindRow(HWND h) {
     SetWindowPos(h, nullptr, 0, 0, wr.right - wr.left, (wr.bottom - wr.top) + kRowH,
                  SWP_NOMOVE | SWP_NOZORDER);
     layoutPanel(h);
+    layoutView(h);          // see the note in buildPanel: a clamped grow fires no WM_SIZE
     InvalidateRect(h, nullptr, TRUE);
+}
+
+// Height the N-D bank adds to the control strip at a given window width: one row of
+// controls (dims box, Reset, Save, status) plus however many rows the sliders wrap into.
+// Zero when there is no bank.
+int LiveWindow::Impl::ndStripH(int clientW) const {
+    if (!hasNdPanel.load() || hNdSlider.empty()) return 0;
+    // One controls row, then the fill cells, then the plane sliders — each group wrapped
+    // to whatever the current width allows.
+    const int fillRows = hNdFill.empty()
+        ? 0 : (int)((hNdFill.size() + ndFillPerRow(clientW) - 1) / ndFillPerRow(clientW));
+    return (1 + fillRows + ndBankRows(clientW, (int)hNdSlider.size())) * kRowH;
+}
+
+// One slider's caption: the plane it turns and the angle it is at ("xw  +30"). Rewritten
+// as the slider moves, so the exact value is readable without a tooltip — a trackbar has
+// no numeric display of its own and a bank of 45 unlabelled sliders is unusable.
+void LiveWindow::Impl::setNdLabelText(int k) {
+    if (k < 0 || k >= (int)hNdLabel.size() || !hNdLabel[(size_t)k]) return;
+    const double a = (k < (int)ndAngleVal.size()) ? ndAngleVal[(size_t)k] : 0.0;
+    const std::string name = (k < (int)ndLabels.size()) ? ndLabels[(size_t)k] : "?";
+    wchar_t buf[48];
+    swprintf(buf, 48, L"%hs %+.0f", name.c_str(), a);
+    SetWindowTextW(hNdLabel[(size_t)k], buf);
+}
+
+// One fill's amount readout, as a fraction of the model radius ("0.35"). A trackbar has no
+// numeric display and "how much emboss" is a number worth seeing.
+void LiveWindow::Impl::setNdAmtText(int k) {
+    if (k < 0 || k >= (int)hNdAmtLbl.size() || !hNdAmtLbl[(size_t)k]) return;
+    const double a = (k < (int)ndAmtVal.size()) ? ndAmtVal[(size_t)k] : 0.0;
+    wchar_t buf[24];
+    swprintf(buf, 24, L"%.2f", a);
+    SetWindowTextW(hNdAmtLbl[(size_t)k], buf);
+}
+
+// Build (or REBUILD) the N-D slider bank and grow the window by the rows it needs, so the
+// image area is unchanged. Runs on the UI thread (via WM_MKNDPANEL) and reads the staged
+// reqNdLabels/reqNdAngles/reqNdDims.
+//
+// Rebuilding in place is the normal case, not an edge one: changing the dimension box
+// changes the number of PLANES (n(n-1)/2), so every slider has to go and a new set arrive.
+// The old handles are destroyed first and the window shrunk back by the rows they held, so
+// a walk up and down the dimension box does not ratchet the window taller each time.
+void LiveWindow::Impl::buildNdPanel(HWND h) {
+    if (!hasPanel.load()) return;
+    std::vector<std::string> labels, dimLabels, fillChoices;
+    std::vector<double>      angles, amounts;
+    std::vector<int>         fillSel;
+    int dims;
+    { std::lock_guard<std::mutex> lk(inMtx);
+      labels = reqNdLabels; angles = reqNdAngles; dims = reqNdDims;
+      dimLabels = reqNdDimLabels; fillChoices = reqNdFillChoices;
+      fillSel = reqNdFill; amounts = reqNdAmounts; }
+    if (labels.empty()) return;
+
+    HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(h, GWLP_HINSTANCE);
+    auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD style, int id) -> HWND {
+        HWND c = CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | style,
+                                 0, 0, 10, 10, h, (HMENU)(INT_PTR)id, hi, nullptr);
+        if (c) SendMessageW(c, WM_SETFONT, (WPARAM)panelFont, TRUE);
+        return c;
+    };
+
+    const int oldRows = ndRows;
+    const bool first  = !hasNdPanel.load();
+    // Tear the old bank down (a dimension change): hide the bank while it is inconsistent
+    // so a repaint mid-rebuild cannot show half of two different banks.
+    hasNdPanel.store(false);
+    for (HWND c : hNdSlider) if (c) DestroyWindow(c);
+    for (HWND c : hNdLabel)  if (c) DestroyWindow(c);
+    for (HWND c : hNdDimLbl) if (c) DestroyWindow(c);
+    for (HWND c : hNdFill)   if (c) DestroyWindow(c);
+    for (HWND c : hNdAmt)    if (c) DestroyWindow(c);
+    for (HWND c : hNdAmtLbl) if (c) DestroyWindow(c);
+    hNdSlider.clear();
+    hNdLabel.clear();
+    hNdDimLbl.clear(); hNdFill.clear(); hNdAmt.clear(); hNdAmtLbl.clear();
+
+    if (first) {
+        hNdDimsLbl = mk(L"STATIC", L"N-D dims:", SS_RIGHT | SS_CENTERIMAGE, 0);
+        wchar_t db[16]; swprintf(db, 16, L"%d", dims);
+        hNdDims  = mk(L"EDIT", db, ES_NUMBER | ES_RIGHT | WS_BORDER, ID_NDDIMS);
+        hNdReset = mk(L"BUTTON", L"Reset", BS_PUSHBUTTON, ID_NDRESET);
+        hNdSave  = mk(L"BUTTON", L"Save model", BS_PUSHBUTTON, ID_NDSAVE);
+        hNdStat  = mk(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
+    } else if (hNdDims) {
+        wchar_t db[16]; swprintf(db, 16, L"%d", dims);
+        SetWindowTextW(hNdDims, db);
+    }
+
+    ndLabels = labels;
+    ndAngleVal.assign(labels.size(), 0.0);
+    for (size_t k = 0; k < labels.size() && k < angles.size(); ++k) ndAngleVal[k] = angles[k];
+
+    const int n = (int)labels.size();
+    for (int k = 0; k < n; ++k) {
+        hNdLabel.push_back(mk(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE, 0));
+        HWND tb = mk(L"msctls_trackbar32", L"", TBS_HORZ | TBS_NOTICKS,
+                     ID_NDSLIDER_BASE + k);
+        // Whole degrees over the full turn. A plane rotation is periodic in 360, so the
+        // slider wraps naturally at either end rather than clamping somewhere arbitrary.
+        if (tb) {
+            SendMessageW(tb, TBM_SETRANGE, TRUE, MAKELPARAM(-180, 180));
+            SendMessageW(tb, TBM_SETPAGESIZE, 0, 15);
+            SendMessageW(tb, TBM_SETPOS, TRUE, (LPARAM)(long)std::lround(ndAngleVal[(size_t)k]));
+        }
+        hNdSlider.push_back(tb);
+        setNdLabelText(k);
+    }
+    // ---- the per-dimension FILL cells --------------------------------------------
+    // What each extra dimension CONTAINS, which is the difference between a warp that can
+    // only rotate and squash the model (everything `zero`: the whole thing is one 3x3
+    // matrix) and one that genuinely reshapes it.
+    ndDimLabels   = dimLabels;
+    ndFillChoices = fillChoices;
+    ndFillVal.assign(dimLabels.size(), 0);
+    ndAmtVal.assign(dimLabels.size(), 0.0);
+    for (size_t k = 0; k < dimLabels.size(); ++k) {
+        if (k < fillSel.size()) ndFillVal[k] = fillSel[k];
+        if (k < amounts.size()) ndAmtVal[k]  = amounts[k];
+    }
+    for (int k = 0; k < (int)dimLabels.size(); ++k) {
+        std::wstring wl = utf8ToWide(dimLabels[(size_t)k] + ":");
+        hNdDimLbl.push_back(mk(L"STATIC", wl.c_str(), SS_RIGHT | SS_CENTERIMAGE, 0));
+        // A pick-list, not free text: the fills are a closed set, and a typo'd one would
+        // have to be either silently ignored or reported, both worse than not offering it.
+        HWND cb = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_NDFILL_BASE + k);
+        if (cb) {
+            for (const std::string& ch : fillChoices) {
+                std::wstring w = utf8ToWide(ch);
+                SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)w.c_str());
+            }
+            SendMessageW(cb, CB_SETCURSEL, (WPARAM)ndFillVal[(size_t)k], 0);
+        }
+        hNdFill.push_back(cb);
+        HWND amt = mk(L"msctls_trackbar32", L"", TBS_HORZ | TBS_NOTICKS, ID_NDAMT_BASE + k);
+        if (amt) {
+            // 0..1 in hundredths, as a fraction of the model radius — the same units the
+            // -nd-fill amp/depth arguments use, so the two agree.
+            SendMessageW(amt, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+            SendMessageW(amt, TBM_SETPAGESIZE, 0, 5);
+            SendMessageW(amt, TBM_SETPOS, TRUE, (LPARAM)(long)std::lround(ndAmtVal[(size_t)k] * 100.0));
+        }
+        hNdAmt.push_back(amt);
+        hNdAmtLbl.push_back(mk(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE, 0));
+        setNdAmtText(k);
+    }
+    { std::lock_guard<std::mutex> lk(inMtx); ndDimsVal = dims; }
+
+    // Grow the WINDOW by whatever the bank adds, so the image area is unchanged (the same
+    // contract buildPanel and buildBindRow keep). The height itself is derived, not
+    // accumulated: layoutPanel recomputes it from the live width on every layout, so a
+    // resize that rewraps the bank is already handled and must not be double-counted here.
+    hasNdPanel.store(true);                     // publish before laying out (see buildBindRow)
+    RECT cr; GetClientRect(h, &cr);
+    const int wantH = panelBaseH + ndStripH((int)(cr.right - cr.left));
+    const int delta = wantH - panelH;
+    panelH = wantH;
+    (void)first; (void)oldRows;
+    if (delta) {
+        RECT wr; GetWindowRect(h, &wr);
+        SetWindowPos(h, nullptr, 0, 0, wr.right - wr.left,
+                     (wr.bottom - wr.top) + delta, SWP_NOMOVE | SWP_NOZORDER);
+    }
+    layoutPanel(h);
+    layoutView(h);          // see the note in buildPanel: a clamped grow fires no WM_SIZE
+    InvalidateRect(h, nullptr, TRUE);
+}
+
+// Push staged slider positions + status text onto the bank without raising input edges
+// (TBM_SETPOS raises no WM_HSCROLL, exactly as TBM_SETPOS on the timeline does not).
+void LiveWindow::Impl::applyNdState(HWND h) {
+    if (!hasNdPanel.load()) return;
+    std::vector<double> angles, amounts;
+    std::vector<int>    fillSel;
+    std::string status;
+    bool statusOnly = false;
+    { std::lock_guard<std::mutex> lk(inMtx);
+      angles = reqNdAngles; status = reqNdStatus;
+      fillSel = reqNdFill; amounts = reqNdAmounts; statusOnly = reqNdStatusOnly; }
+    // A status-only push must not touch a control: the whole point is that the user may be
+    // mid-drag, and TBM_SETPOS would move the thumb out from under the mouse.
+    if (statusOnly) {
+        if (hNdStat) { std::wstring w = utf8ToWide(status); SetWindowTextW(hNdStat, w.c_str()); }
+        (void)h;
+        return;
+    }
+    for (size_t k = 0; k < hNdSlider.size() && k < angles.size(); ++k) {
+        if (k < ndAngleVal.size()) ndAngleVal[k] = angles[k];
+        if (hNdSlider[k])
+            SendMessageW(hNdSlider[k], TBM_SETPOS, TRUE, (LPARAM)(long)std::lround(angles[k]));
+        setNdLabelText((int)k);
+    }
+    // Mirror the fills too: picking one can hand back a default amount (an emboss at 0.00
+    // would be indistinguishable from `zero`), and the render loop is what decides it.
+    for (size_t k = 0; k < hNdFill.size(); ++k) {
+        if (k < fillSel.size()) {
+            if (k < ndFillVal.size()) ndFillVal[k] = fillSel[k];
+            if (hNdFill[k]) SendMessageW(hNdFill[k], CB_SETCURSEL, (WPARAM)fillSel[k], 0);
+        }
+        if (k < amounts.size()) {
+            if (k < ndAmtVal.size()) ndAmtVal[k] = amounts[k];
+            if (hNdAmt[k])
+                SendMessageW(hNdAmt[k], TBM_SETPOS, TRUE, (LPARAM)(long)std::lround(amounts[k] * 100.0));
+            setNdAmtText((int)k);
+        }
+    }
+    if (hNdStat) {
+        std::wstring w = utf8ToWide(status);
+        SetWindowTextW(hNdStat, w.c_str());
+    }
+    (void)h;
 }
 
 // Position the panel children within the bottom strip. Row 1 = buttons + speed inputs + switch;
@@ -725,6 +1040,12 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     if (!panelH) return;
     RECT cr; GetClientRect(h, &cr);
     int W = cr.right - cr.left, H = cr.bottom - cr.top;
+    // Re-derive the strip height for the CURRENT width before anything is positioned:
+    // narrowing the window wraps the N-D bank onto more rows, and if the strip did not
+    // grow to match, those rows would be laid out below it and never seen. The image area
+    // absorbs the difference (clientSize() subtracts panelH), so the render simply gets
+    // shorter — no window resize from inside a WM_SIZE, which would re-enter this path.
+    if (hasNdPanel.load()) panelH = panelBaseH + ndStripH(W);
     int top = H - panelH;
     const int pad = 5, bh = 24;
     int row1 = top + 5, row2 = top + 5 + (bh + 4), row3 = top + 5 + 2 * (bh + 4);
@@ -737,6 +1058,9 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     // hidden, so revealing it later (setPathCount) needs no relayout.
     place(hClip, 84, row1, bh);
     place(hReset, 56, row1, bh);
+    place(hHelp, 48, row1, bh);
+    place(hColor, 52, row1, bh);
+    place(hSeeThru, 88, row1, bh);
     place(hPath, 66, row1, bh);
     place(hPlay, 56, row1, bh);
     place(hStrideLbl, 58, row1, bh);
@@ -781,6 +1105,45 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
         // The status readout takes whatever width is left (it is SS_ENDELLIPSIS, so a long
         // loom error truncates cleanly instead of overrunning the strip).
         if (hBStat) MoveWindow(hBStat, x, row4, std::max(40, W - pad - x), bh, TRUE);
+    }
+    // N-D rotation bank: a controls row, then the sliders wrapped into a grid. Laid out
+    // last because it sits at the bottom of the strip and its height is what grew the
+    // window; re-deriving the row count here (rather than trusting the stored one) is what
+    // makes a window RESIZE reflow the bank to the new width.
+    if (hasNdPanel.load()) {
+        const int base = top + 5 + (3 + (hasBindRow.load() ? 1 : 0)) * (bh + 4);
+        x = pad;
+        place(hNdDimsLbl, 62, base, bh);
+        place(hNdDims,    40, base, bh);
+        place(hNdReset,   56, base, bh);
+        place(hNdSave,    88, base, bh);
+        if (hNdStat) MoveWindow(hNdStat, x, base, std::max(40, W - pad - x), bh, TRUE);
+        // Fill cells first: they say what the space CONTAINS, and the plane sliders below
+        // rotate within it.
+        const int fillPerRow = (int)ndFillPerRow(W);
+        int fillRows = 0;
+        for (int k = 0; k < (int)hNdFill.size(); ++k) {
+            const int r = k / fillPerRow, c = k % fillPerRow;
+            fillRows = r + 1;
+            const int cx = pad + c * kNdFillCellW;
+            const int cy = base + (bh + 4) * (1 + r);
+            if (hNdDimLbl[(size_t)k]) MoveWindow(hNdDimLbl[(size_t)k], cx, cy, 20, bh, TRUE);
+            // A combo's creation/move height is its DROPPED height; the closed box is one
+            // line regardless, so the extra 160 px is the list, not the control.
+            if (hNdFill[(size_t)k])   MoveWindow(hNdFill[(size_t)k], cx + 22, cy, 122, bh + 160, TRUE);
+            if (hNdAmt[(size_t)k])    MoveWindow(hNdAmt[(size_t)k], cx + 148, cy, 66, bh, TRUE);
+            if (hNdAmtLbl[(size_t)k]) MoveWindow(hNdAmtLbl[(size_t)k], cx + 216, cy, 30, bh, TRUE);
+        }
+        const int planes = (int)hNdSlider.size();
+        const int perRow = std::max(1, (W - 2 * pad) / kNdCellW);
+        for (int k = 0; k < planes; ++k) {
+            const int r = k / perRow, c = k % perRow;
+            const int cx = pad + c * kNdCellW;
+            const int cy = base + (bh + 4) * (1 + fillRows + r);
+            if (hNdLabel[(size_t)k])  MoveWindow(hNdLabel[(size_t)k], cx, cy, 54, bh, TRUE);
+            if (hNdSlider[(size_t)k]) MoveWindow(hNdSlider[(size_t)k], cx + 56, cy,
+                                                 kNdCellW - 62, bh, TRUE);
+        }
     }
 }
 
@@ -990,6 +1353,12 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
         case WM_MKBINDROW:
             if (self) self->buildBindRow(h);          // build the loom bind row + grow window (UI thread)
             return 0;
+        case WM_MKNDPANEL:
+            if (self) self->buildNdPanel(h);          // build/rebuild the N-D slider bank (UI thread)
+            return 0;
+        case WM_SETNDSTATE:
+            if (self) self->applyNdState(h);          // push slider positions + status (UI thread)
+            return 0;
         case WM_SIZE:
             if (self) {
                 self->layoutPanel(h);                // reflow the control strip to the new width
@@ -1059,6 +1428,7 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                 switch (id) {
                     case ID_CLIP:  { std::lock_guard<std::mutex> lk(self->inMtx); self->collideReq = true; } break;
                     case ID_RESET: { std::lock_guard<std::mutex> lk(self->inMtx); self->resetReq   = true; } break;
+                    case ID_HELP:  ftViewerHelpOpen(); break;
                     case ID_PATH:  { std::lock_guard<std::mutex> lk(self->inMtx); self->pathReq     = true; } break;
                     case ID_PLAY:  { std::lock_guard<std::mutex> lk(self->inMtx); self->playReq     = true; } break;
                     case ID_SW_UPDATE:
@@ -1143,7 +1513,51 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                             if (v >= 1) { std::lock_guard<std::mutex> lk(self->inMtx); self->bindDimsVal = v; }
                         }
                         break;
-                    default: break;
+                    case ID_COLOR:
+                        if (self->hColor) {
+                            const bool on = SendMessageW(self->hColor, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                            std::lock_guard<std::mutex> lk(self->inMtx);
+                            self->colorVal = on;
+                        }
+                        break;
+                    case ID_SEETHRU:
+                        if (self->hSeeThru) {
+                            const bool on = SendMessageW(self->hSeeThru, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                            std::lock_guard<std::mutex> lk(self->inMtx);
+                            self->clearVal = on;
+                        }
+                        break;
+                    case ID_NDRESET: { std::lock_guard<std::mutex> lk(self->inMtx); self->ndResetReq = true; } break;
+                    default:
+                        // A fill pick-list. Cached on the notification rather than read at
+                        // drain time, for the reason the bind row's combos are: drainNav
+                        // runs on the RENDER thread and CB_GETCURSEL would be a blocking
+                        // SendMessage into the UI thread on every frame.
+                        if (code == CBN_SELCHANGE && id >= ID_NDFILL_BASE && id < ID_NDFILL_END) {
+                            const int k = id - ID_NDFILL_BASE;
+                            if (k >= 0 && k < (int)self->hNdFill.size()) {
+                                const int selk = (int)SendMessageW(self->hNdFill[(size_t)k],
+                                                                   CB_GETCURSEL, 0, 0);
+                                if (selk >= 0) {
+                                    std::lock_guard<std::mutex> lk(self->inMtx);
+                                    if (k < (int)self->ndFillVal.size()) self->ndFillVal[(size_t)k] = selk;
+                                    self->ndFillMovedReq = true;
+                                }
+                            }
+                            return 0;
+                        }
+                        break;
+                    case ID_NDSAVE:  { std::lock_guard<std::mutex> lk(self->inMtx); self->ndSaveReq  = true; } break;
+                    case ID_NDDIMS:
+                        if (code == EN_CHANGE && self->hNdDims) {
+                            wchar_t b[32]; GetWindowTextW(self->hNdDims, b, 32);
+                            int v = _wtoi(b);
+                            // Same rule as the bind row's box: an empty field reads 0 mid-edit
+                            // and must mean "unchanged". The upper bound matches the CLI's, so
+                            // a stray keystroke cannot ask for a bank of thousands of sliders.
+                            if (v >= 3 && v <= 12) { std::lock_guard<std::mutex> lk(self->inMtx); self->ndDimsVal = v; }
+                        }
+                        break;
                 }
             }
             return 0;
@@ -1155,6 +1569,29 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                 int pos = (int)SendMessageW(self->hTimeline, TBM_GETPOS, 0, 0);
                 std::lock_guard<std::mutex> lk(self->inMtx);
                 self->scrubReq = pos;
+            }
+            // An N-D plane slider: cache the new angle and raise the one-shot "moved" edge.
+            // The sender's control id maps straight back to the plane index, so a bank of
+            // 45 sliders costs one subtraction rather than a search.
+            else if (self && self->hasNdPanel.load() && (HWND)lp) {
+                const int id = GetDlgCtrlID((HWND)lp);
+                const int k  = id - ID_NDSLIDER_BASE;
+                if (k >= 0 && k < (int)self->hNdSlider.size() && self->hNdSlider[(size_t)k] == (HWND)lp) {
+                    const int pos = (int)SendMessageW((HWND)lp, TBM_GETPOS, 0, 0);
+                    { std::lock_guard<std::mutex> lk(self->inMtx);
+                      if (k < (int)self->ndAngleVal.size()) self->ndAngleVal[(size_t)k] = (double)pos;
+                      self->ndMovedReq = true; }
+                    self->setNdLabelText(k);
+                }
+                // ...or a fill AMOUNT slider, which lives in its own id range.
+                const int a = id - ID_NDAMT_BASE;
+                if (a >= 0 && a < (int)self->hNdAmt.size() && self->hNdAmt[(size_t)a] == (HWND)lp) {
+                    const int pos = (int)SendMessageW((HWND)lp, TBM_GETPOS, 0, 0);
+                    { std::lock_guard<std::mutex> lk(self->inMtx);
+                      if (a < (int)self->ndAmtVal.size()) self->ndAmtVal[(size_t)a] = pos / 100.0;
+                      self->ndFillMovedReq = true; }
+                    self->setNdAmtText(a);
+                }
             }
             return 0;
         case WM_KEYDOWN:
@@ -1412,10 +1849,24 @@ NavInput LiveWindow::drainNav() {
     n.simplifyTol = impl_->tolVal;  n.rawRecord = impl_->rawVal;
     // Paint-mode outputs: persistent checkbox state + one-shot Flat edge.
     n.paintMode = impl_->paintVal;  n.speedReset = impl_->flatReq;
+    // Preview-shading toggles: current checkbox state (persistent, like paintMode).
+    n.colorOn = impl_->colorVal;    n.clearOn = impl_->clearVal;
     // Loom bind-row outputs: cached combo selections + one-shot Bind/Unbind edges.
     n.bindChannel = impl_->bindChVal;  n.bindTarget = impl_->bindSlotVal;
     n.bindApply   = impl_->bindReq;    n.bindClear  = impl_->bclearReq;
     n.dimsReq     = impl_->bindDimsVal;
+    // N-D panel outputs: the sliders' CURRENT angles (persistent state, like the fly
+    // camera's turn rate) plus the one-shot moved/Reset/Save edges.
+    if (impl_->hasNdPanel.load()) {
+        n.ndAngles = impl_->ndAngleVal;
+        n.ndFill   = impl_->ndFillVal;
+        n.ndAmount = impl_->ndAmtVal;
+        n.ndFillMoved = impl_->ndFillMovedReq;
+        n.ndMoved  = impl_->ndMovedReq;
+        n.ndDims   = impl_->ndDimsVal;
+        n.ndReset  = impl_->ndResetReq;
+        n.ndSave   = impl_->ndSaveReq;
+    }
     impl_->wheelAcc = impl_->wheelSpeedAcc = 0.0;
     impl_->resetReq = impl_->printReq = impl_->collideReq = impl_->traceReq = false;
     impl_->pathReq = impl_->playReq = false;
@@ -1423,6 +1874,7 @@ NavInput LiveWindow::drainNav() {
     impl_->recReq = impl_->addReq = impl_->insReq = impl_->delReq = impl_->saveReq = false;
     impl_->flatReq = false;
     impl_->bindReq = impl_->bclearReq = false;
+    impl_->ndMovedReq = impl_->ndFillMovedReq = impl_->ndResetReq = impl_->ndSaveReq = false;
     return n;
 }
 
@@ -1480,6 +1932,19 @@ void LiveWindow::setEditState(bool recording, int pointCount) {
                          SetWindowTextW(impl_->hPtLbl, b); }
 }
 
+void LiveWindow::setShadeToggles(bool colorOn, bool clearOn) {
+    if (!impl_ || !impl_->hasPanel.load()) return;
+    // BM_SETCHECK raises no BN_CLICKED, so mirroring the render loop's state here cannot
+    // feed back as a user toggle — the same contract setPanelState keeps.
+    if (impl_->hColor)
+        SendMessageW(impl_->hColor, BM_SETCHECK, colorOn ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (impl_->hSeeThru)
+        SendMessageW(impl_->hSeeThru, BM_SETCHECK, clearOn ? BST_CHECKED : BST_UNCHECKED, 0);
+    std::lock_guard<std::mutex> lk(impl_->inMtx);
+    impl_->colorVal = colorOn;
+    impl_->clearVal = clearOn;
+}
+
 void LiveWindow::setSpeedLabel(double speedX) {
     if (!impl_ || !impl_->hasPanel.load() || !impl_->hSpdLbl) return;
     wchar_t b[32]; swprintf(b, 32, L"%.2fx", speedX);
@@ -1496,6 +1961,60 @@ void LiveWindow::enableBindRow(const std::vector<std::string>& slotNames, int di
     }
     // Build on the window's own thread (synchronous, so the child HWNDs exist on return).
     SendMessageW(hw, WM_MKBINDROW, 0, 0);
+}
+
+void LiveWindow::enableNdPanel(int dims,
+                               const std::vector<std::string>& planeLabels,
+                               const std::vector<double>& anglesDeg,
+                               const std::vector<std::string>& dimLabels,
+                               const std::vector<std::string>& fillChoices,
+                               const std::vector<int>& fillSel,
+                               const std::vector<double>& amounts) {
+    HWND hw = impl_ ? impl_->hwnd.load() : nullptr;
+    if (!hw || !impl_->hasPanel.load() || planeLabels.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(impl_->inMtx);
+        impl_->reqNdLabels = planeLabels;
+        impl_->reqNdAngles = anglesDeg;
+        impl_->reqNdAngles.resize(planeLabels.size(), 0.0);
+        impl_->reqNdDimLabels   = dimLabels;
+        impl_->reqNdFillChoices = fillChoices;
+        impl_->reqNdFill        = fillSel;
+        impl_->reqNdFill.resize(dimLabels.size(), 0);
+        impl_->reqNdAmounts     = amounts;
+        impl_->reqNdAmounts.resize(dimLabels.size(), 0.0);
+        impl_->reqNdDims   = dims;
+    }
+    // Build on the window's own thread (synchronous, so the child HWNDs exist on return).
+    SendMessageW(hw, WM_MKNDPANEL, 0, 0);
+}
+
+void LiveWindow::setNdStatus(const char* status) {
+    HWND hw = impl_ ? impl_->hwnd.load() : nullptr;
+    if (!hw || !impl_->hasNdPanel.load()) return;
+    {
+        std::lock_guard<std::mutex> lk(impl_->inMtx);
+        impl_->reqNdStatus     = status ? status : "";
+        impl_->reqNdStatusOnly = true;
+    }
+    SendMessageW(hw, WM_SETNDSTATE, 0, 0);
+}
+
+void LiveWindow::setNdState(const std::vector<double>& anglesDeg,
+                            const std::vector<int>& fillSel,
+                            const std::vector<double>& amounts,
+                            const char* status) {
+    HWND hw = impl_ ? impl_->hwnd.load() : nullptr;
+    if (!hw || !impl_->hasNdPanel.load()) return;
+    {
+        std::lock_guard<std::mutex> lk(impl_->inMtx);
+        impl_->reqNdAngles = anglesDeg;
+        impl_->reqNdFill    = fillSel;
+        impl_->reqNdAmounts = amounts;
+        impl_->reqNdStatus  = status ? status : "";
+        impl_->reqNdStatusOnly = false;
+    }
+    SendMessageW(hw, WM_SETNDSTATE, 0, 0);
 }
 
 void LiveWindow::setBindState(const std::vector<std::string>& targets, const char* status) {

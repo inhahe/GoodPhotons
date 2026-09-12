@@ -83,12 +83,20 @@
 #include "pattern_device.cuh"   // DPattern / DPatEnvT / dPatternEval — shared with raster_cuda.cu
 #include "stochtile.h"    // O7: the host/device-shared histogram-preserving tiling operator
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
+#include "surfmerge.h"   // SurfMap/SurfPhoton/SurfMis: mode J's point x point merges
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
 #include "allocreport.h"  // OOM that names the buffer, its size and the flag that sizes it
 #include "photonmap_io.h" // -savemap / -loadmap, shared with the CPU mode-M path in main.cpp
 #include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
 #include "lighttree.h"    // Conty-Kulla light BVH: the SAME traversal the CPU runs, not a copy
+#include "parallel.h"     // ft::stopRequested — cooperative `-stop` between deposit chunks
+#include "duration.h"     // humanDur: "[[[dd:]hh:]mm:]ss" for the stall watchdog's elapsed times
                           // (the header is dependency-free and __host__ __device__ for this)
+#include "rng.h"          // g_rngSalt — `-seed`, folded into every DEVICE seed origin below.
+                          // The salt is a host value and the kernels take their seed as a
+                          // launch argument, so the device needs no state of its own: every
+                          // place a seed is *derived* on the host XORs it in, and nothing
+                          // inside a kernel changes.
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
 // every kernel launch/sync return code MUST be checked: under GPU contention (a second
@@ -211,18 +219,52 @@ static constexpr Real BIG     = 1e30;
 // 400 m, far below any occluder these rays could legitimately need to see. The fp64 build
 // sets the relative term to zero so it stays bit-identical to the CPU reference.
 #if FTRACE_GPU_FP32
-static constexpr double CONN_REL_EPS = 1e-5;
+static constexpr double CONN_REL_EPS  = 1e-5;
+static constexpr double COORD_REL_EPS = 8.0 / 8388608.0;   // 8 float ulps of the far end's largest coordinate
 #else
-static constexpr double CONN_REL_EPS = 0.0;
+static constexpr double CONN_REL_EPS  = 0.0;
+static constexpr double COORD_REL_EPS = 0.0;
 #endif
 // `absEps == 0` means "do not shorten at all": the distant-sun connection's far end is the
 // scene EXIT, not a sampled surface point, so it must keep the whole segment (see the
 // shape==6 branch of the s=1 connection, which sets occlEps = 0 for exactly that reason).
-__device__ __host__ inline Real connMaxT(double dist, double absEps = 2e-6) {
+// `coordMag` is the far end's largest coordinate magnitude: a point at |p| is only known to
+// ~|p|*2^-23, and when the light is much nearer than the shading point is to the origin that
+// quantisation exceeds dist*CONN_REL_EPS (at |p| = 5e4 and dist = 613 they are 4e-3 vs 6e-3),
+// so the shortening must cover it too. occludedTo() supplies it; direct callers may pass 0.
+__device__ __host__ inline Real connMaxT(double dist, double absEps = 2e-6, double coordMag = 0.0) {
     if (absEps <= 0.0) return (Real)dist;
     double e = dist * CONN_REL_EPS;
+    const double c = coordMag * COORD_REL_EPS;
+    if (c > e) e = c;
     return (Real)(dist - (e > absEps ? e : absEps));
 }
+// The SAME reasoning applies to every NEE / light-sampling shadow ray, whose far end is
+// also a sampled point on an emitter, and to the camera legs — all of which used to
+// shorten by a hard-coded `dist - 2*RAY_EPS`. With RAY_EPS = 1e-4f that shortening is
+// 2e-4, while one ulp of a float at magnitude d is d*2^-23, so the subtraction rounds
+// straight back to `dist` once
+//
+//     2e-4 < 0.5 ulp   <=>   d > 2e-4 / (0.5 * 2^-23)  ~=  3360 scene units.
+//
+// Past that the ray reaches the sampled point exactly, re-hits the emitter it was
+// sampled from, and the sample is thrown away as occluded. Measured on a sphere light
+// at four distances (scraps/rbnm_d*.ftsl, mode R, GPU vs the CPU double build):
+//
+//     d = 6325  (0.27 ulp, lost entirely)      -23.67%      <- predicted broken
+//     d = 3162  (0.53 ulp, on the round bound)  -1.64%      <- predicted marginal
+//     d = 1581  (1.06 ulp, survives)            -0.20%      <- predicted clean
+//     d =  632  (5.3  ulp, survives)            -0.36%      <- predicted clean
+//
+// i.e. the predicted ~3360 threshold falls exactly between the marginal and the broken
+// case. Uniformly scaling that scene by 0.1 -- same angles, same ratios, same image,
+// only smaller floats -- takes the error from -23.67% to -0.36%, which is what makes it
+// a precision failure rather than an algorithmic one. This was the real cause of the
+// long-standing "GPU and CPU disagree on participating-media brightness" report: it has
+// nothing to do with media (it reproduces with no medium in the scene at all), it is
+// simply that the repro scene put its light 6 km away. See known-issues.md GPU-NEE-EPS.
+
+
 
 // DVec3 stores Real and does Real arithmetic (the hot path), but its 3-arg
 // constructor keeps DOUBLE parameters so the host baking code's brace-init from
@@ -243,6 +285,44 @@ struct DVec3 {
     HD Real& operator[](int i)       { return (&x)[i]; }
 };
 HD static inline Real dot(const DVec3& a, const DVec3& b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+
+// ---- Self-intersection-safe ray ORIGIN --------------------------------------------------
+// Wachter & Binder, "A Fast and Robust Method for Avoiding Self-Intersection", Ray Tracing
+// Gems ch. 6. The origin is advanced by a fixed number of float ULPS along the normal (256
+// of them, times the normal's component), with a small absolute push very near zero where
+// ulps are too fine to matter. That is the ONLY offset that is correct at every scale: the
+// old `p + n * RAY_EPS` (1e-4f) is below half an ulp for |p| > ~1680 and the BDPT/VCM
+// `ng * 1e-6f` below half an ulp for |p| > ~17, so both rounded away and left the origin
+// ON the surface it had just left -- observed as photons born on a distant sphere light
+// re-hitting it (mode B `absorbed=0.1525` on a 6 km light; known-issues GPU-ORIGIN-EPS).
+// A RELATIVE epsilon is the wrong fix at the origin (unlike connMaxT at the far end): 1e-5
+// of a 100 km coordinate is a metre, which walks straight through a wall.
+//
+// `dOffsetAlong(p, ng, w)` picks the side from the direction the ray LEAVES in, so a
+// reflected and a transmitted ray both clear the surface without the caller having to
+// know which it is; `ng` should be the geometric normal (either orientation). A zero `ng`
+// (a vertex with no surface) degrades to a push along `w` itself.
+//
+// The fp64 device build keeps the CPU reference's absolute 1e-6 so it stays bit-identical.
+#if FTRACE_GPU_FP32
+__device__ static inline Real dOffsetComp(Real p, Real n) {
+    const int   of = (int)(256.0f * n);
+    const float pi = __int_as_float(__float_as_int(p) + ((p < 0.0f) ? -of : of));
+    return (fabsf(p) < (1.0f / 32.0f)) ? p + (1.0f / 65536.0f) * n : pi;
+}
+__device__ static inline DVec3 dOffsetPoint(const DVec3& p, const DVec3& n) {
+    return DVec3{dOffsetComp(p.x, n.x), dOffsetComp(p.y, n.y), dOffsetComp(p.z, n.z)};
+}
+#else
+__device__ static inline DVec3 dOffsetPoint(const DVec3& p, const DVec3& n) {
+    return p + n * RAY_EPS;
+}
+#endif
+__device__ static inline DVec3 dOffsetAlong(const DVec3& p, const DVec3& ng, const DVec3& w) {
+    const Real nn = dot(ng, ng);
+    if (!(nn > (Real)0)) return dOffsetPoint(p, w);
+    return dOffsetPoint(p, (dot(ng, w) >= (Real)0) ? ng : -ng);
+}
 // Componentwise (Hadamard) product — RGB throughput * albedo in the fast RGB backward.
 HD static inline DVec3 hadamard(const DVec3& a, const DVec3& b) { return {a.x*b.x, a.y*b.y, a.z*b.z}; }
 HD static inline DVec3 cross(const DVec3& a, const DVec3& b) {
@@ -411,6 +491,11 @@ struct DMaterial {
     // the camera sees them. matEmit is that fallback, consulted only when
     // dEmitterForMat() < 0 so a mesh/quad light never double-counts.
     int    matIsLight;
+    // Device twin of Material::hideCamera — primary visibility off. Only the bounce-0
+    // camera ray of a gather/backward path skips this material; every other ray sees it.
+    // See Material::hideCamera (scene.h) for why the flag exists at all, and
+    // closestHit(..., camHide) below for how it is enforced.
+    int    hideCamera;
     double matEmit[SPEC_N];
     DVec3  rgbMatEmit;          // matEmit baked to linear sRGB, for the fast RGB backward
     // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
@@ -504,7 +589,8 @@ struct DMediumStack {
 
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
                  DVec3 tangent; double bitangentSign;    // C6 tangent frame for normal mapping
-                 double curvature; };                    // O3 per-face mean curvature (Tri::finalize)
+                 double curvature;                       // O3 per-face mean curvature (Tri::finalize)
+                 int vcol; };                            // Tri::vcol -> DScene::vertColors, or -1
 struct DSphere { DVec3 c; double r; int matId; };
 // One round cone of a curve/fiber strand — the device twin of CurveSeg (curve.h). The host
 // record is already a POD in exactly this shape; only the scalar type narrows to Real.
@@ -638,6 +724,76 @@ struct DVdbGrid {
     DVec3            imin;          // integer min-corner of the baked lattice
 };
 
+// Device twin of MajorantGrid (majorant.h): the per-cell control + residual majorant that
+// makes transmittance through a thick heterogeneous medium converge. `ctrl == nullptr`
+// means "no grid" and every entry point falls back to the single global `densityMax`, so an
+// unbounded density field (which has no finite region to grid) behaves exactly as before.
+struct DMajorant {
+    const float* ctrl;         // per-cell control density (null => no grid)
+    const float* res;          // per-cell residual majorant, sup|density - ctrl| over the cell
+    DVec3        wmin, cell, invCell;
+    int          nx, ny, nz;
+};
+
+// 3D DDA over a DMajorant, handing back one [t0,t1] span and cell index at a time. Device
+// twin of Renderer::majorantWalk; the two must step identically or CPU and GPU renders of
+// the same heterogeneous medium would disagree by more than noise. Doubles throughout,
+// matching the host walk (the tracking loops are double on the device already).
+struct DMajWalk {
+    int    c[3], step[3], nn[3];
+    double tNext[3], tDelta[3];
+    double t0, tEnd;
+    double ox[3], dx[3];
+
+    __device__ void init(const DMajorant& g, const DVec3& o, const DVec3& d,
+                         double ta, double tb) {
+        ox[0] = o.x; ox[1] = o.y; ox[2] = o.z;
+        dx[0] = d.x; dx[1] = d.y; dx[2] = d.z;
+        const double lo[3] = {g.wmin.x, g.wmin.y, g.wmin.z};
+        const double cs[3] = {g.cell.x, g.cell.y, g.cell.z};
+        const double ic[3] = {g.invCell.x, g.invCell.y, g.invCell.z};
+        nn[0] = g.nx; nn[1] = g.ny; nn[2] = g.nz;
+        for (int k = 0; k < 3; ++k) {
+            double p = ox[k] + dx[k] * ta;
+            int i = (int)floor((p - lo[k]) * ic[k]);
+            c[k] = i < 0 ? 0 : (i >= nn[k] ? nn[k] - 1 : i);
+            if (dx[k] > 1e-12) {
+                step[k] = 1;
+                tNext[k] = (lo[k] + (c[k] + 1) * cs[k] - ox[k]) / dx[k];
+                tDelta[k] = cs[k] / dx[k];
+            } else if (dx[k] < -1e-12) {
+                step[k] = -1;
+                tNext[k] = (lo[k] + c[k] * cs[k] - ox[k]) / dx[k];
+                tDelta[k] = -cs[k] / dx[k];
+            } else {
+                step[k] = 0; tNext[k] = 1e300; tDelta[k] = 1e300;
+            }
+        }
+        t0 = ta; tEnd = tb;
+    }
+    // Advance to the next non-empty span. Returns false when the segment (or the grid) is
+    // exhausted; `ci` is the flat cell index, [a,b] the span within it.
+    __device__ bool next(const DMajorant& g, size_t& ci, double& a, double& b) {
+        for (;;) {
+            if (t0 >= tEnd) return false;
+            int axis = (tNext[0] < tNext[1]) ? ((tNext[0] < tNext[2]) ? 0 : 2)
+                                             : ((tNext[1] < tNext[2]) ? 1 : 2);
+            double t1 = tNext[axis] < tEnd ? tNext[axis] : tEnd;
+            size_t cell = ((size_t)c[2] * g.ny + c[1]) * g.nx + c[0];
+            double s0 = t0;
+            if (t1 >= tEnd) { t0 = tEnd; }
+            else {
+                t0 = t1;
+                c[axis] += step[axis];
+                if (c[axis] < 0 || c[axis] >= nn[axis]) t0 = tEnd;   // left the grid
+                else tNext[axis] += tDelta[axis];
+            }
+            if (t1 > s0) { ci = cell; a = s0; b = t1; return true; }
+            if (t0 >= tEnd) return false;
+        }
+    }
+};
+
 struct DMedium {
     int    enabled;
     double sigma_a[SPEC_N];
@@ -654,6 +810,7 @@ struct DMedium {
     const PatNode*   density;         // device pool for the density formula (or null)
     int              densityN;        // node count of the density program
     double           densityMax;      // majorant (sup of density over the bound)
+    DMajorant        majorant;        // per-cell control/residual grid (ctrl null => none)
     // --- Optional imported .nvdb/.vdb volume, uploaded as a NATIVE SPARSE brick grid ---
     // When `densGrid.brickData` is non-null the density multiplier is TRILINEARLY
     // sampled from the sparse lattice (ROADMAP C2) instead of the pattern VM; takes
@@ -703,6 +860,11 @@ struct DMedium {
     const double*     rbCdf;          // per-lambda CDF over mu for importance sampling
     int               rbNLam, rbNMu;  // table dimensions
     double            rbLam0, rbDLam; // wavelength axis origin/step (nm)
+    // ACHROMATIC-PATH BEAMS (photonbeams.h / scene.h mediumAchromatic): 1 when this medium's
+    // gather-time spectral tail — sigma_s and the phase function — is flat in lambda, so a
+    // beam lying in it can be folded at the emitter's mean CIE with no chromatic variance.
+    // Baked host-side because it is a whole-band scan of two Spectrum objects.
+    int               achro;
 };
 
 // One triangle of a Mesh emitter (mirrors host EmitTri): v0 + two edge vectors, the
@@ -746,6 +908,9 @@ struct DEmitter {
     // wavelength-integrated radiance the spectral estimator converges to (the
     // p(lambda)*invPdfLambda cancellation), so NEE folds it in with no per-wavelength term.
     DVec3  rgbEmit;
+    // ACHROMATIC-PATH BEAMS (photonbeams.h): this emitter's SPD-weighted mean CIE, i.e. the
+    // expectation of CIE(lambda) under its own emission sampler. Host twin: Emitter::cieMean.
+    DVec3  cieMean;
 };
 
 // PBRT's IsDeltaLight (device twin of bdpt.h isDeltaEmitter): this emitter's emission
@@ -933,7 +1098,48 @@ struct DEmissiveVolume {
     double        lamStep;  // bin width in nm
 };
 
+// ---- GATHER-TIME SPECTRAL FOLD on the device (FOLD-GPU (2)) ---------------------------------
+// Device twin of Scene::BowLut. One table per (emitter, medium) pair that is eligible
+// (`Scene::bowLutEligible`), each kBowBins entries uniform in cos(theta) over [-1, 1], holding
+// the effective colour and the effective scalar phase. `off[em * nMed + med]` is the entry
+// offset, or -1 where the pair has no table -- which is the same question `Scene::bowLut`
+// answers with a null pointer.
+enum { kBowBins = 8192 };
+struct DBowTab {
+    const float4* tab;   // xyz = Bow(cos)/phaseLum(cos), w = phaseLum(cos)
+    const int*    off;   // size nEm * nMed; -1 = no table for that pair
+    int nEm, nMed;
+};
+__device__ static inline bool dBowEval(const DBowTab& bt, int em, int med, double cosTheta,
+                                       double& cx, double& cy, double& cz, double& phase) {
+    if (!bt.tab || em < 0 || med < 0 || em >= bt.nEm || med >= bt.nMed) return false;
+    const int base = bt.off[em * bt.nMed + med];
+    if (base < 0) return false;
+    // Same clamp and same lerp as Scene::BowLut::eval -- the tables are shared, so the
+    // interpolation has to be too or the two backends disagree by a bin.
+    double u = (cosTheta + 1.0) * 0.5 * (double)(kBowBins - 1);
+    if (!(u > 0.0)) u = 0.0;
+    if (u > (double)(kBowBins - 1)) u = (double)(kBowBins - 1);
+    const int i = (int)u;
+    const int j = (i + 1 < kBowBins) ? i + 1 : i;
+    const double f = u - (double)i;
+    const float4 a = bt.tab[base + i], b = bt.tab[base + j];
+    cx = (double)a.x * (1.0 - f) + (double)b.x * f;
+    cy = (double)a.y * (1.0 - f) + (double)b.y * f;
+    cz = (double)a.z * (1.0 - f) + (double)b.z * f;
+    phase = (double)a.w * (1.0 - f) + (double)b.w * f;
+    return true;
+}
+
 struct DScene {
+    // Per-vertex colours (Scene::vertColors), three linear-RGB floats per entry, indexed
+    // by DTri::vcol; and the shared Jakob-Hanika RGB -> coefficient table that turns an
+    // interpolated one into a spectrum. `jhLut` is the SAME table the stochastic-tiling
+    // textures use (upsample::coeffLut()) — uploaded once and pointed at from both places,
+    // since it is a pure function of colour and shared by every backend.
+    const float* vertColors;  int nVertColors;
+    const float* jhLut;
+    PatSlice     ndSlice;     // -nd: the 3-D slice of N-space fields are evaluated on
     const DTri*      tris;  int nTris;
     const DSphere*   sph;   int nSph;
     // Flat mirror surfaces (Scene::mirrorPlanes, uploaded verbatim): one entry per
@@ -950,6 +1156,11 @@ struct DScene {
     const int* dielSph;   int nDielSph;
     const int* mirrorSph; int nMirrorSph;
     const DMaterial* mats;
+    // Device twin of Scene::camHiddenAny — does ANY material carry hideCamera? Gates the
+    // per-primitive material lookup in closestHit's camera-ray mode, so a scene with no
+    // hidden flat (all but a handful) pays one uniform compare per camera ray instead of a
+    // global load per BVH leaf primitive. See DMaterial::hideCamera.
+    int              camHiddenAny;
     const DNode*     nodes; const int* primIdx; int nNodes;
     // Implicit surfaces (isosurface/CSG/metaballs). BVH prims with index
     // >= nTris+nSph map to implicits[prim - nTris - nSph]; fieldNodes is the flat
@@ -1006,7 +1217,15 @@ struct DScene {
     // spatial bound (distant suns) that are connected unconditionally.
     const LightTreeNode* lightTree; int lightTreeRoot;
     const int*       lightTreeAlways; int nLightTreeAlways;
+    // Reverse indices for ltSelectPdf (GLOSSY-NEE's BSDF-sampling half). Host twin:
+    // Scene::lightTreeParent / lightTreeLeaf, both plain int arrays derived from the node
+    // array, so they upload with no remap like everything else here.
+    const int*       lightTreeParent;
+    const int*       lightTreeLeaf;  int nLightTreeLeaf;
     int              bkLightTree;    // 0 = -no-lighttree: exact all-emitters splitting
+    int              bkGlossyNee;    // 0 = -no-glossy-nee: no connection at a D_GLOSSY vertex
+    int              gatherArea;     // -gatherarea <M>: probe samples for the M-GATHERAREA
+                                     // footprint (0 = off, the default)
     double           bkLightSplit;   // -light-split
     int              bkLightSamples; // -light-samples
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
@@ -1027,6 +1246,7 @@ struct DScene {
     const double*    emitSamplerCdf; int emitSamplerN; double emitSamplerStep;
     double           emitG;
     const DMedium*   media;    // participating media array (superposed); null if none
+    DBowTab bow;   // gather-time spectral fold tables (FOLD-GPU (2)); bow.tab null = none
     int              mediaN;   // number of media (0 => vacuum)
     // Volumetric blackbody emission ("fire", ROADMAP C3). Photon birth splits emitter-
     // vs-fire by power: grandTotal = totalPower + totalEmissionPower. Null/0 => no fire.
@@ -1105,6 +1325,7 @@ __host__ __device__ static inline DPatEnv dPatEnvOf(const DScene& sc) {
     e.grids = sc.grids; e.nGrids = sc.nGrids;
     e.scatters = sc.scatters; e.nScatters = sc.nScatters;
     e.dataPool = sc.dataPool; e.dataPoolN = sc.dataPoolN;
+    e.slice = sc.ndSlice;
     return e;
 }
 
@@ -1905,6 +2126,26 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
         if (t < tb) { tHit = (Real)t; return true; }
         return false;
     }
+    // Per-cell majorant grid (majorant.h): delta tracking is unbiased for ANY upper bound,
+    // so use the tight local sup (ctrl + res) — far fewer null collisions, and a vacuum
+    // cell is skipped with no RNG draw at all. Host twin: Renderer::sampleMediumCollision.
+    if (m.majorant.ctrl) {
+        DMajWalk w; w.init(m.majorant, o, dir, ta, tb);
+        size_t ci; double a, b;
+        while (w.next(m.majorant, ci, a, b)) {
+            double sigMax = stBase * ((double)m.majorant.ctrl[ci] + (double)m.majorant.res[ci]);
+            if (sigMax <= 0.0) continue;              // vacuum cell
+            double t = a;
+            for (;;) {
+                t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
+                if (t >= b) break;
+                DVec3 pp = o + dir * (Real)t;
+                double sigT = stBase * dMedDensityAt(m, pp, env);
+                if ((double)rng.uniform() * sigMax < sigT) { tHit = (Real)t; return true; }
+            }
+        }
+        return false;
+    }
     double sigMax = stBase * m.densityMax;
     if (sigMax <= 0.0) return false;
     double t = ta;
@@ -1919,7 +2160,11 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
 
 // Unbiased transmittance along [o, o+dir*dist]. Device twin of
 // Renderer::mediumTransmittance: exact exp for a homogeneous medium (no RNG draw), else
-// ratio tracking. Homogeneous scenes therefore keep the exact analytic transmittance.
+// RESIDUAL ratio tracking against the per-cell majorant grid, falling back to plain ratio
+// tracking against the global majorant when the medium has no grid. Homogeneous scenes
+// therefore keep the exact analytic transmittance. See majorant.h for why the residual
+// split is what makes an optically thick volume converge (~1100x variance reduction at
+// tau = 8) and why merely TIGHTENING the majorant would have done nothing.
 __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const DVec3& dir,
                                          Real dist, Real lambda, DRng& rng,
                                          const DPatEnv& env) {
@@ -1928,6 +2173,27 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
     double ta, tb;
     if (!dMedClip(m, o, dir, 0.0, (double)dist, ta, tb)) return (Real)1;
     if (!m.heterogeneous) return (Real)exp(-stBase * (tb - ta));
+    if (m.majorant.ctrl) {
+        DMajWalk w; w.init(m.majorant, o, dir, ta, tb);
+        size_t ci; double a, b; double Tr = 1.0;
+        while (w.next(m.majorant, ci, a, b)) {
+            const double sigC = stBase * (double)m.majorant.ctrl[ci];
+            const double sigR = stBase * (double)m.majorant.res[ci];
+            if (sigC > 0.0) Tr *= exp(-sigC * (b - a));      // control term, analytic
+            if (sigR <= 0.0) { if (Tr <= 0.0) break; continue; }
+            double t = a;
+            for (;;) {
+                t += -log(1.0 - (double)rng.uniformOpen()) / sigR;
+                if (t >= b) break;
+                DVec3 pp = o + dir * (Real)t;
+                double sigT = stBase * dMedDensityAt(m, pp, env);
+                Tr *= 1.0 - (sigT - sigC) / sigR;
+                if (Tr == 0.0) break;
+            }
+            if (Tr == 0.0) break;
+        }
+        return (Real)(Tr > 0.0 ? Tr : 0.0);
+    }
     double sigMax = stBase * m.densityMax;
     if (sigMax <= 0.0) return (Real)1;
     double Tr = 1.0, t = ta;
@@ -2124,6 +2390,17 @@ struct DHit {
     Real u, v;   // interpolated surface texture coordinates
     DVec3 tangent; Real bitangentSign;  // C6 surface tangent frame for normal mapping
     Real curv;   // O3 mean curvature, signed toward the shaded side (see Hit::curv)
+    // Per-vertex COLOUR, deferred: the index into DScene::vertColors plus the two
+    // independent barycentrics (the third is 1-b0-b1, since they sum to one).
+    //
+    // The host resolves this INSIDE intersectTri, because Scene's intersectors are
+    // methods that already hold the table. The device intersector is a free function
+    // called from the BVH leaf loops and has no DScene in scope, and threading one
+    // through the hottest loop in the renderer to serve a rare feature is the wrong
+    // trade — so it stores what it cheaply has (an int and two Reals, no worse than the
+    // three floats the host writes) and dDiffuseRho, which DOES hold the scene, does the
+    // lookup. Same answer, paid for only where it is used.
+    int  vcol; Real vb0, vb1;
     // O3 stage 2 cavity, filled LAZILY by dCavityOf() and cached, exactly like the
     // host's Hit::cavity: it needs whole-scene traversal so no intersector fills it,
     // and one shading point asks for it several times (mix weight, roughness, reflect).
@@ -2169,7 +2446,8 @@ __device__ static inline float dSmaxF(float a, float b, float k) { return -dSmin
 __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float x, float y, float z, float f,
                                       float nx, float ny, float nz, float r,
-                                      float u, float v, const DPatEnv& env);
+                                      float u, float v, const DPatEnv& env,
+                                      const float* dext = nullptr);
 
 // `env` publishes the scene's texture/grid/scatter tables so a DF_EXPR leaf can BE a
 // sampled volume or height field (`function { expr "grid:terrain(x, z) - y" }`), exactly
@@ -2181,11 +2459,30 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
     switch (nd.op) {
         case DF_SPHERE:
             return sqrt(px*px + py*py + pz*pz) - nd.p[0];
-        case DF_EXPR: {   // arbitrary formula f(x,y,z); r=|p|, other vars (f/normals) are 0
+        case DF_EXPR: {   // arbitrary formula f(x,y,z[,d4..]); r=|p|, other vars are 0
             if (!exprPool) return BIG;
-            double r = sqrt(px*px + py*py + pz*pz);
-            return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
-                                0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, 0.0, env);
+            // N-D slice: map the 3-D sample onto the slice through N-space, so x/y/z are
+            // the first three components of the N-D point and d4.. the rest. Device twin
+            // of the host's patApplySlice; inactive slice leaves everything untouched.
+            double qx = px, qy = py, qz = pz;
+            double dex[kPatMaxExtraDims];
+            const double* dexp = nullptr;
+            if (env.slice.dims > 3) {
+                const PatSlice& s = env.slice;
+                const int n = (s.dims < 3 + kPatMaxExtraDims) ? s.dims : 3 + kPatMaxExtraDims;
+                for (int k = 0; k < n; ++k) {
+                    const double v = s.a[k*3+0]*px + s.a[k*3+1]*py + s.a[k*3+2]*pz + s.o[k];
+                    if      (k == 0) qx = v;
+                    else if (k == 1) qy = v;
+                    else if (k == 2) qz = v;
+                    else             dex[k-3] = v;
+                }
+                for (int k = n - 3; k < kPatMaxExtraDims; ++k) if (k >= 0) dex[k] = 0.0;
+                dexp = dex;
+            }
+            double r = sqrt(qx*qx + qy*qy + qz*qz);
+            return dPatternEval(exprPool + nd.exprOff, nd.exprN, qx, qy, qz, 0.0,
+                                0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, 0.0, env, dexp);
         }
         case DF_BOX: {
             double r = nd.p[3];
@@ -2256,11 +2553,29 @@ __device__ static float dFieldLeafSDFF(const DFieldNodeF& nd, float px, float py
     switch (nd.op) {
         case DF_SPHERE:
             return sqrtf(px*px + py*py + pz*pz) - nd.p[0];
-        case DF_EXPR: {   // arbitrary formula f(x,y,z); r=|p|, other vars (f/normals) are 0
+        case DF_EXPR: {   // arbitrary formula f(x,y,z[,d4..]); r=|p|, other vars are 0
             if (!exprPool) return (float)BIG;
-            float r = sqrtf(px*px + py*py + pz*pz);
-            return dPatternEvalF(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0f,
-                                 0.0f, 0.0f, 0.0f, r, 0.0f, 0.0f, env);
+            // N-D slice, in the same FP32 the march works in — twin of the double
+            // dFieldLeafSDF above and of the host's patApplySlice.
+            float qx = px, qy = py, qz = pz;
+            float dex[kPatMaxExtraDims];
+            const float* dexp = nullptr;
+            if (env.slice.dims > 3) {
+                const PatSlice& s = env.slice;
+                const int n = (s.dims < 3 + kPatMaxExtraDims) ? s.dims : 3 + kPatMaxExtraDims;
+                for (int k = 0; k < kPatMaxExtraDims; ++k) dex[k] = 0.0f;
+                for (int k = 0; k < n; ++k) {
+                    const float v = (float)(s.a[k*3+0]*px + s.a[k*3+1]*py + s.a[k*3+2]*pz + s.o[k]);
+                    if      (k == 0) qx = v;
+                    else if (k == 1) qy = v;
+                    else if (k == 2) qz = v;
+                    else             dex[k-3] = v;
+                }
+                dexp = dex;
+            }
+            float r = sqrtf(qx*qx + qy*qy + qz*qz);
+            return dPatternEvalF(exprPool + nd.exprOff, nd.exprN, qx, qy, qz, 0.0f,
+                                 0.0f, 0.0f, 0.0f, r, 0.0f, 0.0f, env, dexp);
         }
         case DF_BOX: {
             float r = nd.p[3];
@@ -2681,6 +2996,7 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     hit.bitangentSign = (Real)tri.bitangentSign;
     // O3: curvature follows the shaded side, exactly as the host intersectTri does.
     hit.curv = (Real)(flipped ? -tri.curvature : tri.curvature);
+    hit.vcol = tri.vcol; hit.vb0 = b0; hit.vb1 = b1;
     return true;
 }
 // Interface-preserving wrapper (builds the shear inline) for any one-off caller.
@@ -3023,10 +3339,21 @@ __device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& ro
 // texture samplers (which depend on dWrapIndex), but is called from closestHit's tail.
 __device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h);
 
+// `camHide` marks this as a CAMERA (primary) ray, which is the one and only ray type that
+// `DMaterial::hideCamera` applies to — device twin of Scene::closestHit's `skipCamHidden`.
+// Callers pass it as `bounce == 0` on a camera path and never on a photon / light-subpath
+// walk. `sc.camHiddenAny` collapses it to nothing for a scene with no hidden material.
 __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3& rd,
-                                   Real tmin = RAY_EPS, Real tCap = BIG) {
+                                   Real tmin = RAY_EPS, Real tCap = BIG,
+                                   bool camHide = false) {
     DHit h; h.t = tCap; h.valid = false; h.matId = 0; h.sensorId = -1;
     if (sc.nNodes == 0) return h;
+    // One uniform test, hoisted out of the leaf loop. `hidden()` is checked BEFORE the
+    // intersection, so a hidden primitive costs a matId load rather than a full ray test.
+    const bool camHideOn = camHide && sc.camHiddenAny;
+    auto hidden = [&](int matId) -> bool {
+        return camHideOn && sc.mats[matId].hideCamera != 0;
+    };
     DVec3 invD{(Real)1 / rd.x, (Real)1 / rd.y, (Real)1 / rd.z};
     const DTriShear sh = makeTriShear(rd);
     // Hoisted per ray, not per segment (a fur render tests thousands of segments per ray).
@@ -3046,11 +3373,18 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
-                if (prim < sc.nTris)              { if (intersectTri(sh, ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
-                else if (prim < sc.nTris + sc.nSph){ if (intersectSphere(ro, rd, sc.sph[prim - sc.nTris], tmin, h)) tMax = h.t; }
-                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { if (intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], ro, rd, tmin, h)) tMax = h.t; }
-                else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { if (intersectCurveSeg(cray, ro, rd, sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits], tmin, h)) tMax = h.t; }
+                if (prim < sc.nTris)              { const DTri& t = sc.tris[prim];
+                                                    if (!hidden(t.matId) && intersectTri(sh, ro, rd, t, tmin, h)) tMax = h.t; }
+                else if (prim < sc.nTris + sc.nSph){ const DSphere& s = sc.sph[prim - sc.nTris];
+                                                    if (!hidden(s.matId) && intersectSphere(ro, rd, s, tmin, h)) tMax = h.t; }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { const DImplicit& im = sc.implicits[prim - sc.nTris - sc.nSph];
+                                                    if (!hidden(im.matId) && intersectImplicit(sc, im, ro, rd, tmin, h)) tMax = h.t; }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
+                                                    if (!hidden(cs.matId) && intersectCurveSeg(cray, ro, rd, cs, tmin, h)) tMax = h.t; }
                 else {
+                    // Instanced meshes are not covered — see the host twin in scene.h for why
+                    // (per-BLAS-triangle materials live below this decode, and nothing that can
+                    // carry hideCamera today is ever instanced).
                     // Instance leaf: transform the ray into BLAS-local space, walk the
                     // shared sub-BVH, and map any closer hit back to world space.
                     const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits - sc.nCurveSegs];
@@ -3111,8 +3445,13 @@ struct DGrinMedia {
 // costs nothing extra — the marcher already redoes grinAt/closestHit on every iteration — and
 // it keeps the bending math in this one function instead of a second copy of it. On return
 // from a single step, (previous ro, the NEW rd, med->arc) is exactly the sub-segment walked.
+// `camHide` marks this march as a CAMERA (primary) ray and is threaded into the internal
+// closestHit calls that bound each step: a `hide_camera` surface must not truncate a camera
+// march any more than it may stop a straight camera ray, or a hidden flat inside/behind a
+// GRIN region would freeze the bending at its own depth. Host twin: grin.h marchSegments.
 __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
-                                  DGrinMedia* med = nullptr, int maxSteps = 200000) {
+                                  DGrinMedia* med = nullptr, int maxSteps = 200000,
+                                  bool camHide = false) {
     const int GRIN_MAX_STEPS = maxSteps;
     const bool doMedia = (med != nullptr) && (med->rng != nullptr) && sc.mediaN > 0;
     // Accumulate position/direction in DOUBLE (not Real=float) so the running Eikonal
@@ -3148,7 +3487,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
             // surface, else stop (straight-ray body takes over). This branch needs the
             // full-range closest hit (dS bounds the entry search) but runs only at
             // region entries, not per Eikonal step.
-            DHit hs = closestHit(sc, cro, crd);
+            DHit hs = closestHit(sc, cro, crd, RAY_EPS, BIG, camHide);
             double dS = hs.valid ? (double)hs.t : 1e30;
             double bestTa = 1e30; int bestM = -1;
             for (int mi = 0; mi < sc.mediaN; ++mi) {
@@ -3187,7 +3526,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
 #else
         tcap = nextafter(tcap, DBL_MAX);
 #endif
-        DHit hs = closestHit(sc, cro, crd, RAY_EPS, tcap);
+        DHit hs = closestHit(sc, cro, crd, RAY_EPS, tcap, camHide);
         if (hs.valid && (double)hs.t <= ds) break;   // surface within a step
         // Symplectic Eikonal step with optical direction T = n·d (|T| = n):
         //   T += ∇n·ds ;  x += (T/n)·ds ;  d = T/|T|.
@@ -3230,9 +3569,22 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
     rd = DVec3{dx, dy, dz};
 }
 
+// `camLeg` says this segment IS the camera leg of a connection — a photon-to-pinhole or
+// vertex-to-camera/lens shadow ray in a forward / bidirectional mode. In those modes the
+// camera leg plays the part closestHit's primary ray plays in a backward mode, so it is
+// where DMaterial::hideCamera has to apply and the only place it may. Pass it false (the
+// default) for an NEE / light-connection segment: a hidden flat still shadows, or turning
+// off primary visibility would silently change the lighting. Device twin of
+// Scene::occluded's `camLeg` (scene.h).
 __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& dir,
-                                 Real maxDist, Real tmin = RAY_EPS) {
+                                 Real maxDist, Real tmin = RAY_EPS, bool camLeg = false) {
     if (sc.nNodes == 0) return false;
+    // One uniform test, hoisted out of the leaf loop; `hidden()` is checked BEFORE the
+    // intersection, so a hidden primitive costs a matId load rather than a full ray test.
+    const bool camHideOn = camLeg && sc.camHiddenAny;
+    auto hidden = [&](int matId) -> bool {
+        return camHideOn && sc.mats[matId].hideCamera != 0;
+    };
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
     const DTriShear sh = makeTriShear(dir);
     const DCurveRay cray = sc.nCurveSegs ? makeCurveRay(dir) : DCurveRay{DVec3{(Real)0,(Real)0,(Real)1}, (Real)1};
@@ -3248,12 +3600,19 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                 int prim = sc.primIdx[n.first + i];
                 DHit h; h.t = tMax; h.valid = false;
                 bool blocked;
-                if (prim < sc.nTris)                              blocked = intersectTri(sh, o, dir, sc.tris[prim], tmin, h);
-                else if (prim < sc.nTris + sc.nSph)               blocked = intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h);
-                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) blocked = intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h, /*anyHit=*/true);
-                else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) blocked = intersectCurveSeg(cray, o, dir, sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits], tmin, h, /*anyHit=*/true);
+                if (prim < sc.nTris)                              { const DTri& t = sc.tris[prim];
+                                                                    blocked = !hidden(t.matId) && intersectTri(sh, o, dir, t, tmin, h); }
+                else if (prim < sc.nTris + sc.nSph)               { const DSphere& s = sc.sph[prim - sc.nTris];
+                                                                    blocked = !hidden(s.matId) && intersectSphere(o, dir, s, tmin, h); }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { const DImplicit& im = sc.implicits[prim - sc.nTris - sc.nSph];
+                                                                    blocked = !hidden(im.matId) && intersectImplicit(sc, im, o, dir, tmin, h, /*anyHit=*/true); }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
+                                                                    blocked = !hidden(cs.matId) && intersectCurveSeg(cray, o, dir, cs, tmin, h, /*anyHit=*/true); }
                 else {
-                    // Instance leaf: any-hit inside the shared BLAS in local space.
+                    // Instance leaf: any-hit inside the shared BLAS in local space. NOT covered by
+                    // `hidden()`: instanced materials live per-BLAS-triangle, below this decode, and
+                    // nothing that can carry hideCamera today (a `light area`'s two world tris) is
+                    // ever instanced. Same exclusion as closestHit and the host twin.
                     const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits - sc.nCurveSegs];
                     DVec3 lo = affPoint(inst.Lm, inst.Lt, o);
                     DVec3 ld = affDir(inst.Lm, dir);
@@ -3268,6 +3627,33 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
         }
     }
     return false;
+}
+
+// Largest coordinate magnitude of a point: the scale that sets one float ulp of its position.
+__device__ static inline double dMaxAbs(const DVec3& p) {
+    double m = fabs((double)p.x);
+    if (fabs((double)p.y) > m) m = fabs((double)p.y);
+    if (fabs((double)p.z) > m) m = fabs((double)p.z);
+    return m;
+}
+// Visibility of a specific TARGET point from an origin that dOffsetAlong has already moved off
+// its surface. The ray is re-aimed FROM THE MOVED ORIGIN (PBRT's SpawnRayTo). The old form,
+// `occluded(o, w, connMaxT(dist))`, kept the direction and length computed from the UNMOVED
+// point, so a push of s toward the target left the far end s*cos(a) BEYOND it -- inside the
+// emitter -- and the sample was thrown away as occluded. With the old 1e-4 push that overshoot
+// was always under the 2e-4 far-end shortening; a scale-correct push is not, whenever the
+// light is nearer than ~3x the shading point's coordinate magnitude. Measured before this: a
+// radius-6 sphere 613 units from a quad at |p| = 5000 lost 97% of its NEE samples in modes R
+// and D alike (spot light at the same place: clean; mode B, whose shadow rays end at the
+// pinhole: clean). The shortening also covers the float quantisation of the target's own
+// coordinates via connMaxT's coordMag term. Only the occlusion query is re-aimed; the
+// estimator's G, pdfs and directions are untouched.
+__device__ static inline bool occludedTo(const DScene& sc, const DVec3& o, const DVec3& target,
+                                         double absEps, Real tmin = RAY_EPS, bool camLeg = false) {
+    DVec3 tv = target - o;
+    const Real td = length(tv);
+    if (!(td > (Real)0)) return false;
+    return occluded(sc, o, tv / td, connMaxT((double)td, absEps, dMaxAbs(target)), tmin, camLeg);
 }
 
 // ---- `cavity` pattern variable (O3 stage 2) — device twin of scene.h cavityAt ----
@@ -3389,7 +3775,7 @@ __device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, co
         if (ok) outDir = pert;
     }
     if (transmitted) *transmitted = refracted;
-    ro = h.p + outDir * RAY_EPS; rd = outDir;
+    rd = outDir; ro = dOffsetAlong(h.p, h.ng, rd);
 }
 
 // Nested-dielectric PRIORITY step (Schmidt & Budge 2002), shared by every device transport
@@ -3415,7 +3801,7 @@ __device__ static void dDielectricStep(const DScene& sc, const DMaterial& m, con
             (stk.empty() || (outMat >= 0 && dHasPriority(sc.mats[outMat])));
         if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
             stk.push(mi, pr);
-            outO = h.p + d * RAY_EPS; outD = d; return;
+            outD = d; outO = dOffsetAlong(h.p, h.ng, outD); return;
         }
         Real extIor = (ranked && outMat >= 0) ? specLookup(sc.mats[outMat].ior, lambda) : (Real)1;
         bool transmitted = false; DVec3 nro, nrd;
@@ -3430,7 +3816,7 @@ __device__ static void dDielectricStep(const DScene& sc, const DMaterial& m, con
             (after.empty() || (newMat >= 0 && dHasPriority(sc.mats[newMat])));
         if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
             stk.popMat(mi);
-            outO = h.p + d * RAY_EPS; outD = d; return;
+            outD = d; outO = dOffsetAlong(h.p, h.ng, outD); return;
         }
         Real extIor = (ranked && newMat >= 0) ? specLookup(sc.mats[newMat].ior, lambda) : (Real)1;
         bool transmitted = false; DVec3 nro, nrd;
@@ -3465,7 +3851,7 @@ __device__ static bool thinFilmInterface(const DScene& sc, const DMaterial& m, c
         if (whittedWeight) *whittedWeight = (double)R;   // weight, not a survival roll
         else if (rng.uniform() >= R) return false;       // transmitted -> absorbed
         DVec3 o = normalize(reflectv(d, nl));
-        ro = h.p + o * RAY_EPS; rd = o;
+        rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
         return true;
     }
     Real nA = entering ? (Real)1 : ns, nB = entering ? ns : (Real)1;
@@ -3482,7 +3868,7 @@ __device__ static bool thinFilmInterface(const DScene& sc, const DMaterial& m, c
         else outDir = d * eta + nl * (eta * cosI - cosT);
     }
     outDir = normalize(outDir);
-    ro = h.p + outDir * RAY_EPS; rd = outDir;
+    rd = outDir; ro = dOffsetAlong(h.p, h.ng, rd);
     return true;
 }
 // Multilayer stack interface (port of render.h multilayerInterface). Returns false
@@ -3504,7 +3890,7 @@ __device__ static bool multilayerInterface(const DMaterial& m, const DHit& h, co
         Real R = multilayerReflectance((Real)1, cosI, lambda, m.layerN, m.layerK, m.layerThick, nL, ns, ks);
         if (whittedWeight) *whittedWeight = (double)R;   // weight, not a survival roll
         else if (rng.uniform() >= R) return false;
-        DVec3 o = normalize(reflectv(d, nl)); ro = h.p + o * RAY_EPS; rd = o; return true;
+        DVec3 o = normalize(reflectv(d, nl)); rd = o; ro = dOffsetAlong(h.p, h.ng, rd); return true;
     }
     Real nA = entering ? (Real)1 : ns, nB = entering ? ns : (Real)1;
     Real eta = nA / nB;
@@ -3525,7 +3911,7 @@ __device__ static bool multilayerInterface(const DMaterial& m, const DHit& h, co
         if (doReflect) outDir = reflectv(d, nl);
         else outDir = d * eta + nl * (eta * cosI - cosT);
     }
-    outDir = normalize(outDir); ro = h.p + outDir * RAY_EPS; rd = outDir; return true;
+    outDir = normalize(outDir); rd = outDir; ro = dOffsetAlong(h.p, h.ng, rd); return true;
 }
 // Grating diffraction (port of render.h gratingDiffract). Returns false if absorbed.
 // `whittedU` (non-null only in mode W) replaces the rng draw with a coordinate off the
@@ -3586,7 +3972,7 @@ __device__ static bool gratingDiffract(const DMaterial& m, const DHit& h, const 
     DVec3 a = ut + t * ((Real)pick * lod);
     DVec3 v = a + nl * sqrt(fmax((Real)0, (Real)1 - dot(a, a)));
     v = normalize(v);
-    ro = h.p + nl * RAY_EPS; rd = v;
+    rd = v; ro = dOffsetAlong(h.p, h.ng, rd);
     return true;
 }
 
@@ -3657,7 +4043,7 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     if (stG <= (Real)0) return;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occludedTo(sc, dOffsetAlong(p, ng, wdir), p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real f = rho / (Real)DPI;
     // Projection-general splat: contrib = beta*f*cosSurf*corr / (dist^2 * pixelSolidAngle).
     // For a rectilinear lens pixelSolidAngle = pixelPlaneArea*cosCam^3, recovering the
@@ -3680,7 +4066,7 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
     DVec3 wdir = toCam / dist;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occludedTo(sc, p + wdir * RAY_EPS, p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real ph = dMedPhase(med, dot(wIn, wdir), lambda);
     Real Lambda = medAlbedo(med, lambda);
     // Projection-general splat (no cosSurf for a volume vertex): the phase carries the
@@ -3717,7 +4103,7 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (cosLens <= (Real)1e-6) return;               // not heading toward the film
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occludedTo(sc, dOffsetAlong(p, ng, wdir), p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
     Real contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
     // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification) — CPU twin: render.h connectLens.
@@ -3749,7 +4135,7 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occludedTo(sc, p + wdir * RAY_EPS, p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real ph = dMedPhase(med, dot(wIn, wdir), lambda);
     Real Lambda = medAlbedo(med, lambda);
     Real contrib = beta * Lambda * ph * cosLens * (Real)DPI * (R * R) / (dist * dist);
@@ -4351,7 +4737,7 @@ __device__ static void connectHair(const DScene& sc, const DCamera& cam, double*
     if (!cam.project(p, px, py, cosCam, dist2)) return;
     const Real off = dHairExitOffset(hs, n, wdir);
     if (off >= dist) return;
-    if (occluded(sc, p + wdir * off, wdir, dist - off - RAY_EPS)) return;
+    if (occluded(sc, p + wdir * off, wdir, connMaxT((double)dist - (double)off, RAY_EPS, dMaxAbs(p)), RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real f = dHairFCos(hs, wdir);
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * f / (Real)((double)dist2 * solidAngle);
@@ -4378,7 +4764,7 @@ __device__ static void connectLensHair(const DScene& sc, const DCamera& cam, dou
     if (!cam.lensImage(A, wdir, px, py)) return;
     const Real off = dHairExitOffset(hs, n, wdir);
     if (off >= dist) return;
-    if (occluded(sc, p + wdir * off, wdir, dist - off - RAY_EPS)) return;
+    if (occluded(sc, p + wdir * off, wdir, connMaxT((double)dist - (double)off, RAY_EPS, dMaxAbs(p)), RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real fcos = (Real)DPI * dHairFCos(hs, wdir);
     Real contrib = beta * fcos * cosLens * (R * R) / (dist * dist);
     // Same flux -> film-irradiance normaliser as connectLens (see there).
@@ -4410,9 +4796,21 @@ __device__ static void connectLensHair(const DScene& sc, const DCamera& cam, dou
 // sized from FREE VRAM), so every byte per record is photons the GPU can't hold: dropping
 // it shrinks the record from 44 to 32 bytes, ~27% more photons in the same VRAM. Don't add
 // a field here without a reader.
+//
+// `caustic` is the one field here that the density estimate never reads, and it is here anyway:
+// it is the L·S⁺·D classification of the path that deposited this photon (host twin: the
+// `caustic` argument of Renderer::depositPhoton), and its reader is the HOST, which uses it to
+// split the download into the global map and the caustic map. It could have been packed into a
+// sign bit to keep the record at 32 bytes; it is a separate field because an implicit encoding
+// in a buffer that several kernels write and two host loops read is a trap, and the cost is
+// 12.5% fewer photons per VRAM chunk on a deposit that already chunks. Partitioning on the HOST
+// also avoids a SECOND device cursor with its own capacity, overflow detection and
+// rerun-at-a-lower-rate path — all of which would have to stay in agreement with the first
+// one's, for no gain.
 struct DPhoton {
     DVec3 pos, n;
     float power, lambda;
+    int   caustic;            // 1 = L·S+·D path (-> the caustic map); 0 = everything else
 };
 
 // One DEPOSITED photon beam (device twin of PhotonBeam, photonbeams.h): the chord a photon
@@ -4428,9 +4826,79 @@ struct DBeamDep {
     DVec3 o, d;               // true segment start (world) and unit direction of travel
     float len;                // crossing length in world units
     float power;              // carried flux at `o`, after the deposit's Russian roulette
-    float lambda;             // wavelength (nm) — monochromatic, like a photon
+    float lambda;             // HERO wavelength (nm)
     float absorb;             // sigma_a of the enclosing dielectric (0 in air)
     int   med;                // index into DScene::media
+    int   bowEm;              // emitter index for the GATHER-time fold, or -1 (FOLD-GPU (2))
+    // SPECTRAL BUNDLE (photonbeams.h). The stratified SECONDARY wavelengths this same chord
+    // also carries; every wavelength in the bundle carries power/(nSec+1). Plain floats here,
+    // unlike the packed form in the gather-side DBeamRec, because this buffer is at most
+    // `-beamcount` records and its only job is to be copied to the host PhotonBeam, which
+    // stores floats — a packed encode here would have to be undone immediately.
+    float lamS[3];
+    int   nSec;               // 0 = classic monochromatic beam
+    // ACHROMATIC-PATH FOLD (photonbeams.h). 1 => `cieA` is the emitter's mean CIE and the
+    // gather must fold this beam at it instead of at CIE(lambda). Mutually exclusive with
+    // the bundle above, which it supersedes exactly.
+    float cieA[3];
+    int   achro;
+};
+
+// The photon's LIVE spectral bundle, carried down the path by the forward tracer and handed
+// to dEmitBeams (host twin: the `specLam`/`specSec` locals of Renderer::tracePhoton). It is
+// born with the photon on a plain SPD-sampled emitter and retired — `n = 0`, which is exactly
+// the pre-0.202.0 monochromatic beam — after ONE transport iteration, because everything the
+// photon does from there on (a surface scatter, a medium scatter, glass absorption) is
+// wavelength-dependent and the record carries no per-wavelength weight to track the
+// divergence with. A null pointer anywhere in the chain means "this caller has no bundle",
+// which is what every mode other than M-with-beams passes.
+struct DBeamSpec {
+    Real lam[3];
+    int  n = 0;
+    // ---- ACHROMATIC-PATH STATE (photonbeams.h, ACHROMATIC-PATH BEAMS) --------------------
+    // `achro` is the STRONGER of the two claims this struct carries, and it is why the
+    // retirement rule below is not simply "one step". The bundle (`n`) is retired after one
+    // transport iteration because the record has no per-wavelength weights to track a
+    // divergence with; `achro` instead asserts that NOTHING HAS DIVERGED — that the path from
+    // this emitter to here is provably wavelength-independent — and that claim survives every
+    // event which is itself wavelength-independent. In an achromatic HG medium a scatter is
+    // exactly that: the free flight uses an achromatic sigma_t, the direction comes from `g`
+    // alone, and the albedo weight is flat. So `achro` rides through hundreds of cloud
+    // scatters where the bundle cannot, which is the whole reason it exists — see the
+    // measurement in known-issues.md, where the bundle reached ~1 beam in 278.
+    //
+    // `cie` is the emitter's Emitter::cieMean, so an ACHROMATIC-path deposit needs no emitter
+    // index -- but the GATHER-time fold does: its colour is a function of the scattering angle,
+    // read from a per-(emitter, medium) table at gather time. Two bytes, set at birth.
+    DVec3 cie{0, 0, 0};
+    int   achro = 0;
+    int   emIdx = -1;   // emitter this photon was born on; -1 = unknown (no gather-time fold)
+};
+
+// ---- AIMED CAUSTIC EMISSION (device twin of caim::AimMap, causticaim.h) ------------------
+// One bounding sphere over a cluster of focusing primitives. Uploaded verbatim from the host
+// map — the clustering is a build-time host job over the whole scene, and the device only ever
+// needs to sample from and count against the finished set.
+struct DAimTarget {
+    DVec3 c;
+    Real  r;
+};
+
+// The aimed-emission configuration of ONE forward launch. Bound on BOTH deposit passes: the
+// main pass needs it to down-weight the caustic deposits the aimed pass is also making, and
+// binding it changes nothing else about the main pass (a photon that lands nowhere near
+// focusing geometry gets rho = 0 and weight exactly 1, and draws no extra randomness).
+struct DAimMap {
+    const DAimTarget* targets = nullptr;
+    int    n        = 0;
+    double sumR2    = 0.0;    // SUM_j r_j^2, cached host-side: the distant footprint measure
+    // True only in the dedicated caustic pass, where emission is RESAMPLED from this map
+    // instead of from the emitter's own distribution.
+    bool   aimed    = false;
+    // N_c / N_m — the caustic pass's photon count over the main pass's. The balance
+    // heuristic's only free parameter, and it is not free: it is the ratio actually run.
+    double misRatio = 0.0;
+    HD bool on() const { return targets != nullptr && n > 0; }
 };
 
 struct DCamSet {
@@ -4463,9 +4931,30 @@ struct DCamSet {
     unsigned long long* beamCount = nullptr;
     unsigned long long  beamCap   = 0;
     double              beamKeep  = 1.0;
+    // SPECTRAL BEAMS (CLI -beamspec, photonbeams.h). How many stratified wavelengths one
+    // deposited beam carries; 1 = the classic monochromatic beam, bit-for-bit. The host sets
+    // this only when the scene can honour it (achromatic extinction — beamSpectralOK in
+    // photonmap_render.h), so the device never has to re-derive the gate.
+    int                 beamSpecC = 1;
+    // ACHROMATIC-PATH BEAMS (photonbeams.h). Scene-wide permission for the mean-CIE fold:
+    // every medium's EXTINCTION is wavelength-independent, so a free flight anywhere in the
+    // scene samples the same distance for every wavelength and the photon's path — not merely
+    // its colour — is provably lambda-invariant. Same predicate as beamSpecC's (scene.h
+    // beamSpectralOK), asked separately because this fold does not need `-beamspec > 1`: it
+    // stores no extra wavelengths, so a `-beamspec 1` render still gets it.
+    bool                beamAchroOK = false;
+    // AIMED CAUSTIC PASS (CLI -causticn, causticaim.h). See DAimMap above.
+    DAimMap aim;
+    // Cross media STRAIGHT without storing beams. The aimed caustic pass must transport by the
+    // same rules as the main pass it is MIS-combined with — under `-beams` the main pass
+    // crosses straight, and an analog collision here would set PV_BIT_SCATTER and destroy the
+    // L·S+·D classification the caustic map is defined by — but it must not STORE beams,
+    // because the beam map belongs to the main pass and is normalised by its nEmitted.
+    // (Host twin: Renderer::beamStraightOnly.)
+    bool beamStraightOnly = false;
     // Either beam path makes the photon cross media STRAIGHT (analog redirect skipped) and
     // needs the per-photon side stream, so the two gates are asked together everywhere.
-    HD bool beamsOn() const { return beamGather || beamCount != nullptr; }
+    HD bool beamsOn() const { return beamGather || beamCount != nullptr || beamStraightOnly; }
     // PHOTON-BEAM MULTIPLE SCATTERING (-beams-order). Host twin: Renderer::beamOrderMax /
     // beamMSAllowed. 1 = single scatter (pre-0.199.0, bit-identical); 0 = unlimited.
     int beamOrderMax = 0;
@@ -4490,19 +4979,227 @@ struct DGatherPhoton {
     float lambda;           // wavelength (nm) — rho(lambda_p) still varies per photon
 };
 
+// ---- GATHER FOOTPRINT (M-GATHERAREA), device twin of photonmap_render.h ----------------------
+// The density estimate divides by pi*r^2, the area of the whole gather disc, while collecting
+// only from the part of that disc that is real, same-facing surface. Where the disc overhangs --
+// a cap edge, a fold of cloth, a hair strand -- the divisor is too big and the estimate is dark
+// in proportion (measured on gallery_rain: flat ground 0 %, cap edge -33 %, hair -68 %).
+//
+// Measured by probing M points of the tangent-plane disc along -n. Three details are load-
+// bearing, all of them learned the hard way on the host and none of them optional here:
+//
+//   * the 1/cos JACOBIAN. The probe samples the tangent PLANE, so it measures projected area
+//     while the estimator needs surface area (dA = dq/cos). Without it the correction overshoots
+//     on exactly the geometry it is for -- hair went -68 % to +31 %, past zero.
+//   * the early-out GATE, which is also the silhouette test: if the first M/4 probes all land
+//     flat-on, this disc is inside a plane and the rest can only agree. Four rays instead of
+//     sixteen over most of a frame.
+//   * INDEPENDENT samples, not stratified. Stratifying the radius walks the rings centre-
+//     outwards, so the gate's first probes all land in the middle of the disc -- which is
+//     covered by definition -- and the gate then fires on nearly every gather and the
+//     correction stops happening. Measured: cap_gyroid -16.9 % stratified against -4.3 %
+//     independent. Do not "improve" this without re-reading the host comment.
+__device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
+                                         Real r, DRng& rng, int M) {
+    if (M <= 0 || !(r > (Real)0)) return 1.0;
+    DVec3 t, b; onb(n, t, b);
+    double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
+    const int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
+    for (int i = 0; i < M; ++i) {
+        if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;
+        const double rr = (double)r * sqrt((double)rng.uniform());
+        const double ph = 2.0 * DPI * (double)rng.uniform();
+        const DVec3 q = p + t * (Real)(rr * cos(ph)) + b * (Real)(rr * sin(ph));
+        // `2r` of travel: within the disc a curved surface deviates from the tangent plane by
+        // at most ~r^2/(2R), far inside this window for any radius worth gathering at.
+        const DHit h = closestHit(sc, q + n * r, n * (Real)(-1), RAY_EPS, (Real)2 * r, false);
+        if (!h.valid) continue;
+        const double c = (double)dot(h.n, n);
+        if (c >= 0.5) area += 1.0 / c;       // same 60-degree acceptance the photon query uses
+    }
+    return area / (double)M;
+}
+__device__ static inline double dGatherAreaScale(double cov) {
+    return (cov >= 0.05) ? 1.0 / cov : 1.0;  // one stray probe must not become a firefly
+}
+
 // A view-independent photon-map query structure on the device (device twin of PhotonMap
 // in photonmap.h): a uniform hash grid (cell size == gather radius) over cell-contiguous
 // photon records, so a radius-r query touches only the 3x3x3 neighbourhood. Built on the
 // host (PhotonMap::build) from the deposited photons, then uploaded for the gather kernel.
 // (No nEmitted here: the normalization is folded into each record's pX/pY/pZ.)
 struct DPhotonMap {
-    const DGatherPhoton* photons; // reordered into cell-contiguous runs
-    const int*     cellStart; // size nCells+1; cell c occupies [cellStart[c], cellStart[c+1])
-    DVec3  lo;                // grid origin (world)
+    const DGatherPhoton* photons; // reordered into bucket-contiguous runs
+    const int*   cellStart;   // size tableMask+2; bucket b is [cellStart[b], cellStart[b+1])
+    DVec3  lo;                // lattice origin (world)
     Real   cellSize;          // == gather radius
-    Real   radius;            // gather radius (world units)
-    int    nx, ny, nz;
+    Real   radius;            // gather radius (world units) — a MAXIMUM when kGather > 0
+    Real   kGather;           // per-query adaptive target population; 0 = fixed radius
+    unsigned int tableMask;   // bucket count - 1; see pmCellHash (photonmap.h)
 };
+
+// The 3x3x3 bucket walk, shared by all three device gathers (mode-M gather, its final-gather
+// sub-ray, and SPPM). Factored out when the lattice became hashed in 0.199.6: the three copies
+// previously each open-coded a dense (iz*ny+iy)*nx+ix index plus its own per-axis bounds tests,
+// and three hand-copied transcriptions of the host's binning is three chances to disagree with
+// it — a disagreement that does not crash, it just silently gathers nothing.
+//
+// `body(k)` is invoked for every photon index in the neighbourhood; the DISTANCE TEST IS THE
+// CALLER'S, because each of the three sites already had one fused with its own leak/normal
+// rejection and lifting it here would cost a second subtract-and-dot per candidate.
+template <class F>
+__device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3& p, F body) {
+    const int ix = (int)floor(((double)p.x - (double)pm.lo.x) / (double)pm.cellSize);
+    const int iy = (int)floor(((double)p.y - (double)pm.lo.y) / (double)pm.cellSize);
+    const int iz = (int)floor(((double)p.z - (double)pm.lo.z) / (double)pm.cellSize);
+    for (int dz = -1; dz <= 1; ++dz)
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const unsigned int c = pmCellHash(ix + dx, iy + dy, iz + dz, pm.tableMask);
+            const int e = pm.cellStart[c + 1];
+            for (int k = pm.cellStart[c]; k < e; ++k) body(k);
+        }
+}
+
+// Per-query adaptive gather radius — device twin of PhotonMap::adaptiveRadius (photonmap.h),
+// where the full argument lives. In one word: a caustic map holds two populations whose
+// densities differ by orders of magnitude (the focused filament and the specular wash), one
+// radius per MAP cannot serve both, so each gather solves for its own. One 3x3x3 walk
+// histograms d^2/r^2 into geometric shells; the suffix sum of that histogram is the radius
+// profile, and the tightest shell still holding `kGather` photons — interpolated inside the
+// shell under local uniform density — is the answer.
+//
+// Returns pm.radius exactly when kGather <= 0 or the whole disc holds fewer than k photons,
+// so a fixed-radius map keeps the fixed-radius path. The normal test matches the caller's
+// (a mismatch would divide accepted photons by an area chosen for a rejected population and
+// print a dark seam along every surface junction).
+#define PM_ADAPT_BINS 16                     // covers r down to r * 2^-8 = r/256
+template <int NB = PM_ADAPT_BINS>
+__device__ static inline Real dPmAdaptiveRadius(const DPhotonMap& pm, const DVec3& p,
+                                                const DVec3& n) {
+    if (!(pm.kGather > (Real)0) || pm.photons == nullptr || !(pm.radius > (Real)0))
+        return pm.radius;
+    int hist[NB];
+#pragma unroll
+    for (int i = 0; i < NB; ++i) hist[i] = 0;
+    const Real r2    = pm.radius * pm.radius;
+    const Real invR2 = (Real)1 / r2;
+    dPmNeighborhood(pm, p, [&](int k) {
+        const DGatherPhoton& ph = pm.photons[k];
+        DVec3 d = p - ph.pos;
+        Real d2 = dot(d, d);
+        if (d2 > r2) return;
+        if (dot(ph.n, n) < (Real)0.5) return;
+        // Shell index: t in (2^-(i+1), 2^-i] -> i, i.e. i = -ilogb(t) - 1.
+        Real t = d2 * invR2;
+        int i = (t > (Real)0) ? (-ilogb((double)t) - 1) : (NB - 1);
+        i = min(max(i, 0), NB - 1);
+        ++hist[i];
+    });
+    long long C = 0;
+    for (int i = NB - 1; i >= 0; --i) {
+        C += hist[i];
+        if ((double)C >= (double)pm.kGather) {
+            double rq2 = (double)r2 * ldexp(1.0, -i) * ((double)pm.kGather / (double)C);
+            if (rq2 >= (double)r2) return pm.radius;
+            Real rq = (Real)sqrt(rq2);
+            Real rMin = pm.radius * (Real)(1.0 / 256.0);
+            return (rq < rMin) ? rMin : rq;
+        }
+    }
+    return pm.radius;                        // fewer than k in the disc — nothing to tighten
+}
+
+// ---------------------- DETERMINISTIC transmittance, for MIS WEIGHTS ONLY --------------
+//
+// Device twin of beamgather.h's trDet / trDetMedium, and it exists for the same reason:
+// dMediaTransmittance is an unbiased ESTIMATOR (ratio tracking through a heterogeneous
+// medium), so two calls on the same segment return two different numbers. That is exactly
+// right inside a contribution and exactly wrong inside a weight — a balance heuristic is
+// unbiased only if, for one fixed path, the competing techniques' weights sum to 1, and an
+// edge's transmittance appears in several of them. Independent draws break the partition.
+//
+// "Deterministic first, accurate second", again matching the host: exact for a homogeneous
+// medium (the common case, and the validation case), a fixed 4-point midpoint quadrature of
+// the optical depth for a heterogeneous one. The quadrature's only cost is weight QUALITY.
+__device__ static double dTrDetMedium(const DMedium& m, const DVec3& o, const DVec3& dir,
+                                      double dist, Real lambda, const DPatEnv& env) {
+    const double stBase = (double)medSigmaT(m, lambda);
+    if (stBase <= 0.0) return 1.0;
+    double ta, tb;
+    if (!dMedClip(m, o, dir, 0.0, dist, ta, tb)) return 1.0;
+    const double L = tb - ta;
+    if (!(L > 0.0)) return 1.0;
+    if (!m.heterogeneous) return exp(-stBase * L);
+    const int kN = 4;                       // host trDetMedium's kN — keep the two in step
+    const double dt = L / (double)kN;
+    double tau = 0.0;
+    for (int i = 0; i < kN; ++i)
+        tau += dMedDensityAt(m, o + dir * (Real)(ta + ((double)i + 0.5) * dt), env);
+    return exp(-stBase * tau * dt);
+}
+__device__ static double dTrDet(const DScene& sc, const DVec3& o, const DVec3& dir,
+                                double dist, Real lambda, const DPatEnv& env) {
+    double Tr = 1.0;
+    for (int i = 0; i < sc.mediaN; ++i) {
+        Tr *= dTrDetMedium(sc.media[i], o, dir, dist, lambda, env);
+        if (Tr <= 0.0) return 0.0;
+    }
+    return Tr;
+}
+
+// The same transmittance evaluated at MANY distances along ONE fixed ray — device twin of
+// beamgather.h's TrRay, and hoisted for the same reason: mode J's merge weight calls dTrDet
+// once per beam HIT along a single camera segment, and a dense medium hands that segment
+// hundreds of hits, so essentially all of the clip + spectral lookup is per-RAY work being
+// paid per-hit. Build once per segment; each evaluation is then one exp per crossed medium.
+//
+// BIT-IDENTICAL to dTrDet rather than merely close (dMedClip intersects the medium's own
+// interval with [0,dist], so clipping to tMax and then to t <= tMax is the same interval;
+// the surviving media multiply in scene order; a skipped medium contributes exactly 1).
+// A HETEROGENEOUS medium keeps the slow path — its quadrature samples positions that depend
+// on the interval, so nothing about it can be hoisted.
+//
+// kMax is 4 here against the host's 8 purely to bound thread-local memory; the overflow path
+// is `slow`, which routes straight back to dTrDet and is numerically the same answer.
+struct DTrRay {
+    static const int kMax = 4;
+    double sigT[kMax], ta[kMax], tb[kMax];
+    int n;
+    int slow;
+    __device__ void build(const DScene& sc, const DVec3& oo, const DVec3& dd, double tMax,
+                          Real lam) {
+        n = 0; slow = 0;
+        if (sc.mediaN > kMax) { slow = 1; return; }
+        for (int i = 0; i < sc.mediaN; ++i) {
+            const DMedium& m = sc.media[i];
+            if (m.heterogeneous) { slow = 1; n = 0; return; }
+            const double st = (double)medSigmaT(m, lam);
+            if (st <= 0.0) continue;                       // dTrDet's 1.0 factor
+            double a, b;
+            if (!dMedClip(m, oo, dd, 0.0, tMax, a, b)) continue;
+            if (!(b - a > 0.0)) continue;
+            sigT[n] = st; ta[n] = a; tb[n] = b; ++n;
+        }
+    }
+    __device__ double at(const DScene& sc, const DVec3& oo, const DVec3& dd, double t,
+                         Real lam, const DPatEnv& env) const {
+        if (slow) return dTrDet(sc, oo, dd, t, lam, env);
+        double Tr = 1.0;
+        for (int i = 0; i < n; ++i) {
+            const double hi = t < tb[i] ? t : tb[i];
+            const double L = hi - ta[i];
+            if (!(L > 0.0)) continue;                      // dTrDet's 1.0 factor
+            Tr *= exp(-sigT[i] * L);
+            if (Tr <= 0.0) return 0.0;
+        }
+        return Tr;
+    }
+};
+
+// remap0 of the MIS machinery: a zero density is a DELTA one, and the ratio it appears in
+// must cancel rather than annihilate. Host twin: bdpt.h's misRemap0 / its local `remap0`.
+__device__ static inline double dMisRemap0(double f) { return f != 0.0 ? f : 1.0; }
 
 // ---------------------- photon BEAMS on the device (mode M volume) --------------------
 // Gather-tuned sub-beam record — what the device beam estimator actually reads. It is the
@@ -4514,13 +5211,79 @@ struct DPhotonMap {
 // `s0`/`len` describe THIS sub-segment; `o`/`d` remain the parent beam's true origin and
 // direction, because the beam-side transmittance is measured from where the stored power
 // applies, not from where the split happened to cut (photonbeams.h, BEAM SPLITTING).
+// `invRad` is 1 / (this beam's medium's kernel half-width). The half-width is PER MEDIUM since
+// 0.201.0 (photonbeams.h: it is a fixed fraction of the medium's own measured mean free path),
+// and it is carried per RECORD rather than looked up from a per-medium array by `med` because
+// that would be a dependent load in the innermost loop of the volume gather. One float per
+// sub-beam is 32 MB at the 8 M default ceiling, against a DBeamRec that was already 56 B — and
+// the reciprocal form makes the kernel evaluation strictly CHEAPER than the old shared-radius
+// one, because the reject test becomes d2*invRad^2 >= 1, which is the same quantity (d/r)^2
+// the Epanechnikov kernel needs anyway. The old code took a sqrt to get d and then squared
+// x = d*invRadius straight back.
 struct DBeamRec {
     DVec3 o, d;             // parent beam origin (world) and unit direction
     float s0, len;          // this sub-segment's [s0, s0+len] range along the beam
-    float pX, pY, pZ;       // cie{X,Y,Z}(lambda) * power / nEmitted
-    float lambda;           // wavelength (nm) — sigma_s / phase / transmittance all need it
+    float pX, pY, pZ;       // cie{X,Y,Z}(lambda) * power / (nEmitted * nLam)
+    float lambda;           // HERO wavelength (nm) — sigma_s / phase / Tr all need it
+    float pw;               // power / (nEmitted * nLam), WITHOUT the colour — the gather-time
+                            // fold supplies its own colour, so it cannot use pX/pY/pZ
+    short emIdx;            // emitter this beam came from; -1 = unknown (a GPU-traced map)
+    short achro;            // 2 = the gather-time fold applies (scene.h PhotonBeam::achro)
     float absorb;           // sigma_a of the enclosing dielectric (0 in air)
+    float invRad;           // 1 / kernel half-width of THIS beam's medium
     int   med;              // index into DScene::media
+    // --- SPECTRAL BUNDLE (photonbeams.h) ------------------------------------------------
+    // The secondary wavelengths this chord also carries. QUANTISED to 0.01 nm as an offset
+    // from 360 nm: three floats would have grown the record by 12 bytes on top of pwSec's 4,
+    // and at the 8 M sub-beam ceiling every byte here is 8 MB of VRAM *and* 8 MB of traffic
+    // through the innermost loop of the volume gather. 0.01 nm is two orders finer than the
+    // 1 nm grid every spectral table in the engine is sampled on, so the quantisation is
+    // exact for every consumer; the visible band 360..830 nm maps to 0..47000, inside u16.
+    unsigned short lamS[3];
+    unsigned char  nSec;     // 0 = classic monochromatic beam; <= kBeamSecMax
+    unsigned char  pad;
+    // power / (nEmitted * nLam) * wS[k], WITHOUT the CIE fold — the per-secondary constant a
+    // member needs, since it supplies its own CIE triple. Unused when nSec == 0.
+    //
+    // This is ONE array rather than a shared scalar times `PhotonBeam::wS[k]` because the two
+    // always appear multiplied: folding the weight in here costs 8 bytes of record and saves a
+    // multiply in the innermost loop of the volume gather, which is the opposite of the trade
+    // the quantised `lamS` above is making.
+    float pwSec[3];
+
+    __host__ __device__ float lamSec(int i) const { return 360.0f + (float)lamS[i] * 0.01f; }
+    static unsigned short packLam(double lam) {
+        double q = (lam - 360.0) * 100.0;
+        if (q < 0.0) q = 0.0;
+        if (q > 65535.0) q = 65535.0;
+        return (unsigned short)(q + 0.5);
+    }
+};
+
+// The LIGHT half of every merge's MIS weight, one entry per PRE-SPLIT beam — device twin of
+// photonbeams.h's BeamMis, uploaded only in mode J (`DBeamMap::mis` is null in mode M, which
+// is the gather's signal to fall back to weight 1, i.e. mode M's own raw estimator).
+//
+// Why the light half arrives this way at all: the camera half of a merge weight is explicit
+// (the eye vertices are right there in the kernel and its loops can be replayed over them),
+// but the light subpath is long gone by gather time — it was summed into these accumulators
+// while the beam was deposited. See BeamMergeWeight in bdpt.h for the shape of the sum.
+//
+// Field order mirrors the host struct, but the LAYOUT does not have to: this is rebuilt
+// field-by-field at upload, so there is no memcpy to keep in step.
+struct DBeamMis {
+    double sumC;          // light-side connection accumulator
+    double sumM;          // light-side BEAM-merge accumulator, without the n_m * 2r factor
+    double sumMs;         // light-side POINT-merge accumulator, without its n_m * pi r_s^2
+    float  pdfDir;        // solid-angle pdf of the beam's direction at y_{s-1}
+    float  rCoef;         // cos(y_{s-1}) / pdfFwd(y_{s-1}); the cos is 1 off a surface
+    float  etaPrev;       // the BEAM merge AT y_{s-1}, still missing only its Tr; 0 off a medium
+    float  etaPrevS;      // the POINT merge AT y_{s-1}, complete but for its kappaS; 0 off a
+                          // storable surface site
+    float  leadIn;        // distance from y_{s-1} to THIS beam's clipped origin
+    int    gateC1;        // is "connect x to y_{s-1}" a legal strategy? (y_{s-1} not delta)
+    int    vert;          // the light subpath vertex index j of y_{s-1} (so s = j+1) — the
+                          // depth cap needs it, and nothing else does
 };
 
 // The uploaded BeamMap: the host's BVH over kernel-inflated per-sub-beam AABBs (photonbeams.h)
@@ -4530,9 +5293,50 @@ struct DBeamMap {
     const DBeamRec* beams     = nullptr;
     const DNode*    nodes     = nullptr;
     const int*      primIdx   = nullptr;
-    Real            radius    = 0;   // 1D kernel half-width (world units)
-    Real            invRadius = 0;   // 1/radius, so the kernel costs no divide
+    Real            radiusMax = 0;   // largest per-medium half-width — reporting only; the
+                                     // gather reads each record's own invRad
     int             nNodes    = 0;
+    // --- MODE J only (null/0 in mode M, and then the gather is bit-for-bit the old one) ---
+    // `mis` is indexed by the PRE-SPLIT beam through `misIdx`, exactly as the host is: one
+    // beam splits into up to thousands of sub-beams and duplicating 40 B of identical MIS
+    // data per sub-beam would multiply the map's VRAM footprint by the split factor.
+    const DBeamMis* mis     = nullptr;
+    const int*      misIdx  = nullptr;   // sub-beam -> mis entry (null => identity)
+    int             nMis     = 0;
+    // n_m * 2r: the merge technique's sample count times the 1D kernel's full width. It is a
+    // property of the MAP (nEmitted x radRef), so it travels with the map rather than as a
+    // separate kernel argument that could be forgotten at one of the call sites.
+    double          mergeKappa = 0.0;
+    double          sinMin = 0.0;   // twin of BeamMap::sinMin (`-beamsinmin`); 0 = unbounded
+
+    // The MIS partials of sub-beam `i`, or null when the map carries none.
+    __device__ const DBeamMis* misOf(int i) const {
+        if (!mis) return nullptr;
+        const int j = misIdx ? misIdx[i] : i;
+        return (j >= 0 && j < nMis) ? &mis[j] : nullptr;
+    }
+};
+
+// The per-CAMERA-SEGMENT constants of a merge weight — device twin of the camera-side half
+// of bdpt.h's BeamMergeWeight, which the host builds once per segment and reads per hit.
+// Everything here is independent of WHERE along the segment a beam is hit, which is exactly
+// why it is hoisted: a dense medium hands one segment hundreds of hits.
+struct DBeamMergeW {
+    double kappa      = 0.0;  // == DBeamMap::mergeKappa (n_m * 2r), copied in for locality
+    double kappaS     = 0.0;  // == DSurfMap::kappaS (n_m * pi r_s^2): the OTHER merge kind's,
+                              // for the denominator. 0 without `-jsurf`.
+    double etaKSurf   = 0.0;  // kappaS if eye[k] is a storable photon site, else 0 -- the POINT
+                              // merge AT eye[k], the twin of etaKCoef's beam merge there
+    double lamCam     = 0.0;  // the CAMERA path's wavelength (see the spectral note below)
+    double pdfDirCam  = 0.0;  // PathSeg::pdfDir: solid-angle density of the segment direction
+    double gateS1     = 0.0;  // is the reference connection C1 legal? (eye[k] not delta)
+    double cosFacK    = 1.0;  // projected cosine at eye[k] along the segment; 1 off a surface
+    double invPdfFwdK = 1.0;  // 1 / remap0(eye[k].pdfFwd)
+    double etaKCoef   = 0.0;  // sin(theta_k) / (sigma_t(eye[k]) * Tr~(eye[k] -> eye[k-1]))
+    double segSumC    = 0.0;  // camera-side connection accumulator from eye[k] inward
+    double segSumM    = 0.0;  // camera-side merge accumulator, kappa factored out
+    int    camVert    = 0;    // k: the camera subpath index of the vertex this segment leaves
+    int    maxDepth   = 0;    // the same cap the connection loop applies
 };
 
 // Beam x Ray 1D single-scatter estimate along the camera segment [oc, oc + dc*tMax] —
@@ -4555,10 +5359,231 @@ struct DBeamMap {
 // legitimate grazing beam into a random huge weight. The cross product has no cancellation
 // there, so the host's 1e-9 rejection threshold stays meaningful at float precision instead
 // of having to be loosened (which would have BIASED the estimate by dropping real samples).
+// ---- device-side cancellation for the mode-M gather ----
+//
+// Holds a pointer to a flag in MAPPED PINNED host memory, published once (cudaMemcpyToSymbol)
+// before the gather starts. A __device__ global rather than a kernel parameter so the deep
+// callees that actually burn the time — this BVH walk and dPhotonGather's bounce loop — can
+// test it without threading a pointer through every signature between them and kGather.
+//
+// Mapped memory specifically: the host thread that launched the kernel is parked inside
+// cudaDeviceSynchronize for the whole launch and can issue no CUDA call, so the flag has to be
+// raisable by a plain store from a different thread.
+__device__ int* g_dGatherStop = nullptr;
+__device__ __forceinline__ bool dGatherStopped() {
+    return g_dGatherStop != nullptr && *(const volatile int*)g_dGatherStop != 0;
+}
+
+// ---- intra-launch PROGRESS for the mode-M gather ----
+//
+// The same mapped-pinned trick, running the other way: the kernel counts retired samples into
+// host memory and the poller thread reads them while the launching thread is blocked.
+//
+// This exists because cancellation alone left the other half of the problem standing. At
+// 960x540 the gather is ONE launch per spp (see kGather's note), so `done` moved 0 -> 100% with
+// nothing in between: the caption named the phase correctly and then sat at `0 / 172.8k (0%),
+// 0.00s` for 45 minutes. A render in perfect health was still indistinguishable from a wedged
+// one, which is the exact complaint naming the phase was supposed to answer.
+//
+// atomicAdd_system, not atomicAdd: the target is host memory shared with a CPU thread that is
+// reading it concurrently, and only the _system scope is coherent across that boundary. One
+// atomic per retired sample is 518400 of them spread over the whole launch — unmeasurable
+// against a gather that walks thousands of beams per sample.
+// Guarded because `all-major` fat binaries include sm_50/sm_52, where the _system scope does
+// not exist (it arrived with Pascal). The plain atomic still counts correctly there; it merely
+// loses the coherence guarantee, which for a progress bar means a reader may lag — the exact
+// failure mode a progress bar can absorb.
+__device__ unsigned long long* g_dGatherDone = nullptr;
+__device__ __forceinline__ void dGatherRetire() {
+    if (!g_dGatherDone) return;
+#if __CUDA_ARCH__ >= 600
+    atomicAdd_system(g_dGatherDone, 1ull);
+#else
+    atomicAdd(g_dGatherDone, 1ull);
+#endif
+}
+
+// --- The merge weight itself (mode J) --------------------------------------------------
+//
+// Device twin of bdpt.h's BeamMergeWeight::operator(), called once per beam hit. It returns
+// the balance-heuristic weight of "merge THIS beam here" against every other technique that
+// could have produced the same path.
+//
+// SHAPE. The merged path is y_0..y_{s-1}, x, eye[k], ..., eye[0]. Its reference technique is
+// the connection "C1" that would have made x the LAST CAMERA vertex and joined it to
+// y_{s-1}. Every term below is a density RATIO against that one, so the weight is
+// etaS / (sum of them) and no absolute path density is ever formed.
+//
+// SPECTRAL MISMATCH (documented approximation, and the host makes the same one): the beam
+// carries its own wavelength and the camera path another. Camera-side quantities use `lamCam`,
+// light-side ones the beam's, and the phase value at x — computed once by the gather — serves
+// both densities there. It perturbs the weight, never the estimator's support.
+//
+// A DELTA light-side density returns 0, i.e. drops the merge: `lm->pdfDir` is 0 when the light
+// walk left y_{s-1} by a specular bounce, and dMisWeight's own merge terms vanish in exactly
+// the same case, so the partition of unity still holds.
+__device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& mw,
+                                          const DBeamMis& lm, const DBeamRec& b,
+                                          const DTrRay& camTr, const DVec3& oc, const DVec3& dc,
+                                          double tCam, double sBeam, double sinT,
+                                          double dens, double phase, const DPatEnv& env) {
+    // THE DEPTH CAP. The merged path has s = j+1 light vertices and t = k+2 camera ones,
+    // hence depth = j+k+1. The connection loop refuses depth > maxDepth, so a merge past the
+    // cap would contribute a path length mode D never builds — energy with nothing to MIS
+    // against, which measured 1.6x too bright on an optically thick medium.
+    if (lm.vert + mw.camVert + 1 > mw.maxDepth) return 0.0;
+    const double rhoL = (double)lm.leadIn + sBeam;   // y_{s-1} -> x, not b.o -> x
+    if (!(tCam > 0.0) || !(rhoL > 0.0)) return 0.0;
+    const double invR2 = 1.0 / (rhoL * rhoL), invT2 = 1.0 / (tCam * tCam);
+    // The pair of geometric densities AT x. Both are cosine-free: x is a medium point.
+    const double gL = (double)lm.pdfDir * invR2;     // light side  (p_L-perp)
+    const double gC = mw.pdfDirCam * invT2;          // camera side (the free flight)
+    if (!(gL > 0.0)) return 0.0;                     // delta light-side density
+    if (b.med < 0 || b.med >= sc.mediaN) return 0.0;
+    const double sigT = (double)medSigmaT(sc.media[b.med], (Real)mw.lamCam) * dens;
+    if (!(sigT > 0.0)) return 0.0;
+    const double trC = camTr.at(sc, oc, dc, tCam, (Real)mw.lamCam, env);   // Tr~(x -> eye[k])
+    if (!(trC > 0.0)) return 0.0;
+    // eta of THIS merge against C1 — the numerator of the weight, and a term of its
+    // denominator (a technique competes with itself at ratio exactly its own).
+    const double etaS = mw.kappa * sinT * gL / (sigT * trC);
+    if (!(etaS > 0.0)) return 0.0;
+
+    // pdfRev(y_{s-1}): the density of the last light vertex seen from x. The phase value at x
+    // is its direction density (HG samples proportionally to its own value), and rCoef carries
+    // the cosine and the 1/pdfFwd that turn it into the ratio the light loop accumulates.
+    const double R  = phase * (double)lm.rCoef * invR2;
+    // pdfRev(x)/pdfFwd(x): remap0 on BOTH, exactly as dMisWeight does, so a delta camera
+    // continuation cancels instead of annihilating.
+    const double C1 = dMisRemap0(gL) / dMisRemap0(gC);
+    const double pdfRevK = phase * mw.cosFacK * invT2;   // pdfRev(eye[k]) in the merged path
+    const double C2   = pdfRevK * mw.invPdfFwdK;
+    const double etaK = (mw.kappa * mw.etaKCoef + mw.etaKSurf) * pdfRevK;  // merge AT eye[k]
+    // The merge AT y_{s-1}. Its sin(theta) and p_L were known when the beam was deposited
+    // (its outgoing direction IS the beam); only the transmittance over the now-known
+    // y_{s-1} -> x span is left.
+    double etaPrevTerm = 0.0;
+    if (lm.etaPrev > 0.f) {
+        const DVec3 yPrev = b.o - b.d * (Real)lm.leadIn;
+        const double trP = dTrDet(sc, yPrev, b.d, rhoL, b.lambda, env);
+        if (trP > 0.0) etaPrevTerm = mw.kappa * (double)lm.etaPrev / trP;
+    }
+    const double etaPrevS = mw.kappaS * (double)lm.etaPrevS;
+    const double den = (double)lm.gateC1                     // C1 itself (ratio 1)
+                     + R * lm.sumC                           // light-side connections
+                     + mw.gateS1 * C1                        // the t-1 camera connection
+                     + C1 * C2 * mw.segSumC                  // camera-side connections
+                     + R * (mw.kappa * lm.sumM + mw.kappaS * lm.sumMs
+                            + etaPrevTerm + etaPrevS)        // light-side merges, BOTH kinds
+                     + etaS                                  // this merge
+                     + C1 * etaK                             // merge at eye[k]
+                     + C1 * C2 * mw.segSumM;                 // camera-side merges (pre-scaled)
+    if (!(den > 0.0)) return 0.0;
+    return etaS / den;
+}
+
+// `mw` non-null is MODE J: every hit is multiplied by the merge weight above, and the map is
+// then one half of a two-technique MIS estimator rather than the whole estimate. Null is mode
+// M, and then not one line below changes — the gather is bit-for-bit the pre-mode-J one.
+// `camTr` is the caller's per-segment deterministic-transmittance cache (unused when `mw` is
+// null, and built by the caller precisely because it is a constant of the SEGMENT).
+// THE ESTIMATOR, BEAM x RAY, for ONE surviving candidate (photonbeams.h's twin) -- hoisted out
+// of dGatherPhotonBeams so that the inline gather below and the WAVEFRONT gather (kWfBeamEval)
+// run the identical code: one copy of what a beam contributes, two ways of scheduling it.
+// `t`/`s` are the closest-approach parameters along the camera segment / the beam, `cosT` and
+// `den` (= sin^2 theta) the pair's geometry, `x2` the squared normalised kernel offset (< 1).
+__device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const DBeamRec& b,
+                                    int beamIdx, const DVec3& oc, const DVec3& dc,
+                                    Real t, Real s, Real cosT, Real den, double x2,
+                                    double aGlassCam, DRng& rng,
+                                    const DBeamMergeW* mw, const DTrRay* camTr,
+                                    const DPatEnv& env,
+                                    double& oX, double& oY, double& oZ) {
+        if (b.med < 0 || b.med >= sc.mediaN) return;
+        const DMedium& md = sc.media[b.med];
+        const Real lam = b.lambda;
+        const DVec3 xc = oc + dc * t;
+        // sigma_s AT the gather point — density field and all, so a heterogeneous
+        // cloud shapes the bow instead of a uniform slab of it. The DENSITY is
+        // wavelength-independent (it is a scalar field), so this one evaluation — the
+        // expensive half, since it runs a compiled pattern program — serves the whole
+        // spectral bundle below.
+        const double dens = dMedDensityAt(md, xc, env);
+        const double ss = (double)specLookup(md.sigma_s, lam) * dens;
+        if (!(ss > 0.0)) return;
+        // connectVolume's convention: phase(dot(wIn, wToCamera)), wIn = b.d, wToCam = -dc.
+        // THE GATHER-TIME SPECTRAL FOLD (FOLD-GPU (2), host twin: beamgather.h). Gated on
+        // `mw == nullptr` -- i.e. no merge weight, i.e. mode M -- which is the device's way of
+        // asking what `WeightFn::kFoldGatherTime` asks on the host: mode J's weight sets it
+        // false, because its MIS ratios are built from the monochromatic phase and a folded
+        // colour cannot be paired with them.
+        double bowX = 0.0, bowY = 0.0, bowZ = 0.0, bowPhase = 0.0;
+        const bool folded = (mw == nullptr) && b.achro == 2 &&
+                            dBowEval(sc.bow, (int)b.emIdx, b.med, (double)(-cosT),
+                                     bowX, bowY, bowZ, bowPhase);
+        const double phase = folded ? bowPhase : (double)dMedPhase(md, -cosT, lam);
+        if (!(phase > 0.0)) return;
+        // 1D Epanechnikov kernel, normalised so its integral over [-r, r] is 1.
+        const double kk = 1.0 - x2;
+        const double K1 = 0.75 * (double)b.invRad * kk;
+        // Bounded at `bm.sinMin` (`-beamsinmin`, UPBP-CONV (3)): the same clamp the host applies
+        // in BeamMap::hitBeam, and applied at the same place -- before the MIS weight below
+        // reads it -- so the technique and its pdf stay one function.
+        const double sinT = fmax((double)sqrt((double)den), bm.sinMin);
+        double w = K1 / sinT * ss * phase;
+        // MIS (mode J); exactly absent in mode M. `dens` and `phase` are handed over
+        // rather than recomputed: the merge weight needs sigma_t(x) and the phase
+        // value at the merge point, and both are one multiply away from what the
+        // lines above just built. Applied BEFORE the `w > 0` reject so a technique
+        // the weight kills costs no transmittance marches — the host's order too.
+        if (mw) {
+            const DBeamMis* lm = bm.misOf(beamIdx);
+            // A null entry means the map carries no MIS data for this beam, which is
+            // the gather's signal to fall back to weight 1 (mode M's estimator).
+            if (lm) w *= dBeamMergeWeight(sc, *mw, *lm, b, *camTr, oc, dc,
+                                          (double)t, (double)s, sinT, dens, phase, env);
+        }
+        if (!(w > 0.0)) return;
+        if (b.absorb > 0.f)  w *= exp(-(double)b.absorb * (double)s);   // glass, beam side
+        if (aGlassCam > 0.0) w *= exp(-aGlassCam * (double)t);          // glass, camera side
+        if (s > (Real)0) w *= (double)dMediaTransmittance(sc, b.o, b.d, s, lam, rng);
+        if (t > (Real)0) w *= (double)dMediaTransmittance(sc, oc, dc, t, lam, rng);
+        if (!(w > 0.0)) return;
+        // A folded beam takes its colour from the bow table (already divided by the phase it
+        // carries, exactly as the host's `bowCie`), scaled by the colourless power; every other
+        // beam uses the record's baked colour.
+        if (folded) { const double pwf = (double)b.pw * w;
+                      oX += bowX * pwf; oY += bowY * pwf; oZ += bowZ * pwf; }
+        else        { oX += (double)b.pX * w; oY += (double)b.pY * w; oZ += (double)b.pZ * w; }
+        // SECONDARY wavelengths of the spectral bundle (host twin: gatherPhotonBeams).
+        // They share this beam's geometry, its kernel weight and — decisively — BOTH
+        // transmittance marches, which are the whole cost of the loop above and are
+        // wavelength-independent whenever the bundle is allowed at all (the extinction
+        // is achromatic; see beamSpectralOK). So all that differs per wavelength is
+        // sigma_s * phase * CIE. `w / (ss * phase)` recovers the shared factor with one
+        // division instead of rebuilding the chain; both terms are known positive here.
+        if (b.nSec) {
+            const double wShared = w / (ss * phase);
+            for (int k = 0; k < (int)b.nSec; ++k) {
+                const Real li = b.lamSec(k);
+                const double ssi = (double)specLookup(md.sigma_s, li) * dens;
+                if (!(ssi > 0.0)) continue;
+                const double phi = (double)dMedPhase(md, -cosT, li);
+                if (!(phi > 0.0)) continue;
+                const double wi = wShared * (double)b.pwSec[k] * ssi * phi;
+                oX += (double)cieX(li) * wi;
+                oY += (double)cieY(li) * wi;
+                oZ += (double)cieZ(li) * wi;
+            }
+        }
+}
+
 __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DVec3& oc, const DVec3& dc, Real tMax,
                                           double aGlassCam, DRng& rng,
-                                          double& oX, double& oY, double& oZ) {
+                                          double& oX, double& oY, double& oZ,
+                                          const DBeamMergeW* mw = nullptr,
+                                          const DTrRay* camTr = nullptr) {
     oX = oY = oZ = 0.0;
     if (bm.nNodes == 0) return;
     const DVec3 invD{(Real)1 / dc.x, (Real)1 / dc.y, (Real)1 / dc.z};
@@ -4566,7 +5591,17 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
     if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) return;
     const DPatEnv env = dPatEnvOf(sc);
     int stack[64]; int sp = 0; stack[sp++] = 0;
+    // THIS is where a gather actually spends its time, so this is where cancellation has to
+    // live. A probe ray visits thousands of nodes here (G = 8534 gathered beams on
+    // gallery_rain's default), while kGather's own grid-stride loop runs ONE iteration per
+    // thread — 518400 samples over 262144 threads — so a poll up there fires once, at the
+    // instant of launch, and never again. That is why the first attempt at device-side
+    // cancellation changed nothing: measured 186 s to stop against a ~194 s remaining launch.
+    // Every 64th node keeps the mapped-memory read (a PCIe round trip, necessarily uncached)
+    // far off the hot path while still bounding stop latency to a few nodes' work.
+    int stopPoll = 0;
     while (sp) {
+        if ((++stopPoll & 63) == 0 && dGatherStopped()) return;
         const DNode& n = bm.nodes[stack[--sp]];
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
@@ -4584,37 +5619,200 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 if (s < b.s0 || s > b.s0 + b.len) continue;
                 const DVec3 diff = (oc + dc * t) - (b.o + b.d * s);
                 const Real d2 = dot(diff, diff);
-                if (d2 >= bm.radius * bm.radius) continue;
-                // --- the estimator (photonbeams.h, THE ESTIMATOR: BEAM x RAY) -------
-                if (b.med < 0 || b.med >= sc.mediaN) continue;
-                const DMedium& md = sc.media[b.med];
-                const Real lam = b.lambda;
-                const DVec3 xc = oc + dc * t;
-                // sigma_s AT the gather point — density field and all, so a heterogeneous
-                // cloud shapes the bow instead of a uniform slab of it.
-                const double ss = (double)specLookup(md.sigma_s, lam) * dMedDensityAt(md, xc, env);
-                if (!(ss > 0.0)) continue;
-                // connectVolume's convention: phase(dot(wIn, wToCamera)), wIn = b.d, wToCam = -dc.
-                const double phase = (double)dMedPhase(md, -cosT, lam);
-                if (!(phase > 0.0)) continue;
-                // 1D Epanechnikov kernel, normalised so its integral over [-r, r] is 1.
-                const double x  = (double)sqrt(d2) * (double)bm.invRadius;
-                const double kk = 1.0 - x * x;
-                if (!(kk > 0.0)) continue;
-                const double K1 = 0.75 * (double)bm.invRadius * kk;
-                double w = K1 / (double)sqrt((double)den) * ss * phase;
-                if (!(w > 0.0)) continue;
-                if (b.absorb > 0.f)  w *= exp(-(double)b.absorb * (double)s);   // glass, beam side
-                if (aGlassCam > 0.0) w *= exp(-aGlassCam * (double)t);          // glass, camera side
-                if (s > (Real)0) w *= (double)dMediaTransmittance(sc, b.o, b.d, s, lam, rng);
-                if (t > (Real)0) w *= (double)dMediaTransmittance(sc, oc, dc, t, lam, rng);
-                if (!(w > 0.0)) continue;
-                oX += (double)b.pX * w; oY += (double)b.pY * w; oZ += (double)b.pZ * w;
+                // (d_perp / r_med)^2, with r_med this beam's own medium's half-width.
+                const double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
+                if (!(x2 < 1.0)) continue;
+                dBeamHitEval(sc, bm, b, bm.primIdx[n.first + i], oc, dc, t, s, cosT, den, x2,
+                             aGlassCam, rng, mw, camTr, env, oX, oY, oZ);
             }
         } else {
             Real tc;
             if (boxHit(bm.nodes[n.left],  oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.left;
             if (boxHit(bm.nodes[n.right], oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.right;
+        }
+    }
+}
+
+// ---- WAVEFRONT beam gather for mode J (UPBP-CONV) ----------------------------------------
+// The inline gather above is one thread per CAMERA PATH walking the beam BVH and evaluating every
+// surviving beam in place. Measured on _fog_thick (128^2, 60 s, RTX 4090, 0.260.1): 382 spp with
+// a segment gathering 32 beams against 6513 spp gathering ~1. That 17x is warp divergence, not
+// arithmetic -- each lane walks its own beam list and each hit runs its own weight and marches,
+// so lanes in a warp serialise against each other's lists. So mode J's camera pass SEPARATES the
+// three phases: kBdptT writes each segment, with the per-segment weight state it already builds,
+// to a queue; kWfBeamHits (one thread per segment) walks the BVH and appends (segment, beam, t, s)
+// candidates; kWfBeamEval (one thread per candidate) runs the estimator -- dBeamHitEval, the same
+// function the inline path calls -- and accumulates into the film. Each phase is uniform work.
+//
+// Nothing is dropped on overflow: a segment that does not fit the queue is gathered inline by
+// kBdptT exactly as before, and a candidate that does not fit the hit queue is evaluated on the
+// spot by kWfBeamHits. The result is the same estimator summed in a different order (per-hit
+// atomics, and a per-hit RNG stream for the stochastic transmittance of heterogeneous media),
+// so it is validated statistically: parity against the inline path (FTRACE_NOWAVEFRONT=1).
+// ---- mode J's SECOND merge kind on the device: point x point surface merges (`-jsurf`) ------
+// Device twin of surfmerge.h. The host map is already a DENSE uniform lattice (`cellStart` +
+// `order`, cell == gather radius), so it is uploaded as it stands rather than rebuilt as the
+// hashed lattice mode M's photon map uses: the gather has to bin EXACTLY the way the light pass
+// stored, and two transcriptions of one binning rule is two chances to disagree -- a
+// disagreement that does not crash, it silently gathers nothing (cf. dPmNeighborhood's note).
+// Device twin of bdpt.h's FTRACE_J_HALF (0 = both halves, 1 = connections only, 2 = merges
+// only). Both halves keep the SAME MIS weights they have in a full render, so the two sum to
+// it -- which is what makes a CPU-vs-GPU comparison of ONE half a clean measurement.
+__constant__ int c_jHalf = 0;
+
+struct DSurfPhoton {
+    DVec3 p, wo;                              // wo: unit, toward the PREVIOUS light vertex
+    float lambda, beta, cx, cy, cz;           // cie{X,Y,Z}(lambda), cached at store time
+    unsigned misIdx;
+};
+struct DSurfMis {                             // the light-side half of the merge's MIS weight
+    double sumC, sumMb, sumMs, pdfFwdA;
+    float  rCoef;
+    unsigned char  gateC1;
+    unsigned short vert;                      // j, for the depth cap (merge depth = j + k)
+};
+struct DSurfMap {
+    const DSurfPhoton* pts;
+    const DSurfMis*    mis;
+    const int*         cellStart;             // size nx*ny*nz + 1
+    const int*         order;                 // photon indices, cell-contiguous
+    DVec3  lo;
+    Real   cell;                              // == radius
+    int    nx, ny, nz;
+    Real   radius;
+    double kappaS;                            // n_m * pi r_s^2 -- this technique's constant
+    long long nPts;
+};
+
+struct DWfSeg {
+    DVec3  o, d;
+    double tMax, beta, aGlass;
+    DBeamMergeW mw;
+    DTrRay      tr;
+    int    px, py;
+    float  lambda;
+    unsigned long long seed;
+};
+struct DWfHit { int seg; int beam; float t, s; };
+// One band of the wave-schedule PROFILE (see renderBdptCuda): what the paths of pixel slots
+// [px0, px1) produced. Kept across calls, so the first chunk of every epoch is sized right.
+struct WfBand { long long px0, px1; double hitsPerPath, segsPerPath; };
+static std::vector<WfBand> g_wfProfile;
+static int g_wfProfileResX = -1, g_wfProfileResY = -1, g_wfProfileDepth = -1;
+struct DWfQueue {
+    DWfSeg* segs;  int* nSegs; int segCap;
+    DWfHit* hits;  int* nHits; int hitCap;
+    int*    overflow;   // [0] segments gathered inline (queue full), [1] hits evaluated on the spot
+    // WAVE ORDER (0.261.1). runMul == 0 -- the default, and every non-wavefront launch -- makes a
+    // wave a contiguous range of pixels, i.e. a horizontal band. FTRACE_WFSTRAT=1 sets runMul
+    // to an odd golden-ratio multiplier on a power-of-two run domain (runMask + 1 >= nRuns):
+    // the kernel then enumerates the chunk's pixels in 32-pixel runs permuted by
+    // (run * runMul) & runMask -- a bijection with no division -- so every wave covers the
+    // whole image like a Fibonacci lattice and is a sample of the same distribution. That makes
+    // the adaptive wave size exact (on _fog_cornell it cut the on-the-spot spill from 59 M to
+    // 8.4 M hits at 256^2 / 60 s), but it costs 7 % of _fog_thick's paths (4430 against 4765
+    // spp / 60 s through the same code): the segment queue is filled by grid-wide atomics, so a
+    // kWfBeamHits warp holds 32 segments from random paths OF THE WAVE, and a band's paths are
+    // alike while a stratified wave's are as unalike as the image allows -- warp divergence in
+    // the beam-tree walk. A spilled candidate is evaluated in place and costs nothing
+    // measurable, so the band order is the default, and the jumps its last-wave estimate cannot
+    // see -- the chunk boundary (bottom band to top band) and the doubling at a light's edge --
+    // are sized from the previous chunk's per-band PROFILE instead (see the wave loop).
+    // Under FTRACE_WFSTRAT=1 the index space is padded to whole runs of the power-of-two
+    // domain; a run >= nRuns, or a slot past its row's width, is skipped. A warp still traces
+    // 32 adjacent pixels either way, and the per-pixel sample streams, seeded by pixel, are the
+    // same in both orders.
+    unsigned runsPerRow, nRuns, runMask, runMul;
+};
+
+__global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX) {
+    const int nS = min(*q.nSegs, q.segCap);
+    const DPatEnv env = dPatEnvOf(sc);
+    for (int si = blockIdx.x * blockDim.x + threadIdx.x; si < nS; si += gridDim.x * blockDim.x) {
+        const DWfSeg& sg = q.segs[si];
+        const DVec3 oc = sg.o, dc = sg.d;
+        const Real tMax = (Real)sg.tMax;
+        if (bm.nNodes == 0) continue;
+        const DVec3 invD{(Real)1 / dc.x, (Real)1 / dc.y, (Real)1 / dc.z};
+        Real tRoot;
+        if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) continue;
+        int stack[64]; int sp = 0; stack[sp++] = 0;
+        int stopPoll = 0;
+        DRng rng; rng.seed(sg.seed * 2 + 1, sg.seed ^ 0x9E3779B97F4A7C15ull);   // on-the-spot fallback only
+        double fX = 0.0, fY = 0.0, fZ = 0.0;
+        while (sp) {
+            if ((++stopPoll & 63) == 0 && dGatherStopped()) break;
+            const DNode& n = bm.nodes[stack[--sp]];
+            if (n.count > 0) {
+                for (int i = 0; i < n.count; ++i) {
+                    const int bi = bm.primIdx[n.first + i];
+                    const DBeamRec& b = bm.beams[bi];
+                    const Real cosT = dot(dc, b.d);
+                    const DVec3 cr  = cross(dc, b.d);
+                    const Real den  = dot(cr, cr);
+                    if (den < (Real)1e-9) continue;
+                    const DVec3 w0 = oc - b.o;
+                    const Real dd = dot(dc, w0), ee = dot(b.d, w0);
+                    const Real t = (cosT * ee - dd) / den;
+                    const Real s = (ee - cosT * dd) / den;
+                    if (t < (Real)0 || t > tMax) continue;
+                    if (s < b.s0 || s > b.s0 + b.len) continue;
+                    const DVec3 diff = (oc + dc * t) - (b.o + b.d * s);
+                    const Real d2 = dot(diff, diff);
+                    const double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
+                    if (!(x2 < 1.0)) continue;
+                    const int h = atomicAdd(q.nHits, 1);
+                    if (h < q.hitCap) {
+                        q.hits[h] = DWfHit{si, bi, (float)t, (float)s};
+                    } else {
+                        atomicAdd(&q.overflow[1], 1);
+                        dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
+                                     &sg.mw, &sg.tr, env, fX, fY, fZ);
+                    }
+                }
+            } else {
+                Real tc;
+                if (boxHit(bm.nodes[n.left],  oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.left;
+                if (boxHit(bm.nodes[n.right], oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.right;
+            }
+        }
+        if (fX != 0.0 || fY != 0.0 || fZ != 0.0) {
+            const size_t o = ((size_t)sg.py * resX + sg.px) * 3;
+            atomicAdd(&camFilm[o + 0], fX * sg.beta);
+            atomicAdd(&camFilm[o + 1], fY * sg.beta);
+            atomicAdd(&camFilm[o + 2], fZ * sg.beta);
+        }
+    }
+}
+
+__global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX) {
+    const int nH = min(*q.nHits, q.hitCap);
+    const DPatEnv env = dPatEnvOf(sc);
+    for (int hi = blockIdx.x * blockDim.x + threadIdx.x; hi < nH; hi += gridDim.x * blockDim.x) {
+        const DWfHit h = q.hits[hi];
+        const DWfSeg& sg = q.segs[h.seg];
+        const DBeamRec& b = bm.beams[h.beam];
+        const DVec3 oc = sg.o, dc = sg.d;
+        const Real cosT = dot(dc, b.d);
+        const DVec3 cr  = cross(dc, b.d);
+        const Real den  = dot(cr, cr);
+        if (den < (Real)1e-9) continue;
+        const Real t = (Real)h.t, s = (Real)h.s;
+        const DVec3 diff = (oc + dc * t) - (b.o + b.d * s);
+        const Real d2 = dot(diff, diff);
+        double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
+        if (x2 >= 1.0) x2 = 0.999999;   // the candidate passed x2 < 1 in kWfBeamHits; keep it
+        DRng rng;
+        rng.seed((sg.seed ^ ((unsigned long long)h.beam * 0x9E3779B97F4A7C15ull)) * 2 + 1,
+                 sg.seed + (unsigned long long)hi);
+        double oX = 0.0, oY = 0.0, oZ = 0.0;
+        dBeamHitEval(sc, bm, b, h.beam, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
+                     &sg.mw, &sg.tr, env, oX, oY, oZ);
+        if (oX != 0.0 || oY != 0.0 || oZ != 0.0) {
+            const size_t o = ((size_t)sg.py * resX + sg.px) * 3;
+            atomicAdd(&camFilm[o + 0], oX * sg.beta);
+            atomicAdd(&camFilm[o + 1], oY * sg.beta);
+            atomicAdd(&camFilm[o + 2], oZ * sg.beta);
         }
     }
 }
@@ -4651,14 +5849,28 @@ __device__ static void splatSurfaceAllHair(const DScene& sc, const DCamSet& cs, 
 // deposit total); stores only when a buffer is bound and the slot is within capacity.
 // The photon's travel/incident direction is deliberately not a parameter: no gather reads
 // it (see DPhoton), so it isn't stored (matches Renderer::depositPhoton on the host).
+// `caustic` records the L·S+·D classification of the path that got here (see DPhoton); the
+// host reads it back to partition the download into the two maps.
+// `causticW` is the aimed pass's balance-heuristic weight (causticaim.h), which applies to a
+// CAUSTIC record and nothing else — 1 on every render without `-causticn`. The dedicated
+// aimed pass additionally drops non-caustic deposits outright: it exists only to feed the
+// caustic map, its global deposits would be normalised by the wrong nEmitted, and storing
+// them would cost a buffer the size of the whole aimed budget to then throw away on the host.
 __device__ static void depositPhoton(const DCamSet& cs, const DVec3& p,
-                                     const DVec3& n, Real beta, Real lambda) {
+                                     const DVec3& n, Real beta, Real lambda,
+                                     bool caustic = false, Real causticW = (Real)1) {
     if (!cs.depCount) return;
+    if (caustic && causticW != (Real)1) {
+        beta *= causticW;
+        if (!(beta > (Real)0)) return;
+    }
+    if (cs.aim.aimed && !caustic) return;
     unsigned long long i = atomicAdd(cs.depCount, 1ULL);
     if (cs.depPhotons && i < cs.depCap) {
         DPhoton ph;
         ph.pos = p; ph.n = n;
         ph.power = (float)beta; ph.lambda = (float)lambda;
+        ph.caustic = caustic ? 1 : 0;
         cs.depPhotons[i] = ph;
     }
 }
@@ -4673,15 +5885,22 @@ __device__ static void depositPhoton(const DCamSet& cs, const DVec3& p,
 // device buffer, and a rate change that perturbed the transport stream would silently move
 // every surface photon too — so the two streams are kept disjoint and the surface map comes
 // out bit-identical whatever the beam rate turns out to be.
+//
+// `spec` (optional) is the photon's live spectral bundle; it rides along untouched — the
+// chord a photon cuts through a fog does not depend on its wavelength, so the same segment
+// legitimately carries every wavelength in the bundle (photonbeams.h).
 __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVec3& o,
                                   const DVec3& dir, Real dLen, Real lambda, Real beta,
-                                  Real aGlass, DRng& rng, int offFilt = DMedStraight) {
+                                  Real aGlass, DRng& rng, int offFilt = DMedStraight,
+                                  const DBeamSpec* spec = nullptr) {
     if (!cs.beamCount || !(beta > 0)) return;
     // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
-    // 1e30-long box (host twin: Renderer::kBeamFarScale == 8).
+    // 1e30-long box (host twin: Renderer::kBeamFarScale == 8). Applied PER MEDIUM and only to
+    // the unbounded ones: a bounded medium's own clip is already finite, so the clamp could
+    // only cut a beam short of the region it must fill. See the host comment for the scene
+    // this was found on.
     const double farLimit = 8.0 * fmax(sc.sceneRadius, 1e-3);
-    const double dBeam = fmin((double)dLen, farLimit);
-    if (!(dBeam > 0.0)) return;
+    if (!((double)dLen > 0.0)) return;
     const double keep = cs.beamKeep;
     for (int i = 0; i < sc.mediaN; ++i) {
         const DMedium& md = sc.media[i];
@@ -4693,6 +5912,7 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
         // store. `iorN > 0` is the device's Medium::grin().
         if (md.iorN > 0) continue;
         double ta, tb;
+        const double dBeam = md.bounded ? (double)dLen : fmin((double)dLen, farLimit);
         if (!dMedClip(md, o, dir, 0.0, dBeam, ta, tb)) continue;
         if (!(tb > ta)) continue;
         if (keep < 1.0 && (double)rng.uniform() >= keep) continue;
@@ -4721,6 +5941,36 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
             bd.lambda = (float)lambda;
             bd.absorb = (float)aGlass;
             bd.med    = i;
+            // ACHROMATIC-PATH FOLD, decided per DEPOSITED BEAM rather than per photon,
+            // because the two conditions live in different places: the PATH being
+            // wavelength-independent is a property of the photon (spec->achro), while the
+            // gather-time tail being flat is a property of THIS medium (md.achro). A photon
+            // crossing gallery_rain's achromatic cloud and its chromatic rainbow rain in the
+            // same step deposits one beam of each kind, and only the cloud one may fold.
+            const int achro = (spec && spec->achro && sc.media[i].achro) ? 1 : 0;
+            // GATHER-TIME FOLD (host twin: render.h's `bowEm`). The medium's coefficients are
+            // flat but its phase is a rainbow table, so `achro` above correctly refused the
+            // deposit-time fold -- the colour is not decidable without the scattering angle. It
+            // IS decidable at gather time from the bow table, provided the path carried no
+            // spectral weight of its own. Asking the uploaded offset table whether the pair has
+            // one keeps both backends' notion of "eligible" identical by construction.
+            int bowEm = -1;
+            if (!achro && spec && spec->achro && spec->emIdx >= 0 && sc.bow.tab &&
+                spec->emIdx < sc.bow.nEm && i < sc.bow.nMed &&
+                sc.bow.off[spec->emIdx * sc.bow.nMed + i] >= 0)
+                bowEm = spec->emIdx;
+            bd.bowEm  = bowEm;
+            bd.achro  = achro;
+            // `cieA` is the fallback colour for BOTH folds: the achromatic-path one uses it
+            // outright, and the gather-time one falls back to it wherever no table applies.
+            const int wantCie = (achro || bowEm >= 0) ? 1 : 0;
+            bd.cieA[0] = wantCie ? (float)spec->cie.x : 0.f;
+            bd.cieA[1] = wantCie ? (float)spec->cie.y : 0.f;
+            bd.cieA[2] = wantCie ? (float)spec->cie.z : 0.f;
+            // The bundle is redundant against the mean it was approximating: suppress it so
+            // the record's power is not also divided by nLam (photonbeams.h push()).
+            bd.nSec   = (spec && !achro && bowEm < 0) ? spec->n : 0;
+            for (int j = 0; j < 3; ++j) bd.lamS[j] = (j < bd.nSec) ? (float)spec->lam[j] : 0.f;
             cs.beamOut[k] = bd;
         }
     }
@@ -4747,7 +5997,7 @@ __device__ static void connectEmissionVolume(const DScene& sc, const DCamera& ca
     DVec3 wdir = toCam / dist;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occludedTo(sc, p + wdir * RAY_EPS, p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) / (Real)((double)dist2 * solidAngle);
     contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
@@ -4770,7 +6020,7 @@ __device__ static void connectEmissionLensVolume(const DScene& sc, const DCamera
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occludedTo(sc, p + wdir * RAY_EPS, p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) * cosLens * (Real)DPI * (R * R) / (dist * dist);
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
@@ -5055,7 +6305,7 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
         if (aGlass > 0.0) contrib *= exp(-aGlass * ch.innerLen);
 
         DVec3 wPR = wP.toR();
-        if (occluded(sc, (p + wP * 1e-6).toR(), wPR, connMaxT(dP))) continue;
+        if (occludedTo(sc, dOffsetAlong(p.toR(), wPR, wPR), p.toR() + wPR * dP, 2e-6)) continue;
         if (sc.mediaN > 0)
             contrib *= (double)dMediaTransmittance(sc, p.toR(), wPR, (Real)dP, lambda, rng);
 
@@ -5195,10 +6445,10 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         if (aGlass > 0.0) contrib *= exp(-aGlass * ch.innerLen);
 
         DVec3 wPR = wP.toR();
-        if (occluded(sc, (p + wP * 1e-6).toR(), wPR, connMaxT(dP2))) continue;
+        if (occludedTo(sc, dOffsetAlong(p.toR(), wPR, wPR), p.toR() + wPR * dP2, 2e-6)) continue;
         D3 wE = eye - ch.P1; double dE = d3len(wE); wE = wE * (1.0 / dE);
         DVec3 wER = wE.toR();
-        if (occluded(sc, (ch.P1 + wE * 1e-6).toR(), wER, connMaxT(dE))) continue;
+        if (occludedTo(sc, dOffsetAlong(ch.P1.toR(), wER, wER), ch.P1.toR() + wER * dE, 2e-6, RAY_EPS, /*camLeg=*/true)) continue;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
 
         if (sc.mediaN > 0) {
             contrib *= (double)dMediaTransmittance(sc, p.toR(),   wPR, (Real)dP2, lambda, rng);
@@ -5273,7 +6523,10 @@ __device__ static bool dReflectOffSphere(const D3& o, const D3& d, const DSphere
 // Twin of Renderer::mirrorSeenAt.
 __device__ static bool dMirrorSeenAt(const DScene& sc, const D3& eye, const D3& wE,
                                      double dE, DHit& hm) {
-    hm = closestHit(sc, eye.toR(), wE.toR());
+    // This leg starts AT THE EYE, so it is a camera ray and a `hide_camera` flat must not
+    // answer either of the two questions above — it is neither the mirror nor a legitimate
+    // blocker of the view. Twin of Renderer::mirrorSeenAt. See DMaterial::hideCamera.
+    hm = closestHit(sc, eye.toR(), wE.toR(), RAY_EPS, BIG, /*camHide=*/true);
     if (!hm.valid) return false;
     if (fabs((double)hm.t - dE) > 1e-4 * (1.0 + dE)) return false;   // something in front
     return dIsPlanarMirrorMat(sc.mats[hm.matId]);
@@ -5343,7 +6596,7 @@ __device__ static void dConnectSpecularPlane(const DScene& sc, const DCamera& ca
     // any-hit occlusion walk is cheaper than the closest-hit that confirms the mirror,
     // so a shadowed connection never pays for the expensive query. Both tests must
     // pass and neither draws RNG, so the order is unobservable.
-    if (occluded(sc, (p + wP * 1e-6).toR(), wP.toR(), connMaxT(dP))) return;
+    if (occludedTo(sc, dOffsetAlong(p.toR(), wP.toR(), wP.toR()), p.toR() + wP.toR() * dP, 2e-6)) return;
     DHit hm;
     if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) return;
 
@@ -5475,7 +6728,7 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
         const double G = (eps * eps) / jac;
         const double D = 1.0 / sqrt(G);
 
-        if (occluded(sc, (p + wP * 1e-6).toR(), wP.toR(), connMaxT(dP))) continue;
+        if (occludedTo(sc, dOffsetAlong(p.toR(), wP.toR(), wP.toR()), p.toR() + wP.toR() * dP, 2e-6)) continue;
         DHit hm;
         if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) continue;
 
@@ -5798,7 +7051,8 @@ __device__ static float dPatValueNoiseF(float x, float y, float z) {
 __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float x, float y, float z, float f,
                                       float nx, float ny, float nz, float r,
-                                      float u, float v, const DPatEnv& env) {
+                                      float u, float v, const DPatEnv& env,
+                                      const float* dext) {
     float st[64]; int sp = 0;
     float reg[PAT_CSE_REGS];    // CSE registers (float: bit-identical to re-running the
                                 // stored subtree in this evaluator's own precision)
@@ -5807,6 +7061,10 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
         switch ((PatOp)nd.op) {
             case PatOp::Const:    st[sp++] = nd.a; break;
             case PatOp::VarX:     st[sp++] = x;  break;
+            case PatOp::VarD4: case PatOp::VarD5:  case PatOp::VarD6:
+            case PatOp::VarD7: case PatOp::VarD8:  case PatOp::VarD9:
+            case PatOp::VarD10: case PatOp::VarD11: case PatOp::VarD12:
+                st[sp++] = dext ? dext[(int)nd.op - (int)PatOp::VarD4] : 0.0f;  break;
             case PatOp::VarY:     st[sp++] = y;  break;
             case PatOp::VarZ:     st[sp++] = z;  break;
             case PatOp::VarF:     st[sp++] = f;  break;
@@ -6180,6 +7438,23 @@ __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const D
             rv = specLookup(m.reflect, lambda);
         }
     }
+    // Per-vertex colour multiplies the albedo — the device twin of the host's
+    // diffuseReflectance. Interpolate the COLOUR (the quantity that actually varies
+    // linearly across a face), then look the sigmoid coefficients up in the shared table:
+    // exactly what the host does, through the same STOCH_HD stochJhCoeff and the same
+    // upsample::coeffLut() bytes, so the two agree rather than approximate each other.
+    if (h.vcol >= 0 && sc.vertColors && sc.jhLut) {
+        const int i = h.vcol * 3;
+        if (i + 8 < sc.nVertColors) {
+            const Real b0 = h.vb0, b1 = h.vb1, b2 = (Real)1 - b0 - b1;
+            const double r = b0 * sc.vertColors[i + 0] + b1 * sc.vertColors[i + 3] + b2 * sc.vertColors[i + 6];
+            const double g = b0 * sc.vertColors[i + 1] + b1 * sc.vertColors[i + 4] + b2 * sc.vertColors[i + 7];
+            const double b = b0 * sc.vertColors[i + 2] + b1 * sc.vertColors[i + 5] + b2 * sc.vertColors[i + 8];
+            double c[3];
+            stochJhCoeff(sc.jhLut, r, g, b, c);
+            rv *= stochReflAt(c, (double)lambda);   // the host's upsample::reflAt, device side
+        }
+    }
     return clamp01(m.reflectPat < 0 ? rv : rv * dReflectPatMul(sc, m, h));
 }
 
@@ -6334,12 +7609,212 @@ __device__ static double dEnvPdf(const DEnvMap& e, const DVec3& d) {
 
 enum { WF_CONTINUE = 0, WF_TERMINATE = 1 };
 
+// ---- AIMED CAUSTIC EMISSION (device twin of causticaim.h + Renderer::applyCausticAim) -----
+// The host header holds the derivation; the device only needs the four primitives it reduces
+// to. The one structural difference from the host is that the target list is walked from
+// global memory rather than a std::vector, so every helper takes (targets, n) directly.
+//
+// The counting formula — p_a(x) = (number of footprints containing x) / T — is why these are
+// so small: there is no stored pdf, no normalisation table and no grid, just an overlap count
+// against at most `-causticaimk` spheres.
+
+// cos of the cone half-angle target j subtends from `o`; -1 when `o` is inside it (the whole
+// sphere of directions, which is the correct limit for an emitter embedded in a dielectric).
+__device__ static inline double dAimConeCos(const DAimTarget& tg, const DVec3& o) {
+    const DVec3 w = tg.c - o;
+    const double d2 = (double)dot(w, w), r2 = (double)tg.r * (double)tg.r;
+    if (d2 <= r2) return -1.0;
+    return sqrt(fmax(0.0, 1.0 - r2 / d2));
+}
+
+__device__ static inline double dAimSumOmega(const DAimMap& am, const DVec3& o) {
+    double s = 0.0;
+    for (int i = 0; i < am.n; ++i) s += 2.0 * DPI * (1.0 - dAimConeCos(am.targets[i], o));
+    return s;
+}
+
+__device__ static inline int dAimConeCount(const DAimMap& am, const DVec3& o, const DVec3& w) {
+    int n = 0;
+    for (int i = 0; i < am.n; ++i) {
+        const DVec3 v = am.targets[i].c - o;
+        const double d2 = (double)dot(v, v), r2 = (double)am.targets[i].r * (double)am.targets[i].r;
+        if (d2 <= r2) { ++n; continue; }
+        const double dl = sqrt(d2);
+        if ((double)dot(w, v) / dl >= sqrt(fmax(0.0, 1.0 - r2 / d2))) ++n;
+    }
+    return n;
+}
+
+// Draw a direction from the aimed cone mixture: `u0` picks a target proportional to its own
+// solid angle, `u1`/`u2` place the direction uniformly inside that cone.
+__device__ static bool dAimConeSample(const DAimMap& am, double sumOmega, const DVec3& o,
+                                      double u0, double u1, double u2, DVec3& w) {
+    if (am.n <= 0 || !(sumOmega > 0.0)) return false;
+    double pick = u0 * sumOmega, acc = 0.0;
+    int j = 0;
+    for (; j + 1 < am.n; ++j) {
+        acc += 2.0 * DPI * (1.0 - dAimConeCos(am.targets[j], o));
+        if (pick < acc) break;
+    }
+    const DAimTarget tg = am.targets[j];
+    const double cosMax = dAimConeCos(tg, o);
+    DVec3 axis = tg.c - o;
+    const double al = (double)length(axis);
+    axis = (al > 1e-12) ? axis / (Real)al : DVec3{(Real)0, (Real)0, (Real)1};
+    const double ct = 1.0 - u1 * (1.0 - cosMax);
+    const double st = sqrt(fmax(0.0, 1.0 - ct * ct));
+    const double ph = 2.0 * DPI * u2;
+    DVec3 tt, bb; onb(axis, tt, bb);
+    w = tt * (Real)(st * cos(ph)) + bb * (Real)(st * sin(ph)) + axis * (Real)ct;
+    return true;
+}
+
+// 2-D coordinates of target j's centre, projected onto the upstream plane a distant emitter
+// draws its entry point from (basis t/b, through sceneCenter, perpendicular to the travel
+// direction — exactly the plane `onb(dir, t, b)` builds in genPhoton).
+__device__ static inline void dAimDiscProject(const DAimTarget& tg, const DVec3& sceneCenter,
+                                              const DVec3& t, const DVec3& b,
+                                              double& x, double& y) {
+    const DVec3 w = tg.c - sceneCenter;
+    x = (double)dot(w, t);
+    y = (double)dot(w, b);
+}
+
+__device__ static inline int dAimDiscCount(const DAimMap& am, const DVec3& sceneCenter,
+                                           const DVec3& t, const DVec3& b, double x, double y) {
+    int n = 0;
+    for (int i = 0; i < am.n; ++i) {
+        double cx, cy; dAimDiscProject(am.targets[i], sceneCenter, t, b, cx, cy);
+        const double dx = x - cx, dy = y - cy;
+        const double r = (double)am.targets[i].r;
+        if (dx * dx + dy * dy < r * r) ++n;
+    }
+    return n;
+}
+
+__device__ static bool dAimDiscSample(const DAimMap& am, const DVec3& sceneCenter,
+                                      const DVec3& t, const DVec3& b,
+                                      double u0, double u1, double u2, double& x, double& y) {
+    if (am.n <= 0 || !(am.sumR2 > 0.0)) return false;
+    double pick = u0 * am.sumR2, acc = 0.0;
+    int j = 0;
+    for (; j + 1 < am.n; ++j) {
+        acc += (double)am.targets[j].r * (double)am.targets[j].r;
+        if (pick < acc) break;
+    }
+    const DAimTarget tg = am.targets[j];
+    double cx, cy; dAimDiscProject(tg, sceneCenter, t, b, cx, cy);
+    const double rr = (double)tg.r * sqrt(u1);
+    const double ph = 2.0 * DPI * u2;
+    x = cx + rr * cos(ph);
+    y = cy + rr * sin(ph);
+    return true;
+}
+
+// The whole scheme in one call, straight after the ordinary emission sample has been drawn.
+// Device twin of Renderer::applyCausticAim — see render.h for the full contract. In the MAIN
+// pass this only MEASURES the sample (no RNG draw at all, so every existing GPU render stays
+// bit-identical) and returns the balance-heuristic weight in `wOut`; in the AIMED pass it
+// additionally RESAMPLES whichever half of the emission the targets actually constrain.
+//
+// `em == nullptr` is a volumetric blackbody birth: isotropic from a point inside the fire,
+// which is the cone case with p_u = 1/(4*pi).
+//
+// Returns false when the sample carries no light (an aimed direction outside a spot's outer
+// cone, below an area emitter's horizon, or outside the upstream disc that IS a distant
+// emitter's entire phase space). Those are zero contributions, not rejections needing
+// compensation: p_u is genuinely zero there.
+__device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
+                                        const DEmitter* em, DVec3& origin, DVec3& dir,
+                                        const DVec3& emitN, Real& spotW, DRng& rng,
+                                        Real& wOut) {
+    wOut = (Real)1;
+    const DAimMap& am = cs.aim;
+    if (!am.on()) return true;
+    // rho = p_a/p_u. The default is 1, not 0: an emitter that CANNOT be aimed (a collimated
+    // one — its direction is a delta) is emitted by the caustic pass with the ordinary
+    // sampler, so there the two strategies are identical and rho is exactly 1. The balance
+    // heuristic then degenerates to splitting the deposit between two equal passes.
+    double rho = 1.0;
+    const bool distant   = em && (em->shape == 3 || em->shape == 6);   // env / sun
+    const bool collimated = em && em->collimated && !distant;
+    if (collimated) {
+        // nothing to aim: rho stays 1
+    } else if (distant) {
+        DVec3 t, b; onb(dir, t, b);
+        const DVec3 base = sc.sceneCenter - dir * (Real)sc.sceneRadius;
+        if (!(am.sumR2 > 0.0)) return true;
+        double x, y;
+        if (am.aimed) {
+            if (!dAimDiscSample(am, sc.sceneCenter, t, b,
+                                (double)rng.uniform(), (double)rng.uniform(),
+                                (double)rng.uniform(), x, y))
+                return true;
+            origin = base + t * (Real)x + b * (Real)y;
+        } else {
+            const DVec3 off = origin - base;
+            x = (double)dot(off, t); y = (double)dot(off, b);
+        }
+        const double R = sc.sceneRadius;
+        // Outside the disc the emitter delivers nothing at all, so p_u = 0 and the whole
+        // contribution is zero — not a lost sample, a zero one. (Reachable only from the aimed
+        // pass, and only when a target's bounding sphere pokes past the scene's own.)
+        if (x * x + y * y > R * R) return !am.aimed;
+        int n = dAimDiscCount(am, sc.sceneCenter, t, b, x, y);
+        if (am.aimed && n < 1) n = 1;      // we drew it from a disc, so it is in one
+        rho = (double)n * R * R / am.sumR2;
+    } else {
+        const double sumOmega = dAimSumOmega(am, origin);
+        if (!(sumOmega > 0.0)) return true;
+        if (am.aimed) {
+            DVec3 w;
+            if (!dAimConeSample(am, sumOmega, origin, (double)rng.uniform(),
+                                (double)rng.uniform(), (double)rng.uniform(), w))
+                return true;
+            dir = w;
+            if (em && em->shape == 2) {                       // spot
+                const double ct = (double)dot(dir, em->beamDir);
+                if (ct <= em->spotCosOuter) return false;      // outside the cone: p_u = 0
+                const double omegaOuter = 2.0 * DPI * (1.0 - em->spotCosOuter);
+                spotW = (Real)(spotFalloff(ct, em->spotCosInner, em->spotCosOuter)
+                               * omegaOuter / em->spotOmega);
+            } else if (em && (double)dot(dir, emitN) <= 0.0) {
+                return false;                                  // below the horizon: p_u = 0
+            }
+        }
+        double pu;
+        if (em && em->shape == 2) {
+            const double ct = (double)dot(dir, em->beamDir);
+            pu = (ct > em->spotCosOuter) ? 1.0 / (2.0 * DPI * (1.0 - em->spotCosOuter)) : 0.0;
+        } else if (em) {
+            const double c = (double)dot(dir, emitN);
+            pu = (c > 0.0) ? c / DPI : 0.0;                    // cosine hemisphere
+        } else {
+            pu = 1.0 / (4.0 * DPI);                            // isotropic volumetric birth
+        }
+        if (!(pu > 0.0)) return !am.aimed;
+        int n = dAimConeCount(am, origin, dir);
+        if (am.aimed && n < 1) n = 1;
+        rho = ((double)n / sumOmega) / pu;
+    }
+    // Balance heuristic: w = N_m p_u / (N_m p_u + N_c p_a). causticaim.h has why the SAME
+    // weight is right for a photon from either pass.
+    wOut = (Real)(1.0 / (1.0 + am.misRatio * rho));
+    return true;
+}
+
 // Sample one photon from the emitters: fills ro/rd/beta/lambda, accumulates the
 // emitted energy, and performs the direct emitter->camera connection (models A/B).
 // Returns false when the wavelength draw yields a zero pdf (skip this photon).
+// `spec` (optional out) is the photon's SPECTRAL BUNDLE at birth (DBeamSpec): the extra
+// stratified wavelengths its beams may also carry. It is left empty unless the scene and the
+// emitter both qualify — see the fill site below.
 __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
                                  int camMode, DRng& rng,
-                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted) {
+                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted,
+                                 DBeamSpec* spec = nullptr, Real* causticW = nullptr) {
+    if (spec) { spec->n = 0; spec->achro = 0; spec->cie = DVec3{0, 0, 0}; spec->emIdx = -1; }
+    if (causticW) *causticW = (Real)1;
     // ROADMAP C3: split birth between surface/point/env emitters and volumetric "fire"
     // emission by power. grandTotal = totalPower + totalEmissionPower; the volumeBirth
     // test short-circuits (drawing NO extra RNG) when there are no emissive volumes, so
@@ -6376,6 +7851,16 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         double sr = sqrt(fmax(0.0, 1.0 - z * z));
         double phi = 2.0 * DPI * (double)rng.uniform();
         DVec3 dir = DVec3{ (Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z };
+        // Aimed caustic emission (causticaim.h). A fire birth POINT is already fixed, so it is
+        // the DIRECTION that gets aimed; p_u for an isotropic birth is 1/(4pi), which is the
+        // `em == nullptr` case. No-op — and no RNG draw — unless an aim map is bound.
+        {
+            DVec3 emitNv = dir; Real spotWv = (Real)1;   // unread when em == nullptr
+            Real wv = (Real)1;
+            if (!dApplyCausticAim(sc, cs, nullptr, origin, dir, emitNv, spotWv, rng, wv))
+                return false;
+            if (causticW) *causticW = wv;
+        }
         // Direct-visibility emission splat (the flame seen directly by the camera).
         camSplatEmissionAll(sc, cs, camMode, origin, lambda, beta, rng);
         ro = origin + dir * RAY_EPS; rd = dir;
@@ -6450,8 +7935,22 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
     }
+    // Aimed caustic emission (causticaim.h). Placed here, after the shape branch has produced
+    // an ordinary sample and BEFORE `beta *= spotW`, because the aimed pass resamples the
+    // direction and therefore recomputes spotW. In the main pass this only measures the
+    // sample — no RNG draw, so every existing render stays bit-for-bit — and returns the
+    // caustic MIS weight. Host twin: the same call in Renderer::tracePhoton.
+    {
+        Real wv = (Real)1;
+        if (!dApplyCausticAim(sc, cs, &em, origin, dir, emitN, spotW, rng, wv)) return false;
+        if (causticW) *causticW = wv;
+    }
     Real pdfL = 0;
-    lambda = sampleLambda(sc, em, rng, pdfL);
+    // The variate is drawn explicitly rather than inside sampleLambda so the spectral bundle
+    // below can stratify from the SAME u (hero sampling, hero.h). Bit-identical: sampleLambda
+    // is exactly this call with its own rng.uniform().
+    const double uLam = (double)rng.uniform();
+    lambda = sampleLambdaU(sc, em, uLam, pdfL);
     if (pdfL <= 0) return false;
     // When emissive volumes exist the emitter-vs-fire split already consumed the
     // totalPower/grandTotal factor, so a chosen emitter photon carries the full
@@ -6477,6 +7976,49 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     if (emitPatW != 1.0) beta = (Real)((double)beta * emitPatW);
     eEmitted += beta;
 
+    // SPECTRAL BUNDLE at birth (host twin: Renderer::tracePhoton). C-1 more wavelengths,
+    // stratified from the same variate through the same emitter CDF, that this photon's beams
+    // will also carry. They all carry the SAME power — the emission pdf is proportional to the
+    // emitter's own SPD, so spd(lambda)/pdf(lambda) is the SPD's integral for every wavelength
+    // alike — which is why the record stores wavelengths and no weights.
+    //
+    // Excluded, because on these paths `beta` is NOT wavelength-independent and the
+    // equal-power argument fails outright: an IMAGE environment (beta is reweighted by the
+    // texel's own radiance at lambda) and a GRIN scene (the bend, and thus the whole geometry
+    // of the path, is a function of lambda). A volumetric "fire" birth returns far above and
+    // never reaches here, for the same reason: its beta carries ke(x, lambda)/pdf(lambda).
+    if (spec && cs.beamSpecC > 1 && cs.beamCount && !envImage && !sc.hasGrin) {
+        const int C = (cs.beamSpecC > 4) ? 4 : cs.beamSpecC;
+        for (int i = 1; i < C; ++i) {
+            double uu = uLam + (double)i / (double)C;
+            if (uu >= 1.0) uu -= 1.0;
+            Real pI = 0;
+            const Real lI = sampleLambdaU(sc, em, uu, pI);
+            // A zero-density secondary would have to be given weight 0 while the survivors
+            // kept 1/C, and the record stores no per-wavelength weight — so drop the WHOLE
+            // bundle rather than renormalise over the survivors, which would over-count them.
+            if (!(pI > 0)) { spec->n = 0; break; }
+            spec->lam[spec->n++] = lI;
+        }
+    }
+    // ACHROMATIC-PATH STATE at birth. The gate is the SAME one the bundle uses — and for the
+    // same reason, since both rest on `beta` being wavelength-independent — but it does not
+    // need `-beamspec > 1`, because the mean-CIE fold is not a bundle and costs no record
+    // space. A photon born on an emitter with no visible-band energy has cieMean {0,0,0},
+    // which would fold every beam it lays down to black, so that case stays monochromatic.
+    if (spec && cs.beamAchroOK && cs.beamCount && !envImage && !sc.hasGrin) {
+        const DVec3 cm = em.cieMean;
+        if (cm.x > 0 || cm.y > 0 || cm.z > 0) { spec->cie = cm; spec->achro = 1; }
+    }
+    // The emitter index travels whenever the path is still wavelength-independent, whether or
+    // not THIS medium can fold at deposit time: the gather-time fold's question is asked per
+    // deposited beam, and a photon can cross an achromatic cloud and a rainbow curtain in one
+    // step. Kept separate from `achro` for exactly that reason.
+    if (spec && cs.beamAchroOK && cs.beamCount && !envImage && !sc.hasGrin) {
+        const DVec3 cm = em.cieMean;
+        if (cm.x > 0 || cm.y > 0 || cm.z > 0) spec->emIdx = (ei <= 32767) ? (int)ei : -1;
+    }
+
     // Connect the emitter itself to the camera (makes the source visible): model
     // B splats to the pinhole, model A splats through the finite lens pupil. Model
     // C instead catches photons that physically arrive. A spot is a point light
@@ -6489,7 +8031,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         camSpecularSplatAll(sc, cs, camMode, origin, emitN, lambda, beta, (Real)1, rng);
     }
 
-    ro = origin + dir * RAY_EPS; rd = dir;
+    ro = dOffsetAlong(origin, emitN, dir); rd = dir;
     return true;
 }
 
@@ -6561,7 +8103,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
     } else if (m.type == D_MIRROR) {
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
-        DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; return WF_CONTINUE;
+        DVec3 o = reflectv(rd, h.n); rd = o; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
     } else if (m.type == D_GRATING) {
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -6570,8 +8112,8 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_HALFMIRROR) {
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
-        if (rng.uniform() < r) { DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; }
-        else { ro = h.p + rd * RAY_EPS; }
+        if (rng.uniform() < r) { DVec3 o = reflectv(rd, h.n); rd = o; ro = dOffsetAlong(h.p, h.ng, rd); }
+        else { ro = dOffsetAlong(h.p, h.ng, rd); }
         return WF_CONTINUE;
     } else if (m.type == D_FILTER) {
         // Colored gel / Wratten filter (device twin of render.h MatType::Filter): a thin
@@ -6579,14 +8121,14 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         // else absorb. RR on the transmittance keeps beta unchanged and unbiased.
         Real t = clamp01(dTransmitSlot(sc, m, h, lambda));
         if (rng.uniform() >= t) { eAbsorbed += beta; return WF_TERMINATE; }
-        ro = h.p + rd * RAY_EPS;   // straight through, direction unchanged
+        ro = dOffsetAlong(h.p, h.ng, rd);   // straight through, direction unchanged
         return WF_CONTINUE;
     } else if (m.type == D_GLOSSY) {
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
         DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
-        ro = h.p + h.n * RAY_EPS; rd = o; return WF_CONTINUE;
+        rd = o; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
     } else if (m.type == D_FLUORESCENT) {
         // Two competing channels: elastic diffuse reflection (albedo rho, wavelength
         // preserved) and dye excitation (prob aEff = min(eps, 1-rho) so the channels
@@ -6624,13 +8166,67 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         }
         { DVec3 wo = cosineHemisphere(h.n, rng);
           beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
-          ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
+          rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
     } else if (m.type == D_HAIR) {
         // Split out (__noinline__) so its fat double-precision frame is only paid on an
         // actual hair hit — see the comment on interactHair.
         return interactHair(sc, cs, camMode, m, h, ro, rd, beta, lambda, rng, eAbsorbed);
     }
     return WF_CONTINUE;   // unreachable: caller dispatches only the specular types
+}
+
+// ---- caustic classification (device twin of photonVertexKind, render.h) ----------------
+// The bit pair a photon carries down its path for Jensen's two-map split. Bit 0 = "a FOCUSING
+// vertex has been seen"; bit 1 = "a SCATTERING vertex has been seen". A deposit is a caustic
+// iff FOCUS && !SCATTER, i.e. the path reads L·S⁺·D. See render.h for what makes a vertex
+// focusing rather than scattering, and why the glossy threshold sits where it does — the two
+// definitions MUST agree, or a CPU and a GPU render of the same scene split their photons
+// differently and disagree on the image.
+#define PV_BIT_FOCUS   1
+#define PV_BIT_SCATTER 2
+// The per-path caustic state, carried from emission to the deposit. `bits` is the pair above;
+// `w` is the balance-heuristic MIS weight the aimed caustic pass gives this photon at BIRTH
+// (causticaim.h; host twin Renderer::causticW), which scales the caustic deposit and nothing
+// else.
+//
+// A struct rather than the weight bit-packed into the int: this object is written by two
+// kernels and read by a third, and DPhoton's own comment already records why an implicit
+// encoding in a buffer several kernels touch is a trap. It is also cheap — the only *storage*
+// of it is the wavefront's per-slot array, one entry per in-flight photon.
+//
+// A path makes AT MOST ONE caustic deposit, because every deposit site sets PV_BIT_SCATTER
+// immediately after storing: the first diffuse vertex either is a caustic (a focus vertex
+// preceded it) or is not, and everything past it is diffuse indirect light. So `w` is
+// consumed exactly once, or never.
+struct DPathCaustic {
+    int  bits;
+    Real w;
+};
+// L·S+·D: focused at least once, never scattered since. A null `pc` means the caller is not
+// classifying at all (every mode but M), so nothing it deposits is a caustic.
+__device__ static inline bool dPathIsCaustic(const DPathCaustic* pc) {
+    return pc && (pc->bits & PV_BIT_FOCUS) && !(pc->bits & PV_BIT_SCATTER);
+}
+// The caustic-deposit weight for this path — exactly 1 when nothing is aiming, which is every
+// render without `-causticn`.
+__device__ static inline Real dPathCausticW(const DPathCaustic* pc) {
+    return pc ? pc->w : (Real)1;
+}
+__device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h);
+__device__ static inline int dPhotonVertexBit(const DScene& sc, const DMaterial& m,
+                                              const DHit& h) {
+    switch (m.type) {
+        case D_DIELECTRIC: case D_MIRROR: case D_THINFILM:
+        case D_MULTILAYER: case D_GRATING: case D_HALFMIRROR:
+            return PV_BIT_FOCUS;
+        case D_GLOSSY:
+            return (dMatRoughness(sc, m, h) <= (Real)kCausticGlossRoughness) ? PV_BIT_FOCUS
+                                                                             : PV_BIT_SCATTER;
+        case D_FILTER:
+            return 0;                       // straight through: direction untouched
+        default:
+            return PV_BIT_SCATTER;          // Fluorescent, Hair, and the diffuse family
+    }
 }
 
 // Advance a photon by one bounce given its precomputed intersection `h`. Mutates
@@ -6642,13 +8238,23 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
 // span it just walked, which this step never sees otherwise: `grinArc` is the arc length
 // marched (so the dielectric Beer-Lambert can cover it) and `grinMed >= 0` means a medium
 // collided during the march, at `ro`. Defaults (-1, 0) are "no GRIN in this scene".
+//
+// `pathC` (optional) is the caustic state carried down the path — the PV_BIT_* pair above
+// plus the aimed pass's MIS weight (DPathCaustic), host twins `sawFocus`/`sawScatter` and
+// `causticW` in Renderer::tracePhoton. Null means "do not classify", which is what every mode
+// other than M passes.
+//
+// `spec` (optional) is the photon's live SPECTRAL BUNDLE (DBeamSpec). It is deposited with
+// this step's beam and then RETIRED, unconditionally, before returning: see the note at the
+// retirement site for why that is the conservative and provably-correct rule.
 __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 int camMode, int diffraction, const DHit& h,
                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
                                 double& eAbsorbed, double& eSensor, double& eEscaped,
                                 DMediumStack& stk, DRng* crng = nullptr,
                                 int grinMed = -1, Real grinArc = 0,
-                                int* beamScat = nullptr) {
+                                int* beamScat = nullptr, DPathCaustic* pathC = nullptr,
+                                DBeamSpec* spec = nullptr) {
     Real dSurf = h.valid ? h.t : BIG;
 
     // Dielectric Beer-Lambert over the marched arc (the block further down only covers the
@@ -6673,7 +8279,13 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     // ordinary fog somewhere else in a GRIN scene does (host twin: Renderer::emitBeams).
     const bool doBeamSplat   = cs.beamGather && crng && cs.nCam > 1 && camMode != CAM_C && sc.mediaN > 0;
     const bool doBeamDeposit = cs.beamCount && crng && sc.mediaN > 0;
-    const bool doBeam = doBeamSplat || doBeamDeposit;
+    // `beamStraightOnly` is the aimed caustic pass (causticaim.h): it must cross media by the
+    // SAME rule as the main pass it is MIS-combined with, but store nothing. Everything below
+    // then falls out on its own — the splat loop runs zero cameras (nCam == 0), dEmitBeams is
+    // gated on doBeamDeposit, and the transmittance draw already bills the transport stream
+    // whenever the splat path is off. Host twin: Renderer::doBeamStraight.
+    const bool doBeam = doBeamSplat || doBeamDeposit ||
+                        (cs.beamStraightOnly && crng && sc.mediaN > 0);
     // MULTIPLE SCATTERING in the beam media (0.199.0; -beams-order). Host twin: the `beamMS`
     // flag in Renderer::tracePhoton, where the full derivation lives. In short: the stored
     // beams are LONG (they run to the next surface and the gather applies Tr analytically), so
@@ -6739,7 +8351,18 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     {
         int cm = stk.topMat();
         Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
-        if (a > 0) beta *= exp(-a * dEvent);
+        if (a > 0) {
+            beta *= exp(-a * dEvent);
+            // Coloured glass: sigma_a is per-wavelength, and the beam record stores ONE
+            // `absorb` which the gather Beer-Lamberts every wavelength with. Handing the
+            // secondaries the hero's absorption would be a bias, not noise, so a beam that
+            // runs inside an absorbing dielectric goes back to monochromatic. (Host twin:
+            // the `specSec = 0` beside Renderer::tracePhoton's glass Beer-Lambert.)
+            // The achromatic-path claim dies here for the same reason and a stronger one:
+            // `beta` itself has just been multiplied by a wavelength-dependent factor, so the
+            // photon no longer represents the whole band at equal power.
+            if (spec) { spec->n = 0; spec->achro = 0; }
+        }
     }
 
     // PHOTON-BEAMS gather (device twin of the CPU -beams block in render.h, where the full
@@ -6786,7 +8409,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // Mode M: store the crossing itself, so every camera of a flyby can gather from it
         // later without the photon knowing any camera exists.
         if (doBeamDeposit) dEmitBeams(sc, cs, ro, rd, dChord, lambda, betaPre, aC, *crng,
-                                      beamMS ? DMedAll : DMedStraight);
+                                      beamMS ? DMedAll : DMedStraight, spec);
         if (!beamMS) {
             // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over the
             // whole crossing (single-scatter transmission) so surfaces behind the fog are
@@ -6809,6 +8432,31 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
             eAbsorbed += (double)(before - beta);
         }
     }
+    // Retire the spectral bundle (host twin: the `specSec = 0` in Renderer::tracePhoton).
+    // OUTSIDE the beam block on purpose: if that block was skipped (a march hit, or a
+    // zero-length chord) nothing was deposited, but the photon still goes on to interact, so a
+    // bundle left live here would be picked up by a LATER chord's deposit — after a
+    // wavelength-dependent surface event, where the shared geometry argument no longer holds.
+    // One retirement per step, unconditionally, is what makes the rule airtight.
+    //
+    // THE ACHROMATIC-PATH FLAG IS RETIRED BY A WEAKER RULE, and that difference is the whole
+    // point of it. The bundle has to die every step because the record stores wavelengths with
+    // no weights, so it cannot represent a path where the wavelengths have started to diverge.
+    // `achro` claims instead that they have NOT diverged, and an event that is itself
+    // wavelength-independent leaves that claim true. A scatter in an achromatic medium is
+    // exactly such an event: the free flight that reached it used an achromatic sigma_t, the
+    // albedo roulette below reads a flat albedo, and dMedPhaseSample takes its direction from
+    // `g` alone. Everything else — any surface interaction, an escape, a rainbow or otherwise
+    // chromatic medium — does diverge, so the flag dies.
+    //
+    // This is what makes the mean-CIE fold reach a cloud at all. gallery_rain's cloud has
+    // albedo 0.9964, so a photon inside it scatters of the order of 278 times before it is
+    // absorbed; under the bundle's one-step rule only the FIRST of those ~278 chords was ever
+    // spectral, which is why `-beamspec 4` measured -8.5% chroma there and nothing more.
+    if (spec) {
+        spec->n = 0;
+        if (spec->achro && !(mediumEvent && sc.media[scatterMed].achro)) spec->achro = 0;
+    }
 
     if (mediumEvent) {
         const DMedium& sm = sc.media[scatterMed];
@@ -6828,6 +8476,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real phPdf;   // scatter dir from HG or the rainbow droplet phase (pdf unused: p/pdf==1)
         DVec3 nd = dMedPhaseSample(sm, rd, lambda, rng, phPdf);
         ro = mp; rd = nd;
+        // An ANALOG collision is a wide redirect: the beam's focus does not survive it, so
+        // anything deposited downstream is indirect light. A `-beams` STRAIGHT crossing never
+        // reaches here and stays neutral — it does not deflect the photon at all. (render.h)
+        if (pathC) pathC->bits |= PV_BIT_SCATTER;
         return WF_CONTINUE;
     }
 
@@ -6853,6 +8505,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         m.type == D_HAIR) {
         // The specular / wavelength-switching lobes (+ the fiber BCSDF, which is
         // wavelength-coupled like them) — shared with the hero tracer.
+        // Classify for the caustic split BEFORE the interaction, in the CALLER: this is the
+        // one place that holds both `m` and `h`, and keeping it out of interactSpecular (which
+        // the hero tracer also calls) leaves exactly one definition of the rule.
+        if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
                                 ro, rd, beta, lambda, rng, eAbsorbed, stk);
     } else if (m.type == D_DIFFUSETRANSMIT) {
@@ -6868,7 +8524,9 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
-        depositPhoton(cs, h.p, h.n, beta, lambda);   // photon-map deposit (mode M)
+        // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
+        depositPhoton(cs, h.p, h.n, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+        if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         // Both lobes get the adjoint correction; |cos| in the factor makes it lobe-agnostic,
         // so h.n / ngo serve the transmit lobe too (nb = -h.n is used only for the splat side).
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rhoR, rng);
@@ -6878,21 +8536,23 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else absorb — beta
         // unchanged on a scatter (like the diffuse case), plus the adjoint correction.
         Real u = rng.uniform();
-        if (u < rhoR)      { DVec3 wo = cosineHemisphere(h.n, rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
-        else if (u < sum)  { DVec3 wo = cosineHemisphere(nb,  rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); ro = h.p + nb  * RAY_EPS; rd = wo; return WF_CONTINUE; }
+        if (u < rhoR)      { DVec3 wo = cosineHemisphere(h.n, rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
+        else if (u < sum)  { DVec3 wo = cosineHemisphere(nb,  rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
         eAbsorbed += beta; return WF_TERMINATE;
     } else {
         // Diffuse (texture-sampled reflectance when the material binds a texture).
         Real rho = dDiffuseRho(sc, m, h, lambda);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
-        depositPhoton(cs, h.p, h.n, beta, lambda);   // photon-map deposit (mode M)
+        // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
+        depositPhoton(cs, h.p, h.n, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+        if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
         { DVec3 wo = cosineHemisphere(h.n, rng);
           beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
-          ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
+          rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
     }
 }
 
@@ -6920,7 +8580,7 @@ __device__ static void connectHero(const DScene& sc, const DCamera& cam, double*
     if (stG <= (Real)0) return;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occludedTo(sc, dOffsetAlong(p, ng, wdir), p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real geo = cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
@@ -6953,7 +8613,7 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occludedTo(sc, dOffsetAlong(p, ng, wdir), p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     Real cellNorm = (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     Real geo = cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG * cellNorm;
@@ -6992,7 +8652,9 @@ __device__ static void camSpecularSplatAllHero(const DScene& sc, const DCamSet& 
 // false when the hero wavelength draws a zero pdf (skip this photon). Emission geometry is
 // byte-identical to genPhoton (λ-independent); only the wavelength/throughput bundle differs.
 __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int camMode, int C,
-        DRng& rng, DVec3& ro, DVec3& rd, Real* lam, Real* beta, bool& secAlive, double& eEmitted) {
+        DRng& rng, DVec3& ro, DVec3& rd, Real* lam, Real* beta, bool& secAlive, double& eEmitted,
+        Real* causticW = nullptr) {
+    if (causticW) *causticW = (Real)1;
     // A scene with no emitters arrives here with sc.emitters == nullptr (the host uploads a
     // null pointer for an empty emitter list), so the indexing below would fault the device.
     // genPhoton has the equivalent prologue (grandTotal <= 0) and dGenLightSubpath the
@@ -7045,6 +8707,13 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
     }
+    // Aimed caustic emission — see the scalar genPhoton. Before `base *= spotW` for the same
+    // reason (the aimed pass recomputes spotW).
+    {
+        Real wv = (Real)1;
+        if (!dApplyCausticAim(sc, cs, &em, origin, dir, emitN, spotW, rng, wv)) return false;
+        if (causticW) *causticW = wv;
+    }
 
     // Hero + stratified secondaries from this emitter's SPD (one base draw, C-1 wrapped
     // strata). The hero must have a valid pdf; a dead secondary simply carries beta 0.
@@ -7085,7 +8754,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         camSpecularSplatAllHero(sc, cs, camMode, origin, emitN, lam, beta, rhoOne, nUp, rng);
     }
 
-    ro = origin + dir * RAY_EPS; rd = dir;
+    ro = dOffsetAlong(origin, emitN, dir); rd = dir;
     return true;
 }
 
@@ -7101,7 +8770,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
 __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int camMode,
         int diffraction, int C, const DHit& h, DVec3& ro, DVec3& rd, Real* lam, Real* beta,
         bool& secAlive, DRng& rng, double& eAbsorbed, double& eSensor, double& eEscaped,
-        DMediumStack& stk) {
+        DMediumStack& stk, DPathCaustic* pathC = nullptr) {
     const int nUp = C;
     Real dEvent = h.valid ? h.t : BIG;
 
@@ -7142,7 +8811,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
         DVec3 wiPrev = -rd;
-        for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i]);
+        { const bool caus = dPathIsCaustic(pathC);
+          for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i], caus);
+          if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
             splatSurfaceAllHero(sc, cs, camMode, h.p, nb, ngo * (Real)(-1), wiPrev, lam, beta, rhoT, nUp, rng);
@@ -7173,7 +8844,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             DVec3 wo = cosineHemisphere(h.n, rng);
             Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
             for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-            ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE;
+            rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
         } else if (uu < sumHero) {
             for (int i = 0; i < nUp; ++i) {
                 Real w = rhoT[i] / qT;
@@ -7183,13 +8854,14 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             DVec3 wo = cosineHemisphere(nb, rng);
             Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
             for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-            ro = h.p + nb * RAY_EPS; rd = wo; return WF_CONTINUE;
+            rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
         }
         for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i];
         return WF_TERMINATE;
     }
 
     if (m.type == D_MIRROR || m.type == D_FILTER || m.type == D_GLOSSY) {
+        if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);   // caustic split
         // ACHROMATIC delta lobes (device twin of render.h's Mirror/Filter/Glossy hero case):
         // specular — so no camera connect, exactly like the scalar path — but the outgoing
         // DIRECTION does not depend on λ, so the bundle keeps riding and only the per-λ
@@ -7212,13 +8884,13 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             beta[i] *= w;
         }
         if (m.type == D_MIRROR) {
-            DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o;
+            DVec3 o = reflectv(rd, h.n); rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
         } else if (m.type == D_FILTER) {
-            ro = h.p + rd * RAY_EPS;   // straight through, direction unchanged
+            ro = dOffsetAlong(h.p, h.ng, rd);   // straight through, direction unchanged
         } else {
             DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
             if (dot(o, h.n) <= 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
-            ro = h.p + h.n * RAY_EPS; rd = o;
+            rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
         }
         return WF_CONTINUE;
     }
@@ -7231,6 +8903,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         // here because its sigma_a (and the reflectance→absorption inversion) is per-λ, so
         // one fiber interaction cannot be shared across C wavelengths — matching the CPU
         // tracePhotonHero, which de-heroes onto the scalar MatType::Hair path.
+        if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);   // caustic split
         beta[0] *= (Real)C; secAlive = false;
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
                                 ro, rd, beta[0], lam[0], rng, eAbsorbed, stk);
@@ -7241,7 +8914,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, m, h, lam[i]));
     DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     DVec3 wiPrev = -rd;
-    for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i]);
+    { const bool caus = dPathIsCaustic(pathC);
+      for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i], caus);
+      if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
     if (camMode == CAM_A || camMode == CAM_B) {
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
         camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rho, nUp, rng);
@@ -7262,7 +8937,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     DVec3 wo = cosineHemisphere(h.n, rng);
     Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
     for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-    ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE;
+    rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
 }
 
 // Full hero photon: emit, then bounce until termination. While the secondaries are alive
@@ -7274,19 +8949,28 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
     Real lam[hero::kHeroMax], beta[hero::kHeroMax];
     bool secAlive = false;
     DVec3 ro, rd;
-    if (!genPhotonHero(sc, cs, camMode, C, rng, ro, rd, lam, beta, secAlive, eEmitted)) return;
+    // `causticW` rides on the path state below: the aimed caustic pass fixes it at birth and
+    // it is spent at the ONE caustic deposit the path can make.
+    Real bornCausticW = (Real)1;
+    if (!genPhotonHero(sc, cs, camMode, C, rng, ro, rd, lam, beta, secAlive, eEmitted,
+                       &bornCausticW)) return;
     DMediumStack stk; stk.clear();
     bool done = false;
+    // Caustic classification of the path so far (host twin: sawFocus/sawScatter in
+    // Renderer::tracePhotonHero). It survives the de-hero handoff below because the two step
+    // functions share it — a bundle that de-heros at a gem must carry that FOCUS onward, or
+    // every dispersive caustic would be filed as ordinary indirect light.
+    DPathCaustic pathC{0, bornCausticW};
     for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
         if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // gate excludes GRIN; kept for symmetry
         DHit h = closestHit(sc, ro, rd);
         int r;
         if (secAlive)
             r = shadeStepHero(sc, cs, camMode, diffraction, C, h, ro, rd, lam, beta, secAlive, rng,
-                              eAbsorbed, eSensor, eEscaped, stk);
+                              eAbsorbed, eSensor, eEscaped, stk, &pathC);
         else
             r = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta[0], lam[0], rng,
-                          eAbsorbed, eSensor, eEscaped, stk);
+                          eAbsorbed, eSensor, eEscaped, stk, nullptr, -1, 0, nullptr, &pathC);
         if (r == WF_TERMINATE) done = true;
     }
     if (!done) {
@@ -7313,7 +8997,15 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             continue;
         }
         DVec3 ro, rd; Real beta, lambda;
-        if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
+        // The photon's spectral bundle (`-beamspec`): filled at birth, deposited with the
+        // first chord, retired by shadeStep. Empty for every scene that does not qualify, in
+        // which case every beam is the classic monochromatic record.
+        DBeamSpec spec;
+        // The aimed caustic pass's per-photon MIS weight, fixed at birth and spent at the ONE
+        // caustic deposit a path can make (causticaim.h). Exactly 1 without `-causticn`.
+        Real bornCausticW = (Real)1;
+        if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted, &spec,
+                       &bornCausticW)) continue;
         bool done = false;
         DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
         // PHOTON-BEAMS: an INDEPENDENT per-photon stream used ONLY by the beam branch —
@@ -7328,6 +9020,9 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         // -beams-order cap can retire multiple scattering mid-path (host twin: `beamScatters`
         // in Renderer::tracePhoton).
         int beamScat = 0;
+        // Caustic state of the path so far — see dPhotonVertexBit / dPathIsCaustic, plus the
+        // aimed pass's MIS weight fixed at birth (causticaim.h).
+        DPathCaustic pathC{0, bornCausticW};
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             // Bend through any GRIN region first, INTEGRATING THE MEDIA ALONG THE CURVE
             // (see dGrinMarch): every medium is transported analog on the curved span,
@@ -7338,7 +9033,8 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             DHit h = closestHit(sc, ro, rd);
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                           eAbsorbed, eSensor, eEscaped, stk, cs.beamsOn() ? &crng : nullptr,
-                          gm.hit ? gm.which : -1, gm.arc, &beamScat) == WF_TERMINATE) done = true;
+                          gm.hit ? gm.which : -1, gm.arc, &beamScat,
+                          &pathC, &spec) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -7391,6 +9087,14 @@ struct WFState {
     // allocated always but only written/read in GRIN scenes.
     int*   gmMed;
     Real*  gmArc;
+    // Caustic path state: the per-slot twin of the megakernel's local `DPathCaustic pathC`
+    // in kTrace. A photon's FOCUS/SCATTER history decides which photon map its next diffuse
+    // deposit lands in (see dPhotonVertexBit / dPathIsCaustic), and that history is built up
+    // across bounces — so like the medium stack it has to live in the pool rather than in a
+    // shade-kernel local, which dies at the kernel boundary. The aimed pass's MIS weight
+    // (causticaim.h) rides in the same record for the same reason: it is fixed at BIRTH, in
+    // wfSpawn, and spent bounces later at the deposit.
+    DPathCaustic* pathC;
 };
 
 // Claim photon budget and emit fresh photons into `slot` until one is successfully
@@ -7406,10 +9110,14 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
         unsigned long long idx = atomicAdd(dispatched, 1ULL);
         if (idx >= (unsigned long long)N) return false;
         DVec3 ro, rd; Real beta, lambda; double eEm = 0;
-        if (genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEm)) {
+        Real bornCausticW = (Real)1;
+        if (genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEm, nullptr, &bornCausticW)) {
             st.ro[slot] = ro; st.rd[slot] = rd;
             st.beta[slot] = beta; st.lambda[slot] = lambda;
             st.bounce[slot] = 0; st.alive[slot] = 1; st.stkN[slot] = 0;
+            // Fresh photon: no vertex seen yet, so neither bit is set; the aimed pass's
+            // weight is whatever emission just assigned it (1 without `-causticn`).
+            st.pathC[slot] = DPathCaustic{0, bornCausticW};
             atomicAdd(&energy[0], eEm);
             return true;
         }
@@ -7469,9 +9177,11 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
         stk.pri[i]    = st.stkPri[slot * DMediumStack::CAP + i];
     }
     double eAbs = 0, eSen = 0, eEsc = 0;
+    DPathCaustic pathC = st.pathC[slot];   // caustic history + MIS weight, from earlier bounces
     int res = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                         eAbs, eSen, eEsc, stk, nullptr,
-                        st.gmMed[slot], st.gmArc[slot]);   // GRIN pre-pass, from kWfExtend
+                        st.gmMed[slot], st.gmArc[slot],   // GRIN pre-pass, from kWfExtend
+                        nullptr, &pathC);
     int bounce = st.bounce[slot] + 1;
     bool pathDone = (res == WF_TERMINATE);
     // Bounce cap: the photon survived maxBounce shadeStep calls without terminating —
@@ -7486,6 +9196,7 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
         st.lambda[slot] = lambda;   // fluorescence may Stokes-shift lambda mid-path
         // Store the medium stack back to SoA (carry to the next segment).
         st.stkN[slot] = stk.n;
+        st.pathC[slot] = pathC;   // carry the caustic history + MIS weight too
         for (int i = 0; i < stk.n; ++i) {
             st.stkMat[slot * DMediumStack::CAP + i] = stk.matIdx[i];
             st.stkPri[slot * DMediumStack::CAP + i] = stk.pri[i];
@@ -7616,6 +9327,55 @@ __device__ static inline bool dOnSurface(const DVertex& v) {
 __device__ static inline bool dConnectibleType(int tp) {
     return tp == D_DIFFUSE || tp == D_GLOSSY || tp == D_FLUORESCENT || tp == D_DIFFUSETRANSMIT;
 }
+
+// --- MODE J (UPBP): eta' of the merge technique at a medium vertex ----------------------
+//
+// Device twin of bdpt.h mergeEtaPrime. The merge/connection density RATIO at `v`, less the
+// constant kappa = n_m * 2r the caller factors out (it is the same at every site, so it does
+// not belong in here). Returning 0 means "no merge technique exists here", which is the
+// correct weight contribution for a non-medium vertex — and is what makes every call below
+// vanish in mode D, where kappa is 0 and none of them is even reached.
+//
+// WHY 2r AND NOT THE KERNEL VALUE: same reason VCM uses 1/(pi r^2) rather than its own
+// kernel. When this ratio weights a CONNECTION, the merge being weighed against is
+// hypothetical and has d_perp = 0, where the kernel is at its maximum and nothing like what
+// a real merge sees. The balance heuristic needs a consistent partition, not the pointwise
+// kernel; 1/(2r) is the mean of K1 over its support.
+// Device twin of bdpt.h's surfMergeSite: could the light pass have STORED a photon here? The
+// gather and the weight must ask the same question the store did -- a site the weight counts but
+// the map never fills under-weights every competing technique, and one the map fills but the
+// weight ignores double-counts.
+__device__ static inline bool dSurfMergeSite(const DScene& sc, const DVertex& v) {
+    if (v.type != BV_SURFACE || v.delta || v.matId < 0) return false;
+    return dConnectibleType(sc.mats[v.matId].type);
+}
+
+__device__ static double dMergeEtaPrime(const DScene& sc, const DVec3& pPrev, const DVertex& v,
+                                        const DVec3& pNext, double pLight, Real lambda,
+                                        const DPatEnv& env) {
+    if (v.type != BV_MEDIUM) return 0.0;
+    if (v.mediumId < 0 || v.mediumId >= sc.mediaN) return 0.0;
+    if (!(pLight > 0.0)) return 0.0;
+    DVec3 din = v.p - pPrev;
+    const double dl = sqrt(ddot(din, din));
+    if (!(dl > 0.0)) return 0.0;
+    din = din * (Real)(1.0 / dl);
+    DVec3 dout = pNext - v.p;
+    const double dn = sqrt(ddot(dout, dout));
+    if (!(dn > 0.0)) return 0.0;
+    dout = dout * (Real)(1.0 / dn);
+    // sin of the angle between the beam and the camera ray. The camera ray runs the other
+    // way (-dout), but |sin| is unchanged by the flip.
+    const double c = ddot(din, dout);
+    const double s2 = 1.0 - c * c;
+    if (!(s2 > 0.0)) return 0.0;                 // exactly collinear: no acceptance volume
+    const DMedium& md = sc.media[v.mediumId];
+    const double sigT = (double)medSigmaT(md, lambda) * dMedDensityAt(md, v.p, env);
+    if (!(sigT > 0.0)) return 0.0;
+    const double tr = dTrDet(sc, v.p, dout, dn, lambda, env);
+    if (!(tr > 0.0)) return 0.0;
+    return sqrt(s2) * pLight / (sigT * tr);
+}
 __device__ static bool dVertConnectible(const DScene& sc, const DVertex& v) {
     if (v.type == BV_CAMERA) return true;
     if (v.type == BV_MEDIUM) return true;   // volume in-scatter always connects
@@ -7699,7 +9459,7 @@ __device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
         DHit h = dVertHit(vt);
         double r = clamp01(dReflectSlot(sc, m, h, lambda));
         double e = dGlossyExp((double)dMatRoughness(sc, m, h));
-        DVec3 mdir = reflectv(wo * (Real)-1, ns);
+        DVec3 mdir = reflectv(wo * (Real)(-1), ns);
         double cosLobe = ddot(wi, mdir);
         if (cosLobe <= 0) return 0.0;
         double lobe = (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
@@ -7728,7 +9488,7 @@ __device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
         if (cosWi <= 0 || cosWo <= 0) return 0.0;
         DHit h = dVertHit(vt);
         double e = dGlossyExp((double)dMatRoughness(sc, m, h));
-        DVec3 mdir = reflectv(wo * (Real)-1, ns);
+        DVec3 mdir = reflectv(wo * (Real)(-1), ns);
         double cosLobe = ddot(wi, mdir);
         if (cosLobe <= 0) return 0.0;
         return (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
@@ -8072,6 +9832,134 @@ __device__ static void dGenRay(const DCamera& cam, int px, int py, Real jx, Real
     rd = normalize(cam.w * (Real)cos(th) + radial * (Real)sin(th));
 }
 
+// kDMaxLightPick is deliberately half the CPU's 32: the LtSample array and ltSample's
+// traversal stack are per-thread local-memory frames in a megakernel that is already
+// register-starved, so every slot is paid by every thread. 16 connections per vertex is
+// far past the point where more splitting improves the image.
+#define kDMaxLightPick 16
+// (Hoisted above the GLOSSY-NEE block below, which needs the same bound: dLightPickExact has to
+// scan exactly the prefix of lightTreeAlways that dPickEmitters draws, or the two halves of the
+// MIS weight disagree about which emitters were connected. Its original home is DEmitterDraw,
+// a few hundred lines down.)
+
+// ---- GLOSSY-NEE on the device ---------------------------------------------------------------
+// `dBsdfF` / `dBsdfPdf` above take a DVertex, which the BDPT path has and the backward shade
+// loop has not; these are the same two expressions on a DHit. Glossy only, because Glossy is the
+// only lobe the hook is ever handed -- a diffuse vertex already goes through `rho/PI`, which is
+// the same number by a shorter route.
+__device__ static inline double dGlossyFHit(const DScene& sc, const DMaterial& m, const DHit& h,
+                                            const DVec3& wo, const DVec3& wi, Real lambda) {
+    const double cosWi = ddot(wi, h.n), cosWo = ddot(wo, h.n);
+    if (cosWi <= 0 || cosWo <= 0) return 0.0;
+    const double r = clamp01(dReflectSlot(sc, m, h, lambda));
+    const double e = dGlossyExp((double)dMatRoughness(sc, m, h));
+    const DVec3 mdir = reflectv(wo * (Real)(-1), h.n);
+    const double cosLobe = ddot(wi, mdir);
+    if (cosLobe <= 0) return 0.0;
+    return r * ((e + 1.0) / (2.0 * DPI) * pow(cosLobe, e)) / cosWi;
+}
+__device__ static inline double dGlossyPdfHit(const DScene& sc, const DMaterial& m, const DHit& h,
+                                              const DVec3& wo, const DVec3& wi) {
+    const double cosWi = ddot(wi, h.n), cosWo = ddot(wo, h.n);
+    if (cosWi <= 0 || cosWo <= 0) return 0.0;
+    const double e = dGlossyExp((double)dMatRoughness(sc, m, h));
+    const DVec3 mdir = reflectv(wo * (Real)(-1), h.n);
+    const double cosLobe = ddot(wi, mdir);
+    if (cosLobe <= 0) return 0.0;
+    return (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
+}
+
+// The evaluable lobe handed to bkNeeLight; `wo` points toward the previous vertex.
+struct DNeeBsdf { const DMaterial* m; DVec3 wo; };
+
+// The other half of the weight, carried one bounce forward: how likely the lobe was to produce
+// the continuation, and where it left from. `pdf > 0` is the flag, and every delta bounce
+// leaves it clear -- so a mirror or dielectric chain keeps full-weight emission as before.
+struct DGlossyMis {
+    double pdf;
+    DVec3  from;
+    DVec3  n;        // the glossy vertex's shading normal -- dLightSelPdf re-walks from there
+    __device__ void clear() { pdf = 0.0; }
+};
+
+// Host twin: BackwardRenderer::lightSelPdf -- the probability dPickEmitters SELECTS emitter `e`
+// at vertex (p, n). Both halves of the glossy MIS weight call this, so they cannot disagree; the
+// ESTIMATOR keeps ltSample's own exact pdf. See the host comment for why leaving the factor out
+// is unbiased and measurably noisier.
+__device__ static inline double dLightSelPdf(const DScene& sc, int e, const DVec3& p,
+                                             const DVec3& nrm) {
+    if (!sc.bkLightTree || sc.bkWhitted || sc.lightTreeRoot < 0 || !sc.lightTree) return 1.0;
+    // Only the prefix dPickEmitters draws (it stops at kDMaxLightPick) -- host twin's note.
+    const int nAlw = (sc.nLightTreeAlways < kDMaxLightPick) ? sc.nLightTreeAlways : kDMaxLightPick;
+    for (int i = 0; i < nAlw; ++i) if (sc.lightTreeAlways[i] == e) return 1.0;
+    if (sc.bkLightSamples <= 0 || nAlw >= kDMaxLightPick) return 0.0;
+    if (!sc.lightTreeParent || !sc.lightTreeLeaf || e < 0 || e >= sc.nLightTreeLeaf) return 0.0;
+    const double pp[3] = {(double)p.x, (double)p.y, (double)p.z};
+    const double nn[3] = {(double)nrm.x, (double)nrm.y, (double)nrm.z};
+    return ltSelectPdf<32>(sc.lightTree, sc.lightTreeRoot, sc.lightTreeParent,
+                           sc.lightTreeLeaf[e], pp, nn, true, (double)sc.bkLightSplit);
+}
+
+// Host twin: BackwardRenderer::lightPdfW -- the density that WOULD have produced direction `wi`
+// from `from`, for the BSDF-sampling side of the weight. 0 = not covered (delta, env, outside
+// the coverage rule, degenerate), which the callers read as "full weight".
+//
+// The device samples spheres and cylinders by uniform AREA (bkEmitterGeom), unlike the host's
+// cone / visible-arc importance sampling, so the area form below is the right one for BOTH here.
+__device__ static inline double dLightPdfWShape(const DScene& sc, int e, const DVec3& from,
+                                                const DVec3& wi, const DVec3* hitP,
+                                                const DVec3* hitN) {
+    if (e < 0 || e >= sc.nEmitters) return 0.0;
+    const DEmitter& em = sc.emitters[e];
+    if (em.collimated) return 0.0;
+    if (em.shape == 6) {                       // Sun (DEmitter::shape; 2 = spot, 3 = env)
+        if (!dInSunCone(em, wi)) return 0.0;                   // outside the solar cone
+        return (em.spotOmega > 0) ? 1.0 / (double)em.spotOmega : 0.0;
+    }
+    if (em.shape == 2 || em.shape == 3) return 0.0;            // Spot (delta) / Env (own MIS)
+    if (!hitP || !hitN || !(em.area > 0)) return 0.0;
+    const DVec3 d = *hitP - from;
+    const double dist2 = (double)ddot(d, d);
+    const double cosLight = (double)ddot(*hitN, wi * (Real)(-1));
+    if (!(dist2 > 0.0) || !(cosLight > 0.0)) return 0.0;
+    return dist2 / ((double)em.area * cosLight);
+}
+// ...and the whole NEE density: p_select * p_light. Host twin: lightPdfW.
+__device__ static inline double dLightPdfWAt(const DScene& sc, int e, const DVec3& from,
+                                             const DVec3& fromN, const DVec3& wi,
+                                             const DVec3* hitP, const DVec3* hitN) {
+    const double selP = dLightSelPdf(sc, e, from, fromN);
+    if (!(selP > 0.0)) return 0.0;
+    return dLightPdfWShape(sc, e, from, wi, hitP, hitN) * selP;
+}
+
+// Balance-heuristic weight for an emitter reached by the CONTINUATION; 1 when the previous
+// bounce was not a MIS'd glossy one, or when the light is not covered.
+__device__ static inline double dGlossyHitWeight(const DScene& sc, const DGlossyMis& gm, int e,
+                                                 const DVec3& wi, const DVec3* hitP,
+                                                 const DVec3* hitN) {
+    if (!(gm.pdf > 0.0)) return 1.0;
+    const double pL = dLightPdfWAt(sc, e, gm.from, gm.n, wi, hitP, hitN);
+    if (!(pL > 0.0)) return 1.0;
+    const double sum = gm.pdf + pL;
+    return (sum > 0.0) ? gm.pdf / sum : 1.0;
+}
+
+// dSunRadiance with the weight applied PER SUN -- the weight depends on which cone the
+// direction fell in, so the sum cannot be weighted after the fact.
+__device__ static inline double dSunRadianceMis(const DScene& sc, const DGlossyMis& gm,
+                                                const DVec3& d, Real lambda) {
+    if (sc.sunCount == 0) return 0.0;
+    if (!(gm.pdf > 0.0)) return dSunRadiance(sc, d, lambda);
+    double L = 0.0;
+    for (int i = 0; i < sc.nEmitters; ++i) {
+        const DEmitter& em = sc.emitters[i];
+        if (em.shape != 6 || !dInSunCone(em, d)) continue;
+        L += (double)specLookup(em.emitSpd, lambda) * dGlossyHitWeight(sc, gm, i, d, nullptr, nullptr);
+    }
+    return L;
+}
+
 // Surface next-event estimation (port of backward.h neeLight, v1 scope). Uniform
 // area-measure connection to each area/sphere/cylinder emitter (device emitterSample-
 // Point matches the BDPT device path; unbiased, an independent noise realization vs
@@ -8094,6 +9982,13 @@ struct BkNeeGeom {
     bool  spot;      // point-spot emitter (deterministic connect, draws no rng)
     bool  sun;       // distant-sun emitter (cone NEE in solid-angle measure)
     Real  wSun;      // sun only: the complete λ-independent weight cosSurf*Omega*stG
+    // GLOSSY-NEE: the SOLID-ANGLE density this connection was sampled with -- what the balance
+    // heuristic weighs the lobe's density against. 0 means DELTA (a spot): no BSDF sample can
+    // reach it, so its NEE weight is 1 and there is nothing to weigh. Note the device samples
+    // spheres and cylinders by UNIFORM AREA where the host cone-samples them, so this is the
+    // device's own density and not a copy of the host's -- which is correct: MIS only requires
+    // each side to report the density IT used.
+    Real  pdfW;
 };
 // Does this emitter consume its two sample coordinates? A collimated beam and a point-spot
 // are deterministic connections and draw nothing; every area shape (and the sun's cone)
@@ -8120,7 +10015,7 @@ __device__ static bool bkHairResponse(const DHairShade& hsv, const DVec3& wi,
 __device__ static bool bkHairBlocked(const DScene& sc, const DHit& h, const DHairShade& hsv,
                                      const DVec3& wi, Real d) {
     const Real off = dHairExitOffset(hsv, h.n, wi);
-    const Real len = d - off - RAY_EPS;
+    const Real len = connMaxT((double)d - (double)off, RAY_EPS, dMaxAbs(h.p));
     if (len <= (Real)0) return true;
     return occluded(sc, h.p + wi * off, wi, len);
 }
@@ -8149,8 +10044,9 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
         if (g.fall <= (Real)0) return false;
         if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-               : occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
+               : occludedTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist, 2 * RAY_EPS)) return false;
         g.G = (Real)0; g.spot = true; g.sun = false;
+        g.pdfW = (Real)0;                                   // delta: no lobe sample can reach it
         return true;
     }
     if (em.shape == 6) {
@@ -8171,9 +10067,10 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
         g.dist2 = g.dist * g.dist;
         if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-               : occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist)) return false;
+               : occluded(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist)) return false;
         g.wSun = (Real)((double)g.cosSurf * em.spotOmega * (double)g.stG);
         g.G = (Real)0; g.fall = (Real)1; g.spot = false; g.sun = true;
+        g.pdfW = (em.spotOmega > 0) ? (Real)(1.0 / em.spotOmega) : (Real)0;   // uniform in cone
         return true;
     }
     Real u1 = su1, u2 = su2;
@@ -8203,10 +10100,14 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     Real cosLight = dot(nL, -g.wi);               // light is one-sided
     if (cosLight <= 0) return false;
     if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-           : occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
+           : occludedTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist, 2 * RAY_EPS)) return false;
     g.G = g.cosSurf * cosLight / g.dist2;
     if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
     g.fall = (Real)1; g.spot = false; g.sun = false;
+    // Uniform over em.area, so pdf_W = pdf_A * dist^2 / cos(light). `epat` is a radiance
+    // profile folded into G, not a change of density, so it does not appear here.
+    g.pdfW = (em.area > 0) ? (Real)((double)g.dist2 / ((double)em.area * (double)cosLight))
+                           : (Real)0;
     return true;
 }
 
@@ -8219,27 +10120,27 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
 // identical 6.25 % noise. The draw below replaces the loop bound: it returns the emitters
 // to connect to plus 1/p(e) for each, turning `sum_e w_e` into `sum_selected w_e / p(e)`.
 //
-// kDMaxLightPick is deliberately half the CPU's 32: the LtSample array and ltSample's
-// traversal stack are per-thread local-memory frames in a megakernel that is already
-// register-starved, so every slot is paid by every thread. 16 connections per vertex is
-// far past the point where more splitting improves the image.
-#define kDMaxLightPick 16
 
 struct DEmitterDraw {
     int  n;             // number of connections to make
     bool all;           // true: entries are emitters 0..n-1, each with weight 1 (the old loop)
+    // false = ltSample declined a split for want of room, so its pdfs are NOT the reverse
+    // walk's values and the glossy MIS weight has to walk after all. Host twin: EmitterDraw.
+    bool selExact;
     LtSample s[kDMaxLightPick];
     __device__ int emitter(int i) const { return all ? i : s[i].emitter; }
     __device__ double weight(int i) const {
         return all ? 1.0 : (s[i].pdf > 0.0 ? 1.0 / s[i].pdf : 0.0);
     }
+    // The selection probability the draw already knows -- the weight's numerator.
+    __device__ double selPdf(int i) const { return all ? 1.0 : s[i].pdf; }
 };
 
 // `nrm` is the receiver normal, or null at a volume vertex (which has none to bound with).
 // Mode W keeps the exact path: its deterministic G x G lattice has no variance to trade.
 __device__ static void dPickEmitters(const DScene& sc, const DVec3& p, const DVec3* nrm,
                                      DRng& rng, DEmitterDraw& d) {
-    d.n = 0; d.all = false;
+    d.n = 0; d.all = false; d.selExact = true;
     if (!sc.bkLightTree || sc.bkWhitted || sc.lightTreeRoot < 0 || !sc.lightTree) {
         d.all = true; d.n = sc.nEmitters; return;
     }
@@ -8254,9 +10155,11 @@ __device__ static void dPickEmitters(const DScene& sc, const DVec3& p, const DVe
         const double pp[3] = {(double)p.x, (double)p.y, (double)p.z};
         double nn[3] = {0.0, 0.0, 0.0};
         if (nrm) { nn[0] = (double)nrm->x; nn[1] = (double)nrm->y; nn[2] = (double)nrm->z; }
+        bool limited = false;
         d.n += ltSample<DRng, kDMaxLightPick + 2>(
                    sc.lightTree, sc.lightTreeRoot, pp, nn, nrm != nullptr,
-                   sc.bkLightSplit, budget, d.s + d.n, rng);
+                   sc.bkLightSplit, budget, d.s + d.n, rng, &limited);
+        d.selExact = !limited;
     }
 }
 
@@ -8269,7 +10172,8 @@ __device__ static void dPickEmitters(const DScene& sc, const DVec3& p, const DVe
 // the exact CPU neeLight convention (backward.h).
 __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                                     double invPdfLambda, Real lambda, DRng& rng,
-                                    int giDepth = 0, const DHairShade* hs = nullptr) {
+                                    int giDepth = 0, const DHairShade* hs = nullptr,
+                                    const DNeeBsdf* nb = nullptr) {
     double total = 0.0;
     Real f = rho / (Real)DPI;                         // Lambertian BRDF
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
@@ -8281,6 +10185,18 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnv)
+        // GLOSSY-NEE: connect only where the MIS pair can agree on the selection probability.
+        // Host twin: neeLight's COVERAGE note. Elsewhere the lobe keeps the emitter to itself,
+        // at full weight, exactly as before this existed.
+        // `selP` is that probability. It belongs in the WEIGHT, never in the estimator, which
+        // already divides by ltSample's own exact pdf through selW.
+        double selP = 1.0;
+        if (nb) {
+            // ltSample already multiplied these ratios on the way down (host twin measured the
+            // re-walk at 5.1 % of a frame), so take them when they are exact.
+            selP = draw.selExact ? draw.selPdf(di) : dLightSelPdf(sc, k, h.p, h.n);
+            if (!(selP > 0.0)) continue;
+        }
         const bool uv = dEmitterNeedsUV(em);
         // Whitted: G x G deterministic shadow rays per area light, averaged. A
         // deterministic emitter (spot/beam) has nothing to stratify, so it stays at 1.
@@ -8296,11 +10212,40 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
             else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
             BkNeeGeom g;
             if (!bkEmitterGeom(sc, h, ngo0, em, u1, u2, g, hs)) continue;
-            double contrib = g.sun
-                ? (double)(f * g.wSun) * emitW
-                : g.spot
-                ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
-                : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+            // `rho/PI` IS the glossy f by a shorter route for a diffuse vertex, so the two arms
+            // are one estimator; the branch exists so the default path's float expression --
+            // and on the device that matters, `Real` is fp32 by default -- is untouched.
+            double contrib;
+            if (nb) {
+                const double fv = dGlossyFHit(sc, *nb->m, h, nb->wo, g.wi, lambda);
+                if (!(fv > 0.0)) continue;
+                double wMis = 1.0;
+                if (g.pdfW > (Real)0) {          // 0 = delta light: nothing to weigh against
+                    const double pNee = (double)g.pdfW * selP;   // the strategy's REAL density
+                    const double pLobe = dGlossyPdfHit(sc, *nb->m, h, nb->wo, g.wi);
+                    const double sum = pNee + pLobe;
+                    if (sum > 0.0) wMis = pNee / sum;
+                }
+                // The glossy arm stays in DOUBLE end to end, unlike the default one. `Real` is
+                // fp32 by default here, and dGlossyFHit's value is r*lobe/cos(wi) while `g`
+                // carries cos(surf) -- the same cosine -- so the product cancels it. In fp32
+                // that cancellation loses most of the mantissa at a grazing connection, which
+                // is exactly where a narrow lobe puts its energy. The default arm's fp32
+                // expression below is left textually alone so it stays bit-identical.
+                const double fw = fv * wMis;
+                contrib = g.sun
+                    ? fw * (double)g.wSun * emitW
+                    : g.spot
+                    ? fw * (double)g.fall * (double)g.cosSurf / (double)g.dist2
+                         * (double)g.stG * emitW
+                    : fw * (double)g.G * emitW * (double)em.area * (double)g.stG;
+            } else {
+                contrib = g.sun
+                    ? (double)(f * g.wSun) * emitW
+                    : g.spot
+                    ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
+                    : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+            }
             // Shadow-ray transmittance through any participating media (superposition;
             // homogeneous = exact exp with no rng draw, heterogeneous = ratio tracking).
             // Matches the forward connectVolume / device volume-NEE transmittance so
@@ -8322,7 +10267,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
 __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Real* rho,
                                       double* L, const double* thr, const Real* lam,
                                       const double* invPdf, int nUp, DRng& rng,
-                                      int giDepth = 0) {
+                                      int giDepth = 0, const DNeeBsdf* nb = nullptr) {
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     const bool whitted = (sc.bkWhitted != 0);
     DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
@@ -8332,6 +10277,11 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
         if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;
+        double selP = 1.0;                             // GLOSSY-NEE coverage, as in bkNeeLight
+        if (nb) {
+            selP = draw.selExact ? draw.selPdf(di) : dLightSelPdf(sc, k, h.p, h.n);
+            if (!(selP > 0.0)) continue;
+        }
         const bool uv = dEmitterNeedsUV(em);
         const int G = (whitted && uv) ? (giDepth ? sc.bkGiGrid : sc.bkGrid) : 1;
         const int nS = G * G;
@@ -8344,14 +10294,36 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
             else if (uv) { su1 = rng.uniform(); su2 = rng.uniform(); }
             BkNeeGeom g;
             if (!bkEmitterGeom(sc, h, ngo0, em, su1, su2, g)) continue;
+            // GLOSSY-NEE: the lobe geometry -- and therefore the balance-heuristic weight -- is
+            // wavelength-free, which is the same fact that lets the bundle survive a glossy
+            // vertex at all. Computed once, shared by every member.
+            double wMisG = 1.0;
+            if (nb && g.pdfW > (Real)0) {
+                const double pNee = (double)g.pdfW * selP;       // the strategy's REAL density
+                const double pLobe = dGlossyPdfHit(sc, *nb->m, h, nb->wo, g.wi);
+                const double sum = pNee + pLobe;
+                if (sum > 0.0) wMisG = pNee / sum;
+            }
             for (int i = 0; i < nUp; ++i) {
-                Real f = rho[i] / (Real)DPI;
                 double emitW = (double)specLookup(em.emitSpd, lam[i]) * invPdf[i];
-                double contrib = g.sun
-                    ? (double)(f * g.wSun) * emitW
-                    : g.spot
-                    ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
-                    : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+                double contrib;
+                if (nb) {   // double end to end -- see the note in bkNeeLight
+                    const double fw = dGlossyFHit(sc, *nb->m, h, nb->wo, g.wi, lam[i]) * wMisG;
+                    if (!(fw > 0.0)) continue;
+                    contrib = g.sun
+                        ? fw * (double)g.wSun * emitW
+                        : g.spot
+                        ? fw * (double)g.fall * (double)g.cosSurf / (double)g.dist2
+                             * (double)g.stG * emitW
+                        : fw * (double)g.G * emitW * (double)em.area * (double)g.stG;
+                } else {
+                    Real f = rho[i] / (Real)DPI;
+                    contrib = g.sun
+                        ? (double)(f * g.wSun) * emitW
+                        : g.spot
+                        ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
+                        : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+                }
                 L[i] += thr[i] * contrib * invS;
             }
         }
@@ -8388,7 +10360,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             DVec3 wi = toL / dist;
             Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
-            if (occluded(sc, p + wi * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+            if (occludedTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS)) continue;
             Real phase = dMedPhase(med, dot(wIn, wi), lambda);
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
             double contrib = (double)(alb * phase * fall / dist2) * emitW;
@@ -8421,7 +10393,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         DVec3 wi = toL / dist;
         Real cosLight = dot(nL, wi * (Real)(-1));         // light is one-sided
         if (cosLight <= 0) continue;
-        if (occluded(sc, p + wi * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+        if (occludedTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS)) continue;
         Real phase = dMedPhase(med, dot(wIn, wi), lambda); // phase == its own pdf (HG or rainbow)
         Real G = cosLight / dist2;                        // no surface cosine at a volume vertex
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
@@ -8450,8 +10422,11 @@ struct BkEnvGeom {
     double wMis;      // balance heuristic vs. the cosine-sampled continuation
     double farDist;   // shadow-ray length to the scene exit
 };
+// `nb` non-null = a GLOSSY vertex (GLOSSY-NEE): the MIS partner is then the lobe's density
+// rather than the cosine hemisphere's, exactly as the fiber branch already swaps in the BCSDF's.
 __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkEnvGeom& g,
-                                 const DHairShade* hs = nullptr) {
+                                 const DHairShade* hs = nullptr,
+                                 const DNeeBsdf* nb = nullptr) {
     // Sample an incoming env direction: image env importance-samples the luminance CDF
     // (dEnvSample gives dir + solid-angle pdfW), constant env is uniform on the sphere
     // (pdf 1/4pi). Both draw exactly two uniforms in the same order as the CPU
@@ -8488,22 +10463,32 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
     g.stG = dShadowTerminatorG(g.wi, h.n, ngo);             // Chiang soft terminator (1 if flat)
     if (g.stG <= (Real)0) return false;                     // behind true geometry: hard shadow
     g.farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
-    if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, (Real)g.farDist)) return false;
-    double pdfBsdf = (double)g.cosSurf / DPI;               // cosine-hemisphere pdf for wi
-    g.wMis = g.pdfW / (g.pdfW + pdfBsdf);                   // balance heuristic
+    if (occluded(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, (Real)g.farDist)) return false;
+    // The density the CONTINUATION would have sampled wi with: the lobe's at a glossy vertex,
+    // the cosine hemisphere's otherwise. Same number the env-escape site carries in gmis.pdf.
+    double pdfBsdf = nb ? dGlossyPdfHit(sc, *nb->m, h, nb->wo, g.wi)
+                        : (double)g.cosSurf / DPI;
+    g.wMis = (g.pdfW + pdfBsdf > 0.0) ? g.pdfW / (g.pdfW + pdfBsdf) : 1.0;   // balance heuristic
     return true;
 }
 
 __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
                                   double invPdfLambda, Real lambda, DRng& rng,
-                                  const DHairShade* hs = nullptr) {
+                                  const DHairShade* hs = nullptr,
+                                  const DNeeBsdf* nb = nullptr) {
     if (sc.envIndex < 0) return 0.0;
     BkEnvGeom g;
-    if (!bkEnvGeom(sc, h, rng, g, hs)) return 0.0;
+    if (!bkEnvGeom(sc, h, rng, g, hs, nb)) return 0.0;
     double Lenv = (sc.env.scale != nullptr) ? dEnvRadiance(sc.env, g.wi, lambda)
                                             : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
     if (Lenv <= 0.0) return 0.0;
-    double contrib = ((double)rho / DPI) * Lenv * (double)g.cosSurf * invPdfLambda / g.pdfW
+    // The glossy arm in DOUBLE end to end, for the reason bkNeeLight gives: f is r*lobe/cos(wi)
+    // and the geometry carries cos(surf), the same cosine, so fp32 would lose the mantissa
+    // exactly where a narrow lobe puts its energy.
+    const double fVal = nb ? dGlossyFHit(sc, *nb->m, h, nb->wo, g.wi, lambda)
+                           : ((double)rho / DPI);
+    if (!(fVal > 0.0)) return 0.0;
+    double contrib = fVal * Lenv * (double)g.cosSurf * invPdfLambda / g.pdfW
                      * g.wMis * (double)g.stG;
     if (sc.mediaN > 0)                                      // Beer-Lambert to the scene exit
         contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, (Real)g.farDist, lambda, rng);
@@ -8515,16 +10500,20 @@ __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
 // path, so no transmittance term.
 __device__ static void bkNeeEnvHero(const DScene& sc, const DHit& h, const Real* rho,
                                     double* L, const double* thr, const Real* lam,
-                                    const double* invPdf, int nUp, DRng& rng) {
+                                    const double* invPdf, int nUp, DRng& rng,
+                                    const DNeeBsdf* nb = nullptr) {
     if (sc.envIndex < 0) return;
     BkEnvGeom g;
-    if (!bkEnvGeom(sc, h, rng, g)) return;
+    if (!bkEnvGeom(sc, h, rng, g, nullptr, nb)) return;
     const bool imageEnv = (sc.env.scale != nullptr);
     for (int i = 0; i < nUp; ++i) {
         double Lenv = imageEnv ? dEnvRadiance(sc.env, g.wi, lam[i])
                                : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lam[i]);
         if (Lenv <= 0.0) continue;
-        L[i] += thr[i] * (((double)rho[i] / DPI) * Lenv * (double)g.cosSurf * invPdf[i]
+        const double fVal = nb ? dGlossyFHit(sc, *nb->m, h, nb->wo, g.wi, lam[i])
+                               : ((double)rho[i] / DPI);
+        if (!(fVal > 0.0)) continue;
+        L[i] += thr[i] * (fVal * Lenv * (double)g.cosSurf * invPdf[i]
                           / g.pdfW * g.wMis * (double)g.stG);
     }
 }
@@ -8671,8 +10660,12 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                                   DVec3& ro, DVec3& rd, Real& lambda, double& invPdfLambda,
                                   double& thr, double& L, bool& specularArrival,
                                   double& contBsdfPdf, DMediumStack& stk, DRng& rng,
-                                  DGiCtx gi) {
+                                  DGiCtx gi, DGlossyMis* gm = nullptr) {
     const bool whitted = (sc.bkWhitted != 0);
+    // Cleared here rather than per delta branch, so the invariant is structural: `gm->pdf > 0`
+    // can only mean "the LAST bounce was a MIS'd glossy one". A mirror or dielectric leaving a
+    // stale value behind would silently halve the emission on the far side of the chain.
+    if (gm) gm->clear();
     switch (mp->type) {
         case D_DIELECTRIC: {
             // Mode W: dominant Fresnel branch weighted into the throughput instead of a coin
@@ -8709,7 +10702,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             // converges at 1 spp where Russian roulette needs tens.
             if (whitted) { if (!dWhittedAttenuate(thr, (double)r)) return false; }
             else if (rng.uniform() >= r) return false;   // RR absorb
-            ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); specularArrival = true; return true;
+            rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
         }
         case D_GRATING: {
             Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
@@ -8732,10 +10725,10 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             if (whitted) {
                 const bool refl = (r >= (Real)0.5);
                 if (!dWhittedAttenuate(thr, refl ? (double)r : 1.0 - (double)r)) return false;
-                if (refl) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
-                else      { ro = h.p + rd * RAY_EPS; }
-            } else if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
-            else                          { ro = h.p + rd * RAY_EPS; }
+                if (refl) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+                else      { ro = dOffsetAlong(h.p, h.ng, rd); }
+            } else if (rng.uniform() < r) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+            else                          { ro = dOffsetAlong(h.p, h.ng, rd); }
             specularArrival = true; return true;
         }
         case D_FILTER: {
@@ -8743,7 +10736,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             Real t = clamp01(dTransmitSlot(sc, *mp, h, lambda));
             if (whitted) { if (!dWhittedAttenuate(thr, (double)t)) return false; }
             else if (rng.uniform() >= t) return false;   // absorbed
-            ro = h.p + rd * RAY_EPS;                // direction unchanged
+            ro = dOffsetAlong(h.p, h.ng, rd);                // direction unchanged
             specularArrival = true; return true;
         }
         case D_GLOSSY: {
@@ -8758,12 +10751,29 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
                                             gi.sIdx, gi.bounce);
                 if (dot(o, h.n) <= 0) return false;
-                ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; return true;
+                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
+            }
+            // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE; host twin backward.h
+            // ~1489). Without it the only route to this material's light is a lobe sample
+            // landing on the emitter -- ~1/115 against a 0.53-degree sun for a roughness-0.05
+            // lobe. Taken BEFORE the Russian roulette, whose coin governs the continuation
+            // only; the connection carries `r` inside dGlossyFHit.
+            if (gm) {
+                const DNeeBsdf nb{mp, rd * (Real)(-1)};
+                L += thr * bkNeeLight(sc, h, (Real)1, invPdfLambda, lambda, rng, gi.depth,
+                                      nullptr, &nb);
+                // ...and the SKY, which is a light like any other (host twin: backward.h).
+                L += thr * bkNeeEnv(sc, h, (Real)1, invPdfLambda, lambda, rng, nullptr, &nb);
             }
             if (rng.uniform() >= r) return false;
             DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
             if (dot(o, h.n) <= 0) return false;
-            ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; return true;
+            if (gm) {                    // the other half of the weight, for whatever `o` hits
+                gm->pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
+                gm->from = h.p;
+                gm->n = h.n;
+            }
+            rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
         }
         case D_DIFFUSETRANSMIT: {
             // Two-lobe Lambertian (device twin of backward.h DiffuseTransmit): NEE the
@@ -8800,8 +10810,8 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             }
             if (directOnly) return false;            // Whitted: no diffuse indirect
             Real u = rng.uniform();
-            if (u < rhoR)     { DVec3 wOut = cosineHemisphere(h.n, rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI; ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; return true; }
-            else if (u < sum) { DVec3 wOut = cosineHemisphere(nb,  rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, nb )) / DPI; ro = h.p + nb  * RAY_EPS; rd = wOut; specularArrival = false; return true; }
+            if (u < rhoR)     { DVec3 wOut = cosineHemisphere(h.n, rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; return true; }
+            else if (u < sum) { DVec3 wOut = cosineHemisphere(nb,  rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, nb )) / DPI; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; return true; }
             return false;                            // absorbed
         }
         case D_FLUORESCENT: {
@@ -8859,7 +10869,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             if (u < rhoEl) {                                                  // elastic continuation
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                ro = h.p + h.n * RAY_EPS; rd = wOut;
+                rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd);
                 specularArrival = false; return true;
             } else if (u < rhoEl + pF) {                                      // fluoro (wavelength-switched)
                 thr *= wFluo / pF;
@@ -8867,7 +10877,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 invPdfLambda = invPdfIn;
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                ro = h.p + h.n * RAY_EPS; rd = wOut;
+                rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd);
                 specularArrival = false; return true;
             }
             return false;                                                     // absorbed / terminated
@@ -8904,7 +10914,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             if (rng.uniform() >= rho) return false; // RR on albedo
             DVec3 wOut = cosineHemisphere(h.n, rng);
             contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-            ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; return true;
+            rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; return true;
         }
     }
 }
@@ -8921,6 +10931,11 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                                     Real lambda, double invPdfLambda, DRng& rng,
                                     DGiCtx gi) {
     double L = 0.0, thr = 1.0;
+    // GLOSSY-NEE: the lobe density of a glossy continuation, carried to whichever emitter site
+    // it reaches. Null when the estimator is off, which turns every site below back into its
+    // pre-0.266 form, rng draws included.
+    DGlossyMis gmis; gmis.clear();
+    DGlossyMis* const gmp = sc.bkGlossyNee ? &gmis : nullptr;
     bool specularArrival = (gi.depth == 0);            // camera ray may see a light directly; a
                                                        // gather ray must NOT (the vertex's own
                                                        // NEE already counted that emitter)
@@ -8954,8 +10969,15 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // only routes the medium through the marcher), the haze came out 22% dark through
         // its own centre against a 2.2% noise floor, and vanished visually.
         DGrinMedia gmed; gmed.rng = &rng; gmed.lambda = lambda;
-        if (sc.hasGrin) dGrinMarch(sc, ro, rd, &gmed);
-        DHit h = closestHit(sc, ro, rd);
+        // Camera segment: the marcher's own hit test must skip a `hide_camera` surface too,
+        // or the bending would stop dead at an invisible flat. See DMaterial::hideCamera.
+        if (sc.hasGrin) dGrinMarch(sc, ro, rd, &gmed, 200000,
+                                   /*camHide=*/(b == 0 && gi.depth == 0));
+        // `b == 0 && gi.depth == 0` is precisely the camera segment (the same test the O8
+        // footprint stamp below uses), so it is also precisely where a `hide_camera` surface
+        // must be transparent — and nowhere else on the path. See DMaterial::hideCamera.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG,
+                            /*camHide=*/(b == 0 && gi.depth == 0));
         // O8 stage 2: stamp the shading footprint on the CAMERA SEGMENT only (host twin:
         // backward.h radiance()). A secondary bounce would need ray differentials /
         // cones to know how much its own footprint spread, so it keeps fw = 0
@@ -9007,8 +11029,14 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 double Lenv = (imageEnv ? dEnvRadiance(sc.env, rd, lambda)
                                         : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda))
                               * invPdfLambda;
-                if (specularArrival) {
-                    L += thr * Lenv;
+                if (specularArrival && !(gmis.pdf > 0.0)) {
+                    L += thr * Lenv;                 // delta chain: nothing connected for it
+                } else if (gmis.pdf > 0.0) {
+                    // GLOSSY-NEE: complement of the weight the connection above used. Gated on
+                    // the SAME test, so a case cannot appear in one half and not the other.
+                    const double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
+                    const double sum = gmis.pdf + pdfEnv;
+                    L += thr * Lenv * ((sum > 0.0) ? gmis.pdf / sum : 1.0);
                 } else {
                     double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
                     double wMis = (contBsdfPdf + pdfEnv > 0.0)
@@ -9021,7 +11049,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             // (bkEmitterGeom / bkNeeVolume) and sets specularArrival = false, so this is
             // a clean single-strategy split, not a missing MIS weight (host twin: backward.h).
             if (sc.sunCount > 0 && specularArrival)
-                L += thr * dSunRadiance(sc, rd, lambda) * invPdfLambda;
+                L += thr * dSunRadianceMis(sc, gmis, rd, lambda) * invPdfLambda;
             // Escaped gather ray -> the far-field `ambient` fill. This is what makes -gi and
             // -ambient compose: in an empty scene every direction escapes and the normalised
             // gather collapses exactly back to rho * ambient, so switching -gi on never
@@ -9056,14 +11084,19 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             const double* eSpd = (li >= 0)          ? sc.emitters[li].emitSpd
                                : (mp->matIsLight)   ? mp->matEmit
                                                     : nullptr;
-            if (eSpd)
+            if (eSpd) {
+                // GLOSSY-NEE's lobe-sampling half; 1 -- and this expression bit-identical to
+                // its pre-0.266 form -- unless the previous bounce was a MIS'd glossy one.
+                const double wMis = (gmis.pdf > 0.0)
+                    ? dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n) : 1.0;
                 L += thr * (double)specLookup(eSpd, lambda) * invPdfLambda
-                         * dEmitPatMul(sc, mp->emitPat, h);
+                         * dEmitPatMul(sc, mp->emitPat, h) * wMis;
+            }
         }
 
         if (!bkInteract<GiDepth == 0>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
                                       invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk,
-                                      rng, gi))
+                                      rng, gi, gmp))
             return L;                                   // path terminated in the interaction
     }
     return L;
@@ -9122,6 +11155,9 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                           int bounce0, double* Lout, DRng& rng, DGiCtx gi) {
     Real   lam[hero::kHeroMax];
     double invPdf[hero::kHeroMax], thr[hero::kHeroMax];
+    // GLOSSY-NEE: the hero twin of bkRadiance's carrier. Cleared just before the material
+    // switch (see the note there), never at the top of the loop.
+    DGlossyMis gmis; gmis.clear();
     // Copy only the LIVE entries: a monochromatic sub-path spawned by the split fills only
     // slot 0 of its lamIn/invPdfIn/thrIn, so reading all C would read indeterminate values
     // (harmless while nUp == 1 ignores them, but still UB).
@@ -9141,7 +11177,10 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
     for (int b = bounce0; b < maxBounce; ++b) {
         int nUp = secAlive ? C : 1;                    // wavelengths still being propagated
         gi.bounce = b;                                 // see the scalar twin: mode W's per-vertex lattice
-        DHit h = closestHit(sc, ro, rd);
+        // Camera segment only — same test as the footprint stamp below, and for the same
+        // reason a heroSplit re-entry (bounce0 > 0) is not one. See DMaterial::hideCamera.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG,
+                            /*camHide=*/(b == 0 && gi.depth == 0));
         // O8 stage 2 footprint, camera segment only — see the scalar twin. The test is
         // `b == 0`, NOT `b == bounce0`: a heroSplit re-entry resumes at a DEEPER bounce,
         // and that sub-path's first vertex is not a camera vertex.
@@ -9165,7 +11204,14 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
             if (sc.envIndex >= 0) {
                 const bool imageEnv = (sc.env.scale != nullptr);
                 double wMis = 1.0;
-                if (!specularArrival) {                // MIS against the env-NEE at the last vertex
+                if (gmis.pdf > 0.0) {
+                    // GLOSSY-NEE: the lobe-sampling half, complementing the connection the
+                    // glossy branch below now makes to the sky. Tested FIRST because a glossy
+                    // bounce also sets specularArrival, and this is the more specific case.
+                    const double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
+                    const double sum = gmis.pdf + pdfEnv;
+                    wMis = (sum > 0.0) ? gmis.pdf / sum : 1.0;
+                } else if (!specularArrival) {         // MIS against the env-NEE at the last vertex
                     double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
                     wMis = (contBsdfPdf + pdfEnv > 0.0) ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
                 }
@@ -9178,7 +11224,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
             }
             if (sc.sunCount > 0 && specularArrival)     // directly-viewed solar disc
                 for (int i = 0; i < nUp; ++i)
-                    L[i] += thr[i] * dSunRadiance(sc, rd, lam[i]) * invPdf[i];
+                    L[i] += thr[i] * dSunRadianceMis(sc, gmis, rd, lam[i]) * invPdf[i];
             // Escaped GATHER ray -> the far-field `ambient` fill, which is what makes -gi and
             // -ambient compose instead of compete (see the scalar twin bkRadiance).
             if (whitted && gi.depth && sc.bkAmbient > 0.0)
@@ -9204,10 +11250,19 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                                   : nullptr;
             if (eSpd) {
                 double ep = dEmitPatMul(sc, mp->emitPat, h);
+                if (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the scalar loop
+                    ep *= dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n);
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * (double)specLookup(eSpd, lam[i]) * invPdf[i] * ep;
             }
         }
+
+        // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
+        // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so
+        // a clear at the loop top erases it a few lines before its only consumer -- leaving the
+        // connection in place with the compensating weight silently pinned at 1, i.e. double
+        // counting. Invisible on a small light and worth ~1 % on a big one; see the host twin.
+        gmis.clear();
 
         switch (mp->type) {
             case D_DIFFUSETRANSMIT: {
@@ -9260,12 +11315,12 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     for (int i = 0; i < nUp; ++i) thr[i] *= (double)rhoR[i] / (double)qR;
                     DVec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                    ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
+                    rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
                 } else if (u < sumHero) {                          // transmit (back)
                     for (int i = 0; i < nUp; ++i) thr[i] *= (double)rhoT[i] / (double)qT;
                     DVec3 wOut = cosineHemisphere(nb, rng);
                     contBsdfPdf = fmax(0.0, (double)dot(wOut, nb)) / DPI;
-                    ro = h.p + nb * RAY_EPS; rd = wOut; specularArrival = false; break;
+                    rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
                 }
                 return;                                            // absorbed
             }
@@ -9288,6 +11343,15 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                                   : clamp01(dReflectSlot(sc, *mp, h, lam[i]));
                     if ((double)c[i] > q) q = (double)c[i];
                 }
+                // GLOSSY-NEE: a Glossy lobe is the one member of this achromatic group with a
+                // FINITE value, so it is the one that can be connected to a light; a mirror and
+                // a gel are delta and stay exactly as they were. Before the Russian roulette,
+                // whose coin governs the continuation only.
+                if (sc.bkGlossyNee && !whitted && mp->type == D_GLOSSY) {
+                    const DNeeBsdf gnb{mp, rd * (Real)(-1)};
+                    bkNeeLightHero(sc, h, c, L, thr, lam, invPdf, nUp, rng, gi.depth, &gnb);
+                    bkNeeEnvHero(sc, h, c, L, thr, lam, invPdf, nUp, rng, &gnb);   // the sky too
+                }
                 if (whitted) {
                     // Deterministic: carry every live λ's coefficient as weight (no coin, no
                     // c_i/q reweight) and stop only once the WHOLE bundle has fallen under the
@@ -9303,19 +11367,22 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     for (int i = 0; i < nUp; ++i) thr[i] *= (double)c[i] / q;
                 }
                 if (mp->type == D_MIRROR) {
-                    ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n);
+                    rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd);
                 } else if (mp->type == D_FILTER) {
-                    ro = h.p + rd * RAY_EPS;                       // direction unchanged
+                    ro = dOffsetAlong(h.p, h.ng, rd);                       // direction unchanged
                 } else if (whitted) {
                     // Glossy: the lobe off the deterministic lattice (mirror at sample 0).
                     DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
                                                 gi.sIdx, b);
                     if (dot(o, h.n) <= 0) return;
-                    ro = h.p + h.n * RAY_EPS; rd = o;
+                    rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
                 } else {
                     DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                     if (dot(o, h.n) <= 0) return;
-                    ro = h.p + h.n * RAY_EPS; rd = o;
+                    if (sc.bkGlossyNee)      // the other half of the weight, for what `o` hits
+                        { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
+                          gmis.from = h.p; gmis.n = h.n; }
+                    rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
                 }
                 specularArrival = true;
                 break;
@@ -9426,7 +11493,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 for (int i = 0; i < nUp; ++i) thr[i] *= (double)rho[i] / (double)q;
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
+                rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
             }
         }
     }
@@ -9495,7 +11562,7 @@ __device__ static void bkGiGatherHero(const DScene& sc, int diffraction, const D
         if (dot(ngo, d) <= 0) continue;
         wSum += c;
         double Lg[hero::kHeroMax];
-        bkRadianceHero<1>(sc, diffraction, h.p + ngo * RAY_EPS, d, lam, invPdf, nUp, Lg,
+        bkRadianceHero<1>(sc, diffraction, dOffsetAlong(h.p, h.ng, d), d, lam, invPdf, nUp, Lg,
                           rng, sub);
         // Firefly clamp (see bkGiClamp). NOT applied to wSum: a clamped direction keeps its
         // weight c, so the estimator still normalises by the realised sum of cosines and an
@@ -9524,7 +11591,7 @@ __device__ static double bkGiGather(const DScene& sc, int diffraction, const DHi
         if (c <= 0.0) continue;
         if (dot(ngo, d) <= 0) continue;
         wSum += c;
-        double Lg = bkRadiance<1>(sc, diffraction, h.p + ngo * RAY_EPS, d, lambda, invPdfLambda,
+        double Lg = bkRadiance<1>(sc, diffraction, dOffsetAlong(h.p, h.ng, d), d, lambda, invPdfLambda,
                                   rng, sub);
         if (sc.bkGiClamp > 0.0 && Lg > sc.bkGiClamp) Lg = sc.bkGiClamp;   // see bkGiClamp
         acc += c * Lg;
@@ -9685,7 +11752,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             if (stG <= (Real)0) continue;
             Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
-            if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+            if (occludedTo(sc, dOffsetAlong(h.p, h.ng, wi), h.p + wi * dist, 2 * RAY_EPS)) continue;
             total = total + hadamard(f * (fall * cosSurf / dist2 * stG * selWr), em.rgbEmit);
             continue;
         }
@@ -9697,7 +11764,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             Real stG = dShadowTerminatorG(wi, h.n, ngo0);
             if (stG <= (Real)0) continue;
             Real dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
-            if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist)) continue;
+            if (occluded(sc, dOffsetAlong(h.p, h.ng, wi), wi, dist)) continue;
             total = total + hadamard(f * (Real)((double)(cosSurf * stG) * em.spotOmega * selW), em.rgbEmit);
             continue;
         }
@@ -9716,7 +11783,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         if (stG <= (Real)0) continue;
         Real cosLight = dot(nL, -wi);
         if (cosLight <= 0) continue;
-        if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+        if (occludedTo(sc, dOffsetAlong(h.p, h.ng, wi), h.p + wi * dist, 2 * RAY_EPS)) continue;
         Real G = cosSurf * cosLight / dist2;
         if (epat != 1.0) G = (Real)((double)G * epat);   // no-op without a pattern
         total = total + hadamard(f * (G * em.area * stG * selWr), em.rgbEmit);
@@ -9740,7 +11807,7 @@ __device__ static DVec3 bkNeeEnvRGB(const DScene& sc, const DHit& h, const DVec3
     Real stG = dShadowTerminatorG(wi, h.n, ngo);
     if (stG <= (Real)0) return DVec3(0, 0, 0);
     double farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
-    if (occluded(sc, h.p + ngo * RAY_EPS, wi, (Real)farDist)) return DVec3(0, 0, 0);
+    if (occluded(sc, dOffsetAlong(h.p, h.ng, wi), wi, (Real)farDist)) return DVec3(0, 0, 0);
     double pdfBsdf = (double)cosSurf / DPI;
     double wMis = pdfW / (pdfW + pdfBsdf);
     Real k = (Real)((double)cosSurf / pdfW * wMis * (double)stG);
@@ -9762,7 +11829,8 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
     const int maxBounce = sc.bkMaxBounce;
     const bool directOnly = (sc.bkDirectOnly != 0);
     for (int b = 0; b < maxBounce; ++b) {
-        DHit h = closestHit(sc, ro, rd);
+        // b == 0 is the camera ray this path was handed. See DMaterial::hideCamera.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(b == 0));
         if (!h.valid) {                                // escaped -> constant env
             if (sc.envIndex >= 0) {
                 if (specularArrival) {
@@ -9821,19 +11889,19 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 Real q = rgbLuma(mp->rgbAlbedo);
                 if (q <= (Real)0 || rng.uniform() >= (double)q) return L;
                 beta = hadamard(beta, mp->rgbAlbedo) / q;
-                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); specularArrival = true; break;
+                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; break;
             }
             case D_HALFMIRROR: {
                 Real r = clamp01(rgbLuma(mp->rgbAlbedo));
-                if (rng.uniform() < (double)r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
-                else                           { ro = h.p + rd * RAY_EPS; }
+                if (rng.uniform() < (double)r) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+                else                           { ro = dOffsetAlong(h.p, h.ng, rd); }
                 specularArrival = true; break;
             }
             case D_FILTER: {
                 Real q = rgbLuma(mp->rgbTransmit);
                 if (q <= (Real)0 || rng.uniform() >= (double)q) return L;
                 beta = hadamard(beta, mp->rgbTransmit) / q;
-                ro = h.p + rd * RAY_EPS; specularArrival = true; break;
+                ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; break;
             }
             case D_GLOSSY: {
                 Real q = rgbLuma(mp->rgbAlbedo);
@@ -9841,7 +11909,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                 if (dot(o, h.n) <= 0) return L;
                 beta = hadamard(beta, mp->rgbAlbedo) / q;
-                ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; break;
+                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; break;
             }
             case D_DIFFUSETRANSMIT: {
                 DVec3 rhoR = clampRgb01(mp->rgbAlbedo);
@@ -9861,12 +11929,12 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                     beta = hadamard(beta, rhoR) / pR;
                     DVec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                    ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
+                    rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
                 } else if (u < pR + pT) {
                     beta = hadamard(beta, rhoT) / pT;
                     DVec3 wOut = cosineHemisphere(nb, rng);
                     contBsdfPdf = fmax(0.0, (double)dot(wOut, nb)) / DPI;
-                    ro = h.p + nb * RAY_EPS; rd = wOut; specularArrival = false; break;
+                    rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
                 }
                 return L;                                   // absorbed
             }
@@ -9882,7 +11950,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 beta = hadamard(beta, rho) / q;
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
+                rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
             }
         }
     }
@@ -10092,6 +12160,36 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
     }
 }
 
+// --- Subpath ray segments, for the mode-J (UPBP) beam merge ---------------------------
+//
+// Device twin of bdpt.h's PathSeg. A BDPT *connection* joins two sampled vertices, so it
+// only ever needs the vertices; a beam *merge* integrates along a whole RAY, pairing it with
+// every photon beam whose kernel that ray passes through — so what it needs is the SEGMENT,
+// which the vertex list does not contain and dRandomWalk otherwise throws away.
+//
+// A segment is NOT "the edge between path[i] and path[i+1]": it runs from path[i] to the
+// SURFACE that ends the ray, which is strictly further whenever a medium collision created
+// path[i+1] in between. That is the point — the merge is an *alternative* to the free-flight
+// distance sample, so it must see the whole span that sample was drawn from. For the same
+// reason `beta` is the throughput arriving at the segment's ORIGIN with no free-flight
+// factor in it (analog media transport makes it constant along the span), and the segment's
+// own transmittance is left to the gather, which computes Tr to each beam's own closest
+// approach rather than to a shared endpoint.
+//
+// Trimmed relative to the host struct: no betaSec[]/nUp. The host's renderRows splats
+// `m * sg.beta` and never touches the secondaries, and the hero bundle is gated off for any
+// scene with media anyway — so carrying C-1 extra doubles per segment through thread-local
+// memory would cost occupancy to store a value nothing reads.
+struct DPathSeg {
+    DVec3  o;          // segment origin
+    DVec3  d;          // unit direction
+    double tMax;       // distance to the surface that ends it (1e30 if the ray escapes)
+    double beta;       // throughput arriving at `o` (no free-flight factor; see above)
+    double aGlass;     // absorption of the dielectric the ray is inside (exp(-a*t) per hit)
+    double pdfDir;     // solid-angle density of `d` at the vertex this segment leaves
+    int    vert;       // index in the subpath of that vertex
+};
+
 // Continue a subpath whose endpoint is already path[0]; append surface vertices
 // until a miss/absorption/maxDepth. Direct port of bdpt.h randomWalk.
 // `importance` marks the LIGHT (particle) subpath: only then is the Veach adjoint
@@ -10111,7 +12209,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                                    const DHeroBundle& hb, int maxDepth, DRng& rng,
                                    DVertex* path, double* pathSec, int secStride, int maxV, int& n,
                                    bool importance, const double* betaSecIn, int nUpIn,
-                                   DEscape* esc = nullptr) {
+                                   DEscape* esc = nullptr,
+                                   DPathSeg* segs = nullptr, int* nSegs = nullptr,
+                                   int maxSegs = 0) {
     const Real lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;
@@ -10121,9 +12221,28 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
     for (int i = 0; i + 1 < nUp; ++i) betaSec[i] = betaSecIn[i];
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack for exterior-IOR resolution
     for (int bounces = 0;;) {
-        DHit h = closestHit(sc, ro, rd);
+        // `hide_camera` is primary visibility only, so it applies to exactly one ray in this
+        // walk: the first edge of the RADIANCE (camera) subpath. An importance walk starts at
+        // a light and never has a camera ray at all. See DMaterial::hideCamera.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG,
+                            /*camHide=*/(!importance && bounces == 0));
         if (h.valid && h.sensorId >= 0) return;
         double dSurf = h.valid ? (double)h.t : 1e30;
+
+        // Record the segment for the mode-J (UPBP) merge, BEFORE the free-flight draw below
+        // consumes it (see DPathSeg). `dSurf` is 1e30 on an escaping ray, which the gather
+        // clips to the beams that actually exist — so a ray leaving the scene through a
+        // medium needs no special case. Records no RNG draw, so a walk that passes `segs`
+        // and one that does not produce bit-identical paths.
+        if (segs && *nSegs < maxSegs) {
+            DPathSeg& sg = segs[*nSegs];
+            sg.o = ro; sg.d = rd; sg.tMax = dSurf; sg.beta = beta;
+            const int cmS = stk.topMat();
+            sg.aGlass = (cmS >= 0) ? (double)specLookup(sc.mats[cmS].absorb, lambda) : 0.0;
+            sg.pdfDir = pdfFwd;
+            sg.vert   = n - 1;
+            ++(*nSegs);
+        }
 
         // Participating media: sample the earliest real collision up to the surface
         // (or 1e30 in open space). Homogeneous free-flight — its transmittance is
@@ -10386,8 +12505,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // EXCEPTION: Mirror and Filter are delta but wavelength-INDEPENDENT in direction,
         // so they set keepBundle and carry the secondaries on a per-λ secF instead.
         if (delta && !keepBundle) nUp = 1;
-        double sgn = dot(wi, path[cur].ng) >= 0.0 ? 1.0 : -1.0;
-        ro = path[cur].p + path[cur].ng * (Real)(sgn * 1e-6);
+        ro = dOffsetAlong(path[cur].p, path[cur].ng, wi);
         rd = normalize(wi);
         pdfFwd = delta ? 0.0 : pdfW;
     }
@@ -10405,7 +12523,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, int diffraction,
                                         int px, int py, const DHeroBundle& hb, int maxDepth,
                                         DRng& rng, DVertex* path, double* pathSec, int secStride,
-                                        int maxV, DEscape* esc = nullptr) {
+                                        int maxV, DEscape* esc = nullptr,
+                                        DPathSeg* segs = nullptr, int* nSegs = nullptr,
+                                        int maxSegs = 0) {
     const Real lambda = hb.lam[0];
     // The camera vertex sees every wavelength at unit throughput: the bundle starts at full
     // width with all secondary throughputs 1 (importance leaves the camera achromatic).
@@ -10434,7 +12554,8 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         path[0] = c; int n = 1;
         double pdfDir = dCameraPdfDir(cam, ddot(rd, cam.w));   // MIS-irrelevant placeholder
         dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, hb, maxDepth - 1, rng,
-                    path, pathSec, secStride, maxV, n, false, betaSec0, 1, esc);
+                    path, pathSec, secStride, maxV, n, false, betaSec0, 1, esc,
+                    segs, nSegs, maxSegs);
         return n;
     }
     c.p = cam.eye;
@@ -10446,7 +12567,8 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     double cosCam = ddot(rd, cam.w);
     double pdfDir = dCameraPdfDir(cam, cosCam);
     dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, hb, maxDepth - 1, rng,
-                path, pathSec, secStride, maxV, n, false, betaSec0, hb.C, esc);
+                path, pathSec, secStride, maxV, n, false, betaSec0, hb.C, esc,
+                segs, nSegs, maxSegs);
     return n;
 }
 // Sample a light subpath. path[0] is the light endpoint (beta = Le).
@@ -10579,11 +12701,32 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
 // other strategies, then rolls the mutations back. Here the vertices live in the
 // per-thread local arrays, so we save whole vertices before ANY mutation and restore
 // them at the end (whole-vertex restore subsumes PBRT's field-wise ScopedAssignments).
+//
+// MERGES (mode J / UPBP). `mergeKappa` is n_m * 2r, zero in every mode but J, and that zero
+// deletes every merge term below — so mode D stays bit-for-bit what it was. Non-zero, each
+// hypothetical strategy in the two walks additionally carries the MERGE that would have
+// happened at its own vertex, because a merge competes with this connection for the very
+// same path; leaving it out makes the connection weights and the merge weights sum to more
+// than 1 and brightens every medium. Index mapping (the part where an off-by-one hides), per
+// the host header note at bdpt.h misWeight:
+//   * camera loop step i accumulates strategy j = n - i, whose vertex is eye[i-1]; so the
+//     merge site charged at step i is eye[i-1], needing i >= 2 for eye[i-2] to exist.
+//   * light loop step i accumulates strategy j = i, vertex light[i]; its camera-side
+//     neighbour is light[i+1], or `pt` at i == s-1 where the light subpath ends.
+//   * strategy j = s (this connection, ratio exactly 1) has vertex pt, added once outside.
+// The substitutions are the pointer/index ones this function already uses: eye[i-1].pdfRev
+// is the a5 override at i-1 == tMi (i-1 == ti is unreachable, i <= t-1); eye[t-1] is PtP so
+// t == 1 picks up `sampled`; light[s-1] is QsP; eye[t-1].pdfRev is the a4 override ptPdfRev.
+// Accumulated in a SEPARATE double: kappa is ~n_m*2r ~ 1e3, and sumRi/ri are float here.
 __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
                                     const DVertex* light, const DVertex* eye,
-                                    const DVertex& sampled, int s, int t, Real lambda) {
+                                    const DVertex& sampled, int s, int t, Real lambda,
+                                    double mergeKappa = 0.0, double kappaSurf = 0.0) {
     if (s + t == 2) return 1.0;
     const int si = s - 1, ti = t - 1, sMi = s - 2, tMi = t - 2;
+    const bool merges = mergeKappa > 0.0 || kappaSurf > 0.0;
+    const DPatEnv env = merges ? dPatEnvOf(sc) : dPatEnvNone();
+    double sumMg = 0.0;
 
     // Non-mutating rewrite of the PBRT ScopedAssignment dance: the old code copied the
     // four vertices adjacent to the connection edge to locals, wrote hypotheticals into
@@ -10615,6 +12758,18 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
         else               { num = (float)eye[i].pdfRev; den = (float)eye[i].pdfFwd; dl = eye[i].delta; }
         ri *= (num != 0.f ? num : 1.f) / (den != 0.f ? den : 1.f);
         if (!dl && !eye[i - 1].delta) sumRi += ri;
+        if (merges && i >= 2) {                      // merge at eye[i-1]
+            const double pRev = (i - 1 == tMi) ? (double)ptMPdfRev : eye[i - 1].pdfRev;
+            const double e = dMergeEtaPrime(sc, eye[i].p, eye[i - 1], eye[i - 2].p,
+                                            pRev, lambda, env);
+            // ...and the POINT merge at the same vertex. A vertex is a medium point or a
+            // surface, never both, so at most one of these is non-zero -- but BOTH have to be
+            // here, or a connection keeps a weight that ignores a technique competing for its
+            // paths and the weights stop summing to one (measured: +15 % on `_cornell_diffuse`).
+            const double eS = (kappaSurf > 0.0 && dSurfMergeSite(sc, eye[i - 1]) && pRev > 0.0)
+                            ? pRev : 0.0;
+            if (e > 0.0 || eS > 0.0) sumMg += (double)ri * (e * mergeKappa + eS * kappaSurf);
+        }
     }
     ri = 1.f;
     for (int i = s - 1; i >= 0; --i) {
@@ -10632,8 +12787,25 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
         bool deltaPrev = (i > 0) ? (light[i - 1].delta != 0)
                                  : dIsDeltaLightVertex(sc, (si == 0) ? *QsP : light[0]);
         if (!dl && !deltaPrev) sumRi += ri;
+        if (merges && i >= 1 && t > 0) {             // merge at light[i]
+            const DVec3 pNext = (i + 1 <= s - 1) ? light[i + 1].p : PtP->p;
+            const double e = dMergeEtaPrime(sc, light[i - 1].p, light[i], pNext,
+                                            light[i].pdfFwd, lambda, env);
+            const double eS = (kappaSurf > 0.0 && dSurfMergeSite(sc, light[i]) &&
+                               light[i].pdfFwd > 0.0) ? (double)light[i].pdfFwd : 0.0;
+            if (e > 0.0 || eS > 0.0) sumMg += (double)ri * (e * mergeKappa + eS * kappaSurf);
+        }
     }
-    return 1.0 / (1.0 + (double)sumRi);
+    // The merge at the connection vertex pt itself. Its own connection strategy IS this one,
+    // so the ratio multiplying it is exactly 1.
+    if (merges && s >= 1 && t >= 2) {
+        const double e = dMergeEtaPrime(sc, QsP->p, *PtP, eye[tMi].p,
+                                        (double)ptPdfRev, lambda, env);
+        const double eS = (kappaSurf > 0.0 && dSurfMergeSite(sc, *PtP) && ptPdfRev > 0.0)
+                        ? (double)ptPdfRev : 0.0;
+        if (e > 0.0 || eS > 0.0) sumMg += e * mergeKappa + eS * kappaSurf;
+    }
+    return 1.0 / (1.0 + (double)sumRi + sumMg);
 }
 
 // Connect strategy (s,t); returns the MIS-weighted radiance of the HERO wavelength. For
@@ -10651,12 +12823,17 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
                                       const double* lightSec, const double* eyeSec, int secStride,
                                       int s, int t, const DHeroBundle& hb, DRng& rng,
                                       int& outPx, int& outPy, int& isSplat,
-                                      double* Lsec, int& nUpConn) {
+                                      double* Lsec, int& nUpConn, double mergeKappa = 0.0,
+                                      double kappaSurf = 0.0) {
     const Real lambda = hb.lam[0];
     const double invPdfLambda = hb.invPdf[0];
     isSplat = 0;
     nUpConn = 0;                    // set to the real width only once a contribution exists
-    if (t > 1 && s != 0 && dIsLightVertex(sc, eye[t - 1])) return 0.0;
+    // PBRT's infinite-area-light guard — the vertex TYPE, not dIsLightVertex(). See the host
+    // twin in bdpt.h connectBDPT for the measurement: testing dIsLightVertex() here deleted
+    // every s>=1 strategy ending on an emissive SURFACE, i.e. all direct lighting on any
+    // surface that also glows.
+    if (t > 1 && s != 0 && eye[t - 1].type == BV_LIGHT) return 0.0;
 
     double L = 0.0;
     int nUp = 1;                    // live wavelengths for THIS connection (set per branch)
@@ -10732,15 +12909,14 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             f *= adj;
             for (int i = 0; i + 1 < nUp; ++i)
                 fSec[i] = dBsdfF(sc, qs, wo, wcam, hb.lam[i + 1]) * adj;
-            double sgn = ddot(qs.ng, wcam) >= 0.0 ? 1.0 : -1.0;
-            o = qs.p + qs.ng * (Real)(sgn * 1e-6);
+                        o = dOffsetAlong(qs.p, qs.ng, wcam);
         }
         {   // max over live wavelengths (identical to `f <= 0` when nUp == 1)
             double mxF = f;
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
             if (!(mxF > 0.0)) return 0.0;
         }
-        if (occluded(sc, o, wcam, connMaxT(dist))) return 0.0;
+        if (occludedTo(sc, o, cam.eye, 2e-6, RAY_EPS, /*camLeg=*/true)) return 0.0;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
         double cosCam = ddot(qs.p - cam.eye, cam.w) / dist;   // positive (point in front)
         // Hero-only transmittance: the hero gate excludes any medium, so Tr is exactly 1
         // whenever nUp > 1.
@@ -10784,10 +12960,10 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             DVec3 toL = em.origin - pt.p; double dist2 = ddot(toL, toL);
             if (dist2 <= 0.0) return 0.0;
             dist = sqrt(dist2); wi = toL * (Real)(1.0 / dist);
-            double fall = spotFalloff(ddot(wi * (Real)-1, em.beamDir),
+            double fall = spotFalloff(ddot(wi * (Real)(-1), em.beamDir),
                                       em.spotCosInner, em.spotCosOuter);
             if (fall <= 0.0) return 0.0;               // outside the cone
-            y = em.origin; nOut = wi * (Real)-1;
+            y = em.origin; nOut = wi * (Real)(-1);
             Wgeom = fall / (dist2 * pdfChoice);        // emitSpd is an INTENSITY (W/sr)
         } else if (em.shape == 6) {
             // Distant sun: sample a direction inside the solar cone (pdfW = 1/Omega) and
@@ -10796,7 +12972,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             wi = dSunSampleCone(em, em.beamDir * (Real)-1, (double)u1, (double)u2);
             dist = (double)length(sc.sceneCenter - pt.p) + sc.sceneRadius;
             occlEps = 0.0;
-            y = pt.p + wi * (Real)dist; nOut = wi * (Real)-1;
+            y = pt.p + wi * (Real)dist; nOut = wi * (Real)(-1);
             Wgeom = em.spotOmega / pdfChoice;
         } else {
             // The sampled point's `emit pattern:` factor scales the radiance this strategy
@@ -10806,7 +12982,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             DVec3 toL = y - pt.p; double dist2 = ddot(toL, toL);
             if (dist2 <= 0.0) return 0.0;
             dist = sqrt(dist2); wi = toL * (Real)(1.0 / dist);
-            double cosLight = ddot(nOut, wi * (Real)-1);
+            double cosLight = ddot(nOut, wi * (Real)(-1));
             if (cosLight <= 0.0) return 0.0;           // emitter stays one-sided
             if (em.area <= 0.0) return 0.0;
             Wgeom = cosLight * em.area / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
@@ -10845,10 +13021,9 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
                 stG = (double)dShadowTerminatorG(wi, pt.ns, ngoP);
                 if (stG <= 0.0) return 0.0;
             }
-            double sgn = ddot(pt.ng, wi) >= 0.0 ? 1.0 : -1.0;
-            o = pt.p + pt.ng * (Real)(sgn * 1e-6);
+                        o = dOffsetAlong(pt.p, pt.ng, wi);
         }
-        if (occluded(sc, o, wi, connMaxT(dist, occlEps))) return 0.0;
+        if (occludedTo(sc, o, pt.p + wi * (Real)dist, occlEps)) return 0.0;
         double f = (pt.type == BV_MEDIUM) ? dMediumScatterF(sc, pt, wo, wi, lambda)
                                           : dBsdfF(sc, pt, wo, wi, lambda) * stG;
         double fSec[BDPT_NSEC];
@@ -10919,8 +13094,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
                 stGE = (double)dShadowTerminatorG(w, pt.ns, ngoE);
                 if (stGE <= 0.0) return 0.0;
             }
-            double sgn = ddot(pt.ng, w) >= 0.0 ? 1.0 : -1.0;
-            o = pt.p + pt.ng * (Real)(sgn * 1e-6);
+                        o = dOffsetAlong(pt.p, pt.ng, w);
         }
         if (qs.type != BV_MEDIUM) {
             cosL = ddot(qs.ns, w * (Real)-1);
@@ -10938,7 +13112,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosL = 1.0;
         }
-        if (occluded(sc, o, w, connMaxT(dist))) return 0.0;
+        if (occludedTo(sc, o, pt.p + w * (Real)dist, 2e-6)) return 0.0;
         double fE, fL;
         double fESec[BDPT_NSEC], fLSec[BDPT_NSEC];
         if (pt.type == BV_MEDIUM) {
@@ -10986,10 +13160,80 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     double mx = L;
     for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mx) mx = Lsec[i];
     if (!(mx > 0.0)) return 0.0;
-    const double mis = dMisWeight(sc, cam, light, eye, sampled, s, t, lambda);
+    const double mis = dMisWeight(sc, cam, light, eye, sampled, s, t, lambda, mergeKappa, kappaSurf);
     for (int i = 0; i + 1 < nUp; ++i) Lsec[i] *= mis;
     nUpConn = nUp;
     return L * mis;
+}
+
+// ---- mode J's point x point merges on the device (`-jsurf`) --------------------------------
+// Device twin of surfmerge.h's vmGatherCorr: the density estimate reads flux per GEOMETRIC
+// area while every strategy it is MIS-combined with integrates against the SHADING cosine.
+// Exactly 1 on flat geometry.
+__device__ static inline double dVmGatherCorr(const DVec3& wp, const DVec3& ns, const DVec3& ng) {
+    const double den = fabs(ddot(wp, ng));
+    if (den <= 1e-8) return 1.0;
+    return fabs(ddot(wp, ns)) / den;
+}
+
+// Device twin of bdpt.h's SurfMergeWeight. Every field is a constant of the GATHER SITE, so it
+// is built once per camera vertex and the per-photon call is the three lines at the bottom.
+struct DSurfMergeW {
+    double kappaB = 0.0, kappaS = 0.0;
+    double invPdfFwdK = 1.0, gateD1 = 0.0, cosPrev = 1.0, invDistPrev2 = 0.0;
+    double invPdfFwdKm1 = 1.0, etaKm1Coef = 0.0, segSumC = 0.0, segSumM = 0.0;
+    int camVert = 0, maxDepth = 0;
+
+    __device__ double operator()(const DSurfMis& lm, double pdfDirRev, double pdfDirFwd) const {
+        if ((int)lm.vert + camVert > maxDepth) return 0.0;   // merge depth is j + k here
+        const double etaS = kappaS * lm.pdfFwdA;
+        if (!(etaS > 0.0)) return 0.0;
+        const double R  = pdfDirRev * (double)lm.rCoef;
+        const double D1 = dMisRemap0(lm.pdfFwdA) * invPdfFwdK;
+        const double pdfRevKm1 = pdfDirFwd * cosPrev * invDistPrev2;
+        const double D2 = pdfRevKm1 * invPdfFwdKm1;
+        const double den = (double)lm.gateC1
+                         + R * (lm.sumC + kappaB * lm.sumMb + kappaS * lm.sumMs)
+                         + etaS
+                         + D1 * (gateD1 + etaKm1Coef * pdfRevKm1 + D2 * (segSumC + segSumM));
+        if (!(den > 0.0)) return 0.0;
+        return etaS / den;
+    }
+};
+
+// One camera vertex's gather. Mirrors SurfMap::query's 3x3x3 walk EXACTLY -- same clamped cell
+// coordinate, same dense index, same `<= r^2` test -- because the map was binned by that rule on
+// the host and a second transcription of it is a second chance to disagree.
+__device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const DVertex& vk,
+                                    const DVec3& woCam, const DSurfMergeW& sw,
+                                    double& gX, double& gY, double& gZ) {
+    const double r2 = (double)sm.radius * (double)sm.radius;
+    const int ix = (int)fmin(fmax(floor(((double)vk.p.x - (double)sm.lo.x) / (double)sm.cell), 0.0), (double)(sm.nx - 1));
+    const int iy = (int)fmin(fmax(floor(((double)vk.p.y - (double)sm.lo.y) / (double)sm.cell), 0.0), (double)(sm.ny - 1));
+    const int iz = (int)fmin(fmax(floor(((double)vk.p.z - (double)sm.lo.z) / (double)sm.cell), 0.0), (double)(sm.nz - 1));
+    const DVec3 ngo = (ddot(vk.ng, vk.ns) >= 0.0) ? vk.ng : DVec3{-vk.ng.x, -vk.ng.y, -vk.ng.z};
+    for (int dz = -1; dz <= 1; ++dz) { const int cz = iz + dz; if (cz < 0 || cz >= sm.nz) continue;
+    for (int dy = -1; dy <= 1; ++dy) { const int cy = iy + dy; if (cy < 0 || cy >= sm.ny) continue;
+    for (int dx = -1; dx <= 1; ++dx) { const int cx = ix + dx; if (cx < 0 || cx >= sm.nx) continue;
+        const long long c = ((long long)cz * sm.ny + cy) * sm.nx + cx;
+        for (int q = sm.cellStart[c]; q < sm.cellStart[c + 1]; ++q) {
+            const int idx = sm.order[q];
+            const DSurfPhoton& ph = sm.pts[idx];
+            const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
+            if (ddot(dd, dd) > r2) continue;
+            const DSurfMis& lm = sm.mis[ph.misIdx];
+            const Real lam = (Real)ph.lambda;
+            double fCam = dBsdfF(sc, vk, woCam, ph.wo, lam);
+            if (!(fCam > 0.0)) continue;
+            fCam *= dVmGatherCorr(ph.wo, vk.ns, ngo);
+            const double pdfDirRev = dBsdfPdf(sc, vk, woCam, ph.wo, lam);
+            const double pdfDirFwd = dBsdfPdf(sc, vk, ph.wo, woCam, lam);
+            const double w = sw(lm, pdfDirRev, pdfDirFwd);
+            if (!(w > 0.0)) continue;
+            const double cf = w * fCam * (double)ph.beta;
+            gX += (double)ph.cx * cf; gY += (double)ph.cy * cf; gZ += (double)ph.cz * cf;
+        }
+    }}}
 }
 
 // BDPT megakernel: one thread renders one (pixel,sample), grid-stride over all
@@ -11018,20 +13262,57 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 // launched — when `-max-bounce N` asks for N > BDPT_MAXDEPTH. The connection double-loop
 // below is O(MAXD^2), so the deep variant is genuinely slower per sample; that, plus the
 // local-memory cost, is why it is opt-in rather than the default.
-template <int NS, int MAXD>
+//
+// Templated on MERGE = mode J (UPBP). False is mode D and the kernel is bit-for-bit what it
+// was: no DPathSeg array, no segSum arrays, mergeKappa == 0 (so every merge term inside
+// dMisWeight vanishes) and no merge block. True adds the beam×ray half of the estimator.
+// A template flag rather than a runtime one because the per-thread segment array is the
+// kernel's largest single local allocation after the vertex stacks — mode D must not pay
+// occupancy for storage it never writes. Mode J only ever instantiates NS == 0: the hero
+// bundle is gated off for any scene with a participating medium, and mode J without one has
+// nothing to merge.
+template <int NS, int MAXD, bool MERGE, bool STRAT>
 __global__ void __launch_bounds__(128, 3)
 kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                       long long totalSamples, long long chunkSpp, long long sppTotal,
                       long long sampleBase, int resX, int maxDepth,
-                      int diffraction, unsigned long long seedBase, int heroC) {
-    enum { SECN = (NS > 0 ? NS : 1), MAXV = BDPT_MAXV_OF(MAXD) };
+                      int diffraction, unsigned long long seedBase, int heroC,
+                      DBeamMap bm, DSurfMap sm, DWfQueue wq, long long idxBegin, long long idxEnd) {
+    enum { SECN = (NS > 0 ? NS : 1), MAXV = BDPT_MAXV_OF(MAXD),
+           SEGN = (MERGE ? BDPT_MAXV_OF(MAXD) : 1) };
+    // `bm.beams == nullptr` is the dispatcher's own "-nobeams / empty map" signal, so this
+    // single test is the whole gate — with it false the camera walk is not even asked to
+    // record its segments and the render is mode D down to the RNG stream (gate 1).
+    const bool mergeOn = MERGE && bm.beams != nullptr && bm.nNodes > 0;
+    // The merge technique's constant, n_m * 2r, travelling with the map so no call site can
+    // forget it. Zero unless the map actually carries MIS partials, and that zero is what
+    // makes every merge term inside dMisWeight disappear. Weighted and unweighted merges
+    // must move together: weighting the connections down while the merges are still raw
+    // would darken the volume as surely as the reverse brightens it, so ONE value gates both.
+    const double mergeKappa = mergeOn ? bm.mergeKappa : 0.0;
+    // The point x point kind's constant. Zero unless `-jsurf` filled a surface map, and that
+    // zero is what makes every surface term in the weight vanish -- the same gate mergeKappa is
+    // for the beams.
+    const double kappaSurf = (sm.nPts > 0) ? sm.kappaS : 0.0;
     if (maxDepth > MAXD) maxDepth = MAXD;   // device array bound (host picks the variant)
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     const int C = (NS > 0) ? heroC : 1;
-    for (long long idx = g; idx < totalSamples; idx += G) {
-        long long pix = idx / chunkSpp;
-        long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
+    // [idxBegin, idxEnd) is the wave the host is running (the whole chunk when the
+    // wavefront gather is off); idxEnd <= totalSamples.
+    for (long long idx = idxBegin + g; idx < idxEnd; idx += G) {
+        const long long slot = idx / chunkSpp;   // pixel slot (padded to whole runs when stratified)
+        long long pix = slot;
+        if (STRAT) {                             // stratified waves: see DWfQueue (compile-time:
+                                                 // the default kernel carries none of this)
+            const unsigned run = ((unsigned)(slot >> 5) * wq.runMul) & wq.runMask;
+            if (run >= wq.nRuns) continue;       // padding run of the power-of-two domain
+            const unsigned row = run / wq.runsPerRow;
+            const int px0 = (int)(run - row * wq.runsPerRow) * 32 + (int)(slot & 31);
+            if (px0 >= resX) continue;           // padding slot of a partial run
+            pix = (long long)row * (long long)resX + px0;
+        }
+        long long gidx = pix * sppTotal + sampleBase + (idx - slot * chunkSpp);
         DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
@@ -11064,10 +13345,14 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
 
         DVertex eye[MAXV], light[MAXV];
         double eyeSec[MAXV * SECN], lightSec[MAXV * SECN];
+        DPathSeg segs[SEGN];
+        int nSegs = 0;
         // Only pay for escape tracking when the scene actually has a distant sun.
         DEscape esc; esc.escaped = 0; esc.beta = 0.0; esc.nUp = 1;
         int nE = dGenCameraSubpath(sc, cam, diffraction, px, py, hb, maxDepth + 1, rng, eye, eyeSec, NS, MAXV,
-                                   (sc.sunCount > 0) ? &esc : nullptr);
+                                   (sc.sunCount > 0) ? &esc : nullptr,
+                                   mergeOn ? segs : nullptr, mergeOn ? &nSegs : nullptr,
+                                   mergeOn ? (int)SEGN : 0);
         int nL = dGenLightSubpath(sc, cam, diffraction, hb, maxDepth + 1, rng, light, lightSec, NS, MAXV);
 
         Real cx = cieX(lambda), cy = cieY(lambda), cz = cieZ(lambda);
@@ -11111,8 +13396,9 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 if ((s == 1 && t == 1) || depth < 0 || depth > maxDepth) continue;
                 int spx = 0, spy = 0, isSplat = 0, nUpConn = 0;
                 double Lsec[SECN];
-                double c = dConnectBDPT(sc, cam, light, eye, lightSec, eyeSec, NS,
-                                        s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn);
+                double c = (c_jHalf == 2) ? 0.0 : dConnectBDPT(sc, cam, light, eye, lightSec, eyeSec, NS,
+                                        s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn,
+                                        mergeKappa, kappaSurf);
                 if (nUpConn <= 0) continue;
                 // Reject a non-positive — and, critically, a NON-FINITE — contribution before
                 // it reaches the film, exactly as BdptRenderer::renderRows does. Negated form
@@ -11146,6 +13432,195 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                     atomicAdd(&camFilm[o + 2], az);
                 }
             }
+
+        // ---- MERGES (mode J / UPBP) -------------------------------------------------
+        // The other half of the estimator: every photon beam whose kernel this camera
+        // subpath passed through. Unlike a connection this needs no light subpath at all —
+        // the beam map IS a cache of light subpaths, traced once for the whole frame —
+        // which is exactly why it reaches where a connection cannot: deep inside a thick
+        // medium the camera's own free-flight sampling essentially never lands on the
+        // scattering point a connection would have to be made from, whereas a beam is a
+        // whole LINE of deposited power and is hit by merely passing near it.
+        //
+        // The gather returns XYZ built at the BEAMS' wavelengths, not at this sample's hero
+        // λ (the standard spectral-photon-mapping estimate); `sg.beta` is this sample's own
+        // hero throughput to the segment origin, a scalar multiplying the XYZ triple.
+        //
+        // Placed after every connection deliberately: the gather draws from `rng`
+        // (ratio-tracked transmittance in a heterogeneous medium), and running it here means
+        // those draws cannot shift the connection half of the SAME sample. They cannot shift
+        // the next sample either, because the stream is re-seeded per (pixel,sample) at the
+        // top of this loop — so "turn the merges off and mode J is mode D bit-for-bit"
+        // survives even though the two halves share a generator. Host twin: renderRows.
+        // Either merge kind opens this region. `mergeOn` needs a BEAM map, so gating the
+        // whole block on it silently dropped the point merges on any scene without media --
+        // exactly the scene the point merges exist for.
+        if ((mergeOn || kappaSurf > 0.0) && c_jHalf != 1) {
+            // The camera half of every merge weight, replayed ONCE for the whole subpath.
+            // dMisWeight's camera loop telescopes inward from the merge point; everything it
+            // accumulates strictly camera-side of eye[k] is independent of WHERE along the
+            // segment a beam is hit, so it is summed here and read off per segment.
+            double segSumC[SEGN], segSumM[SEGN];
+            if (mergeKappa > 0.0 || kappaSurf > 0.0) {
+                for (int k = 0; k < nE && k < (int)SEGN; ++k) segSumC[k] = segSumM[k] = 0.0;
+                for (int k = 1; k < nE && k < (int)SEGN; ++k) {
+                    const double gate = (!eye[k].delta && !eye[k - 1].delta) ? 1.0 : 0.0;
+                    // eta' of the merge AT eye[k-1]; needs both its neighbours, so it starts
+                    // at k = 2. Its pdfRev is the RECORDED one: moving the light-side
+                    // neighbour of eye[k] along the same ray does not change the direction
+                    // arriving at eye[k-1].
+                    // Both kinds, each scaled by its OWN kappa here rather than factored
+                    // out of the sum (bdpt.h: mergeEtaPrime(...).scale(mk)) -- with two kinds
+                    // there is no single kappa to factor. A vertex is a medium point or a
+                    // surface, never both, so exactly one of these is non-zero.
+                    double eK = 0.0;
+                    if (k >= 2) {
+                        eK = mergeKappa * dMergeEtaPrime(sc, eye[k].p, eye[k - 1], eye[k - 2].p,
+                                                         eye[k - 1].pdfRev, lambda, dPatEnvOf(sc));
+                        if (kappaSurf > 0.0 && dSurfMergeSite(sc, eye[k - 1]) &&
+                            eye[k - 1].pdfRev > 0.0)
+                            eK += kappaSurf * eye[k - 1].pdfRev;
+                    }
+                    double carry = 0.0, carryM = 0.0;
+                    if (k >= 2) {
+                        // No ratio exists at the camera vertex itself, which is why the
+                        // recurrence starts one step in.
+                        const double rC = dMisRemap0(eye[k - 1].pdfRev) /
+                                          dMisRemap0(eye[k - 1].pdfFwd);
+                        carry  = rC * segSumC[k - 1];
+                        carryM = rC * segSumM[k - 1];
+                    }
+                    segSumC[k] = gate + carry;
+                    segSumM[k] = eK + carryM;
+                }
+            }
+            for (int i = 0; mergeOn && i < nSegs; ++i) {
+                const DPathSeg& sg = segs[i];
+                if (!(sg.beta > 0.0)) continue;
+                // Hoisted out of the per-hit weight: the ray/bounds clip and the spectral
+                // sigma_t lookup are constants of the SEGMENT, and a dense medium hands one
+                // segment hundreds of hits. Built unconditionally so the gather's `camTr` is
+                // never dangling — cheap (one clip per medium).
+                DTrRay camTr;
+                camTr.build(sc, sg.o, sg.d, sg.tMax, lambda);
+                DBeamMergeW mw;
+                mw.kappa = mergeKappa; mw.lamCam = (double)lambda; mw.pdfDirCam = sg.pdfDir;
+                if (mergeKappa > 0.0) {
+                    const int k = (sg.vert < nE) ? sg.vert : nE - 1;
+                    const DVertex& vk = eye[k < 0 ? 0 : k];
+                    mw.gateS1     = vk.delta ? 0.0 : 1.0;
+                    mw.cosFacK    = (vk.type == BV_SURFACE || vk.type == BV_LIGHT)
+                                  ? fabs((double)ddot(vk.ns, sg.d)) : 1.0;
+                    mw.invPdfFwdK = 1.0 / dMisRemap0(vk.pdfFwd);
+                    mw.segSumC    = (k >= 0 && k < (int)SEGN) ? segSumC[k] : 0.0;
+                    mw.segSumM    = (k >= 0 && k < (int)SEGN) ? segSumM[k] : 0.0;
+                    mw.kappaS     = kappaSurf;
+                    // The POINT merge AT eye[k]: unlike its beam twin there is no geometry to
+                    // gather, so the whole merge-point-independent coefficient IS kappaS.
+                    mw.etaKSurf   = (kappaSurf > 0.0 && dSurfMergeSite(sc, vk)) ? kappaSurf : 0.0;
+                    // The depth cap, the same one the connection loop above applies: a merge
+                    // at light vertex j on this segment makes a path of depth j + k + 1.
+                    mw.camVert    = k;
+                    mw.maxDepth   = maxDepth;
+                    // The merge AT eye[k]. Its light-side incoming direction is -sg.d
+                    // whatever x turns out to be, so sin(theta) and the whole coefficient are
+                    // merge-point INDEPENDENT and belong here, not in the per-hit weight.
+                    if (k >= 1 && vk.type == BV_MEDIUM &&
+                        vk.mediumId >= 0 && vk.mediumId < sc.mediaN) {
+                        DVec3 dp = eye[k - 1].p - vk.p;
+                        const double dn = sqrt(ddot(dp, dp));
+                        if (dn > 0.0) {
+                            dp = dp * (Real)(1.0 / dn);
+                            const double cc = ddot(sg.d, dp);
+                            const double s2 = 1.0 - cc * cc;
+                            const DMedium& md = sc.media[vk.mediumId];
+                            const DPatEnv env = dPatEnvOf(sc);
+                            const double sT = (double)medSigmaT(md, lambda) *
+                                              dMedDensityAt(md, vk.p, env);
+                            const double tr = dTrDet(sc, vk.p, dp, dn, lambda, env);
+                            if (s2 > 0.0 && sT > 0.0 && tr > 0.0)
+                                mw.etaKCoef = sqrt(s2) / (sT * tr);
+                        }
+                    }
+                }
+                // WAVEFRONT (UPBP-CONV): hand the segment -- and the weight state just built for
+                // it -- to the queue; kWfBeamHits / kWfBeamEval do the gather after this kernel.
+                // A full queue means this segment is gathered inline, right here, as before.
+                bool queued = false;
+                if (wq.segs) {
+                    const int si = atomicAdd(wq.nSegs, 1);
+                    if (si < wq.segCap) {
+                        DWfSeg& ws = wq.segs[si];
+                        ws.o = sg.o; ws.d = sg.d; ws.tMax = sg.tMax; ws.beta = sg.beta; ws.aGlass = sg.aGlass;
+                        ws.mw = mw; ws.tr = camTr; ws.px = px; ws.py = py; ws.lambda = (float)lambda;
+                        ws.seed = (unsigned long long)gidx * 1315423911ull + (unsigned long long)i * 2654435761ull;
+                        queued = true;
+                    } else {
+                        atomicAdd(&wq.overflow[0], 1);
+                    }
+                }
+                if (!queued) {
+                    double mX = 0.0, mY = 0.0, mZ = 0.0;
+                    dGatherPhotonBeams(sc, bm, sg.o, sg.d, (Real)sg.tMax, sg.aGlass, rng,
+                                       mX, mY, mZ, &mw, &camTr);
+                    if (mX != 0.0 || mY != 0.0 || mZ != 0.0) {
+                        size_t o = ((size_t)py * resX + px) * 3;
+                        atomicAdd(&camFilm[o + 0], mX * sg.beta);
+                        atomicAdd(&camFilm[o + 1], mY * sg.beta);
+                        atomicAdd(&camFilm[o + 2], mZ * sg.beta);
+                    }
+                }
+            }
+
+            // ---- POINT MERGES (`-jsurf`): the half folded in from mode U ------------------
+            // Per VERTEX, not per segment -- a point merge happens where the camera walk
+            // actually landed, so there is no ray to march and no rng draw, which is also why
+            // "merges off == mode D bit-for-bit" survives this for free.
+            if (kappaSurf > 0.0 && sm.nPts > 0) {
+                const double vmNorm = 1.0 / kappaSurf;
+                for (int k = 1; k < nE; ++k) {
+                    const DVertex& vk = eye[k];
+                    if (!dSurfMergeSite(sc, vk) || !(vk.beta > 0.0)) continue;
+                    const DVertex& vp = eye[k - 1];
+                    DVec3 woCam{vp.p.x - vk.p.x, vp.p.y - vk.p.y, vp.p.z - vk.p.z};
+                    const double d2 = ddot(woCam, woCam);
+                    if (!(d2 > 0.0)) continue;
+                    const double invD = 1.0 / sqrt(d2);
+                    woCam = woCam * (Real)invD;
+                    DSurfMergeW sw;
+                    sw.kappaB       = mergeKappa;
+                    sw.kappaS       = kappaSurf;
+                    sw.invPdfFwdK   = 1.0 / dMisRemap0(vk.pdfFwd);
+                    sw.gateD1       = vp.delta ? 0.0 : 1.0;
+                    sw.cosPrev      = dOnSurface(vp) ? fabs(ddot(vp.ns, woCam)) : 1.0;
+                    sw.invDistPrev2 = 1.0 / d2;
+                    sw.invPdfFwdKm1 = 1.0 / dMisRemap0(vp.pdfFwd);
+                    // The merge AT eye[k-1], less its pdfRev. pLight = 1 turns the primed eta
+                    // into the bare coefficient, which is legitimate HERE (and not in the beam
+                    // gather) because both of eye[k-1]'s neighbours are known: the merge site
+                    // is eye[k] itself, so there is no per-photon geometry.
+                    sw.etaKm1Coef   = 0.0;
+                    if (k >= 2) {
+                        sw.etaKm1Coef = mergeKappa * dMergeEtaPrime(sc, vk.p, vp, eye[k - 2].p,
+                                                                    1.0, lambda, dPatEnvOf(sc));
+                        if (dSurfMergeSite(sc, vp)) sw.etaKm1Coef += kappaSurf;
+                    }
+                    sw.segSumC      = (k - 1 < (int)SEGN) ? segSumC[k - 1] : 0.0;
+                    sw.segSumM      = (k - 1 < (int)SEGN) ? segSumM[k - 1] : 0.0;
+                    sw.camVert      = k;
+                    sw.maxDepth     = maxDepth;
+                    double gX = 0.0, gY = 0.0, gZ = 0.0;
+                    dSurfMergeAt(sc, sm, vk, woCam, sw, gX, gY, gZ);
+                    if (gX != 0.0 || gY != 0.0 || gZ != 0.0) {
+                        const double f = vk.beta * vmNorm;
+                        const size_t o = ((size_t)py * resX + px) * 3;
+                        atomicAdd(&camFilm[o + 0], gX * f);
+                        atomicAdd(&camFilm[o + 1], gY * f);
+                        atomicAdd(&camFilm[o + 2], gZ * f);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -11166,7 +13641,13 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
 // sampled direction (the caller averages K). Because the sub-ray is cosine-weighted and the
 // visible BRDF is Lambertian, the cosine and 1/pi cancel to rho(vis), folded per photon
 // (diffuse hit) or applied once (specular-arrival emitter/env). Keep in sync with photonGatherSub.
-__device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, int diffraction,
+//
+// `pmC` is the CAUSTIC map (the L.S+.D partition of the same deposit); its photons are a
+// disjoint set from `pm`'s and it carries its own, much smaller, radius — so the two density
+// estimates are simply summed. `pmC.photons == nullptr` when the split is off or the scene
+// produced no caustic path, and then this costs one predictable branch per gather.
+__device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
+                                        const DPhotonMap& pmC, int diffraction,
                                         DVec3 ro, DVec3 rd, Real lambda, double invPdfL,
                                         const DHit& visHit, const DMaterial& visMat, DRng& rng,
                                         double& oX, double& oY, double& oZ) {
@@ -11175,6 +13656,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
     bool specularSeen = false;                           // any specular bounce so far?
     DMediumStack stk; stk.clear();
     const Real r2 = (Real)((double)pm.radius * (double)pm.radius);
+    const bool causOn = (pmC.photons != nullptr);
+    const Real r2C = (Real)((double)pmC.radius * (double)pmC.radius);
     const int maxBounce = 32;
     for (int b = 0; b < maxBounce; ++b) {
         if (sc.hasGrin) {                                // final-gather rays bend too
@@ -11210,41 +13693,77 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
         }
         const DMaterial& m = *mp;
 
-        int li = dEmitterForMat(sc, matId);
-        if (li >= 0) {                                   // emitter
-            if (specularSeen) {                          // specular-direct: NEE can't reach it
+        // Self-emission on a SPECULAR arrival (a diffuse arrival's direct term comes from NEE
+        // at the visible point). Prefers the registered emitter's baked SPD and falls back to
+        // the material's own `emit` for geometry that registers none — a quad, isosurface or
+        // CSG solid — exactly as bkRadiance does; testing `li >= 0` alone made every such
+        // glowing surface invisible to mode M. Does NOT return: an emissive material still
+        // has a BSDF. Host twin: photonGatherSub.
+        {
+            const int li = dEmitterForMat(sc, matId);
+            const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
+                               : (m.matIsLight)   ? m.matEmit
+                                                  : nullptr;
+            if (eSpd && specularSeen && dot(rd, h.ng) < 0) {
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
-                double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * rhoV * invPdfL
+                double e = (double)specLookup(eSpd, lambda) * thr * rhoV * invPdfL
                          * dEmitPatMul(sc, m.emitPat, h);   // `emit pattern:` at this hit
                 oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
             }
-            return;                                       // else: direct handled by NEE at vis
         }
 
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
             // Density estimate at y, folding the visible-point reflectance per photon wavelength.
             float gx = 0.f, gy = 0.f, gz = 0.f;
-            int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
-            int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
-            int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
-            ix = min(max(ix, 0), pm.nx - 1);
-            iy = min(max(iy, 0), pm.ny - 1);
-            iz = min(max(iz, 0), pm.nz - 1);
-            for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= pm.nz) continue;
-              for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= pm.ny) continue;
-                for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
-                  int c = (cz * pm.ny + cy) * pm.nx + cx;
-                  for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
-                      const DGatherPhoton& ph = pm.photons[k];
-                      DVec3 d = h.p - ph.pos;
-                      if (dot(d, d) > r2) continue;
-                      if (dot(ph.n, h.n) < (Real)0.5) continue;
-                      float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
-                      float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
-                      float w = rhoY * rhoV;
-                      gx += w * ph.pX; gy += w * ph.pY; gz += w * ph.pZ;
-                  }
-                }}}
+            dPmNeighborhood(pm, h.p, [&](int k) {
+                const DGatherPhoton& ph = pm.photons[k];
+                DVec3 d = h.p - ph.pos;
+                if (dot(d, d) > r2) return;
+                if (dot(ph.n, h.n) < (Real)0.5) return;
+                float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
+                float w = rhoY * rhoV;
+                gx += w * ph.pX; gy += w * ph.pY; gz += w * ph.pZ;
+            });
+            if (causOn) {
+                // The caustic map gathers at its own PER-QUERY radius (dPmAdaptiveRadius).
+                // pX/pY/pZ carry the fold for the map's fixed radius, so rescale the sum by
+                // the area ratio r^2/r_q^2 rather than re-folding every record.
+                const Real rq  = dPmAdaptiveRadius(pmC, h.p, h.n);
+                const Real r2q = rq * rq;
+                float cx = 0.f, cy = 0.f, cz = 0.f;
+                dPmNeighborhood(pmC, h.p, [&](int k) {
+                    const DGatherPhoton& ph = pmC.photons[k];
+                    DVec3 d = h.p - ph.pos;
+                    if (dot(d, d) > r2q) return;
+                    if (dot(ph.n, h.n) < (Real)0.5) return;
+                    float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                    float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
+                    float w = rhoY * rhoV;
+                    cx += w * ph.pX; cy += w * ph.pY; cz += w * ph.pZ;
+                });
+                const float aw = (r2q > (Real)0) ? (float)((double)r2C / (double)r2q) : 0.f;
+                // M-GATHERAREA: the caustic map has its OWN radius, so its own coverage --
+                // matching the host, where the correction lives inside each `est` call keyed
+                // on that map's rq. One shared coverage would be cheaper and wrong.
+                double cs = 1.0;
+                if (sc.gatherArea)
+                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea));
+                gx += cx * (float)(aw * cs);
+                gy += cy * (float)(aw * cs);
+                gz += cz * (float)(aw * cs);
+            }
+            // ...and the MAIN map's, at its own radius. The device folds norm/pi into every
+            // photon record at UPLOAD time (see DGatherPhoton), so unlike the host there is no
+            // per-gather normalisation to scale -- the correction multiplies the accumulated
+            // sum instead. Same estimator, different place to put the multiply.
+            if (sc.gatherArea) {
+                const double ms = dGatherAreaScale(
+                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea));
+                gx = (float)((double)gx * ms);
+                gy = (float)((double)gy * ms);
+                gz = (float)((double)gz * ms);
+            }
             oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
         }
@@ -11252,13 +13771,13 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
         switch (m.type) {                                // specular walk (monochromatic)
             case D_MIRROR: {
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_GLOSSY: {
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
-                ro = h.p + h.n * RAY_EPS; rd = o; break;
+                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_DIELECTRIC: {
                 DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
@@ -11266,17 +13785,17 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
             }
             case D_HALFMIRROR: {
                 Real r = clamp01(dReflectSlot(sc, m, h, lambda));
-                if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
-                else                   { ro = h.p + rd * RAY_EPS; }
+                if (rng.uniform() < r) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+                else                   { ro = dOffsetAlong(h.p, h.ng, rd); }
                 break;
             }
             case D_FILTER: {
                 thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
-                ro = h.p + rd * RAY_EPS; break;
+                ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
         }
         specularSeen = true;                             // only specular cases reach here
@@ -11300,7 +13819,14 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
 // specular leg alike — first collects single scatter from the beams it passes near, then takes
 // the medium's own attenuation. Beams are the only cache record carrying a photon DIRECTION,
 // so they are the only thing that can evaluate a phase function; see photonbeams.h.
-__device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int diffraction,
+//
+// `pmC` is the CAUSTIC map: the L.S+.D subset of the same deposit, held apart precisely so it
+// can carry its OWN (much smaller) gather radius. One radius cannot serve both populations —
+// buildAuto sizes it for the majority, which is the broad ambient wash, and a caustic is a thin
+// high-contrast concentration that such a radius convolves flat. The two sets are disjoint and
+// share nEmitted, so the estimates just add: nothing is double-counted and nothing is dropped.
+__device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
+                                     const DPhotonMap& pmC, int diffraction,
                                      DVec3 ro, DVec3 rd, Real lambda, double invPdfL, DRng& rng,
                                      int fgRays, const DBeamMap* bm,
                                      double& oX, double& oY, double& oZ) {
@@ -11311,10 +13837,15 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
     // VISITED photon (~85% of visits fail it), and on GeForce parts a double compare +
     // f2d convert issue at 1/64 rate, so keeping the test in FP32 matters.
     const Real r2 = (Real)((double)pm.radius * (double)pm.radius);
+    const bool causOn = (pmC.photons != nullptr);
+    const Real r2C = (Real)((double)pmC.radius * (double)pmC.radius);
     const int maxBounce = 32;
     const bool volOn = (bm != nullptr) && bm->nNodes > 0 && sc.mediaN > 0;
 
     for (int b = 0; b < maxBounce; ++b) {
+        // Second cancellation point, covering the rays that spend their time BOUNCING rather
+        // than in one big beam walk (a scene with no media never enters dGatherPhotonBeams).
+        if (dGatherStopped()) return;
         // Glass absorption for THIS segment, hoisted above the escape test because the beam
         // gather below needs it: a beam seen through a dielectric is attenuated to its own
         // closest-approach point, not to the segment end (host twin: photonmap_render.h).
@@ -11336,7 +13867,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
             for (int gs = 0; gs < 200000; ++gs) {  // same safety cap the marcher applies
                 DVec3 pro = ro;
                 DGrinMedia gm;                     // rng == nullptr: bend only, no collisions
-                dGrinMarch(sc, ro, rd, &gm, 1);    // — a camera ray's volume answer IS the
+                dGrinMarch(sc, ro, rd, &gm, 1, /*camHide=*/(b == 0));  // — a camera ray's volume answer IS the
                 if (!gm.stepped) break;            //   beam gather below
                 const Real slen = (Real)gm.arc;
                 if (volOn && slen > 0) {
@@ -11349,7 +13880,10 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
             }
             if (thr <= 0.0) return;
         }
-        DHit h = closestHit(sc, ro, rd);
+        // b == 0 is the camera ray dPhotonGather was handed (mode M's eye pass); see
+        // DMaterial::hideCamera. dPhotonGatherSub's walk is NOT given this: a final-gather
+        // sub-ray leaves a visible point, so it is an indirect ray and must see the flat.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(b == 0));
         // --- Participating media along this segment (mode M with -beams) ------------------
         // Done BEFORE `thr` takes the segment's attenuation, for the same reason: each
         // gathered beam carries the transmittance to ITS OWN closest approach.
@@ -11399,14 +13933,29 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
         }
         const DMaterial& m = *mp;
 
-        int li = dEmitterForMat(sc, matId);
-        if (li >= 0) {                                   // directly-viewed / specular-seen emitter
-            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL
-                     * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
-            oX += (double)cieX(lambda) * e;
-            oY += (double)cieY(lambda) * e;
-            oZ += (double)cieZ(lambda) * e;
-            return;
+        // Self-emission of a directly-viewed / specularly-seen emitter, one-sided by the
+        // geometric normal to match bkRadiance. Prefers the registered emitter's baked SPD
+        // (it may carry a `power`/`lumens` flux normalisation the raw material spectrum does
+        // not) and falls back to the material's own `emit` when this geometry registered no
+        // emitter at all — only tessellated geometry does, so a glowing `quad`, isosurface or
+        // CSG solid has an emissive MATERIAL and no DEmitter. Testing `li >= 0` alone is what
+        // made gallery_rain's grid floor lose its green lines entirely under mode M on GPU.
+        //
+        // NOT a `return`: an emissive material still has a BSDF, so a glowing DIFFUSE surface
+        // both emits and reflects and the walk falls through to the density estimate. Host
+        // twin: photonGather — see its comment for the four-mode measurement.
+        {
+            const int li = dEmitterForMat(sc, matId);
+            const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
+                               : (m.matIsLight)   ? m.matEmit
+                                                  : nullptr;
+            if (eSpd && dot(rd, h.ng) < 0) {
+                double e = (double)specLookup(eSpd, lambda) * thr * invPdfL
+                         * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
+                oX += (double)cieX(lambda) * e;
+                oY += (double)cieY(lambda) * e;
+                oZ += (double)cieZ(lambda) * e;
+            }
         }
 
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
@@ -11426,10 +13975,10 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 //       Lambertian 1/pi cancel to rho(vis), folded inside dPhotonGatherSub.
                 double fx = 0.0, fy = 0.0, fz = 0.0;
                 for (int k = 0; k < fgRays; ++k) {
-                    DVec3 gro = h.p + h.n * RAY_EPS;
                     DVec3 grd = cosineHemisphere(h.n, rng);
+                    DVec3 gro = dOffsetAlong(h.p, h.ng, grd);
                     double sx, sy, sz;
-                    dPhotonGatherSub(sc, pm, diffraction, gro, grd, lambda, invPdfL, h, m, rng, sx, sy, sz);
+                    dPhotonGatherSub(sc, pm, pmC, diffraction, gro, grd, lambda, invPdfL, h, m, rng, sx, sy, sz);
                     fx += sx; fy += sy; fz += sz;
                 }
                 double inv = thr / (double)fgRays;
@@ -11444,27 +13993,55 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
             // far below the 8-bit output quantum, and FP64 FMAs would issue at 1/64 rate. The
             // per-sample total is promoted to double once at the end (film math stays double).
             float gx = 0.f, gy = 0.f, gz = 0.f;
-            int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
-            int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
-            int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
-            ix = min(max(ix, 0), pm.nx - 1);
-            iy = min(max(iy, 0), pm.ny - 1);
-            iz = min(max(iz, 0), pm.nz - 1);
-            for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= pm.nz) continue;
-              for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= pm.ny) continue;
-                for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
-                  int c = (cz * pm.ny + cy) * pm.nx + cx;
-                  for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
-                      const DGatherPhoton& ph = pm.photons[k];
-                      DVec3 d = h.p - ph.pos;
-                      if (dot(d, d) > r2) continue;
-                      if (dot(ph.n, h.n) < (Real)0.5) continue;   // reject cross-surface leakage
-                      float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
-                      gx += rho * ph.pX;
-                      gy += rho * ph.pY;
-                      gz += rho * ph.pZ;
-                  }
-                }}}
+            dPmNeighborhood(pm, h.p, [&](int k) {
+                const DGatherPhoton& ph = pm.photons[k];
+                DVec3 d = h.p - ph.pos;
+                if (dot(d, d) > r2) return;
+                if (dot(ph.n, h.n) < (Real)0.5) return;   // reject cross-surface leakage
+                float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                gx += rho * ph.pX;
+                gy += rho * ph.pY;
+                gz += rho * ph.pZ;
+            });
+            // Caustic map: same estimator, its own PER-QUERY radius, summed in (see the
+            // header comment and dPmAdaptiveRadius). The area ratio r^2/r_q^2 corrects the
+            // fixed-radius normalisation already folded into pX/pY/pZ.
+            if (causOn) {
+                const Real rq  = dPmAdaptiveRadius(pmC, h.p, h.n);
+                const Real r2q = rq * rq;
+                float cx = 0.f, cy = 0.f, cz = 0.f;
+                dPmNeighborhood(pmC, h.p, [&](int k) {
+                    const DGatherPhoton& ph = pmC.photons[k];
+                    DVec3 d = h.p - ph.pos;
+                    if (dot(d, d) > r2q) return;
+                    if (dot(ph.n, h.n) < (Real)0.5) return;
+                    float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                    cx += rho * ph.pX;
+                    cy += rho * ph.pY;
+                    cz += rho * ph.pZ;
+                });
+                const float aw = (r2q > (Real)0) ? (float)((double)r2C / (double)r2q) : 0.f;
+                // M-GATHERAREA: the caustic map has its OWN radius, so its own coverage --
+                // matching the host, where the correction lives inside each `est` call keyed
+                // on that map's rq. One shared coverage would be cheaper and wrong.
+                double cs = 1.0;
+                if (sc.gatherArea)
+                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea));
+                gx += cx * (float)(aw * cs);
+                gy += cy * (float)(aw * cs);
+                gz += cz * (float)(aw * cs);
+            }
+            // ...and the MAIN map's, at its own radius. The device folds norm/pi into every
+            // photon record at UPLOAD time (see DGatherPhoton), so unlike the host there is no
+            // per-gather normalisation to scale -- the correction multiplies the accumulated
+            // sum instead. Same estimator, different place to put the multiply.
+            if (sc.gatherArea) {
+                const double ms = dGatherAreaScale(
+                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea));
+                gx = (float)((double)gx * ms);
+                gy = (float)((double)gy * ms);
+                gz = (float)((double)gz * ms);
+            }
             oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
         }
@@ -11472,13 +14049,13 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
         switch (m.type) {                                // specular walk (monochromatic)
             case D_MIRROR: {
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_GLOSSY: {
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
-                ro = h.p + h.n * RAY_EPS; rd = o; break;
+                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_DIELECTRIC: {
                 DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
@@ -11486,34 +14063,75 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
             }
             case D_HALFMIRROR: {
                 Real r = clamp01(dReflectSlot(sc, m, h, lambda));
-                if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
-                else                   { ro = h.p + rd * RAY_EPS; }
+                if (rng.uniform() < r) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+                else                   { ro = dOffsetAlong(h.p, h.ng, rd); }
                 break;
             }
             case D_FILTER: {
                 thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
-                ro = h.p + rd * RAY_EPS; break;
+                ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
         }
         if (thr <= 0.0) return;
     }
 }
 
-// One thread per (pixel, sample); grid-strides over totalSamples. Mirrors kBackward's
-// seeding (global sample index) so a chunked gather is decorrelated across chunks. The
-// gather already returns XYZ, so (unlike kBackward) no cie(lambda) multiply is applied.
-__global__ void kGather(DScene sc, DPhotonMap pm, DBeamMap bm, DCamera cam,
+// One thread per (pixel, sample); grid-strides over [idxBase, idxEnd) of this chunk's flat
+// (pixel, sample) index space. Mirrors kBackward's seeding (global sample index) so a
+// chunked gather is decorrelated across chunks. The gather already returns XYZ, so (unlike
+// kBackward) no cie(lambda) multiply is applied.
+//
+// The [idxBase, idxEnd) window exists so the host can cut ONE chunk into several launches
+// and poll the stop flag between them. At the resolutions this mode runs at, the chunk
+// size clamps to a single spp (200000/npix < 1), so without the window the finest seam an
+// external `ftrace -stop` could land on was a whole frame's worth of gathering — minutes,
+// with -beams — which is what made a perfectly healthy stop look like a failure. Every
+// seed here is a pure function of the GLOBAL index gidx, never of the launch bounds, so a
+// sliced chunk samples exactly the same paths as an unsliced one.
+//
+// The launch geometry is named because the SLICE SIZE MUST NOT FALL BELOW IT. This is a
+// persistent grid that grid-strides over its sample range, so a slice with fewer samples
+// than there are threads leaves threads idle outright — see the sliceLo comment in
+// renderPhotonMapSharedCuda for the 11x that cost before the floor was tied to this.
+static constexpr int kGatherGrid  = 2048;
+static constexpr int kGatherBlock = 128;
+__global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, DCamera cam,
                         double* film, double* hits,
-                        long long totalSamples, long long chunkSpp, long long sppTotal,
+                        long long idxBase, long long idxEnd,
+                        long long chunkSpp, long long sppTotal,
                         long long sampleBase, int resX, int diffraction, int fgRays,
                         unsigned long long seedBase) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
-    for (long long idx = g; idx < totalSamples; idx += G) {
+    int poll = 0;
+    for (long long idx = idxBase + g; idx < idxEnd; idx += G) {
+        // Cooperative cancellation, and the ONLY thing that makes a gather interruptible.
+        //
+        // The host can only poll BETWEEN launches, and at every ordinary resolution there is
+        // exactly one launch: `sliceOcc` (4 * kGatherGrid * kGatherBlock = 1048576) exceeds a
+        // frame's sample count (518400 at 960x540; 172800 for a whole 3-spp render at
+        // 320x180), so the slice loop never iterates and there is no "between". Measured
+        // before this existed: a `-stop` issued one minute into a 320x180 gather returned
+        // 879 s later having cancelled nothing — the render had simply run to completion. On
+        // gallery_rain at -n 800M the same single launch runs for hours.
+        //
+        // Shrinking the slice is NOT the alternative: tying it below the occupancy floor left
+        // most of this persistent grid idle and cost a measured 11x (see sliceLo). Polling
+        // here is independent of slice size, so the floor stays exactly as tuned.
+        //
+        // NOTE this poll is nearly worthless ON ITS OWN and is kept only as a cheap guard for
+        // the multi-sample-per-thread case: at 960x540 there are 518400 samples for 262144
+        // threads, i.e. ONE iteration each, so it fires at launch time and never again. The
+        // polls that actually make a stop land are the ones inside dGatherPhotonBeams' BVH
+        // walk and dPhotonGather's bounce loop, where the time is really spent.
+        //
+        // Returning early leaves the scratch film partially written, which is exactly what
+        // the host's `chunkDone = false` discard path already exists to throw away.
+        if ((poll++ & 3) == 0 && dGatherStopped()) return;
         long long pix  = idx / chunkSpp;
         long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
         DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
@@ -11522,7 +14140,10 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DBeamMap bm, DCamera cam,
 
         double pdf = 0.0;
         Real lambda = dSampleSceneLambda(sc, rng, pdf);
-        if (pdf <= 0.0) continue;
+        // Retire on the reject path too. It is a rare sample, but an undercount here would
+        // leave the bar stalled just short of 100% at the end of a launch — which reads as
+        // exactly the wedged render this counter exists to rule out.
+        if (pdf <= 0.0) { dGatherRetire(); continue; }
         double invPdfL = dInvPdfLambda(sc, lambda);
 
         DVec3 ro, rd;
@@ -11530,13 +14151,34 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DBeamMap bm, DCamera cam,
         dGenRay(cam, px, py, jx, jy, ro, rd);            // pinhole only (lens cams gated to CPU)
 
         double oX, oY, oZ;
-        dPhotonGather(sc, pm, diffraction, ro, rd, lambda, invPdfL, rng, fgRays,
+        dPhotonGather(sc, pm, pmC, diffraction, ro, rd, lambda, invPdfL, rng, fgRays,
                       bm.nNodes > 0 ? &bm : nullptr, oX, oY, oZ);
         size_t o = ((size_t)py * resX + px) * 3;
         atomicAdd(&film[o + 0], oX);
         atomicAdd(&film[o + 1], oY);
         atomicAdd(&film[o + 2], oZ);
         if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
+        dGatherRetire();   // one retired sample — the host's only view inside this launch
+    }
+}
+
+// Fold a completed chunk's scratch accumulation into the camera's film, then leave the
+// scratch for the host to clear. kGather writes into scratch rather than straight into the
+// film so that a chunk abandoned part-way (external `ftrace -stop`, closed window) can be
+// DISCARDED whole. That matters because the film is normalised by a single global spp
+// count, not per pixel: committing half a chunk would leave the pixels that got their
+// sample ~1/spp brighter than the ones that did not, i.e. a visible band across the last
+// frame of every stopped render. Dropping the partial chunk makes a stop anywhere inside a
+// chunk produce exactly the image a stop at the preceding chunk boundary would have.
+__global__ void kFilmFold(double* film, double* hits, const double* sfilm, const double* shits,
+                          long long npix) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long S = (long long)gridDim.x * blockDim.x;
+    for (; i < npix; i += S) {
+        film[i * 3 + 0] += sfilm[i * 3 + 0];
+        film[i * 3 + 1] += sfilm[i * 3 + 1];
+        film[i * 3 + 2] += sfilm[i * 3 + 2];
+        if (hits && shits) hits[i] += shits[i];
     }
 }
 
@@ -11562,12 +14204,13 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
     for (int b = 0; b < maxBounce; ++b) {
         if (sc.hasGrin) {                                // GRADIENT-INDEX: the camera ray bends,
             DGrinMedia gm;                               // exactly as the deposit's photons do.
-            dGrinMarch(sc, ro, rd, &gm);                 // rng == nullptr: bend only
+            dGrinMarch(sc, ro, rd, &gm, 200000, /*camHide=*/(b == 0));  // rng == nullptr: bend only
             int cm = stk.topMat();                       // Beer-Lambert over the marched arc
             Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
             if (a > 0 && gm.arc > 0) thr *= exp(-(double)a * (double)gm.arc);
         }
-        DHit h = closestHit(sc, ro, rd);
+        // b == 0 is the camera ray this visible-point walk was handed; see DMaterial::hideCamera.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(b == 0));
         if (h.valid) {                                   // Beer-Lambert in current medium
             int cm = stk.topMat();
             Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
@@ -11621,13 +14264,13 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         switch (m.type) {                                // specular walk (monochromatic)
             case D_MIRROR: {
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_GLOSSY: {
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
-                ro = h.p + h.n * RAY_EPS; rd = o; break;
+                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_DIELECTRIC: {
                 DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
@@ -11635,17 +14278,17 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
             }
             case D_HALFMIRROR: {
                 Real r = clamp01(dReflectSlot(sc, m, h, lambda));
-                if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
-                else                   { ro = h.p + rd * RAY_EPS; }
+                if (rng.uniform() < r) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+                else                   { ro = dOffsetAlong(h.p, h.ng, rd); }
                 break;
             }
             case D_FILTER: {
                 thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
-                ro = h.p + rd * RAY_EPS; break;
+                ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
         }
         if (thr <= 0.0) return;
@@ -11701,7 +14344,7 @@ __global__ void kSppmVisiblePoint(DScene sc, DCamera cam, DSppmState st, int res
 // carry pX/pY/pZ = cie(lambda)*power/pi (NO area/nEmitted fold — those depend on the current
 // per-pixel radius and are applied at resolve), so phi? += rho(lambda_p) * p?.
 __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, int resY,
-                            double alpha) {
+                            double alpha, unsigned long long seedBase, long long passIdx) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     long long npix = (long long)resX * resY;
@@ -11713,28 +14356,42 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
         Real r2 = (Real)(R * R);
         float gx = 0.f, gy = 0.f, gz = 0.f;
         double M = 0.0;
-        int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
-        int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
-        int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
-        ix = min(max(ix, 0), pm.nx - 1);
-        iy = min(max(iy, 0), pm.ny - 1);
-        iz = min(max(iz, 0), pm.nz - 1);
-        for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= pm.nz) continue;
-          for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= pm.ny) continue;
-            for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
-              int c = (cz * pm.ny + cy) * pm.nx + cx;
-              for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
-                  const DGatherPhoton& ph = pm.photons[k];
-                  DVec3 d = h.p - ph.pos;
-                  if (dot(d, d) > r2) continue;
-                  if (dot(ph.n, h.n) < (Real)0.5) continue;   // reject cross-surface leakage
-                  float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
-                  gx += rho * ph.pX;
-                  gy += rho * ph.pY;
-                  gz += rho * ph.pZ;
-                  M += 1.0;
-              }
-            }}}
+        dPmNeighborhood(pm, h.p, [&](int k) {
+            const DGatherPhoton& ph = pm.photons[k];
+            DVec3 d = h.p - ph.pos;
+            if (dot(d, d) > r2) return;
+            if (dot(ph.n, h.n) < (Real)0.5) return;   // reject cross-surface leakage
+            float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+            gx += rho * ph.pX;
+            gy += rho * ph.pY;
+            gz += rho * ph.pZ;
+            M += 1.0;
+        });
+        // M-GATHERAREA, the DEVICE twin of sppm_render.h's correction. Mode `S` runs on the GPU
+        // by DEFAULT, so the host edit alone changed nothing a default render executes: the
+        // positive control `_ga_strip` read -19.78 % with the correction off and -19.76 % with
+        // it on, i.e. bit-identical, while the CPU path moved -25.4 % -> -3.3 %. Both halves,
+        // or neither.
+        //
+        // Applied to the flux BEFORE it enters `tau`, for the reason spelled out in the host
+        // twin: `kSppmResolve` divides by `pi R^2` at the FINAL radius and is correct only
+        // because the `ratio2` chain telescopes each pass's contribution to `R_final^2/R_i^2`.
+        // Coverage belongs to the radius actually gathered at, and SPPM shrinks R every pass.
+        if (sc.gatherArea > 0) {
+            // Seeded per (pixel, pass) exactly like kSppmVisiblePoint above, and NOT per thread
+            // or per launch index, so the probe pattern -- and the image -- is independent of
+            // the grid geometry. `+ 0x5851F42D4C957F2DULL` keeps this stream disjoint from the
+            // visible-point stream that shares the same (pix, pass).
+            unsigned long long s = (unsigned long long)(pix) * 0x9E3779B97F4A7C15ULL
+                                 + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL
+                                 + 0x5851F42D4C957F2DULL;
+            DRng grng; grng.seed(s * 2 + 23, seedBase ^ s);
+            const double cs = dGatherAreaScale(
+                dGatherCoverage(sc, h.p, h.n, (Real)R, grng, sc.gatherArea));
+            gx = (float)((double)gx * cs);
+            gy = (float)((double)gy * cs);
+            gz = (float)((double)gz * cs);
+        }
         // Shared-statistics PPM update (Hachisuka 2008).
         double nAcc = st.nAcc[pix];
         double Nnew = nAcc + alpha * M;
@@ -11882,7 +14539,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
                                    bool* keepBundle = nullptr) {
     DVertex vt = dVertFromHit(h, matId);
     const DVec3& ns = h.n;
-    DVec3 wo = normalize(rd * (Real)-1);
+    DVec3 wo = normalize(rd * (Real)(-1));
     wi = DVec3(0, 0, 0); betaFactor = 0; pdfW = 0; pdfRevW = 0; cosThetaOut = 0;
     delta = false; terminate = false;
     const int nSec = (secF && lamAll && nUp > 1) ? nUp - 1 : 0;   // secondaries to fill
@@ -12237,9 +14894,8 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                             if (cam.project(h.p, px, py, cc, d2c)) {
                                 // Shadow ray first, BSDF eval after (bit-identical: no RNG
                                 // in either; skips the eval for occluded splats).
-                                double sgn = ddot(h.ng, wcam) >= 0.0 ? 1.0 : -1.0;
-                                DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
-                                if (!occluded(sc, oo, wcam, connMaxT(distc))) {
+                                                                DVec3 oo = dOffsetAlong(h.p, h.ng, wcam);
+                                if (!occludedTo(sc, oo, h.p + wcam * (Real)distc, 2e-6, RAY_EPS, /*camLeg=*/true)) {  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
                                     DVertex vt = dVertFromHit(h, matId);
                                     // The adjoint correction and shadow-terminator G are purely
                                     // geometric, so they scale every λ the same way.
@@ -12317,8 +14973,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             // does not consult λ at all, so the secondaries ride on.
             if (delta && !keepBundle) nUp = 1;
             prevP = h.p;
-            double sgn2 = ddot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
-            ro = h.p + h.ng * (Real)(sgn2 * 1e-6);
+            ro = dOffsetAlong(h.p, h.ng, wi);
             rd = normalize(wi);
         }
         lvCount[i] = stored;
@@ -12394,7 +15049,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         const bool hasSun = sc.sunCount > 0;
 
         for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
-            DHit h = closestHit(sc, ro, rd);
+            // edges == 1 is the camera-to-first-vertex edge — the primary ray; see
+            // DMaterial::hideCamera. (The light subpath walk never gets this.)
+            DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(edges == 1));
             if (!h.valid) {
                 // The ray left the scene. No env map in VCM scope, but a `light sun` is a
                 // delta-DIRECTION emitter with no geometry: the s=0 term never fires for it
@@ -12575,12 +15232,11 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                     LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1] * epat;
                                     if (LeSec[k] > mxLe) mxLe = LeSec[k];
                                 }
-                                double sgn = ddot(h.ng, wiL) >= 0.0 ? 1.0 : -1.0;
-                                DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
+                                                                DVec3 oo = dOffsetAlong(h.p, h.ng, wiL);
                                 double f = 0.0, fSec[SECN];
                                 for (int k = 0; k + 1 < nUp; ++k) fSec[k] = 0.0;
                                 if (mxLe > 0.0 &&
-                                    !occluded(sc, oo, wiL, connMaxT(distL, occlEps))) {
+                                    !occludedTo(sc, oo, h.p + wiL * (Real)distL, occlEps)) {
                                     f = dBsdfF(sc, vt, wo, wiL, lambda) * stG;
                                     for (int k = 0; k + 1 < nUp; ++k)
                                         fSec[k] = dBsdfF(sc, vt, wo, wiL, lamAll[k + 1]) * stG;
@@ -12654,9 +15310,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     // loop and occluded() has no side effects, so hoisting the
                     // test is bit-identical — it only skips work for connections
                     // that contributed nothing anyway.
-                    double sgn = ddot(h.ng, w) >= 0.0 ? 1.0 : -1.0;
-                    DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
-                    if (occluded(sc, oo, w, connMaxT(distc))) continue;
+                                        DVec3 oo = dOffsetAlong(h.p, h.ng, w);
+                    if (occludedTo(sc, oo, h.p + w * (Real)distc, 2e-6)) continue;
                     DVertex lvt = dVertFromLV(lv);
                     double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
                     double fCam = dBsdfF(sc, vt, wo, w, lambda) * stGCam;
@@ -12787,8 +15442,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             if (!delta) camAllDelta = false;               // disqualifies the escaped-sun strategy
             if (delta && !keepBundle) nUp = 1;             // λ-dependent direction change
             prevP = h.p;
-            double sgn2 = ddot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
-            ro = h.p + h.ng * (Real)(sgn2 * 1e-6);
+            ro = dOffsetAlong(h.p, h.ng, wi);
             rd = normalize(wi);
         }
 
@@ -12843,6 +15497,12 @@ struct PhToBboxF {
     HD BboxF operator()(const DPhoton& p) const {
         return BboxF{(float)p.pos.x, (float)p.pos.y, (float)p.pos.z,
                      (float)p.pos.x, (float)p.pos.y, (float)p.pos.z};
+    }
+};
+struct JSurfToBboxF {
+    HD BboxF operator()(const DSurfPhoton& p) const {
+        return BboxF{(float)p.p.x, (float)p.p.y, (float)p.p.z,
+                     (float)p.p.x, (float)p.p.y, (float)p.p.z};
     }
 };
 struct BboxMergeF {
@@ -12900,19 +15560,161 @@ __global__ void kVcmCellKey(const DVcmLV* lv, int n, DVec3 gLo, double cell,
     }
 }
 
-// Cell id per deposited photon (PhotonMap::cellCoord twin). The host converted DPhoton's
-// float position to a double Vec3 BEFORE the all-double cell math, so promote first.
+// ================== A DEVICE LBVH OVER PHOTON BEAMS (mode J, beam half) =================
+//
+// Karras 2012, emitted into the SAME `DNode` layout the host's SAH builder produces, so
+// `dGatherPhotonBeams` traverses either without knowing which built it. See the scraps note for
+// why the BVH (not the trace) is the thing worth porting: a host realization is 72 % BVH build.
+//
+// 30-bit Morton code from the sub-beam's AABB CENTROID, normalised into the map's bounds. The
+// centroid, not an endpoint: a beam is a segment and its two ends can be far apart, so keying on
+// an end would sort two halves of one chord into different branches.
+__device__ static inline unsigned dExpandBits10(unsigned v) {
+    v = (v * 0x00010001u) & 0xFF0000FFu;
+    v = (v * 0x00000101u) & 0x0F00F00Fu;
+    v = (v * 0x00000011u) & 0xC30C30C3u;
+    v = (v * 0x00000005u) & 0x49249249u;
+    return v;
+}
+__device__ static inline unsigned dMorton3D(float x, float y, float z) {
+    // Clamp before scaling: a centroid exactly on the upper bound would otherwise index 1024.
+    x = fminf(fmaxf(x * 1024.0f, 0.0f), 1023.0f);
+    y = fminf(fmaxf(y * 1024.0f, 0.0f), 1023.0f);
+    z = fminf(fmaxf(z * 1024.0f, 0.0f), 1023.0f);
+    return (dExpandBits10((unsigned)x) << 2) | (dExpandBits10((unsigned)y) << 1)
+         | dExpandBits10((unsigned)z);
+}
+
+// One Morton code per sub-beam. `lo`/`invExt` normalise the centroid into [0,1]^3.
+__global__ void kBeamMorton(const DBeamRec* beams, int n, DVec3 lo, DVec3 invExt,
+                            unsigned* code, int* idx) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        const DBeamRec& b = beams[i];
+        // The sub-beam's own extent: origin + s0*d to origin + (s0+len)*d.
+        const DVec3 a{b.o.x + b.d.x * b.s0, b.o.y + b.d.y * b.s0, b.o.z + b.d.z * b.s0};
+        const DVec3 e{a.x + b.d.x * b.len,  a.y + b.d.y * b.len,  a.z + b.d.z * b.len};
+        const float cx = (float)(((double)a.x + (double)e.x) * 0.5 - (double)lo.x) * (float)invExt.x;
+        const float cy = (float)(((double)a.y + (double)e.y) * 0.5 - (double)lo.y) * (float)invExt.y;
+        const float cz = (float)(((double)a.z + (double)e.z) * 0.5 - (double)lo.z) * (float)invExt.z;
+        code[i] = dMorton3D(cx, cy, cz);
+        idx[i]  = i;
+    }
+}
+
+// Length of the common prefix of codes i and j, with the INDEX appended as a tie-break so that
+// duplicate Morton codes (common: many beams inside one medium cell) still yield a strict
+// ordering. Without the tie-break Karras's range search does not terminate on duplicates -- the
+// single most common way this algorithm is got wrong.
+__device__ static inline int dLbvhDelta(const unsigned* code, int n, int i, int j) {
+    if (j < 0 || j >= n) return -1;
+    const unsigned ci = code[i], cj = code[j];
+    if (ci == cj) return 32 + __clz((unsigned)i ^ (unsigned)j);
+    return __clz(ci ^ cj);
+}
+
+// One thread per INTERNAL node (there are n-1). Determines the node's range by walking out from
+// its own index, finds the split, and wires children: an internal child is its own index, a leaf
+// child is offset by (n-1) into the shared node array.
+__global__ void kLbvhInternal(const unsigned* code, int n, DNode* nodes, int* parent) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n - 1; i += stride) {
+        // Direction of the range this node covers.
+        const int d = (dLbvhDelta(code, n, i, i + 1) - dLbvhDelta(code, n, i, i - 1)) >= 0 ? 1 : -1;
+        const int dMin = dLbvhDelta(code, n, i, i - d);
+        int lMax = 2;
+        while (dLbvhDelta(code, n, i, i + lMax * d) > dMin) lMax <<= 1;
+        int l = 0;
+        for (int t = lMax >> 1; t >= 1; t >>= 1)
+            if (dLbvhDelta(code, n, i, i + (l + t) * d) > dMin) l += t;
+        const int j = i + l * d;
+        const int dNode = dLbvhDelta(code, n, i, j);
+        int sp = 0;
+        for (int t = (l + 1) >> 1; ; t = (t + 1) >> 1) {
+            if (dLbvhDelta(code, n, i, i + (sp + t) * d) > dNode) sp += t;
+            if (t <= 1) break;
+        }
+        const int split = i + sp * d + (d < 0 ? -1 : 0);
+        const int left  = (min(i, j) == split)     ? (split + n - 1)     : split;
+        const int right = (max(i, j) == split + 1) ? (split + 1 + n - 1) : (split + 1);
+        nodes[i].left = left;
+        nodes[i].right = right;
+        nodes[i].first = 0;
+        nodes[i].count = 0;          // internal, per BvhNode::isLeaf()
+        parent[left] = i;
+        parent[right] = i;
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) parent[0] = -1;
+}
+
+// Leaves: one per sub-beam, its box set from the beam's own extent inflated by the kernel radius.
+__global__ void kLbvhLeaves(const DBeamRec* beams, const int* order, int n, float radMax,
+                            DNode* nodes) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        const DBeamRec& b = beams[order[i]];
+        const DVec3 a{b.o.x + b.d.x * b.s0, b.o.y + b.d.y * b.s0, b.o.z + b.d.z * b.s0};
+        const DVec3 e{a.x + b.d.x * b.len,  a.y + b.d.y * b.len,  a.z + b.d.z * b.len};
+        // The gather accepts a beam within its own medium's kernel radius, so the box has to be
+        // inflated by that radius or the traversal will reject hits the estimator would keep --
+        // a silent darkening rather than a crash, which is why it is stated here.
+        const float r = (b.invRad > 0.0f) ? (1.0f / b.invRad) : radMax;
+        DNode& nd = nodes[n - 1 + i];
+        nd.lo = {fminf(a.x, e.x) - r, fminf(a.y, e.y) - r, fminf(a.z, e.z) - r};
+        nd.hi = {fmaxf(a.x, e.x) + r, fmaxf(a.y, e.y) + r, fmaxf(a.z, e.z) + r};
+        nd.left = -1; nd.right = -1;
+        nd.first = i; nd.count = 1;
+    }
+}
+
+// Bottom-up refit. One thread per leaf walks to the root; an atomic counter per internal node
+// lets only the SECOND arriving child proceed, so each internal box is computed exactly once
+// and only after both children are final.
+__global__ void kLbvhRefit(const int* parent, int n, int* visited, DNode* nodes) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        int node = parent[n - 1 + i];
+        while (node >= 0) {
+            if (atomicAdd(&visited[node], 1) == 0) break;   // first child: leave it to the second
+            const DNode& L = nodes[nodes[node].left];
+            const DNode& R = nodes[nodes[node].right];
+            nodes[node].lo = {fminf(L.lo.x, R.lo.x), fminf(L.lo.y, R.lo.y), fminf(L.lo.z, R.lo.z)};
+            nodes[node].hi = {fmaxf(L.hi.x, R.hi.x), fmaxf(L.hi.y, R.hi.y), fmaxf(L.hi.z, R.hi.z)};
+            __threadfence();
+            if (node == 0) break;
+            node = parent[node];
+        }
+    }
+}
+
+// Cell id per deposited SURFACE photon (mode J). Same shape as kVcmCellKey; the positions are
+// DSurfPhoton's, which the gather bins with the identical expression in dSurfMergeAt -- and it
+// is that agreement, not agreement with the host build, that decides whether a merge is found.
+__global__ void kJSurfCellKey(const DSurfPhoton* pts, int n, DVec3 gLo, double cell,
+                              int gnx, int gny, int gnz, int* key) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        int ix = (int)floor(((double)pts[i].p.x - (double)gLo.x) / cell);
+        int iy = (int)floor(((double)pts[i].p.y - (double)gLo.y) / cell);
+        int iz = (int)floor(((double)pts[i].p.z - (double)gLo.z) / cell);
+        ix = min(max(ix, 0), gnx - 1);
+        iy = min(max(iy, 0), gny - 1);
+        iz = min(max(iz, 0), gnz - 1);
+        key[i] = (iz * gny + iy) * gnx + ix;
+    }
+}
+
+// BUCKET id per deposited photon (PhotonMap::cellCoord + cellIndex twin). The host converted
+// DPhoton's float position to a double Vec3 BEFORE the all-double cell math, so promote first.
+// Unclamped and hashed since 0.199.6, matching the host exactly — see pmCellHash.
 __global__ void kSppmCellKey(const DPhoton* ph, long long n, double lox, double loy, double loz,
-                             double cellSize, int gnx, int gny, int gnz, int* key) {
+                             double cellSize, unsigned int tableMask, int* key) {
     long long stride = (long long)gridDim.x * blockDim.x;
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += stride) {
         int ix = (int)floor(((double)ph[i].pos.x - lox) / cellSize);
         int iy = (int)floor(((double)ph[i].pos.y - loy) / cellSize);
         int iz = (int)floor(((double)ph[i].pos.z - loz) / cellSize);
-        ix = min(max(ix, 0), gnx - 1);
-        iy = min(max(iy, 0), gny - 1);
-        iz = min(max(iz, 0), gnz - 1);
-        key[i] = (iz * gny + iy) * gnx + ix;      // int math, as in PhotonMap::cellIndex
+        key[i] = (int)pmCellHash(ix, iy, iz, tableMask);
     }
 }
 
@@ -12937,6 +15739,159 @@ __global__ void kSppmGatherConvert(const DPhoton* ph, const int* order, long lon
         out[i] = g;
     }
 }
+
+// One thread per program: evaluate it through both device VMs. Deliberately dumb — this
+// runs once from a self-test, and the point is that it exercises the SAME two functions the
+// renderer calls, not a simplified copy of them.
+__global__ static void kPatOpProbe(const PatNode* prog, const PatNodeF* progF,
+                                   const int* off, const int* len, int nProg,
+                                   const PatOpProbeIn* in, double* outF64, double* outF32) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nProg) return;
+    DPatEnv env = dPatEnvNoneT<DTexture>();
+    // `dext` must be REAL here, not null. It is the extra-dimension bank d4..d12, and it is
+    // the whole reason this check exists: leaving it null would make d4..d12 read 0 on the
+    // device AND 0 on the host, so the family that shipped broken in 0.230.0 would agree
+    // with itself and pass. The check has to supply the inputs that make a missing opcode
+    // observable.
+    float dF[9];
+    for (int k = 0; k < 9; ++k) dF[k] = (float)in->d[k];
+    outF64[i] = dPatternEval(prog + off[i], len[i], in->x, in->y, in->z, in->f,
+                             in->nx, in->ny, in->nz, in->r, in->u, in->v,
+                             in->curv, in->cavity, in->fw, env, in->d);
+    outF32[i] = (double)dPatternEvalF(progF + off[i], len[i],
+                                      (float)in->x, (float)in->y, (float)in->z, (float)in->f,
+                                      (float)in->nx, (float)in->ny, (float)in->nz,
+                                      (float)in->r, (float)in->u, (float)in->v, env, dF);
+}
+
+// ================ MODE J'S SURFACE-PHOTON LIGHT PASS, ON THE DEVICE ====================
+//
+// Device twin of the deposit inside bdpt.h's traceLightBeamPass (~line 2080) -- the SURFACE
+// half only; the beam half needs a BVH rather than a grid and comes second. One thread per
+// light subpath: sample a wavelength, walk the subpath with the SAME dGenLightSubpath the
+// connection half already uses, and append a DSurfPhoton + its DSurfMis partials at every
+// vertex the host would have stored one at.
+//
+// THE THREE THINGS THAT MUST MATCH THE HOST EXACTLY, because each failure is silent:
+//
+//  * THE SITE PREDICATE. `dSurfMergeSite` is the device twin of `surfMergeSite`, and the
+//    gather and the MIS weight both ask it too. A site the weight counts but the map never
+//    fills under-weights every competing technique; one the map fills but the weight ignores
+//    double-counts. Three call sites, one predicate.
+//  * THE ACCUMULATOR INDEX. `sumC/sumMb/sumMs` are the recurrence's value at u-1, NOT at u: a
+//    point merge's reference connection splits after y_{u-1}. The host keeps three arrays and
+//    indexes back; here they are three scalars read before they are advanced, which is the
+//    same thing and cheaper. Getting this off by one produces a plausible image with a wrong
+//    denominator.
+//  * `nEmitted` COUNTS ATTEMPTS, NOT SUCCESSES. The host increments `done` before the
+//    `pdfLam <= 0` continue, so its n_m is the subpath count it was asked for. Counting only
+//    the subpaths that emitted would inflate kappaS and darken every merge.
+//
+// Vertices beyond `cap` are DROPPED rather than wrapped, and the overflow is reported so the
+// caller can raise the cap: a wrapped write would corrupt a photon another thread is about to
+// gather from, which is a data race that reads as fireflies.
+struct DJSurfOut {
+    DSurfPhoton* pts;
+    DSurfMis*    mis;
+    int*         count;      // [0] photons appended (may exceed cap -- see overflow), [1] unused
+    int          cap;
+};
+
+template <int MAXD>
+__global__ void __launch_bounds__(128, 4)
+kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
+             long long nPaths, unsigned long long seedBase, DJSurfOut out) {
+    enum { MAXV = BDPT_MAXV_OF(MAXD) };
+    if (maxDepth > MAXD) maxDepth = MAXD;
+    const DPatEnv env = dPatEnvOf(sc);
+    const long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long G = (long long)gridDim.x * blockDim.x;
+    for (long long i = g; i < nPaths; i += G) {
+        // Seeded by ABSOLUTE subpath index, exactly as the host pass is ("so the map is
+        // identical for any thread count"), so the realization depends on (index, salt) and
+        // not on the launch geometry.
+        DRng rng; rng.seed((unsigned long long)(i * 2 + 1), seedBase ^ (unsigned long long)i);
+        DHeroBundle hb;
+        double pdfLam = 0.0;
+        hb.lam[0] = dSampleSceneLambda(sc, rng, pdfLam);
+        if (pdfLam <= 0.0) continue;
+        hb.invPdf[0] = dInvPdfLambda(sc, hb.lam[0]);
+        hb.C = 1;                       // single-lambda always: the host pass is too
+        const Real lambda = hb.lam[0];
+        DVertex path[MAXV];
+        double   pathSec[1];            // secStride 0: never written, never read
+        const int np = dGenLightSubpath(sc, cam, diffraction, hb, maxDepth + 1, rng,
+                                        path, pathSec, 0, MAXV);
+        if (np <= 0) continue;
+        const Real cx = cieX(lambda), cy = cieY(lambda), cz = cieZ(lambda);
+        // The recurrence, carried as scalars at index u-1 (see the note above).
+        double accC = 0.0, accMb = 0.0, accMs = 0.0;
+        for (int u = 0; u < np; ++u) {
+            const bool dPrev = (u > 0) ? (path[u - 1].delta != 0)
+                                       : (dIsDeltaLightVertex(sc, path[0]) != 0);
+            const double gate = (!path[u].delta && !dPrev) ? 1.0 : 0.0;
+            if (u == 0) { accC = gate; continue; }
+            const double rL = dMisRemap0(path[u - 1].pdfRev) / dMisRemap0(path[u - 1].pdfFwd);
+            // The merge AT y_{u-1}, which the recurrence would not fold in until the next
+            // iteration but which this vertex's stored partials need now. Both kinds, because
+            // a denominator that carries one is not a partition of unity; at most one is
+            // non-zero (a vertex is in a medium or on a surface, never both).
+            double eBeam = 0.0, eSurf = 0.0;
+            if (u >= 2) {
+                eBeam = dMergeEtaPrime(sc, path[u - 2].p, path[u - 1], path[u].p,
+                                       path[u - 1].pdfFwd, lambda, env);
+                if (dSurfMergeSite(sc, path[u - 1]) && path[u - 1].pdfFwd > 0.0)
+                    eSurf = path[u - 1].pdfFwd;
+            }
+            if (dSurfMergeSite(sc, path[u]) && path[u].pdfFwd > 0.0 && path[u].beta > 0.0) {
+                DVec3 dp = path[u - 1].p - path[u].p;
+                const double rho2 = ddot(dp, dp);
+                if (rho2 > 0.0) {
+                    const double rho = sqrt(rho2);
+                    dp = dp * (Real)(1.0 / rho);
+                    // The cosine of pdfRev*(y_{u-1}), at y_{u-1}, facing back along this same
+                    // edge; 1 at a medium vertex, which has no normal.
+                    const bool prevOnSurf = (path[u - 1].type == BV_SURFACE ||
+                                             path[u - 1].type == BV_LIGHT);
+                    const double cosPrev = prevOnSurf ? fabs(ddot(path[u - 1].ns, dp)) : 1.0;
+                    const int slot = atomicAdd(out.count, 1);
+                    if (slot < out.cap) {
+                        DSurfPhoton& ph = out.pts[slot];
+                        ph.p      = path[u].p;
+                        ph.wo     = dp;                 // unit, toward the previous vertex
+                        ph.lambda = (float)lambda;
+                        ph.beta   = (float)path[u].beta;
+                        ph.cx = (float)cx; ph.cy = (float)cy; ph.cz = (float)cz;
+                        ph.misIdx = (unsigned)slot;     // appended 1:1, so index == slot
+                        DSurfMis& sm = out.mis[slot];
+                        sm.sumC    = accC;
+                        sm.sumMb   = accMb + eBeam;
+                        sm.sumMs   = accMs + eSurf;
+                        sm.pdfFwdA = path[u].pdfFwd;
+                        sm.rCoef   = (float)(cosPrev /
+                                             (rho2 * dMisRemap0(path[u - 1].pdfFwd)));
+                        sm.gateC1  = (unsigned char)(gate > 0.0 ? 1 : 0);
+                        sm.vert    = (unsigned short)u;
+                    }
+                }
+            }
+            const double cPrev = accC, mbPrev = accMb, msPrev = accMs;
+            accC  = gate + rL * cPrev;
+            accMb = rL * (mbPrev + eBeam);
+            accMs = rL * (msPrev + eSurf);
+        }
+    }
+}
+
+// Forced instantiation of both depth variants (BDPT_MAXDEPTH / BDPT_DEEPDEPTH, the same pair
+// kBdptT ships). Without this an unreferenced template is not compiled at all, so the step
+// that "adds the kernel only" would compile trivially and prove nothing -- which is the exact
+// opposite of the point.
+template __global__ void kJSurfLightT<BDPT_MAXDEPTH>(
+    DScene, DCamera, int, int, long long, unsigned long long, DJSurfOut);
+template __global__ void kJSurfLightT<BDPT_DEEPDEPTH>(
+    DScene, DCamera, int, int, long long, unsigned long long, DJSurfOut);
 
 } // namespace gpu
 
@@ -12966,6 +15921,41 @@ const char* cudaDeviceName() { cudaAvailable(); return g_devName; }
 // list travels as a plain device buffer rather than a `__constant__` symbol, so this needs
 // no API beyond the handful the HIP shim at the top of this file already covers.
 int cudaRealBytes() { return gpu::realBytes(); }
+bool cudaPatOpProbe(const PatNode* prog, const int* off, const int* len, int nProg,
+                    const PatOpProbeIn& in, double* outF64, double* outF32) {
+    if (!cudaAvailable() || nProg <= 0) return false;
+    int total = 0;
+    for (int i = 0; i < nProg; ++i) total = (off[i] + len[i] > total) ? off[i] + len[i] : total;
+    std::vector<gpu::PatNodeF> hF((size_t)total);
+    for (int i = 0; i < total; ++i) { hF[i].op = (int)prog[i].op; hF[i].a = (float)prog[i].a; }
+
+    PatNode*  dP  = nullptr; gpu::PatNodeF* dPF = nullptr;
+    int*      dO  = nullptr; int*      dL  = nullptr;
+    double*   d64 = nullptr; double*   d32 = nullptr;
+    PatOpProbeIn* dIn = nullptr;
+    bool ok = cudaMalloc(&dP,  sizeof(PatNode)  * total) == cudaSuccess
+           && cudaMalloc(&dPF, sizeof(gpu::PatNodeF) * total) == cudaSuccess
+           && cudaMalloc(&dO,  sizeof(int) * nProg) == cudaSuccess
+           && cudaMalloc(&dL,  sizeof(int) * nProg) == cudaSuccess
+           && cudaMalloc(&d64, sizeof(double) * nProg) == cudaSuccess
+           && cudaMalloc(&d32, sizeof(double) * nProg) == cudaSuccess
+           && cudaMalloc(&dIn, sizeof(PatOpProbeIn)) == cudaSuccess;
+    if (ok) ok = cudaMemcpy(dP,  prog,     sizeof(PatNode)  * total, cudaMemcpyHostToDevice) == cudaSuccess
+              && cudaMemcpy(dPF, hF.data(), sizeof(gpu::PatNodeF) * total, cudaMemcpyHostToDevice) == cudaSuccess
+              && cudaMemcpy(dO,  off,      sizeof(int) * nProg, cudaMemcpyHostToDevice) == cudaSuccess
+              && cudaMemcpy(dL,  len,      sizeof(int) * nProg, cudaMemcpyHostToDevice) == cudaSuccess
+              && cudaMemcpy(dIn, &in,       sizeof(PatOpProbeIn), cudaMemcpyHostToDevice) == cudaSuccess;
+    if (ok) {
+        gpu::kPatOpProbe<<<(nProg + 127) / 128, 128>>>(dP, dPF, dO, dL, nProg, dIn, d64, d32);
+        ok = cudaDeviceSynchronize() == cudaSuccess
+          && cudaMemcpy(outF64, d64, sizeof(double) * nProg, cudaMemcpyDeviceToHost) == cudaSuccess
+          && cudaMemcpy(outF32, d32, sizeof(double) * nProg, cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+    cudaFree(dP); cudaFree(dPF); cudaFree(dO); cudaFree(dL); cudaFree(d64); cudaFree(d32);
+    cudaFree(dIn);
+    return ok;
+}
+
 bool cudaLatticeProbe(const unsigned long long* idx, int n, double* out) {
     if (!cudaAvailable() || n <= 0) return false;
     unsigned long long* dIdx = nullptr;
@@ -13275,6 +16265,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.bitangentSign = t.bitangentSign;
         d.curvature = t.curvature;      // O3 per-face mean curvature (from Tri::finalize)
         d.matId = t.matId; d.sensorId = t.sensorId;
+        d.vcol  = t.vcol;               // per-vertex colour (Scene::vertColors), or -1
         return d;
     };
     // Instancing now uses a true TWO-LEVEL BVH on the device (matching the CPU): base
@@ -13545,6 +16536,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // CSG/quadric solids). bakeSpec of a null Spectrum yields all zeros, so a
         // non-emissive material costs nothing but the storage.
         d.matIsLight = m.isLight ? 1 : 0;
+        d.hideCamera = m.hideCamera ? 1 : 0;
         bakeSpec(m.emit, d.matEmit);
         { Vec3 le = m.emit ? rgbbake::emitToRgb(m.emit) : Vec3{0, 0, 0};
           d.rgbMatEmit = {le.x, le.y, le.z}; }
@@ -13758,6 +16750,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.emitPat = e.emitPat;             // `emit pattern:` profile over this emitter
         bakeSpec(e.spdFn, de.emitSpd);       // BDPT: baked emission SPD for Le(lambda)
         { Vec3 le = rgbbake::emitToRgb(e.spdFn); de.rgbEmit = {le.x, le.y, le.z}; }  // fast RGB backward
+        de.cieMean = {e.cieMean.x, e.cieMean.y, e.cieMean.z};   // achromatic-path beam fold
         cdfAll.insert(cdfAll.end(), e.spd.cdf.begin(), e.spd.cdf.end());
         dems.push_back(de);
     }
@@ -13879,12 +16872,24 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     double*   d_fluoCdf = fluoCdfAll.empty() ? nullptr : (double*)keep(uploadVec(fluoCdfAll));
 
     DScene& sc = up.sc;
+    // Per-vertex colour: upload the table, and make sure the JH LUT is resident even
+    // when no stochastic texture asked for it (that was the only previous consumer).
+    if (!scene.vertColors.empty()) {
+        sc.vertColors  = (const float*)keep(uploadVec(scene.vertColors));
+        sc.nVertColors = (int)scene.vertColors.size();
+        if (!d_jhLut) d_jhLut = (const float*)keep(uploadVec(upsample::coeffLut()));
+        sc.jhLut = d_jhLut;
+    } else {
+        sc.vertColors = nullptr; sc.nVertColors = 0; sc.jhLut = d_jhLut;
+    }
+    sc.ndSlice = scene.ndSlice;   // by value: 40 doubles, read by every field sample
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
     sc.mirrorPlanes = d_mirp; sc.nMirrorPlanes = (int)mirrorPlanes.size();
     sc.dielSph   = d_dielSph;   sc.nDielSph   = (int)scene.dielSphereIdx.size();
     sc.mirrorSph = d_mirrorSph; sc.nMirrorSph = (int)scene.mirrorSphereIdx.size();
     sc.mats = d_mats;
+    sc.camHiddenAny = scene.camHiddenAny ? 1 : 0;   // see DScene::camHiddenAny
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
     sc.fieldNodes = d_fnodes; sc.fieldExprNodes = d_fexpr;
     sc.fieldNodesF = d_fnodesF; sc.fieldExprNodesF = d_fexprF;
@@ -13905,7 +16910,18 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.lightTreeAlways = scene.lightTreeAlways.empty() ? nullptr
                                                        : (const int*)keep(uploadVec(scene.lightTreeAlways));
     sc.nLightTreeAlways = (int)scene.lightTreeAlways.size();
+    sc.lightTreeParent = scene.lightTreeParent.empty() ? nullptr
+                                                       : (const int*)keep(uploadVec(scene.lightTreeParent));
+    sc.lightTreeLeaf   = scene.lightTreeLeaf.empty() ? nullptr
+                                                     : (const int*)keep(uploadVec(scene.lightTreeLeaf));
+    sc.nLightTreeLeaf  = (int)scene.lightTreeLeaf.size();
     sc.bkLightTree     = lt::gEnabled ? 1 : 0;
+    sc.bkGlossyNee     = lt::gGlossyNee ? 1 : 0;   // GLOSSY-NEE (known-issues.md)
+    {   // M-GATHERAREA footprint budget, same environment channel and same default (8) the host
+        // uses -- the two MUST agree or -device gpu and -device cpu diverge on truncated geometry.
+        const char* e = std::getenv("FTRACE_GATHERAREA");
+        sc.gatherArea = e ? std::atoi(e) : 8;
+    }
     sc.bkLightSplit    = lt::gSplit;
     sc.bkLightSamples  = lt::gSamples;
     sc.lightCdfAll = d_cdfAll;
@@ -13983,6 +16999,24 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.density  = m.density.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.density));
             dm.densityN = (int)m.density.size();
             dm.densityMax = m.densityMax;
+            // Per-cell control/residual majorant grid (majorant.h). Two dense float arrays
+            // — a 128^3 grid is 16 MB, and unlike the density field it is read once per
+            // tracking cell rather than per sample, so a sparse brick layout would buy
+            // little. Absent (unbounded density field) => ctrl null, global majorant.
+            if (m.majorant && m.majorant->valid()) {
+                const MajorantGrid& mg = *m.majorant;
+                dm.majorant.ctrl = (const float*)keep(uploadVec(mg.ctrl));
+                dm.majorant.res  = (const float*)keep(uploadVec(mg.res));
+                dm.majorant.wmin    = {mg.wmin.x, mg.wmin.y, mg.wmin.z};
+                dm.majorant.cell    = {mg.cell.x, mg.cell.y, mg.cell.z};
+                dm.majorant.invCell = {mg.invCell.x, mg.invCell.y, mg.invCell.z};
+                dm.majorant.nx = mg.nx; dm.majorant.ny = mg.ny; dm.majorant.nz = mg.nz;
+            } else {
+                dm.majorant.ctrl = nullptr; dm.majorant.res = nullptr;
+                dm.majorant.wmin = {0,0,0}; dm.majorant.cell = {0,0,0};
+                dm.majorant.invCell = {0,0,0};
+                dm.majorant.nx = dm.majorant.ny = dm.majorant.nz = 0;
+            }
             // Imported .nvdb/.vdb volume: upload a NATIVE SPARSE brick grid (ROADMAP C2).
             if (m.vdb && !m.vdb->empty()) uploadVdbGrid(*m.vdb, dm.densGrid, "density");
             else                          clearVdbGrid(dm.densGrid);
@@ -14033,9 +17067,45 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                 dm.rbPdf = nullptr; dm.rbCdf = nullptr;
                 dm.rbNLam = dm.rbNMu = 0; dm.rbLam0 = 0.0; dm.rbDLam = 1.0;
             }
+            dm.achro = mediumAchromatic(m) ? 1 : 0;   // achromatic-path beam fold (scene.h)
         }
         sc.media  = dmeds.empty() ? nullptr : (const DMedium*)keep(uploadVec(dmeds));
         sc.mediaN = (int)dmeds.size();
+        // GATHER-TIME SPECTRAL FOLD tables (FOLD-GPU (2), host: Scene::bowLuts). One
+        // kBowBins-entry table per eligible (emitter, medium) pair, flattened into one buffer
+        // with an offset table; -1 marks a pair the host has no table for, which is the same
+        // question `Scene::bowLut()` answers with a null pointer. A scene with no rainbow
+        // medium uploads nothing and leaves `sc.bow.tab` null.
+        sc.bow = gpu::DBowTab{nullptr, nullptr, 0, 0};
+        {
+            const int nEm = (int)scene.emitters.size(), nMed = (int)scene.media.size();
+            if (nEm > 0 && nMed > 0 && !scene.bowLuts.empty()) {
+                std::vector<int> off((size_t)nEm * nMed, -1);
+                std::vector<float4> tab;
+                for (int e = 0; e < nEm; ++e)
+                    for (int m2 = 0; m2 < nMed; ++m2) {
+                        const Scene::BowLut* L = scene.bowLut(e, m2);
+                        if (!L || (int)L->cie.size() != (int)Scene::BowLut::kBins) continue;
+                        off[(size_t)e * nMed + m2] = (int)tab.size();
+                        for (int i = 0; i < (int)Scene::BowLut::kBins; ++i)
+                            tab.push_back(make_float4((float)L->cie[i].x, (float)L->cie[i].y,
+                                                      (float)L->cie[i].z, L->phaseLum[i]));
+                    }
+                const char* noBow = std::getenv("FTRACE_NOBOWGPU");
+                if (noBow && std::atoi(noBow) != 0) tab.clear();   // A/B control: demote instead
+                if (!tab.empty()) {
+                    sc.bow.tab  = (const float4*)keep(uploadVec(tab));
+                    sc.bow.off  = (const int*)keep(uploadVec(off));
+                    sc.bow.nEm  = nEm;
+                    sc.bow.nMed = nMed;
+                    std::fprintf(stderr, "[gpu] gather-time spectral fold: %zu bow tables uploaded "
+                                         "(%.1f MB) — a rainbow beam keeps its folded colour instead "
+                                         "of being demoted to CIE(lambda)\n",
+                                 tab.size() / (size_t)Scene::BowLut::kBins,
+                                 tab.size() * sizeof(float4) / 1048576.0);
+                }
+            }
+        }
         sc.hasGrin = grin::sceneHasGrin(scene) ? 1 : 0;   // gate for dGrinMarch (host twin)
         // Emissive "fire" volumes (ROADMAP C3): upload the AABB/meanKe/power + the per-
         // volume Planck-at-emitKelvin wavelength CDF, and the total emission power for the
@@ -14200,6 +17270,7 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     CUDA_CHECK(cudaMalloc(&st.hit,    (size_t)W * sizeof(DHit)));
     CUDA_CHECK(cudaMalloc(&st.gmMed,  (size_t)W * sizeof(int)));    // GRIN pre-pass results,
     CUDA_CHECK(cudaMalloc(&st.gmArc,  (size_t)W * sizeof(Real)));   // extend -> shade
+    CUDA_CHECK(cudaMalloc(&st.pathC, (size_t)W * sizeof(DPathCaustic)));  // caustic path state
     CUDA_CHECK(cudaMemset(st.alive, 0, (size_t)W * sizeof(int)));
 
     unsigned long long* d_dispatched = nullptr;
@@ -14234,7 +17305,7 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
     cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive);
     cudaFree(st.stkMat); cudaFree(st.stkPri); cudaFree(st.stkN); cudaFree(st.hit);
-    cudaFree(st.gmMed); cudaFree(st.gmArc);
+    cudaFree(st.gmMed); cudaFree(st.gmArc); cudaFree(st.pathC);
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
@@ -14247,7 +17318,8 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     using namespace gpu;
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation chunk
     // passes a distinct cumulative-photon offset for an independent stream.
-    unsigned long long kseed = 0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL;
+    unsigned long long kseed = (0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL)
+                             ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     // Hero-wavelength sampling shares one BVH walk across C stratified wavelengths, cutting
     // chromatic noise. It is only physical without participating media / GRIN bending (the
     // geometry must be wavelength-independent between dispersive events), and it lives ONLY
@@ -14584,17 +17656,18 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
             if (el < nextWarn) continue;
             if (!warned) {
                 std::fprintf(stderr,
-                    "\n[gpu-stall] one %lld-spp chunk has been running on the GPU for %.0f s "
+                    "\n[gpu-stall] one %lld-spp chunk has been running on the GPU for %s "
                     "(target is 0.15 s).\n"
                     "[gpu-stall] The render is NOT hung, but until this chunk returns it "
                     "cannot write the -interval image, end on -time, or answer -stop.\n"
                     "[gpu-stall] The usual cause is another process saturating the GPU: check "
                     "`nvidia-smi` for a second CUDA program. Run with -device cpu to sidestep "
                     "it, or free the card.\n",
-                    launchSpp.load(std::memory_order_relaxed), el);
+                    launchSpp.load(std::memory_order_relaxed), humanDur(el).c_str());
                 warned = true;
             } else {
-                std::fprintf(stderr, "[gpu-stall] still in the same chunk after %.0f s.\n", el);
+                std::fprintf(stderr, "[gpu-stall] still in the same chunk after %s.\n",
+                             humanDur(el).c_str());
             }
             std::fflush(stderr);
             nextWarn = el + 60.0;               // then once a minute, so it stays visible
@@ -14629,9 +17702,568 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     }
 }
 
+// ================= host: device-scratch reuse (VCM / SPPM sessions) =================
+// thrust algorithms allocate temporary device storage per call; by default that is a
+// cudaMalloc/cudaFree pair EVERY call, which (with the sessions' own per-pass buffer
+// churn) profiled at ~10% of per-pass API time. This bump arena keeps grow-only blocks
+// alive across passes: alloc() carves from existing blocks (first-fit) and cudaMallocs
+// only on a new high-water mark; deallocate is a no-op; reset() rewinds the offsets at
+// the start of each pass. Steady state: zero device malloc/free per pass.
+struct ThrustArena {
+    struct Block { char* p; size_t cap, off; };
+    std::vector<Block> blocks;
+    void reset() { for (Block& b : blocks) b.off = 0; }
+    char* alloc(size_t n) {
+        n = (n + 255) & ~(size_t)255;                    // 256-byte aligned carves
+        for (Block& b : blocks)
+            if (b.cap - b.off >= n) { char* r = b.p + b.off; b.off += n; return r; }
+        Block nb{}; nb.cap = n; nb.off = n;
+        CUDA_CHECK(cudaMalloc(&nb.p, nb.cap));
+        blocks.push_back(nb);
+        return nb.p;
+    }
+    void release() { for (Block& b : blocks) cudaFree(b.p); blocks.clear(); }
+};
+// Minimal Allocator facade over the arena for FT_THRUST_PAR(alloc).
+struct ThrustArenaAlloc {
+    using value_type = char;
+    ThrustArena* arena;
+    char* allocate(std::ptrdiff_t n) { return arena->alloc((size_t)n); }
+    void deallocate(char*, size_t) {}
+};
+
+// Grow-only device buffer: (re)allocates only when `need` exceeds the current capacity
+// (1.5x growth), so per-pass session buffers stop churning cudaMalloc/cudaFree.
+template <class T>
+static void ensureDevCap(T*& p, size_t& cap, size_t need) {
+    if (need <= cap) return;
+    if (p) { cudaFree(p); p = nullptr; }
+    size_t newCap = cap + cap / 2;
+    if (newCap < need) newCap = need;
+    CUDA_CHECK(cudaMalloc(&p, newCap * sizeof(T)));
+    cap = newCap;
+}
+
+// ---- a device LBVH over the beam map's sub-beams (FTRACE_JLBVH=1) --------------------
+//
+// Grow-only scratch, same discipline as JSurfDev: a per-chunk rebuild must not cudaMalloc four
+// buffers every 0.15 s. Kept separate from JSurfDev because the two maps have different
+// lifetimes -- the surface map is rebuilt per sub-launch, the beam map (for now) per epoch.
+struct JBeamDev {
+    unsigned* code  = nullptr;   size_t codeCap = 0;
+    int* order      = nullptr;   size_t orderCap = 0;
+    int* parent     = nullptr;   size_t parentCap = 0;
+    int* visited    = nullptr;   size_t visitedCap = 0;
+    gpu::DNode* nodes = nullptr; size_t nodesCap = 0;
+    ThrustArena arena;
+    void release() {
+        cudaFree(code); cudaFree(order); cudaFree(parent); cudaFree(visited); cudaFree(nodes);
+        code = nullptr; order = nullptr; parent = nullptr; visited = nullptr; nodes = nullptr;
+        codeCap = orderCap = parentCap = visitedCap = nodesCap = 0;
+        arena.release();
+    }
+    ~JBeamDev() { release(); }
+    JBeamDev() = default;
+    JBeamDev(const JBeamDev&) = delete;
+    JBeamDev& operator=(const JBeamDev&) = delete;
+};
+
+// Build an LBVH over `n` sub-beams already resident as `DBeamRec`s, and point `dbm` at it.
+// `lo`/`hi` are the map's world bounds -- taken from the host BVH's root box, which is exactly
+// the same set of primitives, so no device reduction is needed for them.
+static bool buildBeamLbvhDevice(JBeamDev& d, const gpu::DBeamRec* beams, int n,
+                                const Aabb& bounds, double radMax, gpu::DBeamMap& dbm) {
+    if (n <= 1) return false;                 // a 1-primitive LBVH has no internal node
+    const size_t nNodes = (size_t)(2 * n - 1);
+    ensureDevCap(d.code, d.codeCap, (size_t)n);
+    ensureDevCap(d.order, d.orderCap, (size_t)n);
+    ensureDevCap(d.parent, d.parentCap, nNodes);
+    ensureDevCap(d.visited, d.visitedCap, (size_t)(n - 1));
+    ensureDevCap(d.nodes, d.nodesCap, nNodes);
+    CUDA_CHECK(cudaMemset(d.visited, 0, (size_t)(n - 1) * sizeof(int)));
+
+    const gpu::DVec3 lo((gpu::Real)bounds.lo.x, (gpu::Real)bounds.lo.y, (gpu::Real)bounds.lo.z);
+    auto inv = [](double e) { return (e > 0.0) ? 1.0 / e : 0.0; };
+    const gpu::DVec3 invExt((gpu::Real)inv(bounds.hi.x - bounds.lo.x),
+                            (gpu::Real)inv(bounds.hi.y - bounds.lo.y),
+                            (gpu::Real)inv(bounds.hi.z - bounds.lo.z));
+    int blocks = (n + 127) / 128; if (blocks > 2048) blocks = 2048; if (blocks < 1) blocks = 1;
+    gpu::kBeamMorton<<<blocks, 128>>>(beams, n, lo, invExt, d.code, d.order);
+    cudaCheckKernel("lbvh-morton");
+
+    d.arena.reset();
+    ThrustArenaAlloc tal{&d.arena};
+    auto pol = FT_THRUST_PAR(tal);
+    thrust::device_ptr<unsigned> tk(d.code);
+    thrust::device_ptr<int> to(d.order);
+    // STABLE, so that equal Morton codes keep sub-beam order. `dLbvhDelta`'s index tie-break
+    // then makes the hierarchy deterministic, which is what lets this be A/B'd at all.
+    thrust::stable_sort_by_key(pol, tk, tk + n, to);
+
+    gpu::kLbvhInternal<<<blocks, 128>>>(d.code, n, d.nodes, d.parent);
+    cudaCheckKernel("lbvh-internal");
+    gpu::kLbvhLeaves<<<blocks, 128>>>(beams, d.order, n, (float)radMax, d.nodes);
+    cudaCheckKernel("lbvh-leaves");
+    gpu::kLbvhRefit<<<blocks, 128>>>(d.parent, n, d.visited, d.nodes);
+    cudaCheckKernel("lbvh-refit");
+
+    dbm.nodes = d.nodes;
+    dbm.primIdx = d.order;
+    dbm.nNodes = (int)nNodes;
+    return true;
+}
+
+// ---- mode J's surface photon map, TRACED AND GRIDDED ON THE DEVICE -------------------
+//
+// The point is FREQUENCY, not speed. Measured ([jstats], known-issues U-vs-J): mode J's whole
+// light side is 4 % of a render, so moving it buys 4 % of the wall clock and nothing else --
+// but it costs 27 ms per realization on the host, which is 230 s for the ~8500 realizations
+// mode U gets in 90 s. On the device the same walk is sub-millisecond, so the realization
+// count stops being budget-bound. `FTRACE_JDEVLIGHT=1` selects this path.
+//
+// Grow-only scratch, exactly as the VCM/SPPM sessions do it: a per-chunk rebuild (step 3) must
+// not cudaMalloc/cudaFree six buffers every 0.15 s.
+struct JSurfDev {
+    gpu::DSurfPhoton* pts = nullptr;   size_t ptsCap = 0;
+    gpu::DSurfMis*    mis = nullptr;   size_t misCap = 0;
+    int* count     = nullptr;
+    int* cellKey   = nullptr;          size_t cellKeyCap = 0;
+    int* order     = nullptr;          size_t orderCap = 0;
+    int* cellStart = nullptr;          size_t cellStartCap = 0;
+    ThrustArena arena;
+    long long dropped = 0;             // photons the cap refused, cumulative
+    long long stored  = 0;             // photons in the CURRENT map
+    void release() {
+        cudaFree(pts); cudaFree(mis); cudaFree(count);
+        cudaFree(cellKey); cudaFree(order); cudaFree(cellStart);
+        pts = nullptr; mis = nullptr; count = nullptr;
+        cellKey = nullptr; order = nullptr; cellStart = nullptr;
+        ptsCap = misCap = cellKeyCap = orderCap = cellStartCap = 0;
+        arena.release();
+    }
+    // A local of renderBdptCuda, so the destructor is the release: six device buffers, one of
+    // them the photon slab, must not survive the call that made them.
+    ~JSurfDev() { release(); }
+    JSurfDev() = default;
+    JSurfDev(const JSurfDev&) = delete;
+    JSurfDev& operator=(const JSurfDev&) = delete;
+};
+
+// The device light pass's salt. "JSURFDEL" as a base, XORed with `-seed` and with the
+// ABSOLUTE SAMPLE INDEX this call starts at -- which is what makes consecutive light-side
+// epochs draw INDEPENDENT realizations rather than the same one over and over. Without the
+// sampleBase term a refreshing render would freeze the device map at epoch 0's realization
+// while the host map beside it kept redrawing: the two arms would then not be comparable, and
+// the device one would silently be the -beamfreeze estimator wearing the refresh's name.
+// `-jhostlight` (see render_cuda.h). Set once from argv, read per render.
+static bool g_jHostLight = false;
+void cudaSetJHostLight(bool on) { g_jHostLight = on; }
+
+static unsigned long long jSurfSalt(const SppProgress* prog) {
+    const unsigned long long base = (unsigned long long)(prog ? prog->sampleBase : 0);
+    return 0x4A5355524644454CULL ^ g_rngSalt ^ (base * 0x9E3779B97F4A7C15ULL);
+}
+
+static void buildJSurfMapDevice(JSurfDev& d, const gpu::DScene& sc, const gpu::DCamera& cam,
+                                int diffraction, int maxDepth, long long nPaths, double radius,
+                                long long maxPhotons, unsigned long long salt,
+                                gpu::DSurfMap& dsm) {
+    dsm = gpu::DSurfMap{};
+    d.stored = 0;
+    if (nPaths <= 0 || !(radius > 0.0)) return;
+    size_t cap = (maxPhotons > 0) ? (size_t)maxPhotons : (size_t)4000000;
+    if (cap > (size_t)2000000000) cap = (size_t)2000000000;   // the slot cursor is an int
+    ensureDevCap(d.pts, d.ptsCap, cap);
+    ensureDevCap(d.mis, d.misCap, cap);
+    if (!d.count) CUDA_CHECK(cudaMalloc(&d.count, 2 * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d.count, 0, 2 * sizeof(int)));
+    gpu::DJSurfOut out{};
+    out.pts = d.pts; out.mis = d.mis; out.count = d.count; out.cap = (int)cap;
+    const bool deep = (maxDepth > BDPT_MAXDEPTH);
+    // GRID SIZED TO THE WORK, not copied from the megakernel. Each thread reserves
+    // `DVertex path[MAXV]` in local memory, so a fixed 2048x128 launch reserves hundreds of MB
+    // of local store to run one subpath per thread -- and a per-CHUNK rebuild pays that setup
+    // hundreds of times a render rather than once. The grid-stride loop is unchanged and every
+    // subpath is seeded by its ABSOLUTE index, so the launch geometry cannot alter the map:
+    // this is a pure setup-cost change, bit-identical by construction.
+    int blocks = (int)((nPaths + 127) / 128);
+    if (blocks < 1)    blocks = 1;
+    if (blocks > 2048) blocks = 2048;      // still saturate the card on a large -n
+    if (deep)
+        gpu::kJSurfLightT<BDPT_DEEPDEPTH><<<blocks, 128>>>(sc, cam, diffraction, maxDepth,
+                                                           nPaths, salt, out);
+    else
+        gpu::kJSurfLightT<BDPT_MAXDEPTH><<<blocks, 128>>>(sc, cam, diffraction, maxDepth,
+                                                          nPaths, salt, out);
+    cudaCheckKernel("jsurf-light");
+    int n = 0;
+    CUDA_CHECK(cudaMemcpy(&n, d.count, sizeof(int), cudaMemcpyDeviceToHost));
+    // The cursor counts every ATTEMPT, so it overshoots when the cap binds; the writes past it
+    // were skipped, not wrapped. Clamp and remember, so the ceiling is reportable rather than
+    // a silent thinning of the map (which would darken the merges by an unknown factor).
+    if (n > (int)cap) { d.dropped += (long long)n - (long long)cap; n = (int)cap; }
+    if (n <= 0) return;
+    d.stored = n;
+
+    // --- the grid. surfmerge.h SurfMap::build's geometry, vcmSessionPass's machinery. ---
+    d.arena.reset();
+    ThrustArenaAlloc tal{&d.arena};
+    auto pol = FT_THRUST_PAR(tal);
+    const gpu::BboxF bb = thrust::transform_reduce(
+        pol, thrust::device_pointer_cast(d.pts), thrust::device_pointer_cast(d.pts + n),
+        gpu::JSurfToBboxF{}, gpu::BboxF{FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX},
+        gpu::BboxMergeF{});
+    double cell = radius;
+    long long gnx = 1, gny = 1, gnz = 1;
+    const long long maxCells = 64LL << 20;
+    // The host's doubling loop, verbatim in intent: grow the cell until the lattice fits the
+    // budget. It terminates fast (the count falls 8x a step) and keeps `cell >= radius`, which
+    // is the invariant the 3x3x3 query in dSurfMergeAt relies on -- coarsening only makes a
+    // query visit more photons, it can never make it miss one.
+    for (int guard = 0; guard < 64; ++guard) {
+        const double ex = (double)bb.mxx - (double)bb.mnx + 2.0 * cell;
+        const double ey = (double)bb.mxy - (double)bb.mny + 2.0 * cell;
+        const double ez = (double)bb.mxz - (double)bb.mnz + 2.0 * cell;
+        const long long ax = std::max(1LL, (long long)std::ceil(ex / cell));
+        const long long ay = std::max(1LL, (long long)std::ceil(ey / cell));
+        const long long az = std::max(1LL, (long long)std::ceil(ez / cell));
+        if (ax <= maxCells && ay <= maxCells && az <= maxCells &&
+            (double)ax * (double)ay * (double)az <= (double)maxCells) {
+            gnx = ax; gny = ay; gnz = az; break;
+        }
+        cell *= 2.0;
+        gnx = gny = gnz = 1;
+    }
+    const gpu::DVec3 gLo((gpu::Real)((double)bb.mnx - cell), (gpu::Real)((double)bb.mny - cell),
+                         (gpu::Real)((double)bb.mnz - cell));
+    ensureDevCap(d.cellKey, d.cellKeyCap, (size_t)n);
+    ensureDevCap(d.order,   d.orderCap,   (size_t)n);
+    int ckBlocks = (n + 127) / 128;
+    if (ckBlocks < 1)    ckBlocks = 1;
+    if (ckBlocks > 2048) ckBlocks = 2048;
+    gpu::kJSurfCellKey<<<ckBlocks, 128>>>(d.pts, n, gLo, cell, (int)gnx, (int)gny, (int)gnz,
+                                          d.cellKey);
+    cudaCheckKernel("jsurf-cellkey");
+    thrust::device_ptr<int> tKey(d.cellKey), tOrd(d.order);
+    thrust::sequence(pol, tOrd, tOrd + n);
+    // STABLE, because the host's counting sort is stable and the gather sums in visit order:
+    // an unstable sort would reorder a cell's photons and change the last bits of every merge.
+    thrust::stable_sort_by_key(pol, tKey, tKey + n, tOrd);
+    const long long nCells = gnx * gny * gnz;
+    ensureDevCap(d.cellStart, d.cellStartCap, (size_t)nCells + 1);
+    thrust::lower_bound(pol, tKey, tKey + n,
+                        thrust::counting_iterator<int>(0),
+                        thrust::counting_iterator<int>((int)(nCells + 1)),
+                        thrust::device_pointer_cast(d.cellStart));
+
+    dsm.pts = d.pts; dsm.mis = d.mis;
+    dsm.cellStart = d.cellStart; dsm.order = d.order;
+    dsm.lo = gLo; dsm.cell = (gpu::Real)cell;
+    dsm.nx = (int)gnx; dsm.ny = (int)gny; dsm.nz = (int)gnz;
+    dsm.radius = (gpu::Real)radius;
+    // n_m counts subpaths ASKED FOR, not photons stored -- the host pass counts the same way
+    // (it increments before its `pdfLam <= 0` continue), and getting it wrong scales every
+    // merge by a constant.
+    dsm.kappaS = (double)nPaths * PI * radius * radius;
+    dsm.nPts   = (long long)n;
+}
+
+// ---- FTRACE_JDEVLIGHT=2: compare the host-traced and device-traced maps AS DATA ------
+//
+// The image A/B of these two arms is weak where it matters: the caustic is merge-dominated and
+// high-variance, so a seed-spread error bar from a handful of renders cannot separate "the
+// deposit is wrong" from "not enough seeds". The maps are the better instrument -- ~49 000
+// independent samples each of the same distribution, so their summary statistics agree to
+// ~1/sqrt(N), while every plausible transcription error is GROSS here: an off-by-one in the
+// accumulator index moves the whole sumC distribution by a step of the recurrence, a wrong
+// `vert` moves the depth histogram by a bin, a wrong site predicate moves the count and the
+// gateC1 fraction, a wrong cosPrev/rho2 moves rCoef's median by a factor.
+//
+// Medians as well as means, because pdfFwdA and rCoef are densities: their means are dominated
+// by a tail that two 49 000-sample draws will not agree on, and a mean that disagrees while the
+// median agrees is a statement about the tail, not about the transcription.
+static void compareJSurfMaps(const bdpt::SurfMap& host, const JSurfDev& dev) {
+    if (dev.stored <= 0 || host.pts.empty()) { std::printf("[jdevcmp] nothing to compare\n"); return; }
+    const size_t n = (size_t)dev.stored;
+    std::vector<gpu::DSurfPhoton> dp(n);
+    std::vector<gpu::DSurfMis>    dm(n);
+    CUDA_CHECK(cudaMemcpy(dp.data(), dev.pts, n * sizeof(gpu::DSurfPhoton), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(dm.data(), dev.mis, n * sizeof(gpu::DSurfMis), cudaMemcpyDeviceToHost));
+    auto med = [](std::vector<double> v) {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    auto mean = [](const std::vector<double>& v) {
+        double s = 0.0; for (double x : v) s += x; return v.empty() ? 0.0 : s / (double)v.size();
+    };
+    struct Col { const char* name; std::vector<double> h, d; };
+    Col cols[] = {
+        {"beta",    {}, {}}, {"pdfFwdA", {}, {}}, {"rCoef",  {}, {}},
+        {"sumC",    {}, {}}, {"sumMb",   {}, {}}, {"sumMs",  {}, {}},
+    };
+    for (size_t i = 0; i < host.pts.size(); ++i) {
+        const bdpt::SurfMis* m = host.misOf(i);
+        if (!m) continue;
+        cols[0].h.push_back((double)host.pts[i].beta);
+        cols[1].h.push_back(m->pdfFwdA);
+        cols[2].h.push_back((double)m->rCoef);
+        cols[3].h.push_back(m->sumC);
+        cols[4].h.push_back(m->sumMb);
+        cols[5].h.push_back(m->sumMs);
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const gpu::DSurfMis& m = dm[dp[i].misIdx < n ? dp[i].misIdx : i];
+        cols[0].d.push_back((double)dp[i].beta);
+        cols[1].d.push_back(m.pdfFwdA);
+        cols[2].d.push_back((double)m.rCoef);
+        cols[3].d.push_back(m.sumC);
+        cols[4].d.push_back(m.sumMb);
+        cols[5].d.push_back(m.sumMs);
+    }
+    std::printf("\n[jdevcmp] host %zu photons vs device %zu (%.2f%%)\n",
+                host.pts.size(), n,
+                100.0 * ((double)n / (double)host.pts.size() - 1.0));
+    // MAX AND HIGH QUANTILES, not just mean and median. The first run of this comparator gave
+    // mean ratios of 4e-4 beside median ratios of 0.99, which says the draws differ in the
+    // TAIL and nothing about whether the transcription is right -- a density's mean over
+    // 12 000 samples is a statement about its largest one or two entries. These columns answer
+    // the question that one could not: is the device MISSING the tail, or has it merely not
+    // drawn it? It matters, because `pdfFwdA` is the merge technique's own density (eta =
+    // kappaS * pl_j), so a missing tail under-weights exactly the near-specular merges a
+    // caustic is made of -- which is the sign the reference comparison actually measured.
+    auto quant = [](std::vector<double> v, double q) {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        return v[(size_t)(q * (double)(v.size() - 1))];
+    };
+    std::printf("[jdevcmp] %-9s %11s %11s %8s | %11s %11s %8s | %10s %10s %7s\n",
+                "field", "host mean", "dev mean", "d/h", "host p99.9", "dev p99.9", "d/h",
+                "host max", "dev max", "d/h");
+    for (const Col& c : cols) {
+        const double hm = mean(c.h), dmn = mean(c.d);
+        const double hq = quant(c.h, 0.999), dq = quant(c.d, 0.999);
+        const double hx = quant(c.h, 1.0),   dx = quant(c.d, 1.0);
+        std::printf("[jdevcmp] %-9s %11.4g %11.4g %7.4fx | %11.4g %11.4g %7.4fx | %10.4g %10.4g %6.4fx\n",
+                    c.name, hm, dmn, hm != 0.0 ? dmn / hm : 0.0,
+                    hq, dq, hq != 0.0 ? dq / hq : 0.0,
+                    hx, dx, hx != 0.0 ? dx / hx : 0.0);
+    }
+    std::printf("[jdevcmp] %-9s %11s %11s %8s | %11s %11s %8s\n",
+                "(median)", "", "", "", "host med", "dev med", "d/h");
+    for (const Col& c : cols) {
+        const double hM = med(c.h), dM = med(c.d);
+        std::printf("[jdevcmp] %-9s %11s %11s %8s | %11.4g %11.4g %7.4fx\n",
+                    c.name, "", "", "", hM, dM, hM != 0.0 ? dM / hM : 0.0);
+    }
+    // gateC1 and the depth histogram: pure structure, no tail, so these are the columns that
+    // catch a predicate or an index error outright rather than statistically.
+    long long hg = 0, dg = 0;
+    long long hv[16] = {0}, dv[16] = {0};
+    for (size_t i = 0; i < host.pts.size(); ++i) {
+        const bdpt::SurfMis* m = host.misOf(i);
+        if (!m) continue;
+        hg += (m->gateC1 != 0);
+        if (m->vert < 16) ++hv[m->vert];
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const gpu::DSurfMis& m = dm[dp[i].misIdx < n ? dp[i].misIdx : i];
+        dg += (m.gateC1 != 0);
+        if (m.vert < 16) ++dv[m.vert];
+    }
+    std::printf("[jdevcmp] gateC1 on: host %.4f  dev %.4f\n",
+                (double)hg / (double)host.pts.size(), (double)dg / (double)n);
+    std::printf("[jdevcmp] vert histogram (fraction), host | dev:\n");
+    for (int v = 0; v < 12; ++v) {
+        if (!hv[v] && !dv[v]) continue;
+        std::printf("[jdevcmp]   vert %2d: %.5f | %.5f\n", v,
+                    (double)hv[v] / (double)host.pts.size(), (double)dv[v] / (double)n);
+    }
+    std::printf("\n");
+}
+
+// ---- upload a built photon-beam map to the device ------------------------------------
+//
+// Shared by mode M's volume gather and mode J's BDPT merges, which need the SAME device
+// layout and differ only in whether the MIS partials come with it. Same fold-at-upload trick
+// as DGatherPhoton: the per-beam constants (carried flux, the 1/nEmitted pass normalisation,
+// and the CIE triple at the beam's own wavelength — the host precomputed the last one in
+// BeamMap::build for exactly this reason) collapse into one float3, so the inner loop
+// multiplies geometry and medium terms alone. The BVH goes over verbatim; nNodes == 0 is the
+// "no volume gather" sentinel every entry point tests.
+//
+// `withMis` is mode J. It additionally uploads BeamMis + misIdx and sets `mergeKappa` —
+// n_m * 2r, the merge technique's sample count times the 1D kernel's full width — which is
+// what turns the device gather from mode M's whole estimator into one half of a two-technique
+// MIS pair. The three travel together on purpose: a null `mis` makes DBeamMap::misOf return
+// null, which the gather reads as "weight 1", and a zero `mergeKappa` deletes every merge
+// term inside dMisWeight. Uploading one without the other would double-count or under-count.
+// Upload of the surface photon map (`-jsurf`). Mirrors uploadBeamMapCuda's shape: convert the
+// host vectors into device layouts, hand the pointers over in a DSurfMap, and let `up` own the
+// allocations. An empty or absent map leaves `dsm.nPts == 0`, which every gather reads as "no
+// surface merges" -- the two-technique estimator, unchanged.
+static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurfMap& dsm) {
+    if (!smap || smap->pts.empty() || smap->cellStart.empty() || smap->nEmitted <= 0) return;
+    const size_t n = smap->pts.size();
+    std::vector<gpu::DSurfPhoton> pts(n);
+    for (size_t i = 0; i < n; ++i) {
+        const bdpt::SurfPhoton& q = smap->pts[i];
+        gpu::DSurfPhoton& d = pts[i];
+        d.p  = gpu::DVec3{(gpu::Real)q.p.x,  (gpu::Real)q.p.y,  (gpu::Real)q.p.z};
+        d.wo = gpu::DVec3{(gpu::Real)q.wo.x, (gpu::Real)q.wo.y, (gpu::Real)q.wo.z};
+        d.lambda = q.lambda; d.beta = q.beta;
+        d.cx = q.cx; d.cy = q.cy; d.cz = q.cz;
+        d.misIdx = q.misIdx;
+    }
+    std::vector<gpu::DSurfMis> mis(smap->mis.size());
+    for (size_t i = 0; i < smap->mis.size(); ++i) {
+        const bdpt::SurfMis& m = smap->mis[i];
+        gpu::DSurfMis& d = mis[i];
+        d.sumC = m.sumC; d.sumMb = m.sumMb; d.sumMs = m.sumMs; d.pdfFwdA = m.pdfFwdA;
+        d.rCoef = m.rCoef; d.gateC1 = m.gateC1; d.vert = m.vert;
+    }
+    dsm.pts       = (const gpu::DSurfPhoton*)up.keep(uploadVec(pts));
+    dsm.mis       = (const gpu::DSurfMis*)up.keep(uploadVec(mis));
+    dsm.cellStart = (const int*)up.keep(uploadVec(smap->cellStart));
+    dsm.order     = (const int*)up.keep(uploadVec(smap->order));
+    dsm.lo     = gpu::DVec3{(gpu::Real)smap->lo.x, (gpu::Real)smap->lo.y, (gpu::Real)smap->lo.z};
+    dsm.cell   = (gpu::Real)smap->cell;
+    dsm.nx = (int)smap->nx; dsm.ny = (int)smap->ny; dsm.nz = (int)smap->nz;
+    dsm.radius = (gpu::Real)smap->radius;
+    // n_m * pi r_s^2, the constant the estimator divides by and the weight scales its own
+    // technique with -- the exact twin of the beam map's mergeKappa = n_m * 2 r_b.
+    dsm.kappaS = (double)smap->nEmitted * PI * (double)smap->radius * (double)smap->radius;
+    dsm.nPts   = (long long)n;
+}
+
+static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& dbm,
+                              const StageProgress* stage, bool withMis, bool lbvh = false) {
+    // `lbvh` means the host deliberately skipped its tree because a device one is coming, so an
+    // empty `bvh.nodes` is expected rather than a malformed map. Without that distinction the
+    // guard below would silently drop a perfectly good beam set and the volume would vanish.
+    if (!bmap || bmap->beams.empty() || bmap->nEmitted <= 0) return;
+    if (!lbvh && bmap->bvh.nodes.empty()) return;
+    const double invN = 1.0 / (double)bmap->nEmitted;
+    const size_t nb = bmap->beams.size();
+    // The fourth and last silent stretch: converting millions of sub-beams and millions of
+    // BVH nodes into their device layouts, on one host thread, before the line at the bottom
+    // of this block finally says anything. Name it and make it interruptible.
+    if (stage && stage->reset)  stage->reset();
+    if (stage && stage->report) stage->report("uploading photon beams", 0, (long long)nb,
+                                              nullptr, 0.0);
+    std::vector<gpu::DBeamRec> recs(nb);
+    for (size_t i = 0; i < nb; ++i) {
+        if ((i & 0xFFFFF) == 0) {
+            if (ft::stopRequested()) break;
+            if (stage && stage->report)
+                stage->report("uploading photon beams", (long long)i, (long long)nb,
+                              nullptr, 0.0);
+        }
+        const PhotonBeam& b = bmap->beams[i];
+        // GATHER-TIME SPECTRAL FOLD (achro == 2, scene.h Scene::BowLut). `bmap->cie[i]` holds
+        // the emitter's mean CIE for such a beam, but the whole point of the gather-time fold
+        // is that the colour is only decidable once the scattering angle is known — and the
+        // device gather has no bow table to consult. Using the mean here would pair a
+        // band-averaged colour with a SINGLE-wavelength phase value, which is neither the
+        // folded estimator nor the monochromatic one. So demote to the monochromatic record:
+        // CIE(lambda) is exactly what this beam meant before 0.256.0, so a device gather of a
+        // CPU-traced map stays unbiased — it is simply as noisy as it was, and re-gathering on
+        // the CPU is what buys the fold. (Device parity is tracked in known-issues.md.)
+        const Vec3 ci = (b.achro == 2)
+                        ? Vec3(cieX((double)b.lambda), cieY((double)b.lambda), cieZ((double)b.lambda))
+                        : bmap->cie[i];
+        gpu::DBeamRec& r = recs[i];
+        r.o = gpu::DVec3(b.o.x, b.o.y, b.o.z);
+        r.d = gpu::DVec3(b.d.x, b.d.y, b.d.z);
+        r.s0 = b.s0; r.len = b.len;
+        // `invC` splits the chord's flux evenly over its spectral bundle — every wavelength
+        // in it carries the same power (photonbeams.h) — and is exactly 1.0 for a
+        // monochromatic beam, so a `-beamspec 1` render is bit-identical.
+        const double invC = 1.0 / (double)b.nLam();
+        const double w = (double)b.power * invN * invC;
+        r.pX = (float)(ci.x * w); r.pY = (float)(ci.y * w); r.pZ = (float)(ci.z * w);
+        // ...and the colourless weight beside it, for the gather-time fold (FOLD-GPU (2)): a
+        // folded beam takes its colour from the bow table at the crossing angle, so it needs
+        // the power without a colour baked in. `pX/pY/pZ` stay exactly as they were, and are
+        // still what a beam with no table uses -- the demotion above is now the FALLBACK
+        // rather than the only choice.
+        r.pw = (float)w;
+        r.emIdx = (short)b.emIdx;
+        r.achro = (short)b.achro;
+        r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
+        r.nSec = (unsigned char)b.nSec; r.pad = 0;
+        for (int k = 0; k < 3; ++k) {
+            // The same shared constant, minus the CIE fold, times this member's relative
+            // spectral throughput. `wS` is 1 for every member of a bundle whose path never
+            // diverged spectrally, so a pre-0.257.0 map uploads to exactly the old numbers.
+            r.pwSec[k] = (k < b.nSec) ? (float)(w * (double)b.wS[k]) : 0.0f;
+            r.lamS[k] = (k < b.nSec) ? gpu::DBeamRec::packLam((double)b.lamS[k]) : (unsigned short)0;
+        }
+        const double rm = bmap->radOf(b.med);
+        r.invRad = (float)(rm > 0.0 ? 1.0 / rm : 0.0);
+    }
+    // With `lbvh` there is no host tree to convert; the device builds one straight after.
+    std::vector<gpu::DNode> bnodes(lbvh ? 0 : bmap->bvh.nodes.size());
+    for (size_t i = 0; i < bnodes.size(); ++i) {
+        if ((i & 0xFFFFF) == 0 && ft::stopRequested()) break;
+        const BvhNode& s = bmap->bvh.nodes[i]; gpu::DNode& d = bnodes[i];
+        d.lo = {s.box.lo.x, s.box.lo.y, s.box.lo.z};
+        d.hi = {s.box.hi.x, s.box.hi.y, s.box.hi.z};
+        d.left = s.left; d.right = s.right; d.first = s.first; d.count = s.count;
+    }
+    // A stop during either conversion leaves `recs`/`bnodes` half-built. Don't pay the PCIe
+    // transfer for data nothing will read, and above all don't print the "uploaded" line,
+    // which would be a plain lie in the log about what the device holds. `dbm` stays zeroed,
+    // and `nNodes == 0` is already the "no volume gather" sentinel.
+    if (ft::stopRequested()) return;
+    dbm.beams     = (const gpu::DBeamRec*)up.keep(uploadVec(recs));
+    dbm.nodes     = (const gpu::DNode*)up.keep(uploadVec(bnodes));
+    dbm.primIdx   = (const int*)up.keep(uploadVec(bmap->bvh.primIdx));
+    dbm.radiusMax = (gpu::Real)bmap->radius;
+    dbm.nNodes    = (int)bnodes.size();
+    size_t nMis = 0;
+    if (withMis && !bmap->mis.empty()) {
+        std::vector<gpu::DBeamMis> dm(bmap->mis.size());
+        for (size_t i = 0; i < dm.size(); ++i) {
+            const BeamMis& s = bmap->mis[i]; gpu::DBeamMis& d = dm[i];
+            // BOTH merge kinds since 0.263.0: `sumMs` and `etaPrevS` are the point x point
+            // half, zero unless `-jsurf` filled a surface map, and every term they feed is
+            // multiplied by kappaS -- which is itself zero without one. So an unused surface
+            // map costs exactly the two loads and nothing else.
+            d.sumC = s.sumC; d.sumM = s.sumMb; d.sumMs = s.sumMs;
+            d.pdfDir = s.pdfDir; d.rCoef = s.rCoef;
+            d.etaPrev = s.etaPrev; d.leadIn = s.leadIn;
+            d.gateC1 = (int)s.gateC1; d.vert = (int)s.vert;
+        }
+        nMis = dm.size();
+        dbm.mis    = (const gpu::DBeamMis*)up.keep(uploadVec(dm));
+        dbm.nMis   = (int)nMis;
+        if (!bmap->misIdx.empty())
+            dbm.misIdx = (const int*)up.keep(uploadVec(bmap->misIdx));
+        dbm.mergeKappa = (double)bmap->nEmitted * 2.0 * bmap->radRef();
+        dbm.sinMin = bmap->sinMin;
+    }
+    double rlo = bmap->radius;
+    for (float rm : bmap->radMed) if (rm > 0.f) rlo = std::min(rlo, (double)rm);
+    char rtxt[64];
+    if (rlo < bmap->radius) std::snprintf(rtxt, sizeof rtxt, "%.4g .. %.4g", rlo, bmap->radius);
+    else                    std::snprintf(rtxt, sizeof rtxt, "%.4g", bmap->radius);
+    // Silent on a light-side refresh epoch: the sub-beam / BVH / radius figures describe the
+    // map's SHAPE, which every epoch of a run shares — see g_gpuQuietRebuild.
+    if (g_gpuQuietRebuild) return;
+    if (nMis)
+        std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %s, "
+                    "%zu MIS entries (kappa %.4g) uploaded for the mode-J merges\n",
+                    nb, bnodes.size(), rtxt, nMis, dbm.mergeKappa);
+    else
+        std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %s "
+                    "uploaded for the volume gather\n", nb, bnodes.size(), rtxt);
+}
+
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction, const SppProgress* prog,
-                    int heroC) {
+                    int heroC, const BeamMap* bmap, const StageProgress* stage,
+                    const bdpt::SurfMap* smap) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
@@ -14668,7 +18300,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     const long long sppBase  = prog ? (long long)prog->sampleBase : 0;
     const long long sppTotal = sppBase + spp;
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
-        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
+        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL)
+        ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
 
     std::vector<double> camH(npix * 3), splatH(npix * 3);
     auto download = [&](Film& o) {
@@ -14679,27 +18312,407 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                             camH[3 * i + 1] + splatH[3 * i + 1],
                             camH[3 * i + 2] + splatH[3 * i + 2]);
     };
-    auto launch = [&](long long c, long long base) {
+    // Mode J: the beam map, and with it the merge half of the estimator. Uploaded here and
+    // freed with the rest of `up`. A null/empty map leaves `dbm.nNodes == 0`, which the
+    // MERGE=true kernel reads as "no merges" — so `-nobeams` degenerates to mode D exactly.
+    DBeamMap dbm{};
+    // Default on (0.272.3). Must agree EXACTLY with main.cpp's jSkipHostBvh(): if the host
+    // skipped its tree and this said no, the map would arrive with no tree at all and the
+    // volume would silently vanish. Two predicates, one condition -- so the condition is
+    // written the same way in both, and `g_jHostLight` is the single switch behind both.
+    const bool envOff = std::getenv("FTRACE_JLBVH") &&
+                        std::atoi(std::getenv("FTRACE_JLBVH")) == 0;
+    const bool wantLbvh = !g_jHostLight && !envOff;
+    if (bmap) uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/true, wantLbvh);
+    // FTRACE_JLBVH=1: rebuild the NODES on the device over the very same sub-beams. Same beams,
+    // same gather, a different tree -- so an image difference is a traversal-acceptance
+    // difference and a time difference is tree quality, with no third variable to blame.
+    JBeamDev jbvh;
+    if (dbm.beams && bmap && !bmap->beams.empty() && wantLbvh) {
+        const int nb = (int)bmap->beams.size();
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = buildBeamLbvhDevice(jbvh, dbm.beams, nb, bmap->worldBounds,
+                                            bmap->radius, dbm);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0).count();
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::printf("[jlbvh] device LBVH over %d sub-beams in %.1f ms (host SAH tree had %zu "
+                        "nodes; LBVH has %d)%s\n", nb, ms, bmap->bvh.nodes.size(), dbm.nNodes,
+                        ok ? "" : " -- REFUSED, too few beams; keeping the host tree");
+        }
+    }
+    // `-jsurf`'s map. (The "increment 1: ... an uploaded map changes nothing yet" this comment
+    // used to carry was true for one version. The gather landed in 0.263.1 -- see `mergeAny`
+    // below, which launches the MERGE kernel for a surface map with no beams, and
+    // `dSurfMergeAt`.)
+    // FTRACE_JDEVLIGHT=1: re-trace and re-grid that map ON THE DEVICE instead. Deliberately
+    // the same nPaths / radius / single realization as the host map it replaces, so this is a
+    // clean A/B of WHERE the light side runs. It cannot be bit-identical -- the two walks draw
+    // from different RNG streams -- so the acceptance test is statistical, per ROI.
+    JSurfDev jdev;
+    // DEFAULT 3 -- the device light pass, redrawn per chunk. `-jhostlight` turns it off;
+    // FTRACE_JDEVLIGHT still overrides both, because level 1 (device map, once per epoch) and
+    // level 2 (that plus the host-vs-device map dump) are the two arms every measurement in
+    // known-issues was taken with and they have to stay reachable.
+    //
+    // THE LEVELS ARE NAMED ARMS, NOT A VERBOSITY LADDER. Read them as a set, never as an
+    // ordering where a higher number implies everything below it:
+    //     0  host light pass (`-jhostlight`)
+    //     1  device map, rebuilt once per epoch
+    //     2  = 1 plus the host-vs-device map dump
+    //     3  device map, redrawn per chunk          <- the default
+    //     4  = 3 plus the dump  (for timing the dump against 3 inside one binary)
+    // Getting this wrong is what JDEVCMP-DEFAULT was: the dump's gate read `>= 2`, which was
+    // right while the default was 1 and silently swept the default into the diagnostic arm the
+    // moment it became 3.
+    //
+    // DECIDED BEFORE THE UPLOAD BELOW, because the answer changes whether the upload is worth
+    // doing at all: `buildJSurfMapDevice` opens with `dsm = gpu::DSurfMap{}`, so on the device
+    // path every byte `uploadSurfMapCuda` converts and ships is overwritten a few lines later.
+    int jdevLevel = g_jHostLight ? 0 : 3;
+    if (const char* e = std::getenv("FTRACE_JDEVLIGHT")) jdevLevel = std::atoi(e);
+    const bool jDevLight = smap && smap->nEmitted > 0 && jdevLevel != 0;
+
+    DSurfMap dsm{};
+    // Skip the host map's upload when the device is about to build its own over the top. The
+    // cost is not the PCIe transfer but the two staging vectors built ahead of it, which walk
+    // every surface photon on one core to widen it into the device layout.
+    if (smap && !jDevLight) uploadSurfMapCuda(smap, up, dsm);
+    if (jDevLight) {
+        buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, smap->nEmitted,
+                            smap->radius, (long long)smap->pts.size() * 2 + 1024,
+                            jSurfSalt(prog), dsm);
+        // ONCE. A refreshing render rebuilds this every epoch -- 126 of them in 90 s -- and a
+        // line each would bury the -interval status lines that carry the actual progress.
+        static bool jdevSaid = false;
+        if (!jdevSaid || jdev.dropped) {
+            jdevSaid = true;
+            std::printf("[jdevlight] device light pass: %lld subpaths -> %lld surface photons "
+                        "(host traced %zu)%s\n", (long long)smap->nEmitted, jdev.stored,
+                        smap->pts.size(),
+                        jdev.dropped ? "  [CAP BOUND: some photons dropped]" : "");
+        }
+        // `== 2`, NOT `>= 2`. The levels are not a severity ladder where each one implies the
+        // one below -- they are three named arms, and level 2 is specifically "device map plus
+        // the host-vs-device dump". When the default moved from 1 to 3 in 0.272.x, `>= 2`
+        // silently swept the DEFAULT into the diagnostic arm: every shipped mode-J render with
+        // `-jsurf` downloaded the device map and ran the whole median/histogram comparison once
+        // per light-side epoch. On a 256-spp `_fog_cornell` that is 20 dumps against 9 `[spp]`
+        // status lines -- the diagnostic output outnumbering the progress output 2:1, which is
+        // the exact failure the `jdevSaid` latch a few lines above exists to prevent.
+        //
+        // LEVEL 4 = LEVEL 3 PLUS THE DUMP, and it exists so the cost of the dump can be measured
+        // WITHIN ONE BINARY. Timing the bug by comparing a pre-fix build against a post-fix one
+        // is not a controlled experiment: the two runs are minutes apart on a card whose clocks
+        // depend on how hot it already is, and a first attempt that way came out "2.2x slower
+        // after the fix" -- the beam-hit kernel alone drifting 7.5 s -> 15.7 s on an identical
+        // 6.8 M sub-beam map that neither arm touches. Arms that can be interleaved, seed by
+        // seed, in one process image are the only ones that answer a throughput question here.
+        if (jdevLevel == 2 || jdevLevel == 4) compareJSurfMaps(*smap, jdev);
+    }
+    // Level 3 redraws per chunk (see the note above): remember what the rebuild needs, since the
+    // launch lambda has no `smap` of its own and must not reach for one that may be freed.
+    const bool jPerChunk   = jDevLight && jdevLevel >= 3;
+    // How many light-side realizations to draw INSIDE one chunk (FTRACE_JSPLIT). 1 = off.
+    // Inert without jPerChunk: splitting a chunk that reuses one map buys nothing and costs
+    // a kernel launch per split.
+    // DEFAULT 4, the measured optimum: 0.390x whole-frame variance against k=1 for 8.6 % of the
+    // samples, where k=16 costs 53 % of them and comes back out at 0.503x. The two terms trade,
+    // so this knob has an interior optimum and 4 is where it sits on the scene it was measured
+    // on. Inert where the chunk is already 1 spp (an expensive media frame), which is exactly
+    // where a split would have bought nothing.
+    int jSplitN = 4;
+    if (jPerChunk) {
+        if (const char* e = std::getenv("FTRACE_JSPLIT")) jSplitN = std::atoi(e);
+        if (jSplitN < 1)    jSplitN = 1;
+        if (jSplitN > 1024) jSplitN = 1024;
+        static bool jSaidSplit = false;
+        if (jSplitN > 1 && !jSaidSplit) {
+            jSaidSplit = true;
+            std::printf("mode J: light side on the DEVICE, redrawn %d times per chunk "
+                        "(-jhostlight for the pre-0.272.0 host pass)\n", jSplitN);
+        }
+    }
+    // FTRACE_JBAND=1: redraw per WAVEFRONT BAND instead of (only) per chunk. The band loop
+    // subdivides a chunk by PIXEL, which is the only axis left once the chunk is down to 1 spp
+    // -- the case an expensive media scene is always in. Inert without a wavefront queue, where
+    // there is exactly one band per chunk and this reduces to the per-chunk redraw.
+    bool jPerBand = false;
+    if (jPerChunk) {
+        const char* e = std::getenv("FTRACE_JBAND");
+        jPerBand = e && std::atoi(e) != 0;
+        if (jPerBand)
+            std::printf("[jdevlight] one light-side realization per wavefront band "
+                        "(FTRACE_JBAND) — pixels in one frame may gather from different "
+                        "realizations; unbiased per pixel, but the realization is no longer "
+                        "shared across the image\n");
+    }
+    const long long jPaths = jDevLight ? (long long)smap->nEmitted : 0;
+    const double    jRad   = jDevLight ? smap->radius : 0.0;
+    const long long jCap   = jDevLight ? ((long long)smap->pts.size() * 2 + 1024) : 0;
+    {   // the half-render diagnostic, mirrored from the host so one half can be compared
+        // backend to backend (bdpt::jHalfMode: 1 = connections only, 2 = merges only)
+        // Same strings bdpt.h's jHalfMode() reads -- that function is the source of truth, but
+        // it lives in a header this translation unit does not include.
+        const char* e = std::getenv("FTRACE_J_HALF");
+        const int jh = !e ? 0 : (!std::strcmp(e, "connections") ? 1
+                              : (!std::strcmp(e, "merges") || !std::strcmp(e, "merges-raw")) ? 2 : 0);
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jHalf, &jh, sizeof(int)));
+    }
+    const bool mergeOn = (dbm.nNodes > 0);
+    // WAVEFRONT gather queue (UPBP-CONV): sized for one wave of camera paths; the chunk is run
+    // as consecutive waves. FTRACE_NOWAVEFRONT=1 forces the inline gather (the A/B control).
+    DWfQueue wq{};
+    int* d_wfCounters = nullptr;
+    long long waveSamples = 0;
+    if (mergeOn && !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
+        const int segCap = 1 << 20;          // ~270 B each (~280 MB)
+        const int hitCap = 1 << 25;          // 16 B each  (512 MB): a dense map yields thousands of
+                                             // candidates per segment (_fog_cornell: ~2000), and a
+                                             // spilled candidate is evaluated divergently, on the spot
+        CUDA_CHECK(cudaMalloc(&wq.segs, (size_t)segCap * sizeof(DWfSeg)));
+        CUDA_CHECK(cudaMalloc(&wq.hits, (size_t)hitCap * sizeof(DWfHit)));
+        CUDA_CHECK(cudaMalloc(&d_wfCounters, 4 * sizeof(int)));
+        wq.nSegs = d_wfCounters; wq.nHits = d_wfCounters + 1; wq.overflow = d_wfCounters + 2;
+        wq.segCap = segCap; wq.hitCap = hitCap;
+        waveSamples = (long long)segCap / (long long)(maxDepth + 3);   // SEGN = MAXV = depth + 3
+        if (waveSamples < 1) waveSamples = 1;
+        // wave order (see DWfQueue): bands by default; FTRACE_WFSTRAT=1 = stratified, 32-pixel
+        // runs on a power-of-two domain permuted by an odd golden-ratio multiplier under the mask
+        wq.runsPerRow = ((unsigned)resX + 31u) / 32u;
+        wq.nRuns = wq.runsPerRow * (unsigned)resY;
+        {
+            unsigned dom = 1u;
+            while (dom < wq.nRuns) dom <<= 1;
+            wq.runMask = dom - 1u;
+            const char* e = std::getenv("FTRACE_WFSTRAT");
+            wq.runMul = (e && std::atoi(e) != 0) ? ((unsigned)(0.6180339887498949 * (double)dom) | 1u) : 0u;
+        }
+    }
+    long long wfWaves = 0, wfSpillSegs = 0, wfSpillHits = 0;
+    // Where a mode-J render's seconds go: CUDA-event time of the three wave kernels and the wall
+    // time around each wave (the wave already syncs on the counter copy, so the elapsed-time
+    // queries are free). Reported with the queue use at the end of the render.
+    cudaEvent_t wfEv[4] = {nullptr, nullptr, nullptr, nullptr};
+    double wfMsWalk = 0.0, wfMsHits = 0.0, wfMsEval = 0.0, wfMsWall = 0.0;
+    if (wq.segs) for (auto& e : wfEv) CUDA_CHECK(cudaEventCreate(&e));
+    // The PROFILE: what every band of the previous chunk produced, in hits per path and segments
+    // per path, keyed by pixel slot so chunks of different spp line up. Stationary across chunks
+    // (same map, same camera), so it is the right estimate for a wave about to cover those
+    // bands -- including the top band a new chunk starts on, and the doubling at the light's
+    // edge that the last wave cannot see coming (_fog_cornell spilled 94.6 M hits at 256^2 /
+    // 60 s sized from the last wave alone, with the chunk's densest wave carried across).
+    // It lives ACROSS calls: the progressive loop re-enters this function once per epoch
+    // (~17 times a minute on _fog_thick), and an epoch whose first chunk had to relearn from a
+    // 1024-path wave both spilled on a dense map and, through the epoch rule that scales the
+    // epoch by its own setup time, ran shorter epochs -- 3 % fewer paths a minute against the
+    // 0.261.0 schedule, all of it in the extra map rebuilds. Reset when the frame changes shape.
+    if (g_wfProfileResX != resX || g_wfProfileResY != resY || g_wfProfileDepth != maxDepth) {
+        g_wfProfile.clear();
+        g_wfProfileResX = resX; g_wfProfileResY = resY; g_wfProfileDepth = maxDepth;
+    }
+    std::vector<WfBand>& wfProfilePrev = g_wfProfile;
+    const bool mergeAny = mergeOn || dsm.nPts > 0;   // either kind wants MERGE=true
+    std::vector<WfBand> wfProfileCur;
+    auto launch = [&](long long cAll, long long baseAll) {
+      // ONE LIGHT-SIDE REALIZATION PER SUB-LAUNCH (FTRACE_JDEVLIGHT=3, FTRACE_JSPLIT=k).
+      //
+      // `base` is the ABSOLUTE sample index this sub-batch starts at, so it advances every
+      // sub-launch and never repeats across a resume -- which makes it the right thing to salt
+      // with, and the same quantity the camera side already uses to stay decorrelated across
+      // epoch boundaries.
+      //
+      // WHY THE SPLIT IS INSIDE `launch` RATHER THAN A SMALLER CHUNK. Measured: at
+      // FTRACE_CHUNK_SPP=1 the render manages 665 / 713 / 672 spp in 20 s at JDEVLIGHT 0 / 1 / 3
+      // -- indistinguishable -- so the rebuild is free and the ~30 ms per chunk is the generic
+      // chunk machinery: launch, film download, progress report, film merge. Shrinking the chunk
+      // pays all four per realization; splitting it pays only the launch and the rebuild.
+      //
+      // Each sub-launch is an independent, correctly-normalised estimate against its own valid
+      // map, accumulating into the same device film exactly as consecutive chunks already do.
+      // `kappaS` is unchanged across them (same nPaths, same radius), so the MIS weights stay
+      // consistent within and between sub-launches.
+      for (int jsp = 0; jsp < jSplitN; ++jsp) {
+        const long long cLo = cAll * jsp / jSplitN, cHi = cAll * (jsp + 1) / jSplitN;
+        const long long c = cHi - cLo;
+        if (c <= 0) continue;
+        const long long base = baseAll + cLo;
+        if (jPerChunk)
+            buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, jPaths, jRad, jCap,
+                                jSurfSalt(prog) ^ ((unsigned long long)base *
+                                                   0xD1B54A32D192ED03ULL),
+                                dsm);
+
         long long totalSamples = (long long)npix * c;
-        if (useHero && deep)
-            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C);
+        // Mode J only ever instantiates the scalar (NS == 0) kernel: `useHero` is already
+        // false for any scene with a participating medium, and a mode-J scene without one
+        // has nothing to merge.
+        // EITHER merge kind needs the MERGE=true instantiation, not just the beams: SEGN --
+        // the size of the camera-side MIS sum arrays -- is `MERGE ? MAXV : 1`, so launching the
+        // MERGE=false kernel for a media-free `-jsurf` render left those sums structurally
+        // absent (always index 0, always zero). The surface merges then ran with a denominator
+        // missing its whole camera-side term, i.e. weights too large: +15 % on _cornell_diffuse.
+        if (mergeAny) {
+            // ADAPTIVE WAVES: the first wave is sized by segments alone; every later wave is sized
+            // so that the previous wave's observed hits-per-segment would fill ~70% of the hit
+            // queue, and never more than the segment queue allows. One synchronous 4-int copy per
+            // wave buys a schedule that never spills on a stationary scene.
+            // The FIRST wave is small: a dense map yields thousands of candidates per segment,
+            // and a segment-sized first wave would spill millions of them into the divergent
+            // on-the-spot path before any measurement exists. The adaptive rule then grows the
+            // wave, up to the segment-sized ceiling. Each wave advances by the range it actually
+            // ran (b0 = b1) -- NOT by the wave size, which changes inside the loop.
+            // A wave's size is an estimate of its hits from what is known: the last wave (bands
+            // are neighbours), and from the second chunk on the previous chunk's PROFILE -- the
+            // hits per path every band produced. The size is the largest that keeps the densest
+            // band the wave would cover at ~70% of the hit queue; that is a fixed point (a
+            // smaller wave reaches fewer bands), reached by shrinking from the last-wave size.
+            // So a band gets the size its own density allows, and the two jumps the last wave
+            // cannot see -- the chunk boundary (bottom band -> top band) and the light's edge
+            // inside every chunk -- are simply entries in the profile. The render's first wave
+            // is 1024 paths: 4096 already overflowed the hit queue on _fog_cornell. Under
+            // FTRACE_WFSTRAT=1 the index space is padded to whole runs of the power-of-two
+            // domain, and the profile, keyed by slot, sees stationary waves -- harmless.
+            const long long waveTotal = (wq.runMul != 0u) ? ((long long)wq.runMask + 1) * 32 * c : totalSamples;
+            wfProfileCur.clear();
+            auto sizeFor = [&](double hitsPerPath, double segsPerPath) -> long long {
+                long long n = waveSamples;
+                if (segsPerPath > 0.0) {
+                    const double byHits = (hitsPerPath > 0.0) ? 0.7 * (double)wq.hitCap / hitsPerPath : (double)waveSamples;
+                    const double bySegs = 0.9 * (double)wq.segCap / segsPerPath;
+                    n = (long long)((byHits < bySegs) ? byHits : bySegs);
+                }
+                if (n < 256) n = 256;
+                if (n > waveSamples) n = waveSamples;   // the segment-sized wave is the ceiling
+                return n;
+            };
+            auto profiled = [&](long long from, long long cand, double hpp, double spp) -> long long {
+                if (wfProfilePrev.empty()) return cand;
+                for (int it = 0; it < 8; ++it) {
+                    const long long p0 = from / c, p1 = (from + cand + c - 1) / c;   // slots the wave would cover
+                    double h = hpp, sg = spp;
+                    for (const WfBand& w : wfProfilePrev)
+                        if (w.px1 > p0 && w.px0 < p1) {
+                            if (w.hitsPerPath > h) h = w.hitsPerPath;
+                            if (w.segsPerPath > sg) sg = w.segsPerPath;
+                        }
+                    const long long n = sizeFor(h, sg);
+                    if (n >= cand) return cand;
+                    cand = n;
+                }
+                return cand;
+            };
+            long long wave = !wq.segs ? waveTotal
+                           : profiled(0, wfProfilePrev.empty() ? ((waveSamples < 1024) ? waveSamples : 1024) : waveSamples, 0.0, 0.0);
+            for (long long b0 = 0; b0 < waveTotal; ) {
+                const long long b1 = (b0 + wave < waveTotal) ? b0 + wave : waveTotal;
+                // A REALIZATION PER BAND (FTRACE_JBAND). Salted by the band's first path slot as
+                // well as by `base`, so two bands of one chunk draw different maps and two
+                // chunks never repeat a band's map. `dsm` is passed BY VALUE to the kernel
+                // below, so rebuilding here is all that is needed for the launch to see it.
+                if (jPerBand)
+                    buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, jPaths, jRad,
+                                        jCap,
+                                        jSurfSalt(prog)
+                                            ^ ((unsigned long long)base * 0xD1B54A32D192ED03ULL)
+                                            ^ ((unsigned long long)(b0 + 1) *
+                                               0x9E3779B97F4A7C15ULL),
+                                        dsm);
+                const auto wfT0 = std::chrono::steady_clock::now();
+                if (wq.segs) {
+                    CUDA_CHECK(cudaMemsetAsync(d_wfCounters, 0, 4 * sizeof(int)));
+                    CUDA_CHECK(cudaEventRecord(wfEv[0]));
+                }
+                if (deep && wq.runMul != 0u)
+                    kBdptT<0, BDPT_DEEPDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
+                else if (deep)
+                    kBdptT<0, BDPT_DEEPDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                                          resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
+                else if (wq.runMul != 0u)
+                    kBdptT<0, BDPT_MAXDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                                        resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
+                else
+                    kBdptT<0, BDPT_MAXDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
+                if (wq.segs) {
+                    cudaCheckKernel("bdpt");
+                    CUDA_CHECK(cudaEventRecord(wfEv[1]));
+                    kWfBeamHits<<<2048, 128>>>(up.sc, dbm, wq, d_cam, resX);
+                    cudaCheckKernel("wf-hits");
+                    CUDA_CHECK(cudaEventRecord(wfEv[2]));
+                    kWfBeamEval<<<4096, 128>>>(up.sc, dbm, wq, d_cam, resX);
+                    cudaCheckKernel("wf-eval");
+                    CUDA_CHECK(cudaEventRecord(wfEv[3]));
+                    ++wfWaves;
+                    int cnt[4] = {0, 0, 0, 0};
+                    CUDA_CHECK(cudaMemcpy(cnt, d_wfCounters, sizeof cnt, cudaMemcpyDeviceToHost));
+                    {
+                        float ms = 0.f;
+                        CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[0], wfEv[1])); wfMsWalk += ms;
+                        CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[1], wfEv[2])); wfMsHits += ms;
+                        CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[2], wfEv[3])); wfMsEval += ms;
+                        const double wallMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wfT0).count();
+                        wfMsWall += wallMs;
+                        static const bool waveDebug = std::getenv("FTRACE_WAVE_DEBUG") != nullptr;   // per-wave diagnostic
+                        if (waveDebug) {
+                            float w0 = 0.f, w1 = 0.f, w2 = 0.f;
+                            cudaEventElapsedTime(&w0, wfEv[0], wfEv[1]); cudaEventElapsedTime(&w1, wfEv[1], wfEv[2]); cudaEventElapsedTime(&w2, wfEv[2], wfEv[3]);
+                            std::fprintf(stderr, "[wave] c=%lld paths %lld..%lld (%lld) segs %d hits %d spill %d/%d walk %.2f hits %.2f eval %.2f wall %.2f ms\n",
+                                         c, b0, b1, b1 - b0, cnt[0], cnt[1], cnt[2], cnt[3], w0, w1, w2, wallMs);
+                        }
+                    }
+                    wfSpillSegs += cnt[2]; wfSpillHits += cnt[3];
+                    const long long paths = b1 - b0;
+                    const double segsPerPath = (paths > 0) ? (double)cnt[0] / (double)paths : (double)(maxDepth + 3);
+                    const double hitsPerSeg  = (cnt[0] > 0) ? ((double)cnt[1] + (double)cnt[3]) / (double)cnt[0] : 0.0;
+                    const double hitsPerPath = hitsPerSeg * segsPerPath;
+                    wfProfileCur.push_back(WfBand{b0 / c, (b1 + c - 1) / c, hitsPerPath, segsPerPath});
+                    wave = profiled(b1, sizeFor(hitsPerPath, segsPerPath), hitsPerPath, segsPerPath);
+                }
+                b0 = b1;
+            }
+            if (wq.segs && !wfProfileCur.empty()) wfProfilePrev.swap(wfProfileCur);   // this chunk's bands size the next
+        }
+        else if (useHero && deep)
+            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else if (useHero)
-            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                            resX, maxDepth, diffraction ? 1 : 0, seed, C);
+            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                            resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else if (deep)
-            kBdptT<0, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1);
+            kBdptT<0, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else
-            kBdptT<0, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                    resX, maxDepth, diffraction ? 1 : 0, seed, 1);
+            kBdptT<0, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                                                    resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples);
         cudaCheckKernel("bdpt");
+      }
     };
 
     if (!prog || !prog->report) { launch(spp, sppBase); download(out); }   // single-shot
     else gpuSppChunks(spp, *prog, out, launch, download);
 
     freeUpload(up);
+    if (wq.segs) {
+        int ov[4] = {0, 0, 0, 0};
+        cudaMemcpy(ov, d_wfCounters, sizeof ov, cudaMemcpyDeviceToHost);
+        std::fprintf(stderr, "[gpu] mode J wavefront gather: %lld waves (first up to %lld paths, adaptive after); "
+                             "last wave %d segments / %d hits; spilled over the whole render: %lld segments "
+                             "gathered inline, %lld hits evaluated on the spot (FTRACE_NOWAVEFRONT=1 forces "
+                             "the inline path)\n"
+                             "[gpu] mode J wave loop: GPU time walk %.1f s, beam hits %.1f s, hit eval %.1f s; "
+                             "wall %.1f s (host gaps %.1f s)\n",
+                     wfWaves, waveSamples, ov[0] < wq.segCap ? ov[0] : wq.segCap,
+                     ov[1] < wq.hitCap ? ov[1] : wq.hitCap, wfSpillSegs, wfSpillHits,
+                     wfMsWalk / 1e3, wfMsHits / 1e3, wfMsEval / 1e3, wfMsWall / 1e3,
+                     (wfMsWall - wfMsWalk - wfMsHits - wfMsEval) / 1e3);
+        for (auto& e : wfEv) cudaEventDestroy(e);
+        cudaFree(wq.segs); cudaFree(wq.hits); cudaFree(d_wfCounters);
+    }
     cudaFree(d_cam); cudaFree(d_splat);
     return out;
 }
@@ -14745,16 +18758,33 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
     using namespace gpu;                      // the megakernels live there
     if (!cudaAvailable()) return 0;
     const void* fn = nullptr;
-    if (mode == 'D') {
+    if (mode == 'D' || mode == 'J') {
         // Mirrors renderBdptCuda's dispatch exactly (deep = maxDepth past the default
         // instantiation; hero = the multi-wavelength bundle). The deep variant is the
         // expensive one: BDPT_DEEPDEPTH is 64 vertices of local path state per thread.
+        //
+        // Mode J can launch EITHER kernel and this is called before the beam map exists, so
+        // which one is not yet knowable: a mode-J scene with a medium takes the scalar MERGE
+        // instantiation (the hero bundle is gated off by the medium) and adds the DPathSeg
+        // array on top, while a media-free one is mode D exactly, hero bundle and all. The
+        // answer this function owes its caller is a budget, so it reports the LARGER of the
+        // two — under-reporting is the failure mode that matters here (it is what lets a
+        // render start and then thrash on host memory over PCIe).
         const bool deep = (maxDepth > BDPT_MAXDEPTH);
         const bool hero = (heroC > 1);
-        if      (hero && deep) fn = (const void*)kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH>;
-        else if (hero)         fn = (const void*)kBdptT<BDPT_NSEC, BDPT_MAXDEPTH>;
-        else if (deep)         fn = (const void*)kBdptT<0, BDPT_DEEPDEPTH>;
-        else                   fn = (const void*)kBdptT<0, BDPT_MAXDEPTH>;
+        if (hero && deep)      fn = (const void*)kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false>;
+        else if (hero)         fn = (const void*)kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false>;
+        else if (deep)         fn = (const void*)kBdptT<0, BDPT_DEEPDEPTH, false, false>;
+        else                   fn = (const void*)kBdptT<0, BDPT_MAXDEPTH, false, false>;
+        if (mode == 'J') {
+            const void* mfn = deep ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, true, false>
+                                   : (const void*)kBdptT<0, BDPT_MAXDEPTH, true, false>;
+            cudaFuncAttributes fm{}, fc{};
+            if (cudaFuncGetAttributes(&fm, mfn) == cudaSuccess &&
+                cudaFuncGetAttributes(&fc, fn)  == cudaSuccess &&
+                fm.localSizeBytes > fc.localSizeBytes) fn = mfn;
+            cudaGetLastError();
+        }
     } else if (mode == 'R' || mode == 'W') {
         fn = (const void*)kBackward;
     } else if (mode == 'P') {
@@ -14876,7 +18906,8 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     // with a stream the checkpointed samples already drew, and two correlated samples are
     // worse than a decorrelated stream.
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
-        ^ ((prog && !whitted) ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
+        ^ ((prog && !whitted) ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL)
+        ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
 
     std::vector<double> film(npix * 3);
     auto download = [&](Film& o) {
@@ -14963,7 +18994,8 @@ Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int 
     const long long sppBase  = prog ? (long long)prog->sampleBase : 0;
     const long long sppTotal = sppBase + spp;
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
-        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
+        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL)
+        ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
 
     std::vector<double> film(npix * 3);
     auto download = [&](Film& o) {
@@ -15039,7 +19071,8 @@ long long backwardRGBSessionAccumulate(BackwardRGBSession* s, long long spp, boo
     if (!s || !s->haveCam || spp <= 0) return s ? s->accum : 0;
     const long long base = s->accum;
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
-        ^ (unsigned long long)base * 0x9E3779B97F4A7C15ULL;
+        ^ (unsigned long long)base * 0x9E3779B97F4A7C15ULL
+        ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     long long totalSamples = (long long)s->npix * spp;
     kBackwardRGB<<<2048, 128>>>(s->up.sc, s->up.dc, s->d_film, s->d_hits,
                                 totalSamples, spp, BackwardRGBSession::kSppCap, base,
@@ -15260,14 +19293,33 @@ bool cudaPhotonMapSupported(const Scene& scene) {
 // two halves of the cache must therefore come from one trace. The crossings come back to the
 // host, which owns the trim / radius / split / BVH (BeamPass::build), and the built map is
 // uploaded once so every camera's gather picks up single scatter from it.
+
+// How many of the staged deposits are CAUSTIC (an L.S+.D path; the kernel set DPhoton::caustic
+// at deposit time). Counted on the DEVICE, in one cheap pass over a buffer that is already
+// there, purely so the host can size its two output vectors EXACTLY before the download. The
+// alternatives are both bad: sizing both to nDep doubles the host map's peak footprint at
+// exactly the photon counts where it is already the binding constraint, and growing them
+// chunk-by-chunk makes std::vector::resize recopy the whole (multi-GB) array once per chunk.
+__global__ void kCountCaustic(const gpu::DPhoton* p, unsigned long long n,
+                              unsigned long long* out) {
+    unsigned long long g = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long G = (unsigned long long)gridDim.x * blockDim.x;
+    unsigned long long c = 0;
+    for (unsigned long long i = g; i < n; i += G) if (p[i].caustic) ++c;
+    if (c) atomicAdd(out, c);
+}
+
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
                                             bool diffraction, long long spp,
                                             const SppProgress* prog,
-                                            const std::function<bool(int, const Film&)>* onFrame,
+                                            const std::function<bool(int, const Film&, long long)>* onFrame,
                                             const char* mapLoad, const char* mapSave, int heroC,
-                                            int fgRays, double autoK, BeamPass* beams) {
+                                            int fgRays, double autoK, BeamPass* beams,
+                                            const StageProgress* stage, double causticK,
+                                            const caim::AimMap* aim, long long nAimed,
+                                            double causticAdaptK, PmRadiiPin* pin) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -15289,18 +19341,80 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // trace and optionally persist it (-savemap). The map is view-independent, so a loaded
     // one is re-gathered for any camera/radius without re-tracing a photon.
     PhotonMap pm;
+    // The caustic half of the split (empty, and never uploaded, when causticK <= 0). Its
+    // photons are a DISJOINT subset of the same deposit, so it shares pm's nEmitted and gets
+    // its own — much smaller — adaptive radius. See the header comment on `causticK`.
+    PhotonMap pmC;
+    const bool causticsOn = (causticK > 0.0);
 
     // Bin the map, honouring the density-adaptive radius (autoK > 0). Say out loud what
     // radius it settled on: the one printed before the deposit is only a starting point and
     // a silently-different one would be baffling when comparing renders. The gather below
     // reads pm.radius, so nothing else needs to know which branch ran.
     auto buildMap = [&]() {
-        if (autoK <= 0.0) { pm.build(radius); return; }
+        // A refresh epoch re-bins at the radius the first pass settled on — see PmRadiiPin for
+        // why re-adapting per epoch would not be variance reduction.
+        if (pin && pin->radius > 0.0) { pm.build(pin->radius); return; }
+        if (autoK <= 0.0) { pm.build(radius); if (pin) pin->radius = pm.radius; return; }
         double nProbe = 0.0, kTarget = 0.0;
         const double r = pm.buildAuto(radius, autoK, &nProbe, &kTarget);
         std::printf("[gpu] adaptive gather radius: %.4g -> %.4g (a typical gather saw %.0f "
                     "photons at the starting radius; target %.0f for %zu stored)\n",
                     radius, r, nProbe, kTarget, pm.photons.size());
+        if (pin) pin->radius = pm.radius;
+    };
+    // Host twin: buildCausticMap in main.cpp. Always adaptive — a caustic map built at the
+    // GLOBAL radius is the very thing the split exists to avoid — and short-circuited on an
+    // empty map, because buildAuto's density probe on zero photons returns a meaningless
+    // radius rather than an error.
+    auto buildCaustic = [&]() {
+        if (!causticsOn) return;
+        pmC.nEmitted = pm.nEmitted;          // counts PATHS EMITTED, not photons stored
+        // Refresh epoch: re-bin at the first pass's radius and carry its per-query target.
+        // `kGather` is NOT derived from the radius by PhotonMap, so dropping it here would
+        // silently return the caustic gather to a fixed radius on every epoch but the first.
+        if (pin && pin->radiusC > 0.0) {
+            pmC.build(pin->radiusC);
+            pmC.kGather = pin->kGather;
+            return;
+        }
+        if (pmC.photons.empty()) {
+            if (!g_gpuQuietRebuild)
+                std::printf("[gpu] caustic map: 0 photons (no L-S+-D path in this scene)\n");
+            pmC.build(pm.radius);            // still bin it, so the empty gather is well-formed
+            if (pin) pin->radiusC = pmC.radius;
+            return;
+        }
+        // Probe from the radius the GLOBAL map settled on, not the command-line starting
+        // point: buildAuto's answer is scale-free but its two-octave clamp is not, and the
+        // caustic radius is only ever interesting BELOW the global one anyway.
+        double nProbe = 0.0, kTarget = 0.0;
+        const double r0 = pm.radius;
+        const double r = pmC.buildAuto(r0, causticK, &nProbe, &kTarget, r0);
+        std::printf("[gpu] caustic map: %zu photons, gather radius %.4g -> %.4g (probe saw "
+                    "%.0f; target %.0f)\n", pmC.photons.size(), r0, r, nProbe, kTarget);
+        // ...and then the radius just chosen becomes a MAXIMUM, with each gather tightening
+        // to whatever holds `k` photons locally. See dPmAdaptiveRadius for why one radius per
+        // map is not enough even after the split. Host twin: buildCausticMap in main.cpp.
+        pmC.kGather = 0.0;
+        if (causticAdaptK != 0.0) {
+            const double k = (causticAdaptK > 0.0) ? causticAdaptK : kTarget;
+            if (k > 0.0) {
+                pmC.kGather = k;
+                std::printf("[gpu] caustic map: per-query adaptive gather ON — target %.0f "
+                            "photons, radius %.4g down to %.4g as density allows\n",
+                            k, pmC.radius, pmC.radius / 256.0);
+            }
+        }
+        // Stored flux per emitted path — the invariant the aimed pass (`-causticn`) must leave
+        // alone while changing only the variance. Host twin: buildCausticMap in main.cpp, and
+        // the two numbers are directly comparable, which is how CPU/GPU agreement is checked.
+        long double flux = 0.0L;
+        for (const Photon& p : pmC.photons) flux += (long double)p.power;
+        if (pmC.nEmitted > 0)
+            std::printf("[gpu] caustic map: stored flux/emitted = %.6Lg (%zu photons)\n",
+                        flux / (long double)pmC.nEmitted, pmC.photons.size());
+        if (pin) { pin->radiusC = pmC.radius; pin->kGather = pmC.kGather; }
     };
 
     // The photon-BEAM volume pass (-beams). Only live when the caller supplied a BeamPass AND
@@ -15313,14 +19427,16 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     if (mapLoad && *mapLoad) {
         bool beamsMissing = false;
         mapLoaded = loadPhotonMap(mapLoad, pm, eOut, photonMapGuard(scene, diffraction),
-                                  bmap, &beamsMissing);
+                                  bmap, &beamsMissing, causticsOn ? &pmC : nullptr);
         if (mapLoaded) {
             std::printf("[loadmap] %s: %zu photons from %lld emitted", mapLoad,
                         pm.photons.size(), (long long)pm.nEmitted);
+            if (causticsOn) std::printf(" (+%zu caustic)", pmC.photons.size());
             if (bmap) std::printf(", %zu beams", bmap->beams.size());
             std::printf(" -- deposit skipped\n");
             if (bmap && beamsMissing && beams) beams->loadedMissing = true;
             buildMap();                         // (re)build the grid at the requested radius
+            buildCaustic();
             if (bmap && beams->build) beams->build(*bmap);
         } else {
             std::fprintf(stderr, "[loadmap] falling back to a fresh deposit\n");
@@ -15332,6 +19448,39 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     unsigned long long* d_depCount = nullptr;
     CUDA_CHECK(cudaMalloc(&d_depCount, sizeof(unsigned long long)));
     double* d_energy = nullptr; CUDA_CHECK(cudaMalloc(&d_energy, 5 * sizeof(double)));
+
+    // ---- aimed caustic emission (causticaim.h): upload the target spheres ----
+    // Same gate as the CPU pass (tracePhotonPass): the aimed pass needs somewhere caustic to
+    // deposit and something to aim at. Note the map is bound to the MAIN launch too — that is
+    // not an oversight but the balance heuristic: the main pass has to measure its own samples'
+    // aimed density to weight the caustic deposits the aimed pass is also making. Binding it
+    // draws no extra randomness, so a main pass with nAimed == 0 (misRatio 0 => weight 1) is
+    // bit-for-bit what it was before the aimed pass existed.
+    const bool doAimed = causticsOn && aim && !aim->empty() && nAimed > 0 && N > 0;
+    DAimTarget* d_aim = nullptr;
+    int         nAimT = 0;
+    if (doAimed) {
+        std::vector<DAimTarget> ht(aim->targets.size());
+        for (size_t i = 0; i < aim->targets.size(); ++i) {
+            const caim::Target& t = aim->targets[i];
+            ht[i].c = DVec3(t.c.x, t.c.y, t.c.z);
+            ht[i].r = (Real)t.r;
+        }
+        if (cudaMalloc(&d_aim, ht.size() * sizeof(DAimTarget)) == cudaSuccess) {
+            CUDA_CHECK(cudaMemcpy(d_aim, ht.data(), ht.size() * sizeof(DAimTarget),
+                                  cudaMemcpyHostToDevice));
+            nAimT = (int)ht.size();
+        } else {
+            cudaGetLastError(); d_aim = nullptr;
+            std::fprintf(stderr, "[caustic aim] could not upload %zu target spheres; "
+                                 "falling back to the un-aimed caustic map.\n", ht.size());
+        }
+    }
+    // One place decides whether the aimed pass happens, so the main launch's MIS ratio and the
+    // second launch can never disagree (a nonzero ratio with no second pass would darken the
+    // caustics by exactly the weight it applied).
+    const bool aimOn      = doAimed && (d_aim != nullptr);
+    const double aimRatio = aimOn ? (double)nAimed / (double)N : 0.0;
 
     // Beam staging buffer, sized like the CPU's per-thread banks: 2x the -beamcount target so
     // the pass can overshoot before the one exact (unbiased) host-side trim to the target,
@@ -15358,19 +19507,112 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                  "the volume will be invisible.\n"); }
     }
 
-    auto depositLaunch = [&](DPhoton* buf, unsigned long long cap, double beamKeep) {
+    // The deposit trace. Split into launches when — and only when — someone is listening.
+    //
+    // Why splitting is safe. (a) Photon power is ABSOLUTE: genPhoton hands each photon its
+    // own beta and the density estimate normalises by pm.nEmitted, so the kernel's `N`
+    // argument is a loop bound, not a divisor, and 8 launches of N/8 emit exactly the energy
+    // one launch of N does. (b) The deposit cursor is an ATOMIC on the device that we zero
+    // once, here, outside the loop — so successive launches append rather than overwrite.
+    // (c) Each launch takes `seedBase` = the cumulative photon offset, which is 0 for the
+    // first one, so an unsplit deposit is bit-identical to the historical single launch and a
+    // split one merely draws a different (equally valid) realization per chunk. (d) The split
+    // is a pure function of N, so the count/fill rerun above reproduces it deposit for
+    // deposit — which is the invariant the rerun depends on.
+    //
+    // Why splitting at all. A showcase `-n` is billions of photons, i.e. one kernel launch
+    // running for many minutes: nothing can be read back from it, so the window title froze
+    // on "tracing photons…" for most of the render and the console said nothing at all. A
+    // monolithic launch of that length is also exactly what the Windows TDR watchdog exists
+    // to shoot at. Chunks are sized ADAPTIVELY from the measured rate of the previous one
+    // (target ~1 s), because photons-per-second spans orders of magnitude across scenes and
+    // any fixed chunk count would be far too coarse on one and pure launch overhead on
+    // another. The first chunk is a deliberately small probe for the same reason.
+    const bool splitDeposit = (stage && stage->report);
+    // How many photons the last depositLaunch actually EMITTED. Normally N, but a `-stop`
+    // between chunks ends the trace early, and pm.nEmitted normalises the density estimate —
+    // so reporting the full N after a truncated pass would scale the map down by the fraction
+    // never traced and render a darkened image. (Exactly the accounting tracePhotonPass does
+    // with its per-thread `emitted[tid] = done`.)
+    long long depEmitted = N;
+    // The aimed pass's own emitted count. It deliberately never reaches pm.nEmitted (it emits
+    // no light of its own — it re-estimates the main pass's caustic term with a different
+    // sampler), but a `-stop` mid-way still has to be visible to the accounting below.
+    long long aimEmitted = 0;
+    // Energy for the aimed pass, allocated only if one runs. Kept SEPARATE from d_energy and
+    // then thrown away: the aimed photons are not additional emitted light, so folding their
+    // joules into eOut would double-count the emission and break the energy audit.
+    double* d_energyAim = nullptr;
+    auto depositLaunch = [&](DPhoton* buf, unsigned long long cap, double beamKeep,
+                             bool aimedPass) {
+        const long long Nq = aimedPass ? nAimed : N;
+        double* const eBuf = aimedPass ? d_energyAim : d_energy;
+        // Disjoint RNG stream. The aimed pass must not replay the main pass's photons under a
+        // different sampler — that would correlate the two estimators the balance heuristic
+        // assumes are independent. (Host twin: the per-pass `salt` in tracePhotonPass.)
+        const unsigned long long seed0 = aimedPass ? 0x94D049BB13311000ULL : 0ULL;
+        const char* const label = aimedPass ? "tracing aimed photons" : "tracing photons";
         CUDA_CHECK(cudaMemset(d_depCount, 0, sizeof(unsigned long long)));
-        CUDA_CHECK(cudaMemset(d_energy, 0, 5 * sizeof(double)));
+        CUDA_CHECK(cudaMemset(eBuf, 0, 5 * sizeof(double)));
         DCamSet cs{};                       // nCam == 0: every camera splat is a no-op
         cs.cams = nullptr; cs.films = nullptr; cs.hits = nullptr; cs.nCam = 0;
         cs.depPhotons = buf; cs.depCount = d_depCount; cs.depCap = cap;
         cs.beamOrderMax = pbeams::gOrderMax;   // -beams-order (host twin: Renderer::beamOrderMax)
-        if (d_beamCount) {
+        // Bound on BOTH passes; only `aimed` differs. See the upload above for why the main
+        // pass needs it at all.
+        cs.aim.targets = d_aim; cs.aim.n = nAimT;
+        cs.aim.sumR2 = aim ? aim->sumR2 : 0.0;
+        cs.aim.aimed = aimedPass; cs.aim.misRatio = aimRatio;
+        if (aimedPass) {
+            // Caustic-only: no beam records (the beam map is the main pass's and is normalised
+            // by ITS nEmitted), but media must still be crossed straight or this pass would be
+            // transporting by different rules than the pass it is MIS-combined with.
+            cs.beamStraightOnly = (d_beamCount != nullptr);
+        } else if (d_beamCount) {
             CUDA_CHECK(cudaMemset(d_beamCount, 0, sizeof(unsigned long long)));
             cs.beamOut = d_beams; cs.beamCount = d_beamCount;
             cs.beamCap = beamCap; cs.beamKeep = beamKeep;
+            // SPECTRAL BEAMS. Same gate the CPU deposit uses (photonmap_render.h), asked here
+            // rather than on the device so the device never has to walk the media spectra.
+            cs.beamSpecC = (pbeams::gSpecC > 1 && beamSpectralOK(scene))
+                               ? std::min(pbeams::gSpecC, kBeamSpecMax) : 1;
+            // ACHROMATIC-PATH BEAMS: the same scene-wide extinction test, asked without the
+            // `-beamspec` condition (see DCamSet::beamAchroOK).
+            cs.beamAchroOK = pbeams::gAchro && beamSpectralOK(scene);
         }
-        launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false, CAM_B, heroC);
+        (aimedPass ? aimEmitted : depEmitted) = Nq;
+        if (!splitDeposit) {
+            launchForward(up, cs, eBuf, Nq, diffraction, seed0, /*wavefront*/false,
+                          CAM_B, heroC);
+            return;
+        }
+        stage->report(label, 0, Nq, nullptr, 0.0);
+        // 1 M is small enough to be a sub-second probe on any card that can run this at all,
+        // and large enough to keep ~262 k threads busy rather than measuring launch latency.
+        long long chunk = (Nq < (1ll << 20)) ? Nq : (1ll << 20);
+        for (long long off = 0; off < Nq; ) {
+            const long long cs2 = (off + chunk <= Nq) ? chunk : (Nq - off);
+            const auto t0 = std::chrono::steady_clock::now();
+            launchForward(up, cs, eBuf, cs2, diffraction, seed0 + (unsigned long long)off,
+                          /*wavefront*/false, CAM_B, heroC);
+            CUDA_CHECK(cudaDeviceSynchronize());   // the launch is async; time the WORK
+            const double sec = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            off += cs2;
+            stage->report(label, off, Nq, nullptr, 0.0);
+            // Cooperative stop: the deposit is the phase a `-stop` most often lands in, and
+            // before the split there was no seam to honour it at.
+            if (ft::stopRequested()) { (aimedPass ? aimEmitted : depEmitted) = off; break; }
+            // Retarget ~1 s of work, but never shrink below the probe (a chunk that keeps
+            // halving turns the deposit into launch overhead) and never grow more than 4x at
+            // a step (one anomalously fast chunk must not produce a 10-minute next one).
+            if (sec > 1e-4) {
+                double want = (double)cs2 / sec;              // photons/s -> photons per 1 s
+                if (want > 4.0 * (double)chunk) want = 4.0 * (double)chunk;
+                chunk = (long long)want;
+                if (chunk < (1ll << 20)) chunk = (1ll << 20);
+            }
+        }
     };
     auto readBeamCount = [&]() -> unsigned long long {
         if (!d_beamCount) return 0;
@@ -15398,7 +19640,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     }
     unsigned long long nDep = 0, nBeam = 0;
     if (d_photons) {
-        depositLaunch(d_photons, cap, 1.0); // optimistic fill against the guess
+        depositLaunch(d_photons, cap, 1.0, /*aimed*/false); // optimistic fill against the guess
         CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
         nBeam = readBeamCount();
         // ONE rerun settles both overflows, because the two are independent knobs on the same
@@ -15419,7 +19661,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             // (unlike the photon count, which the atomic still reports exactly), which would
             // bias the estimate. 5% headroom is ~50 standard deviations at a 1 M cap.
             const double keep = bmOver ? 0.95 * (double)beamCap / (double)nBeam : 1.0;
-            depositLaunch(d_photons, cap, keep);
+            depositLaunch(d_photons, cap, keep, /*aimed*/false);
             unsigned long long nFill = 0;
             CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
             if (nFill < nDep) nDep = nFill;
@@ -15427,23 +19669,46 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         }
     } else {
         // Couldn't stage even a modest guess: fall back to the old two-pass flow.
-        depositLaunch(nullptr, 0, 1.0);     // count-only sizing pass
+        depositLaunch(nullptr, 0, 1.0, /*aimed*/false);   // count-only sizing pass
         CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
         nBeam = readBeamCount();
         if (nDep > 0) {
             CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
             const double keep = (d_beams && nBeam > beamCap)
                               ? 0.95 * (double)beamCap / (double)nBeam : 1.0;
-            depositLaunch(d_photons, nDep, keep);   // fill pass (same seed => same nDep deposits)
+            depositLaunch(d_photons, nDep, keep, /*aimed*/false); // fill pass (same seed => same nDep deposits)
             nBeam = readBeamCount();
         }
     }
+    // What the trace actually emitted, which is N unless a `-stop` cut a chunked deposit
+    // short. Set AFTER the deposit (the optimistic `pm.nEmitted = N` above only pre-fills it
+    // for the paths that never reach here), because the density estimate divides by it.
+    pm.nEmitted = depEmitted;
     if (nDep > 0 && d_photons) {
+        // Caustic count first, on the device, so both host vectors can be sized exactly (see
+        // kCountCaustic). Zero when the split is off, which collapses the loop below to the
+        // historical single-destination copy.
+        unsigned long long nCau = 0;
+        if (causticsOn) {
+            unsigned long long* d_cc = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_cc, sizeof(unsigned long long)));
+            CUDA_CHECK(cudaMemset(d_cc, 0, sizeof(unsigned long long)));
+            kCountCaustic<<<1024, 256>>>(d_photons, nDep, d_cc);
+            cudaCheckKernel("caustic-count");
+            CUDA_CHECK(cudaMemcpy(&nCau, d_cc, sizeof nCau, cudaMemcpyDeviceToHost));
+            cudaFree(d_cc);
+            if (nCau > nDep) nCau = nDep;
+        }
         // Download + convert in chunks (never a full host-side DPhoton copy). Positions
         // and payloads split into PhotonMap's two parallel arrays (see Photon in
         // photonmap.h); DPhoton has the same fields, so this is a pure widen + split.
-        ftalloc::resize(pm.photons, (size_t)nDep, "the photon map payloads", "-n");
-        ftalloc::resize(pm.pos, (size_t)nDep, "the photon map positions", "-n");
+        // The caustic flag additionally routes each record to one of TWO destination maps —
+        // a strict partition, so the two counts sum to nDep and no photon is duplicated.
+        ftalloc::resize(pm.photons, (size_t)(nDep - nCau), "the photon map payloads", "-n");
+        ftalloc::resize(pm.pos, (size_t)(nDep - nCau), "the photon map positions", "-n");
+        ftalloc::resize(pmC.photons, (size_t)nCau, "the caustic map payloads", "-n");
+        ftalloc::resize(pmC.pos, (size_t)nCau, "the caustic map positions", "-n");
+        size_t wg = 0, wc = 0;                  // independent write cursors
         std::vector<DPhoton> stage;
         for (size_t off = 0; off < (size_t)nDep; off += PM_CHUNK) {
             size_t cnt = std::min(PM_CHUNK, (size_t)nDep - off);
@@ -15452,14 +19717,113 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                   cudaMemcpyDeviceToHost));
             for (size_t i = 0; i < cnt; ++i) {
                 const DPhoton& d = stage[i];
-                Photon& p = pm.photons[off + i];
-                pm.pos[off + i] = Vec3(d.pos.x, d.pos.y, d.pos.z);
+                const bool caus = (nCau > 0) && d.caustic;
+                PhotonMap& M = caus ? pmC : pm;
+                size_t&    w = caus ? wc  : wg;
+                if (w >= M.photons.size()) continue;   // can't happen; never write past the end
+                Photon& p = M.photons[w];
+                M.pos[w] = Vec3(d.pos.x, d.pos.y, d.pos.z);
                 p.n   = Vec3(d.n.x,   d.n.y,   d.n.z);
                 p.power = d.power; p.lambda = d.lambda;
+                ++w;
             }
         }
     }
     if (d_photons) cudaFree(d_photons);
+    d_photons = nullptr;
+
+    // ---- aimed caustic pass (Jensen's projection map; causticaim.h) --------------------
+    // A SECOND deposit launch whose emission is importance-sampled towards the focusing
+    // geometry, appended to the caustic map only. Deliberately AFTER the main pass and its
+    // download, for three reasons: the main pass's photon buffer is already freed so this one
+    // gets the whole card; the two RNG streams stay disjoint (see `seed0`); and an
+    // `ftrace -stop` during the main pass skips it entirely, leaving the un-aimed caustic map,
+    // which is still correct — just noisier.
+    //
+    // Every record it produces is caustic by construction: device depositPhoton drops a
+    // non-caustic deposit outright when cs.aim.aimed, so no partition is needed here.
+    // pm.nEmitted / pmC.nEmitted stay at the MAIN pass's count — the aimed photons carry no
+    // light of their own, they re-estimate the same caustic term with a different sampler, and
+    // the balance-heuristic weight applied at emission is what makes the sum unbiased.
+    if (aimOn && !ft::stopRequested()) {
+        CUDA_CHECK(cudaMalloc(&d_energyAim, 5 * sizeof(double)));
+        // Caustic deposits are a small fraction of all deposits, so the guess that sizes the
+        // main buffer (2.5/photon) would be wildly over here. Start at the observed main-pass
+        // caustic rate with generous slack, and let the same overflow rerun settle it exactly.
+        double perPhoton = 0.25;
+        if (depEmitted > 0 && pmC.photons.size() > 0)
+            perPhoton = 4.0 * (double)pmC.photons.size() / (double)depEmitted;
+        if (perPhoton < 0.05) perPhoton = 0.05;
+        if (perPhoton > 2.5)  perPhoton = 2.5;
+        unsigned long long acap =
+            (unsigned long long)((double)nAimed * perPhoton) + (1ull << 20);
+        { size_t freeB = 0, totalB = 0;
+          if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
+              unsigned long long fit = (unsigned long long)(freeB / 2 / sizeof(DPhoton));
+              if (acap > fit) acap = fit; } }
+        DPhoton* d_aphotons = nullptr;
+        while (acap >= (1ull << 20) &&
+               cudaMalloc(&d_aphotons, (size_t)acap * sizeof(DPhoton)) != cudaSuccess) {
+            cudaGetLastError(); d_aphotons = nullptr; acap >>= 1;
+        }
+        unsigned long long nAimDep = 0;
+        if (d_aphotons) {
+            depositLaunch(d_aphotons, acap, 1.0, /*aimed*/true);
+            CUDA_CHECK(cudaMemcpy(&nAimDep, d_depCount, sizeof nAimDep, cudaMemcpyDeviceToHost));
+            if (nAimDep > acap) {                       // overflow: resize to the exact count
+                cudaFree(d_aphotons); d_aphotons = nullptr;
+                if (cudaMalloc(&d_aphotons, (size_t)nAimDep * sizeof(DPhoton)) == cudaSuccess) {
+                    acap = nAimDep;
+                    depositLaunch(d_aphotons, acap, 1.0, /*aimed*/true);
+                    unsigned long long nFill = 0;
+                    CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof nFill,
+                                          cudaMemcpyDeviceToHost));
+                    if (nFill < nAimDep) nAimDep = nFill;
+                } else {
+                    // Couldn't hold them all: keep the prefix the first launch did store. That
+                    // is a biased subset (it is whichever deposits won the atomic race), so
+                    // say so rather than silently shipping it.
+                    cudaGetLastError(); d_aphotons = nullptr; nAimDep = 0;
+                    std::fprintf(stderr, "[caustic aim] the aimed pass overflowed its device "
+                                         "buffer and could not be resized; dropping it. Lower "
+                                         "-causticn.\n");
+                }
+            }
+        } else {
+            std::fprintf(stderr, "[caustic aim] could not allocate a device photon buffer for "
+                                 "the aimed pass; falling back to the un-aimed caustic map.\n");
+        }
+        if (d_aphotons && nAimDep > 0) {
+            const size_t base = pmC.photons.size();
+            ftalloc::resize(pmC.photons, base + (size_t)nAimDep, "the caustic map payloads",
+                            "-causticn");
+            ftalloc::resize(pmC.pos, base + (size_t)nAimDep, "the caustic map positions",
+                            "-causticn");
+            std::vector<DPhoton> astage;
+            size_t w = base;
+            for (size_t off = 0; off < (size_t)nAimDep; off += PM_CHUNK) {
+                size_t cnt = std::min(PM_CHUNK, (size_t)nAimDep - off);
+                astage.resize(cnt);
+                CUDA_CHECK(cudaMemcpy(astage.data(), d_aphotons + off, cnt * sizeof(DPhoton),
+                                      cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < cnt; ++i) {
+                    const DPhoton& d = astage[i];
+                    Photon& p = pmC.photons[w];
+                    pmC.pos[w] = Vec3(d.pos.x, d.pos.y, d.pos.z);
+                    p.n = Vec3(d.n.x, d.n.y, d.n.z);
+                    p.power = d.power; p.lambda = d.lambda;
+                    ++w;
+                }
+            }
+            if (!g_gpuQuietRebuild)
+                std::printf("[gpu] aimed caustic pass: %lld photons -> %llu caustic deposits "
+                            "(main pass: %zu)\n",
+                            (long long)aimEmitted, (unsigned long long)nAimDep, base);
+        }
+        if (d_aphotons) cudaFree(d_aphotons);
+        cudaFree(d_energyAim); d_energyAim = nullptr;   // discarded: not additional emission
+    }
+    if (d_aim) { cudaFree(d_aim); d_aim = nullptr; }
 
     // ---- download the deposited beams ----
     // Straight widen into PhotonBeam: `s0` is 0 for every downloaded record because a DEPOSIT
@@ -15485,9 +19849,34 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                   cudaMemcpyDeviceToHost));
             for (size_t i = 0; i < cnt; ++i) {
                 const DBeamDep& d = bstage[i];
-                bmap->beams[off + i] = PhotonBeam{Vec3(d.o.x, d.o.y, d.o.z),
-                                                  Vec3(d.d.x, d.d.y, d.d.z),
-                                                  0.0f, d.len, d.power, d.lambda, d.absorb, d.med};
+                PhotonBeam& b = bmap->beams[off + i];
+                b.o = Vec3(d.o.x, d.o.y, d.o.z);
+                b.d = Vec3(d.d.x, d.d.y, d.d.z);
+                b.s0 = 0.0f; b.len = d.len; b.power = d.power;
+                b.lambda = d.lambda; b.absorb = d.absorb; b.med = d.med;
+                // Spectral bundle (`-beamspec`): 0 secondaries is the classic monochromatic
+                // beam, which is what every non-qualifying scene deposits.
+                b.nSec = (d.nSec < 0) ? 0 : (d.nSec > kBeamSecMax ? kBeamSecMax : d.nSec);
+                for (int k = 0; k < kBeamSecMax; ++k) b.lamS[k] = (k < b.nSec) ? d.lamS[k] : 0.0f;
+                // Per-member weights (0.257.0). The device tracer still retires the bundle at
+                // the first wavelength-DEPENDENT event rather than reweighting it, so every
+                // bundle it deposits is an equal-weight one and 1 is exact, not a placeholder.
+                // (Weighted deposit on the device is FOLD-GPU's other half; see known-issues.md.)
+                for (int k = 0; k < kBeamSecMax; ++k) b.wS[k] = (k < b.nSec) ? 1.0f : 0.0f;
+                // Achromatic-path fold (`-beamachro`): the emitter's mean CIE, used by
+                // BeamMap::build in place of CIE(lambda). Mutually exclusive with the bundle.
+                b.achro = d.achro ? 1 : 0;
+                // `cieA` is the fallback colour for the GATHER-time fold as well as the payload
+                // of the achromatic-path one, so it must survive a beam whose `achro` is about
+                // to become 2 below -- otherwise BeamMap::build would give it a black cieMean.
+                const bool wantCieA = d.achro || d.bowEm >= 0;
+                for (int k = 0; k < 3; ++k) b.cieA[k] = wantCieA ? d.cieA[k] : 0.0f;
+                // GATHER-time fold (achro == 2, scene.h Scene::BowLut). Since 0.264.1 the device
+                // tracer decides this exactly as render.h does, so a GPU-traced map carries it
+                // too -- which is what makes the device bow tables worth having on the common
+                // path rather than only for a `-loadmap`'d CPU map.
+                if (d.bowEm >= 0) { b.achro = 2; b.emIdx = (short)d.bowEm; }
+                else                b.emIdx = -1;
             }
         }
         bmap->nEmitted   = pm.nEmitted;      // same pass, same normalisation
@@ -15499,7 +19888,17 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     if (d_beams)     cudaFree(d_beams);
     if (d_beamCount) cudaFree(d_beamCount);
 
+    // Downloading tens of millions of deposits and counting-sorting them into cells is tens
+    // of seconds on a showcase `-n` — another silent phase between the deposit's last chunk
+    // and the first gathered pixel, so it names itself too.
+    if (stage && stage->reset)  stage->reset();
+    if (stage && stage->report) stage->report("building photon map", 0, 0, nullptr, 0.0);
     buildMap();                             // host counting sort -> cell-contiguous runs
+    // Named separately from the global map: on a caustics run this is a second full sort of its
+    // own partition, and lumping the two under one caption made a stall in the second look like
+    // a stall in the first.
+    if (stage && stage->report) stage->report("building caustic map", 0, 0, nullptr, 0.0);
+    buildCaustic();                         // ... and again for the caustic partition
 
     double energy[5] = {0,0,0,0,0};
     CUDA_CHECK(cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));
@@ -15508,100 +19907,103 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     cudaFree(d_depCount); cudaFree(d_energy);
     if (mapSave && *mapSave) {
         EnergyReport passE{energy[0], energy[1], energy[2], energy[3], energy[4]};
-        if (savePhotonMap(mapSave, pm, passE, photonMapGuard(scene, diffraction), bmap))
-            std::printf("[savemap] wrote %s: %zu photons + %zu beams (%lld emitted)\n",
-                        mapSave, pm.photons.size(), bmap ? bmap->beams.size() : (size_t)0,
-                        (long long)pm.nEmitted);
+        if (savePhotonMap(mapSave, pm, passE, photonMapGuard(scene, diffraction), bmap,
+                          causticsOn ? &pmC : nullptr))
+            std::printf("[savemap] wrote %s: %zu photons (+%zu caustic) + %zu beams "
+                        "(%lld emitted)\n",
+                        mapSave, pm.photons.size(), pmC.photons.size(),
+                        bmap ? bmap->beams.size() : (size_t)0, (long long)pm.nEmitted);
     }
     // Built AFTER the save, deliberately: the file must hold the RAW crossings so one cache
     // serves any later -beamradius / -beamk (the split is radius-dependent).
-    if (bmap && beams->build) beams->build(*bmap);
+    //
+    // This names itself for the same reason `buildMap` above does: the split subdivides every
+    // stored chord and then builds a BVH over the result — on a showcase `-n` that is millions
+    // of sub-beams and it reports nothing until it is finished, so an uninstrumented run sits
+    // on the previous caption for the whole of it. Measured 7.6 s at `-beamcount 6M` and far
+    // more at showcase counts.
+    if (bmap && beams->build) {
+        if (stage && stage->report) stage->report("splitting photon beams", 0, 0, nullptr, 0.0);
+        beams->build(*bmap);
+    }
     }   // end if (!mapLoaded): deposit + build + optional save
 
     // ---- upload the built grid ----
-    DPhotonMap dpm{};
-    dpm.lo = DVec3(pm.lo.x, pm.lo.y, pm.lo.z);
-    dpm.cellSize = (Real)pm.cellSize; dpm.radius = (Real)pm.radius;
-    dpm.nx = pm.nx; dpm.ny = pm.ny; dpm.nz = pm.nz;
-    dpm.photons = nullptr;
-    if (!pm.photons.empty()) {
-        // Upload the sorted map host->device in chunks (no full mirror), folding each
-        // photon's constant gather weight into the record (see DGatherPhoton):
-        // p? = cie?(lambda) * power * norm / pi, with the CIE triple taken from
-        // PhotonMap::cie (precomputed in double by build(), index-aligned with the
-        // sorted photons). The radius is cast through Real first so the folded
-        // normalization equals the old in-kernel double((Real)radius)^2 exactly.
-        const double rr   = (double)(Real)pm.radius;
-        const double area = DPI * rr * rr;
-        const double fold = (pm.nEmitted > 0 && area > 0.0)
-                          ? 1.0 / (area * (double)pm.nEmitted * DPI) : 0.0;
-        size_t n = pm.photons.size();
-        DGatherPhoton* d_sorted = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DGatherPhoton)));
-        std::vector<DGatherPhoton> stage;
-        for (size_t off = 0; off < n; off += PM_CHUNK) {
-            size_t cnt = std::min(PM_CHUNK, n - off);
-            stage.resize(cnt);
-            for (size_t i = 0; i < cnt; ++i) {
-                const Photon& p = pm.photons[off + i];
-                const Vec3&  pp = pm.pos[off + i];
-                const Vec3&  ci = pm.cie[off + i];
-                DGatherPhoton& d = stage[i];
-                d.pos = DVec3(pp.x, pp.y, pp.z);
-                d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
-                const double w = (double)p.power * fold;
-                d.pX = (float)(ci.x * w);
-                d.pY = (float)(ci.y * w);
-                d.pZ = (float)(ci.z * w);
-                d.lambda = p.lambda;
+    // Shared by the global map and the caustic map: identical layout, identical fold, and the
+    // per-map constants (radius, nEmitted) are read from the map itself — which is exactly what
+    // makes the caustic map's smaller radius normalise correctly with no second code path.
+    // `what` names the phase in the live window / status line. Tens of millions of photons get
+    // converted on the host and streamed over PCIe here, which is tens of seconds on a showcase
+    // `-n` and reported nothing at all before — the third silent stretch between the last deposit
+    // chunk and the first gathered pixel.
+    auto uploadPhotonMap = [&](const PhotonMap& M, DPhotonMap& D, const char* what) {
+        D = DPhotonMap{};
+        D.lo = DVec3(M.lo.x, M.lo.y, M.lo.z);
+        D.cellSize = (Real)M.cellSize; D.radius = (Real)M.radius;
+        D.kGather = (Real)M.kGather;   // > 0 only on the caustic map (see -pmadaptive)
+        D.tableMask = M.tableMask;
+        D.photons = nullptr;
+        if (!M.photons.empty()) {
+            // Upload the sorted map host->device in chunks (no full mirror), folding each
+            // photon's constant gather weight into the record (see DGatherPhoton):
+            // p? = cie?(lambda) * power * norm / pi, with the CIE triple taken from
+            // PhotonMap::cie (precomputed in double by build(), index-aligned with the
+            // sorted photons). The radius is cast through Real first so the folded
+            // normalization equals the old in-kernel double((Real)radius)^2 exactly.
+            const double rr   = (double)(Real)M.radius;
+            const double area = DPI * rr * rr;
+            const double fold = (M.nEmitted > 0 && area > 0.0)
+                              ? 1.0 / (area * (double)M.nEmitted * DPI) : 0.0;
+            size_t n = M.photons.size();
+            DGatherPhoton* d_sorted = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DGatherPhoton)));
+            std::vector<DGatherPhoton> stg;
+            if (stage && stage->reset)  stage->reset();   // rate/ETA measured from THIS phase
+            if (stage && stage->report) stage->report(what, 0, (long long)n, nullptr, 0.0);
+            for (size_t off = 0; off < n; off += PM_CHUNK) {
+                // The chunk boundary is already here for host-RAM reasons, so it is also a free
+                // stop seam. Bailing leaves `d_sorted` partly filled, which is harmless: the
+                // camera loop below sees the same flag and gathers nothing, and the pointer is
+                // still handed to `up.keep` after the loop so it is freed on the way out.
+                if (ft::stopRequested()) break;
+                size_t cnt = std::min(PM_CHUNK, n - off);
+                stg.resize(cnt);
+                for (size_t i = 0; i < cnt; ++i) {
+                    const Photon& p = M.photons[off + i];
+                    const Vec3&  pp = M.pos[off + i];
+                    const Vec3&  ci = M.cie[off + i];
+                    DGatherPhoton& d = stg[i];
+                    d.pos = DVec3(pp.x, pp.y, pp.z);
+                    d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
+                    const double w = (double)p.power * fold;
+                    d.pX = (float)(ci.x * w);
+                    d.pY = (float)(ci.y * w);
+                    d.pZ = (float)(ci.z * w);
+                    d.lambda = p.lambda;
+                }
+                CUDA_CHECK(cudaMemcpy(d_sorted + off, stg.data(), cnt * sizeof(DGatherPhoton),
+                                      cudaMemcpyHostToDevice));
+                if (stage && stage->report)
+                    stage->report(what, (long long)(off + cnt), (long long)n, nullptr, 0.0);
             }
-            CUDA_CHECK(cudaMemcpy(d_sorted + off, stage.data(), cnt * sizeof(DGatherPhoton),
-                                  cudaMemcpyHostToDevice));
+            D.photons = (const DGatherPhoton*)up.keep(d_sorted);
         }
-        dpm.photons = (const DGatherPhoton*)up.keep(d_sorted);
-    }
-    // cellStart always has >= 2 entries after build() (even for an empty map, where every
-    // [begin,end) slice is empty so the gather loop simply never runs) — always upload it.
-    dpm.cellStart = (const int*)up.keep(uploadVec(pm.cellStart));
+        // cellStart always has >= 2 entries after build() (even for an empty map, where every
+        // [begin,end) slice is empty so the gather loop simply never runs) — always upload it.
+        D.cellStart = (const int*)up.keep(uploadVec(M.cellStart));
+    };
+    DPhotonMap dpm{}, dpmC{};
+    uploadPhotonMap(pm, dpm, "uploading photon map");
+    // dpmC.photons stays null when the split is off or produced nothing — which is the very
+    // flag the two device gathers test to skip their second estimate entirely.
+    if (causticsOn && !pmC.photons.empty()) uploadPhotonMap(pmC, dpmC, "uploading caustic map");
+    else                                    dpmC.cellStart = dpm.cellStart;  // never dereferenced
 
     // ---- upload the built beam map ----
-    // Same fold-at-upload trick as DGatherPhoton: the per-beam constants (carried flux, the
-    // 1/nEmitted pass normalisation, and the CIE triple at the beam's own wavelength — the
-    // host precomputed the last one in BeamMap::build for exactly this reason) collapse into
-    // one float3, so the inner loop multiplies geometry and medium terms alone. The BVH goes
-    // over verbatim; nNodes == 0 is the "no volume gather" sentinel every entry point tests.
+    // Mode M's volume gather: the same device layout mode J's merges use, minus the MIS
+    // partials (see uploadBeamMapCuda). nNodes == 0 is the "no volume gather" sentinel.
     DBeamMap dbm{};
-    if (bmap && !bmap->beams.empty() && !bmap->bvh.nodes.empty() && bmap->nEmitted > 0) {
-        const double invN = 1.0 / (double)bmap->nEmitted;
-        const size_t nb = bmap->beams.size();
-        std::vector<DBeamRec> recs(nb);
-        for (size_t i = 0; i < nb; ++i) {
-            const PhotonBeam& b = bmap->beams[i];
-            const Vec3&      ci = bmap->cie[i];
-            DBeamRec& r = recs[i];
-            r.o = DVec3(b.o.x, b.o.y, b.o.z);
-            r.d = DVec3(b.d.x, b.d.y, b.d.z);
-            r.s0 = b.s0; r.len = b.len;
-            const double w = (double)b.power * invN;
-            r.pX = (float)(ci.x * w); r.pY = (float)(ci.y * w); r.pZ = (float)(ci.z * w);
-            r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
-        }
-        std::vector<DNode> bnodes(bmap->bvh.nodes.size());
-        for (size_t i = 0; i < bnodes.size(); ++i) {
-            const BvhNode& s = bmap->bvh.nodes[i]; DNode& d = bnodes[i];
-            d.lo = {s.box.lo.x, s.box.lo.y, s.box.lo.z};
-            d.hi = {s.box.hi.x, s.box.hi.y, s.box.hi.z};
-            d.left = s.left; d.right = s.right; d.first = s.first; d.count = s.count;
-        }
-        dbm.beams     = (const DBeamRec*)up.keep(uploadVec(recs));
-        dbm.nodes     = (const DNode*)up.keep(uploadVec(bnodes));
-        dbm.primIdx   = (const int*)up.keep(uploadVec(bmap->bvh.primIdx));
-        dbm.radius    = (Real)bmap->radius;
-        dbm.invRadius = (Real)(1.0 / bmap->radius);
-        dbm.nNodes    = (int)bnodes.size();
-        std::printf("[gpu] photon beams: %zu sub-beams, %zu BVH nodes, kernel radius %.4g "
-                    "uploaded for the volume gather\n", nb, bnodes.size(), bmap->radius);
-    }
+    uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/false);
 
     // ---- gather each camera ----
     // Pull the current device accumulation for camera c into out[c] (film + hit map).
@@ -15613,52 +20015,353 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             out[c].xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
     };
     const bool live = (prog && prog->report);
+    // Diagnostic twin of gpuSppChunks' FTRACE_CHUNK_DEBUG, and for the same reason: this
+    // gather reports only at whole-spp boundaries AND only on the ~30 s log cadence, so an
+    // spp whose line is throttled away merges into its neighbour and two very differently
+    // priced samples read as one. That is not hypothetical — it is how a claimed 10x
+    // per-spp cost difference on gallery_rain came to be argued about from differenced log
+    // timestamps rather than measured. Set FTRACE_CHUNK_DEBUG=1 for every spp's wall time,
+    // =2 for every SLICE's as well (sample range + rate), which is what exposes the
+    // per-scanline-band cost structure inside one spp.
+    const int chunkDebug = [] { const char* e = std::getenv("FTRACE_CHUNK_DEBUG");
+                                return (e && *e) ? std::atoi(e) : 0; }();
     auto lastReport = std::chrono::steady_clock::now();
     bool stopped = false;
+    // ---- the gather's cancellation flag (see kGather's poll for why it must exist) ----
+    //
+    // It lives in MAPPED PINNED host memory deliberately. The thread that launches kGather is
+    // parked inside cudaDeviceSynchronize for the whole launch and cannot issue any CUDA call,
+    // so a flag that needed a cudaMemcpy to raise would be unreachable at precisely the moment
+    // it is needed. A mapped allocation is raised by a plain store, from any thread.
+    int* h_gatherStop = nullptr;
+    int* d_gatherStop = nullptr;
+    CUDA_CHECK(cudaHostAlloc((void**)&h_gatherStop, sizeof(int), cudaHostAllocMapped));
+    *h_gatherStop = 0;
+    CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_gatherStop, h_gatherStop, 0));
+    // Publish it to the device global the deep callees read. Done here, with no kernel in
+    // flight, so it is an ordinary synchronous copy rather than something that would have to
+    // race a running gather.
+    CUDA_CHECK(cudaMemcpyToSymbol(g_dGatherStop, &d_gatherStop, sizeof(int*)));
+    // ---- and the gather's PROGRESS counter, the same mechanism pointed the other way ----
+    //
+    // kGather counts retired samples into this; the poller below reads it while the launching
+    // thread is blocked. Without it the caption was correct but frozen at 0% for a whole spp,
+    // which at 960x540 is the ENTIRE launch (see g_dGatherDone).
+    unsigned long long* h_gatherDone = nullptr;
+    unsigned long long* d_gatherDone = nullptr;
+    CUDA_CHECK(cudaHostAlloc((void**)&h_gatherDone, sizeof(unsigned long long),
+                             cudaHostAllocMapped));
+    *h_gatherDone = 0;
+    CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_gatherDone, h_gatherDone, 0));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_dGatherDone, &d_gatherDone, sizeof(unsigned long long*)));
+    // Armed by the launch site for exactly the span of one launch. `progOffset < 0` means
+    // disarmed, which is the state in every phase that is NOT a gather launch — the poller must
+    // not paint over another phase's caption, and must not touch `stage` once the main thread is
+    // running again and reporting for itself.
+    std::atomic<long long> progOffset{-1};
+    std::atomic<long long> progTotal{0};
+    char progText[96] = {0};
+    // `stage->report` mutates a shared Ticker (rate window, repaint throttles) and is not
+    // reentrant. Disarming happens UNDER this lock, so the main thread's own reports after a
+    // launch cannot overlap a report the poller is still inside.
+    std::mutex reportMu;
+    std::atomic<bool> pollQuit{false};
+    std::thread pollThread([&, h_gatherStop, h_gatherDone] {
+        while (!pollQuit.load(std::memory_order_relaxed)) {
+            if (ft::stopRequested()) { *(volatile int*)h_gatherStop = 1; return; }
+            // reportLive, not report: this is progress from INSIDE a launch that has not
+            // returned, where the retirement curve is convex and no honest rate exists — and
+            // feeding those samples to the trailing window would wreck the rate for the
+            // per-launch reports too. See StageProgress::reportLive.
+            if (stage && stage->reportLive && progOffset.load(std::memory_order_acquire) >= 0) {
+                const long long d = (long long)*(volatile unsigned long long*)h_gatherDone;
+                std::lock_guard<std::mutex> lk(reportMu);
+                const long long off = progOffset.load(std::memory_order_acquire);
+                if (off >= 0)
+                    stage->reportLive(progText, off + d,
+                                      progTotal.load(std::memory_order_relaxed));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
+    // Joined and freed however this function leaves — including the CUDA_CHECK throw paths,
+    // which are numerous below and would otherwise leak a detached thread into a dead context.
+    struct GatherStopGuard {
+        std::atomic<bool>& quit; std::thread& th; int* mem; unsigned long long* mem2;
+        ~GatherStopGuard() {
+            quit.store(true, std::memory_order_relaxed);
+            if (th.joinable()) th.join();
+            if (mem)  cudaFreeHost(mem);
+            if (mem2) cudaFreeHost(mem2);
+        }
+    } gatherStopGuard{pollQuit, pollThread, h_gatherStop, h_gatherDone};
+    // Learned sub-chunk slice (flat (pixel, sample) units), carried ACROSS cameras: on a
+    // flythrough consecutive frames cost almost the same, so re-probing 600 times would be
+    // 600 needlessly small launches for nothing. Re-clamped to the camera's own npix below.
+    long long slice = 0;
     for (int c = 0; c < nc && !stopped; ++c) {
+        // A stop pending before the first camera must not buy four device allocations and a
+        // camera bake it will only throw away. `stopped` is seeded false and is only ever set
+        // from inside the loop, so without this the flag is invisible on the first iteration.
+        if (ft::stopRequested()) { stopped = true; break; }
         DCamera hc = bakeCamera(scene, cams[c], resX[c], resY[c], up);
         const size_t npix = (size_t)resX[c] * resY[c];
         double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
         double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
         CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
         CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
-        const unsigned long long seed = 0xA24BAED4963EE407ULL ^ (0x9E3779B97F4A7C15ULL * (unsigned long long)(c + 1));
+        // Scratch accumulator for the chunk in flight. kGather writes here, and kFilmFold
+        // folds it into d_film only once the WHOLE chunk has landed — see kFilmFold for why
+        // a half-committed chunk would band the image. ~16 MB at 960x540, i.e. nothing next
+        // to the photon map this mode is already holding.
+        double* s_film = nullptr; CUDA_CHECK(cudaMalloc(&s_film, npix * 3 * sizeof(double)));
+        double* s_hits = nullptr; CUDA_CHECK(cudaMalloc(&s_hits, npix * sizeof(double)));
+        const unsigned long long seed = 0xA24BAED4963EE407ULL
+                                      ^ (0x9E3779B97F4A7C15ULL * (unsigned long long)(c + 1))
+                                      ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
         // Chunk spp so a single launch stays well under the Windows TDR watchdog even when a
         // caustic cell holds a dense photon cluster (heavy density query).
         long long chunk = 200000 / (long long)(npix ? npix : 1); if (chunk < 1) chunk = 1;
+        // Sub-chunk slicing, retargeted to ~0.25 s of work per launch. This is the ONLY seam
+        // an external `ftrace -stop` can land on inside a gather: at these resolutions
+        // `chunk` has already clamped to a single spp, so before slicing the shortest
+        // possible stop latency was one entire frame of gathering — minutes with -beams,
+        // well past the -stop wait, which is exactly how a healthy render came to be
+        // reported as a failed stop. Seeds depend only on the global sample index, so
+        // slicing changes no sample: the image is the one an unsliced gather produces.
+        //
+        // THE FLOOR IS AN OCCUPANCY FLOOR, NOT A FRACTION OF THE FRAME, and getting that
+        // wrong cost an order of magnitude. kGather launches a PERSISTENT grid of
+        // kGatherGrid x kGatherBlock threads and grid-strides over [i, hi): a slice holding
+        // fewer samples than that leaves the surplus threads with literally nothing to do,
+        // so throughput falls off a cliff and the 0.25 s target becomes unreachable — at
+        // which point the controller shrinks the slice again, which starves the device
+        // further. The loop drives its own input. Measured on gallery_rain (960x540,
+        // -beams, RTX 4090), one frame, identical work:
+        //
+        //     slice 503904 (whole frame, one launch)   16927 samples/s
+        //     slice 129616                             40165 samples/s
+        //     slice   8101 (the old npix>>6 floor)       631-1224 samples/s   <- 3% of the grid
+        //
+        // i.e. 334 s for a frame sliced at the old floor against 29.8 s for the same frame
+        // in one launch — an 11x tax for nothing, and it alternated spp to spp depending on
+        // whether the previous chunk's tiny tail slice happened to time as "too fast to
+        // measure" and let the size grow back. Measured end to end on that frame at -spp 4:
+        // 713 s before, 119 s after (6.0x), and flat spp to spp instead of 334/30/321/29.
+        //
+        // The stop seam it buys back is small and worth stating honestly: the worst single
+        // launch goes from 12.8 s (a floor slice in the cloud band) to 32 s (a whole spp),
+        // still comfortably inside the 120 s `-stop` wait, and the frame it is a seam
+        // *within* now finishes 6x sooner — so a stop lands sooner in wall clock either way.
+        //
+        // FOUR samples per thread, not one. Filling the grid once is necessary but not
+        // sufficient: kGather is wildly divergent (a probe ray through the cloud gathers
+        // ~840 beams, one aimed at the floor gathers none), and the grid-stride loop is the
+        // only load balancing there is — with one sample per thread it has nothing to hand
+        // a thread that finished early, and the launch costs its slowest ray. Measured on
+        // the same frame: 262144 samples (1.0/thread) ran the top half at 16085/s and the
+        // bottom half at 8428/s, 46.7 s for the spp; one 503904-sample launch (1.9/thread)
+        // covering BOTH did it at 16927/s, 29.8 s — 1.57x for nothing but a bigger slice.
+        const long long sliceOcc = 4ll * kGatherGrid * kGatherBlock;
+        const long long sliceFrac = ((long long)npix >> 6) + 1;
+        const long long sliceLo = (sliceFrac > sliceOcc) ? sliceFrac : sliceOcc;
+        if (slice < sliceLo) slice = ((long long)npix >> 4) + 1;          // first probe: 1/16 spp
+        if (slice < sliceLo) slice = sliceLo;
+        long long sppDone = 0;
+        bool abandoned = false;
+        // Name the gather in the window title / log, with a measure.
+        //
+        // WHY THIS IS NOT REDUNDANT WITH `prog` BELOW. The live SppProgress report only fires
+        // after a COMPLETE chunk, and `chunk` has already clamped to one spp at any real
+        // resolution — so on a heavy scene the first title update is one whole spp away. On
+        // gallery_rain that is upwards of fifteen minutes during which the window still read
+        // `building beam map…`, the caption the previous phase left behind: the beam map had
+        // in fact finished in 23.7 s and the render was gathering the whole time, but nothing
+        // said so, and the only visible evidence — one CPU core pegged by the default
+        // spin-waiting cudaDeviceSynchronize, with the GPU at 100% — reads exactly like a
+        // single-threaded host build that will not end. A stage line fires every 0.25 s from
+        // inside the slice loop instead, so the gather names itself from its first quarter
+        // second, and (on the 30 s log cadence) a headless run's log says so too.
+        //
+        // THAT LAST SENTENCE WAS WRONG AND THE BUG SURVIVED IT — see the report added just
+        // before the `base` loop below. "Every 0.25 s from inside the slice loop" assumes the
+        // slice loop ITERATES; where `sliceOcc >= total` it does not, and the first report is
+        // one whole spp away, which is exactly the symptom described above. The report before
+        // the first launch is what actually fixes it; this one refines the caption afterwards.
+        const long long sampTotal = (long long)npix * spp;   // pixel-samples in this frame
+        char stageText[96];
+        std::snprintf(stageText, sizeof stageText, "gathering frame %d/%d", c + 1, nc);
+        // The poller's copy of the caption. Written here, with the poller disarmed, so it is
+        // never read while being written.
+        std::snprintf(progText, sizeof progText, "%s", stageText);
+        if (stage && stage->reset) stage->reset();   // rate/ETA measured from THIS phase
+        // Name the gather BEFORE the first launch, not after it.
+        //
+        // The report below fires from inside the slice loop, i.e. only once a launch has
+        // already RETURNED — and wherever `sliceOcc >= total` the loop runs exactly once and
+        // covers the whole frame, so "after the first launch" is one entire spp away. That is
+        // the case at every ordinary resolution: at 960x540, total = 518400 while sliceOcc =
+        // 4*2048*128 = 1048576, twice the frame. So the caption the previous phase left
+        // behind (`building beam map…`) stayed up for the whole first sample — measured at
+        // 45+ minutes on gallery_rain at -n 800M, with a render in perfect health behind it.
+        // Fixing the 17109 report was never going to help; it is on the wrong side of the
+        // launch. This one costs nothing: done/total = 0 is the documented "no meaningful
+        // measure yet" encoding, and passing a null `partial` means no film download.
+        if (stage && stage->report) stage->report(stageText, 0, sampTotal, nullptr, 0.0);
         for (long long base = 0; base < spp; base += chunk) {
             long long cs2 = (base + chunk <= spp) ? chunk : (spp - base);
             long long total = (long long)npix * cs2;
-            kGather<<<2048, 128>>>(up.sc, dpm, dbm, hc, d_film, d_hits, total, cs2, spp, base,
-                                   resX[c], diffraction ? 1 : 0, fgRays, seed);
-            cudaCheckKernel("photon-gather");
+            const auto ct0 = std::chrono::steady_clock::now();
+            CUDA_CHECK(cudaMemset(s_film, 0, npix * 3 * sizeof(double)));
+            CUDA_CHECK(cudaMemset(s_hits, 0, npix * sizeof(double)));
+            bool chunkDone = true;
+            for (long long i = 0; i < total; ) {
+                // Honour a stop that arrived BEFORE or BETWEEN launches, without paying a
+                // launch first. The post-launch poll further down is guarded by `i < total`,
+                // which is never true wherever `sliceOcc >= total` — the loop runs once and
+                // covers the frame — so a stop that was already pending when the gather
+                // STARTED still cost a full spp before anything looked at the flag. That is
+                // not hypothetical: on gallery_rain at -n 800M the `[stop] external stop
+                // requested` line sits in the log immediately after the beam-BVH upload, i.e.
+                // the flag was set before this loop was entered, and the process still ran
+                // 45+ more minutes. Polling at the top makes such a stop free.
+                if (ft::stopRequested()) { chunkDone = false; break; }
+                const long long hi = (i + slice < total) ? (i + slice) : total;
+                const auto t0 = std::chrono::steady_clock::now();
+                // Arm the intra-launch progress counter. Zeroed per launch and offset by the
+                // samples this frame has already retired, so the bar reads against the whole
+                // frame rather than restarting at each slice. Both stores are ordinary host
+                // writes to memory the device has not been told to touch yet — the kernel is
+                // launched on the next line, so there is no race to order against.
+                *(volatile unsigned long long*)h_gatherDone = 0;
+                progTotal.store(sampTotal, std::memory_order_relaxed);
+                progOffset.store(base * (long long)npix + i, std::memory_order_release);
+                kGather<<<kGatherGrid, kGatherBlock>>>(
+                                       up.sc, dpm, dpmC, dbm, hc, s_film, s_hits, i, hi, cs2, spp,
+                                       base, resX[c], diffraction ? 1 : 0, fgRays, seed);
+                cudaCheckKernel("photon-gather");
+                CUDA_CHECK(cudaDeviceSynchronize());   // the launch is async; time the WORK
+                // Disarm UNDER the lock: the poller may be inside stage->report right now, and
+                // the main thread is about to call it itself a few lines below.
+                { std::lock_guard<std::mutex> lk(reportMu);
+                  progOffset.store(-1, std::memory_order_release); }
+                const double sec = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count();
+                const long long did = hi - i;
+                i = hi;
+                if (chunkDebug >= 2)
+                    std::fprintf(stderr, "[chunk] gather c%d spp %lld..%lld slice [%lld,%lld) "
+                                 "%lld samples in %s (%.0f/s)\n", c + 1, base, base + cs2,
+                                 hi - did, hi, did, humanDur(sec).c_str(),
+                                 sec > 0 ? did / sec : 0.0);
+                // Only until the frame's first complete chunk exists: from there on `prog`
+                // below owns the caption and says strictly more (spp, photons, noise %).
+                //
+                // The sub-chunk accumulator is also a perfectly good IMAGE while it fills.
+                // kGather maps sample index -> pixel as idx/chunkSpp, so a partial chunk is a
+                // scanline-order prefix: the covered pixels each hold exactly `cs2` samples
+                // and the rest are still zero, which draws as the frame arriving top to
+                // bottom. That is the difference between a dark placeholder for the whole
+                // first spp — half an hour on gallery_rain with -beams — and watching it
+                // land. Only assembled when the host says it would actually be drawn, since
+                // it costs a device->host copy of the film.
+                if (sppDone == 0 && stage && stage->report) {
+                    const bool wantImg = stage->wantFilm && stage->wantFilm();
+                    if (wantImg) downloadFilm(c, s_film, s_hits, npix);
+                    stage->report(stageText, base * (long long)npix + i, sampTotal,
+                                  wantImg ? &out[c] : nullptr, (double)cs2);
+                }
+                // Abandon the chunk in flight, first chunk included.
+                //
+                // It used to require `base > 0`, so that a stop could never leave the film
+                // with zero complete samples in it — the frame would then have to be written
+                // black, which is a worse answer to a stop than the one extra chunk it costs.
+                // The premise is right and the conclusion was wrong: the cost is not "one
+                // extra chunk", it is one entire spp of a gather whose spp can run to a
+                // quarter of an hour, and measured on gallery_rain a `-stop` sat unanswered
+                // for the full 900 s wait and was reported FAILED on a render that was
+                // winding down correctly. The frame with nothing in it is not written at all
+                // instead (see the `sppDone > 0` guard on `onFrame` below), which is both
+                // honest and what every earlier frame of a flythrough — already safely on
+                // disk — makes harmless.
+                // The `i < total` guard this used to carry is now not merely useless but
+                // WRONG. It meant "only abandon if slices remain", which assumed a launch
+                // that returned had run to completion. With device-side cancellation a launch
+                // can return having stopped half way, leaving the scratch film holding a
+                // sample for some pixels and not others — and `i` still reaches `total`,
+                // because the slice was issued whole. Folding that would put exactly the
+                // ~1/spp brightness band across the frame that kFilmFold's comment describes.
+                // So: if a stop is pending, the chunk in flight is partial by definition and
+                // must be discarded, wherever `i` happens to be.
+                if (ft::stopRequested()) { chunkDone = false; break; }
+                // Never below 1/64 spp (a slice that keeps halving turns the gather into
+                // launch latency), never more than 4x up in one step (one anomalously fast
+                // slice must not produce a minutes-long next one). A slice too fast to time
+                // takes the 4x growth outright, so a cheap scene climbs back out of the
+                // probe in two or three launches instead of paying per-launch overhead for
+                // the whole frame.
+                double want = (sec > 1e-6) ? (double)did * (0.25 / sec) : 4.0 * (double)slice;
+                if (want > 4.0 * (double)slice) want = 4.0 * (double)slice;
+                slice = (long long)want;
+                if (slice < sliceLo) slice = sliceLo;
+            }
+            // Partial chunk discarded, not folded: the film still holds exactly `sppDone`
+            // complete samples per pixel, so it needs one last report to say so.
+            if (!chunkDone) { stopped = true; abandoned = true; break; }
+            kFilmFold<<<256, 128>>>(d_film, d_hits, s_film, s_hits, (long long)npix);
+            cudaCheckKernel("photon-gather-fold");
+            sppDone = base + cs2;
+            if (chunkDebug >= 1) {
+                const double cdt = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - ct0).count();
+                std::fprintf(stderr, "[chunk] gather cam %d/%d spp %lld..%lld (%lld spp, "
+                             "%lld samples) in %s (%.0f samples/s)\n", c + 1, nc, base,
+                             sppDone, cs2, total, humanDur(cdt).c_str(),
+                             cdt > 0 ? total / cdt : 0.0);
+                std::fflush(stderr);
+            }
+            const bool frameDone = (sppDone >= spp);
+            const bool stopNow = ft::stopRequested();
             // Live view: after a chunk, hand the host the frame-so-far so it can refresh the
             // window/preview. Throttle to ~10 Hz (a high-res gather chunks one spp at a time,
-            // which is far finer than the eye needs) but always report the completed frame.
+            // which is far finer than the eye needs) but always report the completed frame —
+            // and always report the last one before a stop, so the host normalises by the spp
+            // that actually landed rather than by a stale count.
             if (live) {
-                long long done = base + cs2;
-                bool frameDone = (done >= spp);
                 auto now = std::chrono::steady_clock::now();
-                if (frameDone || std::chrono::duration<double>(now - lastReport).count() >= 0.1) {
+                if (frameDone || stopNow ||
+                    std::chrono::duration<double>(now - lastReport).count() >= 0.1) {
                     downloadFilm(c, d_film, d_hits, npix);
-                    if (prog->report(out[c], done, frameDone)) stopped = true;
+                    if (prog->report(out[c], sppDone, frameDone)) stopped = true;
                     lastReport = now;
-                    if (stopped) break;
                 }
             }
+            if (stopped || stopNow) { stopped = true; break; }
+        }
+        if (abandoned && live && sppDone > 0) {
+            downloadFilm(c, d_film, d_hits, npix);
+            prog->report(out[c], sppDone, false);
         }
         downloadFilm(c, d_film, d_hits, npix);   // ensure out[c] holds the final accumulation
         cudaFree(d_film); cudaFree(d_hits);
+        cudaFree(s_film); cudaFree(s_hits);
         // Hand the finished frame to the host for IMMEDIATE crash-safe write, then release
         // its buffers so a long flythrough runs in ~one frame of host RAM instead of holding
         // all nc films to the end (mirrors the CPU mode-M path, which writes per frame). If
         // the host asks to stop (window closed / Ctrl-C), quit after this frame — everything
         // written so far is already safely on disk.
-        if (onFrame) {
-            bool stopReq = (*onFrame)(c, out[c]);
+        // A frame the stop caught before its first complete sample holds nothing but zeros;
+        // writing it would replace a good previous render of the same path with a black PNG.
+        // Say so and skip it — the frames before it are already on disk.
+        if (onFrame && sppDone > 0) {
+            bool stopReq = (*onFrame)(c, out[c], sppDone);
             Film empty; empty.resX = resX[c]; empty.resY = resY[c];   // shape kept, buffers freed
             out[c] = std::move(empty);
             if (stopReq) stopped = true;
+        } else if (onFrame) {
+            std::printf("\n[camera] frame %d/%d stopped before its first complete sample — "
+                        "nothing written for it.\n", c + 1, nc);
+            std::fflush(stdout);
         }
         if (nc > 1) {   // watchable per-frame progress on a multi-camera (flythrough) render
             std::printf("\r[camera] mode-M GPU gather %d/%d ...", c + 1, nc);
@@ -15669,48 +20372,6 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
 
     freeUpload(up);
     return out;
-}
-
-// ================= host: device-scratch reuse (VCM / SPPM sessions) =================
-// thrust algorithms allocate temporary device storage per call; by default that is a
-// cudaMalloc/cudaFree pair EVERY call, which (with the sessions' own per-pass buffer
-// churn) profiled at ~10% of per-pass API time. This bump arena keeps grow-only blocks
-// alive across passes: alloc() carves from existing blocks (first-fit) and cudaMallocs
-// only on a new high-water mark; deallocate is a no-op; reset() rewinds the offsets at
-// the start of each pass. Steady state: zero device malloc/free per pass.
-struct ThrustArena {
-    struct Block { char* p; size_t cap, off; };
-    std::vector<Block> blocks;
-    void reset() { for (Block& b : blocks) b.off = 0; }
-    char* alloc(size_t n) {
-        n = (n + 255) & ~(size_t)255;                    // 256-byte aligned carves
-        for (Block& b : blocks)
-            if (b.cap - b.off >= n) { char* r = b.p + b.off; b.off += n; return r; }
-        Block nb{}; nb.cap = n; nb.off = n;
-        CUDA_CHECK(cudaMalloc(&nb.p, nb.cap));
-        blocks.push_back(nb);
-        return nb.p;
-    }
-    void release() { for (Block& b : blocks) cudaFree(b.p); blocks.clear(); }
-};
-// Minimal Allocator facade over the arena for FT_THRUST_PAR(alloc).
-struct ThrustArenaAlloc {
-    using value_type = char;
-    ThrustArena* arena;
-    char* allocate(std::ptrdiff_t n) { return arena->alloc((size_t)n); }
-    void deallocate(char*, size_t) {}
-};
-
-// Grow-only device buffer: (re)allocates only when `need` exceeds the current capacity
-// (1.5x growth), so per-pass session buffers stop churning cudaMalloc/cudaFree.
-template <class T>
-static void ensureDevCap(T*& p, size_t& cap, size_t need) {
-    if (need <= cap) return;
-    if (p) { cudaFree(p); p = nullptr; }
-    size_t newCap = cap + cap / 2;
-    if (newCap < need) newCap = need;
-    CUDA_CHECK(cudaMalloc(&p, newCap * sizeof(T)));
-    cap = newCap;
 }
 
 // ============================ GPU SPPM (mode S) ============================
@@ -15789,7 +20450,8 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
 
     // (1) Camera visible-point pass: fresh visible point + direct sample per pixel.
     unsigned long long vpSeed = 0xA24BAED4963EE407ULL
-                              ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL);
+                              ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL)
+                              ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     kSppmVisiblePoint<<<2048, 128>>>(s->up.sc, s->cam, s->st, s->resX, s->resY,
                                      s->maxBounce, vpSeed, passIdx + 1);
     cudaCheckKernel("sppm-visible-point");
@@ -15872,7 +20534,7 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
     // the current per-pixel radius, applied at resolve). Then gather + progressive update.
     const double cellSize = (rMax > 0.0) ? rMax : 1e-6;
     double lox = 0.0, loy = 0.0, loz = 0.0;
-    int gnx = 1, gny = 1, gnz = 1;
+    unsigned int tableMask = 0;
     DPhotonMap dpm{};
     dpm.photons = nullptr;
     if (nDep > 0) {
@@ -15887,25 +20549,24 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
         lox = (double)bb.mnx - cellSize * 0.5;
         loy = (double)bb.mny - cellSize * 0.5;
         loz = (double)bb.mnz - cellSize * 0.5;
-        const double ex = ((double)bb.mxx - lox) + cellSize * 0.5;
-        const double ey = ((double)bb.mxy - loy) + cellSize * 0.5;
-        const double ez = ((double)bb.mxz - loz) + cellSize * 0.5;
-        gnx = std::max(1, (int)std::ceil(ex / cellSize));
-        gny = std::max(1, (int)std::ceil(ey / cellSize));
-        gnz = std::max(1, (int)std::ceil(ez / cellSize));
-        const long long nCells = (long long)gnx * gny * gnz;
+        // Bucket table sized from the PHOTON COUNT, exactly as the host does (pmTableSize).
+        // The former dense variant sized it from gnx*gny*gnz — a cell count that on a fine
+        // SPPM radius over a large scene overflows the `(int)(nCells + 1)` this lower_bound
+        // passed to counting_iterator, i.e. it did not merely cost memory, it wrapped.
+        const unsigned int tableSize = pmTableSize(n);
+        tableMask = tableSize - 1;
         ensureDevCap(s->d_cellKey, s->cellKeyCap, n);
         ensureDevCap(s->d_order,   s->orderCap,   n);
         kSppmCellKey<<<2048, 128>>>(s->d_photons, (long long)n, lox, loy, loz, cellSize,
-                                    gnx, gny, gnz, s->d_cellKey);
+                                    tableMask, s->d_cellKey);
         cudaCheckKernel("sppm-cellkey");
         thrust::device_ptr<int> tKey(s->d_cellKey), tOrd(s->d_order);
         thrust::sequence(pol, tOrd, tOrd + n);
         thrust::stable_sort_by_key(pol, tKey, tKey + n, tOrd);
-        ensureDevCap(s->d_cellStart, s->cellStartCap, (size_t)nCells + 1);
+        ensureDevCap(s->d_cellStart, s->cellStartCap, (size_t)tableSize + 1);
         thrust::lower_bound(pol, tKey, tKey + n,
                             thrust::counting_iterator<int>(0),
-                            thrust::counting_iterator<int>((int)(nCells + 1)),
+                            thrust::counting_iterator<int>((int)tableSize + 1),
                             thrust::device_pointer_cast(s->d_cellStart));
         ensureDevCap(s->d_gather, s->gatherCap, n);
         kSppmGatherConvert<<<2048, 128>>>(s->d_photons, s->d_order, (long long)n, s->d_gather);
@@ -15917,11 +20578,15 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
     }
     dpm.lo = DVec3(lox, loy, loz);
     dpm.cellSize = (Real)cellSize; dpm.radius = (Real)rMax;
-    dpm.nx = gnx; dpm.ny = gny; dpm.nz = gnz;
+    dpm.tableMask = tableMask;
     dpm.cellStart = s->d_cellStart;
 
     // (3) Gather + progressive update.
-    kSppmGather<<<2048, 128>>>(s->up.sc, dpm, s->st, s->resX, s->resY, alpha);
+    // `vpSeed` / `passIdx + 1` are the same pair kSppmVisiblePoint was given, so the footprint
+    // probe's stream is reproducible for a fixed pass sequence; the kernel offsets it so the two
+    // do not overlap.
+    kSppmGather<<<2048, 128>>>(s->up.sc, dpm, s->st, s->resX, s->resY, alpha,
+                               vpSeed, passIdx + 1);
     cudaCheckKernel("sppm-gather");
 }
 
@@ -16085,7 +20750,8 @@ void vcmSessionPass(VcmSession* s, double radius) {
     // (1) Light pass — zero the per-pass splat, then trace one light subpath per pixel.
     CUDA_CHECK(cudaMemset(s->d_splat, 0, np * 3 * sizeof(double)));
     unsigned long long seedL = 0xD1B54A32D192ED03ULL
-                             ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL);
+                             ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL)
+                             ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     if (s->secStride > 0)
         kVcmLightT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
                                  s->d_lvSlab, s->d_lvSecSlab, s->secStride, s->heroC,
@@ -16167,7 +20833,8 @@ void vcmSessionPass(VcmSession* s, double radius) {
 
     // (5) Camera pass — one camera subpath per pixel; adds this pass's radiance into accum.
     unsigned long long seedC = 0xC2B2AE3D27D4EB4FULL
-                             ^ ((unsigned long long)(passIdx + 1) * 0xA24BAED4963EE407ULL);
+                             ^ ((unsigned long long)(passIdx + 1) * 0xA24BAED4963EE407ULL)
+                             ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     if (s->secStride > 0)
         kVcmCameraT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
                               (nLV > 0) ? s->d_lvSecCompact : nullptr, s->secStride, s->heroC,

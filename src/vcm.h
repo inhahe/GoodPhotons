@@ -129,11 +129,12 @@ inline Vec3 fiberOrigin(const Hit& h, bool isHair, const Vec3& dir) {
 // correction. NOTE: the standalone photon-map / SPPM gathers (modes M/S) already smooth-shade
 // in this renderer and must NOT use this — only the MIS-coupled VM merge needs it. Why the
 // coupling makes the difference is logged as tech debt in known-issues.md.
-inline double vmGatherCorr(const Vec3& wp, const Vec3& ns, const Vec3& ng) {
-    double denom = std::fabs(dot(wp, ng));
-    if (denom <= 1e-8) return 1.0;
-    return std::fabs(dot(wp, ns)) / denom;
-}
+//
+// DEFINED IN surfmerge.h (via bdpt.h), not here: mode J's point merge is the same estimator
+// and needs the identical correction, so the function moved to the shared header and this is
+// now only the name. Keeping two copies would let mode U and mode J's merges drift apart on
+// smooth meshes — precisely the class of difference this correction exists to remove.
+using bdpt::vmGatherCorr;
 
 // A stored light-subpath vertex (only connectible/non-delta surface vertices are kept).
 struct LightVertex {
@@ -740,8 +741,11 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                             }
                             const bool isHairV = (mp->type == MatType::Hair);
                             if (mxF > 0.0 &&
+                                // Light-subpath vertex connected to the camera (VCM's t=1): a camera leg,
+                                // so `hide_camera` applies. See Scene::occluded.
                                 !scene.occluded(fiberOrigin(h, isHairV, wcam), wcam,
-                                                distc - fiberStep(h, isHairV, wcam) - 2e-6)) {
+                                                distc - fiberStep(h, isHairV, wcam) - 2e-6,
+                                                1e-6, /*camLeg=*/true)) {
                                 double bsdfRevPdfW = bsdfPdf(*mp, h.n, wcam, wo, lambda, scene, &h);
                                 double imgPtDist = ctx.imagePlaneDist / cosAtCamera;
                                 double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
@@ -848,7 +852,10 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     const bool hasSun = scene.sunCount > 0;
 
     for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
-        Hit h = scene.closestHit(ray);
+        // edges == 1 is the camera-to-first-vertex edge — the primary ray; see
+        // Material::hideCamera. (The light subpath walk above never gets this.)
+        Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
+                                 /*skipCamHidden=*/(edges == 1));
         if (!h.valid) {
             // The ray left the scene. No env map in VCM scope, but a `light sun` is a
             // delta-DIRECTION emitter with no geometry: the s=0 term never fires for it and
@@ -1232,6 +1239,9 @@ inline void vcmPass(const Scene& scene, const Camera& cam, VcmState& st, double 
                     int nThreads, bool diffraction, int maxDepth, uint64_t passSeed,
                     int heroC = 1) {
     if (nThreads < 1) nThreads = 1;
+    // `-seed`: every stream in this pass descends from `passSeed`, so salting it once here
+    // is the whole of the flag for mode `U` (0 by default, so XOR is the identity).
+    passSeed ^= g_rngSalt;
     const int W = st.resX, H = st.resY;
     const long long nPix = (long long)W * H;
 

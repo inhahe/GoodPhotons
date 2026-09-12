@@ -71,8 +71,9 @@
 # --- Why the sun is a real `light sun` (it used to be a distant sphere) ---------------
 # Mode D is the only mode that renders BOTH this scene's bounded heterogeneous media and
 # its directly-seen glass and chrome. (Forward A/B/C do the media but leave a directly-seen
-# dielectric black, which is most of this room; R and the P composite shade the glass but
-# flatten every bounded medium into one global homogeneous haze; see README "Modes".) So
+# dielectric black, which is most of this room; R and the P composite shaded the glass but,
+# until 0.254.0, flattened every bounded medium into one global homogeneous haze — they now
+# superpose the media properly, so that half of the reason is history; see README "Modes".) So
 # whatever the sun is, mode D has to accept it — and when this scene was written it did not
 # accept `light sun`: a delta light was not connectible in BDPT at all, and after v0.124.0
 # made it connectible on the CPU the GPU BDPT kernels still rejected it, which would have
@@ -188,16 +189,48 @@
 # the old behaviour bit-for-bit if you want the crisper single-scatter bow.
 # The one caveat that still keeps D the reference here is that mode M carries directly-seen
 # glass and chrome differently from D (see the sun discussion above). So: mode D for the
-# finished piece, `-mode M -beams` when you want the whole loop in under an hour instead of
-# most of a day.
+# finished piece, and `-mode M -beams` when you want the FORWARD pass shared across the loop.
+# It used to say "when you want the whole loop in under an hour instead of most of a day" --
+# no longer true at 960x540 and the default `-beamblur` (~29 h; see the re-measurement below),
+# because the shared pass is ~30 s for all 600 cameras and the whole cost is the per-frame
+# gather. The amortisation works exactly as advertised; the gather got ~26x more expensive in
+# 0.201.0. `-beamblur` is the knob that trades it back.
 #
 # GPU. `-beams` WAS CPU-only and this header said so, until 0.197.0 ported BOTH halves (the
 # beam deposit and the beam gather) to CUDA -- there is a device beam BVH now and the GPU
 # mode-M meter no longer carves out, so `-device gpu` is correct here and is what you want.
-# MEASURED at 0.198.0 on an RTX 4090 with the exact command below (960x540, -spp 6,
-# -n 20000000): 15224 beams stored -> 367540 sub-beams after split, 236293 BVH nodes uploaded
-# for the volume gather, then a steady 5.0 s/frame -- ~50 min for the 600-frame loop, against
-# ~7.6 h under D. The GPU flyby command, verified end to end:
+# RE-MEASURED 2026-09-02 at 0.209.0 on an RTX 4090 with the exact command below (960x540,
+# -spp 6, -n 20000000): 264022 beams stored -> ~6.2M sub-beams after split, ~4.0M BVH nodes
+# uploaded for the volume gather, then ~29.5 s per spp => ~3.0 min/frame, ~29 h for the
+# 600-frame loop. Against ~7.6 h under D -- so at THIS budget M is no longer the fast option
+# and the "whole loop in under an hour" claim above is gone; see below for why, and for the
+# knob that brings it back.
+#
+# WHAT THE OLD NUMBER SAID AND WHY IT WAS WRONG. This slot used to read "15224 beams stored
+# -> 367540 sub-beams, 236293 BVH nodes, then a steady 5.0 s/frame -- ~50 min for the
+# 600-frame loop", measured at 0.198.0. Three things happened to it, and nobody re-measured:
+#   * 0.199.0 (ac5446b) retuned the cloud in the SAME commit as the analog multiple-scattering
+#     fix: albedo 0.92 -> 0.9964. That is correct physics -- water's single-scattering albedo
+#     really is 0.999+ -- but it takes a photon's expected survival from ~12 scatters to ~278,
+#     and beams stored went 15224 -> 264022 (17x), sub-beams 367540 -> ~6.2M, BVH nodes
+#     236293 -> ~4.0M. Only ~1.8x of that 17x is the multiple scattering itself: `-beams-order
+#     1`, the old single-scatter deposit, stores 145873. The rest is the albedo.
+#   * 0.201.0 (ddc9bc7) replaced "solve the kernel radius for -beamk gathered beams" with
+#     "radius = -beamblur x the medium's own measured mean free path". Here that is 0.0129 m,
+#     at which a probe gathers 843.9 beams instead of 32 -- ~26x the per-probe gather work,
+#     and the gather is the ONLY part of mode M that is paid per frame. The paragraph further
+#     down that says the grain this used to cost "is now free" is WRONG in exactly that way:
+#     it is not free, it is bought with a ~26x larger per-frame gather.
+#   * 0.209.0 fixed a slice-occupancy bug that had been costing a further 6x on top (the GPU
+#     gather was launching 8101-sample slices into a 262144-thread grid). Any per-frame number
+#     taken between 0.201.0 and 0.209.0 is therefore wrong twice over.
+# `-beamblur` (default 0.01) is consequently the main per-frame SPEED knob on this scene and
+# not only a quality knob -- gather cost is ~linear in beams gathered, which goes as the
+# radius squared. `-savemap`/`-loadmap` banks the forward pass so a sweep of it costs one
+# deposit. See known-issues.md, "every performance number in scenes/gallery_rain.ftsl's
+# header is stale".
+#
+# The GPU flyby command, verified end to end:
 #   ftrace -in scenes/gallery_rain.ftsl -camera fly -mode M -device gpu -beams \
 #          -n 20000000 -spp 6 -window -keepwindow -interval 15 \
 #          -o png/gallery_rain.png
@@ -208,21 +241,160 @@
 # path (main.cpp `plainRender`) onto a per-frame fallback that has no GPU implementation at
 # all and rebuilds the map every frame. -checkpoint/-resume stopped breaking it in 0.197.2,
 # but mode M discards them anyway, so just leave them off.
+# SHOWCASE QUALITY under `-mode M -beams`. The command above is a PREVIEW budget (-spp 6,
+# default -beamk 32) and it looks it: the cloud comes out as visible chromatic speckle laid
+# over long straight STREAKS. Measured 2026-09-01 on an RTX 4090 at 0.199.2, 960x540, still
+# camera `cam`, "speckle" = mean |pixel - 3x3 mean| over the cloud crop:
+#
+#     -n 50M  -spp 24 -beamk 256              speckle 7.14, long beam streaks visible
+#     -n 200M -spp 24 -beamk 256              speckle 5.60, streaks GONE
+#     -n 200M -spp 24 -beamk 32               speckle 7.08   <- the cloud is beamk-bound
+#     -n 200M -spp 24 -beamk 256 -denoise     speckle 3.61
+#
+# Read that as three separate knobs, because they fix different artifacts:
+#   * `-n` fixes the STREAKS. A gather point sees a number of beams set by the kernel radius;
+#     with too few beams stored the same long chords are re-gathered by whole runs of
+#     neighbouring pixels, so the variance is spatially CORRELATED and shows as lines rather
+#     than grain. More photons = more, shorter, independent chords. It is one-time cost (the
+#     forward pass is shared by every frame), which makes it by far the best value here.
+#   * `-beamk` USED to fix the volumetric GRAIN, and the 32 -> 256 row above is why the
+#     showcase command still carries it. SINCE 0.201.0 IT NO LONGER DOES ANYTHING HERE, and
+#     that is an improvement, not a loss. The old rule solved the kernel radius for a target
+#     gathered count, which made the radius shrink as `-n` grew -- so grain had to be bought
+#     per-frame, linearly, with `-beamk`. The radius now comes from each medium's MEASURED
+#     mean free path (`-beamblur`, default 0.01), and on this scene that is 1.29 m for the
+#     cloud and 1.73 m for the rain, at which the probe already gathers ~1730 beams. A
+#     `-beamk` FLOOR of 256 is far below that and never binds. Leaving `-beamk 256` in the
+#     command is harmless; dropping it changes nothing. And `-n` reduces the grain for real
+#     now (-21% for 4x the photons, against -6.8% under the old rule). See known-issues.md,
+#     "the gallery_rain cloud rendered as full-saturation RGB speckle".
+#     THIS USED TO SAY THE GRAIN THE FLAG BOUGHT IS "NOW FREE". IT IS NOT FREE -- CORRECTED
+#     2026-09-02. Gather cost is ~linear in beams gathered, so going from a radius solved for
+#     32 to one that gathers 843.9 (at -n 20M; ~1730 at -n 200M) multiplied the per-frame
+#     gather by ~26x. That is a real and defensible trade -- the radius is now a physical
+#     scale that does not move with `n`, which is the whole reason more `-n` finally helps --
+#     but it is a trade, and it is why the 5.0 s/frame at the top of this header became
+#     minutes. It also makes `-beamblur` the per-frame SPEED knob here: halving it quarters
+#     the beams gathered.
+#   * `-denoise` fixes the residual chroma speckle for ~1% of frame time -- it is the single
+#     best quality-per-second flag in the list. `-fireflies 3` measured the same (4.48 vs
+#     4.46) and additionally clamps, so prefer plain -denoise unless you see fireflies.
+#   * `-pmcount 45` is a SPEEDUP, not a quality knob: the default target grows as the cube
+#     root of the stored count, so -n 200M silently raises it 200 -> 890 photons per surface
+#     gather. Pinning it back to a 200 target measured 3m14 vs 5m47 for a visually identical
+#     frame (floor crop 6.56 vs 6.41 speckle -- i.e. that is texture, not noise).
+#
+# The showcase command, verified running:
+#   ftrace -in scenes/gallery_rain.ftsl -camera fly -mode M -device gpu -beams \
+#          -n 200000000 -pmcount 45 -spp 24 \
+#          -beamcount 8000000 -beamsplitmax 24000000 -denoise \
+#          -r 960 540 -window-min -keepwindow -interval 15 \
+#          -o png/gallery_rain_showcase.png
+# The "153 s/frame => ~25.5 h for the 600-frame loop" that used to sit here was STALE (it
+# predated 0.199.0's cloud albedo, 0.201.0's kernel radius and 0.209.0's slice-occupancy fix).
+# RE-MEASURED 2026-09-02 at 0.210.0, RTX 4090, 960x540, -n 200M, still camera `cam`, the exact
+# showcase flags above: 4 spp of gather in 24:08, i.e. 6.03 min/spp. At -spp 24 that is
+# ~2.4 h/FRAME and ~60 days for the 600-frame loop. That is not a deliverable budget, and the
+# reason is below: at this beam density the showcase -spp buys very little. Per-frame cost is
+# LINEAR in -spp and in pixels. Mode D at -spp 140 is ~7.6 h for the WHOLE loop and remains the
+# reference; this is the "M can look finished too" budget.
+#
+# THE SCALING RULE HERE WAS ALSO WRONG. This used to say per-frame cost is "~quadratic in
+# `-beamblur` (via beams gathered)". It is LINEAR. MEASURED 2026-09-02 at 0.210.0 -- one banked
+# -savemap re-gathered at four radii with -loadmap, so the beam population is IDENTICAL across
+# the rows and only the kernel moves; -spp 4, 960x540, -n 200M:
+#
+#     -beamblur   beams/probe   4-spp gather   min/spp   speckle   saturation
+#     0.01 (dflt)      8534.6         24:08       6.03     1.094      0.0233
+#     0.005            4263.2         14:37       3.65     1.585      0.0249
+#     0.0025           2125.8          8:38       2.16     2.030      0.0265
+#     0.00125          1080.1          5:37       1.40     2.536      0.0285
+#
+# Beams gathered HALVES when the radius halves (ratios 2.00 / 2.01 / 1.97), because a beam is a
+# LINE, not a point: the count of lines piercing a gather cylinder of radius r and length L goes
+# as r*L, not r^2. Time falls SUB-linearly in that (8x fewer beams buys only 4.3x less time)
+# because the split is -beamsplitmax-saturated in every row, so the BVH barely shrinks
+# (15.3M -> 14.8M nodes) and you pay near-full traversal to collect fewer samples. Y mean moves
+# -0.2% across the whole sweep, inside the beam-split nondeterminism floor -- the radius is a
+# VARIANCE knob, not a bias knob.
+#
+# AND SHRINKING IT IS A LOSS, NOT A TRADE. -beamblur 0.00125 at -spp 16 finished in 16:03 --
+# LESS wall time than the default's 4 spp at 24:08 -- and was still far grainier (speckle 1.925
+# vs 1.094). Fitting speckle^2 = s0^2 + k/spp to the two small-radius points (2.536 @ 4 spp,
+# 1.925 @ 16 spp) gives k = 14.5 and an IRREDUCIBLE FLOOR s0 = 1.67 -- worse than the default
+# radius reaches at 4 spp, and unreachable at any -spp whatsoever. The cause is the one that
+# also makes -spp useless against beam CHROMA noise (see -beamachro in REFERENCE.md): the beam
+# map is traced ONCE and is view-independent, so extra spp re-gather THE SAME BEAMS. The kernel
+# radius fixes how many beams are averaged per gather point, and that error is a fixed function
+# of the beam set, not a variable resampled per sample. Shrinking the radius does not buy speed
+# at the price of noise -- it CONVERTS spp-reducible noise into a permanent floor. So do NOT
+# use `-beamblur` as a speed knob, and do not raise -spp expecting to undo it.
+#
+# WHAT THE FLOOR IMPLIES -- AND THE LOCKSTEP RECIPE THAT DOES NOT WORK. The floor goes as
+# 1/sqrt(G), G = beams gathered per probe, and G goes as (beam density x radius). Density comes
+# from `-n`, which mode M pays ONCE for all 600 cameras, while the gather is paid per frame. That
+# suggests raising `-n` and cutting `-beamblur` in lockstep to hold G -- and so the floor --
+# constant while cutting per-frame cost. MEASURED 2026-09-02, and it DOES NOT: it moves you
+# ALONG the same cost/quality curve rather than shifting the curve.
+#
+# The -n 800M / -beamblur 0.0025 arm stored 10632728 beams, trimmed to 7998945 by -beamcount,
+# and gathered G = 6325.7 per probe -- within 1.5% of the 6422 predicted by "G is linear in
+# density x radius" (3.01x the density at 1/4 the radius), so the model itself is right. But
+# fitting the sweep above to t = a + b*G gives b = 6.21e-4 min/beam and a FIXED cost
+# a = 0.73 min/spp (it predicts 3.38 and 2.05 against 3.65 and 2.16 measured). Cost therefore
+# tracks G almost entirely -- and the only other term, the BVH, is pinned IDENTICAL in every
+# configuration by -beamsplitmax (~23.7M sub-beams, ~15.2M nodes at -n 200M AND at -n 800M).
+# So holding G constant holds the COST constant too: at -n 800M you would need -beamblur 0.00337
+# to gather the default's 8534.6 beams, and that costs the same 6.03 min/spp the default does.
+# G is the single quantity setting both the cost and the floor, and they move together.
+#
+# WHAT MORE `-n` ACTUALLY BUYS, then, is not speed but DECORRELATION, which is a different
+# artifact: at -n 800M the map holds 7998945 beams with mean split 0.5183 against 2656139 at
+# 0.1715, i.e. many more, much shorter, more independent chords. That attacks the long STREAKS
+# (spatially correlated variance -- neighbouring pixels re-gathering the same long chord), not
+# the per-gather-point floor. So spend `-n` for streaks at equal cost; do not expect it to make
+# the frame cheaper. Note also that -beamcount 8000000 BOUND here (10.6M collected -> 8.0M), so
+# past ~600M photons the extra spend stops raising beam density at all.
+#
+# WHY 960x540 AND NOT 1080p -- this is a HOST RAM ceiling, not a taste call. Read it as a
+# COMMIT ceiling rather than a physical-RAM one: what refuses the allocation is Windows' commit
+# charge, which is shared with every other process on the machine, so this render can be denied
+# memory the box physically has free. MEASURED 2026-09-01: four concurrent Claude sessions held
+# ~171 GiB of private bytes against 1.6-3.2 GiB working sets each, leaving 8.4 GiB of a 256 GiB
+# commit limit with 21 GiB of RAM free -- and the flyby below died in the film allocation even
+# though ~247 GiB of the charge was reserved-but-never-touched. Fix is to raise the pagefile or
+# close the other sessions, NOT to shrink this render. See known-issues.md, "the gallery_rain
+# 600-frame mode-M flyby cannot start". The shared
+# mode-M pass holds ONE FILM PER SELECTED CAMERA in RAM for the whole run (600 of them), at
+# 24 B/pixel: 7.5 GB at 960x540, 13.3 GB at 1280x720, 29.9 GB at 1920x1080 -- and each is ONE
+# CONTIGUOUS request, so no -n / -beamcount value rescues it. Add the photon
+# map (~56 B per DEPOSITED photon: -n 200M deposits 88.2M = 4.9 GB), the beam map (~72 B per
+# beam) and the split array (~1 GB per 8M sub-beams) and 1280x720 with these settings already
+# died on a 64 GB machine -- correctly reported since 0.199.1 as `out of HOST memory ... the
+# buffers that grow with the command line are ...` rather than a bare `bad allocation`.
+# There is no frame-range flag to render the loop in halves, and splitting it across
+# invocations would re-trace the forward pass per chunk (which is the whole point of mode M),
+# so the honest trade at 1080p is a much smaller -n -- and -n is exactly the knob that was
+# buying the most. Hence: deliver at 960x540, or use mode D.
+#
 # Under D this flyby is 600 INDEPENDENT BDPT renders -- D is camera-anchored, it shares nothing
 # across cameras (REFERENCE, "Other modes do NOT save time with multiple cameras"), and the
 # budget flag applies PER FRAME. What IS shared is only the scene build and the exposure
 # anchor: the meter pre-pass meters the selector's frame alone, once, and all 600 reuse it.
 #
 # MEASURED per-frame rate (same run as above, 960x540), and note the 4x SPREAD -- a flat
-# -time gives very different quality at different points on the loop:
-#     fly000 (inside the gyroid channel)  0.63 s/spp   <- worst; glass on all sides
-#     fly137 (the creature coat pass)     0.33 s/spp
-#     fly500                              0.18 s/spp
-#     fly300 (open hall)                  0.16 s/spp   <- best, 4x cheaper than fly000
+# -time gives very different quality at different points on the loop. Frame numbers are
+# POST-ROTATION (see WHERE THE LOOP STARTS); the measurements were taken before it, so each
+# is the old index + 18:
+#     fly018 (inside the gyroid channel)  0.63 s/spp   <- worst; glass on all sides
+#     fly155 (the creature coat pass)     0.33 s/spp
+#     fly518                              0.18 s/spp
+#     fly318 (open hall)                  0.16 s/spp   <- best, 4x cheaper than fly018
 # Mean 0.325 s/spp, so `-spp 140` is ~7.6 h for the loop at a uniform 8.5% (= 100/sqrt(140)),
-# costing 88 s on fly000 and 22 s on fly300. Matching the still's 2.9% would need ~1200
-# spp/frame = 65 h. Check one frame first -- and check `-camera fly000`, the WORST frame, not
-# a pretty one, rather than discovering at frame 300 that the tunnel is a sparkling mess.
+# costing 88 s on fly018 and 22 s on fly318. Matching the still's 2.9% would need ~1200
+# spp/frame = 65 h. Check one frame first -- and check `-camera fly018`, the WORST frame, not
+# a pretty one, rather than discovering at frame 318 that the tunnel is a sparkling mess.
+# fly000 is now the cheap establishing shot, so it is the one frame NOT worth checking.
 #
 # There is also a fixed ~0.8 s per frame inside the render call itself: renderBdptCuda()
 # re-bakes and re-uploads the whole scene on EVERY call (render_cuda.cu ~14095), because mode
@@ -270,9 +442,23 @@ pattern "grid_ground" {
 pattern "ground_fade" {
     expr "1 - smoothstep(10, 22, sqrt((x - 5)*(x - 5) + (z - 3.5)*(z - 3.5)))"
 }
-# ~5% albedo: dark enough that the sunlit plane sits well below the exhibits, bright enough
-# that it still reads as a surface and still catches caustics in the forward modes. The green
-# is a 528 nm Gaussian rather than an `rgb` triple because emission wants a real radiance
+# ~1% albedo — and the 1 is a MEASUREMENT, not a taste call, so do not "restore" the 5% this
+# used to carry. Until v0.199.3 a material that both reflected and emitted was mis-shaded by
+# every renderer but mode R, and this ground is exactly that material: mode D's BDPT threw
+# away every s>=1 strategy that ended on an emissive surface, i.e. ALL of the plane's direct
+# sunlight, and the 5% figure was tuned against the ~1% that the surviving indirect happened
+# to look like. With the bug fixed the plane is genuinely lit and 5% put its body at sRGB 64,
+# level with the white exhibit caps at 75 — the ground stopped being a void and became a
+# second bright plane competing with the pieces. 0.010 puts it back at ~25: unmistakably a
+# surface, unmistakably darker than everything standing on it. (See known-issues.md
+# "an EMISSIVE surface was shaded wrong in three different ways".)
+#
+# Losing 5x of albedo costs the ground's caustics 5x, and that is affordable HERE because the
+# ground was never the caustic catcher: the white stand caps are (that is the whole reason the
+# stands are a wireframe cage plus a solid cap — see MUSEUM STANDS). Check the caps, not the
+# plane, if a caustic ever looks weak.
+#
+# The green is a 528 nm Gaussian rather than an `rgb` triple because emission wants a real radiance
 # magnitude — amp is spectral radiance per nm, and 0.55 puts the line core just at the clip
 # point of the camera's -2 stop absolute exposure, so the lines have a blown core and a graded
 # edge, which is what a glowing wire looks like.
@@ -288,7 +474,7 @@ pattern "ground_fade" {
 # the glowing lines instead.
 material "gridground" {
     type diffuse
-    reflect rgb 0.05 0.055 0.05
+    reflect rgb 0.010 0.011 0.010
     reflect_map pattern:ground_fade
     emit gaussian 528 34 0.55
     emit_map pattern:grid_ground
@@ -398,6 +584,19 @@ texture "tex_marble_creature" { file textures/marble_creature.png encoding srgb 
 # (k=0.45, s=0.30) rather than the orb's, because this cap catches coloured caustics from
 # THIRTEEN refracting solids at once and the stone must not tint any of them.
 texture "tex_marble_compote"  { file textures/marble_compote.png  encoding srgb  filter bilinear  wrap clamp }
+# The THIRTEENTH cap, and the THIRD sheet quarried rather than given its own: ten drops,
+# thirteen stands. `marble texture 1.jpeg` is cut top/bottom — the gold gyroid keeps the TOP
+# half with the heavy gold band, Alice takes the BOTTOM, whose veining is finer and whose
+# field is more white. At 1098x1960 the sheet halves to 1098x980, still over the tool's
+# 1024 MAXDIM, so the gyroid's 634x293 px cap loses nothing visible; the two crops share no
+# pixel, so they are two slabs off one block. Prepared at k=0.70 / s=0.80 rather than the
+# free caps' 1.0/1.0, for two reasons, one of which no other cap has:
+#   * her SHOES are dark and #1 bottoms out at 0.035 linear uncompressed — the creature's
+#     problem exactly, and k=0.70 is the creature's answer (floor lifted to 0.071);
+#   * she is the one object in this hall whose colour is imported PAINT rather than physics
+#     (a glTF baseColor atlas), so a saturated gold slab under her would be the only thing in
+#     the frame competing with the only texture in the frame. s=0.80 keeps the vein a vein.
+texture "tex_marble_alice"    { file textures/marble_alice.png    encoding srgb  filter bilinear  wrap clamp }
 
 # `wrap clamp` (not `repeat`) with `uv planar axis=y` on each cap isosurface maps ONE slab
 # across each tabletop, referenced to that primitive's own world bounds — a quarried slab cut
@@ -417,6 +616,7 @@ material "capmarble_oil"      { type diffuse  reflect texture:tex_marble_oil }
 material "capmarble_axicon"   { type diffuse  reflect texture:tex_marble_axicon }
 material "capmarble_creature" { type diffuse  reflect texture:tex_marble_creature }
 material "capmarble_compote"  { type diffuse  reflect texture:tex_marble_compote }
+material "capmarble_alice"    { type diffuse  reflect texture:tex_marble_alice }
 
 # --- Hero-object materials -----------------------------------------------------
 # `roughness` after `preset` overrides the preset's polished lobe. Gold needs a LOT here, and
@@ -506,6 +706,25 @@ material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) —
 # exactly that ground: it is physically the honest reading of "a 45 cm ruby", but this is a
 # gallery of caustics and a black gem is a hole in it.)
 #
+# THE PALETTE WAS RE-AUTHORED (2026-09-01) and the stones are no longer jewel names. The
+# asset's second cut replaces the muted gemmological set (amethyst/tanzanite/.../morganite,
+# which peaked at 0.77 in a channel) with twelve SATURATED hues that run 0.888 against 0.006
+# — roughly a doubling of chroma, and the reason for the swap: attenuation colour is what
+# tints a caustic, so a more saturated stone throws a more saturated splash. The bowl is
+# untouched, byte-identical to the first cut, so `cp_bowl` above is unchanged.
+#
+# TWO OF THE TWELVE ARE DELIBERATE EXTREMES, and they are the exception to the paragraph
+# above rather than a mistake in it:
+#   * `cp_onyx` is (0.006,0.006,0.006) — neutral and nearly opaque (sigma 121.6 on all three
+#     channels; ~0.07% transmittance across a stone). It IS the black gem that paragraph
+#     argues against, and it is in the file on purpose: onyx is a black stone. It reads as a
+#     silhouette with a specular highlight and contributes no caustic. Kept because the asset
+#     author chose it and one dark stone among eleven bright ones is contrast, not a hole —
+#     but if the compote ever looks like it is missing a gem, this is why.
+#   * `cp_clear` is (1,1,1) — sigma exactly 0, no absorption at all. In SF10 that makes the
+#     one pure-FIRE stone in the dish: undimmed, so it throws the brightest splash of the
+#     twelve, and colourless in transmission, so all of that splash's colour is dispersion.
+#
 # IOR IS THIS SCENE'S CHOICE, NOT THE FILE'S. The GLB says 1.52 flat for all thirteen, which
 # has no dispersion at all and would make thirteen colourless-fire stones. The bowl takes
 # `glass:crystal`, the house glass whose comment above explains why a gallery's vessel is cut
@@ -526,18 +745,18 @@ material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) —
 #     22, and is the better answer even where it never fires: if two facets ever do touch, a
 #     deterministic winner beats an arbitrary one.
 material "cp_bowl"       { type dielectric  ior glass:crystal  priority  1  absorb rgb  22.3 79.3 70.6 }
-material "cp_amethyst"   { type dielectric  ior glass:SF10     priority  2  absorb rgb  39.0 71.5 15.5 }
-material "cp_tanzanite"  { type dielectric  ior glass:SF10     priority  3  absorb rgb  63.8 57.7 13.1 }
-material "cp_sapphire"   { type dielectric  ior glass:SF10     priority  4  absorb rgb 102.1 54.3 14.1 }
-material "cp_aquamarine" { type dielectric  ior glass:SF10     priority  5  absorb rgb  71.5 18.1 14.1 }
-material "cp_tourmaline" { type dielectric  ior glass:SF10     priority  6  absorb rgb  84.8 22.3 32.6 }
-material "cp_emerald"    { type dielectric  ior glass:SF10     priority  7  absorb rgb 102.1 23.3 53.2 }
-material "cp_peridot"    { type dielectric  ior glass:SF10     priority  8  absorb rgb  30.8 15.5 71.5 }
-material "cp_citrine"    { type dielectric  ior glass:SF10     priority  9  absorb rgb   7.0 22.3 85.7 }
-material "cp_topaz"      { type dielectric  ior glass:SF10     priority 10  absorb rgb   7.0 39.0 85.7 }
-material "cp_garnet"     { type dielectric  ior glass:SF10     priority 11  absorb rgb  14.4 74.5 81.1 }
-material "cp_rhodolite"  { type dielectric  ior glass:SF10     priority 12  absorb rgb  15.2 79.4 44.2 }
-material "cp_morganite"  { type dielectric  ior glass:SF10     priority 13  absorb rgb   6.3 26.9 20.5 }
+material "cp_onyx"       { type dielectric  ior glass:SF10     priority  2  absorb rgb 121.6 121.6 121.6 }
+material "cp_chartreuse" { type dielectric  ior glass:SF10     priority  3  absorb rgb  21.1   2.8  42.9 }
+material "cp_pink"       { type dielectric  ior glass:SF10     priority  4  absorb rgb   2.8  33.4  16.7 }
+material "cp_azure"      { type dielectric  ior glass:SF10     priority  5  absorb rgb  48.1  22.0   2.8 }
+material "cp_yellow"     { type dielectric  ior glass:SF10     priority  6  absorb rgb   2.8   7.2 121.6 }
+material "cp_amber"      { type dielectric  ior glass:SF10     priority  7  absorb rgb   2.8  46.6 121.6 }
+material "cp_clear"      { type dielectric  ior glass:SF10     priority  8  absorb rgb   0.0   0.0   0.0 }
+material "cp_cobalt"     { type dielectric  ior glass:SF10     priority  9  absorb rgb 121.6 121.6   2.8 }
+material "cp_green"      { type dielectric  ior glass:SF10     priority 10  absorb rgb  69.3   2.8 121.6 }
+material "cp_red"        { type dielectric  ior glass:SF10     priority 11  absorb rgb   2.8 121.6 121.6 }
+material "cp_violet"     { type dielectric  ior glass:SF10     priority 12  absorb rgb   8.7  33.8   2.8 }
+material "cp_turquoise"  { type dielectric  ior glass:SF10     priority 13  absorb rgb  54.8   8.5   2.8 }
 
 # --- Fur-creature materials (the eleventh exhibit) ---------------------------------
 # Lifted unchanged from `scenes/fur_creature.ftsl`, prefixed `cr_` so nothing here can
@@ -555,6 +774,15 @@ material "cr_belly" { type diffuse  reflect rgb 0.66 0.55 0.40 }   # pale unders
 material "cr_tan"   { type diffuse  reflect rgb 0.58 0.46 0.34 }
 material "cr_eye"   { type glossy   reflect rgb 0.04 0.03 0.03  roughness 0.05 }
 material "cr_nose"  { type glossy   reflect rgb 0.12 0.08 0.08  roughness 0.15 }
+
+# --- Alice's fallback material (the thirteenth exhibit) -----------------------------
+# FTSL requires a `material` on every `mesh`, and this one is never meant to be seen: Alice
+# loads with `import_materials yes` and the glTF material replaces this on every primitive.
+# It exists as a TRIPWIRE. If the baseColor atlas ever fails to import — a re-export that
+# drops the texture, a loader regression, an out-of-range image index — the primitives fall
+# back here, and flat mid-grey on a figure is unmistakable in a frame where nothing else is
+# grey. A plausible-looking skin tone here would let that failure ship silently.
+material "alice_unpainted" { type diffuse  reflect rgb 0.5 0.5 0.5 }
 
 # --- THE GROUND. One quad, 46 x 45 m, x[-18,28] z[-19,26] — no walls, no ceiling.
 # The exhibits used to occupy the old hall's footprint (x in [3.2, 6.8], z in [1.5, 4.8]); the
@@ -1198,6 +1426,86 @@ isosurface "stand_compote_cap" { material capmarble_compote
     # comment above warns about. It costs nothing: the nearest thing in -z is
     # stand_creature_cap, still 0.55 m away.
     box { center 7.46 0.80 6.00  size 1.00 0.20 1.20  round 0.02 } }
+
+# --- exhibit: ALICE (the thirteenth stand) ---------------------------------------------
+# In world coordinates with no `group { translate }` wrapper, for the compote's and the
+# axicon's reason: this piece has no pre-spread layout position to be displaced from, so a
+# `translate 0 0 0` would be noise.
+#
+# WHY HERE: (9.15, 3.55), the FAR-RIGHT court, out past the glass orb at the near edge of the
+# rain shaft. Every other exhibit in this hall is a solid; Alice is the first FIGURE, and the
+# first object whose colour is an imported paint atlas rather than a spectrum. Siting her is
+# therefore a different problem from siting the compote, and `scraps/_alicesite.py` (a grid
+# search that projects every legal plot through the real still camera, then scores it on
+# screen-space overlap against every other exhibit and against the bow) says something blunt
+# about it: THERE IS NO CLEAN FLOOR IN THIS HALL. All 8783 legal floor sites are at least
+# partly screened by a nearer piece, because twelve stands 1.6x apart is a packed room seen
+# from a low eye. Two whole classes of siting had to be thrown out before this one:
+#   * ON THE FLOOR, as a VISITOR rather than an exhibit. Thematically the strongest reading —
+#     the one thing in the room that is not on a plinth — and it fails on geometry, not on
+#     taste. The bottom-centre ray of this camera meets the floor at z=5.479, so a
+#     floor-standing figure any nearer than that has her FEET BELOW THE FRAME, and every site
+#     further away than that is behind the near row. The best floor plot the search could find
+#     (9.00, 4.05 at 0.80) came back 70% covered by the compote and the orb.
+#   * IN THE AISLE, x≈5.0. The centre of a layout is not free floor, it is the sight line of
+#     everything behind it — the compote comment above learned the same thing — and here it is
+#     worse: the gold gyroid spans z 5.00..7.10 across the middle of the aisle, so the whole
+#     aisle behind it is its shadow and the whole aisle in front of it is below the frame.
+# ELEVATION is what breaks the deadlock. On a 0.90 m cap her head reaches y=2.51, which is
+# ABOVE every other exhibit in the hall (the tallest, the gold gyroid's clip, tops out at
+# 2.13), so the top two thirds of her stand in empty sky that nothing can screen. That is the
+# whole argument for making her the thirteenth EXHIBIT rather than the first visitor.
+#
+# The far-right court then wins on four measurements, all from `_alicesite.py`:
+#   * IN FRAME AND LARGE. Alice projects to x 1070..1258, y 266..481 — 188 x 215 px, taller
+#     than anything else in the still and second only to the gyroid in area, with 22 px still
+#     to the right edge. The cap clears it by 27 px. The frame's right margin was the last
+#     empty band left after the compote took the bottom-right corner.
+#   * ALMOST NOTHING IN FRONT OF HER. The only nearer silhouette her box touches is the glass
+#     orb's, and only a 47 px strip of its right edge — which is a BALL OF CRYSTAL, so that
+#     strip refracts her rather than hiding her. (The compote's box grazes her by 6 px.)
+#   * SHE STANDS IN FRONT OF THE BOW, not on top of it. The bow lives at x 772..1188,
+#     y 228..388 and its crown is at x≈950; her left edge at 1070 cuts only its right limb.
+#     A figure with the arc terminating behind her is the whole reason to put her on this side
+#     of the hall instead of the empty left one, where she would have had the axicon in front
+#     of her and black sky behind.
+#   * OFF THE FLIGHT PATH. The flyby's furthest-right control point is x=7.70 (through the
+#     glass orb), so the loop never comes within 1.45 m of this cap — see FLYBY.
+# THE CAP DIPS 0.35 m INTO THE RAIN. Its far edge is at z=3.05 against the rain shaft's near
+# face at z=3.40. That is deliberate and it is cheap: 0.35 m at sigma_t 0.35 is optical depth
+# 0.12, a 12% attenuation smoothly ramped across the slab's far corner and invisible at this
+# size — and a plinth standing with one foot in the weather is the right read for a hall whose
+# subject is rain.
+isosurface "stand_alice" {   # cap top y=0.90
+    material wirecage  union {
+        difference {
+            box { center 9.15 0.09 3.55  size 0.80  0.18  0.80  }
+            box { center 9.15 0.09 3.55  size 0.82  0.158 0.778 }
+            box { center 9.15 0.09 3.55  size 0.778 0.20  0.778 }
+            box { center 9.15 0.09 3.55  size 0.778 0.158 0.82  }
+        }
+        difference {
+            box { center 9.15 0.525 3.55  size 0.40  0.69  0.40  }
+            box { center 9.15 0.525 3.55  size 0.42  0.668 0.378 }
+            box { center 9.15 0.525 3.55  size 0.378 0.71  0.378 }
+            box { center 9.15 0.525 3.55  size 0.378 0.668 0.42  }
+        }
+    }
+}
+isosurface "stand_alice_cap" { material capmarble_alice
+    uv planar axis=y
+    # CENTRED, unlike the four cantilevered caps, and for a reason that is a measurement and
+    # not an oversight: Alice is OPAQUE and DIFFUSE. She throws no caustic to catch, so there
+    # is no downwind for the slab to lean toward and `_gemsweep.py` has nothing to sweep. The
+    # only thing this tabletop has to hold is her own footprint.
+    #
+    # 1.00 x 1.00 rather than the 0.90 the footprint alone would justify. `rotate 0 20 0`
+    # turns a 0.669 x 0.498 m footprint into an 0.799 x 0.697 m AXIS-ALIGNED one, and 0.90
+    # would have left 0.05 m in x — which is not a margin, it is the coincidence the axicon's
+    # cap comment warns about. 1.00 puts it at 0.10 x / 0.15 z. It costs nothing: the nearest
+    # cap is stand_glass_cap, 0.40 m away in x, and the slab still clears the frame edge by
+    # 27 px.
+    box { center 9.15 0.81 3.55  size 1.00 0.18 1.00  round 0.02 } }
 
 # ==============================  HERO PIECES  =================================
 # Each piece is wrapped in the SAME `group { translate }` as its stand — see THE SPREAD
@@ -1962,58 +2270,104 @@ fur "cr_coat_paw_br" {
 # fudge factor.
 #
 # THIRTEEN LOADS OF ONE FILE, which is the part that needs explaining. The asset is one GLB
-# with thirteen nodes -- the bowl plus `gem_00_amethyst` .. `gem_11_morganite` -- and ftrace
+# with thirteen nodes -- the bowl (`glass_ruby`) plus `glass_onyx_00` .. `glass_turquoise_11`
+# -- and ftrace
 # has exactly one lever for giving separate materials to separate nodes of a GLB:
 # `skip_material`, which drops every primitive whose glTF material NAME contains one of the
 # listed substrings. So each load imports the whole file and skips the other twelve pieces.
 # That is 13 x 4.5 MB of parsing, but it is 250,744 triangles total (the bowl is 250,000 of
-# them; each stone is 62), and the alternative -- `import_materials yes` -- would DESTROY the
-# asset: every material in the file is baseColor (1,1,1) with metallic 0, because the colour
-# lives entirely in KHR_materials_volume/transmission, which ftrace's reader does not
-# implement. All thirteen would import as the same white DIFFUSE surface, i.e. a plaster
-# bowl of plaster pebbles in a gallery whose entire subject is dielectric caustics.
+# them; each stone is 62), and it is still worth it even now that `import_materials yes` no
+# longer DESTROYS the asset. It used to: every material in the file is baseColor (1,1,1) with
+# metallic 0 and all the colour lives in KHR_materials_volume/transmission, so back when the
+# reader ignored that extension family all thirteen arrived as the same white DIFFUSE surface
+# -- a plaster bowl of plaster pebbles in a gallery whose entire subject is dielectric
+# caustics. src/gltf.h reads ior/transmission/volume/dispersion now, so an import would at
+# least arrive as GLASS. What it would not arrive as is THIS glass: KHR's attenuation is one
+# RGB triple with no dispersion in it, and the twelve stones below are authored on a named
+# optical glass (SF10, Abbe ~28) precisely so their caustics SPLIT — nor does glTF have any
+# way to express the nested-dielectric `priority` chain that stops twelve stones sitting in a
+# bowl from double-counting their shared interfaces. Keeping the thirteen loads is now a
+# choice about spectra and interface bookkeeping, not a workaround for a missing extension.
 #
 # The commas are not decoration: FTSL starts a new statement at the second bareword, so the
 # twelve patterns must be ONE comma-joined token.
-mesh "cp_ruby" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
+mesh "cp_bowl" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material onyx,chartreuse,pink,azure,yellow,amber,clear,cobalt,green,red,violet,turquoise
     translate 7.35 0.90 6.20   scale 3.0   material cp_bowl }
-mesh "cp_amethyst" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_amethyst }
-mesh "cp_tanzanite" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_tanzanite }
-mesh "cp_sapphire" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_sapphire }
-mesh "cp_aquamarine" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_aquamarine }
-mesh "cp_tourmaline" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,emerald,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_tourmaline }
-mesh "cp_emerald" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,peridot,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_emerald }
-mesh "cp_peridot" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,citrine,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_peridot }
-mesh "cp_citrine" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,topaz,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_citrine }
-mesh "cp_topaz" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,garnet,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_topaz }
-mesh "cp_garnet" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,rhodolite,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_garnet }
-mesh "cp_rhodolite" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,morganite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_rhodolite }
-mesh "cp_morganite" { file "meshes/compote_with_gems.glb"  import_materials no
-    skip_material ruby,amethyst,tanzanite,sapphire,aquamarine,tourmaline,emerald,peridot,citrine,topaz,garnet,rhodolite
-    translate 7.35 0.90 6.20   scale 3.0   material cp_morganite }
+mesh "cp_onyx" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,chartreuse,pink,azure,yellow,amber,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_onyx }
+mesh "cp_chartreuse" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,pink,azure,yellow,amber,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_chartreuse }
+mesh "cp_pink" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,azure,yellow,amber,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_pink }
+mesh "cp_azure" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,yellow,amber,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_azure }
+mesh "cp_yellow" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,amber,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_yellow }
+mesh "cp_amber" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,clear,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_amber }
+mesh "cp_clear" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,cobalt,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_clear }
+mesh "cp_cobalt" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,clear,green,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_cobalt }
+mesh "cp_green" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,clear,cobalt,red,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_green }
+mesh "cp_red" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,clear,cobalt,green,violet,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_red }
+mesh "cp_violet" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,clear,cobalt,green,red,turquoise
+    translate 7.35 0.90 6.20   scale 3.0   material cp_violet }
+mesh "cp_turquoise" { file "meshes/compote_with_gems.glb"  import_materials no
+    skip_material ruby,onyx,chartreuse,pink,azure,yellow,amber,clear,cobalt,green,red,violet
+    translate 7.35 0.90 6.20   scale 3.0   material cp_turquoise }
+
+# --- ALICE (the thirteenth exhibit): the only PAINTED object in the hall ----------------
+# On stand_alice_cap (top y=0.90) at the near edge of the rain shaft — see the stand block
+# above for why the far-right court is the only place in this room a figure can stand.
+#
+# THE ONLY `import_materials yes` IN THE SCENE, and that is the point of her being here. Every
+# other surface in this gallery is authored: a measured n/k metal, a named optical glass, a
+# Jakob-Hanika reflectance, a marble slab rescaled to a target albedo. Alice arrives with an
+# 8192^2 sRGB baseColor atlas and a 4096^2 metallic-roughness map baked into the GLB, and
+# ftrace paints her from them directly (src/gltf.h decodes both straight out of the BIN chunk
+# and area-averages them down to 2048 — an 8K atlas as Vec3 doubles plus its Jakob-Hanika
+# coefficient table is 3.2 GB otherwise). So she is the scene's demonstration that a
+# spectral forward renderer can eat an off-the-shelf textured asset without being re-authored.
+#
+# THE FALLBACK MATERIAL IS NOT DECORATION. FTSL requires one on every `mesh` and it is what
+# the primitives get if the glTF material fails to import, so it has to be a value that would
+# be VISIBLY WRONG rather than plausibly right: `alice_unpainted` is flat 0.5 grey, so a
+# silent texture-import regression shows up as a grey statuette instead of quietly shipping.
+#
+# `metallicFactor` in this GLB is 1.0 — the value that used to turn her into a mirror, because
+# reading the factor alone put her over the metallic>=0.5 cut and typed her Glossy. The real
+# metalness is in the map's blue channel, whose mean is 0.281; the loader now multiplies the
+# two, so she types Diffuse. This is the case that motivated the mean-metalness harvest.
+#
+# SEATING. The GLB is centred on the origin in x/z with its base at y = -0.950291, so unlike
+# the compote there IS a fudge factor and it is exactly that number times the scale: at 0.85,
+# translate y = 0.90 + 0.807747 = 1.707747. Scale 0.85 makes her 1.614 m — read as a figure
+# on a plinth rather than a doll, and her head then reaches 2.514 m, above every other exhibit
+# in the hall, which is the whole reason she is visible at all.
+#
+# `rotate 0 20 0`. The model faces +z out of the box, and +z from this court is 37 deg off the
+# bearing to the still camera at (5.0, 2.95, 9.35) — i.e. she would face out of the frame to
+# the right. A positive y-rotation swings +z toward -x here (scraps/_aliceface.ftsl renders
+# the sign rather than assuming it), so 20 deg turns her most of the way back into the hall:
+# 17 deg off the camera axis, which is a three-quarter view and not a mugshot, and it points
+# her gaze along the row of exhibits instead of off the edge of the picture.
+mesh "alice" { file "meshes/alice.glb"  material alice_unpainted
+    translate 9.15 1.707747 3.55   rotate 0 20 0   scale 0.85 }
 
 # ==============================  LIGHTING  ====================================
 # TWO lights now that the roof is gone (the xenon short-arc lamp that used to hang here was
@@ -2059,10 +2413,17 @@ light sun { dir -0.1470 0.7071 0.6916   angle 0.53   spd blackbody 5800   intens
 # 50 kW over 280 m2 is ~180 W/m2 exitance, and at ~10 m above the pieces the view factor is
 # ~0.55, so they see ~100 W/m2 of skylight against 1000 W/m2 of sun — the ~10% split a real
 # clear-sky day has, and about 1.5% of the power CDF, which is enough that NEE finds it.
-# The panel is 36 deg above the top of frame, so it is never seen; and it is black anyway.
+# The panel is 36 deg above the top of frame, so it is never seen; and it is black anyway
+# - but "36 deg above the top of frame" is a fact about ONE camera, and a camera that pitches
+# up (the flyby does) would find a 20 x 14 m BLACK LID roofing the sky, since the panel's
+# reflectance is black. `hide_camera on` removes that failure mode outright: the bounce-0
+# camera ray passes through, so the camera sees the sky beyond, while the panel still emits
+# its full 50 kW, keeps its ~1.5% of the power CDF, is still NEE-sampled, and still shadows
+# exactly as the sun-clearance arithmetic above assumes. See FTSL.md 11.1.
 light area {
     origin -4 12.0 -6   u 20 0 0   v 0 0 14
     spd blackbody 11000   power 50000
+    hide_camera on
 }
 
 # --- (3) LEFT FILL PANEL (out of frame; exists only to be REFLECTED) ----------------
@@ -2088,6 +2449,20 @@ light area {
 #     z = 6.05, and the panel is still the same 3.5 m off its -x flank — it is now ALONGSIDE
 #     the ball instead of ahead of it, which is the same geometry the right fill panel already
 #     uses deliberately (see below). Re-derive both ends from the formula if the eye moves.
+#     ...WHICH IS NO LONGER SOMETHING YOU HAVE TO DO, because `hide_camera on` below now
+#     makes the whole clearance calculation moot for framing. It is kept as the record of
+#     WHY the panel sits where it does (the y ceiling, the sun clearance, and the distance
+#     from the rain are all still live constraints), but the panel can no longer appear in
+#     frame no matter where the camera goes. That mattered: the flyby camera_curve is
+#     fov_y 70 (half-horizontal 51.2 deg, not 41) and YAWS, and at frame 0 it swung this
+#     panel's near edge from ~56 deg off-axis to ~42 — inside frame, where it rendered as
+#     the large solid slab down the left. A clearance derived for one camera is wrong for
+#     every other camera by construction; the flag is the fix, the arithmetic was not.
+#   * `hide_camera on` costs the fill NOTHING. The panel still emits its full 2.5 kW, still
+#     keeps its share of the light-selection CDF, is still sampled by NEE, still occludes,
+#     still casts shadows — and still appears in the gold gyroid's rim, which is the only
+#     reason it exists (a specular ray is traced at bounce 1, so it sees the rectangle).
+#     Only the bounce-0 camera ray passes through it. See FTSL.md 11.1.
 #   * y stops at 2.60, below every cloud in the scene, so a panel whose whole purpose is to
 #     be seen in a metal cannot instead show up as a bright wash on the underside of fog.
 #   * it cannot eclipse the sun the way an early sky panel did. The sun is nearly overhead
@@ -2101,6 +2476,7 @@ light area {
 light area {
     origin 1.5 0.15 6.0   u 0 2.45 0   v 0 0 4.2
     spd blackbody 5500   power 2500
+    hide_camera on
 }
 
 # --- (4) RIGHT FILL PANEL (the shadow side) ----------------------------------------
@@ -2117,10 +2493,15 @@ light area {
 # 3.2 m instead of 0.67 at 1.6 m) while IMPROVING its angle on the gyroid (cos 0.95 at 3.8 m),
 # because the gyroid is nearly straight off its normal from there. Measure the bow region's
 # mean level before and after any change to this light; it should not move.
+# `hide_camera on` for the same reason as the left panel: this one sits LEVEL WITH AND BEHIND
+# the still camera, which is only a guarantee for THAT camera - a yawing flyby swings it into
+# frame as readily as it did the left one. It still fills the gyroid's +x flank exactly as
+# before (a bounce-1 ray is not a camera ray). See FTSL.md 11.1.
 # cross(u,v) = -x, so it faces the room.
 light area {
     origin 8.6 0.15 9.0   u 0 2.25 0   v 0 0 -3.0
     spd blackbody 5500   power 2000
+    hide_camera on
 }
 
 # ==============================  ATMOSPHERE  ==================================
@@ -2291,11 +2672,48 @@ medium {
     bounds { min 6.5 0 0.6   max 9.5 3.2 3.4 }
     phase rainbow { droplet_um 300   dispersion 0.577 }
     # A soft elliptical shaft, densest at the top where it leaves the cloud and thinning as it
-    # falls, streaked by noise that is stretched ~6x in y so the structure reads as FALLING
+    # falls, streaked by noise that is stretched ~5x in y so the structure reads as FALLING
     # rather than as isotropic lumps. The radial term keeps the box's side faces from showing;
     # the trailing smoothstep does the same job for the top face.
+    #
+    # THE STRETCH IS A RATIO, AND A RATIO IS NOT ENOUGH — THE ABSOLUTE SCALE HAS TO FIT THE
+    # SHAFT. Through 0.201.0 this read `noise(1.2*x, 0.20*y, 1.2*z)`, whose 6:1 ratio was the
+    # right idea at the wrong size, and it made the rain render as VERTICAL STRIPES. `noise` is
+    # unit-lattice value noise (src/pattern.h, patValueNoise), so a frequency of f means a cell
+    # 1/f metres across. y at 0.20 is a cell FIVE METRES tall — and the shaft is 3.2 m. The
+    # field therefore could not complete even one lobe vertically: scraps/rainfield.py evaluates
+    # this expression outside the renderer and counts the lobes (sign changes of the derivative)
+    # along each axis over the shaft:
+    #
+    #     old  1.2 / 0.20 / 1.2      vertical lobes 0.00      lateral lobes  2.54
+    #     new  see below             vertical lobes 4.08      lateral lobes 20.44
+    #
+    # ZERO vertical lobes is not "very stretched", it is EXTRUDED: the lateral pattern is a
+    # fixed 2-D image swept the full height of the shaft, with no top and no bottom anywhere
+    # inside it, and at 0.83 m laterally that is about two-and-a-half metre-wide bands. That is
+    # the reported "rain appears vertically striated", and it is in the scene's density field
+    # rather than in the beam estimator — the measurement above never runs the renderer.
+    #
+    # The replacement picks both frequencies from a length, not from a ratio:
+    #   * GUSTS, 0.50 m across x 2.00 m tall (freq 2.0 / 0.50): the large-scale clumping, at a
+    #     size that still fits 1.6 lobes into the 3.2 m shaft, so gusts have a bottom edge.
+    #   * STREAKS, 0.111 m across x 0.556 m tall (freq 9.0 / 1.80): the visible fall texture.
+    #     0.111 m is ~19 px at the still camera's 8.8 mm/px, so it resolves without aliasing,
+    #     and the majorant grid's cells here are 3.2/128 = 25 mm, four to a streak cell, so
+    #     src/majorant.h still brackets it tightly and ratio tracking does not get slower.
+    # Both octaves are ~5:1 vertically elongated, which is the anisotropy the old expression was
+    # reaching for; the weights sum to 1 so the mean of the noise term is unchanged by
+    # construction and the optical depth this medium was tuned for is preserved.
+    #
+    # One real change comes with it. Over so few cells the OLD field's realised mean was an
+    # accident of the lattice, not 0.5: measured over the shaft box it is 0.5727, 14.5% high,
+    # because barely seven independent hash values covered the whole medium. The new field
+    # measures 0.5004. So the streak factor falls 0.9795 -> 0.9253 and tau drops ~5.5% — the
+    # rain is very slightly thinner than before, and the ~0.7 the sigma_t above is argued from
+    # is now the number this expression actually delivers rather than one it overshot.
     density "saturate( (1 - smoothstep(0.45, 1.05, sqrt( ((x-8.0)/1.30)^2 + ((z-2.0)/1.20)^2 )))
-                     * (0.55 + 0.75*noise(1.2*x, 0.20*y, 1.2*z))
+                     * (0.55 + 0.75*( 0.6*noise(2.0*x, 0.50*y, 2.0*z)
+                                    + 0.4*noise(9.0*x, 1.80*y, 9.0*z) ))
                      * mix(0.55, 1.0, saturate(y/2.4))
                      * (1 - smoothstep(2.55, 3.15, y)) )"
     density_max 1.30
@@ -2391,15 +2809,36 @@ prefer {
 # gallery_settled flies -- there is nothing left to clip a wing on, and the pieces are far
 # enough apart that the camera has to actually travel between them instead of pivoting.
 #
-# THE FIVE PASSES, and why each waypoint is the number it is:
+# WHERE THE LOOP STARTS, and why it is not where the passes start. A closed centripetal
+# Catmull-Rom is invariant under a CYCLIC ROTATION of its control points -- the curve is the
+# same curve, only the parameter origin moves -- so which waypoint is written first is a
+# free choice about the FILM, not about the path. It used to be (5.00, 2.10, 7.35), which
+# put frame 0 one metre off the gold gyroid's clip sphere and pitched 52 deg DOWNWARD into
+# it: the loop opened on an extreme close-up of a lattice, mid-dive, with no shot
+# establishing where any of it was. The two closure-arc points now lead instead, so frame 0
+# sits at (5.32, 2.28, 8.55) -- the furthest-back (z 8.55) and highest-looking-in point on
+# the whole loop -- aimed -z down the centre line at 7.5 deg of downward pitch, which is
+# within 5 deg of the still camera's own hero framing. The hall, both gyroids, the bottle,
+# the ring and the cloud are all in that first frame; the dive into the channel then starts
+# at frame 18 instead of frame 0.
 #
-# 1. GOLD GYROID (t 0.048..0.114). Points 4..10 are gallery_settled's OWN validated threaded
+# Nothing about the geometry moved: same 23.872 m of spline, same Cmax, same clearances,
+# same order of passes. What DID have to move is every `density_at` stop, by the same
+# +0.0555 of arc length -- see the stops themselves. `tools/flyphase.py` does the whole
+# rotation (it parses this block rather than keeping its own copy of the points) and
+# `--rotate <idx>` prints the shifted stop list. It lives in tools/, not scraps/,
+# because the scene now depends on it to stay self-describing.
+#
+# THE FIVE PASSES, and why each waypoint is the number it is. The `t` values are ARC-LENGTH
+# fractions in the CURRENT (post-rotation) parameterization:
+#
+# 1. GOLD GYROID (t 0.104..0.170). Points 6..12 are gallery_settled's OWN validated threaded
 #    channel points, shifted +1.25 in z and nothing else -- which is exactly the rigid
 #    translation this scene's gold gyroid got, so the empty-air tunnel through the
 #    k=10 / T=0.45 lattice still lines up to the millimetre. Do not "tidy" them: they were
 #    solved against the lattice, and 2 cm of drift puts the lens inside a strut.
 #
-# 2. FUR CREATURE (t 0.180..0.226), and this is the one pass that is not through a hole, a
+# 2. FUR CREATURE (t 0.236..0.282), and this is the one pass that is not through a hole, a
 #    bore or a transparent volume. The camera flies through actual FUR: 1.10 m of travel
 #    inside the coat, at 21 mm per frame, the slowest movement anywhere on the loop. Three
 #    things had to line up and all three are measured, not eyeballed.
@@ -2427,14 +2866,14 @@ prefer {
 #    the whole frame: the coat stops being a texture and becomes architecture, which is the
 #    entire argument for standing a groom in a gallery of polished objects.
 #
-# 3. GLASS ORB (t 0.264). World centre (7.70, 1.70, 3.95), r 0.50 -- the orb is levitated
+# 3. GLASS ORB (t 0.320). World centre (7.70, 1.70, 3.95), r 0.50 -- the orb is levitated
 #    0.45 m off its cap now, so the old curve's z=3.50 / y=1.40 pass would miss it by more
 #    than a radius in both axes. That is the reason this curve had to be rewritten at all.
 #    The approach now comes off the creature's tail and climbs from 1.308 to the orb's centre
 #    height, so the camera still crosses the sunlit upper hemisphere on the way in and comes
 #    out looking down its own caustic.
 #
-# 4. KLEIN BOTTLE (t 0.352). The tightest and best beat. scraps/_kleinslice.py walks the
+# 4. KLEIN BOTTLE (t 0.408). The tightest and best beat. scraps/_kleinslice.py walks the
 #    real mesh vertices through the mesh/settle/spread transform chain and reports the body
 #    in horizontal slabs: it is a circle of radius 0.151 about (6.4584, 2.5311) at y=1.12,
 #    and only above y~1.22 does the handle break out toward +x. So y=1.12 is the widest
@@ -2488,12 +2927,22 @@ prefer {
 # CLOSURE. gallery_settled's loop closes on a fold -- it runs forward past the start and
 # doubles back, which `look tangent` renders as a 180 deg swing at the front of the hall.
 # This one closes on an ARC instead: the return leg comes forward to z=8.15, swings across
-# the front and turns back in on the centre line already heading -z, so frame 600 hands off
-# to frame 0 with the HEADING continuous as well as the position. The whole loop is a lazy
+# the front and turns back in on the centre line already heading -z, so the seam has the
+# HEADING continuous as well as the position. The rotation put frame 0 in the MIDDLE of that
+# arc rather than after it, which is strictly better for the seam: the handoff now happens
+# on the arc's slow outside edge (density 6.89, the loop's second-slowest) instead of at the
+# top of the dive, so the one frame boundary a viewer could notice is the one where the
+# camera is moving least. The whole loop is a lazy
 # figure eight -- down the centre, right to the orb and the bottle, left and back behind the
 # ring, then forward again up the left-centre -- so it never retraces its own path either.
 camera_curve "fly" {
-    point 5.00   2.10  7.35     # START (front-high, centre line) — closure arc, LEVEL
+    # START — the ESTABLISHING SHOT. See WHERE THE LOOP STARTS above: these two points used
+    # to be the last two on the list, and the loop is a closed centripetal Catmull-Rom, so
+    # moving them to the front rotates the PHASE without moving the curve by a millimetre.
+    point 5.32   2.28  8.55     # START — apex of the closure arc: the loop's furthest-back
+                                # (z 8.55), highest-looking-in point, aimed -z down the hall
+    point 5.05   2.16  8.15     # turn onto the centre line, already heading -z
+    point 5.00   2.10  7.35     # front-high, centre line — LEVEL, then the dive begins
     point 4.98   1.85  7.10     # descend the centre line
     point 4.95   1.60  6.87     # approach the gold gyroid's +z face (clip sphere ends 6.83)
     point 4.882  1.437 6.855    # final approach — held just OUTSIDE the clip sphere
@@ -2535,26 +2984,38 @@ camera_curve "fly" {
     point 4.35   2.52  5.70     # rise onto the cruise
     point 4.95   2.62  6.55     # over the gold gyroid (its clip tops out at y=2.11)
     point 5.35   2.55  7.45
-    point 5.55   2.42  8.15     # out past the front of the hall
-    point 5.32   2.28  8.55     # swing across the front — the closure ARC, not a fold
-    point 5.05   2.16  8.15     # turn back onto the centre line, already heading -z
+    point 5.55   2.42  8.15     # out past the front of the hall — hands back to the START,
+                                # which is the same closure ARC it always was, not a fold
     up 0 1 0   fov_y 70   mode D   frames 600
     fps 30                         # 600 frames -> 20 s
     look tangent
     spline centripetal
     # Stops are ARC-LENGTH fractions straight off scraps/_flyplan.py, which is what
     # `density_at` has taken since 0.155.0 (before that the loader silently read them as
-    # control-point-INDEX fractions -- see CLEARANCE above). The beats it reports for these
-    # 45 points / 23.87 m are: gyroid channel 0.048..0.114, CREATURE COAT 0.180..0.226,
-    # orb 0.264, klein 0.352, ring 0.607, crystal gyroid 0.722, gold gyroid overflight 0.851.
-    # The creature gets the highest density on the loop (26) and holds it FLAT across the
-    # whole pass rather than peaking at the middle: 53 frames / 1.8 s at 21 mm per frame, so
-    # the coat crosses the lens slowly enough to be read as individual fibres.
-    density_at 0.000  8  density_at 0.050 20  density_at 0.112 20  density_at 0.150 10
-    density_at 0.180 26  density_at 0.226 26  density_at 0.245 12  density_at 0.264 22
-    density_at 0.300 14  density_at 0.352 24  density_at 0.400 10  density_at 0.500  6
-    density_at 0.607 20  density_at 0.680 10  density_at 0.722 14  density_at 0.800  8
-    density_at 0.900  6  density_at 1.000  8
+    # control-point-INDEX fractions -- see CLEARANCE above).
+    #
+    # EVERY STOP BELOW IS THE OLD ONE + 0.0555, because the phase rotation moved t=0 back to
+    # what used to be arc-t 0.9445. That shift is not cosmetic and it is not optional: these
+    # numbers name POSITIONS ON THE CURVE, so leaving them alone would have slid every dwell
+    # 5.6% of the loop (1.33 m) off its beat -- the creature pass would start inside the
+    # gyroid channel's exit. tools/flyphase.py --rotate computes the shifted list.
+    #
+    # The beats for these 45 points / 23.87 m are now: gyroid channel 0.104..0.170,
+    # CREATURE COAT 0.236..0.282, orb 0.320, klein 0.408, ring 0.663, crystal gyroid 0.778,
+    # gold gyroid overflight 0.907. The creature gets the highest density on the loop (26)
+    # and holds it FLAT across the whole pass rather than peaking at the middle: 53 frames /
+    # 1.8 s at 21 mm per frame, so the coat crosses the lens slowly enough to be read as
+    # individual fibres.
+    #
+    # 6.89 at the ends is the old track's value AT the new start (it interpolated 6 -> 8
+    # across old 0.900..1.000, and 0.9445 lands 44.5% along), so the wrap stays continuous:
+    # the loop's slowest, widest cruise runs straight through frame 0, which is what an
+    # establishing shot wants.
+    density_at 0.000 6.89  density_at 0.055  8  density_at 0.105 20  density_at 0.167 20
+    density_at 0.205 10    density_at 0.235 26  density_at 0.281 26  density_at 0.300 12
+    density_at 0.319 22    density_at 0.355 14  density_at 0.407 24  density_at 0.455 10
+    density_at 0.555  6    density_at 0.662 20  density_at 0.735 10  density_at 0.777 14
+    density_at 0.855  8    density_at 0.955  6  density_at 1.000 6.89
     closed
     exposure_lock
     film { res 960 540   exposure 0.25 }

@@ -54,8 +54,15 @@ Three neighbouring documents cover what this one only summarises:
   - [Animated geometry (OBJ sequences) → video](#animated-geometry-obj-sequences--video)
   - [The shared grammar](#the-shared-grammar)
   - [Importing Mitsuba scenes](#importing-mitsuba-scenes)
+- [N-dimensional rotation (`-nd`)](#n-dimensional-rotation--nd)
+  - [Why a zero-filled lift is only a 3x3 matrix](#why-a-zero-filled-lift-is-only-a-3x3-matrix)
+  - [Implicit fields: the other N-D route](#implicit-fields-the-other-n-d-route)
+  - [Filling the extra dimensions](#filling-the-extra-dimensions)
+  - [The interactive slider bank](#the-interactive-slider-bank)
+  - [Saving the projected model](#saving-the-projected-model)
 - [Command-line reference](#command-line-reference)
 - [Output](#output)
+  - [Elapsed times and ETAs](#elapsed-times-and-etas)
   - [Denoising (`-denoise`)](#denoising--denoise)
 
 ---
@@ -64,7 +71,9 @@ Three neighbouring documents cover what this one only summarises:
 
 Modes `A`/`B`/`C`/`P` trace **identical forward physics** and differ only in how
 the camera *measures* the light (splat vs. physical catch vs. composite). `R` and
-`D` are separate backward / bidirectional estimators. All modes are unbiased and
+`D` are separate backward / bidirectional estimators; `U` and `J` are `D` combined
+under MIS with a photon estimator (surface merges and volume beams respectively).
+All modes are unbiased and
 converge to the same image; they trade **speed, noise character, and which light
 paths they can capture at all**.
 
@@ -74,13 +83,14 @@ paths they can capture at all**.
 | `B` | Pinhole splat *(default)* | Light-tracing splat to a pinhole camera; independent photons | CPU + **GPU** |
 | `C` | Finite-aperture catch | Forward photon catch through a thin lens (real depth of field) | CPU + GPU |
 | `R` | Backward reference | Backward path-traced reference image; drives the physical-lens camera | CPU + **GPU** |
-| `W` | Deterministic preview | Mode `R` with **every estimator replaced by a fixed quadrature** — a POV-Ray-style Whitted render that is noise-free at `-spp 1` and ~2 orders of magnitude faster than converging `R`. Trades multi-bounce GI (see `-ambient` for a flat fill, `-gi` for a real deterministic one-bounce gather) and unbiasedness for speed. Also drives the interactive viewer's live lit preview (`-explore`, `T`) | CPU + **GPU** (see below) |
+| `W` | Deterministic preview | Mode `R` with **every estimator replaced by a fixed quadrature** — a POV-Ray-style Whitted render that is noise-free at `-spp 1` and ~2 orders of magnitude faster than converging `R`. Trades multi-bounce GI (see `-ambient` for a flat fill, `-gi` for a real deterministic one-bounce gather) and unbiasedness for speed. **Caveat — media/GRIN need spp.** "Noise-free at 1 spp" holds only while the path stays in the hero *bundle*; participating media, a GRIN volume, or `-heroc 1` drop it onto a scalar path carrying **one wavelength per sample**, and mode `W`'s wavelength lattice depends on the sample index *alone* (shared by every pixel), so an N-spp frame is the whole image rendered at N shared wavelengths. The error is a **uniform colour cast**, not noise — it does not average down per pixel. Measured on `gallery_rain` (rain volume), frame-mean B/G vs. the converged answer 0.705: `1 spp → 0.000` (no blue at all), `8 → 1.243` (magenta), `16 → 0.691`, `64 → 0.694`. Use `-spp 64` or more; ftrace prints a `[mode W] WARNING` below that. This is also why a live `-window` on such a render **changes hue between repaints** while it climbs through the first few dozen spp. Also drives the interactive viewer's live lit preview (`-explore`, `T`) | CPU + **GPU** (see below) |
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
-| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras). The map is **surfaces only**: add `-beams` for the view-independent photon-beam volume cache, without which participating media render as nothing | CPU + **GPU** (both the direct estimate and `-beams`) |
+| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras). The map is **surfaces only**: add `-beams` for the view-independent photon-beam volume cache, without which participating media render as nothing. Since 0.252.0 a single-camera render **redraws the whole light side each epoch and averages** (photon map, caustic map and beam map, `-beamfreeze` to opt out), so the map's own noise falls with render time instead of freezing on one realization — before that, mode `M` had a floor `-spp` could not touch, most visibly as coloured bars through wavelength-dependent media. (0.253.0 finished the job: a *plain* fixed-`-spp` single-camera render takes a different internal route — the shared/GPU one — which was still freezing.) Multi-camera renders still build the map **once**, which is the amortisation this mode exists for | CPU + **GPU** (both the direct estimate and `-beams`) |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU + **GPU** |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU + **GPU** |
+| `J` | UPBP | Mode `D` **plus** the mode-`M` photon-beam volume cache, combined under one MIS weight — the volumetric counterpart of `U`. Connections carry the paths beams are blind to (multiple scattering, surfaces); beam merges carry the deep-in-a-thick-medium paths the camera's distance sampling never reaches. Beams are **on by default** here (`-nobeams` to disable, which reduces it exactly to mode `D`) and are built from mode `J`'s **own light subpaths** since 0.216.0, so `-n` counts subpaths, not photons. Since 0.242.0 the map **sizes itself** from the scene's `-beamk` knee via a discarded pilot, so **leave `-n` off** — giving it is read as an expert overriding the budget and switches the budget off; `-beamcount` (default 1e6) remains a resource ceiling on top of the knee. Since 0.247.0 the light side is **redrawn each epoch and averaged**, so the merge half's noise falls with render time instead of freezing on one realization (`-beamfreeze` opts out). **Correct as of 0.219.0** — both techniques are MIS-weighted and merged paths obey the same `-depth` cap the connections do, so mode `J` estimates the same image mode `D` does (`J/D` mean 1.0006 on `_fog_cornell` and 0.9973 on the thick `_fog_thick`, against 2.0374 and 1.654 before the weights and the cap). Correct, but not yet *faster* than `D` — see **Mode `J`** below. Since 0.258.0 `-jsurf` adds a **second merge kind**, mode `U`'s surface point merges, under the same denominator — connections + beam merges + vertex merges in one mode; opt-in and CPU-only until validated, after which mode `U` is retired | CPU + **GPU** (camera pass, 0.244.0; the light/beam pass stays on the CPU on both backends; `-jsurf` is CPU-only) |
 
 ### Mode `W` — the deterministic (POV-Ray-style) preview
 
@@ -129,6 +139,13 @@ homogeneous haze with `bounds`/`density` ignored, so the same scene on `-device 
 the clouds and the bow entirely. ftrace warns (`[medium] …`) when a render's backward layer
 lands on the degraded CPU path. Both the noise and the divergence are logged in
 `known-issues.md`.
+
+This is **not** only a multi-medium problem — one `bounds`ed medium is enough. The CPU path
+drops the bounds and fills the whole world with that fog, which is a *different scene* rather
+than a rougher render of the same one, so the error is unbounded: on `scenes/_slab_ss.ftsl`
+(a single bounded slab and nothing else) CPU mode `R` comes out **304×** the analytically
+correct radiance. The one case the CPU backward tracer renders faithfully is a single
+**unbounded homogeneous** haze; for anything else, `-device gpu`.
 
 **`-ambient <v>` — the GI stand-in.** With the diffuse indirect bounce gone, a *closed*
 room previews with black shadows, because everything not directly facing the light is lit
@@ -496,12 +513,89 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > two crossings, front + back), so thicker/stacked glass reads progressively darker
 > and hazier. A grazing-angle (Fresnel-like) term thickens the haze at silhouettes
 > so glass edges still read. It's **order-independent** (the transmittance is a
-> commutative product), so overlapping transparent objects need no depth sort and
-> the pass stays nearly free. Tune the per-surface transmittance with
+> commutative sum), so overlapping transparent objects need no depth sort and
+> the pass stays nearly free. Tune the absorption with
 > **`-glass-clarity <0..1>`** (default `0.85`; higher = clearer/less dimming, and
-> passing it implies `-see-through`). This is a *look* preview only — there's still
-> no bending, reflection or coloured absorption. Example:
+> passing it implies `-see-through`).
+>
+> **Absorption follows Beer–Lambert over the PATH LENGTH through the glass, not once per
+> crossed surface** (since 0.236.0). Each clear fragment contributes its depth with a sign
+> — negative entering, positive leaving — so the signed sum over a closed surface is
+> exactly the distance the ray spends inside it. That sum commutes just like the product it
+> replaced, so it still needs no sorting. `-glass-clarity` is now read as the transmittance
+> of one *reference length* (5 % of the geometry's half-diagonal, so it is scale-free), and
+> a slab that thick looks exactly as one crossing used to.
+>
+> The point is that the result no longer depends on **how finely the glass is tessellated**.
+> Two panes and one finely-diced pane are now the same picture; before, every extra triangle
+> along the ray cost another full application of the transmittance. That was not a corner
+> case — an `-nd extrude` on a closed mesh used to add a wall over every interior edge and
+> drive the preview to a flat silhouette (see *N-dimensional rotation*).
+>
+> Single-sided glass — a `filter` gel, a one-quad window — has a front and no back, so there
+> is no enclosed path to integrate. Those pixels fall back to the old per-crossing
+> behaviour, ramped in over a thin sliver of the reference length rather than switched, so a
+> grazing edge cannot flip between the two models. The front/back decision is taken from the
+> **geometric** normal (the winding), never the shading normal, which may be flipped,
+> creased or normal-mapped. This is a *look* preview only — there's still
+> no bending or reflection. Example:
 > `ftrace -in scenes/cornell.ftsl -raster -see-through -window -o png/preview.png`.
+>
+> **Both of these are live toggles in the viewer.** The interactive viewer's control
+> strip carries a **See-through** button (the flag above) and a **Color** button, so a
+> preview can be flipped between them without relaunching. `-see-through` and **`-flat`**
+> (alias `-no-color`) set their starting state.
+>
+> **Neutral shading — `-flat`.** With **Color** off every surface is re-shaded as one
+> neutral clay: no albedo, image skin, triplanar projection, pattern drive or normal map,
+> per-vertex colour, or glass tint, and both children of a per-hit `mix` collapse to the
+> same thing. (The glass tint matters more than it sounds: a clear surface never reaches
+> the shade pass — see-through hands it to the clear-accumulation pass, which reads only
+> that tint — so on an all-glass model it is the *only* thing the toggle can change.) What is left is **form
+> and lighting alone**, which is what you want when the question is "what shape is this?"
+> rather than "what does it look like?" — most of all under an [N-D warp](#n-dimensional-rotation--nd),
+> where the shape *is* the question and a bright texture only hides it. It is applied to
+> the baked preview geometry rather than as a flag in the shade pass, so the CPU and GPU
+> rasterizers behave identically; the cost is that toggling it re-tessellates (and
+> re-uploads, on the GPU path) rather than merely re-rendering.
+> **Glass takes its colour from the material.** Each clear surface transmits its own RGB
+> transmittance rather than one global scalar, so a red filter tints what is behind it red
+> and a dense one darkens it more than a clear window does. Where that number comes from
+> depends on what the material states:
+>
+> * **`filter` / `translucent`** carry `transmit`, a *dimensionless* T(λ) in [0,1] — a
+>   transmittance already, so both its hue **and** its magnitude are used as-is.
+> * **`dielectric` / `thin_film`** colour their interior with `absorb`, a Beer-Lambert
+>   coefficient per unit **length**. Turning that into a transmittance needs a thickness,
+>   and an order-independent rasterizer never pairs a front face with the back face it
+>   belongs to — so only the **hue** is taken and `-glass-clarity` goes on setting how much
+>   each crossing dims. Glass with no absorption is exactly colourless.
+>
+> The **milk haze takes the glass's colour** too — it is light scattered inside the
+> crossed surfaces, so it reaches the eye through the same tint the background does, and an
+> untinted haze is white light arriving from nowhere. It is tinted by the *hue* of the
+> accumulated transmittance rather than its magnitude, so dark glass keeps its frost
+> instead of losing it to the same absorption twice; colourless glass is unaffected
+> exactly (equal channels make the hue white by construction).
+>
+> **`-glass-haze <0..1>`** caps how much of a pixel the frost may take, however many clear
+> surfaces the sight line crossed. The per-surface term is a product, so a sight line
+> through a dozen faceted gems drives it to 1 and the cluster whites out whatever colour
+> the glass is; capping it trades the frosted look for legibility. Default `1` = uncapped
+> (the accumulated product, unchanged). `0.3` reads a dense pile of coloured glass well;
+> `0` removes the haze entirely. It is deliberately **not** a new default: a genuinely
+> six-deep stack of coloured glass really is muddy, so this is a legibility choice you make,
+> not a correction being applied for you.
+>
+> `-glass-clarity` remains the master dial — now the transmittance of one reference
+> length rather than of one crossing — so one control still sets overall transparency. The exponential is taken in wavelength space and converted
+> afterwards (not the other way round), and the conversion is white-balanced against a flat
+> spectrum — without that, an equal-energy stimulus lands at linear sRGB ≈ (1.198, 0.950,
+> 0.908) and a perfectly colourless window would preview with a warm cast. The milk haze is
+> deliberately **not** tinted: it is frosting, not glass colour.
+> `scenes/_glass_tint.ftsl` is the worked example (clear / red / blue dielectrics beside a
+> green gel).
+>
 > Because rasterizing is nearly free, a preview whose size you haven't pinned with
 > `-r` is **upscaled so its long edge is at least 1440 px** (aspect preserved) —
 > a scene that authored a small `film { res 256 256 }` still previews big and
@@ -720,6 +814,29 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > control (`-mode`, `-n`, `-time`, `-noise`, `-forever`, `-device`, `-camera`,
 > `-view`, an explicit `-o`/`-r`, etc.) opts out of the auto-preview and renders
 > normally; `-in <path>` is likewise always an explicit render, never a preview.
+>
+> **A bare *mesh* (`ftrace model.glb`) does the same thing, but yields less
+> readily.** The mesh quick-viewer is *fundamentally* a preview — there is no
+> authored scene to render "properly" — so presentation flags do **not** opt it
+> out: `ftrace model.glb -window -o look.png -r 900` is still a raster preview.
+> Only a genuine light-transport request does (`-mode`, `-n`, `-time`, `-noise`,
+> `-forever`, `-preview`, `-spp`, `-device`, `-savemap`, `-loadmap`,
+> `-wavefront`).
+>
+> When that happens ftrace **says so**, because the opt-out is otherwise silent and
+> surprising — it has just announced `[viewer] quick-view scene for mesh …` and then
+> shows nothing:
+>
+> ```
+> [viewer] -n asks for a real render, so the quick preview window is off;
+>          add -window-min -keepwindow to watch it converge
+> ```
+>
+> The named flag is the one that actually triggered it, and the suggested flags work
+> on the real-render path exactly as they do anywhere else. Such a render also names
+> its output after the **input** (`compote_with_gems.ppm`) rather than falling back to
+> `cornell.ppm`, the built-in Cornell box's default — a run with no Cornell box in it
+> should not leave a file named after one.
 
 ### Speed / accuracy / ability tradeoffs
 
@@ -742,6 +859,7 @@ that converges to the same physical image.
 | `M` | Many cameras sharing one lighting solution (flythroughs); reusable/persistable map | Fast per frame *(after one shared pass)* | ✓ *(walks to diffuse)* | — | ✓ | ✓ *(direct query)* | Direct query blurs contact shadows (use `-pmfg`); media need `-beams` (full multiple scattering since 0.199.0) |
 | `S` | **Caustics / SDS**; progressive, bounded memory | Slow *(many passes)* | ✓ | ✓ | ✓✓ | ✓ *(resident session; pinhole only)* | Many passes to converge |
 | `U` | Robust "have it all" (diffuse GI + caustics), no per-scene mode picking | Heaviest / pass | ✓ | ✓ | ✓ | ✓ *(resident session; pinhole only, no media)* | Heaviest per-pass cost |
+| `J` | **Thick / deep participating media** — `D`'s paths plus `M`'s beams under one MIS weight | `D` + one shared beam pass | ✓ | ✓ *(physical lens)* | ✓ | ✓ *(camera pass on the GPU with the wavefront beam gather; both merge kinds, `-jsurf` included, since 0.263.0)* | Inherits `D`'s scope (no fluorescence / env / collimated); the beam pass is a fixed up-front cost |
 
 - **`B` — pinhole splat (default, fastest).** Every photon that hits a
   camera-visible surface splats to the pinhole, so essentially no photons are
@@ -877,7 +995,35 @@ that converges to the same physical image.
   `-pmcount <k>` sets the target population at 1 M stored photons (default `200`, calibrated
   so ordinary renders keep the look they already had — raise for smoother/blurrier, lower
   for sharper/grainier); `-nopmauto` restores the old fixed-radius behaviour exactly
-  (bit-identical), as does passing an explicit `-pmradius`. `-savemap`/`-loadmap` still lets
+  (bit-identical), as does passing an explicit `-pmradius`.
+  **A low `-pmcount` now actually takes effect on a large scene (0.199.6).** The photon grid
+  used to be a *dense* lattice — one int per cell — so a fine radius over a big scene asked for
+  an array that grew as (scene size / radius)³, and the map defended itself by growing the
+  radius back until the array fit. That guard silently overrode you: on `gallery_rain` (scene
+  radius 32.7 m) `-pmcount 11` asked for 0.031 m and got 0.094 m, three times coarser, which is
+  enough to smear a caustic into a colourless grey blur. The lattice is now hashed and sized
+  from the photon count instead, so the radius you ask for is the radius you get.
+  **Two maps, not one (0.199.7).** One radius cannot serve a scene that has both caustics and
+  ordinary bounce light: `buildAuto` solves for the *majority* population, which is the broad
+  ambient wash, and a caustic is a thin high-contrast concentration that such a radius convolves
+  flat. Mode `M` therefore uses Jensen's **two-map partition** — a deposit reached by an L·S⁺·D
+  path (at least one focusing vertex, no scattering one) goes to a separate **caustic map** with
+  its own, smaller, adaptive radius, and the gather is the sum of the two density estimates. The
+  partition is strict, and both maps divide by the same `nEmitted`, so nothing is double-counted
+  and nothing is dropped. `-pmccount <k>` sets the caustic map's target population (default `50`
+  against the global map's `200` — blur hurts a caustic more than noise does); `-nocaustics`
+  turns the split off and restores the single-map behaviour. The caustic radius is never allowed
+  to exceed the global one: on a scene where caustic photons are very sparse the adaptation would
+  otherwise ask to *grow* it, which is worse than not splitting at all.
+  The split is only the **storage** half of Jensen's scheme; the **sampling** half is
+  `-causticn` (0.203.0 CPU, 0.204.0 GPU), which emits extra photons aimed at the scene's
+  focusing geometry so that the sharp caustic map is also densely *populated*. It is on by
+  default (`auto` = `-n`/4). With it off, a scene whose specular geometry subtends a small
+  solid angle gets a caustic map that is sharp but nearly empty — and, because the caustic
+  radius may not grow past the global one, one that gathers a handful of photons per pixel and
+  reads as noise the denoiser then erases. If a caustic looks absent rather than merely noisy,
+  the number to raise is `-causticn`; the `probe saw N; target K` line printed when the caustic
+  map is built says how far short the population is. `-savemap`/`-loadmap` still lets
   the deposit be paid just once, on **CPU and GPU**, and the file carries **both halves of the
   trace** — surface photons *and* the `-beams` volume cache. (Before 0.195.0 the serialiser
   lived in the CUDA translation unit, so the flags were GPU-only by accident of placement and
@@ -925,9 +1071,216 @@ that converges to the same physical image.
   and are exact; merges gather photons from other paths, so like modes `M`/`S` they use
   the standard spectral-photon-mapping XYZ estimate.)
 
+- **`J` — UPBP (mode `D` and mode `M`'s beams, under one weight).** Unifying Points,
+  Beams and Paths (Křivánek et al. 2014) is to *volumes* what `U` is to surfaces. Mode `D`
+  and mode `M -beams` each solve half of a thick-medium scene and each fails where the
+  other succeeds: BDPT connects a camera vertex to a light vertex, which needs the camera's
+  free-flight distance sampling to *reach* the scattering point — deep inside an optically
+  thick medium it essentially never does, so `D`'s deep glow is pure noise. The beam×ray
+  estimator does reach there (a photon beam is a whole *line* of deposited power, so a
+  camera ray that passes anywhere within the kernel radius collects it), but beams are
+  deposited **straight**, so a light path that scatters in the medium *before* the merge
+  vertex has zero beam density and is invisible to it. Mode `J` runs both on the same
+  camera sample and combines them with the multiple-sample **balance heuristic**, so each
+  path is carried by whichever technique sampled it better and the pair is still one
+  unbiased estimator of the same integral. The beam map is built **once**, before the first
+  pixel, and is **on by default** — `-nobeams` turns it off, which makes mode `J` mode `D`
+  bit-for-bit. Since 0.216.0 mode `J` builds that map from **its own light subpaths** rather
+  than from a photon pass, which changes three things relative to mode `M`: **`-n` counts
+  light subpaths** (the same physical quantity — each carries emitter power — so brightness
+  is unaffected), **`-beamcount` is met by tracing fewer subpaths rather than by thinning**
+  (mode `M` trims the map with Russian roulette, whose per-beam survival probability a MIS
+  weight cannot read, so mode `J` keeps every beam it traces and instead traces the right
+  number of them — see the beam-budget box below), and **`-beamachro` applies since 0.250.0,
+  `-beamspec` since 0.251.0**. Those two are not the same requirement, and treating them as
+  one is what left mode `J`'s cloud *and* rain iridescent until 0.250.0. The *bundle* stores
+  wavelengths and no weights, so every wavelength in it must carry identical power, and a
+  BDPT light subpath's does not **as sampled** (`Le` is `spd(λ)/pdf(λ)` off the **scene-wide**
+  emission sampler, which is a function of λ the moment the scene holds more than one
+  emitter). The *fold* needs only the estimator's **expectation** to be λ-independent, which
+  holds for any sampling density — so 0.250.0 let mode `J` fold its cloud beams at the
+  emitter's mean CIE exactly as mode `M` does. 0.251.0 then bought the bundle too, not by
+  weakening its requirement but by **satisfying** it: the ratio `spd_em(λ)/p_comb(λ)` is the
+  only λ-dependence in `Le`, so dividing it out analytically at the subpath's birth and
+  redrawing the deposit's wavelengths from that emitter's own SPD makes the deposit
+  arithmetically identical to a mode-`M` photon's. So a `phase rainbow` rain curtain — which
+  structurally cannot fold, its scattering genuinely being chromatic — now gets the same
+  `-beamspec 4` bundle mode `M` uses there. That conversion also removes the
+  `spd_em/p_comb` weight-ratio variance, which is why it improves even beams that were
+  already folding.
+  The remaining `-beam*` knobs (`-beamblur`, `-beamk`,
+  `-beamsplit*`, `-beams-order`) work as documented. Scope is mode `D`'s
+  exactly (the connection half *is* BDPT), so no fluorescence, no GRIN, no env/collimated
+  emitters; `spot`/`sun` and heterogeneous media are fine. *Cost:* mode `D`'s per-sample
+  cost plus the merges, on top of one up-front beam pass — so on a media-free scene it is
+  strictly mode `D` with extra words, and it only starts paying for itself where the medium
+  is thick enough that `D` alone is starved.
+
+  > **Correct as of 0.219.0, with three caveats.** The balance-heuristic weights described
+  > above are implemented on both sides, and since 0.219.0 a merged path obeys the same
+  > `-depth` cap the connections do, so a mode-`J` image is a correct estimate of the same
+  > integral mode `D` estimates: the `J/D` scene-linear mean is **1.0006** on
+  > `_fog_cornell.ftsl` and **0.9973** on the thick `_fog_thick.ftsl`, against **2.0374** and
+  > **1.654** before the weights and the depth cap. The caveats: on an optically **thick,
+  > multi-bounce** scene it reads up to **1.6×** an independent mode-`R` reference, and the
+  > error is set by how many **light subpaths** the beam map was built from — not by `-spp`,
+  > which cannot move the merge half at all. The auto-sizer's `-beamk` knee is a *cost*
+  > heuristic, so it happily picks a map that renders ~15 % hot; if a thick-medium mode-`J`
+  > image looks too bright, raise the subpath count (`-n 8192` was enough on `_fog_thick`,
+  > against a knee-chosen 2527). See **UPBP-THICK** in `known-issues.md` — it predates 0.244.0
+  > and both backends reproduce it to 0.1 %. Its beam
+  > map has **no trim** and is sized by `-n` alone, which
+  > is the resource that bites first — **pass a smaller `-n` before anything else** (see the
+  > box below); and the weights carry three deliberate approximations
+  > (one scene-wide kernel radius, a weight built from two wavelengths, and a merge dropped
+  > after a specular light bounce) — all of them weight *quality*, none of them bias. See
+  > **UPBP-W** in `known-issues.md`.
+  >
+  > **Where it does and does not pay.** `_fog_cornell` is a thin fog that BDPT connections
+  > already sample well, and there mode `J` buys **no noise reduction at all** for ~25× mode
+  > `D`'s cost (15.25 % noise at 43 spp, which is exactly mode `D`'s 4.42 % at 512 spp scaled
+  > by `sqrt`). That is the expected result, not a defect: UPBP earns its keep only where the
+  > medium is thick enough, or lit indirectly enough, that the camera's distance sampling
+  > cannot reach the scattering points — which is the regime `-beams` exists for. Mode `J`
+  > also inherits the beam×ray estimator's `1/sin(theta)` tail, so it produces brighter
+  > fireflies than mode `D` on the same scene (peak pixel ~1.9× mode `D`'s here).
+  >
+  > **On a thick medium (0.219.1) the merges work — the estimator is too expensive.** Measured
+  > on `scenes/_fog_thick.ftsl` (`sigma_t 20 / albedo 0.95`) against a converged mode-`D`
+  > reference, mode `J`'s **per-sample** variance is **2.4–8.8× lower** than mode `D`'s, and
+  > the margin *grows* with `-n` — the signature of the merges genuinely reaching paths the
+  > connections cannot. It still loses at **equal time by ~19×**, purely because a sample
+  > costs 45–250× more: the auto-tuned radius has a probe ray gather **252 beams** per camera
+  > segment, and cost scales linearly with that count. The MIS weight is not the expense
+  > (hoisting its per-ray work bought 1.5 %); it is the beam×ray estimator's own two
+  > transmittance marches per surviving hit, which mode `M` pays identically. So the lever
+  > that remains is the **GPU port**, not more CPU tuning — see **UPBP-CONV** in
+  > `known-issues.md` for the tables.
+  >
+  > **The GPU port landed in 0.244.0.** `-device gpu` now runs mode `J`'s **camera** pass as
+  > mode `D`'s BDPT megakernel with the merges switched on (`kBdptT<…, MERGE=true>`), with the
+  > beam map, its BVH and its per-beam MIS partials uploaded once alongside. The **light** pass
+  > — tracing the subpaths, splitting them into sub-beams, building the BVH — stays on the CPU
+  > on both backends, because it is a one-off build whose cost does not scale with spp; the
+  > startup banner says where each half runs rather than claiming one backend for the whole
+  > render. Measured on `_fog_thick` at 128², equal 7-minute budgets: **2871 spp on the GPU vs
+  > 1042 on the CPU (2.8×)** at the default `-beamk`, where the divergent beam gather
+  > dominates, and **50767 vs 3354 (15×)** at `-beamk 1`, where it does not — the gather is the
+  > part that parallelises worst, so the speedup is a function of how many beams a segment
+  > collects. Agreement is verified three ways: mode `J` is **bit-for-bit** mode `D` on the GPU
+  > both with no media and with media under `-nobeams`; against the closed-form single-scatter
+  > slab the GPU reads **1.0029×** where the CPU reads 1.0030×; and CPU-vs-GPU whole-frame
+  > energy on `_fog_thick` agrees to **0.1 %**. The VRAM preflight reports the larger of the
+  > hero and merge kernels for mode `J`, since which of the two launches is not knowable before
+  > the beam map exists.
+  >
+  > **Do not pass `-n` in mode `J` (0.242.0) — the map sizes itself, and passing `-n` turns
+  > that off.** `-n` counts light subpaths, each depositing one beam per span, so the inherited
+  > default `-n 2000000` at `-max-bounce 8` built **12 M beams / 1.2 GB** whether the image was
+  > 4 K or 64×64, and a **64×64** frame with a `-time 30` budget spent over seven minutes inside
+  > its first 1-spp chunk — indistinguishable, from outside, from a hang. Mode `J` now sizes the
+  > map itself: a small **pilot** of light subpaths is traced, measured, and thrown away, and
+  > from it the pass learns how many beams a subpath deposits *in this scene* and where the
+  > scene's **`-beamk` knee** is — the beam count past which the floor stops holding the gathered
+  > count at 32 and every further beam starts being paid for in full. It then traces the
+  > subpaths that fit that knee.
+  >
+  > The knee is a property of the **scene**, not the frame, and that is measured rather than
+  > assumed: at a fixed 120 s budget on `_fog_cornell`, 18 708 / 75 288 / 300 033 raw beams give
+  > 15 / 15 / 4 spp at 0.426 / **0.410** / 0.887 relative RMSE at 128², and 4 / 4 / 1 spp at
+  > **0.805** / 0.822 / 1.888 at 256² — four times the pixels, same knee. Across *scenes* it
+  > moves 23× (`_fog_thick` is already past the floor at 16 428 beams, where `_fog_cornell`
+  > needs ~300 000), which is why no fixed default and no frame formula could be right.
+  >
+  > Left to itself the budget lands where the sweep says it should: on `_fog_thick` it **beats
+  > every hand-picked `-n`** in the grid above by 29 % (relative RMSE 1.942 against a best of
+  > 2.741), by choosing a map smaller than the smallest one swept. On `_fog_cornell` it comes
+  > out above the sweep's best (0.587 against 0.410), that scene's equal-time optimum being
+  > nearer 0.66× its knee — see the paragraph below for why the knee is still the default.
+  > Its pilots put the two scenes' knees **8.7× apart** (~114 000 beams against ~13 000), and
+  > both runs are knee-bound rather than ceiling-bound. *(Both absolute figures are pre-0.272.5,
+  > measured with the 96-chord probe that J-KNEE-NOISE found was biased about 2× low on a scene
+  > with a dielectric; the corrected probe puts `_fog_cornell` near 220–270 k and `_fog_thick`
+  > near 11 k. The ratio the sentence is making a point about survives.)*
+  >
+  > It aims **at** the knee, not below it (0.243.0 — it aimed at half the knee in 0.242.0, and
+  > that was a measurable bias). Below the knee the `-beamk` floor *widens the kernel radius* to
+  > keep the gathered count at 32, so the render silently uses a kernel wider than the
+  > `-beamblur` you asked for: on the analytic gate scene the half-knee map came out **6.4 % off
+  > the absolute radiance**, which falls to **0.34 %** at the knee. **The 6.4 % is contested and
+  > its sign is wrong at least on `_fog_thick`** — a twelve-seed `-beamcount` sweep there, scored
+  > against a 67 448-spp mode-`D` reference, puts a *quarter*-knee map (3.9x the gathered count,
+  > i.e. twice the half-knee inflation) at **−3.8 %**, which is 8 sigma from +6.4 %, and the
+  > paired quarter-knee-minus-knee difference at **−4.7 % ± 1.9**. So an undersized map reads
+  > **low** on a fog box, not high. The analytic-gate figure has not been re-derived on its own
+  > scene; until it is, treat the *magnitude* as the point ("a half-knee map is a few per cent
+  > off") and not the direction. See `known-issues.md`, J-KNEE-NOISE. A smaller map does buy real
+  > speed (the beam BVH is cheaper to traverse), but that trade is declined by default because
+  > noise washes out with render time and a widened kernel does not. So read the knee as *the
+  > smallest map that gets you the kernel width you asked for*, not as a ceiling. On scenes
+  > where the gather is a small share of per-sample cost (very low `-max-bounce`), quality keeps
+  > improving past it — raise `-beamcount` there; and where you would rather have the spp than
+  > the exact kernel, lower `-beamcount` below the knee.
+  >
+  > Overrides, most specific first: **`-n <count>` disables the budget entirely** and traces
+  > exactly that many subpaths (which is what keeps the historical measurements above
+  > reproducible); **`-beamcount <n>`** sets a resource ceiling, and the budget enforced is
+  > `min(ceiling, knee)`; **`-beamk`** moves the knee itself. The pass prints all of it —
+  > the pilot size, the measured beams/subpath, the knee, and which half was binding. Tracked
+  > as **J-BEAMCOST** in `known-issues.md` (fixed).
+  >
+  > **`-jsurf` (0.258.0) adds a SECOND merge kind — mode `U`'s surface point merges — under the
+  > same denominator.** Everything above describes mode `J`'s beam×ray merges, which live in the
+  > *media*. `-jsurf` turns on the other half: the same light subpaths that deposit beams also
+  > deposit **surface photons** at every non-delta surface vertex, and each camera surface vertex
+  > gathers them within `-jsurf-radius` with the ordinary vertex-merging (photon-mapping) density
+  > estimate. That is exactly what mode `U` (VCM) does — the difference is that here it is
+  > MIS-combined with mode `J`'s BDPT connections **and** its beam merges in **one** balance
+  > heuristic, where mode `U` combines only two techniques and refuses media outright. A camera
+  > path that crosses a cloud and lands on a wall is competed for by all three, and only a single
+  > weight can partition that unity, which is the whole reason to fold `U` in here rather than
+  > ship two modes that each solve half the problem. The two kinds cannot share one normalisation
+  > (`n_m·2r_b` for a beam, `n_m·π r_s²` for a point), so each gather scales the other kind by its
+  > own constant and both denominators mention both. The two halves are independent in both
+  > directions: a media-free scene gets surface merges and no beams, a pure-fog scene beams and no
+  > surface photons.
+  >
+  > `-jsurf-radius <r>` is the **starting** gather disc in world units; left off it defaults to the
+  > same `-pmradius` / `-pmradiusfrac` modes `M`/`S`/`U` use, deliberately, so that comparing
+  > `-mode J -jsurf` against `-mode U` is a comparison of *estimators* rather than of radii. It
+  > **shrinks per light-side epoch** on the same Georgiev/SmallVCM schedule mode `U` uses, under the
+  > same `-vcmalpha` — mode `J`'s refresh epoch being its analogue of a VCM iteration. That is not
+  > decoration: a merge estimator's bias is `O(r²)`, so a radius held still is a floor that no
+  > amount of sampling gets under. Pinning `r` on `_cornell_diffuse` (1024 spp, against an 8192 spp
+  > mode-`D` reference) gives **−0.11 %** energy bias at `r=0.005`, **−0.45 %** at `0.0173` and
+  > **−0.52 %** at `0.035` — monotone in `r`, heading for zero, which is the `O(r²)` floor itself
+  > and not a fault in the weight. Because the render reports the plain **mean** of its epochs, the
+  > total bias is the Cesàro mean of the per-epoch biases and goes to zero with them, so plain
+  > averaging suffices and no reweighting is needed. This is also precisely the property mode `U`
+  > has that mode `J` had to acquire. (It has it now — but the measured head-to-head says `U` still wins its own workload by 4–6× at equal time, so `U` is not going anywhere; see UPBP-VM.)
+  >
+  > `-jsurf-count <n>` (default `4e6`) caps the **stored surface photons**, as `-beamcount` caps
+  > beams. It is a memory bound, so it clamps the subpath count **downward only**, after the beam
+  > knee: the beam radius *adapts* to its budget and undershooting it is a real bias, while the
+  > surface radius follows its own schedule and a bigger map costs only RAM. A media-free scene has
+  > no beam pilot to size it, so the light pass falls back to **one subpath per pixel** — mode `U`'s
+  > convention — capped by this ceiling.
+  >
+   > **On by default, on both backends.** `-jsurf` has been the default since 0.260.0 (`-nojsurf` is
+   > the opt-out, exactly as `-nobeams` is), and since **0.263.1 the GPU renders the same
+   > three-technique estimator** — validated to −0.7 / −0.4 / +0.6 % against a 3.1 M-spp mode-`R`
+   > reference, with the merge half matching the CPU's to a median ratio of 0.9998. It used to force the CPU, which was a correctness gate rather than a missing feature:
+   > the device merge weight carried a single merge kind, so a GPU `-jsurf` run would not merely
+   > have skipped the surface merges, it would have *under-weighted the beam ones* — whose
+   > denominator has to include the point-merge terms to sum to one. Both halves landed together,
+   > so the device now renders the same three-technique estimator the CPU does; the port is gated
+   > bit-for-bit in both directions (merges off is still mode `D` exactly, and the beams-only path
+   > is byte-identical to before it). Tracked as **UPBP-VM** in `known-issues.md`, which also
+   > carries the head-to-head against mode `U`, which came out the other way: `U` is 4–6× better at equal time on diffuse GI, so it stays.
+
 The **image-forming modes are all progressive** — the forward camera models
-(`A`/`B`/`C`), the backward reference (`R`), the bidirectional tracer (`D`), and the
-composite (`P`) each refine an image whose brightness is fixed while only graininess
+(`A`/`B`/`C`), the backward reference (`R`), the bidirectional tracer (`D`), UPBP (`J`),
+and the composite (`P`) each refine an image whose brightness is fixed while only graininess
 falls, so they share the same live progress and budget flags (`-time` / `-noise` /
 `-forever` / `-preview` / `-interval`, and periodic crash-safe writes) on **both** the CPU
 and the GPU. They're all GPU-eligible too: **`A`/`B`/`C` and the forward pass of `V`** via
@@ -942,11 +1295,15 @@ backward reference (kept on the CPU as a stable ground truth), remain CPU-only. 
 composite `P` classifies its pixels once, then alternates forward and backward batches
 into two accumulating films, re-fitting the forward→backward scale and re-blending each
 interval. **Disk `-resume`/`-checkpoint` now cover `A`/`B`/`C` (photon-count checkpoint),
-`R`/`D` (spp-count checkpoint), and `P` (dual forward+backward film)** — a resumed render
+`R`/`D`/`J` (spp-count checkpoint), and `P` (dual forward+backward film)** — a resumed render
 continues the *absolute* sample sequence past whatever the checkpoint holds, so its added
 samples genuinely reduce variance; in the deterministic mode `W` the continuation is exact,
 and `-spp 3` followed by `-resume -spp 5` gives bit-for-bit the pixels of a plain `-spp 8`
-(note that `-spp` under `-resume` means *additional* samples, not a total). Since 0.190.3 the
+(note that `-spp` under `-resume` means *additional* samples, not a total). A resumed mode `J`
+rebuilds its beam map from the same seed, so the *merge* half of every added sample repeats the
+map the checkpoint was made against while the *connection* half decorrelates normally — not a
+bias (the map is one fixed realisation of a view-independent cache either way, exactly as in
+mode `M`), just a limit on how much a resume can quiet the merged component. Since 0.190.3 the
 sidecar also carries the `-radcache` table when there is one, as a sparse trailing section,
 so a resumed run continues with a warm cache instead of relearning it. Only the
 persistent-state photon modes `M`/`S`/`U` (whose per-pass state a film alone can't restore)
@@ -1154,6 +1511,119 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   extend/shade passes over a persistent photon pool and wins on **divergent /
   deep-path scenes and smaller GPUs**. Their RNG streams differ, so their images
   match only to within Monte-Carlo noise.
+- **`FTRACE_CHUNK_DEBUG` / `FTRACE_CHUNK_SPP` (diagnostics).** Progressive renders split
+  the sample budget into chunks sized by wall clock, and the normal progress line reports
+  only at chunk boundaries *and* only on a ~30 s log cadence — so a chunk whose line is
+  throttled away merges into its neighbour, and two very differently priced samples read as
+  one. `FTRACE_CHUNK_DEBUG=1` prints every chunk's size and wall time to **stderr**
+  (`[chunk] …`), which is what you want the moment a frame costs more than it should;
+  `FTRACE_CHUNK_SPP=<n>` pins the split instead of adapting it, so a measurement isn't at
+  the mercy of the clock. In **mode `M`**'s shared-photon-map GPU gather the same variable
+  reports per-**spp** cost, and `FTRACE_CHUNK_DEBUG=2` additionally reports every internal
+  *slice* (sample range + samples/s), which exposes the per-scanline-band cost structure
+  inside a single spp — on a scene with a dense participating-medium band the sky and the
+  cloud can differ by more than 10x, and only the slice trace shows it.
+- **`FTRACE_JDEVLIGHT` / `FTRACE_JSPLIT` / `FTRACE_JBAND` (mode `J` light-side diagnostics).**
+  The default is `FTRACE_JDEVLIGHT=3` with `FTRACE_JSPLIT=4` — the device surface light pass,
+  redrawn four times per chunk. `0` is `-jhostlight`; **`1`** traces the map on the device but
+  redraws it only once per epoch, which is the arm every measurement in `known-issues.md` was
+  taken against; **`2`** adds a `[jdevcmp]` dump comparing the host-traced and device-traced maps
+  field by field (means, medians, p99.9, max, the `gateC1` fraction and the `vert` histogram),
+  which is a far stronger test of the deposit than any image comparison — two ~49 000-sample
+  draws of one distribution agree to ~1/sqrt(N), while a transcription error is gross there;
+  **`4`** is the default arm (`3`) *plus* that dump, which exists so the dump's own cost can be
+  A/B'd inside one binary. **These are named arms, not a verbosity ladder** — a higher number
+  does not imply the ones below it, and 0.272.6 fixed a bug where the dump's `>= 2` gate swept
+  the `3` default into the diagnostic arm the moment the default moved from `1` to `3`, so every
+  shipped mode-`J` render was running the comparison once per light-side epoch.
+  `FTRACE_JSPLIT=<k>` sets the in-chunk split; it has an **interior optimum** (k=16 is worse than
+  k=4, because more realizations cost camera samples). `FTRACE_JBAND=1` redraws per wavefront
+  band instead, which is the only axis left once a frame is down to one sample per chunk — it
+  works and is free, but bought nothing measurable on the scene that motivated it, and it makes
+  pixels within one frame gather from different realizations, so it is **off by default**.
+- **`FTRACE_GAREJECT=<pct>` (experimental, mode `M`, host only).** Suppress the `-gatherarea`
+  correction for a gather whose probes REJECT at least `pct` percent of their hits on the normal
+  test — the dense-fur signature, where the correction has the wrong sign (see `FTRACE_GADIAG`).
+  **`30` is the measured knee** (at the default `M = 8`, `15` and `25` are the same gate): on
+  `gallery_rain`, scored at MATCHED sample count, it removes **~25 % of the fur overfill** —
+  `creature` +61.6 % → +45.7 % — for **4.5 points** of collateral spread across `alice_hair`,
+  `alice_dress` and `cap_gyroid`, a **3.5 : 1** trade. (Score these arms at fixed `-spp`, never
+  `-time`: a 15 % spread in sample count moves the 27-pixel `alice_hair` ROI by 17 points.) Paired by seed, since the gate consumes no rng and both arms share a photon map.
+  It is **not** a replacement for `-gatherarea 0` on a fur-dominated scene (which reads +11.8 %),
+  and it stays opt-in because it is host-only — defaulting it would split CPU from GPU.
+  `0`/unset is the default and is bit-identical.
+- **`FTRACE_GAREJW=<pct>` (experimental, mode `M`, host only).** The area a REJECTED footprint
+  probe contributes, as a percentage of an accepted flat-on one. `0` (default) reproduces the
+  pre-0.273.7 estimator exactly, where a reject counts as empty space. **Measured WORSE than
+  `FTRACE_GAREJECT=30`** and kept only so the comparison stays reproducible: `alice_hair` is
+  itself a tangle (~10 % reject against fur's 17-19 %), so a rule that acts in proportion to the
+  reject rate damages the hair it is supposed to protect, while a threshold between the two rates
+  does not. See `known-issues.md` → `M-GATHERAREA`.
+- **`FTRACE_GADIAG=1` (diagnostic, mode `M`).** Per-material tally of *why* a `-gatherarea`
+  footprint probe contributed nothing: **MISS** (the disc overhangs empty space — truncation) or
+  **REJECT** (geometry is there but faces outside the 60 degree cone — a tangle). The shipped
+  estimator adds zero in both cases and so cannot tell them apart, which is what makes the
+  correction right on cloth and hair and wrong on dense fur. Measured on `gallery_rain`, the split
+  separates the two by 5-10x — flat ground 0.0 % reject, fur 17-19 %, the truncation extreme 6 %
+  against 76 % miss. Off by default and bit-identical when off. See `known-issues.md` →
+  `M-GATHERAREA`.
+- **`FTRACE_LOADSTATS=1` (diagnostic).** Prints one `[loadstats]` line after the scene loads,
+  splitting the cost into **parse** (source text → block tree), **assets** (mesh files read and
+  parsed from disk, with the part spent **decoding textures** for imported materials called out
+  separately), **accel** (BVH construction), and **other** — the last being a *remainder*,
+  not a measured phase, covering fur grooms, isosurface polygonisation, medium voxelisation and
+  pattern/SDF bakes. `assets` and `accel` are timed where the work happens rather than by
+  subtraction, so only `other` carries the error of the rest. Useful when a scene takes longer
+  to open than to render. With it enabled each glTF asset also reports its own line, split into
+  image decode and spectral fit, which is what localises a slow load to one file: `gallery_rain`
+  reports `assets 8025 (of which texture decode 1307)
+  + accel 2721 + other 4091` of a 15.1 s load, i.e. **over half of it is reading mesh files**,
+  which is not what its conspicuous fur and volumetrics suggest.
+- **`FTRACE_MSTATS=1` (diagnostic, mode `M`).** Prints one `[mstats]` line at the end of the render
+  splitting the camera gather into the **surface density estimate** and the **beam gather**, with the
+  call counts and the beam share. Thread-seconds, so on N threads the two sum to more than the wall
+  clock. This is the measurement that sizes a volumetric cache: on `gallery_rain` 81 % of the gather
+  is beams (see **VOLCACHE** in `known-issues.md`).
+- **`FTRACE_NOBOWGPU=1` (diagnostic, mode `M` on the GPU).** Turns off the device's gather-time
+  spectral fold, so a rainbow beam is demoted to its monochromatic `CIE(λ)` record the way it was
+  before 0.264.0. The A/B control for that fold; on `gallery_rain` the fold changes 63 % of pixels and
+  is ~10 % faster.
+- **`FTRACE_NOWAVEFRONT=1` (diagnostic, mode `J` on the GPU).** Since 0.261.0 mode `J`'s device
+  camera pass runs its beam gather as a *wavefront* — segments are queued, candidates are
+  enumerated one thread per segment, and evaluated one thread per candidate — instead of one
+  thread per camera path doing everything inline, which was warp-divergent (measured 11× more
+  spp at equal time on `_fog_thick`). Both paths are the same estimator summed in a different
+  order. Setting this forces the old inline gather, which is the A/B control for any parity
+  question; the render reports its queue use in a `[gpu] mode J wavefront gather:` line and where its
+  seconds went — GPU time of the walk, the beam-hit search and the hit evaluation, and the host gaps
+  between waves — in a `[gpu] mode J wave loop:` line. `FTRACE_WAVE_DEBUG=1` prints one `[wave]` line per
+  wave (paths, segments, hits, spills, and the three kernel times) for finer diagnosis.
+- **`FTRACE_WFSTRAT=1` (diagnostic, mode `J` on the GPU).** Orders the wavefront gather’s waves as
+  stratified samples of the whole image (32-pixel runs permuted by a golden-ratio stride) instead of
+  horizontal bands. It makes the adaptive wave size exact — on `_fog_cornell` it cuts the
+  on-the-spot spill from 59 M to 8.4 M hits at 256² / 60 s — but it costs about 7 % of the paths on
+  `_fog_thick`, because a stratified wave is as heterogeneous as the image allows and the beam-tree
+  walk diverges across a warp; a spilled candidate is evaluated in place and costs nothing
+  measurable, so bands are the default. The image is the same either way (per-pixel sample streams
+  are seeded by pixel); this is the A/B for the ordering itself.
+- **`FTRACE_J_HALF` / `FTRACE_BEAM_DIAG` (mode-J diagnostics).** Mode `J` combines BDPT
+  connections with the beam×ray merge, and when its image comes out at the wrong brightness
+  the two halves are indistinguishable from the outside — a broken MIS weight and a beam map
+  that simply isn't where the camera is looking both read as "uniformly too dark".
+  `FTRACE_J_HALF=connections` / `=merges` renders **one half of the estimator, MIS weights
+  and all**. Neither half is a correct image alone, but because the RNG is re-seeded per
+  (pixel, sample) — so suppressing one half cannot perturb the other's stream — the two
+  **sum to exactly the full mode-J image**, which attributes a whole-frame energy error to
+  one half or the other in two renders. `=merges-raw` additionally forces the merge weight
+  to 1, giving the unweighted BB1D estimator: if `merges` and `merges-raw` are *both* zero
+  the weight is exonerated, and the beam map itself is the problem.
+  `FTRACE_BEAM_DIAG=1` then says why, tallying to **stderr** what the beam×ray query
+  actually saw — how many beams the BVH handed to `closestApproach`, which of its four
+  geometric rejections (parallel / t-range / s-range / radius) consumed them, the closest
+  approach ever seen as a multiple of the kernel radius, and which of the gather's own tests
+  (bad medium, σ_s ≤ 0, phase ≤ 0, weight ≤ 0, transmittance ≤ 0) dropped the survivors.
+  Both are off unless set, and cost nothing when off. This pair is what found the
+  `sceneRadius` beam-truncation bug — see known-issues.md → J-SCENERADIUS.
 
 ---
 
@@ -2170,13 +2640,30 @@ per-path carrier is left unqualified here.
 
 | Subtype | Description | Key parameters |
 |---|---|---|
-| *(default)* area | Rectangular area light | `origin`, `u`, `v`, `normal`, `spd` |
+| *(default)* area | Rectangular area light | `origin`, `u`, `v`, `normal`, `spd`, `hide_camera` |
 | `sphere` | Spherical area light | `center`, `radius`, `spd` |
 | `cylinder` | Cylindrical tube light | `center`, `axis`, `length`, `radius`, `caps`, `spd` |
 | `spot` | Cone spotlight with penumbra | `origin`, `dir`, `inner_angle`, `outer_angle`, `spd` |
 | `collimated` | Parallel beam (3 cm pencil, ×enclosing group scale), centered on `origin` | `origin`, `dir`, `spd` |
 | `sun` | Distant directional sun (parallel beam over the whole scene, soft-edged disc) | `elevation` + `azimuth` (or `dir`), `angle`, `spd`, `intensity` |
 | `env` | Environment / IBL light | `file` (lat-long HDR) or `spd`, `rotate`, `intensity`, **or `sky`** (analytic sky, below) |
+
+**Invisible fill flats — `hide_camera`.** A rectangular `area` light is real,
+opaque geometry (two triangles in the BVH), so it renders as a visible slab whenever
+it falls in frame. `hide_camera on` inside an `area` block turns off **primary
+visibility only**, the same narrow meaning the flag has in Cycles / Arnold / PBRT: the
+bounce-0 camera ray passes straight through, and **every other ray sees the surface
+unchanged** — it still emits at full power, keeps its share of the light-selection CDF,
+is still sampled by NEE, still occludes, still casts shadows, and still shows up in a
+specular reflection (a mirror ray is traced at bounce 1). Seen *through* glass it is
+visible, since a refracted ray is not a camera ray. That is exactly what a studio fill
+panel wants: it exists to be *seen in* a highlight, never to be seen directly, and
+without the flag its out-of-frame-ness is a property of one particular camera that
+breaks the moment the camera moves or widens its field of view. Works in every render
+mode on both backends, and costs nothing when unused (a scene with no hidden material
+pays one uniform compare per camera ray, and a hidden primitive is rejected *before*
+it is intersected). The raster preview deliberately keeps drawing hidden flats, so you
+can still see where they are. See FTSL.md §11.1.
 
 **Distant sun.** `light sun { … }` is a first-class **directional** emitter: an
 infinitely-distant disc of angular diameter `angle` (degrees; default `0.53`, the real
@@ -2307,15 +2794,82 @@ first.
 **Curves and fibers** below), and `mesh` (**OBJ, glTF 2.0 / GLB,
 Autodesk FBX, Stanford PLY, STL, and `.ftmesh`** import — the loader dispatches on file
 extension; an extension it does not recognise is parsed as OBJ, and a file that yields
-**zero triangles is a hard load error**, never a silently empty scene). glTF brings
+**zero triangles is a hard load error**, never a silently empty scene). Which formats
+carry a *material* differs, and `tools/mesh_format_matrix.py` renders one geometry
+through all of them to prove it: **OBJ** (via `.mtl`), **glTF/GLB** and **FBX** import
+colour and transmissive glass; **STL** has no material data in the format at all, and
+**`.ftmesh`** is deliberately geometry-only, so for those two every face takes the
+`material` the scene assigns.
+
+**Per-vertex colour** is imported from every format that carries it — PLY's
+`red`/`green`/`blue` (or `diffuse_red`/…), OBJ's extended `v x y z r g b`, glTF's
+`COLOR_0`, and an FBX colour layer — and **multiplies** the material's albedo, which is
+glTF's rule for `COLOR_0` and degrades sensibly elsewhere (against a white material it
+*is* the vertex colour). PLY and OBJ colours are taken as display-space and linearised;
+glTF and FBX state theirs as linear already. It works in the preview **and** in real
+renders: the rasterizer is an RGB pipeline and uses the colour directly, while the
+spectral tracer interpolates the colour across the face and turns it into a reflectance
+per hit through the shared Jakob-Hanika coefficient table (the same one stochastic tiling
+uses, and for the same reason — a colour that exists at no vertex still needs a spectrum).
+It works on every backend — CPU and GPU rasterizer, CPU and GPU tracer — and through
+`mesh_asset` instancing, since a BLAS indexes the same scene-wide colour table. The GPU
+tracer resolves the spectrum with the same shared table and the same `stochJhCoeff`
+lookup the host uses, so the two agree rather than approximate each other.
+`tools/vertex_color_check.py` renders a hue-ramped sphere through every importer, every
+backend and the instanced path to prove it.
+glTF brings
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
-roughness → lobe width; `import_materials no` forces the FTSL `material` instead).
+roughness → lobe width; `import_materials no` forces the FTSL `material` instead), plus
+the four KHR extensions that describe **glass** — without which a transmissive asset
+arrives opaque and white, since that is literally what its core block says:
+`KHR_materials_transmission` (≥ 0.5 → a `dielectric`, the same 0.5 cut `metallic` uses),
+`KHR_materials_ior` → `ior`, `KHR_materials_volume` → `absorb` (its
+`attenuationColor`/`attenuationDistance` are Beer-Lambert, so
+σ = −ln(color)/distance, exactly ftrace's per-metre coefficient — and the distance is
+kept as a preview hint, see *See-through*), and `KHR_materials_dispersion`, whose
+strength is defined as 20/Abbe and so converts to a two-term Cauchy index reproducing
+the same n_d and the same F-to-C spread. Clearcoat, sheen and the rest are still
+ignored.
+It also imports **textures**: `baseColorTexture` → the material's reflectance map (decoded
+as sRGB, with the base-colour factor folded into its texels), `metallicRoughnessTexture` →
+the roughness map (glTF packs occlusion/roughness/metalness into R/G/B, so the **green**
+plane is broadcast to all three channels for ftrace's scalar sampler) and `normalTexture` →
+the normal map, with glTF's `scale` as its strength. Images are decoded **in place** — from
+a bufferView of the GLB's own BIN chunk, a base64 `data:` URI, or a sibling file — so a
+single self-contained `.glb` needs nothing beside it. Two things happen on the way in that
+are worth knowing about:
+* **Big atlases are area-averaged down to 2048 px** in linear light. A texture is stored as
+  `Vec3` doubles and a reflectance map carries a Jakob-Hanika coefficient table beside it,
+  so the 8192² atlases AI mesh generators emit as a matter of course would cost gigabytes;
+  2048 still leaves 4.2 M texels for an asset that covers tens of thousands of pixels.
+* **Metalness is read from the map, not just the factor.** The mean of the map's blue
+  channel multiplies `metallicFactor` before the ≥ 0.5 diffuse-vs-metal cut, because
+  exporters routinely write `metallicFactor 1.0` and put the real (near-zero) metalness in
+  the map — reading the factor alone turns a painted character into a mirror.
+Only `TEXCOORD_0` is used (a map declared on texCoord 1 is sampled with set 0's UVs), there
+is no `KHR_texture_transform`, and occlusion/emissive maps are ignored. Sampler `wrapS` and
+`magFilter` are honoured; ftrace has one wrap mode per texture, so an S/T pair that
+disagrees collapses to S. The load line reports what arrived —
+`loadGltf: alice.glb -> 407792 tris [glTF materials, 2 textures]`.
 `skip_material <substr>[,…]` (repeatable) drops glTF primitives whose material name
 matches — the way to strip the ground plane / studio backdrop that asset-store models
 bundle in with the subject, since geometry can't be subtracted after it loads.
+**OBJ** reads its companion **`.mtl`** (named by `mtllib`, resolved beside the file):
+`Kd` → albedo, `d`/`Tr` → dissolve (< 0.5, or `illum` 4/6/7/9, makes the material a
+**dielectric**), `Ni` → `ior`, `Tf` → `absorb` as one scene unit of glass, and `Ks`/`Ns`
+→ a glossy lobe **only** under a raytrace-reflection `illum` (3/5/8) — a high `Ns` alone
+does not mean metal, since Blender writes `Ks 0.5 / Ns 250` for an ordinary diffuse
+export. A scene's own `use_names` materials still win over the library, and a missing or
+unreadable `.mtl` is silent (plenty of OBJs name one that was never shipped).
+
 **FBX** (`.fbx`, via the vendored MIT/public-domain [`ufbx`](https://github.com/ufbx/ufbx)
-library) imports baked triangle geometry — every mesh instance's faces are
+library) imports its materials from ufbx's normalised PBR property set, falling back to
+the legacy FBX one — base colour → albedo, `transmission_factor` ≥ 0.5 → dielectric with
+`specular_ior`/`transmission_color`, `metalness` ≥ 0.5 → glossy — assigned **per face**
+via `face_material`, so a multi-material FBX arrives as several materials. There is
+deliberately no legacy-Phong → glossy rule, for the same reason OBJ requires `illum`.
+It also imports baked triangle geometry — every mesh instance's faces are
 triangulated and baked through ufbx's world transform, with generated-if-missing
 per-vertex normals and the first UV set filling the same smooth-shading / texturing
 slots the OBJ/glTF paths use; the scene is normalized to right-handed Y-up metres at
@@ -2673,7 +3227,8 @@ isosurface {
 ```
 
 The `expr` string is compiled by the **same math VM as procedural patterns** (variables
-`x y z` and `r = |p|`, plus `sin cos tan exp log sqrt abs floor fract sign min max pow
+`x y z`, `r = |p|`, and — for a field evaluated on an
+[N-D slice](#implicit-fields-the-other-n-d-route) — `d4` … `d12`, plus `sin cos tan exp log sqrt abs floor fract sign min max pow
 atan2 clamp mix smoothstep noise`, the vector-noise components `dnoisex/y/z` /
 `dturbx/y/z` for gradient-noise domain warping, cellular noise
 `worley/worley2/worleyd/worleyid(x, y, z, metric)`, blue-noise placement
@@ -3740,8 +4295,12 @@ placed by delta tracking (analog throughput) and connection edges weighted by ra
 transmittance, exactly as the forward tracer samples them. (The MIS weights omit the
 heterogeneous distance-pdf / transmittance — a variance-only simplification per PBRT-v3;
 the balance heuristic is a partition of unity so the estimator stays unbiased regardless.)
-The backward reference (R/V) and the P composite treat the medium as a single global homogeneous haze
-and warn if you author `density`/`bounds` for them. See `FTSL.md` §12.1.
+**Every other transport layer sees the same media too, since 0.254.0** — the backward reference
+(`R`/`W`/`V`), the `P` composite's camera-side layer and mode `M`'s `-pmfg` final gather all
+superpose the full `medium` list, each region with its own `bounds`, `density` field and phase
+function, on both devices. (Before 0.254.0 the CPU backward tracer collapsed them to the *first*
+authored medium treated as an unbounded homogeneous haze, and warned when it did.) See
+`FTSL.md` §12.1.
 
 **Imported volumes (`.nvdb` / `.vdb`).** Instead of a formula, point the density field at a
 real sparse volume: `density vdb:<path>` imports either a NanoVDB **FloatGrid** (`.nvdb`, the
@@ -3835,6 +4394,15 @@ sphere=((0.5, 0.45, 0.5), 0.32), density_max=1.2)`.
 > **Full reference: [`FTSL.md`](FTSL.md)** — the complete grammar (every block, key,
 > default, spectrum/pattern/material form, and parsing quirk). The overview below is a
 > quick tour; `FTSL.md` is the authoritative spec.
+
+**Comments are `#` or `//`, to end of line.** Both markers are equivalent and both stop
+at the newline; `#` is the canonical one used throughout `scenes/`, and `//` is accepted
+because it is what most people type by reflex. There is deliberately **no `/* … */`** —
+newlines are significant in FTSL (they end statements), so a comment that could cross a
+line would silently delete the statement separators it crossed; a scene containing a
+stray `/*` gets a parse error that says exactly that. A marker only starts a comment at
+the **beginning of a token**, so a `//` inside a bareword (or inside a quoted path, which
+lexes as a string) is left alone.
 
 An FTSL file is a list of blocks. Top-level block types: `scene` (the
 `units …` / `spectral …` header), `material`, `texture`, `pattern` (procedural scalar
@@ -4206,20 +4774,30 @@ splat as before.
 make a rainbow crisper, and it doubles as a regression lever. `-beams-order n` caps at orders
 `1..n`; the default `0` is unlimited (bounded only by `-bounces`).
 
-Sizing: `-beamk <K>` (default 32) sets how many beams a camera segment should gather and the
-kernel radius is derived from it; `-beamcount <n>` (default 1e6) caps stored beams by unbiased
-adaptive thinning; `-beamradius <r>` overrides the radius outright. See the flag table for why
-the beam radius is **much** smaller than the photon-map gather radius.
+Sizing (**changed in 0.201.0**): `-beamblur <frac>` (default `0.01`) sets the kernel half-width
+as a fraction of **each medium's own measured mean free path**; `-beamk <K>` (default 32) is a
+*floor* on the gathered count for sparse maps; `-beamareaslack <f>` (default 1.0) is the cost
+ceiling; `-beamcount <n>` (default 1e6) caps stored beams by unbiased adaptive thinning;
+`-beamradius <r>` overrides the radius outright with one value for every medium. See the flag
+table for why the beam radius is **much** smaller than the photon-map gather radius.
 
 **Reading the noise.** Beam noise does not look like ordinary sample noise — it appears as
-**coloured streaks radiating through the volume**, because a thin kernel over too few stored
-beams lets individual beams be resolved. More `-spp` barely touches it. The knobs that do are
-`-beamcount` (more beams, but the cost climbs steeply because beam AABBs overlap heavily) and
-`-beamk` (a larger `K` widens the kernel, so the same beams blur together — cheaper, at the
-price of a softer bow). Note the consequence of the radius being derived from `K`: lowering
-`-beamcount` does **not** make the image noisier, it makes it *blurrier* and much faster — on
-`_fog_cornell`, `1e6 → 1e5` ran 10.5× quicker for a visually indistinguishable frame with
-auto-exposure agreeing to three significant figures.
+**coloured streaks radiating through the volume**, and in a thick medium as full-saturation
+colour speckle, because each stored beam is *monochromatic* and a thin kernel over too few of
+them lets individual beams be resolved. More `-spp` barely touches it: `-spp` averages the same
+beams again.
+
+Before 0.201.0 **more `-n` did not touch it either**, and that was a design fault rather than a
+fact of the estimator: the radius was solved to hit `-beamk` beams per gather, total beam length
+grows with the photon count, so `r ∝ 1/n` and every extra photon bought a smaller kernel instead
+of more samples. Measured on `gallery_rain`'s cloud, `-n 40M → 160M` moved chroma saturation
+0.1157 → 0.1078 (nothing) while the radius shrank 2.83e-4 → 1.65e-4 to keep the count pinned.
+The radius is now a physical scale (a fixed fraction of the medium's mean free path) that does
+not move with `n` at all, so the knobs that reduce beam noise are the ones you would expect:
+**`-n`** (more stored beams under the same kernel), **`-beamcount`** (keep more of them), and
+**`-beamblur`** (a wider kernel blurs the same beams together — cheaper, at the price of a softer
+bow). Same scene, same photons, `-beamblur 0.01` against the old `-beamk 32` rule: cloud chroma
+saturation **0.1157 → 0.0533**.
 
 **Validated against the `A`/`B` estimator.** On `scenes/_rainbow_test.ftsl`, `-mode M -beams`
 and the established mode-`B` beam splat (forced on with a second camera, since the `A`/`B`
@@ -4278,7 +4856,7 @@ noise floor. (`0 beams stored` in the `-beams` log is correct here — every med
 is GRIN, so there is nothing to deposit.)
 
 **What actually costs time, and the split rule (0.196.0).** Not the number of beams gathered —
-a 16× change in `-beamk` moves the gather 3%. The cost is how many beam AABBs a camera ray has
+a 16× change in the gathered count moves the gather 3%. The cost is how many beam AABBs a ray has
 to *enter*, which by Cauchy's formula is proportional to their total **surface area**. So beams
 are split into sub-segments to tighten those boxes, and each beam is split at its own optimum
 rather than at one length for the whole scene: minimising the area of a beam of length `L` split
@@ -4295,7 +4873,7 @@ bit-identical. See `-beamsplitmax` / `-beamsplit`, and `known-issues.md` for the
 **The beam map persists.** `-savemap <f>` / `-loadmap <f>` store and reload the volume cache
 alongside the surface photons, so the forward pass can be paid once and re-gathered forever.
 A saved cache holds the **raw** crossings, not the split sub-beams, so a reload
-re-solves the kernel from scratch and a later `-beamk` / `-beamradius` still applies. Measured
+re-solves the kernel from scratch and a later `-beamblur` / `-beamk` / `-beamradius` still applies. Measured
 on `_rainbow_test` (1e7 photons): 53.3 s to trace and build, **2.6 s** to reload and build, for
 a bit-identical image.
 
@@ -4319,6 +4897,10 @@ them as animation frames:
   the expensive forward pass is paid once, yet frames don't inherit a shared grain.
 - **`C`/`R`/`D`/`P`/`V`** — each camera is traced **fully independently** with its own
   sample budget, so their randomness (and noise) is **uncorrelated** by construction.
+- **`J`** — independent per camera like `D`, and **currently that includes the beam map**:
+  each frame traces its own photon pass and builds its own map. The map is view-independent
+  and mode `M` already shares one across a whole flythrough, so this is a real (and purely
+  mechanical) inefficiency rather than a design choice — tracked in `known-issues.md`.
 
 Mode `B`'s correlation is usually invisible (and cheaper), but if you want independent,
 film-grain-like noise per camera/frame, render them separately (e.g. via a budget flag,
@@ -4479,6 +5061,235 @@ add-on), this doubles as a Blender → FTSL path.
 
 ---
 
+## N-dimensional rotation (`-nd`)
+
+Load any model ftrace can read, treat its vertices as points of **N-dimensional space**,
+rotate them with the `n(n-1)/2` independent plane rotations such a space has, and project
+orthographically back to three dimensions. The projected mesh **replaces the scene's own**,
+so it previews in the rasterizer, path-traces in every render mode, and can be written back
+out as a model in its own right.
+
+```
+ftrace model.glb -nd 5                      # 5-D: 10 sliders, in the interactive viewer
+ftrace model.glb -nd 4 -nd-angle xw=45      # seed a plane and look at it
+ftrace model.glb -nd 4 -nd-fill w=extrude:0.5 -nd-angle zw=35 \
+                 -nd-export png/prism.obj   # write the projection out, headless
+```
+
+`-nd <n>` **implies the interactive viewer** (as `-explore` does) unless a genuine
+light-transport request is on the command line — so `-nd 4 -mode D -n 1e8 -o png/x.png`
+path-traces the warped model once, headless, with no window.
+
+Only **authored mesh objects** are warped. Native primitives (a floor quad, a box, an
+analytic sphere) stay where they are, because `-nd` is a tool for looking at a *model*, not
+for folding up the room around it; `-nd-object <name>` narrows it further to one mesh.
+Emissive meshes are skipped, since a mesh light copies its triangles into the emitter at
+load time and moving the surface without rebuilding the light would leave the two
+disagreeing about where the light is.
+
+### Why a zero-filled lift is only a 3x3 matrix
+
+Worth knowing before you reach for a large `n`, because it decides whether you need a
+**fill**. Lift a 3-D model by putting **zeros** in dimensions 4…n and the rotation only
+ever reads `R`'s first three *columns*; dropping the extra rows on the way back leaves
+
+```
+p' = M p,   M = R[0:3, 0:3]
+```
+
+— the *same* 3x3 matrix for every vertex. `M` is the top-left block of an orthogonal
+matrix, so its singular values are all ≤ 1: the model can be rotated and **squashed**,
+never stretched. Concretely, a rotation by θ in the **x–w** plane is literally
+
+```
+x' = x·cos θ      y' = y      z' = z
+```
+
+At 90° the model is a flat sheet; at 180° it is `x → −x`, its own **mirror image**. That
+mirror flip (`det M < 0`) is genuinely unreachable by any 3-D rotation, and passing
+continuously through the flat state to get there is the one thing the zero-filled lift
+buys you. Everything else it can do, a `transform` block could do too. ftrace says so out
+loud rather than letting you wonder:
+
+```
+[nd] this warp is LINEAR — every extra dimension is `zero`, so the result is the
+     source model under a single 3x3 matrix (det -0.8134, MIRRORED). Use -nd-fill
+     <dim>=emboss:... or extrude:... for a warp that is not affine.
+```
+
+How much freedom `M` has depends on `n`: at `n = 4` exactly one axis is squashed (the other
+two are preserved), at `n = 5` two are, and from `n = 6` up the sliders can reach **any**
+3x3 contraction. (loom's `mathnd.py` states the same result for *fields* — a 3-input field
+rotated in N-D and sliced back only ever sees an affine remap.)
+
+### Implicit fields: the other N-D route
+
+Everything above is about a **mesh**, and the fills exist because a mesh is a 2-manifold
+sitting in a 3-flat: rotate it in N-D, project back orthographically, and you provably get
+an affine squash unless something puts content in the extra coordinates.
+
+An **implicit field** is not like that. It is defined *everywhere* in N-space, so `-nd`
+does something completely different with one: it tilts the **3-D slice** the field is
+evaluated on. The N-D sample point of a 3-D position `p` is `R · (p, 0, …, 0)`; its first
+three components feed the field's `x`/`y`/`z` and the rest feed **`d4` … `d12`**, nine new
+field variables. Rotating changes which 3-flat of N-space you are looking at, so the
+cross-section genuinely changes — channels reconnect, handles open and close, the topology
+changes. No `emboss`, no `extrude`, no re-tessellation of a source mesh.
+
+The one condition is that the field must actually **read** `d4`. A three-input field
+sliced in N-D only ever sees an affine remap of `(x, y, z)` — the same result, for the same
+reason, as the mesh case — so ftrace says so when it loads one:
+
+```
+[nd] 1 implicit field(s) evaluated on a 4-D slice — but no field reads d4..,
+     so the slice can only remap (x,y,z) affinely; add a d4 term to get a real morph
+```
+
+`scenes/_nd_gyroid.ftsl` is the worked example: the Schoen gyroid's cyclic
+`sin(u)·cos(next u)` sum extended to run `x → y → z → d4 → x`, so it is a genuinely
+four-dimensional field. Rotating `zw` morphs it; rotating `xy` — a rotation entirely inside
+the visible 3-space — merely turns the same solid, which is the control that shows the
+fourth dimension is doing the work.
+
+Both routes share one rotation, so a scene with a mesh *and* an isosurface gets the mesh
+projected and the field sliced by the same sliders. It works in the interactive viewer, in
+the rasterizer (which marches the sliced field) and in the path tracer, on CPU and GPU.
+
+### Filling the extra dimensions
+
+The projection is affine only because the extra coordinates are *constant*. `-nd-fill`
+gives them content, per dimension and independently — dimension 4 can extrude while
+dimension 5 embosses curvature and dimension 6 stays zero.
+
+`-nd-fill <k>=<spec>`, where `k` is the 1-based dimension number (`4`, `5`, …) or its axis
+letter (`w`, `v`, `u`, …). Repeatable.
+
+| Spec | What it does |
+|---|---|
+| `zero` | The classic lift (default). Affine, per above. |
+| `emboss:<src>[:amp[:freq]]` | `x_k = amp · f(vertex)` for a per-vertex scalar `f`. Now `x_k` **varies over the surface**, so `p' = M p + Σ col_k · f_k(p)` is genuinely non-linear and the projection reveals shape that was not in the original. **Topology is untouched** — every vertex and every edge connection survives exactly. |
+| `extrude[:depth]` | Sweeps the mesh into a **real N-D prism** along that axis, keeping its **boundary**. |
+| `skeleton[:depth]` | The same sweep keeping the full CW **2-skeleton** — every edge swept, not just the rim. Aliases: `tesseract`, `2skeleton`, `extrude-skeleton`. |
+
+`amp` and `depth` are fractions of the **model radius**, so the same number means the same
+visual amount whether the model is a 2 cm ring or a 40 m building.
+
+Emboss sources: `curvature` (discrete mean curvature, signed — a bulge positive, a pit
+negative), `radius` (distance from the model centre), `height` (the y coordinate), `noise`
+(the renderer's own solid noise; `freq` is cycles across the model), `u` / `v` (texture
+coordinates). Every source is centred to zero mean and normalised to unit peak before `amp`
+scales it, so an embossed model stays put rather than drifting off-origin.
+
+**What `extrude` actually builds.** The boundary of a 4-D prism is a 3-manifold, which no
+triangle rasterizer can draw, so what is built is the **boundary surface** of the sweep: the
+original triangles at one end, their copy at the other, and each **boundary** edge swept into
+a quad. It is a genuine N-D solid whose 3-D projection changes qualitatively as it turns.
+
+*Boundary* edges only, meaning those with exactly one incident face. The boundary of `S × [0,h]`
+is `S ∪ (S+h) ∪ (∂S × [0,h])`, so an edge that already has two faces contributes nothing to it,
+and a **closed** mesh (`∂S = ∅`) simply doubles: `F → 2F`, no side walls. An open mesh — a plane,
+a shell with a hole — does get walls along its rim, which is what closes the prism.
+
+> Until 0.235.0 a wall was swept over *every* edge, which builds the CW **2-skeleton** rather
+> than the boundary. That is a different object: correct as a complex, wrong as a surface,
+> because every wall over an interior edge is a partition buried inside the solid. Opaque
+> renders never showed it (the z-buffer discards those walls) but `-see-through` charges a
+> transmittance per crossed surface, so a closed model — where *every* edge is interior, i.e.
+> `V+F−2` phantom walls — saturated to a flat silhouette. It also made the mesh far larger
+> than it needed to be.
+
+Cost is therefore `V → 2V`, `E → 2E + V`, and `F → 2F + 2B` for `extrude` with `B` the
+boundary-edge count, or `F → 2F + 2E` for `skeleton`: a closed mesh **doubles** under `extrude`
+and grows about **3.5x** under `skeleton`. `-nd-budget <n>` (default 8 000 000) refuses a
+configuration past a triangle ceiling instead of trying to build it.
+
+**Which to use.** `skeleton` is the classic depiction and the one that makes an extrusion read as
+a single 4-D object — a tesseract is drawn as its 24 squares, 12 of them swept cube edges — so it
+is right for a coarse polytope. `extrude` is right for a dense scanned or sculpted surface, where
+every edge is an artefact of triangulation rather than real structure: there the swept interior
+quads are invisible to an opaque render (the z-buffer discards them) but ruinous to
+`-see-through`, which charges a transmittance per crossed surface and saturates to a flat
+silhouette. A closed mesh under `extrude` simply doubles, so you see the two copies separate as
+you rotate with nothing between them, which is honest — for a closed surface there is genuinely
+nothing there.
+
+> **An extruded axis is invisible until you turn it into view.** An extra dimension reaches
+> the image only through column `k` of the rotation matrix's first three rows; until some
+> rotated plane contains axis `k`, that column is zero, the prism's side walls project to
+> zero area, and they are culled — the triangle count drops straight back to the two lids
+> and it looks like nothing happened. It is the correct picture of a solid seen exactly
+> edge-on. ftrace names the axis and suggests a plane:
+> `[nd] v is filled but edge-on to the projection (turn a plane containing it, e.g. zv, to see it)`
+
+### The interactive slider bank
+
+**A `Help` button in the control strip** opens a written page — every button, key, slider
+and field, and what each `emboss`/`extrude` fill actually does to a model — in your default
+browser. It is generated by the binary itself and written to the temp directory, so it always
+describes the build you are running and needs no repo, no assets and no network.
+
+The live window's control strip grows a **slider per rotation plane**, labelled with the
+plane it turns and its current angle (`xw +25`), wrapped into as many rows as the window
+width allows — 6 sliders at `n = 4`, 21 at `n = 7`, 45 at `n = 10`. Dragging one re-warps
+the model from the pristine captured copy (angles are absolute, never composed), re-shades
+it and re-renders, live. The fly camera, `-see-through` glass and every other viewer control
+keep working throughout.
+
+Above them sits one **fill cell per extra dimension** — the same `zero` / `emboss:<src>` /
+`extrude` choice `-nd-fill` takes, as a pick-list plus an amount slider reading in the same
+model-radius units. This is the control that decides whether the viewer can do anything
+beyond rotate and squash: leave every dimension at `zero` and the whole bank is one 3x3
+matrix, which is why the readout says so — and says what to do about it. While every
+dimension is `zero` the panel's status line reads
+
+```
+250744 tris  |  w=zero v=zero  |  linear: rotating can only squash - set a FILL below (+ raise its amount) to morph
+```
+
+naming the control rather than only the symptom. (It used to stop at
+`linear (a 3x3 squash)`, which correctly described the state and left you no idea that the
+dropdown two rows down was the cure.) The same is true on the console: a linear warp prints
+copy-pasteable `-nd-fill` lines rather than an abstract summary of the syntax.
+
+Two things the cells do for you. Picking a fill while its amount is still 0 starts it at a
+visible default (0.25 emboss, 0.5 extrude), since an emboss at zero is indistinguishable
+from `zero`. And switching one on while its axis is **completely edge-on** turns the
+`z`-*axis* plane to 30° so you can see what you just asked for — the slider visibly moves
+and the reason is printed, rather than leaving you looking at an unchanged model.
+
+Beside them: an **N-D dims** box that changes `n` on the fly (the bank is rebuilt, and
+angles are carried across by **plane identity**, so `xw` stays `xw` rather than being
+re-indexed), a **Reset** that zeroes every angle, **Save model**, and a readout of the
+triangle count, the fills in force, and the linear/edge-on warnings above.
+
+Rebuilding the acceleration structure is deliberately *skipped* while you drag — the
+rasterizer does not need one, and rebuilding a 2 M-triangle extrusion's BVH per slider tick
+would cost seconds. It is rebuilt lazily, once, if you press `T` for a traced preview.
+
+### Saving the projected model
+
+The projection is a real mesh, not a view transform, so it can be kept:
+
+* **`-nd-export <file>`** writes it and exits. `.obj` (welded positions, per-corner normals
+  and UVs, one `o` object per source mesh and `usemtl` per material) or `.ftmesh` (the
+  binary indexed format — see *Geometry*).
+* **Save model** in the viewer writes the configuration you have dialled in, to the
+  `-nd-export` path if you gave one, else to a `<model>_nd.obj` sibling of the source.
+  (Passing both `-nd-export` and `-explore` makes the path the button's target instead of
+  exiting immediately.)
+
+Either way the result reloads as an ordinary model — `ftrace out.obj` — and renders in any
+mode.
+
+`-nd-crease <deg>` (default 30) sets the crease angle used when normals have to be
+re-derived, which happens for any non-linear fill. A purely linear warp instead carries the
+model's *authored* normals through the inverse transpose, so its original smoothing groups
+survive exactly.
+
+`-checknd` runs the algebra and combinatorics as a self-test.
+
+---
+
 ## Command-line reference
 
 **Core**
@@ -4493,25 +5304,44 @@ add-on), this doubles as a Blender → FTSL path.
 | `-topng <in> <out.png> [-ev <c>] [-exposure-anchor <v\|file>]` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); `-ev` re-develops a `.ftbuf` brighter/darker, `-exposure-anchor` develops it at a **shared** gain so a whole sequence of checkpoints can be re-developed flicker-free. See **Output** |
 | `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
 | `-serve` | **Resident preview server.** With `-serve -in <scene.ftsl> [flags…]`, ftrace does *not* exit after one render: it keeps the process — and with it the live window, CUDA context, and spectral/spectral-upsampling tables — resident, and re-renders whenever a new scene path arrives on **stdin** (one path per line), reusing all the other flags (`-mode`/`-n`/`-r`/`-window`/`-o`/…) with only `-in` swapped per frame. Line protocol: prints `[serve] ready` once, then `[serve] done <path>` after each frame; `quit`/`exit`/EOF ends the loop (`[serve] shutdown`). This skips the per-frame cost of process spawn + window/CUDA/table init — the dominant fixed overhead for cheap preview frames — so an external driver (e.g. loom's `PreviewServer`) can stream an animation into a single window that updates in place. Scope: resident-process reuse only; each frame is still a full independent render (no delta/geometry caching yet) and the window keeps the first frame's resolution for the session. |
-| `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
+| `-mode <A..D,J,M,S,U,P,R,V>` | Render mode (default `B`) |
 | `-on-unsupported error\|fallback\|strip` | What to do when the selected mode can't render a scene feature (GRIN media, or a fisheye camera in mode `D`/`U`). `error` (default) prints a diagnostic and aborts; `fallback` renders that camera in mode `R` (backward reference) instead; `strip` removes the offending feature (e.g. drops the GRIN `ior`, turning the medium into a plain one) and renders in the requested mode anyway. Complements `prefer { … } else { … }` in the scene file, which resolves the mode/feature mismatch *before* this policy is consulted |
 | `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier. In mode `M` this is the *starting* radius the density adaptation refines from — except `-pmradius`, which pins it exactly (implies `-nopmauto`) |
 | `-pmcount <k>` | Mode `M` density-adaptive gather radius: target number of photons a typical gather should see, at 1 M stored photons (default `200`; the target grows as the cube root of the stored count). Implies `-pmauto`. Higher = smoother/blurrier and slower, lower = sharper/grainier and faster |
 | `-pmauto` / `-nopmauto` | Turn the mode-`M` density-adaptive gather radius on (default) or off. `-nopmauto` reproduces the old fixed-radius output bit-for-bit |
+| `-caustics` / `-nocaustics` | Mode `M` **two-map caustic split** (Jensen), on by default. Deposits reached by an L·S⁺·D path — focused by ≥1 specular / near-specular vertex and never scattered since the light — go to a separate caustic map with its own smaller adaptive radius, and the gather sums the two density estimates. The partition is strict and both maps share `nEmitted`, so the split neither double-counts nor drops anything; a scene with no caustics simply builds an empty second map. `-nocaustics` restores the single-map behaviour |
+| `-pmccount <k>` | Caustic map's `-pmcount`: target gather population at 1 M stored *caustic* photons (default `50`, against the global map's `200` — a caustic is a high-contrast feature where blur is more objectionable than noise). Implies `-caustics` and `-pmauto`. The chosen radius is capped at the global map's, so a sparse caustic population can never end up blurrier than not splitting at all — and, with `-pmadaptive` on by default, that radius is a *maximum* every gather tightens from |
+| `-pmadaptive` / `-nopmadaptive` | Gather the caustic map at one radius **per query** rather than one per map (default **on**). Each gather solves for the radius that holds `k` photons *locally* — capped at the map's own radius, floored at 1/256 of it — and normalises by the radius it actually used. This is what keeps a focused filament sharp while the sparse specular wash around it keeps the wide kernel it needs; a single map-wide radius cannot serve both even after the two-map split, because the map-wide density probe is decided by the wash. `-nopmadaptive` restores the fixed-radius gather |
+| `-pmadaptivek <k>` | Override `-pmadaptive`'s target population. Default (`0`) uses the same target the caustic map's own radius was solved for, i.e. `-pmccount × ∛(stored / 1 M)`. Lower = sharper and grainier, higher = smoother and blurrier. Implies `-pmadaptive` |
+| `-causticn <n>\|auto\|off` | Mode `M` **aimed caustic emission** (Jensen's projection-map half; CPU **and** GPU): after the ordinary photon pass, emit `n` *additional* photons whose emission is importance-sampled towards the scene's focusing geometry, depositing into the caustic map only. Default `auto` = `-n`/4; `off` (or `0`) disables it, giving bit-for-bit the pre-0.203.0 result. Any other value implies `-caustics`. Ignored with `-loadmap` (there is no emission pass to join). This is a pure **variance reduction** — both passes' caustic deposits carry the same balance-heuristic MIS weight and the caustic map's `nEmitted` stays at the main pass's count, so aiming harder changes the noise and never the answer. On `gallery_rain` it raises the caustic population ~74× at a 25 % larger budget. Aiming is possible only where the emitter has a free variable to aim (a local emitter's *direction*, a sun/env emitter's *origin*); a collimated emitter has neither and is emitted normally |
+| `-causticaimk <k>` | Number of bounding spheres the focusing geometry is clustered into for `-causticn` (default `64`). The clustering minimises Σr², which is exactly the expected fraction of aimed photons that miss. Higher = tighter aim and a slightly longer build; the value only affects efficiency, never correctness |
 | `-pmfg <K>` | Mode `M` final gather: `K` cosine-weighted hemisphere sub-rays per sample, querying the map one bounce away for sharp contact shadows / fine detail (default `0` = off, direct density query). ~`K`× per-sample cost — pair with fewer `-spp` |
-| `-savemap <f>` / `-loadmap <f>` | Mode `M` view-independent photon-map cache, on **CPU and GPU**. `-savemap` writes the trace to `<f>`; `-loadmap` reloads it and **skips the forward pass entirely**, re-gathering any camera / radius for free. **Carries the `-beams` volume cache too**, so a rain / fog / rainbow scene can bank its volume as well as its surfaces — save with `-beams` and the beams go in the file. Only *derived* structures are left out (the photon grid, the beam BVH, the beam split), so **one file serves any later `-pmradius` / `-pmcount` / `-beamk` / `-beamradius`** — reload the same cache with `-beamk 128` and the kernel is re-solved from scratch. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene; a pre-0.195.0 (`FTPMP02`) file still loads and reports no beams, and asking for `-beams` against one warns rather than quietly rendering a volumeless image. Like `-o`, a missing parent directory for `-savemap` is created up front rather than discovered after the deposit |
+| `-savemap <f>` / `-loadmap <f>` | Mode `M` view-independent photon-map cache, on **CPU and GPU**. `-savemap` writes the trace to `<f>`; `-loadmap` reloads it and **skips the forward pass entirely**, re-gathering any camera / radius for free. **Carries the `-beams` volume cache too**, so a rain / fog / rainbow scene can bank its volume as well as its surfaces — save with `-beams` and the beams go in the file. Only *derived* structures are left out (the photon grid, the beam BVH, the beam split), so **one file serves any later `-pmradius` / `-pmcount` / `-pmccount` / `-beamblur` / `-beamk` / `-beamradius`** — reload the same cache with `-beamblur 0.03` and the kernel is re-solved from scratch. Since 0.199.7 (`FTPMP04`) the file also carries the **caustic map** as its own population, so a reload reproduces the split without re-tracing; since 0.202.0 (`FTPMP05`) each beam additionally carries its spectral bundle (see `-beamspec`); since 0.257.0 (**`FTPMP08`**, the current generation) that bundle carries a per-member weight, and an `FTPMP07` file widens to weight 1 on every member — which is *exact*, since equal weights is precisely what an `FTPMP07` bundle meant. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene; a pre-0.202.0 (`FTPMP04`) file loads with monochromatic beams, a pre-0.199.7 (`FTPMP03`) file loads with every photon in the global map (the pre-split behaviour), a pre-0.195.0 (`FTPMP02`) file additionally reports no beams, and asking for `-beams` against one warns rather than quietly rendering a volumeless image. Like `-o`, a missing parent directory for `-savemap` is created up front rather than discovered after the deposit |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R`, photon-map `M`/`S`, BDPT `D` and VCM `U`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, backward `R`, BDPT `D`, and VCM `U`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. In BDPT both subpaths carry the bundle and each connection is evaluated per-λ under one shared MIS weight — on **both** backends, which agree to 0.03%. VCM (`U`) does the same on **both** backends: one bundle per path index feeds both its light and camera subpath, so its *connections* are exact per-λ while its *merges* key off each stored light vertex's own wavelengths — **0.51× noise RMS** at equal passes on a gel + mirror box (CPU), **0.72–0.82× chroma noise** for 1.5–1.7× the time on the GPU, matching the single-λ estimator to 0.02 % and each other to 0.03 %. In modes `R` and `A`/`B`/`C` (and the `M`/`S` deposit) the bundle also rides through mirrors/gels/glossy lobes and every Russian roulette survives on the strongest live λ (no per-λ ratio amplification), worth ~0.42–0.52× noise RMS on coloured interiors in `R` and ~1.1× luma / 1.3–1.8× chroma at equal time in the forward modes. Default `4`; clamped to `1..8`. **Mode `W` defaults to `8` instead** — at 1 spp the bundle *is* the spectral quadrature, and it is nearly free there (measured 2.7 % of frame time versus a single wavelength, because mode `W` is traversal-bound; the same step costs 61 % in mode `R`). `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator) — fine in the sampled modes, but in mode `W` it renders dispersive surfaces flatly **wrong** rather than merely noisy, and a batch mode-`W` render now warns and names the offending material. Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`) and by any scene with participating media, a GRIN volume, or a finite-lens camera |
 | `-herosplit` | **Split-at-dispersion** instead of the default de-hero policy. Normally a dispersive event (dielectric refraction, grating order, fluorescent Stokes shift) *terminates* the `N-1` secondary wavelengths and boosts the hero ×`N`, because they can no longer follow one shared direction. With `-herosplit` all `N` wavelengths **continue**, each running the same interaction with its own λ — refracting along its own Snell direction, diffracting into its own grating order — so the bundle fans out into `N` independent monochromatic sub-paths. Same mean (both estimators are unbiased; verified `sum/emitted = 1.000000` and converged luminance matching a 200 M-photon reference to 0.03 %), but the chromatic spread of a prism / rainbow / dispersive caustic is resolved **geometrically per photon** instead of stochastically across many. Measured on a dispersive `glass:SF10` flint-sphere Cornell box, **at equal wall clock**: **0.70× chroma / 0.89× luma noise RMS inside the caustic**, 0.80× / 0.92× over the whole frame. The extra traversal past the split is linear, not exponential (a monochromatic sub-path never re-splits) and is paid only by photons that actually reach the glass — **1.11×** per photon there — but that ratio is scene-dependent, which is why it stays opt-in. No-op with `-heroc 1`. **CPU forward modes `A`/`B`/`C` + the `M`/`S` photon deposit** only — ignored by the GPU backends, the backward tracer (`R`), BDPT (`D`) and VCM (`U`). |
-| `-beams` / `-photonbeams` | **Photon-beam volumetrics** — two different mechanisms, picked by mode. **Modes `A`/`B` (shared multi-camera / flyby pass):** normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Runs on **CPU and GPU** (spectral-rainbow-phase media stay CPU-tabulated and fall back to CPU); **needs ≥2 shared cameras** + a scattering `medium` — with one camera the ordinary analog path is strictly better (it keeps the multiple scattering `-beams` trades away), so `-beams` is ignored and ftrace says so. Mind that when comparing against mode `M`: a single-camera `-mode B -beams` is *not* a beams render. **Mode `M` (photon map):** stores a **view-independent BEAM MAP**, which is the *only* way mode `M` sees media **at all** — the photon map holds surface records only, so without `-beams` a fog / rain / cloud / rainbow scene renders its volume as **nothing** under `M` (ftrace now warns when it sees that combination). Each photon's straight crossing of each medium is stored as a segment *with its direction*, and the camera gathers them with the Beam × Ray 1D estimator, so the phase function is evaluated at the true per-frame viewing angle and **one forward trace serves every frame of a flyby** instead of mode `D` re-tracing per frame. Tune with `-beamk` / `-beamradius` / `-beamcount`. Runs on **CPU and GPU** (0.197.0) — the device both deposits and gathers the beams, with no backend carve-out. A scattering **gradient-index** medium is the one thing a beam cannot represent (a bent photon has no straight chord); that is refused per medium on *both* backends, with a warning, so an ordinary fog elsewhere in a GRIN scene is unaffected. **Mode `M` carries FULL MULTIPLE SCATTERING since 0.199.0** (see `-beams-order`); the `A`/`B` form is still single-scatter by construction. No effect without a scattering medium. |
+| `-beams` / `-photonbeams` | **Photon-beam volumetrics** — two different mechanisms, picked by mode. **Modes `A`/`B` (shared multi-camera / flyby pass):** normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Runs on **CPU and GPU** (spectral-rainbow-phase media stay CPU-tabulated and fall back to CPU); **needs ≥2 shared cameras** + a scattering `medium` — with one camera the ordinary analog path is strictly better (it keeps the multiple scattering `-beams` trades away), so `-beams` is ignored and ftrace says so. Mind that when comparing against mode `M`: a single-camera `-mode B -beams` is *not* a beams render. **Mode `M` (photon map):** stores a **view-independent BEAM MAP**, which is the *only* way mode `M` sees media **at all** — the photon map holds surface records only, so without `-beams` a fog / rain / cloud / rainbow scene renders its volume as **nothing** under `M` (ftrace now warns when it sees that combination). Each photon's straight crossing of each medium is stored as a segment *with its direction*, and the camera gathers them with the Beam × Ray 1D estimator, so the phase function is evaluated at the true per-frame viewing angle and **one forward trace serves every frame of a flyby** instead of mode `D` re-tracing per frame. Tune with `-beamblur` / `-beamk` / `-beamcount`. Runs on **CPU and GPU** (0.197.0) — the device both deposits and gathers the beams, with no backend carve-out. A scattering **gradient-index** medium is the one thing a beam cannot represent (a bent photon has no straight chord); that is refused per medium on *both* backends, with a warning, so an ordinary fog elsewhere in a GRIN scene is unaffected. **Mode `M` carries FULL MULTIPLE SCATTERING since 0.199.0** (see `-beams-order`); the `A`/`B` form is still single-scatter by construction. **Mode `J` (UPBP) has a beam map ON by default**, since a UPBP render with no beam map is just mode `D` — pass `-nobeams` there to turn it off. Since 0.216.0 mode `J` fills that map from its own **BDPT light subpaths** rather than from a photon pass, so there `-n` counts light subpaths and `-beamcount` does not apply. `-beamachro` applies there since 0.250.0 (what keeps mode `J`'s clouds from streaking) and `-beamspec` since 0.251.0 (what keeps a `phase rainbow` curtain, which structurally cannot fold, from streaking). No effect without a scattering medium. |
+| `-nobeams` / `-no-beams` | Turn the beam map **off**. The opt-out half of `-beams`, and meaningful only in **mode `J`**, the one mode where the map is on by default: everywhere else the map is already off unless asked for. `-mode J -nobeams` is mode `D` **bit-for-bit** (no merge path is entered at all, not merely skipped per-ray), which is what makes the UPBP degenerate-reduction test a property of the code rather than of floating-point luck. Later flags win, so `-beams -nobeams` is off and `-nobeams -beams` is on. |
+| `-jsurf` / `-jmerge-surf` | **Mode `J` only: turn on the SECOND merge kind — the surface point×point merges mode `U` (VCM) exists to provide.** With it, one mode runs BDPT connections, beam×ray merges in the media *and* vertex merges on the surfaces, all under a single balance heuristic — a strict superset of what mode `D`, mode `J` alone or mode `U` does. The same light subpaths that deposit the beam map also deposit surface photons at every non-delta surface vertex; each camera surface vertex then gathers them within `-jsurf-radius`. Independent of the beams in both directions: a **media-free** scene gets surface merges and no beams (mode `J` says so and carries on), a pure-fog scene beams and no surface photons, and a scene with both gets both under one denominator — which is the point, since a camera path that crosses a cloud and lands on a wall is competed for by all three techniques. **On by default on the CPU since 0.260.0** (`-nojsurf` is the opt-out; gate 3 green: X −0.86 % / Y −0.27 % / Z +0.12 % mean, per-pixel medians within 0.1 %). **On the GPU too since 0.263.1**: the device gathers point merges per camera vertex (`dSurfMergeAt`), its weight carries both merge kinds, and the merging kernel is selected for either kind — so both backends render the same three-technique estimator. Validated against a 3.1 M-spp mode-`R` reference: the merge half matches the CPU's to a median ratio of 0.9998, the full render to −0.7 / −0.4 / +0.6 % of ground truth. See **UPBP-VM**. |
+| `-nojsurf` / `-no-jsurf` | Turn mode `J`'s surface point merges off — the opt-out since 0.260.0 (they are on by default). Since 0.263.0 they run on the GPU too, so this no longer has anything to do with picking a backend: both render the same three-technique estimator, and this flag simply drops the third one. |
+| `-jsurf-radius <r>` | **Starting** gather-disc radius `r_s` for `-jsurf`, in world units. **Implies `-jsurf`.** Default (`0` / omitted) is the same `-pmradius` / `-pmradiusfrac` radius modes `M`/`S`/`U` use, deliberately, so that `-mode J -jsurf` against `-mode U` compares *estimators* and not radii. **Shrinks per light-side epoch** (0.258.0) on Georgiev/SmallVCM's schedule `r_e = r · (e+1)^((alpha−1)/2)` under the same **`-vcmalpha`** mode `U` uses — mode `J`'s refresh epoch is its analogue of a VCM iteration. That schedule is what makes the point merges **consistent**: a merge estimator's bias is `O(r²)`, so a radius held still is a bias floor no amount of sampling gets under. Measured on `_cornell_diffuse` at 1024 spp against an 8192 spp mode-`D` reference, with `r` pinned: **−0.11 %** energy bias at `r=0.005`, **−0.45 %** at `0.0173`, **−0.52 %** at `0.035` — monotone in `r` and heading for zero, i.e. the `O(r²)` floor and not an error in the weight. Since the render reports the plain **mean** of its epochs, the total bias is the Cesàro mean of the per-epoch biases and vanishes with them; consistency needs no weighted average. Epoch 0 uses `r` exactly, so a single-epoch render is unchanged. |
+| `-jsurf-count <n>` | Ceiling on the number of **stored surface photons** for `-jsurf` — the point-merge counterpart of `-beamcount`, and a *memory* bound rather than a quality target. Default **`4e6`** (~288 MB; a surface photon plus its MIS record is 72 B). Takes scientific notation the way `-beamcount` does. **Implies `-jsurf`.** Applied as a **downward-only** clamp on the light-subpath count, *after* the beam knee has had its say — the asymmetry is deliberate: the beam map's radius **adapts** to its budget, so undershooting it is a measured bias (a few per cent; the analytic slab gave +6.4 % but a twelve-seed sweep on `_fog_thick` gives −3.8 %, so take the size and not the sign — see the `-beamk` note), whereas the surface radius follows its own schedule and a larger map costs only memory. On a **media-free** scene, where the beam pilot measures nothing and so never lowers the subpath count, the light pass is instead sized at **one subpath per pixel** (mode `U`'s convention) and this ceiling caps the result; without it the inert `-n` default asked for 7.3 M photons / 500 MB and failed the allocation. `0` = unbounded, at your own risk. |
+| `-jhostlight` (alias `-jhost-light`) | Mode `J`, **GPU only**: keep the surface light side on the **host**, redrawn once per epoch, which is what it did before 0.272.0. The default since then is to trace and grid `-jsurf`'s surface photon map **on the device**, redrawn **four times per chunk** — measured at **11.2x less whole-frame variance at equal wall clock** on a surfaces-only scene (`scenes/_caustic_box.ftsl`, 6 seeds, interleaved, sample counts matched by measurement), with the bias unmoved. It is the *frequency* that buys this, not speed: the light pass is only ~4 % of a mode-`J` render, but on the host it costs 27 ms a realization, which caps a 90 s render long before mode `U`'s ~8500. On the device it is free — a media scene fits 88 rebuilds inside a 25 s frame with `host gaps 0.0 s`. **Where it does nothing:** a scene with participating media, because there the *beam* merges dominate and the beam map is still host-traced per epoch (measured 0.96x, i.e. no change). **Since 0.272.3 it also restores the host BEAM BVH.** Mode `J` on the GPU now builds the photon-beam tree on the device as an LBVH and the host skips its own SAH build entirely — measured on `scenes/_fog_thick.ftsl` at **4.3 ms against ~220 ms**, which makes a light-side realization 2.7x cheaper and buys **1.85x more realizations at unchanged samples** (8–9 -> 14–17 in 25 s) for **0.719x the whole-frame variance**, exactly the 0.735x the measured `N^-0.51` fit predicts. It scales: 7 667 722 sub-beams in **27.7 ms**, where the host SAH builder needs seconds. Unbiased — with `-beamfreeze` pinning both arms to the same beams the means agree to **-0.028 % +- 0.017 %** and the median per-pixel difference is **exactly zero**. The two halves of the light side share one flag because they are one decision; there is no way to move only one of them. Use this to reproduce pre-0.272.x output or to measure what the device light side is worth. |
+| `-beamfreeze` (alias `-lightfreeze`) | Modes `J` and `M`: build the light-side cache **once** for the whole render, which is how mode `J` behaved before 0.247.0 and mode `M` before 0.252.0. By default neither does, and the reason is worth stating because it changes what "converged" means. Their error has two halves: a camera-side half that `-spp` averages away, and a light-side half **frozen into the cache** — every camera sample gathers from that same realization, so no amount of `-spp` touches it. A frozen render therefore stops at a **noise floor** that gets *more* conspicuous as the render proceeds, because the camera grain that had been masking it falls away and leaves the frozen pattern standing as apparent structure. Mode `J` freezes its **beam map**; mode `M` freezes its **photon map, caustic map and beam map**. Measured, mode `J`, on `scenes/_fog_thick.ftsl` (`-r 64 -max-bounce 8 -n 256 -beamk 1 -time 60`, whole-frame energy vs a converged mode-`R` reference, eight independent `-seed`s): frozen gives **s.d. 31.6 %**, spanning 0.75–1.63; refreshing gives **s.d. 2.4 %**, spanning 0.96–1.03 — a **13× tighter** result at the same `-n` and the same wall clock, for ~10 % fewer samples. Measured, mode `M`, on `scenes/gallery_rain.ftsl`: frozen, the scene's `phase rainbow` rain lays **saturated coloured bars** down the rain shaft and across the cloud (half the rain's chords are unavoidably monochromatic — a rainbow scatter is wavelength-dependent, so the beam must drop its spectral bundle, and a beam is a *line*, so one single-λ deposit is a streak rather than a speck); refreshed, they land somewhere new each realization and average back to white, beating the frozen render's chroma on every metric at **1/5 the samples**. Use this flag to reproduce pre-refresh output (it is bit-identical to it, verified by md5 against the 0.252.0 binary on the shared/GPU route) or to measure what the refresh is worth. It is not otherwise a good idea. **One case where it *is* a good idea: a mode-`J` flyby.** Since 0.271.0 a multi-camera mode-`J` batch under this flag traces the light side **once** and every later camera reuses it — the map is view-independent, and because the light pass seeds per absolute subpath index under a fixed salt, retracing it per camera would reproduce it bit-for-bit anyway. So the frames are **identical** to what they were (verified with `cmp` on `scenes/_jfly.ftsl` at two map sizes), and a 3-camera batch of that scene ran **86.2 s → 58.0 s**; the saving per skipped frame is exactly the *"N beams from M light subpaths in T"* time mode `J` prints. Without the flag each camera keeps its own refreshing light side, since there is then no one realization to share. |
+| `-beamrefresh <frac>` (alias `-lightrefresh`) | Share of a mode-`J`/`M` render's wall clock spent rebuilding the light side (default `0.10`; **`0.30` since 0.272.4 for a mode-`J` render whose light side is on the device**, because a realization there costs about a third of what it did — measured 1.56x less whole-frame variance at 0.30 than 0.10 on `scenes/_fog_thick.ftsl`, with 0.60 *worse* than 0.30, so the optimum is interior. Mode `M` and CPU mode `J` keep 0.10: neither gets the device beam tree, so a realization still costs them the full host SAH build and their balance point has not moved. An explicit value always wins). `0` means `-beamfreeze`. The render is split into epochs; between them the light side is re-traced under a fresh salt and the epochs' films are averaged, so the light-side noise falls as `1/√epochs` alongside the camera noise instead of standing still. It is affordable because of an asymmetry measured under UPBP-CONV — the *gather* dominates both modes, while the whole light side is only ~2.6 % of a mode-`J` render and ~0.35 % of a mode-`M` one — so decorrelation is nearly free (mode `M` on `gallery_rain` averages 3 realizations in 180 s, ~15 in 900 s). The epoch length adapts to the **measured** per-epoch overhead rather than a fixed time, which matters because mode `J`'s GPU path re-uploads the scene on every epoch: a heavy scene stretches its epochs out (degrading gracefully toward `-beamfreeze`) while a cheap one refreshes every second or so. Camera samples continue across epoch boundaries via the same absolute-sample-index mechanism `-resume` uses, so nothing is re-drawn and the reported spp is the true total. Mode `M` additionally **pins its gather radii** to what epoch 0 chose, so every epoch is the same (finite-radius, therefore biased) estimator and averaging them is plain variance reduction rather than a mixture of slightly different estimators. Since 0.253.0 that applies on the **GPU** route as well, which is the one a plain fixed-`-spp` single-camera render takes. Two things never refresh: the **multi-camera / flyby** path, where the whole point is to amortise one map across many frames (and where refreshing would also hand consecutive frames different realizations, i.e. flicker rather than convergence); and any render using **`-savemap` / `-loadmap`**, since a saved map has to be the one that was actually gathered from and a loaded one is a stored realization with nothing left to re-trace. Since 0.271.1 a mode-`J` render that actually refreshed prints a **`[jstats]`** line itemising where the light-side budget went — subpath trace, beam BVH, surface grid, gather, and an upper bound on per-epoch setup — which is how you tell whether raising this knob can still buy realizations on your scene. (It usually cannot: an epoch cannot be shorter than one GPU chunk, and those retarget to ~0.15 s.) |
 | `-beams-order <n>` / `-beamorder <n>` | Cap the **scattering order** the mode-`M` beam map carries. `0` (default) = unlimited, bounded only by `-bounces`. Before 0.199.0 there was no choice: the depositing photon crossed every medium straight, its extinction was booked as absorbed and only the *unscattered* in-scatter was ever paid back, so anything that scattered twice was deleted — in an optically thick, high-albedo medium that is most of the light, and the volume came out far too dark and far too saturated (multiple scattering is what makes a cloud white). The photon now runs plain **analog** transport under `-beams` and deposits one long beam **per chord between scattering events**, chord *k+1* carrying *k*-times-scattered flux, which makes the gather an unbiased estimator of the *full* volumetric transport. `-beams-order 1` (alias `-beams-single` / `-beams-ss`) restores the pre-0.199.0 single-scatter path **bit-identically** — worth having, because dropping the multiply-scattered veil does make a rainbow crisper, and because it is a free regression lever. |
 | `-beams-single` / `-beams-ss` | Shorthand for `-beams-order 1`. |
-| `-beamk <K>` | Mode-`M` beam gather population: how many photon beams a camera segment should collect (default `32`). The beam kernel radius is *sized to hit this* — bigger is smoother and linearly slower. It is the volume analogue of `-pmcount`. |
-| `-beamradius <r>` | Mode-`M` beam kernel half-width in world units, overriding `-beamk`. Default is automatic. **Do not set this to the photon-map gather radius**: a beam is a 1-D object blurred in 1-D, so the gathered population grows *linearly* in `r` (and in total stored beam length) rather than as `r²` — at the surface map's radius an ordinary fog box collects tens of thousands of beams per ray and the render never finishes. The automatic size is smaller by orders of magnitude. |
-| `-beamcount <n>` | Mode-`M` **ceiling** on stored beams (default `1000000`; `0` = unlimited; accepts `2e6` form). A ceiling, not a quota: the pass keeps every beam it generates until it reaches this number, so a scene whose media are small and bounded (a rain box inside a large hall) legitimately stores far fewer, and that is not a fault. Beams past the ceiling are dropped by Russian roulette with the survivors' power rescaled, so the estimate is unbiased either way. A beam lights a whole chord rather than a point, so far fewer beams than photons are needed — and beams are additionally split for BVH quality (see `-beamsplitmax`). Raising it buys **spatial sharpness, not lower noise** (the kernel radius shrinks to keep `-beamk` on target). Since 0.196.0 the cost of raising it is much flatter than it was: the split now shrinks with the radius, so a denser map no longer means proportionally slower traversal. Since 0.199.1, if the map does not fit in RAM ftrace says so by name — `out of memory allocating the photon-beam map: N x B B = X GiB. Lower -beamcount` — instead of the old bare `error: bad allocation` that left you bisecting `-n` by hand. |
+| `-beamblur <frac>` | Mode-`M` beam kernel half-width, as a fraction of **each medium's own measured mean free path** (default `0.01`). This is the volume estimate's quality knob: larger blurs more beams together (smoother, softer, and slower, since it inflates every sub-beam AABB), smaller keeps the volume crisp at more noise. Per medium, because a scene can hold a dense cloud and a thin rain curtain at once and one radius is simultaneously too blurry for one and too noisy for the other. The mean free path is *measured off the beam map itself* — every stored beam is a sampled free-flight chord, so `mfp = total chord length / chord count` needs no scene access, no wavelength choice, and handles a heterogeneous cloud exactly. **Why the radius is not chosen to hit a sample count (it was, before 0.201.0):** the old rule solved `r = K·A/(2πS)` for a fixed `-beamk`, and total beam length `S` grows with the photon count, so `r ∝ 1/n` — every extra photon bought a *smaller kernel* rather than more samples, and the gather averaged the same `K` monochromatic beams however much you spent. That is a hard colour-noise floor neither `-n` nor `-spp` can move, and it was the cause of the "iridescent" `gallery_rain` cloud. The bias it was buying does not exist either: the `_beams_ms` mode-M-vs-mode-D invariant moves by under one point across a **1000×** radius sweep. **Do not reach for this as a speed knob** — measured on `gallery_rain` at 0.210.0 (one banked `-savemap` re-gathered at four radii through `-loadmap`, so only the kernel moves): gathered beams is **linear** in the radius, not quadratic (8534.6 / 4263.2 / 2125.8 / 1080.1 at `0.01` / `0.005` / `0.0025` / `0.00125`), and gather time falls only *sub*-linearly in that (8× fewer beams bought 4.3× less time) because the split is `-beamsplitmax`-saturated at every radius, so the BVH barely shrinks and you pay near-full traversal for fewer samples. Worse, the noise a small radius adds is **not** `-spp`-reducible: `0.00125` at `-spp 16` finished in *less* wall time than `0.01` at `-spp 4` and was still much grainier (cloud speckle 1.925 vs 1.094), and fitting `speckle² = s₀² + k/spp` gives an **irreducible floor `s₀ ≈ 1.67`**. The beam map is traced once and is view-independent, so extra spp re-gather the *same* beams; the radius fixes how many beams are averaged per gather point, which makes that error a fixed function of the beam set rather than something resampled per sample. Nor is there a free lunch in trading it against `-n`: gathered beams `G` sets *both* the cost (`t ≈ 0.73 + 6.21e-4·G` min/spp on that scene, the beam BVH being pinned identical by `-beamsplitmax`) and the floor (`∝ 1/√G`), so raising `-n` while cutting `-beamblur` to hold `G` constant holds the *cost* constant too — measured at `-n 800M`, `G = 6325.7`, within 1.5% of prediction. What extra `-n` does buy, at equal cost, is **decorrelation**: many more, much shorter, independent chords, which attacks the long *streaks* (neighbouring pixels re-gathering one long chord) rather than the per-gather-point floor. |
+| `-beamk <K>` | Mode-`M` **floor** on the beam gather population: the minimum number of photon beams a camera segment should collect (default `32`). Not a target — `buildAuto` probes the count at the `-beamblur` radii and scales them **up only** if a segment would gather fewer, which is what stops a very sparse map rendering as individual resolvable streaks. It never scales them down; see `-beamblur` for why that direction is the trap. |
+| `-beamsinmin <v>` | Lower bound on the `sin θ` of a mode-`J` beam × ray merge — the angle between the camera ray and the beam (default `0.3`; `0` restores the literal, unbounded estimator). The merge kernel carries a `1/sin θ` Jacobian that is unbounded as the two become parallel, and the MIS weight does not suppress it (a near-parallel merge is *also* a configuration the connections sample badly, so the balance heuristic correctly gives it a large weight) — so a handful of pixels used to carry the whole of mode `J`'s error. Bounding it is the standard UPBP remedy, and it is applied where `sin θ` is *computed*, so the estimator and the MIS weight it is judged by stay one function. Measured on `_fog_thick` at 180 s: the default costs **−0.61 % of the image mean against the unbounded estimator's own −0.57 %** — no resolvable bias — while cutting the worst pixel from 4350× to 1690× the reference and the mean relative squared error from 1.219 to 0.836, at no cost in samples. Values approaching `1` remove the Jacobian altogether and darken badly (`1.0` reads −12 %).
+| `-beamareaslack <f>` | Mode-`M` cost ceiling on the beam kernel (default `1.0`). The kernel inflates every sub-beam's AABB, and a camera ray's cost is proportional to the total box area it must enter, so the per-medium radii are capped at the largest uniform scale whose inflation grows that area by at most `f` over the tight (`r = 0`) area — solved in closed form, since the area is exactly quadratic in the scale. Applied after the `-beamk` floor, so it wins. |
+| `-beamradius <r>` | Mode-`M` beam kernel half-width in world units, one value for **every** medium, overriding `-beamblur` / `-beamk` / `-beamareaslack`. Default is automatic (per medium). **Do not set this to the photon-map gather radius**: a beam is a 1-D object blurred in 1-D, so the gathered population grows *linearly* in `r` (and in total stored beam length) rather than as `r²` — at the surface map's radius an ordinary fog box collects tens of thousands of beams per ray and the render never finishes. The automatic size is smaller by orders of magnitude. |
+| `-beamcount <n>` | **Ceiling** on stored beams (default `1000000`; `0` = unlimited; accepts `2e6` form). **The two modes meet it differently.** Mode `M` meets it by *thinning* with the Russian roulette described below. Mode `J` cannot — the roulette rescales power correctly but leaves each beam a survival probability that mode `J`'s MIS weights would have to divide by and cannot recover — so since 0.242.0 mode `J` meets it by tracing **fewer light subpaths**, sized by a discarded pilot, and there the enforced budget is `min(this ceiling, ½ × the scene's -beamk knee)`; an explicit `-n` turns the whole budget off. (Before 0.242.0 it had no effect in mode `J` at all, and the map was sized by `-n` alone.) A ceiling, not a quota: the pass keeps every beam it generates until it reaches this number, so a scene whose media are small and bounded (a rain box inside a large hall) legitimately stores far fewer, and that is not a fault. Beams past the ceiling are dropped by Russian roulette with the survivors' power rescaled, so the estimate is unbiased either way. A beam lights a whole chord rather than a point, so far fewer beams than photons are needed — and beams are additionally split for BVH quality (see `-beamsplitmax`). Raising it buys **lower noise, at unchanged sharpness** — since 0.201.0 the kernel radius is a physical scale that does not move with the stored count, so more beams means more samples under the same kernel. (Before 0.201.0 it was the other way round: the radius shrank to keep `-beamk` on target, so `-beamcount` traded sharpness against time and did nothing for noise.) Since 0.196.0 the cost of raising it is much flatter than it was: the split now shrinks with the radius, so a denser map no longer means proportionally slower traversal. Since 0.199.1, if the map does not fit in RAM ftrace says so by name — `out of memory allocating the photon-beam map: N x B B = X GiB. Lower -beamcount` — instead of the old bare `error: bad allocation` that left you bisecting `-n` by hand. |
 | `-beamsplitmax <n>` | Ceiling on **sub-beams after the BVH split** (default `8000000`). Beams are split into sub-segments so the BVH gets tight boxes instead of the mostly-empty AABB of a long diagonal; each beam is split at *its own* cost-optimal length, `sqrt(3/Q)·sqrt(4r² + κ/W)`, derived by minimising total AABB **surface area** — the quantity a ray's box-entry count is proportional to, and measurably the real cost of the gather. This flag caps the **memory** that costs (~1 GB per 8 M sub-beams with its BVH), not the quality: below the cap you get the optimum, above it the finest split that fits, and the build log says which. Raising it buys a tighter, faster BVH — worth it for a long flythrough, where the one-time build amortises over every frame. Since 0.199.1 the split array is allocated **once** at its exact final size rather than regrown geometrically from a 2x guess, and an out-of-memory here names this flag. |
 | `-beamsplit <len>` | Pin a **uniform** split length instead of the per-beam rule (expert). Only for measuring the rule against a fixed baseline — the per-beam rule beats any single length, because an axis-aligned beam has a tight box already and wants no split at all while a diagonal one wants many. |
+| `-beamspec <n>` | Wavelengths carried by **one stored beam**, `1..4` (default `4`; `1` = the classic monochromatic beam, bit-for-bit). New in 0.202.0. A surface photon is a *point*, so a single spectral sample there reads as grain; a beam is a *line*, so a single sample lays a **saturated coloured streak** down its whole length, which the eye reads as structure. With `-beamspec 4` the beam stores its hero wavelength plus 3 stratified secondaries (`u + i/C` through the same emission CDF) and the gather folds all four into XYZ **from the same chord**. It is nearly free because the gather's cost is almost entirely wavelength-*independent* — geometry, `densityAt`, and the two ratio-tracking transmittance marches are shared; only `sigma_s(λ)`, the phase function and the CIE lookups repeat, measured at ~1.1× gather time. Through 0.256.0 it needed no per-wavelength weight: emission samples with `p(λ) = SPD(λ)/∫SPD`, so `spd/pdf` is independent of λ and every wavelength in the bundle carried identical power — which is also exactly what limited it, since the bundle then survived exactly **one** transport iteration and collapsed to a plain monochromatic beam at any wavelength-dependent event. **Since 0.257.0 the record carries a per-member weight** (`float wS[3]`), so the members may differ in power and the bundle *survives* a λ-dependent event instead of dying at it: the running ratio `f(λ_i)/f(λ_hero)` is multiplied into `wS[i]` exactly as the achromatic fold multiplies its 12 quadrature bins — one evaluation loop fills both, because they are the same quantity on two grids — and the gather scales member `i` by `wS[i]`. What still retires the bundle is only wavelength-**divergence**: dispersion, gratings, thin film / multilayer, fluorescence, hair, GRIN, glass absorption (whose `absorb` is a single scalar the gather re-applies to every member) and a scatter in a chromatic medium. Mere wavelength-*dependence* — a diffuse albedo, the case that used to kill nearly all of them — no longer does. Coverage on `gallery_rain`'s rain curtain rose **36.2 % → 75.1 %** under mode `J`; see `-beamachro` for the shared verdict function and the measured error table. This widened the on-disk record, so a `-savemap` file written by 0.257.0 or later is `FTPMP08`; an older bundle reads back with every `wS` at 1, which is exactly what it meant. The whole feature still switches off in any scene where a medium's extinction is chromatic, since the shared transmittance march would otherwise hand a secondary the hero's attenuation. Measured on the isolated rain scene: **−8.5 % chroma texture, −4.1 % luma texture** with the mode-M-vs-mode-D invariant unmoved. **Applies to mode `J` since 0.251.0**, which needs one extra step to earn it: mode `J` draws λ from the **scene-wide** emission sampler before it picks an emitter, so its `β` carries `spd_em(λ)/p_comb(λ)` and its wavelengths would *not* carry equal power. That ratio is the only λ-dependence in `Le`, so it is divided out in closed form at the subpath's birth and all `C` deposit wavelengths are redrawn from the chosen emitter's own SPD — after which the deposit is arithmetically a mode-`M` photon's and the equal-power bundle is legal unchanged. The subpath's hero wavelength is **replaced**, not kept as a member: it came from the wrong density, and giving it weight `1/C` alongside the others would bias the estimate. In mode `J` the mechanism therefore does something for the beam's *power* as well as its colour, and so helps even at `-beamspec 1`. Set `1` only to reproduce pre-0.202.0 output. |
+| `-beamachro on\|off` | Fold a provably **wavelength-independent** stored beam at its emitter's *mean* CIE response instead of at one sampled `CIE(λ)` (default `on`; new in 0.210.0). This is the real fix for the coloured streaking `-beamspec` only dented, and unlike `-beamspec` it *removes* the chromatic variance rather than reducing it — at **zero** gather cost and zero extra record bytes, because the colour folds into the beam's stored XYZ power at map-build time. The argument: emission samples `λ` with `p(λ) ∝ SPD(λ)`, so `spd/pdf` is the same for every `λ`; if nothing since birth depended on `λ`, the estimator's expected colour is exactly `∫CIE·SPD / ∫SPD`, a per-emitter constant. Substituting the constant for the sample is therefore unbiased *and* noiseless. It applies when **three** things hold: the scene's extinction is achromatic (as for `-beamspec`), the path has hit no λ-dependent event since birth, and the beam's own medium has a flat `sigma_s` and a non-rainbow phase. The middle test is where it beats `-beamspec`: a bundle is retired after **one** transport step, but "nothing has diverged" survives every event that is *itself* λ-independent — including a scatter in an achromatic medium — so the fold rides through the hundreds of scatters a bright cloud puts a photon through, where the bundle reached about 1 beam in 278. The third test is per **medium**, not per scene, so a scene holding an achromatic cloud *and* a `phase rainbow` rain curtain folds the cloud and leaves the bow's per-wavelength beams alone. The render log reports the coverage it achieved **per medium**, by count and by power (`NN% folded achromatically`, or `achromatic fold n/a` for a medium the fold structurally cannot serve — beside which `NN% spectrally bundled` reports what `-beamspec` picked up instead, so a two-medium scene shows its cloud folding and its rain bundling on adjacent lines). Measured on `gallery_rain`'s cloud (`albedo 0.9964`, plain HG, scalar density — so every colour in it was noise): 89 % of the cloud's beams fold, and the crop's mean chroma saturation falls **0.0740 → 0.0365** at the same 4 spp. Beams loaded from a `-loadmap` cache written before 0.210.0 do not fold — their emitter is not recoverable from the file, so they re-gather exactly as traced; re-trace to get the fold. **Applies to mode `J` as well since 0.250.0**, and the reasoning that had kept it out is worth stating because it is the tempting wrong answer: a BDPT light subpath's `Le` is `spd(λ)/pdf(λ)` off the **scene-wide** emission sampler, so unlike a photon's it is *not* the same for every `λ` — which appears to rule out `-beamspec` (whose record stores no per-wavelength weight, so its members must carry equal power) but **not** this fold, which needs only `E[β(λ)·CIE(λ)] = E[β(λ)]·cieMean`, an identity that holds for any sampling density. (0.251.0 then got `-beamspec` into mode `J` too, by *converting* `β` to the emitter's own density rather than by weakening the equal-power requirement — see that flag.) Nor does anything on the camera side have to be achromatic: mode `J`'s merge already pairs a camera-λ throughput with a beam-λ colour, so the fold changes only the beam-λ factor and leaves that pairing exactly as it was. Set `off` to reproduce pre-0.210.0 output. **Since 0.255.0 the fold also SURVIVES A DIFFUSE SURFACE** (the *spectral fold*, mode `M`'s CPU tracer; mode `J`'s BDPT light subpaths got the identical rule in 0.257.0 — see the end of this entry), which is what finally cleared the residual coloured bars: instrumenting `gallery_rain` showed **87.8 %** of the beams that failed to fold had lost it to a surface event and only 12.2 % to the chromatic rain, and a diagnostic build that folded 100 % of beams measured the floor at cloud-chroma p99 **560 → 182**. A diffuse albedo is wavelength-*dependent* but not wavelength-*divergent* — every λ still travels the same chord — so instead of surrendering, the fold now carries the running ratio `T(λ) = Πf(λ)/Πf(λ_hero)` and stores `E_λ[CIE(λ)·T(λ)]`, evaluated on a 12-bin **equal-SPD-mass** quadrature per emitter. `T(λ_hero) ≡ 1` and the bin sum is exactly `cieMean`, so a path with no spectral factor is bit-for-bit what it was. It folds only where it *reduces* variance: both second moments are computable in closed form from that quadrature, and the fold is taken only when the folded one is smaller — automatic for a neutral surface (Cauchy–Schwarz), and correctly declined for a saturated one, where the `1/ρ(λ_hero)` it would introduce is a firefly generator. Dispersion, gratings, thin film / multilayer, fluorescence, hair, a `Layered` coat, glass absorption and GRIN still retire it, since there the wavelengths stop sharing a chord at all. **Where the ceiling is (0.255.1):** with the surface case absorbed, an attribution build (`FTRACE_FOLDDIAG=1`, which prints a `[folddiag]` line breaking the non-folding beams down by the event that retired them) measures the cloud at `folded 90.10%, chroma-medium 8.53%, specular 1.35%, decline-diffuse 0.02%`. The variance test is therefore **not** what limits it — it declines 0.02 % of the opportunities — and the residual is transport whose wavelengths genuinely take different directions (a `phase rainbow` scatter, a dispersive surface), where a fold is undefined rather than unprofitable. Those beams are correct single-λ samples whose variance falls with photon count, not a bug. **Since 0.256.0 the fold ALSO HAPPENS AT GATHER TIME** when the beam's own medium has flat coefficients but a chromatic *phase* — the `phase rainbow` rain, which the deposit-time fold structurally cannot serve, because the colour of such a beam is undecidable until the scattering angle is known. Widening the same attribution to that medium showed **83.89 %** of its beams were on a perfectly wavelength-independent path and refused purely for want of an angle. A camera ray crossing the beam *does* know `cosθ`, and if `σ_s`/`σ_t` are flat the phase is the only λ-dependent factor left, so the whole spectral integral ∫ spd(λ)·CIE(λ)·p(cosθ,λ)dλ collapses to a function of one scalar and is tabulated per (emitter, medium) at scene-build time, on the 1 nm grid (**not** the 12-bin quadrature above, which would alias a sharply λ-peaked bow into visible colour steps). The beam then paints the entire bow at its own angle, exactly, with no chromatic variance — the bow gets *sharper* as well as cleaner, because the tabulated integral is what the many monochromatic beams were converging to. Measured on `gallery_rain` at 300 s, high-pass chroma energy in the rain (×1000, the streak-only metric — an ordinary hue-spread metric is meaningless in a ROI that is *supposed* to be multi-hued): **385.12 → 298.12**, and in the cloud 846.45 → 219.55 with both folds on; frame luminance unchanged to <0.5 %. It beats even a *hypothetical* 100 %-successful deposit-time fold on the rain (414.77), which is the point — no deposit-time fold can resolve a rainbow phase at all. Scattering *inside* such a medium still retires the fold (there the wavelengths really do go different ways); only crossing one is folded. **Mode `J` deliberately does NOT get this one**, and the reason is not the tempting theoretical one. The theoretical objection is real — the fold is a Rao-Blackwellisation, exact only when λ appears nowhere else in the term, and mode `J`’s merge carries an MIS weight that is a ratio of path densities, one of which contains the phase function, so the weight is itself a function of λ and leaves a residual Cov(w, CIE·p) — but isolating that residual (bundle suppressed in both arms with `-beamspec 1`, so the fold is the only difference) shows it is below the noise floor: against a 6212-spp mode-`D` reference the folded arm is slightly *better*, rain relative RMSE 0.4157 against 0.4263 at seed 7 and 0.4875 against 0.5033 at seed 11. What actually decides it is that a stored beam cannot be BOTH folded and a `-beamspec` bundle — one record cannot carry an emitter-folded colour and a set of secondary wavelengths — so requesting the fold silently destroys the bundle, and in mode `J` the bundle is worth about four times what the fold is worth (rain 0.2587 / 0.2788 with it, against the numbers above). Mode `M` orders those two the other way round, because there the beam map IS the whole volumetric estimate and removing *all* chromatic variance beats sampling four wavelengths of it, whereas in mode `J` the merge is one MIS-weighted technique among several and its weight stays λ-dependent whatever the colour does. So mode `J` declines the fold at deposit time and keeps its bundles; nothing about its output changed in 0.256.0. Not yet on the **device**: a `-device gpu` mode-`M` render still runs the 0.210.0 all-or-nothing rule, so it folds less and is grainier — the same image in the limit, more variance getting there — and a GPU gather of a CPU-traced map demotes gather-time-folded beams back to `CIE(λ)`, which is unbiased and simply as noisy as pre-0.256.0. |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), a **path base name** (`fly` selects every frame of `camera_curve "fly"` — `fly000..fly143` — while excluding unrelated stills), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The path-base form renders one whole flyby from a scene that also declares one-off stills; the index / nearest forms aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
 | `-t <threads>` | CPU thread count |
@@ -4536,6 +5366,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
 | `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, and `V`; **number of passes** for SPPM (`S`) and VCM (`U`) |
+| `-seed <n>` | **Draw a different realization of the same render** (new in 0.246.0). Everything else about ftrace is deterministic: a fixed set of flags produces one image *bit-for-bit*, across thread counts, `-window`/`-time` chunking and resume boundaries. That is the property every `cmp`-verified refactor and every regression gate in the repo leans on, and it has one cost — with a single realization available there is **no way to separate a systematic bias from the luck of one draw**. Render the same frame at `-seed 1`, `-seed 2`, `-seed 3` and the *spread* between them is the estimator's variance at that sample count; anything they all agree on that an independent reference does not is bias. (This is step 1 of the **UPBP-THICK** diagnosis in `known-issues.md`: mode `J`'s beam map is built once, so an error that shrinks as you add light subpaths could be either.) Implemented as a salt XORed into every seed derivation on **both backends and in every mode** — the CPU's single `seedUnit` funnel, mode `M`'s beam-trim roulette, mode `U`/`S`'s per-pass seeds, and each of the GPU's kernel seed origins. **`-seed 0` is the default and is the historical stream**, bit-for-bit, because XOR by zero is the identity — so adding this flag did not invalidate a single existing reference image, and there is no "default seed that happens to differ from the old one". `n` is run through the SplitMix64 finalizer, so consecutive seeds (the natural way to draw a handful of realizations) give streams differing in every bit rather than in one. A seed is **not** a substitute for `-spp`: two seeds at the same sample count are equally noisy, just differently noisy |
 | `-n <photons>` (mode `S`) | Photons traced **per pass** (SPPM rebuilds a bounded map each pass). *(Mode `U` ignores `-n` — its light-path count follows the film resolution.)* |
 
 **Radiance cache** (mode `R`, CPU) — see [Radiance cache](#radiance-cache--radcache--mode-r-cpu)
@@ -4568,7 +5399,7 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-no-media` / `-nomedia` | Drop all participating-media volumes (fog / homogeneous / heterogeneous). Also un-gates the fast `-rgb` backward, which otherwise falls back to spectral on any medium. |
 | `-no-env` / `-noenv` | Remove the environment light (constant or image-based): the scene renders against black, and the emitter CDF is rebuilt without it. |
 | `-no-fluoro` / `-nofluoro` | Demote every fluorescent material to a plain diffuse (using its elastic reflectance albedo) — skips the wavelength-shifting re-emission. |
-| `-max-bounce <N>` | Set path depth to `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, the photon modes, and the bidirectional `D`/`U`). Default is the tracer's own cap: **32** for the unidirectional tracers, **8** for `D`/`U`, whose connection cost grows ~depth². For `D`/`U` the flag therefore *raises* the depth as often as it caps it — a specular-only cavity (a mirror-lined sphere, a kaleidoscope, deeply nested dielectrics) truncates its recursive images to black at 8 edges and wants `-max-bounce 24`–`48` before the hall of mirrors fills in. Specular vertices are cheap there: a delta BSDF has no connection to make. A scene that always needs the deeper walk can say so itself with `render { max_bounce <n> }` (see **Render-setting block**); this flag overrides that. |
+| `-max-bounce <N>` | Set path depth to `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, the photon modes, and the bidirectional `D`/`U`). Default is the tracer's own cap: **32** for the unidirectional tracers, **8** for `D`/`U`, whose connection cost grows ~depth². For `D`/`U` the flag therefore *raises* the depth as often as it caps it — a specular-only cavity (a mirror-lined sphere, a kaleidoscope, deeply nested dielectrics) truncates its recursive images to black at 8 edges and wants `-max-bounce 24`–`48` before the hall of mirrors fills in. Specular vertices are cheap there: a delta BSDF has no connection to make. A scene that always needs the deeper walk can say so itself with `render { max_bounce <n> }` (see **Render-setting block**); this flag overrides that. **Because the two defaults differ, any cross-mode comparison must pass `-max-bounce` explicitly to both renders** — in a high-albedo participating medium bounces 9–32 carry most of the light, so an unmatched mode-`R` reference reads ~**8×** a mode-`D` render of the same scene and looks like a catastrophic bug in whichever mode you were testing. (`J` defaults to 8 as well.) |
 | `-direct-only` / `-directonly` | **Whitted mode:** after a non-specular vertex (diffuse / diffuse-transmit / elastic-fluorescent / fog single-scatter) does its direct-lighting NEE, stop — no diffuse indirect (no colour bleeding, black shadows). Specular chains (mirror / glass / glossy / filter) still recurse. Scoped to the **camera** path tracers (`R` spectral + `-rgb`, and `P`'s backward layer); forward `B` and the photon/BDPT modes honour `-max-bounce` but ignore this. |
 | `-whitted-grid <n>` | **Mode `W` only.** Fire an `n`×`n` fixed lattice of shadow rays at every area light instead of one random point (default `4` → 16 rays). This is the single knob that decides how smooth a soft shadow is; a point/spot/collimated light is a deterministic connection already and ignores it. |
 | `-ambient <v>` / `-amb <v>` | **Mode `W` only.** Flat ambient fill added at every diffuse vertex (POV-Ray's `ambient`) — the cheap stand-in for the diffuse GI mode `W` drops, without which a **closed** room previews with black shadows. **Dimensionless:** `v` is a fraction of a light's own radiance (internally scaled by `Scene::ambientRef()`), so the same value behaves the same in any scene whatever its absolute radiometric scale. Default `0`; `0.02..0.2` is the useful band. With `-gi` it keeps applying, as the **far-field** term a gather ray picks up when it escapes the geometry. |
@@ -4606,6 +5437,105 @@ light.
 | `-light-samples <n>` | Cap on how many emitters one vertex may connect to (default `8`). `1` is the cheapest, pure importance-sampled selection; raising it trades time for less selection noise. Emitters with no usable spatial bound (a distant sun, an environment light) sit outside the tree and are always connected, on top of this budget. |
 | `-light-split <v>` | Adaptive-splitting threshold, as `(node radius / distance)²` (default `1.0`). A node subtending more than this is traversed into **both** children instead of choosing one, which is what stops a nearby cluster of lights from being resolved by a single random pick. Raising it selects more aggressively (faster, noisier); `0` disables splitting; a very large value degenerates back to the all-emitters estimator. |
 
+**Glossy next-event estimation** — a rough metal is the one common material whose light the
+renderer used to find only *by accident*. A `glossy` lobe is a power cosine about the mirror
+direction with solid angle `≈ 2π/(e+1)`, `e = 2/roughness² − 2` — 0.104 sr at `roughness 0.18`,
+0.0079 sr at the metal presets' default 0.05 — and until 0.266.0 no unidirectional mode
+connected such a vertex to a light: it multiplied by the reflectance and walked on, so a
+`light sun { angle 0.53 }` (a disc of **6.8e-5 sr**) was collected only when a lobe sample
+happened to land inside it. Odds of about 1 in 1500 for the gold case, 1 in 115 for chrome, with
+every hit arriving as a spike that many times the mean. On `gallery_rain` that cost the gold
+gyroid **64 %** of its energy and the chrome ring **91 %** at ~120 spp — in mode `R` exactly as
+much as in mode `M`, since both used the same estimator. (Modes `D`/`J`/`U` were never affected;
+BDPT has always connected glossy vertices.)
+
+Glossy vertices now connect, weighted against the lobe-sampling strategy by the **balance
+heuristic** rather than replaced by it — because unlike a diffuse vertex a glossy lobe can be
+much *narrower* than the light (the same scene's 20 m × 14 m sky panel), so neither strategy
+wins everywhere. Measured on `scenes/_spec_repro_sun.ftsl` (four spheres under a real solar
+disc, anchored to mode `D`, which has connected glossy vertices all along), the gold sphere's
+band moves from
+
+| | mode `R` | mode `M` | mode `S` | GPU (`R`) |
+|---|---|---|---|---|
+| glossy gold, estimator off | −6.2 % | −3.8 % | −4.0 % | — |
+| glossy gold, estimator **on** | **−0.3 %** | **−1.1 %** | **−1.1 %** | **+6.7 % vs its own off** |
+
+with the diffuse control unmoved in all of them, and mode `M`'s worst firefly dropping from
+1302× the image mean to 807×. **CPU and GPU agree to ±0.11 %** on every band of both rigs, and
+on the *area*-light rig — where both strategies can reach the light, so a wrong weight would
+show — turning the estimator on moves nothing (±0.04 %), which is the property MIS is supposed
+to have: it changes variance, not the mean.
+
+It is close to free: on `gallery_rain` at 240 s mode `R` went from 348–410 spp to 366–461, i.e.
+inside the run-to-run spread; on the small rig it costs a few percent.
+
+On `gallery_rain` itself the difference is not subtle. At 1015 spp on a GPU, with the estimator
+**off** the gold gyroid renders a dull olive-brown speckled with black holes and the chrome ring
+behind it is barely visible; with it **on**, at the same sample count, the gyroid is saturated
+gold with clean highlights across every lobe and the ring reads as metal. Nothing about the
+scene changed — that is the whole of what a 6.8e-5 sr sun costs a lobe that has to find it by
+chance.
+
+| Flag | Meaning |
+|---|---|
+| `-no-glossy-nee` | Restore the pre-0.266 estimator exactly — rng draw order included, so it is a valid same-binary A/B arm. Use it to measure what the connection is buying, or to check that a difference you are chasing is not this. |
+| `-glossy-nee` | Force it back on (it already is — for overriding an earlier `-no-glossy-nee` in a shared argument list). |
+
+The connection is made only for emitters whose light-tree **selection probability is exactly 1**
+— the all-emitters draw (one light, `-no-lighttree`, mode `W`) and the emitters that sit outside
+the tree because they have no usable spatial bound, which is where a distant `light sun` lives.
+Both halves of the MIS weight consult the same predicate, so they cannot disagree; a
+tree-selected emitter keeps exactly the old estimator, which is unbiased, just as slow as it was.
+Reversing `ltSample`'s adaptive splitting into a selection *density* is what would lift that, and
+is logged in `known-issues.md` → **GLOSSY-NEE**.
+
+**Preview specular (`-raster` / `-explore`)** — the preview rasterizer used to shade diffuse
+only: its own header said "glossy lobes do not exist here either, so roughness/film-thickness
+maps are ignored by design", so an asset whose look depends on its specular lobe — a satin
+fabric, any metal — previewed flat, and a browser glTF viewer showed it better than we did.
+
+Since 0.269.1 `glossy` materials shade through the **split-sum** approximation that real-time
+viewers use: a normalised GGX lobe with Smith masking and Schlick Fresnel for each key light,
+plus the environment term with Karis' analytic BRDF fit (no lookup texture ships). `roughness
+pattern:` and `roughness texture:` are honoured. The highlight is tinted by the material's own
+normal-incidence reflectance, so gold looks like gold rather than white-hot.
+
+Both rasterizer backends agree exactly, and a scene with no glossy material is untouched. It is
+a *preview*: there is still no reflection, refraction, shadow or global illumination here — see
+the mode table for what renders those.
+
+**Gather footprint (mode `M`)** — photon mapping's density estimate divides the photons it finds
+by the area of the gather disc, `πr²`. On a flat wall that is exactly right. On anything the disc
+*overhangs* — the edge of a tabletop, a fold of cloth, a strand of hair — the photons only land on
+the part of the disc that is real surface, while the divisor still assumes the whole thing, so the
+estimate comes out dark in proportion to how much of the disc missed. Measured on
+`scenes/gallery_rain.ftsl` against a 34 781-spp mode-`R` reference: flat ground 0 %, a cap edge
+**−32 %**, a fold of cloth **−40 %**, hair **−68 %**.
+
+Since 0.268.0 the estimate divides by the area it actually gathered from. The footprint is
+measured geometrically, by probing points of the disc and asking what same-facing surface lies
+under them — which works for triangles, isosurfaces, CSG solids and fur alike, where clipping
+primitives analytically would only work for triangles. Same scene, same reference:
+
+| element | before | after |
+|---|---|---|
+| `alice_hair` | −68.2 % | **−7.1 %** |
+| `alice_dress` | −40.0 % | **−12.7 %** |
+| `cap_gyroid` | −32.0 % | **−6.1 %** |
+| `grid_ground` (flat — nothing to correct) | −0.6 % | +0.5 % |
+
+CPU and GPU agree. The remaining error on cloth is a fold hiding surface behind it from the
+probe; see `known-issues.md` → **M-GATHERAREA**.
+
+| Flag | Meaning |
+|---|---|
+| `-gatherarea <M>` | Probe samples per gather (default `8`). `0` restores the pre-0.267 estimator exactly. **Applies to modes `M` and `S`, host and device** — mode `S` gained the correction in 0.273.1, on both paths in the same change, because it dispatches to CUDA by default and a host-only edit there is inert. In mode `S` it is also **free**: the probe runs once per pixel per *pass* rather than once per camera *sample*, so it amortises into the 2 M-photon trace (measured 457 spp against 456 at 40 s) where mode `M` pays 1.30x. **`M` is not a quality dial in either direction** (measured 2026-09-10 on `gallery_rain` against a 34781-spp mode-`R` reference): raising it makes hair and cloth *worse*, not better — `alice_hair` −11.4 % at `M = 8` against −22.1 % at `M = 64`, `alice_dress` −11.0 % against −17.8 % — because the default's apparent accuracy is partly Jensen's upward bias at low `M` offsetting a residual dark bias, and more probes remove the offset without removing the residual. **Pass `-gatherarea 0` for fur-dominated scenes:** the correction is right on cloth, hair and marble (it turns −40 %/−69 %/−33 % into −11 %/−11 %/−6 %) but *creates* a large error on dense fur, which is accurate without it — the `creature` coat measures −3.9 % uncorrected and **+48 %** corrected. See `known-issues.md` → `M-GATHERAREA` for why a tangle inverts the correction and why no coverage threshold separates the two cases. |
+
+It costs 1.3–1.7× the gather on `gallery_rain`, which is nearly all complex geometry, and ~4 %
+on a scene of flat surfaces: a cheap early-out skips the probe entirely wherever the first few
+samples land flat-on, which is most of a typical frame.
+
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
 the composite `P`, and the photon modes `M`/`S`/`U`), on both CPU and GPU. `-resume` /
@@ -4619,7 +5549,7 @@ alone can't restore, so they are not disk-resumable.
 | `-noise <pct>` | Render until the noise floor drops below `pct` % |
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
-| `-window` | Open a real OS window (Win32; no-op off Windows) showing the actual tone-mapped pixels, refreshed every `-window-interval` (default 0.2 s, independent of the `-interval` disk-write cadence — so the image builds up on screen while it renders rather than appearing only when it's finished). The image is **presented by Direct3D 11** (a flip-model swap chain; the control strip below it stays GDI), which is what keeps a fast renderer fast: the previous CPU present — a per-pixel RGB→BGRA repack plus a `HALFTONE` `StretchDIBits` — cost **9 ms/frame** at 1920², more than the render it was displaying, and charged it to the render thread; it is now **~1.3 ms**. In the GPU-rasterized interactive explorer (`-raster -explore -device gpu`) the frame skips host memory **entirely**: CUDA is handed the window's own D3D11 texture and the tone-map kernel writes the finished pixels straight into it, so there is no device→host download, no re-upload, and no host touch of the image at all (measured at 3840²: **26.1 ms → 9.7 ms** per displayed frame). ftrace prints one line saying which way it's presenting; the copy path is used automatically whenever the fast one can't be (notably when D3D picks a different adapter than the CUDA device, as on hybrid iGPU/dGPU laptops, or when a flypath overlay has to be drawn into the pixels). `FTRACE_LIVE_GDI=1` forces the old GDI path (and ftrace falls back to it automatically if D3D can't start). The window is put on screen **before the render starts** — as soon as the scene has loaded and the frame size is known — showing a near-black placeholder with the current stage in the title bar (`preparing…`, `mode W — starting…`), then the first rendered chunk replaces it. Previously it was created lazily by the first repaint, so in the ray-traced modes no window existed until the render was already over and the finished image appeared to flash up for a split second as the process exited. **Every phase that runs before the first pixel now names itself**, so a long silent setup reads as progress instead of a hang: an `exposure_lock` meter pre-pass (on a locked `camera_curve` this is a real reduced render of up to dozens of frames, and it used to complete with no window on screen at all) reports `metering exposure k/N`, and a shared **mode M** pass reports `tracing photons…` → `building photon map…` → `building beam map…` → `frame k/N`. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live — as is the shared mode-`M` multi-camera gather, so a flythrough both flips through its frames *and* shows each individual frame converging (which matters at delivery resolution, where one frame's gather far outlasts a repaint interval) — and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>`, then the transport mode driving that frame (`mode B (pinhole)`, `mode D (BDPT)`, `mode M (photon map)`, …; a per-camera flight shows the mode of the frame currently on screen), then the live status (`spp` / `% noise` or photon count) as it converges, and finally the **compute backend** actually in use — `GPU (NVIDIA GeForce RTX 4090)` (the real device name, so a multi-GPU box says *which* one) or `CPU (12 threads)` — so you can tell at a glance which scene/file the window is showing, how it's being rendered, how far along it is, and what's doing the work. The backend is reported from where the device is *resolved*, not from what `-device` asked for, so a `-device gpu` that fell back (no CUDA build, no free VRAM, an unsupported feature) reads `CPU` and says so; in the interactive explorer, where the raster preview and a `mode W` refinement run on the CPU while a path-trace refinement runs on the GPU, the label follows whichever pass produced the frame on screen. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is.<br><br>**When the render finishes the title says so**, leading with `✔ DONE — <why>` before everything else: `✔ DONE — noise target met  —  ftrace — scene.ftsl → png/out.png  —  mode R (backward ref)  —  [noise] target ~0.5%, 49.1s, 40133 spp, ~0.50% noise  —  GPU (NVIDIA GeForce RTX 4090)`. `<why>` names the budget that ended it — `noise target met`, `time budget reached`, `photon target reached`, `sample target reached`, `stopped early` (Ctrl-C or `-stop`), or `stopped by an error`. Without this the only signal that a render had finished was that the progress text *stopped changing*, which looks exactly like a render still grinding through a long chunk between repaints; it matters most under `-keepwindow`, where the window deliberately outlives the render. The marker is a prefix rather than a suffix so it survives the left-anchored truncation of the taskbar button and a narrow title bar. |
+| `-window` | Open a real OS window (Win32; no-op off Windows) showing the actual tone-mapped pixels, refreshed every `-window-interval` (default 0.2 s, independent of the `-interval` disk-write cadence — so the image builds up on screen while it renders rather than appearing only when it's finished). The image is **presented by Direct3D 11** (a flip-model swap chain; the control strip below it stays GDI), which is what keeps a fast renderer fast: the previous CPU present — a per-pixel RGB→BGRA repack plus a `HALFTONE` `StretchDIBits` — cost **9 ms/frame** at 1920², more than the render it was displaying, and charged it to the render thread; it is now **~1.3 ms**. In the GPU-rasterized interactive explorer (`-raster -explore -device gpu`) the frame skips host memory **entirely**: CUDA is handed the window's own D3D11 texture and the tone-map kernel writes the finished pixels straight into it, so there is no device→host download, no re-upload, and no host touch of the image at all (measured at 3840²: **26.1 ms → 9.7 ms** per displayed frame). ftrace prints one line saying which way it's presenting; the copy path is used automatically whenever the fast one can't be (notably when D3D picks a different adapter than the CUDA device, as on hybrid iGPU/dGPU laptops, or when a flypath overlay has to be drawn into the pixels). `FTRACE_LIVE_GDI=1` forces the old GDI path (and ftrace falls back to it automatically if D3D can't start). The window is put on screen **before the render starts** — as soon as the scene has loaded and the frame size is known — showing a near-black placeholder with the current stage in the title bar (`preparing…`, `mode W — starting…`), then the first rendered chunk replaces it. Previously it was created lazily by the first repaint, so in the ray-traced modes no window existed until the render was already over and the finished image appeared to flash up for a split second as the process exited. **Every phase that runs before the first pixel now names itself**, so a long silent setup reads as progress instead of a hang: an `exposure_lock` meter pre-pass (on a locked `camera_curve` this is a real reduced render of up to dozens of frames, and it used to complete with no window on screen at all) reports `metering exposure k/N`, and a **mode M** pass reports every phase of its long pre-pixel run *with a measure*: `tracing photons — 1.0M / 80.0M (1%), 7.00s, 150.5k/s, ~8:45 left` → `building photon map… 12.0s` → `building beam map… 9.00s` → the gather itself, `frame 7/601  —  [gather] 107 / 160 spp (67%), 80.0M photons, 16:57, ~9.67% noise`. Durations are `[[[dd:]hh:]mm:]ss` throughout — see **Elapsed times and ETAs** under **Output**. This matters more in mode M than anywhere else, because a showcase photon-map render spends most of its wall clock *before* there is an image to show — the deposit of tens of millions of photons alone can run for many minutes, and it used to sit on a single frozen caption for all of it, which is indistinguishable from a wedged render. The photons/second rate and the estimated time remaining are measured from the run in progress over a **trailing ~60 s window** rather than cumulatively from the start of the phase, and the same lines are echoed to stdout on a slower (30 s) cadence so a headless or backgrounded render is legible in its log too. The trailing window matters because these phases are not uniform: a mode-`M` gather opens on a 1/16-spp probe slice which — samples being laid out in scanline order — covers the top of frame, so on a scene whose sky is empty it clocks a rate tens of times the real one. A cumulative average carries that opening lie for many minutes (measured on `gallery_rain` with `-beams`: still reporting 677/s against a true 280/s six minutes in, its ETA having climbed 986 s → 17974 s without ever converging), whereas the trailing window settles on the true figure in about a minute. The window is sampled **when the work advances, not on a timer**, and is kept wide enough to span several updates: a gather advances once per slice, tens of seconds apart, so a time-driven 15 s window kept measuring intervals with no progress in them and reported whichever scanline band it happened to catch — 5.3k/s, 1.0k/s, 280/s, 916/s across four consecutive lines of one steady gather. Until two samples exist the line reads `measuring…` rather than inventing a figure from the probe. **The gather also draws the frame as it fills** instead of holding the dark placeholder for it: one chunk is a whole spp, which with `-beams` at delivery resolution can be half an hour, and because the samples run in scanline order a partial chunk shows as the image arriving top-to-bottom. That preview is **duty-cycle limited to ~10 % of wall clock**, because assembling it costs a device→host copy of the film plus a full-frame tone-map and the gather's slice loop is synchronous — a repaint is *inserted into* the render, not run alongside it. At a fixed 4 Hz that cost the first spp (the only one the partial preview runs during) **129.5 s against ~3 s headless, a 40× penalty on the phase**. Each repaint is now timed and the next held off for nine times what it cost, so cheap frames still refresh at the full 4 Hz and expensive ones back off by themselves; `-window-min` and headless renders of the same scene now finish within a second of each other (105 s vs 106 s). `FTRACE_PAINT_DEBUG=1` prints each repaint's cost and the gap it bought. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live — as is the shared mode-`M` multi-camera gather, so a flythrough both flips through its frames *and* shows each individual frame converging (which matters at delivery resolution, where one frame's gather far outlasts a repaint interval) — and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>`, then the transport mode driving that frame (`mode B (pinhole)`, `mode D (BDPT)`, `mode M (photon map)`, …; a per-camera flight shows the mode of the frame currently on screen), then the live status (`spp` / `% noise` or photon count) as it converges, and finally the **compute backend** actually in use — `GPU (NVIDIA GeForce RTX 4090)` (the real device name, so a multi-GPU box says *which* one) or `CPU (12 threads)` — so you can tell at a glance which scene/file the window is showing, how it's being rendered, how far along it is, and what's doing the work. The backend is reported from where the device is *resolved*, not from what `-device` asked for, so a `-device gpu` that fell back (no CUDA build, no free VRAM, an unsupported feature) reads `CPU` and says so; in the interactive explorer, where the raster preview and a `mode W` refinement run on the CPU while a path-trace refinement runs on the GPU, the label follows whichever pass produced the frame on screen. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is.<br><br>**When the render finishes the title says so**, leading with `✔ DONE — <why>` before everything else: `✔ DONE — noise target met  —  ftrace — scene.ftsl → png/out.png  —  mode R (backward ref)  —  [noise] target ~0.5%, 49.1s, 40133 spp, ~0.50% noise  —  GPU (NVIDIA GeForce RTX 4090)`. `<why>` names the budget that ended it — `noise target met`, `time budget reached`, `photon target reached`, `sample target reached`, `stopped early` (Ctrl-C or `-stop`), or `stopped by an error`. Without this the only signal that a render had finished was that the progress text *stopped changing*, which looks exactly like a render still grinding through a long chunk between repaints; it matters most under `-keepwindow`, where the window deliberately outlives the render. The marker is a prefix rather than a suffix so it survives the left-anchored truncation of the taskbar button and a narrow title bar. |
 | `-window-min` / `-minimized` | Like `-window`, but the window **opens minimized to the taskbar** instead of on the desktop. It is a fully live preview — frames are presented to it exactly as with `-window`, the title bar tracks progress, closing it still stops the render — you just restore it from the taskbar when you want to look, rather than having it put in front of whatever you were doing. It never takes keyboard focus even momentarily (`SW_SHOWMINNOACTIVE`, not `SW_MINIMIZE`, which activates the window first and would swallow a keystroke). The reason to want it: when several renders are launched in sequence — a parameter sweep, a flyby, a batch of validation stills — each one popping a window to the foreground makes the machine unusable for anything else, and the obvious workaround (drop `-window` entirely) throws the live preview away instead of just relocating it. Purely a display choice: the render, its output and its timings are unaffected. Combines with `-keepwindow`, which then holds the finished image in the still-minimized window. Implies `-window`. |
 | `-keepwindow` / `-hold` | Like `-window`, but **don't auto-close** the live window when the render finishes — normally the window is torn down at process exit the instant the last frame completes, so a finished image only flashes on screen. With this set, ftrace keeps the final image up and blocks until you close the window yourself (handy for inspecting a quick `-raster` preview or a completed still), and the title bar switches to `✔ DONE — <why>` (see `-window`) so a held window can't be mistaken for one that is still converging. Implies `-window`. |
 | `-interval <s>` | Periodic image write / status line / ANSI `-preview` refresh (default 15 s). This is the **crash-safety** cadence — how often the PNG and the `.ftbuf` checkpoint are rewritten — and is deliberately *not* what drives the live window (see `-window-interval`). |
@@ -4630,7 +5560,7 @@ alone can't restore, so they are not disk-resumable.
 | `-raster-bench <n>` | Raster **frame-rate benchmark**: after the scene is built (and uploaded, on the GPU), re-render the first selected camera `n` times and report steady-state **ms/frame** (min/median/mean + fps) — the interactive explorer's per-move cost, measured independently of startup. With `-device gpu` also prints a per-pass breakdown (clearvis/project/raster/shade/clear/expose+encode/download, timed with CUDA events on the GPU timeline). Add `-window` and it also reports the **live-window present tail** — what handing each finished frame to the preview costs the render thread — because that tail used to be larger than the render itself and a backend speedup is only real if it stays small. With `-device gpu -window` it then runs a **second, zero-copy phase**: the same `n` frames rendered directly into the window's D3D11 texture, reported as one combined `render+present` figure (there is no separate tail to report — there is no handoff) plus its own per-pass breakdown, so the two presentation paths can be compared pass by pass on one run. Note that the zero-copy *median* pins at the display refresh (16.67 ms / 60.0 fps) because presenting blocks on vblank once both back buffers are queued — read **min** for the true pipeline cost. Writes the last frame to `-o` so backends/builds can be byte-compared. |
 | `-see-through` / `-seethrough` / `-glass` | In `-raster`, render **clear** materials (dielectric / thin-film / filter / diffuse-transmit) as actually see-through instead of solid ghosts: each clear surface between the camera and the opaque background **dims** and **milkily hazes** what's behind it, cumulative with the number of clear surfaces crossed (no refraction, no coloured absorption). Order-independent, so overlapping glass needs no sort. See the preview note under **Render modes**. |
 | `-glass-clarity <0..1>` | Per-surface transmittance for `-see-through` (default `0.85`; higher = clearer / less dimming). Passing it implies `-see-through`. |
-| `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`) and hands control to you: Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly (the step auto-scales to the distance ahead), Ctrl+wheel = bias that step, `C` = wall collision, `T` = cycle the lit preview (see below), `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. The flyby's frames are kept as a **camera-path timeline** in the panel below the image: **scrub/play/pause** across them, **lock** the camera onto the path (travel forward/back along it at a **cams/update** or **cams/second** speed), or release to fly freely — see **Interactive camera** for the full panel. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. **`T` — cycle the lit preview:** the still view cycles **raster → mode `W` → path-traced → raster**. The flat raster (default) is instant and is what you navigate with; the other two render the pose you are actually standing at. Whichever is active, the instant you move the camera it drops back to the responsive raster and re-renders once you settle, so navigation stays fluid. The scene-ignore flags (`-no-media`/`-no-env`/`-no-fluoro`, `-max-bounce`, `-direct-only`) apply to both, so you can strip/cap the scene for a faster preview.<br><br>**mode `W`** is the deterministic Whitted preview (see **Render modes**) on the **CPU**, so unlike the path-traced stage it works on **any scene** and needs no GPU — full spectral walk, all materials, media, environment, and the `-gi` one-bounce gather if you asked for one. It is **noise-free**, so it does not need to converge: the pose renders **once**. Because a mode-`W` frame costs anywhere from ~0.4 s (a Cornell box) to ~26 s (a gyroid labyrinth at 960×600), it is delivered progressively — a **coarse full-frame pass lands immediately**, then full-resolution **row bands** sweep down over it, with the band height continuously retuned from the measured cost of the previous band to keep the viewer responsive on fast and slow scenes alike. The title bar shows the percentage complete. Moving the camera simply abandons the unfinished rows. If the scene contains a material that **de-heroes** the path onto one wavelength — a `layered` coat, participating media, a GRIN volume, or `-heroc 1` — the preview keeps adding passes up to 16 spp to resolve its colour; on any other scene 1 spp is already exact and it stops there. Dispersive materials (glass, thin film, multilayer, grating, half-mirror, fluorescence) used to be on that list and no longer are: mode `W` splits the bundle at a dispersive vertex, so they are colour-correct in the very first pass — see the glass note under **Render modes**. **`-explore -mode W` opens straight into this preview** instead of the raster.<br><br>**path-traced** progressively traces the pose with the fast **RGB backward** tracer (the Stage-2 `-rgb` walk) into a resident GPU session: while the camera holds still the image **converges in place** (the title shows accumulated `spp`), so it ends up more correct than mode `W` — real multi-bounce GI — but it starts noisy, needs a CUDA GPU, and only works when the scene+camera are inside the fast-RGB scope (same scope as `-rgb`). When it isn't available the cycle **skips it**, so `T` becomes a plain raster ↔ mode `W` toggle. |
+| `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`) and hands control to you: Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly (the step auto-scales to the distance ahead), Ctrl+wheel = bias that step, `C` = wall collision, `T` = cycle the lit preview (see below), `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. The flyby's frames are kept as a **camera-path timeline** in the panel below the image: **scrub/play/pause** across them, **lock** the camera onto the path (travel forward/back along it at a **cams/update** or **cams/second** speed), or release to fly freely — see **Interactive camera** for the full panel. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. **`T` — cycle the lit preview:** the still view cycles **raster → mode `W` → path-traced → raster**. The flat raster (default) is instant and is what you navigate with; the other two render the pose you are actually standing at. Whichever is active, the instant you move the camera it drops back to the responsive raster and re-renders once you settle, so navigation stays fluid. The scene-ignore flags (`-no-media`/`-no-env`/`-no-fluoro`, `-max-bounce`, `-direct-only`) apply to both, so you can strip/cap the scene for a faster preview.<br><br>**mode `W`** is the deterministic Whitted preview (see **Render modes**) on the **CPU**, so unlike the path-traced stage it works on **any scene** and needs no GPU — full spectral walk, all materials, media, environment, and the `-gi` one-bounce gather if you asked for one. It is **noise-free**, so it does not need to converge: the pose renders **once**. Because a mode-`W` frame costs anywhere from ~0.4 s (a Cornell box) to ~26 s (a gyroid labyrinth at 960×600), it is delivered progressively — a **coarse full-frame pass lands immediately**, then full-resolution **row bands** sweep down over it, with the band height continuously retuned from the measured cost of the previous band to keep the viewer responsive on fast and slow scenes alike. The title bar shows the percentage complete. Moving the camera simply abandons the unfinished rows. If the scene contains a material that **de-heroes** the path onto one wavelength — a `layered` coat, participating media, a GRIN volume, or `-heroc 1` — the preview keeps adding passes up to 64 spp to resolve its colour (it was 16, which is still ~18% off the converged hue on a rain volume; movement abandons the refinement outright, so the extra passes only run while you hold still); on any other scene 1 spp is already exact and it stops there. Dispersive materials (glass, thin film, multilayer, grating, half-mirror, fluorescence) used to be on that list and no longer are: mode `W` splits the bundle at a dispersive vertex, so they are colour-correct in the very first pass — see the glass note under **Render modes**. **`-explore -mode W` opens straight into this preview** instead of the raster.<br><br>**path-traced** progressively traces the pose with the fast **RGB backward** tracer (the Stage-2 `-rgb` walk) into a resident GPU session: while the camera holds still the image **converges in place** (the title shows accumulated `spp`), so it ends up more correct than mode `W` — real multi-bounce GI — but it starts noisy, needs a CUDA GPU, and only works when the scene+camera are inside the fast-RGB scope (same scope as `-rgb`). When it isn't available the cycle **skips it**, so `T` becomes a plain raster ↔ mode `W` toggle. |
 | `-no-meter` / `-nometer` | Skip the **exposure-lock metering pre-pass**. Normally a locked `camera_curve`/`camera_path`/`camera_orbit` group meters (up to 64 of) its frames up front to compute one shared exposure anchor, so the flyby doesn't flicker. With this flag that pre-pass is skipped and each frame **auto-exposes on its own** — faster startup (no metering the whole path), at the cost of possible frame-to-frame brightness flicker on an animated flyby. Implied by `-explore` (the interactive viewer auto-exposes per frame, so metering a whole flyby just to fly one frame is wasted work). |
 | `-noclip` / `-nocollide` | Start the interactive fly-viewer with **wall collision off** (fly through geometry) — for placing a camera *outside* the room or *inside* glass. Collision is **on by default** (you can't fly through walls); press `C` in the viewer to cycle `slide` → `stop` → `noclip` live. See the fly-camera controls under **Interactive fly camera**. |
 | `-anim <file.json>` | Edit a **loom `CurveDrive` sidecar** in the interactive fly editor (implies `-explore`). The editor's control points become the drive's N-dimensional points: channels 0–2 are the point you see and move in 3-D, channels 3+ are non-spatial values carried along per point. **Save** writes the reshaped curve back to the sidecar atomically, preserving the drive's name/mode/dims and every channel → scene-variable **binding**. A sidecar that doesn't exist yet is created on the first Save (from whatever control points the scene seeded), so this is also how you start a drive. See **Editing a loom animation drive** under **Interactive fly camera**. |
@@ -4640,10 +5570,10 @@ alone can't restore, so they are not disk-resumable.
 | `-prebake` | With `-viewer`: walk the clock **once** on open and keep every frame's adopted state in memory, then play out of that cache on a wall clock at the panel's `fps` rather than at loom's bake rate. Costs ~0.01 ms a frame to show, so the requested rate is actually delivered, and it makes scrubbing the frame slider instant too. The cache is dropped whenever a build parameter or `frames` changes — a cache built at other values is not a cache of what you are looking at. Same thing as the panel's **prebake** button; the flag exists so a played frame rate can be measured from a script. |
 | `-prebake-cap <MB>` | Memory budget for `-prebake` (default `1024`, also settable live as the panel's **cap MB**). A walk that reaches the cap stops there and says where: the **prefix** it did fill still plays from memory and the remaining frames fall back to bake-paced play, so a long clock degrades instead of failing. Because that degradation is otherwise invisible until you hit it — a loop that runs at the target rate for its first half and stutters through the rest — the walk projects the whole clock's cost after 4 frames and prints it **before** committing: either `~19.4 MB/frame x 96 frames = ~1863 MB, fits the 1024 MB cap` or the shortfall together with the exact `-prebake-cap` value that would cache everything. The same suggestion is repeated on the cap-reached line. |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`). Under `-radcache` the sidecar also carries the radiance-cache table (sparse — occupied cells only), so a resumed render continues warm; see **The radiance cache** |
-| `-stop [<pid>\|all]` | **Stop a running render cleanly, from another shell.** `ftrace -stop <pid>` asks that render to do exactly what Ctrl-C does — finish the current chunk, write the final image **and** `.ftbuf` checkpoint, release the CUDA context through the graceful-shutdown path — then waits (up to 120 s) for it to actually exit, so it's safe to script a rebuild right after. `-stop all` targets every running render; a bare `-stop` just **lists** them (pid + scene → output). This exists because a render launched detached has no console to Ctrl-C into, and **force-killing ftrace mid-CUDA is a known way to wedge the NVIDIA driver into a TDR/bugcheck** — so never `taskkill /F` a render, use this. It also releases a window being held open by `-keepwindow`. Implemented as a sentinel file under `<temp>/ftrace/` (a `<pid>.run` entry per live render, a `<pid>.stop` to signal it), which — unlike a named kernel event — crosses the session / window-station boundary between a detached render and the shell signalling it. Stale channel files are reaped by the next `-stop`: both a `<pid>.run` left by a hard kill and a `<pid>.stop` nobody was left to consume, in each case only once the owning pid is gone. A stop that arrives while the process is still **loading the scene** aborts the load rather than being waited out: it prints `[stop] scene load stopped before rendering — nothing was rendered or written.` and exits **1** (no scene was built, so nothing could be rendered — the non-zero exit is the correct outcome, not an error in your `.ftsl`). Since **0.182.0** it covers every long-lived ftrace process, not just renders: a `-viewer` (loom native viewer) or `-explore` GUI is listed by a bare `-stop` and shuts down cleanly when targeted, its event loop polling the same flag a render polls and then leaving through its normal teardown (D3D11, the loom python child, the window). Also since 0.182.0 the **exit code is honest**: `0` only when every target is genuinely gone (a pid that was already dead counts, and reports `nothing to stop`), and `2` with `[stop] FAILED — still running after 120s: <pids>` when one outlives the wait — previously it printed `stopped cleanly` and exited 0 regardless, so a stop that did nothing looked like a success. Nothing is ever force-killed either way. |
+| `-stop [<pid>\|all]` | **Stop a running render cleanly, from another shell.** `ftrace -stop <pid>` asks that render to do exactly what Ctrl-C does — finish the current chunk, write the final image **and** `.ftbuf` checkpoint, release the CUDA context through the graceful-shutdown path — then waits for it to actually exit, so it's safe to script a rebuild right after. `-stop all` targets every running render; a bare `-stop` just **lists** them (pid + scene → output). This exists because a render launched detached has no console to Ctrl-C into, and **force-killing ftrace mid-CUDA is a known way to wedge the NVIDIA driver into a TDR/bugcheck** — so never `taskkill /F` a render, use this. It also releases a window being held open by `-keepwindow`. Implemented as a sentinel file under `<temp>/ftrace/` (a `<pid>.run` entry per live render, a `<pid>.stop` to signal it, and a `<pid>.ack` the target writes back), which — unlike a named kernel event — crosses the session / window-station boundary between a detached render and the shell signalling it. Stale channel files are reaped by the next `-stop`: a `<pid>.run` left by a hard kill, a `<pid>.stop` nobody was left to consume, and an orphaned `<pid>.ack`, in each case only once the owning pid is gone.<br><br>**The wait is two-phase (since 0.205.1), because "nothing is listening" and "listening but busy" need different budgets.** The target writes `<pid>.ack` the moment its watcher consumes the sentinel — before it reaches a seam — so `-stop` allows **120 s to be acknowledged**, then **900 s** once it has been, printing `[stop] pid N acknowledged — finishing its current chunk…` and a 30 s heartbeat listing who it is still waiting on (unacknowledged pids are marked `?`). Before this, a mode-`M` GPU render was routinely reported as a *failed* stop while stopping perfectly correctly: its shortest seam was a whole frame's gather, which at delivery resolution with `-beams` runs for minutes. That is fixed at the root as well — the gather is now cut into ~0.25 s sub-launches that poll the stop flag between them (the sampling is unchanged; seeds depend only on the global sample index), and a chunk abandoned part-way is discarded whole rather than committed half-done, so a mid-gather stop writes exactly the image a stop at the previous chunk boundary would have. **The bidirectional camera pass (modes `D` and `J`) got the same treatment in 0.241.0**, and for the same reason: it polled the stop flag nowhere at all, so a stop could only land *between* spp chunks — fine while chunks are short, but mode `J`'s first 1-spp chunk on a scene whose beam map is large runs for tens of minutes, and such a render ignored three separate `-stop` invocations across half an hour and could not be ended without the force-kill this whole mechanism exists to avoid. It now polls per pixel, and (as with the mode-`M` gather) a chunk cut short is discarded rather than merged half-done — merging it while crediting a full spp would have baked a permanent dark band into the image. If the stop lands before the very first sample completes there is no image at all, and ftrace now says so (`[stop] interrupted before the first sample completed — nothing was written.`) instead of claiming one was saved. A stop that arrives while the process is still **loading the scene** aborts the load rather than being waited out: it prints `[stop] scene load stopped before rendering — nothing was rendered or written.` and exits **1** (no scene was built, so nothing could be rendered — the non-zero exit is the correct outcome, not an error in your `.ftsl`). Since **0.182.0** it covers every long-lived ftrace process, not just renders: a `-viewer` (loom native viewer) or `-explore` GUI is listed by a bare `-stop` and shuts down cleanly when targeted, its event loop polling the same flag a render polls and then leaving through its normal teardown (D3D11, the loom python child, the window). Also since 0.182.0 the **exit code is honest**: `0` only when every target is genuinely gone (a pid that was already dead counts, and reports `nothing to stop`), and `2` with `[stop] FAILED — still running after <n>s: <pids>` when one outlives the wait — previously it printed `stopped cleanly` and exited 0 regardless, so a stop that did nothing looked like a success. The failure text now distinguishes the two cases it used to conflate: an *acknowledged* pid is reported as having heard the request and still winding down (re-run `-stop` to keep waiting), while an unacknowledged one gets the old list of explanations. Nothing is ever force-killed either way. |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`). **Process-local** — it can only share an anchor between frames rendered by *this* invocation; for a frame-per-invocation sequence use `-exposure-anchor` |
 | `-exposure-anchor <v\|file>` | **Share one auto-exposure anchor across separate `ftrace` invocations** — the missing piece for a sequence whose frames are each rendered by their own process (loom's `render_range`, a batch script, a re-render of one frame). Implies `-exposure-lock`. With a **number** the anchor is used directly (no metering). With a **path**: if the file exists and holds a number that anchor is loaded and reused; otherwise this run meters normally and **writes** its resolved anchor there, so every later frame pointed at the same file develops at the identical gain. Also accepted by **`-topng`**, which is how a *finished* sequence is repaired from its `.ftbuf` checkpoints with no re-render (see **Output**). Without it, per-frame metering can jump — the p99 anchor solves `area(L) = 1%` for a level, and on a scene with a bright compact highlight population the tail density is so thin (~0.25% of frame per octave) that the inversion is ill-conditioned, so a rotating highlight swings the anchor by a third of an octave (measured on `pastel_jack_ring`: 36% single-frame anchor step while every honest brightness measure moved ≤ 2.3%). This is not fixable in the statistic — see the `exposure_lock` notes and `known-issues.md` |
-| `-hdr` | Also write a **32-bit float PFM** beside `-o` (`<out>.pfm`) holding the **scene-linear** image — the exact buffer the tone map consumes, with no exposure, no gamma and **no clamp**. Written on every periodic in-progress write too, so a still-converging render can be metered. Use it whenever you intend to *measure* rather than look: an 8-bit PNG clamps at white, and a caustic is by definition the brightest thing in frame, so its core prints as `#FFFFFF` with all three channels **equal** — the tone map destroys the caustic's colour and its peak-to-screen ratio before any analysis can see them. (Values are radiance in the film's own scale; peak/median ratios and chromaticity are exposure-invariant, so two renders shot at different stops stay comparable.) PFM is a 3-line ASCII header + raw little-endian `float32` RGB triples, raster order left-to-right **bottom-to-top**. |
+| `-hdr` | Also write a **32-bit float PFM** beside `-o` (`<out>.pfm`) holding the **scene-linear** image — the exact buffer the tone map consumes, with no exposure, no gamma and **no clamp**. Written on every periodic in-progress write too, so a still-converging render can be metered. Use it whenever you intend to *measure* rather than look: an 8-bit PNG clamps at white, and a caustic is by definition the brightest thing in frame, so its core prints as `#FFFFFF` with all three channels **equal** — the tone map destroys the caustic's colour and its peak-to-screen ratio before any analysis can see them. (Values are radiance in the film's own scale; peak/median ratios and chromaticity are exposure-invariant, so two renders shot at different stops stay comparable.) PFM is a 3-line ASCII header + raw little-endian `float32` RGB triples, raster order left-to-right **bottom-to-top**. **`-o out.pfm` is not a way to get one** — `.pfm` is not a recognised output extension, so that writes a tone-mapped 8-bit PPM under a `.pfm` name, which looks like a PFM to everything except a reader that checks the header. `-hdr` is the only way. |
 | `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |
 | `-stereo <mode>` | **3-D stereoscopic output** (stills *and* movies). Renders each camera **twice** — a Left/Right eye pair — and composites them into the `-o` image. `mode` picks the fusion: `sbs` (side-by-side **wall-eyed**, L\|R), `cross` (side-by-side **cross-eyed**, R\|L), `anaglyph` (**red-cyan** Dubois glasses, the default kind), or `anaglyph-gm` (**green-magenta** Dubois). Uses the correct **off-axis** rig — two *parallel* cameras offset along the camera right axis with **asymmetric (sheared) frusta** sharing a convergence plane, so there's **no vertical parallax** (toe-in's eye-strain cause). Both eyes share one auto-exposure anchor, so L/R — and every frame of an exposure-locked `camera_path` — tone-map identically. Rectilinear cameras only (a fisheye camera renders mono, with a warning). See **Stereoscopic 3-D** below. |
 | `-eye-sep <m>` | Interocular (eye-to-eye) distance for `-stereo`, in metres. Default `0.063` (63 mm, average human). |
@@ -4653,15 +5583,38 @@ alone can't restore, so they are not disk-resumable.
 | `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checkimplicit`,
-`-checkcurve`, `-checkfur`, `-checkfurgrid`, `-checkfurvol`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
+`-checkcurve`, `-checkfur`, `-checkfurgrid`, `-checkfurvol`, `-checkpmgrid`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
 `-checkbluenoise`, `-checkfnoise`, `-checkstochtile`, `-checkreaction`, `-checkcurv`,
 `-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checkprefer`, `-checkpaths`,
 `-checksdf`, `-checksun`, `-checkbind`, `-checkprop`, `-checkhair`,
-`-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
-`PASS`/`FAIL`. `-checkpaths` guards **asset path resolution** (see *Where asset paths
+`-checkarray`, `-checklattice`, `-checknd`, `-checkpatops`. Each runs deterministically without a scene and prints
+`PASS`/`FAIL`. (`-misaudit` / `-misaudit-poison`, described at the end of this section, are
+also diagnostics but need a scene — they instrument a live render's MIS weights.)
+
+`-checkpatops` guards **the pattern VM against itself**. The VM is implemented three
+times — `patternEval` on the host, the fp64 device template `dPatternEval`, and
+`dPatternEvalF`, an FP32 twin that is what the sphere-trace march actually runs — and none
+of the three switches has a `default:` case. So an opcode that one of them has never heard
+of is not a compile error and not a crash: the node is skipped, the operand stack is left
+one short, and the program returns the wrong slot. When that happened to an isosurface
+field the field read `0` everywhere, never crossed the isolevel, and the surface simply was
+not there — which looks like an empty scene rather than a broken shader, and took a bisect
+across four backends to localise. The check builds one minimal well-formed program per
+opcode (operand count from `patOpStackEffect`, the VM's own arity table), evaluates each on
+all three, and compares. Inputs are deliberately non-zero, *including* the `d4`…`d12`
+extra-dimension bank, because a skipped opcode returns `0` and zero inputs would make
+"skipped" and "evaluated" indistinguishable. Opcodes with an arity that cannot be read from
+the node alone (`grid:`, `scatter:`, whose arity is the named table's dimensionality) are
+reported as skipped rather than silently passed. Three opcodes are **exempt by
+declaration**, printed with their reason on every run: `spec:` is host-only (the compiler
+accepts it only inside an `upsample` body, which the loader evaluates at load time), and
+`curv` / `cavity` / `fw` are absent from the FP32 VM because a field march has no surface to
+measure them on. That table is half the check — a VM that silently drops an opcode and one
+that was never meant to have it are indistinguishable from the outside, so the only thing
+that separates them is a written-down decision. `-checkpaths` guards **asset path resolution** (see *Where asset paths
 are looked for*): it builds a throwaway project tree in the temp directory, `cd`s
 somewhere unrelated, and asserts that a scene loads from there with its texture found
 via the scene's *parent* directory, that an absolute path is returned unchanged, that an
@@ -4776,6 +5729,22 @@ integer-and-`double` arithmetic on both sides, so unlike a rendered image they m
 agree to the last bit — a CUDA build compares them directly, a CPU-only build reports
 that half as `SKIPPED`.
 
+**`-misaudit` / `-misaudit-poison`** are different in kind from the `-check*` family: they
+need a scene, because they instrument a real render. `-misaudit` cross-checks **every CPU
+bidirectional MIS weight** (mode `D -device cpu`, and mode `J`) against a second,
+independently written implementation of the balance heuristic. The shipping one is PBRT's
+*relative* form — it never builds a path density, only ratios, telescoped one vertex at a
+time — so an off-by-one in a ratio loop yields a plausible weight rather than a crash. The
+reference computes each strategy's path density **outright** and divides, summing in logs
+because the products overflow doubles in both directions. At the end of the run ftrace
+prints how many weights were checked, how many disagreed by more than `1e-9`, and the worst
+relative difference with the `(s, t)` it occurred at. It changes no pixel; it only costs
+time. **`-misaudit-poison`** is the negative control: it breaks the reference on purpose
+(omitting the density swap that the eye half needs, since a camera-side subpath is walked
+against the unified path's direction), so the run **must** report disagreements — if it
+does not, the audit is vacuous and ftrace says so in as many words. Run it whenever you
+have reason to doubt that the clean runs mean anything.
+
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are
 still accepted but print a notice and do nothing. See **The shared grammar** above.
@@ -4826,6 +5795,32 @@ load-if-present / meter-and-save otherwise. `-exposure-anchor` also applies only
 `.ftbuf`. See **`exposure_lock`** under **Cameras** for why per-frame metering jumps and
 for loom's `stabilize_exposure()`, which drives this automatically over a whole
 directory of checkpoints.
+
+### Elapsed times and ETAs
+
+Every duration ftrace prints — elapsed time, time remaining, a `-time` budget, a build
+time — is formatted **`[[[dd:]hh:]mm:]ss`**: the most significant unit that is non-zero
+comes first unpadded, and each unit after it is zero-padded to two digits. Below a
+minute the figure keeps its fraction and its `s` suffix, because that is the regime
+where tenths and hundredths are the information.
+
+```
+0.30s        9.5s        42.3s          under a minute — a slice, a BVH build
+1:45         9:59                       minutes and seconds
+3:19:45      23:59:59                   hours
+1:07:00:12   2:11:40:11                 days
+```
+
+This replaces the raw second counts printed before 0.208.0. It is not cosmetic: a
+`gallery_rain` gather at delivery resolution honestly reports `~111612s left`, and
+nobody reads that as *a day and seven hours*. The renders this program is for are
+routinely hours or days long, so a format that is only readable for the first sixty
+seconds makes the user do the arithmetic on every line.
+
+Above a minute there is no unit suffix — the colons carry that meaning, and appending
+`s` would wrongly suggest that `1:45` is a number of seconds. Anything that parses
+ftrace's progress output should read both spellings; the two are trivially
+distinguished by the presence of a colon.
 
 ### Denoising (`-denoise`)
 

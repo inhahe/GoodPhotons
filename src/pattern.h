@@ -55,6 +55,9 @@ enum class PatOp : int {
     // nullary: push a value
     Const = 0,                       // push a (the node's literal)
     VarX, VarY, VarZ,                // world hit point
+    // d4 .. d12: spatial dimensions past the third, read only by a field evaluated on an
+    // N-D slice. Contiguous and in order, so the decoder is one subtraction.
+    VarD4, VarD5, VarD6, VarD7, VarD8, VarD9, VarD10, VarD11, VarD12,
     VarF,                            // implicit field value at the hit (~0 on a surface)
     VarNx, VarNy, VarNz,             // surface normal (oriented against the ray)
     VarR,                            // radius = sqrt(x*x+y*y+z*z)
@@ -498,8 +501,20 @@ PATTERN_HD inline double patScatterSample(const PatScatter& s, const float* pool
 }
 
 // Per-hit evaluation context (the pattern variables).
+// How many spatial dimensions past the third a field may read (`d4` .. `d12`), matching
+// -nd's 12-dimension cap. A field that names none of them costs nothing: the slots stay 0
+// and the compiled expression never emits the opcode.
+static const int kPatMaxExtraDims = 9;
+
 struct PatCtx {
     double x = 0, y = 0, z = 0;   // world point
+    // EXTRA SPATIAL DIMENSIONS, d[0] == `d4`. Zero unless an N-D slice is in scope (see
+    // PatTables::slice). This is what makes a field genuinely N-dimensional rather than a
+    // 3-input function of a rotated point: a 3-input field sliced in N-D only ever sees an
+    // affine remap of (x,y,z) — tilt, shear, drift — and no new structure can appear,
+    // which is the same result that forced -nd's mesh path to grow `emboss`/`extrude`.
+    // A field that actually READS d4 has somewhere for the rotation to take it.
+    double d[kPatMaxExtraDims] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     double f = 0;                 // implicit field value (0 for non-implicit hits)
     double nx = 0, ny = 0, nz = 0;// surface normal
     double r = 0;                 // radius |p|
@@ -547,10 +562,29 @@ struct PatCtx {
 // Deliberately NOT stored inside Implicit/Medium: these are pointers into Scene's
 // vectors, and a Scene is copied and moved (buildCornell returns by value), so a cached
 // copy would dangle. The owner passes them at the call.
+// The 3-D SLICE of N-space a field is evaluated on: the N-D sample point is
+//
+//     P = A * (x, y, z) + O
+//
+// with `A` the first three columns of the N-D rotation (row k gives dimension k's
+// direction in the slice) and `O` the slice offset. P[0..2] feed the field's x/y/z and
+// P[3..] its d4.., so rotating the slice tilts it through N-space and the field's
+// cross-section genuinely changes — no `emboss` needed, because a field exists everywhere
+// in N-space rather than only on the flat a mesh occupies.
+//
+// `dims == 0` means "no slice": the identity, and every evaluator skips the transform
+// entirely, so a scene without -nd pays nothing.
+struct PatSlice {
+    int    dims = 0;                                   // total dimensions, 0 = inactive
+    double a[(3 + kPatMaxExtraDims) * 3] = {0};        // row-major, dims x 3
+    double o[3 + kPatMaxExtraDims] = {0};              // per-dimension offset
+};
+
 struct PatTables {
     const PatGrid*    grids    = nullptr; int nGrids    = 0;
     const PatScatter* scatters = nullptr; int nScatters = 0;
     const float*      dataPool = nullptr; int dataPoolN = 0;
+    const PatSlice*   slice    = nullptr;   // N-D slice, or null for the ordinary 3-D case
 };
 // Splice the tables into a freshly built PatCtx. Null is a no-op, which keeps every
 // evaluator's `const PatTables* = nullptr` default meaning "no tables in scope".
@@ -559,6 +593,23 @@ inline void patBindTables(PatCtx& c, const PatTables* t) {
     c.grids     = t->grids;    c.nGrids    = t->nGrids;
     c.scatters  = t->scatters; c.nScatters = t->nScatters;
     c.dataPool  = t->dataPool; c.dataPoolN = t->dataPoolN;
+}
+
+// Rewrite a context's spatial inputs onto the N-D slice: x/y/z become the first three
+// components of the N-D point and d4.. the rest. A no-op when no slice is bound, so every
+// caller can apply it unconditionally.
+inline void patApplySlice(PatCtx& c, const PatTables* t) {
+    if (!t || !t->slice || t->slice->dims <= 3) return;
+    const PatSlice& s = *t->slice;
+    const double px = c.x, py = c.y, pz = c.z;
+    const int n = (s.dims < 3 + kPatMaxExtraDims) ? s.dims : 3 + kPatMaxExtraDims;
+    for (int k = 0; k < n; ++k) {
+        const double v = s.a[k * 3 + 0] * px + s.a[k * 3 + 1] * py + s.a[k * 3 + 2] * pz + s.o[k];
+        if      (k == 0) c.x = v;
+        else if (k == 1) c.y = v;
+        else if (k == 2) c.z = v;
+        else             c.d[k - 3] = v;
+    }
 }
 
 // Compile-time texture-name resolution for `tex:<name>(u, v)`. A value site passes
@@ -810,6 +861,10 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
         switch (nd.op) {
             case PatOp::Const:    st[sp++] = nd.a; break;
             case PatOp::VarX:     st[sp++] = c.x;  break;
+            case PatOp::VarD4: case PatOp::VarD5:  case PatOp::VarD6:
+            case PatOp::VarD7: case PatOp::VarD8:  case PatOp::VarD9:
+            case PatOp::VarD10: case PatOp::VarD11: case PatOp::VarD12:
+                st[sp++] = c.d[(int)nd.op - (int)PatOp::VarD4];  break;
             case PatOp::VarY:     st[sp++] = c.y;  break;
             case PatOp::VarZ:     st[sp++] = c.z;  break;
             case PatOp::VarF:     st[sp++] = c.f;  break;
@@ -983,6 +1038,16 @@ inline bool isIdentCh(char c)    { return std::isalnum((unsigned char)c) || c ==
 
 // Map an identifier to a variable opcode; returns false if it isn't a variable.
 inline bool varOp(const std::string& s, PatOp& out) {
+    // d4 .. d12: the spatial dimensions past the third. Naming one is what makes a field
+    // N-dimensional; a field that never mentions them is a 3-input function and slicing it
+    // can only remap (x,y,z) affinely, however many dimensions the slice has.
+    if (s.size() >= 2 && s[0] == 'd' && std::isdigit((unsigned char)s[1])) {
+        const int k = std::atoi(s.c_str() + 1);
+        if (k >= 4 && k < 4 + kPatMaxExtraDims) {
+            out = (PatOp)((int)PatOp::VarD4 + (k - 4));
+            return true;
+        }
+    }
     if (s == "x")  { out = PatOp::VarX;  return true; }
     if (s == "y")  { out = PatOp::VarY;  return true; }
     if (s == "z")  { out = PatOp::VarZ;  return true; }
@@ -1299,6 +1364,13 @@ using pattern_detail::varOp;
 // The name of a bindable input, or nullptr if `op` is not a variable. Inverse of varOp.
 inline const char* varName(PatOp op) {
     switch (op) {
+        case PatOp::VarD4: case PatOp::VarD5:  case PatOp::VarD6:
+        case PatOp::VarD7: case PatOp::VarD8:  case PatOp::VarD9:
+        case PatOp::VarD10: case PatOp::VarD11: case PatOp::VarD12: {
+            static char buf[8];
+            std::snprintf(buf, sizeof buf, "d%d", (int)op - (int)PatOp::VarD4 + 4);
+            return buf;
+        }
         case PatOp::VarX:  return "x";   case PatOp::VarY:  return "y";
         case PatOp::VarZ:  return "z";   case PatOp::VarF:  return "f";
         case PatOp::VarNx: return "nx";  case PatOp::VarNy: return "ny";

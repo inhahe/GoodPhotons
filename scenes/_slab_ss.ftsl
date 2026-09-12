@@ -1,0 +1,82 @@
+# Analytic single-scattering slab — the ONE mode-J gate that does not trust another
+# ftrace mode.
+#
+# Gates 1/2/4 are all self-referential in the same way: gate 1 says mode `J` with no beams
+# equals mode `D`, gate 2 says the incremental MIS weight equals an absolute-form one written
+# from the same derivation, and gate 4 says mode `J` equals a converged mode `D`. All three
+# would pass unchanged if mode `D` *and* mode `J` shared a common-mode error — a sigma_s
+# convention, a phase-function normalisation, a point-light intensity of Phi/(2pi) instead of
+# Phi/(4pi). This scene is built so the answer can be computed in closed form (a 1-D
+# quadrature with no Monte Carlo anywhere) by `tools/slab_ss_ref.py`, so mode `J` is checked
+# against physics rather than against its own siblings.
+#
+# The construction, and why each piece is what it is:
+#
+#   * NO GEOMETRY except the emitter. With `-max-bounce 1` the only path that exists is
+#     eye -> (one medium scatter) -> light. Nothing can reflect, so the closed form is the
+#     whole image, not a term in it.
+#   * The emitter is a SPHERE, and a uniformly-emitting Lambertian sphere is EXACTLY a point
+#     source of intensity Phi/(4pi) at every external point: its radiant intensity is
+#     L_e * pi R^2 in every direction, independent of distance. The medium does not spoil
+#     that. Averaging exp(-sigma_t * dist) over the emitting disc gives
+#     exp(-sigma_t d) * (2/(sigma_t R)^2) * ((sigma_t R - 1) exp(sigma_t R) + 1), i.e. a
+#     multiplier that does NOT depend on d — so it lands in the one global constant the gate
+#     already fits, and the reference needs no small-sphere correction. (That derivation
+#     assumes the rays from the emitting disc to the receiver are parallel, which costs
+#     O((R/d)^2); every scatter point in this frame is at least 1.1 m from the emitter against
+#     R = 0.02 m, so that is ~3e-4.)
+#   * The emitter is INSIDE the medium (mode `J`'s beams are deposited by light subpaths, and
+#     a subpath launched from outside a bounded medium into empty space deposits nothing —
+#     mode `J` warns "the beam map is empty" and degenerates to mode `D`, which would make
+#     this gate test the wrong half of the estimator). It is nonetheless OUTSIDE the camera
+#     frustum — 29.1 deg off the view axis against a 15 deg half-fov — so no camera ray passes
+#     near it, the 1/r^2 integrand is never near-singular, the beam x ray estimator's
+#     1/sin(theta) tail is never excited, and its own surface is never directly visible: every
+#     pixel in the frame is pure single scattering with nothing to mask out.
+#   * The medium is BOUNDED (and the bounds are stretched along +x to enclose the emitter), so
+#     both the camera-side and light-side transmittances are finite slab integrals the
+#     reference clips exactly, and `sigma_t 2` is an optical depth of 4 across the viewed part
+#     of the box — thick enough to be a real test of the exponentials, thin enough that the
+#     dimmest corner can still be converged.
+#   * `g 0` makes the phase function exactly 1/(4pi), so the reference has no phase-function
+#     convention to get wrong. (Testing the Henyey-Greenstein convention is a separate gate;
+#     mixing it in here would confound a phase error with an estimator error.)
+#   * `albedo 1.0`: with a single scattering event albedo is a pure scale on sigma_s, so this
+#     only maximises signal.
+#
+# The reference is known up to ONE global scale constant per channel — the emitter's spectral
+# power distribution times ftrace's spectral-to-XYZ-to-linear-sRGB conversion, which is a
+# constant of the scene and not of the pixel. So the gate has two independent halves:
+#   (a) SHAPE: image / reference must be flat across the frame. This tests every distance- and
+#       angle-dependent factor in the estimator — both transmittances, the 1/r^2, the kernel
+#       normalisation's radius dependence, the 1/sin(theta) — and no free parameter can absorb
+#       an error in any of them.
+#   (b) SCALE: the one fitted constant must be the SAME for modes R, D and J. Mode R is a
+#       backward path tracer that shares none of the bidirectional or beam machinery, so
+#       agreement across all three pins the absolute level.
+#
+#   ftrace -in scenes/_slab_ss.ftsl -mode R -device cpu -max-bounce 1 -spp 4096 -hdr -o png/slab_r.png
+#   ftrace -in scenes/_slab_ss.ftsl -mode D -device cpu -max-bounce 1 -time 600 -hdr -o png/slab_d.png
+#   ftrace -in scenes/_slab_ss.ftsl -mode J -device cpu -max-bounce 1 -time 600 -hdr -o png/slab_j.png
+#   python tools/slab_ss_ref.py png/slab_r.pfm png/slab_d.pfm png/slab_j.pfm
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# A pure-scattering isotropic slab. The viewed part is the 2 m cube around the origin; the
+# box is stretched to x = 3 only so that it encloses the emitter (see the header).
+medium {
+    sigma_t 2.0   albedo 1.0   g 0.0
+    bounds { min -1 -1 -1   max 3 1 1 }
+}
+
+# The only object in the scene. Inside the medium, outside the frame.
+light sphere { center 2.5 0 0.5   radius 0.02   spd preset:bb6500 }
+
+camera "cam" {
+    eye 0 0 5   look_at 0 0 0   up 0 1 0   fov_y 30
+    mode R
+    film { res 96 96 }
+}

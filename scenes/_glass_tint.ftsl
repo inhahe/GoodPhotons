@@ -1,0 +1,53 @@
+# Coloured see-through glass in the preview rasterizer (-see-through).
+#
+# Four transmissive surfaces in a row against a bright wall, covering both ways a clear
+# material can state a colour:
+#
+#   * a plain dielectric with no absorption  -> colourless, dims only by -glass-clarity
+#   * dielectrics with a red / blue `absorb` -> Beer-Lambert TINT (hue only: an
+#     order-independent rasterizer never pairs a front face with its back, so there is no
+#     thickness to raise the coefficient to, and the magnitude stays with the clarity dial)
+#   * a `filter` gel                         -> `transmit` is a dimensionless T(lambda),
+#                                               so its hue AND its magnitude are real
+#
+# Look at it with:
+#   ftrace -in scenes/_glass_tint.ftsl -raster -see-through -r 640 -o png/glass_tint.png
+# and against `-glass-clarity 1` to see the master dial separated from the tints.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# --- materials -------------------------------------------------------------
+material "white" { type diffuse    reflect whitewall 0.75 }
+material "clear" { type dielectric ior    glass:BK7 }
+# Beer-Lambert absorption is per METRE and unbounded, so these are coefficients, not
+# reflectances: absorbing the short end leaves red, absorbing the long end leaves blue.
+material "ruby"  { type dielectric ior glass:BK7  absorb rgb 0.4 6.0 7.0 }
+material "azure" { type dielectric ior glass:BK7  absorb rgb 7.0 3.0 0.4 }
+# A gel states its transmittance outright, so it darkens as well as tints.
+material "gel"   { type filter     transmit gaussian center=545 sigma=35 }
+
+# --- a bright back wall to look through ------------------------------------
+quad { origin -1.2 -0.6 -0.5   u 2.4 0 0   v 0 1.6 0   material white }
+quad { origin -1.2 -0.6 -0.5   u 2.4 0 0   v 0 0 1.4   material white }   # floor
+
+# --- the four samples ------------------------------------------------------
+sphere { center -0.75 0.05 0.35   radius 0.26   material clear }
+sphere { center -0.25 0.05 0.35   radius 0.26   material ruby  }
+sphere { center  0.25 0.05 0.35   radius 0.26   material azure }
+sphere { center  0.75 0.05 0.35   radius 0.26   material gel   }
+
+# --- light -----------------------------------------------------------------
+light area {
+    origin -0.6 0.95 0.2   u 1.2 0 0   v 0 0 0.6   normal 0 -1 0
+    spd preset:bb6500
+}
+light env { spd 0.25 }
+
+# --- camera ----------------------------------------------------------------
+camera "cam" {
+    eye 0 0.15 2.2   look_at 0 0.05 0.35   up 0 1 0   fov_y 40
+    film { res 640 400 }
+}

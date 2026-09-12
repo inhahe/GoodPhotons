@@ -30,6 +30,8 @@
 #include "render.h"
 #include "photonmap.h"
 #include "photonbeams.h"   // volume single-scatter cache (mode M with -beams)
+#include "beamgather.h"    // gatherPhotonBeams — the Beam x Ray estimator (shared with mode J)
+#include "causticaim.h"    // Jensen projection map: aimed emission for the caustic pass
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 #include "backward.h"      // BackwardRenderer::neeLight / neeEnv for final-gather direct lighting
 #include "scene_film.h"
@@ -37,6 +39,297 @@
 #include "color.h"
 #include "geometry.h"
 #include "parallel.h"      // ft::stopRequested — cooperative `-stop` inside the pixel loop
+#include "render_progress.h"   // StageProgress — deposit progress for the live window/title
+#include <algorithm>
+#include <atomic>
+
+#include <chrono>
+
+// ---- GATHER FOOTPRINT (M-GATHERAREA, `-gatherarea <M>`) --------------------------------------
+// The direct density estimate divides by pi*r^2, the area of the full gather disc, while
+// collecting only from the part of that disc that is real, same-facing surface. Where the disc
+// overhangs -- a cap edge, a fold of cloth, a hair strand -- the divisor is too big and the
+// estimate is dark in proportion. Measured on `gallery_rain`: flat ground 0 %, a cap edge -33 %,
+// Alice's dress -42 %, her hair -71 %.
+//
+// `gatherCoverage` measures the fraction of the tangent-plane disc that has same-facing surface
+// under it, by probing M points along -n. Returns 1.0 when the feature is off, so the estimate
+// is bit-identical then.
+//
+// WHY A PROBE AND NOT AN ANALYTIC CLIP: the entry prescribes clipping each same-facing primitive
+// to the disc, which is exact for triangles and IMPOSSIBLE for everything else in this scene --
+// fur (the biggest single loss, mats 38-41), isosurfaces, CSG solids. One intersector call
+// handles them all, and it is the same intersector the render already trusts.
+// ON BY DEFAULT at 8 probes since v0.268.0. `-gatherarea 0` restores the pre-0.267 estimator.
+// 8 is where the sweep plateaus: it recovers 91 % of `alice_hair`'s -68 % for 1.3-1.7x the
+// gather cost, and 16 buys only a few more points. Lower is NOT better despite scoring well on
+// cloth -- see the Jensen note in known-issues.md.
+inline int gatherAreaSamples() {
+    static const int m = [] {
+        const char* e = std::getenv("FTRACE_GATHERAREA");
+        return e ? std::atoi(e) : 8;
+    }();
+    return m;
+}
+// FTRACE_GADIAG=1: per-material tally of WHY a probe contributed nothing. See the M-GATHERAREA
+// fur case -- a probe that hits empty space and a probe that hits geometry facing the wrong way
+// both add 0 to the coverage, but they mean opposite things, and the shipped estimator cannot
+// tell them apart. Diagnostic only: off (the default) nothing below is touched and the estimate
+// is bit-identical.
+// FTRACE_GAREJECT=<pct>: suppress the footprint correction for a gather whose probes REJECT at
+// least `pct` percent of their hits on the normal test -- the tangle signature. 0 = off, and off
+// is bit-identical to the pre-0.273.6 estimator. See M-GATHERAREA: dense fur is accurate
+// UNCORRECTED and +48 % corrected, because the probe sees the nearest layer while the query
+// gathers from the whole ball, so on a tangle the correction has the wrong SIGN.
+inline int gaRejectPct() {
+    static const int p = [] {
+        const char* e = std::getenv("FTRACE_GAREJECT");
+        return e ? std::atoi(e) : 0;
+    }();
+    return p;
+}
+// FTRACE_GAREJW=<pct>: the area a REJECTED probe contributes, as a percentage of the 1.0 an
+// accepted flat-on probe contributes. 0 = the pre-0.273.7 behaviour (a reject counts as empty
+// space, identical to a miss) and is the default. See M-GATHERAREA: treating "there is surface
+// here, facing the wrong way" as "there is no surface here" is what makes a tangle read as low
+// coverage and so drives the correction the wrong way on dense fur.
+inline int gaRejWeightPct() {
+    static const int p = [] {
+        const char* e = std::getenv("FTRACE_GAREJW");
+        return e ? std::atoi(e) : 0;
+    }();
+    return p;
+}
+// FTRACE_GADEPTH=1: require NEGATIVE mean probe depth as well as a high reject rate before the
+// tangle gate fires. Depth is measured below the tangent plane, so negative means the geometry
+// found by the probes sits ABOVE it -- the shading point is inside a packed coat. Sparse strands
+// give positive depth (probes fall through the gaps), and they NEED the correction. See
+// M-GATHERAREA: the reject rate alone cannot tell fur from hair, because both are tangles.
+inline bool gaDepthGateOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_GADEPTH");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+inline bool gaDiagOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_GADIAG");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+struct GaDiagMat {
+    std::atomic<long long> miss{0}, reject{0}, accept{0};
+    // OCCUPANCY, which orientation alone cannot give: how far below the tangent plane the first
+    // surface sits. `depthSum` is in units of the gather radius; `deep` counts hits past 0.25 r.
+    // A packed shell (fur) hits shallow and tight; sparse strands (hair) let probes fall through
+    // the gaps and hit something far below. See M-GATHERAREA, the fur-vs-hair split.
+    std::atomic<long long> deep{0};
+    std::atomic<long long> depthMilli{0};   // sum of 1000*depth/r, integral so it can be atomic
+};
+inline std::vector<GaDiagMat>& gaDiag() {
+    static std::vector<GaDiagMat> t(1024);      // matId is small; 1024 is far past any scene
+    return t;
+}
+
+inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
+                             double r, Pcg32& rng, int M, int matId = -1) {
+    if (M <= 0 || !(r > 0.0)) return 1.0;
+    Vec3 t, b; onb(n, t, b);
+    double area = 0.0;                 // in units of the full disc, so 1.0 == fully covered
+    int   nRej = 0;                    // probes that FOUND geometry facing the wrong way
+    double depthSum = 0.0;             // sum of (hit depth below the tangent plane) / r
+    int    nHit = 0;                   // probes that found anything at all
+    // THE SILHOUETTE GATE, as an adaptive early-out rather than a separate heuristic. The entry
+    // proposes "only worth doing when the gather is near a silhouette or a small-feature
+    // primitive", and the honest way to know that is to ask the same estimator with fewer
+    // samples: probe a quarter of the budget first, and if every one of them lands on surface
+    // that is flat-on (cos ~ 1), this disc is in the interior of a plane and the remaining
+    // probes can only confirm it. That costs 4 rays instead of 16 on the ground plane and the
+    // caps -- which is most of a frame -- while any disc that is actually truncated shows a
+    // miss almost immediately and pays the full budget.
+    //
+    // Deliberately NOT a photon-count test: this entry already establishes that no photon
+    // statistic can separate geometry from illumination, and a gate built on one would skip
+    // exactly the dim truncated gathers that need correcting most.
+    // `max(2, M/4)` and never M itself: at M = 4 the old form set probe0 = 4, so the check sat
+    // at an index the loop never reaches and the early-out silently never fired -- which is why
+    // M = 4 cost as much as M = 8 in the first sweep.
+    const int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
+    for (int i = 0; i < M; ++i) {
+        if (i == probe0 && area >= (double)probe0 * 0.995)
+            return 1.0;                // interior of a flat patch: nothing to correct
+        // STRATIFIED in the disc, and the stratification is not a refinement -- it attacks a
+        // BIAS. The estimate divides by the measured coverage, and E[1/cov] > 1/E[cov] by
+        // Jensen, so noise in `cov` makes the correction too BRIGHT, the more so the fewer
+        // samples. Measured: `alice_dress` reads -5.9 % at M = 4 against -15.2 % at M = 16, and
+        // the M = 4 figure is not the better one -- it is a bias cancelling the layering
+        // under-count below. Cutting the variance of `cov` at fixed M shrinks that bias for
+        // free, and a disc stratifies exactly: equal-area rings x equal angle sectors, jittered
+        // inside each cell so it stays unbiased.
+        //
+        // sqrt(u) within the ring puts equal expected samples per unit AREA; a linear radius
+        // would over-weight the middle and report a truncated disc as fuller than it is.
+        // INDEPENDENT, not stratified, and that is a decision with a measurement behind it.
+        // Stratifying the radius to fight the Jensen bias below is incompatible with the
+        // early-out above: `u1 = (i + xi)/M` walks the rings from the centre outwards, so the
+        // gate's first M/4 probes all land in the MIDDLE of the disc, which is covered almost
+        // by definition -- the gate then fires on nearly every gather and the correction stops
+        // happening. Measured at M = 16: `cap_gyroid` -4.3 % independent against -16.9 %
+        // radius-stratified, `alice_hair` +1.5 % against -14.8 %. (Stratifying BOTH dimensions
+        // off one index is worse still, -32.9 %, because it correlates radius with angle and
+        // puts every sample on a spiral.) Independent samples are spread over the whole disc by
+        // construction, which is exactly what the gate needs to see.
+        //
+        // sqrt(u) puts equal expected samples per unit AREA; a linear radius would over-weight
+        // the middle and report a truncated disc as fuller than it is.
+        const double rr = r * std::sqrt(rng.uniform());
+        const double ph = 2.0 * PI * rng.uniform();
+        const Vec3 q = p + t * (rr * std::cos(ph)) + b * (rr * std::sin(ph));
+        // Probe from r ABOVE the tangent plane straight down. `2r` of travel is what lets a
+        // curved surface still count: within the disc it deviates from the plane by at most
+        // ~r^2/(2R), far inside this window for any radius worth gathering at.
+        const Hit h = scene.closestHit(Ray{q + n * r, n * -1.0});
+        if (gaDiagOn() && matId >= 0 && matId < (int)gaDiag().size()) {
+            GaDiagMat& g = gaDiag()[matId];
+            if (!(h.valid && h.t <= 2.0 * r))          g.miss.fetch_add(1, std::memory_order_relaxed);
+            else {
+                if (dot(h.n, n) < 0.5) g.reject.fetch_add(1, std::memory_order_relaxed);
+                else                   g.accept.fetch_add(1, std::memory_order_relaxed);
+                // Depth below the tangent plane, over ANY hit (accepted or rejected) -- the
+                // question is where the geometry is, not which way it faces.
+                const double depth = (h.t - r) / r;
+                g.depthMilli.fetch_add((long long)(depth * 1000.0), std::memory_order_relaxed);
+                if (depth > 0.25) g.deep.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // Same 60-degree acceptance the photon query uses (dot(ph.n, h.n) < 0.5 rejects), so the
+        // footprint and the estimator agree on what surface is "here".
+        if (h.valid && h.t <= 2.0 * r) {
+            const double c = dot(h.n, n);
+            // THE PROJECTION JACOBIAN, and it is not a refinement -- without it the correction
+            // overshoots badly on exactly the geometry it is for. The probe samples uniformly in
+            // the TANGENT PLANE, so it measures PROJECTED area; the estimator needs SURFACE
+            // area, and dA = dq / cos(tilt). A patch tilted 60 degrees carries twice the surface
+            // its shadow suggests. Measured on gallery_rain without this term: alice_hair went
+            // from -68.0 % to +31.1 % -- past zero, because hair is nearly all steeply-tilted
+            // surface and every bit of it was counted at its projected size. Flat ground has
+            // cos = 1 and is untouched either way, which is why the null control could not have
+            // caught this and the truncated elements could.
+            if (c >= 0.5) area += 1.0 / c;
+            else          ++nRej;
+            depthSum += (h.t - r) / r;   // < 0 when the geometry sits ABOVE the tangent plane
+            ++nHit;
+        }
+    }
+    // THE TANGLE GATE. A high reject share means the disc is full of geometry pointing every
+    // which way, not hanging over empty space -- and there the correction is not merely weaker,
+    // it points the wrong way. Doing nothing is the measured-correct action for fur.
+    if (gaRejectPct() > 0 && nRej * 100 >= gaRejectPct() * M) {
+        // With the depth condition on, a tangle whose geometry lies BELOW the plane is sparse
+        // strands rather than a packed coat, and those need the correction rather than losing it.
+        const bool overfilled = !gaDepthGateOn() || (nHit > 0 && depthSum < 0.0);
+        if (overfilled) return 1.0;
+    }
+    // A REJECT IS EVIDENCE OF SURFACE, NOT OF EMPTY SPACE. Adding its area back is the
+    // continuous form of the same fix the gate approximates, and on geometry that rejects
+    // nothing -- which is what truncation measures -- it changes exactly nothing.
+    if (gaRejWeightPct() > 0)
+        area += (double)nRej * (double)gaRejWeightPct() * 0.01;
+    return area / (double)M;
+}
+// Never divide by a coverage so small that one stray probe inflates a pixel into a firefly. A
+// gather that finds under a twentieth of its disc is not a measurement worth rescaling.
+// Report the split, most-probed material first. Names come from MeshGroup, which is the only
+// place an authored name survives the flatten into Scene::tris.
+inline const char* nmOf(const Scene& sc, int matId, char* buf) {
+    if (const char* n = sc.meshNameForMat(matId)) return n;
+    std::snprintf(buf, 24, "mat%d", matId);
+    return buf;
+}
+inline void gaDiagReport(const Scene& scene) {
+    if (!gaDiagOn()) return;
+    std::vector<std::string> nm(gaDiag().size());
+    for (const auto& mg : scene.meshGroups)
+        if (mg.matId >= 0 && mg.matId < (int)nm.size() && nm[mg.matId].empty())
+            nm[mg.matId] = mg.name;
+    struct Row { int id; long long mi, rj, ac, tot, dp, dm; };
+    std::vector<Row> rows;
+    for (int i = 0; i < (int)gaDiag().size(); ++i) {
+        const long long mi = gaDiag()[i].miss.load(), rj = gaDiag()[i].reject.load(),
+                        ac = gaDiag()[i].accept.load();
+        if (mi + rj + ac > 0)
+            rows.push_back({i, mi, rj, ac, mi + rj + ac,
+                            gaDiag()[i].deep.load(), gaDiag()[i].depthMilli.load()});
+    }
+    if (rows.empty()) return;
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.tot > b.tot; });
+    std::fprintf(stderr,
+        "\n[gadiag] why a footprint probe contributed nothing, per material.\n"
+        "[gadiag] MISS = the disc overhangs empty space (truncation). REJECT = geometry is there\n"
+        "[gadiag] but faces the wrong way (a tangle). Same coverage, opposite causes.\n"
+        "[gadiag] %-22s %10s %8s %8s %8s %8s %8s\n", "material", "probes",
+        "miss%", "rej%", "acc%", "depth/r", "deep%");
+    char buf[24];
+    for (size_t k = 0; k < rows.size() && k < 24; ++k) {
+        const Row& r = rows[k];
+        const long long hits = r.rj + r.ac;
+        std::fprintf(stderr, "[gadiag] %-22s %10lld %7.1f%% %7.1f%% %7.1f%% %8.3f %7.1f%%\n",
+                     nmOf(scene, r.id, buf),
+                     r.tot, 100.0 * (double)r.mi / (double)r.tot,
+                     100.0 * (double)r.rj / (double)r.tot,
+                     100.0 * (double)r.ac / (double)r.tot,
+                     hits ? (double)r.dm / 1000.0 / (double)hits : 0.0,
+                     hits ? 100.0 * (double)r.dp / (double)hits : 0.0);
+    }
+}
+
+inline double gatherAreaScale(double cov) {
+    return (cov >= 0.05) ? 1.0 / cov : 1.0;
+}
+
+// ---- MODE-M PHASE PROFILE (`-mstats`) -------------------------------------------------------
+// VOLCACHE asks for the split inside a mode-M frame's camera gather: how much is the SURFACE
+// density estimate and how much is the BEAM gather, since only the latter is what a volumetric
+// radiance cache would remove. Per-thread accumulators, summed and printed once.
+struct MStats {
+    std::atomic<long long> surfNs{0}, beamNs{0};
+    std::atomic<long long> surfN{0}, beamN{0};
+    void report(double wallSec) const {
+        const double s = (double)surfNs.load() * 1e-9, b = (double)beamNs.load() * 1e-9;
+        if (s <= 0.0 && b <= 0.0) return;
+        std::fprintf(stderr,
+            "[mstats] camera gather: surface estimate %.2f s over %lld calls | beam gather %.2f s "
+            "over %lld probes | %.0f%% of the gather is beams | wall %.1f s (thread-seconds, so "
+            "the two sum to more than the wall on %d threads)\n",
+            s, surfN.load(), b, beamN.load(), (s + b) > 0.0 ? 100.0 * b / (s + b) : 0.0,
+            wallSec, (int)std::thread::hardware_concurrency());
+    }
+};
+inline MStats& mStats() { static MStats m; return m; }
+inline bool mStatsOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_MSTATS");
+        return e && std::atoi(e) != 0;
+    }();
+    return on;
+}
+struct MStatTimer {          // RAII: adds its lifetime to one accumulator, only when enabled
+    std::atomic<long long>* ns; std::atomic<long long>* n;
+    std::chrono::steady_clock::time_point t0;
+    MStatTimer(std::atomic<long long>* nsAcc, std::atomic<long long>* nAcc)
+        : ns(mStatsOn() ? nsAcc : nullptr), n(nAcc) {
+        if (ns) t0 = std::chrono::steady_clock::now();
+    }
+    ~MStatTimer() {
+        if (!ns) return;
+        ns->fetch_add((long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t0).count(),
+                      std::memory_order_relaxed);
+        n->fetch_add(1, std::memory_order_relaxed);
+    }
+};
 
 // ---- Forward photon pass: deposit into the map, no camera splat ---------------------
 // Traces N photons across nThreads, each depositing into a private bank, then
@@ -59,12 +352,54 @@
 // transmission). That is the documented `-beams` trade, now available to mode M.
 // `beamTarget` is a budget on the stored beam count, applied as Russian roulette per beam;
 // <= 0 keeps every crossing.
+// `stage` (optional) reports deposit progress — how many of the N photons have been
+// traced — so the caller can keep the live window's title bar moving through what is
+// otherwise the longest silent phase of a mode-M render. Purely informational.
+//
+// `pmCaustic` (optional) turns on Jensen's TWO-MAP split: a deposit whose path reads
+// L·S⁺·D — at least one focusing vertex, no scattering one (see photonVertexKind in
+// render.h) — goes to *pmCaustic INSTEAD OF pm. The split is strict, so the two maps
+// partition the same deposits: nothing is duplicated, nothing is lost, and a gather that
+// sums the two estimates is exactly the one-map estimate would have been IF one radius
+// suited both. It does not, which is the whole point — a caustic is a thin high-contrast
+// concentration whose photons are orders of magnitude denser than the diffuse background,
+// so buildAuto picks each map its own radius and the caustic stops being smeared away by
+// a kernel sized for the ambient illumination. Null keeps every deposit in `pm` (mode S
+// and every pre-0.199.7 caller).
+//
+// `aim` + `nAimed` (optional) add Jensen's PROJECTION-MAP half of the two-map scheme: a
+// SECOND pass of nAimed photons whose emission is importance-sampled towards the scene's
+// focusing geometry (causticaim.h), depositing into *pmCaustic only. Without it the caustic
+// map is sharp and nearly empty — 0.12 % of deposits on gallery_rain — because a uniformly
+// emitting sky almost never happens to hit a gem. The two passes are combined with the
+// balance heuristic: both passes' caustic deposits are scaled by the SAME per-photon weight
+// w = 1/(1 + (N_c/N_m)·rho) computed at emission (Renderer::applyCausticAim), and the caustic
+// map's nEmitted stays at the main pass's count. So the aimed pass is a pure variance
+// reduction — an incomplete or over-eager target set costs efficiency, never correctness —
+// and nAimed = 0 leaves every deposit bit-for-bit what it was.
+// `depositSurfaces` = false traces the pass for its BEAMS ALONE and leaves `pm` empty. This
+// is mode J (UPBP), where surface transport is BDPT's job and a surface photon map would be
+// both unused and, at the photon counts a beam map wants, the largest allocation in the
+// process. Every other aspect of the pass — emission, media crossing, Russian roulette, the
+// RNG stream — is untouched, so the beams a beams-only pass deposits are bit-identical to the
+// ones a full mode-M pass would have deposited at the same seed. (Nothing branches on
+// `photonDeposit` except `Renderer::depositPhoton`, which is a no-op when it is null.)
 inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
                             bool diffraction, PhotonMap& pm, int heroC = hero::kHeroC,
                             uint64_t seedBase = 0, BeamMap* bm = nullptr,
-                            long long beamTarget = 0) {
+                            long long beamTarget = 0,
+                            const StageProgress* stage = nullptr,
+                            PhotonMap* pmCaustic = nullptr,
+                            const caim::AimMap* aim = nullptr,
+                            long long nAimed = 0,
+                            bool depositSurfaces = true) {
     if (nThreads < 1) nThreads = 1;
+    // The aimed pass needs somewhere caustic to deposit and something to aim at.
+    const bool doAimed = pmCaustic && aim && !aim->empty() && nAimed > 0 && N > 0;
+    if (!doAimed) { aim = nullptr; nAimed = 0; }
+    const double aimRatio = doAimed ? (double)nAimed / (double)N : 0.0;
     std::vector<PhotonBank> banks(nThreads);
+    std::vector<PhotonBank> cbanks(pmCaustic ? nThreads : 0);
     std::vector<BeamBank>   bbanks(nThreads);
     std::vector<long long> emitted(nThreads, 0);
     // Beam budget: give each thread its share of the target as a self-thinning CAP and let
@@ -80,9 +415,12 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         if (beamTarget > 0)
             bbanks[t].cap = std::max<size_t>(1024, (size_t)(2 * beamTarget / nThreads));
         // Private, per-thread stream for the self-thinning draws, so which beams get dropped
-        // never depends on — or perturbs — the photon tracer's own RNG sequence.
+        // never depends on — or perturbs — the photon tracer's own RNG sequence. Salted by
+        // `-seed` like every other stream: WHICH beams the roulette drops is part of the
+        // realization, so leaving it fixed would have left mode M's beam map partly frozen
+        // across seeds, which is the opposite of what the flag is for.
         bbanks[t].rng.seed(seedBase + 0x9E3779B97F4A7C15ULL * (uint64_t)(t + 1),
-                           0xBF58476D1CE4E5B9ULL);
+                           0xBF58476D1CE4E5B9ULL ^ g_rngSalt);
     }
 
     // Hero-wavelength deposit (modes M/S): each traced path deposits its live wavelengths
@@ -91,12 +429,55 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     // chroma noise. Same gate as the forward tracers: no media / no GRIN (those stay C=1).
     const bool heroOn = (heroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
 
-    auto worker = [&](int tid) {
-        Renderer r; r.diffraction = diffraction; r.photonDeposit = &banks[tid];
-        if (bm) r.beamDeposit = &bbanks[tid];
+    // SPECTRAL BEAMS. Where `heroOn` above is gated OFF by the presence of media, this one is
+    // gated on exactly the opposite thing — it is the media cache's own spectral widening, and
+    // it applies precisely when there ARE media. `-beamspec` (pbeams::gSpecC) asks for it; the
+    // scene has to be able to honour it (beamSpectralOK, above); and there must be a beam map
+    // to deposit into at all.
+    const int beamSpecC = (bm && pbeams::gSpecC > 1 && beamSpectralOK(scene))
+                              ? std::min(pbeams::gSpecC, kBeamSpecMax) : 1;
+    // ACHROMATIC-PATH BEAMS. Same scene-wide extinction test, asked without the `-beamspec`
+    // condition — the mean-CIE fold stores no extra wavelengths, so `-beamspec 1` gets it too
+    // (photonbeams.h, ACHROMATIC-PATH BEAMS).
+    const bool beamAchroOK = bm && pbeams::gAchro && beamSpectralOK(scene);
+
+    // Published photon count for `stage`. Written by the workers on the SAME 4096-photon
+    // cadence as the stop poll (one relaxed fetch_add per 4096 photons is unmeasurable next
+    // to 4096 path traces) and read by the monitor thread below. Relaxed ordering is right:
+    // nothing is synchronised through it, it only feeds a title bar.
+    std::atomic<long long> tracedTotal{0};
+
+    auto worker = [&](int tid, bool aimed) {
+        Renderer r; r.diffraction = diffraction;
+        if (aimed) {
+            // Caustic-only pass: no global deposits (the global map is the main pass's and
+            // is normalised by ITS nEmitted), and no beam deposits for the same reason — but
+            // media must still be crossed straight, or this pass would be transporting by
+            // different rules than the pass it is being combined with.
+            r.causticDeposit  = &cbanks[tid];
+            r.aimEmission     = true;
+            r.beamStraightOnly = (bm != nullptr);
+        } else {
+            if (depositSurfaces) r.photonDeposit = &banks[tid];
+            if (pmCaustic) r.causticDeposit = &cbanks[tid];
+            if (bm) r.beamDeposit = &bbanks[tid];
+        }
+        // Bound on BOTH passes: the main pass does not aim, but it still has to MEASURE its
+        // own samples' aimed density to weight its caustic deposits. That measurement draws
+        // no randomness, so the main pass's photon set is untouched.
+        r.aimMap = aim; r.aimMisRatio = aimRatio;
         r.useHero = heroOn; r.heroC = heroC;
+        r.beamSpecC = aimed ? 1 : beamSpecC;
+        r.beamAchroOK = !aimed && beamAchroOK;
+        // Mode M never consults this one — its photon is born at the chosen emitter's own
+        // spectral density, so it needs no conversion (see bdpt.h, BeamSpectral). It is set
+        // anyway so the field never reads as "this scene's extinction is chromatic" in a
+        // scene where it is not.
+        r.beamSpecOK = !aimed && bm && beamSpectralOK(scene);
         Pcg32 rng;
-        long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
+        const long long Np = aimed ? nAimed : N;
+        const uint64_t salt = aimed ? 0x94D049BB133111EBULL : 0xEB44ACCAB455D165ULL;
+        long long lo = Np * tid / nThreads, hi = Np * (tid + 1) / nThreads;
         EnergyReport e;
         long long done = 0;
         for (long long i = lo; i < hi; ++i) {
@@ -111,19 +492,52 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
             // microseconds, so a per-iteration atomic load would be measurable in the hottest
             // loop of a mode-M/S build, while 4096 of them still lands the stop in well under
             // a tenth of a second.
-            if ((done & 0xFFF) == 0 && ft::stopRequested()) break;
-            seedUnit(rng, seedBase + (uint64_t)i, 0xEB44ACCAB455D165ULL);
+            if ((done & 0xFFF) == 0) {
+                if (done) tracedTotal.fetch_add(0x1000, std::memory_order_relaxed);
+                if (ft::stopRequested()) break;
+            }
+            seedUnit(rng, seedBase + (uint64_t)i, salt);
             r.tracePhoton(scene, (const Camera*)nullptr, (Film*)nullptr, (Film*)nullptr, rng, e);
             ++done;
         }
+        tracedTotal.fetch_add(done & 0xFFF, std::memory_order_relaxed);   // the tail
         // Count what was ACTUALLY emitted, not what was asked for. pm.nEmitted normalises the
         // density estimate, so reporting the full share after an early break would scale a
         // truncated pass down by the fraction it never traced and darken the image.
-        emitted[tid] = done;
+        // The aimed pass deliberately does NOT count: it emits no light of its own, it
+        // re-estimates the main pass's caustic term with a different sampler.
+        if (!aimed) emitted[tid] = done;
     };
     std::vector<std::thread> pool;
-    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
+    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t, false);
+    // The deposit is a join-and-wait, so progress has to be sampled from OUTSIDE it: a
+    // monitor thread polls the published count while the workers run. It is only started
+    // when someone asked for progress, so a headless render spawns nothing extra.
+    std::atomic<bool> monitorStop{false};
+    std::thread monitor;
+    if (stage && stage->report) {
+        const long long nTotal = N + nAimed;
+        monitor = std::thread([&, nTotal] {
+            while (!monitorStop.load(std::memory_order_relaxed)) {
+                stage->report("tracing photons",
+                              tracedTotal.load(std::memory_order_relaxed), nTotal,
+                              nullptr, 0.0);
+                for (int i = 0; i < 20 && !monitorStop.load(std::memory_order_relaxed); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
+    }
     for (auto& th : pool) th.join();
+    // --- Aimed caustic pass (causticaim.h) --------------------------------------------
+    // Runs after the main pass rather than alongside it so both can use every core, and so
+    // an `ftrace -stop` during the main pass skips it entirely (the caustic map is then
+    // simply the un-aimed one, which is still correct — just noisier).
+    if (doAimed && !ft::stopRequested()) {
+        std::vector<std::thread> apool;
+        for (int t = 0; t < nThreads; ++t) apool.emplace_back(worker, t, true);
+        for (auto& th : apool) th.join();
+    }
+    if (monitor.joinable()) { monitorStop.store(true, std::memory_order_relaxed); monitor.join(); }
 
     size_t total = 0;
     for (auto& b : banks) total += b.size();
@@ -136,6 +550,25 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         pm.photons.insert(pm.photons.end(), banks[t].payload.begin(), banks[t].payload.end());
         pm.pos.insert(pm.pos.end(), banks[t].pos.begin(), banks[t].pos.end());
         pm.nEmitted += emitted[t];
+    }
+    if (pmCaustic) {
+        size_t ctotal = 0;
+        for (auto& b : cbanks) ctotal += b.size();
+        pmCaustic->photons.clear();
+        ftalloc::reserve(pmCaustic->photons, ctotal, "the caustic map payloads", "-n");
+        pmCaustic->pos.clear();
+        ftalloc::reserve(pmCaustic->pos, ctotal, "the caustic map positions", "-n");
+        for (int t = 0; t < nThreads; ++t) {
+            pmCaustic->photons.insert(pmCaustic->photons.end(),
+                                      cbanks[t].payload.begin(), cbanks[t].payload.end());
+            pmCaustic->pos.insert(pmCaustic->pos.end(),
+                                  cbanks[t].pos.begin(), cbanks[t].pos.end());
+        }
+        // SAME normalisation as the global map: nEmitted counts PATHS EMITTED, not photons
+        // stored, and both maps were filled by the one pass. Using the caustic map's own
+        // stored count here would be the classic two-map bug — it would rescale a rare
+        // caustic up to the brightness of the whole light source.
+        pmCaustic->nEmitted = pm.nEmitted;
     }
     if (bm) {
         size_t nb = 0;
@@ -154,57 +587,11 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     }
 }
 
-// ---- Volume gather: single-scatter radiance along one camera SEGMENT from the beam map ---
-// The Beam x Ray 1D estimator (photonbeams.h). For every stored beam whose kernel cylinder
-// the segment [oc, oc + dc*tMax] passes through, add
-//
-//   Phi_b * K1(d_perp)/sin(theta) * sigma_s(x) * f_p(cos theta)
-//         * Tr_beam(0 -> s_b) * Tr_cam(0 -> t_c) / nEmitted
-//
-// weighted by the CIE response at the BEAM's wavelength — the same "estimate built directly
-// in XYZ at the photon's own lambda" trick the surface density estimate uses, so a spectral
-// rainbow comes out spectral without any monochromatic reconstruction.
-//
-// `aGlassCam` is the absorption of the dielectric the CAMERA ray is currently inside; the
-// caller applies it over the whole segment afterwards, so here it is applied only as far as
-// each beam's own closest-approach point. `thr` is NOT applied here — the caller multiplies
-// the returned XYZ by its specular-chain throughput.
-//
-// Note the two transmittance marches per surviving beam (one along the beam, one back along
-// the camera ray). For a heterogeneous medium those are ratio-tracking walks, and they are
-// the dominant cost of this estimator; see known-issues.md.
-inline Vec3 gatherPhotonBeams(const Scene& scene, const Renderer& mats, const BeamMap& bm,
-                              const Vec3& oc, const Vec3& dc, double tMax,
-                              double aGlassCam, Pcg32& rng) {
-    Vec3 acc{0, 0, 0};
-    if (bm.empty() || bm.nEmitted <= 0) return acc;
-    const double invN = 1.0 / (double)bm.nEmitted;
-    const PatTables tabs = scene.patTables();
-    bm.gather(oc, dc, tMax, [&](const BeamHit& bh) {
-        const PhotonBeam& b = bm.beams[bh.idx];
-        if (b.med < 0 || b.med >= (int)scene.media.size()) return;
-        const double lam = (double)b.lambda;
-        const Medium& md = scene.media[b.med];
-        const Vec3 xc = oc + dc * bh.tCam;
-        // sigma_s AT the gather point — density field / imported volume included, so a
-        // heterogeneous cloud shapes the bow instead of a uniform slab of it.
-        const double ss = md.sigma_s(lam) * md.densityAt(xc, &tabs);
-        if (!(ss > 0.0)) return;
-        // Scattering angle. connectVolume's convention: phaseValue(dot(wIn, wToCamera)),
-        // wIn = the photon's propagation direction (b.d), wToCamera = -dc.
-        const double phase = md.phaseValue(-bh.cosT, lam);
-        if (!(phase > 0.0)) return;
-        double w = (double)b.power * bm.kernel1D(bh.dPerp) / bh.sinT * ss * phase * invN;
-        if (!(w > 0.0)) return;
-        if (b.absorb > 0.0f) w *= std::exp(-(double)b.absorb * bh.sBeam);   // glass, beam side
-        if (aGlassCam > 0.0) w *= std::exp(-aGlassCam * bh.tCam);           // glass, camera side
-        if (bh.sBeam > 0.0)  w *= mats.mediaTransmittance(scene, b.o, b.d, bh.sBeam, lam, rng);
-        if (bh.tCam  > 0.0)  w *= mats.mediaTransmittance(scene, oc, dc, bh.tCam, lam, rng);
-        if (!(w > 0.0)) return;
-        acc += bm.cie[bh.idx] * w;
-    });
-    return acc;
-}
+// The Beam x Ray 1D volume gather (`gatherPhotonBeams`) used to be spelled out here. It moved
+// to **beamgather.h** in 0.215.0 so mode J (UPBP, bdpt.h) could call it too without bdpt.h
+// having to include this whole header to reach one function. Same name, same signature, same
+// output — the call sites below are untouched — and it gained a template hook for a per-hit
+// MIS weight that mode M instantiates as the constant 1.
 
 // ---- Final-gather sub-ray: one INDIRECT bounce from a visible point into the map -----
 // A gather ray shot from a diffuse visible point (visHit/visMat). It follows specular
@@ -230,15 +617,29 @@ inline Vec3 gatherPhotonBeams(const Scene& scene, const Renderer& mats, const Be
 // cosine and 1/pi cancel: the visible-point weight reduces to rho(vis), folded per photon
 // (diffuse hit) or applied once (specular-arrival emitter/env). `norm` = 1/(pi r^2
 // nEmitted) as in the caller. Mirrors photonGather's specular walk; keep the two in sync.
+//
+// `pmC`/`normC` are the optional CAUSTIC map and its own normalisation (see tracePhotonPass).
+// When present the density estimate is the SUM of the two maps' estimates — the maps hold
+// disjoint deposits, so this is the same estimator with each population read at the radius
+// that suits it.
 inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pcg32& rng,
                             bool diffraction, int maxBounce, double lambda, double invPdfL,
-                            double norm, const Hit& visHit, const Material& visMat) {
+                            double norm, const Hit& visHit, const Material& visMat,
+                            const PhotonMap* pmC = nullptr, double normC = 0.0) {
     Vec3 L{0, 0, 0};
     double thr = 1.0;
     bool specularSeen = false;                           // any specular bounce so far?
     Renderer mats; mats.diffraction = diffraction;
     MediumStack stk;                                     // nested-dielectric medium stack
     const bool grinAny = grin::sceneHasGrin(scene);      // final-gather rays bend too
+
+    // GLOSSY-NEE. `bwNee` is the shared direct-lighting estimator (its `neeLight` is what the
+    // final gather already uses); `gmis` carries the lobe density of a glossy continuation to
+    // whichever emitter site it reaches, and is cleared at the top of every bounce so a mirror
+    // or a dielectric can never inherit one and halve the emission behind it.
+    BackwardRenderer bwNee; bwNee.diffraction = diffraction;
+    const bool gneeOn = BackwardRenderer::glossyNeeOn();
+    BackwardRenderer::GlossyMis gmis;
 
     for (int b = 0; b < maxBounce; ++b) {
         if (grinAny) {
@@ -278,14 +679,32 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         }
         const Material& m = *mp;
 
-        if (m.isLight) {                                 // hit an emitter
-            if (specularSeen) {                          // specular-direct: NEE can't reach it
-                double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
-                L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                     * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL);
-            }
-            return L;                                     // else: direct handled by NEE at vis
+        // Self-emission on a SPECULAR arrival (a diffuse arrival's direct term comes from
+        // NEE at the visible point, so adding it here too would double-count). One-sided by
+        // the geometric normal, matching Vertex::Le / bkRadiance.
+        //
+        // This no longer RETURNS: an emissive material still has a BSDF, so a glowing
+        // diffuse surface both emits and reflects, and the walk has to go on to the density
+        // estimate below. See photonGather for the measurement.
+        if (m.isLight && specularSeen && dot(ray.d, h.ng) < 0.0) {
+            double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
+            // GLOSSY-NEE's lobe-sampling half; 1 (and bit-identical) unless the last bounce was
+            // a glossy one that already connected to this emitter.
+            const double wMis = (gmis.pdf > 0.0)
+                ? bwNee.glossyHitWeight(scene, gmis,
+                        BackwardRenderer::emitterIndexOfResolved(scene, m), ray.d, &h.p, &h.n)
+                : 1.0;
+            L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                 * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
         }
+
+        // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
+        // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so
+        // a clear at the loop top erases it a few lines before the only code that wants it --
+        // which leaves the connection in place with no compensating weight on the lobe-sampling
+        // side, i.e. double counting wherever both strategies reach the same light. See the
+        // twin note in backward.h.
+        gmis.clear();
 
         switch (m.type) {
             case MatType::Diffuse:
@@ -293,15 +712,40 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             case MatType::Fluorescent: {
                 // Density estimate at y, folding the visible-point reflectance per photon
                 // wavelength: L_o(vis) += rho(vis,l_p) * [rho(y,l_p)/pi] * Phi_p / (pi r^2 N).
-                Vec3 g{0, 0, 0};
-                pm.query(h.p, [&](const Photon& ph, double, int k) {
-                    if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
-                    double rhoY = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
-                    double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
-                    double f = rhoY * (1.0 / PI);
-                    g += pm.cie[k] * (f * rhoV * (double)ph.power);   // == cie(lambda_p), precomputed
-                });
-                L += g * (norm * thr);
+                // `nrmOut` comes back as the map's fixed normalisation unless the map gathers
+                // at a PER-QUERY radius (PhotonMap::adaptiveRadius — the caustic map does),
+                // in which case 1/(pi r_q^2 N) is recomputed for this query's own radius.
+                auto est = [&](const PhotonMap& M, double normFixed, double& nrmOut) {
+                    MStatTimer _t(&mStats().surfNs, &mStats().surfN);
+                    const double rq = M.adaptiveRadius(h.p, h.n);
+                    nrmOut = normFixed;
+                    if (rq != M.radius) {
+                        const double a = PI * rq * rq;
+                        nrmOut = (M.nEmitted > 0 && a > 0.0)
+                                     ? 1.0 / (a * (double)M.nEmitted) : 0.0;
+                    }
+                    // M-GATHERAREA: divide by the area actually gathered from, not by the whole
+                    // disc. `gatherAreaSamples() == 0` (the default) returns coverage 1 and
+                    // leaves nrmOut untouched, so every existing render is bit-identical.
+                    if (const int gaM = gatherAreaSamples())
+                        nrmOut *= gatherAreaScale(
+                            gatherCoverage(scene, h.p, h.n, rq, rng, gaM, h.matId));
+                    Vec3 g{0, 0, 0};
+                    M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
+                        if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
+                        double rhoY = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
+                        double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
+                        double f = rhoY * (1.0 / PI);
+                        g += M.cie[k] * (f * rhoV * (double)ph.power);  // == cie(lambda_p), precomputed
+                    });
+                    return g;
+                };
+                double nA = norm;
+                L += est(pm, norm, nA) * (nA * thr);
+                if (pmC && !pmC->photons.empty()) {
+                    double nB = normC;
+                    L += est(*pmC, normC, nB) * (nB * thr);
+                }
                 return L;
             }
             case MatType::Mirror: {
@@ -310,9 +754,25 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 break;
             }
             case MatType::Glossy: {
+                // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE). The gather ray folds
+                // the VISIBLE point's reflectance into everything it reports, so `rhoV`
+                // multiplies the connection exactly as it multiplies the emission above.
+                // Taken before `thr *= r`: the connection carries `r` inside bsdfF.
+                if (gneeOn) {
+                    const double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
+                    const BackwardRenderer::NeeBsdf nb{&m, ray.d * -1.0};
+                    L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                         * (thr * rhoV * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng,
+                                                        nullptr, BackwardRenderer::GiCtx{}, nullptr, nullptr, &nb));
+                }
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return L;
+                if (gneeOn) {
+                    gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
+                    gmis.from = h.p;
+                    gmis.n = h.n;
+                }
                 ray = Ray{h.p + h.n * 1e-6, o};
                 break;
             }
@@ -413,9 +873,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
 // media transmittance of that segment, so fog correctly dims the surfaces and sky behind it.
 // With `bm` null the walk is media-blind — which is what mode M has always been, and why a
 // fog / rain / cloud scene renders its volume as nothing without -beams.
+//
+// `pmC` (optional) is the CAUSTIC map (see tracePhotonPass): a disjoint half of the same
+// deposits, gathered at its own much finer radius and simply added.
 inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                          Pcg32& rng, bool diffraction, int maxBounce, int fgRays = 0,
-                         const BeamMap* bm = nullptr) {
+                         const BeamMap* bm = nullptr, const PhotonMap* pmC = nullptr) {
     Vec3 L{0, 0, 0};
     double thr = 1.0;
     double pdfL = 0.0;
@@ -428,6 +891,14 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     const double area = PI * pm.radius * pm.radius;
     const double norm = (pm.nEmitted > 0 && area > 0.0)
                             ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
+    // The caustic map carries its OWN radius (chosen by its own buildAuto over its own,
+    // far denser, population) and therefore its own 1/(pi r^2 N). When it also gathers
+    // PER QUERY (PhotonMap::kGather > 0) this is only the fallback: each gather recomputes
+    // the normalisation for the radius it actually used. See PhotonMap::adaptiveRadius.
+    const bool causOn = (pmC != nullptr) && !pmC->photons.empty();
+    const double areaC = causOn ? PI * pmC->radius * pmC->radius : 0.0;
+    const double normC = (causOn && pmC->nEmitted > 0 && areaC > 0.0)
+                            ? 1.0 / (areaC * (double)pmC->nEmitted) : 0.0;
 
     const bool volOn = (bm != nullptr) && !bm->empty() && !scene.media.empty();
     // GRADIENT-INDEX: the CAMERA ray has to bend too. Mode M's forward deposit has marched
@@ -437,6 +908,14 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     // its own geometry.
     const bool grinAny = grin::sceneHasGrin(scene);
 
+
+    // GLOSSY-NEE. `bwNee` is the shared direct-lighting estimator (its `neeLight` is what the
+    // final gather already uses); `gmis` carries the lobe density of a glossy continuation to
+    // whichever emitter site it reaches, and is cleared at the top of every bounce so a mirror
+    // or a dielectric can never inherit one and halve the emission behind it.
+    BackwardRenderer bwNee; bwNee.diffraction = diffraction;
+    const bool gneeOn = BackwardRenderer::glossyNeeOn();
+    BackwardRenderer::GlossyMis gmis;
     for (int b = 0; b < maxBounce; ++b) {
         const int    cmIdx  = stk.topMat();
         const double aGlass = (cmIdx >= 0) ? scene.mats[cmIdx].absorb(lambda) : 0.0;
@@ -451,24 +930,34 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             grin::marchSegments(scene, ray,
                 [&](const Vec3& so, const Vec3& sd, double slen, double&) -> bool {
                     if (volOn) {
-                        L += gatherPhotonBeams(scene, mats, *bm, so, sd, slen, aGlass, rng) * thr;
+                        { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
+                          L += gatherPhotonBeams(scene, mats, *bm, so, sd, slen, aGlass, rng) * thr; }
                         thr *= mats.mediaTransmittance(scene, so, sd, slen, lambda, rng);
                     }
                     if (aGlass > 0.0) thr *= std::exp(-aGlass * slen);
                     return false;   // a camera ray never terminates in the volume here:
                                     // mode M's volume answer IS the beam gather above
-                });
+                },
+                // b == 0 is the camera ray; see Material::hideCamera. (photonGatherSub's
+                // march above is a final-gather sub-ray and keeps the default `false`.)
+                /*camHide=*/(b == 0));
             if (thr <= 0.0) return L;
         }
 
-        Hit h = scene.closestHit(ray);
+        // b == 0 is the camera ray photonGather was handed (mode M's eye pass); see
+        // Material::hideCamera. photonGatherSub's walk is NOT given this: a final-gather
+        // sub-ray leaves a visible point, so it is an indirect ray and must see the flat.
+        Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
+                                 /*skipCamHidden=*/(b == 0));
         // --- Participating media along this segment (mode M with -beams) ---------------
         // Done BEFORE `thr` takes the segment's attenuation, because each gathered beam
         // needs the transmittance to ITS OWN closest-approach point, not to the segment end.
         if (volOn) {
             const double dSeg = h.valid ? h.t : 1e30;
-            L += gatherPhotonBeams(scene, mats, *bm, ray.o, ray.d, dSeg, aGlass, rng)
-                 * thr;
+            { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
+              L += gatherPhotonBeams(scene, mats, *bm, ray.o, ray.d, dSeg, aGlass, rng)
+                   * thr;
+              }
             // Extinction along the camera segment: what is behind the fog gets dimmed.
             thr *= mats.mediaTransmittance(scene, ray.o, ray.d, dSeg, lambda, rng);
             if (thr <= 0.0) return L;
@@ -486,7 +975,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             // the map / NEE already credited with the sun.
             if (scene.sunCount > 0)
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                     * (thr * scene.sunRadiance(ray.d, lambda) * invPdfL);
+                     * (thr * bwNee.sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfL);
             return L;
         }
         const Material* mp = &scene.mats[h.matId];
@@ -501,11 +990,33 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         }
         const Material& m = *mp;
 
-        if (m.isLight) {                                 // directly-viewed emitter
+        // Self-emission of a directly-viewed (or specularly-seen) emitter, one-sided by the
+        // geometric normal to match Vertex::Le / bkRadiance — the surface glows only from
+        // the face cross(u,v) points out of.
+        //
+        // NOT a `return`. An emissive material still has a BSDF: a glowing DIFFUSE surface
+        // both emits and reflects, so the walk falls through to the density estimate below.
+        // Returning here is what made gallery_rain's grid floor render as GRID-ONLY on the
+        // CPU (host `m.isLight` hit, emission returned, body dropped) and as BODY-ONLY on the
+        // GPU (dEmitterForMat missed the unregistered quad, so the emitter branch was never
+        // taken and the grid vanished) — two mode-M paths disagreeing with each other and
+        // both disagreeing with modes R and D. Measured on scraps/mini_grid.ftsl.
+        if (m.isLight && dot(ray.d, h.ng) < 0.0) {
+            const double wMis = (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the sub-walk
+                ? bwNee.glossyHitWeight(scene, gmis,
+                        BackwardRenderer::emitterIndexOfResolved(scene, m), ray.d, &h.p, &h.n)
+                : 1.0;
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                 * (thr * emitSlot(scene, m, h, lambda) * invPdfL);
-            return L;
+                 * (thr * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
         }
+
+        // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
+        // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so
+        // a clear at the loop top erases it a few lines before the only code that wants it --
+        // which leaves the connection in place with no compensating weight on the lobe-sampling
+        // side, i.e. double counting wherever both strategies reach the same light. See the
+        // twin note in backward.h.
+        gmis.clear();
 
         switch (m.type) {
             case MatType::Diffuse:
@@ -518,6 +1029,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     // (a) DIRECT lighting from finite emitters via low-variance next-event
                     //     estimation (shadow rays), so we avoid the high variance of gather
                     //     rays randomly striking a small area light.
+                    //     `neeLight` carries the shadow leg's media transmittance over the
+                    //     WHOLE superposed `scene.media` vector. Until 0.254.0 it applied one
+                    //     unbounded homogeneous haze built from media.front() instead, which
+                    //     in a scene whose first medium is a dense bounded cloud (gallery_rain:
+                    //     sigma_t 2.78, a 3 m box) multiplied every 10-30 m shadow ray by
+                    //     exp(-28)..exp(-83) and deleted mode M's ENTIRE direct term (M-FGDARK).
                     BackwardRenderer bw; bw.diffraction = diffraction;
                     double rhoVis = clamp01(diffuseReflectance(scene, m, h, lambda));
                     double direct = bw.neeLight(scene, h, rhoVis, invPdfL, lambda, rng);
@@ -531,7 +1048,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     for (int k = 0; k < fgRays; ++k) {
                         Ray gr{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
                         fg += photonGatherSub(scene, pm, gr, rng, diffraction, maxBounce,
-                                              lambda, invPdfL, norm, h, m);
+                                              lambda, invPdfL, norm, h, m,
+                                              causOn ? pmC : nullptr, normC);
                     }
                     L += fg * (thr * (1.0 / (double)fgRays));
                     return L;
@@ -540,14 +1058,35 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 // visible points, which fall back here rather than final-gathering):
                 //   L_r(x) = (1/N) sum_p f_r * Phi_p / (pi r^2), f_r = rho/pi (Lambertian),
                 // accumulated in XYZ per photon wavelength.
-                Vec3 g{0, 0, 0};
-                pm.query(h.p, [&](const Photon& ph, double, int k) {
-                    if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
-                    double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
-                    double f = rho * (1.0 / PI);
-                    g += pm.cie[k] * (f * (double)ph.power);          // == cie(lambda_p), precomputed
-                });
-                L += g * (norm * thr);
+                // Per-query adaptive radius on any map that asks for one (the caustic map);
+                // see the twin in photonGatherSub and PhotonMap::adaptiveRadius.
+                auto est = [&](const PhotonMap& M, double normFixed, double& nrmOut) {
+                    MStatTimer _t(&mStats().surfNs, &mStats().surfN);
+                    const double rq = M.adaptiveRadius(h.p, h.n);
+                    nrmOut = normFixed;
+                    if (rq != M.radius) {
+                        const double a = PI * rq * rq;
+                        nrmOut = (M.nEmitted > 0 && a > 0.0)
+                                     ? 1.0 / (a * (double)M.nEmitted) : 0.0;
+                    }
+                    // M-GATHERAREA: divide by the area actually gathered from, not by the whole
+                    // disc. `gatherAreaSamples() == 0` (the default) returns coverage 1 and
+                    // leaves nrmOut untouched, so every existing render is bit-identical.
+                    if (const int gaM = gatherAreaSamples())
+                        nrmOut *= gatherAreaScale(
+                            gatherCoverage(scene, h.p, h.n, rq, rng, gaM, h.matId));
+                    Vec3 g{0, 0, 0};
+                    M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
+                        if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
+                        double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
+                        double f = rho * (1.0 / PI);
+                        g += M.cie[k] * (f * (double)ph.power);       // == cie(lambda_p), precomputed
+                    });
+                    return g;
+                };
+                double nA = norm;
+                L += est(pm, norm, nA) * (nA * thr);
+                if (causOn) { double nB = normC; L += est(*pmC, normC, nB) * (nB * thr); }
                 return L;
             }
             case MatType::Mirror: {
@@ -558,9 +1097,23 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             }
             case MatType::Glossy: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
+                // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE). See backward.h's twin
+                // for why this is MIS and not the single-estimator split the rest of mode M's
+                // walk uses: a glossy lobe can be narrower than the light as easily as wider.
+                if (gneeOn) {
+                    const BackwardRenderer::NeeBsdf nb{&m, ray.d * -1.0};
+                    L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                         * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng,
+                                                 nullptr, BackwardRenderer::GiCtx{}, nullptr, nullptr, &nb));
+                }
                 thr *= r;
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return L;
+                if (gneeOn) {
+                    gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
+                    gmis.from = h.p;
+                    gmis.n = h.n;
+                }
                 ray = Ray{h.p + h.n * 1e-6, o};
                 break;
             }
@@ -659,7 +1212,8 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                                const PhotonMap& pm, long long spp, int nThreads,
                                bool diffraction, int maxBounce = 32,
                                unsigned long long sampleBase = 0, int fgRays = 0,
-                               const BeamMap* bm = nullptr) {
+                               const BeamMap* bm = nullptr,
+                               const PhotonMap* pmC = nullptr) {
     if (nThreads < 1) nThreads = 1;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     std::vector<Film> bands(nThreads);
@@ -687,7 +1241,7 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                              0xA24BAED4963EE407ULL);
                     Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
                     f.add(px, py, photonGather(scene, pm, ray, rng, diffraction, maxBounce,
-                                               fgRays, bm));
+                                               fgRays, bm, pmC));
                 }
             }
         }

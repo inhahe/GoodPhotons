@@ -140,11 +140,26 @@ struct DPTri {
     float  triplanarScale;  // >0: sample the skin by world triplanar instead of UV
     int    emissive;
     int    clear;           // see-through transmissive surface (handled by the clear pass)
+    float3 clearTint;       // its per-crossing RGB transmittance (raster.h clearTintOf)
+    // Per-vertex colour (linear RGB) and whether it is meaningful. kShade already
+    // recomputes this pixel's barycentrics to recover position/normal/UV, so the colour
+    // rides along for free -- no extra device buffer, unlike the host G-buffer which had
+    // to grow a channel because its shade pass is deferred and has only the buffer.
+    float3 vc0, vc1, vc2;
+    int    hasVcol;
     int    normalTex;       // tangent-space normal map, or -1
     float  normalStrength;  // XY scale applied to the sampled tangent-space normal
     int    reflectPat;      // scalar `pattern` scaling the albedo, or -1
     int    emitPat;         // scalar `pattern` masking the emission, or -1
     int    mix;             // index into the DMix table for a per-hit mix, else -1
+    // RASTER-PBR (host twin: raster.h PShade). `rough < 0` = no specular lobe, which shades
+    // byte-for-byte as before, so every diffuse scene is untouched. `f0` is normal-incidence
+    // reflectance -- for a metal preset that IS its measured reflectance, which is why a gold
+    // highlight must come out gold.
+    float  rough;
+    float3 f0;
+    int    roughPat;        // `roughness pattern:`, or -1
+    int    roughTex;        // `roughness texture:`, or -1
 };
 
 // Device twin of raster.h's PMix: the LOSING half of a two-child `mix` whose blend is
@@ -166,6 +181,10 @@ struct DMix {
     float  normalStrength;
     int    reflectPat;
     int    emitPat;
+    float  rough;           // RASTER-PBR: a mix child carries its own lobe, or -1 for none
+    float3 f0;
+    int    roughPat;
+    int    roughTex;
 };
 
 // A device image texture (linear RGB), mirroring raster.h's use of Texture::sampleRgb /
@@ -255,6 +274,10 @@ struct DAttr {
     float  normalStrength;
     int    reflectPat;      // scalar `pattern` scaling the albedo, or -1
     int    emitPat;         // scalar `pattern` masking the emission, or -1
+    float  rough;           // RASTER-PBR: carried through the near clip like every other slot
+    float3 f0;
+    int    roughPat;
+    int    roughTex;
 };
 // Per-slot flags array values (kProject writes, classify/raster/shade/clear probe).
 constexpr int kSlotValid   = 1;   // bit0: slot holds a projected sub-triangle
@@ -519,6 +542,8 @@ __device__ inline void emitSlot(DGeo* geos, DAttr* attrs, int* flags, int idx,
         a.emissive = t.emissive;
         a.normalTex = t.normalTex; a.normalStrength = t.normalStrength;
         a.reflectPat = t.reflectPat; a.emitPat = t.emitPat;
+        a.rough = t.rough; a.f0 = t.f0;          // RASTER-PBR: survive the near clip
+        a.roughPat = t.roughPat; a.roughTex = t.roughTex;
         attrs[idx] = a;
     }
     flags[idx] = kSlotValid | (t.clear ? kSlotClear : 0) | (clipped ? kSlotClipped : 0)
@@ -870,6 +895,30 @@ __device__ inline double dRasterFw(const DCam& cam, float3 wpos, float3 wn) {
 // Pass C: resolve + shade each pixel once. Decode the winning slot, recompute barycentrics
 // at the pixel centre (same float math as kRaster, so the winner's 1/depth reproduces),
 // interpolate world pos/normal, and shade with the same model as raster.h Pass 3.
+// RASTER-PBR, device twins of raster.h's envBrdfApprox / ggxSpec. Kept numerically identical to
+// the host so the two previews agree: same Karis fit, same Smith height-correlated visibility.
+__device__ static inline void envBrdfApproxD(float NoV, float rough, float& A, float& B) {
+    const float x = 1.0f - rough;
+    B = exp2f(-9.28f * NoV) * x * x * x;
+    A = x * x * x * x;
+}
+__device__ static inline float ggxSpecD(const float3& N, const float3& V, const float3& L,
+                                        float rough) {
+    const float3 H = normalize3(V + L);
+    const float NoV = fmaxf(1e-4f, dot3(N, V));
+    const float NoL = fmaxf(0.0f,  dot3(N, L));
+    if (NoL <= 0.0f) return 0.0f;
+    const float NoH = fmaxf(0.0f, dot3(N, H));
+    const float a  = fmaxf(1e-3f, rough * rough);
+    const float a2 = a * a;
+    const float d  = NoH * NoH * (a2 - 1.0f) + 1.0f;
+    const float D  = a2 / (3.14159265358979f * d * d);
+    const float lv = NoL * sqrtf(NoV * NoV * (1.0f - a2) + a2);
+    const float ll = NoV * sqrtf(NoL * NoL * (1.0f - a2) + a2);
+    const float Vis = (lv + ll > 0.0f) ? 0.5f / (lv + ll) : 0.0f;
+    return D * Vis * NoL;
+}
+
 __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
                        const int* flags, const unsigned long long* vis,
                        const DLight* lights, int nLights,
@@ -905,6 +954,11 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     float3 wp0, wp1, wp2, wn0, wn1, wn2, color;
     float2 uv0, uv1, uv2;
     int tex, emissive, nrmTex, rPat, ePat; float tps, nrmS;
+    float shRough; float3 shF0;    // RASTER-PBR: the lobe, carried down every unpack path
+    // Vertex colour comes from the SOURCE triangle either way: a near-clipped slot lerps
+    // position/normal/UV into DAttr, but a clipped triangle's colours are still the
+    // original three, and the barycentrics below are expressed against them.
+    const DPTri& vsrc = tris[slot >> 1];
     if (flags[slot] & kSlotClipped) {
         const DAttr& a = attrs[slot];
         wp0 = a.wp0; wn0 = a.wn0; uv0 = a.uv0;
@@ -913,6 +967,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         color = a.color; tex = a.tex; tps = a.triplanarScale; emissive = a.emissive;
         nrmTex = a.normalTex; nrmS = a.normalStrength;
         rPat = a.reflectPat; ePat = a.emitPat;
+        shRough = a.rough; shF0 = a.f0;
     } else {
         const DPTri& s = tris[slot >> 1];
         wp0 = s.p0; wn0 = s.n0; uv0 = s.uv0;
@@ -921,6 +976,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         color = s.color; tex = s.tex; tps = s.triplanarScale; emissive = s.emissive;
         nrmTex = s.normalTex; nrmS = s.normalStrength;
         rPat = s.reflectPat; ePat = s.emitPat;
+        shRough = s.rough; shF0 = s.f0;
     }
     if (flags[slot] & kSlotBack) {           // two-sided: the whole triangle faces away
         wn0 = wn0 * -1.0f; wn1 = wn1 * -1.0f; wn2 = wn2 * -1.0f;
@@ -967,12 +1023,20 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             color = mx.color; tex = mx.tex; tps = mx.triplanarScale;
             nrmTex = mx.normalTex; nrmS = mx.normalStrength;
             rPat = mx.reflectPat; ePat = mx.emitPat;
+            shRough = mx.rough; shF0 = mx.f0;   // a mix child brings its own lobe
         }
     }
 
     // Image skin: replace the flat albedo with the texture's linear RGB, sampled either at
     // the interpolated per-vertex UV or by world triplanar projection (mirrors raster.h P3).
     float3 col = color;
+    // Per-vertex colour multiplies the albedo -- the same rule the host rasterizer and
+    // the spectral tracer's diffuseReflectance use, and glTF's rule for COLOR_0.
+    if (vsrc.hasVcol) {
+        const float3 vc = (vsrc.vc0 * (w0 * t.invd0) + vsrc.vc1 * (w1 * t.invd1)
+                           + vsrc.vc2 * (w2 * t.invd2)) * d;
+        col = make_float3(col.x * vc.x, col.y * vc.y, col.z * vc.z);
+    }
     if (tex >= 0 && tex < nTex)
         col = (tps > 0.0f) ? dSampleRgbTri(texMeta, texels, tex, wpos, wn, tps)
                            : dSampleRgb(texMeta, texels, tex, uu, vv);
@@ -1015,6 +1079,12 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         }
     }
     float3 V  = normalize3(cam.eye - wpos);
+    // RASTER-PBR: the surface's own lobe. `rough < 0` skips the whole specular block, so a
+    // diffuse scene shades exactly as it did.
+    float rough = shRough;
+    if (rough >= 0.0f) rough = fminf(1.0f, fmaxf(0.02f, rough));
+    const bool spec = (rough >= 0.0f);
+    float3 specAcc = make_float3(0.0f, 0.0f, 0.0f);
     float lit = 0.0f;
     for (int li = 0; li < nLights; ++li) {
         const DLight& lp = lights[li];
@@ -1027,11 +1097,30 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         if (lp.falloff2 > 0.0f) atten = lp.falloff2 / (lp.falloff2 + dist2);
         float cone = 1.0f;
         if (lp.spot) cone = spotFalloffD(dot3(lp.dir, Ld * -1.0f), lp.cosInner, lp.cosOuter);
-        lit += lp.weight * ndl * atten * cone;
+        const float w = lp.weight * atten * cone;
+        lit += w * ndl;
+        if (spec) {
+            const float gg = ggxSpecD(N3, V, Ld, rough) * w;
+            if (gg > 0.0f) {
+                const float f = powf(1.0f - fmaxf(0.0f, dot3(V, normalize3(V + Ld))), 5.0f);
+                specAcc = specAcc + make_float3(shF0.x + (1.0f - shF0.x) * f,
+                                                shF0.y + (1.0f - shF0.y) * f,
+                                                shF0.z + (1.0f - shF0.z) * f) * gg;
+            }
+        }
     }
     float head = fmaxf(0.0f, dot3(N3, V));
     float k = ambient + keyScale * lit + fill * head;
     accum[i] = col * k;
+    if (spec) {
+        // The environment half. This renderer's environment is the single scalar `ambient`,
+        // so prefiltered(R, roughness) collapses to it exactly (host twin explains why that is
+        // split-sum over a uniform environment rather than an approximation of one).
+        float A = 0.0f, B = 0.0f;
+        envBrdfApproxD(fmaxf(1e-4f, dot3(N3, V)), rough, A, B);
+        specAcc = specAcc + make_float3(shF0.x * A + B, shF0.y * A + B, shF0.z * A + B) * ambient;
+        accum[i] = accum[i] + specAcc * keyScale;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,7 +1132,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
 __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
                        const int* flags, int nSlots, const float* zbuf,
                        DCam cam, int W, int H, float clarity, float milkPerSurface,
-                       float rimStrength, float* clearT, float* milkT) {
+                       float rimStrength, float invL0, float* clearT, float* milkT) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nSlots) return;
     int flg = flags[idx];                       // dense probe before touching the record
@@ -1073,7 +1162,12 @@ __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     // MULTIPLIES into clearT/milkT, so an edge covered by both sharers would darken a seam
     // line twice, and one covered by neither would leave a hairline of un-tinted glass.
     const DEdges E = makeEdgesD(t, area);
-    const float tau = clarity;
+    // Per-CHANNEL transmittance: the master clarity dial times this surface's own tint.
+    // The tint rides on the source DPTri, exactly as the host reads it from tris[s.src].
+    const float3 tint = tris[idx >> 1].clearTint;
+    const float tauR = clarity * tint.x;
+    const float tauG = clarity * tint.y;
+    const float tauB = clarity * tint.z;
 
     for (int y = ylo; y <= yhi; ++y) {
         const float py = y + 0.5f;
@@ -1100,12 +1194,78 @@ __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             float3 Vv = normalize3(cam.eye - wpos);
             float ndv = fabsf(dot3(Nn, Vv));
             float graze = 1.0f - ndv;
-            float perMilk = milkPerSurface + rimStrength * graze * graze * graze;
-            if (perMilk > 0.95f) perMilk = 0.95f;
-            atomicMulF(&clearT[row], tau);
-            atomicMulF(&milkT[row], 1.0f - perMilk);
+            // Sign from the GEOMETRIC normal, not the shading one. Shading normals are
+            // authored data -- they can be flipped, smoothed across a crease, or bent by a
+            // normal map -- and the front/back decision here has to be a fact about the
+            // surface, identical on both backends. The winding is that fact.
+            const float3 fnG = cross3(wp1 - wp0, wp2 - wp0);
+            const float ndvSigned = dot3(fnG, cam.eye - wpos);
+            const float dpt = 1.0f / fmaxf(invd, 1e-12f);
+            // See raster.h: Beer-Lambert over PATH LENGTH, not once per crossed surface,
+            // and the rim is a silhouette cue that must saturate rather than compound.
+            float rim = rimStrength * graze * graze * graze;
+            if (rim > 0.95f) rim = 0.95f;
+            const float gR = -logf(fmaxf(tauR, 1e-6f));
+            const float gG = -logf(fmaxf(tauG, 1e-6f));
+            const float gB = -logf(fmaxf(tauB, 1e-6f));
+            const float sgn = (ndvSigned > 0.0f) ? -1.0f : 1.0f;
+            const float sd  = sgn * dpt;
+            const float kk  = sd * invL0;
+            // Native float atomicAdd, where the transmittance product needed atomicMulF --
+            // a compare-and-swap RETRY loop, since CUDA has no float multiply atomic. More
+            // accumulators, but none of them spin.
+            atomicAdd(&clearT[row * 6 + 0], kk * gR);
+            atomicAdd(&clearT[row * 6 + 1], kk * gG);
+            atomicAdd(&clearT[row * 6 + 2], kk * gB);
+            if (sgn < 0.0f) {                       // front faces: the open-surface fallback
+                atomicAdd(&clearT[row * 6 + 3], gR);
+                atomicAdd(&clearT[row * 6 + 4], gG);
+                atomicAdd(&clearT[row * 6 + 5], gB);
+            }
+            atomicAdd(&milkT[row], sd);             // signed thickness
+            atomicMin((unsigned*)&milkT[(size_t)W * H + row],
+                      __float_as_uint(1.0f - rim));
+            (void)milkPerSurface;
         }
     }
+}
+
+// Clamp a device float array UP to a floor. `-glass-haze`: the milk product is a running
+// product over crossed surfaces, so a deep pile drives it to 0 (full haze); flooring it
+// caps how much of the pixel the frost may take. Applied to the finished product rather
+// than inside kClear's atomics, which is exactly equivalent for a decreasing product and
+// leaves the accumulation loop (and its atomicMulF) untouched.
+__global__ static void kFloorF(float* a, float lo, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (a[i] < lo) a[i] = lo;
+}
+
+// Fold the rim half of milkT into the physical half and apply the haze floor, so every
+// downstream reader still sees one float per pixel. Mirrors raster.h's fold pass.
+__global__ static void kFold(const float* clearT, float* clearRGB, float* milkT, int n,
+                             float floorT, float L0, float invL0, float kHaze) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    // BLEND, do not branch, on "is there an enclosed path?". The thickness is an
+    // atomically summed float, so its exact value near zero depends on the order the
+    // fragments landed -- which differs between the backends and between runs. A hard
+    // threshold there turns that into a visible pixel flipping between the path-length
+    // and per-crossing models. Ramping over a thin sliver of L0 keeps small numerical
+    // differences producing small image differences, and reads correctly anyway: very
+    // thin glass IS the single-crossing case.
+    const float L  = milkT[i];
+    const float w  = fminf(fmaxf(L / (0.02f * L0), 0.0f), 1.0f);   // 0 = open, 1 = enclosed
+    const float Lh = fmaxf(L, 0.02f * L0);
+    for (int c = 0; c < 3; ++c) {
+        float tauP = clearT[i * 6 + c] * invL0 * L0;
+        if (!(tauP > 0.0f)) tauP = 0.0f;
+        const float tauO = clearT[i * 6 + 3 + c];
+        clearRGB[i * 3 + c] = expf(-(w * tauP + (1.0f - w) * tauO));
+    }
+    float m = expf(-kHaze * Lh) * milkT[n + i];
+    if (m < floorT) m = floorT;
+    milkT[i] = m;
 }
 
 // Fill a device float array with a constant (used to reset clearT/milkT to 1.0 each frame;
@@ -1188,12 +1348,30 @@ __device__ inline uchar3 tonemapPixel(const float3* accum, const float* zbuf, si
         cz = __dmul_rn(cz, finalExp);
     }
     if (seeThrough) {                              // composite clear glass (display-linear)
-        float T = clearT[i], mt = milkT[i];
-        if (T < 1.0f || mt < 1.0f) {
+        const float Tr = clearT[i * 3 + 0], Tg = clearT[i * 3 + 1], Tb = clearT[i * 3 + 2];
+        const float mt = milkT[i];
+        if (Tr < 1.0f || Tg < 1.0f || Tb < 1.0f || mt < 1.0f) {
             double m = __dsub_rn(1.0, (double)mt); // (1 - mt) evaluated once, as on host
-            cx = __dadd_rn(__dmul_rn(cx, (double)T), __dmul_rn(milkX, m));
-            cy = __dadd_rn(__dmul_rn(cy, (double)T), __dmul_rn(milkY, m));
-            cz = __dadd_rn(__dmul_rn(cz, (double)T), __dmul_rn(milkZ, m));
+            // Haze tinted by the HUE of the accumulated transmittance — the host twin;
+            // see the long comment there for why the hue and not the magnitude.
+            double tmax = fmax(fmax((double)Tr, (double)Tg), (double)Tb);
+            // See raster.h's exposeAndEncodeCore: with no hue to take, take none. Falling
+            // back to inv = 1 leaves hz = milkColor * T ~ 0, so a dense stack composites to
+            // EXACTLY black instead of to the frost that should be all that is left. The two
+            // backends must agree bit for bit, so this branch is duplicated verbatim.
+            // See raster.h: the hue is well defined for any strictly positive tmax
+            // because inv only normalises T by its own max, in double. 1e-6 discarded it
+            // ~130 crossings in, which an extrude reaches easily.
+            bool   hasHue = tmax > 1e-300;
+            double inv  = hasHue ? 1.0 / tmax : 1.0;
+            // Same expression order as the host (plain double, left to right) so the two
+            // stay bit-identical; only the no-hue fallback differs from what it was.
+            double hzX = hasHue ? milkX * (double)Tr * inv : milkX;
+            double hzY = hasHue ? milkY * (double)Tg * inv : milkY;
+            double hzZ = hasHue ? milkZ * (double)Tb * inv : milkZ;
+            cx = __dadd_rn(__dmul_rn(cx, (double)Tr), __dmul_rn(hzX, m));
+            cy = __dadd_rn(__dmul_rn(cy, (double)Tg), __dmul_rn(hzY, m));
+            cz = __dadd_rn(__dmul_rn(cz, (double)Tb), __dmul_rn(hzZ, m));
         }
     }
     return make_uchar3(encodeSrgb(cx, lut), encodeSrgb(cy, lut), encodeSrgb(cz, lut));
@@ -1250,6 +1428,7 @@ bool available() {
 // Opaque uploaded scene: persistent device triangle + light arrays, plus cached per-pixel
 // scratch (grown as needed) so a camera_path re-renders without re-uploading geometry.
 struct Scene {
+    PatSlice ndSlice;             // -nd: the slice of N-space implicit fields are read on
     DPTri*   dtris   = nullptr;
     int      nTris   = 0;
     DGeo*    dgeos   = nullptr;   // 2*nTris slots: screen geometry (classify/raster read this)
@@ -1283,8 +1462,10 @@ struct Scene {
     float3*             accum  = nullptr;
     float*              zbuf   = nullptr;
     unsigned char*      emis   = nullptr;
-    float*              clearT = nullptr;   // see-through cumulative transmittance
+    float*              clearT = nullptr;   // see-through cumulative transmittance (RGB: 3 per pixel)
     float*              milkT  = nullptr;   // see-through milk (haze) product
+    float*              clearRGB = nullptr; // folded 3-float transmittance (see raster.h)
+    float               radius = 1.0f;      // geometry half-diagonal: the path-length scale
     size_t              pixCap = 0;
     // Raster bin lists (slot indices by bbox size, rebuilt per frame) + 3 counters.
     int* dbinSmall = nullptr;
@@ -1322,6 +1503,7 @@ static DPatEnv patEnvOf(const Scene& sc) {
     e.grids    = sc.dgrids;    e.nGrids    = sc.nGrids;
     e.scatters = sc.dscatters; e.nScatters = sc.nScatters;
     e.dataPool = sc.ddataPool; e.dataPoolN = sc.nDataPool;
+    e.slice    = sc.ndSlice;
     return e;
 }
 
@@ -1369,6 +1551,7 @@ void destroy(Scene* sc) {
     if (sc->emis)     cudaFree(sc->emis);
     if (sc->clearT)   cudaFree(sc->clearT);
     if (sc->milkT)    cudaFree(sc->milkT);
+    if (sc->clearRGB) cudaFree(sc->clearRGB);
     if (sc->dbinSmall) cudaFree(sc->dbinSmall);
     if (sc->dbinMed)   cudaFree(sc->dbinMed);
     if (sc->dbinLarge) cudaFree(sc->dbinLarge);
@@ -1389,11 +1572,15 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
     if (!available() || tris.empty()) return nullptr;
     Scene* sc = new Scene();
     sc->nTris = (int)tris.size();
+    sc->radius = (float)(geom.radius > 0.0 ? geom.radius : 1.0);   // path-length scale
     const std::vector<Texture>* textures = scene ? &scene->textures : nullptr;
 
     // Bake triangles.
+    // Baking DPTri is per-triangle and independent, and an -nd warp re-uploads millions
+    // of them on every slider event -- this was ~0.6 s of a 2.5 s rebuild, on one core.
+    // The memcpy that follows is a single transfer either way; only the bake threads.
     std::vector<DPTri> h(tris.size());
-    for (size_t i = 0; i < tris.size(); ++i) {
+    (void)ft::parallelFor(tris.size(), 8192, [&](size_t i) {
         const raster::PTri& t = tris[i];
         DPTri& d = h[i];
         d.p0 = toF3(t.p0); d.p1 = toF3(t.p1); d.p2 = toF3(t.p2);
@@ -1406,12 +1593,21 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         d.triplanarScale = (float)t.triplanarScale;
         d.emissive = t.emissive ? 1 : 0;
         d.clear = t.clear ? 1 : 0;
+        d.clearTint = make_float3((float)t.clearTint.x, (float)t.clearTint.y,
+                                  (float)t.clearTint.z);
+        d.hasVcol = t.hasVcol ? 1 : 0;
+        d.vc0 = make_float3((float)t.vc0.x, (float)t.vc0.y, (float)t.vc0.z);
+        d.vc1 = make_float3((float)t.vc1.x, (float)t.vc1.y, (float)t.vc1.z);
+        d.vc2 = make_float3((float)t.vc2.x, (float)t.vc2.y, (float)t.vc2.z);
         d.normalTex = t.normalTex;
         d.normalStrength = (float)t.normalStrength;
         d.reflectPat = t.reflectPat;
+        d.rough = (float)t.rough;                // RASTER-PBR (host twin: raster.h PShade)
+        d.f0 = make_float3((float)t.f0.x, (float)t.f0.y, (float)t.f0.z);
+        d.roughPat = t.roughPat; d.roughTex = t.roughTex;
         d.emitPat    = t.emitPat;
         d.mix        = t.mix;
-    }
+    });
     // Bake the per-hit `mix` side table (raster.h's PMix -> DMix). One entry per
     // weight-mapped mix MATERIAL, so this stays tiny however many triangles index it.
     std::vector<DMix> hmix(geom.mixes.size());
@@ -1426,6 +1622,9 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         d.normalTex      = m.b.normalTex;
         d.normalStrength = (float)m.b.normalStrength;
         d.reflectPat     = m.b.reflectPat;
+        d.rough          = (float)m.b.rough;     // a mix child carries its own lobe
+        d.f0             = make_float3((float)m.b.f0.x, (float)m.b.f0.y, (float)m.b.f0.z);
+        d.roughPat       = m.b.roughPat; d.roughTex = m.b.roughTex;
         d.emitPat        = m.b.emitPat;
     }
     sc->nMixes = (int)hmix.size();
@@ -1571,6 +1770,9 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
     if (!hpat.empty() &&
         cudaMemcpy(sc->dpatterns, hpat.data(), sizeof(DPattern) * hpat.size(),
                    cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    // The N-D slice rides in the host-side Scene struct (it is read through patEnvOf,
+    // which is built on the host and passed to the kernels by value), so no upload.
+    if (scene) sc->ndSlice = scene->ndSlice;
     if (scene && !scene->grids.empty()) {
         sc->nGrids = (int)scene->grids.size();
         if (cudaMemcpy(sc->dgrids, scene->grids.data(), sizeof(PatGrid) * scene->grids.size(),
@@ -1607,6 +1809,7 @@ static bool ensurePix(Scene* sc, size_t N) {
     if (sc->emis)   { cudaFree(sc->emis);   sc->emis = nullptr; }
     if (sc->clearT) { cudaFree(sc->clearT); sc->clearT = nullptr; }
     if (sc->milkT)  { cudaFree(sc->milkT);  sc->milkT = nullptr; }
+    if (sc->clearRGB) { cudaFree(sc->clearRGB); sc->clearRGB = nullptr; }
     if (sc->dimg)   { cudaFree(sc->dimg);   sc->dimg = nullptr; }
     if (sc->h_img)  { cudaFreeHost(sc->h_img); sc->h_img = nullptr; }
     sc->pixCap = 0;
@@ -1614,8 +1817,9 @@ static bool ensurePix(Scene* sc, size_t N) {
            && tryMalloc((void**)&sc->accum,  sizeof(float3) * N)
            && tryMalloc((void**)&sc->zbuf,   sizeof(float) * N)
            && tryMalloc((void**)&sc->emis,   sizeof(unsigned char) * N)
-           && tryMalloc((void**)&sc->clearT, sizeof(float) * N)
-           && tryMalloc((void**)&sc->milkT,  sizeof(float) * N)
+           && tryMalloc((void**)&sc->clearT, sizeof(float) * N * 6)   // 6 while accumulating
+           && tryMalloc((void**)&sc->milkT,  sizeof(float) * N * 2)   // thickness + rim
+           && tryMalloc((void**)&sc->clearRGB, sizeof(float) * N * 3)
            && tryMalloc((void**)&sc->dimg,   N * 3)
            && tryMallocHost((void**)&sc->h_img, N * 3);
     if (!ok) return false;
@@ -1667,7 +1871,7 @@ static void profResolve(Scene* sc) {
 // Returns false on any device failure (the caller then falls back to the CPU rasterizer).
 static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
                        double exposure, bool autoExpose, double* lockAnchor,
-                       bool seeThrough, double glassClarity,
+                       bool seeThrough, double glassClarity, double hazeCap,
                        double& finalExp, int& gPix, int& TPBout) {
     if (!sc || sc->nTris == 0 || W <= 0 || H <= 0) return false;
     const size_t N = (size_t)W * H;
@@ -1735,13 +1939,29 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
     // See-through clear pass: reset clearT/milkT to 1 and accumulate each clear surface's
     // transmittance/haze against the now-complete opaque depth (sc->zbuf, written by kShade).
     if (seeThrough) {
-        kFillF<<<gPix, TPB>>>(sc->clearT, 1.0f, N);
-        kFillF<<<gPix, TPB>>>(sc->milkT,  1.0f, N);
+        // clearT is 3 floats per pixel, so it needs its own grid: gPix only covers N
+        // threads, and kFillF's `i >= n` guard would silently leave two thirds of the
+        // buffer at whatever the last frame left there.
+        const int gClear = (int)((N * 3 + TPB - 1) / TPB);
+        const int gPix2 = (int)((N * 2 + TPB - 1) / TPB);
+        const int gClr6 = (int)((N * 6 + TPB - 1) / TPB);
+        kFillF<<<gClr6, TPB>>>(sc->clearT, 0.0f, N * 6);   // sums, so they start at 0
+        kFillF<<<gPix, TPB>>>(sc->milkT,  0.0f, N);        // thickness: a sum
+        kFillF<<<gPix, TPB>>>(sc->milkT + N, 1.0f, N);     // rim: a min of (1-r)
         // Stream order already runs kClear after both fills complete.
         kClear<<<gSlots, TPB>>>(sc->dtris, sc->dgeos, sc->dattrs, sc->dflags, 2 * sc->nTris,
                                 sc->zbuf, dc, W, H,
                                 (float)glassClarity, (float)kMilkPerSurface, (float)kRimStrength,
+                                (float)(1.0 / ((sc->radius > 0.0f ? (double)sc->radius : 1.0) * 0.05)),
                                 sc->clearT, sc->milkT);
+        {
+            const double L0d = (sc->radius > 0.0f ? (double)sc->radius : 1.0) * 0.05;
+            const double mp  = fmax(0.0, 1.0 - glassClarity) * 0.55;
+            const double kH  = (mp > 0.0 && mp < 1.0) ? -log(1.0 - mp) / L0d : 0.0;
+            kFold<<<gPix, TPB>>>(sc->clearT, sc->clearRGB, sc->milkT, (int)N,
+                                 hazeCap < 1.0 ? (float)fmax(0.0, 1.0 - hazeCap) : 0.0f,
+                                 (float)L0d, (float)(1.0 / L0d), (float)kH);
+        }
     }
     rec(5);   // recorded either way; the clear window is simply ~0 when see-through is off
 
@@ -1795,17 +2015,17 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
 
 std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int nThreads,
                                  double exposure, bool autoExpose, double* lockAnchor,
-                                 bool seeThrough, double glassClarity) {
+                                 bool seeThrough, double glassClarity, double hazeCap) {
     std::vector<uint8_t> empty;
     (void)nThreads;   // whole frame (incl. expose/tonemap) runs on the device now
     double finalExp = 1.0;
     int gPix = 0, TPB = 0;
     if (!renderCore(sc, cam, W, H, exposure, autoExpose, lockAnchor, seeThrough,
-                    glassClarity, finalExp, gPix, TPB)) return empty;
+                    glassClarity, hazeCap, finalExp, gPix, TPB)) return empty;
     const size_t N = (size_t)W * H;
 
     kToneMap<<<gPix, TPB>>>(sc->accum, sc->zbuf, N, finalExp, seeThrough ? 1 : 0,
-                            sc->clearT, sc->milkT, kMilkColor.x, kMilkColor.y, kMilkColor.z,
+                            sc->clearRGB, sc->milkT, kMilkColor.x, kMilkColor.y, kMilkColor.z,
                             sc->dlut, sc->dimg);
     if (g_prof) cudaEventRecord(sc->ev[6], 0);
 
@@ -1855,13 +2075,13 @@ bool bindPresentTarget(Scene* sc, void* d3d11Device, void* d3d11Texture, int W, 
 
 bool renderFrameToTarget(Scene* sc, const Camera& cam, int W, int H, int nThreads,
                          double exposure, bool autoExpose, double* lockAnchor,
-                         bool seeThrough, double glassClarity) {
+                         bool seeThrough, double glassClarity, double hazeCap) {
     (void)nThreads;
     if (!sc || !sc->gfxRes || sc->gfxW != W || sc->gfxH != H) return false;
     double finalExp = 1.0;
     int gPix = 0, TPB = 0;
     if (!renderCore(sc, cam, W, H, exposure, autoExpose, lockAnchor, seeThrough,
-                    glassClarity, finalExp, gPix, TPB)) return false;
+                    glassClarity, hazeCap, finalExp, gPix, TPB)) return false;
     const size_t N = (size_t)W * H;
 
     // Map the D3D texture into CUDA's address space, grab its array, and write the
@@ -1877,7 +2097,7 @@ bool renderFrameToTarget(Scene* sc, const Camera& cam, int W, int H, int nThread
         cudaSurfaceObject_t surf = 0;
         if (cudaCreateSurfaceObject(&surf, &rd) == cudaSuccess) {
             kToneMapSurf<<<gPix, TPB>>>(sc->accum, sc->zbuf, N, W, finalExp, seeThrough ? 1 : 0,
-                                        sc->clearT, sc->milkT,
+                                        sc->clearRGB, sc->milkT,
                                         kMilkColor.x, kMilkColor.y, kMilkColor.z,
                                         sc->dlut, surf);
             if (g_prof) cudaEventRecord(sc->ev[6], 0);
@@ -1900,8 +2120,187 @@ bool renderFrameToTarget(Scene* sc, const Camera& cam, int W, int H, int nThread
 
 bool bindPresentTarget(Scene*, void*, void*, int, int) { return false; }
 bool renderFrameToTarget(Scene*, const Camera&, int, int, int, double, bool, double*,
-                         bool, double) { return false; }
+                         bool, double, double) { return false; }
 
 #endif
+
+
+// ---- Resident N-D complex ---------------------------------------------------------
+// One thread per vertex: rotate into N-space and keep the first three coordinates. Only
+// the first three ROWS of R are read, which is the whole argument for why an orthographic
+// projection of an N-D rotation is a 3xN matrix.
+__global__ static void kNdProject(const float* pos, int nv, int n, const float* R,
+                                  float cx, float cy, float cz, float* proj) {
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= nv) return;
+    const float* P = pos + (size_t)v * n;
+    float q[3];
+    for (int i = 0; i < 3; ++i) {
+        float acc = 0.0f;
+        const float* Ri = R + (size_t)i * n;
+        for (int j = 0; j < n; ++j) acc += Ri[j] * P[j];
+        q[i] = acc;
+    }
+    proj[(size_t)v * 3 + 0] = q[0] + cx;
+    proj[(size_t)v * 3 + 1] = q[1] + cy;
+    proj[(size_t)v * 3 + 2] = q[2] + cz;
+}
+
+// Face normal and the three Thurmer-Wuthrich corner angles, per complex triangle. A
+// degenerate triangle gets a zero normal, which can never clear the crease threshold, so
+// it drops out of the gather below without needing a separate test.
+__global__ static void kNdFace(const float* proj, const int* tvi, int ntri,
+                               float* fn, float* ang) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ntri) return;
+    const int a = tvi[i * 3 + 0], b = tvi[i * 3 + 1], c = tvi[i * 3 + 2];
+    const float3 P0 = make_float3(proj[(size_t)a*3+0], proj[(size_t)a*3+1], proj[(size_t)a*3+2]);
+    const float3 P1 = make_float3(proj[(size_t)b*3+0], proj[(size_t)b*3+1], proj[(size_t)b*3+2]);
+    const float3 P2 = make_float3(proj[(size_t)c*3+0], proj[(size_t)c*3+1], proj[(size_t)c*3+2]);
+    float3 cr = cross3(P1 - P0, P2 - P0);
+    const float l = sqrtf(dot3(cr, cr));
+    const float3 fnv = (l > 1e-18f) ? cr * (1.0f / l) : make_float3(0.0f, 0.0f, 0.0f);
+    fn[i * 3 + 0] = fnv.x; fn[i * 3 + 1] = fnv.y; fn[i * 3 + 2] = fnv.z;
+    const float3 V[3] = {P0, P1, P2};
+    for (int k = 0; k < 3; ++k) {
+        const float3 A = V[k];
+        float3 e1 = V[(k + 1) % 3] - A, e2 = V[(k + 2) % 3] - A;
+        const float l1 = sqrtf(dot3(e1, e1)), l2 = sqrtf(dot3(e2, e2));
+        float t = 0.0f;
+        if (l1 >= 1e-18f && l2 >= 1e-18f) {
+            float ca = dot3(e1, e2) / (l1 * l2);
+            ca = ca < -1.0f ? -1.0f : (ca > 1.0f ? 1.0f : ca);
+            t = acosf(ca);
+        }
+        ang[i * 3 + k] = t;
+    }
+}
+
+// The crease gather, then write positions and normals into the uploaded DPTri. Mirrors
+// meshFinishTris' fan average: each corner sums the incident faces whose normal is within
+// the crease angle, weighted by the corner angle.
+__global__ static void kNdWrite(const float* proj, const int* tvi, int ntri,
+                                const float* fn, const float* ang,
+                                const unsigned* voff, const unsigned* vcorner,
+                                float cosThresh, DPTri* tris, float* outNrm) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ntri) return;
+    const int idx[3] = {tvi[i * 3 + 0], tvi[i * 3 + 1], tvi[i * 3 + 2]};
+    const float3 fni = make_float3(fn[i*3+0], fn[i*3+1], fn[i*3+2]);
+    float3 P[3], N[3];
+    for (int c = 0; c < 3; ++c) {
+        const int v = idx[c];
+        P[c] = make_float3(proj[(size_t)v*3+0], proj[(size_t)v*3+1], proj[(size_t)v*3+2]);
+        float3 sum = make_float3(0.0f, 0.0f, 0.0f);
+        for (unsigned k = voff[v], e = voff[v + 1]; k < e; ++k) {
+            const unsigned cid = vcorner[k];
+            const float3 fnj = make_float3(fn[(cid/3)*3+0], fn[(cid/3)*3+1], fn[(cid/3)*3+2]);
+            if (dot3(fni, fnj) >= cosThresh) sum = sum + fnj * ang[cid];
+        }
+        const float l = sqrtf(dot3(sum, sum));
+        N[c] = (l > 1e-12f) ? sum * (1.0f / l) : fni;
+    }
+    if (tris) {
+        DPTri& t = tris[i];
+        t.p0 = P[0]; t.p1 = P[1]; t.p2 = P[2];
+        t.n0 = N[0]; t.n1 = N[1]; t.n2 = N[2];
+    }
+    if (outNrm)
+        for (int c = 0; c < 3; ++c) {
+            outNrm[(size_t)i*9 + c*3 + 0] = N[c].x;
+            outNrm[(size_t)i*9 + c*3 + 1] = N[c].y;
+            outNrm[(size_t)i*9 + c*3 + 2] = N[c].z;
+        }
+}
+
+
+// ---- Resident N-D complex: host side ----------------------------------------------
+struct NdResident {
+    float*    pos = nullptr;     // nv * n
+    int*      tvi = nullptr;     // ntri * 3
+    unsigned* voff = nullptr;    // nv + 1
+    unsigned* vcorner = nullptr; // ntri * 3
+    float*    proj = nullptr;    // nv * 3
+    float*    fn = nullptr;      // ntri * 3
+    float*    ang = nullptr;     // ntri * 3
+    float*    R = nullptr;       // 3 * n
+    int nv = 0, n = 0, ntri = 0;
+    float cosThresh = 0.0f;
+};
+
+NdResident* ndUpload(const double* pos, int nv, int n, const int* tvi, int ntri,
+                     const unsigned* voff, const unsigned* vcorner, double creaseDeg) {
+    if (!available() || nv <= 0 || ntri <= 0 || n < 3) return nullptr;
+    NdResident* nd = new NdResident();
+    nd->nv = nv; nd->n = n; nd->ntri = ntri;
+    nd->cosThresh = (float)std::cos(creaseDeg * 3.14159265358979323846 / 180.0);
+    std::vector<float> hp((size_t)nv * n);
+    for (size_t k = 0; k < hp.size(); ++k) hp[k] = (float)pos[k];
+    bool ok = cudaMalloc(&nd->pos, sizeof(float) * hp.size()) == cudaSuccess
+           && cudaMalloc(&nd->tvi, sizeof(int) * (size_t)ntri * 3) == cudaSuccess
+           && cudaMalloc(&nd->voff, sizeof(unsigned) * ((size_t)nv + 1)) == cudaSuccess
+           && cudaMalloc(&nd->vcorner, sizeof(unsigned) * (size_t)ntri * 3) == cudaSuccess
+           && cudaMalloc(&nd->proj, sizeof(float) * (size_t)nv * 3) == cudaSuccess
+           && cudaMalloc(&nd->fn, sizeof(float) * (size_t)ntri * 3) == cudaSuccess
+           && cudaMalloc(&nd->ang, sizeof(float) * (size_t)ntri * 3) == cudaSuccess
+           && cudaMalloc(&nd->R, sizeof(float) * 3 * (size_t)n) == cudaSuccess;
+    if (ok) ok = cudaMemcpy(nd->pos, hp.data(), sizeof(float) * hp.size(), cudaMemcpyHostToDevice) == cudaSuccess
+             && cudaMemcpy(nd->tvi, tvi, sizeof(int) * (size_t)ntri * 3, cudaMemcpyHostToDevice) == cudaSuccess
+             && cudaMemcpy(nd->voff, voff, sizeof(unsigned) * ((size_t)nv + 1), cudaMemcpyHostToDevice) == cudaSuccess
+             && cudaMemcpy(nd->vcorner, vcorner, sizeof(unsigned) * (size_t)ntri * 3, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (!ok) { ndDestroy(nd); return nullptr; }
+    return nd;
+}
+
+void ndDestroy(NdResident* nd) {
+    if (!nd) return;
+    if (nd->pos) cudaFree(nd->pos);
+    if (nd->tvi) cudaFree(nd->tvi);
+    if (nd->voff) cudaFree(nd->voff);
+    if (nd->vcorner) cudaFree(nd->vcorner);
+    if (nd->proj) cudaFree(nd->proj);
+    if (nd->fn) cudaFree(nd->fn);
+    if (nd->ang) cudaFree(nd->ang);
+    if (nd->R) cudaFree(nd->R);
+    delete nd;
+}
+
+// Shared by ndReproject and ndProbe: upload the matrix and run the three kernels.
+static bool ndRun(NdResident* nd, const double* R3n, double cx, double cy, double cz,
+                  DPTri* tris, float* outNrm) {
+    if (!nd) return false;
+    std::vector<float> hr((size_t)3 * nd->n);
+    for (size_t k = 0; k < hr.size(); ++k) hr[k] = (float)R3n[k];
+    if (cudaMemcpy(nd->R, hr.data(), sizeof(float) * hr.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    const int TPB = 256;
+    kNdProject<<<(nd->nv + TPB - 1) / TPB, TPB>>>(nd->pos, nd->nv, nd->n, nd->R,
+                                                       (float)cx, (float)cy, (float)cz, nd->proj);
+    kNdFace<<<(nd->ntri + TPB - 1) / TPB, TPB>>>(nd->proj, nd->tvi, nd->ntri, nd->fn, nd->ang);
+    kNdWrite<<<(nd->ntri + TPB - 1) / TPB, TPB>>>(nd->proj, nd->tvi, nd->ntri, nd->fn,
+                                                       nd->ang, nd->voff, nd->vcorner,
+                                                       nd->cosThresh, tris, outNrm);
+    return cudaDeviceSynchronize() == cudaSuccess && cudaGetLastError() == cudaSuccess;
+}
+
+bool ndReproject(Scene* sc, NdResident* nd, const double* R3n,
+                 double cx, double cy, double cz, int triOffset) {
+    if (!sc || !nd || triOffset < 0 || triOffset + nd->ntri > sc->nTris) return false;
+    return ndRun(nd, R3n, cx, cy, cz, sc->dtris + triOffset, nullptr);
+}
+
+bool ndProbe(NdResident* nd, const double* R3n, double cx, double cy, double cz,
+             float* outProj, float* outNrm) {
+    if (!available() || !nd) return false;
+    float* dN = nullptr;
+    if (cudaMalloc(&dN, sizeof(float) * (size_t)nd->ntri * 9) != cudaSuccess) return false;
+    bool ok = ndRun(nd, R3n, cx, cy, cz, nullptr, dN);
+    if (ok) ok = cudaMemcpy(outProj, nd->proj, sizeof(float) * (size_t)nd->nv * 3,
+                            cudaMemcpyDeviceToHost) == cudaSuccess
+             && cudaMemcpy(outNrm, dN, sizeof(float) * (size_t)nd->ntri * 9,
+                           cudaMemcpyDeviceToHost) == cudaSuccess;
+    cudaFree(dN);
+    return ok;
+}
 
 }  // namespace raster_cuda

@@ -24,4 +24,4 @@ struct Scene;
 // first UV set (otherwise the Tri fallback UVs are kept). Returns the number of
 // triangles appended; on failure returns 0 and fills `err`.
 int loadFbx(Scene& s, const char* path, int matId, const Affine& xf,
-            bool loadUV, std::string& err);
+            bool loadUV, std::string& err, bool importMaterials = true);
