@@ -3358,8 +3358,37 @@ the geometry is fibers* beats both keeping it everywhere and dropping it everywh
 baseline already has the shipped tangle gate on at 30, so this is an improvement on top of it, not
 an alternative to it.
 
-**Still not on by default, and the reason is the one that kept `-gatherarea` opt-in for months:
-there is no device twin.** Mode `M` runs on the GPU by default, so defaulting a host-only
+**DEVICE TWIN LANDED (v0.276.8), and it agrees with the host exactly on the fur.** Same scene,
+settings, seed and reference, both backends:
+
+| ROI | cpu off | cpu on | gpu off | gpu on |
+|---|---|---|---|---|
+| `creature` (FUR) | +42.0 % | **+7.7 %** | +49.7 % | **+7.7 %** |
+| `alice_hair` | −15.2 % | −15.2 % | −21.9 % | −21.9 % |
+| `alice_dress` | −3.7 % | −3.7 % | −17.2 % | −17.2 % |
+| `cap_gyroid` | −15.5 % | −15.5 % | −4.9 % | −4.9 % |
+| `grid_ground` | +1.0 % | +1.0 % | −2.1 % | −2.1 % |
+
+Everything needed was already there — `DHit::fiberRadius` is the documented twin of
+`Hit::fiberRadius` and the device curve intersector fills it — so this is plumbing, not new physics.
+The flag reads the **same environment channel** as the host, the invariant that stops the backends
+disagreeing about whether a gate is on (the tangle gate's own comment says so).
+
+**A SECOND RESULT WORTH HAVING: the gate makes fur AGREE ACROSS BACKENDS.** The fur baselines differ
+by **7.7 points** between CPU and GPU (+42.0 vs +49.7) and land on **exactly +7.7 % on both** once
+the gate is on. That follows from what the gate does: it replaces a stochastic, backend-specific
+coverage probe with a deterministic 1.0 wherever the geometry is fibers, so the largest source of
+CPU/GPU divergence on fur simply stops being evaluated. (The other four ROIs still differ between
+backends by up to 13 points — that is pre-existing at 64 spp on 27–90 px windows, unchanged by this,
+and not something this gate addresses.)
+
+**Still not on by default**, but the blocker has changed: the device twin now exists, so what
+remains is confidence rather than coverage. The effect is 34–42 points against a per-ROI noise this
+entry measures at ±2.2, and both backends agree to the printed digit — but it is one seed, and this
+entry's own history is that single-seed numbers on these ROIs have been wrong before. Multi-seed,
+then flip.
+
+*(Superseded: the original blocker was that)* there is no device twin. Mode `M` runs on the GPU by default, so defaulting a host-only
 correction would split `-device gpu` from `-device cpu` on any scene with fur. The remaining work
 is the `dGatherCoverage` twin plus a fiber flag on the device hit, then the same four-ROI test on
 both backends, then the flip. Single seed here: the effect is 34 points against a per-ROI noise the

@@ -1228,7 +1228,10 @@ struct DScene {
     int              bkGlossyNee;    // 0 = -no-glossy-nee: no connection at a D_GLOSSY vertex
     int              gatherArea;     // -gatherarea <M>: probe samples for the M-GATHERAREA
                                      // footprint (0 = off, the default)
-    int              gatherRejPct;   // FTRACE_GAREJECT <pct>: the tangle gate. Suppress the
+    int              gatherRejPct;
+    // 1 = FTRACE_GAFIBER: skip the coverage correction where the gather point is on a FIBER.
+    // Same environment channel as the host's gaFiberSkipOn(), so the backends cannot disagree.
+    int              gaFiberSkip;   // FTRACE_GAREJECT <pct>: the tangle gate. Suppress the
                                      // footprint correction for a gather whose probes REJECT at
                                      // least this share of their hits on the normal test, which
                                      // is the dense-fur signature -- there the correction has the
@@ -5007,7 +5010,7 @@ struct DGatherPhoton {
 //     correction stops happening. Measured: cap_gyroid -16.9 % stratified against -4.3 %
 //     independent. Do not "improve" this without re-reading the host comment.
 __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
-                                         Real r, DRng& rng, int M) {
+                                         Real r, DRng& rng, int M, Real fiberR = (Real)0) {
     if (M <= 0 || !(r > (Real)0)) return 1.0;
     DVec3 t, b; onb(n, t, b);
     double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
@@ -5032,6 +5035,12 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
     // bright. Doing nothing is the measured-correct action. Must stay identical to the host
     // predicate or the two backends diverge on fur.
     if (sc.gatherRejPct > 0 && nRej * 100 >= sc.gatherRejPct * M) return 1.0;
+    // THE FIBER GATE, host twin in photonmap_render.h. A gather point on a strand has no surface
+    // footprint for a tangent-plane disc to be clipped against, so the ratio measured above is not
+    // the quantity the density estimate divides by. Decided HERE, after the probes have consumed
+    // their rng draws, exactly as the host does -- returning early would desynchronise the two
+    // backends' streams and make a cross-backend comparison meaningless.
+    if (fiberR > (Real)0 && sc.gaFiberSkip) return 1.0;
     return area / (double)M;
 }
 __device__ static inline double dGatherAreaScale(double cov) {
@@ -13793,7 +13802,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 // on that map's rq. One shared coverage would be cheaper and wrong.
                 double cs = 1.0;
                 if (sc.gatherArea)
-                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea));
+                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea,
+                                                          h.fiberRadius));
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
                 gz += cz * (float)(aw * cs);
@@ -13804,7 +13814,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             // sum instead. Same estimator, different place to put the multiply.
             if (sc.gatherArea) {
                 const double ms = dGatherAreaScale(
-                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea));
+                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea,
+                                    h.fiberRadius));
                 gx = (float)((double)gx * ms);
                 gy = (float)((double)gy * ms);
                 gz = (float)((double)gz * ms);
@@ -14071,7 +14082,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 // on that map's rq. One shared coverage would be cheaper and wrong.
                 double cs = 1.0;
                 if (sc.gatherArea)
-                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea));
+                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea,
+                                                          h.fiberRadius));
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
                 gz += cz * (float)(aw * cs);
@@ -14082,7 +14094,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // sum instead. Same estimator, different place to put the multiply.
             if (sc.gatherArea) {
                 const double ms = dGatherAreaScale(
-                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea));
+                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea,
+                                    h.fiberRadius));
                 gx = (float)((double)gx * ms);
                 gy = (float)((double)gy * ms);
                 gz = (float)((double)gz * ms);
@@ -16974,6 +16987,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // the two backends can disagree about whether it is on.
         const char* g = std::getenv("FTRACE_GAREJECT");
         sc.gatherRejPct = g ? std::atoi(g) : 30;   // default must match the host's gaRejectPct()
+        const char* gf = std::getenv("FTRACE_GAFIBER");
+        sc.gaFiberSkip = (gf && *gf && *gf != '0') ? 1 : 0;   // same channel as gaFiberSkipOn()
     }
     sc.bkLightSplit    = lt::gSplit;
     sc.bkLightSamples  = lt::gSamples;
