@@ -55,7 +55,7 @@ What that leaves, and where each one's frontier actually is:
 
 | item | frontier |
 |---|---|
-| M-GATHERAREA | **3.4x closed as of v0.277.0** — 36.8 -> 10.8 points mean absolute error over four seeds, and the fur case is closed by construction. What is left, scored against the anchor mode at matched spp so the statistic's own floor is removed per ROI: hair -7.4, cloth -10.8, **cap edge -12.6** (the worst, not the nearly-fixed one), fur +7.4 from a different mechanism. Flat ground is now mode `M`'s BEST ROI, 2.6 points closer to truth than the anchor |
+| M-GATHERAREA | **Mean absolute error 36.8 -> 8.0 over four seeds** (v0.277.0 fiber gate, v0.278.0 bias/gate/ball), and the estimator is now nearly independent of the probe count (mean \|gap\| 3.30 -> 1.06) rather than accurate by cancellation. What is left: fur +7.2 from a different mechanism (the gather ball crossing strands), a cap edge -8.5 from the original disc truncation, hair -7.5, cloth -3.8 |
 | VOLCACHE | the volumetric gather, ~4/5 of a `gallery_rain` frame |
 | mode-`J` device light pass | the BEAM half — deposit + a device BVH; premise checked, worth ~12x on a thick medium |
 | UPBP-CONV | **fireflies, not speed** — see (2g): on every statistic not at the mercy of the tail mode `J` already beats mode `D` at equal time (1.37x / 1.28x / 1.52x), while its worst pixel is 3 310 against 532 |
@@ -3024,7 +3024,7 @@ case, the emitter-hit accounting in `pathTrace`), `src/photonmap_render.h` (both
 pdf), `src/render_cuda.cu`. Measured by `scraps/sunspike.sh` + `scraps/robust_roi.py`;
 `scenes/_spec_repro.ftsl` is the four-sphere isolation rig.
 
-### M-GATHERAREA — **FIXED in modes `M` and `S`, host and device** (mode `M` v0.267.0–0.268.0, mode `S` v0.273.1, the fur case v0.277.0; filed 2026-09-05, v0.253.0; **reframed 2026-09-10** — it is not a one-directional error). **Remaining: a ~7–10 point residual on hair and cloth. The dense-fur overfill case is CLOSED — v0.277.0's fiber gate removes the correction from fur entirely, so the fur ROI now reads the SAME with the entry on and off.** mode `M`'s direct density estimate divides by the area of a **full disc**, which is wrong in BOTH directions — too dark where the disc is partly empty (cloth, hair, marble), too bright where a tangle **overfills** it (dense fur)
+### M-GATHERAREA — **FIXED in modes `M` and `S`, host and device** (mode `M` v0.267.0–0.268.0, mode `S` v0.273.1, the fur case v0.277.0; filed 2026-09-05, v0.253.0; **reframed 2026-09-10** — it is not a one-directional error). **Remaining: fur (+7.2 against the anchor, a DIFFERENT mechanism — the gather ball reaching across strands) and a ~4–8 point residual on cloth and a cap edge. The dense-fur overfill case is CLOSED (v0.277.0's fiber gate), and v0.278.0 closed the probe/query domain mismatch, taking mean absolute error from 10.8 to 8.0 while making the estimator nearly independent of the probe count.** mode `M`'s direct density estimate divides by the area of a **full disc**, which is wrong in BOTH directions — too dark where the disc is partly empty (cloth, hair, marble), too bright where a tangle **overfills** it (dense fur)
 
 > **Read the reframing before adding an experiment.** This entry was written as "mode `M` is too
 > dark", and that framing selected its own evidence for a year: every ROI anyone chose was one
@@ -3236,6 +3236,84 @@ between what the probe measures and what the query gathers: the probe measures a
 disc** clipped to same-facing surface, while the estimator's numerator collects photons inside a
 **3D ball** of the same radius. Those are the same set only on a flat surface — which is the one
 ROI with no residual.
+
+**THE RESIDUAL WAS A DOMAIN MISMATCH, AND IT IS NOW FIXED (v0.278.0, `-gaball`, ON BY DEFAULT).**
+The residual left after the two `M`-dependent mechanisms — -12.8 / -11.9 / -8.7 on fine strands,
+folded cloth and a flat edge strip — was suspiciously *uniform*, where the original spread
+(-67.6 / -37.0 / -33.0) tracked how much of the disc misses. **A residual that stops tracking the
+mechanism it is supposed to belong to is a different mechanism**, and this one is structural
+rather than statistical:
+
+`gatherCoverage` starts each probe `r` **above** the tangent plane and accepts `h.t <= 2r`, so its
+acceptance region is a **cylinder** of radius `r` and height `2r`. The estimate's numerator is
+`M.queryR(p, r)` — photons within 3D distance `r`, a **ball**. A surface point at tangent offset
+`rr` and height `dz` sits at distance `sqrt(rr^2 + dz^2) >= rr`, so on anything that is not flat
+the probe counts rim surface the query can never reach. The divisor comes out too big, the
+correction too small, and the estimate too **dark** — the sign of every residual in that table.
+The fix is one inequality: `rr^2 + dz^2 <= r^2`.
+
+| ROI | entry off | `M8` shipped | honest | **+ball** | anchor @ 64 spp |
+|---|---|---|---|---|---|
+| `alice_hair` | -67.6 | -10.0 | -15.4 | **-9.9** | -2.6 |
+| `alice_dress` | -37.0 | -12.3 | -13.4 | **-5.2** | -1.5 |
+| `cap_gyroid` | -33.0 | -11.4 | -7.5 | -7.5 | +1.2 |
+| `creature` (fur) | +9.5 | +9.5 | +9.5 | +9.5 | +2.1 |
+| `grid_ground` | -3.8 | -2.8 | -2.7 | -2.6 | -5.4 |
+| **mean abs error** | 36.8 | 10.8 | 11.4 | **8.0** | |
+
+**TWO NULLS THAT CANNOT MOVE, AND DID NOT.** On flat geometry the probe hits at exactly
+`h.t == r`, so `dz == 0` and the test reduces to `rr <= r` — true for every probe. So `grid_ground`
+*and* `cap_gyroid` (a flat tabletop edge strip, whose residual is disc truncation rather than
+curvature) are both algebraically inert, and both read identically at **every seed**:
+
+    grid_ground   honest  -1.90  -2.10  -2.80  -3.90        cap_gyroid  honest  -1.10  -2.00  -15.50  -11.20
+                  +ball   -1.90  -2.10  -2.80  -3.80                    +ball   -1.10  -2.00  -15.50  -11.20
+
+A one-inequality change moved **exactly** the two curved/tilted ROIs, by +5.5 and +8.2 in the
+predicted direction, while two independent nulls held to the printed digit. `cap_gyroid` is the
+better of the two because nothing *forced* it to be a null — it was chosen as a test ROI for
+truncation, and the fix correctly declines to touch it.
+
+**DEFAULTED ON, together with `-gabias` and `-gagate -1`, after the two checks this entry's own
+history demands.**
+
+1. **`M`-independence survives the ball fix** — it improves. Mean \|gap\| over the three moving
+   ROIs: **3.30 (raw) -> 1.29 (honest) -> 1.06 (honest+ball)**. That matters because
+   `M`-independence is the entire reason the other two flags exist, and a fix that restored the
+   `M`-dependence would have undone them.
+2. **The backends do the same thing.** The host twins were written alongside the device ones and
+   had never been *run*. They do not agree in absolute terms — but they already disagree by 7-14
+   points with the flags **off**, which is inside the seed-to-seed spread these ROIs show
+   (`alice_dress` alone ranges -17.2 to +8.5 across four seeds), so absolute agreement was never
+   the answerable question at n = 1. The answerable one is whether the flags do the same thing to
+   both: `alice_dress` +6.0 / +6.5, `cap_gyroid` +3.8 / +4.3, `grid_ground` +0.2 / +0.2,
+   `creature` 0.0 / 0.0 (GPU / CPU). Agreement to ~0.5 points; only the 27 px `alice_hair`
+   differs (-0.5 / -2.6).
+
+**All three flipped together, because that is the arm that was measured.** `-gaball` alone on the
+shipped default is untested, and on an entry whose defining hazard is biases cancelling, shipping
+a configuration nobody ran would be the specific mistake this entry keeps recording.
+
+**Verified in the form the GPU allows** (bit-identity is unavailable there; the rig's own floor is
+median 8.06e-08 / p99 8.98e-08, measured during the fiber-gate campaign), and each check against
+an image from a *different binary*:
+
+| comparison | median | p99 | max |
+|---|---|---|---|
+| new default vs the measured arm (0.277.2 binary, flags explicit) | 0.00 | **8.74e-08** | 1.28e-05 |
+| `-gabias 0 -gagate 0 -gaball 0` vs the old default (0.277.0 binary) | 0.00 | **8.99e-08** | 4.46e-05 |
+| on vs off | 1.32e-03 | **3.50e-01** | 1.99e+00 |
+
+So the new default *is* the configuration that was measured, the off-switches restore the
+pre-0.278 estimator, and both reach the code. **Mode `S` gets all three for free** — `sppm_render.h`
+routes through the same `gatherCoverage`/`gatherAreaScale` pair, which was checked by auditing all
+three host call sites rather than assumed.
+
+**What is left, and it is no longer this entry's mechanism.** Against the per-ROI anchor floor:
+`creature` **+7.2** (fur, where the fiber gate deliberately suppresses the correction, so this is
+the gather ball reaching across strands — a different defect), `cap_gyroid` **-8.5** (disc
+truncation at an edge, the original mechanism, and the one case the ball fix cannot help),
+`alice_hair` **-7.5** and `alice_dress` **-3.8**.
 
 **What the residual is NOT.** It is not the fur path: `alice_hair` is *mesh* geometry, not curves,
 which is why the fiber gate leaves it alone — it moves -67.6 -> -10.0 under the coverage probe

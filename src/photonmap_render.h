@@ -161,7 +161,7 @@ inline bool gaFiberSkipOn() {
 inline bool gaBiasOn() {
     static const bool on = [] {
         const char* e = std::getenv("FTRACE_GABIAS");
-        return e && *e && *e != '0';
+        return !(e && *e == '0');       // ON by default since 0.278.0
     }();
     return on;
 }
@@ -178,9 +178,31 @@ inline bool gaBiasOn() {
 inline int gaGateProbes() {
     static const int n = [] {
         const char* e = std::getenv("FTRACE_GAGATE");
-        return e ? std::atoi(e) : 0;
+        return e ? std::atoi(e) : -1;   // -1 = no early-out, the default since 0.278.0
     }();
     return n;
+}
+// FTRACE_GABALL=1 (`-gaball 1`): accept a probe only where its hit lies inside the same BALL the
+// photon query uses, not merely inside the probe's cylinder. PROTOTYPE, off by default.
+//
+// The probe starts `r` above the tangent plane and accepts `h.t <= 2r`, so it accepts surface
+// anywhere in a cylinder of radius r and height 2r. The numerator is `queryR(p, r)` -- photons
+// within 3D distance r, a BALL. A surface point at tangent offset `rr` and height `dz` sits at
+// distance sqrt(rr^2 + dz^2) >= rr, so on anything non-flat the probe counts rim surface the
+// query can never reach: the area comes out too big, the correction too small, and the estimate
+// too dark. That is the sign of the entire residual left after `-gabias` and `-gagate`, and that
+// residual is the same size on three quite different geometries, which a footprint-shaped error
+// would not be.
+//
+// FLAT GROUND CANNOT MOVE, by construction: a flat hit lands at `h.t == r` exactly, so `dz == 0`
+// and the test becomes `rr <= r`, true for every probe. `grid_ground` is also the one ROI with no
+// residual to explain, so it is a control that cannot move rather than one that merely did not.
+inline bool gaBallOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_GABALL");
+        return !(e && *e == '0');       // ON by default since 0.278.0
+    }();
+    return on;
 }
 inline bool gaDiagOn() {
     static const bool on = [] {
@@ -312,7 +334,12 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
             // surface and every bit of it was counted at its projected size. Flat ground has
             // cos = 1 and is untouched either way, which is why the null control could not have
             // caught this and the truncated elements could.
-            if (c >= 0.5) area += 1.0 / c;
+            // Only `area` is gated on the ball (see gaBallOn); `nHit`/`nRej`/`depthSum` keep
+            // their cylinder basis so the tangle gate is held fixed by construction and the two
+            // arms differ in exactly one quantity.
+            const double dz = r - h.t;      // signed height of the hit above the tangent plane
+            const bool inBall = !gaBallOn() || (rr * rr + dz * dz <= r * r);
+            if (c >= 0.5) { if (inBall) area += 1.0 / c; }
             else          ++nRej;
             depthSum += (h.t - r) / r;   // < 0 when the geometry sits ABOVE the tangent plane
             ++nHit;

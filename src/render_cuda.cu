@@ -1241,6 +1241,9 @@ struct DScene {
     // FTRACE_GAGATE <n>: hold the flat-interior early-out at n probes, not M/4. Host twin
     // gaGateProbes(). 0 = the M/4 behaviour, the default.
     int              gaGate;
+    // 1 = FTRACE_GABALL: accept a probe only inside the BALL the query uses, not the probe's
+    // cylinder. Host twin gaBallOn().
+    int              gaBall;
     double           bkLightSplit;   // -light-split
     int              bkLightSamples; // -light-samples
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
@@ -5034,7 +5037,11 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
         const DHit h = closestHit(sc, q + n * r, n * (Real)(-1), RAY_EPS, (Real)2 * r, false);
         if (!h.valid) continue;
         const double c = (double)dot(h.n, n);
-        if (c >= 0.5) area += 1.0 / c;       // same 60-degree acceptance the photon query uses
+        // Only `area` is gated on the ball (see DScene::gaBall), so nRej and therefore the
+        // tangle gate below are held fixed by construction and the arms differ in one quantity.
+        const double dz = (double)r - (double)h.t;   // hit height above the tangent plane
+        const bool inBall = !sc.gaBall || (rr * rr + dz * dz <= (double)r * (double)r);
+        if (c >= 0.5) { if (inBall) area += 1.0 / c; }  // same 60-deg acceptance as the query
         else          ++nRej;                // geometry IS here, facing the wrong way: a tangle
     }
     // THE TANGLE GATE, host twin in photonmap_render.h. A high reject share means the disc is
@@ -17006,9 +17013,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         const char* gf = std::getenv("FTRACE_GAFIBER");
         sc.gaFiberSkip = (gf && *gf == '0') ? 0 : 1;   // default must match host gaFiberSkipOn()
         const char* gb = std::getenv("FTRACE_GABIAS");
-        sc.gaBias = (gb && *gb && *gb != '0') ? 1 : 0;  // same channel as the host's gaBiasOn()
+        sc.gaBias = (gb && *gb == '0') ? 0 : 1;        // default must match host gaBiasOn()
         const char* gg = std::getenv("FTRACE_GAGATE");
-        sc.gaGate = gg ? std::atoi(gg) : 0;             // same channel as gaGateProbes()
+        sc.gaGate = gg ? std::atoi(gg) : -1;            // default must match gaGateProbes()
+        const char* gbl = std::getenv("FTRACE_GABALL");
+        sc.gaBall = (gbl && *gbl == '0') ? 0 : 1;      // default must match gaBallOn()
     }
     sc.bkLightSplit    = lt::gSplit;
     sc.bkLightSamples  = lt::gSamples;
