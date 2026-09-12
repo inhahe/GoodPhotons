@@ -20648,6 +20648,19 @@ i.e. a ~1 % offset that is the *same for both materials* and therefore not this 
 fix improved them; the residual ~1 % is material-independent and belongs to whatever else `U`/`J`
 do (a photon-merge radius bias would look like this).
 
+**`Hair` PRE-DIVIDES THE SAME WAY, so the swap changed it too — and it had no test, so one was
+run.** Mode `D` on `scenes/fur_basics.ftsl`: **no non-finite values** in any arm, `D`/`R` = 0.9971
+(CPU) and 0.9969 (GPU), backends agreeing to 0.9998. So the fiber BCSDF is consistent with mode `R`
+to 0.3 % after the change. Worth saying explicitly because the swap is the *principled* adjoint for
+a BCSDF as much as for a lobe (`f*(a,b) = f(b,a)` regardless of the model), but "principled" is not
+"tested", and hair was the one material the reciprocity rigs could not exercise.
+
+*While there: that scene carries a few negative floats (60 of 192 000 in mode `R`, median
+−4.7e-06, worst −3.1e-04) — and **46 of the 60 are in the B channel**. That is the spectral→linear-sRGB
+conversion, not a transport bug: an out-of-gamut spectrum has negative components in the narrowest
+primary. Mode `R` has MORE of them than `D`, so it predates this change. Noted so the next person
+who spots negative radiance on fur does not chase it.*
+
 **A RESIDUAL SURVIVES, exactly as this entry predicted it would, and is now isolated** — see the
 next entry. It is *not* this bug: it lives only where the camera path's own lobe sample can reach
 the light, and it grows as the lobe NARROWS, the opposite trend from what was fixed here.
