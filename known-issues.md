@@ -20824,7 +20824,65 @@ where the lobe is narrowest. So the suspect is that strategy's emitter-hit densi
 area→solid-angle pdf conversion for "the lobe hit the light", rather than the BSDF value (which
 the furnace and the off-axis rig now both vindicate).
 
-Discriminator to run first: vary the light's **angular size** in this highlight geometry. The
+**THE DISCRIMINATOR IS RUN, AND THE ERROR COLLAPSES ONTO ONE VARIABLE: `p_lobe / p_light`.**
+16 configurations — roughness 0.02 / 0.05 / 0.1 / 0.3 / 0.6 crossed with panels of 0.2 / 1 / 2 / 4 m,
+all at the same centre and power by construction, one batch, one binary, fixed `-spp`
+(`scraps/_gwsz_*.ftsl`, `scraps/szsweep*.sh`). Sorted by the pdf ratio:
+
+| `p_lobe/p_light` | roughness | panel | `D`/`R` | error |
+|---|---|---|---|---|
+| 0.0006 | 0.60 | 0.2 m | 0.9998 | **−0.02 %** |
+| 0.0145 | 0.60 | 1.0 m | 1.0017 | +0.17 % |
+| 0.0253 | 0.10 | 0.2 m | 1.0011 | +0.11 % |
+| 0.0580 | 0.60 | 2.0 m | 1.0072 | +0.72 % |
+| 0.1017 | 0.05 | 0.2 m | 1.0063 | +0.63 % |
+| 0.2320 | 0.60 | 4.0 m | 1.0209 | +2.09 % |
+| 0.6334 | 0.10 | 1.0 m | 1.0362 | +3.62 % |
+| 0.6365 | 0.02 | 0.2 m | 1.0420 | +4.20 % |
+| 2.5337 | 0.10 | 2.0 m | 1.0506 | **+5.06 %** |
+| 2.5433 | 0.05 | 1.0 m | 1.0491 | **+4.91 %** |
+| 10.135 | 0.10 | 4.0 m | 1.0328 | +3.28 % |
+| 10.173 | 0.05 | 2.0 m | 1.0356 | +3.56 % |
+| 15.912 | 0.02 | 1.0 m | 1.0266 | +2.66 % |
+| 40.693 | 0.05 | 4.0 m | 1.0143 | +1.43 % |
+| 63.649 | 0.02 | 2.0 m | 1.0102 | +1.02 % |
+| 254.60 | 0.02 | 4.0 m | 1.0038 | **+0.38 %** |
+
+**It is a single-humped function of the ratio: ~0 at both ends, peaking near 5 % around ratio 2.5.**
+The collapse is the strong part — **three pairs matched in ratio but differing in BOTH roughness and
+light size agree to within 0.6 points** (0.633 vs 0.637 → 3.62/4.20 %; 2.534 vs 2.543 → 5.06/4.91 %;
+10.14 vs 10.17 → 3.28/3.56 %). Neither roughness nor solid angle controls this on its own — the two
+roughness series *cross* when plotted against solid angle — but their ratio does.
+
+*(Caveat on the axis: `p_lobe` here is the lobe's PEAK density `(e+1)/2π`, not its average over the
+light, so the ratio is a proxy that overstates the true mixing parameter. That is consistent with
+the peak landing at 2.5 rather than at 1.0, where a balance-heuristic 50/50 split would put it.)*
+
+**WHAT THAT SHAPE PROVES, and it is sharper than it looks.** The combined estimator has expectation
+`E[Σ_j w_j f/p_j] = ∫ f(x) · Σ_j w_j(x) dx`, so it is unbiased **iff `Σ_j w_j(x) = 1` pointwise in
+the path `x`** — and for ANY weights meeting that, however badly chosen. Weights being "wrong but
+normalised" therefore cannot bias anything. Both ends of the table reading ~0 says each strategy is
+individually unbiased (when one weight → 1 you get that strategy alone, and it is right). So the
+only way to get a hump in the middle is **`Σ_j w_j(x) ≠ 1` for a given path** — the strategies
+computing **different densities for the same path**, so their weights do not complete.
+
+**AND THIS IS EXACTLY THE CASE `-misaudit` CANNOT SEE — by its own documentation.** That audit
+compares one call's weight against an independently written implementation *reading the same
+patched densities*: "the densities are not what is under test here, the combination arithmetic is."
+It also already warns that the naive version of the check is vacuous — "summing across calls sums
+weights belonging to *different sampled paths*". So a clean `-misaudit` (which this scene gives:
+499 360 weights, 0 disagreements, poison control firing on 352 167) and a density inconsistency are
+perfectly compatible. The two results together are what localise the bug.
+
+**THE TEST THAT WOULD FIND IT**, and it does not exist yet: take **one** path, reconstruct it from
+every `(s,t)` split, and assert the weights **sum to 1 for that path**. That is a different
+quantity from anything `misaudit` computes, and it is the only one whose failure is equivalent to
+the bias. Build it by generating a camera subpath, then for each `s` forming the same unified
+vertex list and calling the weight for that split — then compare `Σ_j w_j` against 1 per path
+rather than per call. Pick the scene at ratio ≈ 2.5 (roughness 0.05, 1 m panel), where the effect
+is largest.
+
+Discriminator already run, for the record: vary the light's **angular size** in this highlight geometry. The
 conversion is `pdf_A · dist²/cos`, so a pdf-conversion error scales with the light's solid angle
 while a BSDF error does not — the same test that cleanly exonerated solid angle for the adjoint
 bug (a 16× change moved it only 1.7 %). Also worth one arm: a light small enough that the narrow
