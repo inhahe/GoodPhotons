@@ -3195,7 +3195,16 @@ single pair — however well controlled — was never going to pin it.
 > then the effect. Every version above was an attempt to measure the effect with an unmeasured
 > rig.
 
-**PORTED TO THE DEVICE (v0.273.10), which is what could let it stop being opt-in.**
+**ON BY DEFAULT SINCE v0.274.0, with `-tanglegate <pct>` to change or disable it.** The gate was
+opt-in for exactly one stated reason — it was host-only — and that reason is retired. Verified on a
+rig first proven deterministic (`-beamfreeze`, fixed `-spp`, one binary): same command twice
+**bit-identical**; default vs `-tanglegate 30` **bit-identical**, so the default really is 30 on
+both backends; default vs `-tanglegate 0` **differs**, so the off-switch reaches the code. That
+last pair matters — an off-switch that silently does nothing is how the mode-`S` twin passed its
+null control while being inert, and how `>= 2` swept the default into the diagnostic arm.
+`-tanglegate 0` restores the pre-0.274.0 estimator exactly.
+
+**PORTED TO THE DEVICE (v0.273.10), which is what let it stop being opt-in.**
 `dGatherCoverage` now counts rejects and applies the same predicate, with the threshold carried as
 `DScene::gatherRejPct` read from the SAME `FTRACE_GAREJECT` channel the host reads — the invariant
 the neighbouring `gatherArea` field already states in as many words, *"the two MUST agree or
@@ -6455,12 +6464,31 @@ sooner in wall clock either way.
 > | configuration | result |
 > |---|---|
 > | split count, 3 runs at 20 M photons | **bit-identical** |
-> | CPU frame, same binary, twice | **bit-identical** (0 / 43 200 floats) |
+> | CPU frame, same binary, twice, **`-r 160 90 -spp 2`** | **bit-identical** (0 / 43 200 floats) |
+> | CPU frame, same binary, twice, **`-r 320 180 -spp 64`** | **NOT reproducible** — 98 889 / 172 800 floats |
+> | CPU frame, same binary, twice, **`-spp 64` + `-beamfreeze`** | **bit-identical** |
 > | GPU frame, `-beamfreeze`, `-spp 8`, twice | 2.6 % of floats differ, **median 8.6e-08, p90 1.2e-07**, frame mean identical to 7 digits |
 > | GPU frame, refresh on, `-spp 1` | differs substantially — but that image is ~100 % noise, and the light-side refresh is **wall-clock driven** by design (`epochSec = (rebuildSec + setupSec) / g_beamRefreshFrac`), so two runs can average a different number of realizations. `-beamfreeze` pins it. |
 >
 > So the residual GPU difference is **float accumulation order at ~1e-7 relative** — benign, and
 > the expected consequence of a parallel gather summing in whatever order the warps finish.
+>
+> **AMENDED 2026-09-12, and the amendment corrects my own over-generalisation.** The first version
+> of this note cited one bit-identical CPU frame at `-r 160 90 -spp 2` as evidence that `-beams`
+> renders reproduce. They do not, in general: at `-r 320 180 -spp 64` two runs of an identical
+> command differ on **98 889 / 172 800 floats**. `-spp 2` is precisely the configuration too SHORT
+> to reach a second light-side epoch, so it was the one setting that could not exhibit the
+> problem — I generalised from the only case incapable of falsifying the claim, which is the same
+> error as the `alice_dress` control that could not reveal a vertical flip.
+>
+> **The cause is the refresh, not the split, and it is by design.** `epochSec = (rebuildSec +
+> setupSec) / g_beamRefreshFrac` is wall-clock driven, so two runs average a different number of
+> light-side realizations. Adding `-beamfreeze` pins it to one and the same pair becomes
+> **bit-identical** at `-spp 64`. So: the split IS deterministic (three runs at 20 M photons give
+> identical counts, above), and frame reproducibility requires `-beamfreeze`.
+>
+> **Practical rule for any `-beams` A/B: pass `-beamfreeze`.** Without it the arms differ by ~57 %
+> of their floats before the change under test does anything.
 >
 > **THE CONSEQUENCE THIS ENTRY CLAIMED IS WITHDRAWN.** It said "an A/B of any other change carries
 > a ~0.7/255 noise floor and a regression smaller than that cannot be detected at all". That floor

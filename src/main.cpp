@@ -18753,6 +18753,18 @@ static int run(int argc, char** argv) {
         // M-GATHERAREA prototype: probe samples for the gather footprint (0 = off, the default).
         // Routed through the environment because gatherCoverage is reached from a header with no
         // access to main.cpp's statics, exactly as -mstats is.
+        // The tangle gate. Routed through the environment for the same two reasons -gatherarea
+        // is: `gatherCoverage` lives in a header with no access to these statics, and the device
+        // upload reads the SAME channel, which is what stops the two backends disagreeing about
+        // whether the gate is on.
+        else if ((!std::strcmp(argv[i], "-tanglegate") ||
+                  !std::strcmp(argv[i], "-tangle-gate")) && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GAREJECT", argv[++i]);
+#else
+            setenv("FTRACE_GAREJECT", argv[++i], 1);
+#endif
+        }
         else if (!std::strcmp(argv[i], "-gatherarea") && i + 1 < argc) {
 #ifdef _WIN32
             _putenv_s("FTRACE_GATHERAREA", argv[++i]);

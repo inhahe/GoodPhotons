@@ -16937,7 +16937,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // The tangle gate rides the same channel for the same reason: read it anywhere else and
         // the two backends can disagree about whether it is on.
         const char* g = std::getenv("FTRACE_GAREJECT");
-        sc.gatherRejPct = g ? std::atoi(g) : 0;
+        sc.gatherRejPct = g ? std::atoi(g) : 30;   // default must match the host's gaRejectPct()
     }
     sc.bkLightSplit    = lt::gSplit;
     sc.bkLightSamples  = lt::gSamples;

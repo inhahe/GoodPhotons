@@ -1541,27 +1541,34 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   band instead, which is the only axis left once a frame is down to one sample per chunk — it
   works and is free, but bought nothing measurable on the scene that motivated it, and it makes
   pixels within one frame gather from different realizations, so it is **off by default**.
-- **`FTRACE_GAREJECT=<pct>` (experimental, mode `M`, host only).** Suppress the `-gatherarea`
-  correction for a gather whose probes REJECT at least `pct` percent of their hits on the normal
-  test — the dense-fur signature, where the correction has the wrong sign (see `FTRACE_GADIAG`).
-  **`30` is the measured knee** (at the default `M = 8`, `15` and `25` are the same gate): on
-  `gallery_rain`, at fixed `-spp` over four realizations, it takes **17.7 ± 2.2 points** off the
-  fur overfill (~8 sigma) while its collateral on `alice_hair`, `alice_dress`, `cap_gyroid` and
-  the flat-ground null each sits at or below ~1 point. Host and device agree on the fur to 0.4
-  points. **Score these arms in one batch on one binary at fixed `-spp`:** mode `M` is
-  bit-reproducible within a build but its realization diverges completely across builds, so arms
-  from different binaries are not comparable. (Score these arms at fixed `-spp`, never
-  `-time`: a 15 % spread in sample count moves the 27-pixel `alice_hair` ROI by 17 points.) Paired by seed, since the gate consumes no rng and both arms share a photon map.
-  It is **not** a replacement for `-gatherarea 0` on a fur-dominated scene (which reads +11.8 %),
-  and it stays opt-in because it is host-only — defaulting it would split CPU from GPU.
-  `0`/unset is the default and is bit-identical.
-- **`FTRACE_GAREJW=<pct>` (experimental, mode `M`, host only).** The area a REJECTED footprint
-  probe contributes, as a percentage of an accepted flat-on one. `0` (default) reproduces the
-  pre-0.273.7 estimator exactly, where a reject counts as empty space. **Measured WORSE than
-  `FTRACE_GAREJECT=30`** and kept only so the comparison stays reproducible: `alice_hair` is
-  itself a tangle (~10 % reject against fur's 17-19 %), so a rule that acts in proportion to the
-  reject rate damages the hair it is supposed to protect, while a threshold between the two rates
-  does not. See `known-issues.md` → `M-GATHERAREA`.
+- **`-tanglegate <pct>` (mode `M`, host and device; `FTRACE_GAREJECT` is the same channel).**
+  Suppress the `-gatherarea` footprint correction for a gather whose probes **REJECT** at least
+  `pct` percent of their hits on the 60-degree normal test. That is the dense-fur signature —
+  geometry is present but facing every which way — and there the correction has the **wrong sign**,
+  reading a packed coat too bright because the probe sees only the nearest layer while the query
+  gathers from the whole ball. **ON BY DEFAULT AT 30 since v0.274.0**; `-tanglegate 0` restores the
+  pre-0.274.0 estimator exactly.
+
+  **`30` is the measured knee** — at the default `M = 8`, `15` and `25` are the *same* gate
+  (`nRej >= 2`), and the distinct thresholds are ~30 (`>= 3`) and ~40 (`>= 4`). On `gallery_rain`
+  it takes **17.7 ± 2.2 points** off the fur overfill (~8 sigma over four realizations) while its
+  collateral on `alice_hair`, `alice_dress`, `cap_gyroid` and the flat-ground null each sits at or
+  below ~1 point. Host and device agree on the fur to **0.4 points**. On pure truncation
+  (`scenes/_ga_strip.ftsl`) it moves the frame **+0.047 %**, about a thousandth of the correction's
+  own magnitude there, so it cannot quietly undo the case the correction exists for.
+
+  **It is not a replacement for `-gatherarea 0` on a fur-dominated scene**, which reads +11.8 %
+  against the gate's ~+45 %: the gate only declines to make the overfill worse, it does not measure
+  the overfilled area. Its value is on **mixed** scenes, where cloth and hair need the correction
+  and fur must not be wrecked by it.
+
+  **Measuring these arms — the rig bites harder than the effect.** Put every arm in ONE batch on
+  ONE binary at **fixed `-spp`**, and pass **`-beamfreeze`**. A `-time` budget varies the sample
+  count by ~15 % run to run, which moves the 27-pixel `alice_hair` ROI by 17 points; the
+  wall-clock-driven light-side refresh makes two identical `-spp 64` commands differ on ~57 % of
+  their floats; and mode `M`'s realization diverges completely across builds, so arms from
+  different binaries are never comparable.
+
 - **`FTRACE_GADIAG=1` (diagnostic, mode `M`).** Per-material tally of *why* a `-gatherarea`
   footprint probe contributed nothing: **MISS** (the disc overhangs empty space — truncation) or
   **REJECT** (geometry is there but faces outside the 60 degree cone — a tangle). The shipped

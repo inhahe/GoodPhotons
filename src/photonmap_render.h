@@ -81,10 +81,16 @@ inline int gatherAreaSamples() {
 // is bit-identical to the pre-0.273.6 estimator. See M-GATHERAREA: dense fur is accurate
 // UNCORRECTED and +48 % corrected, because the probe sees the nearest layer while the query
 // gathers from the whole ball, so on a tangle the correction has the wrong SIGN.
+// ON BY DEFAULT AT 30 since v0.274.0. It was opt-in only because it was host-only, and
+// defaulting a host-only correction would have split `-device gpu` from `-device cpu` on any
+// scene with dense fur; the device twin landed in v0.273.10 and the two agree on the fur to 0.4
+// points, so that reason is retired. Measured: fur -17.7 +- 2.2 points, collateral <= 1 point on
+// every other ROI, +0.047 % on pure truncation, inert on flat ground. `-tanglegate 0` restores
+// the pre-0.274.0 estimator exactly.
 inline int gaRejectPct() {
     static const int p = [] {
         const char* e = std::getenv("FTRACE_GAREJECT");
-        return e ? std::atoi(e) : 0;
+        return e ? std::atoi(e) : 30;
     }();
     return p;
 }
