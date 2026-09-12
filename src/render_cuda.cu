@@ -14344,7 +14344,7 @@ __global__ void kSppmVisiblePoint(DScene sc, DCamera cam, DSppmState st, int res
 // carry pX/pY/pZ = cie(lambda)*power/pi (NO area/nEmitted fold — those depend on the current
 // per-pixel radius and are applied at resolve), so phi? += rho(lambda_p) * p?.
 __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, int resY,
-                            double alpha) {
+                            double alpha, unsigned long long seedBase, long long passIdx) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     long long npix = (long long)resX * resY;
@@ -14367,6 +14367,31 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
             gz += rho * ph.pZ;
             M += 1.0;
         });
+        // M-GATHERAREA, the DEVICE twin of sppm_render.h's correction. Mode `S` runs on the GPU
+        // by DEFAULT, so the host edit alone changed nothing a default render executes: the
+        // positive control `_ga_strip` read -19.78 % with the correction off and -19.76 % with
+        // it on, i.e. bit-identical, while the CPU path moved -25.4 % -> -3.3 %. Both halves,
+        // or neither.
+        //
+        // Applied to the flux BEFORE it enters `tau`, for the reason spelled out in the host
+        // twin: `kSppmResolve` divides by `pi R^2` at the FINAL radius and is correct only
+        // because the `ratio2` chain telescopes each pass's contribution to `R_final^2/R_i^2`.
+        // Coverage belongs to the radius actually gathered at, and SPPM shrinks R every pass.
+        if (sc.gatherArea > 0) {
+            // Seeded per (pixel, pass) exactly like kSppmVisiblePoint above, and NOT per thread
+            // or per launch index, so the probe pattern -- and the image -- is independent of
+            // the grid geometry. `+ 0x5851F42D4C957F2DULL` keeps this stream disjoint from the
+            // visible-point stream that shares the same (pix, pass).
+            unsigned long long s = (unsigned long long)(pix) * 0x9E3779B97F4A7C15ULL
+                                 + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL
+                                 + 0x5851F42D4C957F2DULL;
+            DRng grng; grng.seed(s * 2 + 23, seedBase ^ s);
+            const double cs = dGatherAreaScale(
+                dGatherCoverage(sc, h.p, h.n, (Real)R, grng, sc.gatherArea));
+            gx = (float)((double)gx * cs);
+            gy = (float)((double)gy * cs);
+            gz = (float)((double)gz * cs);
+        }
         // Shared-statistics PPM update (Hachisuka 2008).
         double nAcc = st.nAcc[pix];
         double Nnew = nAcc + alpha * M;
@@ -20557,7 +20582,11 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
     dpm.cellStart = s->d_cellStart;
 
     // (3) Gather + progressive update.
-    kSppmGather<<<2048, 128>>>(s->up.sc, dpm, s->st, s->resX, s->resY, alpha);
+    // `vpSeed` / `passIdx + 1` are the same pair kSppmVisiblePoint was given, so the footprint
+    // probe's stream is reproducible for a fixed pass sequence; the kernel offsets it so the two
+    // do not overlap.
+    kSppmGather<<<2048, 128>>>(s->up.sc, dpm, s->st, s->resX, s->resY, alpha,
+                               vpSeed, passIdx + 1);
     cudaCheckKernel("sppm-gather");
 }
 

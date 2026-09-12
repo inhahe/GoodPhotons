@@ -341,6 +341,33 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     phi += pm.cie[k] * (f * (double)ph.power);        // == cie(lambda_p), precomputed
                     M += 1.0;
                 });
+                // M-GATHERAREA, mode `S`'s twin of the mode-`M` correction. The query above
+                // rejects photons whose normal disagrees with the hit's, and nothing clips the
+                // disc to the surface, yet `sppmResolve` divides by the area of a FULL disc --
+                // so a gather on thin or truncated geometry is normalised by an area it never
+                // collected from. Measured on `scenes/_ga_strip.ftsl` (a 0.4 m strip under a
+                // 0.5 m pinned radius) mode `S` read -21.9 % against a mode-`D` anchor, where
+                // uncorrected mode `M` read -52.5 % and corrected mode `M` read +8.3 %.
+                //
+                // APPLIED HERE, AT ACCUMULATION, AND NOT AT RESOLVE. `sppmResolve` divides the
+                // accumulated `tau` by `pi R^2` at the FINAL radius, which is correct only
+                // because every pass's contribution has been rescaled by the `ratio2` chain --
+                // the product of later ratios is exactly `R_final^2 / R_i^2`, so the sum
+                // telescopes into `sum_i phi_i / (pi R_i^2)`. Coverage is a property of the
+                // radius that was actually gathered at, and SPPM's radius shrinks every pass,
+                // so a single coverage measured at `R_final` would misprice every earlier pass.
+                // Scaling `phi` before it enters `tau` puts each pass's flux over its own
+                // footprint, which is the quantity the telescoping sum then carries.
+                //
+                // The RNG is seeded per PIXEL and per PASS rather than per thread, so the
+                // probe pattern -- and hence the image -- does not depend on `-t`.
+                if (const int gaM = gatherAreaSamples()) {
+                    Pcg32 grng;
+                    grng.seed(((uint64_t)y << 20) ^ (uint64_t)x,
+                              0x9e3779b97f4a7c15ULL ^ (uint64_t)st.passes);
+                    phi = phi * gatherAreaScale(
+                        gatherCoverage(scene, h.p, h.n, P.radius, grng, gaM));
+                }
                 // Progressive radius / flux update (shared-statistics PPM).
                 double Nnew = P.nAcc + alpha * M;
                 double denom = P.nAcc + M;

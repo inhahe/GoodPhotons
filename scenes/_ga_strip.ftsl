@@ -1,0 +1,27 @@
+# POSITIVE CONTROL for M-GATHERAREA's footprint correction: a narrow strip, so that every gather
+# disc on it overhangs both long edges and most of the disc is empty space.
+#
+# `_ga_null.ftsl` proves the correction does NOTHING where it should do nothing. That is only half
+# a test: an estimator that always returned coverage 1.0 would pass it. This is the other half --
+# geometry where the correction MUST fire, and by a predictable amount, so a mode that lacks the
+# correction reads visibly dark against one that has it.
+#
+# The strip is 0.4 m wide. With `-pmradius 0.5` pinned on the command line the gather disc is
+# wider than the strip in both directions, so coverage is roughly (strip width)/(2r) -- order 40 %
+# -- and the uncorrected estimate should read roughly that fraction of the truth. Pinning the
+# radius matters: an adaptive radius would shrink until the disc fitted the strip and quietly
+# erase the very effect being measured.
+#
+# Anchor with mode B or D, which have no density estimate and so no disc to normalise by.
+scene { units meters  spectral 360 830 1 }
+material "white" { type diffuse reflect whitewall 0.75 }
+quad { origin -0.2 0 -6   u 0.4 0 0   v 0 0 12   material white }
+light area {
+    origin -1 3 -1   u 2 0 0   v 0 0 2   normal 0 -1 0
+    spd preset:bb6500
+}
+camera "cam" {
+    eye 0 2.2 3.2   look_at 0 0 0   up 0 1 0   fov_y 40
+    mode B
+    film { res 96 96 }
+}

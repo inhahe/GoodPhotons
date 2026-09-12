@@ -2656,7 +2656,7 @@ case, the emitter-hit accounting in `pathTrace`), `src/photonmap_render.h` (both
 pdf), `src/render_cuda.cu`. Measured by `scraps/sunspike.sh` + `scraps/robust_roi.py`;
 `scenes/_spec_repro.ftsl` is the four-sphere isolation rig.
 
-### M-GATHERAREA — OPEN (2026-09-05, v0.253.0; **reframed 2026-09-10** — it is not a one-directional error): mode `M`'s direct density estimate divides by the area of a **full disc**, which is wrong in BOTH directions — too dark where the disc is partly empty (cloth, hair, marble), too bright where a tangle **overfills** it (dense fur)
+### M-GATHERAREA — **FIXED in modes `M` and `S`, host and device** (mode `M` v0.267.0–0.268.0, mode `S` v0.273.1; filed 2026-09-05, v0.253.0; **reframed 2026-09-10** — it is not a one-directional error). **Remaining: the dense-fur overfill case, which the correction makes worse (`-gatherarea 0` is the escape hatch).** mode `M`'s direct density estimate divides by the area of a **full disc**, which is wrong in BOTH directions — too dark where the disc is partly empty (cloth, hair, marble), too bright where a tangle **overfills** it (dense fur)
 
 > **Read the reframing before adding an experiment.** This entry was written as "mode `M` is too
 > dark", and that framing selected its own evidence for a year: every ROI anyone chose was one
@@ -2897,10 +2897,65 @@ null control (my first attempt, +0.30 %) would have condemned a working estimato
   because four probes cannot resolve a coverage as low as hair's. Picking the default on the
   cloth numbers would have shipped the least accurate setting for the most flattering reason.
 
-  Still **opt-in**, despite 1.30× being affordable: there is no device or mode-`S` twin yet, and
-  turning it on by default would make `-device gpu` disagree with `-device cpu` on every scene
-  with truncated geometry — precisely the class of bug the rest of this file spent the day
-  removing.
+  ~~Still **opt-in**, despite 1.30× being affordable: there is no device or mode-`S` twin yet~~
+  — **both twins now exist and the correction is ON BY DEFAULT** (mode `M` device twin
+  `dGatherCoverage`, defaulted in v0.268.0; mode `S` both paths in v0.273.1). The concern this
+  sentence raised was the right one — turning it on without a device twin would have made
+  `-device gpu` disagree with `-device cpu` by up to 70 % on truncated geometry — and it is the
+  reason the default flip waited for the twin. Left struck through rather than deleted because
+  the sentence outlived its own condition by two releases and nothing flagged it: a stale
+  *reason* is worse than a stale fact, since it keeps arguing for a decision whose basis is gone.
+* **Mode `S` (SPPM) carried the full defect until v0.273.1, and fixing it needed BOTH paths.**
+  `sppm_render.h` divided by `pi P.radius^2` while its query applied the same
+  `dot(ph.n, h.n) < 0.5` rejection — the identical normalisation mismatch, in a mode that modes
+  `M`-CPU and `M`-GPU both had fixed.
+
+  **Applied at accumulation, not at resolve, and that is forced rather than stylistic.**
+  `sppmResolve` divides accumulated `tau` by `pi R^2` at the FINAL radius, which is correct only
+  because the `ratio2` chain rescales each pass by exactly `R_final^2 / R_i^2`, so the sum
+  telescopes into `sum_i phi_i / (pi R_i^2)`. Coverage belongs to the radius actually gathered
+  at, and SPPM shrinks its radius every pass — a single coverage measured at `R_final` would
+  misprice every earlier pass. Scaling `phi` before it enters `tau` puts each pass's flux over
+  its own footprint, which is the quantity the telescoping sum then carries.
+
+  | control | `-gatherarea 0` | `-gatherarea 8` |
+  |---|---|---|
+  | `_ga_strip`, GPU (must fire) | −19.31 % | **−2.79 %** |
+  | `_ga_strip`, CPU | −25.42 % | **−3.27 %** |
+  | `_ga_null`, GPU (must vanish) | −0.59 % | **−0.59 %** |
+
+  86 % of the error recovered on GPU, 87 % on CPU, the two within 0.5 points of each other
+  (SPPM noise at 40 s), and an exact no-op on the null.
+
+  **It is FREE in mode `S`, where mode `M` pays 1.30x** — 457 spp against 456 at 40 s. Structural,
+  not luck: mode `M` probes once per camera *sample* so the cost scales with spp, while SPPM
+  probes once per pixel per *pass* and a pass is dominated by tracing 2 M photons. So the budget
+  argument that shaped mode `M`'s default does not apply here.
+
+* **THE POSITIVE CONTROL IS THE ONLY REASON THIS WORKED, and it did not exist before 0.273.1.**
+  Mode `S` dispatches to CUDA **by default**, so the first version — a host-only edit to
+  `sppm_render.h` — changed nothing a default render executes. The evidence:
+
+  | | `-gatherarea 0` | `-gatherarea 8` |
+  |---|---|---|
+  | GPU (the default path) | −19.78 % | −19.76 % |
+  | CPU (`-device cpu`) | −25.42 % | −3.27 % |
+
+  **The null control passed perfectly in both arms and would have certified the no-op as a
+  success.** `_ga_null.ftsl` proves the correction does nothing where it should do nothing — a
+  test an estimator that always returned coverage 1.0 also passes. `scenes/_ga_strip.ftsl` (new:
+  a 0.4 m strip under a `-pmradius 0.5` pinned disc, so coverage is order 40 % and the correction
+  *must* fire) is the other half, and it is what distinguished "correctly does nothing here" from
+  "does nothing anywhere". **A null control alone cannot validate a correction; it can only
+  invalidate one.** The radius has to be pinned, too — an adaptive radius shrinks until the disc
+  fits the strip and quietly erases the effect being measured.
+
+  This is the same wrong-branch failure as the `skipBvh` bug earlier the same day (a decision
+  expressed at one of two call sites, where the one exercised was the other one), which means
+  reading about it was not enough to avoid it. The habit that actually catches it is mechanical:
+  **before measuring, confirm from the run's own log which path executed** — here one line,
+  `mode S: SPPM on NVIDIA GeForce RTX 4090`, said it outright.
+
 * **Stratified sampling was tried twice and REVERTED both times — do not retry it without
   reading this.** It was aimed at the Jensen bias above, and it is incompatible with the gate.
   (a) Stratifying *both* dimensions off one index (`u1 = u2 = (i + ξ)/M`) correlates radius with
