@@ -165,6 +165,23 @@ inline bool gaBiasOn() {
     }();
     return on;
 }
+// FTRACE_GAGATE=<n> (`-gagate <n>`): hold the flat-interior early-out at a FIXED n probes
+// instead of `M/4`. 0 = the M/4 behaviour and is the default, so this is bit-identical off.
+//
+// The gate returns coverage 1.0 -- no correction -- when its first `probe0` probes all land on
+// flat-on surface. With `probe0 = M/4` that is 2-of-2 at M = 8 but 8-of-8 at M = 32, so the SAME
+// disc passes the SAME test at two different rates purely because the budget changed (0.90
+// against 0.66 on a 95 %-covered disc). Measured by elimination: `-gabias` removes the Jensen
+// half of the M-dependence and collapsed `alice_hair` 4.5x and `alice_dress` 6.7x, while
+// `cap_gyroid` -- an edge strip, which is exactly the geometry this gate misjudges -- got 2.0x
+// WORSE. What survives the removal of one mechanism is the other one.
+inline int gaGateProbes() {
+    static const int n = [] {
+        const char* e = std::getenv("FTRACE_GAGATE");
+        return e ? std::atoi(e) : 0;
+    }();
+    return n;
+}
 inline bool gaDiagOn() {
     static const bool on = [] {
         const char* e = std::getenv("FTRACE_GADIAG");
@@ -230,7 +247,11 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
     // `max(2, M/4)` and never M itself: at M = 4 the old form set probe0 = 4, so the check sat
     // at an index the loop never reaches and the early-out silently never fired -- which is why
     // M = 4 cost as much as M = 8 in the first sweep.
-    const int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
+    // `-gagate n` holds this at n regardless of M (see gaGateProbes). Clamped to M-1 so the
+    // check index stays inside the loop: probe0 == M is the silent-no-op the comment above warns
+    // about, since `i == probe0` is then never reached.
+    int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
+    if (const int gp = gaGateProbes()) probe0 = (gp < M) ? gp : (M > 1 ? M - 1 : M);
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995)
             return 1.0;                // interior of a flat patch: nothing to correct

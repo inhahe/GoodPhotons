@@ -1238,6 +1238,9 @@ struct DScene {
     int              gaFiberSkip;
     // 1 = FTRACE_GABIAS: the bias-corrected coverage `(area+1)/(M+1)`. Host twin gaBiasOn().
     int              gaBias;
+    // FTRACE_GAGATE <n>: hold the flat-interior early-out at n probes, not M/4. Host twin
+    // gaGateProbes(). 0 = the M/4 behaviour, the default.
+    int              gaGate;
     double           bkLightSplit;   // -light-split
     int              bkLightSamples; // -light-samples
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
@@ -5017,7 +5020,10 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
     DVec3 t, b; onb(n, t, b);
     double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
     int    nRej = 0;                         // probes that FOUND geometry facing the wrong way
-    const int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
+    // `-gagate n` holds this at n regardless of M, host twin in photonmap_render.h. Clamped to
+    // M-1 so the check index stays inside the loop.
+    int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
+    if (sc.gaGate) probe0 = (sc.gaGate < M) ? sc.gaGate : (M > 1 ? M - 1 : M);
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;
         const double rr = (double)r * sqrt((double)rng.uniform());
@@ -17001,6 +17007,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         sc.gaFiberSkip = (gf && *gf == '0') ? 0 : 1;   // default must match host gaFiberSkipOn()
         const char* gb = std::getenv("FTRACE_GABIAS");
         sc.gaBias = (gb && *gb && *gb != '0') ? 1 : 0;  // same channel as the host's gaBiasOn()
+        const char* gg = std::getenv("FTRACE_GAGATE");
+        sc.gaGate = gg ? std::atoi(gg) : 0;             // same channel as gaGateProbes()
     }
     sc.bkLightSplit    = lt::gSplit;
     sc.bkLightSamples  = lt::gSamples;

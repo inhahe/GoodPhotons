@@ -3169,6 +3169,74 @@ configuration that could be **both** honest (no `M`-dependence) **and** accurate
 removed, then the footprint model itself under-corrects and no amount of estimator repair will
 close this entry.
 
+**BOTH MECHANISMS REMOVED (v0.277.2, `-gagate -1`), AND THE TOTAL `M`-DEPENDENCE ONLY MOVES WHEN
+BOTH GO.** `-gagate <n>` holds the flat-interior early-out at a fixed probe count instead of
+`M/4`; `-gagate -1` disables it outright (`probe0 = -1`, an index `i` never reaches), which is the
+version with no free parameter to argue about. Four seeds, both probe counts, one binary
+(`scraps/ga_gate_run.sh`):
+
+| ROI | gap raw | gap +bias | gap +bias, gate off |
+|---|---|---|---|
+| `alice_hair` | +2.83 | +1.15 | +2.25 |
+| `alice_dress` | +3.05 | -1.40 | +1.20 |
+| `cap_gyroid` | **-4.03** | **-7.35** | **-0.42** |
+| `creature` / `grid_ground` | 0.00 / -0.08 | 0.00 / -0.22 | 0.00 / -0.03 |
+| **mean \|gap\|** | **3.30** | **3.30** | **1.29** |
+
+**The `mean |gap|` row is the result.** The pseudo-count alone left the total `M`-dependence
+*exactly* where it was — 3.30 to 3.30 — while moving it off hair and cloth and onto the cap. Only
+removing the gate's `M`-scaling as well brings it down, to **1.29**. Two fixes, each of which
+looks like a wash or worse on its own, that pay off only together: which is precisely what "two
+biases cancelling" predicts, and why every partial attempt on this entry has read as a failure.
+`cap_gyroid`'s gap collapsing **17x** (-7.35 to -0.42) also converts the gate mechanism from
+inference-from-code into a measured one.
+
+**Accuracy, which is the part that decides whether it ships:**
+
+| ROI | entry off | `M8` shipped | `M8`+bias | **`M8`+bias+gate off** | `M32`+bias+gate off |
+|---|---|---|---|---|---|
+| `alice_hair` | -67.6 | **-10.0** | -16.7 | -15.4 | -17.7 |
+| `alice_dress` | -37.0 | -12.3 | -17.8 | **-13.4** | -14.6 |
+| `cap_gyroid` | -33.0 | -11.4 | -15.9 | **-7.5** | -7.0 |
+| `creature` (fur) | +9.5 | +9.5 | +9.5 | +9.5 | +9.5 |
+| `grid_ground` | -3.8 | -2.8 | -3.0 | -2.7 | -2.6 |
+| **mean abs error** | 36.8 | **10.8** | 15.0 | **11.4** | 12.2 |
+
+So the honest estimator costs **0.6 points of mean absolute error** (10.8 -> 11.4) and buys
+**2.6x less `M`-dependence**, at no measurable time cost — the gate-off arm reports 98 % of the
+camera gather at 1:00, identical to gate-on, so never early-outing is free. Within that, `cap_gyroid`
+*improves* by 3.9 points and `alice_hair` pays 5.4.
+
+**DECISION: both flags stay OFF by default, and the criterion for changing that is written down
+here so it is not re-litigated from taste.** The case for defaulting them on is real — it makes
+`-gatherarea <M>` a convergence knob rather than a bias knob, and the shipped default's accuracy
+is a cancellation whose ratio is a property of *this scene's* coverage distribution, not something
+anyone chose. But it costs 5.4 visible points on hair today, and the robustness it buys cannot be
+*demonstrated* on the one scene that has a converged reference. **Default them on when either (a)
+the residual under-correction below is fixed, at which point the trade disappears, or (b) a second
+scene with a converged reference shows the shipped cancellation failing — which is the experiment
+that would settle it, and it needs a reference render rather than an argument.**
+
+**AND THE RESIDUAL IS SUSPICIOUSLY UNIFORM, WHICH IS A LEAD.** With both estimator mechanisms
+removed, and scored against the per-ROI mode-`R`-at-64-spp floor established above rather than
+against zero:
+
+| ROI | `M8`+bias+gate off | anchor floor | residual |
+|---|---|---|---|
+| `alice_hair` | -15.4 | -2.6 | **-12.8** |
+| `alice_dress` | -13.4 | -1.5 | **-11.9** |
+| `cap_gyroid` | -7.5 | +1.2 | **-8.7** |
+
+Three ROIs with completely different geometry — fine strands, broad folded cloth, a flat edge
+strip — landing within 4 points of each other once the two `M`-dependent mechanisms are gone. The
+earlier spread (-67.6 / -37.0 / -33.0) tracked *how much of the disc misses*, exactly as this
+entry's mechanism section says; what is left does **not** track that, which argues for a single
+systematic cause rather than three geometry-specific ones. The obvious suspect is the mismatch
+between what the probe measures and what the query gathers: the probe measures a **tangent-plane
+disc** clipped to same-facing surface, while the estimator's numerator collects photons inside a
+**3D ball** of the same radius. Those are the same set only on a flat surface — which is the one
+ROI with no residual.
+
 **What the residual is NOT.** It is not the fur path: `alice_hair` is *mesh* geometry, not curves,
 which is why the fiber gate leaves it alone — it moves -67.6 -> -10.0 under the coverage probe
 while `creature` does not move at all.

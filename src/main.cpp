@@ -18757,6 +18757,14 @@ static int run(int argc, char** argv) {
         // is: `gatherCoverage` lives in a header with no access to these statics, and the device
         // upload reads the SAME channel, which is what stops the two backends disagreeing about
         // whether the gate is on.
+        // The flat-interior gate's probe count. Same plumbing as -tanglegate below.
+        else if (!std::strcmp(argv[i], "-gagate") && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GAGATE", argv[++i]);
+#else
+            setenv("FTRACE_GAGATE", argv[++i], 1);
+#endif
+        }
         // The bias-corrected coverage. Same plumbing and reasons as -tanglegate below.
         else if (!std::strcmp(argv[i], "-gabias") && i + 1 < argc) {
 #ifdef _WIN32
