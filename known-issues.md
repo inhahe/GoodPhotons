@@ -20851,6 +20851,49 @@ is 2.4 — so the real `w_nee` is 0.57 at grid 4, not 0.02, and the connection *
 rather than over-delivers. Inferring a factor from a weight I had not measured was the error;
 printing the weight is what fixed it.
 
+**ATTEMPT 3 — THE MAXIMUM HEURISTIC: TRIED, FAILED ON ONE CASE, REVERTED — AND IT PROVES AN
+IMPOSSIBILITY THAT RULES OUT A WHOLE FAMILY OF FIXES.** Winner-takes-all is a legitimate MIS
+weighting function (it partitions unity pointwise, which is all unbiasedness needs) and it makes
+both halves consult the same comparison at the same direction, so they cannot disagree. Wired into
+all three sites with complementary tie-breaks (`>=` on the lattice, `<` on the connection),
+`FTRACE_WGLOSSY_BALANCE=1` restoring the old behaviour:
+
+| case | balance | maximum |
+|---|---|---|
+| tiny light, r=0.05 | 1.102 | **0.986** |
+| big light, r=0.05 | 1.049 | **1.007** |
+| 1 m, r=0.3 | 1.028 | **0.985** |
+| 1 m, r=0.6 | 1.008 | **0.981** |
+| **1 m, r=0.05** | 1.296 | **1.511** ✗ |
+| diffuse / mirror (nulls) | 0.978 / 1.112 | unchanged |
+
+Four of five improve; one gets materially worse, and it is the case that was already worst. At
+1 m / r=0.05 the lattice wins at the mode (`pLobe` 127 > `pNee` 50) **and** the connection wins
+across the whole lobe tail (`pLobe` ~2.4 < 50), so each takes weight ~1 over its own samples and
+the sum double-counts.
+
+**THE GENERAL RESULT: no per-direction weighting can fix this.** Unbiasedness needs each strategy to
+deliver an unbiased estimate of `∫ w_i(ω) f(ω) dω` under its own density. The connection does. The
+lattice cannot: it evaluates at ONE point and returns the whole lobe integral, so whatever weight it
+is handed — `w(mode)` under the balance heuristic, `1` under the maximum heuristic — it claims a
+**point** weight for an **integral's** worth of energy. That is exact only if `w` is constant over
+the lobe, which is precisely the regime where there was no error to begin with. So the balance
+heuristic, the maximum heuristic, the power heuristic and every other pointwise `w` are all ruled
+out together, which is worth more than the attempt cost.
+
+**What is left, therefore, is exactly two options:**
+
+1. **Average `w` over the lobe** and hand the lattice that. Correct by construction, and the only
+   option that keeps a smooth blend. Needs `∫ w_bsdf(ω) lobe(ω) dω`, which nothing computes today;
+   for an area light it has no closed form, so it would want its own small quadrature — plausibly
+   reusing the light grid already being walked.
+2. **A per-EMITTER switch**, deciding once per (vertex, emitter) from the lobe's PEAK density
+   `(e+1)/2π` — known from roughness alone, so available at the connection site without sampling —
+   against `p_light`, and giving one strategy everything. Predicted from the decomposition:
+   0.982 / 1.126 / 0.986 / ~0.985 / ~0.981, i.e. better than today on all three large errors and
+   ~1 point worse on the two already-good cases. Cheap, but reintroduces the seam question, since
+   the decision now jumps per emitter rather than per direction.
+
 **THE FIX, now that the mechanism is known.** Either give the lattice a weight averaged over the
 lobe rather than the value at its sampled direction, or stop MIS-ing an incompatible pair and pick
 the accurate strategy outright — the hard switch costed above, whose numbers are already measured
