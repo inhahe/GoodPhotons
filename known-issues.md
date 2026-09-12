@@ -56,7 +56,7 @@ What that leaves, and where each one's frontier actually is:
 | item | frontier |
 |---|---|
 | M-GATHERAREA | **Mean absolute error 36.8 -> 8.0 over four seeds** (v0.277.0 fiber gate, v0.278.0 bias/gate/ball), and the estimator is now nearly independent of the probe count (mean \|gap\| 3.30 -> 1.06) rather than accurate by cancellation. What is left: fur +7.2 from a different mechanism (the gather ball crossing strands), a cap edge -8.5 from the original disc truncation, hair -7.5, cloth -3.8 |
-| VOLCACHE | the volumetric gather, ~4/5 of a `gallery_rain` frame |
+| VOLCACHE | the volumetric gather, ~4/5 of a `gallery_rain` frame. **Reopened 2026-09-12**: the simple form is scene-dependent, not dead — the order >= 2 field shows **zero** measurable structure on `_fog_thick` (82.8 % order >= 2) against 0.334 on `gallery_rain` (40.7 %), with the order histogram as a runtime predictor. Limitation: that inference runs the entry's image-space argument backwards, so a world-space field probe is the rig to build first |
 | mode-`J` device light pass | the BEAM half — deposit + a device BVH; premise checked, worth ~12x on a thick medium |
 | UPBP-CONV | **fireflies, not speed** — see (2g): on every statistic not at the mercy of the tail mode `J` already beats mode `D` at equal time (1.37x / 1.28x / 1.52x), while its worst pixel is 3 310 against 532 |
 
@@ -1930,10 +1930,77 @@ sized by the clipmap (~1 m cells at 20 m) averages over many pixels of a field w
 pixel-scale structure, in the only region where that field is the dominant signal.
 
 **Status: the simple form of VOLCACHE — cache order >= 2, skip those beams — is NOT supported by
-this measurement.** What is not ruled out is a split design that caches only the low-frequency part
+this measurement ON THIS SCENE. The `_fog_thick` re-test below reverses it for optically thick
+media, which is the regime a volume cache is actually for.** What is not ruled out is a split design that caches only the low-frequency part
 and leaves a residual to the gather, but that is a substantially different and larger feature than
 this entry proposes, and it must be justified on its own terms. The ~30 % ceiling remains correct
 as a COST figure; what changed is the evidence that spending it is safe.
+
+**THE `_fog_thick` RE-TEST, RUN 2026-09-12 — AND THE FIELD IS SMOOTH THERE.** This entry named
+the experiment that could reopen it: re-measure on a medium that is genuinely diffuse, because
+`gallery_rain`'s rain is only 40.7 % order >= 2 and a field dominated by orders 2-3 still
+remembers the source geometry. `_fog_thick` measures **82.8 % order >= 2 with HALF its chords at
+order 7+**, against `gallery_rain`'s 3 % — so it is the regime where deep multiple scattering has
+had a chance to diffuse. Same rig, `-beamradius` pinned at the scene's own 0.004682 on both arms,
+`scraps/vc_thick.sh`:
+
+| band | MS structure, pair (3,7) | pair (11,13) | cross (3,11) | **SS control** |
+|---|---|---|---|---|
+| top third | -0.066 | +0.002 | +0.000 | 0.072 / 0.012 / -0.038 |
+| middle | -0.005 | -0.010 | -0.057 | 0.237 / 0.184 / 0.101 |
+| bottom third | -0.001 | +0.052 | +0.003 | **0.761 / 0.697 / 0.758** |
+
+**All nine multiple-scatter values lie in [-0.066, +0.052], scattering either side of zero** —
+which is what a correlation estimator does when the true value IS zero — while the single-scatter
+control reads **0.70-0.76** on the bottom third in all three. A ~12 sigma separation between the
+field under test and the control, in the same images. Against `gallery_rain`'s **0.334**.
+
+**Three reasons this null is worth more than a null usually is.**
+
+1. **It survived a sample-size increase.** Scored on pair (3,7), then re-scored on an entirely
+   independent pair (11,13), then on a cross pair — the standard this file already applied to the
+   `FTRACE_JBAND` null. All three agree.
+2. **The control is strong here, not marginal.** 0.70-0.76 against `gallery_rain`'s control of
+   0.192 on its ground. The estimator is demonstrably able to resolve real structure in *these*
+   images at *this* sample count; it simply finds none in the order >= 2 field.
+3. **The measurement is BETTER CONDITIONED than the one it revises.** On `gallery_rain`,
+   `full - order1` was a difference of independent renders on a signal ~34 % of the frame, so it
+   carried roughly 3x either arm's relative noise — the reason this entry built the
+   cross-correlation in the first place. Here multiple scatter is **99.2 % of image energy**
+   (measured, both seeds), so `full - order1` is very nearly `full` and the difference amplifies
+   noise not at all. A null from a *more* sensitive rig is stronger evidence, and noise
+   amplification was the specific way these numbers could have been fooled.
+
+**THE LIMITATION, AND IT IS A REAL ONE: THIS RUNS THE ENTRY'S OWN INFERENCE BACKWARDS.** The
+argument above says image-space roughness is a *lower bound* on field roughness, because a camera
+ray integrates the in-scatter field along its path. That direction is valid and is what condemned
+`gallery_rain`: **rough image ⇒ rough field.** The converse does **not** follow — a smooth image is
+*consistent with* a smooth field but could also be a rough field averaged away along the ray. So
+the honest status change is from "measured to be unsafe" to **"not measured to be unsafe, with the
+one available proxy consistent with safety"**, which is weaker than it first looks.
+
+*There is an argument that the gap is small in exactly this regime, and it should be read as an
+argument rather than a measurement.* The integration-length objection scales with how far into the
+medium a camera ray gathers. At an optical depth of ~20 the ray's contribution is dominated by the
+first mean free path or so, so the image is closer to a SURFACE sample of the field than to a long
+line integral — the averaging that would hide field structure is weakest precisely where the
+medium is thickest. That asymmetry runs the opposite way to intuition and is why the thick case is
+the one worth pursuing. **What would settle it is a world-space probe of the in-scatter field on a
+grid, rather than through camera rays**, and that is the rig to build before writing any cache.
+
+**What this changes.**
+* The simple form is **scene-dependent, not dead**. It is unsafe on a low-order medium and, as far
+  as the available proxy can say, safe on a high-order one.
+* **There is now a runtime predictor**, and it is already printed: the scattering-order histogram
+  on the beam-map line. 40.7 % order >= 2 is a scene where the field carries structure; 82.8 % is
+  one where it does not. (Two points do not locate the threshold between them — that is the next
+  measurement, and `-beams-order` makes intermediate regimes easy to synthesise.) Note the
+  histogram was **wrong on `-device gpu` until v0.278.1** — see BEAMORDER-GPU, found while setting
+  this very experiment up.
+* **Cost and safety point the same way**, which is the happy part: the thick, high-order media
+  where the field is smoothest are also where the beam gather is most expensive and a cache would
+  save the most. The scene where the field is rough is the one where multiple scatter is a smaller
+  share of the cost anyway.
 
 **The rig is two scripts and four renders**, so re-testing on another scene is cheap:
 `-beamradius` pinned, two seeds, `scraps/ms_struct.py`. A scene whose medium is genuinely
