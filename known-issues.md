@@ -56,7 +56,7 @@ What that leaves, and where each one's frontier actually is:
 | item | frontier |
 |---|---|
 | M-GATHERAREA | **Mean absolute error 36.8 -> 8.0 over four seeds** (v0.277.0 fiber gate, v0.278.0 bias/gate/ball), and the estimator is now nearly independent of the probe count (mean \|gap\| 3.30 -> 1.06) rather than accurate by cancellation. What is left: fur +7.2 from a different mechanism (the gather ball crossing strands), a cap edge -8.5 from the original disc truncation, hair -7.5, cloth -3.8 |
-| VOLCACHE | the volumetric gather, ~4/5 of a `gallery_rain` frame. **Reopened 2026-09-12**: the simple form is scene-dependent, not dead — the order >= 2 field shows **zero** measurable structure on `_fog_thick` (82.8 % order >= 2) against 0.334 on `gallery_rain` (40.7 %), with the order histogram as a runtime predictor. Limitation: that inference runs the entry's image-space argument backwards, so a world-space field probe is the rig to build first |
+| VOLCACHE | the volumetric gather, ~4/5 of a `gallery_rain` frame. **Reopened 2026-09-12**: the simple form is scene-dependent, not dead. A `sigma_t` sweep on one scene, one variable, takes the order >= 2 field's structure **0.367 -> 0.023 -> -0.066** while the single-scatter control **rises** 0.515 -> 0.602 -> 0.761 — so the smoothness is the FIELD's, not the camera ray's path integral, and the stated limitation is settled. Threshold is between 12 % and 36 % of chords at order 7+, a number already printed on the beam-map line |
 | mode-`J` device light pass | the BEAM half — deposit + a device BVH; premise checked, worth ~12x on a thick medium |
 | UPBP-CONV | **fireflies, not speed** — see (2g): on every statistic not at the mercy of the tail mode `J` already beats mode `D` at equal time (1.37x / 1.28x / 1.52x), while its worst pixel is 3 310 against 532 |
 
@@ -1930,8 +1930,11 @@ sized by the clipmap (~1 m cells at 20 m) averages over many pixels of a field w
 pixel-scale structure, in the only region where that field is the dominant signal.
 
 **Status: the simple form of VOLCACHE — cache order >= 2, skip those beams — is NOT supported by
-this measurement ON THIS SCENE. The `_fog_thick` re-test below reverses it for optically thick
-media, which is the regime a volume cache is actually for.** What is not ruled out is a split design that caches only the low-frequency part
+this measurement ON THIS SCENE, and IS supported on an optically thick one, which is the regime a
+volume cache is actually for. See the `_fog_thick` re-test and the `sigma_t` sweep below: the
+order >= 2 field's structure falls monotonically with `sigma_t` (0.367 -> 0.023 -> -0.066) while
+the single-scatter control rises (0.515 -> 0.602 -> 0.761), so the smoothness is the field's and
+not an artefact of the measurement.** What is not ruled out is a split design that caches only the low-frequency part
 and leaves a residual to the gather, but that is a substantially different and larger feature than
 this entry proposes, and it must be justified on its own terms. The ~30 % ceiling remains correct
 as a COST figure; what changed is the evidence that spending it is safe.
@@ -1979,8 +1982,48 @@ ray integrates the in-scatter field along its path. That direction is valid and 
 the honest status change is from "measured to be unsafe" to **"not measured to be unsafe, with the
 one available proxy consistent with safety"**, which is weaker than it first looks.
 
-*There is an argument that the gap is small in exactly this regime, and it should be read as an
-argument rather than a measurement.* The integration-length objection scales with how far into the
+**MEASURED, AND THE LIMITATION IS DISMISSED (the `sigma_t` sweep, same day).** The two hypotheses
+predict **opposite trends**, which is what makes this settleable rather than arguable:
+
+* **H1** — the field genuinely smooths as scattering order grows → structure **falls** as `sigma_t` rises.
+* **H2** — the camera ray's path integral hides real structure → structure **rises** as `sigma_t`
+  rises, because the ray's contribution is weighted by `exp(-sigma_t t)` and the effective
+  integration length is ~`1/sigma_t`.
+
+`scenes/_fog_st2.ftsl` and `_fog_st6.ftsl` are `_fog_thick` with **only** the `sigma_t` line
+changed, so geometry, albedo, phase and camera are held fixed by construction; the kernel radius is
+probed per scene and then pinned, because it derives from the medium and pinning one value across
+the sweep would have made it a radius sweep too (`scraps/vc_sweep.sh`).
+
+| `sigma_t` | order >= 2 | order 7+ | MS share of energy | **MS structure** top / mid / bottom |
+|---|---|---|---|---|
+| **2** | 65.6 % | 12.0 % | 58.1 % | **0.367 / 0.180 / 0.657** |
+| **6** | 79.6 % | 36.2 % | 85.2 % | **0.023 / 0.020 / 0.293** |
+| **20** | 82.8 % | 49.7 % | 99.2 % | **-0.066 / -0.005 / -0.001** |
+
+**Structure falls monotonically with `sigma_t` in all three bands. That is H1, and it refutes H2**
+— across a 10x range of `sigma_t` on one scene with one variable. The smoothness of the order >= 2
+field is a property of **the field**, not an artefact of integrating it along a camera ray, and the
+limitation this entry stated about its own `_fog_thick` result is therefore resolved rather than
+merely argued around.
+
+**The control is what makes the collapse trustworthy.** If raising `sigma_t` simply blinded the
+rig, *both* rows would fall together. Single scatter on the bottom third goes **0.515 -> 0.602 ->
+0.761** — it *rises* while multiple scatter collapses to zero, in the same images, from the same
+renders. The estimator keeps its sensitivity exactly where the field under test loses its
+structure.
+
+**And the low end reproduces `gallery_rain`.** At `sigma_t 2` the top third reads **0.367** against
+`gallery_rain`'s **0.334** — two unrelated scenes with comparable order distributions giving
+comparable structure. The two halves of this entry are measuring the same quantity.
+
+**The threshold is between `sigma_t` 2 and 6**, where the top third goes 0.367 -> 0.023: in
+order-histogram terms, somewhere between **12 % and 36 % of chords at order 7+**. That is the
+number a cache would gate itself on, and it is already printed on the beam-map line of every
+render.
+
+*The pre-measurement argument, kept because it predicted the result and because its reasoning is
+reusable:* The integration-length objection scales with how far into the
 medium a camera ray gathers. At an optical depth of ~20 the ray's contribution is dominated by the
 first mean free path or so, so the image is closer to a SURFACE sample of the field than to a long
 line integral — the averaging that would hide field structure is weakest precisely where the
