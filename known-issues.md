@@ -6491,7 +6491,50 @@ range, wall time and rate. That trace is what made the cause visible in one run 
 throttled log had been argued about from differenced timestamps; see `scraps/spp_bands.sh` for a
 summariser. Documented in `REFERENCE.md` under *Backends & performance*.
 
-### OPEN (2026-09-02, v0.209.0): every performance number in `scenes/gallery_rain.ftsl`'s header is stale by up to ~250x, and the header actively asserts the opposite
+### **CLOSED — the entry is itself stale** (re-tested 2026-09-12 at v0.273.10; filed 2026-09-02, v0.209.0): every performance number in `scenes/gallery_rain.ftsl`'s header is stale by up to ~250x, and the header actively asserts the opposite
+
+> **RE-TESTED: THE HEADER IS ACCURATE, AND HAS BEEN SINCE THE DAY THIS WAS FILED.** The header was
+> corrected in the same session that produced this entry — it now carries "RE-MEASURED 2026-09-02
+> at 0.209.0 ... ~29.5 s per spp => ~3.0 min/frame, ~29 h for the 600-frame loop" plus an explicit
+> *"WHAT THE OLD NUMBER SAID AND WHY IT WAS WRONG"* section. Seventy versions later it still
+> reproduces:
+>
+> | quantity | header (0.209.0) | measured (v0.273.10) |
+> |---|---|---|
+> | per spp at 960x540 | ~29.5 s | **31.0 s** (+5 %) |
+> | beams stored | 264 022 | 262 084 |
+> | sub-beams after split | ~6.2 M | 6 198 852 |
+> | BVH nodes uploaded | ~4.0 M | 3 992 845 |
+>
+> Nothing here needs changing. **This entry should have been closed on the day it was filed** and
+> instead sat OPEN for ten days asserting that a corrected document was wrong.
+
+> **AND A CAUTIONARY TALE ABOUT HOW I NEARLY "FIXED" IT.** The first measurement gave **42.0 s per
+> spp**, a 1.42x regression against the header, and I spent two rounds falsifying explanations for
+> it (the `-gatherarea` footprint correction; the gather-time bow fold) before checking the
+> configuration. **The header's number is for `-camera fly` at 960x540. I had substituted
+> `-camera cam` to render one frame instead of 600 — and camera `cam` carries
+> `film { res 1280 720 }`, a 1.778x pixel count.** Every derived number followed from that: a
+> phantom regression, a phantom 44.7 h flyby estimate, two wasted hypotheses.
+>
+> The resolution was printed on every `wrote ...pfm (1280x720, ...)` line the whole time. **When
+> you substitute part of a documented command, you have changed the measurement** — the scene's
+> cameras carry their own film blocks, so swapping `-camera` silently swaps resolution, and on
+> this scene that is the single largest cost term.
+
+> **TWO REAL FINDINGS FELL OUT OF THE FAILED FALSIFICATIONS**, both worth having:
+>
+> **1. On `gallery_rain`, neither `-gatherarea` nor the gather-time bow fold costs more than ~1 %.**
+> Three arms at 1280x720: default **42.0** s/spp, `-gatherarea 0` **42.0**, `FTRACE_NOBOWGPU=1`
+> **41.5**. The beam traversal at **883.8 beams per probe** swamps both. `REFERENCE.md` quotes
+> **1.30x** for `-gatherarea` on mode `M` — that figure was measured on a lighter configuration
+> and **does not generalise to a beam-dominated scene**. Worth knowing before anyone plans around
+> it: on this scene the footprint correction is effectively free.
+>
+> **2. The gather is SUBLINEAR in pixels.** 960x540 -> 1280x720 is 1.778x the pixels for
+> **1.35x** the cost (31.0 -> 42.0 s/spp). So a bigger frame is cheaper per pixel here, which
+> points at fixed per-spp overhead or better GPU occupancy at larger launches, and means
+> per-pixel cost extrapolated from a small test render will over-estimate a big one.
 
 **Context.** The scene header carries "MEASURED at 0.198.0 ... 15224 beams stored -> 367540
 sub-beams after split, 236293 BVH nodes uploaded ... then a steady **5.0 s/frame** -- ~50 min for
