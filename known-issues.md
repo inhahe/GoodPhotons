@@ -20608,7 +20608,51 @@ existing lobe-sampled continuation, which already carries `contBsdfPdf`. That is
 structure `D_DIFFUSE` uses, just with a non-constant BRDF, and it fixes both the black preview
 and the (currently very high) variance of a glossy surface in mode R.
 
-## OPEN (2026-09-12): mode `D` (BDPT) evaluates the glossy BSDF in the WRONG DIRECTION on light subpaths
+## ~~OPEN~~ **DONE (v0.276.0)** (2026-09-12): mode `D` (BDPT) evaluated the glossy BSDF in the WRONG DIRECTION on light subpaths
+
+**FIXED IN v0.276.0 by `bsdfFAdjoint` / `dBsdfFAdjoint`** — `f*(wo,wi) = f(wi,wo)`, used at every
+particle-vertex *connection*. The acceptance test written below **before** the fix, run after:
+
+| | before | after |
+|---|---|---|
+| sign-flip, camera near-normal | **0.8517** | **1.0075** |
+| sign-flip, camera matched 45° | 1.0366 | 1.0105 |
+| sign-flip, camera grazing | 1.0169 | **0.9998** |
+| off-axis rig, glossy r=0.2 | 1.0824 | **1.0001** |
+| off-axis rig, glossy r=0.6 | 1.1592 | **0.9998** |
+| off-axis rig, glossy r=0.9 | 1.1971 | **1.0000** |
+
+**The null controls hold bit-exactly.** Diffuse (`ρ/π`, reciprocal) and `mirror` (delta, never
+connected) are **bit-identical** across the change in both rigs, and mode `R` is bit-identical and
+still furnace-flat. That is the whole reason the fix is expressible as a *rename*: swapping the
+arguments of a reciprocal BSDF cannot change its value, so a site switched from `bsdfF` to
+`bsdfFAdjoint` is provably a no-op for every material except the non-reciprocal ones.
+
+**THE AUDIT CRITERION IS MECHANICAL, which is what made the scope knowable rather than guessed.**
+Every site that already carried `shadingAdjointCorr` / `dShadingAdjointCorr` — the *shading-normal*
+half of the same Veach rule — is a particle vertex, and needed the BSDF's own half. That is 12 call
+lines in 3 files: `bdpt.h` (t=1 splat, interior light endpoint), `vcm.h` (the same two, modes `U`/`J`),
+and `render_cuda.cu` (both BDPT sites, the light-trace splat, and the VCM connection). **Continuation
+sites — `beta *= shadingAdjointCorr(...)` — are deliberately NOT changed**: there the `f·cos/pdf = r`
+collapse evaluates the same direction it sampled, so it is already self-consistent. `bsdfPdf` is
+also left alone, because the Glossy lobe factor *is* symmetric under the swap (provable:
+`dot(wi, reflect(-wo,ns)) == dot(wo, reflect(-wi,ns))`), so the densities were already reciprocal
+and "fixing" them would have broken MIS weights that were correct.
+
+**Both backends, and the other bidirectional modes.** Mode `D` is CPU+GPU, so the device twin was
+mandatory or the backends would have split: GPU/CPU now agree to **1.0001–1.0004**. Modes `U` (VCM)
+and `J` (UPBP) share the construct and were patched with it; afterwards they show **no
+glossy-specific error** — `U`/`R` = 0.9913 (diffuse) vs 0.9899 (glossy), `J`/`R` = 0.9888 vs 0.9892,
+i.e. a ~1 % offset that is the *same for both materials* and therefore not this bug. **No pre-fix
+`U`/`J` baseline was captured**, so that is a statement about their state now, not a claim that the
+fix improved them; the residual ~1 % is material-independent and belongs to whatever else `U`/`J`
+do (a photon-merge radius bias would look like this).
+
+**A RESIDUAL SURVIVES, exactly as this entry predicted it would, and is now isolated** — see the
+next entry. It is *not* this bug: it lives only where the camera path's own lobe sample can reach
+the light, and it grows as the lobe NARROWS, the opposite trend from what was fixed here.
+
+**The diagnosis, preserved:**
 
 **ROOT CAUSE FOUND, and confirmed by a signed prediction.** `bsdfF`'s Glossy case returns
 `r * lobe / cos(wi)` — deliberately, so that `f*cos/pdf` collapses to `r` — which makes it
@@ -20698,6 +20742,38 @@ that is the null control. Acceptance: the sign-flip table above must go to **1.0
 camera angles**, the furnace must stay flat, and the `~+3.5 %` residual at the neutral
 configurations should be re-measured afterwards — it survives when the reciprocity term is
 neutral, so it is a **second, separate effect** and is not explained by any of the above.
+
+## OPEN (2026-09-12): mode `D` reads a few percent high on a glossy surface whose LOBE reaches the light
+
+Left over after the adjoint-BSDF fix above, which removed the connection-side error completely
+(off-axis rig 1.0824/1.1592/1.1971 → 1.0001/0.9998/1.0000). This is the other configuration, and a
+different mechanism. `scraps/_gwhl_*.ftsl` places camera and light symmetrically about the tile
+normal so the mirror direction lands **on** the light; mode `R` (furnace-validated) is the
+reference:
+
+| material | `D`/`R` before the adjoint fix | after |
+|---|---|---|
+| diffuse | 0.9957 | 0.9957 |
+| mirror | 1.0002 | 1.0002 |
+| glossy r=0.05 | 1.0366 | **1.0361** |
+| glossy r=0.3 | 1.0372 | **1.0211** |
+| glossy r=0.6 | 1.0326 | **1.0073** |
+
+**It grows as the lobe narrows** — +3.6 % at roughness 0.05 against +0.7 % at 0.6 — which is the
+*opposite* trend from the adjoint bug (that one grew as the lobe widened, because the connection's
+MIS share grew). Diffuse and mirror are untouched, so it is again specific to a **finite** lobe.
+
+Where to look: in this geometry the dominant strategy is the unidirectional one — the camera
+subpath's own lobe sample landing on the emitter (`s=0`) — and its MIS share is largest exactly
+where the lobe is narrowest. So the suspect is that strategy's emitter-hit density, i.e. the
+area→solid-angle pdf conversion for "the lobe hit the light", rather than the BSDF value (which
+the furnace and the off-axis rig now both vindicate).
+
+Discriminator to run first: vary the light's **angular size** in this highlight geometry. The
+conversion is `pdf_A · dist²/cos`, so a pdf-conversion error scales with the light's solid angle
+while a BSDF error does not — the same test that cleanly exonerated solid angle for the adjoint
+bug (a 16× change moved it only 1.7 %). Also worth one arm: a light small enough that the narrow
+lobe *straddles* its edge, since a partially-covered emitter is where an area-measure slip shows.
 
 ## OPEN (2026-08-04): `phase rainbow` — the 2048-bin uniform-in-mu table under-resolves large droplets, and monodisperse supernumeraries read as a white arc
 

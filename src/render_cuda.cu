@@ -9856,6 +9856,18 @@ __device__ static void dGenRay(const DCamera& cam, int px, int py, Real jx, Real
 // a few hundred lines down.)
 
 // ---- GLOSSY-NEE on the device ---------------------------------------------------------------
+// ADJOINT BSDF for a PARTICLE (light-subpath) vertex: f*(wo,wi) = f(wi,wo). Device twin of
+// bsdf_eval.h's bsdfFAdjoint, where the full reasoning lives. Call this, not dBsdfF, wherever a
+// light-subpath vertex is CONNECTED to something -- exactly the sites already carrying
+// dShadingAdjointCorr, which is the shading-normal half of the same Veach rule. dBsdfF
+// pre-divides by cos(wi), which is self-consistent on a continuation but not at a connection,
+// where the Glossy lobe factor is symmetric under the swap and the denominator is not.
+// Reciprocal BSDFs are unchanged by it, so switching a site over cannot perturb a diffuse scene.
+__device__ static inline double dBsdfFAdjoint(const DScene& sc, const DVertex& vt,
+                                              const DVec3& wo, const DVec3& wi, Real lambda) {
+    return dBsdfF(sc, vt, wi, wo, lambda);
+}
+
 // `dBsdfF` / `dBsdfPdf` above take a DVertex, which the BDPT path has and the backward shade
 // loop has not; these are the same two expressions on a DHit. Glossy only, because Glossy is the
 // only lobe the hook is ever handed -- a diffuse vertex already goes through `rho/PI`, which is
@@ -12922,7 +12934,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
             double stG = twoSided ? 1.0 : (double)dShadowTerminatorG(wcam, qs.ns, ngoQ);
             if (stG <= 0.0) return 0.0;
-            f = dBsdfF(sc, qs, wo, wcam, lambda);
+            f = dBsdfFAdjoint(sc, qs, wo, wcam, lambda);   // ADJOINT: qs is a particle vertex
             // Adjoint correction on the LIGHT-subpath vertex qs (particle side, outgoing
             // toward camera). 1 when ns==ng. wo = toward previous (light-side) vertex.
             // |cos| inside dShadingAdjointCorr makes it lobe-agnostic (serves the transmit lobe).
@@ -12930,7 +12942,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             const double adj = (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ) * stG;
             f *= adj;
             for (int i = 0; i + 1 < nUp; ++i)
-                fSec[i] = dBsdfF(sc, qs, wo, wcam, hb.lam[i + 1]) * adj;
+                fSec[i] = dBsdfFAdjoint(sc, qs, wo, wcam, hb.lam[i + 1]) * adj;
                         o = dOffsetAlong(qs.p, qs.ng, wcam);
         }
         {   // max over live wavelengths (identical to `f <= 0` when nUp == 1)
@@ -13151,7 +13163,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             for (int i = 0; i + 1 < nUp; ++i)
                 fLSec[i] = dMediumScatterF(sc, qs, woL, w * (Real)-1, hb.lam[i + 1]);
         } else {
-            fL = dBsdfF(sc, qs, woL, w * (Real)-1, lambda) * stGL;
+            fL = dBsdfFAdjoint(sc, qs, woL, w * (Real)-1, lambda) * stGL;   // ADJOINT (qs)
             // Adjoint correction on the LIGHT-subpath endpoint qs only (particle side,
             // outgoing = -w toward the eye vertex). fE is the Radiance side — no correction.
             // |cos| inside dShadingAdjointCorr makes it lobe-agnostic (serves the transmit lobe).
@@ -13159,7 +13171,8 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             const double adjL = (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);
             fL *= adjL;
             for (int i = 0; i + 1 < nUp; ++i)
-                fLSec[i] = dBsdfF(sc, qs, woL, w * (Real)-1, hb.lam[i + 1]) * stGL * adjL;
+                fLSec[i] = dBsdfFAdjoint(sc, qs, woL, w * (Real)-1, hb.lam[i + 1])
+                           * stGL * adjL;
         }
         {   // max over live wavelengths on each side (identical to the scalar tests at nUp==1)
             double mxE = fE, mxL = fL;
@@ -14922,10 +14935,11 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                     // The adjoint correction and shadow-terminator G are purely
                                     // geometric, so they scale every λ the same way.
                                     double geo = (double)dShadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
-                                    double f = dBsdfF(sc, vt, wo, wcam, lambda) * geo;
+                                    double f = dBsdfFAdjoint(sc, vt, wo, wcam, lambda) * geo;
                                     double fSec[SECN], mxf = f;
                                     for (int k = 0; k + 1 < nUp; ++k) {
-                                        fSec[k] = dBsdfF(sc, vt, wo, wcam, lamAll[k + 1]) * geo;
+                                        fSec[k] = dBsdfFAdjoint(sc, vt, wo, wcam,
+                                                                lamAll[k + 1]) * geo;
                                         if (fSec[k] > mxf) mxf = fSec[k];
                                     }
                                     if (mxf > 0.0) {
@@ -15337,7 +15351,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     DVertex lvt = dVertFromLV(lv);
                     double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
                     double fCam = dBsdfF(sc, vt, wo, w, lambda) * stGCam;
-                    double fLit = dBsdfF(sc, lvt, lv.wo, w * (Real)-1, lambda);
+                    double fLit = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1, lambda);
                     fLit *= adjLit;
                     // The camera path and the stored light path share this pass's bundle (same
                     // path index i), so a connection is EXACT per-λ over the wavelengths still
@@ -15348,7 +15362,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     const DVcmSec* lsRow = ((NS > 0) && lvSec) ? (lvSec + (size_t)j * secStride) : nullptr;
                     for (int k = 0; k + 1 < nUpConn; ++k) {
                         double fc = dBsdfF(sc, vt, wo, w, lamAll[k + 1]) * stGCam;
-                        double fl = dBsdfF(sc, lvt, lv.wo, w * (Real)-1, lamAll[k + 1]) * adjLit;
+                        double fl = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1,
+                                                  lamAll[k + 1]) * adjLit;
                         fProdSec[k] = fc * fl;
                         if (fProdSec[k] > mxProd) mxProd = fProdSec[k];
                     }

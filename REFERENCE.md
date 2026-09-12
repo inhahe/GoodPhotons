@@ -5500,6 +5500,14 @@ tree-selected emitter keeps exactly the old estimator, which is unbiased, just a
 Reversing `ltSample`'s adaptive splitting into a selection *density* is what would lift that, and
 is logged in `known-issues.md` → **GLOSSY-NEE**.
 
+**The bidirectional modes (`D`, `U`, `J`) evaluate a glossy lobe correctly since 0.276.0.** They
+traverse each vertex in both directions, and the BSDF convention (pre-dividing by the sampled
+direction's cosine) is not reciprocal for a glossy lobe, so a path built from the light side
+disagreed with the same path built from the camera side by `cos(wo)/cos(wcam)`. Mode `D` measured
+**15 % too dim** with the camera near the surface normal and up to **20 % too bright** where a
+connection dominated; it is now within **0.02 %** of mode `R` across roughness 0.2–0.9. Diffuse and
+`mirror` output is bit-identical across that fix, and CPU/GPU agree to 0.04 %.
+
 **Mode `W` takes the connection too, since 0.275.0.** It is the same estimator as mode `R` with
 quadrature substituted for sampling — a `lightGrid`×`lightGrid` walk over each light instead of
 one random point, and the lobe's own lattice direction carrying the other half of the MIS weight —

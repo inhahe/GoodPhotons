@@ -1929,6 +1929,26 @@ why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
     to multiply back in — so `f·G` comes out to exactly `hairFCos × cosOther/dist²` and every
     MIS ratio, strategy weight and density conversion stays untouched and provably consistent.
     A `hairCosGuard` floor of 1e-7 keeps the division finite at a grazing endpoint.
+  - *...and that pre-divide is exactly what makes `f` NON-RECIPROCAL, so a particle vertex needs
+    the ADJOINT (0.276.0).* The convention divides by `cos(ns, wi)`, the **newly sampled**
+    direction — self-consistent on a continuation, where the direction evaluated is the direction
+    sampled, but not at a *connection*. `Glossy` is the clearest case: its lobe factor is
+    symmetric under swapping `wo`/`wi` (`dot(wi, reflect(-wo,ns)) == dot(wo, reflect(-wi,ns))`,
+    algebraically) while the denominator is not, so one physical path picked up
+    `r·lobe/cos(camera-side)` when a light subpath built it and `r·lobe/cos(light-side)` when a
+    camera subpath did, and MIS combined two estimators that disagreed by `cos(wo)/cos(wcam)`.
+    Measured on mode `D` as **15 % too dim** with the camera near the normal and too bright with
+    it grazing — a sign flip. `bsdfFAdjoint(m, ns, wo, wi) = bsdfF(m, ns, wi, wo)` (device twin
+    `dBsdfFAdjoint`) is Veach's particle-tracing rule for the BSDF itself; `shadingAdjointCorr`
+    was already the shading-normal half of it, and the two are **independent** — the latter is 1
+    on flat geometry, where this is still required. **The rule for new code: every site that needs
+    `shadingAdjointCorr` needs `bsdfFAdjoint` too, and no other site does.** That criterion is
+    greppable, which is how the scope was bounded to 12 call lines across `bdpt.h`, `vcm.h` and
+    `render_cuda.cu` rather than guessed at. Which direction is correct is settled by energy, not
+    preference: under uniform illumination `∫ r·lobe/cos(w_incident) · cos(w_incident) dω = r`,
+    whereas dividing by the camera-side cosine does not integrate to `r` — and a white-furnace
+    test measures mode `R`, which builds paths camera-side, flat to **0.04 %**. Leave `bsdfPdf`
+    alone: the lobe factor is symmetric, so the densities were always reciprocal.
   - *Modes M / S scatter but never gather.* `struct Photon { Vec3 n; float power; float
     lambda; }` carries **no incident direction**, so a directional BCSDF has nothing to
     evaluate against at a density-estimate gather. `sppm_render.h` and `photonmap_render.h`
