@@ -55,7 +55,7 @@ What that leaves, and where each one's frontier actually is:
 
 | item | frontier |
 |---|---|
-| M-GATHERAREA | **3.4x closed as of v0.277.0** — 36.8 -> 10.8 points mean absolute error over four seeds, and the fur case is closed by construction. What is left is a ~7-10 point residual on hair and cloth, plus a ~3-point flat-ground floor that is probably not this entry at all |
+| M-GATHERAREA | **3.4x closed as of v0.277.0** — 36.8 -> 10.8 points mean absolute error over four seeds, and the fur case is closed by construction. What is left, scored against the anchor mode at matched spp so the statistic's own floor is removed per ROI: hair -7.4, cloth -10.8, **cap edge -12.6** (the worst, not the nearly-fixed one), fur +7.4 from a different mechanism. Flat ground is now mode `M`'s BEST ROI, 2.6 points closer to truth than the anchor |
 | VOLCACHE | the volumetric gather, ~4/5 of a `gallery_rain` frame |
 | mode-`J` device light pass | the BEAM half — deposit + a device BVH; premise checked, worth ~12x on a thick medium |
 | UPBP-CONV | **fireflies, not speed** — see (2g): on every statistic not at the mercy of the tail mode `J` already beats mode `D` at equal time (1.37x / 1.28x / 1.52x), while its worst pixel is 3 310 against 532 |
@@ -3067,20 +3067,48 @@ else that happens to move.
    it is why the `Remaining:` clause in the header changed.
 2. **The null is not zero, and it is not this entry's doing.** `grid_ground` reads -3.8 % with the
    entry fully OFF (-3.1 / -3.2 / -4.0 / -5.0, same sign at every seed), on a 46x45 m quad where
-   a 0.38 m disc cannot overhang anything. So mode `M` carries a ~3-point deficit on flat ground
-   against a *converged* mode-`R` reference, independent of the gather footprint — and every
-   residual above should be read against that floor: hair ~-7, dress ~-9, cap ~-9.
-   **Two candidate explanations, cheaply separable:** either mode `M` really is ~3 % low on flat
-   diffuse, or a 5 %-trimmed mean of a 64-spp frame sits below the converged value for reasons of
-   convergence rather than bias. Render mode `R` at the *same* 64 spp and score `grid_ground`
-   against the same reference — ~0 % indicts mode `M`, ~-3 % indicts the statistic. Note that the
-   5-seed campaign below scored `grid_ground` as correct for mode `M`, but against mode `R` **at
-   matched sample count**, which is exactly the comparison that cannot see a shared convergence
-   offset.
+   a 0.38 m disc cannot overhang anything. **Measured the same day and it is the STATISTIC, not
+   mode `M`** — see the control immediately below, which also rescales every residual in the
+   table above.
 3. **The correction still moves that flat null by +1.0 point at every seed**, so `gatherCoverage`
    returns slightly less than 1 where the geometry says it must be exactly 1. Small, and in the
    direction that helps, but a probe that is not inert where it should be inert is the most
    concrete lead on the remaining hair/cloth residual.
+
+**THE FLOOR IS THE STATISTIC'S, AND MODE `M` IS BETTER THAN THE ANCHOR ON FLAT GROUND
+(2026-09-12).** The separator is one render: score the **anchor mode at the same 64 spp** against
+the same converged reference. Mode `R` has no gather disc, no footprint and no photon map — it is
+the reference's own estimator, merely less converged — so any deficit it shows is the sample count
+and the trimmed mean talking, not a density estimate. Same four seeds, `scraps/ga_floor.sh`:
+
+| ROI | mode `M`, shipped default | **mode `R` @ 64 spp** | mode `M` residual above the anchor |
+|---|---|---|---|
+| `alice_hair` | -10.0 % | -2.6 % | **-7.4** |
+| `alice_dress` | -12.3 % | -1.5 % | **-10.8** |
+| `cap_gyroid` | -11.4 % | +1.2 % | **-12.6** |
+| `creature` (fur) | +9.5 % | +2.1 % | **+7.4** |
+| `grid_ground` | **-2.8 %** | **-5.4 %** | **+2.6** |
+
+**Three corrections to the section above fall out of that one column.**
+
+* **`grid_ground`'s deficit is not mode `M`'s.** The anchor reads -5.4 % there (-5.6 / -3.6 /
+  -6.2 / -6.3, same sign at every seed) while reading within ~2 points on every *other* ROI. So a
+  5 %-trimmed mean of a 64-spp `gallery_rain` frame under-reads that one ROI by ~5 points in
+  whatever mode — most likely the rain column in front of it, which converges from below. Mode
+  `M` is **2.6 points closer to truth than the anchor** on flat ground, which is the opposite of
+  a defect.
+* **The residuals are therefore LARGER than the "read it against the floor" guess, not smaller.**
+  Subtracting `grid_ground`'s -3.8 % gave hair ~-7 / dress ~-9 / cap ~-9; the per-ROI anchor gives
+  **-7.4 / -10.8 / -12.6**. `cap_gyroid` is the one that moves most, and in the wrong direction
+  for the optimistic reading — it is not nearly-fixed, it is the **worst** of the three. A floor
+  measured on one ROI does not transfer to another; it has to be measured per ROI, which is what
+  this table does and the previous paragraph did not.
+* **Fur still carries +7.4 points, and the fiber gate is not what left it there.** The gate
+  restores the *uncorrected* estimator on fur, and the uncorrected estimator was already
+  +13 % (11σ) in the 5-seed table below. "Accurate uncorrected" in this entry has always meant
+  *relative to +48 % corrected*, not absolutely. That residual is mode `M`'s own density estimate
+  on a dense tangle and belongs to a different mechanism than the footprint — the gather ball
+  reaching across many strands — so it will not be fixed by anything in this entry.
 
 **What the residual is NOT.** It is not the fur path: `alice_hair` is *mesh* geometry, not curves,
 which is why the fiber gate leaves it alone — it moves -67.6 -> -10.0 under the coverage probe
