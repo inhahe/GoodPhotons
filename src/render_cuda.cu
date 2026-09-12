@@ -1228,14 +1228,16 @@ struct DScene {
     int              bkGlossyNee;    // 0 = -no-glossy-nee: no connection at a D_GLOSSY vertex
     int              gatherArea;     // -gatherarea <M>: probe samples for the M-GATHERAREA
                                      // footprint (0 = off, the default)
-    int              gatherRejPct;
-    // 1 = FTRACE_GAFIBER: skip the coverage correction where the gather point is on a FIBER.
-    // Same environment channel as the host's gaFiberSkipOn(), so the backends cannot disagree.
-    int              gaFiberSkip;   // FTRACE_GAREJECT <pct>: the tangle gate. Suppress the
+    int              gatherRejPct;   // FTRACE_GAREJECT <pct>: the tangle gate. Suppress the
                                      // footprint correction for a gather whose probes REJECT at
                                      // least this share of their hits on the normal test, which
                                      // is the dense-fur signature -- there the correction has the
                                      // wrong SIGN. 0 = off.
+    // 1 = FTRACE_GAFIBER: skip the coverage correction where the gather point is on a FIBER.
+    // Same environment channel as the host's gaFiberSkipOn(), so the backends cannot disagree.
+    int              gaFiberSkip;
+    // 1 = FTRACE_GABIAS: the bias-corrected coverage `(area+1)/(M+1)`. Host twin gaBiasOn().
+    int              gaBias;
     double           bkLightSplit;   // -light-split
     int              bkLightSamples; // -light-samples
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
@@ -5041,9 +5043,17 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
     // their rng draws, exactly as the host does -- returning early would desynchronise the two
     // backends' streams and make a cross-backend comparison meaningless.
     if (fiberR > (Real)0 && sc.gaFiberSkip) return 1.0;
+    // The pseudo-count, host twin in photonmap_render.h's gaBiasOn(). Applied here and not at the
+    // early returns above, which all mean "do not correct" and must stay exactly 1.0 -- which
+    // this form also gives at `area == M`, so they agree by construction, not by a special case.
+    if (sc.gaBias) return (area + 1.0) / (double)(M + 1);
     return area / (double)M;
 }
-__device__ static inline double dGatherAreaScale(double cov) {
+__device__ static inline double dGatherAreaScale(int gaBias, double cov) {
+    // With the pseudo-count on, `cov` is bounded below by 1/(M+1) and the cliff would only
+    // misfire at large M -- at M = 32 a zero-coverage gather lands at 0.030, under the threshold,
+    // and would lose its correction entirely.
+    if (gaBias) return (cov > 0.0) ? 1.0 / cov : 1.0;
     return (cov >= 0.05) ? 1.0 / cov : 1.0;  // one stray probe must not become a firefly
 }
 
@@ -13802,7 +13812,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 // on that map's rq. One shared coverage would be cheaper and wrong.
                 double cs = 1.0;
                 if (sc.gatherArea)
-                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea,
+                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea,
                                                           h.fiberRadius));
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
@@ -13813,7 +13823,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             // per-gather normalisation to scale -- the correction multiplies the accumulated
             // sum instead. Same estimator, different place to put the multiply.
             if (sc.gatherArea) {
-                const double ms = dGatherAreaScale(
+                const double ms = dGatherAreaScale(sc.gaBias,
                     dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea,
                                     h.fiberRadius));
                 gx = (float)((double)gx * ms);
@@ -14082,7 +14092,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 // on that map's rq. One shared coverage would be cheaper and wrong.
                 double cs = 1.0;
                 if (sc.gatherArea)
-                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea,
+                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea,
                                                           h.fiberRadius));
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
@@ -14093,7 +14103,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // per-gather normalisation to scale -- the correction multiplies the accumulated
             // sum instead. Same estimator, different place to put the multiply.
             if (sc.gatherArea) {
-                const double ms = dGatherAreaScale(
+                const double ms = dGatherAreaScale(sc.gaBias,
                     dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea,
                                     h.fiberRadius));
                 gx = (float)((double)gx * ms);
@@ -14444,7 +14454,7 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
                                  + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL
                                  + 0x5851F42D4C957F2DULL;
             DRng grng; grng.seed(s * 2 + 23, seedBase ^ s);
-            const double cs = dGatherAreaScale(
+            const double cs = dGatherAreaScale(sc.gaBias,
                 dGatherCoverage(sc, h.p, h.n, (Real)R, grng, sc.gatherArea));
             gx = (float)((double)gx * cs);
             gy = (float)((double)gy * cs);
@@ -16989,6 +16999,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         sc.gatherRejPct = g ? std::atoi(g) : 30;   // default must match the host's gaRejectPct()
         const char* gf = std::getenv("FTRACE_GAFIBER");
         sc.gaFiberSkip = (gf && *gf == '0') ? 0 : 1;   // default must match host gaFiberSkipOn()
+        const char* gb = std::getenv("FTRACE_GABIAS");
+        sc.gaBias = (gb && *gb && *gb != '0') ? 1 : 0;  // same channel as the host's gaBiasOn()
     }
     sc.bkLightSplit    = lt::gSplit;
     sc.bkLightSamples  = lt::gSamples;

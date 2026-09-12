@@ -3110,6 +3110,65 @@ and the trimmed mean talking, not a density estimate. Same four seeds, `scraps/g
   on a dense tangle and belongs to a different mechanism than the footprint — the gather ball
   reaching across many strands — so it will not be fixed by anything in this entry.
 
+**THE JENSEN HALF IS NOW FIXABLE, AND FIXING IT ALONE MAKES THE NUMBERS WORSE (v0.277.1,
+`-gabias 1`, off by default).** The repair proposed above was built and measured: replace the
+coverage `area / M` with the pseudo-counted `(area + 1) / (M + 1)`, which is exactly 1.0 at full
+coverage (so the early-outs and flat ground are untouched by construction), is bounded by `M + 1`
+(so `gatherAreaScale`'s `cov < 0.05 -> 1.0` cliff becomes unnecessary — and that cliff points the
+wrong way, since a gather that found almost no surface needs the *largest* correction, not none),
+and is the textbook near-unbiased estimator of `1/p`. Four seeds, both probe counts, one binary
+(`scraps/ga_bias_run.sh`):
+
+| ROI | `M8` | `M32` | `M8`+bias | `M32`+bias | `M8-M32` raw | `M8-M32` +bias |
+|---|---|---|---|---|---|---|
+| `alice_hair` | -10.0 | -12.8 | -16.7 | -17.9 | **+2.83** | **+1.15** |
+| `alice_dress` | -12.3 | -15.3 | -17.8 | -16.4 | **+3.05** | **-1.40** |
+| `cap_gyroid` | -11.4 | -7.3 | -15.9 | -8.5 | **-4.03** | **-7.35** |
+| `creature` (fur) | +9.5 | +9.5 | +9.5 | +9.5 | 0 | 0 |
+| `grid_ground` | -2.8 | -2.7 | -3.0 | -2.8 | -0.08 | -0.22 |
+
+Mean absolute error over the four non-null ROIs: **10.8 (`M8`) / 11.3 (`M32`) / 15.0 (`M8`+bias)
+/ 13.1 (`M32`+bias)**.
+
+**Read the last two columns before the first four — the prediction was about them.** The claim was
+that removing the Jensen inflation should collapse the `M`-dependence, because "the numbers got
+smaller" proves nothing when the raw estimator can be made to produce almost any value by choosing
+`M`. On hair and cloth it did: **+2.83 -> +1.15** and **+3.05 -> -1.40**, the latter flipping sign,
+which is itself expected — `E[(M+1)/(k+1)] = (1-(1-c)^(M+1))/c` slightly *under*-estimates `1/c`,
+more so at small `M`, so a small overshoot at `M = 8` is the correction working rather than
+failing.
+
+**And `cap_gyroid` went the other way, 1.8x worse, which is the result worth keeping.** The
+pseudo-count removes the Jensen mechanism and nothing else. A residual `M`-dependence that
+*survives* that removal is, by elimination, the other mechanism — the early-out's `probe0 = M/4`
+threshold, which was inference from the code an hour ago and is now measured. It grew rather than
+merely persisting because the `M = 8` Jensen brightening had been partly masking it. `cap_gyroid`
+is an edge strip, which is exactly the geometry a "are the first few probes all flat-on?" test
+misjudges.
+
+**THE UNCOMFORTABLE HALF: total error went 10.8 -> 15.0, so this must NOT be defaulted on.** The
+honest reading is the one this entry has had to make twice already, and it is the same shape as
+"`M = 4` scores best": **the shipped configuration is accurate partly by cancellation.** There are
+two errors — Jensen brightening, and an under-correction of the footprint itself — and at `M = 8`
+they point in opposite directions. Removing the brightening alone exposes the under-correction it
+was hiding. Concretely, `alice_hair` uncorrected is -67.6 %; *honestly* corrected it is -16.7 %,
+a **75 %** recovery rather than the 85 % the shipped configuration appears to give, and the rest
+of that apparent recovery is a bias that happens to point the right way.
+
+That is worth stating plainly because it changes what "fixed" means for this entry: the shipped
+numbers are better than the estimator deserves, and they depend on `M` staying at 8, on this
+scene's coverage distribution, and on the two errors keeping their present ratio. None of those is
+a property anyone chose.
+
+**What to build next is now specific rather than directional.** `-gagate <n>` (holding the
+early-out at a fixed probe count instead of `M/4`) attacks part of the under-correction, since
+every spurious gate firing returns coverage 1.0 — no correction at all — on a disc that is only
+mostly covered. The combination `-gabias 1 -gagate <n>` is the arm to measure: it is the first
+configuration that could be **both** honest (no `M`-dependence) **and** accurate (error below
+10.8), and either outcome is informative. If the error stays above 10.8 with both mechanisms
+removed, then the footprint model itself under-corrects and no amount of estimator repair will
+close this entry.
+
 **What the residual is NOT.** It is not the fur path: `alice_hair` is *mesh* geometry, not curves,
 which is why the fiber gate leaves it alone — it moves -67.6 -> -10.0 under the coverage probe
 while `creature` does not move at all.

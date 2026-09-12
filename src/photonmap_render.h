@@ -138,6 +138,33 @@ inline bool gaFiberSkipOn() {
     }();
     return on;
 }
+// FTRACE_GABIAS=1 (`-gabias 1`): the BIAS-CORRECTED coverage, `(area + 1) / (M + 1)` instead of
+// `area / M`. PROTOTYPE, off by default.
+//
+// The estimate divides by coverage, so it is `1/c-hat` of a noisy `c-hat`, and E[1/c-hat] >
+// 1/E[c-hat] by Jensen -- the correction reads too bright, the more so the fewer probes. That is
+// not a convergence error that more probes fix cheaply: measured, `alice_dress` reads -12.3 % at
+// M = 8 against -15.4 % at M = 32 and has stopped moving between 16 and 32, so four times the
+// rays buys three points of bias and nothing else.
+//
+// A pseudo-count removes it for free. For the plain binomial case (every probe flat-on, so
+// `area` is a hit count) `(M+1)/(k+1)` is the textbook near-unbiased estimator of `1/p`. Here
+// `area` carries the projection Jacobian and so is not a count, but the same shrinkage applies
+// and the three properties that matter are structural:
+//   * at `area == M` it is EXACTLY 1.0, so full coverage stays inert and flat ground stays
+//     bit-identical -- which is what the whole feature rests on;
+//   * it is bounded by M+1, so `gatherAreaScale`'s `cov < 0.05 -> 1.0` cliff is unnecessary --
+//     and that cliff points the WRONG WAY, since a gather that found almost no surface is the
+//     one that needs the LARGEST correction, not none;
+//   * it is monotone in `area`, so it cannot reorder two gathers the raw estimator ranked.
+// The prediction to test it against is that the M = 8 and M = 32 results should CONVERGE.
+inline bool gaBiasOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_GABIAS");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
 inline bool gaDiagOn() {
     static const bool on = [] {
         const char* e = std::getenv("FTRACE_GADIAG");
@@ -289,6 +316,10 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
     // caller's rng is shared across gather points, so every later point would shift too -- the
     // four ROIs that must not move would then move for an unrelated reason.
     if (fiberR > 0.0 && gaFiberSkipOn()) return 1.0;
+    // The pseudo-count (see gaBiasOn). Applied HERE and not at the early returns above, because
+    // those all mean "do not correct" and must stay exactly 1.0 -- which this form also gives at
+    // `area == M`, so the two agree by construction rather than by a special case.
+    if (gaBiasOn()) return (area + 1.0) / (double)(M + 1);
     return area / (double)M;
 }
 // Never divide by a coverage so small that one stray probe inflates a pixel into a firefly. A
@@ -341,6 +372,10 @@ inline void gaDiagReport(const Scene& scene) {
 }
 
 inline double gatherAreaScale(double cov) {
+    // With the pseudo-count on, `cov` is already bounded below by 1/(M+1) and the cliff would do
+    // nothing but misfire at large M -- at M = 32 a zero-coverage gather lands at 0.030, below
+    // the threshold, and would have its correction thrown away entirely.
+    if (gaBiasOn()) return (cov > 0.0) ? 1.0 / cov : 1.0;
     return (cov >= 0.05) ? 1.0 / cov : 1.0;
 }
 
