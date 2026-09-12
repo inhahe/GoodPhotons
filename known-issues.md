@@ -21247,6 +21247,36 @@ tilt the panel, which is what exposed it.
 perpendicularity check. Declare one that is not perpendicular and the emitter's **rectangle lies in
 one plane while its emission axis points out of that plane**.
 
+**THE FIRST-ORDER EFFECT IS AN EXACT `cos(tilt)` DIMMING, MODE-INDEPENDENT — measured 2026-09-12,
+and it corrects the magnitude AND the sign recorded below.** Two scenes identical in every respect
+(same `origin`, `u`, `v`, hence the same rectangle and the same area), differing only in the
+declared `normal`, diffuse tile, mode `R` at 512 spp:
+
+| declared normal | tile radiance |
+|---|---|
+| `= cross(u,v)` | 0.107982 |
+| tilted 45° out of plane | 0.076355 |
+| **ratio** | **0.7071** |
+
+`cos(45°) = 0.70711`. Exact. `emitterGeom` puts `cosLight` in the **numerator** of
+`w = cosSurf·cosLight·A/dist²`, so tilting the normal away from the patch's real orientation scales
+the emitter's whole contribution by `cos(tilt)` — it makes the light **DIMMER**, not brighter, and
+it does so identically in every mode.
+
+**Which is why the mode-`D`-vs-`R` discrepancy was only ~5 %: both modes share `emitterGeom`, so
+the first-order error CANCELS in that comparison and what I measured was the second-order MIS
+residual.** So the entry's own "biases the render by a few percent, differently per render mode"
+understates it by roughly a factor of six. The real figures for shipped content: `mirror_selfie`'s
+three tilted wall-washes deliver `cos(21.8°)` = **0.928** and `cos(36.9°)` = **0.800** of their
+intended output — **7 % and 20 % too dim**.
+
+**And it means the authored "aim" does nothing an author would want.** An area light here is
+Lambertian: its radiance is uniform over the hemisphere about `normal`, and the cosine lives in the
+*geometry* term, not in a falloff. Tilting `normal` therefore does not beam light toward anything —
+it only rescales the output by `cos(tilt)` and shifts which hemisphere is lit. `mirror_selfie`'s
+comment ("face the back wall head-on") is achieved by where the panels *are*, not by the tilt; the
+tilt is purely costing it 7–20 % of the light.
+
 **THE DEFECT IS A CONFLATION, not the override.** A flat rectangle's geometric normal is
 perpendicular to it, necessarily. But one field serves two jobs:
 
@@ -21288,7 +21318,17 @@ and moves no pixel.
 | `scraps/mesh_light3.ftsl` | **90.0°** — the normal lies *in* the panel's plane, fully degenerate |
 | my own glossy rigs (`_gwhl_*`, `_gwrec_*`, `_gwsz_*`) | 45.0° |
 
-**THE REAL FIX, when someone takes it:** split `Emitter`'s normal into `nEmit` (authored, aimable)
+**THE REAL FIX IS SMALLER THAN "SPLIT THE FIELD", now that the uses are traced.** `cosLight` is
+computed once in `emitterGeom` (`backward.h` ~598, hero twin ~1415) and used in exactly **three**
+places: the one-sided test `cosLight <= 0`, the geometry term `G = cosSurf·cosLight/dist²`, and the
+conversion `pdfW = dist²/(A·cosLight)`. The test is where an authored side is legitimate; the other
+two are pure geometry and must use `cross(u,v)`. And only the **Quad** shape is affected —
+`samplePoint` returns a genuinely geometric `nOut` for sphere (`(y-origin)/radius`), cylinder
+(`rad`) and mesh (`t.nrm`), and only the quad branch returns the authored field (`scene.h` ~1037).
+So the change is: give the quad branch a geometric normal for `G`/`pdfW` while keeping the declared
+one for the side test, in `emitterGeom` + its hero twin + the two device twins.
+
+*(The original framing, kept:)* split `Emitter`'s normal into `nEmit` (authored, aimable)
 and `nGeom` (always `normalize(cross(u,v))`), mirror it on the device, then audit every site that
 reads the normal for which of the two it wants — emission sampling and the side test take `nEmit`;
 every `pdf_A · dist²/cos`, every `G` term, and `lightSelPdf`'s cone reasoning take `nGeom`. Until
