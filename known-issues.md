@@ -6433,7 +6433,41 @@ scene's own pre-existing run-to-run beam-split variation (see the entry below), 
 120 s `-stop` wait — and the frame that seam sits inside now finishes 6x sooner, so a stop lands
 sooner in wall clock either way.
 
-### OPEN (2026-09-02, v0.209.0): the beam **split** is not reproducible run to run, so `-beams` renders of an identical command line differ
+### **FIXED** — re-tested 2026-09-12 at v0.273.10 (filed 2026-09-02, v0.209.0): the beam **split** is not reproducible run to run, so `-beams` renders of an identical command line differ
+
+> **RE-TESTED AND THE DEFECT IS GONE.** Three runs of this entry's own command line
+> (`gallery_rain -mode M -device gpu -beams -n 20000000`, with `-r` and `-spp` held fixed since
+> the split budget scales with `res x resY x spp`) now give **262 084 stored -> 1 675 636 after
+> split, identically, three times out of three**. The entry reported 6 208 839 / 6 286 537 /
+> 6 168 032 — a 1.9 % spread. There is no spread left. (The deposited count differs from the
+> entry's 264 022 because the scene and the tracer have both moved in ten days; what matters is
+> the run-to-run variance, which is zero.)
+>
+> **I did not find which change fixed it**, and the prescription in the body below — make the
+> split a pure function of the beam and a deterministically-reduced scalar — reads as still
+> undone, so this may have been fixed incidentally. `splitSah` is serial today and `pieces()`
+> sums `std::ceil(...)`, i.e. whole numbers, which add EXACTLY in double regardless of order;
+> that is the property the fix needed, however it arrived.
+>
+> **What remains, characterised, because "renders differ" was the headline and part of it is
+> still true:**
+>
+> | configuration | result |
+> |---|---|
+> | split count, 3 runs at 20 M photons | **bit-identical** |
+> | CPU frame, same binary, twice | **bit-identical** (0 / 43 200 floats) |
+> | GPU frame, `-beamfreeze`, `-spp 8`, twice | 2.6 % of floats differ, **median 8.6e-08, p90 1.2e-07**, frame mean identical to 7 digits |
+> | GPU frame, refresh on, `-spp 1` | differs substantially — but that image is ~100 % noise, and the light-side refresh is **wall-clock driven** by design (`epochSec = (rebuildSec + setupSec) / g_beamRefreshFrac`), so two runs can average a different number of realizations. `-beamfreeze` pins it. |
+>
+> So the residual GPU difference is **float accumulation order at ~1e-7 relative** — benign, and
+> the expected consequence of a parallel gather summing in whatever order the warps finish.
+>
+> **THE CONSEQUENCE THIS ENTRY CLAIMED IS WITHDRAWN.** It said "an A/B of any other change carries
+> a ~0.7/255 noise floor and a regression smaller than that cannot be detected at all". That floor
+> is now **zero on the CPU and ~1e-7 on the GPU**, so `-beams` A/Bs are as sensitive as the
+> estimator allows. That matters well beyond this entry: it was the stated reason small `-beams`
+> effects were considered unmeasurable, and M-GATHERAREA spent several iterations reasoning around
+> a floor that no longer exists. **Re-test a floor before you plan around it.**
 
 **Observed.** Three runs of the identical command (`gallery_rain`, `-mode M -device gpu -beams
 -n 20000000`) deposit **exactly** 264 022 beams every time — the forward pass is deterministic —
