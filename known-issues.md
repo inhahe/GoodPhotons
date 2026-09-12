@@ -1717,6 +1717,54 @@ knee's own variance is understood — shrinking the pilot on a scene where the e
 unstable would make the map size *more* random, not less. `FTRACE_JPILOT=<n>` overrides the size
 for exactly this investigation.
 
+### BEAMORDER-GPU — OPEN (2026-09-12, found while starting VOLCACHE's `_fog_thick` check): `PhotonBeam::order` is **never set on the device**, so VOLCACHE's own order histogram is silently empty under `-device gpu` — and the report counts the untracked chords in its DENOMINATOR
+
+Same scene, same binary, same everything but the backend:
+
+    -device cpu   scattering order of stored chords: 1:60.1% 2:16.7% 3:9.2% 4:5.6% 5:3.4% 6:2.0% 7+:3.0%
+    -device gpu   scattering order of stored chords:        <- label, no data
+
+The CPU row reproduces the distribution VOLCACHE records (59.3 / 16.8 / 9.1 / 5.6 / 3.4 / 2.0 /
+3.8) to within a point, so the field works on the host. `DBeamDep` (render_cuda.cu ~4843) — the
+device twin of `PhotonBeam`, written by `dEmitBeams` and downloaded into the host `BeamMap` —
+**has no `order` member at all**, so every device-deposited chord arrives on the host with
+`order == 0`.
+
+**The reporting defect is the worse half, and it is the same shape as two other bugs this file
+records.** `main.cpp` ~12431 classifies a chord as *untracked* only when it equals
+`kBeamOrderUnknown` (255). `0` is not that sentinel, so it is counted as **known**; then the
+print loop starts at `o = 1` and drops `hist[0]` from the display. The result is a population that
+is **excluded from the output but included in the denominator**, and the
+`[some chords did not track order]` note that exists for precisely this case never fires because
+`0 != 255`. Today 100 % of device chords are 0, so the row is merely blank — visible if you look.
+The dangerous case is a MIXED map, where every printed percentage would be quietly too low with
+nothing saying so.
+
+That is the third instance of the same error in this file: the `GaDiagMat::fiber` percentage
+divided a per-gather-point counter by a per-probe total (M-GATHERAREA), and `-beamk`'s knee put a
+fixed-seed probe count in a denominator. **When a diagnostic's denominator and numerator are
+populated by different code paths, check that every member of the denominator could have
+contributed to the numerator.**
+
+**Consequences.**
+* VOLCACHE's order distribution, and the "40.7 % of chords are order >= 2" cross-validation built
+  on it, are **CPU-only results**. They are not wrong — the CPU row still reproduces — but they
+  cannot be re-measured on the GPU, and the entry does not say so.
+* Any `-device gpu` mode-`M` beams render loses the diagnostic silently.
+* `-beams-order <n>` itself is unaffected: it is applied at deposit time in `render.h`'s
+  `beamMSAllowed`, which is a different mechanism from the stored field.
+
+**The fix, in two independent parts.**
+1. *Reporting, host-only, no render change*: treat `order == 0` as untracked rather than known, so
+   it leaves the denominator and the existing note fires. This is worth doing on its own — it
+   converts a silently wrong percentage into an explicit gap.
+2. *Device*: add `order` to `DBeamDep`, set it at the `dEmitBeams` call site from the device's own
+   scatter counter (the host passes `beamScatters + 1`, and render_cuda.cu ~9067 already names
+   `beamScatters` as its twin), and carry it through the download into `PhotonBeam`.
+
+**Workaround meanwhile: measure the order distribution with `-device cpu`,** which is what
+VOLCACHE's existing numbers used.
+
 ### VOLCACHE — OPEN (2026-09-06, v0.257.0): the radiance cache covers diffuse *surfaces* only, so the volumetric gather — which is where ~all of a `gallery_rain` frame's time actually goes — is recomputed in full every frame of a flyby
 
 **The measurement that motivates this.** A flyby amortises the forward pass across frames, and
