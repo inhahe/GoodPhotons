@@ -133,6 +133,10 @@ struct GaDiagMat {
     // the gaps and hit something far below. See M-GATHERAREA, the fur-vs-hair split.
     std::atomic<long long> deep{0};
     std::atomic<long long> depthMilli{0};   // sum of 1000*depth/r, integral so it can be atomic
+    // Is the GATHER POINT itself on a fiber? Counted so the type test can be verified to separate
+    // fur from mesh before anything is gated on it -- every statistic tried so far (reject rate,
+    // depth, deep%) failed to. Per material, so the table shows the split directly.
+    std::atomic<long long> fiber{0};
 };
 inline std::vector<GaDiagMat>& gaDiag() {
     static std::vector<GaDiagMat> t(1024);      // matId is small; 1024 is far past any scene
@@ -140,8 +144,16 @@ inline std::vector<GaDiagMat>& gaDiag() {
 }
 
 inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
-                             double r, Pcg32& rng, int M, int matId = -1) {
+                             double r, Pcg32& rng, int M, int matId = -1,
+                             double fiberR = 0.0) {
     if (M <= 0 || !(r > 0.0)) return 1.0;
+    // Is the gather point itself on a fiber? TALLY ONLY -- nothing is gated on it, because the
+    // tally is what showed it cannot be: see M-GATHERAREA. A gather point on a 0.64 mm strand has
+    // no surface footprint for a disc to be clipped against, so skipping the correction there is
+    // the right idea, but `cr_coat` (used by `fur` blocks and nothing else) reports fiberRadius > 0
+    // on only 15.9 % of its probes, so the test cannot reach the other 84 %.
+    if (fiberR > 0.0 && gaDiagOn() && matId >= 0 && matId < (int)gaDiag().size())
+        gaDiag()[matId].fiber.fetch_add(1, std::memory_order_relaxed);
     Vec3 t, b; onb(n, t, b);
     double area = 0.0;                 // in units of the full disc, so 1.0 == fully covered
     int   nRej = 0;                    // probes that FOUND geometry facing the wrong way
@@ -260,14 +272,15 @@ inline void gaDiagReport(const Scene& scene) {
     for (const auto& mg : scene.meshGroups)
         if (mg.matId >= 0 && mg.matId < (int)nm.size() && nm[mg.matId].empty())
             nm[mg.matId] = mg.name;
-    struct Row { int id; long long mi, rj, ac, tot, dp, dm; };
+    struct Row { int id; long long mi, rj, ac, tot, dp, dm, fb; };
     std::vector<Row> rows;
     for (int i = 0; i < (int)gaDiag().size(); ++i) {
         const long long mi = gaDiag()[i].miss.load(), rj = gaDiag()[i].reject.load(),
                         ac = gaDiag()[i].accept.load();
         if (mi + rj + ac > 0)
             rows.push_back({i, mi, rj, ac, mi + rj + ac,
-                            gaDiag()[i].deep.load(), gaDiag()[i].depthMilli.load()});
+                            gaDiag()[i].deep.load(), gaDiag()[i].depthMilli.load(),
+                            gaDiag()[i].fiber.load()});
     }
     if (rows.empty()) return;
     std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.tot > b.tot; });
@@ -275,19 +288,21 @@ inline void gaDiagReport(const Scene& scene) {
         "\n[gadiag] why a footprint probe contributed nothing, per material.\n"
         "[gadiag] MISS = the disc overhangs empty space (truncation). REJECT = geometry is there\n"
         "[gadiag] but faces the wrong way (a tangle). Same coverage, opposite causes.\n"
-        "[gadiag] %-22s %10s %8s %8s %8s %8s %8s\n", "material", "probes",
-        "miss%", "rej%", "acc%", "depth/r", "deep%");
+        "[gadiag] %-22s %10s %8s %8s %8s %8s %8s %8s\n", "material", "probes",
+        "miss%", "rej%", "acc%", "depth/r", "deep%", "fiber%");
     char buf[24];
     for (size_t k = 0; k < rows.size() && k < 24; ++k) {
         const Row& r = rows[k];
         const long long hits = r.rj + r.ac;
-        std::fprintf(stderr, "[gadiag] %-22s %10lld %7.1f%% %7.1f%% %7.1f%% %8.3f %7.1f%%\n",
+        std::fprintf(stderr,
+                     "[gadiag] %-22s %10lld %7.1f%% %7.1f%% %7.1f%% %8.3f %7.1f%% %7.1f%%\n",
                      nmOf(scene, r.id, buf),
                      r.tot, 100.0 * (double)r.mi / (double)r.tot,
                      100.0 * (double)r.rj / (double)r.tot,
                      100.0 * (double)r.ac / (double)r.tot,
                      hits ? (double)r.dm / 1000.0 / (double)hits : 0.0,
-                     hits ? 100.0 * (double)r.dp / (double)hits : 0.0);
+                     hits ? 100.0 * (double)r.dp / (double)hits : 0.0,
+                     100.0 * (double)r.fb / (double)r.tot);
     }
 }
 
@@ -735,7 +750,8 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     // leaves nrmOut untouched, so every existing render is bit-identical.
                     if (const int gaM = gatherAreaSamples())
                         nrmOut *= gatherAreaScale(
-                            gatherCoverage(scene, h.p, h.n, rq, rng, gaM, h.matId));
+                            gatherCoverage(scene, h.p, h.n, rq, rng, gaM, h.matId,
+                                           h.fiberRadius));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
                         if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
@@ -1080,7 +1096,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     // leaves nrmOut untouched, so every existing render is bit-identical.
                     if (const int gaM = gatherAreaSamples())
                         nrmOut *= gatherAreaScale(
-                            gatherCoverage(scene, h.p, h.n, rq, rng, gaM, h.matId));
+                            gatherCoverage(scene, h.p, h.n, rq, rng, gaM, h.matId,
+                                           h.fiberRadius));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
                         if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage

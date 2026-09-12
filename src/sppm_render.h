@@ -366,7 +366,8 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     grng.seed(((uint64_t)y << 20) ^ (uint64_t)x,
                               0x9e3779b97f4a7c15ULL ^ (uint64_t)st.passes);
                     phi = phi * gatherAreaScale(
-                        gatherCoverage(scene, h.p, h.n, P.radius, grng, gaM));
+                        gatherCoverage(scene, h.p, h.n, P.radius, grng, gaM, h.matId,
+                                       h.fiberRadius));
                 }
                 // Progressive radius / flux update (shared-statistics PPM).
                 double Nnew = P.nAcc + alpha * M;

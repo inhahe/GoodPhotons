@@ -3297,6 +3297,37 @@ already available at the gather site, and the gather already passes `h.matId`, s
 `type diffuse`, so a material-type test would return false for it — and a geometric test is the
 better choice anyway, being independent of whatever material an author paints on the strands.
 
+**THE TYPE TEST WAS PROTOTYPED AND IT CANNOT CARRY THE GATE — because `fiberRadius` is missing on
+84 % of the hits it should be set on.** The tally is now a permanent `fiber%` column in the
+`FTRACE_GADIAG` table (v0.276.5, tally only, nothing gated on it), and it says:
+
+| material | probes | rej% | **fiber%** |
+|---|---|---|---|
+| `mat39` (`cr_coat`, the fur) | 3 732 | 16.7 % | **15.9 %** |
+| `mat45` (the mesh ROI) | 7 834 | 10.3 % | **0.0 %** |
+| every other material (14 of them) | — | — | **0.0 %** |
+
+**Perfectly specific, hopelessly insensitive.** Only the fur material has fiber gather points at
+all, so the discriminator does separate fur from mesh with no false positives across fifteen
+materials — exactly what the entry asked for. But it reaches only 15.9 % of the fur's own probes, so
+gating on it would leave 84 % of the overfill uncorrected.
+
+**And that 84 % is an anomaly, not a property of the scene.** `cr_coat` is used by the fifteen `fur`
+blocks and **by nothing else** — no mesh carries it — so every one of those 3 732 probes is on
+strand geometry by construction. `-fur-volume` is opt-in and was not passed (the log shows real
+strands: 56 549 on the barrel alone), so the far tier is not swallowing them either. Yet
+`Hit::fiberRadius`, which `curve.h` ~372 sets on every curve hit, is zero for 84 % of them. So
+either that contract is not held on all curve paths, or mode `M`'s gather reconstructs its `Hit`
+somewhere that drops the field.
+
+**That is the thing to fix first, and it is worth more than this gate.** `fiberRadius` is not a
+diagnostic field: `scene.h` ~2854 uses it to decide whether a hair connection may step past the
+strand's own body, and `design.md` records a shadow-ray epsilon of `2.5 × Hit::fiberRadius` that
+"every shadow ray that uses it must also shorten its max-t by the same amount". A field that is
+silently zero on most curve hits affects those too. Once it is reliable, re-run this tally: if
+`fiber%` goes to ~100 % for `cr_coat`, the type test becomes both specific and sensitive and the
+gate is worth building.
+
 Not implemented: it would change mode `M`/`S` output on any scene with fur, so it wants its own
 change with the four-ROI measurement this entry already specifies, plus the device twin.
 
