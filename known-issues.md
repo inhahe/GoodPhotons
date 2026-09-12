@@ -1643,6 +1643,74 @@ justify unbounded complexity.
   on the ground. So this is not a marginal term that could simply be dropped — but it also means
   any flattening of its structure shows up in the one region where nothing else contributes.
 
+**THE PREMISE IS MEASURED, AND IT DOES NOT HOLD ON `gallery_rain` (2026-09-11).** This entry
+assumes the cacheable half is "the multiple-scattering, low-frequency in-scatter wash. Slowly
+varying in space, nearly isotropic after a few scatters", and argues it from the ORDER
+distribution: 67 % of multiple scatter arrives at order >= 3, "exactly the regime where the
+radiance field smooths out". **That argument establishes DIRECTIONAL isotropy, and a world-space
+cell cache needs SPATIAL smoothness.** A field can be perfectly isotropic at every point and still
+vary sharply from point to point; only the spatial claim decides whether cells smear it. It had
+never been tested.
+
+**Isolating the order >= 2 field needs the kernel PINNED, and the first attempt did not pin it.**
+`full - (-beams-order 1)` looks like a clean subtraction and is not: the order-1 arm deposits
+~1.8x fewer chords, so the `-beamk` knee picks **different kernel radii** (0.01298 -> 0.01376 and
+0.01734 -> 0.0191 across the two media), and a density estimate divided by kernel measure scales
+directly with that. The tell was that multiple scatter came out **negative** — −2.8 % and −7.1 %
+of the light in the top two thirds — which is physically impossible, since adding scattering
+orders cannot reduce radiance. An impossible value is the cheapest possible signal that a confound
+is larger than the effect. With `-beamradius 0.0135` forced on both arms the negatives vanish and
+the field reads **+33.9 % / +3.6 % / +75.0 %**.
+
+**Then the roughness has to be separated from Monte Carlo noise, because the difference image
+carries both arms' noise.** `full - order1` is a difference of two independent renders on a signal
+that is ~34 % of the frame, so its relative noise is roughly 3x either arm's, while the
+single-scatter comparison is a direct render at 1x. Any raw roughness ratio is therefore biased
+toward multiple scatter looking rougher no matter what the field does — the uncorrected number was
+"2.4x rougher", and it means nothing. Render both arms at TWO seeds and cross-correlate the
+difference images' Laplacians instead: noise is independent between seeds and cancels in the
+cross-term, so what survives is structure power (`scraps/ms_struct.py`).
+
+| band | **MS** structure fraction | **SS** structure fraction (control) |
+|---|---|---|
+| top third (the rain volume) | **0.334** | −0.057 |
+| middle | −0.000 | 0.008 |
+| bottom third (ground) | 0.000 | **0.192** |
+
+**In the rain volume — where this entry says multiple scatter is +282 % of the signal and where a
+volume cache would do its work — a third of the order >= 2 field's fine detail is real,
+reproducible spatial structure**, about 5 sigma against the estimator's ~±0.06 noise floor. Single
+scatter there is smooth: its high-frequency content is all noise, which is correct rather than a
+rig failure, because a rainbow is a smooth angular GRADIENT and a Laplacian sees nothing in a
+gradient. The control resolves real structure where it exists — SS scores 0.192 on the ground.
+
+**It is not beam-streak artifact, which was the alternative that would have flipped the
+conclusion.** If the fine structure were the beam map's own discretisation, a cache would AVERAGE
+it away and improve matters. But the two difference images come from different seeds and therefore
+entirely different beam maps, so streaks cannot correlate between them. What survives the
+cross-correlation is the field.
+
+**And image-space roughness is a LOWER bound on field roughness**, because a camera ray through a
+medium integrates the in-scatter field along its whole path — every pixel already averages many
+world-space cells, and perspective compresses distant ones further. A rough image implies a field
+at least that rough. The inference runs in the direction that matters.
+
+**So the entry's own warning is now quantified rather than feared**: *"any flattening of its
+structure shows up in the one region where nothing else contributes."* It would. A cell cache
+sized by the clipmap (~1 m cells at 20 m) averages over many pixels of a field with measurable
+pixel-scale structure, in the only region where that field is the dominant signal.
+
+**Status: the simple form of VOLCACHE — cache order >= 2, skip those beams — is NOT supported by
+this measurement.** What is not ruled out is a split design that caches only the low-frequency part
+and leaves a residual to the gather, but that is a substantially different and larger feature than
+this entry proposes, and it must be justified on its own terms. The ~30 % ceiling remains correct
+as a COST figure; what changed is the evidence that spending it is safe.
+
+**The rig is two scripts and four renders**, so re-testing on another scene is cheap:
+`-beamradius` pinned, two seeds, `scraps/ms_struct.py`. A scene whose medium is genuinely
+diffuse — `_fog_thick`, which measures 82.8 % order >= 2 against `gallery_rain`'s 40.7 % — is the
+obvious candidate, and would be the thing to check before closing this line off entirely.
+
 **GROUNDWORK LANDED (2026-09-11, v0.273.4): `PhotonBeam::order`, so the order distribution can
 be READ instead of inferred.** The cap `-beams-order` is applied at DEPOSIT time
 (`render.h`'s `beamMSAllowed`), so nothing downstream could tell an order-1 chord from an order-5
