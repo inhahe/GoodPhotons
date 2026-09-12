@@ -600,13 +600,20 @@ struct BackwardRenderer {
         double cosSurf, stG;                             // response is a shadow WALK, and
         if (!response(wi, cosSurf, stG)) return false;    // a back-facing sample is free to skip
         if (blocked(wi, dist, 2e-6)) return false;
-        double G = cosSurf * cosLight / dist2;           // geometry term
+        // The SIDE test above used the authored normal, where an aimed panel is legitimate. The
+        // MEASURE below is the solid angle the PATCH subtends, so it belongs to the patch's own
+        // orientation: a `normal` tilted out of plane otherwise scales this emitter's whole
+        // contribution by cos(tilt). Identical expression, bit for bit, unless the light is
+        // actually tilted (see Emitter::normalTilted).
+        const double cosGeo = em.normalTilted ? std::fabs(dot(em.nGeom, wi * -1.0)) : cosLight;
+        if (!(cosGeo > 0.0)) return false;
+        double G = cosSurf * cosGeo / dist2;             // geometry term
         w = G * effArea * stG;                           // pdf_area = 1/effArea (visible area for cylinder)
         if (epat != 1.0) w *= epat;                      // no-op (and bit-identical) without a pattern
         // Area measure -> solid angle: pdf_W = pdf_A * dist^2 / cos(light). `epat` is a
         // RADIANCE profile folded into `w`, not a change of density, so it does not appear.
-        if (pdfWOut && effArea > 0.0 && cosLight > 0.0)
-            *pdfWOut = dist2 / (effArea * cosLight);
+        if (pdfWOut && effArea > 0.0 && cosGeo > 0.0)
+            *pdfWOut = dist2 / (effArea * cosGeo);
         wiOut = wi;
         return true;
     }
@@ -1416,7 +1423,12 @@ struct BackwardRenderer {
                 if (cosLight <= 0) continue;
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
                 double phase = med.phaseValue(dot(wIn, wi), lambda);
-                double G = cosLight / dist2;               // no surface cosine at a volume vertex
+                // Patch orientation for the measure, authored normal for the side test above --
+                // see emitterGeom. Bit-identical unless the light is tilted.
+                const double cosGeoV = em.normalTilted ? std::fabs(dot(em.nGeom, wi * -1.0))
+                                                       : cosLight;
+                if (!(cosGeoV > 0.0)) continue;
+                double G = cosGeoV / dist2;                // no surface cosine at a volume vertex
                 contrib = albedo * phase * emitW * G * effArea;
                 if (epat != 1.0) contrib *= epat;
             }

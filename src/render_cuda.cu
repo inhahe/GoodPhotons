@@ -878,6 +878,8 @@ struct DEmitTri { DVec3 v0, e1, e2, nrm; double cumArea; DVec3 uv0, uvE1, uvE2; 
 // wavelength CDF slice inside the flattened lightCdfAll buffer.
 struct DEmitter {
     DVec3  origin, u, v, normal, beamDir;
+    DVec3  nGeom;              // quad: normalize(cross(u,v)); see Emitter::nGeom
+    int    normalTilted;       // 1 when the authored normal left the patch's plane
     double area, power;
     int    collimated;
     int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder, 5 mesh, 6 sun
@@ -10126,12 +10128,20 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     if (cosLight <= 0) return false;
     if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
            : occludedTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist, 2 * RAY_EPS)) return false;
-    g.G = g.cosSurf * cosLight / g.dist2;
+    // Side test above: authored normal. Measure below: the patch's own orientation, since the
+    // solid angle a patch subtends depends on how it is oriented and not on where its emission is
+    // aimed. Host twin backward.h's emitterGeom, where the reasoning lives. Bit-identical unless
+    // the light is actually tilted.
+    const double cosGeo = em.normalTilted
+                              ? fabs((double)ddot(em.nGeom, g.wi * (Real)(-1)))
+                              : (double)cosLight;
+    if (!(cosGeo > 0.0)) return false;
+    g.G = (Real)((double)g.cosSurf * cosGeo / (double)g.dist2);
     if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
     g.fall = (Real)1; g.spot = false; g.sun = false;
     // Uniform over em.area, so pdf_W = pdf_A * dist^2 / cos(light). `epat` is a radiance
     // profile folded into G, not a change of density, so it does not appear here.
-    g.pdfW = (em.area > 0) ? (Real)((double)g.dist2 / ((double)em.area * (double)cosLight))
+    g.pdfW = (em.area > 0) ? (Real)((double)g.dist2 / ((double)em.area * cosGeo))
                            : (Real)0;
     return true;
 }
@@ -16727,6 +16737,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.u       = {e.u.x, e.u.y, e.u.z};
         de.v       = {e.v.x, e.v.y, e.v.z};
         de.normal  = {e.normal.x, e.normal.y, e.normal.z};
+        de.nGeom   = {e.nGeom.x, e.nGeom.y, e.nGeom.z};
+        de.normalTilted = e.normalTilted ? 1 : 0;
         de.beamDir = {e.beamDir.x, e.beamDir.y, e.beamDir.z};
         de.area = e.area; de.power = e.power;
         de.collimated = e.collimated ? 1 : 0;

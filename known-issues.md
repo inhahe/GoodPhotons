@@ -21241,7 +21241,40 @@ normal was exactly anti-parallel to the tile→light direction), so every one of
 blind to the emitter cosine — I even wrote that down as a "rig blind spot" and only then thought to
 tilt the panel, which is what exposed it.
 
-## OPEN (2026-09-12): an area light's emission normal and its GEOMETRIC normal are the same field, so an aimed panel is silently inconsistent — **warned since v0.276.1**
+## ~~OPEN~~ **DONE (v0.276.3)** (2026-09-12): an area light's emission normal and its GEOMETRIC normal were the same field, so a tilted panel was dimmed by exactly `cos(tilt)`
+
+**FIXED IN v0.276.3.** `Emitter` now carries `nGeom` (the patch's own `normalize(cross(u,v))`) and
+a `normalTilted` flag, both computed once in `addAreaLight` — the single choke point every quad
+emitter goes through, loader and built-in scenes alike. `emitterGeom`, the volume NEE and the
+device `bkEmitterGeom` use `nGeom` for the **measure** (the geometry term `G` and the
+area→solid-angle `pdfW`) while keeping the authored `normal` for the **one-sided test**, which is
+the one place an authored side is meaningful.
+
+| check | result |
+|---|---|
+| tilted 45° panel vs the geometrically-correct one | **1.0000** (was 0.7071) |
+| well-formed light, vs the pre-fix binary | **bit-identical**, 0 floats differ |
+| GPU vs CPU, both arms | 0.9999 |
+
+**The bit-identity is by construction, not by luck.** `normalize(cross(u,v))` and the stored
+`normal` are computed by different routes and differ in the last bits even when the light is
+well-formed, so substituting one for the other would have perturbed every quad-light scene ever
+rendered. Precomputing `normalTilted` and keeping the *original* float expression whenever it is
+false means a well-formed scene cannot move at all.
+
+**Only the Quad shape needed it:** `samplePoint` already returns a genuinely geometric normal for
+sphere (`(y-origin)/radius`), cylinder (`rad`) and mesh (`t.nrm`); only the quad branch handed back
+the authored field. And `lightPdfW` / `dLightPdfW` were already correct — they take the normal from
+the *hit*, which is the triangle's.
+
+**The warning stays, with new text.** A tilt no longer corrupts anything, so the old wording ("the
+emitter is then inconsistent…") became false and was replaced. It now says what is actually worth
+saying: an area light is **Lambertian**, so tilting `normal` does not aim or beam it — it only
+rotates which hemisphere emits — and to point light somewhere you move the panel or rotate `u`/`v`.
+`scenes/mirror_selfie.ftsl` still warns three times, and its wall-washes are now delivering the
+full output its author asked for rather than 0.928 and 0.800 of it.
+
+## ~~superseded heading~~ (kept for search: an area light's emission normal and its GEOMETRIC normal are the same field)
 
 `src/ftsl.h`: `normal` is a free override of the emission axis, defaulting to `cross(u,v)`, with no
 perpendicularity check. Declare one that is not perpendicular and the emitter's **rectangle lies in

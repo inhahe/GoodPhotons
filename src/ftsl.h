@@ -6336,12 +6336,13 @@ private:
                     const double deg = std::acos(std::fmin(1.0, std::fabs(d))) * 180.0 / PI;
                     std::fprintf(stderr,
                         "[light] WARNING: area light at (%g %g %g) declares `normal %g %g %g`, "
-                        "which is %.1f deg off perpendicular to its own `u`x`v`. The emitter is "
-                        "then inconsistent: its samples come from the rectangle while its pdf "
-                        "converts area to solid angle using `normal`, so MIS-combined estimators "
-                        "disagree with each other (measured +5%% mode D vs mode R at a 45 deg "
-                        "tilt). To AIM the panel, rotate `u`/`v` so the rectangle actually faces "
-                        "that way; use `normal` only to choose which SIDE of the panel emits.\n",
+                        "which is %.1f deg off perpendicular to its own `u`x`v`. Since 0.276.3 "
+                        "the MEASURE is handled correctly -- the area<->solid-angle conversion "
+                        "uses the patch's own orientation, so the tilt no longer dims this light "
+                        "by cos(tilt) -- but it is probably still not what you meant: an area "
+                        "light is LAMBERTIAN, so tilting `normal` does not aim or beam it, it "
+                        "only rotates which hemisphere emits. To point light somewhere, move the "
+                        "panel or rotate `u`/`v`; use `normal` only to pick which SIDE emits.\n",
                         o.x, o.y, o.z, nrm.x, nrm.y, nrm.z, deg);
                 }
             }
