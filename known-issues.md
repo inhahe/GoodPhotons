@@ -3006,6 +3006,56 @@ centroid sits 4r/3π ≈ 0.42 r off-centre and a strand is anisotropic. It softe
 (third column above) instead of separating them: it is a weaker correction everywhere, not a
 correction that fires only where it belongs.
 
+**A SIGNAL THAT DOES SEPARATE THEM, MEASURED (2026-09-11, v0.273.5, `FTRACE_GADIAG=1`).** This
+entry's blocking conclusion is that *"cloth and fur receive the same correction factor to within
+1 %, so no rule reading only the coverage can separate them"*. That is true, and it is about the
+COVERAGE. The probe loop computes a second, purely geometric quantity and then discards it:
+
+    const Hit h = scene.closestHit(...);
+    if (h.valid && h.t <= 2.0 * r) {
+        const double c = dot(h.n, n);
+        if (c >= 0.5) area += 1.0 / c;     // "no hit" and "hit, wrong normal" BOTH add 0
+    }
+
+A probe that finds **empty space** and a probe that finds **geometry facing the wrong way** both
+contribute nothing, and they mean opposite things. Truncation — a cloth edge, a strand at a
+silhouette — overhangs nothing, so it MISSES. A tangle has geometry everywhere, so it HITS and is
+REJECTED on the 60-degree test. Splitting the two costs three counters and no behaviour change
+(`gatherCoverage` is bit-identical with the flag off). `gallery_rain`, 160x90, 4 spp:
+
+| material | probes | miss % | **reject %** | accept % | reject / (miss+reject) |
+|---|---|---|---|---|---|
+| mat0 — flat ground | 66 054 | 0.3 | **0.0** | 99.7 | — (the null, as it should be) |
+| mat1 | 6 066 | **75.8** | 6.0 | 18.2 | **7.3 %** |
+| mat13 | 27 436 | 43.7 | 1.6 | 54.7 | 3.5 % |
+| mat16 | 6 392 | 51.5 | 2.5 | 46.1 | 4.6 % |
+| **mat39** (fur) | 3 716 | 37.9 | **16.8** | 45.3 | **30.7 %** |
+| **mat40** (fur) | 1 350 | 30.1 | **19.1** | 50.8 | **38.8 %** |
+| mat45 | 7 834 | 40.9 | **10.2** | 48.9 | 20.0 % |
+
+`photonmap_render.h`'s own comment names the fur as **mats 38-41**, and those are exactly the rows
+with elevated reject rates — 16.8 % and 19.1 % against 0-6 % for everything else. The truncation
+extreme, mat1 at 75.8 % miss, sits at 7.3 % on the ratio. **That is a 5-10x separation between the
+two failure modes this entry says cannot be told apart**, on a quantity the estimator already
+computes.
+
+**What this does and does not establish.** It establishes that the SIGNAL exists and is geometric,
+so it escapes both of this entry's blocking results — the coverage one (this is not the coverage)
+and the photon-statistic one (this reads geometry, not photons). It does **not** establish that a
+rule built on it works: the previous four attempts all failed at the step *after* the signal, by
+softening both columns instead of separating them, and a gate on reject-fraction could do the same.
+The honest next step is to implement the simplest possible rule and score
+`alice_hair` / `alice_dress` / `cap_gyroid` / `creature` together — the fur ROI included from the
+start, since this entry's own reframing records that omitting it is what let the original framing
+survive for a year.
+
+**Why the fur needs the opposite correction, which the split also explains.** The probe takes the
+NEAREST hit, so it measures the VISIBLE surface; the query gathers from the whole ball. On a
+tangle the same-facing area inside the ball is far larger than the disc, so the estimate should be
+divided by MORE and read darker — while the measured coverage is low, so the shipped correction
+multiplies by 1/cov and reads **+48 %** brighter. Sign backwards, for a reason the reject rate is
+the visible symptom of.
+
 **Why no photon statistic can work**, from the per-material instrumentation (a 150 s
 `gallery_rain` render dumping, per material, the mean σ_major/r, σ_minor/r, |μ|/r, gate-fire
 rate, applied ratio, and the accepted photons' normal agreement |mean n|):

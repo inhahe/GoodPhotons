@@ -40,6 +40,7 @@
 #include "geometry.h"
 #include "parallel.h"      // ft::stopRequested — cooperative `-stop` inside the pixel loop
 #include "render_progress.h"   // StageProgress — deposit progress for the live window/title
+#include <algorithm>
 #include <atomic>
 
 #include <chrono>
@@ -70,8 +71,28 @@ inline int gatherAreaSamples() {
     }();
     return m;
 }
+// FTRACE_GADIAG=1: per-material tally of WHY a probe contributed nothing. See the M-GATHERAREA
+// fur case -- a probe that hits empty space and a probe that hits geometry facing the wrong way
+// both add 0 to the coverage, but they mean opposite things, and the shipped estimator cannot
+// tell them apart. Diagnostic only: off (the default) nothing below is touched and the estimate
+// is bit-identical.
+inline bool gaDiagOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_GADIAG");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+struct GaDiagMat {
+    std::atomic<long long> miss{0}, reject{0}, accept{0};
+};
+inline std::vector<GaDiagMat>& gaDiag() {
+    static std::vector<GaDiagMat> t(1024);      // matId is small; 1024 is far past any scene
+    return t;
+}
+
 inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
-                             double r, Pcg32& rng, int M) {
+                             double r, Pcg32& rng, int M, int matId = -1) {
     if (M <= 0 || !(r > 0.0)) return 1.0;
     Vec3 t, b; onb(n, t, b);
     double area = 0.0;                 // in units of the full disc, so 1.0 == fully covered
@@ -125,6 +146,12 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
         // curved surface still count: within the disc it deviates from the plane by at most
         // ~r^2/(2R), far inside this window for any radius worth gathering at.
         const Hit h = scene.closestHit(Ray{q + n * r, n * -1.0});
+        if (gaDiagOn() && matId >= 0 && matId < (int)gaDiag().size()) {
+            GaDiagMat& g = gaDiag()[matId];
+            if (!(h.valid && h.t <= 2.0 * r))          g.miss.fetch_add(1, std::memory_order_relaxed);
+            else if (dot(h.n, n) < 0.5)                g.reject.fetch_add(1, std::memory_order_relaxed);
+            else                                       g.accept.fetch_add(1, std::memory_order_relaxed);
+        }
         // Same 60-degree acceptance the photon query uses (dot(ph.n, h.n) < 0.5 rejects), so the
         // footprint and the estimator agree on what surface is "here".
         if (h.valid && h.t <= 2.0 * r) {
@@ -145,6 +172,44 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
 }
 // Never divide by a coverage so small that one stray probe inflates a pixel into a firefly. A
 // gather that finds under a twentieth of its disc is not a measurement worth rescaling.
+// Report the split, most-probed material first. Names come from MeshGroup, which is the only
+// place an authored name survives the flatten into Scene::tris.
+inline const char* nmOf(const Scene& sc, int matId, char* buf) {
+    if (const char* n = sc.meshNameForMat(matId)) return n;
+    std::snprintf(buf, 24, "mat%d", matId);
+    return buf;
+}
+inline void gaDiagReport(const Scene& scene) {
+    if (!gaDiagOn()) return;
+    std::vector<std::string> nm(gaDiag().size());
+    for (const auto& mg : scene.meshGroups)
+        if (mg.matId >= 0 && mg.matId < (int)nm.size() && nm[mg.matId].empty())
+            nm[mg.matId] = mg.name;
+    struct Row { int id; long long mi, rj, ac, tot; };
+    std::vector<Row> rows;
+    for (int i = 0; i < (int)gaDiag().size(); ++i) {
+        const long long mi = gaDiag()[i].miss.load(), rj = gaDiag()[i].reject.load(),
+                        ac = gaDiag()[i].accept.load();
+        if (mi + rj + ac > 0) rows.push_back({i, mi, rj, ac, mi + rj + ac});
+    }
+    if (rows.empty()) return;
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.tot > b.tot; });
+    std::fprintf(stderr,
+        "\n[gadiag] why a footprint probe contributed nothing, per material.\n"
+        "[gadiag] MISS = the disc overhangs empty space (truncation). REJECT = geometry is there\n"
+        "[gadiag] but faces the wrong way (a tangle). Same coverage, opposite causes.\n"
+        "[gadiag] %-22s %10s %8s %8s %8s\n", "material", "probes", "miss%", "rej%", "acc%");
+    char buf[24];
+    for (size_t k = 0; k < rows.size() && k < 24; ++k) {
+        const Row& r = rows[k];
+        std::fprintf(stderr, "[gadiag] %-22s %10lld %7.1f%% %7.1f%% %7.1f%%\n",
+                     nmOf(scene, r.id, buf),
+                     r.tot, 100.0 * (double)r.mi / (double)r.tot,
+                     100.0 * (double)r.rj / (double)r.tot,
+                     100.0 * (double)r.ac / (double)r.tot);
+    }
+}
+
 inline double gatherAreaScale(double cov) {
     return (cov >= 0.05) ? 1.0 / cov : 1.0;
 }
@@ -588,7 +653,8 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     // disc. `gatherAreaSamples() == 0` (the default) returns coverage 1 and
                     // leaves nrmOut untouched, so every existing render is bit-identical.
                     if (const int gaM = gatherAreaSamples())
-                        nrmOut *= gatherAreaScale(gatherCoverage(scene, h.p, h.n, rq, rng, gaM));
+                        nrmOut *= gatherAreaScale(
+                            gatherCoverage(scene, h.p, h.n, rq, rng, gaM, h.matId));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
                         if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
@@ -932,7 +998,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     // disc. `gatherAreaSamples() == 0` (the default) returns coverage 1 and
                     // leaves nrmOut untouched, so every existing render is bit-identical.
                     if (const int gaM = gatherAreaSamples())
-                        nrmOut *= gatherAreaScale(gatherCoverage(scene, h.p, h.n, rq, rng, gaM));
+                        nrmOut *= gatherAreaScale(
+                            gatherCoverage(scene, h.p, h.n, rq, rng, gaM, h.matId));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
                         if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage

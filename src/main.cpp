@@ -17033,6 +17033,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                          renderChunked, res, resY);
             mStats().report(std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - tM0).count());
+            gaDiagReport(scene);          // FTRACE_GADIAG=1; silent otherwise
             return out;
         }
     }

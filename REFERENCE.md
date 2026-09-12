@@ -1541,6 +1541,14 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   band instead, which is the only axis left once a frame is down to one sample per chunk — it
   works and is free, but bought nothing measurable on the scene that motivated it, and it makes
   pixels within one frame gather from different realizations, so it is **off by default**.
+- **`FTRACE_GADIAG=1` (diagnostic, mode `M`).** Per-material tally of *why* a `-gatherarea`
+  footprint probe contributed nothing: **MISS** (the disc overhangs empty space — truncation) or
+  **REJECT** (geometry is there but faces outside the 60 degree cone — a tangle). The shipped
+  estimator adds zero in both cases and so cannot tell them apart, which is what makes the
+  correction right on cloth and hair and wrong on dense fur. Measured on `gallery_rain`, the split
+  separates the two by 5-10x — flat ground 0.0 % reject, fur 17-19 %, the truncation extreme 6 %
+  against 76 % miss. Off by default and bit-identical when off. See `known-issues.md` →
+  `M-GATHERAREA`.
 - **`FTRACE_LOADSTATS=1` (diagnostic).** Prints one `[loadstats]` line after the scene loads,
   splitting the cost into **parse** (source text → block tree), **assets** (mesh files read and
   parsed from disk, with the part spent **decoding textures** for imported materials called out
