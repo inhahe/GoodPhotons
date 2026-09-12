@@ -5809,7 +5809,7 @@ as the one at fault.
     - **A gyroid SHELL is a diffuser, not a bank of prisms — and the plain sphere beats it.**
       The scene long asserted the opposite: its crystal gyroid was a shell (`|G| < 0.55`) on
       the theory that a gyroid is a pack of small prisms and prisms split light.
-      `scraps/_gemsweep.py` disproves it. A shell is a labyrinth of thin *curved sheets*, so a
+      `tools/_gemsweep.py` disproves it. A shell is a labyrinth of thin *curved sheets*, so a
       ray crosses a dozen of them and is deviated a dozen small random ways; what reaches the
       cap is a shadow with a filigree of sub-centimetre threads. The fix is not the lattice
       frequency but the *topology*: dropping the `abs` takes the field to `G < 0`, one of the
@@ -6019,7 +6019,7 @@ as the one at fault.
     - **The axicon has a 4 cm GIRDLE, and that is the only gem cut it can afford.** Asked to
       shape it "more like a diamond", the answer is that a diamond cut is an *anti-caustic*
       shape — but "how much gem silhouette can it carry" is a different question from "should
-      it be a brilliant", and it has its own sweep (`scraps/_gemsweep.py`, piece `gcone`; SF10,
+      it be a brilliant", and it has its own sweep (`tools/_gemsweep.py`, piece `gcone`; SF10,
       drop 0.65, 480 px / 600 spp, and **`GEMBOX=0.7`** — see the box caveat below). Everything
       added *above* the girdle plane, leaving the 45° conical exit face untouched:
 
@@ -6068,13 +6068,13 @@ as the one at fault.
       direction and the reason both are measured. Every other cap is unchanged to three
       decimals (gyroid 2.84 %/0.444→0.445, glass 0.00 % both), i.e. no side effects.
     - **`contained_by` is a hard clip in the gem rig, and its default box was shaving the
-      control.** `scraps/_gemsweep.py` boxed every piece at ±0.5 m while `vcone1.0`'s girdle
+      control.** `tools/_gemsweep.py` boxed every piece at ±0.5 m while `vcone1.0`'s girdle
       radius is 0.56, so every axicon number the rig printed before the girdle sweep was
       measured on a cone with four flats cut into its rim. Harmless for *ranking* shapes that
       all share the box, which is why the default is unchanged — but `GEMBOX=0.7` now exists,
       and any absolute axicon number must say which box it came from. (The rows above are all
       `GEMBOX=0.7`; the rows in the piece-ranking table further up are all ±0.5.)
-    - **Metrics do not replace looking at it: `scraps/_capcrop.py`.** It crops a cap's screen
+    - **Metrics do not replace looking at it: `tools/_capcrop.py`.** It crops a cap's screen
       footprint out of the float buffer and prints it three ways — *as shipped* (exactly the
       PNG), *under-exposed* (gain set so the cap's own 2×2 peak lands just under white), and
       *chromaticity only* (renormalised to equal luminance, saturation stretched). The three

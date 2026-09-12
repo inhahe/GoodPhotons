@@ -6931,7 +6931,7 @@ buys caustic *sharpness*, and `gallery_rain` needed both.
 anywhere, the scene is meant to showcase good caustics."
 
 **What it was not.** Not missing energy and not wrong colour. Metered per cap with
-`scraps/_capchroma.py` on `-hdr` `.pfm` output, mode `M`'s caustic ratios came out comparable to
+`tools/_capchroma.py` on `-hdr` `.pfm` output, mode `M`'s caustic ratios came out comparable to
 the mode-`D` ground truth (axicon 5.30x, diamond 5.47x, glass 4.64x), and the amplified difference
 against a no-caustic control is a field of correctly-coloured caustics. Not the aimed pass either:
 the balance heuristic **conserves** caustic energy (`flux/emitted` 1817.83 vs 1815.88 across a 16x
@@ -11201,7 +11201,7 @@ to before.
 **Standing lesson.** A rendering CLI's console output can be broken in a way that no
 redirected test will ever catch. When touching terminal output, check it in a real console.
 
-### OPEN (2026-08-05): `scraps/_gemsweep.py` — `spread` is not resolution-stable and can invert a ranking
+### OPEN (2026-08-05): `tools/_gemsweep.py` — `spread` is not resolution-stable and can invert a ranking
 
 Found while adjudicating a box vs sphere clip for `gallery_rain`'s crystal gyroid. `coverage`
 is a *count* of cells above the cut, so it is stable across render resolution (the same
@@ -11234,7 +11234,7 @@ Until then: **never rank two pieces measured at different `GEMRES`**, and stamp 
 resolution into every printed row (`_remeter.py` already prints `[NNNpx]`; `_gemsweep.py`'s
 own sweep header prints it once but the per-row lines do not carry it).
 
-### DONE (2026-08-05): `scraps/_gemsweep.py` — `-fireflies 3` did not hold at the rig's own prescribed finalist setting
+### DONE (2026-08-05): `tools/_gemsweep.py` — `-fireflies 3` did not hold at the rig's own prescribed finalist setting
 
 `_gemsweep.py` is the caustic-metering rig used to adjudicate the gallery's glass exhibits
 (it renders one piece over a bare white cap in the gallery's sun, meters the float `.pfm`
@@ -11626,7 +11626,7 @@ whatever it is given to the cap albedo. The other nine sources are of unverified
 unwatermarked provenance and should be spot-checked at the same time. The raw drops themselves
 are deliberately left untracked (see `.gitignore`); only the prepared PNGs are committed.
 
-### OPEN (2026-08-04): `scraps/_capchroma.py` scores marble VEINS as a caustic — the metric assumes a uniform cap albedo
+### OPEN (2026-08-04): `tools/_capchroma.py` scores marble VEINS as a caustic — the metric assumes a uniform cap albedo
 
 **Symptom.** With the tabletops textured, the gyroid cap meters **coverage 4.55 %, sat 0.434,
 spread 0.201, fan 0.84** in the converged frame. The untextured control of the same frame meters
@@ -20526,10 +20526,41 @@ suspect outputs and re-run **once**. Mixed-`-spp` data is exactly the "one batch
 `-spp`" rule being violated by accident rather than by choice, which is the version of it that
 survives review.
 
-## OPEN (tech debt, 2026-08-04): `design.md`'s measurement rigs live in git-ignored `scraps/`
+## ~~OPEN~~ **DONE (2026-09-12)** (tech debt, 2026-08-04): `design.md`'s measurement rigs lived in git-ignored `scraps/`
 
-`design.md` cites `scraps/_gemsweep.py`, `scraps/_capchroma.py`, `scraps/_capcrop.py` and
-`scraps/_pfm.py` as the authority for decisions that are *shipped* in `scenes/gallery_rain.ftsl`
+**PROMOTED.** `_pfm.py`, `_capchroma.py`, `_capcrop.py` and `_gemsweep.py` now live in `tools/`,
+tracked, and the **22** path references were rewritten in the same commit — `design.md` (4),
+`scenes/gallery_rain.ftsl` (6), `known-issues.md` (12). Every measured table in `design.md` is now
+re-derivable from a clean clone. Each file was compared byte-for-byte against its new copy before
+the original was removed.
+
+**THE MOVE IS SAFE FOR A REASON WORTH WRITING DOWN.** `_capchroma` and `_gemsweep` compute
+`ROOT = dirname(dirname(abspath(__file__)))` and `chdir` there, then open `scenes/…` and
+`./ftrace.exe` relative to it. That works from `tools/` only because `tools/` and `scraps/` are
+**both exactly one level below the repo root**. A future home one level deeper — `tools/measure/`,
+say — would silently break all four by pointing `ROOT` at `tools/`. Verified empirically rather
+than by reading: `python tools/_gemsweep.py` prints its banner (so it resolved its config and its
+paths) and then fails only on the missing mode argument.
+
+**TWO CORRECTIONS TO THIS ENTRY'S OWN SCOPING, both found by checking before moving:**
+
+1. **The import closure is larger than the four.** `scraps/_cmp3.py` also imports `_pfm`, and
+   `scraps/_remeter.py` imports `_gemsweep`. Neither is cited in `design.md` or any scene (0 and 0),
+   so they are genuine throwaways rather than load-bearing — but moving the cluster would have
+   silently broken both. Each now carries a two-line `sys.path` shim pointing at `tools/`, and both
+   were re-run to confirm they still work.
+2. **`_capcrop` imports `_pfm` as well as `_capchroma`**, not just `_capchroma` as recorded. It does
+   not change the conclusion (the whole cluster moves together) but the stated graph was incomplete.
+
+Also: the "~40 path references" estimate was **22**, and `scraps/cmp_pfm.py` / `scraps/_cmp_pfm.py`
+— cited by `design.md` ~7104 and `scenes/_grin_scatfog.ftsl` — are the *same* latent risk and are
+**still in `scraps/`**. Both exist today, so nothing is stranded yet; left out deliberately because
+this entry named four files and a promotion should be auditable against what it claimed to do.
+
+## ~~superseded heading~~ (kept for search: design.md's measurement rigs live in git-ignored scraps/)
+
+`design.md` cites `tools/_gemsweep.py`, `tools/_capchroma.py`, `tools/_capcrop.py` and
+`tools/_pfm.py` as the authority for decisions that are *shipped* in `scenes/gallery_rain.ftsl`
 — which glass the axicon is cut from, what drop it hangs at, how big its cap is, and (2026-08-04)
 that it gets a 0.04 m girdle and no crown. Those files are **untracked**: `.gitignore` has a
 blanket `/scraps/`, on the correct general principle that scraps is for throwaway scripts.
@@ -20547,7 +20578,7 @@ that wants to be its own commit, not a rider on a scene tweak.
 
 ## FIXED (2026-08-05): `-fireflies 3` does not always clear the gem rig's peak, so `peak` alone can be nonsense
 
-While sweeping crown angles for the axicon's girdle (`scraps/_gemsweep.py piece gcone0.08/20/0.60
+While sweeping crown angles for the axicon's girdle (`tools/_gemsweep.py piece gcone0.08/20/0.60
 0.65`, SF10, 480 px / 600 spp, `-hdr -fireflies 3`) the rig printed:
 
 ```
@@ -21686,7 +21717,7 @@ either. It was a gyroid **shell**, `|G| < 0.55` — which is not a pack of prism
 scene asserted) but a labyrinth of thin *curved sheets*. A ray crosses a dozen of them and is
 deviated a dozen small random ways, so the piece is a **diffuser**: what lands on the cap is a
 shadow with a filigree of sub-centimetre threads, too thin to survive even a 4x box downsample.
-`scraps/_gemsweep.py` floats one piece at a time over a bare cap in the scene's own sun, box-
+`tools/_gemsweep.py` floats one piece at a time over a bare cap in the scene's own sun, box-
 averages 4x in linear light (mode D is one hero wavelength per sample, so raw per-pixel colour
 is speckle — see the entry below), and scores coverage above 1.2x the bare level, excess-
 weighted saturation, and peak:
@@ -21796,7 +21827,7 @@ Three further conclusions:
 
 **THE MEASUREMENTS ABOVE WERE ALL TAKEN THROUGH A CLIPPING 8-BIT PIPE, and that is a tooling
 bug big enough to have its own fix (2026-08-04).** Metering the shipped frame instead of the
-isolation rig (`scraps/_capchroma.py`, which projects each cap out of the scene through the
+isolation rig (`tools/_capchroma.py`, which projects each cap out of the scene through the
 still camera and runs the same metric) showed the axicon's in-scene caustic at spread 0.057
 against the rig's 0.212 — apparently a wash-out by the scene's sky-panel fill, which the rig
 does not have. It was not. **596 of that cap's 22639 pixels are exactly (255, 255, 255).** A
@@ -21978,7 +22009,7 @@ of it, over a 0.09 x 0.15 m patch. So `fan` validates a reading and `spread` siz
 axicon wins on magnitude 6:1 and the ordering is unchanged.
 
 **THEN LOOK AT IT, WHICH THE METRICS DO NOT REPLACE (2026-08-04).** All of the above is
-statistics on a cap; none of it says what the picture looks like. `scraps/_capcrop.py` crops a
+statistics on a cap; none of it says what the picture looks like. `tools/_capcrop.py` crops a
 cap's screen footprint out of the float buffer and prints it three ways, stacked and upscaled:
 **as shipped** (linear x GAIN, sRGB — exactly the PNG), **under-exposed** (gain set so the
 cap's own 2x2 peak lands just under white), and **chromaticity only** (every pixel renormalised
