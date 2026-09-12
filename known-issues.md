@@ -1375,6 +1375,54 @@ test is already built: the knee at 512 stratified rays must land on the **8 192-
 0.6 % stability must not regress. Note the fixed probe seed means this is a **deterministic**
 target, not a statistical one — the same scene must give the same answer, so the check is exact.
 
+**ATTEMPT 1 — A HALTON LATTICE INSTEAD OF THE RNG DRAW: TRIED, FAILED ITS PRE-REGISTERED TEST,
+REVERTED.** The reasoning was that this estimator is a quadrature that happens to be written as
+Monte Carlo — its seed is fixed, so nothing about it was ever meant to vary — and that six uniform
+dimensions with no stratification is why it lands short. Implemented as Halton in bases
+2/3/5/7/11/13, Cranley-Patterson rotated per dimension, identical closest-approach count, with
+`FTRACE_JPROBE_RANDOM=1` restoring the rng for a same-binary A/B. Converged reference first, from
+32 768 rng rays: **280 689** (`_fog_cornell`), **12 290** (`_fog_thick`, converged — 8 192 and
+32 768 agree to 0.6 %). Then 512 rays, three seeds, one binary:
+
+| scene | arm | seed 3 | seed 7 | seed 11 | spread | median / ref |
+|---|---|---|---|---|---|---|
+| `_fog_thick` | rng | 11 026 | 10 815 | 10 931 | 1.02x | 0.889x |
+| `_fog_thick` | **lattice** | 12 934 | 12 581 | 12 873 | 1.03x | **1.047x** |
+| `_fog_cornell` | rng | 221 325 | 238 700 | 213 536 | **1.12x** | 0.789x |
+| `_fog_cornell` | **lattice** | 202 754 | **352 240** | 243 120 | **1.74x** | 0.866x |
+
+**On the smooth scene it works** — absolute error against the reference falls from 11.1 % to 4.7 %,
+the spread is unchanged, and the lattice at 8 192 rays returns 12 258 against the reference's
+12 290, so it converges to the same limit. **On the clustered scene it fails both halves of the
+test**: the seed spread REGRESSES from 1.12x to 1.74x (seed 7 returns 352 240), and the lattice at
+8 192 rays converges to **251 040** — 10.6 % *below* the 32 768-ray reference and further off than
+the rng's own 266 470 at the same count. A construction that converges to the wrong number is worse
+than a noisy one that converges to the right one, so this is reverted rather than shipped behind a
+flag.
+
+**Why it failed, and the part I got wrong first.** My initial explanation was that a deterministic
+point set is reused by every probe call in a render (the floor loop calls it up to four more times)
+so a bad alignment never averages out — **but that is not a difference between the arms**:
+`probeGatherCount` re-seeds `Pcg32` to a fixed constant on entry, so the *rng* arm draws the
+identical point set on every call too. Both are deterministic; only the point set's quality
+differs. Two things that do distinguish them:
+
+1. **Halton in bases 11 and 13 is strongly correlated over the first few hundred indices** — exactly
+   the range 512 rays occupies — and a Cranley-Patterson rotation shifts that structure without
+   removing it. A scrambled (Faure/Owen) radical inverse, or Sobol, or a rank-1 lattice, would not
+   share this specific weakness.
+2. **The six-dimensional endpoint pair is the wrong thing to stratify.** What decides a chord's hit
+   count on a clustered beam set is *whether the chord passes through the cluster* — a property of
+   the chord as a line, not of its two endpoints' individual coordinates. Stratifying the endpoints
+   spreads the samples evenly through a parameterization that is not the one the integrand varies
+   over, which is how a lattice can be well distributed and still land on the wrong answer.
+
+**So the next attempt should reparameterize before it stratifies**: sample the chord as a direction
+plus a perpendicular offset about the beam cloud's own principal axes (the map already computes
+`bounds()`, and a cheap covariance of the beam midpoints would give the axes), then stratify *that*.
+Judge it the same way — against the 32 768-ray reference on both scenes, with the clustered scene's
+spread as a hard gate, since that is the one this attempt broke.
+
 *(Superseded framing, kept because the reasoning is still the record: the entry blamed a dielectric
 for letting a light subpath deposit a wildly varying number of chords. The chord COUNT does swing
 3.15x across seeds on `_fog_cornell` against 1.04x on `_fog_thick`, so that observation was right —
