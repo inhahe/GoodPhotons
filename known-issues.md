@@ -20342,6 +20342,29 @@ is the convenient way to pull the single flyby frame closest to a point (it prin
 `flyNNN` it picked and how far off it was), which is how the four fly-through passes were
 each validated without rendering the loop.
 
+## NOTE (2026-09-12): a timed-out shell does NOT stop the render script it launched — two instances then race on the same filenames
+
+Recorded because it silently invalidated a whole batch and the corruption is invisible in the
+output files. A foreground `bash scraps/szsweep.sh` hit the 10-minute tool timeout; the *tool call*
+ended, but the script and its `ftrace` child kept running. Relaunching the same script in the
+background produced **two concurrent instances writing the same `png/…/szR_*.pfm` and `szD_*.pfm`
+paths** — and, because the relaunch had also lowered `-spp`, the surviving files were an arbitrary
+mix of 4096/2048-spp and 1024/512-spp renders. Every one of them looked perfectly well-formed.
+
+The tell was `ftrace -stop` (bare) listing **two** live renders when the script only ever runs them
+sequentially. That is now the thing to check after any timeout:
+
+```
+ftrace -stop            # bare: lists every live render, pid + scene -> output
+ps -ef | grep '[m]yrig.sh'   # the PARENT script, which -stop does not know about
+```
+
+Stopping the renders alone is not enough — the parent script immediately launches the next one. Kill
+the script first (by **its own pid**, never by image name), then `ftrace -stop all`, then delete the
+suspect outputs and re-run **once**. Mixed-`-spp` data is exactly the "one batch, one binary, fixed
+`-spp`" rule being violated by accident rather than by choice, which is the version of it that
+survives review.
+
 ## OPEN (tech debt, 2026-08-04): `design.md`'s measurement rigs live in git-ignored `scraps/`
 
 `design.md` cites `scraps/_gemsweep.py`, `scraps/_capchroma.py`, `scraps/_capcrop.py` and
@@ -20775,6 +20798,25 @@ reference:
 **It grows as the lobe narrows** — +3.6 % at roughness 0.05 against +0.7 % at 0.6 — which is the
 *opposite* trend from the adjoint bug (that one grew as the lobe widened, because the connection's
 MIS share grew). Diffuse and mirror are untouched, so it is again specific to a **finite** lobe.
+
+**THE MIS COMBINATION ARITHMETIC IS EXONERATED, and the null is trustworthy because the negative
+control fired.** `-misaudit` cross-checks every CPU bidirectional weight against a second,
+independently written implementation that builds each strategy's path density outright instead of
+telescoping ratios:
+
+| run | weights checked | disagreed > 1e-9 | worst relative difference |
+|---|---|---|---|
+| roughness 0.05 | 499 360 | **0** | 1.67e-15 |
+| roughness 0.6 | 485 859 | **0** | 1.93e-15 |
+| **`-misaudit-poison`** | 499 360 | **352 167** | 9.999e-01 |
+
+The poison arm is the whole reason the clean arms mean anything — a cross-check that has only ever
+agreed is equally consistent with "both forms are right" and "the check is vacuous", and this
+entry's own parent bug was found only after a rig that *could not see the effect* was thrown out.
+1.7e-15 is float noise, so **the weights are combined correctly**; the residual is therefore in a
+**density fed to those weights** (a `pdfFwd`/`pdfRev`), or in an estimator's own value — not in the
+combination. Since `bsdfPdf`'s Glossy case is provably symmetric under the direction swap, the
+BSDF-side density is not it either, which leaves the **emitter-side** density.
 
 Where to look: in this geometry the dominant strategy is the unidirectional one — the camera
 subpath's own lobe sample landing on the emitter (`s=0`) — and its MIS share is largest exactly
