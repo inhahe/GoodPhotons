@@ -76,6 +76,18 @@ inline int gatherAreaSamples() {
 // both add 0 to the coverage, but they mean opposite things, and the shipped estimator cannot
 // tell them apart. Diagnostic only: off (the default) nothing below is touched and the estimate
 // is bit-identical.
+// FTRACE_GAREJECT=<pct>: suppress the footprint correction for a gather whose probes REJECT at
+// least `pct` percent of their hits on the normal test -- the tangle signature. 0 = off, and off
+// is bit-identical to the pre-0.273.6 estimator. See M-GATHERAREA: dense fur is accurate
+// UNCORRECTED and +48 % corrected, because the probe sees the nearest layer while the query
+// gathers from the whole ball, so on a tangle the correction has the wrong SIGN.
+inline int gaRejectPct() {
+    static const int p = [] {
+        const char* e = std::getenv("FTRACE_GAREJECT");
+        return e ? std::atoi(e) : 0;
+    }();
+    return p;
+}
 inline bool gaDiagOn() {
     static const bool on = [] {
         const char* e = std::getenv("FTRACE_GADIAG");
@@ -96,6 +108,7 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
     if (M <= 0 || !(r > 0.0)) return 1.0;
     Vec3 t, b; onb(n, t, b);
     double area = 0.0;                 // in units of the full disc, so 1.0 == fully covered
+    int   nRej = 0;                    // probes that FOUND geometry facing the wrong way
     // THE SILHOUETTE GATE, as an adaptive early-out rather than a separate heuristic. The entry
     // proposes "only worth doing when the gather is near a silhouette or a small-feature
     // primitive", and the honest way to know that is to ask the same estimator with fewer
@@ -166,8 +179,13 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
             // cos = 1 and is untouched either way, which is why the null control could not have
             // caught this and the truncated elements could.
             if (c >= 0.5) area += 1.0 / c;
+            else          ++nRej;
         }
     }
+    // THE TANGLE GATE. A high reject share means the disc is full of geometry pointing every
+    // which way, not hanging over empty space -- and there the correction is not merely weaker,
+    // it points the wrong way. Doing nothing is the measured-correct action for fur.
+    if (gaRejectPct() > 0 && nRej * 100 >= gaRejectPct() * M) return 1.0;
     return area / (double)M;
 }
 // Never divide by a coverage so small that one stray probe inflates a pixel into a firefly. A

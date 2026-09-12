@@ -1541,6 +1541,11 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   band instead, which is the only axis left once a frame is down to one sample per chunk — it
   works and is free, but bought nothing measurable on the scene that motivated it, and it makes
   pixels within one frame gather from different realizations, so it is **off by default**.
+- **`FTRACE_GAREJECT=<pct>` (experimental, mode `M`, host only).** Suppress the `-gatherarea`
+  correction for a gather whose probes REJECT at least `pct` percent of their hits on the normal
+  test — the dense-fur signature, where the correction has the wrong sign (see `FTRACE_GADIAG`).
+  **Built but not validated**: the ROI rig's seed-to-seed noise on the fur is 19x the effect it
+  would have to resolve, so no number is quoted. `0`/unset is the default and is bit-identical.
 - **`FTRACE_GADIAG=1` (diagnostic, mode `M`).** Per-material tally of *why* a `-gatherarea`
   footprint probe contributed nothing: **MISS** (the disc overhangs empty space — truncation) or
   **REJECT** (geometry is there but faces outside the 60 degree cone — a tangle). The shipped

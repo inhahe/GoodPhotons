@@ -3039,6 +3039,52 @@ extreme, mat1 at 75.8 % miss, sits at 7.3 % on the ratio. **That is a 5-10x sepa
 two failure modes this entry says cannot be told apart**, on a quantity the estimator already
 computes.
 
+**A GATE ON THE SIGNAL IS BUILT AND IS DELIBERATELY UNTESTED (v0.273.6, `FTRACE_GAREJECT=<pct>`).**
+Fur is accurate UNCORRECTED, so the natural rule is to suppress the correction where the reject
+share says "tangle": `if (nRej * 100 >= pct * M) return 1.0;`. Unset or 0 keeps today's behaviour
+exactly, so the shipped default is bit-identical. **No number is quoted for it, because the
+acceptance rig cannot currently see the thing it would have to measure.**
+
+**The rig's noise floor, measured rather than assumed.** Two runs of the SAME arm at different
+seeds (`gallery_rain`, `-mode M -beams`, 320x180, 150 s, CPU, 5 %-trimmed mean per ROI against the
+34 781-spp mode-`R` reference):
+
+| ROI | px | seed-to-seed spread, same config | the off→on effect it must resolve |
+|---|---|---|---|
+| **`creature`** (the fur) | **36** | **15.3 points** (+8.9 → −6.4) | **0.8 points** |
+| `alice_hair` | 27 | 6.0 points | 39.2 points |
+| `alice_dress` | 90 | 10.4 points | 45.2 points |
+
+**On the fur the noise is 19x the effect.** Cloth and hair are fine — their effects run 4-7x their
+noise — but `creature` is the ROI the whole fur question turns on, and there the rig is blind. A
+first reading of these same numbers as "the correction barely acts on the creature, 0.8 points
+against the 52 this entry reports" was therefore *noise being mistaken for a finding*, and is
+withdrawn.
+
+It also explains a failed validation: this rig did not reproduce the entry's published
+`-gatherarea 0` values (`alice_hair` −49 % against a published −68 %, `creature` +8.9 % against
+−3.9 %) while `alice_dress` matched to half a point. At ±10-15 points on a single seed, agreement
+is luck either way — and `alice_dress`, the one that matched, is also the largest ROI at 90 px.
+
+**What a valid test costs, now that it is quantified.** The entry's own measurements used 900 s at
+640x360: 4x the pixels and 6x the time, so ~24x the samples and ~5x less noise, which puts
+`creature` near 3 points against a 52-point effect. This rig used 150 s at 320x180 — about **24x
+under-sampled**. So the acceptance run is ~15 minutes of CPU per arm, three arms, and it should be
+seeded at least twice per arm given the spread above. That is the price of an answer here, and it
+is worth paying only when someone intends to act on the result.
+
+**What must be scored, and why all of it.** `creature` (must improve from the corrected +48 %),
+`alice_hair` / `alice_dress` / `cap_gyroid` (must not regress), and `grid_ground` (must not move).
+The failure mode to watch for is the one the covariance-ellipse attempt hit — *"a weaker correction
+everywhere, not a correction that fires only where it belongs"* — which shows up as every ROI
+drifting toward the uncorrected column together, so the uncorrected arm has to be in the table as
+a third column rather than assumed.
+
+**And the per-gather statistics are the reason to expect trouble.** The 17-19 % vs 0-6 % separation
+is a per-MATERIAL average over many gathers; the gate decides on ONE gather with M=8 probes, where
+19 % is 1.5 rejects and 6 % is 0.5. Those distributions overlap heavily. The signal being real does
+not make it usable at M=8, and raising M costs the 1.30x that made `-gatherarea 8` the default.
+
 **What this does and does not establish.** It establishes that the SIGNAL exists and is geometric,
 so it escapes both of this entry's blocking results — the coverage one (this is not the coverage)
 and the photon-statistic one (this reads geometry, not photons). It does **not** establish that a
