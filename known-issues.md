@@ -1335,6 +1335,27 @@ Closer on both, and **4x closer on the trimmed mean** — which is the statistic
 scene, where the raw mean is firefly-dominated. So v0.272.5 is an accuracy fix as well as a
 stability and speed one, and the 6 % shift was the image moving *toward* ground truth.
 
+**INDEPENDENT CORROBORATION, already in `REFERENCE.md` and written a week earlier.** The
+`-beamk` note says: *"Below the knee the `-beamk` floor widens the kernel radius to keep the
+gathered count at 32, so the render silently uses a kernel wider than the `-beamblur` you asked
+for: on the analytic gate scene the half-knee map came out **6.4 % off the absolute radiance**,
+which falls to **0.34 %** at the knee."*
+
+The 96-ray probe was reporting a knee about **half** the converged value on `_fog_cornell`
+(~136 k against ~267 k), and the measured trimmed bias it caused on `_fog_thick` was **5.9 %**.
+That is the documented half-knee number, **6.4 %**, arrived at from a completely different
+direction — an analytic gate scene a week ago, and a mode-`D` reference today. The two agree to
+within their own error bars, which is about as much confirmation as this kind of claim gets.
+
+*It also means the defect was diagnosable from the docs alone.* "The knee is the smallest map that
+gets you the kernel width you asked for" plus "the probe estimates it from 96 chords" is enough to
+predict both the bias and its size, without rendering anything.
+
+**Stale figure noted:** the same section quotes `_fog_cornell`'s knee as **~114 000 beams**. That
+was measured with the 96-chord probe, so it is the biased value; the corrected probe puts it near
+**220–270 k**. The 8.7x scene-to-scene ratio it illustrates survives — `_fog_thick` moved too, to
+~11 k — but the absolute numbers there are pre-0.272.5.
+
 **The lesson is about the mental model, not the arithmetic.** "The knee sizes the map" made a mean
 shift look like a bug; the entry's own text said the knee drives radius inflation, which makes the
 shift *expected*. A 5.3-sigma surprise is worth a reference render before it is worth a revert.

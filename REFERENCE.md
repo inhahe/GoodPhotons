@@ -1198,7 +1198,10 @@ that converges to the same physical image.
   > out above the sweep's best (0.587 against 0.410), that scene's equal-time optimum being
   > nearer 0.66× its knee — see the paragraph below for why the knee is still the default.
   > Its pilots put the two scenes' knees **8.7× apart** (~114 000 beams against ~13 000), and
-  > both runs are knee-bound rather than ceiling-bound.
+  > both runs are knee-bound rather than ceiling-bound. *(Both absolute figures are pre-0.272.5,
+  > measured with the 96-chord probe that J-KNEE-NOISE found was biased about 2× low on a scene
+  > with a dielectric; the corrected probe puts `_fog_cornell` near 220–270 k and `_fog_thick`
+  > near 11 k. The ratio the sentence is making a point about survives.)*
   >
   > It aims **at** the knee, not below it (0.243.0 — it aimed at half the knee in 0.242.0, and
   > that was a measurable bias). Below the knee the `-beamk` floor *widens the kernel radius* to
