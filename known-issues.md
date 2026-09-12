@@ -1489,15 +1489,44 @@ the image toward ground truth. What does *not* survive is any claim to know **wh
 the flourish that "the defect was diagnosable from the docs alone" — it was not, because the docs
 describe a bias of the opposite sign.
 
-**The experiment that settles it** is `scraps/kneedir.sh`, and it exists because the probe must
-come out of the loop: with the probe in play, map size is a random variable, so the arms differ in
-their *distribution* of map sizes and no single arm has a map size to point at. `-beamcount` bounds
-the map deterministically, making size the independent variable — quarter knee, half knee, knee, at
-matched seeds on `_fog_thick`. The log's own *"a probe ray gathers 32.0 beams (N at the raw mfp
-radii)"* reports the inflation each arm actually received, so the x-axis is measured rather than
-assumed. If the half-knee arm reads high, `REFERENCE.md` is right and the pre-fix arm's −3.46 %
-has some other cause entirely. If it reads low, the `+6.4 %` in `REFERENCE.md` needs its own sign
-audited.
+**SETTLED (n=12): AN UNDERSIZED MAP READS *LOW*, AND `REFERENCE.md`'S SIGN IS THE ONE THAT IS
+WRONG.** `scraps/kneedir.sh` / `kneedir2.sh` take the probe out of the loop entirely — `-beamcount`
+pins map size deterministically, so size stops being a random variable and becomes the independent
+variable — and score each arm against the same 67 448-spp mode-`D` reference on `_fog_thick`,
+twelve seeds, paired (both arms share a seed, so the difference cancels whatever that seed does to
+the path set):
+
+| arm | raw gather → `-beamk` floor | inflation | raw mean vs ref | trimmed | raw − trimmed |
+|---|---|---|---|---|---|
+| `-beamcount 2750` (quarter knee) | 8.2 → 32 | **3.9x in count** | **−3.77 % ± 1.28** | −3.79 % | **+0.02** |
+| `-beamcount 5500` (half knee, n=4) | 16.6 → 32 | 1.93x | +0.33 % ± 2.29 | −4.00 % | +4.33 |
+| `-beamcount 11000` (at the knee) | 31.7 → 32 | 1.01x | **+0.88 % ± 1.42** | −3.01 % | **+3.90** |
+
+**Paired difference, quarter knee minus knee: −4.65 % ± 1.86, 2.5 sigma.** `REFERENCE.md`'s
+`-beamk` note puts a *half*-knee map at **+6.4 %**; the measured value at *quarter* knee — twice
+that inflation — is **8.0 sigma** from +6.4 %. The documented figure does not describe this scene.
+
+**This reinstates the original probe-arm result, which the retraction above had left in doubt.**
+The pre-fix probe built a `_fog_thick` map with more radius inflation than the shipped probe does
+(raw gather **30.5** vs **31.7** against a floor of 32), and more inflation reads low: −3.46 % then
+from the probe arms, −3.77 % now from `-beamcount`, two rigs that share no machinery. The
+retraction was right that magnitude-matching against `REFERENCE.md` was not evidence; it was wrong
+about which side the error was on.
+
+**A candidate mechanism, with the right magnitude, that the data volunteered.** The last column is
+the firefly tail — how far the raw mean sits above the trimmed one, i.e. how much of the frame's
+energy is in rare bright pixels. It **collapses from +3.90 at the knee to +0.02 at quarter knee**:
+the inflated kernel has smeared the spikes away almost completely. The raw mean falls by about
+what the tail was worth (3.90 against the 4.65 paired difference, consistent inside the error), so
+"a wider kernel blurs out the tail and the whole-frame mean goes with it" fits both the sign and
+the size. Recorded as a candidate and not a conclusion: two confident mechanisms have already been
+imposed on this data today and both were wrong, and a blur ought to conserve energy in a converged
+render, so what this really says is that something about the tail is not converged at 256 spp.
+
+**What to do with `REFERENCE.md`.** Flagged there as contested rather than overwritten. Its +6.4 %
+was measured on "the analytic gate scene", which has not been retested, and a figure that is right
+for an analytic slab and wrong for a fog box is a scene-dependence worth knowing about rather than
+a typo to silently correct. Re-deriving it on its own scene is the open task.
 
 **Stale figure noted, separately:** the same `REFERENCE.md` section quotes `_fog_cornell`'s knee
 as **~114 000 beams**. That was measured with the 96-chord probe, i.e. with the estimator this
