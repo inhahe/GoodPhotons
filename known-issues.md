@@ -1643,6 +1643,70 @@ justify unbounded complexity.
   on the ground. So this is not a marginal term that could simply be dropped — but it also means
   any flattening of its structure shows up in the one region where nothing else contributes.
 
+**GROUNDWORK LANDED (2026-09-11, v0.273.4): `PhotonBeam::order`, so the order distribution can
+be READ instead of inferred.** The cap `-beams-order` is applied at DEPOSIT time
+(`render.h`'s `beamMSAllowed`), so nothing downstream could tell an order-1 chord from an order-5
+one — and substituting a cached value for the order >= 2 part of the gather is this entry's whole
+premise. The field costs **nothing**: it lands in the padding byte between `achro` and the
+2-byte-aligned `emIdx`, so `sizeof(PhotonBeam)` is unchanged (verified — same knee, stored count,
+split count and 12 MB map as v0.272.6 on an identical command).
+
+The beam-map report line now carries the distribution, and `gallery_rain` measures:
+
+| order | 1 | 2 | 3 | 4 | 5 | 6 | 7+ |
+|---|---|---|---|---|---|---|---|
+| share of stored chords | **59.3 %** | 16.8 % | 9.1 % | 5.6 % | 3.4 % | 2.0 % | 3.8 % |
+
+**40.7 % of chords are order >= 2**, and that cross-validates the field against a number already
+in this entry from a different rig: dropping order >= 2 was measured to take the gather from
+**87.8 to 50.8 beams per probe**, a **42.1 %** reduction. A population count over the map and a
+beams-per-probe statistic from two separate renders agree to 1.4 points, which is the evidence
+that the field is populated correctly rather than merely declared.
+
+**It also dissolves an apparent conflict with the table below.** That table says order 2 is 33 %
+of all multiple scatter; the histogram says 41 %. Both are right — the table is **energy**-weighted
+(top-third radiance per `-beams-order` cap) and the histogram is **population**-weighted (chords in
+the map). Energy says what a cache changes *visually*; population says how many beams it lets you
+*skip*, which is why the population number is the one that tracks beams-per-probe and therefore
+the speed ceiling. Quote whichever answers the question being asked, and say which it is.
+
+**The cacheable share is strongly scene-dependent, so the ~30 % ceiling above is a `gallery_rain`
+number and not a general one.** `_fog_thick` — a dense homogeneous fog, mfp 0.47 m — measures
+`1:17.2% 2:9.1% 3:7.4% 4:6.2% 5:5.5% 6:4.9% 7+:49.8%`: only **17.2 %** single scatter, **82.8 %**
+cacheable, with nearly half the map at order 7+. A thick medium would pay far more for this
+feature than the scene that motivated it.
+
+**Mode `J` stores `kBeamOrderUnknown` and the histogram stays silent for it.** Its natural
+candidate, `PathSeg::vert`, is the subpath VERTEX index and counts surface bounces, where
+`order` means MEDIUM scattering order. Passing `vert` would have type-checked, looked reasonable,
+and made `order >= 2` mean two different things by mode. Counting medium scatters in `randomWalk`
+is the work when mode `J` needs this; until then the field says "unknown" out loud.
+
+> **TWO BUGS IN THIS INCREMENT, BOTH CAUGHT BY CONTROLS AND NEITHER BY READING THE CODE.**
+>
+> **1. The guard destroyed the thing it was guarding.** `kBeamOrderUnknown` is 255, and the clamp
+> beside it read `order > 254 ? 254 : order` — so the sentinel took the `> 254` branch and was
+> stored as a legitimate-looking order **254**. Mode `J` then reported a confident
+> `7+:100.0%`: a fabricated distribution, produced by the mechanism added to prevent exactly
+> that. Both halves were written minutes apart in one change, and each reads correctly in
+> isolation; the collision exists only in the arithmetic between them. Caught only because
+> "mode `J` must print NOTHING" had been written down as an acceptance criterion first. The rule
+> now is that a value which cannot be represented becomes the sentinel, never the nearest
+> representable order — where it would be indistinguishable from a measurement.
+>
+> **2. The insertion point was chosen by grep and broke an `if`/`else if` chain.**
+> `if (ai.budgetBit) say(...);` looked standalone but is the HEAD of a chain whose `else if`
+> sits sixty lines later behind a long comment. C2181. Same error as the `skipBvh` branch
+> earlier the same day: **an anchor found by text match tells you nothing about that line's
+> syntactic role.**
+>
+> **And a third, in the harness rather than the code.** A patch script that failed its assertion,
+> followed on the NEXT LINE by `echo <ver> > VERSION && ./scraps/build.sh`, produced a healthy
+> `build ok: ftrace 0.273.3` for source that was never patched — `VERSION` is compiled in, so the
+> exe genuinely changed, just not as intended. `scraps/build.sh`'s mtime check proves a binary was
+> PRODUCED, not that it contains the change. Its header now says: chain the patch and the build
+> with `&&`, never a newline, and grep the source for the new text before trusting the binary.
+
 **Per order, measured the same way** (`-beams-order 2` and `3`, same rig). Scored on the TOP
 THIRD, because that is where multiple scatter is the signal rather than a correction:
 

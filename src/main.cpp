@@ -12417,6 +12417,39 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
                         tag, ai.probeK0, ai.targetK,
                         g_nFromCli ? " (or -n, which is currently sizing this map)" : "");
     }
+    // MEDIUM SCATTERING ORDER of the stored chords, which is the quantity VOLCACHE is
+    // sized by: only order >= 2 is cacheable, because single scatter is view-dependent
+    // (a rainbow's colour at a point depends on the angle to the sun) and must stay
+    // per-frame. Until PhotonBeam::order existed this could only be INFERRED, by rendering
+    // separate `-beams-order 1/2/3` arms and differencing them -- three renders and a
+    // subtraction to learn what one pass over the map now reports exactly.
+    //
+    // Silent when no stored chord tracks its order: mode `J` deposits kBeamOrderUnknown
+    // because it counts subpath vertices rather than medium scatters, and a histogram that
+    // invented a distribution for it would be worse than no line at all.
+    {
+        size_t hist[8] = {0}, unknown = 0, known = 0;
+        for (const PhotonBeam& b : bm.beams) {
+            if (b.order == kBeamOrderUnknown) { ++unknown; continue; }
+            ++known;
+            hist[b.order < 7 ? b.order : 7] += 1;
+        }
+        if (known > 0) {
+            std::string row;
+            char buf[64];
+            for (int o = 1; o < 8; ++o) {
+                if (!hist[o]) continue;
+                std::snprintf(buf, sizeof buf, "%s%d%s:%.1f%%", row.empty() ? "" : " ",
+                              o, o == 7 ? "+" : "",
+                              100.0 * (double)hist[o] / (double)known);
+                row += buf;
+            }
+            say("%s   scattering order of stored chords: %s%s  "
+                "(order >= 2 is the cacheable share -- see VOLCACHE)\n",
+                tag, row.c_str(),
+                unknown ? "  [some chords did not track order]" : "");
+        }
+    }
     if (bm.beams.empty())
         std::fprintf(stderr, "[beams] warning: 0 beams stored — no photon crossed a "
                              "scattering medium; the volume will be invisible.\n");

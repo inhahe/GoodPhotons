@@ -203,6 +203,10 @@
 // make multiple scattering a small change to the transport.
 namespace pbeams { inline int gOrderMax = 0; }
 
+// Sentinel for PhotonBeam::order -- "this depositor does not track medium scattering order".
+// See the field's own note for why mode `J` stores this instead of something plausible.
+inline constexpr unsigned char kBeamOrderUnknown = 255;
+
 // ------------------------------- SPECTRAL BEAMS ----------------------------------------
 // A deposited beam used to carry ONE wavelength, exactly like a photon. That is defensible
 // for a surface photon — it is a point, so its colour noise is grain, which the eye forgives
@@ -352,6 +356,25 @@ struct PhotonBeam {
     //     whose Scene::bowLut the gather evaluates; `cieA` still holds that emitter's cieMean
     //     as the fallback any consumer without the table (the device gather) can fall back to.
     unsigned char achro;
+    // MEDIUM SCATTERING ORDER of this chord: 1 = single scatter (the photon came straight from
+    // the emitter), 2 = it scattered once in a medium first, and so on. This is the quantity
+    // `-beams-order` caps, and it is recorded here because that cap is applied at DEPOSIT time
+    // (render.h's `beamMSAllowed`) -- so without this field nothing downstream can tell an
+    // order-1 chord from an order-5 one, and VOLCACHE's whole premise is substituting a cached
+    // value for the order >= 2 part of the gather.
+    //
+    // Costs NOTHING: it sits in the padding byte between `achro` and the 2-byte-aligned
+    // `emIdx`, so sizeof(PhotonBeam) is unchanged on a 6.8 M-sub-beam map.
+    //
+    // `kBeamOrderUnknown` IS NOT A DEFAULT, IT IS A REFUSAL TO GUESS. Mode `J`'s light pass
+    // deposits through the same bank but counts something different: `PathSeg::vert` is the
+    // subpath VERTEX index, which includes surface bounces, while mode `M`'s `beamScatters`
+    // counts MEDIUM scatters only. Storing one where a reader expects the other would make
+    // `order >= 2` silently mean two different things by mode -- so mode `J` stores the
+    // sentinel and any consumer must handle it explicitly rather than receive a plausible
+    // wrong number. VOLCACHE targets mode `M`'s `-beams` gather; when mode `J` needs it, the
+    // work is to count medium scatters there, not to reinterpret this field.
+    unsigned char order;
     // Emitter index for `achro == 2`, else -1. Sixteen bits because a scene with more than
     // 32767 emitters would have bigger problems; `emitBeams` refuses the fold above that
     // rather than truncating, so the field can never name the wrong light.
@@ -416,11 +439,25 @@ struct BeamBank {
     // `emIdx >= 0` asks for the GATHER-time fold (achro == 2): the caller has established that
     // the path was wavelength-independent with unit spectral weight and that this medium's
     // only chromatic term is its phase table. `cieA` must still be supplied, as the fallback.
+    // `order` is REQUIRED and deliberately not defaulted: a default is how the second of two
+    // call sites silently keeps the wrong value (see known-issues, the `skipBvh` branch that
+    // measured no change because the exercised branch was the other one). Making omission a
+    // compile error is the only version of this that cannot drift.
     void push(const Vec3& o, const Vec3& d, double len, double power,
-              double lambda, double absorb, int med,
+              double lambda, double absorb, int med, int order,
               const double* lamS = nullptr, int nSec = 0, const double* cieA = nullptr,
               int emIdx = -1, const double* wS = nullptr) {
         PhotonBeam b;
+        // A VALUE THAT CANNOT BE REPRESENTED BECOMES THE SENTINEL, never the nearest
+        // representable order. The first version of this line read
+        //     order < 0 ? kBeamOrderUnknown : (order > 254 ? 254 : order)
+        // and `kBeamOrderUnknown` IS 254+1 -- so the sentinel took the `> 254` branch and was
+        // stored as a real-looking order 254. Mode `J`, whose whole point here is to say "I do
+        // not track this", instead reported a confident `7+:100.0%`. The guard destroyed the
+        // thing it was guarding, and only the control that required mode `J` to print nothing
+        // caught it.
+        b.order = (order < 0 || order >= (int)kBeamOrderUnknown)
+                      ? kBeamOrderUnknown : (unsigned char)order;
         b.o = o; b.d = d;
         b.s0 = 0.0f; b.len = (float)len; b.power = (float)power;
         b.lambda = (float)lambda; b.absorb = (float)absorb; b.med = med;

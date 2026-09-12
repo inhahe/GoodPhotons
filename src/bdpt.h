@@ -2030,7 +2030,15 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 // cloud's beam to a single colour and gives the rain's a weighted bundle
                 // instead — the rain's scattering really is chromatic, so its beam has to keep
                 // wavelengths, it just no longer has to keep only ONE.
+                // kBeamOrderUnknown, NOT `sg.vert`. `PathSeg::vert` is the subpath VERTEX
+                // index and counts surface bounces too, where PhotonBeam::order means MEDIUM
+                // scattering order -- the quantity `-beams-order` caps and the one VOLCACHE
+                // would key on. Passing `vert` here would read as a valid order and be wrong
+                // by however many surfaces the subpath touched. Counting medium scatters in
+                // randomWalk is the fix when mode `J` needs this; until then the field says
+                // "unknown" out loud.
                 mats.emitBeams(scene, sg.o, sg.d, sg.tMax, lam, pw, sg.aGlass, rng,
+                               kBeamOrderUnknown,
                                Renderer::MedAll, lamS, nSec, cie, dEm,
                                nSec > 0 ? wsBuf : nullptr);
             };

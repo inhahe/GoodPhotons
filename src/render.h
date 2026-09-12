@@ -989,8 +989,11 @@ struct Renderer {
     // transmittance are wavelength-independent wherever the bundle is still alive, which is
     // exactly the condition tracePhoton maintains; only the members' accumulated spectral
     // weights may differ, and that is what `specW` carries.
+    // `order` = medium scattering order of this chord, 1 = single scatter. REQUIRED, not
+    // defaulted -- see BeamBank::push. Pass `kBeamOrderUnknown` if the caller genuinely does
+    // not track it, so the gap is explicit at the call site instead of invisible.
     void emitBeams(const Scene& scene, const Vec3& o, const Vec3& dir, double dLen,
-                   double lambda, double beta, double aGlass, Pcg32& rng,
+                   double lambda, double beta, double aGlass, Pcg32& rng, int order,
                    MedFilter offFilt = MedStraight,
                    const double* lamS = nullptr, int nSec = 0,
                    const Vec3* achroCie = nullptr, int foldEmIdx = -1,
@@ -1067,7 +1070,7 @@ struct Renderer {
             if (foldDiagOn() && i < 16)
                 g_foldKillHist[i][achroCie ? FK_None : g_foldKill].fetch_add(
                     1, std::memory_order_relaxed);
-            beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i,
+            beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i, order,
                               lamS, nSec, (useAchro || bowEm >= 0) ? ca : nullptr, bowEm,
                               specW);
         }
@@ -3058,7 +3061,12 @@ struct Renderer {
                         if (k >= 0 && k < (ptrdiff_t)scene.emitters.size() && k <= 32767)
                             foldEmIdx = (int)k;
                     }
-                    emitBeams(scene, ray.o, ray.d, dChord, lambda, betaPre, curAbsorb(lambda), rng,
+                    // `beamScatters` counts medium scatters already made, so the chord being deposited
+            // now is order beamScatters + 1: zero prior scatters is single scatter. Same
+            // convention `-beams-order` uses -- `beamMSAllowed(n)` asks whether order n+2 is
+            // still permitted, so the chord at n is order n+1.
+            emitBeams(scene, ray.o, ray.d, dChord, lambda, betaPre, curAbsorb(lambda), rng,
+                      beamScatters + 1,
                               beamMS ? MedAll : MedStraight, specLam, specSec,
                               achroPath ? &cieF : nullptr, foldEmIdx, specW);
                 }
