@@ -3075,6 +3075,35 @@ zero and the null flat. **It is selective, not a weaker correction everywhere** 
 specific failure the covariance-ellipse attempt hit, and it would have shown as `cap_gyroid`
 drifting back toward −26.9 %. It moved 0.1.
 
+**AND IT DOES NOT TOUCH THE CASE THE CORRECTION EXISTS FOR.** The risk a tangle gate carries is
+that truncated geometry also trips it, silently disabling the correction on the cloth/hair/edge
+cases that motivated the whole entry — which would be far worse than the ~1 point of collateral
+seen on `gallery_rain`. Measured on the two controls, at **fixed `-spp`** so the sample count
+cannot differ between arms:
+
+| control | what it is | gate 30 vs gate off |
+|---|---|---|
+| `_ga_strip` | a 0.4 m strip under a pinned 0.5 m disc — pure truncation | **+0.047 %** (worst pixel +0.27 %) |
+| `_ga_null` | one 12 m flat quad — nothing to correct | no-op; the gate cannot fire |
+
+`_ga_strip`'s probes measure **52.0 % miss / 0.0 % reject / 48.0 % accept** — textbook truncation,
+exactly what the model predicts — and the correction moves that scene from **−52.5 % to +8.3 %**.
+So the gate perturbs it by about a *thousandth* of the correction's own magnitude. It cannot
+quietly undo the thing it sits inside.
+
+> **Two rig notes from measuring this, both worth keeping.**
+>
+> **`-time` is not a valid control for a bit-identity test.** The first run of this comparison used
+> `-time 25` and the arms got **65 vs 67 spp**, which showed up as 4 206 differing floats and
+> +0.013 % — and read exactly like "the gate fires on truncated geometry". Sample count has to be
+> fixed by construction, not by wall clock.
+>
+> **A rounded diagnostic hid a real signal.** `FTRACE_GADIAG` printed `0.0 %` reject on the strip,
+> which is not the same as zero: across 319 292 probes that can conceal ~160 rejects, and at 64 spp
+> a single tripped gather marks its pixel. At fixed `-spp` the arms genuinely do differ on 4 115
+> floats. The *count* said "differs"; the *magnitude* said "by 0.047 %", and only the magnitude
+> answered the question. Report both when a diagnostic is a percentage of a large denominator.
+
 **It is NOT a solution and stays opt-in.** `-gatherarea 0` still gives the fur +11.8 % against
 gate 30's +44.8 %, so a fur-dominated scene should still just turn the correction off. And it is
 host-only: defaulting it would make `-device gpu` disagree with `-device cpu`, the exact condition
