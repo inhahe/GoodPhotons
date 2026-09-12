@@ -4357,6 +4357,56 @@ paths the connections cannot. Mode `J` loses only because a sample costs 45–25
 the error by reference-brightness quartile (`scraps/pfmerr.py -q`) shows mode `D` ahead in every
 quartile, so there is no dim region where mode `J` is quietly winning.
 
+**RE-MEASURED ON v0.273.4 (2026-09-11): THE EQUAL-TIME GAP IS ~3x, NOT ~19x — the cost half of
+this entry is six times better than it reads.** (2b) was measured on 2026-09-03 at v0.219.1, and
+mode `J` has since gained the device surface light pass, the device beam LBVH, the `-beamrefresh`
+retune and the `-beamk` knee fix. `_fog_thick`, 96x96, `-max-bounce 8`, 90 s per arm, GPU, scored
+against the 67 448-spp mode-`D` reference (`png/knee/ref.pfm`), **four seeds, paired**:
+
+| | v0.219.1 (as filed) | **v0.273.4** |
+|---|---|---|
+| sample rate, `D` / `J` | 45x | **4.2x** |
+| equal-time variance, `J` / `D` | ~19x | **2.97x ± 0.22** |
+| per-sample variance, `J` / `D` | 0.11–0.42x | **0.71x ± 0.06** |
+
+Mode `J` is still behind at equal time and still the better estimator per sample; both margins
+moved, and the cost margin moved an order of magnitude. n=1 gave 3.09x and 0.72x — inside the
+n=4 error bars, so on this scene the variance RATIO is far better behaved than the image MEAN,
+which needed n=12 to settle in J-KNEE-NOISE. Worth knowing when sizing a rig here.
+
+**AND `-n` CANNOT CLOSE THE REST — the default is already at the good end of the trade.** The
+obvious next move is the one this entry's own table invites: per-sample variance improves with
+`-n` (3022 -> 826 -> 310 at 20 k / 100 k / 400 k), so somewhere there ought to be an equal-time
+optimum. There is not, because the default is not the low end of that curve. The knee caps the
+map at **10 947 beams from 2 094 subpaths**, so raising `-n` only moves away from parity:
+
+| `-n` | spp in 90 s | noise |
+|---|---|---|
+| default (knee-bound) | **9 467** | 1.03 % |
+| 200 000 | 41 | 15.6 % |
+| 800 000 | 3 | 57.7 % |
+
+Sample count collapses far faster than per-sample variance improves — the same shape as the table
+above, read correctly. So the 2.97x is close to mode `J`'s best on this scene under every knob
+that does not change the per-hit work.
+
+**Which confirms this entry's own diagnosis by elimination.** Light-side cost is now device-side,
+the budget knob is exhausted, and the weight was already shown to be worth ~1.5 %. What is left is
+the beam x ray estimator's **two transmittance marches per surviving hit**, which mode `M` pays
+identically. That is the only remaining target, and it is the thing to attack if mode `J` is ever
+to win at equal time.
+
+**A metric warning that cost a wrong answer here, recorded because the next person will hit it.**
+A per-pixel *relative* metric (`(a-r)^2 / (r+eps)^2`) on this scene reported mode `J` **2.27x
+BETTER at equal time** — the exact opposite of the truth. `_fog_thick` has **62.3 % of its pixels
+below 1 % of the frame mean**, so with a small eps the statistic is dominated by near-black pixels
+where mode `J` does look better and where nothing is visible. The brightness-quartile split made
+it obvious: mode `D`'s relMSE in the dimmest quartile was **exactly 0** (those pixels are
+identically black), and the third quartile implied ~52 % typical relative error at 40 578 spp,
+which is not credible. **Use a global normalisation** — `sqrt(mean (a-r)^2) / mean(r)`, no
+per-pixel division — on any scene with a large dark fraction. `scraps/relmse.py` carries both and
+the warning.
+
 **Where the cost actually is — measured, not assumed.** The auto-tuned radius makes a probe ray
 gather **252 beams** per camera segment, and mode `J` runs the full weight *and* the estimator for
 each. Cost scales exactly linearly with the beam count (`-n` 20 k → 100 k is 5× the beams and
