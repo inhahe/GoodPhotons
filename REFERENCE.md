@@ -1544,8 +1544,13 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
 - **`FTRACE_GAREJECT=<pct>` (experimental, mode `M`, host only).** Suppress the `-gatherarea`
   correction for a gather whose probes REJECT at least `pct` percent of their hits on the normal
   test — the dense-fur signature, where the correction has the wrong sign (see `FTRACE_GADIAG`).
-  **Built but not validated**: the ROI rig's seed-to-seed noise on the fur is 19x the effect it
-  would have to resolve, so no number is quoted. `0`/unset is the default and is bit-identical.
+  **`30` is the measured knee** (at the default `M = 8`, `15` and `25` are the same gate): on
+  `gallery_rain` it removes **~25 % of the fur overfill** — `creature` +60.5 % → +44.8 % — for
+  about **1 point** each on `alice_hair` and `alice_dress`, with `cap_gyroid` and the flat-ground
+  null unmoved. Paired by seed, since the gate consumes no rng and both arms share a photon map.
+  It is **not** a replacement for `-gatherarea 0` on a fur-dominated scene (which reads +11.8 %),
+  and it stays opt-in because it is host-only — defaulting it would split CPU from GPU.
+  `0`/unset is the default and is bit-identical.
 - **`FTRACE_GADIAG=1` (diagnostic, mode `M`).** Per-material tally of *why* a `-gatherarea`
   footprint probe contributed nothing: **MISS** (the disc overhangs empty space — truncation) or
   **REJECT** (geometry is there but faces outside the 60 degree cone — a tangle). The shipped

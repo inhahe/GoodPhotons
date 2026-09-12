@@ -3039,53 +3039,72 @@ extreme, mat1 at 75.8 % miss, sits at 7.3 % on the ratio. **That is a 5-10x sepa
 two failure modes this entry says cannot be told apart**, on a quantity the estimator already
 computes.
 
-**A GATE ON THE SIGNAL IS BUILT AND IS DELIBERATELY UNTESTED (v0.273.6, `FTRACE_GAREJECT=<pct>`).**
-Fur is accurate UNCORRECTED, so the natural rule is to suppress the correction where the reject
-share says "tangle": `if (nRej * 100 >= pct * M) return 1.0;`. Unset or 0 keeps today's behaviour
-exactly, so the shipped default is bit-identical. **No number is quoted for it, because the
-acceptance rig cannot currently see the thing it would have to measure.**
+**THE GATE WORKS, SELECTIVELY, AND IS MEASURED (v0.273.6, `FTRACE_GAREJECT=<pct>`).** Fur is
+accurate UNCORRECTED, so the rule is to suppress the correction where the reject share says
+"tangle": `if (nRej * 100 >= pct * M) return 1.0;`. Unset or 0 is the default and is
+bit-identical. `gallery_rain`, `-mode M -beams`, 320x180, 150 s, CPU, 5 %-trimmed mean per ROI
+against the 34 781-spp mode-`R` reference:
 
-**The rig's noise floor, measured rather than assumed.** Two runs of the SAME arm at different
-seeds (`gallery_rain`, `-mode M -beams`, 320x180, 150 s, CPU, 5 %-trimmed mean per ROI against the
-34 781-spp mode-`R` reference):
+| ROI | `-gatherarea 0` | `8` (default) | gate 15 | **gate 30** | gate 40 |
+|---|---|---|---|---|---|
+| `creature` (the FUR) | +11.8 % | **+60.5 %** | +31.9 % | **+44.8 %** | +54.4 % |
+| `alice_hair` | −66.9 % | −2.8 % | −16.2 % | **−4.0 %** | −1.2 % |
+| `alice_dress` | −37.1 % | −8.6 % | −15.4 % | **−10.1 %** | −8.6 % |
+| `cap_gyroid` | −26.9 % | −2.9 % | −3.1 % | **−2.8 %** | −2.2 % |
+| `grid_ground` (null) | −4.8 % | −3.6 % | −3.6 % | **−3.9 %** | −3.9 % |
 
-| ROI | px | seed-to-seed spread, same config | the off→on effect it must resolve |
+**At M = 8, `pct` 15 and 25 are the SAME gate** (`nRej >= 2`); the distinct thresholds are ~30
+(`>= 3`) and ~40 (`>= 4`). 30 is the knee.
+
+**PAIRED BY SEED, which is the only way this is measurable.** The gate is evaluated AFTER the
+probe loop and consumes no rng, so both arms trace an identical photon map with identical probe
+patterns and the seed variance cancels in the difference. It has to: the ABSOLUTE values swing
+enormously seed to seed (`creature` +60.5 % -> +94.2 %, `alice_dress` −8.6 % -> −27.3 %), while
+the paired difference holds to about a point:
+
+| ROI | gate30 − on, seed 1 | seed 2 | mean |
 |---|---|---|---|
-| **`creature`** (the fur) | **36** | **15.3 points** (+8.9 → −6.4) | **0.8 points** |
-| `alice_hair` | 27 | 6.0 points | 39.2 points |
-| `alice_dress` | 90 | 10.4 points | 45.2 points |
+| `creature` | **−15.7** | **−24.0** | **−19.9 points** |
+| `alice_hair` | −1.2 | −1.0 | −1.1 |
+| `alice_dress` | −1.5 | −1.3 | −1.4 |
+| `cap_gyroid` | +0.1 | −0.1 | **0.0** |
+| `grid_ground` | −0.3 | +1.2 | +0.5 |
 
-**On the fur the noise is 19x the effect.** Cloth and hair are fine — their effects run 4-7x their
-noise — but `creature` is the ROI the whole fur question turns on, and there the rig is blind. A
-first reading of these same numbers as "the correction barely acts on the creature, 0.8 points
-against the 52 this entry reports" was therefore *noise being mistaken for a finding*, and is
-withdrawn.
+**~25 % of the fur overfill removed for ~8:1 benefit-to-collateral**, with `cap_gyroid` at exactly
+zero and the null flat. **It is selective, not a weaker correction everywhere** — which is the
+specific failure the covariance-ellipse attempt hit, and it would have shown as `cap_gyroid`
+drifting back toward −26.9 %. It moved 0.1.
 
-It also explains a failed validation: this rig did not reproduce the entry's published
-`-gatherarea 0` values (`alice_hair` −49 % against a published −68 %, `creature` +8.9 % against
-−3.9 %) while `alice_dress` matched to half a point. At ±10-15 points on a single seed, agreement
-is luck either way — and `alice_dress`, the one that matched, is also the largest ROI at 90 px.
+**It is NOT a solution and stays opt-in.** `-gatherarea 0` still gives the fur +11.8 % against
+gate 30's +44.8 %, so a fur-dominated scene should still just turn the correction off. And it is
+host-only: defaulting it would make `-device gpu` disagree with `-device cpu`, the exact condition
+that kept the original correction opt-in until its device twin landed.
 
-**What a valid test costs, now that it is quantified.** The entry's own measurements used 900 s at
-640x360: 4x the pixels and 6x the time, so ~24x the samples and ~5x less noise, which puts
-`creature` near 3 points against a 52-point effect. This rig used 150 s at 320x180 — about **24x
-under-sampled**. So the acceptance run is ~15 minutes of CPU per arm, three arms, and it should be
-seeded at least twice per arm given the spread above. That is the price of an answer here, and it
-is worth paying only when someone intends to act on the result.
+> **THE RIG BUG THAT COST THREE ITERATIONS, because it is the kind that survives a control.**
+> `scraps/gallery_rain.rois` measures **y from the BOTTOM**; the scorer read both the reference
+> and the render top-origin. Every ROI was on the wrong object. The symptoms were a `creature`
+> reading −100 % against the reference, an "emissive grid floor" reading pure black, and the
+> correction appearing to move the fur by **0.8 points where 52 was expected**.
+>
+> **A control passed the whole time and that is why it took three iterations.** `alice_dress`
+> reproduced this entry's published −40.3 % to within half a point — but `alice_dress` is a
+> neutral off-white with neutral content above and below it, so its hue is *invariant under a
+> vertical flip*. It matched in both orientations. The one ROI that appeared to validate the rig
+> was the only one structurally incapable of invalidating it. **A control that cannot fail is not
+> a control** — the same lesson as the mode-`S` twin earlier the same day, where a null control
+> passed for a change that did nothing.
+>
+> What eventually caught it was checking HUE rather than magnitude. An exposure or gamma error
+> can darken an image; it cannot turn `alice_hair`'s blonde (227, 171, 99) into blue-grey
+> (56, 65, 69) or `cap_gyroid`'s gold into black. The ROI file annotates every box with the sRGB
+> it should show, which made the test one line — and that annotation existed the entire time.
+>
+> Two conclusions recorded in earlier drafts are withdrawn: "the rig is ~24x under-sampled" and
+> "the correction barely acts on the fur". Both were the flip. With it fixed the rig reproduces
+> every published figure — `alice_hair` −66.9/−68.0 % against a published **−68.0 %**,
+> `cap_gyroid` −26.9 % against **−33.3 %**, and the fur at **+60.5 %** against **+48 %**.
 
-**What must be scored, and why all of it.** `creature` (must improve from the corrected +48 %),
-`alice_hair` / `alice_dress` / `cap_gyroid` (must not regress), and `grid_ground` (must not move).
-The failure mode to watch for is the one the covariance-ellipse attempt hit — *"a weaker correction
-everywhere, not a correction that fires only where it belongs"* — which shows up as every ROI
-drifting toward the uncorrected column together, so the uncorrected arm has to be in the table as
-a third column rather than assumed.
-
-**And the per-gather statistics are the reason to expect trouble.** The 17-19 % vs 0-6 % separation
-is a per-MATERIAL average over many gathers; the gate decides on ONE gather with M=8 probes, where
-19 % is 1.5 rejects and 6 % is 0.5. Those distributions overlap heavily. The signal being real does
-not make it usable at M=8, and raising M costs the 1.30x that made `-gatherarea 8` the default.
-
-**What this does and does not establish.** It establishes that the SIGNAL exists and is geometric,
+**What this does and does not establish.****What this does and does not establish.** It establishes that the SIGNAL exists and is geometric,
 so it escapes both of this entry's blocking results — the coverage one (this is not the coverage)
 and the photon-statistic one (this reads geometry, not photons). It does **not** establish that a
 rule built on it works: the previous four attempts all failed at the step *after* the signal, by
