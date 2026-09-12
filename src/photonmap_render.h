@@ -100,6 +100,18 @@ inline int gaRejWeightPct() {
     }();
     return p;
 }
+// FTRACE_GADEPTH=1: require NEGATIVE mean probe depth as well as a high reject rate before the
+// tangle gate fires. Depth is measured below the tangent plane, so negative means the geometry
+// found by the probes sits ABOVE it -- the shading point is inside a packed coat. Sparse strands
+// give positive depth (probes fall through the gaps), and they NEED the correction. See
+// M-GATHERAREA: the reject rate alone cannot tell fur from hair, because both are tangles.
+inline bool gaDepthGateOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_GADEPTH");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
 inline bool gaDiagOn() {
     static const bool on = [] {
         const char* e = std::getenv("FTRACE_GADIAG");
@@ -109,6 +121,12 @@ inline bool gaDiagOn() {
 }
 struct GaDiagMat {
     std::atomic<long long> miss{0}, reject{0}, accept{0};
+    // OCCUPANCY, which orientation alone cannot give: how far below the tangent plane the first
+    // surface sits. `depthSum` is in units of the gather radius; `deep` counts hits past 0.25 r.
+    // A packed shell (fur) hits shallow and tight; sparse strands (hair) let probes fall through
+    // the gaps and hit something far below. See M-GATHERAREA, the fur-vs-hair split.
+    std::atomic<long long> deep{0};
+    std::atomic<long long> depthMilli{0};   // sum of 1000*depth/r, integral so it can be atomic
 };
 inline std::vector<GaDiagMat>& gaDiag() {
     static std::vector<GaDiagMat> t(1024);      // matId is small; 1024 is far past any scene
@@ -121,6 +139,8 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
     Vec3 t, b; onb(n, t, b);
     double area = 0.0;                 // in units of the full disc, so 1.0 == fully covered
     int   nRej = 0;                    // probes that FOUND geometry facing the wrong way
+    double depthSum = 0.0;             // sum of (hit depth below the tangent plane) / r
+    int    nHit = 0;                   // probes that found anything at all
     // THE SILHOUETTE GATE, as an adaptive early-out rather than a separate heuristic. The entry
     // proposes "only worth doing when the gather is near a silhouette or a small-feature
     // primitive", and the honest way to know that is to ask the same estimator with fewer
@@ -174,8 +194,15 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
         if (gaDiagOn() && matId >= 0 && matId < (int)gaDiag().size()) {
             GaDiagMat& g = gaDiag()[matId];
             if (!(h.valid && h.t <= 2.0 * r))          g.miss.fetch_add(1, std::memory_order_relaxed);
-            else if (dot(h.n, n) < 0.5)                g.reject.fetch_add(1, std::memory_order_relaxed);
-            else                                       g.accept.fetch_add(1, std::memory_order_relaxed);
+            else {
+                if (dot(h.n, n) < 0.5) g.reject.fetch_add(1, std::memory_order_relaxed);
+                else                   g.accept.fetch_add(1, std::memory_order_relaxed);
+                // Depth below the tangent plane, over ANY hit (accepted or rejected) -- the
+                // question is where the geometry is, not which way it faces.
+                const double depth = (h.t - r) / r;
+                g.depthMilli.fetch_add((long long)(depth * 1000.0), std::memory_order_relaxed);
+                if (depth > 0.25) g.deep.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         // Same 60-degree acceptance the photon query uses (dot(ph.n, h.n) < 0.5 rejects), so the
         // footprint and the estimator agree on what surface is "here".
@@ -192,12 +219,19 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
             // caught this and the truncated elements could.
             if (c >= 0.5) area += 1.0 / c;
             else          ++nRej;
+            depthSum += (h.t - r) / r;   // < 0 when the geometry sits ABOVE the tangent plane
+            ++nHit;
         }
     }
     // THE TANGLE GATE. A high reject share means the disc is full of geometry pointing every
     // which way, not hanging over empty space -- and there the correction is not merely weaker,
     // it points the wrong way. Doing nothing is the measured-correct action for fur.
-    if (gaRejectPct() > 0 && nRej * 100 >= gaRejectPct() * M) return 1.0;
+    if (gaRejectPct() > 0 && nRej * 100 >= gaRejectPct() * M) {
+        // With the depth condition on, a tangle whose geometry lies BELOW the plane is sparse
+        // strands rather than a packed coat, and those need the correction rather than losing it.
+        const bool overfilled = !gaDepthGateOn() || (nHit > 0 && depthSum < 0.0);
+        if (overfilled) return 1.0;
+    }
     // A REJECT IS EVIDENCE OF SURFACE, NOT OF EMPTY SPACE. Adding its area back is the
     // continuous form of the same fix the gate approximates, and on geometry that rejects
     // nothing -- which is what truncation measures -- it changes exactly nothing.
@@ -220,12 +254,14 @@ inline void gaDiagReport(const Scene& scene) {
     for (const auto& mg : scene.meshGroups)
         if (mg.matId >= 0 && mg.matId < (int)nm.size() && nm[mg.matId].empty())
             nm[mg.matId] = mg.name;
-    struct Row { int id; long long mi, rj, ac, tot; };
+    struct Row { int id; long long mi, rj, ac, tot, dp, dm; };
     std::vector<Row> rows;
     for (int i = 0; i < (int)gaDiag().size(); ++i) {
         const long long mi = gaDiag()[i].miss.load(), rj = gaDiag()[i].reject.load(),
                         ac = gaDiag()[i].accept.load();
-        if (mi + rj + ac > 0) rows.push_back({i, mi, rj, ac, mi + rj + ac});
+        if (mi + rj + ac > 0)
+            rows.push_back({i, mi, rj, ac, mi + rj + ac,
+                            gaDiag()[i].deep.load(), gaDiag()[i].depthMilli.load()});
     }
     if (rows.empty()) return;
     std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.tot > b.tot; });
@@ -233,15 +269,19 @@ inline void gaDiagReport(const Scene& scene) {
         "\n[gadiag] why a footprint probe contributed nothing, per material.\n"
         "[gadiag] MISS = the disc overhangs empty space (truncation). REJECT = geometry is there\n"
         "[gadiag] but faces the wrong way (a tangle). Same coverage, opposite causes.\n"
-        "[gadiag] %-22s %10s %8s %8s %8s\n", "material", "probes", "miss%", "rej%", "acc%");
+        "[gadiag] %-22s %10s %8s %8s %8s %8s %8s\n", "material", "probes",
+        "miss%", "rej%", "acc%", "depth/r", "deep%");
     char buf[24];
     for (size_t k = 0; k < rows.size() && k < 24; ++k) {
         const Row& r = rows[k];
-        std::fprintf(stderr, "[gadiag] %-22s %10lld %7.1f%% %7.1f%% %7.1f%%\n",
+        const long long hits = r.rj + r.ac;
+        std::fprintf(stderr, "[gadiag] %-22s %10lld %7.1f%% %7.1f%% %7.1f%% %8.3f %7.1f%%\n",
                      nmOf(scene, r.id, buf),
                      r.tot, 100.0 * (double)r.mi / (double)r.tot,
                      100.0 * (double)r.rj / (double)r.tot,
-                     100.0 * (double)r.ac / (double)r.tot);
+                     100.0 * (double)r.ac / (double)r.tot,
+                     hits ? (double)r.dm / 1000.0 / (double)hits : 0.0,
+                     hits ? 100.0 * (double)r.dp / (double)hits : 0.0);
     }
 }
 

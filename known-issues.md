@@ -3064,7 +3064,7 @@ the paired difference holds to about a point:
 
 | ROI | gate30 − on, seed 1 | seed 2 | mean |
 |---|---|---|---|
-| `creature` | **−15.7** | **−24.0** | **−19.9 points** |
+| `creature` | **−15.7** | **−24.0** | **−19.9 points** (`-time`; see the matched-spp correction below) |
 | `alice_hair` | −1.2 | −1.0 | −1.1 |
 | `alice_dress` | −1.5 | −1.3 | −1.4 |
 | `cap_gyroid` | +0.1 | −0.1 | **0.0** |
@@ -3112,6 +3112,60 @@ the ball overfills. Nothing measured here tests that, and a rule based on it wou
 statistic that sees occupancy rather than orientation — the ray probe measures the latter. Whoever
 picks this up should note the gate's 5.8:1 is achieved by exploiting a 7-point gap between two
 rates that a better statistic might separate outright.
+
+**CORRECTION TO THE RATIO ABOVE, AND THE RIG BUG BEHIND IT: `-time` IS NOT A CONTROL.** Every ROI
+arm in this entry was rendered with `-time 150`, which on this machine delivers anywhere from
+**87 to 101 spp** — a 15 % spread, run to run, from an identical command. On a firefly-heavy scene
+the trimmed mean moves with sample count (more samples means more chances to catch a rare bright
+path), so that spread lands directly on the score. Measured with the perfect control — the SAME
+configuration, seed and binary, differing only in the spp `-time` happened to deliver:
+
+| ROI | px | 87 spp | 100 spp | **spurious swing** |
+|---|---|---|---|---|
+| `alice_hair` | 27 | −19.8 % | −2.8 % | **17.0 points** |
+| `alice_dress` | 90 | −16.1 % | −9.4 % | 6.7 |
+| `cap_gyroid` | 56 | −5.0 % | −1.9 % | 3.1 |
+| `creature` | 36 | +56.8 % | +55.6 % | 1.2 |
+
+**Re-scored at matched spp (100-101):**
+
+| rule | fur benefit | `alice_hair` | `alice_dress` | `cap_gyroid` | ratio |
+|---|---|---|---|---|---|
+| **gate 30** | **−15.9** | −2.0 | −1.6 | −0.9 | **3.5 : 1** |
+| gate 30 + depth | −6.0 | −2.0 | −1.0 | −0.5 | 1.7 : 1 |
+
+**The gate's headline survives; its ratio does not.** Fur still moves +61.6 % → +45.7 %, which is
+the same **~25 % of the overfill** quoted above. But the collateral is 4.5 points, not 2.7, so the
+benefit-to-collateral ratio is **3.5 : 1 and not the 5.8 : 1 recorded earlier** — and the two-seed
+"paired" confirmation was `-time` too, so its tight per-seed differences were partly luck in how
+closely the arms' spp happened to match.
+
+**THE DEPTH CONDITION IS REJECTED (`FTRACE_GADEPTH`, v0.273.9).** The idea was sound on the
+diagnostic: fur's mean probe depth is **−0.127** (geometry ABOVE the tangent plane, i.e. the
+shading point sits inside a packed coat) while the other tangle, mat45, is **+0.074**, so
+requiring negative depth should have vetoed the gate on hair and kept it on fur. It does not work:
+at matched spp it halves the benefit (−6.0 against −15.9) while barely reducing collateral, and
+**`alice_hair` reads −2.8 % under BOTH rules**, so the veto does not protect hair at all. The
+mat45 → depth-veto story fails on its own terms rather than on an artifact.
+
+> **A first reading of this had the depth gate as a catastrophe — `alice_hair` at −19.8 % against
+> gate 30's −4.0 %, a 16-point regression.** That was the 87-spp run. It was caught not by
+> statistics but by ARITHMETIC THAT COULD NOT BE TRUE: adding a conjunct to a gate makes it fire
+> strictly LESS often, so hair had to move *toward* the ungated value, and it moved 16 points the
+> other way. A surprising result is worth chasing; an impossible one means the measurement is
+> broken. That is the third time in this session a physically-impossible value flagged a broken
+> rig before any error bar would have — the others being multiple scatter reading −2.8 % of the
+> light, and a mode-`D` relMSE of exactly 0 in a quartile.
+>
+> **Two confounds had to be stripped, in order.** First a cross-binary comparison (gate 30 from
+> v0.273.6 against gate 30 + depth from v0.273.9) — the same mistake as the JDEVCMP timing
+> recorded in this file, made again with the lesson already written down. That one turned out
+> innocent: gate 30 reproduces across builds to ~1 point. Then the real one, `-time`.
+>
+> **The rule that actually prevents this is procedural, not mnemonic:** render every arm of a
+> comparison in ONE batch, on ONE binary, at FIXED `-spp`. "Remember that binaries differ" and
+> "remember that `-time` varies" are things I demonstrably do not remember under load; a single
+> command that renders all arms together cannot forget.
 
 **AND IT DOES NOT TOUCH THE CASE THE CORRECTION EXISTS FOR.** The risk a tangle gate carries is
 that truncated geometry also trips it, silently disabling the correction on the cloth/hair/edge
