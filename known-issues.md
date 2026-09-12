@@ -21262,6 +21262,16 @@ well-formed, so substituting one for the other would have perturbed every quad-l
 rendered. Precomputing `normalTilted` and keeping the *original* float expression whenever it is
 false means a well-formed scene cannot move at all.
 
+**REGRESSION-CHECKED, and the blast radius is bounded by construction rather than by hope.** The
+correction is exact at a second angle, not just the 45° the mechanism was measured at — a **36.9°**
+tilt (`mirror_selfie`'s own angle) reads 0.107982 against the geometrically-correct panel's
+0.107982, ratio **1.0000**, where pre-fix it would have been `cos(36.9°)` = 0.7997. And the runtime
+predicate agrees with the static survey: `cornell`, `material_presets` and `_fog_cornell` all emit
+**0** warnings, so their emitters take `normalTilted == false` and therefore the original float
+expression. Combined with the survey (38 malformed lights across `scenes/` + `scraps/`, of which
+exactly **3 shipped**, all in `mirror_selfie`), the set of shipped scenes whose output this changes
+is *that one scene*.
+
 **Only the Quad shape needed it:** `samplePoint` already returns a genuinely geometric normal for
 sphere (`(y-origin)/radius`), cylinder (`rad`) and mesh (`t.nrm`); only the quad branch handed back
 the authored field. And `lightPdfW` / `dLightPdfW` were already correct — they take the normal from
