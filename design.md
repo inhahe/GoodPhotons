@@ -3555,6 +3555,40 @@ as the one at fault.
   and both maps divide by the **same `nEmitted`** — which counts paths EMITTED, not photons
   stored, and is the classic two-map bug if you use the caustic map's own count instead: a rare
   caustic would be rescaled to full light-source brightness.
+  **THE GATHER FOOTPRINT (`-gatherarea`, on by default at 8 probes since v0.268.0; mode `S`
+  gained it in v0.273.1).** The density estimate above divides by `pi r^2`, the area of a FULL
+  disc, while two things stop the photons it sums from having come from one: the query rejects
+  any photon whose normal disagrees with the hit's by more than 60 degrees, and nothing clips the
+  disc to the surface, so wherever the disc overhangs a silhouette or a thin feature that part of
+  it collected from geometry that is not there. Both are area mismatches and both are one-sided,
+  so they add: on `gallery_rain` the error runs 0 % on flat ground, −38 % on a tabletop edge,
+  −44 % on cloth and −70 % on hair, in proportion to how much of the disc is real surface.
+
+  The fix measures the covered fraction by **ray probe** rather than analytically: `M` stratified
+  points in the tangent-plane disc, each traced from `r` above the plane straight down, accepted
+  on the same 60-degree test the photon query uses, and weighted by `1/cos(tilt)` because the
+  probe samples PROJECTED area while the estimator needs SURFACE area. `gatherCoverage` /
+  `gatherAreaScale` in `photonmap_render.h`, device twin `dGatherCoverage` in `render_cuda.cu`,
+  and `sppm_render.h` applies it to each pass's flux BEFORE it enters `tau` — coverage belongs to
+  the radius actually gathered at, and SPPM shrinks its radius every pass, so a single coverage
+  measured at the final radius would misprice every earlier one.
+
+  **An analytic clip was the obvious design and is the wrong one here:** clipping same-facing
+  primitives to the disc is exact for triangles and impossible for fur, isosurfaces and CSG
+  solids — and fur is the single largest loss on the scene that motivated this, so the exact
+  method would have missed the case it was built for. One intersector call handles every
+  representation, and it is the same intersector the render already trusts.
+
+  **It is not a quality dial, and it is wrong on dense fur.** More probes make hair and cloth
+  *worse*, because the default's apparent accuracy is partly Jensen's upward bias at low `M`
+  (`E[1/cov] > 1/E[cov]`) offsetting a residual dark bias. And where a tangle **overfills** the
+  disc the correction has the sign backwards: `creature`'s fur coat is accurate uncorrected and
+  **+48 %** corrected, because the probe sees only the nearest layer while the query gathers from
+  the whole ball. `-gatherarea 0` restores the pre-0.267 estimator exactly and is the escape
+  hatch for fur-dominated scenes. Counting the hidden layers is NOT the fix and was measured:
+  their area is real and their photons are accepted, but the visible point is on the FRONT layer
+  and dividing its photons by front-plus-back area dilutes the surface being shaded.
+
   The classifier is `photonVertexKind` (`render.h`) with device twin `dPhotonVertexBit`
   (`render_cuda.cu`), three-way: **FOCUS** (dielectric, mirror, thin-film, multilayer, grating,
   half-mirror, and glossy at roughness ≤ `kCausticGlossRoughness`), **SCATTER** (rough glossy,
@@ -3910,6 +3944,20 @@ as the one at fault.
   regression lever. `kWfShade` (wavefront) and `traceHeroPhoton` pass no scatter counter, so they
   degrade to single scatter — neither runs beams. Cost note: MS deposits several times more beams
   per photon, so a `-n` that fit before may now exhaust the beam budget (see known-issues.md).
+  **Each stored chord also RECORDS its order** in `PhotonBeam::order` (v0.273.4) — 1 = single
+  scatter, 2 = it scattered once in a medium first, and so on — because the cap above is applied
+  at DEPOSIT time, so without the field nothing downstream can tell an order-1 chord from an
+  order-5 one. It costs no memory: it occupies the padding byte between `achro` and the
+  2-byte-aligned `emIdx`, leaving `sizeof(PhotonBeam)` unchanged. `BeamBank::push` and
+  `Renderer::emitBeams` take it as a REQUIRED parameter, so a new depositor cannot silently
+  inherit a wrong value. **Mode `J` stores the sentinel `kBeamOrderUnknown`**: its natural
+  candidate, `PathSeg::vert`, is the subpath VERTEX index and counts surface bounces, where this
+  field means MEDIUM scattering order — passing it would type-check and make `order >= 2` mean two
+  different things depending on mode. Anything that cannot be represented becomes the sentinel
+  rather than the nearest representable order, where it would be indistinguishable from a
+  measurement. The beam-map report line prints the distribution (`gallery_rain`: 59.3 % single
+  scatter, 40.7 % order >= 2; `_fog_thick`: 17.2 % / 82.8 %) and stays silent when no chord tracks
+  its order, so it cannot invent one for mode `J`.
   **Ported to the device in 0.197.0 — deposit *and* gather.** The scope is larger than "upload
   the BVH" because `-beams` changes the **transport**, not just the reconstruction: the
   depositing photon crosses straight, so the surface photon map and the beam map have to come
