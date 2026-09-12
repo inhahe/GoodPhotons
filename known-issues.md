@@ -3204,6 +3204,21 @@ last pair matters — an off-switch that silently does nothing is how the mode-`
 null control while being inert, and how `>= 2` swept the default into the diagnostic arm.
 `-tanglegate 0` restores the pre-0.274.0 estimator exactly.
 
+**MODE `S` REGRESSION-CHECKED TOO, since the default flip changes it as well** — the gate lives in
+`gatherCoverage`, which both modes call, and mode `M` was the only one measured. On
+`_ga_strip` (mode `S`, GPU, `-spp 48`), default vs `-tanglegate 0`: median relative delta
+**1.10e-07** against a same-command rig noise of **1.11e-07**, frame means equal to six decimals.
+The gate's effect is indistinguishable from the rig's own float noise, i.e. **inert on truncated
+geometry exactly as designed** (0 % reject cannot fire it). Establishing the rig noise FIRST is
+what makes that readable: two identical results otherwise cannot tell "correctly inert" from "flag
+not wired in", which is precisely how the mode-`S` footprint twin once passed its null control
+while doing nothing. The positive control came from a different scene — on `gallery_rain` the same
+pair differs by 13 379 floats, so the flag demonstrably reaches the code.
+
+*Incidentally: GPU renders carry ~1e-7 accumulation-order noise in mode `S` as well as mode `M`,
+so that is a backend property rather than a per-mode one. Any GPU A/B on either mode has a
+~1e-7 floor and cannot be checked by bit-identity.*
+
 **PORTED TO THE DEVICE (v0.273.10), which is what let it stop being opt-in.**
 `dGatherCoverage` now counts rejects and applies the same predicate, with the threshold carried as
 `DScene::gatherRejPct` read from the SAME `FTRACE_GAREJECT` channel the host reads — the invariant
