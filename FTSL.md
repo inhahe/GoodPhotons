@@ -2077,7 +2077,7 @@ scene to fixed-exposure output (`power` wins if both given). Env lights reject
 
 | subtype | keys (defaults) |
 |---|---|
-| `area` (default) | `origin` `u` `v` `normal`(from u×v) `spd`, `spd_map`, `hide_camera`(off) — a rectangle |
+| `area` (default) | `origin` `u` `v` `normal`(from u×v) `spd`, `spd_map`, `hide_camera`(off) — a rectangle. **`normal` should pick a SIDE, not tilt the panel:** it defaults to `u`×`v`, and a value that is not perpendicular to `u`×`v` makes the emitter inconsistent (its samples come from the rectangle while its pdf converts area to solid angle using `normal`), which biases the render by a few percent, differently per render mode. ftrace **warns** at load since 0.276.1, naming the light and the angle. To aim a panel, rotate `u`/`v` so the rectangle actually faces that way. |
 | `collimated` | `dir`(0,0,-1) `origin`(0.5,0.5,0.95) `spd` — a thin pencil beam |
 | `sphere` | `center` `radius`(0.1) `spd` — a glowing ball (also dropped into geometry) |
 | `cylinder` | `center` `axis`(0,1,0) `length`(0.5) `radius`(0.05) `segments`(48) `caps`(off) `spd` — a tube/fluorescent |

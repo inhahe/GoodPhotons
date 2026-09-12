@@ -20871,35 +20871,61 @@ normal was exactly anti-parallel to the tile→light direction), so every one of
 blind to the emitter cosine — I even wrote that down as a "rig blind spot" and only then thought to
 tilt the panel, which is what exposed it.
 
-## OPEN (2026-09-12): `light area` silently accepts a `normal` that is not perpendicular to `u`×`v`, and the emitter is then inconsistent
+## OPEN (2026-09-12): an area light's emission normal and its GEOMETRIC normal are the same field, so an aimed panel is silently inconsistent — **warned since v0.276.1**
 
-`src/ftsl.h` ~6309: `if (!vec3Of(b, "normal", nrm)) nrm = normalize(cross(u, v));`. So `normal` is a
-free override with **no perpendicularity check**, and `FTSL.md` documents it only as
-"`normal`(from u×v)" — which reads like a convenience default rather than a constraint.
+`src/ftsl.h`: `normal` is a free override of the emission axis, defaulting to `cross(u,v)`, with no
+perpendicularity check. Declare one that is not perpendicular and the emitter's **rectangle lies in
+one plane while its emission axis points out of that plane**.
 
-Declare one that is not perpendicular and you get an emitter whose **rectangle lies in one plane
-while its emission axis points out of that plane**. Every area-measure quantity (the sampled point,
-`em.area`, the `pdf_A · dist²/cos` conversion) then disagrees with the emission cosine, so
-estimators that apply that cosine in different places disagree with each other. Measured cost, mode
-`D` against mode `R` on an otherwise identical scene (`scraps/_gwsz_*.ftsl`, 16 configurations):
+**THE DEFECT IS A CONFLATION, not the override.** A flat rectangle's geometric normal is
+perpendicular to it, necessarily. But one field serves two jobs:
 
-| | `D`/`R` |
+1. the **emission** cosine falloff and the one-sided emission test — where an authored aim is a
+   fair, if non-physical, artistic control; and
+2. the **area ↔ solid-angle conversion** `pdf_A · dist²/cos` — pure geometry, which *must* use
+   `cross(u,v)`, because the solid angle a patch subtends depends on how the patch is **oriented**,
+   not on where its emission is aimed.
+
+For a well-formed light the two coincide and nothing is noticed. Tilt them apart and (2) is
+silently wrong, so estimators that apply that cosine in different places disagree with each other.
+Measured: a 45° tilt cost **+5 % mode `D` against mode `R`**, as a smooth single-humped function of
+`p_lobe/p_light` peaking where MIS mixes the two strategies evenly — which reads exactly like a
+BDPT weighting bug and cost two iterations to pin on the scene instead of the renderer.
+
+**I HAD RECOMMENDED ORTHOGONALIZING THE NORMAL. THAT IS WRONG, and checking the shipped scenes is
+what showed it.** `scenes/mirror_selfie.ftsl` tilts `normal` **deliberately**, with a comment
+saying so, to AIM two wall-wash panels — *"Two wall-wash lights flanking the mirror … that face the
+back wall head-on"*, `normal 0.8 0 -0.6` on a panel whose own plane faces +x. Forcing the normal
+perpendicular would swing those lights 37° off the wall they exist to light. **Aiming a panel is a
+reasonable thing to want**, so the override should stay; it is the *conversion* that must stop using
+it.
+
+**SHIPPED IN v0.276.1: a load-time warning.** It names the light by origin, gives the angle off
+perpendicular, states the consequence, and says what to do instead (rotate `u`/`v` to aim the
+panel; use `normal` only to pick which **side** emits). Verified: fires on a 45° rig, fires **3
+times** on `scenes/mirror_selfie.ftsl`, silent on well-formed scenes including `cornell`, and
+**bit-identical** output across 0.276.0 → 0.276.1 on the same malformed scene — it is a diagnostic
+and moves no pixel.
+
+**SURVEY of every `light area` with an explicit `normal`** (`scraps/` scanner, 1000 blocks across
+`scenes/` and `scraps/`): **38 malformed**, of which 3 are in shipped content:
+
+| scene | off perpendicular |
 |---|---|
-| panel 45° out of its own plane | up to **1.0506** |
-| same configuration, consistent normal | **1.0000** |
+| `scenes/mirror_selfie.ftsl` ×3 | 21.8°, 36.9°, 36.9° |
+| `scraps/klein_look.ftsl`, `klein_open_view.ftsl`, `klein_capped_test.ftsl` | 33.1°, 56.7° |
+| `scraps/noise_ours.ftsl` | 19.8° |
+| `scraps/mesh_light3.ftsl` | **90.0°** — the normal lies *in* the panel's plane, fully degenerate |
+| my own glossy rigs (`_gwhl_*`, `_gwrec_*`, `_gwsz_*`) | 45.0° |
 
-The bias is a smooth single-humped function of `p_lobe/p_light`, peaking near **+5 %** where MIS
-mixes the two strategies evenly and vanishing at either extreme — so it looks exactly like a
-renderer bug, and it cost a full iteration to identify as a scene error. It is also **silent**:
-no warning, and the render looks entirely plausible.
-
-Worth fixing at load time, cheaply, in either of two ways: (a) **warn** when
-`|dot(normalize(normal), normalize(cross(u,v)))| < 1 - 1e-6`, naming the light, or (b) treat the
-declared `normal` as selecting the **side** only — keep its sign, take the axis from `cross(u,v)` —
-which is what an author who writes `normal 0 -1 0` on a horizontal panel actually means, and makes
-the override unable to create an inconsistent emitter at all. (b) plus a warning when the two
-differ by more than a hemisphere flip is probably the right combination; (a) alone is enough to
-stop the silent case.
+**THE REAL FIX, when someone takes it:** split `Emitter`'s normal into `nEmit` (authored, aimable)
+and `nGeom` (always `normalize(cross(u,v))`), mirror it on the device, then audit every site that
+reads the normal for which of the two it wants — emission sampling and the side test take `nEmit`;
+every `pdf_A · dist²/cos`, every `G` term, and `lightSelPdf`'s cone reasoning take `nGeom`. Until
+then a tilted panel is biased by a few percent, differently per mode, and `mirror_selfie` is
+affected. Repairing that scene without the code change means rotating its `u`/`v` so the rectangles
+genuinely face the wall — which preserves the author's intent and costs only a small change in each
+panel's spatial extent.
 
 ## OPEN (2026-08-04): `phase rainbow` — the 2048-bin uniform-in-mu table under-resolves large droplets, and monodisperse supernumeraries read as a white arc
 
