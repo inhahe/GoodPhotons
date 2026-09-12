@@ -1225,7 +1225,7 @@ transfer by being written down; it transfers by being built into the harness.**
 `src/scene.h` (`Emitter::sampleSphereCone`), `src/ftsl.h` ~6112 (where the emissive sphere joins
 the geometry). Measured by `scraps/gate_neeeps.sh`.
 
-### JDEVCMP-DEFAULT — **FIXED** (2026-09-11, v0.272.6): the mode-`J` device light pass ran its **host-vs-device diagnostic comparison in the shipped default**, once per light-side epoch — costing throughput and burying the progress lines under 2x their volume in debug output
+### JDEVCMP-DEFAULT — **FIXED** (2026-09-11, v0.272.6): the mode-`J` device light pass ran its **host-vs-device diagnostic comparison in the shipped default**, once per chunk — burying the progress output under 2x its volume in debug tables (throughput cost measured and found to be nil, < 70 ms per dump)
 
 **Found while verifying something else.** A `_fog_cornell` knee-verification render printed a full
 `[jdevcmp]` table — host/device medians for `beta`, `pdfFwdA`, `rCoef`, `sumC`, `sumMb`, `sumMs`,
@@ -1257,21 +1257,47 @@ every epoch — 126 of them in 90 s — and a line each would bury the `-interva
 carry the actual progress."* The same reasoning had already been written down, next to the code,
 and applied to the neighbouring print only.
 
-It was not just noise, either: each dump downloads the device map and runs a median over every
-field, once per epoch. **How much that cost is still being measured, and the first attempt at
-measuring it was itself a lesson.** Comparing the pre-fix binary against the post-fix one — same
-scene, seed, spp, probe setting, identical knee (347 780 beams both times) — said the *fixed*
-binary was **2.2x slower**. It is not: the giveaway is that the regression lands in `beam hits`,
-7.5 s → 15.7 s, a kernel neither binary touches and whose input (a 6.8 M sub-beam map) is the
-same in both. The two runs were twenty minutes apart on a card that had been rendering the whole
-time, so what the experiment measured was the GPU's clocks, not the change. **Two builds minutes
-apart is not a controlled comparison on hardware with thermal history.**
+**THE COST IS THE SPAM, NOT THE THROUGHPUT — measured, after two rounds of getting it wrong.**
+The first draft of this entry asserted "it was not just noise, either: each dump downloads the
+device map and runs a median over every field, per epoch." That was an assumption written as a
+finding. Measured, with both arms in one binary (`FTRACE_JDEVLIGHT=4` = level 3 plus the dump) and
+interleaved 3,4,4,3 so the beam map is bit-identical between them — same knee, same sub-beam
+count, same noise to four digits — the dump is **free within the resolution of the rig**:
 
-The fix for the rig, rather than a fudge factor: `FTRACE_JDEVLIGHT=4` was added as "level 3 plus
-the dump", so both arms exist in **one binary** and can be interleaved seed by seed
-(`scraps/jdevcmp_cost.sh` runs them 3,4,4,3 per seed so monotone drift cancels to first order).
-A diagnostic that cannot be A/B'd against its own absence within one process image cannot have its
-cost quoted.
+| round | spp | dumps/run | lvl 3 | lvl 4 (+dump) | difference |
+|---|---|---|---|---|---|
+| 1 | 24 | 4 | 3 seeds | 3 seeds | +1.18 s ± 2.85 → **< 1.7 s/dump**, useless bound |
+| **2** | **96** | **13.5** | 208.1, 206.8 s | 207.1, 205.1 s | **−1.37 s ± 1.18 (1.2σ)** → **< 70 ms/dump** |
+
+Round 2 is the one to read. Seed 3 showed **+3.9 s** in round 1 and **−1.4 s** in round 2 — same
+seed, 3.4x the dumps, effect gone and sign flipped. Round 1's apparent signal was noise that
+happened to agree across two of three seeds, which is exactly what noise does one time in four.
+
+**Why both arms have to live in ONE binary.** The first attempt at this number compared the
+pre-fix build against the post-fix one — same scene, seed, spp, probe setting, and an identical
+knee of 347 780 beams — and reported the *fixed* binary **2.2x slower**. The tell is where the
+regression landed: `beam hits`, 7.5 s → 15.7 s, a kernel neither binary touches, fed a 6.8 M
+sub-beam map that was the same in both. The two runs were twenty minutes apart on a card that had
+been rendering throughout, so what the experiment measured was the GPU's clock state. **Two builds
+minutes apart is not a controlled comparison on hardware with thermal history** — hence
+`FTRACE_JDEVLIGHT=4`, and hence interleaving.
+
+**The rig fix worth remembering: raise the signal, do not average down the noise.** Round 1 could
+not resolve the effect at four dumps per run, and the cure for that is not more seeds — it is more
+dumps per run. Going 24 → 96 spp cost the same GPU time as another three seeds would have and
+bought a bound **24x tighter**.
+
+**And the envelope calculation should have come first.** `compareJSurfMaps` moves ~10 MB
+device→host and sorts 119 k elements: order **100 ms**, so ~1.4 s across 14 dumps, ~0.7 % of a
+205-second render — *below what any wall-clock A/B on this hardware can resolve*. One minute of
+arithmetic would have predicted the null, and would have said the throughput question was not
+worth a rig at all. The measured bound, < 70 ms/dump, agrees with that envelope and excludes the
+~900 ms/dump that round 1 hinted at by **13x**. "Check that the rig can see the effect" applies to
+positive predictions, not only to null results.
+
+So the defect is real and the fix stands, but for the reason at the top of this entry — a
+diagnostic dump burying the progress output 2:1 in the shipped default — and not for a
+performance one.
 
 **A second, smaller waste in the same eight lines.** `uploadSurfMapCuda(smap, up, dsm)` ran
 unconditionally, converting every host surface photon into the device layout through two staging
