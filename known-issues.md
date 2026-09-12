@@ -2520,7 +2520,7 @@ something the dielectric path does on exit.
 **Where it bites:** `src/photonmap_render.h` (the estimate and its normalisation),
 `scenes/gallery_rain.ftsl`, `scraps/mbeamk.log` and `scraps/mbias.log` (the measurements).
 
-### GLOSSY-NEE — **FIXED, CPU AND GPU** (CPU 2026-09-07 v0.266.0; GPU twins 2026-09-09 v0.266.4; filed the same day at v0.265.0). **One sub-item remains**: `p_L(e, x, omega)` for an arbitrary emitter and direction, needed on the BSDF-sampling side. (This heading said "**GPU still open**" until 2026-09-11, by which point its own sub-item 3 read "The GPU twins — DONE" and sub-item 2 the same. A heading is the only part of an entry most readers see, so a stale one is worse than a stale paragraph.): no unidirectional mode did next-event estimation at a `MatType::Glossy` vertex, so a rough metal under a small light is found only by chance — a 6.8e-5 sr sun costs a gold gyroid 64 % of its energy at 120 spp and a chrome ring 91 %
+### GLOSSY-NEE — **FIXED, CPU AND GPU** (CPU 2026-09-07 v0.266.0; GPU twins 2026-09-09 v0.266.4; filed the same day at v0.265.0). **COMPLETE as of the 2026-09-11 audit** — `p_L(e, x, omega)` is implemented as `lightPdfW` / `lightPdfWShape` and every emitter shape is covered. (This heading said "**GPU still open**" until 2026-09-11, by which point its own sub-item 3 read "The GPU twins — DONE" and sub-item 2 the same. A heading is the only part of an entry most readers see, so a stale one is worse than a stale paragraph.): no unidirectional mode did next-event estimation at a `MatType::Glossy` vertex, so a rough metal under a small light is found only by chance — a 6.8e-5 sr sun costs a gold gyroid 64 % of its energy at 120 spp and a chrome ring 91 %
 
 > **FIXED on the CPU in v0.266.0.** Glossy vertices now connect to lights, balance-heuristic
 > weighted against the lobe-sampling strategy. Measured on `scenes/_spec_repro_sun.ftsl` — four
@@ -2817,10 +2817,34 @@ bit-identical behind a null hook. `emitterGeom` already returns `w = cos(surf)/p
 
 **What is genuinely missing** and is the bulk of the work:
 
-1. **`p_L(e, x, ω)` for an arbitrary emitter and direction**, needed on the BSDF-sampling side
-   where the emitter is discovered by a ray hit rather than chosen. One case per
-   `EmitterShape` (Area/quad, Sphere, Sun, Spot — delta, so no MIS —, Env — which already has
-   `envPdfDir` and its own MIS at `backward.h` ~1857, the exact idiom to copy).
+1. ~~**`p_L(e, x, ω)` for an arbitrary emitter and direction**~~ — **DONE**, and it was done
+   before this list was last read. `backward.h`'s `lightPdfW` (selection pdf x shape pdf) and
+   `lightPdfWShape` cover every case, and `glossyHitWeight` consumes it as
+   `gm.pdf / (gm.pdf + p_L)`:
+
+   | shape | `p_L` | |
+   |---|---|---|
+   | Sun | `1 / spotOmega` inside the cone | |
+   | Sphere, viewpoint outside | cone solid angle | falls through to area form when inside |
+   | Cylinder, uncapped | `dist^2 / (visibleArea . cosL)` | carries its own double-count warning |
+   | Area/quad, capped cylinder | `dist^2 / (area . cosL)` | |
+   | **Spot** | **0** | delta — no lobe can hit it, so NEE-only and weight 1 is correct |
+   | **Env** | **0** | MIS'd at its own escape site instead, `gmis.pdf / (gmis.pdf + pdfEnv)` |
+
+   **The two zeros are the part worth checking, and they are right.** A shape `lightPdfWShape`
+   does not handle makes `glossyHitWeight` return 1.0 — full credit on the BSDF side — which
+   double counts if the NEE side also contributes. Spot is a delta light no continuation can
+   hit, and Env is weighted at `backward.h` ~2192/2464 rather than here. So every case appears
+   in **both halves or neither**, exactly once.
+
+   **Confirmed by the paired test, not just by reading.** `-no-glossy-nee` restores the pre-0.266
+   estimator in the same binary, and both arms must converge to the same image because NEE is
+   variance reduction and not a different integrand. `scenes/_spec_repro_env.ftsl`, mode `R`,
+   40 s each (669–755 k spp, 0.12 % noise per arm): whole frame **+0.001 %**, brightest decile —
+   the glossy spheres themselves — **+0.000 %**. Unbiased to the fifth digit.
+
+   *(Mode `D` cannot anchor this rig: it refuses environment lights outright. The paired
+   on/off comparison is the better test anyway — one binary, one scene, one seed.)*
 2. ~~**A light-tree selection pdf `ltPdf(e | x, n)`**~~ — **DONE (v0.270.0)**, as
    `ltSelectPdf` in `lighttree.h`. The worry about `ltShouldSplit` turned out to be misplaced:
    the root→leaf path is UNIQUE in a tree, so a split contributes a factor of exactly 1 and
