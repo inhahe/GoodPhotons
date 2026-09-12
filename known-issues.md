@@ -3075,6 +3075,44 @@ zero and the null flat. **It is selective, not a weaker correction everywhere** 
 specific failure the covariance-ellipse attempt hit, and it would have shown as `cap_gyroid`
 drifting back toward −26.9 %. It moved 0.1.
 
+**A CONTINUOUS ALTERNATIVE WAS TRIED AND IS WORSE — and the reason identifies what is actually
+left unsolved.** The gate treats a symptom; the underlying defect is that `gatherCoverage` adds 0
+for a MISS and 0 for a REJECT, i.e. it records "surface is present, facing the wrong way" as
+"surface is absent". The principled repair is to let a reject carry area —
+`coverage = (sum_accepted 1/cos + w * nRej) / M`, `FTRACE_GAREJW=<pct>` (v0.273.7, 0 = off) —
+which is continuous, needs no threshold, and is bit-identical on zero-reject geometry BY
+CONSTRUCTION rather than by measurement. It was expected to beat the gate. It does not:
+
+| rule | fur benefit | `alice_hair` | `alice_dress` | `cap_gyroid` | **benefit : collateral** |
+|---|---|---|---|---|---|
+| **gate 30** | **−15.7** | −1.2 | −1.5 | +0.1 | **5.8 : 1** |
+| `w = 50` | −14.2 | **+1.1** | −5.5 | +1.5 | 2.6 : 1 |
+| `w = 100` | −28.9 | −13.9 | −10.1 | −0.3 | 1.2 : 1 |
+| `w = 200` | −43.7 | −24.4 | −14.0 | +0.2 | 1.1 : 1 |
+
+**`alice_hair` IS A TANGLE, and that is the finding.** The prediction written before the run was
+"w=100 costs about 1.4 points of cloth collateral, from the 1.6-6.0 % reject rate". It cost
+**13.9 points on hair** — wrong by an order of magnitude. Looking again at the gadiag table, there
+is a third elevated material: **mat45 at 10.2 % reject**, sitting between the fur (16.8-19.1 %)
+and everything else (0-6 %). The sweep confirms it behaviourally, since hair moves MORE than
+cloth under the reject weight (13.9 against 10.1) and so must reject more often. Hair had been
+grouped with cloth on the assumption that it was truncation-dominated; it is both.
+
+**So the reject rate separates TANGLES from flat and truncated geometry — but hair and fur are
+both tangles, and hair NEEDS the correction while fur does not.** A linear weight cannot
+distinguish them: it acts on both in proportion to a rate they nearly share. A THRESHOLD placed
+above hair's 10 % and below fur's 17-19 % can, which is precisely what gate 30 does and why the
+cruder rule is the better one here. **The continuous form is worse *because* it is continuous.**
+
+**What is still unsolved, stated sharply.** The remaining distinction is not tangle-vs-truncation
+— the reject rate already captures that — it is *fur-vs-hair*, two tangles that want opposite
+treatment. The plausible axis is **density**: hair is sparse strands with gaps between them, so
+its gather ball still contains mostly empty space and the correction is right; fur is packed, so
+the ball overfills. Nothing measured here tests that, and a rule based on it would need a
+statistic that sees occupancy rather than orientation — the ray probe measures the latter. Whoever
+picks this up should note the gate's 5.8:1 is achieved by exploiting a 7-point gap between two
+rates that a better statistic might separate outright.
+
 **AND IT DOES NOT TOUCH THE CASE THE CORRECTION EXISTS FOR.** The risk a tangle gate carries is
 that truncated geometry also trips it, silently disabling the correction on the cloth/hair/edge
 cases that motivated the whole entry — which would be far worse than the ~1 point of collateral

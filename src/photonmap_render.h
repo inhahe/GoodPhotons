@@ -88,6 +88,18 @@ inline int gaRejectPct() {
     }();
     return p;
 }
+// FTRACE_GAREJW=<pct>: the area a REJECTED probe contributes, as a percentage of the 1.0 an
+// accepted flat-on probe contributes. 0 = the pre-0.273.7 behaviour (a reject counts as empty
+// space, identical to a miss) and is the default. See M-GATHERAREA: treating "there is surface
+// here, facing the wrong way" as "there is no surface here" is what makes a tangle read as low
+// coverage and so drives the correction the wrong way on dense fur.
+inline int gaRejWeightPct() {
+    static const int p = [] {
+        const char* e = std::getenv("FTRACE_GAREJW");
+        return e ? std::atoi(e) : 0;
+    }();
+    return p;
+}
 inline bool gaDiagOn() {
     static const bool on = [] {
         const char* e = std::getenv("FTRACE_GADIAG");
@@ -186,6 +198,11 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
     // which way, not hanging over empty space -- and there the correction is not merely weaker,
     // it points the wrong way. Doing nothing is the measured-correct action for fur.
     if (gaRejectPct() > 0 && nRej * 100 >= gaRejectPct() * M) return 1.0;
+    // A REJECT IS EVIDENCE OF SURFACE, NOT OF EMPTY SPACE. Adding its area back is the
+    // continuous form of the same fix the gate approximates, and on geometry that rejects
+    // nothing -- which is what truncation measures -- it changes exactly nothing.
+    if (gaRejWeightPct() > 0)
+        area += (double)nRej * (double)gaRejWeightPct() * 0.01;
     return area / (double)M;
 }
 // Never divide by a coverage so small that one stray probe inflates a pixel into a firefly. A

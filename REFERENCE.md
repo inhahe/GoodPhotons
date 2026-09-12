@@ -1551,6 +1551,13 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   It is **not** a replacement for `-gatherarea 0` on a fur-dominated scene (which reads +11.8 %),
   and it stays opt-in because it is host-only — defaulting it would split CPU from GPU.
   `0`/unset is the default and is bit-identical.
+- **`FTRACE_GAREJW=<pct>` (experimental, mode `M`, host only).** The area a REJECTED footprint
+  probe contributes, as a percentage of an accepted flat-on one. `0` (default) reproduces the
+  pre-0.273.7 estimator exactly, where a reject counts as empty space. **Measured WORSE than
+  `FTRACE_GAREJECT=30`** and kept only so the comparison stays reproducible: `alice_hair` is
+  itself a tangle (~10 % reject against fur's 17-19 %), so a rule that acts in proportion to the
+  reject rate damages the hair it is supposed to protect, while a threshold between the two rates
+  does not. See `known-issues.md` → `M-GATHERAREA`.
 - **`FTRACE_GADIAG=1` (diagnostic, mode `M`).** Per-material tally of *why* a `-gatherarea`
   footprint probe contributed nothing: **MISS** (the disc overhangs empty space — truncation) or
   **REJECT** (geometry is there but faces outside the 60 degree cone — a tangle). The shipped
