@@ -2078,6 +2078,45 @@ is deposited. That needs the stored order at gather time, which is exactly the f
 populated on both backends in v0.278.1 — found, as it happens, while setting up the experiment two
 sections above.
 
+**THE CACHEABLE SHARE, MEASURED INSIDE THE GATHER (v0.278.2).** `FTRACE_BEAM_DIAG=1` now also
+counts what fraction of beam intersection **candidates** come from chords of order >= 2 — the
+share a volume cache could remove. It costs one atomic and changes nothing about the deposit,
+which is the whole point: the `-beams-order 1` arm above cannot answer this because it changes
+which chords exist. No new record was needed either — after `build()` the `beams` vector holds the
+SUB-beams as full `PhotonBeam` objects, so the split already carries `order`.
+
+| scene | order >= 2, **population** | order >= 2, **gather candidates** |
+|---|---|---|
+| `gallery_rain` | 40.7 % | **43.5 %** |
+| `_fog_st2` (`sigma_t` 2) | 65.6 % | **68.9 %** |
+| `_fog_st6` (`sigma_t` 6) | 79.6 % | **81.0 %** |
+| `_fog_thick` (`sigma_t` 20) | 82.8 % | **83.2 %** |
+
+**Two results, and the second one rescues a number this entry had just put in doubt.**
+
+1. **The cheap statistic is a good proxy for the expensive one.** Gather share tracks population
+   share to within ~3 points at every point of the sweep. So the order histogram already printed on
+   every render's beam-map line predicts the cache's *payoff* as well as its *safety* — one line of
+   existing output answers both questions, and a cache can gate itself on it without new
+   instrumentation.
+2. **The ~30 % / 42.1 % ceiling is CONFIRMED, by a method that does not share the flaw of the one
+   that produced it.** `gallery_rain` reads **43.5 %**, against the old arm's "87.8 -> 50.8 beams
+   per probe, a 42.1 % reduction" — 1.4 points apart. The section above was right that the old
+   *method* was unsound and right to flag the number as unverified; it was also right that a
+   **count** survives the flaw where a **time** does not, which is exactly what happened.
+
+**Read 83.2 % as a ceiling, not a saving.** It is the share of intersection candidates a cache
+could displace; the cache still costs a lookup, and the BVH traversal that produced those
+candidates is not all eliminated. What it does establish is that on the thick media where the
+field is smooth enough to cache, **five sixths of the beam gather's work is against chords the
+cache would replace** — and the gather is 99 % of the camera-gather time there (`-mstats`).
+
+**So VOLCACHE now has all three of its preconditions measured**, and they agree with each other:
+safety (structure 0.00 against a 0.76 control at `sigma_t` 20), payoff (83.2 % of gather
+candidates), and a runtime predictor (the order histogram, tracking within 3 points). The scene
+where the cache is *safe* is the scene where it pays *most*; the scene where it is unsafe is where
+it pays least.
+
 **The rig is two scripts and four renders**, so re-testing on another scene is cheap:
 `-beamradius` pinned, two seeds, `scraps/ms_struct.py`. A scene whose medium is genuinely
 diffuse — `_fog_thick`, which measures 82.8 % order >= 2 against `gallery_rain`'s 40.7 % — is the

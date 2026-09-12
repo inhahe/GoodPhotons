@@ -576,6 +576,13 @@ struct BeamMis {
 struct BeamDiag {
     bool on = false;
     mutable std::atomic<long long> cand{0}, rejPar{0}, rejT{0}, rejS{0}, rejR{0};
+    // VOLCACHE's cost question, answered INSIDE the gather: what share of the intersection tests
+    // comes from chords a volume cache could replace? `-beams-order 1` cannot answer it -- it
+    // changes which chords are deposited (single-scatter chords cross the whole medium), hits the
+    // same `-beamcount` cap, and so measures beam GEOMETRY rather than the cacheable share; on
+    // `_fog_thick` it made the gather 56 % SLOWER. Counting here changes nothing about the
+    // deposit, which is the whole point.
+    mutable std::atomic<long long> candMS{0};
     mutable std::atomic<long long> pass{0}, rejMed{0}, rejSS{0}, rejPh{0}, rejW{0}, rejTr{0};
     mutable std::atomic<long long> minRatio{1LL << 62};  // min (d_perp/r) * 1e6, as an integer
     void bump(std::atomic<long long>& c) const {
@@ -595,6 +602,11 @@ struct BeamDiag {
             " radius %lld | closest approach seen = %.4g x the kernel radius\n",
             cand.load(), rejPar.load(), rejT.load(), rejS.load(), rejR.load(),
             (double)minRatio.load() * 1e-6);
+        std::fprintf(stderr,
+            "[beamdiag] %lld of those candidates (%.1f %%) are chords of scattering order >= 2 "
+            "-- the share a volume cache could remove (VOLCACHE)\n",
+            candMS.load(),
+            cand.load() ? 100.0 * (double)candMS.load() / (double)cand.load() : 0.0);
         std::fprintf(stderr,
             "[beamdiag] geometric hits %lld | dropped by: bad medium %lld, sigma_s<=0 %lld,"
             " phase<=0 %lld, weight<=0 %lld, transmittance<=0 %lld\n",
@@ -1306,7 +1318,15 @@ struct BeamMap {
     // the closest approach falls outside either segment, or beyond the kernel radius.
     bool closestApproach(int i, const Vec3& oc, const Vec3& dc, double tMax, BeamHit& out) const {
         const PhotonBeam& b = beams[i];
-        if (beamDiag().on) beamDiag().cand.fetch_add(1, std::memory_order_relaxed);
+        if (beamDiag().on) {
+            beamDiag().cand.fetch_add(1, std::memory_order_relaxed);
+            // `beams` holds the SUB-beams after build(), and a split copies the parent's fields,
+            // so `order` is already here -- no new record and no gather-side plumbing. Untracked
+            // chords (kBeamOrderUnknown) are excluded rather than counted as low order; see
+            // BEAMORDER-GPU for what counting them the other way costs.
+            if (b.order >= 2 && b.order != kBeamOrderUnknown)
+                beamDiag().candMS.fetch_add(1, std::memory_order_relaxed);
+        }
         const double cosT = dot(dc, b.d);
         const double den  = 1.0 - cosT * cosT;              // == sin^2(theta)
         if (den < 1e-9) { beamDiag().bump(beamDiag().rejPar); return false; }  // parallel

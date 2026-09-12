@@ -1632,6 +1632,11 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   geometric rejections (parallel / t-range / s-range / radius) consumed them, the closest
   approach ever seen as a multiple of the kernel radius, and which of the gather's own tests
   (bad medium, σ_s ≤ 0, phase ≤ 0, weight ≤ 0, transmittance ≤ 0) dropped the survivors.
+  Since 0.278.2 it also reports **what share of those candidates are chords of scattering
+  order ≥ 2** — the fraction of the beam gather's work a volume cache could displace. Measured:
+  43.5 % on `gallery_rain`, 68.9 / 81.0 / 83.2 % across a σ_t 2 / 6 / 20 sweep, tracking the
+  scattering-order histogram on the beam-map line to within ~3 points. See known-issues.md →
+  VOLCACHE, which also explains why `-beams-order 1` cannot be used to measure this.
   Both are off unless set, and cost nothing when off. This pair is what found the
   `sceneRadius` beam-truncation bug — see known-issues.md → J-SCENERADIUS.
 
