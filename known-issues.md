@@ -3346,6 +3346,31 @@ where the denominator is dominated by something else is not a measurement of the
 81 %-beams figure was in `-mstats` output that had already been read, on this same scene, in the
 VOLCACHE entry.
 
+**CROSS-SCENE SMOKE TEST OF THE FLIP (2026-09-12), because every number behind it came from one
+scene.** v0.278.0 changes the estimator on every mode-`M` *and* mode-`S` render there is, and mode
+`S` — which shares `gatherCoverage` through `sppm_render.h` — had never been run **once** during
+any of this work; its involvement was established by reading call sites. No other scene has a
+converged reference, so this is a pathology check rather than an accuracy one: 160x90, `-spp 8`,
+new default against `-gatherarea 0` (`scraps/ga_smoke.sh`).
+
+| scene | arm | non-finite | mean | max/mean |
+|---|---|---|---|---|
+| `cornell` | new / old | **0 / 0** | 4.2564e11 / 4.2451e11 | 486.8 / 488.0 |
+| `fur_creature` | new / old | **0 / 0** | 3.1745e-2 / 3.1659e-2 | 2.5 / 2.5 |
+| `crystalloop` | new / old | **0 / 0** | 3.2021e-4 / 3.1657e-4 | 270.8 / 273.9 |
+| `cornell`, mode `S` | new | **0** | 4.1942e11 | 338.1 |
+
+No NaN or infinity anywhere, mode `S` runs and is sane, and **`max/mean` goes DOWN in every scene**
+(488.0 -> 486.8, 273.9 -> 270.8) — the firefly tail gets shorter, which is what the bound predicts:
+the pseudo-counted scale is capped at `M+1 = 9`, where the old `cov >= 0.05` cliff allowed 20.
+Means move +0.3 % / +0.3 % / +1.2 %, so the correction is active without being dramatic off the
+scene it was measured on.
+
+*(`crystalloop` is a flyby and was rendered without `-camera`, so it produced its whole 120-frame
+loop — see the open entry on that. Frame 119 of each arm is what is scored above. The negatives
+those images carry are the known spectral-gamut artifact, cleared by being identical arm-for-arm;
+the note on that has been corrected, since its "negatives appear in B" rule does not generalise.)*
+
 **What the residual is NOT.** It is not the fur path: `alice_hair` is *mesh* geometry, not curves,
 which is why the fiber gate leaves it alone — it moves -67.6 -> -10.0 under the coverage probe
 while `creature` does not move at all.
@@ -21663,9 +21688,20 @@ a BCSDF as much as for a lobe (`f*(a,b) = f(b,a)` regardless of the model), but 
 
 *While there: that scene carries a few negative floats (60 of 192 000 in mode `R`, median
 −4.7e-06, worst −3.1e-04) — and **46 of the 60 are in the B channel**. That is the spectral→linear-sRGB
-conversion, not a transport bug: an out-of-gamut spectrum has negative components in the narrowest
-primary. Mode `R` has MORE of them than `D`, so it predates this change. Noted so the next person
-who spots negative radiance on fur does not chase it.*
+conversion, not a transport bug: an out-of-gamut spectrum has negative components in whichever
+primary the colour falls outside. Mode `R` has MORE of them than `D`, so it predates this change.
+Noted so the next person who spots negative radiance on fur does not chase it.*
+
+> **"The narrowest primary" was too specific, and would mislead whoever checked it next
+> (2026-09-12).** The channel split is a property of the SCENE's hues, not of the renderer:
+> `fur_basics` puts 46 of 60 in B, but `cornell` at 160x90 mode `M` is **R 26 / G 7 / B 13** and
+> `crystalloop` is **R 53 / G 50 / B 113**, with mode `S` on `cornell` roughly even at 19/12/14.
+> Saturated cyan-green content drives red negative; saturated blue-violet drives blue. So the
+> *test* for "is this the gamut artifact?" is not "are they in B" — it is that the negatives sit
+> on strongly saturated pixels and are **identical across renderer arms**, which is how they were
+> cleared during the v0.278.0 smoke test (46 / 46 and 216 / 216, arm for arm). Magnitude is no
+> guide either: cornell's worst negative is **47x its mean positive**, because the artifact scales
+> with the brightness of the out-of-gamut pixel and that scene has an emitter in frame.
 
 **A RESIDUAL SURVIVES, exactly as this entry predicted it would, and is now isolated** — see the
 next entry. It is *not* this bug: it lives only where the camera path's own lobe sample can reach
