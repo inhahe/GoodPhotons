@@ -20782,7 +20782,48 @@ values too (there `p_light` 50 > `p_lobe` 3.4, so it picks the connection, which
 lattice is only a delta at `-spp 1` — past that it samples the lobe, so its character depends on
 `-spp`, which is precisely what makes a clean MIS formulation awkward here.
 
-**Open question before implementing the middle rule:** it is a hard switch on `p_lobe` vs `p_light`,
+**ATTEMPT 2 — LET THE CONNECTION OWN THE LIGHT (no MIS blend): PROTOTYPED, INCONCLUSIVE BY
+CONSTRUCTION, REVERTED.** The reasoning was better than the hard switch: the lattice half at
+`-spp 1` is a one-point quadrature at the lobe's mode, so it is *biased* wherever `L` varies across
+the lobe, and MIS combines *unbiased* estimators — no weights repair it. The connection is a
+converged quadrature, so let it own the light: no threshold, hence no seam. Prototyped behind
+`FTRACE_WGLOSSY_LATTICE=1` (same-binary A/B), suppressing `specularArrival` at a whitted glossy
+vertex so the lattice delivers no emission:
+
+| case | lattice only | MIS blend | "conn owns" |
+|---|---|---|---|
+| r=0.05, big light (31.6°) | 0.982 | 1.049 | **0.091** |
+| r=0.05, 1 m (8.1°) | 1.126 | 1.296 | **0.488** |
+| r=0.3, 1 m | 1.244 | 1.028 | 0.950 |
+| r=0.6, 1 m | 2.628 | 1.008 | 0.970 |
+| diffuse / mirror (nulls) | 0.978 / 1.112 | 0.978 / 1.112 | 0.978 / 1.112 |
+
+Broad lobes land at 0.95–0.97; a narrow lobe loses **91 %** of the light. But the test does not
+measure the rule it was meant to: suppressing the lattice leaves the connection's **own** internal
+balance-heuristic factor `pNee/(pNee+pLobe)` in place, so this arm is `connection × w_nee` with
+`w_nee` = 0.28 and 0.02 — neither the blend nor the connection alone. Testing the rule properly
+needs that factor bypassed too, which is a second change, so this one is reverted rather than
+half-measured. (The nulls being bit-unchanged does confirm the edit was correctly scoped.)
+
+**AND IT PRODUCED A FALSE ALARM ABOUT MY OWN EARLIER RESULT, worth recording.** Seeing the
+connection collapse at narrow roughness, I suspected the "grid resolution refuted" finding above
+had been measured through the blend, where the connection contributes little — i.e. that the grid
+might matter after all. It does not: on the connection arm alone, `-whitted-grid` 4 vs 32 gives
+**0.091 vs 0.089** and **0.488 vs 0.486**. The original refutation stands and the doubt was
+unfounded.
+
+**So the live unknown is narrow and stated exactly:** backing `w_nee` out of the two arms gives the
+connection's unweighted value as **1.74x** (8.1° light) and **4.55x** (31.6° light) of mode `R` —
+a real over-estimate, grid-converged, growing with light size, in an estimator whose algebra checks
+out term by term (`bsdfF`'s `1/cos_surf` cancels `emitterGeom`'s `cos_surf`, leaving
+`r·lobe·cos_light·A/dist²`, and the `acc/nS` average is a correct stratified quadrature).
+**Three iterations of black-box sweeps have exhausted what they can tell.** The next step is
+instrumentation, not another sweep: print `fVal`, `w`, `pdfWLight`, `pLobe` and the per-sample
+product for one pixel of `scraps/_gwdec_big.ftsl` at roughness 0.05, where the expected answer is
+`r·L` and the arm reads 4.55x of it, so a factor of ~4.5 in one of four printed quantities cannot
+hide.
+
+**Open question if the hard switch is revisited instead:** it is a hard switch on `p_lobe` vs `p_light`,
 and in a deterministic preview a threshold crossing is a visible seam wherever roughness or light
 distance varies across a surface. Worth checking on a scene with a roughness gradient before
 shipping — `scenes/_record_rough.ftsl` has one.
