@@ -1317,6 +1317,28 @@ what the table above does.
 `_fog_thick` — stable before and after — moves from ~13 03x to ~10 9xx and stays tight
 (11 026 / 10 815 / 10 931, **1.02x**), and the CPU path is unaffected.
 
+**AND THE FIX TURNS OUT TO CUT BIAS 4x, WHICH IS NOT WHAT IT WAS FOR.** Comparing the two probe
+configs at 256 spp x 4 seeds showed the image mean moving **+6.14 % +- 1.17 %, 5.3 sigma** — which
+should be impossible for a pure sizing parameter, and looked like a shipped regression. It is not.
+The knee does not only size the map: **below it, `buildAuto` INFLATES the kernel radii** to reach
+`targetK`, and this file already calls that inflation a documented bias. So the knee feeds bias
+directly, and moving it had to move the mean.
+
+Scored against a **67 448-spp mode-`D` reference** (0.39 % noise) on `_fog_thick`:
+
+| arm | raw mean vs ref | trimmed mean vs ref |
+|---|---|---|
+| 96 x 120 000 (pre-0.272.5) | −3.46 % +-0.76 | **−5.9 %** |
+| **512 x 24 000 (shipped)** | **+2.45 % +-0.96** | **−1.5 %** |
+
+Closer on both, and **4x closer on the trimmed mean** — which is the statistic to believe on a fog
+scene, where the raw mean is firefly-dominated. So v0.272.5 is an accuracy fix as well as a
+stability and speed one, and the 6 % shift was the image moving *toward* ground truth.
+
+**The lesson is about the mental model, not the arithmetic.** "The knee sizes the map" made a mean
+shift look like a bug; the entry's own text said the knee drives radius inflation, which makes the
+shift *expected*. A 5.3-sigma surprise is worth a reference render before it is worth a revert.
+
 **The remaining idea, if the residual 1.12x ever matters:** The variance comes from uniform
 chords sampling a clustered set, so the directions to try are ones that cut variance at equal
 cost: stratifying the chords over the AABB instead of drawing them independently, or reusing the
