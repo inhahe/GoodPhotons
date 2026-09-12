@@ -3127,12 +3127,43 @@ configuration, seed and binary, differing only in the spp `-time` happened to de
 | `cap_gyroid` | 56 | −5.0 % | −1.9 % | 3.1 |
 | `creature` | 36 | +56.8 % | +55.6 % | 1.2 |
 
-**Re-scored at matched spp (100-101):**
+**Re-scored at matched spp (100-101), single pair:**
 
 | rule | fur benefit | `alice_hair` | `alice_dress` | `cap_gyroid` | ratio |
 |---|---|---|---|---|---|
-| **gate 30** | **−15.9** | −2.0 | −1.6 | −0.9 | **3.5 : 1** |
+| **gate 30** | **−15.9** | −2.0 | −1.6 | −0.9 | 3.5 : 1 |
 | gate 30 + depth | −6.0 | −2.0 | −1.0 | −0.5 | 1.7 : 1 |
+
+**AND THEN PROPERLY: FIXED `-spp 64`, THREE SEEDS, ONE BATCH, PAIRED. THE ANSWER IS 12.4 : 1.**
+The 3.5 : 1 above is itself unreliable — it was computed from ABSOLUTE per-arm values at n=1, and
+those carry ±7-11 point error bars. Redone the way the procedural rule says (all nine renders in
+one command, every log verified at 64/64 spp), scoring the PAIRED difference instead:
+
+| ROI | seed 1 | seed 2 | seed 3 | mean |
+|---|---|---|---|---|
+| `creature` (the FUR) | −18.5 | −22.4 | −18.0 | **−19.6 ± 1.4** |
+| `alice_hair` | +1.5 | −2.4 | −1.4 | −0.8 ± 1.2 |
+| `alice_dress` | +0.5 | −1.4 | −1.4 | −0.8 ± 0.6 |
+| `cap_gyroid` | −0.5 | +0.0 | +0.4 | **−0.0 ± 0.2** |
+| `grid_ground` (null) | −0.3 | −0.0 | +0.0 | −0.1 ± 0.1 |
+
+**Fur −19.6 points against 1.6 points of total collateral, a 12.4 : 1 trade**, with `alice_hair`
+statistically indistinguishable from zero and `cap_gyroid` exactly zero. Better than either
+earlier figure, and the first one that is actually controlled.
+
+**Why the paired difference is trustworthy where the absolute values are not.** The gate is
+evaluated AFTER the probe loop and consumes no rng, so both arms trace an identical photon map
+with identical probe patterns; everything except the gate cancels in the difference. The numbers
+show it directly: absolute `creature on` is **+73.6 ± 11.2** while the paired difference is
+**±1.4**. Absolute ROI values also move with spp (`creature on` reads +73.6 at 64 spp and +61.6 at
+100 spp), which is the confound above — the paired difference does not.
+
+**Three attempts at one number, and each failed differently.** `-time` arms with absolute diffs
+gave 5.8 : 1 (spp confounded). A single matched-spp pair with absolute diffs gave 3.5 : 1 (n=1 on
+a ±11-point quantity). Fixed spp, three seeds, paired diffs gives 12.4 : 1. **The second attempt
+"corrected" the first by replacing a confound with noise** — which is worth more as a warning than
+the final number is as a result: fixing the flaw you just found does not mean the new measurement
+is sound.
 
 **The gate's headline survives; its ratio does not.** Fur still moves +61.6 % → +45.7 %, which is
 the same **~25 % of the overfill** quoted above. But the collateral is 4.5 points, not 2.7, so the

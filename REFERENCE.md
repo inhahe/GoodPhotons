@@ -1545,9 +1545,9 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   correction for a gather whose probes REJECT at least `pct` percent of their hits on the normal
   test — the dense-fur signature, where the correction has the wrong sign (see `FTRACE_GADIAG`).
   **`30` is the measured knee** (at the default `M = 8`, `15` and `25` are the same gate): on
-  `gallery_rain`, scored at MATCHED sample count, it removes **~25 % of the fur overfill** —
-  `creature` +61.6 % → +45.7 % — for **4.5 points** of collateral spread across `alice_hair`,
-  `alice_dress` and `cap_gyroid`, a **3.5 : 1** trade. (Score these arms at fixed `-spp`, never
+  `gallery_rain`, scored PAIRED at fixed `-spp` over three seeds, it takes **19.6 points** off the
+  fur overfill for **1.6 points** of total collateral — a **12.4 : 1** trade, with `alice_hair`
+  statistically zero (−0.8 ± 1.2) and `cap_gyroid` exactly zero (−0.0 ± 0.2). (Score these arms at fixed `-spp`, never
   `-time`: a 15 % spread in sample count moves the 27-pixel `alice_hair` ROI by 17 points.) Paired by seed, since the gate consumes no rng and both arms share a photon map.
   It is **not** a replacement for `-gatherarea 0` on a fur-dominated scene (which reads +11.8 %),
   and it stays opt-in because it is host-only — defaulting it would split CPU from GPU.
