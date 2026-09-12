@@ -2591,7 +2591,14 @@ as the one at fault.
   direction, weighted by its reflectance, but takes it from a 2-D radical-inverse lattice on
   the power-cosine lobe (`whittedGlossyDir` → `glossyDirUV` in `render.h`) rather than the
   rng — the path is deliberately **not** forked, which would cost N^depth inside a gyroid
-  labyrinth. That lattice is what makes the mode *consistent* on rough specular: collapsing
+  labyrinth. **A glossy vertex also takes the light connection here (0.275.0)**, on the same
+  lattice-vs-rng principle: `neeLight`'s `whitted` branch walks a `lightGrid`² quadrature over the
+  light and the lattice direction supplies the other half of the MIS weight, so mode `W`'s glossy
+  estimator is mode `R`'s with quadrature substituted for sampling rather than a different one.
+  Until 0.275.0 all four glossy sites (host/device × scalar/hero) guarded that connection behind
+  `!whitted` and returned before it, which made a glossy surface **pure black at `-spp 1`** — the
+  mode's headline configuration, since sample 0 of the lattice *is* the mirror direction. See
+  `known-issues.md` → the `type glossy` backward-NEE entry. That lattice is what makes the mode *consistent* on rough specular: collapsing
   every sample onto the mirror direction (pre-0.109.0) meant extra spp bought edge
   antialiasing and nothing else, so a satin metal never converged at any budget (measured:
   6 % better over 256× the samples, versus 19× better now). The polar coordinate is

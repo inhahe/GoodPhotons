@@ -20472,7 +20472,81 @@ Option (a) matches what people actually author (a glowing panel), and the one-si
 only really load-bearing for closed `isosurface`/mesh solids, whose normals are already
 outward.
 
-## OPEN (2026-08-04): `type glossy` renders black in the backward modes (R / W) — no NEE
+## ~~OPEN~~ **DONE (v0.275.0)** (2026-08-04): `type glossy` had no direct-lighting term in the backward modes (R / W)
+
+**RESOLVED IN TWO HALVES, AND THE SECOND ONE IS WHY THIS ENTRY STAYED OPEN SO LONG.** Mode `R`
+got the connection in **v0.266.0** (GLOSSY-NEE). Mode `W` did not: every glossy site guarded the
+connection behind `!whitted` and returned before it, in all **four** places it is written —
+`backward.h` scalar and hero, `render_cuda.cu` scalar and hero. So the entry read as stale (the
+headline symptom was gone from mode `R`) while half of it was still live, and closing it wholesale
+would have dropped a real bug. **v0.275.0** removes that guard at all four sites.
+
+**What mode `W` actually did, measured** (`scraps/_gw_*.ftsl` — one tile, one small overhead
+panel, four scenes identical but for the material line, so the ROI cannot drift between arms;
+`scraps/gw_verify.py`). ROI mean over the tile:
+
+| material | mode `R` (ref) | `W` @1 spp, before | `W` @1 spp, after | after / `R` | zero px before | after |
+|---|---|---|---|---|---|---|
+| diffuse | 0.197778 | 0.194706 | 0.194706 | 0.984 | 2.9 % | 2.9 % |
+| glossy r=0.2 | 0.022545 | **0.000000** | 0.019530 | 0.866 | **100 %** | 25.5 % |
+| glossy r=0.6 | 0.157664 | **0.000000** | 0.149635 | 0.949 | **100 %** | 2.9 % |
+| glossy r=0.9 | 0.125590 | **0.000000** | 0.121213 | 0.965 | **100 %** | 2.9 % |
+
+**Pure black — not dark, exactly 0.000000 over every pixel of the tile — at `-spp 1`, which is
+mode `W`'s headline configuration and what `-explore`'s lit preview runs.** The cause is that
+`whittedGlossyDir` maps sample 0 to the mirror direction, so at 1 spp a glossy surface shows only
+a mirror reflection; in this scene that reflects black sky. The 2.9 % of zero pixels left after
+the fix is the same 2.9 % the *diffuse* arm has (tile edge pixels inside the ROI), and r=0.2's
+residual 25.5 % is matched by mode `R`'s own 22.5 % — those zeros are physical, the lobe genuinely
+vanishing 53° off-axis, not stipple.
+
+**BOTH HALVES OF THE WEIGHT, which is what made the fix one line longer than it looks.** The
+connection is balance-heuristic weighted against the lobe-sampling strategy, so running it while
+leaving the lattice's emitter hit at full weight double-counts, and suppressing that hit instead
+drops the BSDF half and biases low. The whitted branch therefore also sets `gmis`/`gm->pdf` for
+the lattice direction, exactly as the rng path does — so mode `W` now runs **the same estimator as
+mode `R` with quadrature substituted for sampling**, which is what mode `W` is defined to be.
+(`REFERENCE.md` already listed mode `W` among the selection-probability-1 cases where the
+connection applies, so the docs described this before the code did.)
+
+**Verified on all four axes, including the one that has caught this repo before:** mode `R` is
+**bit-identical** across the change on all four materials (0 floats differing — the connection
+already sat between `r` and the Russian roulette, so non-whitted rng order never moved); the GPU
+twin agrees with the host to **1.000** on all four; and **`-no-glossy-nee` restores the pre-0.275.0
+preview bit-identically**, so the off-switch demonstrably reaches the code. That last check is not
+ceremony — an off-switch that silently does nothing is how the mode-`S` footprint twin once passed
+its null control while being inert.
+
+**TWO CLAIMS IN THE ORIGINAL TEXT BELOW ARE WRONG, and both were wrong in the same direction:**
+they overstated how well the *other* modes did, which is what made mode `W` look like the only
+offender.
+
+1. *"while modes A/B/C/D/M shade it normally"* — **no.** Mode `B` renders a glossy tile
+   **exactly 0.000000 at every roughness** in this scene, while its diffuse tile matches mode `R`
+   to 0.14 %. That is not a new bug but a *documented* one: forward `A`/`B`/`C` cannot splat a
+   specular-first pixel to a pinhole (`REFERENCE.md`: "specular-first still black — the analytic
+   connections are pinhole-only", "rough specular … still black"). Mode `M` does shade it, to
+   within 0.3 %. Mode `D` shades it but reads **high and increasingly so with roughness** — see
+   the entry below.
+2. *"previews as pure black, even at high `-spp`"* — **the `-spp` clause is backwards.** Pure black
+   is specifically the `-spp 1` case. At `-spp 64` the lattice does find the light and the mean
+   came within 0.85–1.02× of mode `R`; what was wrong there was *spatial*, 34–90 % of the tile
+   still exactly zero, i.e. stipple rather than shading (RMS-Laplacian/mean 1.92 vs mode `R`'s
+   1.46 at r=0.2, 0.46 vs 0.23 at r=0.6). The comment in the source said as much — "the fix for
+   that is more spp, which now works" — and more spp does **not** work: it trades one black tile
+   for a stippled one, and 1 spp is the configuration the mode exists for.
+
+**An earlier version of this verification could not see the effect at all, which is worth
+recording.** The first rig used one glossy tile at `roughness 0.15` with a grazing camera and an
+overhead light, chosen so the mirror lobe could not catch the light. It read **exactly 0.000000 in
+every mode, forward ones included** — and that unanimity was the tell: at that roughness, with the
+lobe pointed 78° away from the light, **black is the physically correct answer**, so the rig was
+incapable of distinguishing "no direct-lighting term" from "correctly dark". Only a broad lobe has
+real BRDF value along the light→camera path. The diffuse control passed in that rig (both halves
+of a symmetric frame read 0.008514 vs 0.008515), which is exactly why a passing control proves the
+rig works and *not* that the rig can see the thing under test.
+
+**The original diagnosis, preserved:**
 
 `bkInteract`'s `D_GLOSSY` case (`src/render_cuda.cu` ~6733, host twin `src/backward.h`)
 reflects the ray into a lobe around the mirror direction and returns. It never calls
@@ -20493,6 +20567,38 @@ light with the Cook-Torrance/Phong lobe's BRDF value and MIS it (balance heurist
 existing lobe-sampled continuation, which already carries `contBsdfPdf`. That is the same
 structure `D_DIFFUSE` uses, just with a non-constant BRDF, and it fixes both the black preview
 and the (currently very high) variance of a glossy surface in mode R.
+
+## OPEN (2026-09-12): mode `D` (BDPT) over-estimates a glossy surface, and the error grows with roughness
+
+Found by the rig built for the glossy-`W` entry above (`scraps/_gw_*.ftsl`, `scraps/glossyw4.sh`),
+so the geometry, light and camera are identical across every row and the only variable is the
+material. One tile, one small overhead panel, ROI mean over the tile, mode `R` (512 spp) as the
+unbiased reference:
+
+| material | `R` (ref) | `D` | `D`/`R` | `M` | `M`/`R` |
+|---|---|---|---|---|---|
+| diffuse | 0.197778 | 0.197796 | **1.000** | 0.197623 | 0.999 |
+| glossy r=0.2 | 0.022545 | 0.024403 | **1.082** | 0.022532 | 0.999 |
+| glossy r=0.6 | 0.157664 | 0.182767 | **1.159** | 0.158104 | 1.003 |
+| glossy r=0.9 | 0.125590 | 0.150345 | **1.197** | 0.125833 | 1.002 |
+
+**Why this is a real signal and not noise or a budget artifact.** The diffuse row agrees to
+**0.01 %**, so the rig, the ROI and the exposure are all sound; mode `M` agrees to **0.3 %** on
+the very same glossy materials, so the BRDF itself is fine and this is specific to `D`'s
+estimator; and the error is **monotone in roughness across three points** rather than scattered.
+`-max-bounce` cannot explain it either — the scene is a single quad with no inter-reflection, so
+there is no multi-bounce transport for `D`'s default of 8 to clip differently from `R`'s 32.
+
+The shape of it (exact on a constant BRDF, high on a non-constant one, worse as the lobe widens)
+points at the glossy lobe's pdf/eval pair inside `bdpt.h` — either a weight that assumes a
+Lambertian cosine pdf, or an MIS weight over the BDPT connection strategies that uses a different
+`bsdfPdf` convention than the one the lobe was sampled with. **Not yet chased**, and deliberately
+logged rather than fixed in the same change as the mode-`W` connection: they are different
+estimators and folding them together would make either one's verification unreadable.
+
+Next step when someone picks this up: add a `mirror` arm (a delta lobe should be exact, which
+would localise it to the *finite* lobe path) and a second light size (which changes the
+solid-angle pdf without touching the BRDF, separating a pdf-convention bug from a BRDF bug).
 
 ## OPEN (2026-08-04): `phase rainbow` — the 2048-bin uniform-in-mu table under-resolves large droplets, and monodisperse supernumeraries read as a white arc
 

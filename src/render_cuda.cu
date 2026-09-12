@@ -10754,18 +10754,6 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
         }
         case D_GLOSSY: {
             Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-            // Mode W: the lobe off a deterministic lattice rather than the rng, so the
-            // direction is the same for every pixel (noise-free) but varies with the sample
-            // index (so -spp actually resolves the lobe). At -spp 1 this IS the mirror
-            // direction, which is exact for a near-mirror and over-sharpens as roughness
-            // grows; the fix for that is more spp, which now works.
-            if (whitted) {
-                if (!dWhittedAttenuate(thr, (double)r)) return false;
-                DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
-                                            gi.sIdx, gi.bounce);
-                if (dot(o, h.n) <= 0) return false;
-                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
-            }
             // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE; host twin backward.h
             // ~1489). Without it the only route to this material's light is a lobe sample
             // landing on the emitter -- ~1/115 against a 0.53-degree sun for a roughness-0.05
@@ -10777,6 +10765,24 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                                       nullptr, &nb);
                 // ...and the SKY, which is a light like any other (host twin: backward.h).
                 L += thr * bkNeeEnv(sc, h, (Real)1, invPdfLambda, lambda, rng, nullptr, &nb);
+            }
+            // WHITTED (mode W): the SAME connection with quadrature instead of the rng, and both
+            // halves of the weight -- the connection's above, and gm->pdf below for the lattice
+            // direction. Host twin backward.h, where the full reasoning lives. This branch used
+            // to return BEFORE the connection, so at -spp 1 (where the lattice IS the mirror
+            // direction) a glossy surface whose mirror ray missed the light rendered PURE BLACK,
+            // in mode W's headline configuration.
+            if (whitted) {
+                if (!dWhittedAttenuate(thr, (double)r)) return false;
+                DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
+                                            gi.sIdx, gi.bounce);
+                if (dot(o, h.n) <= 0) return false;
+                if (gm) {
+                    gm->pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
+                    gm->from = h.p;
+                    gm->n = h.n;
+                }
+                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
             }
             if (rng.uniform() >= r) return false;
             DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
@@ -11360,7 +11366,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 // FINITE value, so it is the one that can be connected to a light; a mirror and
                 // a gel are delta and stay exactly as they were. Before the Russian roulette,
                 // whose coin governs the continuation only.
-                if (sc.bkGlossyNee && !whitted && mp->type == D_GLOSSY) {
+                if (sc.bkGlossyNee && mp->type == D_GLOSSY) {
                     const DNeeBsdf gnb{mp, rd * (Real)(-1)};
                     bkNeeLightHero(sc, h, c, L, thr, lam, invPdf, nUp, rng, gi.depth, &gnb);
                     bkNeeEnvHero(sc, h, c, L, thr, lam, invPdf, nUp, rng, &gnb);   // the sky too
@@ -11388,6 +11394,9 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
                                                 gi.sIdx, b);
                     if (dot(o, h.n) <= 0) return;
+                    if (sc.bkGlossyNee)   // the other half of the weight -- see the scalar twin
+                        { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
+                          gmis.from = h.p; gmis.n = h.n; }
                     rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
                 } else {
                     DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);

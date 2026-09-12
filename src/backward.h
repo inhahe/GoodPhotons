@@ -1778,19 +1778,6 @@ struct BackwardRenderer {
             }
             case MatType::Glossy: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                // Whitted: the lobe off a deterministic lattice rather than the rng, so the
-                // direction is the same for every pixel (noise-free) but varies with the
-                // sample index (so -spp actually resolves the lobe). At -spp 1 this IS the
-                // mirror direction, which is exact for a near-mirror and over-sharpens as
-                // roughness grows; the fix for that is more spp, which now works.
-                if (whitted) {
-                    if (!whittedAttenuate(thr, r)) return false;
-                    Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
-                                              materialRoughness(scene, m, h), gi.sIdx, gi.bounce);
-                    if (dot(o, h.n) <= 0) return false;
-                    ray = Ray{h.p + h.n * 1e-6, o};
-                    specularArrival = true; return true;
-                }
                 // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE). Without it the only
                 // way to this material's light is a lobe sample that happens to land on the
                 // emitter -- odds of ~1/115 against a 0.53-degree sun for a roughness-0.05
@@ -1812,6 +1799,38 @@ struct BackwardRenderer {
                     if (scene.envIndex >= 0)
                         L += thr * neeEnv(scene, h, 1.0, invPdfLambda, lambda, rng,
                                           nullptr, nullptr, &nb);
+                }
+                // WHITTED (mode W): the SAME connection, with quadrature instead of the rng. The
+                // lobe comes off a deterministic lattice, so the direction is identical for every
+                // pixel (noise-free) but varies with the sample index, and the neeLight above
+                // walked a GxG grid over each light rather than one random point.
+                //
+                // This branch used to return BEFORE the connection, which left the lattice as the
+                // only route to a light. At -spp 1 the lattice IS the mirror direction, so every
+                // glossy surface whose mirror ray missed the light rendered PURE BLACK -- and
+                // -spp 1 is mode W's headline configuration, and what -explore's lit preview
+                // runs. Measured over one tile: 0.000000 against mode R's 0.0225 / 0.1577 /
+                // 0.1256 at roughness 0.2 / 0.6 / 0.9. The comment that stood here said "the fix
+                // for that is more spp, which now works"; it does not -- at -spp 64 the tile was
+                // still 34-90 % exactly-zero pixels, i.e. stipple rather than shading.
+                //
+                // BOTH HALVES OF THE WEIGHT. The connection is balance-heuristic weighted against
+                // the lobe-sampling strategy, so running it while leaving the lattice's emitter
+                // hit at full weight would double-count, and suppressing that hit instead would
+                // drop the BSDF half and bias low. Hence gm->pdf for the lattice direction too,
+                // exactly as the rng path sets it below.
+                if (whitted) {
+                    if (!whittedAttenuate(thr, r)) return false;
+                    Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
+                                              materialRoughness(scene, m, h), gi.sIdx, gi.bounce);
+                    if (dot(o, h.n) <= 0) return false;
+                    if (gm) {
+                        gm->pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
+                        gm->from = h.p;
+                        gm->n = h.n;
+                    }
+                    ray = Ray{h.p + h.n * 1e-6, o};
+                    specularArrival = true; return true;
                 }
                 if (rng.uniform() >= r) return false;
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
@@ -2699,7 +2718,7 @@ struct BackwardRenderer {
                     // a FINITE value, so it is the one that can be connected to a light. A
                     // mirror and a gel are delta and stay exactly as they were. Taken before the
                     // Russian roulette, whose coin governs only the continuation.
-                    if (glossyNee && !whitted && m.type == MatType::Glossy) {
+                    if (glossyNee && m.type == MatType::Glossy) {
                         const NeeBsdf nb{&m, ray.d * -1.0};
                         neeLightHero(scene, h, /*rho unused*/c, L, thr, lam, invPdf, nUp, rng,
                                      spdCache, gi, &nb);
@@ -2726,6 +2745,11 @@ struct BackwardRenderer {
                         Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
                                                   materialRoughness(scene, m, h), gi.sIdx, b);
                         if (dot(o, h.n) <= 0) { finish(); return; }
+                        if (glossyNee) {   // the other half of the weight -- see the scalar twin
+                            gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lam[0], scene, &h);
+                            gmis.from = h.p;
+                            gmis.n = h.n;
+                        }
                         ray = Ray{h.p + h.n * 1e-6, o};
                     } else {
                         Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);

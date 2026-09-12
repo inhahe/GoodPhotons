@@ -5489,7 +5489,7 @@ chance.
 
 | Flag | Meaning |
 |---|---|
-| `-no-glossy-nee` | Restore the pre-0.266 estimator exactly — rng draw order included, so it is a valid same-binary A/B arm. Use it to measure what the connection is buying, or to check that a difference you are chasing is not this. |
+| `-no-glossy-nee` | Restore the pre-0.266 estimator exactly — rng draw order included, so it is a valid same-binary A/B arm. Use it to measure what the connection is buying, or to check that a difference you are chasing is not this. In mode `W` it restores the pre-0.275.0 preview bit-identically. |
 | `-glossy-nee` | Force it back on (it already is — for overriding an earlier `-no-glossy-nee` in a shared argument list). |
 
 The connection is made only for emitters whose light-tree **selection probability is exactly 1**
@@ -5499,6 +5499,18 @@ Both halves of the MIS weight consult the same predicate, so they cannot disagre
 tree-selected emitter keeps exactly the old estimator, which is unbiased, just as slow as it was.
 Reversing `ltSample`'s adaptive splitting into a selection *density* is what would lift that, and
 is logged in `known-issues.md` → **GLOSSY-NEE**.
+
+**Mode `W` takes the connection too, since 0.275.0.** It is the same estimator as mode `R` with
+quadrature substituted for sampling — a `lightGrid`×`lightGrid` walk over each light instead of
+one random point, and the lobe's own lattice direction carrying the other half of the MIS weight —
+which is what mode `W` is defined to be. Before 0.275.0 the glossy case returned *before* the
+connection, so a glossy surface could only reach a light by its lobe lattice landing on one; at
+`-spp 1`, where that lattice **is** the mirror direction, any glossy surface whose mirror ray
+missed the light rendered **pure black**. Since `-spp 1` is mode `W`'s headline configuration and
+what `-explore`'s lit preview runs, this is the difference between a glossy floor previewing as
+shaded and previewing as a hole — `scenes/gallery_rain.ftsl`'s ground had to be authored `type
+diffuse` for exactly this reason. Measured over one tile: 0.000000 → 0.87–0.97× of mode `R`
+across roughness 0.2–0.9, with mode `R` itself bit-identical across the change.
 
 **Preview specular (`-raster` / `-explore`)** — the preview rasterizer used to shade diffuse
 only: its own header said "glossy lobes do not exist here either, so roughness/film-thickness
