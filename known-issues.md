@@ -8551,7 +8551,43 @@ threshold rather than assuming it went away. A cheap runtime net would be a GPU
 self-test at init (trace one known photon, compare against the CPU) — worth doing if
 this class of failure recurs.
 
-### OPEN (2026-08-15, v0.186.0): a mesh area light is sampled UNIFORMLY BY AREA, so every occluded or backfacing part of the emitter still costs samples
+### OPEN — **but the measured penalty no longer reproduces** (re-tested 2026-09-12, v0.273.10; filed 2026-08-15, v0.186.0): a mesh area light is sampled UNIFORMLY BY AREA, so every occluded or backfacing part of the emitter still costs samples
+
+> **RE-TESTED ON THIS ENTRY'S OWN RIG AND THE 1.31x IS GONE.** `scraps/occl_one.ftsl` vs
+> `scraps/occl_two.ftsl`, mode `R`, GPU, **512 spp x 4 seeds** (the originals were 32 spp):
+>
+> | | result |
+> |---|---|
+> | patch mean, two / one | **0.99997** — the sealed panel contributes nothing, so the control holds |
+> | high-frequency noise, two / one | **1.0014 ± 0.0005** (SE 0.0002, n=4) |
+>
+> Per seed: 1.0021 / 1.0013 / 1.0011 / 1.0013 — tight, so this is not noise. The entry measured
+> **1.31x**. The penalty is now 0.14 %.
+>
+> **The stated mechanism is UNCHANGED in the code**, which is why this is not being closed:
+> `Scene::meshTris` is still commented "per-triangle area CDF for uniform sampling" and
+> `samplePoint` still binary-searches `cumArea` (`scene.h` ~1015). So the draw really is still
+> blind to the shading point; what has changed is that it no longer costs measurable variance on
+> this test.
+>
+> **Unexplained, and I am not guessing.** A plausible candidate is that NEE/BSDF MIS absorbs the
+> wasted draws — GLOSSY-NEE's weight work (v0.266.0+) post-dates this entry — but I did not test
+> it, and my prediction going in ("the emitter-level light tree cannot help: `occl_two` is ONE
+> emitter, hence one leaf") was right about the tree and still wrong about the outcome.
+>
+> **THE TEST THAT WOULD SETTLE IT:** `occl_two` wastes **50 %** of the emitter, which is the
+> MILDEST version of the case this entry is about — its own text asks about "a room whose signage
+> is one mesh of dozens of scattered patches and only a few are visible", i.e. 90-95 % waste. Build
+> that scene. If the penalty stays ~1.00x there too, close the entry; if it scales with the waste
+> fraction, the entry is live and its rig was simply too gentle to show the severity.
+>
+> **Also stale in the entry below: the scope note.** It says "ftrace has **no many-lights
+> importance sampling anywhere**". An emitter-level light tree shipped in v0.270.0 —
+> `src/lighttree.h`, `LightTreeNode` carrying centre, bounding-sphere radius, emission cone and
+> power, which is exactly the Conty & Kulla structure prescribed as fix (1). **So fix (1) is half
+> built**: what remains is precisely the entry's own closing line, "a tree over emitters whose
+> mesh-emitter leaves descend into that emitter's own triangle tree" — the tree has **zero**
+> references to `meshTris` or `shape == 5` today.
 
 `EmitterShape::Mesh` (added for mesh area lights, C5) picks a triangle from a
 cumulative-area CDF and then samples it barycentrically — `Emitter::samplePoint`
