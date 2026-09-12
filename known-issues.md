@@ -3334,8 +3334,37 @@ specifies: skip the coverage correction where `fiberRadius > 0`, measure `alice_
 `cap_gyroid` and `creature` per-ROI on `gallery_rain` at fixed `-spp`, and expect the fur ROI to
 move and the other three not to.
 
-Not implemented: it would change mode `M`/`S` output on any scene with fur, so it wants its own
-change with the four-ROI measurement this entry already specifies, plus the device twin.
+**PROTOTYPED AND MEASURED (v0.276.7, `FTRACE_GAFIBER=1`, CPU only, OFF BY DEFAULT). It works, and
+the acceptance test was written down before the numbers existed.** One batch, one binary, fixed
+`-spp 64`, `-beamfreeze`, seed 3, 320x180 to match the 34781-spp reference:
+
+| ROI | px | correction on (shipped) | **fiber skip** | differing pixels |
+|---|---|---|---|---|
+| `creature` (the FUR) | 49 | **+42.0 %** | **+7.7 %** | **49 — all of them** |
+| `alice_hair` | 40 | −15.2 % | −15.2 % | **0** |
+| `alice_dress` | 110 | −3.7 % | −3.7 % | **0** |
+| `cap_gyroid` | 72 | −15.5 % | −15.5 % | **0** |
+| `grid_ground` (null) | 663 | +1.0 % | +1.0 % | **0** |
+
+**The fur overfill drops 34.3 points and NOT ONE of the 885 pixels in the other four ROIs moves.**
+That is an exact criterion rather than "the trimmed means agree", and it is only available because
+the skip is placed AFTER the probe loop: returning early would have skipped the probes' rng draws,
+and `photonmap_render.h` passes the caller's shared `rng` in by reference, so every later gather
+point would have shifted and all five ROIs would have moved for an unrelated reason.
+
+For scale, +7.7 % is nearer the reference than the entry's recorded `-gatherarea 0` figure for fur
+(+11.8 %, different batch, so not directly comparable) — i.e. skipping the correction *only where
+the geometry is fibers* beats both keeping it everywhere and dropping it everywhere. Note the
+baseline already has the shipped tangle gate on at 30, so this is an improvement on top of it, not
+an alternative to it.
+
+**Still not on by default, and the reason is the one that kept `-gatherarea` opt-in for months:
+there is no device twin.** Mode `M` runs on the GPU by default, so defaulting a host-only
+correction would split `-device gpu` from `-device cpu` on any scene with fur. The remaining work
+is the `dGatherCoverage` twin plus a fiber flag on the device hit, then the same four-ROI test on
+both backends, then the flip. Single seed here: the effect is 34 points against a per-ROI noise the
+entry measures at ±2.2, so the sign and scale are not in doubt, but the exact figure wants the
+four realizations the entry's own gate measurement used.
 
 **What is still unsolved, stated sharply.** The remaining distinction is not tangle-vs-truncation
 — the reject rate already captures that — it is *fur-vs-hair*, two tangles that want opposite

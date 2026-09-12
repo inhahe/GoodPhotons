@@ -118,6 +118,21 @@ inline bool gaDepthGateOn() {
     }();
     return on;
 }
+// FTRACE_GAFIBER=1: skip the coverage correction where the gather point is ON A FIBER. PROTOTYPE,
+// off by default, CPU only (no device twin yet) -- so do not compare backends with it set.
+//
+// A gather point on a 0.64 mm strand has no surface footprint for a tangent-plane disc to be
+// clipped against, so `coverage` there measures how much of a disc neighbouring strands happen to
+// intersect, which is not the quantity the density estimate divides by. The fiber% column of
+// FTRACE_GADIAG shows the test separates fur from mesh 100 % to 0 % on two scenes, which neither
+// the reject rate nor the depth statistic could do. See M-GATHERAREA.
+inline bool gaFiberSkipOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_GAFIBER");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
 inline bool gaDiagOn() {
     static const bool on = [] {
         const char* e = std::getenv("FTRACE_GADIAG");
@@ -162,6 +177,7 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
         gaDiag()[matId].points.fetch_add(1, std::memory_order_relaxed);
         if (fiberR > 0.0) gaDiag()[matId].fiber.fetch_add(1, std::memory_order_relaxed);
     }
+
     Vec3 t, b; onb(n, t, b);
     double area = 0.0;                 // in units of the full disc, so 1.0 == fully covered
     int   nRej = 0;                    // probes that FOUND geometry facing the wrong way
@@ -263,6 +279,11 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
     // nothing -- which is what truncation measures -- it changes exactly nothing.
     if (gaRejWeightPct() > 0)
         area += (double)nRej * (double)gaRejWeightPct() * 0.01;
+    // PROTOTYPE (see gaFiberSkipOn): decided HERE, after the probes have run and consumed their
+    // rng draws, so the arms differ only on fur. Returning early would skip those draws, and the
+    // caller's rng is shared across gather points, so every later point would shift too -- the
+    // four ROIs that must not move would then move for an unrelated reason.
+    if (fiberR > 0.0 && gaFiberSkipOn()) return 1.0;
     return area / (double)M;
 }
 // Never divide by a coverage so small that one stray probe inflates a pixel into a firefly. A
