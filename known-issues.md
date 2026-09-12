@@ -20720,6 +20720,47 @@ its own plane (see the `light area` entry). Re-run with `cross(u,v)` equal to th
 roughness-independence signature, and the worst case is **59.2x** rather than 15.6x. Both nulls hold
 exactly (diffuse and mirror unchanged to the last digit).
 
+**DIAGNOSED FURTHER (2026-09-12): the fault is in mode `W`'s GRID branch of `neeLight`, not in the
+MIS weights and not in the lattice.** Two hypotheses tested, one refuted, one located:
+
+*Refuted — grid resolution.* `-whitted-grid` 4 (default) / 8 / 32 give **1.296x / 1.294x / 1.294x**
+at roughness 0.05. The quadrature is converged; more points change nothing. A converged quadrature
+that is still 30 % off is a normalisation error, not a sampling one.
+
+*Located — decompose by making each strategy dominate.* At roughness 0.05 (lobe ~2°), vary only the
+light's angular size so the balance-heuristic weight sweeps from lattice-dominated to
+connection-dominated (`scraps/_gwdec_*.ftsl`, consistent panels):
+
+| light | subtends | `w_nee` | mode `R` | lattice only | both | lat/`R` | both/`R` |
+|---|---|---|---|---|---|---|---|
+| tiny | 1.6° | 0.91 | 16.488 | 29.233 | 18.173 | **1.773** | **1.102** |
+| 1 m | 8.1° | 0.28 | 7.593 | 8.549 | 9.839 | 1.126 | 1.296 |
+| big | 31.6° | 0.02 | 1.1267 | 1.1065 | 1.1825 | **0.982** | **1.049** |
+
+**Where the lattice is badly wrong the MIS pair rescues it** — tiny light, 1.773x → 1.102x — which
+is this fix doing exactly what it exists for: the lattice assumes the whole lobe sees the radiance
+of the mirror direction, which over-counts hard once the light is smaller than the lobe.
+**Where the lattice is already good, a connection carrying a weight of 0.02 moved the answer 6.7
+points the wrong way.** Backing the connection's own standalone value out of each row gives
+**1.03x / 1.73x / 4.3x** of `R` for lights of 1.6° / 8.1° / 31.6° — so the connection over-estimates,
+and worse the larger the light is relative to the lobe.
+
+**That violates an invariant worth stating**: adding a *correctly weighted* second strategy must move
+an estimate toward the truth, never away, because the weights partition unity. So one half is
+mis-normalised, and it is the connection.
+
+**It is specific to the whitted branch.** Mode `R` reaches the same `neeLight` with random UVs
+instead of `gridUV`, and the white-furnace test measures mode `R` flat to **0.04 %** across
+roughness 0.2–0.9 — so neither the connection's concept nor `bsdfF` is at fault. The suspect is the
+`const int G = (whitted && uv) ? ... : 1` path and how its `nS` grid points are combined against the
+light's area pdf. Whoever picks this up should print the two halves' contributions for one pixel of
+`scraps/_gwdec_big.ftsl`, where the connection's weight is 0.02 and its excess is 6.7 points, so a
+factor error is unmissable.
+
+**Net effect on a user today**: this fix is a large win wherever the lattice is wrong — including the
+black-at-`-spp 1` case it was written for, and every light smaller than the lobe — and a modest loss
+only for a near-mirror lobe under a light much larger than it.
+
 **But at r=0.05 the fix now makes it WORSE, 1.1259 -> 1.2958 in the mean and 1.07x -> 1.23x at the
 peak.** That is a real regression in v0.275.0, confined to a NEAR-MIRROR lobe whose lattice
 direction already lands on the light, and the malformed light had hidden it (it read
