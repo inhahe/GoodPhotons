@@ -20812,7 +20812,53 @@ might matter after all. It does not: on the connection arm alone, `-whitted-grid
 **0.091 vs 0.089** and **0.488 vs 0.486**. The original refutation stands and the doubt was
 unfounded.
 
-**So the live unknown is narrow and stated exactly:** backing `w_nee` out of the two arms gives the
+**ROOT CAUSE FOUND BY INSTRUMENTATION (2026-09-12). The lattice delivers the integral over the whole
+lobe but takes the MIS weight evaluated at the lobe's MODE, which is the maximum of `w_bsdf` across
+the lobe — so it claims full energy at the most favourable weight, and the two weights sum to more
+than 1.** Printed every factor of the connection for one pixel of `scraps/_gwdec_big.ftsl`
+(roughness 0.05, 31.6° light) at `-r 1 1 -heroc 1`, which gives exactly one camera path and one
+full grid:
+
+| grid | nS | max `pLobe` | quadrature **without** MIS | **with** MIS | MIS keeps |
+|---|---|---|---|---|---|
+| 4 (default) | 16 | 2.40 | 136.9 | 77.96 | 0.569 |
+| 32 | 1024 | **119.5** | **724.1** | 66.59 | **0.092** |
+
+The lobe's peak density is `(e+1)/2π` = **127.2**, so grid 4 never samples nearer than ~5.7° to a
+2° lobe (max `pLobe` 2.40, the far tail) while grid 32 resolves it (119.5). And the converged,
+un-weighted connection reads **724.1** against the analytic `r·L` = **703.1** — **correct to 3 %**.
+
+**So the connection was never wrong.** Its estimator, its grid and its normalisation are all fine.
+What is wrong is the pair of weights:
+
+| | keeps | delivers |
+|---|---|---|
+| lattice (BSDF half) | `w_bsdf` at the lobe **mode** = **0.97** | ~1.0x truth |
+| connection | 66.59 / 724.07 = **0.092** | 1.03x truth |
+| **sum** | **1.06** | measured blend **1.049** ✓ |
+
+The weights *do* partition unity pointwise in direction — that is not the failure. The failure is
+that mode `W`'s lattice is a **one-point quadrature at the mode**: it returns the whole lobe's
+energy while taking the weight belonging to the single most BSDF-favourable direction in it. At
+`-spp 1` the lattice direction *is* the mode (`glossyDirUV` maps `u1 == 1` to `mdir` exactly), so
+the over-weighting is maximal there and shrinks as `-spp` grows and the lattice spreads over the
+lobe — which is exactly the spp dependence observed.
+
+**AND IT RETIRES MY OWN BACKED-OUT FIGURES.** I had inferred "the connection over-estimates by
+1.74x and 4.55x" by dividing the measured arms by a `w_nee` computed from the lobe's **peak**
+density (127). The connection's samples never reach the peak — they sit in the tail where `pLobe`
+is 2.4 — so the real `w_nee` is 0.57 at grid 4, not 0.02, and the connection **under**-delivers
+rather than over-delivers. Inferring a factor from a weight I had not measured was the error;
+printing the weight is what fixed it.
+
+**THE FIX, now that the mechanism is known.** Either give the lattice a weight averaged over the
+lobe rather than the value at its sampled direction, or stop MIS-ing an incompatible pair and pick
+the accurate strategy outright — the hard switch costed above, whose numbers are already measured
+(0.982 / 1.126 / 1.102 against the current 1.049 / 1.296 / 1.102). The switch is the smaller change
+and needs only the seam check on `scenes/_record_rough.ftsl`; the averaged weight is more
+principled but needs an integral of `w_bsdf` over the lobe that nothing currently computes.
+
+**Superseded framing, kept for the record:** backing `w_nee` out of the two arms gives the
 connection's unweighted value as **1.74x** (8.1° light) and **4.55x** (31.6° light) of mode `R` —
 a real over-estimate, grid-converged, growing with light size, in an estimator whose algebra checks
 out term by term (`bsdfF`'s `1/cos_surf` cancels `emitterGeom`'s `cos_surf`, leaving
