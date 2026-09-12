@@ -20746,8 +20746,46 @@ points the wrong way.** Backing the connection's own standalone value out of eac
 and worse the larger the light is relative to the lobe.
 
 **That violates an invariant worth stating**: adding a *correctly weighted* second strategy must move
-an estimate toward the truth, never away, because the weights partition unity. So one half is
-mis-normalised, and it is the connection.
+an estimate toward the truth, never away, because the weights partition unity.
+
+**AND THE CAUSE IS STRUCTURAL, NOT A FACTOR — correcting my own framing of the line above.** I read
+`neeLight`'s estimator expecting a missing constant and it is algebraically right: for Glossy,
+`bsdfF` returns `r·lobe/cos_surf` and `emitterGeom`'s `w` supplies `cos_surf·cos_light·A/dist²`, so
+the surface cosine **cancels** and the term is `r·lobe·cos_light·A/dist²` — exactly the
+area-sampled form of `∫ f cos L dω`. The whitted branch differs from the random one *only* in
+placing UVs on a `gridUV` lattice and averaging `acc/nS`, which is a stratified quadrature of the
+same integral. There is no factor to find.
+
+**What is wrong is that mode `W`'s two halves are not the two strategies the weights describe.** The
+balance heuristic is computed from `pLobe = bsdfPdf(...)`, the density of the **random** lobe
+sampler — but mode `W`'s BSDF half does not sample that density. At `-spp 1` it takes ONE
+deterministic direction (the mirror direction, `u1 == 1`) carrying weight `r`. So the weights
+`pNee/(pNee+pLobe)` describe mode `R`'s strategy pair, not mode `W`'s, and for mode `W` they do not
+partition unity. That is why the error tracks *how unlike the two halves are*: it is smallest where
+the lobe and the light are comparable and grows at both extremes, and it is why a converged grid
+(`-whitted-grid 32`) cannot help.
+
+So "run mode `R`'s estimator with quadrature substituted for sampling" — the principle v0.275.0 was
+built on — is only **approximately** valid, and this is where the approximation shows.
+
+**Candidate rules, with the numbers the decomposition already predicts for each:**
+
+| rule | big light (31.6°) | 1 m (8.1°) | tiny (1.6°) |
+|---|---|---|---|
+| current (MIS blend) | 1.049 | 1.296 | **1.102** |
+| lattice only when `p_lobe > p_light`, else connection | **0.982** | **1.126** | **1.102** |
+| "delta always wins" (lattice whenever its ray hits the light) | **0.982** | **1.126** | 1.773 ✗ |
+
+The middle rule dominates the current behaviour on all three, and reproduces the good r=0.3 / r=0.6
+values too (there `p_light` 50 > `p_lobe` 3.4, so it picks the connection, which measured 1.028 and
+1.008). **"Delta always wins" is the more principled-sounding rule and it fails**, because mode `W`'s
+lattice is only a delta at `-spp 1` — past that it samples the lobe, so its character depends on
+`-spp`, which is precisely what makes a clean MIS formulation awkward here.
+
+**Open question before implementing the middle rule:** it is a hard switch on `p_lobe` vs `p_light`,
+and in a deterministic preview a threshold crossing is a visible seam wherever roughness or light
+distance varies across a surface. Worth checking on a scene with a roughness gradient before
+shipping — `scenes/_record_rough.ftsl` has one.
 
 **It is specific to the whitted branch.** Mode `R` reaches the same `neeLight` with random UVs
 instead of `gridUV`, and the white-furnace test measures mode `R` flat to **0.04 %** across
