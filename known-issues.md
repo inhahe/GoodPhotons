@@ -1394,6 +1394,27 @@ case where the reallocation spends *more* probe work than before, a deliberately
 (`-beamcount 2000`, 2 014 stored: 2107 ms -> 2006 ms). Faster because a correctly sized map needs
 fewer `-beamk` floor rounds and each round costs a whole probe, so accuracy pays for itself here.
 
+**REGRESSION-CHECKED ON THE REAL TARGET, not just the two fog toys.** `gallery_rain` (mode `J`,
+GPU, `-beamfreeze`, same binary, old split forced with `FTRACE_JPROBE=512,24000`):
+
+| | old split | new split |
+|---|---|---|
+| knee | 10 626 | **11 683** (+9.9 %) |
+| beams stored -> after split | 9 731 -> 148 890 | 10 726 -> 165 903 (+11.4 %) |
+| kernel radius | 0.01417 m | **0.01388 m** (−2 % blur) |
+| wall clock | 23 970 ms | **22 868 ms** (−4.6 %) |
+
+A ~10 % bigger map that renders **faster** and blurs **less** — the same floor-round saving, on a
+scene with fifteen media rather than one. No non-finite values in either arm.
+
+**The image agrees, but only a robust statistic can say so.** 61.7 % of pixels are lit in both
+arms, and across them the new/old ratio is 1.035 / 0.997 / 1.006 / 1.012 / 0.993 at p10 / p25 / p50
+/ p75 / p90 — ~1 % through the body of the distribution. The **frame mean** reads 0.971, and that is
+not a statistic here: at `-spp 2` the top ten pixels carry **13 %** of the lit total, and the single
+brightest differs 89.4 vs 81.7 between arms, which alone moves the mean by ~1 %. A first pass at
+this comparison used the frame mean and an ROI thresholded at 2 % of the max — the threshold landed
+on a firefly and selected 95 pixels. Percentiles were what made the check readable.
+
 **AND IT CORRECTS A NUMBER I PUT IN THIS ENTRY AN HOUR EARLIER.** I recorded the old config's seed
 spread as **1.12x** from three seeds. At six seeds it is **1.53x** (rel sd 18.5 %) — max/min over
 three samples is dominated by whichever seed happened to be extreme, and three seeds simply had not
