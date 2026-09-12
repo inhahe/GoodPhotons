@@ -1225,6 +1225,73 @@ transfer by being written down; it transfers by being built into the harness.**
 `src/scene.h` (`Emitter::sampleSphereCone`), `src/ftsl.h` ~6112 (where the emissive sphere joins
 the geometry). Measured by `scraps/gate_neeeps.sh`.
 
+### JDEVCMP-DEFAULT — **FIXED** (2026-09-11, v0.272.6): the mode-`J` device light pass ran its **host-vs-device diagnostic comparison in the shipped default**, once per light-side epoch — costing throughput and burying the progress lines under 2x their volume in debug output
+
+**Found while verifying something else.** A `_fog_cornell` knee-verification render printed a full
+`[jdevcmp]` table — host/device medians for `beta`, `pdfFwdA`, `rCoef`, `sumC`, `sumMb`, `sumMs`,
+the `gateC1` rates and an eight-row vertex histogram — with **no `FTRACE_*` variable set anywhere**
+in the process, the user environment, or the machine environment. The dump is supposed to require
+`FTRACE_JDEVLIGHT=2`.
+
+**The cause is one comparison operator meeting a changed default.** `FTRACE_JDEVLIGHT`'s levels
+are three *named arms*, not a severity ladder:
+
+| level | meaning |
+|---|---|
+| 0 | host light pass (`-jhostlight`) |
+| 1 | device map, rebuilt once per epoch |
+| 2 | level 1 **plus** the host-vs-device map dump |
+| 3 | device map, redrawn **per chunk** — the default since 0.272.x |
+| 4 | level 3 **plus** the dump — added in 0.272.7, so the dump's cost is measurable in one binary |
+
+The dump was gated `if (jdevLevel >= 2)`, which is correct as long as the default is 1. In
+0.272.x the default moved to **3** — and `3 >= 2`, so the dump came along with it. Nothing in the
+change re-audited the comparisons that *mention* the level, because the change was about which
+level to default to, not about what the levels mean.
+
+**What it cost.** On a 256-spp `_fog_cornell` the render emitted **20 `[jdevcmp]` blocks against
+9 `[spp]` status lines** — the diagnostic output outnumbering the progress output 2:1, and 71 % of
+the log by volume on a shorter repro. That is precisely the failure mode the `jdevSaid` latch
+eleven lines above it exists to prevent for `[jdevlight]`: *"a refreshing render rebuilds this
+every epoch — 126 of them in 90 s — and a line each would bury the `-interval` status lines that
+carry the actual progress."* The same reasoning had already been written down, next to the code,
+and applied to the neighbouring print only.
+
+It was not just noise, either: each dump downloads the device map and runs a median over every
+field, once per epoch. **How much that cost is still being measured, and the first attempt at
+measuring it was itself a lesson.** Comparing the pre-fix binary against the post-fix one — same
+scene, seed, spp, probe setting, identical knee (347 780 beams both times) — said the *fixed*
+binary was **2.2x slower**. It is not: the giveaway is that the regression lands in `beam hits`,
+7.5 s → 15.7 s, a kernel neither binary touches and whose input (a 6.8 M sub-beam map) is the
+same in both. The two runs were twenty minutes apart on a card that had been rendering the whole
+time, so what the experiment measured was the GPU's clocks, not the change. **Two builds minutes
+apart is not a controlled comparison on hardware with thermal history.**
+
+The fix for the rig, rather than a fudge factor: `FTRACE_JDEVLIGHT=4` was added as "level 3 plus
+the dump", so both arms exist in **one binary** and can be interleaved seed by seed
+(`scraps/jdevcmp_cost.sh` runs them 3,4,4,3 per seed so monotone drift cancels to first order).
+A diagnostic that cannot be A/B'd against its own absence within one process image cannot have its
+cost quoted.
+
+**A second, smaller waste in the same eight lines.** `uploadSurfMapCuda(smap, up, dsm)` ran
+unconditionally, converting every host surface photon into the device layout through two staging
+vectors and shipping them across — immediately before `buildJSurfMapDevice` opens with
+`dsm = gpu::DSurfMap{}` and discards all of it. Harmless (the allocations are arena-tracked by
+`up.keep`, so nothing leaks) but pure waste on the default path. Now gated on `!jDevLight`, which
+required hoisting the level decision above the upload — the upload's worth depends on the answer.
+
+**The fix** is `jdevLevel == 2`, not `>= 2`, with the reasoning written where the operator is so
+the next default change cannot repeat it. Verified both directions: default now emits **0** dump
+blocks, `FTRACE_JDEVLIGHT=2` still emits them, so the arm every measurement in this file was taken
+with stays reachable.
+
+**The general shape, worth keeping.** *When a flag's default moves from "off" to "on", every `>=`
+or `!=` test against that flag becomes a live code path.* The audit is mechanical — grep the flag,
+read each comparison, ask whether it was written assuming the old default — and it was skipped
+here because the levels read like a verbosity scale, where higher implying lower is the natural
+reading. They are not a scale. Naming them `arm` rather than `level` would have made `>=` look as
+wrong as it is.
+
 ### J-KNEE-NOISE — OPEN (2026-09-11, v0.272.4): mode `J`'s **`-beamk` knee**, which sizes the entire beam map, varies by **3.8x between seeds** on a scene with a dielectric — so the same scene rendered twice picks maps differing several-fold in memory, gather cost and merge coverage
 
 **Found while asking a different question.** The budget pilot traces `clamp(nPaths/32, 2048,
@@ -1317,48 +1384,109 @@ what the table above does.
 `_fog_thick` — stable before and after — moves from ~13 03x to ~10 9xx and stays tight
 (11 026 / 10 815 / 10 931, **1.02x**), and the CPU path is unaffected.
 
-**AND THE FIX TURNS OUT TO CUT BIAS 4x, WHICH IS NOT WHAT IT WAS FOR.** Comparing the two probe
+**AND THE FIX ALSO MOVED THE IMAGE, WHICH IS NOT WHAT IT WAS FOR.** Comparing the two probe
 configs at 256 spp x 4 seeds showed the image mean moving **+6.14 % +- 1.17 %, 5.3 sigma** — which
-should be impossible for a pure sizing parameter, and looked like a shipped regression. It is not.
-The knee does not only size the map: **below it, `buildAuto` INFLATES the kernel radii** to reach
-`targetK`, and this file already calls that inflation a documented bias. So the knee feeds bias
-directly, and moving it had to move the mean.
+should be impossible for a pure *sizing* parameter, and looked like a shipped regression. It is
+not a regression: the shift is toward ground truth. Scored against a **67 448-spp mode-`D`
+reference** (0.39 % noise) on `_fog_thick`, with `scraps/knee_score.py`:
 
-Scored against a **67 448-spp mode-`D` reference** (0.39 % noise) on `_fog_thick`:
-
-| arm | raw mean vs ref | trimmed mean vs ref |
+| arm | raw mean vs ref (n=4) | per seed |
 |---|---|---|
-| 96 x 120 000 (pre-0.272.5) | −3.46 % +-0.76 | **−5.9 %** |
-| **512 x 24 000 (shipped)** | **+2.45 % +-0.96** | **−1.5 %** |
+| 96 x 120 000 (pre-0.272.5) | **−3.46 % ± 0.76** | −5.71 −3.01 −2.55 −2.57 |
+| **512 x 24 000 (shipped)** | **+2.45 % ± 0.96** | +2.25 −0.00 +2.93 +4.63 |
 
-Closer on both, and **4x closer on the trimmed mean** — which is the statistic to believe on a fog
-scene, where the raw mean is firefly-dominated. So v0.272.5 is an accuracy fix as well as a
-stability and speed one, and the 6 % shift was the image moving *toward* ground truth.
+The pre-fix arm is **low on every seed**, 4.6 sigma below the reference. The shipped arm is
+**2.45 % ± 0.96 above** it — closer to zero, and on the other side of it, but *still 2.6 sigma
+from zero*, so "unbiased" is not what this shows. What it shows is that the probe change more
+than halved the distance to a mode-`D` reference, which makes v0.272.5 an accuracy improvement as
+well as a stability and speed one.
 
-**INDEPENDENT CORROBORATION, already in `REFERENCE.md` and written a week earlier.** The
-`-beamk` note says: *"Below the knee the `-beamk` floor widens the kernel radius to keep the
-gathered count at 32, so the render silently uses a kernel wider than the `-beamblur` you asked
-for: on the analytic gate scene the half-knee map came out **6.4 % off the absolute radiance**,
-which falls to **0.34 %** at the knee."*
+**The residual is an open thread and is probably not about the probe at all.** Both arms are
+significantly non-zero against mode `D`, in opposite directions, which is the signature of a
+mode-`J`-vs-mode-`D` discrepancy that the probe merely modulates rather than causes. Splitting
+that apart needs a mode-`J` arm whose map size is pinned — which is what `scraps/kneedir.sh`
+builds anyway, so the two questions share a rig.
 
-The 96-ray probe was reporting a knee about **half** the converged value on `_fog_cornell`
-(~136 k against ~267 k), and the measured trimmed bias it caused on `_fog_thick` was **5.9 %**.
-That is the documented half-knee number, **6.4 %**, arrived at from a completely different
-direction — an analytic gate scene a week ago, and a mode-`D` reference today. The two agree to
-within their own error bars, which is about as much confirmation as this kind of claim gets.
+**Read the raw mean, not a trimmed one.** The raw mean is what is unbiased in expectation, which
+is the property being tested; a trimmed mean is not, and it also depends on a trim fraction that
+has to be quoted alongside it or the number cannot be reproduced. An earlier version of this
+paragraph reported "−5.9 % → −1.5 %, 4x closer" from an unstated trim; a 2 %-trim rescore of the
+same PFMs gives −4.24 % → +0.62 %. Same ordering, different factor — which is exactly why the
+trimmed statistic does not belong in the headline.
 
-*It also means the defect was diagnosable from the docs alone.* "The knee is the smallest map that
-gets you the kernel width you asked for" plus "the probe estimates it from 96 chords" is enough to
-predict both the bias and its size, without rendering anything.
+**Why the mean moves at all is NOT yet established** — see the retraction immediately below, which
+withdraws the radius-inflation explanation this paragraph used to carry.
 
-**Stale figure noted:** the same section quotes `_fog_cornell`'s knee as **~114 000 beams**. That
-was measured with the 96-chord probe, so it is the biased value; the corrected probe puts it near
-**220–270 k**. The 8.7x scene-to-scene ratio it illustrates survives — `_fog_thick` moved too, to
-~11 k — but the absolute numbers there are pre-0.272.5.
+**RETRACTED: THE "INDEPENDENT CORROBORATION" ABOVE HAD THE SIGN BACKWARDS.** The paragraph
+that stood here argued that `REFERENCE.md`'s `-beamk` note — *"on the analytic gate scene the
+half-knee map came out **6.4 % off the absolute radiance**, which falls to **0.34 %** at the
+knee"* — confirmed the measured bias, because 6.4 % and the measured 5.9 % agree to within their
+error bars. It matched two magnitudes and never checked either of the things that would have
+falsified it.
 
-**The lesson is about the mental model, not the arithmetic.** "The knee sizes the map" made a mean
-shift look like a bug; the entry's own text said the knee drives radius inflation, which makes the
-shift *expected*. A 5.3-sigma surprise is worth a reference render before it is worth a revert.
+**1. The directions disagree.** `REFERENCE.md`'s `-jsurf-count` row states the sign explicitly:
+undershooting the beam knee is *"a measured bias (**+6.4 %** on the analytic slab)"* — an
+undersized map reads **HIGH**. The pre-fix arm reads **LOW**, −3.46 % ± 0.76 raw against the
+mode-`D` reference. A mechanism that predicts +6 % cannot be the explanation for −3.5 %, however
+well the magnitudes line up. |a| ≈ |b| is not a ≈ b, and that is the whole of the error.
+
+**2. "The 96-ray probe reported a knee about half the converged value" is contradicted by this
+entry's own table.** That claim came from reading `131 885` and `140 923` as "~136 k" and setting
+it against the post-fix "~220–270 k". But the third seed in that same row is **496 091**, and
+dropping it is what produced the factor of two. Take the row as a whole:
+
+| probe | seed 3 | seed 7 | seed 11 | **mean** |
+|---|---|---|---|---|
+| 96 × 120 000 (pre-fix) | 131 885 | 140 923 | 496 091 | **256 300** |
+| 512 × 24 000 (shipped) | 221 325 | 238 700 | 213 536 | **224 520** |
+
+The old probe is **not a systematic under-estimator**. Its mean knee is if anything *higher* than
+the shipped probe's — it is an estimator with roughly the right centre and a heavy upper tail.
+`_fog_cornell` seed 1 under the old probe lands at **347 780**, above everything in the new row,
+which is the same fact from a fourth seed. So "undersized map" was never established for the arm
+that reads low, and the mechanism had no foundation underneath the sign error either.
+
+**3. The trimmed figures in the table above are not reproducible as quoted.** They depend on a
+trim fraction that was never written down. A fresh 2 %-trim luminance scorer
+(`scraps/knee_score.py`) over the same PFMs gives **−4.24 % → +0.62 %**, not −5.9 % → −1.5 %;
+the "4x closer on the trimmed mean" is an artifact of one unstated choice. **Quote the raw mean.**
+It is the unbiased estimator, it is stated with its standard error, and it reproduces exactly:
+
+| arm | raw mean vs ref (n=4) |
+|---|---|
+| 96 × 120 000 (pre-0.272.5) | **−3.46 % ± 0.76** |
+| **512 × 24 000 (shipped)** | **+2.45 % ± 0.96** |
+
+**What survives.** The pre-fix arm sits systematically below a 67 448-spp reference and the
+shipped arm sits much nearer zero; both statistics agree on that ordering, so v0.272.5 did move
+the image toward ground truth. What does *not* survive is any claim to know **why**, and with it
+the flourish that "the defect was diagnosable from the docs alone" — it was not, because the docs
+describe a bias of the opposite sign.
+
+**The experiment that settles it** is `scraps/kneedir.sh`, and it exists because the probe must
+come out of the loop: with the probe in play, map size is a random variable, so the arms differ in
+their *distribution* of map sizes and no single arm has a map size to point at. `-beamcount` bounds
+the map deterministically, making size the independent variable — quarter knee, half knee, knee, at
+matched seeds on `_fog_thick`. The log's own *"a probe ray gathers 32.0 beams (N at the raw mfp
+radii)"* reports the inflation each arm actually received, so the x-axis is measured rather than
+assumed. If the half-knee arm reads high, `REFERENCE.md` is right and the pre-fix arm's −3.46 %
+has some other cause entirely. If it reads low, the `+6.4 %` in `REFERENCE.md` needs its own sign
+audited.
+
+**Stale figure noted, separately:** the same `REFERENCE.md` section quotes `_fog_cornell`'s knee
+as **~114 000 beams**. That was measured with the 96-chord probe, i.e. with the estimator this
+entry shows has a 3.76x seed spread, so it is one draw rather than a value — the corrected probe
+puts the centre near **220-270 k**. The 8.7x scene-to-scene ratio it illustrates survives
+(`_fog_thick` moved too, to ~11 k), but the absolute numbers there are pre-0.272.5. This is a
+**spread** problem, not a bias one — see the retraction above for why "the old probe read low"
+does not hold up.
+
+**The lesson that survives is the cheap one: a 5.3-sigma surprise is worth a reference render
+before it is worth a revert.** The shift looked like a regression, and one 150-second mode-`D`
+render showed it was the image moving toward ground truth. The *second* lesson is the expensive
+one, and it is in the retraction below: the explanation that felt most satisfying — a documented
+number in another file agreeing to within error bars — was wrong, and one glance at its sign
+would have caught it before it was committed.
 
 **The remaining idea, if the residual 1.12x ever matters:** The variance comes from uniform
 chords sampling a clustered set, so the directions to try are ones that cut variance at equal

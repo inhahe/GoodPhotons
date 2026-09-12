@@ -1523,7 +1523,12 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   taken against; **`2`** adds a `[jdevcmp]` dump comparing the host-traced and device-traced maps
   field by field (means, medians, p99.9, max, the `gateC1` fraction and the `vert` histogram),
   which is a far stronger test of the deposit than any image comparison — two ~49 000-sample
-  draws of one distribution agree to ~1/sqrt(N), while a transcription error is gross there.
+  draws of one distribution agree to ~1/sqrt(N), while a transcription error is gross there;
+  **`4`** is the default arm (`3`) *plus* that dump, which exists so the dump's own cost can be
+  A/B'd inside one binary. **These are named arms, not a verbosity ladder** — a higher number
+  does not imply the ones below it, and 0.272.6 fixed a bug where the dump's `>= 2` gate swept
+  the `3` default into the diagnostic arm the moment the default moved from `1` to `3`, so every
+  shipped mode-`J` render was running the comparison once per light-side epoch.
   `FTRACE_JSPLIT=<k>` sets the in-chunk split; it has an **interior optimum** (k=16 is worse than
   k=4, because more realizations cost camera samples). `FTRACE_JBAND=1` redraws per wavefront
   band instead, which is the only axis left once a frame is down to one sample per chunk — it

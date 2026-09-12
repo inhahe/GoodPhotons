@@ -18323,8 +18323,6 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // used to carry was true for one version. The gather landed in 0.263.1 -- see `mergeAny`
     // below, which launches the MERGE kernel for a surface map with no beams, and
     // `dSurfMergeAt`.)
-    DSurfMap dsm{};
-    if (smap) uploadSurfMapCuda(smap, up, dsm);
     // FTRACE_JDEVLIGHT=1: re-trace and re-grid that map ON THE DEVICE instead. Deliberately
     // the same nPaths / radius / single realization as the host map it replaces, so this is a
     // clean A/B of WHERE the light side runs. It cannot be bit-identical -- the two walks draw
@@ -18334,9 +18332,30 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // FTRACE_JDEVLIGHT still overrides both, because level 1 (device map, once per epoch) and
     // level 2 (that plus the host-vs-device map dump) are the two arms every measurement in
     // known-issues was taken with and they have to stay reachable.
+    //
+    // THE LEVELS ARE NAMED ARMS, NOT A VERBOSITY LADDER. Read them as a set, never as an
+    // ordering where a higher number implies everything below it:
+    //     0  host light pass (`-jhostlight`)
+    //     1  device map, rebuilt once per epoch
+    //     2  = 1 plus the host-vs-device map dump
+    //     3  device map, redrawn per chunk          <- the default
+    //     4  = 3 plus the dump  (for timing the dump against 3 inside one binary)
+    // Getting this wrong is what JDEVCMP-DEFAULT was: the dump's gate read `>= 2`, which was
+    // right while the default was 1 and silently swept the default into the diagnostic arm the
+    // moment it became 3.
+    //
+    // DECIDED BEFORE THE UPLOAD BELOW, because the answer changes whether the upload is worth
+    // doing at all: `buildJSurfMapDevice` opens with `dsm = gpu::DSurfMap{}`, so on the device
+    // path every byte `uploadSurfMapCuda` converts and ships is overwritten a few lines later.
     int jdevLevel = g_jHostLight ? 0 : 3;
     if (const char* e = std::getenv("FTRACE_JDEVLIGHT")) jdevLevel = std::atoi(e);
     const bool jDevLight = smap && smap->nEmitted > 0 && jdevLevel != 0;
+
+    DSurfMap dsm{};
+    // Skip the host map's upload when the device is about to build its own over the top. The
+    // cost is not the PCIe transfer but the two staging vectors built ahead of it, which walk
+    // every surface photon on one core to widen it into the device layout.
+    if (smap && !jDevLight) uploadSurfMapCuda(smap, up, dsm);
     if (jDevLight) {
         buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, smap->nEmitted,
                             smap->radius, (long long)smap->pts.size() * 2 + 1024,
@@ -18351,7 +18370,23 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         smap->pts.size(),
                         jdev.dropped ? "  [CAP BOUND: some photons dropped]" : "");
         }
-        if (jdevLevel >= 2) compareJSurfMaps(*smap, jdev);
+        // `== 2`, NOT `>= 2`. The levels are not a severity ladder where each one implies the
+        // one below -- they are three named arms, and level 2 is specifically "device map plus
+        // the host-vs-device dump". When the default moved from 1 to 3 in 0.272.x, `>= 2`
+        // silently swept the DEFAULT into the diagnostic arm: every shipped mode-J render with
+        // `-jsurf` downloaded the device map and ran the whole median/histogram comparison once
+        // per light-side epoch. On a 256-spp `_fog_cornell` that is 20 dumps against 9 `[spp]`
+        // status lines -- the diagnostic output outnumbering the progress output 2:1, which is
+        // the exact failure the `jdevSaid` latch a few lines above exists to prevent.
+        //
+        // LEVEL 4 = LEVEL 3 PLUS THE DUMP, and it exists so the cost of the dump can be measured
+        // WITHIN ONE BINARY. Timing the bug by comparing a pre-fix build against a post-fix one
+        // is not a controlled experiment: the two runs are minutes apart on a card whose clocks
+        // depend on how hot it already is, and a first attempt that way came out "2.2x slower
+        // after the fix" -- the beam-hit kernel alone drifting 7.5 s -> 15.7 s on an identical
+        // 6.8 M sub-beam map that neither arm touches. Arms that can be interleaved, seed by
+        // seed, in one process image are the only ones that answer a throughput question here.
+        if (jdevLevel == 2 || jdevLevel == 4) compareJSurfMaps(*smap, jdev);
     }
     // Level 3 redraws per chunk (see the note above): remember what the rebuild needs, since the
     // launch lambda has no `smap` of its own and must not reach for one that may be freed.
