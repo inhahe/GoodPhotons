@@ -2106,7 +2106,58 @@ FOLD"):
    surface case.
 2. **Gather-time spectral fold** (0.256.0). `Scene::BowLut` tabulates
    `∫spd·CIE·p(cosθ,λ)dλ` per (emitter, medium) and `beamgather.h` evaluates it at the
-   crossing angle. The device has **no bow table at all**.
+   crossing angle. ~~The device has **no bow table at all**.~~ **STALE — the device twin
+   `DBowLut` landed with part 2 in v0.264.0** (same `kBowBins`, same clamp and lerp, one table
+   per eligible (emitter, medium) pair). Left struck through because this sentence sat directly
+   under a heading that already said "part 2 landed" and still read as the open problem.
+
+> **PART 1 IS SIZED, AND IT DOES NOT PAY FOR THE PORT (2026-09-11, v0.273.4).** Before writing
+> any CUDA the question is what the deposit-time surface fold is worth, and that is measurable
+> *today* on the CPU, where it already works: `FTRACE_NOSURFFOLD=1` flips `foldWorthIt` off in
+> one binary at one seed and one `-spp`, so the arms are **paired** — same RNG stream, seed
+> variance cancels in the difference. `gallery_rain`, 320x180, 24 spp, seed 7, scored with
+> `scraps/chroma_noise.py` (high-frequency **chromaticity** step to the right/down neighbour,
+> which divides brightness out entirely — a coloured streak survives it, luminance noise does
+> not), per third because multiple scatter is +282 % in the top third and −0.3 % in the bottom:
+>
+> | arm | folded | top third | middle | bottom | whole |
+> |---|---|---|---|---|---|
+> | surface fold OFF (what the device does today) | 89.1 % | 0.395 | 1.086 | 0.00885 | 0.6766 |
+> | surface fold ON (CPU shipped) | 91.7 % | 1.000x | 0.999x | **0.640x** | **0.999x** |
+> | surface fold FORCED, no variance guard | **91.7 %** | 1.001x | 1.000x | 0.665x | 1.000x |
+>
+> **The whole-frame effect is 1.001x — nil.** The fold cuts chroma streaking by 1.56x in the
+> BOTTOM third and nowhere else, and the bottom third carries ~1 % of the frame's chroma noise
+> (0.00885 against the middle's 1.086). Porting it would spend 12 spectral albedo evaluations
+> per diffuse bounce, inside a kernel that already reserves `DVertex path[MAXV]` in local
+> memory, to improve the quietest third of the image.
+>
+> **It is not a blind-rig null, and it is not an inert feature.** The fold fraction moves
+> (89.1 % -> 91.7 %), the bottom third moves 1.56x, and a pixel-level diff shows the two arms
+> differ on **2.1 % / 21.0 % / 6.8 %** of pixels by third — so the fold fires everywhere,
+> including where it changes the most pixels (the middle third, 21 %) and helps least (1.001x).
+> It is active and measurable; it simply does not reduce COLOUR streaking in the volume.
+>
+> **Which fits the mechanism.** The surface fold only rescues chords that passed through a
+> diffuse surface, and on this scene those land on and near the ground. The rain column above is
+> lit by chords whose spectral fate is decided by the medium's rainbow phase function — which is
+> part 2's territory, and part 2 is already on the device. So the entry's motivation, "a
+> `-device gpu` render is correct but visibly grainier", is dominated by a term that has since
+> been ported.
+>
+> **The variance guard is not the limiter.** `FTRACE_FOLDFORCE=1` leaves the fold fraction at
+> exactly 91.7 % and the chroma numbers unchanged, so the shipped implementation is already at
+> this fold's ceiling on this scene. Any future attempt has to raise the ceiling, not the guard.
+>
+> **A loose thread, recorded rather than glossed.** This entry attributes **87.8 %** of unfolded
+> deposits to a surface event, which against an 89.1 % baseline implies ~9.6 points are
+> recoverable. The surface fold recovers **2.6**, and forcing the guard off recovers no more. So
+> something other than `foldWorthIt` retires the remaining ~7 points, and the 87.8 % figure
+> overstates the headroom. Worth knowing before anyone re-opens this on the strength of it.
+>
+> **Status: part 1 DEPRIORITISED on measured evidence**, not abandoned. A scene whose graininess
+> is surface-dominated rather than volume-dominated would flip this, and the rig to check is two
+> commands: the `NOSURFFOLD` pair plus `scraps/chroma_noise.py`.
 
 **Consequences, exactly.**
 - A GPU-traced beam map never carries `achro == 2`; `render_cuda.cu`'s download loop sets
