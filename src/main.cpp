@@ -24217,6 +24217,12 @@ static int run(int argc, char** argv) {
                 sharedWriteFail = true;
         }
         noteFinishReason(g_stopRequested ? "stopped early" : "all frames gathered");
+        // FTRACE_GADIAG=1's per-material miss/reject/accept split. gaDiagReport() had NO CALLER
+        // -- the tally was collected and then silently dropped, so the documented diagnostic was
+        // dead and the reject rates the M-GATHERAREA entry cites were unreproducible. Printed
+        // here, after the gather, because that is when every probe has been counted. No-op (and
+        // no cost) unless the variable is set.
+        gaDiagReport(scene);
     };
     runSharedPhotonMap(groupM);
 

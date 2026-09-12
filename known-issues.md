@@ -3265,6 +3265,41 @@ distinguish them: it acts on both in proportion to a rate they nearly share. A T
 above hair's 10 % and below fur's 17-19 % can, which is precisely what gate 30 does and why the
 cruder rule is the better one here. **The continuous form is worse *because* it is continuous.**
 
+**THE DIAGNOSTIC THIS ENTRY'S EVIDENCE COMES FROM WAS DEAD — fixed in v0.276.4.**
+`gaDiagReport()` had **no callers**. The per-material tally was collected into its atomics on every
+probe and then silently dropped, so `FTRACE_GADIAG=1` printed nothing and the reject rates quoted
+below could not be reproduced by anyone, including me. It is now called at the end of the mode-`M`
+gather, where every probe has been counted. The numbers **do** reproduce: `mat39` rejects **16.7 %**
+and `mat40` **19.2 %** against the entry's "fur 16.8–19.1 %", and `mat45` rejects **10.3 %** against
+its "`alice_hair` at 10.2 %". Same class of bug as the off-switch that silently does nothing, and
+the same lesson: a diagnostic nobody has run since it was written is indistinguishable from one that
+does not work.
+
+*Follow-up, small:* the report prints `mat39` / `mat45` rather than names for exactly the materials
+under study. `nmOf` falls back to `matN` when no `MeshGroup` claims the material, and neither the
+`fur` blocks (which own no mesh) nor Alice's glTF-imported materials do — `alice_unpainted` is the
+FTSL fallback that the scene says is "never meant to be seen". Falling back to the material's own
+authored name would make the table readable.
+
+**AND THE DENSITY HYPOTHESIS BELOW RESTS ON A MISCHARACTERISATION OF THE GEOMETRY.** It reads
+`alice_hair` as "sparse strands with gaps between them" against fur's packed strands. But
+`alice_hair` is not strands at all: Alice is `mesh "alice" { file "meshes/alice.glb" }`, a triangle
+mesh, and **all 15 `fur` blocks in the scene attach to `cr_*` creature surfaces** — there is no fur
+anywhere on Alice. So the comparison is not sparse-strands-vs-packed-strands; it is **a sculpted
+mesh versus an actual strand cloud**.
+
+That reframing suggests a discriminator that is a **type test rather than a rate threshold**, which
+is what this entry asks for ("a better statistic might separate outright"): the coverage correction
+assumes a tangent-plane **disc of surface**, which is meaningful on a mesh and meaningless on a
+strand cloud. `Hit::fiberRadius` (`geometry.h` ~144, set by `curve.h` ~372 on every curve hit) is
+already available at the gather site, and the gather already passes `h.matId`, so the test is cheap.
+**It must be the geometric test, not `isFiberMat`**: the fur carries `material cr_coat`, which is
+`type diffuse`, so a material-type test would return false for it — and a geometric test is the
+better choice anyway, being independent of whatever material an author paints on the strands.
+
+Not implemented: it would change mode `M`/`S` output on any scene with fur, so it wants its own
+change with the four-ROI measurement this entry already specifies, plus the device twin.
+
 **What is still unsolved, stated sharply.** The remaining distinction is not tangle-vs-truncation
 — the reject rate already captures that — it is *fur-vs-hair*, two tangles that want opposite
 treatment. The plausible axis is **density**: hair is sparse strands with gaps between them, so
