@@ -2045,6 +2045,39 @@ grid, rather than through camera rays**, and that is the rig to build before wri
   save the most. The scene where the field is rough is the one where multiple scatter is a smaller
   share of the cost anyway.
 
+**AND `-beams-order 1` IS NOT A COST CONTROL — which invalidates the obvious way to price the
+cache, so it is recorded before anyone uses it (2026-09-12).** The natural next measurement is
+"how much time does the order >= 2 part of the beam gather cost?", and the natural arm is
+`-beams-order 1`. It does not work. `_fog_thick`, `-mstats`, identical settings, radius pinned:
+
+| arm | beam gather (thread-s) | stored chords | after split | mean split |
+|---|---|---|---|---|
+| full | **640.1** | 999 574 | 7 800 285 | 0.0601 |
+| `-beams-order 1` | **998.6** | 999 621 | 7 860 379 | 0.0761 |
+
+**The order-capped arm is 56 % SLOWER, from the same number of probes.** The reason is visible in
+the last three columns: it stores essentially the *same* number of chords, because `-beamcount`
+caps the deposit and both arms hit the cap — so the cap does not remove work, it **changes which
+chords are stored**. A single-scatter chord crosses the whole medium where a high-order one is a
+short hop between scatters, so the arm swaps many short beams for fewer long ones, the mean split
+grows 0.060 -> 0.076, the sub-beam count goes *up*, and the looser BVH boxes cull worse.
+
+So `-beams-order 1` is a **content** control — it correctly answers "what does the order >= 2 field
+look like?", which is what the structure test above uses it for — and **not** a cost control. Any
+speed number derived from it is measuring beam geometry, not the cacheable share.
+
+**This puts a question mark over this entry's own ~30 % cost ceiling**, which came from the same
+kind of arm (87.8 -> 50.8 beams per probe on `gallery_rain`). That figure is a *count*, which is a
+fairer measure than time, and `gallery_rain` may not hit the deposit cap the way `_fog_thick` does
+— so it is not refuted, it is **unverified**, and it should be re-derived before it is used to
+justify building anything.
+
+**The measurement that would work is now possible and was not before.** Count or time only the
+beam intersections whose chord has `order >= 2`, inside the gather itself, with no change to what
+is deposited. That needs the stored order at gather time, which is exactly the field BEAMORDER-GPU
+populated on both backends in v0.278.1 — found, as it happens, while setting up the experiment two
+sections above.
+
 **The rig is two scripts and four renders**, so re-testing on another scene is cheap:
 `-beamradius` pinned, two seeds, `scraps/ms_struct.py`. A scene whose medium is genuinely
 diffuse — `_fog_thick`, which measures 82.8 % order >= 2 against `gallery_rain`'s 40.7 % — is the
