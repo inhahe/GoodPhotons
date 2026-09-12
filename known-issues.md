@@ -3112,9 +3112,60 @@ and the trimmed mean talking, not a density estimate. Same four seeds, `scraps/g
 
 **What the residual is NOT.** It is not the fur path: `alice_hair` is *mesh* geometry, not curves,
 which is why the fiber gate leaves it alone — it moves -67.6 -> -10.0 under the coverage probe
-while `creature` does not move at all. And it has **not** been tested against the entry's own
-warning that `M = 8`'s apparent accuracy is two biases cancelling and that it should be evaluated
-at `M >= 32`; `-gatherarea 32` on these same four seeds is the obvious next measurement.
+while `creature` does not move at all.
+
+**AND IT IS NOT THE PROBE COUNT — `-gatherarea 32` MEASURED (2026-09-12), which settles the
+entry's "evaluate at `M >= 32`" warning and turns it into something more useful.** Same four
+seeds, same binary, `scraps/ga_m32.sh`:
+
+| ROI | `M = 8` (shipped) | `M = 32` | direction |
+|---|---|---|---|
+| `alice_hair` | -10.0 % | -12.9 % | **darker**, 3/4 seeds |
+| `alice_dress` | -12.3 % | -15.4 % | **darker**, 3/4 seeds |
+| `cap_gyroid` | -11.4 % | **-7.4 %** | **brighter**, 4/4 seeds |
+| `creature` (fur) | +9.5 % | +9.5 % | identical — the fiber gate short-circuits both |
+| `grid_ground` | -2.8 % | -2.7 % | unchanged |
+
+Mean absolute error over the four non-null ROIs: **10.8 (`M = 8`) against 11.3 (`M = 32`)**. So
+quadrupling the probe budget does not improve the estimator — it **redistributes** the error, and
+in opposite directions on different ROIs. That is the "two biases cancelling" warning, now with
+both biases named:
+
+1. **Jensen, and the code already says so.** `gatherCoverage`'s stratification comment states it
+   outright: the estimate divides by measured coverage, `E[1/cov] > 1/E[cov]`, so noise in `cov`
+   makes the correction too **bright**, the more so the fewer probes — with `alice_dress` at
+   -5.9 % (`M = 4`) against -15.2 % (`M = 16`) recorded there. The new column extends that series
+   to `M = 32` at **-15.4 %**, which is the load-bearing part: **between 16 and 32 it has stopped
+   moving**, so the Jensen bias has converged and `-15.4 %` is very nearly the estimator's
+   *asymptotic* answer for cloth. The shipped `M = 8`'s better-looking `-12.3 %` is therefore not
+   accuracy, it is 3 points of Jensen brightening sitting on top of a 15-point shortfall.
+2. **The early-out's threshold scales with `M`, which nobody intended.** The flat-interior gate is
+   `if (i == probe0 && area >= probe0 * 0.995) return 1.0` with `probe0 = M/4` — so it demands
+   **2 of 2** flat-on probes at `M = 8` and **8 of 8** at `M = 32`. On a disc that is genuinely
+   95 % covered those have probabilities 0.90 and 0.66, so the gate fires far more often at low
+   `M`, and every firing returns coverage 1.0 — *no correction at all*. `cap_gyroid` is exactly
+   that case (an edge strip: mostly covered, partly hanging off), and it is the one ROI that gets
+   **brighter** with more probes. **This is inference from the code plus the direction of the
+   data, not a measurement** — the test that would confirm it is to hold `probe0` at a fixed
+   count instead of `M/4` and check that `cap_gyroid`'s `M`-dependence collapses while
+   `alice_dress`'s (mechanism 1) does not.
+
+**Cost is not the reason to prefer `M = 8`, and that changes the trade.** At seeds 3 and 13 the
+`-gatherarea 0`, `8` and `32` arms all report **98 % of the camera gather at 1:00**; the probe
+count is unmeasurable against the beam gather, which `-mstats` puts at 81 % of the frame. The
+original "8 is where the sweep plateaus, for 1.3-1.7x the gather cost" was a **host** measurement
+of the gather in isolation. On the device, in a whole frame, there is no cost argument left — so
+if a bias-corrected estimator wants 32 probes, it can have them.
+
+**What this says to build.** Not more probes. The estimator is `1/hat(c)` of a noisy `hat(c)`
+with a hard cliff (`gatherAreaScale` returns 1.0 below `cov = 0.05`, a step from 20x to 1x), so
+the probe count is a **bias** knob rather than a convergence knob. The standard repair is to stop
+plugging a noisy estimate into a convex function: `(M+1)/(k+1)` is the textbook near-unbiased
+estimator of `1/p` for a binomial `k`, it is bounded (no cliff needed), it is monotone, and at
+`k = M` it returns **exactly 1.0**, so full coverage stays inert and flat ground stays
+bit-identical. Its sharp, falsifiable prediction is that the `M = 8` and `M = 32` columns above
+should largely **converge** — which is a much better acceptance test than "did the numbers get
+smaller".
 
 **Found by** the `gallery_rain` accuracy campaign (5 seeds × {R, D, J, M}, 640×360, anchor =
 mode `R`; `scraps/_modecmp_acc.bat`, `scraps/roi_stats.py`, ROIs in `scraps/gallery_rain.rois`).
