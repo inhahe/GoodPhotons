@@ -8575,6 +8575,41 @@ this class of failure recurs.
 > it, and my prediction going in ("the emitter-level light tree cannot help: `occl_two` is ONE
 > emitter, hence one leaf") was right about the tree and still wrong about the outcome.
 >
+> **THE 90 %-WASTE TEST IS BUILT AND RUN (`scraps/occl_many.ftsl`, `scraps/tenpanel.obj`): the
+> mechanism IS REAL AND SCALES, and it is ~25x smaller than this entry records.** One visible
+> 0.3x0.3 panel plus NINE identical panels sealed in one opaque crate, all one mesh emitter, so
+> 90 % of every uniform-by-area draw returns zero. `lumens 12000` over ten panels leaves the
+> visible one at exactly 1200 lm, so the converged image must still match `occl_one`. Mode `R`,
+> GPU, 512 spp x 4 seeds:
+>
+> | waste | wasted panels | HF noise penalty vs `occl_one` |
+> |---|---|---|
+> | 50 % (`occl_two`) | 1 | **1.0014 ± 0.0005** |
+> | 90 % (`occl_many`) | 9 | **1.0122 ± 0.0007** |
+>
+> Patch-mean control **1.00016** — the sealed panels contribute nothing, so the scenes really are
+> equivalent and the difference really is sampling variance.
+>
+> **The scaling is the trustworthy part**: one metric, two configurations, 8.7x the penalty for 9x
+> the waste. So the blind draw does cost variance, exactly as the entry says, and the cost is
+> proportional to the wasted fraction. Extrapolating, even 99 wasted panels against one visible
+> would cost ~13 %.
+>
+> **But the severity recorded here does not hold.** This entry reports **1.31x for 50 % waste**;
+> the same configuration now measures **1.0014x** — a 220x gap in the RATIO. My metric (RMS
+> Laplacian over the patch, mean-normalised) is not the entry's (absolute values 2.488 -> 3.251),
+> so the absolutes are not comparable, but no metric choice turns 1.0014 into 1.31 on one pair of
+> images. Either the code improved enormously or the original measurement was flawed; v0.186.0 is
+> not re-runnable here, so that stays open.
+>
+> **CONSEQUENCE — the prescribed fix is no longer justified by this evidence.** Fix (1) is a light
+> BVH over `Emitter::meshTris` with a device mirror, and fix (2) is ReSTIR DI on top; the case for
+> them rested on "~1.7x the samples for the same quality" on the feature's main path. The measured
+> cost is **~1 % at 90 % waste**. That does not pay for a per-triangle tree plus its device twin.
+> **Do not build it on this entry's numbers.** If someone wants it, justify it on a scene where
+> the penalty is actually large and show that scene first — and note that the emitter-level tree
+> (v0.270.0) already exists, so the many-emitter half of the original argument is served.
+
 > **THE TEST THAT WOULD SETTLE IT:** `occl_two` wastes **50 %** of the emitter, which is the
 > MILDEST version of the case this entry is about — its own text asks about "a room whose signage
 > is one mesh of dozens of scattered patches and only a few are visible", i.e. 90-95 % waste. Build
