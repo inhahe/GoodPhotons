@@ -55,7 +55,7 @@ What that leaves, and where each one's frontier actually is:
 
 | item | frontier |
 |---|---|
-| M-GATHERAREA | geometric footprint; a covariance-ellipse attempt was tried and reverted, and no photon statistic can work |
+| M-GATHERAREA | **3.4x closed as of v0.277.0** — 36.8 -> 10.8 points mean absolute error over four seeds, and the fur case is closed by construction. What is left is a ~7-10 point residual on hair and cloth, plus a ~3-point flat-ground floor that is probably not this entry at all |
 | VOLCACHE | the volumetric gather, ~4/5 of a `gallery_rain` frame |
 | mode-`J` device light pass | the BEAM half — deposit + a device BVH; premise checked, worth ~12x on a thick medium |
 | UPBP-CONV | **fireflies, not speed** — see (2g): on every statistic not at the mercy of the tail mode `J` already beats mode `D` at equal time (1.37x / 1.28x / 1.52x), while its worst pixel is 3 310 against 532 |
@@ -3024,7 +3024,7 @@ case, the emitter-hit accounting in `pathTrace`), `src/photonmap_render.h` (both
 pdf), `src/render_cuda.cu`. Measured by `scraps/sunspike.sh` + `scraps/robust_roi.py`;
 `scenes/_spec_repro.ftsl` is the four-sphere isolation rig.
 
-### M-GATHERAREA — **FIXED in modes `M` and `S`, host and device** (mode `M` v0.267.0–0.268.0, mode `S` v0.273.1; filed 2026-09-05, v0.253.0; **reframed 2026-09-10** — it is not a one-directional error). **Remaining: the dense-fur overfill case, which the correction makes worse (`-gatherarea 0` is the escape hatch).** mode `M`'s direct density estimate divides by the area of a **full disc**, which is wrong in BOTH directions — too dark where the disc is partly empty (cloth, hair, marble), too bright where a tangle **overfills** it (dense fur)
+### M-GATHERAREA — **FIXED in modes `M` and `S`, host and device** (mode `M` v0.267.0–0.268.0, mode `S` v0.273.1, the fur case v0.277.0; filed 2026-09-05, v0.253.0; **reframed 2026-09-10** — it is not a one-directional error). **Remaining: a ~7–10 point residual on hair and cloth. The dense-fur overfill case is CLOSED — v0.277.0's fiber gate removes the correction from fur entirely, so the fur ROI now reads the SAME with the entry on and off.** mode `M`'s direct density estimate divides by the area of a **full disc**, which is wrong in BOTH directions — too dark where the disc is partly empty (cloth, hair, marble), too bright where a tangle **overfills** it (dense fur)
 
 > **Read the reframing before adding an experiment.** This entry was written as "mode `M` is too
 > dark", and that framing selected its own evidence for a year: every ROI anyone chose was one
@@ -3035,6 +3035,58 @@ pdf), `src/render_cuda.cu`. Measured by `scraps/sunspike.sh` + `scraps/robust_ro
 > accuracy is **two biases cancelling**, so evaluate at `M >= 32`; and cloth and fur receive the
 > **same** correction factor to within 1 %, so no rule reading only the coverage can separate
 > them. The geometric and parameter-tuning lines are both closed. — so it is dark in proportion to how much of the disc misses: flat ground 0 %, a cap edge −38 %, Alice's dress −44 %, her hair −70 %
+
+**WHERE THE ENTRY STANDS, END TO END (2026-09-12, v0.277.0).** Four corrections have shipped since
+the headline numbers were measured — the coverage probe (`-gatherarea 8`), the tangle gate
+(`-tanglegate 30`), the probe-budget reallocation (v0.276.x) and the fiber gate (`-fibergate 1`)
+— and none of them had ever been scored *together*, against the reference, at more than one
+seed. `-gatherarea 0` disables the whole entry (`gatherCoverage` is not even called), so the two
+arms below are exactly **before this entry** and **after everything it shipped**. One binary, four
+seeds, `-spp 64`, `-beamfreeze`, 320x180, GPU, 5 %-trimmed mean against the 34 781-spp mode-`R`
+reference (`scraps/ga_state.sh` + `scraps/ga_roi.py`):
+
+| ROI | `-gatherarea 0` | shipped default | improves at |
+|---|---|---|---|
+| `alice_hair` | **-67.6 %** | **-10.0 %** | 4/4 seeds |
+| `alice_dress` | **-37.0 %** | **-12.3 %** | 4/4 |
+| `cap_gyroid` | **-33.0 %** | **-11.4 %** | 4/4 |
+| `creature` (the fur) | +9.5 % | +9.5 % | — *identical at every seed* |
+| `grid_ground` (the null) | -3.8 % | -2.8 % | 4/4, +1.0 point |
+
+Mean absolute error over the four non-null ROIs: **36.8 -> 10.8 points, a 3.4x reduction.** The
+`-gatherarea 0` column reproduces this entry's original -71 / -44 / -38 to within a few points,
+which is what says the rig is measuring the thing the entry was filed about rather than something
+else that happens to move.
+
+**Three things in that table are worth more than the headline.**
+
+1. **`creature` is identical in both arms at all four seeds** — +7.7 / +16.1 / +21.1 / -6.9 %,
+   digit for digit. The fiber gate does not *reduce* the fur error, it removes the correction
+   from fur altogether, so the "+48 % corrected" failure mode is gone **by construction** rather
+   than by tuning. That is the strongest form in which this entry's fur half could be closed, and
+   it is why the `Remaining:` clause in the header changed.
+2. **The null is not zero, and it is not this entry's doing.** `grid_ground` reads -3.8 % with the
+   entry fully OFF (-3.1 / -3.2 / -4.0 / -5.0, same sign at every seed), on a 46x45 m quad where
+   a 0.38 m disc cannot overhang anything. So mode `M` carries a ~3-point deficit on flat ground
+   against a *converged* mode-`R` reference, independent of the gather footprint — and every
+   residual above should be read against that floor: hair ~-7, dress ~-9, cap ~-9.
+   **Two candidate explanations, cheaply separable:** either mode `M` really is ~3 % low on flat
+   diffuse, or a 5 %-trimmed mean of a 64-spp frame sits below the converged value for reasons of
+   convergence rather than bias. Render mode `R` at the *same* 64 spp and score `grid_ground`
+   against the same reference — ~0 % indicts mode `M`, ~-3 % indicts the statistic. Note that the
+   5-seed campaign below scored `grid_ground` as correct for mode `M`, but against mode `R` **at
+   matched sample count**, which is exactly the comparison that cannot see a shared convergence
+   offset.
+3. **The correction still moves that flat null by +1.0 point at every seed**, so `gatherCoverage`
+   returns slightly less than 1 where the geometry says it must be exactly 1. Small, and in the
+   direction that helps, but a probe that is not inert where it should be inert is the most
+   concrete lead on the remaining hair/cloth residual.
+
+**What the residual is NOT.** It is not the fur path: `alice_hair` is *mesh* geometry, not curves,
+which is why the fiber gate leaves it alone — it moves -67.6 -> -10.0 under the coverage probe
+while `creature` does not move at all. And it has **not** been tested against the entry's own
+warning that `M = 8`'s apparent accuracy is two biases cancelling and that it should be evaluated
+at `M >= 32`; `-gatherarea 32` on these same four seeds is the obvious next measurement.
 
 **Found by** the `gallery_rain` accuracy campaign (5 seeds × {R, D, J, M}, 640×360, anchor =
 mode `R`; `scraps/_modecmp_acc.bat`, `scraps/roi_stats.py`, ROIs in `scraps/gallery_rain.rois`).
