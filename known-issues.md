@@ -3382,8 +3382,38 @@ CPU/GPU divergence on fur simply stops being evaluated. (The other four ROIs sti
 backends by up to 13 points — that is pre-existing at 64 spp on 27–90 px windows, unchanged by this,
 and not something this gate addresses.)
 
-**Still not on by default**, but the blocker has changed: the device twin now exists, so what
-remains is confidence rather than coverage. The effect is 34–42 points against a per-ROI noise this
+**ON BY DEFAULT SINCE v0.277.0, with `-fibergate <0|1>` to change it.** Four GPU seeds, one binary,
+fixed `-spp 64`, seed the only variable:
+
+| seed | `creature` off | `creature` on | delta |
+|---|---|---|---|
+| 3 | +49.7 % | +7.7 % | −42.0 |
+| 7 | +54.8 % | +16.1 % | −38.7 |
+| 11 | +67.5 % | +21.1 % | −46.4 |
+| 13 | +22.3 % | −6.9 % | −29.2 |
+
+**Mean absolute fur error 48.6 % → 13.0 %, an improvement at 4/4 seeds, never the wrong sign** — and
+`alice_hair`, `alice_dress`, `cap_gyroid` and `grid_ground` read the **same value in both arms at
+every seed**, so the collateral is exactly zero across four realizations. The `off` spread alone
+(+22.3…+67.5 % on a 36 px ROI) is why four were needed: one seed could have put the delta anywhere
+from −29 to −46.
+
+**VERIFIED THE WAY THIS FILE HAS LEARNED TO, and the GPU needed the right form of it.** Bit-identity
+is *not available* on the GPU — accumulation order gives a ~1e-7 floor — so the rig's own noise was
+measured first and the arms read against it, same binary:
+
+| comparison | floats | median rel | p99 | max |
+|---|---|---|---|---|
+| default vs default (**rig noise**) | 3134 | 8.06e-08 | 8.98e-08 | 6.08e-05 |
+| default vs `-fibergate 1` | 3007 | **8.09e-08** | **8.91e-08** | 3.46e-06 |
+| default vs `-fibergate 0` | 5109 | 1.07e-07 | **1.86e-01** | **2.00e+00** |
+
+`-fibergate 1` is indistinguishable from the rig noise to three digits, so the default really is on;
+`-fibergate 0` is six orders of magnitude above it, so the off-switch reaches the code. That second
+row is the one that matters — an off-switch which silently does nothing is how the mode-`S` footprint
+twin once passed its null control while inert.
+
+*(Superseded: the blocker was confidence rather than coverage.)* The effect is 34–42 points against a per-ROI noise this
 entry measures at ±2.2, and both backends agree to the printed digit — but it is one seed, and this
 entry's own history is that single-seed numbers on these ROIs have been wrong before. Multi-seed,
 then flip.

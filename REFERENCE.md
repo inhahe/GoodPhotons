@@ -5489,6 +5489,7 @@ chance.
 
 | Flag | Meaning |
 |---|---|
+| `-fibergate <0\|1>` | The **fiber gate** (on by default since 0.277.0). Modes `M`/`S` divide a photon gather by the fraction of a tangent-plane disc that is real surface (`-gatherarea`), which is meaningful on a mesh and meaningless on a **strand**: a gather point sitting on a 0.6 mm fiber has no surface footprint for a disc to be clipped against. The gate skips the correction wherever the gather point is on curve geometry, which separates fur from mesh **100 % to 0 %** where the reject-rate and depth statistics could not. Measured on `gallery_rain` over four seeds, mean absolute error on the fur ROI **48.6 % → 13.0 %**, an improvement at 4/4 seeds, with the other four ROIs reading the same value in both arms at every seed. `-fibergate 0` restores the previous estimator exactly. Both backends read the same channel, so they cannot disagree about whether it is on. |
 | `-no-glossy-nee` | Restore the pre-0.266 estimator exactly — rng draw order included, so it is a valid same-binary A/B arm. Use it to measure what the connection is buying, or to check that a difference you are chasing is not this. In mode `W` it restores the pre-0.275.0 preview bit-identically. |
 | `-glossy-nee` | Force it back on (it already is — for overriding an earlier `-no-glossy-nee` in a shared argument list). |
 

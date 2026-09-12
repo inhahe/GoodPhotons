@@ -18757,6 +18757,15 @@ static int run(int argc, char** argv) {
         // is: `gatherCoverage` lives in a header with no access to these statics, and the device
         // upload reads the SAME channel, which is what stops the two backends disagreeing about
         // whether the gate is on.
+        // The fiber gate. Same plumbing and the same reasons as -tanglegate below.
+        else if ((!std::strcmp(argv[i], "-fibergate") ||
+                  !std::strcmp(argv[i], "-fiber-gate")) && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GAFIBER", argv[++i]);
+#else
+            setenv("FTRACE_GAFIBER", argv[++i], 1);
+#endif
+        }
         else if ((!std::strcmp(argv[i], "-tanglegate") ||
                   !std::strcmp(argv[i], "-tangle-gate")) && i + 1 < argc) {
 #ifdef _WIN32

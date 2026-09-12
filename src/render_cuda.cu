@@ -16988,7 +16988,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         const char* g = std::getenv("FTRACE_GAREJECT");
         sc.gatherRejPct = g ? std::atoi(g) : 30;   // default must match the host's gaRejectPct()
         const char* gf = std::getenv("FTRACE_GAFIBER");
-        sc.gaFiberSkip = (gf && *gf && *gf != '0') ? 1 : 0;   // same channel as gaFiberSkipOn()
+        sc.gaFiberSkip = (gf && *gf == '0') ? 0 : 1;   // default must match host gaFiberSkipOn()
     }
     sc.bkLightSplit    = lt::gSplit;
     sc.bkLightSamples  = lt::gSamples;

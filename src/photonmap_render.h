@@ -118,8 +118,13 @@ inline bool gaDepthGateOn() {
     }();
     return on;
 }
-// FTRACE_GAFIBER=1: skip the coverage correction where the gather point is ON A FIBER. PROTOTYPE,
-// off by default, CPU only (no device twin yet) -- so do not compare backends with it set.
+// THE FIBER GATE, ON BY DEFAULT since 0.277.0 (`-fibergate 0` restores the old estimator).
+// Skips the coverage correction where the gather point is ON A FIBER, on both backends.
+//
+// Measured on gallery_rain, four GPU seeds, one binary, fixed -spp: mean absolute error on the fur
+// ROI 48.6 % -> 13.0 %, an improvement at 4/4 seeds and never the wrong sign, with the other four
+// ROIs reading the SAME value in both arms at every seed. The `off` spread across those seeds is
+// +22.3..+67.5 %, which is why four realizations were needed to claim anything.
 //
 // A gather point on a 0.64 mm strand has no surface footprint for a tangent-plane disc to be
 // clipped against, so `coverage` there measures how much of a disc neighbouring strands happen to
@@ -129,7 +134,7 @@ inline bool gaDepthGateOn() {
 inline bool gaFiberSkipOn() {
     static const bool on = [] {
         const char* e = std::getenv("FTRACE_GAFIBER");
-        return e && *e && *e != '0';
+        return !(e && *e == '0');       // ON by default since 0.277.0; `-fibergate 0` turns it off
     }();
     return on;
 }
