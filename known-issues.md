@@ -1328,7 +1328,7 @@ gather probe from 96 rays to 512 and the entry was never updated:
 |---|---|---|---|---|---|
 | 4 096 | 206 549 | 247 717 | 235 752 | 1.20x | 1.33x |
 | 16 384 | 264 478 | 254 471 | 274 744 | **1.08x** | 1.08x |
-| 62 500 (shipped) | 221 325 | 238 700 | 213 536 | **1.12x** | **3.76x** |
+| 62 500 (shipped) | 221 325 | 238 700 | 213 536 | 1.12x at n=3, **1.53x at n=6** | **3.76x** |
 
 Pilot-to-pilot agreement, the entry's second complaint, improved too: medians 235 752 / 264 478 /
 221 325 — **1.19x**, against ~136 k / ~268 k / ~176 k (1.97x) when filed.
@@ -1374,6 +1374,38 @@ test is already built: the knee at 512 stratified rays must land on the **8 192-
 (~275 k on `_fog_cornell`, ~12.4 k on `_fog_thick`) at 512-ray cost, and `_fog_thick`'s four-seed
 0.6 % stability must not regress. Note the fixed probe seed means this is a **deterministic**
 target, not a statistical one — the same scene must give the same answer, so the check is exact.
+
+**FIXED IN v0.276.2 BY REALLOCATING THE PROBE BUDGET — 512 rays x 24 000 tests -> 8 192 x 1 500,
+the same 12.3 M closest-approach tests.** The finding was already written in this file and in the
+code note: *rays* are what the estimate needs and tests-per-ray buy nothing (forcing the stride to
+1 changed the worst seed by 2 %). The split simply had not followed it. Against the converged
+32 768-ray reference:
+
+| scene | config | spread | rel sd | median / ref | mean ms |
+|---|---|---|---|---|---|
+| `_fog_cornell` | 512x24k (old) | 1.53x | **18.5 %** | 0.819x | 5220 |
+| `_fog_cornell` | **8192x1.5k** | **1.26x** | **8.1 %** | **0.967x** | **3624** |
+| `_fog_thick` | 512x24k (old) | 1.02x | — | 0.889x | 2226 |
+| `_fog_thick` | **8192x1.5k** | 1.02x | — | **0.995x** | **1831** |
+
+**The ~15 % low bias is gone** (18 % and 11 % low -> 3 % and 0.5 %), the clustered scene's seed
+spread is **2.3x tighter**, and it is **faster in every configuration measured** — including the one
+case where the reallocation spends *more* probe work than before, a deliberately tiny map
+(`-beamcount 2000`, 2 014 stored: 2107 ms -> 2006 ms). Faster because a correctly sized map needs
+fewer `-beamk` floor rounds and each round costs a whole probe, so accuracy pays for itself here.
+
+**AND IT CORRECTS A NUMBER I PUT IN THIS ENTRY AN HOUR EARLIER.** I recorded the old config's seed
+spread as **1.12x** from three seeds. At six seeds it is **1.53x** (rel sd 18.5 %) — max/min over
+three samples is dominated by whichever seed happened to be extreme, and three seeds simply had not
+drawn the tail. Every spread figure here is now n=6 with a relative standard deviation beside it,
+because that is the statistic that does not depend on getting lucky.
+
+**What remains is real scene variation, not an estimator defect.** 8.1 % rel sd on `_fog_cornell`
+against ~1 % on `_fog_thick`: the beam set genuinely differs seed to seed on a scene whose
+dielectric redistributes where chords land (the chord COUNT swings 3.15x across seeds there against
+1.04x on `_fog_thick`). Since the probe's rng is fixed-seeded it contributes none of that, so no
+amount of probe work can remove it — only a different sizing rule could, and there is no evidence
+one is needed.
 
 **ATTEMPT 1 — A HALTON LATTICE INSTEAD OF THE RNG DRAW: TRIED, FAILED ITS PRE-REGISTERED TEST,
 REVERTED.** The reasoning was that this estimator is a quadrature that happens to be written as

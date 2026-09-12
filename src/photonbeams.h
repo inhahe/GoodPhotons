@@ -1129,20 +1129,38 @@ struct BeamMap {
         //     which is exactly where the measured spread explodes (pilot 62 500 -> ~375 k beams
         //     -> stride 3 -> 3.76x spread, against 1.08x and 1.33x for the two pilot sizes that
         //     stay under it at stride 1).
-        // 512 x 24 000 since 0.272.5, from 96 x 120 000 (J-KNEE-NOISE). The total work is
-        // roughly unchanged -- 12.3 M closest-approach tests against 11.5 M -- because the
-        // measurement says RAYS are what matter and tests-per-ray are not: forcing the stride
-        // to 1 left the worst seed at 508 542 against 496 091 (no effect), while going 96 ->
-        // 2 048 rays cut the knee's seed spread from 3.76x to 1.19x. So the budget is spent
-        // where it buys something.
+        // 8 192 x 1 500 since 0.276.2, from 512 x 24 000 (0.272.5), from 96 x 120 000. Every one
+        // of those is ~12 M closest-approach tests: the budget has never changed, only how it is
+        // SPLIT, and rays are what it should buy. That was already the finding recorded here --
+        // forcing the stride to 1 left the worst seed at 508 542 against 496 091, i.e. no effect,
+        // while 96 -> 2 048 rays cut the knee's seed spread from 3.76x to 1.19x -- but the split
+        // did not follow it far enough. Against a converged 32 768-ray reference (280 689 on
+        // `_fog_cornell`, 12 290 on `_fog_thick`, the latter converged since 8 192 and 32 768
+        // agree to 0.6 %):
         //
-        // And it is FASTER, which is not a trade-off but a consequence. A wrong knee sizes the
-        // whole beam map, so the shipped 96-ray config's own cost swung 1.27 / 5.28 / 3.52 s
-        // across three seeds on `_fog_cornell` -- mean 3.36 s -- purely because one seed drew a
-        // 496 k-beam knee. At 512 rays the knees agree to 1.12x and the cost is 2.38 / 2.01 /
-        // 1.63 s, mean 2.01 s. Stabilising the estimate removes the occasional enormous map.
-        size_t kProbeRays = 512;
-        size_t maxTests   = 24000;
+        //                          spread   rel sd   median/ref   mean ms
+        //   _fog_cornell  512x24k   1.53x   18.5 %   0.819x       5220    (six seeds)
+        //   _fog_cornell  8192x1.5k 1.26x    8.1 %   0.967x       3624
+        //   _fog_thick    512x24k   1.02x     --     0.889x       2226    (three seeds)
+        //   _fog_thick    8192x1.5k 1.02x     --     0.995x       1831
+        //
+        // So the old split was 18 % and 11 % LOW against its own definition, which matters because
+        // this number sits in a DENOMINATOR (`kneeBeams = pilotBeams * targetK / k0`) and a low
+        // k0 sizes every beam map low -- a bias, not noise, paid in kernel blur once `buildAuto`
+        // widens the radii to hold the floor. Six seeds rather than three because max/min over
+        // three samples is dominated by whichever seed was extreme: it read the old split as
+        // 1.12x, against 1.53x truthfully.
+        //
+        // And it is FASTER everywhere measured, which is a consequence rather than a trade: a
+        // correctly sized map needs fewer `-beamk` floor rounds and each round costs a whole
+        // probe. Including the one case where this reallocation spends MORE probe work than
+        // before -- a deliberately tiny map, `-beamcount 2000` / 2 014 stored, 2107 ms -> 2006 ms.
+        //
+        // It leans much harder on storage-order striding (stride 9 -> 148 on a 222 k-beam map),
+        // which is the second suspect named above. Accuracy improved anyway, so that suspect is
+        // retired more firmly than the stride-1 test alone retired it.
+        size_t kProbeRays = 8192;
+        size_t maxTests   = 1500;
         if (const char* e = std::getenv("FTRACE_JPROBE")) {
             long long r = 0, m = 0;
             if (std::sscanf(e, "%lld,%lld", &r, &m) == 2 && r > 0 && m > 0) {
