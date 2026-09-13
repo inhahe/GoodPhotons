@@ -1445,6 +1445,54 @@ today.
 2.4 sigma and should be read as "large and negative", not as -3.6. What is solid is the SIGN, shared
 by all four materials, and `red`'s magnitude.
 
+### VOLCACHE cannot "extend the radiance cache" as worded — the volumetric gather is a BEAM QUERY, not a point lookup
+
+Before building, the structural question: where would a cache attach? The surface cache terminates a
+path **at a vertex** — one position, one normal, one lookup, return. The volumetric gather has no
+such site.
+
+`gatherPhotonBeams(scene, mats, bm, ray.o, ray.d, dSeg, ...)` is called **once per camera ray
+segment** (photonmap_render.h:1210, 1234) and its body is
+
+    bm.gather(oc, dc, tMax, [&](const BeamHit& bh) { ... xc = oc + dc * bh.tCam; ... });
+
+i.e. it asks the beam map which beams pass near the whole segment and accumulates one contribution
+per beam, **at whatever position along the segment that beam happens to approach**. It is a line
+integral evaluated at a scattered, data-dependent set of points, not a march over fixed ones.
+
+**So a position-indexed cache cannot replace the call.** There is no set of query points to look
+cells up at; the points are chosen by which beams exist. Using a cache at all requires *marching* the
+segment — which is a different estimator, with different noise, not an extension of the existing one.
+"Extend the radiance cache to the volumetric gather" is one line in the queue and several weeks of
+work behind that reading.
+
+**The design that does work is a HYBRID, and it is the one this entry's own measurements already
+argue for.** The entry's framing is *"cache order >= 2, skip those beams"*, and the structure tests
+say the order >= 2 field is spatially smooth while single scatter is not (`_fog_thick`: MS structure
+0.023 against an SS control of 0.602). That splits the integral cleanly:
+
+* **order 1 — keep the beam query exactly as it is.** Sharp, view-dependent, and the part the
+  structure tests say a cache would ruin.
+* **order >= 2 — march the segment against a position-indexed cache** of in-scattered radiance. The
+  field is smooth, which is precisely the condition that makes a coarse marched lookup adequate,
+  and it is 83.2 % of gather candidates on `_fog_thick`.
+
+Two estimators, one per scattering order, joined by the order histogram the entry already validated
+as a runtime predictor. That is buildable and the measurements to justify it exist.
+
+**But the economics have NOT been measured and must be before building.** Marching still costs a
+walk along the ray; what the cache removes is the beam *query*, not the traversal. Whether marching
+a cached field beats querying beams is an open question — and it is answerable cheaply from
+`-mstats`, which already reports where mode-M time goes, against the march cost of the medium's own
+majorant grid. **A cache that saves 83 % of the candidates and spends it all on marching is worth
+nothing, and nothing in this entry currently rules that out.**
+
+**One transferable warning from the surface cache, measured today.** Doubling its cell cost
+**-3.62 points on `glass`** against -0.4 on the diffuse walls — the sharper the radiance variation,
+the more a coarse cell hurts. A volume cache inherits that: whatever cell size the smooth order >= 2
+field permits, it must not be applied to the order-1 term, and the hybrid above is what keeps them
+apart.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
