@@ -3583,7 +3583,8 @@ as the one at fault.
   stored, and is the classic two-map bug if you use the caustic map's own count instead: a rare
   caustic would be rescaled to full light-source brightness.
   **THE GATHER FOOTPRINT (`-gatherarea`, on by default at 8 probes since v0.268.0; mode `S`
-  gained it in v0.273.1).** The density estimate above divides by `pi r^2`, the area of a FULL
+  gained it in v0.273.1; the fiber gate v0.277.0, and `-gabias` / `-gagate` / `-gaball` all
+  on by default since v0.278.0).** The density estimate above divides by `pi r^2`, the area of a FULL
   disc, while two things stop the photons it sums from having come from one: the query rejects
   any photon whose normal disagrees with the hit's by more than 60 degrees, and nothing clips the
   disc to the surface, so wherever the disc overhangs a silhouette or a thin feature that part of
@@ -3606,15 +3607,44 @@ as the one at fault.
   method would have missed the case it was built for. One intersector call handles every
   representation, and it is the same intersector the render already trusts.
 
-  **It is not a quality dial, and it is wrong on dense fur.** More probes make hair and cloth
-  *worse*, because the default's apparent accuracy is partly Jensen's upward bias at low `M`
-  (`E[1/cov] > 1/E[cov]`) offsetting a residual dark bias. And where a tangle **overfills** the
-  disc the correction has the sign backwards: `creature`'s fur coat is accurate uncorrected and
-  **+48 %** corrected, because the probe sees only the nearest layer while the query gathers from
-  the whole ball. `-gatherarea 0` restores the pre-0.267 estimator exactly and is the escape
-  hatch for fur-dominated scenes. Counting the hidden layers is NOT the fix and was measured:
-  their area is real and their photons are accepted, but the visible point is on the FRONT layer
-  and dividing its photons by front-plus-back area dilutes the surface being shaded.
+  **It was not a quality dial, and three separate defects were why (all fixed, v0.277.0-v0.278.0).**
+  The estimator had four things wrong with it at once, and because they partly cancelled, fixing
+  any one alone made the numbers *worse* — which is why the entry stalled for so long and why each
+  of these shipped only with the others.
+
+  * **Dense fur had the sign backwards.** A tangle *overfills* the disc, so `creature`'s coat was
+    accurate uncorrected and **+48 %** corrected. Fixed by the **fiber gate** (v0.277.0): skip the
+    correction wherever the gather point is on curve geometry, tested on `Hit::fiberRadius` /
+    `DHit::fiberRadius`. It is a *geometric* test, not a photon statistic — reject-rate and depth
+    heuristics were both tried and cannot separate fur from hair, while the fiber test does it
+    100 % to 0 %. Counting the hidden layers is NOT the fix and was measured: their area is real
+    and their photons are accepted, but the visible point is on the FRONT layer, so dividing its
+    photons by front-plus-back area dilutes the surface being shaded.
+  * **Jensen's bias made the probe count a BIAS knob, not a convergence knob.** The estimate is
+    `1/c-hat` of a noisy `c-hat` and `E[1/c-hat] > 1/E[c-hat]`, so fewer probes read brighter.
+    Fixed by the pseudo-count `(area+1)/(M+1)` (`-gabias`), which is exactly 1.0 at full coverage —
+    so flat ground stays untouched by construction — bounded by `M+1`, and the textbook
+    near-unbiased estimator of `1/p`.
+  * **The flat-interior early-out asked for more evidence when given more probes.** Its threshold
+    was `probe0 = M/4`, i.e. 2-of-2 flat-on probes at `M = 8` but 8-of-8 at `M = 32`, so the same
+    disc passed the same test at different rates purely because the budget changed. `-gagate`
+    holds it at a fixed count, and `-1` (the default) removes the early-out entirely.
+  * **The probe accepted a CYLINDER while the query gathers from a BALL.** Probes start `r` above
+    the tangent plane and accept `h.t <= 2r`; the numerator is `queryR(p, r)`. A point at tangent
+    offset `rr` and height `dz` is at `sqrt(rr^2 + dz^2) >= rr`, so on anything non-flat the probe
+    counted rim surface the query can never reach — divisor too big, estimate too dark. `-gaball`
+    adds the one inequality, and on flat geometry `dz = 0` makes it algebraically inert.
+
+  Together: mean absolute error on `gallery_rain`'s five ROIs **36.8 -> 8.0 points**, and the
+  estimator is now nearly independent of its own probe count (`M = 8` vs `32` disagreement
+  **3.30 -> 1.06**) rather than accurate by cancellation. All three flags restore the previous
+  behaviour when set to 0, and all three read the same environment channel on host and device, so
+  the backends cannot disagree about which estimator is running.
+
+  `-gatherarea 0` still restores the pre-0.267 estimator exactly, but it is now a **speed/accuracy
+  knob rather than a correctness escape hatch**: the correction costs ~1.6x the frame on a
+  surfaces-only mode-`M` render, and is unmeasurable on a beam-heavy one where the volume gather
+  dominates.
 
   The classifier is `photonVertexKind` (`render.h`) with device twin `dPhotonVertexBit`
   (`render_cuda.cu`), three-way: **FOCUS** (dielectric, mirror, thin-film, multilayer, grating,
