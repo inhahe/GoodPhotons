@@ -2377,6 +2377,23 @@ because the code path it needed is not the one this scene takes.
 **Seven candidates are now eliminated:** kernel radius, beam set and split, FP32 precision, the
 1/sin singularity, the gather-time spectral fold, order >= 2, and stochastic transmittance.
 
+**THE MITIGATION IS VALIDATED AT EQUAL COST — spend on beams, not samples.** Raising `-beamcount`
+is **10.1x slower** (14.7 s -> 148.7 s at `-spp 34`), so the only fair test is against spending that
+same time on samples instead. Two seeds per arm, same rig:
+
+| arm | wall | median | p90 | p99 | max/level |
+|---|---:|---:|---:|---:|---:|
+| baseline: 300k beams, `-spp 34` | ~15 s | 0.2245 | 1.398 | 4.685 | 23.9 |
+| **more beams: `-beamcount 0`, `-spp 34`** | ~149 s | **0.0924** | **0.487** | **1.202** | **3.7** |
+| more samples: 300k beams, `-spp 340` | ~147 s | 0.1925 | 1.112 | 3.440 | 12.4 |
+
+**At matched wall clock, beams beat samples by 2.1x at the median and 3.4x at the max.** Ten times
+the samples barely moved the tail at all (4.685 -> 3.440, a mere 1.36x), which is the same lesson the
+`-spp` regime table in this file records: on a media scene the photon realization dominates and
+samples buy almost nothing. `-beamcount` is the actionable form of that principle, and the earlier
+version of this entry — which reported the beam arm without pricing it — would have recommended a
+10x cost without establishing it was the better way to spend it.
+
 **A PRACTICAL MITIGATION FOUND, AND TWO MORE CANDIDATES ELIMINATED.**
 
 **Raising `-beamcount` collapses the device tail.** With `-beamcount 0` (no trim) on the same scene
