@@ -2821,7 +2821,29 @@ already had the correct pattern for "device can't do X, fall back and say so" in
 another silently took a ~10x penalty. Worth noting for the next such gap: check whether a sibling
 already does it properly before designing a warning.
 
-**Still not checked:** the CPU-only `coat` material features (`REFERENCE.md` ~1799).
+**Checked — the CPU-only `layered`/`coat` material is accurate and announced, by the same mechanism.**
+`render_cuda.cu:16211` puts `MatType::Layered` into the very same `cudaForwardSupported` gate
+(*"the device shadeStep has no Layered branch, so any Layered material forces a CPU
+forward/backward fallback (like indexed palettes)"*), and the gate's message names it explicitly.
+
+**AUDIT COMPLETE.** Every documented backend limitation in `REFERENCE.md` has now been either
+dissolved or verified against current code:
+
+| claim | outcome |
+|---|---|
+| GLOSSY-NEE env gap | **dissolved** — shipped v0.266.3/0.266.4 |
+| `-noise` needs a convergence test | **dissolved** — it is `100/sqrt(spp)`; shipped v0.295.0 |
+| CPU backward loses bounded clouds | **dissolved** — fixed v0.254.0, doc ~41 versions stale |
+| `-radcache` has no device path | verified true |
+| `-photon-bounce` is host-only | verified true |
+| spectral palette forces CPU | verified true, and announced |
+| `layered`/`coat` is CPU-only | verified true, and announced |
+
+**Three of seven were stale.** The two announced fallbacks share one gate and one message, which is
+the pattern worth copying; the three dissolved ones had no such mechanism, which is exactly why they
+rotted unnoticed — a limitation enforced by code stays honest, a limitation asserted only in prose
+does not.
+
 
 **Why this class is worth sweeping deliberately.** An open bug has someone waiting on it; a
 documented limitation has the opposite property — it tells every reader *not* to try, so nobody
