@@ -2117,6 +2117,47 @@ candidates), and a runtime predictor (the order histogram, tracking within 3 poi
 where the cache is *safe* is the scene where it pays *most*; the scene where it is unsafe is where
 it pays least.
 
+**ANISOTROPY: THE SCOPE CONDITION NOBODY HAD STATED, AND IT HOLDS (2026-09-12).** Every
+thick-medium result above is at `g 0.0` — `_fog_thick` is isotropic and the `sigma_t` sweep held
+`g` fixed — while `gallery_rain`, the scene where the field IS rough, uses `phase rainbow`, which
+is strongly directional. So "the order >= 2 field is smooth on thick media" silently meant
+"...on thick **isotropic** media", and a cache scoped on it would have inherited the gap.
+
+Tested with a **similarity-matched pair**, both at `g 0.9` (`scraps/vc_gsweep.py`):
+
+| scene | `sigma_t` | reduced `sigma_t'` | order 7+ | **MS structure** | SS control |
+|---|---|---|---|---|---|
+| `_fog_g9deep` | 191 | ~20.0 | 70.7 % | **0.000 / 0.002 / 0.000** | 0.000 / 0.768 / 0.172 |
+| `_fog_g9shal` | 20 | ~2.1 | 61.4 % | **-0.031 / -0.006 / -0.006** | 0.008 / 0.214 / 0.728 |
+
+`_fog_g9deep` matches `_fog_thick` on reduced depth *and* reduced albedo (0.952 against 0.95) —
+matching `sigma_t'` alone would not do, since the naive `sigma_t 200 / albedo 0.95` gives a reduced
+albedo of 0.655, a different medium wearing the right number.
+
+**`_fog_g9shal` is the result, and it was not the one designed for.** It came out as a
+discriminator between two candidate predictors that had been moving together and could not be
+separated by anything above:
+
+* by **raw scattering order** it is deep (61.4 % at order 7+) → predicts SMOOTH;
+* by **reduced optical depth** it is shallow (`sigma_t'` ~ 2.1, where isotropic `sigma_t 2` read
+  **0.367**) → predicts ROUGH.
+
+It reads **-0.031 / -0.006 / -0.006**. So **the scattering-order histogram is the predictor and the
+reduced optical depth is not** — confirmed by a case built to break it, which is worth more than
+the original evidence where the two moved together. Physically: spatial smoothing is driven by how
+many times energy has been *relocated*, and every scatter moves a photon one mean free path however
+forward-peaked it is. At `sigma_t 20` that is ~20 relocations across the box even at `g 0.9`;
+directional memory survives, spatial structure does not.
+
+**AND THE NEW SCOPE CONDITION, stated this time rather than left implicit.** This shows *spatial*
+smoothness survives anisotropy. It does **not** show the field is direction-INdependent — at
+`g 0.9` the in-scatter almost certainly still varies with direction, and this rig sees one camera,
+so it cannot tell. The conclusion that survives is therefore: **the order histogram predicts the
+spatial resolution a position-indexed cache needs, at any `g`.** Whether each cell can hold a
+scalar or needs a directional representation (SH, or a small lobe set) is a separate question, and
+the experiment for it is two cameras at very different angles scoring the same world region — not
+this one.
+
 **The rig is two scripts and four renders**, so re-testing on another scene is cheap:
 `-beamradius` pinned, two seeds, `scraps/ms_struct.py`. A scene whose medium is genuinely
 diffuse — `_fog_thick`, which measures 82.8 % order >= 2 against `gallery_rain`'s 40.7 % — is the
