@@ -3900,6 +3900,30 @@ where the denominator is dominated by something else is not a measurement of the
 81 %-beams figure was in `-mstats` output that had already been read, on this same scene, in the
 VOLCACHE entry.
 
+**AND THE CHAIN NOW CLOSES: THE FOOTPRINT CORRECTION IS COMPLETE AT THIS ROI, AND ~12 % OF ITS
+DEFICIT IS NOT FOOTPRINT AT ALL.** Three numbers, two of them measured on the ROI itself:
+
+| | value |
+|---|---|
+| correction **achieved** by the ROI (-33.0 % -> -7.5 %, 4-seed means) | **1.381x** |
+| correction **applied**, from `capmarble_gold`'s coverage histogram | **1.329x** |
+| correction **needed** to reach the reference | **1.493x** |
+
+**Achieved and applied agree to 3.9 %**, which is the load-bearing check: the correction the ROI
+actually receives matches what the probe says it should, so there is no plumbing error between
+measuring coverage and applying it. (It also validates the material-wide histogram as a proxy *in
+this case* — the ROI's own behaviour confirms it, which is the right direction for that inference
+after the population mistakes recorded above.)
+
+**The shortfall against `needed` is 8.1 %, and that is exactly the -7.5 % residual.** So the
+footprint correction is not under-performing; it is *complete*, and the disc truncation it corrects
+only accounts for **1.329x of the 1.493x** the ROI requires. The remaining **~1.12x (12 %) is a
+different deficit**, and no amount of further probe work can reach it.
+
+**That closes the footprint line for `cap_gyroid`.** The original mechanism — "the disc hangs off
+the cap edge" — is measured, corrected, and verified end to end. What is left at this ROI belongs
+to a separate investigation, and the entry should stop attributing it here.
+
 **FIRST, A CORRECTION TO THE TWO SECTIONS BELOW: THE `cap_gyroid` ROI IS NOT ON THE GYROID.** Its
 own definition says so, and has all along — `scraps/gallery_rain.rois`:
 
