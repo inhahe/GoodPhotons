@@ -24,6 +24,7 @@
 // (runSharedPhotonMap) traces/builds one map, then calls renderPhotonCamera below for
 // each frame's camera.
 #pragma once
+#include "gafootprint.h"
 #include <vector>
 #include <thread>
 #include <cstdint>
@@ -79,6 +80,34 @@ inline int photonMaxBounce() {
         return v >= 1 ? v : 32;
     }();
     return m;
+}
+
+// FTRACE_GAGEOM=1 (`-gageom 1`): coverage from the geometric footprint rather than from probe
+// rays. OFF by default -- it is a prototype, it is CPU-only, and it is inert on flat geometry by
+// construction (footprint 1.0000 there), so switching it on changes only the places the probe was
+// already guessing at. `-gageom-disc` / `-gageom-curve` set its sampling.
+inline bool gaGeomOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_GAGEOM");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+inline int gaGeomDisc() {
+    static const int n = [] {
+        const char* e = std::getenv("FTRACE_GAGEOMDISC");
+        const int v = e ? std::atoi(e) : 0;
+        return v >= 1 ? v : 64;
+    }();
+    return n;
+}
+inline int gaGeomCurve() {
+    static const int n = [] {
+        const char* e = std::getenv("FTRACE_GAGEOMCURVE");
+        const int v = e ? std::atoi(e) : 0;
+        return v >= 1 ? v : 4;
+    }();
+    return n;
 }
 
 inline int gatherAreaSamples() {
@@ -266,6 +295,39 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                              double r, Pcg32& rng, int M, int matId = -1,
                              double fiberR = 0.0) {
     if (M <= 0 || !(r > 0.0)) return 1.0;
+    // `-gageom 1`: take the coverage from the GEOMETRY instead of from probe rays. The probe
+    // fires M nearest-hit rays and so sees only the first surface along each; the geometric
+    // footprint tests every primitive the ball contains. Measured against analytic answers:
+    // exactly 1.0000 on a flat plane (so this is inert there, and flat ground stays
+    // bit-identical) and 0.5986 on floor within 0.25 m of a wall, where a point ON the
+    // junction must see half a disc and the minimum observed is 0.5156.
+    //
+    // DELIBERATELY NOT APPLIED ON FIBERS, and the fiber gate below is left to handle them.
+    // On a coat the measured footprint is ~2.9x pi r^2 -- a tangle really does hold that much
+    // surface -- so using it as a divisor would make fur about three times DARKER, and fur
+    // already reads -17 % against truth. The footprint is right and the DIVISION is wrong
+    // there: the density estimate assumes the ball meets one locally flat surface, and with
+    // ~600 strands in it the numerator is already the wrong region. See M-GATHERAREA.
+    if (gaGeomOn() && !(fiberR > 0.0 && gaFiberSkipOn())) {
+        const double denom = 3.14159265358979323846 * r * r;
+        const double cov = gatherFootprintArea(scene, p, n, r, gaGeomDisc(), gaGeomCurve()) / denom;
+        // THE COVERAGE MUST BE BOUNDED AWAY FROM ZERO. The estimate divides by it, and a
+        // measured footprint of exactly 0 is not rare -- `skin` on fur_creature reports
+        // min 0.0000, a gather that found no same-facing surface at all. The first build of
+        // this path returned that straight through and produced a pixel 4.7e+11 times too
+        // bright on `_ga_corner`, which would have wrecked any render it touched. The probe
+        // path never had the problem because its pseudo-count `(area+1)/(M+1)` is bounded
+        // below by construction; this path bypassed that.
+        //
+        // Clamped to one disc cell rather than snapped to 1.0. Returning 1.0 would be the
+        // `cov < 0.05 -> 1.0` cliff that gaBias removed, and that cliff points the WRONG WAY:
+        // a gather that found almost no surface is the one needing the LARGEST correction,
+        // not none. A floor of 1/kDisc is the smallest non-zero area this method can resolve
+        // -- one disc ray hitting -- so it bounds the correction at kDisc-fold while staying
+        // monotone in the measurement.
+        const double floorCov = 1.0 / (double)gaGeomDisc();
+        return cov < floorCov ? floorCov : cov;
+    }
     // Is the gather point itself on a fiber? TALLY ONLY -- nothing is gated on it, because the
     // tally is what showed it cannot be: see M-GATHERAREA. A gather point on a 0.64 mm strand has
     // no surface footprint for a disc to be clipped against, so skipping the correction there is

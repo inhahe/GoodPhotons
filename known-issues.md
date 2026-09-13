@@ -921,6 +921,52 @@ that, because the numerator is already measuring the wrong region. This is M-GAT
 2. **For fur it must NOT be used as a divisor.** A tangle needs a different estimator, not a
    different denominator, and that is a larger question than this item was scoped as.
 
+### `-gageom 1`: the geometric footprint wired into the estimator — inert on flat, and it AGREES with the probe on a clipped disc
+
+`gatherCoverageRaw` can now take its coverage from `gatherFootprintArea` instead of from probe rays.
+Host-only prototype, off by default, and it leaves the fiber gate alone for the reason the previous
+entry establishes: a coat's footprint is ~2.9x pi r^2, so using it as a divisor there would make fur
+three times darker.
+
+**Two properties verified, one of which could have failed:**
+
+* **Inert on flat, byte-identical.** `_ga_null`, mode M, CPU, same seed, `-gageom 0` and `-gageom 1`
+  produce the same md5. The footprint is exactly 1.0000 on a plane, so the correction is
+  algebraically a no-op — the same by-construction guarantee the whole feature rests on.
+* **Live, not silently inert.** The corner scene's md5 differs. That check matters: this file now
+  records two separate occasions where a clean null came from a flag that did nothing.
+
+**And then the result, scored per strip rather than whole-frame:**
+
+| strip | px | geometric vs probe |
+|---|---|---|
+| `s00` (0-0.25 m from wall) | 440 | **+0.39 %** |
+| `s02` | 435 | -0.63 % |
+| `s05` | 652 | +0.24 % |
+| `s10`, `s20` | 951, 1852 | **0.00 %** |
+| `s40`, `wall` | 5430, 2952 | +0.02 % |
+
+**The geometric footprint reproduces the probe.** On a disc clipped by one wall the two agree to
+within half a percent, and on the interior to zero. That is not a disappointment — it is the
+measurement saying where the probe is already right: a single-layer clip is exactly what 8
+nearest-hit rays handle well, since the first surface each ray meets IS the only surface. **The
+probe fails on tangles, where there are ~600 layers, and there the footprint is the wrong divisor
+anyway.** So the geometric path's value is confined to multi-layer surface geometry — folded cloth,
+stacked shells — which is `alice_dress` territory and has not yet been measured.
+
+**A bug found and fixed while wiring it, and an alarm that was my own error:**
+
+* **Real**: the geometric coverage can be exactly 0 (`skin` on `fur_creature` reports min 0.0000),
+  and the estimate divides by it. The probe path is bounded below by its `(area+1)/(M+1)`
+  pseudo-count; this path bypassed that. Now clamped to one disc cell, `1/kDisc` — not snapped to
+  1.0, because that is the `cov < 0.05 -> 1.0` cliff gaBias removed and it points the wrong way: a
+  gather that found almost no surface needs the LARGEST correction, not none.
+* **Not real**: I read `max |diff| = 4.7e+11` on the corner scene as an explosion. Both images have
+  mean **6.17e+11** — that scene's absolute radiance scale is ~1e12, so it is one pixel differing
+  76 % relative, and the clamp was never exercised there (its minimum footprint is 0.5156). Comparing
+  an absolute difference against no scale is this file's recurring error; recorded rather than
+  quietly corrected.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than

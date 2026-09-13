@@ -19266,6 +19266,13 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-roi-minpx")     && i + 1 < argc) roiMinPx     = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-gafootprint") && i + 1 < argc) gaFootprintR = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-gafparea") && i + 1 < argc) gaFpAreaR = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-gageom") && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GAGEOM", argv[++i]);
+#else
+            setenv("FTRACE_GAGEOM", argv[++i], 1);
+#endif
+        }
         else if (!std::strcmp(argv[i], "-gafp-disc") && i + 1 < argc) gaFpDisc = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-gafp-curve") && i + 1 < argc) gaFpCurve = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-gafootprint-stride") && i + 1 < argc) gaFootprintStride = std::atoi(argv[++i]);
