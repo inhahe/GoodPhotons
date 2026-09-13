@@ -1725,6 +1725,50 @@ change and is now **~19 %** (4.07 s of 21.2 s). Still the single largest identif
 traversal, and still not amortised across frames — whether `-beamfreeze` avoids the rebuild on a
 flyby is unmeasured and is the obvious next question.
 
+### "mode M ~0.35 %" — the figure justifying `-beamrefresh`'s default is off by two orders of magnitude on `_fog_thick`
+
+`-beamrefresh`'s default of 0.10 is justified in `main.cpp` by:
+
+> *the light side is a small fraction of either render (mode J ~2.6 %, mode M ~**0.35 %** — both are
+> dominated by the gather), so a 10 % budget affords many rebuilds without being felt.*
+
+The light side is what `buildBeamMap()` does, and that includes the **beam BVH build** — a refresh
+calls exactly this function. On `_fog_thick` the BVH build alone is **4.07 s**.
+
+**Separated properly**, since the light side is fixed per frame while the gather scales with spp,
+two spp points solve for both (`t = L + spp·g`):
+
+    spp 16   20.1 s        g = 716 ms/spp
+    spp 64   54.5 s        L = 8.6 s fixed
+
+| spp | frame | light side | **share** |
+|---|---|---|---|
+| 16 | 20.1 s | 8.6 s | **43 %** |
+| 64 | 54.5 s | 8.6 s | **16 %** |
+
+**43 %, not 0.35 %.** The quoted figure would need spp in the thousands to hold on this scene. And
+the share is not a constant at all — it falls as 1/spp, because the numerator is fixed and the
+denominator is not. Quoting it as a single number is the error, independent of which scene produced
+0.35 %: the comment names no scene and no sample count, so it reads as a property of mode M and is
+not one.
+
+**What it does and does not undermine.** The `-beamrefresh` *controller* is unaffected: it measures
+its own overhead and sets epoch length to `overhead/frac`, so the light-side share comes out as
+`frac/(1+frac)` **by construction** — verified previously at 0.10 → 9.1 % predicted against 8.3-10.5 %
+measured. It cannot be misled by a wrong comment. What is undermined is the *choice* of 0.10: it was
+picked because realizations were believed nearly free, and on this scene a realization costs 43 % of
+a frame at spp 16. Whether 0.10 is still right is now an open question rather than a settled one.
+
+**And this is the same error shape as VOLCACHE's "83.2 % of gather candidates"** two entries above:
+a number measured in one configuration, quoted without its conditions, and then used to justify a
+design decision somewhere else. Both were found the same way — by measuring the thing the number
+claimed to describe.
+
+**Caveat on my own figure, in the same spirit:** two spp points, one scene, one device, no repeats,
+and the model assumes the light side is exactly fixed and the gather exactly linear in spp. Both are
+approximations. The 43 % should be read as "tens of percent", which is all that is needed to
+contradict 0.35 %.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
