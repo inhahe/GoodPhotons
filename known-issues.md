@@ -917,8 +917,37 @@ i.e. the light side is **31 % of the variance**. So `L -> 0` — a *perfect* lig
 many free realizations, which is strictly more than the port can deliver — is worth
 **sqrt(1.446) = 1.20x**. The port's realistic ~9x more realizations is worth **1.16x**.
 
-**This contradicts the premise check above (1 -> 5 realizations at 2.9x in variance, 1.75x in
-s.d.) and the disagreement is not resolved.** What differs: that measurement was at equal *time*
+**THE `spp` CHECK IS RUN, AND `L/C` DOES NOT GROW — so the ceiling does not recover with sample
+count.** The settling experiment named below, at 4x the samples:
+
+| spp | realizations | frozen | many | ratio | `L/C` | light share | **ceiling** |
+|---|---|---|---|---|---|---|---|
+| 1024 | 1 vs 11 | 0.3126 | 0.2639 | 1.185 | 0.462 | 31.6 % | **1.209x** |
+| 4096 | 1 vs 30 | 0.2456 | 0.2035 | 1.207 | 0.480 | 32.4 % | **1.216x** |
+
+**Flat to within a point over a 4x change in samples**, and the reason is the controller: it holds
+the light side at `frac/(1+frac)` of *time*, so realizations grow with spp (11 -> 30) at about the
+rate the camera term falls, and the ratio is pinned. **The ceiling is a property of the scene and
+the knob, not of how long you render.** So the port cannot be rescued by pointing at higher sample
+counts.
+
+**Which leaves the statistic as the explanation for the 2.9x, and the tail will not settle it at
+n = 4.** That check scored *brightest 2x2 blocks* — a tail statistic — where this one scores a
+median over lit pixels. Splitting the same data by quantile (1 vs 30 realizations, 4096 spp):
+
+| | median | p75 | p90 | p99 | mean |
+|---|---|---|---|---|---|
+| gain from 30 realizations | **1.207x** | 0.941x | 0.806x | 0.711x | 0.991x |
+
+**My own tail numbers move the OTHER way** — more realizations looking *worse* at p90/p99 — which
+is not credible as physics and is exactly what a tail statistic does at **n = 4 seeds**. This file
+already records the rule (`max`/`min` over n=3 is dominated by the extreme seed; a 1.12x reading
+became 1.53x at n=6), and it applies to the 2.9x block figure just as much as to these quantiles.
+
+**So the defensible position is the conservative one: on the median and the mean — the statistics
+that are stable at this seed count — a perfect light side is worth 1.0-1.2x.** Any larger claim
+rests on a tail statistic, and settling *that* needs many more seeds rather than more samples,
+because the spp lever has now been tested and does nothing. What differs: that measurement was at equal *time*
 rather than equal samples, scored block means rather than per-pixel spread, and ran at 20 s
 (~2 600 spp) against 1024 spp here. The direction is the puzzle — at higher spp the camera term
 `C` is smaller, so the light side should be a *larger* share and realizations should matter
