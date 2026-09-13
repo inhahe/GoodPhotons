@@ -731,6 +731,48 @@ much fur there is, and it is a one-line change to test: the same fur block `on` 
 a quad, at the same density. `wall`/`floor` read ~0 % in the creature, so the enclosing room is not
 a candidate — the room does not bias anything it touches.
 
+### Substrate swings the coat 15 points and FLIPS ITS SIGN — but still does not reach the creature
+
+`_fur_substrate.ftsl`: the creature's `coat_barrel` fur block copied verbatim onto a flat quad and
+onto a 0.10 m sphere, both in one frame, with the only difference between the furred arms being what
+they grow on. Prediction committed in cfb4fc7 before the renders existed.
+
+| material | role | px | seed 3 | seed 7 | mean |
+|---|---|---|---|---|---|
+| `bare_quad` | **NULL** flat, no fur | 1200 | +0.16 % | +0.78 % | **+0.47 %** |
+| `bare_sph` | **NULL** sphere, no fur | 690 | +0.52 % | -1.21 % | **-0.34 %** |
+| `ground` | room floor | 47471 | +0.69 % | -0.21 % | **+0.24 %** |
+| `flat_coat` | coat on a QUAD | 294 | +0.21 % | -7.81 % | -3.80 % |
+| `sph_coat` | coat on a SPHERE | 1376 | +11.25 % | +11.45 % | **+11.35 %** |
+
+**All three nulls pass, and the sphere null is the one that mattered.** It was built in specifically
+so that a curvature effect could be separated from a fur effect, and it could have failed: a gather
+disc on a curved surface genuinely has less same-facing area within the ball than a flat one. It
+reads -0.34 %. **Curvature alone does not bias the gather at this radius**, so `sph_coat` is about
+the fur, not about the sphere.
+
+**Substrate matters, by about 15 points, and flips the sign.** The same fur reads a few percent
+NEGATIVE on a flat quad and **+11.35 % POSITIVE** on a sphere. The sphere number is systematic — two
+seeds agree to 0.2 points — while the flat number should be read only as "a few percent negative":
+its seeds span 8 points on a 294-pixel ROI, because at this viewing angle the strands on a flat
+patch are seen nearly end-on and most of the quad's pixels show the skin between them.
+
+**But neither arm reaches the creature's -17 % to -33 %, so the prediction is refuted on both of its
+first two branches**, and its third applies: what still differs is the creature's many coats on many
+adjacent body parts — and, found by reading the scene rather than guessing, **its lighting**.
+`fur_creature.ftsl` is an enclosed room lit by **two area lights** (`power 300` overhead and
+`power 55` from the front); this rig is open and lit by a uniform env. Under a localised source a
+tangle self-shadows severely and directionally, which is a different regime for both the photon pass
+and the backward reference, and it is the cheapest remaining variable to change: one light block.
+
+**Running tally for this thread.** Refuted as *the* explanation, each after surviving its own test:
+dimensional scaling, strand crossing, saturation, the medium, scene composition, the corner effect,
+hair-BCSDF non-reciprocity, per-strand density, and now substrate. What has been *established* is
+narrower and more useful: the estimator is exact on unfurred geometry in every rig built here
+(+0.47 %, -0.34 %, +0.24 %, and -0.05 %/+0.04 % on the creature), the error is entirely a fur
+phenomenon, and on the creature the fiber gate brackets it at -33.6 % and +46.8 % with the truth
+unreachable in between.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
