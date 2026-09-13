@@ -1982,6 +1982,39 @@ more fur to find — so the estimate tends to `1/r^2` while a normal gather hold
 `r^-0.46` is that saturation partway in. **That is the same family as this entry's founding
 observation** that "the gather disc is wider than her head", not a new dimensional defect.
 
+**FIVE-POINT SWEEP: THE PREDICTION HOLDS, MONOTONICALLY, WITH THE CONTROL FLAT (2026-09-12,
+`scraps/fur_cross.sh`).** Two points gave a direction; the model deserved a test it could fail. The
+prediction was written into the script before the run — *the error falls monotonically and crosses
+zero above 0.3846* — and `grid_ground` was included because a flat 46x45 m quad has nothing to
+saturate, so if the **control** also trended the sweep would be measuring something global and no
+conclusion about fur would survive.
+
+| `r` | `r/R` | **`creature`** | `grid_ground` (control) |
+|---|---|---|---|
+| 0.2000 | 1.25 | **+60.7 %** | -1.7 % |
+| 0.2412 | 1.51 | **+41.8 %** | -1.8 % |
+| 0.3846 | 2.40 | **+11.9 %** | -2.0 % |
+| 0.5500 | 3.44 | **-4.0 %** | -1.1 % |
+| 0.8000 | 5.00 | **-37.7 %** | -0.3 % |
+
+**Monotone across a 4x radius range, and the control moves 1.7 points where the fur moves 98.** The
+zero crossing interpolates to **`r* = 0.503`** (`r/R` = 3.14); the adaptive rule picks 0.3846, which
+is **23 % below** it. So the saturation model survives the first test it could have failed, and it
+is now the only one of this entry's three explanations still standing.
+
+**What this is and is not.** It IS a demonstration that `creature`'s error is a smooth, monotone
+function of the gather radius with a zero crossing — a one-parameter story, not a defect with a
+sign. It is NOT a fix: mode `M` has **one** global radius, and the sweep shows different ROIs want
+different ones (`grid_ground` is flattest at 0.80, `creature` is exact at 0.50). A per-object
+radius is a different estimator, and this entry should not pretend otherwise.
+
+**The shippable form is a diagnostic, not guidance**: the renderer knows the gather radius and the
+`[fur]` line already reports each coat's sphere-equivalent area, so `r/R` is computable and a
+warning could say *this coat is smaller than the gather radius, so its shading is a saturated
+estimate*. That is a statement of fact rather than advice, which is the right register given the
+model is one scene old. What would justify more: the same five-point sweep on a second scene with
+`r/R > 1`, confirming the crossing sits near `r/R ~ 3` rather than at a scene-specific value.
+
 **THE SIGN CHECK, run because this mechanism has now been revised twice in an hour.** Under
 saturation a larger ball collects the same flux over a larger divisor, so the estimate falls and
 the error should *shrink* as `r` grows. It does: **+35.5 % at `r/R` = 1.51 against +9.5 % at
