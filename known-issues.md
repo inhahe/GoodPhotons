@@ -2377,14 +2377,39 @@ because the code path it needed is not the one this scene takes.
 **Seven candidates are now eliminated:** kernel radius, beam set and split, FP32 precision, the
 1/sin singularity, the gather-time spectral fold, order >= 2, and stochastic transmittance.
 
-**What still has to explain the optical-depth dependence.** At `sigma_t 20` the gather sums **790
-beams per probe** (host log) against a handful in thin fog. Remaining candidates in test order: a
-device-side **cap or early-exit on beams per query** that the host lacks — a plain cap would bias
-rather than fatten a tail, but a randomised or traversal-order-dependent one would do exactly this;
-a difference in **camera-side scatter-point sampling**, which at `sigma_t 20` clusters gather points
-near the camera; and the **beam power distribution**, which widens with depth. Check the `-beamk`
-floor first, since the host log reports crossing it (*"past the -beamk floor (790.5 > 32), so the
-gather now pays for every extra beam"*).
+**A PRACTICAL MITIGATION FOUND, AND TWO MORE CANDIDATES ELIMINATED.**
+
+**Raising `-beamcount` collapses the device tail.** With `-beamcount 0` (no trim) on the same scene
+and matched `-spp`:
+
+| arm | median | p90 | p99 | max/level |
+|---|---:|---:|---:|---:|
+| GPU, trimmed to 300k (default) | 0.2245 | 1.398 | 4.685 | 23.9 |
+| GPU, **no trim** | 0.0924 | 0.487 | **1.202** | **3.7** |
+| CPU, trimmed to 300k | 0.1668 | 0.735 | 1.577 | 5.0 |
+
+The untrimmed device arm **beats the trimmed host arm on every metric**. So an operator seeing
+fireflies in thick media on the GPU has a lever today: raise `-beamcount` (or set 0). **This is
+mitigation, not diagnosis** — the untrimmed run also gathers **11 830 beams per probe against 735**,
+because dropping the cap raises both the beam count and the auto-radius, so most of the improvement
+may simply be 16x more samples per query. Recorded as advice, not as a cause.
+
+**Eliminated — a device-side per-query beam cap.** The obvious reading of the trim result was that
+the device gathers fewer beams per query, so a rescaled high-power beam dominates more. It does
+gather fewer, but only by 7 %: **735.4 against the host's 790.5**. A 7 % difference cannot produce a
+3x tail.
+
+**Eliminated — the trim itself as a device difference.** The `-beamcount` trim is **shared host
+code** (`main.cpp:12271` prints it for both backends) and runs before the device upload, so both
+backends receive the same trimmed, rescaled beam set. It cannot be where the two diverge. That it
+*interacts* with the device tail is real — but the trim is common to both.
+
+**Status after eight eliminated candidates.** At matched trim, matched beam set, and per-probe gather
+counts within 7 %, the device tail remains ~3x the host's at `sigma_t 20` and *better* than the
+host's at `sigma_t 0.6`, with means agreeing to 1.62 %. Nothing yet examined accounts for that. The
+honest next step is not another hypothesis from the outside but an instrumented comparison: dump the
+per-beam contributions both backends compute for the *same* probe ray and diff the distributions.
+Everything cheaper has now been tried.
 
 **Separately, and do not conflate them:** the ~1.3x MEDIAN gap is present in both regimes and is in
 fact *larger* in thin fog (0.0247/0.0121 = **2.0x**) than in thick (1.35x). It is a different
