@@ -1491,9 +1491,28 @@ VOLCACHE **strongly positive on thick media**. At `sigma_t 0.6` the saving is ~a
 same cost — still positive, but the margin is thin enough that implementation overheads could erase
 it.
 
-**Caveat, and it points one way:** the stub reads 4 floats from a 1 MB grid that fits in L2. A real
-cache is larger and may interpolate, so this is a **lower bound** on lookup cost; the true march is
-somewhere above 4-10 %.
+**Re-measured on a quiet machine, and the marginal rate confirms the extrapolation.** Discarding a
+first-run warm-up (see the noise note below), `0 -> 32 -> 64` steps read 15.50, 18.07 and ~19.2-22.7 s.
+Fitting `cost = a + b*steps` against the 256-step point gives **b ~ 0.018-0.026 s/step** — the same
+marginal rate the linear region gave — **plus a ~2 s per-frame fixed term**.
+
+**That fixed term is an artifact of the stub, not of a cache.** The stub *adds* a branch and a sink
+update to every gather call; a real cache *replaces* the query. So the marginal rate is the quantity
+to carry forward (**4-11 % of frame at 32-64 steps**) and the fixed 2 s should be ignored — measuring
+by addition rather than replacement always costs something the real change would not.
+
+**Two caveats, pointing opposite ways.** The stub reads 4 floats from a 1 MB grid that fits in L2, so
+a larger or interpolating cache costs *more*; but it also pays that per-call overhead a real
+implementation would not, so the headline figure costs *less*. 4-11 % remains the best estimate, with
+the error bars on both sides rather than one.
+
+**MACHINE TIMING NOISE, characterised in passing and worth having.** Four identical runs read 16.61,
+15.90, 15.13, 15.14 s: a **~10 % first-run warm-up**, then steady state agreeing to **0.07 %**. A
+separate set during background load read 19.41 and 19.05 against a 15.63 baseline — a **24 %**
+excursion. So: **discard the first run, use the median of at least three, and re-check the baseline
+in the same batch as the arms.** Several of this session's timing comparisons would have been
+unreadable without that, and one set (the first 32/64 stub attempt) was taken during exactly such an
+excursion and had to be redone.
 
 **Recommendation.** Worth prototyping *if* thick media matter to the intended workload, and the
 prototype should be a cost-only stub priced on a mid-depth scene (`sigma_t ~6`), not on
