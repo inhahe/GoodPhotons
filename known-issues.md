@@ -2334,14 +2334,38 @@ earlier the same day, and it would have produced a confident wrong diagnosis her
 **So four candidates are now out** — kernel radius, beam set and split, FP32 precision, and the
 1/sin singularity — each by a direct test rather than by argument.
 
-**The lead that reading turned up instead: the gather-time spectral fold.** `render_cuda.cu` ~5566
-describes *"THE GATHER-TIME SPECTRAL FOLD (FOLD-GPU (2), host twin: beamgather.h), gated on
-`mw == nullptr` — i.e. no merge weight, i.e. mode M"*. That is a real algorithmic difference in the
-mode-M beam gather specifically, which is exactly the configuration where the tail appears, and it is
-where the next tick should look: whether the device's fold and its host twin are the same estimator,
-or merely the same intent. Note the gate — mode J sets it false because *"its MIS ratios are built
-from the monochromatic phase and a folded colour cannot be paired with them"* — which means a mode-J
-beam render is a ready-made control: if the tail is the fold, mode J should not show it.
+**FIFTH CANDIDATE ELIMINATED, AT ZERO COST: the gather-time spectral fold.** `render_cuda.cu` ~5566
+documents a mode-M-only fold (FOLD-GPU (2)) which looked like a promising algorithmic difference. It
+never fires on the test scene. The renderer announces it — `[gpu] gather-time spectral fold: N bow
+tables uploaded` — and that line appears **58 times in a `gallery_rain` log and zero times in any
+`_fog_thick` GPU log** on disk. Checking whether the rig could see the candidate at all, before
+testing it, cost one grep of logs already written and retired the hypothesis outright.
+
+**THE DECISIVE NARROWING: the penalty is specific to HIGH OPTICAL DEPTH.** `_fog_thick` is
+`sigma_t 20`; its sibling `_fog_cornell` is `sigma_t 0.6`. Same rig, same matched `-spp`:
+
+| condition | arm | median | p90 | p99 | max/level |
+|---|---|---:|---:|---:|---:|
+| thin, `sigma_t 0.6` | GPU | 0.0247 | 0.118 | **0.911** | **93.3** |
+| thin, `sigma_t 0.6` | CPU | 0.0121 | 0.077 | **1.081** | **111.1** |
+| thick, `sigma_t 20` | GPU | 0.2245 | 1.398 | **4.685** | 23.9 |
+| thick, `sigma_t 20` | CPU | 0.1668 | 0.735 | **1.577** | 5.0 |
+
+**In thin media the tail is REVERSED — the GPU is better** (p99 0.911 against 1.081, max 93 against
+111). The 3x penalty exists only at high optical depth. Whatever differs between the two gathers is
+therefore something that only matters once paths scatter many times.
+
+**That points at the order >= 2 part of the gather**, which `photonbeams.h:364` treats as a distinct
+component (*"VOLCACHE's whole premise is substituting a cached value for the `order >= 2` part of the
+gather"*), with per-beam scattering order tracked explicitly and `kBeamOrderUnknown` documented as
+*"NOT A DEFAULT, IT IS A REFUSAL TO GUESS"*. In thin fog almost all light is order 1; at `sigma_t 20`
+the multiply-scattered orders dominate — precisely the regime split the measurement just drew. **The
+next step is to compare how host and device weight or terminate `order >= 2` beams**, not the gather
+formula as a whole.
+
+**Separately, and do not conflate them:** the ~1.3x MEDIAN gap is present in both regimes and is in
+fact *larger* in thin fog (0.0247/0.0121 = **2.0x**) than in thick (1.35x). It is a different
+phenomenon from the tail and is unexplained by any of the five eliminated candidates.
 
 **The rig is reusable:** `scraps/tail.py <prefix> <label>` scores any pair of two-seed PFM arms by
 percentile. Render with `-hdr`, matched `-spp`, seeds 1 and 2, named `png/<prefix>_<dev>_<seed>.png`.
