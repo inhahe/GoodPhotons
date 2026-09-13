@@ -3900,6 +3900,47 @@ where the denominator is dominated by something else is not a measurement of the
 81 %-beams figure was in `-mstats` output that had already been read, on this same scene, in the
 VOLCACHE entry.
 
+**THE COMMON RESIDUAL IS *NOT* FINITE-RADIUS SMOOTHING BIAS — tested and refuted (2026-09-12,
+`scraps/ga_radius.sh`).** After the correction, all three truncated ROIs keep a shortfall that does
+not track geometry (hair 11.0 %, dress 5.5 %, cap 8.1 %) while the corrections themselves span
+1.38x-2.78x. A residual common to fine strands, folded cloth and a flat cap edge is one mechanism,
+and the obvious candidate was the ordinary finite-radius bias this entry already sets aside as a
+different, expected phenomenon.
+
+**It has a signature nothing else shares, and the prediction was registered before the run.**
+Smoothing bias goes as `r^2`; the adaptive radius was read from the log rather than assumed —
+**0.3846 -> 0.2412** at 4x photons, a ratio of **0.627**, not the 0.500 an `N^-1/2` law would
+give — so `r^2` falls to **0.393** and every residual should retain 39 % of its value. A footprint
+error, by contrast, is radius-independent to first order, because coverage is a ratio of areas.
+
+| ROI | 1x photons | 4x photons | predicted if smoothing bias |
+|---|---|---|---|
+| `alice_hair` | -9.9 % | **-9.9 %** | -3.9 % |
+| `alice_dress` | -5.2 % | **-4.2 %** | -2.0 % |
+| `cap_gyroid` | -7.5 % | **-5.5 %** | -2.9 % |
+| `grid_ground` | -2.6 % | **-3.2 %** | -1.0 % |
+
+**Nothing lands near the prediction** — hair does not move at all, dress and cap retain 73-81 %,
+and the flat null gets slightly worse. So the shared residual is **not** the smoothing bias, and
+that candidate is now closed rather than merely unexamined.
+
+**AND THE SAME RUN FOUND SOMETHING LARGER: MORE PHOTONS MAKE FUR WORSE, AND THE MECHANISM IS
+DIMENSIONAL.** `creature` went **+9.5 % -> +41.0 %** when the radius fell 37 %.
+
+The density estimate divides by `pi r^2` because it is a **surface** estimator. Near a 0.64 mm
+strand the photons within radius `r` scale as **`r`**, not `r^2` — a line, not a plane — so the
+estimate goes as `1/r` and **diverges as the radius shrinks**. Predicted from that alone:
+`(1 + 9.5 %) / 0.627 = +74.6 %`, measured **+41.0 %**; same sign, same order, about half the
+magnitude, which is what a coat that is part strand-core and part quasi-surface envelope should
+give. Nothing else in the estimator produces brightening from a smaller radius.
+
+**This is why the fiber gate cannot be the end of the fur story.** The gate switches the *coverage
+correction* off on strands, which was right — but the residual it leaves is the **normalisation**
+being dimensionally wrong on curve geometry, and no footprint work reaches that. It also means the
+fur error is **not a fixed offset**: it grows as photon count rises, so a user who increases `-n`
+for a cleaner image gets a more wrong one. That deserves its own entry, and it is the strongest
+remaining lead in this area.
+
 **AND THE CHAIN NOW CLOSES: THE FOOTPRINT CORRECTION IS COMPLETE AT THIS ROI, AND ~12 % OF ITS
 DEFICIT IS NOT FOOTPRINT AT ALL.** Three numbers, two of them measured on the ROI itself:
 
