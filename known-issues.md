@@ -967,6 +967,48 @@ stacked shells — which is `alice_dress` territory and has not yet been measure
   an absolute difference against no scale is this file's recurring error; recorded rather than
   quietly corrected.
 
+### The named target scene is made of IMPLICITS, which the footprint cannot measure — caught by an impossible zero
+
+Running `-gafparea` on `gallery_rain`, the scene the queue names as the thing to measure before
+touching the device, returned **footprint 0.0000 over 38 gathers on `capmarble_axicon`** — a solid
+marble cap with, supposedly, no same-facing surface in a ball centred on it. That cannot be true of
+any solid object, which is what made it visible.
+
+**The cause is a conclusion I drew from one scene.** The census two entries above found spheres at
+0-1.7 per ball and implicits and instances at exactly 0.0, and I wrote that "the area code needs TWO
+primitive cases, not five". That census was taken on `fur_creature`. `gallery_rain`'s caps are
+implicit isosurfaces, and its census reads:
+
+| material | curveSeg | tris | spheres | **implicit** |
+|---|---|---|---|---|
+| `gridground` | 2.3 | 2.3 | 0.0 | **2.0** |
+| `capmarble_gold` | 3.0 | 4.0 | 0.0 | **6.0** |
+| `wirecage` | 4.0 | 4.0 | 0.0 | **5.7** |
+
+Skipping a primitive class does not omit it from the answer — it silently subtracts its area, and
+after the divide that becomes an over-brightening of up to `kDisc`-fold (64x at the default). This is
+the "generalised from one scene" error, and the fur thread above contains ten instances of it.
+
+**Fix: the measurement now reports when it is INCOMPLETE and the estimator refuses to use it.**
+`gatherFootprintArea` sets an `incomplete` flag when the ball held a sphere, implicit or instance,
+and `-gageom` falls through to the probe for that gather — a coarser estimate beating a confidently
+wrong one. Verified afterwards:
+
+* `_ga_null` still renders **byte-identical** with `-gageom 0` and `1` (flat, triangles only).
+* `gallery_rain` at 64x36 now has **median change 0.000 %** and only 13 of 1184 pixels moving more
+  than 1 %, where before the fallback the path was free to apply a 64-fold correction.
+* The diagnostic prints an `UNMEAS. % of ball` column and marks any row above 50 % as
+  **"NOT MEASURABLE, number is meaningless"**. `gallery_rain` reads 100 % on every row; `_ga_null`
+  reads 0 %.
+
+**What this costs item 2.** The geometric footprint **cannot currently address `alice_dress` or
+`cap_gyroid` at all**, because those surfaces are implicit and the method has no area routine for
+them. Its validated domain is triangle and curve-segment geometry: exact on flat, exact on a disc
+clipped by a wall, and — per the entry above — the wrong divisor on fur. Extending it to implicits
+means sampling an isosurface's area inside a ball, which is a real piece of work and has not been
+scoped. Recorded so the next person does not re-derive the two-class conclusion from the same one
+scene.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than

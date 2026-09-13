@@ -310,7 +310,16 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
     // ~600 strands in it the numerator is already the wrong region. See M-GATHERAREA.
     if (gaGeomOn() && !(fiberR > 0.0 && gaFiberSkipOn())) {
         const double denom = 3.14159265358979323846 * r * r;
-        const double cov = gatherFootprintArea(scene, p, n, r, gaGeomDisc(), gaGeomCurve()) / denom;
+        // If the ball held geometry this cannot measure, the area is an UNDER-count and the
+        // divide would over-brighten by up to kDisc-fold. Fall through to the probe instead:
+        // a coarser estimate beats a confidently wrong one. gallery_rain is the scene that
+        // forced this -- its caps are implicit isosurfaces and the first build of this path
+        // reported footprint 0.0000 on a solid marble cap, which is impossible.
+        bool incomplete = false;
+        const double raw = gatherFootprintArea(scene, p, n, r, gaGeomDisc(), gaGeomCurve(),
+                                               &incomplete);
+        if (!incomplete) {
+        const double cov = raw / denom;
         // THE COVERAGE MUST BE BOUNDED AWAY FROM ZERO. The estimate divides by it, and a
         // measured footprint of exactly 0 is not rare -- `skin` on fur_creature reports
         // min 0.0000, a gather that found no same-facing surface at all. The first build of
@@ -327,6 +336,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
         // monotone in the measurement.
         const double floorCov = 1.0 / (double)gaGeomDisc();
         return cov < floorCov ? floorCov : cov;
+        }
     }
     // Is the gather point itself on a fiber? TALLY ONLY -- nothing is gated on it, because the
     // tally is what showed it cannot be: see M-GATHERAREA. A gather point on a 0.64 mm strand has

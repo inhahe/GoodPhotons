@@ -27,8 +27,18 @@
 //
 // `1/|cos|` is the projection Jacobian: a disc ray meeting a surface at a slant subtends
 // more surface area than the disc cell it came from.
+// `incomplete` (optional) is set when the ball contains a primitive class this function
+// CANNOT measure -- spheres, implicits, instances. That is not a corner case: the census
+// that justified handling only triangles and curve segments was taken on `fur_creature`,
+// which has none of them, while `gallery_rain` -- the scene the queue names as the target
+// -- is built from implicit isosurfaces and reports 2 to 6 of them per ball. Skipping a
+// class silently returns a near-zero area, which after the divide becomes a 64-fold
+// over-brightening. A caller that gets `incomplete` must fall back rather than use the
+// number.
 inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
-                                  double r, int kDisc, int kCurve) {
+                                  double r, int kDisc, int kCurve,
+                                  bool* incomplete = nullptr) {
+    if (incomplete) *incomplete = false;
     const size_t nT = sc.tris.size(), nS = sc.spheres.size(),
                  nI = sc.implicits.size(), nC = sc.curveSegs.size();
     const double r2 = r * r, kPi = 3.14159265358979323846;
@@ -75,9 +85,9 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             }
             return;
         }
-        u -= nT; if (u < nS) return;    // spheres:   0-1.7 per ball (census)
-        u -= nS; if (u < nI) return;    // implicits: 0.0 everywhere
-        u -= nI; if (u >= nC) return;   // instances: 0.0 everywhere
+        u -= nT; if (u < nS) { if (incomplete) *incomplete = true; return; }   // spheres
+        u -= nS; if (u < nI) { if (incomplete) *incomplete = true; return; }   // implicits
+        u -= nI; if (u >= nC) { if (incomplete) *incomplete = true; return; }  // instances
         // A curve segment is a thin cylinder whose size is COMPARABLE to the ball, so here
         // sampling the primitive itself is the cheap and accurate way round — the opposite
         // of the triangle case, and for the opposite reason.

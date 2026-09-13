@@ -361,7 +361,7 @@ inline int gaFootprintReport(const Scene& scene, const Camera& cam, int resX, in
 // which makes `_ga_null` a test that can fail rather than a demonstration that cannot.
 inline int gaFpAreaReport(const Scene& sc, const Camera& cam, int resX, int resY,
                           double r, int stride, int kDisc, int kCurve) {
-    struct Stat { long long n = 0; double sum = 0, lo = 1e30, hi = -1e30; };
+    struct Stat { long long n = 0, inc = 0; double sum = 0, lo = 1e30, hi = -1e30; };
     std::vector<Stat> st(sc.mats.size());
     const double denom = 3.14159265358979323846 * r * r;
     if (stride < 1) stride = 1;
@@ -371,26 +371,44 @@ inline int gaFpAreaReport(const Scene& sc, const Camera& cam, int resX, int resY
             Hit h = sc.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
                                   /*skipCamHidden=*/true);
             if (!h.valid || h.matId < 0 || h.matId >= (int)st.size()) continue;
-            const double a = gatherFootprintArea(sc, h.p, h.n, r, kDisc, kCurve) / denom;
+            bool incomplete = false;
+            const double a = gatherFootprintArea(sc, h.p, h.n, r, kDisc, kCurve,
+                                                 &incomplete) / denom;
             Stat& s = st[h.matId];
-            ++s.n; s.sum += a;
+            ++s.n; if (incomplete) ++s.inc;
+            s.sum += a;
             if (a < s.lo) s.lo = a;
             if (a > s.hi) s.hi = a;
         }
     std::printf("[gafparea] radius %.5g, every %dth pixel, %d disc rays, %dx%d curve samples\n",
                 r, stride, kDisc, kCurve, kCurve);
-    std::printf("%-22s %8s %12s %10s %10s\n",
-                "material", "gathers", "footprint", "min", "max");
-    std::printf("%-22s %8s %12s %10s %10s\n",
-                "", "", "(x pi r^2)", "", "");
-    std::printf("%s\n", "--------------------------------------------------------------");
+    std::printf("%-22s %8s %12s %10s %10s %9s\n",
+                "material", "gathers", "footprint", "min", "max", "UNMEAS.");
+    std::printf("%-22s %8s %12s %10s %10s %9s\n",
+                "", "", "(x pi r^2)", "", "", "% of ball");
+    std::printf("%s\n", "-------------------------------------------------------------------------");
+    long long totInc = 0, totN = 0;
     for (int m = 0; m < (int)st.size(); ++m) {
         const Stat& s = st[m];
         if (s.n == 0) continue;
         const char* nm = sc.matNameFor(m);
         if (!nm) continue;
-        std::printf("%-22s %8lld %12.4f %10.4f %10.4f\n",
-                    nm, s.n, s.sum / (double)s.n, s.lo, s.hi);
+        totInc += s.inc; totN += s.n;
+        const double incPct = 100.0 * (double)s.inc / (double)s.n;
+        // A row whose balls contain spheres, implicits or instances has an UNDER-counted
+        // area, and printing it without saying so is how the first run of this tool
+        // reported `capmarble_axicon` at footprint 0.0000 over 38 gathers -- a solid marble
+        // cap with, supposedly, no surface in a ball centred on it. The estimator falls back
+        // to the probe in that case; the diagnostic has to say it rather than imply a zero.
+        std::printf("%-22s %8lld %12.4f %10.4f %10.4f %8.0f%%%s\n",
+                    nm, s.n, s.sum / (double)s.n, s.lo, s.hi, incPct,
+                    incPct > 50.0 ? "  <- NOT MEASURABLE, number is meaningless" : "");
     }
+    if (totN > 0 && totInc * 2 > totN)
+        std::printf("\n[gafparea] %.0f%% of gathers contained geometry this cannot measure "
+                    "(spheres / implicits / instances). Only triangles and curve segments are "
+                    "handled; -gageom falls back to the probe wherever that is true, so the "
+                    "estimator is safe, but this table is not a description of THIS scene.\n",
+                    100.0 * (double)totInc / (double)totN);
     return 0;
 }
