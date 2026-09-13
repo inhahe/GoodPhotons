@@ -375,7 +375,11 @@ inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
 // Report the split, most-probed material first. Names come from MeshGroup, which is the only
 // place an authored name survives the flatten into Scene::tris.
 inline const char* nmOf(const Scene& sc, int matId, char* buf) {
+    // Mesh group FIRST: where one exists its name is the OBJECT (`alice_dress`), which is more
+    // useful in a diagnostic than the material, and putting it first keeps existing output
+    // byte-identical. The material name only fills in the cases that printed `matN`.
     if (const char* n = sc.meshNameForMat(matId)) return n;
+    if (const char* n = sc.matNameFor(matId))     return n;
     std::snprintf(buf, 24, "mat%d", matId);
     return buf;
 }

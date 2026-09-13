@@ -974,6 +974,13 @@ public:
         if (!checkEmitPatsSupported(L)) return false;
         // Diagnostic only (never fails a load): a curv-driven material whose geometry
         // can only report 0 would otherwise render flat with no explanation at all.
+        // Publish the authored material names before anything that might want to report one.
+        // The parser is the only place they exist -- a Material carries no name -- and until
+        // 0.278.3 the only consumer was a local reversal inside warnCurvOnFlatGeometry below.
+        L.scene.matNames.assign(L.scene.mats.size(), std::string());
+        for (const auto& kv : matIndex_)
+            if (kv.second >= 0 && kv.second < (int)L.scene.matNames.size())
+                L.scene.matNames[kv.second] = kv.first;
         warnCurvOnFlatGeometry(L);
         // Decide whether any cavity probe rays will ever be fired, and how far.
         setupCavity(L);

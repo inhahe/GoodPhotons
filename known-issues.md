@@ -3870,6 +3870,27 @@ where the denominator is dominated by something else is not a measurement of the
 81 %-beams figure was in `-mstats` output that had already been read, on this same scene, in the
 VOLCACHE entry.
 
+**THE DIAGNOSTIC CAN NAME THINGS NOW (v0.278.3).** `FTRACE_GADIAG` printed `mat39` / `mat45` for
+exactly the materials this entry is about, because `nmOf` named a material by finding a **MeshGroup**
+that used it — which works for imported meshes and fails for isosurfaces, CSG, quads and spheres.
+`cap_gyroid` *is* an isosurface, so it never had a name. The authored names already existed in the
+FTSL loader's name->index map (`ftsl.h` reversed it locally for one warning, with a comment saying a
+`Material` carries no name of its own); they are now published as `Scene::matNames` and `nmOf` falls
+back to them. **Mesh-group name stays first**, so where one exists the output is byte-identical and
+still reports the OBJECT rather than the material. Only the `matN` cases change:
+
+    [gadiag] material                   probes    miss%     rej%     acc%  depth/r    deep%   fiber%
+    [gadiag] gridground                  47568     0.1%     0.0%    99.9%   -0.003     0.0%     0.0%
+    [gadiag] capmarble_gyroidx            3872    21.8%     1.6%    76.6%   -0.022     2.9%     0.0%
+    [gadiag] mat45                        1808    37.3%    10.8%    51.8%    0.061    23.5%     0.0%
+
+**`gridground` is the control and it behaves**: 99.9 % accept, depth ~0 — a flat quad where the disc
+cannot overhang, which is why the correction is inert there. **`capmarble_gyroidx` is the
+`cap_gyroid` ROI**, now identifiable: 21.8 % miss, so coverage ~0.77 and the correction multiplies by
+~1.3. The residual after that is the -7.5 recorded above, which is the number to explain next.
+The remaining `matN` rows are materials with no authored name at all (importer-built or anonymous),
+which is the honest limit of this approach rather than a bug.
+
 **AND MODE `S`'s LIMIT IS CHECKED, NOT ASSUMED (2026-09-12).** SPPM shrinks its gather radius
 every pass, and `sppm_render.h` applies the coverage to each pass's flux **at that pass's own
 radius** — so on a smooth surface the tangent disc becomes locally flat as `R` falls, coverage

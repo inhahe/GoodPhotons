@@ -2948,6 +2948,19 @@ struct Scene {
         return nullptr;
     }
 
+    // AUTHORED MATERIAL NAMES, indexed by matId; empty where the loader had none (a material
+    // built by an importer rather than declared in FTSL). Filled once at load from the parser's
+    // name->index map -- a `Material` itself carries no name, which is why this exists.
+    //
+    // `meshNameForMat` above only answers for geometry that came in as a MESH. Everything else --
+    // isosurface, CSG, quad, sphere -- had no name at all, so per-material diagnostics printed
+    // `mat45` for exactly the things worth naming (M-GATHERAREA's `cap_gyroid` is an isosurface).
+    std::vector<std::string> matNames;
+    const char* matNameFor(int matId) const {
+        if (matId < 0 || matId >= (int)matNames.size() || matNames[matId].empty()) return nullptr;
+        return matNames[matId].c_str();
+    }
+
     // Linear-scan reference (pre-BVH), kept for the -checkbvh self-test.
     Hit closestHitLinear(const Ray& r, double tmin = 1e-6) const {
         Hit h;
