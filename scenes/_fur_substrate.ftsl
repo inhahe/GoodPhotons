@@ -1,0 +1,73 @@
+# Substrate or grooming? The creature's EXACT fur parameters, on a flat quad and on a sphere.
+#
+# WHY BOTH ARMS ARE IN ONE FRAME. `_fur_recip` showed a flat furred patch at the creature's authored
+# density reading -2.1 % where the creature's coats read -17 % to -33 %, and density and gather
+# radius are both excluded. But comparing that rig to the creature varied FAR more than the
+# substrate: it used radius 0.0008 against the creature's 0.00040, 8 segments against 2, and NO
+# comb, NO droop and NO clump where the creature has comb 0.32, droop 0.45 and clump 0.45 at
+# clump_size 0.013. Clumping gathers strands into tufts, which is exactly the tangle structure the
+# coverage probe is documented to misjudge. Changing substrate and grooming together would have
+# repeated this thread's most expensive habit.
+#
+# So every fur block below is a verbatim copy of `coat_barrel` from fur_creature.ftsl -- density,
+# points, segments, length, jitter, radius, direction, comb, droop, clump, clump_size, seed -- and
+# the ONLY thing that differs between the two furred arms is what they grow on.
+#
+# TWO NULLS, both by construction: `bare_quad` and `bare_sph` carry no fur, so mode M and mode R
+# must agree on them for any reason whatsoever. They also separate the two questions -- a null that
+# moved on the sphere but not the quad would mean curvature alone biases the gather, independently
+# of fur, and every furred column would have to be read against that instead of against zero.
+#
+# PREDICTION, REGISTERED BEFORE THE RUN:
+#   `flat_coat` reproduces _fur_recip's few percent, and `sph_coat` lands in the creature's -17 % to
+#   -33 % band. That would make the SUBSTRATE the factor.
+#   If BOTH land in the -17 % to -33 % band, the grooming (radius/clump/droop) did it and the
+#   substrate is irrelevant -- and `_fur_recip`'s -2.1 % was an artifact of ungroomed straight
+#   strands, not of flatness.
+#   If NEITHER does, the remaining difference is the creature's many coats on many body parts.
+scene { units meters  spectral 360 830 1 }
+
+material "bare_quad" { type diffuse  reflect whitewall 0.75 }
+material "flat_skin" { type diffuse  reflect whitewall 0.75 }
+material "bare_sph"  { type diffuse  reflect rgb 0.30 0.22 0.19 }
+material "sph_skin"  { type diffuse  reflect rgb 0.30 0.22 0.19 }
+material "flat_coat" { type diffuse  reflect rgb 0.40 0.25 0.13 }
+material "sph_coat"  { type diffuse  reflect rgb 0.40 0.25 0.13 }
+material "ground"    { type diffuse  reflect rgb 0.34 0.30 0.27 }
+
+quad { origin -1 0 -1   u 5 0 0   v 0 0 3   material ground }
+
+quad   "q_bare" { origin 0.10 0.001 0.15   u 0.30 0 0   v 0 0 0.30   material bare_quad }
+quad   "q_fur"  { origin 0.55 0.001 0.15   u 0.30 0 0   v 0 0 0.30   material flat_skin }
+sphere "s_bare" { center 1.10 0.100 0.30   radius 0.100   material bare_sph }
+sphere "s_fur"  { center 1.50 0.100 0.30   radius 0.100   material sph_skin }
+
+# Verbatim copies of fur_creature.ftsl `coat_barrel`. Only `on` and `material` differ.
+fur "f_flat" {
+    on "q_fur"   material flat_coat   density 450000
+    points 4   segments 2
+    length 0.042   length_jitter 0.35
+    radius 0.00040
+    direction 0 0 -1   comb 0.32
+    droop 0.45   jitter 0.30
+    clump 0.45   clump_size 0.013
+    seed 11
+}
+fur "f_sph" {
+    on "s_fur"   material sph_coat   density 450000
+    points 4   segments 2
+    length 0.042   length_jitter 0.35
+    radius 0.00040
+    direction 0 0 -1   comb 0.32
+    droop 0.45   jitter 0.30
+    clump 0.45   clump_size 0.013
+    seed 11
+}
+
+light env { spd preset:d65 }
+
+camera "cam" {
+    eye 0.85 1.40 1.95   look_at 0.85 0.06 0.30   up 0 1 0   fov_y 45
+    mode M
+    film { res 256 256 }
+}
