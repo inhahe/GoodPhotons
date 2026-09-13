@@ -23580,6 +23580,36 @@ static int run(int argc, char** argv) {
     // checkpoint of its own: it writes each frame's image the instant that frame's gather
     // completes, which is the crash-safety a sidecar would have bought.)
     const bool plainRender = !(timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever || preview);
+    // M-TIME-CPU: a wall-clock or indefinite budget no longer costs mode M the device. The shared
+    // path's light-side refresh loop (see "THE LIGHT-SIDE REFRESH, ON THE DEVICE" below) already
+    // averaged independent realizations per epoch; it just could not be told to stop on a clock,
+    // and `plainRender` therefore sent every budgeted render to the CPU-only single-camera driver
+    // -- measured at ~16 s/spp against 0.79 s/spp on the device for the same frame.
+    //
+    // Admitted ONLY when the device route is certain, not merely likely. If a budgeted camera
+    // entered groupM and then failed the GPU gate, it would land on the shared CPU branch, which
+    // gathers a fixed spp and would ignore the budget outright -- a worse bug than the one being
+    // fixed. Every condition the GPU branch itself tests is therefore rechecked here.
+    //
+    // Excluded on purpose:
+    //   * `-noise`, which needs a convergence test this loop does not have yet; it keeps the
+    //     CPU driver and the warning.
+    //   * `-preview`, whose ANSI thumbnail genuinely belongs to the single-camera driver.
+    //   * more than one mode-M camera. A flythrough's shared map is the FEATURE -- amortising one
+    //     forward pass across every frame -- and refreshing it would both destroy that and hand
+    //     consecutive frames different realizations, which is flicker, not convergence.
+    int mModeCams = 0;
+    for (const RenderCam& rc : toRender) if (rc.mode == 'M') ++mModeCams;
+    bool budgetedGpuM = false;
+#ifdef HAVE_CUDA
+    budgetedGpuM = (timeBudgetSec > 0.0 || runForever) && !(noiseTarget > 0.0) && !preview &&
+                   mModeCams == 1 && !g_beamFreeze && g_pmapLoad.empty() && g_pmapSave.empty() &&
+                   (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
+                   cudaAvailable() && cudaPhotonMapSupported(scene);
+    if (budgetedGpuM)
+        for (const RenderCam& rc : toRender)
+            if (rc.mode == 'M' && rc.cam.hasLens()) budgetedGpuM = false;
+#endif
     std::vector<int> groupB, groupA, groupM, restIdx;
     bool mModeBudgeted = false;   // a mode-M camera dropped from groupM by the budget test
     for (int i = 0; i < (int)toRender.size(); ++i) {
@@ -23599,7 +23629,7 @@ static int run(int argc, char** argv) {
         // gather is an independent backward pass per camera, so frames don't share noise —
         // only the underlying radiance solution. That makes it safe to share even across
         // exposure-locked camera_path frames, so it isn't gated on `expGroup < 0`.
-        else if (rc.mode == 'M' && plainRender)                               groupM.push_back(i);
+        else if (rc.mode == 'M' && (plainRender || budgetedGpuM))            groupM.push_back(i);
         else {
             // A mode-M camera reaching here under a budget is the silent-CPU case warned
             // about below. Lens cameras are excluded because they would never have had the
@@ -23644,12 +23674,11 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
         if ((!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
             cudaAvailable() && cudaPhotonMapSupported(scene))
-            std::printf("[camera] NOTE: -time/-noise/-forever/-preview put mode M on the "
-                        "single-camera progressive driver, which is CPU-only, so this render "
-                        "will NOT use %s. That driver refreshes the photon map every epoch; a "
-                        "fixed -spp does run on the device but averages only gather noise off "
-                        "ONE map realization -- enough on surface scenes, not in thick media, "
-                        "where -n is what converges.\n", cudaDeviceName());
+            std::printf("[camera] NOTE: this budgeted mode-M render is on the single-camera "
+                        "progressive driver, which is CPU-only, so it will NOT use %s. "
+                        "-time and -forever DO run on the device now (0.294.0); -noise and "
+                        "-preview still do not, and nor does a multi-camera or lens-camera "
+                        "render, which keeps one shared map by design.\n", cudaDeviceName());
 #endif
     }
     // A single-camera forward group has nothing to share — fold it back into the per-camera
@@ -24259,7 +24288,21 @@ static int run(int argc, char** argv) {
                             epochFilm = f; epochSpp = sppDone;
                             return g_stopRequested != 0;
                         };
-                    for (; !stopAll && sppAll < spp && !ft::stopRequested(); ++lightEpoch) {
+                    // A WALL-CLOCK OR INDEFINITE BUDGET DRIVES THIS LOOP TOO (M-TIME-CPU).
+                    // The loop already averaged independent light-side realizations; it simply
+                    // had no way to be told "keep going until the clock runs out" because its
+                    // only stop test was a total-sample target. With the cap lifted, each epoch
+                    // is still bounded by `epochSec` through `inner`, so a huge cap does not
+                    // make one enormous epoch -- it makes many normal ones.
+                    const bool budgeted = (timeBudgetSec > 0.0 || runForever);
+                    const long long sppCap = budgeted ? ((long long)1 << 60) : spp;
+                    auto budgetSpent = [&]() {
+                        return timeBudgetSec > 0.0 &&
+                               std::chrono::duration<double>(clk::now() - gStart).count()
+                                   >= timeBudgetSec;
+                    };
+                    for (; !stopAll && sppAll < sppCap && !ft::stopRequested() && !budgetSpent();
+                         ++lightEpoch) {
                         RngSaltScope saltScope(lightEpoch);
                         // Everything the device prints about the map's SHAPE — the adaptive
                         // radius it settled on, the caustic-map population, the sub-beam /
@@ -24306,17 +24349,26 @@ static int run(int argc, char** argv) {
                                     stopAll = true; return true;
                                 }
                             }
+                            // END ON THE RENDER'S CLOCK AS WELL AS THE EPOCH'S. `epochSec` is
+                            // derived from the light-side overhead divided by `-beamrefresh`, so
+                            // on a heavy scene it is deliberately LONGER than a short budget --
+                            // measured at ~100 s against a 40 s `-time`, which ran one epoch and
+                            // overshot the budget 2.5x because the only budget test was between
+                            // epochs. A per-epoch stop test cannot bound a render whose epoch is
+                            // longer than the whole budget.
+                            if (budgetSpent()) return true;
                             return std::chrono::duration<double>(clk::now() - tEpoch).count()
                                    >= epochSec;
                         };
-                        runPass(spp - sppAll, &inner, &grabFrame, &radiiPin);
+                        runPass(sppCap - sppAll, &inner, &grabFrame, &radiiPin);
                         if (epochSpp <= 0) break;          // stopped before a complete sample
                         acc.merge(epochFilm);
                         sppAll += epochSpp;
                         epochFilm = Film{};
                         // Crash-safe: write the running average after every epoch, exactly as
                         // the un-refreshed path writes after its one and only gather.
-                        midEpoch = (sppAll < spp) && !stopAll && !ft::stopRequested();
+                        midEpoch = (sppAll < sppCap) && !stopAll && !ft::stopRequested()
+                                   && !budgetSpent();
                         if (writeFrame(0, acc, sppAll)) stopAll = true;
                         midEpoch = false;
                     }

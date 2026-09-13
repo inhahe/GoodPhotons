@@ -2105,38 +2105,47 @@ Verified on all three cases, because a warning that fires in the wrong one is wo
 stays silent and reads "on NVIDIA GeForce RTX 4090"; `-time` + `-device cpu` stays silent, since a
 user who asked for the CPU has lost nothing and telling them otherwise would be false.
 
-**STILL OPEN, BUT MUCH SMALLER THAN TWO EARLIER VERSIONS OF THIS ENTRY CLAIMED.** The entry first
-proposed spp-chunking (wrong: it would pin one photon realization and stop converging), then
-epoch-looping the shared device path (right in principle, scoped as a large new feature). Reading the
-code before building it shows **the epoch loop already exists on the device** and has since 0.253.0 —
-`main.cpp` ~24212, *"THE LIGHT-SIDE REFRESH, ON THE DEVICE, FOR A LONE CAMERA"*. It carries every
-piece the design called for:
+**FIXED IN v0.294.0 for `-time` and `-forever`.** The device already had the epoch loop (0.253.0,
+*"THE LIGHT-SIDE REFRESH, ON THE DEVICE, FOR A LONE CAMERA"*) with `RngSaltScope` per epoch, a
+`PmRadiiPin` so every epoch re-bins at epoch 0's radii, and per-epoch film accumulation. It simply
+could not be told to stop on a clock. Two edits:
 
-* `RngSaltScope(lightEpoch)` per epoch, with **epoch 0 the identity**, so a single-epoch render is
-  bit-for-bit what it always was — the by-construction guarantee that nothing existing changes.
-* `PmRadiiPin`, so epoch 0 adapts the gather radii and later epochs re-bin at exactly those radii.
-  Not cosmetic: the estimate is biased at finite radius, so re-adapting per epoch would average
-  estimators that are not the same estimator. (The entry there records the drift it fixed,
-  0.05781 -> 0.05794 over two epochs.)
-* Per-epoch film capture and accumulation, and the `frac`-driven epoch length.
+1. **The loop's cap and stop test.** `sppAll < spp` became `sppAll < sppCap` with the cap lifted when
+   budgeted, plus a wall-clock test in the loop condition.
+2. **The routing gate** at `main.cpp:23576` now admits a budgeted mode-M camera, but **only when the
+   device route is certain** — every condition the GPU branch itself tests is rechecked, because a
+   budgeted camera that entered `groupM` and then failed the GPU gate would land on the shared CPU
+   branch, which gathers a fixed spp and would ignore the budget outright. That is a worse bug than
+   the one being fixed.
 
-**That comment even names this bug.** It observes that `plainRender` routes a fixed-`-spp` lone camera
-to the refreshing device path *"while the same render with `-time` did not. Two paths, same mode,
-opposite behaviour, decided by a flag that has nothing to do with the light side."*
+**A third edit the first test forced, and the reason to have tested at all.** With only the two edits
+above, `-time 40` ran **101 s** — 2.5x over budget, in a single epoch. `epochSec` is the light-side
+overhead divided by `-beamrefresh`, so on a heavy scene it is deliberately *longer* than a short
+budget; a stop test that only runs *between* epochs cannot bound a render whose epoch outlasts the
+whole budget. The in-epoch callback now ends on the render's clock as well as the epoch's. After
+that: **43 s against a 40 s budget**, the 3 s being scene load and the final write.
 
-**So the remaining work is two small things, not a feature:**
+| arm | device | warning |
+|---|---|---|
+| `-time` + `-device gpu` | **shared photon map on the RTX 4090** | silent |
+| `-noise` + `-device gpu` | CPU threads | warns |
+| `-time` + `-device cpu` | CPU threads | silent |
 
-1. The loop's stop condition is `sppAll < spp` — a total-sample target. It needs the wall-clock,
-   noise and indefinite budgets as additional stop tests.
-2. The grouping gate at `main.cpp:23576` must admit a budgeted mode-M camera into `groupM`. The
-   fold-back gate at 23600 already sends it to the CPU path unless the GPU route is available, so
-   that half needs no change. `-preview` should stay excluded, since the ANSI thumbnail genuinely
-   belongs to the single-camera driver.
+**Still excluded, deliberately:** `-noise` (needs a convergence test this loop does not have),
+`-preview` (the ANSI thumbnail belongs to the single-camera driver), lens cameras, and any group of
+more than one mode-M camera — a flythrough's shared map is the feature, and refreshing it would
+destroy the amortisation *and* give consecutive frames different realizations, which is flicker
+rather than convergence. The warning was reworded to say exactly this, since it had listed `-time`
+among the flags that cost you the device and that is no longer true.
 
-**One trap to respect while doing it:** a MULTI-camera group must keep its single shared map. The
-0.253.0 comment is explicit that refreshing a flythrough would destroy the amortisation that is the
-entire point of the shared path *and* hand consecutive frames different realizations, which is
-temporal flicker rather than convergence. So the budget must only admit a group of exactly one.
+**On verifying no regression, because the obvious test was invalid.** Byte-comparing a non-budgeted
+render before and after would have condemned the change: two runs of the *identical* command already
+differ by max 175 / rms 11.8 on 0-255 values, because the beam realization varies run to run even at
+a fixed seed (sub-beam counts ranged 3 707 554 - 3 711 524 across this session's logs). Measuring
+that floor first, old-vs-new lands at rms 11.9-12.2, i.e. inside it. The stronger argument is by
+construction: with `timeBudgetSec <= 0` and no `-forever`, `sppCap == spp` and both `budgetSpent()`
+tests are constant-false, so all three edits are provable no-ops and `plainRender` renders take
+byte-for-byte the path they always did.
 
 **WHAT THE 20x IS WORTH IS REGIME-DEPENDENT — measured on two scenes, 2026-09-13.** The ratio is
 denominated in spp, so it is worth whatever an spp is worth, and that turns out to differ by a factor
