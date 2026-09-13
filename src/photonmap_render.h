@@ -64,6 +64,23 @@
 // 8 is where the sweep plateaus: it recovers 91 % of `alice_hair`'s -68 % for 1.3-1.7x the
 // gather cost, and 16 buys only a few more points. Lower is NOT better despite scoring well on
 // cloth -- see the Jensen note in known-issues.md.
+// FTRACE_PHOTONBOUNCE=<n> (`-photon-bounce <n>`): cap the LIGHT path's bounce count in
+// tracePhotonPass. It exists because nothing else could reach it. `-max-bounce` governs the
+// CAMERA path, and in mode M that path stops at the first diffuse hit, so `-max-bounce 2`, `32`
+// and `64` produce byte-identical mode-M images -- a perfectly clean, perfectly meaningless null
+// for any question about how far LIGHT travels before it is deposited. The photon side sat at
+// Renderer's struct default of 32 with no flag able to move it.
+// HOST ONLY. The device photon pass in render_cuda.cu has its own cap and does not read this;
+// use -device cpu when sweeping it, and see MAXBOUNCE-IGNORED in known-issues.md.
+inline int photonMaxBounce() {
+    static const int m = [] {
+        const char* e = std::getenv("FTRACE_PHOTONBOUNCE");
+        const int v = e ? std::atoi(e) : 0;
+        return v >= 1 ? v : 32;
+    }();
+    return m;
+}
+
 inline int gatherAreaSamples() {
     static const int m = [] {
         const char* e = std::getenv("FTRACE_GATHERAREA");
@@ -630,7 +647,7 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     std::atomic<long long> tracedTotal{0};
 
     auto worker = [&](int tid, bool aimed) {
-        Renderer r; r.diffraction = diffraction;
+        Renderer r; r.diffraction = diffraction; r.maxBounce = photonMaxBounce();
         if (aimed) {
             // Caustic-only pass: no global deposits (the global map is the main pass's and
             // is normalised by ITS nEmitted), and no beam deposits for the same reason — but

@@ -477,6 +477,20 @@ accepted and ignored:
 
 `REFERENCE.md` claimed the flag "applies to ... the photon modes", which was false; corrected.
 
+**FOLLOW-UP, same day: `-photon-bounce` added, because nothing could reach the light path.**
+Retesting on `-device cpu` produced a *byte-identical* null too — and this time the flag was not
+being dropped. `-max-bounce` caps the CAMERA path, and in mode M that path terminates at the first
+diffuse hit, so capping it at 2 versus 32 genuinely cannot change the image. The light path's cap
+lives on the `Renderer` inside `tracePhotonPass`, which takes no bounce parameter at all and sat at
+the struct default of 32 with no flag able to move it. So the question "does light run out of
+bounces before it reaches the belly" was unaskable, on either device, by any existing means — which
+is a more interesting defect than the dropped flag was.
+
+`-photon-bounce <n>` (host, `FTRACE_PHOTONBOUNCE`, following `gatherAreaSamples()`'s idiom in the
+same file) now caps it. **Sensitivity confirmed before use:** `-photon-bounce 2` vs `32` moves
+`fur_creature` by **-20.4 %** with a max per-pixel difference of 3.0e-02, so a null from this flag
+means something. That check is now the first step of any sweep in this file, not an afterthought.
+
 **THE HYPOTHESIS IS STILL UNTESTED, NOT REFUTED.** No evidence either way was produced about whether
 bounce truncation explains `belly`. Recording it as refuted would have been the worst outcome of the
 tick — a false negative propagated into the file on the strength of a flag that did nothing. The

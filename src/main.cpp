@@ -18829,6 +18829,16 @@ static int run(int argc, char** argv) {
             setenv("FTRACE_GATHERAREA", argv[++i], 1);
 #endif
         }
+        // Cap the LIGHT path's bounces (host mode M / S). `-max-bounce` caps the CAMERA path,
+        // which in mode M ends at the first diffuse hit -- so it cannot answer any question
+        // about how far light travels before deposit. See photonmap_render.h photonMaxBounce().
+        else if (!std::strcmp(argv[i], "-photon-bounce") && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_PHOTONBOUNCE", argv[++i]);
+#else
+            setenv("FTRACE_PHOTONBOUNCE", argv[++i], 1);
+#endif
+        }
         else if (!std::strcmp(argv[i], "-glossy-nee"))    { lt::gGlossyNee = true;  }
         else if (!std::strcmp(argv[i], "-lighttree"))    { lt::gEnabled = true; }
         else if (!std::strcmp(argv[i], "-light-split") && i + 1 < argc) {
