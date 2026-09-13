@@ -2665,14 +2665,34 @@ at gather scale (52.6 against 60.7), the opposite of what long correlated runs w
 
 So an ordering difference cannot matter, a clustering difference is measured to go the wrong way, and
 yet the device's map realizations demonstrably vary 1.63x more from seed to seed. **One of those
-three measurements is answering a different question from the one it appears to.** The most likely
-candidate is the dispersion statistic: cells sized to the gather radius may be far too coarse to see
-structure that a 160x correlation at stride 32 implies. The next step is that same occupancy test
-across several cell sizes rather than one.
+three measurements is answering a different question from the one it appears to.**
 
 *(Also worth keeping: the first version of the correlation probe returned a perfectly clean 0.0000 on
 both arms, which reads as a tidy null. Asking why a null was quite so perfect is what exposed the
 spectral bundle underneath it.)*
+
+**AN ATTEMPT AT THE RIGHT STATISTIC THAT FAILED, AND WHY IT IS WORTH RECORDING.** The quantity that
+would settle this is *how many independent photon paths contribute to one gather* — same photon
+count, fewer distinct contributors, higher realization variance. Since same-path photons are adjacent
+in file order, counting index-runs per gather-sized cell looked like a cheap proxy. It produced a
+tidy-looking result (device 76 photons from 8 runs, host 60 from 15) that **must not be believed**,
+for two independent reasons found after the fact:
+
+1. **The proxy is backend-dependent.** Index adjacency means "same path" only where paths are stored
+   contiguously — which is the device. The host interleaves across 12 threads, so one host path is
+   fragmented into many runs and its run count *overstates* its distinct paths. The statistic is not
+   comparable between the two things it was built to compare.
+2. **The window is a prefix, not a sample.** Reading the first 3 M photons is a near-random sample of
+   an interleaved host map but a spatially-localised subset of a path-contiguous device map. That
+   alone explains the device's apparent 2.6x excess of dense cells (20 677 against 7 801) without any
+   physical difference at all.
+
+**Neither flaw is fixable within the saved format:** correcting the window needs random sampling,
+which breaks the run-counting that needs contiguity; and correcting the proxy needs a path identifier,
+which the map deliberately does not store (`photonmap_io.h`: "What is NOT stored, deliberately: every
+derived structure"). **So the honest next step is instrumentation** — tag each deposit with its path
+id in a debug build and count distinct paths per gather directly. That is a real change rather than
+another analysis of data already on disk, and everything cheaper has now been tried.
 * **The deposit.** Both trace 2 000 000 photons, but how many survive into the map, and with what
   power distribution, has not been compared.
 
