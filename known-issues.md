@@ -598,6 +598,61 @@ post-hoc arithmetic fit to one number, not a measurement, and it is recorded as 
 that would test it is a LAYERED rig — stacked furred shells at a fixed areal density — where the
 prediction is that `ln(1+deficit)` is linear in the number of layers crossed.
 
+### The FIBER gate is the switch, and it brackets the truth: belly reads -33.6 % with it and +46.8 % without
+
+Two ticks running I explained why `-gatherarea` is inert on `belly` and was wrong both times — first
+"its coverage is 1.0 because the belly is smooth and far larger than the disc" (which ignores the
+fur standing on it), then "the tangle gate has already suppressed it". Toggling the gates settles it.
+`fur_creature`, natural radius, seed 3, bias vs the mode-R reference:
+
+| material | px | default | `-tanglegate 0` | `-fibergate 0` | both off |
+|---|---|---|---|---|---|
+| `wall` | 6605 | -0.22 % | -0.22 % | -0.09 % | -0.09 % |
+| `floor` | 5116 | -0.17 % | -0.16 % | -0.03 % | -0.02 % |
+| `coat` | 1369 | -16.99 % | -16.48 % | **+57.51 %** | +67.22 % |
+| `belly` | 743 | -33.61 % | **-33.61 %** | **+46.77 %** | +51.54 % |
+| `tan` | 274 | -19.43 % | -17.07 % | +85.66 % | +104.06 % |
+| `skin` | 195 | -7.85 % | -0.27 % | +72.89 % | +102.84 % |
+
+**The tangle gate is exactly inert on `belly` (-33.61 % both).** It is the FIBER gate that moves it,
+by **80 points**. So the -33 % is the fiber gate selecting the uncorrected branch, and the corrected
+branch is +46.8 %.
+
+**Neither branch is right, and that is the finding.** The truth is bracketed at -33.6 % and +46.8 %
+and the estimator has no setting that reaches it. This is M-GATHERAREA's own thesis measured
+directly on a scene with an exact in-frame null: *no photon statistic can work on a tangle, so the
+fix must be geometric*. The gates are a choice of which way to be wrong.
+
+**Both gates pass a by-construction null.** `wall` and `floor` carry no fur, so neither gate can
+touch them — and they move +0.00 and +0.00 in the paired comparison below. A gate that fired on
+unfurred geometry would invalidate every other column; it does not.
+
+### The tangle gate costs 7.7 points on `skin` here and buys nothing measurable
+
+Scoring the tangle gate as a PAIRED difference per seed — which cancels the seed noise that dominates
+the absolute columns — over two seeds:
+
+| material | base s3 | tg0 s3 | base s7 | tg0 s7 | mean Δ |
+|---|---|---|---|---|---|
+| `wall` | -0.22 % | -0.22 % | +0.13 % | +0.13 % | **+0.00** |
+| `floor` | -0.17 % | -0.16 % | +0.24 % | +0.25 % | **+0.00** |
+| `belly` | -33.61 % | -33.61 % | -32.35 % | -32.34 % | +0.01 |
+| `coat` | -16.99 % | -16.48 % | -16.60 % | -16.17 % | +0.47 |
+| `tan` | -19.43 % | -17.07 % | -19.70 % | -17.32 % | +2.37 |
+| `skin` | -7.85 % | -0.27 % | -9.29 % | -1.50 % | **+7.69** |
+| `eye` | -2.42 % | +0.03 % | +0.93 % | +3.32 % | +2.42 |
+
+Every furred material moves TOWARD zero and every unfurred one does not move at all. `skin` goes
+from -8.6 % to -0.9 %; `tan` from -19.6 % to -17.2 %. The per-seed differences agree to 0.2 points
+(`skin` +7.58 and +7.79), so this is systematic, not noise.
+
+**This is NOT a recommendation to change the default.** The gate was tuned on other scenes, where it
+is recorded as buying -17.7 ± 2.2 points on fur; one scene cannot overturn that, and `eye` is pushed
+from -0.7 % to +1.7 %, i.e. past zero. What it does establish is that **the tangle gate's benefit is
+scene-dependent and is a net cost here**, which the entry did not previously record, and that any
+re-tuning has a cheap paired rig to use: `fur_creature` + `-roi-mask` + the mode-R reference, with
+`wall`/`floor` as a null that provably cannot respond.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
