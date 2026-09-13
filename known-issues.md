@@ -3870,6 +3870,30 @@ where the denominator is dominated by something else is not a measurement of the
 81 %-beams figure was in `-mstats` output that had already been read, on this same scene, in the
 VOLCACHE entry.
 
+**AND MODE `S`'s LIMIT IS CHECKED, NOT ASSUMED (2026-09-12).** SPPM shrinks its gather radius
+every pass, and `sppm_render.h` applies the coverage to each pass's flux **at that pass's own
+radius** — so on a smooth surface the tangent disc becomes locally flat as `R` falls, coverage
+goes to 1, and the correction must switch itself off in the limit. If it did not, mode `S` would
+carry a bias that no number of passes removes. Nobody had checked it. `cornell.ftsl` (spheres, so
+there is curvature for the correction to act on), default against `-gatherarea 0`:
+
+| passes | p99 \|on−off\| | p99.9 | mean ratio |
+|---|---|---|---|
+| 16 | 0.235 | 0.405 | 1.0037 |
+| 256 | **0.192** | **0.291** | 1.0045 |
+
+**The correction weakens as the radius falls**, which is the required behaviour. The drop is modest
+(-18 % / -28 %) because SPPM's radius itself only falls ~35 % over a 16x pass increase — the
+correction is tracking `R`, not lagging it. No evidence of a non-vanishing term.
+
+*One trap worth recording, because it points the wrong way.* The fraction of pixels differing at
+all goes **12.5 % → 100 %**, which reads as the correction *growing*. It is a threshold artifact:
+with more passes the per-pass difference accumulates past the 1e-6 comparison floor in pixels where
+it was previously invisible, while the per-pixel magnitude is falling. The quantiles are the
+statistic; a count of pixels over a fixed threshold is not one. (The two arms' RNG streams do
+*not* diverge here — mode `S` draws coverage probes from a separate `grng` — so the difference is
+the correction rather than resampling.)
+
 **CROSS-SCENE SMOKE TEST OF THE FLIP (2026-09-12), because every number behind it came from one
 scene.** v0.278.0 changes the estimator on every mode-`M` *and* mode-`S` render there is, and mode
 `S` — which shares `gatherCoverage` through `sppm_render.h` — had never been run **once** during
