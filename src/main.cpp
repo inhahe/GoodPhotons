@@ -19143,6 +19143,10 @@ static int run(int argc, char** argv) {
             int v = std::atoi(argv[++i]);
             pbeams::gOrderMax = (v < 0) ? 0 : v;
         }
+        else if (!std::strcmp(argv[i], "-beams-minorder") && i + 1 < argc) {
+            const int v = std::atoi(argv[++i]);
+            pbeams::gOrderMin = (v < 0) ? 0 : v;
+        }
         else if (!std::strcmp(argv[i], "-beams-single") || !std::strcmp(argv[i], "-beams-ss"))
             pbeams::gOrderMax = 1;
         else if (!std::strcmp(argv[i], "-beamradius") && i + 1 < argc) g_beamRadiusAbs = std::atof(argv[++i]);

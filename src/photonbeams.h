@@ -202,6 +202,12 @@
 // See the `beamMS` block in Renderer::tracePhoton for what the number means and why LONG beams
 // make multiple scattering a small change to the transport.
 namespace pbeams { inline int gOrderMax = 0; }
+// `-beams-minorder <n>`: DISCARD chords below scattering order n at deposit time. Unlike
+// `gOrderMax`, which caps further scattering and so changes the photon's path, this changes
+// only what is STORED -- transport is untouched and the omitted chords' energy is simply
+// absent from the estimate. That is what makes it a clean experiment: the measured image
+// change is exactly the energy share those orders carried, with no second-order effects.
+namespace pbeams { inline int gOrderMin = 0; }
 
 // Sentinel for PhotonBeam::order -- "this depositor does not track medium scattering order".
 // See the field's own note for why mode `J` stores this instead of something plausible.
@@ -447,6 +453,9 @@ struct BeamBank {
               double lambda, double absorb, int med, int order,
               const double* lamS = nullptr, int nSec = 0, const double* cieA = nullptr,
               int emIdx = -1, const double* wS = nullptr) {
+        // `-beams-minorder` filter: drop this chord entirely rather than store it.
+        if (pbeams::gOrderMin > 0 && order >= 0 &&
+            order < pbeams::gOrderMin && order < (int)kBeamOrderUnknown) return;
         PhotonBeam b;
         // A VALUE THAT CANNOT BE REPRESENTED BECOMES THE SENTINEL, never the nearest
         // representable order. The first version of this line read

@@ -1470,6 +1470,30 @@ which sounds like preserving the important term and approximating a remainder. I
 the cached part **is** the image, at every depth measured — half of it at `sigma_t 0.6`, essentially
 all of it at 20. There is no regime where the cache is a cheap approximation of a minor contributor.
 
+**AND IT SUGGESTS AN OPTIMISATION THAT NEEDS NO CACHE AT ALL — `-beams-minorder` (v0.298.0).** If
+order-1 carries 0.4 % of the energy at `sigma_t 20` while costing ~17 % of the gather work (18.5 % of
+hits, 16.2 % of candidates), then simply *not storing it* is a saving with a measurable, bounded
+error. The new flag discards chords below a given scattering order **at deposit time**, which leaves
+photon transport untouched — unlike `-beams-order`, which caps further scattering and so changes the
+paths themselves.
+
+**Measured on `_fog_thick`, `-beams-minorder 2` against the default:**
+* **mean radiance falls 0.24 %** — the energy counter predicted 0.4 %, so the prediction holds on the
+  quantity that matters;
+* **timing is inconclusive**: paired reps give 3.54, 1.89 and **-0.94** s, i.e. two of three favour
+  dropping order-1, mean saving ~8 % but with one rep going the other way. The predicted ~10 % is
+  consistent with this but not established by it.
+
+**One confound worth stating rather than burying:** the per-pixel difference reads median 15.7 % of
+level, which is *not* the order-1 contribution. Depositing fewer chords changes which subset the
+`-beamcount` cap keeps, so the two images carry different photon realizations. The frame mean
+averages that out — which is why the 0.24 % is trustworthy and the 15.7 % is not. A clean per-pixel
+number needs `-beamcount 0` on both arms.
+
+**Scope: thick media only.** At `sigma_t 0.6` order-1 carries **50.8 %** of the energy, so
+`-beams-minorder 2` would halve the image there. The flag is a knob for the regime where the energy
+table says it is safe, not a default.
+
 **Consequences for the plan, which should be read before any prototype:**
 * The accuracy bar is the *image* quality bar, not a tolerance on a small term. A cached field good
   to 10 % is a 10 % error on the whole render at high depth.
