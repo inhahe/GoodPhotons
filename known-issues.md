@@ -43,6 +43,16 @@ name files that no longer exist at all, all in closed entries.
 
 ## Open issues
 
+**THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
+inherited. Two moved a long way and in opposite directions: **M-GATHERAREA closed from 36.8 to 8.0
+points** (four defects that partly cancelled, which is why fixing any one alone had always made
+things worse), and **the mode-`J` port was re-priced from ~12x down to ~1.2x** against a measured
+variance ceiling. **VOLCACHE was reopened** — its simple form is scene-dependent rather than dead,
+and it now has safety, payoff (83 % of gather candidates), a runtime predictor and a cell size, all
+measured. One new bug fell out of building the rigs: **BEAMORDER-GPU**, where the device never set
+a beam's scattering order *and* the report counted the untracked chords in its own denominator —
+the third instance of that denominator error this file records.
+
 **WORKING-QUEUE AUDIT (2026-09-11, second of the day).** Of the nine items driving that day's
 autonomous session, **four were already finished** — GLOSSY-NEE's env-light gap (v0.266.3 CPU,
 v0.266.4 device), `_deltalight_mix`'s +0.79 % (closed 2026-09-09 as a single-seed raw-mean
@@ -57,7 +67,7 @@ What that leaves, and where each one's frontier actually is:
 |---|---|
 | M-GATHERAREA | **Mean absolute error 36.8 -> 8.0 over four seeds** (v0.277.0 fiber gate, v0.278.0 bias/gate/ball), and the estimator is now nearly independent of the probe count (mean \|gap\| 3.30 -> 1.06) rather than accurate by cancellation. What is left: fur +7.2 from a different mechanism (the gather ball crossing strands), a cap edge -8.5 from the original disc truncation, hair -7.5, cloth -3.8 |
 | VOLCACHE | the volumetric gather, ~4/5 of a `gallery_rain` frame. **Reopened 2026-09-12**: the simple form is scene-dependent, not dead. A `sigma_t` sweep on one scene, one variable, takes the order >= 2 field's structure **0.367 -> 0.023 -> -0.066** while the single-scatter control **rises** 0.515 -> 0.602 -> 0.761 — so the smoothness is the FIELD's, not the camera ray's path integral, and the stated limitation is settled. Threshold is between 12 % and 36 % of chords at order 7+, a number already printed on the beam-map line |
-| mode-`J` device light pass | the BEAM half — deposit + a device BVH; premise checked, worth ~12x on a thick medium |
+| mode-`J` device light pass | **RE-PRICED DOWN 2026-09-12: ~1.2x, not ~12x.** The device LBVH already landed (v0.272.1-2); what is left is a ~400 ms host residual, not the 51 ms on record. But at FIXED samples the light side is only **32 % of the variance**, so a *perfect* light side — more than the port can deliver — is worth **1.21x**, and that ceiling is flat across a 4x `spp` change because the refresh controller pins the ratio. The old ~12x prices realizations linearly; two independent measurements put the exponent at `N^0.07`-`N^0.33`. Any larger claim rests on a tail statistic that n=4 cannot resolve |
 | UPBP-CONV | **fireflies, not speed** — see (2g): on every statistic not at the mercy of the tail mode `J` already beats mode `D` at equal time (1.37x / 1.28x / 1.52x), while its worst pixel is 3 310 against 532 |
 
 **AND THE TAIL IS NOT A LIGHT-SIDE PROBLEM — measured 2026-09-11, from data already on disk.**
