@@ -26449,10 +26449,32 @@ the C++ `
 heredoc; the fix that finally works is to build the backslash from `chr(92)` and never write an
 escape through the shell at all.
 
-**Limits.** The equality test uses synthetic primitives, so real geometry is covered only indirectly
-by the other three self-tests. And 2-3x is well short of an ideal fork-join's ~10x, because the top
-levels are inherently serial — one thread bins all `n` primitives at the root — which is also why the
-beam caller gains less than the scene one despite being the larger tree.
+**REAL-GEOMETRY VERIFICATION ADDED IN v0.292.1, closing the limit this entry declared.** The
+synthetic-primitive test could not reproduce what actual scenes produce -- degenerate centroids,
+coincident boxes, hair segments, split beams -- so `FTRACE_BVH_VERIFY=1` now makes *every* build
+re-run itself serially and compare node-for-node. It roughly triples build time and is a debugging
+switch, not a default. Every tree in every scene tried is identical:
+
+| tree | prims | result |
+|---|---:|---|
+| `gallery_rain` scene | 2 469 624 | identical |
+| `fur_creature` scene | 1 786 758 | identical |
+| `gallery` scene | 456 769 | identical |
+| **`_fog_thick` beam BVH** | 3 709 615 | identical |
+| small auxiliary tree | 13 | identical |
+
+The beam tree is the one that mattered to check, since it is built from *split beams* rather than
+mesh triangles and is the caller rebuilt every epoch; the 13-prim tree matters for the opposite
+reason, confirming the tiny trees that never fork are still compared rather than skipped.
+
+**End-to-end, measured and predicted in that order.** From the component timings the frame should
+lose the 1.63 s the build no longer spends: 20 s - 1.63 = ~18.4 s. Measured after the change,
+twice: **18 s and 18 s**, against 20 s at v0.291.0 -- **~10 % off a single-epoch frozen frame**, and
+proportionally more on a refreshed render, where the build recurs every epoch instead of once.
+
+**Remaining limit, honestly.** 2-3x is still short of an ideal fork-join's ~10x, because the top
+levels are inherently serial -- one thread bins all `n` primitives at the root -- which is also why
+the beam caller gains less than the scene one despite being the larger tree.
 
 **Where it would still matter, and is not refuted:** the interactive explorer and quick previews,
 where load latency *is* the product rather than a prelude to a long render. A 2.3 s stall before an

@@ -1523,6 +1523,16 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   *slice* (sample range + samples/s), which exposes the per-scanline-band cost structure
   inside a single spp — on a scene with a dense participating-medium band the sky and the
   cloud can differ by more than 10x, and only the slice trace shows it.
+- **`FTRACE_BVH_VERIFY` (parallel-build correctness, debugging).** `FTRACE_BVH_VERIFY=1` makes every
+  BVH build re-run itself **serially** and compare the two node arrays element by element,
+  printing `[bvh-verify] ok: <prims> prims, <nodes> nodes identical` or a FAIL naming how many
+  nodes differ. It roughly triples build time, so it is for verifying a change to the builder, not
+  for normal use. It exists because `-checkbvhparallel` builds *synthetic* primitives, which do not
+  reproduce what real scenes contain (degenerate centroids, coincident boxes, hair segments, split
+  beams); this switch checks the trees an actual scene builds. Verified identical on
+  `gallery_rain` (2.47 M prims), `fur_creature` (1.79 M), `gallery` (0.46 M) and the `_fog_thick`
+  **beam** BVH (3.71 M), plus a 13-prim auxiliary tree.
+
 - **`FTRACE_BVH_TIME` (acceleration-structure build cost).** `FTRACE_BVH_TIME=1` prints one
   `[bvh] <prims> -> <nodes> in <t> s, 1 thread (<n> MB of BuildPrim)` line for every BVH build
   costing more than 0.1 s. Off by default: a scene builds many small trees and the noise buries the

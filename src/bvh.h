@@ -26,6 +26,20 @@ inline bool bvhTimeEnabled() {
     return on;
 }
 
+// FTRACE_BVH_VERIFY=1 makes every build re-run itself serially and compare, so the
+// parallel==serial invariant is checked on REAL scene geometry rather than on the synthetic
+// primitives of -checkbvhparallel. Roughly triples build time, so it is a debugging switch,
+// not something to leave on; but it is the only check that covers the trees an actual scene
+// produces — degenerate centroids, coincident boxes, hair segments, split beams — none of
+// which a generated point cloud reproduces faithfully.
+inline bool bvhVerifyEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_BVH_VERIFY");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
 // Branch-free component fetch (Vec3 is standard-layout with x,y,z contiguous —
 // same trick as Vec3::operator[]); the old two-branch ternary showed up in
 // profiles via the slab test's 6 calls per node.
@@ -154,6 +168,45 @@ struct Bvh {
         stopped = ctx.stop.load(std::memory_order_relaxed);
         primIdx.resize(n);
         for (int i = 0; i < n; ++i) primIdx[i] = bp[i].idx;
+        // Shadow serial rebuild, compared node for node. Skipped when the build never forked
+        // (threads == 1, or a `-stop` landed and made the tree coarse by a path that depends
+        // on timing and so legitimately differs between runs).
+        if (bvhVerifyEnabled() && threads > 1 && !stopped) {
+            std::vector<BvhNode> parNodes = nodes;
+            std::vector<int> parPrim = primIdx;
+            std::vector<BuildPrim> bp2(n);
+            for (int i = 0; i < n; ++i) {
+                bp2[i].box = boxes[i]; bp2[i].centroid = boxes[i].center(); bp2[i].idx = i;
+            }
+            nodes.clear(); nodes.reserve(2 * n);
+            BuildCtx sctx;                       // budget 0 == never forks == the serial build
+            unsigned stick = 0;
+            buildRange(bp2, 0, n, nodes, stick, sctx);
+            primIdx.resize(n);
+            for (int i = 0; i < n; ++i) primIdx[i] = bp2[i].idx;
+            size_t bad = 0;
+            if (nodes.size() != parNodes.size() || primIdx.size() != parPrim.size()) {
+                bad = (size_t)-1;
+            } else {
+                for (size_t i = 0; i < nodes.size(); ++i) {
+                    const BvhNode& x = nodes[i];
+                    const BvhNode& y = parNodes[i];
+                    if (x.left != y.left || x.right != y.right || x.first != y.first ||
+                        x.count != y.count || std::memcmp(&x.box, &y.box, sizeof(Aabb)) != 0) ++bad;
+                }
+                for (size_t i = 0; i < primIdx.size(); ++i)
+                    if (primIdx[i] != parPrim[i]) ++bad;
+            }
+            if (bad == (size_t)-1)
+                std::printf("[bvh-verify] FAIL: %d prims -- serial %zu nodes vs parallel %zu\n",
+                            n, nodes.size(), parNodes.size());
+            else if (bad)
+                std::printf("[bvh-verify] FAIL: %d prims -- %zu of %zu nodes/indices differ\n",
+                            n, bad, nodes.size());
+            else
+                std::printf("[bvh-verify] ok: %d prims, %zu nodes identical\n", n, nodes.size());
+            nodes.swap(parNodes); primIdx.swap(parPrim);   // keep the parallel result
+        }
         if (timeIt) {
             const double el = std::chrono::duration<double>(
                                   std::chrono::steady_clock::now() - t0).count();
