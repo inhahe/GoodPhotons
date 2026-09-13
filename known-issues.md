@@ -2359,6 +2359,38 @@ somewhere between r = 8 and r = 12.** Two readings, and they answer different qu
    thick regime, and the conversion would need redoing on a thin medium where rays see all the way
    through.
 
+**THE SURFACE CACHE ALREADY SOLVES THE SAFETY PROBLEM A DIFFERENT WAY, AND THIS ENTRY'S WHOLE
+ANALYSIS MISSED IT (noticed 2026-09-12 while auditing neighbouring entries).** Everything above
+asks *"is the order >= 2 field smooth enough to cache?"* — an all-or-nothing question, answered
+scene by scene. `-radcache`, the **surface** radiance cache this entry proposes extending, does not
+ask it. Its own entry records a **-18.76 %** raw systematic error per read on `cornell.ftsl` — far
+worse than anything measured here — and it ships anyway, because **`-radcache-validate` verifies
+cached cells against fresh samples and retires the ones it can prove wrong**: 19 corrected and 9
+retired on that scene, pulling -18.76 % to **-0.27 %**.
+
+**That changes what the structure measurements above are FOR.** They were treated as a go/no-go
+gate on the whole feature. With reader verification the requirement is far weaker: the field does
+not need to be smooth, only smooth in *most* cells, with the rest detected and retired. A volume
+cache that inherits that machinery is safe on `gallery_rain` too — the scene this entry currently
+rules out — because the rough cells are exactly the ones verification would retire. The structure
+numbers stop being a gate and become a *predictor of the retirement rate*, i.e. of how much of the
+83 % cacheable share the cache actually gets to keep.
+
+**Two more things transfer from that entry, and both were independently re-derived here at cost:**
+
+* Its listed proper fix is *"a **directional (SH / spherical-Gaussian) cell payload** instead of a
+  scalar mean per normal bucket"* — the same answer the diffusion argument gives for volumes
+  (scalar plus a flux vector). The surface and volume caches want the same payload upgrade.
+* *"Cell averaging is a low-pass filter"* and *"a caustic's radiance varies enormously within one
+  cell"* is the surface statement of exactly what `scraps/vc_cell.py` measures for volumes. The
+  cell-sizing rig above would work on the surface cache unchanged, and the surface cache has never
+  had its cell size measured that way.
+
+**The lesson about method, since it cost a whole investigation's worth of framing:** this entry
+proposes extending a feature that already exists, and the existing feature's own entry contains
+both the architecture and the escape hatch. Reading the neighbour first would have reframed the
+safety question before any of the renders above were run.
+
 **The rig is two scripts and four renders**, so re-testing on another scene is cheap:
 `-beamradius` pinned, two seeds, `scraps/ms_struct.py`. A scene whose medium is genuinely
 diffuse — `_fog_thick`, which measures 82.8 % order >= 2 against `gallery_rain`'s 40.7 % — is the
