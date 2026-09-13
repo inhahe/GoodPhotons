@@ -8,115 +8,71 @@
 // The geometric footprint: same-facing surface area inside the gather ball, measured from
 // the GEOMETRY rather than inferred from a photon statistic.
 //
-// TWO PRIMITIVE CASES, because the census showed spheres average 0-1.7 per ball and
-// implicits and instances are exactly 0.0 in every scene this entry uses. They keep the
-// present behaviour and cost nothing.
+// WHY IT MARCHES RAYS INSTEAD OF CLASSIFYING PRIMITIVES. The first version walked the BVH's
+// candidate primitives and computed each one's area analytically, which needed a routine per
+// primitive class. It had two routines — triangles and curve segments — chosen from a census
+// taken on `fur_creature`, which happens to contain nothing else. `gallery_rain`, the scene
+// the queue actually names, is built from implicit isosurfaces: that version reported
+// footprint 0.0000 over 38 gathers on a solid marble cap, because a skipped class does not
+// drop out of the answer, it silently subtracts its area.
 //
-// TRIANGLES ARE SAMPLED THROUGH THE DISC, NOT OVER THEMSELVES. Sampling a primitive's own
-// surface collapses when the primitive dwarfs the ball: `_ga_null`'s floor is a 12 m quad
-// and a 0.05 m ball covers 1e-4 of it, so a few dozen samples over the triangle would
-// return zero almost always. Casting through stratified points of the tangent disc instead
-// makes the cost per primitive independent of its size.
+// Marching the ray removes the whole category of error. Every surface the renderer can
+// intersect is counted, by the intersector the renderer already trusts, with no per-class
+// code to be complete or incomplete. Triangles, spheres, implicits, curve segments and
+// instances all work, and a class added later works without touching this file.
 //
-// AND IT DELIBERATELY IGNORES OCCLUSION, which is the whole point. The shipped probe takes
-// the NEAREST hit along each ray, so on a coat it measures the first layer while the query
-// gathers from the entire ball — the failure this entry documents, and which the census put
-// at ~600 curve segments per ball against ~3 on flat ground. Testing every candidate
-// primitive against every disc ray counts all layers, so the two finally measure the same
-// region.
+// IT IGNORES OCCLUSION ON PURPOSE — that is the entire point. The shipped probe takes the
+// NEAREST hit along each ray, so on a coat it measures the first layer while the query
+// gathers from the whole ball; the census put that at ~600 curve segments per ball against
+// ~3 on flat ground. Marching past each hit and continuing counts every layer, so the
+// footprint and the photon query finally describe the same region.
 //
-// `1/|cos|` is the projection Jacobian: a disc ray meeting a surface at a slant subtends
-// more surface area than the disc cell it came from.
-// `incomplete` (optional) is set when the ball contains a primitive class this function
-// CANNOT measure -- spheres, implicits, instances. That is not a corner case: the census
-// that justified handling only triangles and curve segments was taken on `fur_creature`,
-// which has none of them, while `gallery_rain` -- the scene the queue names as the target
-// -- is built from implicit isosurfaces and reports 2 to 6 of them per ball. Skipping a
-// class silently returns a near-zero area, which after the divide becomes a 64-fold
-// over-brightening. A caller that gets `incomplete` must fall back rather than use the
-// number.
+// `1/|cos|` is the projection Jacobian: a ray meeting a surface at a slant subtends more
+// surface area than the disc cell it came from. `|dot|` rather than `dot` because a hit
+// normal is oriented against the ray, and a back-facing layer occupies area just the same.
+//
+// `incomplete` (optional) is set when a ray hit the layer cap, i.e. the chord held more
+// surfaces than were counted, so the area is an under-count and the caller should not
+// divide by it.
 inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
-                                  double r, int kDisc, int kCurve,
+                                  double r, int kDisc, int maxLayers,
                                   bool* incomplete = nullptr) {
     if (incomplete) *incomplete = false;
-    const size_t nT = sc.tris.size(), nS = sc.spheres.size(),
-                 nI = sc.implicits.size(), nC = sc.curveSegs.size();
-    const double r2 = r * r, kPi = 3.14159265358979323846;
-    if (kDisc < 1) kDisc = 1;
-    if (kCurve < 1) kCurve = 1;
-    // Tangent frame and the stratified disc samples, built once per gather.
+    if (!(r > 0.0) || kDisc < 1) return 0.0;
+    if (maxLayers < 1) maxLayers = 1;
+    const double kPi = 3.14159265358979323846;
+    const double r2 = r * r;
+    const double eps = (r * 1e-4 > 1e-9) ? r * 1e-4 : 1e-9;   // scale-relative, not absolute
+
     Vec3 t1 = (std::fabs(n.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
     t1 = normalize(cross(t1, n));
     const Vec3 t2 = cross(n, t1);
-    std::vector<Vec3> disc;
-    disc.reserve((size_t)kDisc);
-    for (int i = 0; i < kDisc; ++i) {
-        // Sunflower placement: equal-area radii, golden-angle azimuth. Deterministic, so
-        // two runs of the same scene give the same footprint and an A/B is not comparing
-        // two different random draws.
-        const double rr = r * std::sqrt((i + 0.5) / (double)kDisc);
-        const double th = (double)i * 2.39996322972865332;
-        disc.push_back(p + (t1 * std::cos(th) + t2 * std::sin(th)) * rr);
-    }
+
     const double cellArea = (kPi * r2) / (double)kDisc;
     double area = 0.0;
-    sc.bvh.traverseSphere(p, r, [&](int pi) {
-        size_t u = (size_t)pi;
-        if (u < nT) {
-            const Tri& t = sc.tris[u];
-            const double cs = dot(t.gn, n);
-            if (std::fabs(cs) < 0.5) return;        // not same-facing: the photon query
-            const Vec3 e1 = t.v1 - t.v0, e2 = t.v2 - t.v0;   // rejects these too
-            for (const Vec3& q : disc) {
-                // Ray (q, n) against the triangle, unbounded in both directions.
-                const Vec3 pv = cross(n, e2);
-                const double det = dot(e1, pv);
-                if (std::fabs(det) < 1e-18) continue;
-                const double inv = 1.0 / det;
-                const Vec3 tv = q - t.v0;
-                const double bu = dot(tv, pv) * inv;
-                if (bu < 0.0 || bu > 1.0) continue;
-                const Vec3 qv = cross(tv, e1);
-                const double bvv = dot(n, qv) * inv;
-                if (bvv < 0.0 || bu + bvv > 1.0) continue;
-                const double tt = dot(e2, qv) * inv;
-                const Vec3 hitp = q + n * tt;
-                if (dot(hitp - p, hitp - p) <= r2) area += cellArea / std::fabs(cs);
-            }
-            return;
+    for (int i = 0; i < kDisc; ++i) {
+        // Sunflower placement: equal-area radii, golden-angle azimuth. Deterministic, so two
+        // runs of the same scene give the same footprint and an A/B compares one thing.
+        const double rr = r * std::sqrt((i + 0.5) / (double)kDisc);
+        const double th = (double)i * 2.39996322972865332;
+        const Vec3 q = p + (t1 * std::cos(th) + t2 * std::sin(th)) * rr;
+        // The chord of the ball along n through q. Outside it there is no ball to be in.
+        const double half = std::sqrt((r2 - rr * rr > 0.0) ? (r2 - rr * rr) : 0.0);
+        if (!(half > 0.0)) continue;
+        const Vec3 start = q - n * half;
+        const double span = 2.0 * half;
+        double t0 = eps;
+        int layers = 0;
+        for (; layers < maxLayers; ++layers) {
+            Ray ray{start, n};
+            Hit h = sc.closestHit(ray, t0, nullptr, /*skipHair=*/false,
+                                  /*skipCamHidden=*/true);
+            if (!h.valid || h.t > span) break;
+            const double c = std::fabs(dot(h.n, n));
+            if (c >= 0.5) area += cellArea / c;   // same-facing: what the photon query keeps
+            t0 = h.t + eps;
         }
-        u -= nT; if (u < nS) { if (incomplete) *incomplete = true; return; }   // spheres
-        u -= nS; if (u < nI) { if (incomplete) *incomplete = true; return; }   // implicits
-        u -= nI; if (u >= nC) { if (incomplete) *incomplete = true; return; }  // instances
-        // A curve segment is a thin cylinder whose size is COMPARABLE to the ball, so here
-        // sampling the primitive itself is the cheap and accurate way round — the opposite
-        // of the triangle case, and for the opposite reason.
-        const CurveSeg& s = sc.curveSegs[u];
-        const Vec3 ax = s.p1 - s.p0;
-        const double L = std::sqrt(dot(ax, ax));
-        if (!(L > 0.0)) return;
-        const Vec3 az = ax * (1.0 / L);
-        Vec3 c1 = (std::fabs(az.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
-        c1 = normalize(cross(c1, az));
-        const Vec3 c2 = cross(az, c1);
-        const double lat = 2.0 * kPi * (0.5 * (s.r0 + s.r1)) * L;
-        int acc = 0, tot = 0;
-        for (int a = 0; a < kCurve; ++a) {
-            const double fa = (a + 0.5) / (double)kCurve;
-            const Vec3 cc = s.p0 + ax * fa;
-            const double rr = s.r0 + (s.r1 - s.r0) * fa;
-            for (int b = 0; b < kCurve; ++b) {
-                const double th = 2.0 * kPi * ((b + 0.5) / (double)kCurve);
-                const Vec3 nn = c1 * std::cos(th) + c2 * std::sin(th);
-                const Vec3 q = cc + nn * rr;
-                ++tot;
-                // Facing is tested PER SAMPLE here: a cylinder's normal turns right around
-                // its circumference, so one verdict for the whole segment would be meaningless.
-                if (dot(q - p, q - p) <= r2 && std::fabs(dot(nn, n)) >= 0.5) ++acc;
-            }
-        }
-        if (tot) area += lat * (double)acc / (double)tot;
-    });
+        if (layers >= maxLayers && incomplete) *incomplete = true;
+    }
     return area;
 }
-

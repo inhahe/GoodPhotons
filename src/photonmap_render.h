@@ -101,11 +101,15 @@ inline int gaGeomDisc() {
     }();
     return n;
 }
-inline int gaGeomCurve() {
+// Max surfaces counted along one disc ray. The footprint marches past each hit and keeps
+// going, so this bounds the work on a tangle -- a coat's chord can cross dozens of strands.
+// Hitting the cap sets `incomplete` and the estimator falls back rather than divide by an
+// under-count.
+inline int gaGeomLayers() {
     static const int n = [] {
-        const char* e = std::getenv("FTRACE_GAGEOMCURVE");
+        const char* e = std::getenv("FTRACE_GAGEOMLAYERS");
         const int v = e ? std::atoi(e) : 0;
-        return v >= 1 ? v : 4;
+        return v >= 1 ? v : 32;
     }();
     return n;
 }
@@ -316,7 +320,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
         // forced this -- its caps are implicit isosurfaces and the first build of this path
         // reported footprint 0.0000 on a solid marble cap, which is impossible.
         bool incomplete = false;
-        const double raw = gatherFootprintArea(scene, p, n, r, gaGeomDisc(), gaGeomCurve(),
+        const double raw = gatherFootprintArea(scene, p, n, r, gaGeomDisc(), gaGeomLayers(),
                                                &incomplete);
         if (!incomplete) {
         const double cov = raw / denom;

@@ -18313,7 +18313,7 @@ static int run(int argc, char** argv) {
     const char* roiMaskFile  = nullptr;
     double gaFootprintR = 0.0;   // -gafootprint <r>
     double gaFpAreaR = 0.0;      // -gafparea <r>
-    int    gaFpDisc = 64, gaFpCurve = 4;
+    int    gaFpDisc = 64, gaFpCurve = 32;   // gaFpCurve is now the per-ray LAYER CAP
     int    gaFootprintStride = 4;
     double    roiMinPurity = 0.60;
     double    roiMinShare  = 0.50;

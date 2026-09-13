@@ -360,7 +360,7 @@ inline int gaFootprintReport(const Scene& scene, const Camera& cam, int resX, in
 // 1.0 BY CONSTRUCTION -- a ball centred on a plane meets it in a disc of exactly pi r^2 --
 // which makes `_ga_null` a test that can fail rather than a demonstration that cannot.
 inline int gaFpAreaReport(const Scene& sc, const Camera& cam, int resX, int resY,
-                          double r, int stride, int kDisc, int kCurve) {
+                          double r, int stride, int kDisc, int maxLayers) {
     struct Stat { long long n = 0, inc = 0; double sum = 0, lo = 1e30, hi = -1e30; };
     std::vector<Stat> st(sc.mats.size());
     const double denom = 3.14159265358979323846 * r * r;
@@ -372,7 +372,7 @@ inline int gaFpAreaReport(const Scene& sc, const Camera& cam, int resX, int resY
                                   /*skipCamHidden=*/true);
             if (!h.valid || h.matId < 0 || h.matId >= (int)st.size()) continue;
             bool incomplete = false;
-            const double a = gatherFootprintArea(sc, h.p, h.n, r, kDisc, kCurve,
+            const double a = gatherFootprintArea(sc, h.p, h.n, r, kDisc, maxLayers,
                                                  &incomplete) / denom;
             Stat& s = st[h.matId];
             ++s.n; if (incomplete) ++s.inc;
@@ -380,8 +380,8 @@ inline int gaFpAreaReport(const Scene& sc, const Camera& cam, int resX, int resY
             if (a < s.lo) s.lo = a;
             if (a > s.hi) s.hi = a;
         }
-    std::printf("[gafparea] radius %.5g, every %dth pixel, %d disc rays, %dx%d curve samples\n",
-                r, stride, kDisc, kCurve, kCurve);
+    std::printf("[gafparea] radius %.5g, every %dth pixel, %d disc rays, %d layers max\n",
+                r, stride, kDisc, maxLayers);
     std::printf("%-22s %8s %12s %10s %10s %9s\n",
                 "material", "gathers", "footprint", "min", "max", "UNMEAS.");
     std::printf("%-22s %8s %12s %10s %10s %9s\n",

@@ -1009,6 +1009,45 @@ means sampling an isosurface's area inside a ball, which is a real piece of work
 scoped. Recorded so the next person does not re-derive the two-class conclusion from the same one
 scene.
 
+### The footprint now MARCHES rays instead of classifying primitives — and gallery_rain becomes measurable
+
+The per-class version needed an area routine per primitive kind and had two, chosen from a census
+taken on `fur_creature`. `gallery_rain` is built from implicit isosurfaces, so it reported
+**0.0000 on a solid marble cap** — a skipped class does not drop out of the answer, it silently
+subtracts its area.
+
+**Marching removes the category, not just the instance.** Each disc ray is traced through the scene,
+its hit recorded, and the trace resumed just past it until the ball's chord is exhausted. Every
+surface the renderer can intersect is counted, by the intersector the renderer already trusts, with
+no per-class code to be complete or incomplete — and a primitive class added later works without
+touching the file. It is also, by construction, the all-layer probe this entry has wanted since the
+census: the shipped probe takes the NEAREST hit and so sees one layer of a ~600-segment ball.
+
+**Verified against the analytic answer and then on the target scene:**
+
+| scene | material | footprint | unmeasurable |
+|---|---|---|---|
+| `_ga_null` | `white` (12 m flat quad) | **1.0000** (min = max) | **0 %** |
+| `gallery_rain` | `gridground` (flat ground) | **1.0079** | 0 % |
+| | `capmarble_gold` | 0.9634 | 0 % |
+| | `capmarble_axicon` | 0.7939 | 0 % |
+| | `capmarble_gyroidx` | 0.7150 | 0 % |
+| | `wirecage` (thin wire) | **0.5104** | 0 % |
+| | `capmarble_alice` | 1.4745 | 0 % |
+| | `gold` | 1.0838 | 0 % |
+
+Every row is now measurable, and every value is physically sensible without being told what to
+expect: flat ground sits at 1.0 in a real scene as it does in the synthetic one, cap edges clip
+BELOW a full disc, a thin wire is about half of one, and the curved and multi-layer caps exceed it.
+`capmarble_gyroidx` at 0.715 and `capmarble_axicon` at 0.794 are the `cap_gyroid` family the queue
+names, and they are exactly the "footprint smaller than pi r^2" case M-GATHERAREA was filed for.
+
+**Cost, stated plainly.** Each gather now fires `kDisc` rays (64 by default) and re-traces past every
+hit, so the estimator path is one to two orders of magnitude more expensive per gather than the 8-ray
+probe. That is acceptable for a CPU prototype behind a flag and is NOT a shippable default; the
+`incomplete` flag now means only that a ray hit the 32-layer cap, in which case `-gageom` still falls
+back to the probe.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
