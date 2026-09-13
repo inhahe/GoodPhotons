@@ -1450,6 +1450,34 @@ by all four materials, and `red`'s magnitude.
 *The four sections below are the derivations, accumulated over several sittings and partly
 superseding one another. This is what they add up to; read it before adding an experiment.*
 
+**THE ACCURACY BAR, measured (v0.297.1) — and it reframes the design.** Every share above counts
+*work*. This counts the *answer*: what fraction of the gathered radiance comes from the chords a
+cache would replace.
+
+| `sigma_t` | candidates (work) | hits (work) | **energy (answer)** |
+|---:|---:|---:|---:|
+| 0.6 | 49.5 % | 42.5 % | **49.2 %** |
+| 6 | 63.5 % | 55.4 % | **61.4 %** |
+| 20 | 83.8 % | 81.5 % | **99.6 %** |
+
+**At `sigma_t 20`, order >= 2 carries 99.6 % of the radiance — order-1 contributes 0.4 %.** Note the
+energy share *exceeds* the work share there (99.6 against 81.5), because at high optical depth
+single-scatter light barely penetrates, so the multiply-scattered chords are individually brighter as
+well as more numerous.
+
+**This changes what VOLCACHE is.** The hybrid was framed as "keep order-1 exact and cache the rest",
+which sounds like preserving the important term and approximating a remainder. It is the opposite:
+the cached part **is** the image, at every depth measured — half of it at `sigma_t 0.6`, essentially
+all of it at 20. There is no regime where the cache is a cheap approximation of a minor contributor.
+
+**Consequences for the plan, which should be read before any prototype:**
+* The accuracy bar is the *image* quality bar, not a tolerance on a small term. A cached field good
+  to 10 % is a 10 % error on the whole render at high depth.
+* The `order-1 exact` half of the hybrid buys almost nothing at high depth (0.4 % of energy) while
+  still costing its full deposit, BVH build and traversal. **Whether it is worth keeping at all is
+  now an open question** — a pure cache might be both faster and simpler than the hybrid.
+* The 51-58 % speed ceiling is unchanged; what changed is the risk attached to claiming it.
+
 **What it would replace:** the `order >= 2` share of the beam gather. Order-1 chords stay by design,
 so their deposit, their BVH build and their traversal are charged in full whatever happens.
 

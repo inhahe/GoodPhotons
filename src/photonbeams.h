@@ -590,6 +590,11 @@ struct BeamDiag {
     // different rate from order-1 ones -- they are shorter and more scattered, so they might be
     // -- the two shares differ and VOLCACHE's ceiling sits between them rather than at 83 %.
     mutable std::atomic<long long> passMS{0};
+    // ENERGY, not just test count. The two shares above say what fraction of the WORK is
+    // cacheable; this says what fraction of the ANSWER is. Different questions, different
+    // bars: a cache carrying 80 % of the radiance must be accurate, one carrying 20 % need
+    // only be cheap. Nothing here had measured it.
+    mutable std::atomic<double> wAll{0.0}, wMS{0.0};
     mutable std::atomic<long long> pass{0}, rejMed{0}, rejSS{0}, rejPh{0}, rejW{0}, rejTr{0};
     mutable std::atomic<long long> minRatio{1LL << 62};  // min (d_perp/r) * 1e6, as an integer
     void bump(std::atomic<long long>& c) const {
@@ -620,6 +625,10 @@ struct BeamDiag {
             passMS.load(),
             pass.load() ? 100.0 * (double)passMS.load() / (double)pass.load() : 0.0,
             cand.load() ? 100.0 * (double)candMS.load() / (double)cand.load() : 0.0);
+        std::fprintf(stderr,
+            "[beamdiag] and of the gathered ENERGY, %.1f %% comes from order >= 2 -- the accuracy\n"
+            "           bar a cache must meet, as distinct from the work shares above\n",
+            wAll.load() > 0.0 ? 100.0 * wMS.load() / wAll.load() : 0.0);
         std::fprintf(stderr,
             "[beamdiag] geometric hits %lld | dropped by: bad medium %lld, sigma_s<=0 %lld,"
             " phase<=0 %lld, weight<=0 %lld, transmittance<=0 %lld\n",

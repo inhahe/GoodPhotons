@@ -317,6 +317,11 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         if (bh.sBeam > 0.0)  w *= mats.mediaTransmittance(scene, b.o, b.d, bh.sBeam, lam, rng);
         if (bh.tCam  > 0.0)  w *= mats.mediaTransmittance(scene, oc, dc, bh.tCam, lam, rng);
         if (!(w > 0.0)) { beamDiag().bump(beamDiag().rejTr); return; }
+        if (beamDiag().on) {
+            beamDiag().wAll.fetch_add(w, std::memory_order_relaxed);
+            if (b.order >= 2 && b.order != kBeamOrderUnknown)
+                beamDiag().wMS.fetch_add(w, std::memory_order_relaxed);
+        }
         acc += (bow ? bowCie : bm.cie[bh.idx]) * w;
         // SECONDARY wavelengths of the bundle. They share this beam's geometry, its kernel
         // weight and BOTH transmittance marches — the bundle only exists on a path whose
