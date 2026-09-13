@@ -2071,13 +2071,39 @@ rather than traded away. The per-chunk hook needed for the stop test already exi
 (`liveProg.report` returns "stop after this chunk", and is how a closed window ends a gather), but it
 is armed only under `g_showWindow` and would have to be unconditional.
 
-**A caveat on my own 20x that cuts the other way:** both arms of that measurement carried
-`-beamfreeze`, i.e. both were forbidden to refresh. That makes the throughput comparison fair, but it
-means the 20x was measured in the one configuration where the shared path's inability to refresh
-costs it nothing. An epoch-looping implementation pays a rebuild per epoch that the `-spp` arm never
-paid, so **do not expect the fixed version to be 20x** — the honest prediction is "somewhat less, by
-an unmeasured amount". Worth measuring against a reference rather than by reported `% noise`, which
-is computed from the film and so keeps falling on a frozen map even while the map error does not.
+**THE 20x IS NOT 20x THE IMAGE — measured 2026-09-13, and it overturns this entry's own headline.**
+The ratio is denominated in spp, so it is only worth what an spp is worth, and on a frozen map an spp
+is worth almost nothing. Scored by seed-to-seed spread on `_fog_thick` at 256² (the two seeds
+differenced at MATCHED spp, so the photon realization is held fixed by construction and gather noise
+is the only term that can fall):
+
+| spp | seed-to-seed RMS | as % of signal level |
+|---:|---:|---:|
+| 8  | 44.83 | 63.5 % |
+| 32 | 43.67 | 62.0 % |
+
+**Ratio 1.026, where pure gather noise predicts 2.000.** Quadrupling the samples removed 2.6 % of the
+seed-to-seed difference. The photon realization dominates the image so completely that spp is nearly
+irrelevant on this scene — which means the budgeted CPU path, slower per sample, was spending its
+time on the axis that actually converges (independent map realizations) while the fast `-spp` arm
+accumulated samples that barely moved the picture.
+
+So the original framing — "a silent 20x penalty on the documented workflow" — is **too strong**. What
+is certain is the routing (`-device gpu` is disregarded, log lines name the device, beam uploads 1
+against 0) and the per-sample throughput. What is NOT established is that the budgeted render
+produces a worse image per second; on this scene it plausibly produces a better one. The 0.290.1
+warning text said "a fixed -spp gathers the same image on the device", which is false, and was
+corrected in 0.290.2 to report the lost device without recommending `-spp` as a substitute.
+
+**A second caveat, which cuts the same way:** both arms of the 20x carried `-beamfreeze`, i.e. both
+were forbidden to refresh — exactly the configuration where the shared path's inability to refresh
+costs it nothing. An epoch-looping implementation pays a rebuild per epoch the `-spp` arm never paid,
+so do not expect the fixed version to be 20x either.
+
+**Method note for whoever measures this next:** do not score it by the reported `% noise`, which is
+computed from the film and so keeps falling on a frozen map even while the map error does not — the
+table above is the demonstration of exactly that trap. Score seed-to-seed at matched spp, or against
+a reference.
 
 **Caveat on my own numbers:** one scene, one resolution, single runs of each arm, so the 20x is a
 ratio of two unreplicated timings and should read as "more than an order of magnitude". The

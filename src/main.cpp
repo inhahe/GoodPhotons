@@ -23596,6 +23596,15 @@ static int run(int argc, char** argv) {
     // CPU threads at ~16 s/spp and never uploads the beams at all. Roughly 20x, from two
     // unreplicated timings -- read it as "more than an order of magnitude", not as 20.00.
     //
+    // DO NOT READ THAT 20x AS 20x THE IMAGE. It is denominated in spp, and on a frozen map spp
+    // is nearly worthless: scoring seed-to-seed spread on `_fog_thick` (two seeds differenced
+    // at matched spp, so gather noise is the only thing that can fall) gives RMS 44.83 at
+    // spp 8 against 43.67 at spp 32 -- a ratio of 1.026 where pure gather noise predicts
+    // 2.000. Quadrupling the samples removed 2.6% of the difference, because the photon
+    // realization dominates it entirely. The budgeted CPU path is slower per sample but spends
+    // the time on independent map realizations, which is the axis that actually converges. So
+    // this NOTE reports the lost device WITHOUT recommending -spp as a substitute for it.
+    //
     // That matters more than it looks: CLAUDE.md tells the operator to prefer a bounded budget
     // over a giant `-n`, so the DOCUMENTED default workflow is the slow one. Until the shared
     // path can honour a budget, the least owed is a word, in the idiom `-radcache` already
@@ -23606,9 +23615,10 @@ static int run(int argc, char** argv) {
             cudaAvailable() && cudaPhotonMapSupported(scene))
             std::printf("[camera] NOTE: -time/-noise/-forever/-preview put mode M on the "
                         "single-camera progressive driver, which is CPU-only, so this render "
-                        "will NOT use %s. A fixed -spp gathers the same image on the device "
-                        "(measured >10x faster). The shared GPU map gathers a fixed spp per "
-                        "frame and so cannot honour a budget.\n", cudaDeviceName());
+                        "will NOT use %s. That driver refreshes the photon map every epoch, "
+                        "which is what actually converges mode M; a fixed -spp does run on "
+                        "the device, but gathers ONE map realization, so raise -n as well "
+                        "rather than -spp alone.\n", cudaDeviceName());
 #endif
     }
     // A single-camera forward group has nothing to share — fold it back into the per-camera
