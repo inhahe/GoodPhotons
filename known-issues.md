@@ -1363,6 +1363,48 @@ fraction that disables what it measures, the initialiser mistaken for a default 
 before running eight renders and publishing a conclusion. **Reading the flag costs one grep; not
 reading it cost three sweeps and a retracted entry.**
 
+### Radiance-cache cell size, measured properly: termination is strongly cell-dependent, the auto-sizer is CONSERVATIVE
+
+Fourth attempt, and the first valid one: CPU (the GPU has no cache), validation left at its **0.05
+default** (1 disables termination by construction), cell varied alone. `cornell.ftsl`, mode R,
+256 spp, seed 3, scored per material against a 1024-spp no-cache reference.
+
+| cell | x auto | ready | **terminated** | white | red | green | glass |
+|---|---|---|---|---|---|---|---|
+| **off** (no cache) | — | — | — | +0.44 % | -0.29 % | +0.41 % | -1.43 % |
+| 0.10 | 0.25x | 9 | 0.7 % | +1.11 % | +0.12 % | +0.89 % | +1.16 % |
+| 0.20 | 0.50x | 2 | 0.2 % | +0.42 % | -0.40 % | +0.30 % | -1.59 % |
+| **0.40 (auto)** | **1.00x** | 5 | **3.3 %** | +0.48 % | -0.21 % | +0.45 % | -1.26 % |
+| 0.80 | 2.00x | 3 | **24.6 %** | +0.09 % | -0.40 % | +0.22 % | -1.91 % |
+
+**The `off` row is the point of the table.** At 256 spp against a 1024-spp reference the *no-cache*
+render is already 0.44 / -0.29 / 0.41 / -1.43 off — that is sampling noise, not cache error, and it
+is the same size as every difference between the cache arms. Without that row one could read
+"cell 0.10 costs +1.11 % on white" as a cache cost; against `off` it is one noise floor from
+nothing.
+
+**What IS resolved, because it is a count and not a noisy mean: the termination rate.** It goes
+0.7 % → 0.2 % → **3.3 %** → **24.6 %** across a 8x span of cell size. At the cell the auto-sizer
+chooses the cache answers **3.3 %** of consults; at twice that it answers **24.6 %**, a 7x gain.
+
+**So the auto-sizer looks conservative on this scene** — doubling its cell buys seven times the
+utilisation, and the per-material error does not visibly follow. That is a suggestion, NOT a result:
+the error column cannot resolve a change smaller than its own noise floor, and one seed at 256 spp
+on one scene cannot separate a 0.5-point drift (`glass` -1.43 % off vs -1.91 % at 2x) from chance.
+Establishing it needs several seeds and a higher reference, and the honest statement today is that
+**utilisation is strongly cell-dependent and well measured; the error cost is below what this rig
+resolves.**
+
+**Two structural facts fell out, both worth keeping:**
+
+* **A cell at or beyond the scene size collapses to one configuration.** Cells 0.80 and 1.60 give
+  byte-identical images and identical statistics (3 ready, 5 retired, 469800/1910363). `cornell` is
+  a unit box, so past ~0.8 every point lands in the same cells and asking for more does nothing.
+* **`ready` count is not utilisation.** Cell 0.10 has the MOST ready cells (9) and nearly the LEAST
+  termination (0.7 %); cell 0.80 has 3 ready and 24.6 %. Many small ready cells in the wrong places
+  beat by few large ones in the right places — so the status line's `ready` figure should not be
+  read as a health indicator, which is exactly how I read it two entries ago.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
