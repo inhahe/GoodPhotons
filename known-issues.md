@@ -31,6 +31,36 @@ from the four field sites, and the mode-`J` flyby still falls to `restIdx` at `m
 Both belong to the same family as the `cmd /c` failure this script was written for: the harness
 said nothing, and silence was read as information.
 
+**THE ONE MEASUREMENT ERROR THIS PROJECT KEEPS MAKING, in the header because it has now caused
+SEVEN wrong conclusions and each was recorded only in its own entry.** Every one has the same
+shape: **the thing measured was not the thing meant**, and in every case the number looked
+perfectly reasonable. Not one was caught by thinking harder about the value; every one was caught
+by going back to the definition.
+
+| what was compared | why it was wrong |
+|---|---|
+| `GaDiagMat::fiber` % | a per-gather-point counter divided by a per-**probe** total — capped at 1/M, so 15.9 % read as "hopeless" when the truth was 100 % |
+| `-beamk`'s knee | a **fixed-seed** probe count in a denominator, contributing no seed-to-seed variance |
+| BEAMORDER-GPU | untracked chords (`order == 0`) counted as *known*, dropped from the printed row but kept in the denominator |
+| "the probes are free" | probe cost measured on a scene where `-mstats` puts **81 %** of the gather in beams |
+| mode-`J` "8.7x regression" | totals divided by **different epoch counts** (5 against 17) |
+| `cap_gyroid` coverage | a **per-material** histogram compared against an **edge-strip ROI**'s requirement |
+| `cap_gyroid` material | analysed `capmarble_gyroidx` because the ROI is *named* `cap_gyroid`; its definition says `capmarble_gold`, "clear of the gyroid" |
+
+**The check that would have caught all seven, and it is one sentence: before comparing two numbers,
+say out loud which population each is drawn from, and confirm they are the same one.** For a
+diagnostic specifically: **every member of the denominator must be able to contribute to the
+numerator.** For an ROI: **open the file that defines it** — `scraps/gallery_rain.rois` carries a
+comment on every box naming the material and what it deliberately excludes.
+
+**Why this keeps happening is worth naming too.** These are not arithmetic slips; the arithmetic
+was right every time. The failure is that a *name* (`fiber%`, `cap_gyroid`, "light side", "beam
+BVH") gets treated as a definition. A name is a label someone chose for a population, and the
+population is what the number is about. **The general form was written into this file mid-session
+and then walked into twice more within the hour**, which is the strongest available evidence that
+stating it once is not enough — it belongs at the point of use, next to each counter, and several
+now carry it.
+
 **A repro scene for an OPEN entry must be TRACKED** (`scenes/`, not `scraps/`). `scraps/` is
 git-ignored, so an entry whose repro lives there cannot be re-validated and its drift cannot be
 detected — on 2026-09-10 that nearly produced a false "7× regression" report against the GRIN
