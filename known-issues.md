@@ -2530,12 +2530,32 @@ The device's floor is solid — spp 128 and 256 agree to **0.6 %** at ~**0.0308*
 ratio ~1.25** — real and permanent, but far below the **1.63x variance** this entry led with, which
 was the transient spp-34 peak.
 
-**The estimator's own noise is now visible and bounds every ratio quoted in this entry.** The host
-reading *rose* from spp 64 to 128 (0.02662 -> 0.02856), which variance cannot do with more samples.
-Three seeds per point therefore carries roughly **7-10 % noise**, which is the same size as several
-differences argued over above — including the "peak at 1.277 then 1.177" shape, which should be read
-as "a gap that narrows", not as a located maximum. Anything needing better than ~10 % precision here
-wants 8+ seeds per point.
+**THE ESTIMATOR'S PRECISION, MEASURED RATHER THAN GUESSED — and it is the ABSOLUTE values that move,
+not the ratios.** An earlier version of this paragraph inferred "7-10 % noise bounds every ratio
+quoted here" from the host reading rising between spp 64 and 128. Recomputing every 3-seed subset of
+the 4-seed data shows something more specific:
+
+| arm | 4-seed SD | the four 3-seed subsets |
+|---|---:|---|
+| GPU | 0.03470 | 0.03155, 0.03138, 0.03137, 0.03164 |
+| CPU | 0.02718 | 0.02460, 0.02468, 0.02499, 0.02466 |
+
+**Every 3-seed subset lands ~9.5 % BELOW the 4-seed value — all four of them, on both arms.** That is
+not scatter, it is the small-sample bias of the sample standard deviation, and it is systematic and
+one-directional.
+
+**But it cancels in a ratio.** The GPU/CPU ratio from those same subsets reads **1.282, 1.272, 1.255,
+1.283** against the 4-seed **1.277** — a spread of **±1.1 %**. So:
+
+* **Ratios between two arms at a MATCHED seed count are trustworthy to about ±1 %**, which is far
+  tighter than the differences argued over in this entry, and the conclusions drawn from them stand.
+* **Absolute SD values must never be compared across different seed counts.** A 3-seed figure and a
+  4-seed figure differ by ~9.5 % from the estimator alone, before any physics.
+
+That also correctly demotes, rather than explains, the host's spp 64 -> 128 rise: both points used
+three seeds, so the bias is common to them and cannot be the cause; that one is ordinary
+render-to-render variation, and it is the reason the asymptotic floor ratio above is quoted as
+"~1.25x" rather than to three digits.
 
 **Final characterisation.** The device's mode-M map-noise floor is ~1.25x the host's in variance.
 Below spp ~16 the difference is invisible (camera noise dominates both); it is most pronounced in the
