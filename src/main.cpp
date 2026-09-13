@@ -12165,7 +12165,29 @@ static double    g_beamSinMin    = 0.3;
 // (2M), -0.38 +- 0.17 % (4M), +1.06 +- 1.21 % (16M) against the 8M default, none significant at
 // 2 dof -- against a 5.3 % seed-to-seed spread on the DEFAULT arm against itself, which is what
 // the earlier single-seed "1.2-1.8 % difference" had actually been measuring.
-static long long g_beamSplitMax  = 4000000;
+//
+// REVERTED TO 8M ON 2026-09-13, because the measurement above was taken against a
+// SINGLE-THREADED BVH build and v0.292.x parallelised it. The 4M default existed only to dodge
+// a build cost that has since fallen ~3x (2.92 s -> ~0.98 s on this scene), and dodging it now
+// costs more traversal than it saves in build. Paired, same seed, sub-second timing:
+//
+//   beamcount 1M:  4M 17.78 / 18.10 s   vs  8M 17.36 / 17.51 s   -> 8M faster by 0.42, 0.59 s
+//   beamcount 2M:  4M 34.77 s           vs  8M 30.68 s           -> 8M faster by 4.09 s (11.8%)
+//
+// Consistent in direction at both operating points and growing with beam density, which is what
+// the mechanism predicts: denser beams make the 4M cap bind harder, forcing coarser sub-beams and
+// so more traversal, while the build cost that used to punish 8M is now cheap.
+//
+// Nothing about the accuracy analysis above needs redoing -- it was measured against the 8M arm,
+// so reverting moves TOWARD its reference rather than away, and more splits approximate the
+// kernel more finely rather than less.
+//
+// The general lesson, which is why this is spelled out rather than just changed back: a tuning
+// constant is only valid against the system it was measured on. This one was a real 6.7-15.3%
+// win when it shipped and became a ~3-12% LOSS a few hours later, without its own code changing
+// at all, because a different component got faster. Re-derive tuned constants after optimising
+// anything they trade against.
+static long long g_beamSplitMax  = 8000000;
 static double    g_beamSplitLen  = 0.0;
 
 // MODE J'S BEAM BUDGET, IN RAW (PRE-SPLIT) BEAMS -- see J-BEAMCOST and bdpt.h's long note.

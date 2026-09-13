@@ -1611,10 +1611,37 @@ which is the signature of noise rather than a split-induced bias, since more spl
 toward the exact kernel, not away. At one seed and spp 16 that cannot be separated from chance, and
 a 15 % speed-up that quietly costs 1 % of accuracy is not a speed-up.
 
-**So: recorded as a promising, unfinished optimisation, not a recommendation.** What it needs is
-several seeds against a converged reference, scored per material — the same paired rig that settled
-the radiance-cache cell size earlier today, which resolved a 0.46-point effect that an unpaired
-single seed called noise. Until then `-beamsplitmax` should keep its default.
+**RESOLVED, THEN INVERTED — the full arc, because it is the most instructive thing in this entry.**
+The accuracy doubt above was settled by the paired three-seed test recorded at `main.cpp`'s
+`g_beamSplitMax`: -0.12 +- 0.23 % (2 M), -0.38 +- 0.17 % (4 M), +1.06 +- 1.21 % (16 M) against the
+8 M arm, none significant, against a 5.3 % seed-to-seed spread on the default arm against *itself* --
+which is what the original single-seed "1.2-1.8 % difference" had really been measuring. The default
+was duly changed to **4 M** on the strength of the timing win.
+
+**On 2026-09-13 that change was reverted to 8 M, because a different optimisation invalidated it.**
+The whole 4 M case was dodging a BVH build cost, and v0.292.x parallelised that build, cutting it
+~3x (2.92 s -> ~0.98 s on this scene). Dodging it now costs more traversal than it saves. Re-swept,
+paired, same seed, sub-second timing:
+
+| | 4 M | 8 M | 8 M advantage |
+|---|---:|---:|---:|
+| beamcount 1 M, rep 1 | 17.78 s | 17.36 s | 0.42 s |
+| beamcount 1 M, rep 2 | 18.10 s | 17.51 s | 0.59 s |
+| beamcount 2 M | 34.77 s | 30.68 s | **4.09 s (11.8 %)** |
+| beamcount 2 M, as shipped default | 34.77 s | 31.50-32.58 s | ~2.7 s (7.9 %) |
+
+Consistent in direction at both operating points and growing with beam density, which is what the
+mechanism predicts: denser beams make the 4 M cap bind harder, forcing coarser sub-beams and so more
+traversal, while the build cost that used to punish 8 M is now cheap. Nothing in the accuracy
+analysis needed redoing -- it was measured *against* the 8 M arm, so reverting moves toward its
+reference, and more splits approximate the kernel more finely rather than less.
+
+**The lesson, which is why this arc is written out rather than quietly patched: a tuning constant is
+only valid against the system it was measured on.** This one was a genuine 6.7-15.3 % win when it
+shipped and a ~3-12 % LOSS a few hours later, with its own code untouched, because a component it
+trades against got faster. After optimising anything, re-derive the constants that trade against it.
+The two numbers this entry offers for future tuning -- build cost per split entry, and the traversal
+saturation point above ~4 M splits -- are exactly the pair whose *ratio* moved.
 
 **Independently useful regardless of how that lands:** build is ~1.05 µs per split entry and
 traversal saturates above ~4 M splits on this scene. Those two constants are what any future tuning
