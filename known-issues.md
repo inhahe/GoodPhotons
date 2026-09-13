@@ -653,6 +653,48 @@ scene-dependent and is a net cost here**, which the entry did not previously rec
 re-tuning has a cheap paired rig to use: `fur_creature` + `-roi-mask` + the mode-R reference, with
 `wall`/`floor` as a null that provably cannot respond.
 
+### CORRECTION: `belly` is a FUR material, not skin — and the "ordered by fur depth" table was wrong
+
+`fur_creature.ftsl` line 32 declares `material "belly" { ... }  # pale underside`, and lines 126
+and 136 use it as the **coat** on the chest and neck: `on "chest" material belly density 450000`.
+The body spheres are all `material skin`. So:
+
+| material | what it actually is |
+|---|---|
+| `coat`, `belly`, `tan` | **fur strands** (three coat colours) |
+| `skin` | the sphere surface beneath the coats |
+| `wall`, `floor` | unfurred room |
+
+**I read a material name as an anatomical description** and built two ticks of inference on it —
+that `belly` was "smooth skin under the densest coat", that its coverage was therefore 1.0, that
+light had to cross more fur to reach it than to reach `coat`. All of that was about a surface that
+does not exist in the scene. It is this file's recurring error in its most literal form: *the thing
+measured is not the thing meant.* Nothing caught it until the fiber gate moved `belly` by 80 points,
+which is impossible for a non-fiber gather point, and reading the scene was the only thing that
+could resolve it.
+
+**What survives.** The measurements are all still valid — they were per-material and correctly
+scored. What changes is their INTERPRETATION:
+
+* The deficit is **not ordered by how much fur light crosses**. `coat` -17 %, `tan` -23 %,
+  `belly` -32 % are three fur materials on different body parts, and `skin` -11 % is the surface
+  between the strands. The "fur-depth ordering" table is withdrawn.
+* The fiber gate's 80-point swing on `belly`/`coat`/`tan` is now exactly what it should be: those
+  ARE fiber gather points, `fiberR > 0`, so `gatherCoverageRaw` returns 1.0 early with the gate on
+  and computes a real coverage with it off. No mystery remains.
+* `wall`/`floor` being inert under both gates is likewise exactly right: no fibers, nothing to gate.
+* **The bracket stands and is the important result**: on fur the estimator gives -33.6 % one way and
+  +46.8 % the other, with the truth in between and no setting reaching it.
+
+**And it explains the `_fur_recip` shortfall without appeal to layering.** That rig's densest patch
+was **160 000 strands/m²**; `fur_creature`'s coats are authored `density 450000`, i.e. **2.8x
+denser**. The "-2.45 % is 13x too small, so something must compound over ~13 crossings" reasoning
+compared two different densities while believing they were matched to 0.91x — the match was computed
+against the barrel coat's *strand count over sphere area* (175 800/m²), which is the realised count,
+not the authored density the other coats use. The layered-rig follow-up is therefore NOT the next
+step; re-running `_fur_recip` at 450 000/m² is, and it is a one-line change to a scene that already
+has a passing null.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
