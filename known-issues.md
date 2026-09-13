@@ -95,7 +95,7 @@ What that leaves, and where each one's frontier actually is:
 
 | item | frontier |
 |---|---|
-| M-GATHERAREA | **Mean absolute error 36.8 -> 8.0 over four seeds** (v0.277.0 fiber gate, v0.278.0 bias/gate/ball), and the estimator is now nearly independent of the probe count (mean \|gap\| 3.30 -> 1.06) rather than accurate by cancellation. What is left: fur +7.2 from a different mechanism (the gather ball crossing strands), a cap edge -8.5 from the original disc truncation, hair -7.5, cloth -3.8 |
+| M-GATHERAREA | **Mean absolute error 36.8 -> 8.0 over four seeds** (v0.277.0 fiber gate, v0.278.0 bias/gate/ball), and the estimator is now nearly independent of the probe count (mean \|gap\| 3.30 -> 1.06) rather than accurate by cancellation. What is left: fur +7.2 from a different mechanism (FURDIM: the gather ball is 2.4x the radius of the body part, not anything about strands), a cap edge -8.5 from the original disc truncation, hair -7.5, cloth -3.8 |
 | VOLCACHE | the volumetric gather, ~4/5 of a `gallery_rain` frame. **Reopened 2026-09-12**: the simple form is scene-dependent, not dead. A `sigma_t` sweep on one scene, one variable, takes the order >= 2 field's structure **0.367 -> 0.023 -> -0.066** while the single-scatter control **rises** 0.515 -> 0.602 -> 0.761 — so the smoothness is the FIELD's, not the camera ray's path integral, and the stated limitation is settled. Threshold is between 12 % and 36 % of chords at order 7+, a number already printed on the beam-map line |
 | mode-`J` device light pass | **RE-PRICED DOWN 2026-09-12: ~1.2x, not ~12x.** The device LBVH already landed (v0.272.1-2); what is left is a ~400 ms host residual, not the 51 ms on record. But at FIXED samples the light side is only **32 % of the variance**, so a *perfect* light side — more than the port can deliver — is worth **1.21x**, and that ceiling is flat across a 4x `spp` change because the refresh controller pins the ratio. The old ~12x prices realizations linearly; two independent measurements put the exponent at `N^0.07`-`N^0.33`. Any larger claim rests on a tail statistic that n=4 cannot resolve |
 | UPBP-CONV | **LARGELY RETIRED 2026-09-12.** Both filed claims are refuted by later sections of this same file: mode `J` *beats* mode `D` at equal time (1.37x / 1.28x / 1.52x), and v0.272.0 made `-spp` converge the merge half (measured: frozen improves only 1.27x over a 4x spp range against 2.0x for pure sampling; refresh pays the shortfall off). The firefly framing went with them — both modes peak at the same pixel at every seed. What remains is the 4 %-energy, 1669x-peaked **connection** residual, which is shared BDPT machinery, not UPBP |
@@ -1981,6 +1981,22 @@ scenes it is 8 % of it. Once the ball engulfs the object the collected flux satu
 more fur to find — so the estimate tends to `1/r^2` while a normal gather holds steady, and
 `r^-0.46` is that saturation partway in. **That is the same family as this entry's founding
 observation** that "the gather disc is wider than her head", not a new dimensional defect.
+
+**THE SIGN CHECK, run because this mechanism has now been revised twice in an hour.** Under
+saturation a larger ball collects the same flux over a larger divisor, so the estimate falls and
+the error should *shrink* as `r` grows. It does: **+35.5 % at `r/R` = 1.51 against +9.5 % at
+`r/R` = 2.40.** Direction confirmed. Magnitude is partial rather than full saturation — pure
+`1/r^2` would predict **+178 %** at the smaller radius against the **+35.5 %** measured, giving an
+effective exponent of 0.46 out of a possible 2.00, which is what a ball that engulfs *some* of the
+object rather than all of it should give.
+
+**The uncomfortable corollary, and the reason no warning ships from this yet:** the error crosses
+zero at some radius **above** 0.3846, so this ROI would be *least* wrong with a gather radius
+**larger** than the adaptive rule picks — the opposite of the usual "more photons, smaller radius,
+better image". That is a strong claim resting on a mechanism revised twice today, and it is exactly
+the kind of advice that should not be shipped as a renderer warning on one scene's evidence. **What
+it would take:** a radius sweep with several points above and below 0.3846 to locate the crossing,
+on this scene and at least one other with `r/R > 1`. Until then this is a diagnosis, not guidance.
 
 **So the `r^1.54` reading and the "effective dimension 1.54" gloss are withdrawn.** They were one
 scene, and the exponent is a scale artefact rather than a property of fur. The withdrawn reasoning
