@@ -2310,10 +2310,38 @@ one left standing: **the device beam gather computes a different estimator than 
 same one less accurately.** Both are unbiased in the mean (radiance agrees to 1.62 %), so this is a
 variance difference between two genuinely different formulas or sampling schemes.
 
-**Next step is now unambiguous and is code reading, not more measurement:** compare the device beam
-gather's per-beam contribution against the host's in `photonbeams.h` term by term. The host gathers
-790 beams per probe and produces a tail 3x thinner from the same geometry, so the difference is in
-what each contribution *is*, not in how many there are.
+**FOURTH CANDIDATE ELIMINATED: the 1/sin(theta) singularity.** Reading the two gathers term by term
+found the most promising lead yet — `photonbeams.h:1353` computes `out.sinT = max(sqrt(den), sinMin)`
+and its comment says outright that *"a beam parallel to the camera ray gives an unbounded
+contribution (UPBP-CONV (3)); `sinMin` bounds it"*, with the contribution at `beamgather.h:270` being
+`power * kernel1D(dPerp) / bh.sinT`. A missing clamp on the device would have explained every piece
+of evidence at once: beam-only, tail-only, precision-independent, mean-preserving.
+
+**It is not that.** The device has the same clamp, at the same point in the computation
+(`render_cuda.cu` ~5580, *"Bounded at `bm.sinMin`... the same clamp the host applies in
+BeamMap::hitBeam, and applied at the same place"*). And tightening it changes nothing on either side:
+
+| `-beamsinmin` | GPU p99 | CPU p99 | ratio |
+|---|---:|---:|---:|
+| 0.3 (default) | 4.685 | 1.577 | 2.97x |
+| 0.6 | 4.467 | 1.552 | 2.88x |
+
+**A trap avoided on the way:** `photonbeams.h:649` reads `double sinMin = 0.0;`, which looks like the
+clamp being off by default. It is a struct *initialiser*, not the default — the flag's real default is
+**0.3**, per `-h`. This file already records the identical mistake being made with `baseCell = 0.05`
+earlier the same day, and it would have produced a confident wrong diagnosis here twice over.
+
+**So four candidates are now out** — kernel radius, beam set and split, FP32 precision, and the
+1/sin singularity — each by a direct test rather than by argument.
+
+**The lead that reading turned up instead: the gather-time spectral fold.** `render_cuda.cu` ~5566
+describes *"THE GATHER-TIME SPECTRAL FOLD (FOLD-GPU (2), host twin: beamgather.h), gated on
+`mw == nullptr` — i.e. no merge weight, i.e. mode M"*. That is a real algorithmic difference in the
+mode-M beam gather specifically, which is exactly the configuration where the tail appears, and it is
+where the next tick should look: whether the device's fold and its host twin are the same estimator,
+or merely the same intent. Note the gate — mode J sets it false because *"its MIS ratios are built
+from the monochromatic phase and a folded colour cannot be paired with them"* — which means a mode-J
+beam render is a ready-made control: if the tail is the fold, mode J should not show it.
 
 **The rig is reusable:** `scraps/tail.py <prefix> <label>` scores any pair of two-seed PFM arms by
 percentile. Render with `-hdr`, matched `-spp`, seeds 1 and 2, named `png/<prefix>_<dev>_<seed>.png`.
