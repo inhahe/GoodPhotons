@@ -71,6 +71,77 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-09-13): ROIBOX — "score per-ROI, never whole-frame" was unenforceable on every scene but one; `-roiboxes` derives ROIs from the renderer's own visibility
+
+The rule this project keeps re-learning is *score per-ROI, not whole-frame*. It was written into
+`tools/roi_score.py`, into this file's header, and into the fur entry. It still got broken, and the
+reason turns out to be structural rather than a lapse of attention.
+
+**`scraps/gallery_rain.rois` was the only ROI file in the repository.** Building it meant reading
+primitive centres out of the `.ftsl` by hand, projecting them through the camera, and checking every
+candidate box against the projected footprint of everything nearer the camera. Its own header
+records two ways that silently produced a box on the wrong object, and it took three drafts. Nobody
+was going to repeat that per scene — so any cross-scene comparison quietly fell back to whole-frame,
+and a per-ROI radius sweep on `gallery_rain` ended up being compared against whole-frame sweeps on
+`fur_basics` / `fur_creature` as though the two numbers were the same statistic. Four mechanisms
+were proposed and withdrawn on the back of that comparison.
+
+So the fix is not another reminder. **The rule was unenforceable, and the cure is to make the ROI
+cheap enough that there is no reason to skip it.**
+
+**`-roiboxes` stops reimplementing visibility and reads it off the renderer.** One pixel-centre
+camera ray per pixel, at the camera and resolution the render would use, recording which material
+each pixel actually sees. A box derived this way cannot land on the cap next door, because its
+pixels are by construction the pixels showing that material. Occlusion is not reasoned about; it is
+simply what the intersector returned.
+
+A bounding box still is not automatically an ROI, and that trap survives: a material used in two
+places has a bbox spanning both and everything between. So each material's mask is split into
+connected components, only the largest is reported, and two numbers gate it — **purity** (pixels in
+the box that really show the material) and **share** (the material's pixels inside that one region).
+A box failing either is emitted commented out with the reason, so an untrustworthy ROI cannot be
+copied out of the output by accident. On `gallery_rain` that correctly rejects `wirecage`
+(160 regions, share 0.065) and `gridground` (20 regions, purity 0.404) — the two cases the
+hand-built file needed three drafts to discover, found automatically and for free.
+
+**VALIDATION, and the bug it caught.** Checked against the hand-built file, which is the one
+trustworthy ground truth available: `cr_coat` ⊃ `creature`, `capmarble_axicon` ⊃ `cap_axicon`,
+`gold` ⊃ `gyroid`, `gridground` ⊃ `grid_ground`, `capmarble_compote` ⊃ `compote`. Six independent
+agreements.
+
+But the FIRST run disagreed with all of them, and the way it disagreed is worth recording, because
+it is the hardest failure mode to see. `Camera::genRay` maps `py = 0` to `sy = -1`, i.e. to `-v`:
+**raster row 0 is the image BOTTOM**, while `.rois` and `tools/roi_score.py` both measure y downward
+from the top. Emitting raster rows directly gave boxes that were correct in x, landed on real
+objects, had plausible purity — and were **vertically mirrored**. Nothing about the numbers looked
+wrong.
+
+It was caught by two by-construction impossibilities rather than by scrutiny:
+
+* the tool reported materials at `y = 0.0` on a frame whose **top 17 % is provably empty black sky**
+  (measured: mean exactly 0 over the `sky` ROI, and over the whole top two rows of a 12-row profile);
+* it placed the creature **below** the plinth cap the creature stands on.
+
+Neither required knowing the right answer — only that the reported answer was impossible. That is
+the third time in this file a measurement error was caught by returning to what the number must be
+rather than by thinking harder about what it was.
+
+The cure is applied in the same spirit: rather than hardcode the convention that was just gotten
+wrong, `roiBoxesReport` **derives** the row order by tracing the first and last row and comparing
+them against the camera's own up vector, so it stays correct if `genRay`'s film mapping ever changes.
+
+**What this unblocks.** FURDIM's entry says whoever resumes must *fix the statistic first — one
+ROI-equivalent measure applied to every scene — before proposing anything*. That is now a command
+rather than a project: `-roiboxes` on `fur_basics` / `fur_creature` / `fur_species` yields coat ROIs
+directly comparable to `gallery_rain`'s, and the sweeps' `.pfm` files are all still on disk, so the
+cross-scene comparison can be re-scored **without re-rendering anything**.
+
+**Known limits.** The pass is single-threaded (a diagnostic at preview resolution; determinism is
+worth more than the speed here) and classifies by the pixel centre, so a silhouette pixel belongs
+wholly to whichever material the centre hit — the same sub-pixel approximation mode P's classifier
+makes. Purity for a round object is capped near π/4 ≈ 0.785 by geometry alone, which is why the
+default gate is 0.60 and not higher.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than

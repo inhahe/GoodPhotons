@@ -150,6 +150,7 @@
 #include "airtight.h"           // -check-airtight: ray-parity audit of the marched isosurface field
 #include "priority_audit.h"     // ahead-of-time nested-dielectric priority ambiguity warning
 #include "camera.h"
+#include "roiboxes.h"           // -roiboxes: per-material ROIs read off the renderer's own primary visibility
 #include "raster.h"             // -raster: fast solid-shaded preview rasterizer (no light transport)
 #include "render.h"
 #include "rainbow.h"            // Airy-theory droplet phase function (rainbows in droplet media)
@@ -18294,6 +18295,12 @@ static int run(int argc, char** argv) {
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
     bool checkTriNormalOnly = false;
+    // -roiboxes and its gates. The defaults are deliberately strict: this tool's whole
+    // point is that an ROI you cannot trust should not be easy to copy out of its output.
+    bool      roiBoxesOnly = false;
+    double    roiMinPurity = 0.60;
+    double    roiMinShare  = 0.50;
+    long long roiMinPx     = 24;
     bool checkMeshFormatsOnly = false;
     bool checkPreferOnly = false;
     bool checkPathsOnly = false;
@@ -19007,6 +19014,10 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checktrinormal")) checkTriNormalOnly = true;
+        else if (!std::strcmp(argv[i], "-roiboxes")) roiBoxesOnly = true;
+        else if (!std::strcmp(argv[i], "-roi-minpurity") && i + 1 < argc) roiMinPurity = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-roi-minshare")  && i + 1 < argc) roiMinShare  = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-roi-minpx")     && i + 1 < argc) roiMinPx     = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkmesh")) checkMeshFormatsOnly = true;
         else if (!std::strcmp(argv[i], "-checkprefer")) checkPreferOnly = true;
         else if (!std::strcmp(argv[i], "-checkpaths")) checkPathsOnly = true;
@@ -20251,6 +20262,21 @@ static int run(int argc, char** argv) {
             c.setFocus(focusDist);   // thin lens for the finite-aperture modes A/C (0 = camera obscura)
         }
         toRender.push_back({"", c, mode, fresX, fresY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1, cLook, cUp, cFov});
+    }
+
+    // -roiboxes: derive per-material ROIs from primary visibility, print them, exit.
+    // Placed HERE, after `toRender` is final, so the boxes come from exactly the camera
+    // and resolution the render would have used. An ROI derived against a different
+    // camera than the one scored is precisely the mismatch this flag exists to prevent,
+    // so it must not be computed from a camera assembled separately for the purpose.
+    if (roiBoxesOnly) {
+        if (toRender.empty()) {
+            std::fprintf(stderr, "[roiboxes] no camera selected -- nothing to derive ROIs from\n");
+            return 1;
+        }
+        const RenderCam& rc = toRender.front();
+        return roiBoxesReport(scene, rc.cam, rc.res, rc.resY, rc.name.c_str(), inFile,
+                              roiMinPurity, roiMinShare, roiMinPx);
     }
 
     // -explore/-fly: seed the interactive raster viewer at the first selected frame

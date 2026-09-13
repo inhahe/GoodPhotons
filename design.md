@@ -4459,6 +4459,10 @@ as the one at fault.
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.
+- **`roiboxes.h`** — `-roiboxes`: per-material measurement ROIs read off a pixel-centre
+  primary-visibility pass, split into connected components and gated on purity/share.
+  Depends on `camera.h` (it asks `genRay` which raster row is the top rather than
+  assuming one), so it is included after it.
 - **`filmToRgb8` auto-exposure cost** — the p99 anchor wants exactly **one** order
   statistic, so it uses `std::nth_element` (O(n), partitions in place) rather than a full
   `std::sort` of every pixel's luminance, and it builds the luminance array **only when
@@ -7972,6 +7976,36 @@ cost a black frame, never the display driver.
 - Rule: any hot-path optimization must be **bit-identical** (CPU sha1) or
   visually/fuzzy identical (GPU) vs. the pre-change exe before committing, one
   commit per optimization so any regression can be reverted alone.
+
+## Measurement ROIs come from the renderer, not from the scene file (`roiboxes.h`, `-roiboxes`, 0.279.0)
+
+Scoring an A/B on the whole frame averages the region under test together with everything that
+cannot respond to it, so this project's standing rule is to score per-ROI. Enforcing that needs an
+ROI per scene, and for a long time exactly one existed (`scraps/gallery_rain.rois`) because building
+one meant hand-projecting primitive coordinates through the camera and then checking each box
+against the projected footprint of every nearer object. The rule was therefore unenforceable
+everywhere else, and cross-scene comparisons silently degraded to whole-frame.
+
+`-roiboxes` removes the hand work by not reimplementing visibility at all. It fires one pixel-centre
+camera ray per pixel — through the same `Scene::closestHit` and the same `RenderCam` the render will
+use, which is why the hook sits *after* `toRender` is final — and records the material each pixel
+actually sees. Occlusion needs no reasoning: it is whatever the intersector returned.
+
+The remaining trap is that a bounding box is not a region. A material used in several places has a
+bbox spanning all of them plus the gaps. So the per-pixel material image is flood-filled into
+connected components in a single pass over the frame (components keyed by material id, 4-connected),
+only the largest component per material is reported, and each box carries **purity** (pixels inside
+it that really show the material) and **share** (the material's pixels inside that component).
+Failing boxes are printed commented out with the reason, so the output cannot be copy-pasted into a
+bad measurement.
+
+**The y origin is derived, not asserted.** `Camera::genRay` maps `py = 0` to `sy = -1` (`-v`), so
+raster row 0 is the image *bottom*, while the `.rois` format and `tools/roi_score.py` measure y
+downward from the top. The first implementation emitted raster rows directly and produced boxes that
+were right in x, landed on real objects, and were vertically mirrored — a failure with no visible
+symptom in the numbers. `roiBoxesReport` now traces the first and last row and compares them against
+the camera's own up vector to decide which end is the top, so the answer survives any future change
+to `genRay`'s film mapping.
 
 ## Scene-authoring tools (`tools/`)
 
