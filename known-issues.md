@@ -2162,6 +2162,31 @@ FOLD-GPU part (1), is deprioritised by its own measurement**: a 43-point fold-co
 *nothing* on the streak metric, with a working on/off control (0 % folding costs 1.59x) proving
 the null is real rather than blind.
 
+**ADDENDUM 2026-09-13 — item (1) re-verified at the granularity the queue actually asks for, and
+it holds.** A later autonomous tick started reimplementing GLOSSY-NEE's env-light gap before checking
+this audit, got as far as reading the code, and found it already there. Rather than stop at "present",
+I ran the check the queue's own last rule names — *when both halves of an MIS weight are written in
+different places, verify every case appears in both or neither* — because a hook that nothing passes
+is indistinguishable from no hook, and that is exactly how this class of bug hides:
+
+| path | NEE half (lobe pdf into the env weight) | escape half (`gmis.pdf`) | co-gated? |
+|---|---|---|---|
+| host scalar | `backward.h:1805` builds `NeeBsdf`, passes `&nb` to `neeEnv` under `if (gm)` | `1840` (Whitted lattice) and `1852` (rng), both under `if (gm)` | yes |
+| host hero | `2734` builds `NeeBsdf`, passes `&nb` to `neeEnvHero` under `glossyNee && m.type == Glossy` | `2761` / `2770` | yes |
+| device | `render_cuda.cu:10547` `dGlossyPdfHit` when `nb`, else `cosSurf/PI` | `11463` / `11470` | yes |
+
+Both halves are gated on the same condition on all three paths, and the Whitted lattice direction
+sets `gm->pdf` too — the case most likely to have been missed, since it is a separate branch from the
+rng one and a comment at `1829` shows it was specifically reasoned about. The env-escape reads
+(`2223`, `2495`, `11116`) are all gated on `gmis.pdf > 0`, so a vertex cannot contribute to one half
+without the other. **Item (1) is complete; no further work.**
+
+**What is genuinely open has moved since this audit was written.** M-GATHERAREA's stated fix (the
+geometric footprint) was refuted on its own named targets on 2026-09-13, and a new item appeared the
+same day: **M-TIME-CPU**, where a `-time`/`-noise`/`-forever` budget routes mode M to a CPU-only
+path. Its fix — epoch-looping the shared GPU photon-map path — is real, unclaimed work, and unlike
+most of the queue it has not been measured away.
+
 What that leaves, and where each one's frontier actually is:
 
 | item | frontier |
