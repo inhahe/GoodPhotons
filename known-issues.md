@@ -2257,11 +2257,45 @@ RMS (the RMS is outlier-owned here, reading 1.06 *relative*, i.e. above the sign
 only reached users who passed an explicit `-spp`. It is now reachable from the documented default
 workflow on any media scene.
 
-**What this entry does NOT establish:** the mechanism. Candidates worth separating are the device
-beam traversal itself, the `-beamsplitmax` sub-beam kernel, and the FP32 device build
-(`FTRACE_GPU_FP32=1`) — though precision alone should bias rather than fatten a tail, so it is the
-least likely of the three. One scene per condition, two seeds; the *direction* is well controlled but
-the magnitude is not replicated.
+**MECHANISM NARROWED (2026-09-13, same day): two candidates eliminated, one left with a decisive
+test.**
+
+**A better control than the cross-scene one above: toggle beams on ONE scene.** Comparing
+`_cornell_diffuse` with `_fog_thick` confounds beams with everything else that differs between two
+scenes. Rendering `_fog_thick` *without* `-beams`, matched `-spp`, same rig:
+
+| config | arm | median | p90 | p99 | max/level |
+|---|---|---:|---:|---:|---:|
+| fog, **no** beams | GPU | 0.0056 | 0.0427 | 13.55 | 47.0 |
+| fog, **no** beams | CPU | 0.0046 | 0.0453 | 13.86 | 50.6 |
+| fog, **with** beams | GPU | 0.225 | 1.40 | **4.68** | **23.9** |
+| fog, **with** beams | CPU | 0.167 | 0.73 | **1.58** | **5.0** |
+
+Without beams the devices are at **parity, and the GPU is better on all three tail metrics** (p90
+0.0427 vs 0.0453, p99 13.55 vs 13.86, max 47.0 vs 50.6). One flag on the same scene creates the whole
+gap. The mild ~1.2-1.35x median difference survives the toggle, confirming it is a separate,
+beams-independent device property and not part of this defect.
+
+**Eliminated — the kernel radius.** The two devices choose it independently, and a narrower kernel
+would mean fewer beams per query and so genuinely more variance. They agree to 0.06 %: GPU
+**0.004688**, CPU **0.004685**.
+
+**Eliminated — the beam set and the split.** GPU collects 568 144 beams, trims to 300 008, splits to
+**1 495 507** sub-beams; CPU collects 572 384, trims to 300 051, splits to **1 493 424**. Agreement to
+0.14 %, so both devices gather essentially the same geometry.
+
+**Also worth knowing: this is not a too-few-samples problem.** The host log reports a probe ray
+gathering **790.5 beams**, well past the `-beamk` floor of 32. With 790 contributions per query, a
+heavy tail means individual terms can spike, not that the estimate is starved.
+
+**Remaining candidate, with its test:** the **FP32 device build**. `CMakeLists.txt:136` makes it an
+option (`FTRACE_GPU_FP32`, ON by default) and `render_cuda.cu:183` notes `-DFTRACE_GPU_FP32=OFF`
+builds the exact-FP64 path. Single precision would not merely bias an otherwise-fine estimate, but it
+*would* amplify a near-degenerate denominator into a spike, which is the shape of the evidence.
+**The decisive test is to configure a separate build directory with `-DFTRACE_GPU_FP32=OFF`** — a
+separate directory so the working binary is untouched — and re-run the beams-on arms. If the tail
+collapses to CPU parity, the mechanism is precision; if it does not, it is the beam traversal
+arithmetic itself and the next step is reading that kernel.
 
 **The rig is reusable:** `scraps/tail.py <prefix> <label>` scores any pair of two-seed PFM arms by
 percentile. Render with `-hdr`, matched `-spp`, seeds 1 and 2, named `png/<prefix>_<dev>_<seed>.png`.
