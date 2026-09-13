@@ -2131,11 +2131,18 @@ that: **43 s against a 40 s budget**, the 3 s being scene load and the final wri
 | `-noise` + `-device gpu` | CPU threads | warns |
 | `-time` + `-device cpu` | CPU threads | silent |
 
-**Still excluded, deliberately:** `-noise` (needs a convergence test this loop does not have),
-`-preview` (the ANSI thumbnail belongs to the single-camera driver), lens cameras, and any group of
-more than one mode-M camera — a flythrough's shared map is the feature, and refreshing it would
-destroy the amortisation *and* give consecutive frames different realizations, which is flicker
-rather than convergence. The warning was reworded to say exactly this, since it had listed `-time`
+**`-noise` ADDED IN v0.295.0 — and the reason it was excluded was simply wrong.** This entry said
+`-noise` "needs a convergence test this loop does not have". It needs none. The reported noise figure
+is `100 / sqrt(spp)` (`main.cpp` ~15528) — **a pure function of the sample count, not a measurement
+of the image** — so a noise target *is* a sample target: `-noise X` is exactly `-spp (100/X)^2`.
+(Confirmed against a log line: 12 spp reported "~28.87 % noise", and 100/sqrt(12) = 28.87.) The fix
+was arithmetic, not a convergence criterion. Verified on the device: `-noise 20` stops at **25 spp**
+and `-noise 10` at **100 spp**, both on the shared photon map, with plain `-spp` unaffected.
+
+**Still excluded, deliberately:** `-preview` (the ANSI thumbnail belongs to the single-camera
+driver), lens cameras, and any group of more than one mode-M camera — a flythrough's shared map is
+the feature, and refreshing it would destroy the amortisation *and* give consecutive frames different
+realizations, which is flicker rather than convergence. The warning was reworded to say exactly this, since it had listed `-time`
 among the flags that cost you the device and that is no longer true.
 
 **WHAT THE FIX IS ACTUALLY WORTH, MEASURED — and it is not what the throughput suggests.** At a

@@ -23602,7 +23602,7 @@ static int run(int argc, char** argv) {
     for (const RenderCam& rc : toRender) if (rc.mode == 'M') ++mModeCams;
     bool budgetedGpuM = false;
 #ifdef HAVE_CUDA
-    budgetedGpuM = (timeBudgetSec > 0.0 || runForever) && !(noiseTarget > 0.0) && !preview &&
+    budgetedGpuM = (timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0) && !preview &&
                    mModeCams == 1 && !g_beamFreeze && g_pmapLoad.empty() && g_pmapSave.empty() &&
                    (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
                    cudaAvailable() && cudaPhotonMapSupported(scene);
@@ -23676,8 +23676,8 @@ static int run(int argc, char** argv) {
             cudaAvailable() && cudaPhotonMapSupported(scene))
             std::printf("[camera] NOTE: this budgeted mode-M render is on the single-camera "
                         "progressive driver, which is CPU-only, so it will NOT use %s. "
-                        "-time and -forever DO run on the device now (0.294.0); -noise and "
-                        "-preview still do not, and nor does a multi-camera or lens-camera "
+                        "-time, -forever and -noise DO run on the device now (0.295.0); "
+                        "-preview still does not, and nor does a multi-camera or lens-camera "
                         "render, which keeps one shared map by design.\n", cudaDeviceName());
 #endif
     }
@@ -24294,8 +24294,19 @@ static int run(int argc, char** argv) {
                     // only stop test was a total-sample target. With the cap lifted, each epoch
                     // is still bounded by `epochSec` through `inner`, so a huge cap does not
                     // make one enormous epoch -- it makes many normal ones.
-                    const bool budgeted = (timeBudgetSec > 0.0 || runForever);
-                    const long long sppCap = budgeted ? ((long long)1 << 60) : spp;
+                    const bool budgeted = (timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0);
+                    // `-noise` NEEDS NO CONVERGENCE TEST. The reported figure is
+                    // `100 / sqrt(spp)` (main.cpp ~15528) -- a pure function of the sample count,
+                    // not a measurement of the image -- so a noise target IS a sample target:
+                    // `-noise X` is exactly `-spp (100/X)^2`. This loop was excluded from `-noise`
+                    // on the assumption it needed a convergence criterion it did not have. It
+                    // needed arithmetic.
+                    const long long sppFromNoise =
+                        (noiseTarget > 0.0)
+                            ? (long long)std::ceil((100.0 / noiseTarget) * (100.0 / noiseTarget))
+                            : 0;
+                    const long long sppCap =
+                        budgeted ? (sppFromNoise > 0 ? sppFromNoise : ((long long)1 << 60)) : spp;
                     auto budgetSpent = [&]() {
                         return timeBudgetSec > 0.0 &&
                                std::chrono::duration<double>(clk::now() - gStart).count()
