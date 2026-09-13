@@ -4467,6 +4467,22 @@ as the one at fault.
   -33.6 % with the fiber gate, +46.8 % without). Candidates are a deliberate superset — a false
   candidate costs a test, a missed one costs correctness. `-checkspherequery` brute-force
   verifies the no-miss invariant.
+- **`gafootprint.h`** — `gatherFootprintArea()`: the same-facing surface area actually inside
+  a gather ball, measured geometrically. Fires `kDisc` stratified rays through the tangent
+  disc and MARCHES each one, resuming past every hit until the ball's chord is exhausted, so
+  every layer is counted rather than only the nearest — which is the whole difference from
+  the probe in `photonmap_render.h`, and the reason that probe fails on a tangle holding
+  ~600 curve segments. Marching also means there is no per-primitive-class code: triangles,
+  spheres, implicits, curve segments and instances all work through the same
+  `Scene::closestHit`, and a class added later needs no change here. An earlier per-class
+  version had exactly two routines and silently returned ~0 area on `gallery_rain`, whose
+  caps are implicit isosurfaces. Consumed by `-gafparea` (diagnostic) and `-gageom` (wires
+  it into `gatherCoverageRaw` as the coverage, host only, off by default).
+  **Validated**: exactly 1.0000 on a flat plane, 0.5986 on floor within 0.25 m of a wall
+  against an analytic half-disc, 1.0079 on `gallery_rain`'s open ground. **Not used on
+  fibers**: a coat's footprint measures ~2.9x pi r^2, so dividing by it would darken fur
+  threefold — the footprint is right there and the DIVISION is the wrong estimator, because
+  the density estimate assumes the ball meets one locally flat surface.
 - **`roiboxes.h`** — `-roiboxes`: per-material measurement ROIs read off a pixel-centre
   primary-visibility pass, split into connected components and gated on purity/share.
   Depends on `camera.h` (it asks `genRay` which raster row is the top rather than
