@@ -1982,6 +1982,43 @@ more fur to find — so the estimate tends to `1/r^2` while a normal gather hold
 `r^-0.46` is that saturation partway in. **That is the same family as this entry's founding
 observation** that "the gather disc is wider than her head", not a new dimensional defect.
 
+**SECOND SCENE: THE PREDICTION IS REFUTED — THE ERROR RUNS THE OTHER WAY, SO NO `r/R` THRESHOLD
+EXISTS AND NO DIAGNOSTIC SHIPS (`scraps/fur_cross2.sh`).** The gate this entry set was whether the
+crossing sits near `r/R ~ 3` on a second scene. `fur_basics` was pushed into the regime with
+`-pmradius` (its `ball_coat` has a sphere-equivalent radius of 0.130 m) and given its own 2048-spp
+mode-`R` reference, because a zero crossing is only defined against truth:
+
+| `r` | `r/R` | error vs reference |
+|---|---|---|
+| 0.05 | 0.38 | **+1.6 %** |
+| 0.10 | 0.77 | +5.1 % |
+| 0.15 | 1.15 | +9.3 % |
+| 0.25 | 1.92 | +13.7 % |
+| 0.40 | 3.08 | **+27.9 %** |
+
+**The error RISES monotonically with `r`** — where `creature` on `gallery_rain` **fell**
+monotonically over the same `r/R` range (+60.7 % at 1.25 down to -37.7 % at 5.00). Same quantity,
+same method, opposite sign. There is no crossing here at all: `fur_basics` is least wrong at the
+*smallest* radius tried.
+
+**So the saturation model does not generalise, and a threshold cannot be quoted.** Three
+explanations for the fur effect have now been offered and withdrawn in one evening — dimensional,
+strand-crossing, and saturation — while the *effect itself* has survived every control. The entry
+keeps the effect and drops the mechanism.
+
+**And there is a confound in the comparison that is mine, worth stating because it weakens the
+refutation as well as the claim.** The `gallery_rain` sweep ran `-beams -beamfreeze` over a rain
+medium; `fur_basics` has no medium and no beam gather. So the two curves differ in the estimator
+being exercised, not only in the scene, and "opposite signs" may be the volumetric gather rather
+than the fur. **Matching that was free and I did not do it** — the honest reading is that the second
+scene fails to confirm rather than cleanly contradicts.
+
+**What is actually established, after four sweeps:** on each scene *individually*, the fur error is
+a smooth, monotone function of the gather radius, large (tens of percent) and easily measured. What
+is not established is any mechanism, any threshold, or any cross-scene rule. **The shippable output
+today is the measurement and the rigs, not a warning** — and specifically not the "use a larger
+radius" guidance the single-scene crossing appeared to license two sections ago.
+
 **FIVE-POINT SWEEP: THE PREDICTION HOLDS, MONOTONICALLY, WITH THE CONTROL FLAT (2026-09-12,
 `scraps/fur_cross.sh`).** Two points gave a direction; the model deserved a test it could fail. The
 prediction was written into the script before the run — *the error falls monotonically and crosses
