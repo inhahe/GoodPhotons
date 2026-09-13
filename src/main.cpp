@@ -18298,6 +18298,7 @@ static int run(int argc, char** argv) {
     // -roiboxes and its gates. The defaults are deliberately strict: this tool's whole
     // point is that an ROI you cannot trust should not be easy to copy out of its output.
     bool      roiBoxesOnly = false;
+    const char* roiAuditFile = nullptr;
     double    roiMinPurity = 0.60;
     double    roiMinShare  = 0.50;
     long long roiMinPx     = 24;
@@ -19015,6 +19016,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checktrinormal")) checkTriNormalOnly = true;
         else if (!std::strcmp(argv[i], "-roiboxes")) roiBoxesOnly = true;
+        else if (!std::strcmp(argv[i], "-roi-audit") && i + 1 < argc) roiAuditFile = argv[++i];
         else if (!std::strcmp(argv[i], "-roi-minpurity") && i + 1 < argc) roiMinPurity = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-roi-minshare")  && i + 1 < argc) roiMinShare  = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-roi-minpx")     && i + 1 < argc) roiMinPx     = std::atoll(argv[++i]);
@@ -20277,6 +20279,14 @@ static int run(int argc, char** argv) {
         const RenderCam& rc = toRender.front();
         return roiBoxesReport(scene, rc.cam, rc.res, rc.resY, rc.name.c_str(), inFile,
                               roiMinPurity, roiMinShare, roiMinPx);
+    }
+    if (roiAuditFile) {
+        if (toRender.empty()) {
+            std::fprintf(stderr, "[roi-audit] no camera selected\n");
+            return 1;
+        }
+        const RenderCam& rc = toRender.front();
+        return roiAuditReport(scene, rc.cam, rc.res, rc.resY, roiAuditFile);
     }
 
     // -explore/-fly: seed the interactive raster viewer at the first selected frame

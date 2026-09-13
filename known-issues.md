@@ -136,6 +136,50 @@ rather than a project: `-roiboxes` on `fur_basics` / `fur_creature` / `fur_speci
 directly comparable to `gallery_rain`'s, and the sweeps' `.pfm` files are all still on disk, so the
 cross-scene comparison can be re-scored **without re-rendering anything**.
 
+### The auditor's first run: two of the ground-truth ROIs were not looking at what they are named after
+
+`-roi-audit <file.rois>` reports, per box, what fraction of its pixels each material actually
+occupies. Pointed at `scraps/gallery_rain.rois` — the hand-built file that every M-GATHERAREA and
+FURDIM number in this document was scored against — it found two boxes measuring something other
+than their label:
+
+| ROI | px | dominant material | share | rest |
+|---|---|---|---|---|
+| `brass` "brass cluster, largest lobe" | 9 | **`glass`** | **77.8 %** | brass 22 % |
+| `creature` "fur coat, many-bounce" | 36 | **`cr_belly`** | **75.0 %** | `cr_coat` 25 % |
+| `gem_diamond` | 210 | `glass` | 78.6 % | gridground 16 %, capmarble_chrome 4 % |
+| `cap_diamond` | 161 | `capmarble_gyroidx` | 82.6 % | glass 17 % |
+| `grid_ground` | 600 | `gridground` | 69.5 % | flint 30 % |
+
+Everything else is clean — `sky` 100 % escaped, `cap_gyroid` 100 % `capmarble_gold`, `gyroid` 100 %
+`gold`, `glass_orb` 100 % `glass`, `chrome_ring` 100 % `chrome`, `cap_axicon` 99.7 %.
+
+**`brass` is a 3x3 box in which 7 of 9 pixels are glass.** Its own comment says "settle group
+applied", so the likely story is that the cluster was physically settled after the box was placed
+and the box stayed behind. Any per-ROI number quoted for `brass` is a glass number.
+
+**`creature` is three-quarters belly skin.** This is not a placement error — the box is on the
+creature — but it is a population error, and it is the FURDIM one. Fur strands are sub-pixel: a
+pixel-centre ray either hits a strand (`cr_coat`) or passes between strands to the skin behind
+(`cr_belly`), and here only a quarter of centres hit a strand. So the sweep labelled "the fur error
+falls with gather radius" was measured on a box that is 75 % not-fur, and then compared against
+whole-frame sweeps on other scenes. The effect may well be real; the *label* was never checked.
+
+This also explains why `-roiboxes` rejects fur outright: on `fur_creature` at 160x90 the `coat`
+material scores purity 0.440 across **28 regions**, and `tan` 0.317 across 31. **Fur is the worst
+case for a box ROI there is** — thin, sub-pixel, interleaved with background — so a rectangle over
+fur is mostly not fur, on any scene, at any placement. That is a property of the material, not of
+anyone's box-drawing, and it means FURDIM's "one ROI-equivalent measure applied to every scene"
+cannot be a rectangle at all. It needs a per-pixel material mask, which `roiMaterialImage()` now
+computes and which is the obvious next step.
+
+**A limitation the audit makes visible, and which is NOT a defect in those ROIs:** the five
+volumetric ROIs (`cloud`, `cloud_base`, `cloud_limb`, `rain_column`, `rainbow`) all report 100 %
+"sky/escaped", because a primary ray through participating media hits no surface. `-roi-audit`
+classifies by first surface hit and is therefore blind to media; it says nothing about whether a
+volumetric ROI is well placed. `alice_dress` / `alice_hair` report `(unnamed)` for the same
+structural reason `-roiboxes` skips them: the Alice mesh's materials carry no names to report.
+
 **Known limits.** The pass is single-threaded (a diagnostic at preview resolution; determinism is
 worth more than the speed here) and classifies by the pixel centre, so a silhouette pixel belongs
 wholly to whichever material the centre hit — the same sub-pixel approximation mode P's classifier

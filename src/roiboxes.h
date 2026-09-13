@@ -69,8 +69,8 @@ struct RoiBox {
 // `-1` means the ray escaped (sky) or hit a sensor, neither of which is an ROI.
 // Single-threaded on purpose: this is a diagnostic that runs once at preview
 // resolution, and a deterministic serial pass is worth more here than the speed.
-inline std::vector<RoiBox> roiBoxesCompute(const Scene& scene, const Camera& cam,
-                                           int resX, int resY) {
+inline std::vector<int> roiMaterialImage(const Scene& scene, const Camera& cam,
+                                         int resX, int resY) {
     const size_t n = (size_t)resX * (size_t)resY;
     std::vector<int> mid(n, -1);
     for (int py = 0; py < resY; ++py)
@@ -82,6 +82,13 @@ inline std::vector<RoiBox> roiBoxesCompute(const Scene& scene, const Camera& cam
                                      /*skipCamHidden=*/true);
             mid[(size_t)py * resX + px] = (h.valid && h.sensorId < 0) ? h.matId : -1;
         }
+    return mid;
+}
+
+inline std::vector<RoiBox> roiBoxesCompute(const Scene& scene, const Camera& cam,
+                                           int resX, int resY) {
+    const size_t n = (size_t)resX * (size_t)resY;
+    const std::vector<int> mid = roiMaterialImage(scene, cam, resX, resY);
 
     // Flood-fill connected components of equal material id (4-connectivity), one pass
     // over the whole image rather than one pass per material.
@@ -204,5 +211,83 @@ inline int roiBoxesReport(const Scene& scene, const Camera& cam, int resX, int r
     if (usable == 0)
         std::printf("# No usable ROI. Either the camera sees none of the named materials, or\n"
                     "# every one of them is scattered -- check the camera before scoring.\n");
+    return 0;
+}
+
+// -roi-audit <file.rois> — say what an EXISTING ROI file's boxes are actually looking at.
+//
+// The boxes a measurement campaign rests on are usually hand-placed, and a hand-placed box
+// can be right about the object and still wrong about the pixels: fur, foliage and any
+// thin structure are sub-pixel and interleaved with whatever is behind them, so a box
+// squarely on a fur coat can be mostly background. Nothing in a radiance number says so.
+// This prints, per box, what fraction of its pixels each material actually occupies, so a
+// box can be checked against what it was supposed to sample.
+inline int roiAuditReport(const Scene& scene, const Camera& cam, int resX, int resY,
+                          const char* roisPath) {
+    std::FILE* f = std::fopen(roisPath, "rb");
+    if (!f) { std::fprintf(stderr, "[roi-audit] cannot open %s\n", roisPath); return 1; }
+    const std::vector<int> mid = roiMaterialImage(scene, cam, resX, resY);
+    const Ray rLo = cam.genRay(resX / 2, 0, 0.5, 0.5);
+    const Ray rHi = cam.genRay(resX / 2, resY - 1, 0.5, 0.5);
+    const bool row0IsTop = dot(rLo.d, cam.v) > dot(rHi.d, cam.v);
+    const int nMat = (int)scene.mats.size();
+
+    std::printf("[roi-audit] %s against %s at %dx%d\n", roisPath,
+                scene.matNames.empty() ? "(unnamed materials)" : "the visible materials",
+                resX, resY);
+    std::printf("%-16s %6s  %-24s %7s   %s\n",
+                "roi", "px", "dominant material", "share", "rest");
+    char line[1024];
+    while (std::fgets(line, sizeof line, f)) {
+        const char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0') continue;
+        char nm[128];
+        double x0, y0, x1, y1;
+        if (std::sscanf(p, "%127s %lf %lf %lf %lf", nm, &x0, &y0, &x1, &y1) != 5) continue;
+
+        // .rois y is TOP-DOWN; map it back to this camera's raster row order.
+        int rt0 = (int)(y0 * resY), rt1 = (int)(y1 * resY);
+        if (rt1 <= rt0) rt1 = rt0 + 1;
+        int ry0, ry1;                                   // inclusive raster rows
+        if (row0IsTop) { ry0 = rt0; ry1 = rt1 - 1; }
+        else           { ry0 = resY - rt1; ry1 = resY - 1 - rt0; }
+        int rx0 = (int)(x0 * resX), rx1 = (int)(x1 * resX) - 1;
+        if (rx1 < rx0) rx1 = rx0;
+        if (ry0 < 0) ry0 = 0; if (ry1 > resY - 1) ry1 = resY - 1;
+        if (rx0 < 0) rx0 = 0; if (rx1 > resX - 1) rx1 = resX - 1;
+
+        std::vector<long long> cnt((size_t)nMat + 1, 0);   // [nMat] = escaped (sky)
+        long long tot = 0;
+        for (int y = ry0; y <= ry1; ++y)
+            for (int x = rx0; x <= rx1; ++x) {
+                const int m = mid[(size_t)y * resX + x];
+                ++cnt[(m < 0 || m >= nMat) ? (size_t)nMat : (size_t)m];
+                ++tot;
+            }
+        if (tot <= 0) continue;
+        int b1 = 0;
+        for (int m = 1; m <= nMat; ++m) if (cnt[m] > cnt[b1]) b1 = m;
+        const char* bn = (b1 == nMat) ? "(sky/escaped)" : scene.matNameFor(b1);
+        char rest[256]; rest[0] = '\0';
+        int used = 0;
+        for (int k = 0; k < 3; ++k) {
+            int b = -1;
+            for (int m = 0; m <= nMat; ++m)
+                if (m != b1 && cnt[m] > 0 && (b < 0 || cnt[m] > cnt[b])) b = m;
+            if (b < 0 || cnt[b] == 0) break;
+            const char* n2 = (b == nMat) ? "(sky)" : scene.matNameFor(b);
+            used += std::snprintf(rest + used, sizeof rest - (size_t)used, "%s%s %.0f%%",
+                                  used ? ", " : "", n2 ? n2 : "?",
+                                  100.0 * (double)cnt[b] / (double)tot);
+            cnt[b] = 0;
+            if (used >= (int)sizeof rest - 24) break;
+        }
+        const double share = (double)cnt[b1] / (double)tot;
+        std::printf("%-16s %6lld  %-24s %6.1f%%   %s%s\n", nm, tot, bn ? bn : "(unnamed)",
+                    100.0 * share, rest,
+                    share < 0.5 ? "   <- the box is mostly NOT its dominant material" : "");
+    }
+    std::fclose(f);
     return 0;
 }
