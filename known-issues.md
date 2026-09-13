@@ -2071,39 +2071,42 @@ rather than traded away. The per-chunk hook needed for the stop test already exi
 (`liveProg.report` returns "stop after this chunk", and is how a closed window ends a gather), but it
 is armed only under `g_showWindow` and would have to be unconditional.
 
-**THE 20x IS NOT 20x THE IMAGE — measured 2026-09-13, and it overturns this entry's own headline.**
-The ratio is denominated in spp, so it is only worth what an spp is worth, and on a frozen map an spp
-is worth almost nothing. Scored by seed-to-seed spread on `_fog_thick` at 256² (the two seeds
-differenced at MATCHED spp, so the photon realization is held fixed by construction and gather noise
-is the only term that can fall):
+**WHAT THE 20x IS WORTH IS REGIME-DEPENDENT — measured on two scenes, 2026-09-13.** The ratio is
+denominated in spp, so it is worth whatever an spp is worth, and that turns out to differ by a factor
+of ~2 in *convergence order* between scene types. Scored by seed-to-seed spread at MATCHED spp (the
+two seeds differenced, so the photon realization is held fixed by construction and gather noise is
+the only term that can fall):
 
-| spp | seed-to-seed RMS | as % of signal level |
-|---:|---:|---:|
-| 8  | 44.83 | 63.5 % |
-| 32 | 43.67 | 62.0 % |
+| scene | RMS @ spp 8 | RMS @ spp 32 | ratio | reading |
+|---|---:|---:|---:|---|
+| `_fog_thick` (thick media, beams) | 44.83 | 43.67 | **1.026** | map realization dominates |
+| `_cornell_diffuse` (surfaces, no media) | 16.29 | 8.39 | **1.940** | gather noise dominates |
 
-**Ratio 1.026, where pure gather noise predicts 2.000.** Quadrupling the samples removed 2.6 % of the
-seed-to-seed difference. The photon realization dominates the image so completely that spp is nearly
-irrelevant on this scene — which means the budgeted CPU path, slower per sample, was spending its
-time on the axis that actually converges (independent map realizations) while the fast `-spp` arm
-accumulated samples that barely moved the picture.
+Pure gather noise predicts **2.000**; a pinned map floor predicts **~1.0**. So:
 
-So the original framing — "a silent 20x penalty on the documented workflow" — is **too strong**. What
-is certain is the routing (`-device gpu` is disregarded, log lines name the device, beam uploads 1
-against 0) and the per-sample throughput. What is NOT established is that the budgeted render
-produces a worse image per second; on this scene it plausibly produces a better one. The 0.290.1
-warning text said "a fixed -spp gathers the same image on the device", which is false, and was
-corrected in 0.290.2 to report the lost device without recommending `-spp` as a substitute.
+* **On surfaces, `-spp` converges essentially perfectly** and the device's per-sample throughput *is*
+  real image quality. The original "silent 20x penalty" framing is close to right here.
+* **In thick media the photon realization dominates so completely** that quadrupling the samples
+  moves the picture by 2.6 %. Only more photons — or more epochs — converge it, and a fast `-spp`
+  arm is accumulating samples that barely change the image.
 
-**A second caveat, which cuts the same way:** both arms of the 20x carried `-beamfreeze`, i.e. both
-were forbidden to refresh — exactly the configuration where the shared path's inability to refresh
-costs it nothing. An epoch-looping implementation pays a rebuild per epoch the `-spp` arm never paid,
-so do not expect the fixed version to be 20x either.
+**I generalised from one scene twice in a row, in opposite directions, and both times the correction
+came from measuring a second case rather than from thinking harder.** First: measured throughput
+(s/spp) and nearly concluded about quality. Second: measured `_fog_thick` alone and wrote "spp is
+nearly worthless", which is true of thick media and false of surfaces. The general lesson is the
+queue's own rule — a ratio is only worth what its denominator is worth, and one scene does not
+establish a denominator.
 
-**Method note for whoever measures this next:** do not score it by the reported `% noise`, which is
-computed from the film and so keeps falling on a frozen map even while the map error does not — the
-table above is the demonstration of exactly that trap. Score seed-to-seed at matched spp, or against
-a reference.
+**Reusable diagnostic, worth having independently of this bug:** to find out whether `-n` or `-spp`
+is the binding constraint for a mode-M scene, render two seeds at each of two spp levels and take the
+seed-to-seed RMS. A ratio near `sqrt(spp2/spp1)` means gather noise dominates, so raise `-spp`; a
+ratio near 1 means the map realization dominates, so raise `-n`. No reference image is needed,
+because differencing two seeds at matched spp cancels everything except what actually varies.
+`scraps/floor_score.py` is the scorer.
+
+**Method note:** do not score any of this by the reported `% noise`. It is film-derived, so it keeps
+falling on a pinned map even while the map error does not — the `_fog_thick` row is a demonstration
+of exactly that trap.
 
 **Caveat on my own numbers:** one scene, one resolution, single runs of each arm, so the 20x is a
 ratio of two unreplicated timings and should read as "more than an order of magnitude". The
