@@ -133,10 +133,7 @@ clean 1-spp preview, or spend `-spp 32..64` to converge the haze.
 **And media are one of the few places the CPU and GPU backward tracers disagree.** The
 **GPU** megakernel superposes the scene's **whole** `media` list — every `bounds` region,
 every `density` field, every per-medium phase function, `phase rainbow` included — so
-`-mode W` on the GPU renders bounded clouds and a real rainbow. The **CPU** backward
-(`backward.h`) still collapses everything to the **first authored medium**, as a global
-homogeneous haze with `bounds`/`density` ignored, so the same scene on `-device cpu` loses
-the clouds and the bow entirely. ftrace warns (`[medium] …`) when a render's backward layer
+`-mode W` on the GPU renders bounded clouds and a real rainbow. The **CPU** backward tracer did the same until v0.254.0 — `Scene::backwardMedium()` collapsed everything to the **first authored medium** as a global homogeneous haze with `bounds`/`density` ignored — but **that limitation is gone**: `backward.h` now superposes the whole list through the same `Renderer` implementation the forward tracer uses (extinction adds, so transmittance is the product; the first collision in a union of Poisson processes is the earliest free flight). Verified on `scenes/_fog_st6.ftsl`, which carries two media: CPU and GPU agree to **5.6 %** in mean radiance and neither emits a `[medium]` warning, where a collapse to one unbounded haze would differ totally. *(The `phase rainbow` half of the old claim is NOT re-verified here — a mode-`W` probe of `_rainbow_test.ftsl` renders black on both backends, so that rig could not see the effect; that scene is validated with `-mode M -beams` in its own section.)* ftrace warns (`[medium] …`) when a render's backward layer
 lands on the degraded CPU path. Both the noise and the divergence are logged in
 `known-issues.md`.
 
