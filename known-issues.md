@@ -1224,6 +1224,45 @@ second. The file now carries four traps, every one of them added after it cost a
 The sweep is re-running on `-device cpu`. Its result, when it arrives, will be the first measurement
 of a parameter the surface cache has shipped with since v0.257.0.
 
+### `-radcache-validate` takes a VALUE, and it swallowed the flag after it — the sweep was void a second time
+
+The CPU rerun was void too, for a different reason, and this one was mine rather than the
+renderer's. Every validate-ON arm came back byte-identical and every one reported the same cell:
+
+    v00125 f9debea6  cell 0.4004      v010   f9debea6  cell 0.4004
+    v0025  f9debea6  cell 0.4004      v020   f9debea6  cell 0.4004
+    v005   f9debea6  cell 0.4004      v040   f9debea6  cell 0.4004
+    nov040 5b5d0d84  cell 0.4
+
+`0.4004` is the AUTO cell size; `0.4` is the one arm that actually got the flag. The command line
+was `-radcache -radcache-validate -radcache-cell "$c"`, and **`-radcache-validate` takes a fraction
+in 0..1**, so it consumed the *next token* as its value: `atof("-radcache-cell")` is 0, which turned
+validation OFF, and `$c` was left as a stray positional. Six arms that differed in nothing.
+
+**A flag that takes a value can eat the flag after it, and the result looks like a clean null.** Both
+halves of the failure are silent: no parse error, because the argument is a well-formed string that
+`atof` maps to 0; and no behavioural complaint, because 0 is a legal validation fraction.
+
+**TRAP 4 did not fire, and the reason matters more than the bug.** It had been added one tick
+earlier — to `roi_score.py`'s `main()`. This sweep was scored by `scraps/rccell_score.py`, a
+hand-rolled script, which never calls `main()`. That is the *identical* failure `roi_score.py`'s own
+header describes for traps 1 and 2: *"both were then walked into AGAIN by hand-rolled scorers"*. A
+guard that only protects the tool nobody reaches for protects nothing.
+
+So the check is now **`assert_arms_differ(named)`**, a function any scratch script can use in one
+import and one line. Pointed at the void sweep it exits immediately:
+
+    !! ARMS "v00125" and "v0025" are BYTE-IDENTICAL -- the same image. Check the render logs:
+       a flag the renderer declined to honour, or one silently swallowed by a neighbouring flag
+       that takes a value, is the usual cause. Refusing to score.
+
+**One real measurement did survive the wreckage.** `nov040` (cell 0.4) and the auto arms
+(cell 0.4004) produce *different images* — a **0.1 %** change in cell size is enough to change the
+result, because moving a cell boundary reassigns which samples land in which cell. So the cache's
+output is not a smooth function of its cell size; part of any cell-size sweep is reshuffling noise
+rather than resolution. A sweep over that parameter needs several seeds per point, which the
+re-run now under way does not have — and that limitation is worth knowing before reading it.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than

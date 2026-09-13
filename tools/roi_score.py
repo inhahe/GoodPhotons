@@ -63,6 +63,26 @@ def tmean(v, t=0.05):
     return v[k:len(v) - k].mean() if len(v) - 2 * k > 0 else v.mean()
 
 
+def assert_arms_differ(named):
+    """TRAP 4, callable from a one-off script. `named` is {label: ndarray}.
+
+    Exits if any two arms are byte-identical. Exposed as a function because the trap was
+    first added inside `main()` and then immediately bypassed by a hand-rolled scorer in the
+    very next run -- which is exactly the failure roi_score.py's own header describes for
+    traps 1 and 2. A guard that only protects the tool nobody used protects nothing, so it
+    is one import and one line for a scratch script.
+    """
+    items = list(named.items())
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            (na, va), (nb, vb) = items[i], items[j]
+            if va.shape == vb.shape and np.array_equal(va, vb):
+                sys.exit(f'!! ARMS "{na}" and "{nb}" are BYTE-IDENTICAL -- the same image. '
+                         f'Check the render logs: a flag the renderer declined to honour, or '
+                         f'one silently swallowed by a neighbouring flag that takes a value, '
+                         f'is the usual cause. Refusing to score.')
+
+
 def boxmask(H, W, ys, ye, xs, xe):
     """A rectangle, as the boolean mask every region is represented by internally."""
     m = np.zeros((H, W), dtype=bool)
