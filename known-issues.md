@@ -26500,15 +26500,37 @@ true size without over-committing. Replicated twice per caller:
 Identity re-verified after the change on real geometry (`gallery_rain` 1 589 917 nodes, the beam tree
 2 389 281 nodes), plus `-checkbvhparallel` and the three geometry self-tests.
 
-**Remaining limit, honestly.** ~3x is still short of an ideal fork-join's ~10x. Fitting Amdahl to the
-beam curve gives a serial fraction around 0.29, which is the root levels: one thread computes the
-root's bounds, bins all `n` primitives, and partitions them before either child can start. Two of
-those three passes (bounds and binning) are min/max reductions and therefore **order-independent, so
-they could be parallelised without breaking bit-identity**. The partition cannot: `std::partition`'s
-exact output permutation is an implementation detail, and reproducing it in parallel is not
-practical — which matters because `primIdx` order is part of what the verifier compares. Parallelising
-the two reductions alone would cut the serial fraction to roughly 0.1 and is the next real step, worth
-perhaps another 1.5-2x on top.
+**OPTIMISATION CLOSED HERE (v0.292.3), on a measurement that refutes my own previous estimate.**
+The prior version of this paragraph fitted Amdahl to the thread-scaling curve, read a serial fraction
+near 0.29, attributed it to the root levels, and concluded that parallelising the root's bounds and
+binning was "worth perhaps another 1.5-2x". Measuring the root scan directly says otherwise:
+
+| | root scan | build | critical path (~2x root) |
+|---|---:|---:|---:|
+| scene BVH (`gallery_rain`) | **0.072 s** | 0.71 s | ~20 % |
+| beam BVH (`_fog_thick`) | **0.082 s** | 0.98-1.21 s | ~14-17 % |
+
+Of that, only the bounds and binning passes can be split — they are min/max reductions and so
+order-independent — while the `std::partition` beneath them cannot, because its exact output
+permutation is an implementation detail and `primIdx` order is part of what the verifier compares.
+That is roughly two thirds of the scan, and 12 threads would recover about eleven twelfths of it:
+**~0.10 s, against the 1.94 s per epoch already saved. About 5 % as large an increment, for a much
+more intricate change** (claiming threads mid-recursion, a parallel reduction merge, and a new
+correctness surface). `CLAUDE.md`'s own rule — *keep going until further effort buys only marginal
+speedups, then stop* — applies, so this is where it stops.
+
+**Why the Amdahl estimate was wrong, since the mistake generalises.** A fit to the thread curve tells
+you *that* there is a plateau; it does not tell you *where* the serialisation is. The 0.29 lumps
+together the root scan, memory-bandwidth saturation and thread-spawn overhead. Attributing all of it
+to the root scan — the one component I happened to have a fix in mind for — inflated the estimate
+roughly fourfold. Measuring the suspected component directly cost one instrument and settled it.
+
+**Final state of this work:** scene BVH 1.87 s -> 0.71 s (**2.6x**), beam BVH 2.92 s -> ~0.98 s
+(**3.0x**), bit-identical to the serial build on synthetic primitives (`-checkbvhparallel`) and on
+every real tree tried (`FTRACE_BVH_VERIFY`), with `FTRACE_BVH_TIME` reporting build cost and root
+scan for anyone who revisits this. Note the beam figure moved 0.98 -> 1.21 s between two runs of the
+same command, which is the run-to-run variance this file has warned about throughout; treat ~3x as
+approximate.
 
 **Where it would still matter, and is not refuted:** the interactive explorer and quick previews,
 where load latency *is* the product rather than a prelude to a long render. A 2.3 s stall before an

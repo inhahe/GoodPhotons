@@ -175,6 +175,7 @@ struct Bvh {
         if (maxThreads > 0) threads = maxThreads;
         else if (bvhThreadOverride() > 0) threads = bvhThreadOverride();
         BuildCtx ctx;
+        ctx.totalN = n;
         ctx.budget.store(threads - 1, std::memory_order_relaxed);
         unsigned tick = 0;
         buildRange(bp, 0, n, nodes, tick, ctx);
@@ -224,6 +225,11 @@ struct Bvh {
             const double el = std::chrono::duration<double>(
                                   std::chrono::steady_clock::now() - t0).count();
             if (el >= 0.1)
+                std::printf("[bvh] scan: root %.3f s (critical path ~2x that), "
+                            "%.2f s summed over nodes >= %d prims\n",
+                            (double)ctx.rootScanNs.load(std::memory_order_relaxed) * 1e-9,
+                            (double)ctx.scanNs.load(std::memory_order_relaxed) * 1e-9,
+                            PAR_SCAN_MIN);
                 std::printf("[bvh] %d prims -> %zu nodes in %.2f s, up to %d threads "
                             "(%.1f MB of BuildPrim)\n", n, nodes.size(), el, threads,
                             (double)(n * sizeof(BuildPrim)) / (1024.0 * 1024.0));
@@ -251,7 +257,22 @@ struct Bvh {
     // and scene.h:2508 assigns one Bvh to another -- so the build state lives in build()'s frame
     // and travels down the recursion by pointer instead. Caught at compile time, which is the
     // good case; a Bvh that silently stopped being copyable would have been a worse bug.
-    struct BuildCtx { std::atomic<int> budget{0}; std::atomic<bool> stop{false}; };
+    struct BuildCtx {
+        std::atomic<int> budget{0};
+        std::atomic<bool> stop{false};
+        // Nanoseconds spent in the bounds+bin+partition scan of LARGE nodes, summed across
+        // threads. This is the quantity that decides whether parallelising those passes is
+        // worth writing: bounds and binning are min/max reductions and so could be split
+        // without disturbing bit-identity, but the partition beneath them cannot, so the
+        // reachable win is bounded by this number and is smaller than it.
+        std::atomic<long long> scanNs{0};
+        // The ROOT scan alone, which is the part genuinely on the critical path: while it
+        // runs nothing else can. Summed-across-threads time cannot answer that, because
+        // most large-node scans already overlap with other subtrees.
+        std::atomic<long long> rootScanNs{0};
+        int totalN = 0;
+    };
+    static constexpr int PAR_SCAN_MIN = 100000;   // "large" for the measurement above
 
     static void appendRemap(std::vector<BvhNode>& out, const std::vector<BvhNode>& buf) {
         const int base = (int)out.size();
@@ -300,6 +321,9 @@ struct Bvh {
             ctx.stop.store(true, std::memory_order_relaxed);
         if (ctx.stop.load(std::memory_order_relaxed)) { makeLeaf(); return nodeIdx; }
 
+        const bool bigScan = bvhTimeEnabled() && count >= PAR_SCAN_MIN;
+        const auto scanT0 = bigScan ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
         int axis = cbounds.largestAxis();
         double cLo = vget(cbounds.lo, axis), cHi = vget(cbounds.hi, axis);
         if (cHi - cLo < 1e-12) { makeLeaf(); return nodeIdx; } // degenerate centroids
@@ -355,6 +379,14 @@ struct Bvh {
                              });
         }
 
+        if (bigScan && count == ctx.totalN)
+            ctx.rootScanNs.fetch_add((long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - scanT0).count(),
+                                     std::memory_order_relaxed);
+        if (bigScan)
+            ctx.scanNs.fetch_add((long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - scanT0).count(),
+                                 std::memory_order_relaxed);
         int l, r;
         // Only fork where the subtree is big enough to pay for a thread, and only while the
         // budget allows. fetch_sub returns the PREVIOUS value, so `> 0` is the test for having
