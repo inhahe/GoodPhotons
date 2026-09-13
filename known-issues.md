@@ -1571,6 +1571,36 @@ beam count rather than scaling — so doubling the beams from 1 M to 2 M costs 3
 100 % more traversal. That is an optimisation target with no cache involved, and it is not in this
 file anywhere.
 
+**CEILING CORROBORATED FROM A SECOND, INDEPENDENT DIRECTION (2026-09-13).** `FTRACE_BEAM_DIAG=1`
+already answers the cacheable-share question inside the gather — the counter and its caveat were
+built for exactly this and had not been run. On `_fog_thick`:
+
+    [beamdiag] candidates 158107913 | rejected: parallel 0, t-range 9272651,
+               s-range 34039803, radius 100404287
+    [beamdiag] 131959962 of those candidates (83.5 %) are chords of scattering order >= 2
+               -- the share a volume cache could remove (VOLCACHE)
+
+**83.5 %**, reproducing the 83.2 % the original payoff argument quoted. The entry above is right that
+this is a share of *candidates*, not of cost — but today's cost decomposition converts it:
+
+* the gather is **~61 %** of the frame (the `8.8 s fixed + 0.70 s/spp` fit, with the fixed part now
+  7.2 s because v0.292.x parallelised the beam BVH build from 3.20 s to 1.57 s — which *raised* the
+  gather's share from 56 %);
+* removing 83.5 % of the intersection tests takes **~51 % of the frame** with it;
+* and those beams leave the BVH too, so most of the remaining 1.57 s build goes as well, for a total
+  near **58 %**, before the cache pays its own march cost.
+
+**Two independent routes now give the same answer.** The `-beamcount` sweep in the section above
+concluded "not more than about half the frame even in the best case" from timing alone; the
+order-share counter reaches ~51-58 % from geometry alone. They agree, which is worth more than either
+figure by itself.
+
+**Also worth knowing:** the counter's own comment records that the obvious alternative experiment is
+invalid — `-beams-order 1` "changes which chords are deposited (single-scatter chords cross the whole
+medium), hits the same `-beamcount` cap, and so measures beam GEOMETRY rather than the cacheable
+share; on `_fog_thick` it made the gather 56 % SLOWER." That is a trap already walked into and
+documented; do not repeat it.
+
 **Limits.** One scene, one device, spp 16, two repeats, two-point fits. The percentages are
 approximate and the split between deposit and gather inside the 47 % slice is *not* resolved — that
 needs instrumentation, and it is the one number still missing before VOLCACHE can be priced. But the
