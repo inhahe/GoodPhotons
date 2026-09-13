@@ -2641,16 +2641,38 @@ map collapses the SD from 0.0347 to 0.0052, i.e. with the light side frozen, ~97
 this entry has been measuring *was* the map realization. A per-map histogram cannot see that; only a
 across-realizations comparison can.
 
-**The hypothesis this points to, and its quantitative test.** If the device's photon streams are
-partially correlated — threads in a warp sharing or neighbouring their random sequences — the map
-would have fewer *effective* independent photons than the nominal 2 000 000, while any single map
-still looks statistically normal. That is exactly a realization-variance defect invisible to
-single-map statistics. It predicts a number: the device at 2 M photons should match the host at
-**2 M / 1.63 = ~1.23 M** photons. That is one sweep to check, and it would convert the hypothesis
-into a measured effective-photon count.
+**A LARGE ASYMMETRY FOUND IN THE DEPOSIT, measured on the saved maps with no renders.** If device
+photon streams are correlated, deposits near each other in the file should be near each other in
+space. The first attempt at that probe read **0.00000 median distance on both backends** — blind,
+because a spectral bundle deposits ~4 wavelengths at one identical position (run length 4 on both).
+Striding past the bundle:
 
-(Mode `R`'s parity is not evidence against this: its camera paths are indexed per pixel-sample, a
-different mapping from photon-id to thread than the deposit uses.)
+| stride | GPU gap / random | CPU gap / random |
+|---:|---:|---:|
+| 4 | **0.0047** | 0.802 |
+| 8 | **0.0049** | 0.910 |
+| 32 | **0.0061** | 0.996 |
+
+**On the device, photons 32 entries apart are still ~160x closer together than random pairs; on the
+host they are statistically independent by stride 32.** The device deposits in long,
+spatially-correlated runs, the host's are interleaved.
+
+**Deliberately not concluding from this, because it conflicts with two other measurements and the
+conflict is the useful part.** (a) Deposit *order* should not reach the gather at all — the grid is
+rebuilt from positions on load, and the `-loadmap` test above shows two backends gathering an
+identical map to 0.2 %. (b) The occupancy-dispersion comparison found the device map **less** clumped
+at gather scale (52.6 against 60.7), the opposite of what long correlated runs would suggest.
+
+So an ordering difference cannot matter, a clustering difference is measured to go the wrong way, and
+yet the device's map realizations demonstrably vary 1.63x more from seed to seed. **One of those
+three measurements is answering a different question from the one it appears to.** The most likely
+candidate is the dispersion statistic: cells sized to the gather radius may be far too coarse to see
+structure that a 160x correlation at stride 32 implies. The next step is that same occupancy test
+across several cell sizes rather than one.
+
+*(Also worth keeping: the first version of the correlation probe returned a perfectly clean 0.0000 on
+both arms, which reads as a tidy null. Asking why a null was quite so perfect is what exposed the
+spectral bundle underneath it.)*
 * **The deposit.** Both trace 2 000 000 photons, but how many survive into the map, and with what
   power distribution, has not been compared.
 
