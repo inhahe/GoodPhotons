@@ -506,6 +506,54 @@ earlier today, one layer down: *the thing measured is not the thing meant*. Here
 was not the parameter the renderer used. The sweep was clean, monotone in nothing, reproducible, and
 void. The only thing that caught it was rendering a value so extreme that agreement was impossible.
 
+### Bounce truncation REFUTED — the first trustworthy null in this thread — and the deficit reproduces on the CPU
+
+With `-photon-bounce` able to move the image, the actual question could finally be asked. CPU mode M,
+n = 2e6, spp 8, adaptive radius, light-path cap 32 vs 128:
+
+| material | px | cap 32 vs ref | cap 128 vs ref | 128 vs 32 |
+|---|---|---|---|---|
+| `wall` | 6605 | +0.14 % | +0.14 % | 0.000 % |
+| `floor` | 5116 | -0.19 % | -0.19 % | 0.000 % |
+| `coat` | 1369 | -16.72 % | -16.72 % | 0.000 % |
+| `belly` | 743 | -31.58 % | -31.58 % | 0.000 % |
+| `tan` | 274 | -23.46 % | -23.46 % | 0.000 % |
+| `skin` | 195 | -10.73 % | -10.73 % | 0.000 % |
+
+`max |cap128 - cap32| = 0.0000e+00` — byte-identical. **Russian roulette terminates every photon
+path well before 32 bounces, so the cap is not binding and truncation cannot be what darkens the
+belly.** This null is worth something precisely because the same flag at 2 moves the image -20.4 %;
+the two previous nulls in this thread were produced by flags that could not move it at all.
+
+**The deficit also reproduces on a different device with different sampling**, which rules out a
+large family of explanations at once. GPU (default n, spp 64, radius 0.0092) vs CPU (n = 2e6, spp 8,
+its own adaptive radius): `coat` -16.99 % vs -16.72 %, `belly` -33.61 % vs -31.58 %, `floor` -0.17 %
+vs -0.19 %. Two independent implementations, different photon counts, different radii, same answer.
+It is not a device artefact, not a photon-count artefact, and not a radius artefact.
+
+**What is left, and the ordering that points at it.** Rank the materials by how much fur light must
+pass through to reach them:
+
+| material | fur between it and the light | deficit |
+|---|---|---|
+| `wall`, `floor` | none | **0 %** |
+| `coat` | the strands themselves | -17 % |
+| `skin` | thinly furred | -11 % |
+| `tan` | furred | -23 % |
+| `belly` | under the densest coat | **-32 %** |
+
+The deficit is zero wherever there is no fur and grows with how much fur the light crosses. The
+footprint correction is provably inert on `belly` (coverage 1.0 at r = 0.0092; the flag A/B moved it
+0.2 points), and bounces are now ruled out. **The remaining candidate that fits the ordering is a
+discrepancy between how a hair BCSDF attenuates light travelling FORWARD through a strand (the
+photon pass) and BACKWARD (the mode-R reference) — i.e. non-reciprocity, which hair models are
+notoriously easy to get wrong.** A per-strand transmission mismatch compounds with the number of
+strands crossed, which is exactly the shape of the table above.
+
+That is a hypothesis with a registered prediction available: on a minimal scene — one diffuse patch
+under a controlled number of hair strands — the mode-M-vs-mode-R gap should grow with strand count
+and vanish at zero strands. It has not been tested, and is recorded as untested.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
