@@ -1799,6 +1799,42 @@ interior optimum), 0.30 wins and *"their optimum has not moved"* is wrong. A thi
 and would be the most interesting: **frac 0 wins**, i.e. on mode M refreshing does not pay for itself
 at all, and the light side should simply be frozen.
 
+### `-beamrefresh 0.10` is effectively `-beamfreeze` on `_fog_thick` — and the sweep I launched could not have shown it
+
+The controller comment states the rule is *"self-correcting: a cheap scene refreshes often, an
+expensive one stretches its epochs out until, **in the limit, it behaves like `-beamfreeze`**"*, and
+the code confirms it: `epochSec = (rebuildSec + setupSec) / g_beamRefreshFrac` at both refresh sites.
+
+**Combine that with the light side measured at 8.6 s on `_fog_thick`** and the default's behaviour
+falls out arithmetically:
+
+| `-beamrefresh` | epoch | realizations in 30 s | in 240 s |
+|---|---|---|---|
+| 0.05 | 172 s | **1.1** | 2.3 |
+| **0.10 (default)** | **86 s** | **1.2** | 3.7 |
+| 0.30 | 28.7 s | 1.7 | 9.1 |
+| 0.60 | 14.3 s | 2.5 | 17.1 |
+
+**At the shipped default this scene gets barely more than ONE realization in any render shorter than
+about 90 seconds.** The feature is nominally on and is doing essentially nothing — the limit the
+comment describes, reached at the default rather than at some extreme.
+
+**And that is a direct consequence of the mis-estimated overhead.** The 0.35 % figure implied a
+rebuild so cheap that 0.10 would afford many realizations; at the true 43 % it affords one. The
+number and the default were chosen together, and correcting the number un-chooses the default.
+
+**I stopped my own sweep rather than score it.** It ran 30 s arms, where the table above shows
+0, 0.05 and 0.10 all deliver one realization and are the same render — the arms would have been
+indistinguishable and `assert_arms_differ` would likely have refused them. That is the
+"check the rig can see the effect" rule applied *before* reading the numbers instead of after,
+which is the first time today it has been applied in that order.
+
+**What a real test costs, stated so it is not under-budgeted again:** arms need enough realizations
+to separate, so ~240 s each — 10 arms is ~40 minutes, plus a longer reference. The cheaper and
+sharper alternative is to test on a scene whose light side is genuinely small, where the default
+was presumably tuned; the same table there would show many realizations at 0.10 and the comparison
+would have something to compare.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
