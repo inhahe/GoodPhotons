@@ -896,6 +896,32 @@ LBVH kernel itself still reports **3.7 ms** against the 4.3 ms recorded above, s
 where the time goes. The residual — host-side split, CIE table, box pass and upload — is
 **~400 ms**, not 51 ms.
 
+**AND THE LIGHT-SIDE PERCENTAGE IS A SETPOINT, NOT A MEASUREMENT — which changes how every number
+in this entry should be read.** `main.cpp` ~24060 sizes each epoch from the measured preamble:
+*"whatever elapsed before the first sample landed IS the overhead, and the epoch runs `1/frac` of
+it"*. So a cycle is `overhead + overhead/frac`, and the light side is **`frac / (1 + frac)`** by
+construction, whatever the overhead happens to cost. Predicted against measured:
+
+| `-beamrefresh` | predicted light side | measured |
+|---|---|---|
+| 0.10 | 9.1 % | **8.3 % / 8.6 % / 10.5 %** |
+| 0.95 | 48.7 % | **44.8 %** |
+
+Both within a point or two, over a 5x range of the knob. **The controller does exactly what it
+says**, and three consequences follow that are easy to get backwards:
+
+1. **"The light side is 6.7 % / 9.6 % / 10.5 % of the render" is not evidence about the light
+   side's cost.** It is `-beamrefresh`'s target. Every such figure quoted above is reporting the
+   knob setting.
+2. **The realization COUNT is the signal.** A more expensive preamble stretches each epoch by the
+   same factor, so realizations fall in proportion at a fixed share of the frame. That is why 17
+   realizations then against 5 now is the meaningful comparison, and why the per-build number had
+   to be extracted with the epoch-count dependence measured out.
+3. **Making the preamble cheaper cannot reduce the light side's share — it buys realizations.**
+   So the device-deposit port must be valued in realizations at a fixed share, never in time
+   saved. (The v0.272.2 table above already does this correctly: 17 realizations against 9 at
+   6.7 % against 9.5 %. The framing elsewhere in this entry does not.)
+
 **Stated as a discrepancy rather than a regression, because the comparison is not clean.** The
 table above records 17 realizations in 25 s; this binary gets 5 in 25 s while producing *more*
 samples (3248 against 2821), so the refresh cadence per sample has changed as well, and a
