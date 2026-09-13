@@ -1538,6 +1538,44 @@ with the 2583-beam query that walk would replace — and neither number is in th
 **Nothing here says VOLCACHE is not worth building.** It says the number quoted as its payoff does
 not measure its payoff, and the real one is still unmeasured.
 
+### VOLCACHE's real ceiling, measured: at most ~47 % of the frame, and less once deposit is excluded
+
+The previous entry showed the "83.2 % of gather candidates" figure is a share of candidates, not of
+cost, and that the payoff must come from replacing the beam *traversal*. So: how much of a frame is
+that traversal? Measured without instrumentation, by sweeping `-beamcount` with the **kernel radius
+pinned** (`-beamradius 0.004687`, the confound that voided the previous attempt), `_fog_thick`, 128²,
+spp 16, two repeats:
+
+| `-beamcount` | total | BVH build | scales with count | fixed |
+|---|---|---|---|---|
+| 250 k | 11.4 s | 2.5 s (22 %) | 2.8 s (25 %) | 6.0 s (53 %) |
+| 500 k | 17.0 s | 6.4 s (38 %) | 5.6 s (33 %) | 6.0 s (35 %) |
+| **1 M (default)** | **24.2 s** | **7.6 s (31 %)** | **11.3 s (47 %)** | **6.0 s (25 %)** |
+| 2 M | 36.4 s | 7.8 s (22 %) | 22.6 s (62 %) | 6.0 s (17 %) |
+
+Fit of the non-BVH time: **6.0 s fixed + 11.3 ms per thousand beams**, stable across the sweep.
+
+**The BVH build had to be separated because it does not scale** — 2.5, 6.4, 7.6, 7.8 s — it saturates,
+almost certainly because the split count is capped by `-beamsplitmax`. Leaving it in the slope would
+have inflated the traversal estimate by a third.
+
+**So the ceiling on VOLCACHE is the 47 % slice, and the true figure is lower**, for a reason the
+architecture forces: the hybrid design keeps order-1 beams, so the beams must still be **emitted,
+deposited and built into a BVH**. The 31 % BVH slice stays. Photon deposit also lives inside the
+47 % slice and stays with it. What a cache can remove is only the *query* part of that 47 %, and it
+must then pay for marching a cached field in its place.
+
+**A number worth having on its own: the beam BVH build is 31 % of this frame.** Nearly a third of a
+`_fog_thick` render is spent building an acceleration structure over beams, and it saturates with
+beam count rather than scaling — so doubling the beams from 1 M to 2 M costs 3 % more build and
+100 % more traversal. That is an optimisation target with no cache involved, and it is not in this
+file anywhere.
+
+**Limits.** One scene, one device, spp 16, two repeats, two-point fits. The percentages are
+approximate and the split between deposit and gather inside the 47 % slice is *not* resolved — that
+needs instrumentation, and it is the one number still missing before VOLCACHE can be priced. But the
+bound is now grounded: **not 83 %, and not more than about half the frame even in the best case.**
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
