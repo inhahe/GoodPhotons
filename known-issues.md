@@ -3021,6 +3021,36 @@ above had survived 29, 1 and 41 versions respectively. The cost of an audit pass
 against the claims that name a specific symbol or flag; those are exactly the ones a code change can
 silently invalidate.
 
+### HOW TO TIME ANYTHING IN THIS REPO (2026-09-13) — pair within a repetition, discard the warm-up
+
+**The machine drifts 10-20 % between sittings and up to 24 % under transient load, which is larger
+than most effects anyone measures here.** Four identical runs read 16.61, 15.90, 15.13, 15.14 s —
+a ~10 % first-run warm-up, then steady state agreeing to **0.07 %**. A set taken while something else
+was running read 19.41 and 19.05 against a 15.63 s baseline.
+
+**The rule, which costs nothing:**
+
+1. **Alternate the arms inside each repetition** (A, B, A, B — not AAA then BBB). Drift then hits both
+   arms equally and cancels in the difference.
+2. **Discard the first repetition.** It carries a ~10 % warm-up penalty, and whichever arm you ran
+   first wears it.
+3. **Three repetitions minimum**, and report the paired differences, not the means of each arm.
+4. **Never compare absolute times across sittings.** Ratios survive drift; seconds do not.
+
+**This is not theoretical — it has already corrected two published figures in this file and nearly
+reversed a shipped default:**
+
+* **`-beamsplitmax` 4 M -> 8 M (v0.293.0)** was decided partly on a single run per arm with 4 M
+  measured *first*, so the arm being reverted away from carried the warm-up. Re-tested paired, 8 M
+  wins **3 of 3** by 4.64 / 0.53 / 3.25 s. **The revert stood** — but it was luck, not method.
+* **The BVH parallel-build speedup** was reported at **2.6x** for the scene tree. Paired, it is
+  **3.06x**: the serial reading had been taken at a fast moment while the parallel one had not. The
+  beam tree's 3.01x was unaffected because both its readings came from the same sitting.
+
+**Both errors were invisible without re-running paired**, and both sat in `REFERENCE.md` as measured
+fact. A single-run A/B on this machine is not a measurement; it is a coin weighted by whatever else
+the OS was doing.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
