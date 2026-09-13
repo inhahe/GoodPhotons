@@ -18299,6 +18299,7 @@ static int run(int argc, char** argv) {
     // point is that an ROI you cannot trust should not be easy to copy out of its output.
     bool      roiBoxesOnly = false;
     const char* roiAuditFile = nullptr;
+    const char* roiMaskFile  = nullptr;
     double    roiMinPurity = 0.60;
     double    roiMinShare  = 0.50;
     long long roiMinPx     = 24;
@@ -19017,6 +19018,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checktrinormal")) checkTriNormalOnly = true;
         else if (!std::strcmp(argv[i], "-roiboxes")) roiBoxesOnly = true;
         else if (!std::strcmp(argv[i], "-roi-audit") && i + 1 < argc) roiAuditFile = argv[++i];
+        else if (!std::strcmp(argv[i], "-roi-mask")  && i + 1 < argc) roiMaskFile  = argv[++i];
         else if (!std::strcmp(argv[i], "-roi-minpurity") && i + 1 < argc) roiMinPurity = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-roi-minshare")  && i + 1 < argc) roiMinShare  = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-roi-minpx")     && i + 1 < argc) roiMinPx     = std::atoll(argv[++i]);
@@ -20287,6 +20289,39 @@ static int run(int argc, char** argv) {
         }
         const RenderCam& rc = toRender.front();
         return roiAuditReport(scene, rc.cam, rc.res, rc.resY, roiAuditFile);
+    }
+    // -roi-mask: write the per-pixel material id as a .pfm, plus a `<path>.materials.txt`
+    // legend. A rectangle cannot represent a thin material -- fur scores purity 0.44 over
+    // 28 regions on fur_creature, so no box over it is mostly it. The mask is the ROI that
+    // always exists, and scoring it is the only way one statistic applies to every scene.
+    // It is written through the SAME writePfm the renders use, so the row order cannot
+    // drift from the images it will be used to index.
+    if (roiMaskFile) {
+        if (toRender.empty()) {
+            std::fprintf(stderr, "[roi-mask] no camera selected\n");
+            return 1;
+        }
+        const RenderCam& rc = toRender.front();
+        const std::vector<int> mid = roiMaterialImage(scene, rc.cam, rc.res, rc.resY);
+        std::vector<Vec3> px(mid.size());
+        for (size_t k = 0; k < mid.size(); ++k) {
+            const double v = (double)mid[k];      // -1 = escaped (sky / no surface)
+            px[k] = Vec3{v, v, v};
+        }
+        if (!writePfm(roiMaskFile, rc.res, rc.resY, px)) {
+            std::fprintf(stderr, "[roi-mask] could not write %s\n", roiMaskFile);
+            return 1;
+        }
+        const std::string legend = std::string(roiMaskFile) + ".materials.txt";
+        std::ofstream lf(legend);
+        lf << "# material id -> name, for " << roiMaskFile << " (" << rc.res << "x" << rc.resY << ")\n";
+        lf << "-1\t(sky/escaped)\n";
+        long long named = 0;
+        for (int m = 0; m < (int)scene.mats.size(); ++m)
+            if (const char* nm = scene.matNameFor(m)) { lf << m << '\t' << nm << '\n'; ++named; }
+        std::printf("[roi-mask] wrote %s (%dx%d) and %s (%lld named materials)\n",
+                    roiMaskFile, rc.res, rc.resY, legend.c_str(), named);
+        return 0;
     }
 
     // -explore/-fly: seed the interactive raster viewer at the first selected frame

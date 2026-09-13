@@ -61,6 +61,53 @@ def tmean(v, t=0.05):
     return v[k:len(v) - k].mean() if len(v) - 2 * k > 0 else v.mean()
 
 
+def boxmask(H, W, ys, ye, xs, xe):
+    """A rectangle, as the boolean mask every region is represented by internally."""
+    m = np.zeros((H, W), dtype=bool)
+    m[ys:ye, xs:xe] = True
+    return m
+
+
+def maskbands(path, want, H, W):
+    """Per-material masks from an ftrace `-roi-mask` .pfm plus its .materials.txt legend.
+
+    TRAP 3 -- A RECTANGLE IS NOT A POPULATION, AND FOR SOME MATERIALS NO RECTANGLE IS.
+    Fur, foliage and any thin structure are sub-pixel and interleaved with whatever is
+    behind them, so a box over them is mostly not them. Measured: on `fur_creature` the
+    coat scores purity 0.44 over 28 disjoint regions, and `gallery_rain`'s hand-placed
+    `creature` ROI -- the one every FURDIM number came from, labelled "fur coat" -- is
+    75 % `cr_belly` skin and 25 % `cr_coat`. No amount of care in placing the box fixes
+    that; the material simply is not rectangular.
+    So the honest region for such a material is the set of pixels that actually show it,
+    which `ftrace -roi-mask` writes and this reads. It is also the only ROI definition
+    that transfers across scenes unchanged, which is what makes a cross-scene comparison
+    mean anything: the population is "the pixels showing material X" in both, rather than
+    a box here and the whole frame there.
+    """
+    mid = lum(readpfm(path))
+    if mid.shape != (H, W):
+        sys.exit(f'mask is {mid.shape[1]}x{mid.shape[0]} but the renders are {W}x{H} -- '
+                 f'regenerate it with the same -r as the renders')
+    names = {}
+    try:
+        for line in io.open(path + '.materials.txt', encoding='utf-8'):
+            if line.startswith('#'):
+                continue
+            p = line.rstrip('\n').split('\t')
+            if len(p) == 2:
+                names[int(p[0])] = p[1]
+    except OSError:
+        sys.exit(f'no legend beside {path} -- expected {path}.materials.txt')
+    out = {}
+    for i, nm in sorted(names.items()):
+        if want is not None and nm not in want:
+            continue
+        m = (np.rint(mid) == i)
+        if m.sum() > 0:
+            out[nm] = m
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('dir')
@@ -68,7 +115,9 @@ def main():
     ap.add_argument('--seeds', type=int, default=16)
     ap.add_argument('--bands', default='', help='name=y0:y1:x0:x1,... in [0,1] fractions')
     ap.add_argument('--rois', default='', help='a .rois file (format: name x0 y0 x1 y1)')
-    ap.add_argument('--only', default='', help='comma-separated ROI names to score')
+    ap.add_argument('--only', default='', help='comma-separated ROI/material names to score')
+    ap.add_argument('--mask', default='', help='an ftrace -roi-mask .pfm: score each material '
+                                               'on the pixels that actually show it')
     ap.add_argument('--list', action='store_true', help='print the parsed boxes and exit')
     ap.add_argument('--null', default='', help='band the change provably cannot affect')
     ap.add_argument('--cost', type=float, default=1.0, help='t_other / t_base, interleaved')
@@ -87,12 +136,17 @@ def main():
     if len(set(ns.values())) > 1:
         print(f'! arms have different seed counts {ns} -- variance columns are not matched')
 
-    if a.rois:
+    want = set(f for f in a.only.split(',') if f) if a.only else None
+    boxinfo = {}
+    if a.mask:
+        bands = maskbands(a.mask, want, H, W)
+        if not bands:
+            sys.exit(f'no materials from {a.mask} are visible (or --only matched none)')
+    elif a.rois:
         # FIELD ORDER IS `name x0 y0 x1 y1` -- fractions of width/height, x FIRST. Written here
         # once because getting it wrong silently yields one-pixel boxes rather than an error:
         # neighbouring ROIs then report identical numbers and a bad rig looks like a clean result.
         bands = {}
-        want = set(f for f in a.only.split(',') if f) if a.only else None
         for line in io.open(a.rois, encoding='utf-8'):
             m = re.match(r'\s*([A-Za-z_][\w]*)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)', line)
             if not m or line.lstrip().startswith('#'): continue
@@ -105,24 +159,30 @@ def main():
                 print('! ROI "%s" is degenerate at %dx%d (%d x %d px) -- check the field order'
                       % (name, W, H, xe - xs, ye - ys))
                 continue
-            bands[name] = (slice(ys, ye), slice(xs, xe))
+            bands[name] = boxmask(H, W, ys, ye, xs, xe)
+            boxinfo[name] = (ys, ye, xs, xe)
         if a.list:
-            for n, (sy, sx) in bands.items():
+            for n, (ys, ye, xs, xe) in boxinfo.items():
                 print('%-16s rows %4d..%-4d cols %4d..%-4d  (%d x %d px)'
-                      % (n, sy.start, sy.stop, sx.start, sx.stop,
-                         sx.stop - sx.start, sy.stop - sy.start))
+                      % (n, ys, ye, xs, xe, xe - xs, ye - ys))
             return
     elif a.bands:
         bands = {}
         for spec in a.bands.split(','):
             name, box = spec.split('=')
             y0, y1, x0, x1 = (float(v) for v in box.split(':'))
-            bands[name] = (slice(int(y0 * H), int(y1 * H)), slice(int(x0 * W), int(x1 * W)))
+            bands[name] = boxmask(H, W, int(y0 * H), int(y1 * H), int(x0 * W), int(x1 * W))
     else:
-        bands = {'top third': (slice(0, H // 3), slice(None)),
-                 'middle': (slice(H // 3, 2 * H // 3), slice(None)),
-                 'bottom third': (slice(2 * H // 3, H), slice(None))}
-    bands['WHOLE FRAME'] = (slice(None), slice(None))
+        # Thirds of a frame are slabs, not regions: nothing in them corresponds to
+        # anything in the scene, so a difference in one localises to nothing. They are a
+        # last resort for "I have no region at all", and saying so is cheaper than a
+        # reader assuming the rows mean more than they do.
+        print('! no --mask, --rois or --bands: falling back to horizontal thirds, which are\n'
+              '! slabs of the image and not regions of the SCENE. Prefer `ftrace -roi-mask`.')
+        bands = {'top third': boxmask(H, W, 0, H // 3, 0, W),
+                 'middle': boxmask(H, W, H // 3, 2 * H // 3, 0, W),
+                 'bottom third': boxmask(H, W, 2 * H // 3, H, 0, W)}
+    bands['WHOLE FRAME'] = np.ones((H, W), dtype=bool)
 
     base = arms[0]
     print(f'\nbaseline: {base}   seeds: {ns[base]}   cost ratio: {a.cost:.3f}\n')
@@ -134,21 +194,21 @@ def main():
 
     warnings = []
     for name, sl in bands.items():
-        npx = ims[base][(slice(None),) + sl].shape[1] * ims[base][(slice(None),) + sl].shape[2]
+        npx = int(sl.sum())
         # ROI SIZE IS PART OF THE RESULT. gallery_rain's `creature` is 6x6 px at 320x180 and
         # `alice_hair` 9x3 -- a trimmed mean over ~30 pixels is a far weaker number than the
         # column width suggests, and nothing else on the line says so.
         # An ROI with no signal in the BASELINE is a misapplied .rois file (wrong scene, wrong
         # camera) far more often than it is a legitimately black region -- and every ratio below
         # would come out NaN and be read as "no change". Say so instead.
-        if not (ims[base][(slice(None),) + sl].mean() > 0.0):
+        if not (ims[base][:, sl].mean() > 0.0):
             print('%-20s%8d   ! no signal in the baseline -- wrong scene or camera for this .rois?'
                   % (name, npx))
             continue
         row = '%-20s%8d' % (name, npx)
         for arm in arms[1:]:
-            vb = tmean(ims[base][(slice(None),) + sl].var(axis=0, ddof=1))
-            vo = tmean(ims[arm][(slice(None),) + sl].var(axis=0, ddof=1))
+            vb = tmean(ims[base][:, sl].var(axis=0, ddof=1))
+            vo = tmean(ims[arm][:, sl].var(axis=0, ddof=1))
             r = vo / vb if vb > 0 else float('nan')
             # BIAS ON RAW MEANS (trap 1). Per-seed image means, so the standard error comes
             # from the seed spread, which is the only honest error bar available here.
@@ -175,8 +235,8 @@ def main():
         else:
             sl = bands[a.null]
             for arm in arms[1:]:
-                vb = tmean(ims[base][(slice(None),) + sl].var(axis=0, ddof=1))
-                vo = tmean(ims[arm][(slice(None),) + sl].var(axis=0, ddof=1))
+                vb = tmean(ims[base][:, sl].var(axis=0, ddof=1))
+                vo = tmean(ims[arm][:, sl].var(axis=0, ddof=1))
                 r = vo / vb
                 ok = abs(r - 1.0) < 0.05
                 print('%s NULL CONTROL "%s" for %s: %.3fx%s' %

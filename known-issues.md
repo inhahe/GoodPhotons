@@ -180,6 +180,60 @@ classifies by first surface hit and is therefore blind to media; it says nothing
 volumetric ROI is well placed. `alice_dress` / `alice_hair` report `(unnamed)` for the same
 structural reason `-roiboxes` skips them: the Alice mesh's materials carry no names to report.
 
+### FURDIM re-scored on material masks: the fur scenes' whole-frame statistic WAS the backdrop
+
+With `-roi-mask` + `roi_score.py --mask` the four archived sweeps were re-scored on each
+material's own pixels, at zero render cost (the `.pfm` files were all still on disk). Bias vs the
+smallest radius in each sweep, per material, with each scene's own flat surface as the control:
+
+| scene | control | control moves | coat moves | skin/belly moves |
+|---|---|---|---|---|
+| `gallery_rain` (+beams) | `gridground` | **+2.3 %** | `cr_coat` **-40.5 %** ±8.9 | `cr_belly` **-54.0 %** ±3.5 |
+| `gallery_rain` (-beams) | `gridground` | **+2.7 %** | `cr_coat` -35.1 % ±24.1 | `cr_belly` -42.8 % ±26.4 |
+| `fur_creature` | `wall` / `floor` | **+22.2 / +21.3 %** | `coat` +20.6 % | `belly` +36.4 % |
+| `fur_basics` | `white` | **+24.7 %** | `ginger` +56.5 %, `brown` +104.6 % | — |
+
+**The finding that closes the original comparison.** On both isolated fur scenes the whole-frame
+number is the BACKDROP, to within two points:
+
+* `fur_creature` — whole frame +23.3 %, `wall` +22.2 % (the wall is 6605 of 14400 px)
+* `fur_basics` — whole frame +22.3 %, `white` +24.7 % (the backdrop is 6785 of 14400 px)
+
+So "the fur error RISES with r on `fur_basics` / `fur_creature`" was a measurement of the wall
+behind the fur. It was compared against `gallery_rain`'s per-ROI number and the difference in sign
+was attributed, in turn, to dimensionality, strand crossing, saturation, the medium, and scene
+composition. All five were explaining an artefact of the statistic. This is what the entry's own
+instruction — *fix the statistic first* — was for, and it is now done.
+
+**What is actually true, stated no more strongly than the data allows.**
+
+1. **Every scene has a large global response to the gather radius, and it must be subtracted per
+   scene.** It is +21 to +25 % on the two small enclosed scenes and only +2 % on `gallery_rain`.
+   The plausible reading is that a growing gather ball in a small room reaches across concave
+   corners and collects the adjoining surface, while `gallery_rain`'s ground is a large open quad
+   far from anything — but that is a hypothesis, not a measurement, and it is not needed for the
+   conclusion above.
+2. **No cross-scene comparison in this thread ever had a control.** It was available in every
+   scene the whole time — each has a flat surface — and scoring whole-frame is precisely what
+   hid it.
+3. **The residual, after subtracting each scene's own control, still differs in sign**:
+   `gallery_rain` -38 to -43 points, `fur_basics` +32 to +80, `fur_creature` -1 for the coat and
+   +14 for the belly. **So there is still no single mechanism, and the hypothesis I formed from
+   `gallery_rain` alone one step earlier — that this is M-GATHERAREA's small-object footprint
+   deficit — does not survive `fur_basics`,** where the coats rise far above their control rather
+   than falling. Recorded as refuted rather than quietly dropped; it is the sixth.
+
+**Caveat that limits all of the above: these sweeps have only TWO seeds** (3 and 7), so the error
+bars are wide wherever the ROI is small. `gallery_rain`'s `cr_coat` is 279 px and its without-beams
+fall of -35.1 % carries ±24.1 %, i.e. about 1.4 sigma — suggestive, not established. The
+with-beams fall (-40.5 % ±8.9) is 4.5 sigma, and the `fur_basics` / `fur_creature` numbers have
+tight bars (±0.1 to ±1.0 %) because their ROIs are thousands of pixels. Any resumption should
+re-run with more seeds before trusting the small-ROI columns.
+
+**Status.** The cross-scene comparison is withdrawn, with the cause identified rather than guessed.
+The mechanism behind the per-scene residual is open. The statistic is fixed and is now the default
+path (`ftrace -roi-mask` -> `roi_score.py --mask`), so a resumption starts from a valid rig.
+
 **Known limits.** The pass is single-threaded (a diagnostic at preview resolution; determinism is
 worth more than the speed here) and classifies by the pixel centre, so a silhouette pixel belongs
 wholly to whichever material the centre hit — the same sub-pixel approximation mode P's classifier
