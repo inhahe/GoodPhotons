@@ -2531,11 +2531,40 @@ M-TIME-CPU work measured the GPU gathering **8x** the samples of the CPU at matc
 each device sample is worth 1/1.63 of a host sample, the effective advantage is nearer **5x**. Every
 GPU-vs-CPU throughput comparison in this file is subject to the same correction.
 
-**Not established:** the mechanism. The leading candidate is a sampling-quality difference — host
-stratification the device does not replicate would produce exactly a modest, scene-independent,
-precision-independent constant factor. A grep for `stratif`/`jitter` finds only *spectral*
-stratification on the host side, so this is a hypothesis, not a finding. The rig is four seeds and
-`np.std(..., ddof=1)` over scene-linear PFMs; it is cheap and it works on any scene.
+**LOCALISED TO THE PHOTON MAP — mode R is at exact parity.** The obvious next question is whether
+the deficit is in the camera-side transport or in the photon map, and mode `R` answers it: same
+scene, same camera sampling, same BSDF sampling, same RNG, no photon map at all.
+
+| mode | GPU | CPU | ratio |
+|---|---:|---:|---:|
+| **R** (backward path tracing, no map) | 0.06155 | 0.06159 | **0.999** |
+| **M** (photon map) | 0.03470 | 0.02718 | **1.277** |
+
+**Parity to within 0.1 %** without the map, with mean radiance agreeing to 0.09 %. So the deficit is
+entirely in the photon-map path — deposit or gather — and **the stratification hypothesis this entry
+carried is dead**: host stratification the device did not replicate would be camera-side and would
+have shown up in mode `R` too. That was the leading candidate and it is now excluded by the cheapest
+possible test, which is the second time in this investigation that the best-motivated hypothesis
+failed a control rather than a direct test.
+
+**What remains, and it is a short list.** The difference is in the photon map itself:
+
+* **The gather kernel.** If the two paths weight photons differently inside the radius — a flat kernel
+  against a cone or Epanechnikov one — the variances differ by exactly this kind of modest constant
+  while both stay unbiased. This is the first thing to read.
+* **The gather radius or accepted count.** The device already accepts **2.1 % fewer photons per
+  query** (2259 against 2307), which is worth only 1.01x on its own but shows the two queries do not
+  select identically.
+* **The deposit.** Both trace 2 000 000 photons, but how many survive to the map, and with what power
+  distribution, has not been compared.
+
+**Also worth noting for how this file reads elsewhere:** the GPU is *not* generally noisier. In mode
+`R` it matches the host exactly. The 1.63x variance correction applies to **mode M only**, which is
+where it was measured and where the M-TIME-CPU throughput claims were made.
+
+**The rig:** four seeds, `np.std(..., ddof=1)` over scene-linear PFMs, median over signal-bearing
+pixels. Cheap, works on any scene, and the four-seed form is what makes it trustworthy — all six
+pairs agreed to ~2 %, which is what ruled out a seed-correlation artifact.
 
 ## Open issues
 
