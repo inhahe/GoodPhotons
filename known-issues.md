@@ -2785,6 +2785,34 @@ where it was measured and where the M-TIME-CPU throughput claims were made.
 pixels. Cheap, works on any scene, and the four-seed form is what makes it trustworthy — all six
 pairs agreed to ~2 %, which is what ruled out a seed-correlation artifact.
 
+### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
+
+Three recorded blockers dissolved in one session, each on a single grep against code that had moved
+on without the docs following:
+
+* **GLOSSY-NEE's env-light gap** — the queue's top item for the day. Already implemented at v0.266.3
+  (CPU) / v0.266.4 (device); both halves of the MIS weight verified co-gated on host, hero and device.
+* **`-noise` excluded from the device mode-M budget loop** — recorded as needing "a convergence test
+  this loop does not have". The reported noise figure is `100/sqrt(spp)`, a pure function of sample
+  count, so `-noise X` is exactly `-spp (100/X)^2`. It needed arithmetic. Shipped in v0.295.0.
+* **"the CPU backward tracer loses bounded clouds"** in `REFERENCE.md` — true until **v0.254.0**,
+  false for ~41 minor versions since. Corrected, with the `phase rainbow` half explicitly left
+  unverified because the probe used to check it rendered black.
+
+**Claims checked in the same sweep and still TRUE**, recorded so they are not re-checked:
+`-radcache` has no device implementation (zero `radcache` symbols in `render_cuda.cu`);
+`-photon-bounce` is host-only (`renderPhotonMapSharedCuda` takes no bounce parameter).
+
+**Not checked, and needing more than a grep:** the spectral-texture "CPU only; GPU falls back"
+(`REFERENCE.md` ~3552) and the CPU-only `coat` material features (~1799).
+
+**Why this class is worth sweeping deliberately.** An open bug has someone waiting on it; a
+documented limitation has the opposite property — it tells every reader *not* to try, so nobody
+generates the evidence that would retire it, and it can outlive its cause indefinitely. The three
+above had survived 29, 1 and 41 versions respectively. The cost of an audit pass is a few greps
+against the claims that name a specific symbol or flag; those are exactly the ones a code change can
+silently invalidate.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
