@@ -2225,6 +2225,47 @@ ratio of two unreplicated timings and should read as "more than an order of magn
 1 against 0.
 
 
+### GPU-BEAM-TAIL — the device BEAM gather has a heavy firefly tail; the device photon gather does not (2026-09-13)
+
+Found while pricing the M-TIME-CPU fix, which exposed a device-vs-host quality gap to `-time` users
+for the first time. Localised here, and it is narrower than it first looked.
+
+Method: matched `-spp` (so sample count is not a confound), two seeds per arm, scene-linear PFM via
+`-hdr` (so auto-exposure is not a confound -- it differs 33 % between devices and would otherwise
+inflate whichever arm it liked), seed-to-seed absolute difference scored by percentile rather than
+RMS (the RMS is outlier-owned here, reading 1.06 *relative*, i.e. above the signal itself).
+
+| scene | arm | median | p90 | p99 | max/level |
+|---|---|---:|---:|---:|---:|
+| `_cornell_diffuse` (no media, no beams) | GPU | 0.0334 | 0.119 | **7.62** | **104.0** |
+| `_cornell_diffuse` | CPU | 0.0257 | 0.090 | **7.36** | **127.8** |
+| `_fog_thick` (media, beams) | GPU | 0.225 | 1.40 | **4.68** | **23.9** |
+| `_fog_thick` | CPU | 0.167 | 0.73 | **1.58** | **5.0** |
+
+**Two separate effects, and only one of them is a device defect.**
+
+1. **The heavy tail is BEAM-SPECIFIC.** Without beams the two devices' tails agree — p99 7.62 against
+   7.36, and the GPU's worst pixel is *better* than the CPU's (104 vs 128). Add beams and the device
+   blows out to **2.97x the p99 and 4.8x the max**. Whatever this is, it lives in the device beam
+   gather, not the device photon gather. (Cornell's own p99 of ~7.6 on *both* arms is a property of
+   that scene, not of either device.)
+2. **A general ~1.3x median gap exists on both scenes** (0.0334/0.0257 = 1.30, 0.225/0.167 = 1.35).
+   Consistent across two very different scenes, so probably real, but it is a different and much
+   milder phenomenon than the tail and should not be conflated with it.
+
+**Why this matters now.** Before v0.294.0 a `-time` render was routed to the CPU, so the beam tail
+only reached users who passed an explicit `-spp`. It is now reachable from the documented default
+workflow on any media scene.
+
+**What this entry does NOT establish:** the mechanism. Candidates worth separating are the device
+beam traversal itself, the `-beamsplitmax` sub-beam kernel, and the FP32 device build
+(`FTRACE_GPU_FP32=1`) — though precision alone should bias rather than fatten a tail, so it is the
+least likely of the three. One scene per condition, two seeds; the *direction* is well controlled but
+the magnitude is not replicated.
+
+**The rig is reusable:** `scraps/tail.py <prefix> <label>` scores any pair of two-seed PFM arms by
+percentile. Render with `-hdr`, matched `-spp`, seeds 1 and 2, named `png/<prefix>_<dev>_<seed>.png`.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
