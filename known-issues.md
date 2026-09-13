@@ -2803,8 +2803,25 @@ on without the docs following:
 `-radcache` has no device implementation (zero `radcache` symbols in `render_cuda.cu`);
 `-photon-bounce` is host-only (`renderPhotonMapSharedCuda` takes no bounce parameter).
 
-**Not checked, and needing more than a grep:** the spectral-texture "CPU only; GPU falls back"
-(`REFERENCE.md` ~3552) and the CPU-only `coat` material features (~1799).
+**Checked since, and ACCURATE — the spectral-texture palette fallback.** `render_cuda.cu` ~16161
+states it outright: *"the device only bakes the JH-upsampled coeff path, so a palette-bound albedo
+forces the CPU tracer (which evaluates the palette exactly)"*. The device's ten `palette` references
+are the **detection** logic (`paletteTex` / `usesPaletteTex` feeding `cudaForwardSupported`), not
+support — so the device declines rather than rendering something subtly wrong, which is the right
+failure.
+
+**And unlike M-TIME-CPU, it tells the user**, with the reason and on the right stream:
+
+    [device] scene has a GPU-unsupported feature (layered material, indexed palette, parametric
+    record, oversized multilayer/mix material, or an emissive 'fire' volume); using CPU
+
+to `stderr` when `-device gpu` was asked for explicitly, and as `[device] auto -> CPU (...)` on
+stdout under `auto`. **That is the same idiom M-TIME-CPU was missing this morning** — the codebase
+already had the correct pattern for "device can't do X, fall back and say so" in one place while
+another silently took a ~10x penalty. Worth noting for the next such gap: check whether a sibling
+already does it properly before designing a warning.
+
+**Still not checked:** the CPU-only `coat` material features (`REFERENCE.md` ~1799).
 
 **Why this class is worth sweeping deliberately.** An open bug has someone waiting on it; a
 documented limitation has the opposite property — it tells every reader *not* to try, so nobody
