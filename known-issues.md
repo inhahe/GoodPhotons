@@ -1913,7 +1913,7 @@ knee's own variance is understood — shrinking the pilot on a scene where the e
 unstable would make the map size *more* random, not less. `FTRACE_JPILOT=<n>` overrides the size
 for exactly this investigation.
 
-### FURDIM — OPEN (2026-09-12, v0.278.4): mode `M`'s density estimate divides by `pi r^2` — a **surface** normalisation — but fur is not a surface, so the fur estimate scales as **`r^-0.46`** and gets **WORSE as the gather radius shrinks**. More photons make fur less accurate, which is the opposite of what anyone would expect
+### FURDIM — OPEN (2026-09-12, v0.278.4; **mechanism CORRECTED the same evening**): mode `M`'s fur estimate scales as **`r^-0.46`** on `gallery_rain` and gets **WORSE as the gather radius shrinks**, so more photons make fur less accurate. **The cause is NOT fur's dimensionality — two other coats show no radius dependence at all. It is that the gather ball is 2.4x the RADIUS of the body part it sits on**
 
 **Measured with the photon count held FIXED and only the radius moving** (`-pmradius` with
 `-pmadaptive 0`, so the beam map, the photon map and every sample are identical between arms;
@@ -1951,6 +1951,42 @@ envelope.
   cross-section (`2 r L`) rather than a disc's area where `Hit::fiberRadius > 0`. That is a real
   change to the density estimate and wants its own measurement campaign; the point of this entry is
   that the *diagnosis* is now settled.
+
+**THE DIMENSIONAL EXPLANATION IS REFUTED BY TWO OTHER COATS, AND THE REAL CAUSE IS SCALE.** The
+entry above named the check — is `r^-0.46` a property of fur, or of this coat? — and it is not fur.
+Same radius-only method, photon count fixed, radius probed per scene because it is scene-scale
+dependent (`scraps/fur_expo.sh`):
+
+| scene | `r` big | `r` small | median per-pixel ratio | exponent |
+|---|---|---|---|---|
+| `gallery_rain` `creature` | 0.3846 | 0.2412 | **1.237** | **`r^-0.46`** |
+| `fur_basics` | 0.01004 | 0.006295 | **0.993** | `r^+0.01` |
+| `fur_species` | 0.01101 | 0.006903 | **1.000** | `r^-0.00` |
+
+**Both other coats are flat to 1 %**, with p90 at 1.04 — no sub-population anywhere near 1.24, over
+24 671 and 17 845 lit pixels. And they are built the same way: `[fur]` reports 60 000 strands /
+480 000 segments on a 0.21 m^2 ball against `creature`'s 56 549 / 339 294 on 0.32 m^2, so this is
+not strands-versus-volume.
+
+**What differs is the gather radius against the object:**
+
+| | sphere-equivalent radius | gather `r` | **`r/R`** |
+|---|---|---|---|
+| `gallery_rain` `cr_coat_barrel` | 0.160 m | 0.3846 | **2.40** |
+| `fur_basics` | 0.130 m | 0.0100 | 0.077 |
+| `fur_species` | 0.120 m | 0.0110 | 0.092 |
+
+**In `gallery_rain` the gather ball is larger than the entire furred body part**; in the close-up
+scenes it is 8 % of it. Once the ball engulfs the object the collected flux saturates — there is no
+more fur to find — so the estimate tends to `1/r^2` while a normal gather holds steady, and
+`r^-0.46` is that saturation partway in. **That is the same family as this entry's founding
+observation** that "the gather disc is wider than her head", not a new dimensional defect.
+
+**So the `r^1.54` reading and the "effective dimension 1.54" gloss are withdrawn.** They were one
+scene, and the exponent is a scale artefact rather than a property of fur. The withdrawn reasoning
+is kept above because it predicted the right *direction* for the wrong reason, and because the
+control that killed it — running the identical sweep on two other coats — is exactly what the
+previous section asked for and cost four renders.
 
 **A SUBTLETY ABOUT THE FIX, BECAUSE THE OBVIOUS FORM IS WRONG AND IT INTERACTS WITH A CLOSED
 LINE.** "Normalise by a cylinder's `2 pi a L` instead of `pi r^2`" is the natural first move and it
