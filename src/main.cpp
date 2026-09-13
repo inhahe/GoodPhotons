@@ -23556,6 +23556,7 @@ static int run(int argc, char** argv) {
     // completes, which is the crash-safety a sidecar would have bought.)
     const bool plainRender = !(timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever || preview);
     std::vector<int> groupB, groupA, groupM, restIdx;
+    bool mModeBudgeted = false;   // a mode-M camera dropped from groupM by the budget test
     for (int i = 0; i < (int)toRender.size(); ++i) {
         const RenderCam& rc = toRender[i];
         // Forward A/B sharing no longer requires `plainRender`: the shared pass itself
@@ -23574,7 +23575,41 @@ static int run(int argc, char** argv) {
         // only the underlying radiance solution. That makes it safe to share even across
         // exposure-locked camera_path frames, so it isn't gated on `expGroup < 0`.
         else if (rc.mode == 'M' && plainRender)                               groupM.push_back(i);
-        else                                                                  restIdx.push_back(i);
+        else {
+            // A mode-M camera reaching here under a budget is the silent-CPU case warned
+            // about below. Lens cameras are excluded because they would never have had the
+            // device anyway, so saying they lost it would be false.
+            if (rc.mode == 'M' && !rc.cam.hasLens()) mModeBudgeted = true;
+            restIdx.push_back(i);
+        }
+    }
+    // SAY SO WHEN THE BUDGET COSTS THE DEVICE. This is the same trap `-checkpoint` fell into
+    // above, with one difference that makes it harder to notice: `-checkpoint` was IGNORED by
+    // mode M, so the fix was simply to stop letting an ignored flag matter. A wall-clock /
+    // noise / indefinite budget is genuinely HONOURED -- the shared path gathers a fixed spp
+    // per frame and cannot do it, so the single-camera progressive driver really is required.
+    // The render is therefore correct, just an order of magnitude slower, which is exactly the
+    // kind of cost that goes unnoticed for a long time.
+    //
+    // Measured on `_fog_thick` at 128^2, `-beams -beamcount 1000000 -beamfreeze`, same seed,
+    // one flag apart: `-spp 64` gathers on the 4090 at 0.79 s/spp; `-time 100` gathers on 12
+    // CPU threads at ~16 s/spp and never uploads the beams at all. Roughly 20x, from two
+    // unreplicated timings -- read it as "more than an order of magnitude", not as 20.00.
+    //
+    // That matters more than it looks: CLAUDE.md tells the operator to prefer a bounded budget
+    // over a giant `-n`, so the DOCUMENTED default workflow is the slow one. Until the shared
+    // path can honour a budget, the least owed is a word, in the idiom `-radcache` already
+    // uses when it cannot honour a flag on the device.
+    if (mModeBudgeted) {
+#ifdef HAVE_CUDA
+        if ((!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
+            cudaAvailable() && cudaPhotonMapSupported(scene))
+            std::printf("[camera] NOTE: -time/-noise/-forever/-preview put mode M on the "
+                        "single-camera progressive driver, which is CPU-only, so this render "
+                        "will NOT use %s. A fixed -spp gathers the same image on the device "
+                        "(measured >10x faster). The shared GPU map gathers a fixed spp per "
+                        "frame and so cannot honour a budget.\n", cudaDeviceName());
+#endif
     }
     // A single-camera forward group has nothing to share — fold it back into the per-camera
     // path (models A/B still get the GPU there via renderForwardCuda).

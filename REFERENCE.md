@@ -5608,7 +5608,7 @@ alone can't restore, so they are not disk-resumable.
 
 | Flag | Meaning |
 |---|---|
-| `-time <s>` | Render until a wall-clock budget |
+| `-time <s>` | Render until a wall-clock budget. **In mode `M` a budget currently costs you the GPU.** The shared photon-map path — the only one with a device backend — gathers a fixed spp per frame and so cannot honour a wall-clock, noise or indefinite budget; `-time`, `-noise`, `-forever` and `-preview` therefore route a mode-`M` camera to the single-camera progressive driver, which is CPU-only. Measured on `_fog_thick` one flag apart, `-spp 64` gathers on a 4090 at 0.79 s/spp against ~16 s/spp on 12 CPU threads under `-time`, so prefer a fixed `-spp` for mode `M` on the device. Since 0.290.1 ftrace says so on startup rather than silently falling back; see `known-issues.md` → `M-TIME-CPU`. |
 | `-noise <pct>` | Render until the noise floor drops below `pct` % |
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |

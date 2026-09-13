@@ -1993,217 +1993,75 @@ render achieved **2 realizations**, where that table predicted about ten.
 `frac/(1+frac)` predicts 47 %. Same order, so the controller is behaving roughly as designed even
 though the absolute throughput it is dividing up is the anomalous one.
 
-### BUG: `-time` silently ignores `-device gpu` for mode M and runs on the CPU — ~20x slower, no warning
+### M-TIME-CPU — a `-time`/`-noise`/`-forever`/`-preview` budget silently costs mode M the GPU (~20x) — DIAGNOSED, mitigated in 0.290.1
 
-Two renders differing in **one flag**, everything else identical (`_fog_thick`, 128², `-device gpu`,
-`-beams -beamcount 1000000 -beamfreeze`, same seed):
+**Symptom.** Two renders differing in **one flag**, everything else identical (`_fog_thick`, 128²,
+`-device gpu`, `-beams -beamcount 1000000 -beamfreeze`, same seed):
 
     -spp 64     [camera] shared photon map (mode M) on NVIDIA GeForce RTX 4090 ...
-                [gpu] photon beams: 3883025 sub-beams, 2499673 BVH nodes ... uploaded
+                [gpu] photon beams: 3883025 sub-beams ... uploaded
                 -> 60 spp in 47.7 s   (0.79 s/spp)
 
     -time 100   mode M: photon map — tracing 2000000 photons on 12 CPU THREADS ...
                 (no upload line at all — grep counts 1 against 0)
                 -> 6 spp in 106 s     (~16 s/spp)
 
-**The `-time` render never touched the GPU.** `-device gpu` was passed and silently disregarded.
+**The sample counts are real, not a reporting artifact** — checked first, since it would have voided
+the comparison. The `-spp` run read 28.87 % noise at 12 spp, and 28.87 × sqrt(12/6) = **40.8 %**,
+exactly the 40.82 % the `-time` run reported at 6 spp. Six samples in a hundred seconds is what
+actually happened.
 
-**The sample counts are real, not a reporting artifact** — the first thing checked, since it would
-have voided the comparison. Noise scales as expected: the `-spp` run read 28.87 % at 12 spp, and
-28.87 × sqrt(12/6) = **40.8 %**, exactly the 40.82 % the `-time` run reported at 6 spp. Six samples
-in a hundred seconds is what actually happened.
+**Cause (confirmed, `main.cpp:23557`).**
 
-**This is not a corner case.** `CLAUDE.md` tells the operator to *"prefer a bounded budget over a
-giant `-n`"* and names `-time`, `-noise` and `-forever` as the way to render. So the documented
-default workflow for this project takes a ~20x penalty on mode M, silently. Reproduced on both
-`-time` runs made this session (frozen, and `-beamrefresh 0.90`).
+    const bool plainRender = !(timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever || preview);
+    ...
+    else if (rc.mode == 'M' && plainRender)   groupM.push_back(i);
+    else                                      restIdx.push_back(i);
 
-**Where to start.** There are two mode-M implementations: a host one whose message is
-`mode M: photon map — tracing ... on %d CPU threads` (main.cpp ~16883, inside the single-camera
-path), and the batched GPU one printing `[camera] '%s' (mode M/GPU ...)` around ~24031, which is
-what calls `renderPhotonMapSharedCuda`. A time-budgeted render is routed to the first. Whether the
-right fix is to route it to the second, or to teach the first to use the device, is not something
-this entry establishes.
+`groupM` is the shared photon-map path, and it is **the only mode-M path with a device backend**
+(`renderPhotonMapSharedCuda`). `restIdx` is `runRender`'s single-camera mode-M branch, which has no
+GPU path at all. So any budget flag moves the render to the CPU, and `-device gpu` is disregarded
+without a word.
 
-**Minimum acceptable fix, if the routing is hard: WARN.** `-radcache` already does exactly this when
-it cannot honour a flag — *"IGNORED: the GPU backward megakernel has no cache — pass `-device cpu`"* —
-and `-max-bounce` was given the same treatment earlier today. A silent 20x is the worst of the three
-outcomes; a loud one at least lets the operator choose.
+**This is the second time this exact trap has been sprung**, which is the interesting part. The
+comment directly above that line records the first: `-checkpoint` used to be on the same list and
+"pushed the camera out of groupM and into runRender's single-camera mode-M branch, which has no GPU
+path at all. A flag the mode announces it is ignoring must not silently cost it the entire device
+backend and run 50x slower." The rule was written down; the list was not re-audited against it.
 
-**Caveat on my own numbers, stated because today has repeatedly punished not doing so:** one scene,
-one resolution, one device, single runs of each arm. The 20x is a ratio of two unreplicated timings
-and should be read as "more than an order of magnitude". What is *not* uncertain is the routing: the
-log lines name the device outright, and the upload count is 1 against 0.
+**Why it was not simply deleted from the list too.** `-checkpoint` was *ignored* by mode M, so
+removing it changed nothing about the render. A budget is genuinely **honoured** — the shared path
+gathers a fixed spp per frame and cannot stop on a clock — so the progressive driver really is
+required, and the CPU fallback is a real capability gap rather than a stray condition. That makes
+this a harder fix than the `-checkpoint` one and is why 0.290.1 ships the warning rather than a
+reroute.
 
-## Open issues
+**It is not a corner case.** `CLAUDE.md` tells the operator to *"prefer a bounded budget over a
+giant `-n`"* and names `-time`, `-noise` and `-forever` as the way to render, so the **documented
+default workflow** for this project is the slow one.
 
-**THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
-inherited. Two moved a long way and in opposite directions: **M-GATHERAREA closed from 36.8 to 8.0
-points** (four defects that partly cancelled, which is why fixing any one alone had always made
-things worse), and **the mode-`J` port was re-priced from ~12x down to ~1.2x** against a measured
-variance ceiling. **VOLCACHE was reopened** — its simple form is scene-dependent rather than dead,
-and it now has safety, payoff (83 % of gather candidates), a runtime predictor and a cell size, all
-measured. One new bug fell out of building the rigs: **BEAMORDER-GPU**, where the device never set
-a beam's scattering order *and* the report counted the untracked chords in its own denominator —
-the third instance of that denominator error this file records.
+**Mitigation shipped in 0.290.1.** ftrace now says so on startup, in the idiom `-radcache` already
+uses when it cannot honour a flag on the device:
 
-**WORKING-QUEUE AUDIT (2026-09-13).** The 2026-09-11 audit below is superseded for three of its four
-surviving rows. What today changed, and what a session resuming should actually pick up:
+    [camera] NOTE: -time/-noise/-forever/-preview put mode M on the single-camera progressive
+    driver, which is CPU-only, so this render will NOT use NVIDIA GeForce RTX 4090. A fixed -spp
+    gathers the same image on the device (measured >10x faster). The shared GPU map gathers a
+    fixed spp per frame and so cannot honour a budget.
 
-| item | status after today |
-|---|---|
-| **M-GATHERAREA** | **Its stated fix is REFUTED on its own named targets.** The geometric footprint was built, validated against analytic answers (exactly 1.0000 on a plane, 0.5525 against an analytic half-disc beside a wall, 1.0038 on open ground), proven inert where it must be (byte-identical render), and run on `gallery_rain` — and `capmarble_axicon` moves **+20.01 % → +19.96 %**. Three outcomes close it: on flat geometry the footprint is 1 and there is nothing to fix; on fur it is ~2.9x pi r^2 so dividing by it would darken fur threefold; on the caps it is 0.56-0.92, applied, and unhelpful. **The caps' error is not a footprint error.** |
-| **VOLCACHE** | **Re-scoped twice.** Structurally, the volumetric gather is a *beam query*, not a point lookup, so a cache cannot be "extended" to it — only a hybrid (order 1 beams, order >= 2 marched against a cache) can work. Economically, its quoted payoff of "83.2 % of gather candidates" is a share of **candidates, not cost**; the measured ceiling is **~47 % of a frame** and lower still, since the hybrid must keep emitting, depositing and BVH-building the beams for order 1. |
-| **mode-J port** | unchanged from the 2026-09-12 re-pricing (~1.2x, not ~12x). |
-| **UPBP-CONV** | unchanged (largely retired). |
+Verified on all three cases, because a warning that fires in the wrong one is worse than none:
+`-time` + `-device gpu` prints it and the next line reads "12 CPU threads"; `-spp` + `-device gpu`
+stays silent and reads "on NVIDIA GeForce RTX 4090"; `-time` + `-device cpu` stays silent, since a
+user who asked for the CPU has lost nothing and telling them otherwise would be false.
 
-**And two things that are NOT on the queue came out of the day and are worth more than some of what
-is:**
+**STILL OPEN — the warning is not the fix.** The real fix is one of: teach
+`runSharedPhotonMap` to gather in spp chunks against a budget (it already writes each frame as its
+gather completes, so the crash-safety half exists), or give `runRender`'s mode-M branch a device
+path. The first looks closer to the grain of the code.
 
-* **The beam BVH build is 31 % of a `_fog_thick` frame**, it tracks split entries at ~1.05 µs each
-  rather than beam count, and `-beamsplitmax`'s default sits past the time optimum — 4 M is ~15 %
-  faster than the 8 M default in both repeats. **Image equivalence is not yet established**, so it is
-  not a recommendation, but it is a live optimisation needing only a paired multi-seed check.
-* **`-radcache` measurements**: its cell is auto-sized (not the 0.05 struct initialiser), doubling it
-  buys 9x the utilisation and costs real accuracy (`red` -0.464 ± 0.138, 3.4 sigma), and
-  `-radcache-validate 1` disables the cache's benefit rather than strengthening it.
-
-**The tooling built today is the durable part** and applies to any of the above: `-roiboxes` /
-`-roi-audit` / `-roi-mask` derive exact per-material ROIs on any scene from the renderer's own
-visibility; `-gafparea` measures a gather ball's true same-facing area; `tools/roi_score.py` now
-carries four traps rather than two, including `assert_arms_differ`, callable from scratch scripts.
-Four scenes with by-construction nulls exist: `_ga_corner`, `_fur_recip`, `_fur_substrate`,
-`_fur_substrate_area`.
-
-**WORKING-QUEUE AUDIT (2026-09-11, second of the day).** Of the nine items driving that day's
-autonomous session, **four were already finished** — GLOSSY-NEE's env-light gap (v0.266.3 CPU,
-v0.266.4 device), `_deltalight_mix`'s +0.79 % (closed 2026-09-09 as a single-seed raw-mean
-artifact, one firefly), RASTER-PBR (v0.269.1) and `ltPdf` (v0.270.0) — and **a fifth,
-FOLD-GPU part (1), is deprioritised by its own measurement**: a 43-point fold-coverage gap costs
-*nothing* on the streak metric, with a working on/off control (0 % folding costs 1.59x) proving
-the null is real rather than blind.
-
-What that leaves, and where each one's frontier actually is:
-
-| item | frontier |
-|---|---|
-| M-GATHERAREA | **Mean absolute error 36.8 -> 8.0 over four seeds** (v0.277.0 fiber gate, v0.278.0 bias/gate/ball), and the estimator is now nearly independent of the probe count (mean \|gap\| 3.30 -> 1.06) rather than accurate by cancellation. What is left: fur +7.2 from a different mechanism (FURDIM: the gather ball is 2.4x the radius of the body part, not anything about strands), a cap edge -8.5 from the original disc truncation, hair -7.5, cloth -3.8 |
-| VOLCACHE | the volumetric gather, ~4/5 of a `gallery_rain` frame. **Reopened 2026-09-12**: the simple form is scene-dependent, not dead. A `sigma_t` sweep on one scene, one variable, takes the order >= 2 field's structure **0.367 -> 0.023 -> -0.066** while the single-scatter control **rises** 0.515 -> 0.602 -> 0.761 — so the smoothness is the FIELD's, not the camera ray's path integral, and the stated limitation is settled. Threshold is between 12 % and 36 % of chords at order 7+, a number already printed on the beam-map line |
-| mode-`J` device light pass | **RE-PRICED DOWN 2026-09-12: ~1.2x, not ~12x.** The device LBVH already landed (v0.272.1-2); what is left is a ~400 ms host residual, not the 51 ms on record. But at FIXED samples the light side is only **32 % of the variance**, so a *perfect* light side — more than the port can deliver — is worth **1.21x**, and that ceiling is flat across a 4x `spp` change because the refresh controller pins the ratio. The old ~12x prices realizations linearly; two independent measurements put the exponent at `N^0.07`-`N^0.33`. Any larger claim rests on a tail statistic that n=4 cannot resolve |
-| UPBP-CONV | **LARGELY RETIRED 2026-09-12.** Both filed claims are refuted by later sections of this same file: mode `J` *beats* mode `D` at equal time (1.37x / 1.28x / 1.52x), and v0.272.0 made `-spp` converge the merge half (measured: frozen improves only 1.27x over a 4x spp range against 2.0x for pure sampling; refresh pays the shortfall off). The firefly framing went with them — both modes peak at the same pixel at every seed. What remains is the 4 %-energy, 1669x-peaked **connection** residual, which is shared BDPT machinery, not UPBP |
-
-**AND THE TAIL IS NOT A LIGHT-SIDE PROBLEM — measured 2026-09-11, from data already on disk.**
-The obvious hope after v0.272.0 was that more light-side realizations would also thin the tail. It
-does not. Scoring relSE against the converged mode-`D` reference, `_caustic_box`, 20 s, 6 seeds,
-one realization per EPOCH against four per CHUNK:
-
-| statistic | chunk / epoch |
-|---|---|
-| mean relSE | **0.612x** |
-| 99.9 %-trimmed | **0.599x** |
-| 99 %-trimmed | **0.584x** |
-| worst pixel | 1.472x — **but +0.244 +- 0.165, i.e. 1.5 sigma at n=6 on a max statistic** |
-
-Two things come out of one table. **First, v0.272.0 is better than it was shipped as**: it was
-committed on seed-to-seed *variance*, and this is error against a reference — a stronger claim —
-and it holds at ~1.7x across every robust statistic. **Second, the firefly tail does not move**,
-which localises UPBP-CONV's remaining problem away from the light side and onto the beam x ray
-kernel and the merge weight. That is worth more than the 1.7x: it removes the cheapest candidate.
-
-**AND THE TAIL IS THE CONNECTION HALF, NOT THE MERGES — which inverts where to look.**
-`FTRACE_J_HALF` splits the estimator with both halves keeping their full-render MIS weights.
-`_fog_thick` 96^2, 256 spp, seed 5, GPU, with **mode `D` rendered at identical settings as the
-control**:
-
-| image | mean | max | max/mean | p99.99/mean |
-|---|---|---|---|---|
-| mode `D` | 1.937e9 | 1.827e11 | **94.3** | 47.0 |
-| mode `J` (full) | 2.035e9 | 1.781e11 | **87.5** | 43.9 |
-| `J` connections only | 8.83e7 | 1.474e11 | **1669.3** | 378.8 |
-| `J` merges only | 1.946e9 | 7.91e10 | **40.6** | 31.7 |
-
-Three things fall out. **The merge half is the QUIET one** (40.6x against the connections'
-1669x), so the beam x ray kernel and its `sinMin` clamp are not where the spikes are. **The
-connection half carries 4.3 % of the energy and almost the whole peak** — which is what a working
-MIS partition should look like: the merges take the bulk, leaving connections to cover only the
-paths merges cannot reach, and those are rare and high-variance by construction. **And mode `J`'s
-full-image tail is not worse than mode `D`'s here at all** (87.5 against 94.3) — so (2g)'s
-"worst pixel 3 310 against 532", measured on relSE at `-beamk 8` over 60 s, does not generalise
-to this configuration.
-
-At the full image's worst pixel the split is 1.474e11 connections against 3.07e10 merges: the
-spike is **83 % connection**.
-
-**SWEPT ACROSS `-beamk`, AND THE STRUCTURE IS EXACT: THERE IS NO MODE-`J`-SPECIFIC FIREFLY.**
-Same scene/seed/spp, halves at three beam budgets including the `-beamk 8` that (2g) used:
-
-| `-beamk` | connections' share of the mean | connections max/mean | merges max/mean | full max/mean |
-|---|---|---|---|---|
-| 8 | 12.4 % | 657 | 60.6 | 98.5 |
-| 32 (default) | 4.3 % | 1669 | 40.6 | 87.5 |
-| 128 | 2.1 % | 3745 | 42.7 | 93.4 |
-| mode `D` | — | — | — | **94.3** |
-
-Read the connection row as an ABSOLUTE peak rather than a ratio and it stops moving:
-**1.51e11, 1.47e11, 1.46e11** — constant to 4 % across a 16x change in beam budget. The max/mean
-blow-up from 657 to 3745 is entirely its *denominator* shrinking as the merges take over the mean
-(87.6 % -> 95.6 % -> 97.7 %). The connection half is not getting worse; it is getting smaller
-while its spike stays exactly where it was.
-
-And the full image's worst pixel is the same in every configuration **including mode `D`**:
-1.82e11, 1.78e11, 1.73e11, and mode `D` 1.83e11. **It is one path that BDPT connections find and
-nothing suppresses** — the same path, at the same value, whether or not merging is switched on.
-
-**So the merge technique adds no tail, and UPBP-CONV's firefly framing is about the SHARED BDPT
-tail.** There is no mode-`J`-specific firefly bug to look for; the MIS partition is behaving
-exactly as it should, with the merges absorbing the bulk and leaving the connections their
-spikes. Anything that fixes this fixes mode `D` too, which makes it a general path-tracing
-firefly problem (clamping, roulette, or a path-space filter) rather than anything in the merge
-estimator or its weight.
-
-**AND WITH MATCHED SEEDS THE CLAIM IS SETTLED: MODE `J`'S TAIL IS MODE `D`'S TAIL.**
-The single-seed version above was not enough, and checking why is what produced the result.
-The peak **moves with `-seed`** — (15,46) / (16,43) / (16,51) — and is isolated, sitting
-**4.6x / 15.9x / 12.0x** above its own 8 neighbours, so it is a genuine firefly and not a bright
-feature. But its size varies **3.6x between seeds within mode `D` alone** (94x / 336x / 310x of
-the frame mean), which is larger than the between-mode gap anyone has claimed. A one-seed tail
-comparison cannot resolve this quantity at all.
-
-Matched seeds, equal **spp** (not equal time — the question is whether the estimator makes
-spikes, not which is faster):
-
-| seed | mode `D` max/mean | mode `J` max/mean | argmax |
-|---|---|---|---|
-| 5 | 94.3 | 87.5 | **(15,46) both** |
-| 11 | 336.0 | 329.0 | **(16,43) both** |
-| 23 | 309.9 | 311.1 | **(16,51) both** |
-| mean | 247 | 243 | **J/D = 0.98x** |
-
-**Identical to 2 %, and at literally the same pixel every time.** The firefly is a camera-side
-path that both modes find, and mode `J`'s MIS weighting neither amplifies nor suppresses it. So
-(2g)'s "worst pixel 3 310 against 532" is, on this evidence, a seed artifact of the same family
-as the `_deltalight_mix` +0.79 % — a single draw of a statistic whose own spread is several-fold.
-
-**Consequence: UPBP-CONV has no firefly sub-problem.** What remains of that entry is the equal-
-TIME cost question, which (2g) already answers in mode `J`'s favour on every robust statistic.
-
-*Worth recording about the process*: the two ticks before this one analysed seed 5 alone, which
-happens to be the **mildest** of the three (94x against 336x and 310x). The conclusion survived,
-but only by luck — the right move was to check the seed dependence of the statistic before
-building an argument on one value of it, and that check is three renders. But the lever it points
-at is a 4 %-energy, 1669x-peaked residual, which is a different and much more specific target
-than "the beam gather".
-
-The worst-pixel column is reported *because* it looks like a regression and is not one. A max
-over 9 000 lit pixels from 6 seeds is the noisiest statistic in this file, and 1.5 sigma from it
-is nothing — the same shape as four other "findings" earlier the same day that dissolved on more
-samples.
-
-**The pattern worth naming.** Two audits in two days, eight stale entries the first time and four
-stale queue items the second. An entry's *conclusion* decays faster than its code does, and
-nothing in the process notices — so the audit has to be a scheduled activity, not a thing done
-when something feels off.
-
+**Caveat on my own numbers:** one scene, one resolution, single runs of each arm, so the 20x is a
+ratio of two unreplicated timings and should read as "more than an order of magnitude". The
+**routing** is not uncertain — the log lines name the device outright and the beam-upload count is
+1 against 0.
 
 ### UPBP-VM — DONE (2026-09-07, v0.263.1; the CPU half filed 2026-09-06, v0.260.0): mode `J`'s surface point merges (`-jsurf`) are **on by default on the CPU** since 0.260.0 — all three gates green — but have **no device twin**, so a GPU mode-`J` run is still the two-technique estimator and mode `U` cannot be retired yet
 
