@@ -2355,13 +2355,36 @@ testing it, cost one grep of logs already written and retired the hypothesis out
 111). The 3x penalty exists only at high optical depth. Whatever differs between the two gathers is
 therefore something that only matters once paths scatter many times.
 
-**That points at the order >= 2 part of the gather**, which `photonbeams.h:364` treats as a distinct
-component (*"VOLCACHE's whole premise is substituting a cached value for the `order >= 2` part of the
-gather"*), with per-beam scattering order tracked explicitly and `kBeamOrderUnknown` documented as
-*"NOT A DEFAULT, IT IS A REFUSAL TO GUESS"*. In thin fog almost all light is order 1; at `sigma_t 20`
-the multiply-scattered orders dominate — precisely the regime split the measurement just drew. **The
-next step is to compare how host and device weight or terminate `order >= 2` beams**, not the gather
-formula as a whole.
+**TWO MORE CANDIDATES ELIMINATED BY READING, BEFORE SPENDING A TICK TESTING THEM.**
+
+**Order >= 2 — refuted.** The optical-depth split pointed at the multiply-scattered component, since
+`photonbeams.h:364` treats `order >= 2` as a distinct thing. But **the host gather never branches on
+order at all**: `order` does not occur in `beamgather.h` except in the unrelated phrase "scene
+order". Beam order is tracked for diagnostics and for VOLCACHE's *future* design, not used by the
+estimator. Neither path can differ on something neither path reads.
+
+**Stochastic transmittance — refuted, and it was the better hypothesis.** The host contribution ends
+with two transmittance marches that take an **`rng`** (`beamgather.h:278-279`, beam side and camera
+side), and a stochastic transmittance estimator has near-zero variance at `sigma_t 0.6` and enormous
+variance at `sigma_t 20` — precisely the measured signature. The device makes the same two calls in
+the same order. **But both short-circuit for a homogeneous medium:** the device returns
+`exp(-stBase * (tb - ta))` when `!m.heterogeneous`, and `render.h:1161` says the host does the same
+(*"exact exp for a homogeneous one"*). `_fog_thick`'s medium carries no density/noise/pattern term,
+so it is homogeneous and **both paths compute transmittance analytically, with zero variance** — the
+`rng` argument is never reached. A hypothesis that fit every piece of evidence was still wrong,
+because the code path it needed is not the one this scene takes.
+
+**Seven candidates are now eliminated:** kernel radius, beam set and split, FP32 precision, the
+1/sin singularity, the gather-time spectral fold, order >= 2, and stochastic transmittance.
+
+**What still has to explain the optical-depth dependence.** At `sigma_t 20` the gather sums **790
+beams per probe** (host log) against a handful in thin fog. Remaining candidates in test order: a
+device-side **cap or early-exit on beams per query** that the host lacks — a plain cap would bias
+rather than fatten a tail, but a randomised or traversal-order-dependent one would do exactly this;
+a difference in **camera-side scatter-point sampling**, which at `sigma_t 20` clusters gather points
+near the camera; and the **beam power distribution**, which widens with depth. Check the `-beamk`
+floor first, since the host log reports crossing it (*"past the -beamk floor (790.5 > 32), so the
+gather now pays for every extra beam"*).
 
 **Separately, and do not conflate them:** the ~1.3x MEDIAN gap is present in both regimes and is in
 fact *larger* in thin fog (0.0247/0.0121 = **2.0x**) than in thick (1.35x). It is a different
