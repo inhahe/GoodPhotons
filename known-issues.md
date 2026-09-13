@@ -1643,6 +1643,31 @@ trades against got faster. After optimising anything, re-derive the constants th
 The two numbers this entry offers for future tuning -- build cost per split entry, and the traversal
 saturation point above ~4 M splits -- are exactly the pair whose *ratio* moved.
 
+**BUT THE LESSON HAS A LIMIT, ALSO MEASURED (2026-09-13).** Having found one inverted constant, the
+obvious move was to re-derive every constant that touches BVH build cost. The nearest analogue is
+`Bvh::LEAF_SIZE`, a pure build-versus-traverse knob: bigger leaves mean fewer nodes and a cheaper
+build but more primitive tests. With the build now ~1 s of an 18 s frame, the prediction was that its
+optimum would shift toward *smaller* leaves. Swept by rebuilding, two repeats each, `_fog_thick`
+beamcount 1 M:
+
+| `LEAF_SIZE` | 2 | **4 (shipped)** | 8 |
+|---|---:|---:|---:|
+| mean frame | 19.24 s | **18.37 s** | 19.86 s |
+
+**4 is a genuine interior optimum, bracketed on both sides, and it did not move at all.** The
+prediction was wrong, and the reason is worth keeping: `-beamsplitmax` trades build time *directly*
+against traversal, so build cost is a first-order term and a 3x change in it moves the optimum.
+`LEAF_SIZE` trades node visits against primitive tests -- **both traversal-side effects** -- with
+build cost only a minor term, so making the build faster leaves its optimum where it was. *Not every
+constant that touches a component is sensitive to that component's cost;* only the ones where it
+appears as a leading term. Re-deriving `LEAF_SIZE` cost three rebuilds to learn nothing had changed,
+which is the correct outcome of a check, not a wasted one.
+
+**Incidental, and worth knowing before someone reports it as a bug:** changing `LEAF_SIZE` changes
+the image. Closest-hit is exact regardless of tree shape, but the beam gather *sums* contributions in
+traversal order, so a differently-shaped tree reorders the accumulation and lands on the ~1e-7
+floating-point floor this file documents elsewhere. Expected, not a defect.
+
 **Independently useful regardless of how that lands:** build is ~1.05 µs per split entry and
 traversal saturates above ~4 M splits on this scene. Those two constants are what any future tuning
 of this knob has to trade off, and neither was written down before.
