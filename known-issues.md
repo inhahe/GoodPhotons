@@ -2549,14 +2549,24 @@ failed a control rather than a direct test.
 
 **What remains, and it is a short list.** The difference is in the photon map itself:
 
-* **The gather kernel.** If the two paths weight photons differently inside the radius — a flat kernel
-  against a cone or Epanechnikov one — the variances differ by exactly this kind of modest constant
-  while both stay unbiased. This is the first thing to read.
-* **The gather radius or accepted count.** The device already accepts **2.1 % fewer photons per
-  query** (2259 against 2307), which is worth only 1.01x on its own but shows the two queries do not
-  select identically.
-* **The deposit.** Both trace 2 000 000 photons, but how many survive to the map, and with what power
-  distribution, has not been compared.
+* **The gather kernel — ELIMINATED.** Both are **flat (box)**: the host accumulates
+  `g += cie[k] * (f * rhoV * ph.power)` and the device `gx += rho * ph.pX`, neither weighting by
+  distance within the radius. A cone-against-flat mismatch would have explained the constant exactly;
+  it is not that.
+* **A gap in the FP64 elimination above, found by reading and then closed by analysis.** The device's
+  gather accumulators are declared `float gx, gy, gz` and `float rho` — **hard `float`, not `Real`** —
+  and `-DFTRACE_GPU_FP32=OFF` only remaps `Real`. So the FP64 build never touched this code, and the
+  earlier "precision eliminated" result did not cover the one place precision would most plausibly
+  act. It is still eliminated, but by a bound rather than by that experiment: the comment at the
+  declaration reasons that a float sum of `n` same-sign terms errs `~n * 2^-24` relative, which at the
+  measured ~2300 photons per query is **1.4e-4** — four orders of magnitude below a 28 % SD increase.
+  Worth recording as a caution: a build-flag experiment only tests the code the flag reaches.
+* **The gather radius or accepted count.** The device accepts **2.1 % fewer photons per query** (2259
+  against 2307), worth only 1.01x on its own but showing the two queries do not select identically.
+  This is now the leading candidate and wants a direct comparison of the adaptive-radius logic —
+  `dPmAdaptiveRadius` on the device against the host's, on the same point.
+* **The deposit.** Both trace 2 000 000 photons, but how many survive into the map, and with what
+  power distribution, has not been compared.
 
 **Also worth noting for how this file reads elsewhere:** the GPU is *not* generally noisier. In mode
 `R` it matches the host exactly. The 1.63x variance correction applies to **mode M only**, which is
