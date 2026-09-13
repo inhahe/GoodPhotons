@@ -202,6 +202,8 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
     bm.gather(oc, dc, tMax, [&](const BeamHit& bh) {
         const PhotonBeam& b = bm.beams[bh.idx];
         beamDiag().bump(beamDiag().pass);
+        if (beamDiag().on && b.order >= 2 && b.order != kBeamOrderUnknown)
+            beamDiag().passMS.fetch_add(1, std::memory_order_relaxed);
         if (b.med < 0 || b.med >= (int)scene.media.size()) {
             beamDiag().bump(beamDiag().rejMed); return;
         }

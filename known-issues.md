@@ -1590,6 +1590,23 @@ this is a share of *candidates*, not of cost — but today's cost decomposition 
 * and those beams leave the BVH too, so most of the remaining 1.57 s build goes as well, for a total
   near **58 %**, before the cache pays its own march cost.
 
+**AND THE SHARE HOLDS FOR SHADING WORK TOO, not just traversal (v0.295.1).** `candMS` counts
+intersection *tests*, which is the right measure for BVH traversal but not for the per-hit kernel and
+transmittance work. If order >= 2 chords — shorter and more scattered — were rejected at a different
+rate, the two shares would diverge and the ceiling would sit between them. A matching counter on
+accepted hits says they do not:
+
+| measure | order >= 2 share |
+|---|---:|
+| stored chords (the deposit's own log line) | ~83 % |
+| candidates — BVH traversal work | **83.5 %** |
+| accepted hits — per-hit shading work | **81.5 %** |
+
+Three numbers from three stages of the pipeline, all within two points. **The ~51-58 % ceiling is
+therefore robust across both cost components** rather than resting on the candidate share alone.
+(The deposit line also shows how deep the scattering goes on this scene: order 1 is 17.0 %, and
+**order 7+ alone is 49.6 %**.)
+
 **Two independent routes now give the same answer.** The `-beamcount` sweep in the section above
 concluded "not more than about half the frame even in the best case" from timing alone; the
 order-share counter reaches ~51-58 % from geometry alone. They agree, which is worth more than either

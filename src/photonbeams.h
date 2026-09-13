@@ -583,6 +583,13 @@ struct BeamDiag {
     // `_fog_thick` it made the gather 56 % SLOWER. Counting here changes nothing about the
     // deposit, which is the whole point.
     mutable std::atomic<long long> candMS{0};
+    // The same question one stage later: of the candidates that SURVIVE to be real
+    // contributions, what share is cacheable? `candMS` counts intersection TESTS, which is the
+    // right measure for BVH traversal cost; this counts accepted HITS, which is the right
+    // measure for the per-hit kernel/transmittance work. If order >= 2 chords are rejected at a
+    // different rate from order-1 ones -- they are shorter and more scattered, so they might be
+    // -- the two shares differ and VOLCACHE's ceiling sits between them rather than at 83 %.
+    mutable std::atomic<long long> passMS{0};
     mutable std::atomic<long long> pass{0}, rejMed{0}, rejSS{0}, rejPh{0}, rejW{0}, rejTr{0};
     mutable std::atomic<long long> minRatio{1LL << 62};  // min (d_perp/r) * 1e6, as an integer
     void bump(std::atomic<long long>& c) const {
@@ -606,6 +613,12 @@ struct BeamDiag {
             "[beamdiag] %lld of those candidates (%.1f %%) are chords of scattering order >= 2 "
             "-- the share a volume cache could remove (VOLCACHE)\n",
             candMS.load(),
+            cand.load() ? 100.0 * (double)candMS.load() / (double)cand.load() : 0.0);
+        std::fprintf(stderr,
+            "[beamdiag] of the ACCEPTED hits, %lld (%.1f %%) are order >= 2 -- the per-hit share,\n"
+            "           against the %.1f %% candidate share above (traversal vs shading work)\n",
+            passMS.load(),
+            pass.load() ? 100.0 * (double)passMS.load() / (double)pass.load() : 0.0,
             cand.load() ? 100.0 * (double)candMS.load() / (double)cand.load() : 0.0);
         std::fprintf(stderr,
             "[beamdiag] geometric hits %lld | dropped by: bad medium %lld, sigma_s<=0 %lld,"
