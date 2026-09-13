@@ -27,9 +27,9 @@
 // ~3 on flat ground. Marching past each hit and continuing counts every layer, so the
 // footprint and the photon query finally describe the same region.
 //
-// `1/|cos|` is the projection Jacobian: a ray meeting a surface at a slant subtends more
-// surface area than the disc cell it came from. `|dot|` rather than `dot` because a hit
-// normal is oriented against the ray, and a back-facing layer occupies area just the same.
+// `1/cos` is the projection Jacobian: a ray meeting a surface at a slant subtends more
+// surface area than the disc cell it came from. The facing test is SIGNED and calibrated
+// per gather (see below), so `cos` is positive wherever a layer is accepted.
 //
 // `incomplete` (optional) is set when a ray hit the layer cap, i.e. the chord held more
 // surfaces than were counted, so the area is an under-count and the caller should not
@@ -48,6 +48,28 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
     t1 = normalize(cross(t1, n));
     const Vec3 t2 = cross(n, t1);
 
+    // CALIBRATE THE AUTHORED ORIENTATION, once per gather, against the surface the gather
+    // point is actually on. `Hit::ng` is raw geometric orientation, which is dependable for
+    // a closed mesh (outward) and arbitrary for a hand-authored quad — `_ga_null`'s floor has
+    // `u x v` pointing DOWN, so a signed test against it rejects the very surface being
+    // gathered from and the footprint collapses to zero. One extra trace fixes that: find the
+    // surface at `p` and, if its `ng` opposes the gather normal, flip the whole comparison for
+    // this gather. Then a signed test means "faces the same way as the surface I am standing
+    // on", which is exactly what the photon query's `dot(ph.n, h.n) >= 0.5` means and is
+    // independent of how the scene was authored.
+    //
+    // Signed (rather than |dot|) is what stops a CLOSED SOLID being counted twice: its far
+    // face opposes and drops out, matching the query, which gathers no photons from it. And
+    // unlike parity-by-crossing-order this still counts every layer of STACKED THIN SHELLS,
+    // whose normals all agree — cloth folds and coat layers are real same-facing surface and
+    // the query does take photons from all of them.
+    double orient = 1.0;
+    {
+        const Ray cal{p - n * (eps * 4.0), n};
+        const Hit hc = sc.closestHit(cal, eps, nullptr, /*skipHair=*/false,
+                                     /*skipCamHidden=*/true);
+        if (hc.valid && dot(hc.ng, n) < 0.0) orient = -1.0;
+    }
     const double cellArea = (kPi * r2) / (double)kDisc;
     double area = 0.0;
     for (int i = 0; i < kDisc; ++i) {
@@ -82,25 +104,11 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // `Hit::ng` is the RAW geometric normal, independent of which way the ray came,
             // so unlike `Hit::n` it can be compared with the gather point's normal at all.
             //
-            // BUT THE TEST IS STILL |dot|, NOT SIGNED, AND THAT IS A KNOWN DEFECT. Signed was
-            // tried and reverted the same tick: `_ga_null`'s floor is an authored quad whose
-            // `u x v` points DOWN, so the signed test rejected the very surface the gather sits
-            // on and the footprint collapsed from 1.0000 to 0.0000 on the scene it is validated
-            // against. A single-sided quad has no dependable outward orientation -- the renderer
-            // sidesteps that by orienting against the ray, which is why `ph.n` works for photons
-            // and cannot be reproduced here from geometry alone.
-            //
-            // So |dot| stands, and its cost is that a CLOSED SOLID is counted twice: the march
-            // crosses the near face and the far face and accepts both, while the photon query
-            // accepts only the near one. That roughly doubles the footprint on solids and
-            // darkens them, which is what the gallery_rain A/B measured -- including a
-            // 3.5-point move on a null whose footprint is 1.008 and where the correction is
-            // algebraically inert. THE FIX IS ENTRY/EXIT PARITY: the march knows the sign of
-            // `dot(n, h.ng)` at each crossing, so it can count entries and skip exits and get
-            // one face per solid regardless of authored orientation. Not implemented, because
-            // it needs its own validation against the same three scenes and half-understanding
-            // this is what produced the void A/B in the first place.
-            const double c = std::fabs(dot(h.ng, n));
+            // The comparison is SIGNED and uses `orient` from the calibration above, so it
+            // reproduces the query on all three shapes that matter: a closed solid's far face
+            // opposes and drops out, stacked thin shells all agree and are all counted, and an
+            // authored quad works whichever way its `u x v` happens to point.
+            const double c = dot(h.ng, n) * orient;
             if (c >= 0.5) area += cellArea / c;   // same-facing: what the photon query keeps
             t0 = h.t + eps;
         }

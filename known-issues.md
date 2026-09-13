@@ -1099,6 +1099,46 @@ and shipping a half-understood facing rule is what produced the void A/B in the 
 **Status: `-gageom` stays off by default and must not be used on scenes containing closed solids.**
 Its validated domain is a single-layer surface, where it reproduces the probe to within half a point.
 
+### The facing test, third attempt: SIGNED but calibrated per gather — and now it matches the query on all three shapes
+
+The void A/B traced to the footprint and the photon query disagreeing about what counts as
+same-facing. Three candidate rules, and only the third survives all the controls:
+
+| rule | closed solid | stacked thin shells | authored quad |
+|---|---|---|---|
+| `fabs(dot(ng, n))` | **double-counts** far face | correct | correct |
+| `dot(ng, n)` signed | correct | correct | **0.0000** — `_ga_null`'s `u x v` points down |
+| parity by crossing order | correct | **wrong** — counts only the first shell | correct |
+| **signed + per-gather calibration** | correct | correct | correct |
+
+The calibration is one extra trace per gather: find the surface at `p`, and if its `ng` opposes the
+gather normal, flip the comparison for that gather. A signed test then means *"faces the same way as
+the surface I am standing on"*, which is exactly what `dot(ph.n, h.n) >= 0.5` means for a photon and
+is independent of how the scene was authored. Parity by crossing order was rejected because cloth
+folds and coat layers are **real** same-facing surface that the query does take photons from —
+counting only the first shell would trade a solid-body error for a thin-shell one.
+
+**Controls, all three scenes, after the change:**
+
+| scene | material | footprint | expected |
+|---|---|---|---|
+| `_ga_null` | `white` | **1.0000** (min = max) | exactly 1 — a ball on a plane meets a disc |
+| `_ga_corner` | `s10`, `s20` (interior) | **1.0000** (min = max) | inert away from the wall |
+| | `s00` (0-0.25 m from wall) | 0.5525 (min 0.5156) | ~half a disc at the junction |
+| | `s40` | 0.9707 | clipped by the floor's outer edge at x = 8 |
+| `gallery_rain` | `gridground` (open ground) | **1.0038** | ~1, and it is the A/B's null |
+| | `capmarble_gold` | 0.9203 | cap edge, below a full disc |
+| | `capmarble_axicon` | 0.6577 | " |
+| | `capmarble_gyroidx` | 0.5588 | " |
+
+**The caps fell from 0.715 to 0.559 and from 0.794 to 0.658**, which is the double-counted far face
+going away — the direction the diagnosis predicted, on the scene where it was diagnosed. `_ga_null`
+and the interior strips stayed at exactly 1.0000 with zero spread, so the change is inert where it
+must be.
+
+The gallery_rain A/B is re-running against this, with `gridground` as the same null that failed last
+time. **A null that has already caught one bug is worth more than one that has never fired.**
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
