@@ -234,6 +234,67 @@ re-run with more seeds before trusting the small-ROI columns.
 The mechanism behind the per-scene residual is open. The statistic is fixed and is now the default
 path (`ftrace -roi-mask` -> `roi_score.py --mask`), so a resumption starts from a valid rig.
 
+### The gather radius has TWO errors of opposite sign, and only an outside anchor separates them
+
+Two measurements this tick, both on `scenes/_ga_corner.ftsl` (new, tracked) and the archived
+`fur_creature` sweep.
+
+**1. The corner effect is real, is graded by distance, and is small.** `_ga_corner` is one floor
+split into six strips at increasing distance from a single wall, each strip a separate material
+NAME with a byte-identical BSDF, so `-roi-mask` separates them and the only difference between
+strips is how far they sit from the wall. One scene and one render per radius, so exposure, photon
+count, light and camera are the same numbers for every strip; and since true radiance does not
+depend on the gather radius, any movement across the sweep is estimator bias with no reference
+needed. Bias vs r = 0.05, three seeds:
+
+| strip | distance from wall | r=0.20 | r=0.40 | r=0.80 |
+|---|---|---|---|---|
+| `s00` | 0.00-0.25 m | +0.42 % | +1.80 % | **+4.14 %** ±0.43 |
+| `s02` | 0.25-0.50 m | +0.06 % | -0.09 % | **+1.38 %** ±0.15 |
+| `s05` | 0.50-1.00 m | -0.22 % | -0.46 % | -0.46 % ±0.16 |
+| `s10`, `s20` | 1-4 m | ~0 | ~0 | ~0 |
+| `s40` **(null)** | 4-8 m | -0.00 % | +0.06 % | +0.40 % ±0.25 |
+
+The prediction registered in the scene header holds exactly: **the effect is distance-gated.**
+`s00` starts moving at r = 0.20; `s02` only at r = 0.80, i.e. once the radius exceeds its own
+distance from the wall; nothing past 0.5 m moves at all; and the by-construction null is flat. No
+global cause can produce that ordering. **But +4.1 % on the strip touching the wall cannot explain
+the +21-25 % whole-frame rise of the enclosed fur scenes, so the corner effect is confirmed as a
+mechanism and REFUTED as the explanation for that.** Seventh refutation in this thread.
+
+**2. The trend is a large-radius EXCESS, not a small-radius deficit — and the previous table could
+not tell you which.** Scoring a sweep against its own smallest radius has a hidden baseline: "every
+material rises with r" and "the smallest radius reads low" are the same sentence. `fur_cross3.sh`
+happened to render a mode-R reference (2048 spp, no photon map, no gather, no radius), so the
+`fur_creature` sweep can be anchored to truth instead:
+
+| material | r=0.02 | r=0.05 | r=0.10 | r=0.20 | r=0.40 |
+|---|---|---|---|---|---|
+| `wall` | **-0.0 %** | +0.1 % | +0.4 % | +1.5 % | **+22.1 %** |
+| `floor` | **+0.2 %** | +0.6 % | +4.8 % | +16.9 % | **+21.5 %** |
+| `coat` | +5.5 % | +20.3 % | +27.9 % | +31.2 % | +27.3 % |
+| `belly` | +2.0 % | +26.5 % | +33.2 % | +68.2 % | +39.2 % |
+
+**At the smallest radius the gather is exact on the flat surfaces — 0.0 % and +0.2 %.** The error
+is entirely at large radius and entirely positive. So the mechanism is the numerator, not the
+denominator: a disc that reaches across a surface boundary collects the neighbour's photons *in
+addition*, inflating the sum. That is the OPPOSITE SIGN to M-GATHERAREA's headline defect, which is
+a denominator error -- dividing by pi r^2 when the real footprint is smaller under-estimates. Both
+exist, they partly cancel, and which one dominates depends on whether a gather point has too little
+same-facing surface within r (deficit) or too much other-facing surface within r (excess).
+
+That is worth stating plainly because M-GATHERAREA has been treated throughout as a single signed
+error to be corrected. It is two, and `_ga_corner` now isolates the excess with a null that cannot
+move, which the gallery scenes never could.
+
+**Tool fix made in the same tick.** `roi_score.py --null` checked VARIANCE only, and a gather-radius
+sweep legitimately changes variance everywhere: the null strip 4-8 m from the only wall read
+0.278x / 0.074x / 0.013x / 0.004x and the tool called it "measuring something other than its label"
+four times, on a rig that was in fact perfect. A false alarm that discredits a correct rig is as
+costly as a missed one. `--null` now reports **both halves** -- bias (with its standard error, the
+half that was actually informative here, and which passed) and variance, the latter labelled as
+unreadable whenever the arms differ by something that changes noise everywhere.
+
 **Known limits.** The pass is single-threaded (a diagnostic at preview resolution; determinism is
 worth more than the speed here) and classifies by the pixel centre, so a silhouette pixel belongs
 wholly to whichever material the centre hit — the same sub-pixel approximation mode P's classifier

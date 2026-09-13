@@ -233,17 +233,37 @@ def main():
         if a.null not in bands:
             print(f'! --null names "{a.null}", which is not one of the bands: {list(bands)}')
         else:
+            # THE NULL HAS TWO HALVES AND THEY FAIL FOR DIFFERENT REASONS. Variance and bias
+            # are separate claims, and which one the null can speak to depends on what the
+            # arms differ BY. A parameter that legitimately changes variance everywhere in
+            # the frame -- sample count, gather radius, filter width -- makes the variance
+            # null inapplicable by construction, not failed: measured instance, a gather
+            # radius sweep read 0.278x / 0.074x / 0.013x / 0.004x on a floor strip 4-8 m from
+            # the only wall, purely because a wider gather averages more photons. Reporting
+            # that as "the rig is measuring something other than its label" is a false alarm
+            # that would discredit a correct rig, so both halves are printed and the variance
+            # half says plainly when it cannot be read.
             sl = bands[a.null]
             for arm in arms[1:]:
                 vb = tmean(ims[base][:, sl].var(axis=0, ddof=1))
                 vo = tmean(ims[arm][:, sl].var(axis=0, ddof=1))
-                r = vo / vb
-                ok = abs(r - 1.0) < 0.05
-                print('%s NULL CONTROL "%s" for %s: %.3fx%s' %
-                      ('  ' if ok else '!!', a.null, arm, r,
-                       '' if ok else '  -- the change cannot affect this band, so the rig is '
-                                     'measuring something other than its label. Check that the '
-                                     'arms are matched on sample count, not just on wall time.'))
+                r = vo / vb if vb > 0 else float('nan')
+                mb = np.array([im[sl].mean() for im in ims[base]])
+                mo = np.array([im[sl].mean() for im in ims[arm]])
+                d = mo.mean() / mb.mean() - 1
+                se = np.sqrt(mb.var(ddof=1) / len(mb) + mo.var(ddof=1) / len(mo)) / abs(mb.mean())
+                bias_ok = abs(d) <= max(2.0 * se, 0.005)
+                var_ok = abs(r - 1.0) < 0.05
+                print('%s NULL "%s" for %s: bias %+.3f%%+-%.3f%s' %
+                      ('  ' if bias_ok else '!!', a.null, arm, 100 * d, 100 * se,
+                       '' if bias_ok else '  -- this band CANNOT move, so the rig is measuring '
+                                          'something other than its label; every other column '
+                                          'is suspect.'))
+                print('   %s   variance %.3fx%s' % (' ' if var_ok else '?', r,
+                      '' if var_ok else '  -- only meaningful if the arms do NOT differ by '
+                                        'something that changes noise everywhere (sample count, '
+                                        'gather radius, filter width). If they do, read the bias '
+                                        'line and ignore this one.'))
     for w in warnings:
         print('!! ' + w)
     if not warnings and not a.null:
