@@ -2225,7 +2225,41 @@ ratio of two unreplicated timings and should read as "more than an order of magn
 1 against 0.
 
 
-### GPU-BEAM-TAIL — the device BEAM gather has a heavy firefly tail; the device photon gather does not (2026-09-13)
+### GPU-BEAM-TAIL — **NARROWER THAN THE HEADING SAYS**: the device tail gap needs beams *and* extreme optical depth; the universal finding is a ~1.3x MEDIAN gap (2026-09-13)
+
+**SCOPE CORRECTED AFTER A SECOND BEAM SCENE.** Every measurement below was taken on `_fog_thick`
+(`sigma_t 20`). Running the identical rig on `_beams_ms` (`sigma_t 6`, also beams, also media) shows
+**no device tail gap at all**:
+
+| scene | arm | median | p90 | p99 | max/level |
+|---|---|---:|---:|---:|---:|
+| `_beams_ms`, `sigma_t 6` | GPU | 0.0450 | 0.155 | **10.55** | 99.3 |
+| `_beams_ms`, `sigma_t 6` | CPU | 0.0329 | 0.118 | **9.55** | **116.4** |
+| `_fog_thick`, `sigma_t 20` | GPU | 0.2245 | 1.398 | **4.685** | 23.9 |
+| `_fog_thick`, `sigma_t 20` | CPU | 0.1668 | 0.735 | **1.577** | 5.0 |
+
+p99 ratio **1.10** on `_beams_ms` against **2.97** on `_fog_thick`, and the GPU's worst pixel is
+*better* there (99.3 against 116.4). Collecting every condition tested:
+
+| condition | device tail gap? |
+|---|---|
+| `_cornell_diffuse`, no beams | no (GPU max better) |
+| `_fog_thick`, beams off | no (GPU better on all three tail metrics) |
+| `_fog_cornell`, beams, `sigma_t 0.6` | no (reversed, GPU better) |
+| `_beams_ms`, beams, `sigma_t 6` | **no** |
+| `_fog_thick`, beams, `sigma_t 20` | **yes, 2.97x p99** |
+
+So the tail gap needs beams **and** an optical depth somewhere between 6 and 20 — **one scene in the
+repo exhibits it.** That is a real effect, reproduced across seeds, precision builds and `-beamsinmin`
+settings, but it is an edge case rather than the general device-beam defect the original heading
+claimed.
+
+**THE FINDING THAT DOES GENERALISE IS THE MEDIAN GAP.** The device runs ~1.3x noisier at the median
+on *every* scene tested, beams or not: `_cornell_diffuse` **1.30x**, `_fog_thick` beams **1.35x**,
+`_beams_ms` **1.37x**, thin fog **2.04x**. That is present in five of five conditions including
+no-beam scenes, which makes it the more valuable target of the two, and none of the eight candidates
+eliminated below touches it — they were all aimed at the tail.
+
 
 Found while pricing the M-TIME-CPU fix, which exposed a device-vs-host quality gap to `-time` users
 for the first time. Localised here, and it is narrower than it first looked.
