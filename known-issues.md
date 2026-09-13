@@ -1048,6 +1048,57 @@ probe. That is acceptable for a CPU prototype behind a flag and is NOT a shippab
 `incomplete` flag now means only that a ray hit the 32-layer cap, in which case `-gageom` still falls
 back to the probe.
 
+### The gallery_rain A/B ran, its NULL FAILED, and the measurement is void — with the cause found
+
+The queue's gate is to measure `cap_gyroid` on `gallery_rain` before touching the device. The A/B
+ran: mode-R reference, `-gageom 0` against `-gageom 1`, scored per material on a mask. **It is not
+reportable, because the null moved.**
+
+| material | footprint | probe | geometric | delta |
+|---|---|---|---|---|
+| `gridground` | **1.008 (NULL)** | -12.86 % | -16.34 % | **-3.48** |
+| `capmarble_axicon` | 0.794 | +20.01 % | +1.74 % | -18.27 |
+| `capmarble_gyroidx` | 0.715 | -7.54 % | -29.61 % | -22.07 |
+| `capmarble_gold` | 0.963 | +8.96 % | +4.05 % | -4.91 |
+
+`gridground`'s measured footprint is 1.008, so the correction is algebraically inert there and it
+**cannot** move. It moved 3.5 points, and every other row moved the same way — negative. The
+`capmarble_axicon` column looks like a triumph (+20.01 % to +1.74 %) and must not be quoted: a rig
+whose null fails is measuring something other than its label, and this entry has a section on
+exactly that.
+
+**The cause, found by putting both halves side by side** — the prompt's own rule, that when the two
+halves of a test live in different places you check every case appears in both or neither:
+
+    photon query   dot(ph.n, h.n) >= 0.5      SIGNED, consistently-oriented normals
+    footprint      fabs(dot(h.n,  n)) >= 0.5  ABSOLUTE, and `Hit::n` is oriented against the ray
+
+Two mistakes at once. `Hit::n` is flipped to oppose whatever ray found it, so against a march along
+`+n` its sign carries no information at all; and `fabs` then accepts back faces that the photon query
+throws away. On a **closed solid** the march crosses the near face and the far face and counts both,
+roughly doubling the footprint — and dividing by a doubled area darkens everything, uniformly, which
+is precisely the shape of the table above.
+
+**Fixed as far as it can be safely fixed.** The test now uses `Hit::ng`, the raw geometric normal,
+which unlike `Hit::n` can be compared with the gather normal at all. **Signed was tried and reverted
+in the same tick**: `_ga_null`'s floor is an authored quad whose `u x v` points DOWN, so the signed
+test rejected the surface the gather sits on and the footprint collapsed from 1.0000 to **0.0000** on
+the scene it is validated against. A single-sided quad has no dependable outward orientation — the
+renderer sidesteps that by orienting against the ray, which is why `ph.n` works for photons and
+cannot be reconstructed from geometry alone.
+
+So `|dot|` stands and the double-counting on solids stands with it. Controls re-verified after the
+revert: `_ga_null` **1.0000**, `_ga_corner` `s20` **1.0000**, `s00` **0.5525** (min 0.5156, against
+an analytic half-disc of 0.5).
+
+**The correct fix is ENTRY/EXIT PARITY** — the march knows the sign of `dot(n, ng)` at each crossing,
+so it can count entries and skip exits, giving one face per solid whatever the authored orientation.
+It is deliberately NOT implemented here: it needs its own validation against the same three scenes,
+and shipping a half-understood facing rule is what produced the void A/B in the first place.
+
+**Status: `-gageom` stays off by default and must not be used on scenes containing closed solids.**
+Its validated domain is a single-layer surface, where it reproduces the probe to within half a point.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than

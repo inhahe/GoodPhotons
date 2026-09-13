@@ -68,7 +68,39 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             Hit h = sc.closestHit(ray, t0, nullptr, /*skipHair=*/false,
                                   /*skipCamHidden=*/true);
             if (!h.valid || h.t > span) break;
-            const double c = std::fabs(dot(h.n, n));
+            // THE FACING TEST MUST BE THE PHOTON QUERY'S, EXACTLY. That query keeps a photon
+            // when `dot(ph.n, h.n) >= 0.5` — SIGNED, against consistently-oriented normals —
+            // so a back face is rejected and contributes no photons. The first version of
+            // this loop used `fabs(dot(h.n, n))`, which is wrong twice over: `Hit::n` is
+            // oriented AGAINST the ray, so its sign carries no information here, and the
+            // absolute value then accepts back faces the query throws away. On a closed
+            // solid the march counts entry AND exit, roughly doubling the footprint, and
+            // dividing by it darkens everything — which is exactly what the gallery_rain A/B
+            // showed, including a 3.5-point move on a null whose footprint is 1.008 and
+            // where the correction is algebraically inert.
+            //
+            // `Hit::ng` is the RAW geometric normal, independent of which way the ray came,
+            // so unlike `Hit::n` it can be compared with the gather point's normal at all.
+            //
+            // BUT THE TEST IS STILL |dot|, NOT SIGNED, AND THAT IS A KNOWN DEFECT. Signed was
+            // tried and reverted the same tick: `_ga_null`'s floor is an authored quad whose
+            // `u x v` points DOWN, so the signed test rejected the very surface the gather sits
+            // on and the footprint collapsed from 1.0000 to 0.0000 on the scene it is validated
+            // against. A single-sided quad has no dependable outward orientation -- the renderer
+            // sidesteps that by orienting against the ray, which is why `ph.n` works for photons
+            // and cannot be reproduced here from geometry alone.
+            //
+            // So |dot| stands, and its cost is that a CLOSED SOLID is counted twice: the march
+            // crosses the near face and the far face and accepts both, while the photon query
+            // accepts only the near one. That roughly doubles the footprint on solids and
+            // darkens them, which is what the gallery_rain A/B measured -- including a
+            // 3.5-point move on a null whose footprint is 1.008 and where the correction is
+            // algebraically inert. THE FIX IS ENTRY/EXIT PARITY: the march knows the sign of
+            // `dot(n, h.ng)` at each crossing, so it can count entries and skip exits and get
+            // one face per solid regardless of authored orientation. Not implemented, because
+            // it needs its own validation against the same three scenes and half-understanding
+            // this is what produced the void A/B in the first place.
+            const double c = std::fabs(dot(h.ng, n));
             if (c >= 0.5) area += cellArea / c;   // same-facing: what the photon query keeps
             t0 = h.t + eps;
         }
