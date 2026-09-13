@@ -12152,7 +12152,20 @@ static constexpr double kBeamRefreshDevJ = 0.30;
 // -0.57 % -- no resolvable bias -- while cutting the worst pixel from 4350x to 1690x the
 // reference and the mean relative squared error from 1.219 to 0.836. See BeamMap::sinMin.
 static double    g_beamSinMin    = 0.3;
-static long long g_beamSplitMax  = 8000000;
+// 4M since 0.290.0, measured down from 8M. Splitting trades BVH BUILD against TRAVERSAL: build
+// costs ~1.05 us per split entry and rises linearly, while traversal SATURATES above ~4M splits
+// (on _fog_thick: 19.0, 16.4, 15.5, 15.2 s at 2/4/8/16M), so there is an interior optimum and 8M
+// sat past it. Measured across three media spanning 100x in sigma_t and two phase functions --
+// _fog_thick 15.3 %, _fog_g9deep 9.3 %, _fog_st2 6.7 % faster at 4M than at 8M -- with 4M winning
+// all six repeats.
+//
+// The image is unaffected, which is not a hope: photonbeams.h splits a beam into sub-segments that
+// "share the parent's origin and power and only carry their own [s0, s0+len] range, so nothing has
+// to be re-integrated". Checked anyway, paired over three seeds on _fog_thick: -0.12 +- 0.23 %
+// (2M), -0.38 +- 0.17 % (4M), +1.06 +- 1.21 % (16M) against the 8M default, none significant at
+// 2 dof -- against a 5.3 % seed-to-seed spread on the DEFAULT arm against itself, which is what
+// the earlier single-seed "1.2-1.8 % difference" had actually been measuring.
+static long long g_beamSplitMax  = 4000000;
 static double    g_beamSplitLen  = 0.0;
 
 // MODE J'S BEAM BUDGET, IN RAW (PRE-SPLIT) BEAMS -- see J-BEAMCOST and bdpt.h's long note.
