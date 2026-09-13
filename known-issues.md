@@ -2138,6 +2138,41 @@ destroy the amortisation *and* give consecutive frames different realizations, w
 rather than convergence. The warning was reworded to say exactly this, since it had listed `-time`
 among the flags that cost you the device and that is no longer true.
 
+**WHAT THE FIX IS ACTUALLY WORTH, MEASURED — and it is not what the throughput suggests.** At a
+matched 90 s budget on `_fog_thick`, the device arm gathers **276 spp against the CPU's 34**, and both
+complete 2 light-side realizations. Scored properly (scene-linear PFM via `-hdr`, two seeds per arm,
+seed-to-seed difference) the device image is nevertheless **worse**:
+
+| | median \|diff\| | p90 | p99 | max/level |
+|---|---:|---:|---:|---:|
+| GPU, 90 s budget (276 spp) | 0.228 | 1.34 | 4.41 | **26.6** |
+| CPU, 90 s budget (34 spp) | 0.173 | 0.78 | 1.67 | 5.0 |
+
+Noisier at *every* quantile and progressively worse toward the tail, which is the signature of
+fireflies rather than general noise. Eight times the samples did not buy a better picture.
+
+**The cause is the device, not the routing — established by a matched-spp control** rather than
+argued. At `-spp 34` on both devices the GPU reads median 0.225 / p90 1.40 / p99 4.68 / max 23.9,
+within noise of its own time-budgeted numbers, and the CPU likewise. So the gap is a property of the
+device gather at any sample count, and **this fix did not create it: it exposed it.** `-time` users
+were previously routed to the CPU and therefore accidentally shielded from a device-side tail that
+`-spp` users have had all along. Mean radiance agrees between devices to **1.62 %**, so this is a
+variance/tail difference, not a bias.
+
+**Two measurement traps on the way here, both of which would have produced a confident wrong answer.**
+First, PNGs are tone-mapped with *auto-exposure*, which differed **33 % between devices** (3.5e-12 vs
+4.6e-12) and 3.9 % between the GPU's own two seeds against the CPU's 1.1 % — so a PNG comparison
+inflates exactly the arm that turned out to look worse. Rendering `-hdr` and scoring scene-linear
+removes it. Second, the linear RMS came out at **1.06 relative**, i.e. above the signal itself, which
+is a tell that outliers own the statistic; the median and percentiles above are what the conclusion
+rests on, and they are milder (1.32x at the median) than the RMS ratio of 2.24.
+
+**This fix still stands.** A silently ignored budget is worse than an honoured one, the device really
+does deliver 8x the samples, and `-device cpu` remains available for anyone who wants the lighter
+tail. But the device tail is now a user-visible issue on media scenes and deserves its own
+investigation — it is plausibly the same mechanism as the `_deltalight_mix` GPU-vs-CPU item and the
+tail entries elsewhere in this file.
+
 **On verifying no regression, because the obvious test was invalid.** Byte-comparing a non-budgeted
 render before and after would have condemned the change: two runs of the *identical* command already
 differ by max 175 / rms 11.8 on 0-255 values, because the beam realization varies run to run even at
