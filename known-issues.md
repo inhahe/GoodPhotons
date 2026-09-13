@@ -1632,6 +1632,34 @@ measured. One new bug fell out of building the rigs: **BEAMORDER-GPU**, where th
 a beam's scattering order *and* the report counted the untracked chords in its own denominator —
 the third instance of that denominator error this file records.
 
+**WORKING-QUEUE AUDIT (2026-09-13).** The 2026-09-11 audit below is superseded for three of its four
+surviving rows. What today changed, and what a session resuming should actually pick up:
+
+| item | status after today |
+|---|---|
+| **M-GATHERAREA** | **Its stated fix is REFUTED on its own named targets.** The geometric footprint was built, validated against analytic answers (exactly 1.0000 on a plane, 0.5525 against an analytic half-disc beside a wall, 1.0038 on open ground), proven inert where it must be (byte-identical render), and run on `gallery_rain` — and `capmarble_axicon` moves **+20.01 % → +19.96 %**. Three outcomes close it: on flat geometry the footprint is 1 and there is nothing to fix; on fur it is ~2.9x pi r^2 so dividing by it would darken fur threefold; on the caps it is 0.56-0.92, applied, and unhelpful. **The caps' error is not a footprint error.** |
+| **VOLCACHE** | **Re-scoped twice.** Structurally, the volumetric gather is a *beam query*, not a point lookup, so a cache cannot be "extended" to it — only a hybrid (order 1 beams, order >= 2 marched against a cache) can work. Economically, its quoted payoff of "83.2 % of gather candidates" is a share of **candidates, not cost**; the measured ceiling is **~47 % of a frame** and lower still, since the hybrid must keep emitting, depositing and BVH-building the beams for order 1. |
+| **mode-J port** | unchanged from the 2026-09-12 re-pricing (~1.2x, not ~12x). |
+| **UPBP-CONV** | unchanged (largely retired). |
+
+**And two things that are NOT on the queue came out of the day and are worth more than some of what
+is:**
+
+* **The beam BVH build is 31 % of a `_fog_thick` frame**, it tracks split entries at ~1.05 µs each
+  rather than beam count, and `-beamsplitmax`'s default sits past the time optimum — 4 M is ~15 %
+  faster than the 8 M default in both repeats. **Image equivalence is not yet established**, so it is
+  not a recommendation, but it is a live optimisation needing only a paired multi-seed check.
+* **`-radcache` measurements**: its cell is auto-sized (not the 0.05 struct initialiser), doubling it
+  buys 9x the utilisation and costs real accuracy (`red` -0.464 ± 0.138, 3.4 sigma), and
+  `-radcache-validate 1` disables the cache's benefit rather than strengthening it.
+
+**The tooling built today is the durable part** and applies to any of the above: `-roiboxes` /
+`-roi-audit` / `-roi-mask` derive exact per-material ROIs on any scene from the renderer's own
+visibility; `-gafparea` measures a gather ball's true same-facing area; `tools/roi_score.py` now
+carries four traps rather than two, including `assert_arms_differ`, callable from scratch scripts.
+Four scenes with by-construction nulls exist: `_ga_corner`, `_fur_recip`, `_fur_substrate`,
+`_fur_substrate_area`.
+
 **WORKING-QUEUE AUDIT (2026-09-11, second of the day).** Of the nine items driving that day's
 autonomous session, **four were already finished** — GLOSSY-NEE's env-light gap (v0.266.3 CPU,
 v0.266.4 device), `_deltalight_mix`'s +0.79 % (closed 2026-09-09 as a single-seed raw-mean
