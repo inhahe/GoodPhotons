@@ -327,6 +327,62 @@ reads ON +0.22 % vs OFF -0.98 % while `s10`/`s20` read identical. The genuine in
 `s10` and `s20`, and the scene should have carried a strip bounded on neither side. The claim was
 right about the geometry I was thinking about and wrong about the geometry that was there.
 
+### Confirmed on a second scene — and then bounded: the over-correction is real but outside the operating range
+
+`fur_creature` at r = 0.40, both arms at matched spp, anchored to its mode-R reference (seed 3;
+the effects below dwarf the ±0.1-1.0 % seed spread these thousand-pixel ROIs showed earlier):
+
+| material | px | correction ON | OFF |
+|---|---|---|---|
+| `wall` | 6605 | **+22.00 %** | **-16.47 %** |
+| `floor` | 5116 | +21.65 % | -2.62 % |
+| `coat` | 1369 | +26.44 % | +15.18 % |
+| `belly` | 743 | +39.83 % | **+39.65 %** |
+
+So the enclosed-scene brightening of the FLAT surfaces is confirmed as the footprint correction
+over-shooting: the wall swings 38 points when the flag is toggled and lands 22 past truth. The
+overshoot is far larger here than `_ga_corner`'s 4 points, which fits — a point in a small room is
+within r of several boundaries at once, not one.
+
+**`belly` moves 0.2 points between arms.** The correction is inert on it, so `belly`'s +40 % is a
+different and still-uncorrected problem, not this one. Worth separating now rather than letting it
+ride along with a mechanism that demonstrably does not touch it.
+
+**THE QUALIFIER THAT GOVERNS ALL OF IT, and it changes the severity completely.** `-pmadaptive 0
+-pmradius 0.40` forces a radius this renderer would never choose. The logs record what it does
+choose:
+
+| scene | adaptive gather radius | radii the sweep used | multiple of natural |
+|---|---|---|---|
+| `fur_creature` | 0.0201 -> **0.0092** | 0.02 - 0.40 | **2x - 43x** |
+| `fur_basics` | 0.0186 -> **0.0100** | 0.05 - 0.40 | **5x - 40x** |
+| `fur_species` | 0.0183 -> **0.0110** | — | — |
+| `gallery_rain` | 0.3846 -> **0.2412** | 0.20 - 0.80 | **0.8x - 3.3x** |
+
+At `fur_creature`'s smallest swept radius, 0.02 — still twice its natural one — the flat surfaces
+read **-0.0 %** and **+0.2 %** against truth. **So the over-correction is not a defect in shipped
+renders of these scenes; it is what the estimator does when driven 20-40x past the radius its own
+adaptive rule picks.** Anything this entry says about a +22 % brightening applies to that forced
+regime and to nothing a user would hit.
+
+**And it is the third structural reason the original cross-scene comparison could not work.** The
+first was the statistic (whole frame vs per-ROI). The second was the missing per-scene control.
+The third is this: `gallery_rain` was swept at roughly 1x its natural radius while the fur scenes
+were swept at 5-40x theirs, so the curves being compared were sampling different parts of the
+estimator's behaviour entirely. Every number needed for that check was sitting in the sweep logs
+the whole time, one grep away, and no explanation proposed in this thread required a new render to
+rule out.
+
+**Guard-symmetry audit, done in the same tick and clean.** The prompt's rule — when both halves of
+a mechanism live in different places, verify every case appears in both or neither — applied to the
+cross-surface rejection `dot(ph.n, h.n) < 0.5`, since every sweep above ran on `-device gpu`. Host:
+`photonGatherSub` and `photonGather` (photonmap_render.h 918, 1264) and the SPPM gather
+(sppm_render.h 338). Device: `dPhotonGather` and `kSppmGather` (render_cuda.cu 14090, 14455).
+`photonGatherSub` is called from `photonGather`, so the host pair is one chain that the device
+consolidates into one function. Every gather site on both sides has the guard; no asymmetry. This
+is also what ruled out "the query sums the neighbour's photons" as the cause of the excess, before
+any render was spent on it.
+
 **Tool fix made in the same tick.** `roi_score.py --null` checked VARIANCE only, and a gather-radius
 sweep legitimately changes variance everywhere: the null strip 4-8 m from the only wall read
 0.278x / 0.074x / 0.013x / 0.004x and the tool called it "measuring something other than its label"
