@@ -1263,6 +1263,54 @@ output is not a smooth function of its cell size; part of any cell-size sweep is
 rather than resolution. A sweep over that parameter needs several seeds per point, which the
 re-run now under way does not have — and that limitation is worth knowing before reading it.
 
+### First measurement of the radiance cache's cell size: at the shipped default it is INERT on `cornell`
+
+`-radcache` has shipped since v0.257.0 with `baseCell = 0.05` and the number has never been
+measured. Swept directly on `cornell.ftsl`, mode R, CPU, 128 spp, one seed, `-radcache-validate 1`,
+scored by image identity first because that is the strongest statement available:
+
+| `-radcache-cell` | ready cells | consults terminated | image |
+|---|---|---|---|
+| 0.0125 | 0 | — | **identical to `-no-radcache`** |
+| 0.025 | 0 | — | identical |
+| **0.05 (default)** | 1 of 1009 | **0 / 1 182 517 (0.0 %)** | **identical** |
+| 0.10 | 1 | — | identical |
+| 0.20 | 1, 3 retired | — | differs |
+| 0.40 | 1, 1 retired | — | differs |
+| auto (0.4004) | 1, 1 retired | 8851 / 1 171 208 (**0.8 %**) | differs |
+
+**At its default cell size the cache is byte-identical to not having a cache.** Not "small effect" —
+the same md5 as `-no-radcache` at the same seed and spp. It builds 1009 cells, fills 0.4 % of them,
+gets one ready, and answers **zero** queries.
+
+**And it is not a warm-up problem.** Re-run at **1024 spp**, 8x the samples, same cell: 29 cells
+ready instead of 1, 2.4 M update samples instead of 0.3 M, 12 corrected and 3 retired by readers —
+and still **0 of 9 455 322 consults terminated**. The cache populates happily and is never used.
+Whatever gates a consult, it is not sample count.
+
+The cell size is what moves it: nothing below 0.10, an image change at 0.20, and 0.8 % of consults
+at ~0.40. So utilisation is governed by cell size and **the shipped default sits below the threshold
+on this scene** — by a factor of at least four.
+
+**Two honest limits on how far this reads.**
+
+1. **One frame, and the cache is a FLYBY feature.** VOLCACHE's entry states its purpose as avoiding
+   recomputation *"every frame of a flyby"*. A single frame may legitimately show no benefit, since
+   the payoff is reuse across frames. But 0.0 % of consults terminated means it is not helping this
+   frame either, at any cell size below 0.2, and that is worth knowing before extending the design
+   to volumes.
+2. **It does not match the numbers already in this file, and that needs reconciling rather than
+   asserting.** The radcache entry records **-18.76 %** raw systematic error per read on
+   *`cornell.ftsl`* — the same scene — pulled to **-0.27 %** by verification, with *19 corrected and
+   9 retired*. Reads plainly happened there. My configuration answers none. So one of us is running
+   a different setup (`-radcache-warm`, `-radcache-passes`, `-radcache-train`, a different cell or
+   mode), and the discrepancy is a lead, not a contradiction I have proven. The next step is to find
+   the flags that produced those numbers and re-measure the cell size in THAT configuration.
+
+**Also settled: validation demonstrably works.** `-radcache-validate 1` and `-radcache-validate 0` at
+cell 0.40 give different images, so the earlier tick's "validation changes nothing" was entirely the
+swallowed-flag artifact and not a property of the feature.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
