@@ -1982,6 +1982,46 @@ more fur to find — so the estimate tends to `1/r^2` while a normal gather hold
 `r^-0.46` is that saturation partway in. **That is the same family as this entry's founding
 observation** that "the gather disc is wider than her head", not a new dimensional defect.
 
+**AND THE MEDIUM IS INNOCENT — one scene, one variable, same ROI (2026-09-13,
+`scraps/fur_cross4.sh`). FOURTH WITHDRAWAL.** The conclusion below — "the medium is what does it" —
+was drawn from `fur_creature` versus `gallery_rain`, and those differ in **two** ways: the medium
+AND the scene composition (a crowded gallery versus an isolated creature). That is structurally the
+same confound this entry criticised two sections earlier, committed by me an hour after writing the
+criticism.
+
+Mode `M` is media-blind without `-beams`, so dropping that flag removes the medium and leaves the
+geometry, lighting and camera untouched. Same `creature` ROI, same radii:
+
+| `r` | `r/R` | ROI brightness | vs `r` = 0.20 |
+|---|---|---|---|
+| 0.2000 | 1.25 | 2.151e-01 | 1.000x |
+| 0.3846 | 2.40 | 2.001e-01 | 0.930x |
+| 0.5500 | 3.44 | 1.677e-01 | 0.780x |
+| 0.8000 | 5.00 | 1.098e-01 | **0.510x** |
+
+**It still FALLS without the medium** — 0.510x here against 0.388x with beams over the same range.
+So the medium contributes little and **does not flip the sign**. The medium explanation is
+withdrawn, joining dimensional, strand-crossing and saturation.
+
+**AND A SECOND FAULT IN MY OWN COMPARISONS, worth more than the withdrawal.** The `fur_creature` and
+`fur_basics` sweeps scored the **whole lit frame**; the `gallery_rain` sweeps scored the
+**`creature` ROI**. Different statistics over different populations — so "rises versus falls" was
+never a like-for-like comparison, and **every cross-scene claim in this thread is unreliable as
+run**, including the refutation that withdrew the saturation model.
+
+**What survives, and it is narrow but solid:** within `gallery_rain`, scored consistently on one
+ROI, the `creature` estimate falls monotonically with the gather radius, by 0.39-0.51x across
+`r/R` = 1.25 to 5.00, **with or without the participating medium**. That is a single-scene,
+single-variable, same-statistic result and nothing in it depends on fur.
+
+**This thread stops here.** Five mechanisms were proposed and four withdrawn; the fifth (scene
+composition — the growing ball reaching off the creature onto darker neighbours, which is
+`compote`'s mechanism with the sign reversed) is consistent with everything above but has not been
+tested, and testing it needs a matched-statistic sweep across scenes that this thread has repeatedly
+failed to run correctly. **The effect is real and documented; the mechanism is open; the rigs are in
+`scraps/`.** Anyone resuming should fix the statistic first — one ROI-equivalent measure applied to
+every scene — before proposing anything.
+
 **THE CONTROLLED COMPARISON: SAME CREATURE, MEDIUM REMOVED, SIGN FLIPS (2026-09-13,
 `scraps/fur_cross3.sh`).** The refutation below carried a confound I introduced — `gallery_rain`'s
 sweep ran `-beams -beamfreeze` over a rain medium and `fur_basics` had neither. `fur_creature`
