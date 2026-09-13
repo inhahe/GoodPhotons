@@ -291,3 +291,62 @@ inline int roiAuditReport(const Scene& scene, const Camera& cam, int resX, int r
     std::fclose(f);
     return 0;
 }
+
+// -gafootprint <r>: census of what is actually INSIDE a gather ball, per material.
+//
+// The gather divides by pi r^2 — the area of a flat disc — while collecting from whatever
+// same-facing surface is really in the ball. M-GATHERAREA's probe tries to measure that
+// with nearest-hit rays and is documented to fail on a tangle because "the probe sees the
+// nearest layer while the query gathers from the whole ball". Before writing area code
+// for five primitive classes, this answers the prior question: WHAT is in the ball, and
+// how much of it, on fur versus on flat geometry? A class that never appears needs no
+// area routine, and a ball that holds one triangle on flat ground and thousands of curve
+// segments on fur is the defect stated in units anyone can check.
+//
+// Geometric, not photon-derived: it reports primitive counts from `Bvh::traverseSphere`,
+// which `-checkspherequery` verifies misses nothing.
+inline int gaFootprintReport(const Scene& scene, const Camera& cam, int resX, int resY,
+                             double r, int stride) {
+    struct Stat { long long n = 0; double tri = 0, sph = 0, imp = 0, cur = 0, ins = 0; };
+    const size_t nT = scene.tris.size(), nS = scene.spheres.size(),
+                 nI = scene.implicits.size(), nC = scene.curveSegs.size();
+    std::vector<Stat> st(scene.mats.size());
+    if (stride < 1) stride = 1;
+    for (int py = 0; py < resY; py += stride)
+        for (int px = 0; px < resX; px += stride) {
+            Ray ray = cam.genRay(px, py, 0.5, 0.5);
+            Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
+                                     /*skipCamHidden=*/true);
+            if (!h.valid || h.matId < 0 || h.matId >= (int)st.size()) continue;
+            long long t = 0, s = 0, im = 0, c = 0, in = 0;
+            scene.bvh.traverseSphere(h.p, r, [&](int p) {
+                size_t u = (size_t)p;
+                if (u < nT) { ++t; return; }
+                u -= nT; if (u < nS) { ++s; return; }
+                u -= nS; if (u < nI) { ++im; return; }
+                u -= nI; if (u < nC) { ++c; return; }
+                ++in;
+            });
+            Stat& a = st[h.matId];
+            ++a.n; a.tri += (double)t; a.sph += (double)s;
+            a.imp += (double)im; a.cur += (double)c; a.ins += (double)in;
+        }
+    std::printf("[gafootprint] radius %.5g, every %dth pixel, %dx%d\n", r, stride, resX, resY);
+    std::printf("%-22s %8s %10s %9s %9s %9s %9s\n",
+                "material", "gathers", "curveSeg", "tris", "spheres", "implicit", "instance");
+    std::printf("%s\n", "----------------------------------------------------------------------------------");
+    bool any = false;
+    for (int m = 0; m < (int)st.size(); ++m) {
+        const Stat& a = st[m];
+        if (a.n == 0) continue;
+        const char* nm = scene.matNameFor(m);
+        if (!nm) continue;
+        any = true;
+        const double k = 1.0 / (double)a.n;
+        std::printf("%-22s %8lld %10.1f %9.1f %9.1f %9.1f %9.1f\n",
+                    nm, a.n, a.cur * k, a.tri * k, a.sph * k, a.imp * k, a.ins * k);
+    }
+    if (!any)
+        std::printf("[gafootprint] no named material was hit — check -camera and -r.\n");
+    return 0;
+}

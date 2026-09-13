@@ -18311,6 +18311,8 @@ static int run(int argc, char** argv) {
     bool      roiBoxesOnly = false;
     const char* roiAuditFile = nullptr;
     const char* roiMaskFile  = nullptr;
+    double gaFootprintR = 0.0;   // -gafootprint <r>
+    int    gaFootprintStride = 4;
     double    roiMinPurity = 0.60;
     double    roiMinShare  = 0.50;
     long long roiMinPx     = 24;
@@ -19260,6 +19262,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-roi-minpurity") && i + 1 < argc) roiMinPurity = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-roi-minshare")  && i + 1 < argc) roiMinShare  = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-roi-minpx")     && i + 1 < argc) roiMinPx     = std::atoll(argv[++i]);
+        else if (!std::strcmp(argv[i], "-gafootprint") && i + 1 < argc) gaFootprintR = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-gafootprint-stride") && i + 1 < argc) gaFootprintStride = std::atoi(argv[++i]);
         // Chain continues into this segment's original head: without the `else` the two
         // chains are independent and the trailing `else handled = false;` below would mark
         // every flag above as unrecognised.
@@ -20319,6 +20323,11 @@ static int run(int argc, char** argv) {
         }
         const RenderCam& rc = toRender.front();
         return roiAuditReport(scene, rc.cam, rc.res, rc.resY, roiAuditFile);
+    }
+    if (gaFootprintR > 0.0) {
+        if (toRender.empty()) { std::fprintf(stderr, "[gafootprint] no camera selected\n"); return 1; }
+        const RenderCam& rc = toRender.front();
+        return gaFootprintReport(scene, rc.cam, rc.res, rc.resY, gaFootprintR, gaFootprintStride);
     }
     // -roi-mask: write the per-pixel material id as a .pfm, plus a `<path>.materials.txt`
     // legend. A rectangle cannot represent a thin material -- fur scores purity 0.44 over

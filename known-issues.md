@@ -826,6 +826,42 @@ by-construction null that passes; and `Bvh::traverseSphere` with `-checkspherequ
 misses nothing. The next step is the geometric footprint itself, which is backlog item 2 and now has
 both a foundation and a scoring rig.
 
+### `-gafootprint`: a gather ball on fur holds ~600 curve segments; on flat geometry it holds ~3
+
+First use of `Bvh::traverseSphere`. Before writing area routines for five primitive classes, the
+prior question: what is in the ball, and how much? `fur_creature` at its own adaptive radius
+(0.009192), one gather per 2nd pixel:
+
+| material | gathers | curve segs | tris | spheres |
+|---|---|---|---|---|
+| `wall` | 1633 | **2.3** | 3.0 | 0.0 |
+| `floor` | 1297 | 4.1 | 3.8 | 0.0 |
+| `belly` | 183 | **374.1** | 0.0 | 0.7 |
+| `coat` | 343 | **556.0** | 0.5 | 1.0 |
+| `tan` | 67 | **614.4** | 0.7 | 1.4 |
+| `skin` | 52 | **644.9** | 0.4 | 1.7 |
+
+**Two orders of magnitude.** A ball on unfurred geometry contains a handful of primitives; the same
+ball on a coat contains several hundred curve segments. **The shipped probe fires 8 nearest-hit rays
+to estimate the footprint of ~600 segments**, and each ray can return at most the nearest one. That
+is the documented failure — "the probe sees the nearest layer while the query gathers from the whole
+ball" — restated in units, and it explains why every gate is a choice of which way to be wrong
+rather than a fix.
+
+**Two design consequences, which is what this was for.**
+
+1. **The area code needs TWO primitive cases, not five.** Spheres average 0-1.7 per ball, implicits
+   and instances exactly 0.0 everywhere. Curve segments and triangles are the whole problem in every
+   scene this entry uses, so `implicit`/`instance` can keep the present behaviour without loss.
+2. **Cost is bounded and known**: a few hundred segment-area evaluations per gather on fur, none on
+   flat geometry — the expense lands exactly where the estimator is currently wrong, and a scene
+   without fur pays nothing.
+
+**A caveat on the numbers**: these are BVH *candidates*, a deliberate superset — a leaf box can meet
+the ball when its primitives do not, which is why `wall` shows 2.3 curve segments despite being
+nowhere near the creature. The true counts are lower. The 200x contrast is far too large for that to
+matter, but the figures should not be quoted as exact overlaps.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
