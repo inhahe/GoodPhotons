@@ -1,60 +1,57 @@
-# Does the hair BCSDF attenuate light differently FORWARD (photon pass) than BACKWARD (mode R)?
+# Does a fur coat's mode-M deficit scale with STRAND DENSITY, at the density the creature uses?
 #
-# WHAT PROMPTED IT. At fur_creature's own adaptive gather radius, mode M reads exact on every
-# unfurred surface (wall -0.05 %, floor +0.04 %) and 17-33 % TOO DARK on everything the light has
-# to cross fur to reach. The deficit is ordered by how much fur is in the way: coat -17, skin -11,
-# tan -23, belly -32, the belly lying under the densest coat. The footprint correction is provably
-# inert there (coverage 1.0 at r = 0.0092; toggling the flag moves belly 0.2 points) and light-path
-# bounce truncation is refuted (cap 32 vs 128 is byte-identical while cap 2 moves the image 20 %).
-# What is left that fits an ordering in fur thickness is a per-strand transmission mismatch between
-# the two directions of transport, which compounds with the number of strands crossed.
+# SUPERSEDES the first draft of this scene, which had two flaws found by reading fur_creature.ftsl
+# properly rather than by looking at the numbers:
 #
-# THE DISCRIMINATOR IS STRAND COUNT, AND EVERY COUNT IS IN ONE FRAME. Four identical diffuse
-# patches, each its own material NAME with a byte-identical BSDF, differing only in how many hair
-# strands stand on them: 0, 10k, 40k, 160k per square metre (the creature's coats run ~175k/m^2).
-# One mode-M render and one mode-R render score all four, so the photon count, the camera, the
-# light and the exposure are literally the same numbers for every patch -- a confound cannot
-# differ between arms that share a render.
+#   1. IT COMPARED THE WRONG ROW. fur_creature's `coat`, `belly` and `tan` are all FUR materials --
+#      `belly` is the pale underside COAT (`on "chest" material belly`), not skin. The rig's
+#      corresponding material is therefore `hair`, the strands, NOT `p3`, the quad beneath them.
+#      The first draft read p3 at -2.45 % and compared it against belly at -32 %.
+#   2. `hair` WAS ONE MATERIAL ACROSS ALL THREE PATCHES, so its ROI averaged three densities into
+#      one number and could not show a trend at all. Each patch now has its own strand material
+#      with a byte-identical BSDF.
 #
-# p0 IS THE BY-CONSTRUCTION NULL. It carries no fur at all, so mode M and mode R must agree on it
-# to within noise for any reason whatsoever. If p0 moves, the rig is measuring something other
-# than fur and no other column can be read. (fur_creature's wall and floor already pass this test
-# at -0.05 % and +0.04 %, so the null is known to be achievable.)
+# AND THE DENSITY WAS 2.8x OFF. fur_creature authors `density 450000` (strands per unit^2) on every
+# coat. The first draft used `count 160000` on a 1 m^2 patch, matched against the barrel coat's
+# REALISED count over its sphere area (175 800/m^2) -- a different quantity from the authored
+# density the other coats use. This sweep is authored in the same units as the creature and brackets
+# its value: 50k, 150k, 450k per m^2.
+#
+# p0 IS THE BY-CONSTRUCTION NULL, unchanged and already known to pass at +0.13 %: no fur at all, so
+# mode M and mode R must agree on it for any reason whatsoever. If p0 moves, nothing else can be read.
 #
 # PREDICTION, REGISTERED BEFORE THE RUN:
-#   M/R = 1.00 on p0, then falls monotonically with strand count -- p1 > p2 > p3 in deficit.
-#   If instead all four patches show the SAME deficit, the cause is not per-strand and does not
-#   compound, which refutes the transmission-mismatch story.
-#   If p0 also moves, the rig is broken and nothing is concluded.
+#   h1 > h2 > h3 in deficit, monotone in density, and h3 (450k/m^2, the creature's own value) lands
+#   in the -17 % to -33 % range fur_creature's coats show. If h3 is instead a few percent like the
+#   first draft's -2.29 %, then density is NOT the missing factor and the difference lies in the
+#   geometry the coats sit on -- spheres, not a flat quad -- which is the next thing to vary.
 scene { units meters  spectral 360 830 1 }
 
-# One BSDF, four names. Any difference between patches is strand count, never material.
+# One BSDF per role, several names. Any difference between patches is strand density, never material.
 material "p0" { type diffuse  reflect whitewall 0.75 }
 material "p1" { type diffuse  reflect whitewall 0.75 }
 material "p2" { type diffuse  reflect whitewall 0.75 }
 material "p3" { type diffuse  reflect whitewall 0.75 }
-material "hair" { type diffuse  reflect rgb 0.42 0.26 0.13 }
+material "h1" { type diffuse  reflect rgb 0.42 0.26 0.13 }
+material "h2" { type diffuse  reflect rgb 0.42 0.26 0.13 }
+material "h3" { type diffuse  reflect rgb 0.42 0.26 0.13 }
 
-quad "q0" { origin 0.0 0 0   u 1 0 0   v 0 0 1   material p0 }
-quad "q1" { origin 1.4 0 0   u 1 0 0   v 0 0 1   material p1 }
-quad "q2" { origin 2.8 0 0   u 1 0 0   v 0 0 1   material p2 }
-quad "q3" { origin 4.2 0 0   u 1 0 0   v 0 0 1   material p3 }
+quad "q0" { origin 0.0 0 0   u 0.5 0 0   v 0 0 0.5   material p0 }
+quad "q1" { origin 0.7 0 0   u 0.5 0 0   v 0 0 0.5   material p1 }
+quad "q2" { origin 1.4 0 0   u 0.5 0 0   v 0 0 0.5   material p2 }
+quad "q3" { origin 2.1 0 0   u 0.5 0 0   v 0 0 0.5   material p3 }
 
-# Identical grooms; ONLY `count` differs. No droop/curl/clump, so the strands stand straight and
-# the only thing scaling between patches is how many of them the light meets.
-fur "f1" { on "q1"  material hair  count 10000   length 0.05  radius 0.0008  jitter 0.15  seed 1 }
-fur "f2" { on "q2"  material hair  count 40000   length 0.05  radius 0.0008  jitter 0.15  seed 1 }
-fur "f3" { on "q3"  material hair  count 160000  length 0.05  radius 0.0008  jitter 0.15  seed 1 }
+# Authored in the creature's own units. Identical grooms; ONLY `density` differs.
+fur "f1" { on "q1"  material h1  density 50000   length 0.05  radius 0.0008  jitter 0.15  seed 1 }
+fur "f2" { on "q2"  material h2  density 150000  length 0.05  radius 0.0008  jitter 0.15  seed 1 }
+fur "f3" { on "q3"  material h3  density 450000  length 0.05  radius 0.0008  jitter 0.15  seed 1 }
 
-# An ENV light, not a panel. The first draft used a broad area quad above the patches and the
-# camera -- looking straight down -- saw nothing but the back of the light, which `-roiboxes`
-# caught immediately by reporting 0 visible materials. An env light has no geometry to stand in
-# the way and is the broadest source available, which is what a thin fiber needs: a small source
-# leaves most of a strand's circumference in shadow and the coat reads black.
+# An env light: no geometry to stand between the camera and the patches, and the broadest source
+# available, which is what a thin fiber needs.
 light env { spd preset:d65 }
 
 camera "cam" {
-    eye 2.6 7 0.5   look_at 2.6 0 0.5   up 0 0 1   fov_y 45
+    eye 1.3 4 0.25   look_at 1.3 0 0.25   up 0 0 1   fov_y 45
     mode M
     film { res 256 256 }
 }
