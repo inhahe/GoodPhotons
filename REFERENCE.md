@@ -1546,10 +1546,14 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   competing. Pair it with `-parseonly`, which loads and builds without rendering, for a clean
   reading. Measured with it (idle, 2026-09-13): `gallery_rain` 2.47 M prims → **2.33 s**,
   `fur_creature` 1.79 M → **1.34 s**, `gallery` 0.46 M → **0.35 s** — roughly 0.9 µs per primitive,
-  scaling linearly. **Parallelised in v0.292.0** (see `-checkbvhparallel`): the same builds now take
-  **0.75 s** and **1.57 s**, a 3.11x and 2.04x speedup, with the node array proven identical to the
-  serial one. The beam BVH is the caller that matters — it is rebuilt **every epoch** on any mode-M
-  render that is not `-beamfreeze`, where the scene BVH is built once.
+  scaling linearly. **Parallelised in v0.292.0** (see `-checkbvhparallel`), for **~3.0x on both
+  callers** with the node array proven identical to the serial one. Measured paired — alternating
+  `FTRACE_BVH_THREADS=1` and `=12` within each repetition and discarding a warm-up run, because
+  this machine drifts 10-20 % between sittings and absolute build times are not comparable across
+  them: scene BVH **2.32 s -> 0.76 s (3.06x)**, beam BVH **3.50 s -> 1.16 s (3.01x)**, each the
+  mean of three repetitions agreeing to within 8 %. The beam BVH is the caller that matters — it
+  is rebuilt **every epoch** on any mode-M render that is not `-beamfreeze`, where the scene BVH
+  is built once.
 
 - **`FTRACE_JDEVLIGHT` / `FTRACE_JSPLIT` / `FTRACE_JBAND` (mode `J` light-side diagnostics).**
   The default is `FTRACE_JDEVLIGHT=3` with `FTRACE_JSPLIT=4` — the device surface light pass,

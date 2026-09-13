@@ -27325,8 +27325,15 @@ shared atomic budget allows. Measured idle, `FTRACE_BVH_TIME=1`:
 
 | caller | before | after | speedup |
 |---|---:|---:|---:|
-| beam BVH (`_fog_thick`, 3.7 M sub-beams, **per epoch**) | 3.20 s | **1.57 s** | 2.04x |
-| scene BVH (`gallery_rain`, 2.5 M prims, once) | 2.33 s | **0.75 s** | 3.11x |
+| beam BVH (`_fog_thick`, **per epoch**) | 3.50 s | **1.16 s** | **3.01x** |
+| scene BVH (`gallery_rain`, once) | 2.32 s | **0.76 s** | **3.06x** |
+
+*(Re-measured 2026-09-13 under the paired rule — alternating thread counts within each repetition,
+warm-up discarded, three repetitions. The earlier figures in this entry, 2.04x and 3.11x and later
+3.01x and 2.65x, were single runs taken across sittings during which the machine drifted 10-20 %;
+the absolute times moved but both callers land at **~3.0x** once paired. The beam figure was right
+all along at 3.01x; the scene figure was UNDERSTATED at 2.6x because its serial reading happened to
+be taken at a fast moment.)*
 
 **A budget, not a fork depth.** Subtree sizes differ by orders of magnitude, so a fixed depth 4 hands
 one thread a tenth of the tree and eleven threads nothing. Forking depth-first while an atomic
