@@ -26472,9 +26472,43 @@ lose the 1.63 s the build no longer spends: 20 s - 1.63 = ~18.4 s. Measured afte
 twice: **18 s and 18 s**, against 20 s at v0.291.0 -- **~10 % off a single-epoch frozen frame**, and
 proportionally more on a refreshed render, where the build recurs every epoch instead of once.
 
-**Remaining limit, honestly.** 2-3x is still short of an ideal fork-join's ~10x, because the top
-levels are inherently serial -- one thread bins all `n` primitives at the root -- which is also why
-the beam caller gains less than the scene one despite being the larger tree.
+**THREAD SCALING MEASURED (v0.292.2), and it says do NOT tune the thread cap.** `FTRACE_BVH_THREADS=<n>`
+caps the build's threads so the curve can be seen:
+
+| threads | 1 | 2 | 4 | 6 | 8 | 12 |
+|---|---:|---:|---:|---:|---:|---:|
+| scene BVH (`gallery_rain`) | 1.87 s | 1.19 s | 0.79 s | 0.79 s | **0.72 s** | 0.80 s |
+| beam BVH (`_fog_thick`) | 2.92 s | — | 1.45 s | — | 1.20 s | **1.12 s** |
+
+The scene tree looks like it *regresses* past 8 threads and the beam tree does not — it improves
+monotonically to 12. **The two callers disagree, so the "regression" is not real:** it is one 11 %
+reading on a quantity this same file documents as varying 2x even on an idle machine. Capping the
+build at 8 threads on that evidence would be precisely the overfit that has gone wrong repeatedly in
+this session's log. Left at `hardware_concurrency`.
+
+**A real ~12 % found by asking where the time went.** The per-fork buffers had no `reserve`, so a
+multi-million-node subtree reallocated its way up from empty — about 22 doublings, each copying
+everything already written. The node:prim ratio is **0.644 on both callers** (scene
+1589917/2469624, beam 2389129/3709615), so reserving one node per primitive is comfortably above the
+true size without over-committing. Replicated twice per caller:
+
+| | before | after | cumulative vs serial |
+|---|---:|---:|---:|
+| scene BVH | 0.80 s | **0.67-0.74 s** | 1.87 -> 0.705 = **2.65x** |
+| beam BVH | 1.12 s | **0.95-0.99 s** | 2.92 -> 0.97 = **3.01x** |
+
+Identity re-verified after the change on real geometry (`gallery_rain` 1 589 917 nodes, the beam tree
+2 389 281 nodes), plus `-checkbvhparallel` and the three geometry self-tests.
+
+**Remaining limit, honestly.** ~3x is still short of an ideal fork-join's ~10x. Fitting Amdahl to the
+beam curve gives a serial fraction around 0.29, which is the root levels: one thread computes the
+root's bounds, bins all `n` primitives, and partitions them before either child can start. Two of
+those three passes (bounds and binning) are min/max reductions and therefore **order-independent, so
+they could be parallelised without breaking bit-identity**. The partition cannot: `std::partition`'s
+exact output permutation is an implementation detail, and reproducing it in parallel is not
+practical — which matters because `primIdx` order is part of what the verifier compares. Parallelising
+the two reductions alone would cut the serial fraction to roughly 0.1 and is the next real step, worth
+perhaps another 1.5-2x on top.
 
 **Where it would still matter, and is not refuted:** the interactive explorer and quick previews,
 where load latency *is* the product rather than a prelude to a long render. A 2.3 s stall before an

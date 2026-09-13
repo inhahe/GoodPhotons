@@ -26,6 +26,18 @@ inline bool bvhTimeEnabled() {
     return on;
 }
 
+// FTRACE_BVH_THREADS=<n> caps the build's thread count, for scaling measurements. 0/unset =
+// hardware. Exists to tell apart the two things that can limit a parallel build -- memory
+// bandwidth saturation, which flattens the curve early and is not worth fighting, from
+// per-fork copying overhead, which can make high thread counts actively worse.
+inline int bvhThreadOverride() {
+    static const int n = [] {
+        const char* e = std::getenv("FTRACE_BVH_THREADS");
+        return (e && *e) ? std::atoi(e) : 0;
+    }();
+    return n;
+}
+
 // FTRACE_BVH_VERIFY=1 makes every build re-run itself serially and compare, so the
 // parallel==serial invariant is checked on REAL scene geometry rather than on the synthetic
 // primitives of -checkbvhparallel. Roughly triples build time, so it is a debugging switch,
@@ -161,6 +173,7 @@ struct Bvh {
         unsigned hw = std::thread::hardware_concurrency();
         int threads = (hw < 2) ? 1 : (int)hw;
         if (maxThreads > 0) threads = maxThreads;
+        else if (bvhThreadOverride() > 0) threads = bvhThreadOverride();
         BuildCtx ctx;
         ctx.budget.store(threads - 1, std::memory_order_relaxed);
         unsigned tick = 0;
@@ -354,6 +367,13 @@ struct Bvh {
         }
         if (forked) {
             std::vector<BvhNode> lbuf, rbuf;
+            // Reserve, or each side's buffer reallocates its way up from nothing -- ~22
+            // doublings for a multi-million-node subtree, every one of them copying what it
+            // already holds. The node:prim ratio is 0.644 on both callers measured (scene
+            // 1589917/2469624, beam 2389129/3709615), so one node per primitive is comfortably
+            // above the true size without over-committing.
+            lbuf.reserve((size_t)(midIdx - start));
+            rbuf.reserve((size_t)(end - midIdx));
             unsigned lt = 0, rt = 0;
             // The spawned thread takes the LEFT half and this one continues with the right, so
             // the caller's stack keeps doing useful work instead of blocking on a join.

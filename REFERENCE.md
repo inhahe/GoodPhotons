@@ -1523,6 +1523,13 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   *slice* (sample range + samples/s), which exposes the per-scanline-band cost structure
   inside a single spp — on a scene with a dense participating-medium band the sky and the
   cloud can differ by more than 10x, and only the slice trace shows it.
+- **`FTRACE_BVH_THREADS` (build thread cap, measurement).** `FTRACE_BVH_THREADS=<n>` caps the BVH
+  build at `n` threads; unset or `0` uses the hardware count. For measuring the scaling curve — on
+  `gallery_rain` the scene tree goes 1.87 s / 1.19 / 0.79 / 0.72 at 1 / 2 / 4 / 8 threads, and the
+  `_fog_thick` beam tree 2.92 / 1.45 / 1.20 / 1.12 at 1 / 4 / 8 / 12. Note the two callers disagree
+  about whether 12 threads beats 8, by about the size of the run-to-run variation, which is why the
+  cap is left at hardware rather than tuned.
+
 - **`FTRACE_BVH_VERIFY` (parallel-build correctness, debugging).** `FTRACE_BVH_VERIFY=1` makes every
   BVH build re-run itself **serially** and compare the two node arrays element by element,
   printing `[bvh-verify] ok: <prims> prims, <nodes> nodes identical` or a FAIL naming how many
