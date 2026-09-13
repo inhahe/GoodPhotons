@@ -695,6 +695,42 @@ not the authored density the other coats use. The layered-rig follow-up is there
 step; re-running `_fur_recip` at 450 000/m² is, and it is a one-line change to a scene that already
 has a passing null.
 
+### Density REFUTED as the missing factor: a flat patch at the creature's own 450 000/m² reads -2 %
+
+`_fur_recip` rebuilt with per-patch strand materials and authored in the creature's own units.
+Prediction committed in cd86385 before the renders existed. Mode M vs a 512-spp mode-R reference,
+two seeds, scored on the STRAND materials (the row that corresponds to `coat`/`belly`/`tan`):
+
+| material | density | px | seed 3 | seed 7 | mean |
+|---|---|---|---|---|---|
+| `h1` | 50k/m² | 143 | -1.71 % | -1.91 % | -1.81 % |
+| `h2` | 150k/m² | 390 | -3.27 % | -1.68 % | -2.48 % |
+| `h3` | **450k/m²** | 911 | -1.83 % | -2.41 % | **-2.12 %** |
+| `p0` | **bare (null)** | 1444 | -0.09 % | -0.41 % | **-0.25 %** |
+
+**There is no trend.** -1.81, -2.48, -2.12 across a 9x density range, against a seed spread of up to
+1.6 points on a single material. The null passes at -0.25 %.
+
+**So density is refuted.** At the creature's own authored density the flat patch reads **-2.12 %**
+where the creature's coats read **-17 % to -33 %**. The pre-registered fallback therefore applies
+verbatim: *"If h3 is instead a few percent, density is NOT the missing factor and the difference
+lies in the geometry the coats sit on — spheres, not a flat quad — which is the next thing to vary."*
+
+**The regime confound was checked rather than assumed**, which matters because it could have made
+the comparison meaningless: the two scenes' adaptive gather radii are **0.01235** (rig) and
+**0.009192** (creature), a factor of 1.34. Same order, same regime, so the estimator is being
+exercised at a comparable operating point and the refutation stands. Had they differed by 20x — as
+the forced-radius sweeps earlier in this entry did — nothing could have been concluded.
+
+**What actually differs, now that density and gather radius are both excluded.** The creature's
+coats grow on **spheres of radius ~0.10 m carrying 0.055 m strands**, so the coat is roughly half
+the body radius thick and its strands RADIATE, diverging with height so the local strand density
+falls away from the surface. The rig's strands stand parallel on an effectively infinite plane at
+constant density. That is a difference in the tangle structure the coverage probe sees, not in how
+much fur there is, and it is a one-line change to test: the same fur block `on` a sphere instead of
+a quad, at the same density. `wall`/`floor` read ~0 % in the creature, so the enclosing room is not
+a candidate — the room does not bias anything it touches.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
