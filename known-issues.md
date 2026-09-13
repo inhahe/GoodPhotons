@@ -3870,6 +3870,38 @@ where the denominator is dominated by something else is not a measurement of the
 81 %-beams figure was in `-mstats` output that had already been read, on this same scene, in the
 VOLCACHE entry.
 
+**FIRST, A CORRECTION TO THE TWO SECTIONS BELOW: THE `cap_gyroid` ROI IS NOT ON THE GYROID.** Its
+own definition says so, and has all along — `scraps/gallery_rain.rois`:
+
+    cap_gyroid  0.3536 0.8563 0.3767 0.9044   # marble cap (capmarble_gold), -x strip clear of
+                                              # the gyroid and its shadow
+
+The ROI is named for the cap it sits on and deliberately samples a strip **clear of** the gyroid;
+its material is **`capmarble_gold`**. Two sections of analysis below were run against
+`capmarble_gyroidx` on the strength of the ROI's *name*, without opening the file that defines it.
+The ROI definitions were read at the start of this entry's campaign and the comment was written by
+whoever chose the box.
+
+**Redone on the right material, the agreement is striking:**
+
+| | value |
+|---|---|
+| `capmarble_gold` truncated sub-population (52.2 % of its points) | mean coverage **0.664** |
+| coverage implied by the ROI's uncorrected -33.0 % | **0.670** |
+
+**Agreement to 0.006.** So the probe measures this ROI's truncation essentially exactly, and the
+population the ROI samples is the truncated half of `capmarble_gold` rather than anything on the
+gyroid. That is a much stronger statement than either of the sections below reached, and it was
+available from a histogram plus a comment.
+
+**What it leaves open.** If each truncated gather point receives `1/0.664 = 1.51x` and the ROI
+needs `1.49x`, the correction should land it — yet the ROI still reads **-7.5 %**. So the remaining
+question is no longer "is the coverage right" (it is) but "why does applying it not close the gap":
+the candidates are the flux-weighted mix of truncated and interior points inside the ROI's 56 px,
+and the possibility that something other than the footprint is dark there. **The ROI-restricted
+tally remains the instrument**, now to weight the correction by the ROI's own pixels rather than to
+identify a material.
+
 **THE COVERAGE DISTRIBUTION (v0.278.4) KILLS THE LEADING HYPOTHESIS.** `FTRACE_GADIAG` now prints
 a per-material histogram of the coverage each gather point returned, which separates a material's
 flat interior from its truncated edge without any spatial gate to configure. Implemented as a thin
