@@ -773,6 +773,59 @@ narrower and more useful: the estimator is exact on unfurred geometry in every r
 phenomenon, and on the creature the fiber gate brackets it at -33.6 % and +46.8 % with the truth
 unreachable in between.
 
+### Lighting REFUTED — and by the rule registered before the run, this thread hands over
+
+`_fur_substrate_area.ftsl` is byte-identical to `_fur_substrate.ftsl` except `light env` becomes
+`light area`. Two seeds, each scene scored against its own mode-R reference:
+
+| material | px | ENV (s3 / s7) | AREA (s3 / s7) | Δ |
+|---|---|---|---|---|
+| `bare_quad` **NULL** | 1200 | +0.16 / +0.78 | +0.33 / +0.27 | -0.17 |
+| `bare_sph` **NULL** | 690 | +0.52 / -1.21 | -0.98 / -1.21 | -0.75 |
+| `ground` **NULL** | 47471 | +0.69 / -0.21 | +0.06 / -0.02 | -0.22 |
+| `flat_coat` | 294 | +0.21 / -7.81 | -3.79 / -3.67 | **+0.07** |
+| `sph_coat` | 1376 | +11.25 / +11.45 | +18.00 / +15.45 | **+5.38** |
+
+**The nulls hold under the lighting change**, so the pair is comparable and the coat columns mean
+something. **The flat coat does not move at all** (+0.07 points) and **the sphere coat moves FURTHER
+POSITIVE**, away from the creature. Lighting is refuted — the tenth mechanism to be.
+
+The fallback registered in 2f78214 before the renders existed said: *"If the coats barely move,
+lighting is refuted too, the cheap structural variables are exhausted, and this thread should hand
+over to the geometric footprint work rather than keep paying in."* That condition is met, so this is
+where the diagnostic thread stops, by a rule written down in advance rather than by fatigue.
+
+### FURDIM / M-GATHERAREA handover
+
+**Established, and none of it is in doubt:**
+
+* The estimator is **exact on unfurred geometry** in every rig built today: `+0.47 %`, `-0.34 %`,
+  `+0.24 %` (substrate rig), `-0.25 %` (density rig), `-0.05 %` / `+0.04 %` (the creature's own wall
+  and floor). Whatever is wrong is wrong *only* about fur.
+* **Curvature alone is not a bias source**: a bare sphere reads `-0.34 %` at the same gather radius
+  where a furred one reads `+11 %`.
+* On the creature the **fiber gate brackets the truth**: `-33.6 %` with it, `+46.8 %` without, and no
+  setting in between. This is M-GATHERAREA's own thesis measured directly — no photon statistic can
+  recover a tangle's footprint.
+* A **furred sphere reads +11 % to +17 % too BRIGHT** under both lighting models, tight across seeds.
+  That is a real, reproducible defect of its own and it is the OPPOSITE sign to the creature's coats,
+  so the creature's deficit is not generic fur behaviour.
+
+**Refuted as *the* explanation, each after surviving its own test:** dimensional scaling, strand
+crossing, saturation, the medium, scene composition, the corner effect, hair-BCSDF non-reciprocity,
+per-strand density, substrate, lighting.
+
+**The one named hypothesis left untested** is the creature's **many adjacent coats**: every body part
+is surrounded by other furred parts, so light reaching any coat is filtered through its neighbours,
+which no single-object rig reproduces. Recorded as untested, not as likely.
+
+**What the next person inherits, all built and verified today:** `-roiboxes` / `-roi-audit` /
+`-roi-mask` for exact per-material ROIs on any scene; `roi_score.py --mask` with three traps built
+in; `_ga_corner`, `_fur_recip`, `_fur_substrate` and `_fur_substrate_area`, each with a
+by-construction null that passes; and `Bvh::traverseSphere` with `-checkspherequery` verifying it
+misses nothing. The next step is the geometric footprint itself, which is backlog item 2 and now has
+both a foundation and a scoring rig.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
