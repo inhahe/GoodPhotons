@@ -383,6 +383,56 @@ consolidates into one function. Every gather site on both sides has the guard; n
 is also what ruled out "the query sums the neighbour's photons" as the cause of the excess, before
 any render was spent on it.
 
+### At the operating point the error is a DEFICIT of 17-33 %, and the whole thread had its sign backwards
+
+Everything FURDIM ever measured used `-pmadaptive 0` with a radius 2-43x the adaptive rule's own
+choice. Removing the forcing — same scene, same mode-R reference, same material masks, defaults
+otherwise — gives the operating point a user actually hits. Adaptive radius 0.009192, spp 64:
+
+| material | px | seed 3 | seed 7 | mean |
+|---|---|---|---|---|
+| `wall` | 6605 | -0.22 % | +0.13 % | **-0.05 %** |
+| `floor` | 5116 | -0.17 % | +0.24 % | **+0.04 %** |
+| `coat` | 1369 | -16.99 % | -16.60 % | **-16.79 %** |
+| `belly` | 743 | -33.61 % | -32.35 % | **-32.98 %** |
+| `tan` | 274 | -19.43 % | -19.70 % | **-19.56 %** |
+| `skin` | 195 | -7.85 % | -9.29 % | -8.57 % |
+| `eye` | 67 | -2.42 % | +0.93 % | -0.74 % |
+| `nose` | 31 | +48.33 % | +43.67 % | +46.00 % |
+
+**The two seeds agree to a fraction of a point on every large ROI** (0.4 on `coat`, 1.3 on `belly`,
+0.3 on `tan`), so these are systematic and cleanly separated from variance — the separation this
+thread failed to make for most of its life.
+
+**The flat surfaces are EXACT: -0.05 % and +0.04 %.** That is an in-frame, by-construction control
+costing nothing, and it means the rig can see the effect and the estimator is right where it should
+be right. The creature reads 17-33 % TOO DARK.
+
+**So the sign is the opposite of everything the forced-radius work suggested.** Those sweeps showed
+a +22 % excess on flat surfaces and +40 % on `belly`; at the operating point the flat surfaces are
+perfect and the creature is deficient. The excess was an artefact of driving the estimator 20-40x
+past its own adaptive radius, and it is not what a user sees. Every mechanism this thread proposed
+was fitted to that artefact.
+
+**This is M-GATHERAREA's signature, not a fur-specific one.** A deficit on small, thin, curved
+geometry with flat surfaces unaffected is exactly the denominator defect — dividing by pi r^2 where
+the real footprint is smaller — and it is the same shape as `alice_hair` / `alice_dress` /
+`cap_gyroid` on gallery_rain. FURDIM should be treated as an instance of item 2, not a separate
+phenomenon.
+
+**One result inside it does NOT fit that explanation, and it is the more interesting one.** At
+r = 0.0092 the belly is a smooth convex surface tens of times larger than the gather disc, so its
+coverage is 1.0 and the footprint correction is algebraically inert — which the flag A/B confirmed
+independently at r = 0.40 (`belly` ON +39.83 % vs OFF +39.65 %, a 0.2-point difference). **A footprint
+correction cannot explain a -33 % error on a patch whose footprint is not clipped.** Whatever makes
+the belly dark is a separate mechanism, most plausibly something about photons reaching a surface
+underneath dense fur, and it is now the single best-defined open question in this thread.
+
+**`fur_creature` is a better M-GATHERAREA rig than gallery_rain** for this reason: it carries an
+exact null (`wall`, `floor`) and a large graded effect (`coat`, `tan`, `belly`) in the same frame,
+at the default radius, against a cheap reference. `nose` at 31 px should be ignored; it is too small
+to carry a number.
+
 **Tool fix made in the same tick.** `roi_score.py --null` checked VARIANCE only, and a gather-radius
 sweep legitimately changes variance everywhere: the null strip 4-8 m from the only wall read
 0.278x / 0.074x / 0.013x / 0.004x and the tool called it "measuring something other than its label"
