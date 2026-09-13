@@ -1139,6 +1139,58 @@ must be.
 The gallery_rain A/B is re-running against this, with `gridground` as the same null that failed last
 time. **A null that has already caught one bug is worth more than one that has never fired.**
 
+### THE ANSWER: the geometric footprint does NOT fix gallery_rain's caps. Item 2's premise is refuted for its own named targets.
+
+With the facing test fixed and the null re-run, the A/B is finally readable. `gallery_rain`, mode-R
+reference, same seed and same photon map in both arms — so there is no seed noise to hide in, and
+every difference below is the coverage change alone.
+
+**The nulls first, because everything else depends on them:**
+
+* **True null — bit-identical.** `_ga_null`'s footprint is exactly 1.0000 (min = max), so the
+  correction is algebraically a no-op, and `-gageom 0` and `-gageom 1` produce the **same md5**. The
+  estimator is provably inert where the footprint is 1.
+* **Approximate null — and honestly approximate.** `gridground` moved **-0.91 %** (it was -3.48 %
+  before the facing fix). Its footprint is not 1: measured mean **1.0038**, max **1.1094**, because
+  the ball there genuinely catches extra same-facing surface from neighbouring geometry. A -0.9 %
+  move is the right sign and the right order for that, where -3.48 % was not. Calling `gridground` a
+  null was my error — it is *approximately* null, and the exact one is `_ga_null`.
+
+**And the result:**
+
+| material | footprint | probe | geometric | delta | truth |
+|---|---|---|---|---|---|
+| `capmarble_axicon` | 0.658 | **+20.01 %** | **+19.96 %** | **-0.06** | 0 |
+| `capmarble_gyroidx` | 0.559 | -7.54 % | **-10.62 %** | -3.08 | 0 |
+| `capmarble_gold` | 0.920 | +8.96 % | +6.03 % | -2.93 | 0 |
+| `gold` | 1.084 | -5.10 % | -5.36 % | -0.25 | 0 |
+
+**`capmarble_axicon` is 20 % too bright with the probe and 20 % too bright with a footprint measured
+at 0.658.** Substituting a validated geometric area for the probe's estimate moved it by six
+hundredths of a point. `capmarble_gyroidx` got *worse*. Only `capmarble_gold` improved, by 2.9
+points out of 9.
+
+**So the caps' errors are not footprint errors.** Item 2 is specified as "BVH sphere query,
+same-facing prims clipped to the tangent-plane disc, area summed, divide by that instead of pi r^2",
+measured on `alice_hair` / `alice_dress` / `cap_gyroid`. That has now been built, validated against
+analytic answers (exactly 1.0 on a plane, 0.5525 against a half-disc of 0.5 beside a wall), proven
+inert where it must be, and run on the named scene — and **the named targets do not move toward
+truth.** The probe was already recovering the footprint well enough on those surfaces; what remains
+wrong on a marble cap is something else.
+
+**This is the third distinct outcome for the same item, and together they close it:**
+
+1. **On flat geometry** the footprint is exactly 1 and the correction is inert — nothing to fix.
+2. **On fur** the footprint is ~2.9x pi r^2, so dividing by it would darken fur threefold. The
+   footprint is right and the DIVISION is the wrong estimator, because the density estimate assumes
+   the ball meets one locally flat surface.
+3. **On the caps the queue names** the footprint is 0.56-0.92, the correction is real and applied —
+   and it does not help.
+
+The geometric-footprint hypothesis is therefore refuted for every case M-GATHERAREA was filed
+against. `-gageom` stays off by default; it is kept because the diagnostic (`-gafparea`) is what
+produced this answer and is reusable, not because the estimator path earns its cost.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
