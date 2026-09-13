@@ -1191,6 +1191,39 @@ The geometric-footprint hypothesis is therefore refuted for every case M-GATHERA
 against. `-gageom` stays off by default; it is kept because the diagnostic (`-gafparea`) is what
 produced this answer and is reusable, not because the estimator path earns its cost.
 
+### A radiance-cache cell sweep ran entirely on the GPU, where the cache does not exist — and ftrace said so
+
+VOLCACHE's entry notes that the surface cache's cell size *"has never had its cell size measured
+that way"*, so this tick measured it directly: sweep `-radcache-cell` over 0.0125 to 0.40 — a 32x
+range — with `-radcache-validate` on, plus a validation-off control at the largest cell, scored per
+material against a 2048-spp no-cache reference.
+
+Every column came back identical to the digit, control included. That reads as *"cell size does not
+matter, and validation is not needed either"*, which would have been a striking and completely false
+result. The three `.pfm` files share one md5.
+
+**The renderer had already said why**, in the log, on its own initiative:
+
+    [radcache] IGNORED: the GPU backward megakernel has no cache -- pass -device cpu.
+    The render is unaffected and correct; it is simply not using the cache.
+
+A clear, correct, specific warning — the same species of warning added to `-max-bounce` two entries
+above for exactly this failure — and the sweep was launched, completed, scored and very nearly
+believed anyway. **A warning you have to read is not a control.**
+
+**So it is now a control.** `tools/roi_score.py` gains TRAP 4: before scoring anything it compares
+each arm against the baseline and **exits** if any two are byte-identical, naming them and pointing
+at the render logs. That check costs one array comparison and would have stopped this in the first
+second. The file now carries four traps, every one of them added after it cost an investigation:
+
+1. bias tested with a robust statistic,
+2. a null control that is not 1.00,
+3. a rectangle is not a population,
+4. **the arms are the same image.**
+
+The sweep is re-running on `-device cpu`. Its result, when it arrives, will be the first measurement
+of a parameter the surface cache has shipped with since v0.257.0.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than

@@ -1,4 +1,4 @@
-"""Score a render A/B per ROI, with the two traps that have actually bitten this project
+"""Score a render A/B per ROI, with the four traps that have actually bitten this project
 built in as checks rather than as advice.
 
     python tools/roi_score.py <dir> --arms base,other[,other2] --seeds 16 \
@@ -7,9 +7,11 @@ built in as checks rather than as advice.
 
 Files are expected as <dir>/<arm>_s<seed>.pfm.
 
-WHY THIS EXISTS. Both traps below were written down in known-issues.md after they cost an
-investigation, and both were then walked into AGAIN by hand-rolled scorers. A rule you have to
-remember is not a control; a rule the tool applies for you is.
+WHY THIS EXISTS. Every trap below was written down in known-issues.md after it cost an
+investigation, and the first two were then walked into AGAIN by hand-rolled scorers. A rule you
+have to remember is not a control; a rule the tool applies for you is. Traps 3 and 4 live further
+down, beside the code that enforces them: a rectangle is not a population (`maskbands`), and the
+arms may be the same image (`main`).
 
 TRAP 1 -- BIAS TESTED WITH A ROBUST STATISTIC.
 A trimmed mean is not an unbiased estimator of a skewed distribution's mean. Two arms that
@@ -132,6 +134,23 @@ def main():
             sys.exit(f'no renders for arm {arm} in {a.dir}')
         ims[arm] = np.stack([lum(readpfm(f)) for f in fs])
     H, W = ims[arms[0]].shape[1:]
+
+    # TRAP 4 -- THE ARMS ARE THE SAME IMAGE.
+    # A flag that the renderer declined to honour produces a table of identical columns, which
+    # reads as "the change is harmless" and is in fact "there was no change". Measured instance:
+    # a radiance-cache cell-size sweep over a 32x range, plus a validation-off control, every
+    # column identical to the digit -- because ftrace had printed
+    #   [radcache] IGNORED: the GPU backward megakernel has no cache -- pass -device cpu
+    # and the sweep ran on the GPU. The renderer said so plainly and the sweep was still run,
+    # scored and nearly believed. A warning you have to read is not a control; this is.
+    for k in range(1, len(arms)):
+        a0, ak = ims[arms[0]], ims[arms[k]]
+        if a0.shape == ak.shape and np.array_equal(a0, ak):
+            sys.exit(f'!! ARMS "{arms[0]}" and "{arms[k]}" are BYTE-IDENTICAL. They are the same '
+                     f'image, so every column below would be a comparison of a thing with itself. '
+                     f'Check the render logs -- a flag the renderer declined to honour (wrong '
+                     f'-device, an unsupported mode) is the usual cause. Refusing to score.')
+
     ns = {k: v.shape[0] for k, v in ims.items()}
     if len(set(ns.values())) > 1:
         print(f'! arms have different seed counts {ns} -- variance columns are not matched')
