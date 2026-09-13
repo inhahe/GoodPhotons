@@ -3870,6 +3870,38 @@ where the denominator is dominated by something else is not a measurement of the
 81 %-beams figure was in `-mstats` output that had already been read, on this same scene, in the
 VOLCACHE entry.
 
+**THE COVERAGE DISTRIBUTION (v0.278.4) KILLS THE LEADING HYPOTHESIS.** `FTRACE_GADIAG` now prints
+a per-material histogram of the coverage each gather point returned, which separates a material's
+flat interior from its truncated edge without any spatial gate to configure. Implemented as a thin
+recording wrapper around the estimator, so that every early return -- the flat-interior gate, the
+tangle gate, the fiber gate, all of which return 1.0 -- is counted without editing any of them.
+
+    [gadiag] material              bin0    bin1    bin2    bin3    bin4    bin5    bin6    bin7
+    [gadiag] gridground           0.0%    0.0%    0.0%    0.1%    0.1%    0.1%    0.1%   99.6%
+    [gadiag] capmarble_gyroidx    2.5%    5.0%    6.0%    6.2%    5.8%    6.8%    8.5%   59.3%
+
+**`gridground` validates the instrument**: 99.6 % in the top bin, which is what a 46x45 m quad must
+give when a 0.38 m disc cannot overhang it. **`capmarble_gyroidx` is genuinely bimodal** -- 59 %
+interior, 41 % truncated -- which is exactly the dilution that made the per-material mean
+uncomparable.
+
+**And the numbers point the other way from the hypothesis.** Reading the histogram at bin midpoints:
+
+| | mean coverage | **applied correction E[1/cov]** |
+|---|---|---|
+| `capmarble_gyroidx`, all points | 0.798 | **1.90x** |
+| `capmarble_gyroidx`, truncated only (40.8 %) | 0.503 | **3.20x** |
+| what the ROI's -33.0 % implies it needs | 0.670 | **1.49x** |
+
+**The correction already applied is LARGER than the one the ROI needs, and the ROI is still 7.5 %
+dark.** So the residual is *not* the probe under-measuring truncation, which was the standing
+hypothesis and the one the previous section set up. Two possibilities remain and the histogram
+cannot separate them: the ROI's pixels may sample the **59 % interior** sub-population rather than
+the truncated rim (an "edge strip" a few pixels wide can easily sit on the flat top), or something
+other than the footprint is dark there. **The ROI-restricted tally is still the needed instrument**
+-- but it is now needed to identify *which population the ROI samples*, not to measure a
+shortfall that the material-wide data no longer supports.
+
 **WHAT `cap_gyroid`'s RESIDUAL WOULD TAKE, AND WHY THE DIAGNOSTIC CANNOT YET ANSWER IT.** The
 uncorrected ROI reads **-33.0 %**, i.e. 0.670 of truth, so the exact correction it needs is
 **1/0.670 = 1.49x** — equivalently a true coverage of **0.670**, a 33.0 % miss. That is now a

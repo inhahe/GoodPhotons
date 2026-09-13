@@ -213,6 +213,13 @@ inline bool gaDiagOn() {
 }
 struct GaDiagMat {
     std::atomic<long long> miss{0}, reject{0}, accept{0};
+    // DISTRIBUTION of the per-gather-point coverage, 8 equal bins over [0,1] with everything at
+    // or above 1 in the last. The per-material MEAN cannot be compared against an ROI's required
+    // coverage, because a material spans both flat interior (coverage ~1, nothing to correct) and
+    // truncated edge (the part an edge-strip ROI actually scores), and mixing them dilutes exactly
+    // the effect. A histogram lets the two sub-populations separate themselves without a spatial
+    // gate to configure. See M-GATHERAREA / cap_gyroid.
+    std::atomic<long long> covHist[8]{};
     // OCCUPANCY, which orientation alone cannot give: how far below the tangent plane the first
     // surface sits. `depthSum` is in units of the gather radius; `deep` counts hits past 0.25 r.
     // A packed shell (fur) hits shallow and tight; sparse strands (hair) let probes fall through
@@ -235,7 +242,10 @@ inline std::vector<GaDiagMat>& gaDiag() {
     return t;
 }
 
-inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
+// The estimator itself. Wrapped by `gatherCoverage` below, which only records the result -- the
+// wrapper exists so that every early return here (flat-interior gate, tangle gate, fiber gate)
+// is histogrammed without editing any of them.
+inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n,
                              double r, Pcg32& rng, int M, int matId = -1,
                              double fiberR = 0.0) {
     if (M <= 0 || !(r > 0.0)) return 1.0;
@@ -421,8 +431,38 @@ inline void gaDiagReport(const Scene& scene) {
                      hits ? 100.0 * (double)r.dp / (double)hits : 0.0,
                      r.pt ? 100.0 * (double)r.fb / (double)r.pt : 0.0);
     }
+    // The COVERAGE DISTRIBUTION, which the means above cannot substitute for: a material spans
+    // flat interior (coverage ~1, correction inert) and truncated edge (what an edge-strip ROI
+    // scores), and a single mean over both is diluted by exactly the population that is not the
+    // effect. Read the low bins against the coverage an ROI's error implies. See M-GATHERAREA.
+    std::fprintf(stderr, "[gadiag] coverage distribution, %% of gather points per bin "
+                         "(bin 0 = [0,0.125) ... bin 7 = >=0.875):\n");
+    std::fprintf(stderr, "[gadiag] %-22s %7s %7s %7s %7s %7s %7s %7s %7s\n", "material",
+                 "0", "1", "2", "3", "4", "5", "6", "7");
+    for (size_t k = 0; k < rows.size() && k < 24; ++k) {
+        const Row& r = rows[k];
+        long long h[8], tot = 0;
+        for (int b = 0; b < 8; ++b) { h[b] = gaDiag()[r.id].covHist[b].load(); tot += h[b]; }
+        if (!tot) continue;
+        std::fprintf(stderr, "[gadiag] %-22s", nmOf(scene, r.id, buf));
+        for (int b = 0; b < 8; ++b)
+            std::fprintf(stderr, " %6.1f%%", 100.0 * (double)h[b] / (double)tot);
+        std::fprintf(stderr, "   (%lld pts)\n", tot);
+    }
 }
 
+inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
+                             double r, Pcg32& rng, int M, int matId = -1,
+                             double fiberR = 0.0) {
+    const double cov = gatherCoverageRaw(scene, p, n, r, rng, M, matId, fiberR);
+    if (gaDiagOn() && matId >= 0 && matId < (int)gaDiag().size()) {
+        int b = (int)(cov * 8.0);
+        if (b < 0) b = 0;
+        if (b > 7) b = 7;                       // coverage >= 1 (a tilted patch can exceed it)
+        gaDiag()[matId].covHist[b].fetch_add(1, std::memory_order_relaxed);
+    }
+    return cov;
+}
 inline double gatherAreaScale(double cov) {
     // With the pseudo-count on, `cov` is already bounded below by 1/(M+1) and the cliff would do
     // nothing but misfire at large M -- at M = 32 a zero-coverage gather lands at 0.030, below
