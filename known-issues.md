@@ -2619,12 +2619,38 @@ arithmetically against the file size before reading a value):
 distribution is marginally *better* conditioned. Ten candidates are now eliminated and every one of
 them was on the light side or in the map.
 
-**Which forces the conclusion back to the camera side — but narrowly.** Mode `R` is at exact parity
-(0.999), so general camera transport, BSDF sampling and RNG are all sound. What remains is what mode
-`M` does *differently* from mode `R` on the camera side: how many photon-map lookups a sample
-performs, where along the path they are placed, and how each is weighted. That is a much smaller
-surface than "the mode-M path", and it is where the next tick should read — starting from whether the
-two backends make the same number of gather queries per camera sample, which is directly countable.
+**THE GATHER AND CAMERA SIDE ARE AT EXACT PARITY — the whole gap is the DEPOSIT.** `-loadmap` makes
+both backends gather from the *same* saved map, which removes the deposit as a variable by
+construction. Verified it actually loads on each (`deposit skipped` / `skipping the photon trace`,
+both reporting the same 15 404 436 photons, and both then deriving the *identical* adaptive radius
+0.008045 where the device previously got 0.008131 from its own map):
+
+| configuration | GPU | CPU | ratio |
+|---|---:|---:|---:|
+| **shared map (`-loadmap`)** | 0.00524 | 0.00525 | **0.998** |
+| own maps (default) | 0.03470 | 0.02718 | **1.277** |
+
+**Parity to 0.2 %.** So the gather, the kernel, the query, the camera path and the film are all sound
+on the device — everything downstream of the map. The entire variance deficit is in the map each
+backend deposits.
+
+**And that resolves the apparent contradiction with the map statistics above.** Those compared ONE
+map from each backend and found them equivalent — which they are. The quantity that differs is not
+any single map's quality but **how much a backend's map varies from seed to seed**: note the shared
+map collapses the SD from 0.0347 to 0.0052, i.e. with the light side frozen, ~97 % of the variance
+this entry has been measuring *was* the map realization. A per-map histogram cannot see that; only a
+across-realizations comparison can.
+
+**The hypothesis this points to, and its quantitative test.** If the device's photon streams are
+partially correlated — threads in a warp sharing or neighbouring their random sequences — the map
+would have fewer *effective* independent photons than the nominal 2 000 000, while any single map
+still looks statistically normal. That is exactly a realization-variance defect invisible to
+single-map statistics. It predicts a number: the device at 2 M photons should match the host at
+**2 M / 1.63 = ~1.23 M** photons. That is one sweep to check, and it would convert the hypothesis
+into a measured effective-photon count.
+
+(Mode `R`'s parity is not evidence against this: its camera paths are indexed per pixel-sample, a
+different mapping from photon-id to thread than the deposit uses.)
 * **The deposit.** Both trace 2 000 000 photons, but how many survive into the map, and with what
   power distribution, has not been compared.
 
