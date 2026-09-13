@@ -878,6 +878,40 @@ leaf, so it trades deeper traversal against smaller leaf tests and comes out lev
 relative difference of **exactly zero** says most rays find the identical beam set; the 2 % that
 move are at the acceptance boundary, and the mean is unmoved at 0.02 %.
 
+**RE-MEASURED AT v0.278.2, AND THE 51 ms RESIDUAL DOES NOT REPRODUCE — IT IS ~400 ms, WHICH MAKES
+THE REMAINING PORT WORTH MORE, NOT LESS (2026-09-12).** The plan above prices the last piece (the
+split, the CIE table and the box pass that `build()` still does on the host) off a 51 ms
+per-realization residual. Re-measuring `_fog_thick` 96^2 GPU with the current binary:
+
+| run | epochs | beam BVH total | **per build** | light side | spp |
+|---|---|---|---|---|---|
+| `-time 25`, device LBVH (default) | 5 | 2.23 s | **446 ms** | 10.5 % | 3248 |
+| `-time 75`, device LBVH (default) | 16 | 6.33 s | **396 ms** | 8.3 % | — |
+| `-time 25`, `FTRACE_JLBVH=0` | 4 | 2.56 s | **640 ms** | 11.5 % | — |
+
+**Per-build cost is stable across epoch counts (446 ms at 5 epochs, 396 ms at 16), so it is a
+genuine per-build cost and not a fixed setup being amortised** — that was the first hypothesis and
+the 75 s run kills it. The device LBVH is working and is worth ~194 ms of it (640 -> 446), and the
+LBVH kernel itself still reports **3.7 ms** against the 4.3 ms recorded above, so the tree is not
+where the time goes. The residual — host-side split, CIE table, box pass and upload — is
+**~400 ms**, not 51 ms.
+
+**Stated as a discrepancy rather than a regression, because the comparison is not clean.** The
+table above records 17 realizations in 25 s; this binary gets 5 in 25 s while producing *more*
+samples (3248 against 2821), so the refresh cadence per sample has changed as well, and a
+per-realization figure obtained by dividing a total by an epoch count is sensitive to exactly that.
+**My own first reading of these numbers made that error** — dividing by different epoch counts and
+reporting an "8.7x regression" — which is the same denominator mistake this file records three
+times over (`GaDiagMat::fiber`, `-beamk`'s knee, BEAMORDER-GPU). The numbers above are stated
+per-build with the epoch-count dependence measured out, which is what makes them usable.
+
+**What it means for the port.** The piece still on the host costs ~400 ms per realization against a
+~3.7 ms device tree, i.e. it is now **99 % of the light-side cost** and the light side is 8-10 % of
+the frame. The port's value is correspondingly larger than the 51 ms figure implies. It also means
+`-beamrefresh` cannot be re-priced against the old numbers: the knob's trade was ruled out at
+201 ms per realization and must be re-derived at the real figure, which this entry should do before
+quoting the old ruling again.
+
 **AND THE HOST NOW SKIPS ITS OWN TREE WHEN THE DEVICE IS GOING TO BUILD ONE (v0.272.2).**
 `BeamMap::build` gained `skipBvh`, `buildAuto` forwards it, and `BeamMap::worldBounds` carries
 what `bvh.nodes[0].box` used to supply (the Morton normalisation needs it and there is no root
