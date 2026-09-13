@@ -287,6 +287,46 @@ That is worth stating plainly because M-GATHERAREA has been treated throughout a
 error to be corrected. It is two, and `_ga_corner` now isolates the excess with a null that cannot
 move, which the gallery scenes never could.
 
+### The footprint correction, isolated: it is worth ~42 points next to a wall and overshoots by ~4
+
+`-gatherarea 0` restores the pre-0.267 estimator, so `_ga_corner` can price the correction directly.
+Both arms anchored to a mode-R reference (2048 spp, no photon map, no gather), three seeds:
+
+| strip | distance | ON r=0.40 | OFF r=0.40 | ON r=0.80 | OFF r=0.80 |
+|---|---|---|---|---|---|
+| `s00` | 0.00-0.25 m | **+1.96 %** | **-29.14 %** | **+4.35 %** | **-37.37 %** |
+| `s02` | 0.25-0.50 m | +0.14 % | -2.92 % | +1.73 % | -19.99 % |
+| `s05` | 0.50-1.00 m | +0.08 % | +0.20 % | +0.20 % | -4.27 % |
+| `s10` | 1-2 m | +0.20 % | +0.18 % | +0.16 % | +0.16 % |
+| `s20` | 2-4 m | -0.03 % | +0.01 % | -0.20 % | -0.20 % |
+| `s40` | 4-8 m | -0.04 % | -0.30 % | +0.22 % | -0.98 % |
+
+**The A/B's own null passes by construction.** At full coverage the correction is algebraically a
+no-op, so ON and OFF must be identical on the interior strips — and `s10` and `s20` are identical to
+the digit at both radii (+0.16/+0.16, -0.20/-0.20). That is the check that `-gatherarea` does what
+its label says, and without it none of the other columns could be read.
+
+**The correction is doing very large and mostly correct work.** Uncorrected, the floor next to the
+wall reads **-37 %** at r = 0.80: that is M-GATHERAREA's denominator defect, isolated for the first
+time in a scene where a null cannot move. The correction recovers 42 of those points at r = 0.80 and
+31 at r = 0.40, and lands **+4.35 %** and **+1.96 %** on the other side. The residual excess this
+entry has been chasing is an OVER-correction, and it is small next to what the correction buys.
+
+**I had this wrong one tick ago and the earlier paragraph is superseded.** I wrote that the gather
+has "two errors of opposite sign", a denominator deficit and an independent numerator excess, on the
+strength of seeing a positive bias that grew with r. It is not two errors. It is ONE error — the
+denominator deficit — plus a fix that slightly overshoots. The reason the positive residual looked
+like an independent effect is that every measurement of it was taken with the correction ON, which
+is the default, so the large negative it was correcting was never in view. An A/B against the
+feature flag showed it immediately; a sweep of the parameter never could.
+
+**A flaw in my own scene, recorded rather than quietly left.** I called `s40` a by-construction null
+"because nothing is within r of it". That is true of the WALL and false of the floor's outer edge:
+the floor ends at x = 8, so at r = 0.80 points near that edge clip too, which is exactly why `s40`
+reads ON +0.22 % vs OFF -0.98 % while `s10`/`s20` read identical. The genuine interior nulls are
+`s10` and `s20`, and the scene should have carried a strip bounded on neither side. The claim was
+right about the geometry I was thinking about and wrong about the geometry that was there.
+
 **Tool fix made in the same tick.** `roi_score.py --null` checked VARIANCE only, and a gather-radius
 sweep legitimately changes variance everywhere: the null strip 4-8 m from the only wall read
 0.278x / 0.074x / 0.013x / 0.004x and the tool called it "measuring something other than its label"
