@@ -1523,6 +1523,21 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   *slice* (sample range + samples/s), which exposes the per-scanline-band cost structure
   inside a single spp — on a scene with a dense participating-medium band the sky and the
   cloud can differ by more than 10x, and only the slice trace shows it.
+- **`FTRACE_BVH_TIME` (acceleration-structure build cost).** `FTRACE_BVH_TIME=1` prints one
+  `[bvh] <prims> -> <nodes> in <t> s, 1 thread (<n> MB of BuildPrim)` line for every BVH build
+  costing more than 0.1 s. Off by default: a scene builds many small trees and the noise buries the
+  one that matters. It exists because this cost is otherwise **invisible** — the build runs before
+  the first pixel and no other line reports it, so it can only be inferred from wall clock, which on
+  this machine varied 4.5x across one session and 2x even idle whenever another render was
+  competing. Pair it with `-parseonly`, which loads and builds without rendering, for a clean
+  reading. Measured with it (idle, 2026-09-13): `gallery_rain` 2.47 M prims → **2.33 s**,
+  `fur_creature` 1.79 M → **1.34 s**, `gallery` 0.46 M → **0.35 s** — roughly 0.9 µs per primitive,
+  scaling linearly, and single-threaded throughout (`buildRecursive` recurses without
+  `ft::parallelFor`). The practical reading is that the build is **not** worth parallelising for
+  batch rendering: a perfect 12-thread build would save ~2.1 s on the heaviest scene here, against
+  renders measured in minutes. It is only felt where load latency is the product — the interactive
+  explorer and quick previews.
+
 - **`FTRACE_JDEVLIGHT` / `FTRACE_JSPLIT` / `FTRACE_JBAND` (mode `J` light-side diagnostics).**
   The default is `FTRACE_JDEVLIGHT=3` with `FTRACE_JSPLIT=4` — the device surface light pass,
   redrawn four times per chunk. `0` is `-jhostlight`; **`1`** traces the map on the device but

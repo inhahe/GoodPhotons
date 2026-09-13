@@ -26354,3 +26354,36 @@ The real fix is to stop the product underflowing at all -- accumulate log-transm
 a separately renormalised hue alongside the magnitude. Both cost work in the hot per-fragment
 loop and in the device atomics, which is why neither is done yet. Not worth it until someone
 actually needs see-through on a stack this deep.
+
+### BVH-BUILD — single-threaded scene BVH build: **MEASURED AND NOT WORTH PARALLELISING** (2026-09-13)
+
+Recorded earlier in the 2026-09-13 session as a target ("reuse buffers across rebuilds; parallelise
+the build, 12 cores vs 1; shrink `BuildPrim` from 80 B"), on the strength of `Bvh::build()` being
+visibly single-threaded and an inferred ~805 MB allocation. Measured before building anything, and
+the target does not survive.
+
+`FTRACE_BVH_TIME=1` was added (v0.291.0) because this cost is otherwise **invisible** — the build
+runs before the first pixel and nothing reports it, so the only prior evidence was wall clock, which
+varied 4.5x across the session and 2x even idle. With `-parseonly` and nothing else running:
+
+| scene | prims | nodes | build | BuildPrim |
+|---|---:|---:|---:|---:|
+| `gallery_rain` | 2 469 624 | 1 589 917 | **2.33 s** | 188.4 MB |
+| `fur_creature` | 1 786 758 | 1 150 741 | **1.34 s** | 136.3 MB |
+| `gallery` | 456 769 | 293 651 | **0.35 s** | 34.8 MB |
+
+Linear at ~0.9 µs/prim, one thread. **A perfect 12x parallel build saves 2.1 s on the heaviest
+scene in the repo**, against renders measured in minutes to hours — under 1 %, in exchange for
+parallelising the acceleration structure every image depends on and then having to prove
+bit-identity across every scene to trust it. That is a bad trade and the item is closed on it.
+
+**Two corrections to the original note, both against my own earlier claim:** the allocation is
+**188 MB, not ~805 MB** (the larger figure was never measured, and `BuildPrim` is 80 B over 2.47 M
+prims = 188 MB, so 805 MB cannot have been this array); and only **one** tree per scene crosses
+0.1 s, so "reuse buffers across rebuilds" was solving a rebuild storm that does not happen on these
+scenes.
+
+**Where it would still matter, and is not refuted:** the interactive explorer and quick previews,
+where load latency *is* the product rather than a prelude to a long render. A 2.3 s stall before an
+explore session is felt; the same 2.3 s before a 40-minute `gallery_rain` frame is not. If that ever
+becomes the complaint, the measurement rig is now in the binary.

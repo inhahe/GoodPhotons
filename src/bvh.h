@@ -7,9 +7,21 @@
 #include <vector>
 #include <algorithm>
 #include <cfloat>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include "linalg.h"
 #include "geometry.h"
 #include "parallel.h"    // ft::stopRequested — cooperative `-stop` during a long build
+
+// Read once: a scene builds many trees and getenv is not free in a loop.
+inline bool bvhTimeEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_BVH_TIME");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
 
 // Branch-free component fetch (Vec3 is standard-layout with x,y,z contiguous —
 // same trick as Vec3::operator[]); the old two-branch ternary showed up in
@@ -112,12 +124,31 @@ struct Bvh {
         stopped = false;
         m_pollTick = 0;
         if (n == 0) return;
+        // FTRACE_BVH_TIME=1 reports every build costing more than a tenth of a second.
+        // Off by default because a scene builds many small trees and the noise would bury
+        // the one that matters; on, it is the only way to see this cost at all, since the
+        // build happens before the first pixel and no existing line reports it. The whole
+        // build is SINGLE-THREADED (buildRecursive recurses without ft::parallelFor), which
+        // is the thing worth knowing before anyone optimises it -- measure with this rather
+        // than inferring from wall clock, which on this machine varied 4.5x across one
+        // session and 2x even idle, because a concurrent render moves it.
+        const bool timeIt = bvhTimeEnabled();
+        const auto t0 = timeIt ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
         std::vector<BuildPrim> bp(n);
         for (int i = 0; i < n; ++i) { bp[i].box = boxes[i]; bp[i].centroid = boxes[i].center(); bp[i].idx = i; }
         nodes.reserve(2 * n);
         buildRecursive(bp, 0, n);
         primIdx.resize(n);
         for (int i = 0; i < n; ++i) primIdx[i] = bp[i].idx;
+        if (timeIt) {
+            const double el = std::chrono::duration<double>(
+                                  std::chrono::steady_clock::now() - t0).count();
+            if (el >= 0.1)
+                std::printf("[bvh] %d prims -> %zu nodes in %.2f s, 1 thread "
+                            "(%.1f MB of BuildPrim)\n", n, nodes.size(), el,
+                            (double)(n * sizeof(BuildPrim)) / (1024.0 * 1024.0));
+        }
     }
 
     unsigned m_pollTick = 0;   // stop-poll divider for buildRecursive; reset by build()
