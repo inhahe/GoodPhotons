@@ -2377,6 +2377,32 @@ because the code path it needed is not the one this scene takes.
 **Seven candidates are now eliminated:** kernel radius, beam set and split, FP32 precision, the
 1/sin singularity, the gather-time spectral fold, order >= 2, and stochastic transmittance.
 
+**THE MITIGATION DOES NOT GENERALISE — corrected one tick after publishing it.** The equal-cost
+result below is real on `_fog_thick` and **false on the next media scene tried**. `_beams_ms`
+(sigma_t 6, 192^2), same rig, matched ~31 s:
+
+| arm | median | p90 | p99 | max/level |
+|---|---:|---:|---:|---:|
+| baseline: 300k beams, `-spp 16` (~6 s) | 0.0450 | 0.155 | 10.55 | 99.3 |
+| more beams: `-beamcount 0`, `-spp 16` | 0.0377 | 0.151 | **10.56** | **99.4** |
+| more samples: 300k beams, `-spp 88` | 0.0442 | 0.153 | **4.26** | **49.5** |
+
+**More beams leaves the tail completely untouched here; more samples halves it.** The exact opposite
+of the scene below, and I had already written "raise `-beamcount` before raising `-spp`" into
+REFERENCE as user-facing advice. It is now corrected to say the choice is scene-dependent and must be
+measured.
+
+**Neither obvious predictor works.** Optical depth does not: `_beams_ms` is the *thinner* medium
+(sigma_t 6 against 20) yet has the *heavier* baseline tail (p99 10.55 against 4.685). Beams gathered
+per probe does not either: untrimming raises it comparably on both (1114 -> 8466 here, 735 -> 11830
+there). What the split most likely reflects is *where the fireflies originate* — a starved beam
+estimate responds to beams, camera-side path variance responds only to samples — but that is an
+inference, not something these two scenes establish.
+
+**Third time in this session that generalising from one scene has failed**, after the `-spp` regime
+table and the BVH null. The difference is that this one had already reached the user-facing manual
+before the second scene was tried.
+
 **THE MITIGATION IS VALIDATED AT EQUAL COST — spend on beams, not samples.** Raising `-beamcount`
 is **10.1x slower** (14.7 s -> 148.7 s at `-spp 34`), so the only fair test is against spending that
 same time on samples instead. Two seeds per arm, same rig:
