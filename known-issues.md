@@ -896,6 +896,39 @@ LBVH kernel itself still reports **3.7 ms** against the 4.3 ms recorded above, s
 where the time goes. The residual — host-side split, CIE table, box pass and upload — is
 **~400 ms**, not 51 ms.
 
+**AND REALIZATIONS HAVE SHARPLY DIMINISHING RETURNS, WHICH RE-PRICES THIS WHOLE PORT
+(2026-09-12).** The plan values the port at "~100x cheaper realizations", and that is a fair
+estimate of the COST side. It is not the value side, because image error does not fall linearly in
+realization count. Measured at equal time on `_fog_thick` 96^2, 4 seeds, scoring per-pixel
+seed-to-seed relative s.d. (no reference render needed):
+
+| arm | realizations | spp | median rel s.d. | p75 | p95 |
+|---|---|---|---|---|---|
+| `-beamrefresh 0.10` (default) | 5 | 3248 | **0.2244** | 0.3635 | 0.7791 |
+| `-beamrefresh 0.95` | 24 | 1464 | 0.2478 | 0.4267 | 0.9613 |
+
+**4.8x the realizations for 2.2x fewer samples is a net LOSS of 10-23 %**, which confirms the
+entry's existing ruling on the knob — but it also lets the two effects be separated. If samples
+follow `spp^-0.5`, losing 2.2x of them costs 1.49x; the observed cost is only 1.10x, so the extra
+realizations bought **1.35x**. That is `N^0.19` over a 4.8x range.
+
+Cross-checking against this entry's own premise measurement, which went the other way: 1 -> 5
+realizations was worth ~2.9x in *variance*, i.e. **1.7x in s.d.**, an exponent of `N^0.33`. Two
+independent measurements, different ranges, both sub-linear and both far below `N^0.5`.
+
+**So the realization benefit is mostly already captured at the default.** 1 -> 5 buys ~1.7x, 5 ->
+24 buys ~1.35x, and extrapolating the port's ~9x more realizations at fixed samples adds roughly
+**1.2-1.5x** on top. A worthwhile gain, but not the order-of-magnitude the "~100x cheaper
+realizations" framing suggests, and **not the "~12x on a thick medium" this item is billed at in
+the working queue** — that figure prices realizations linearly.
+
+**Caveats, since this is a re-prioritisation and should be easy to overturn.** n = 4 seeds and the
+statistic is a spread-of-spreads; the median over 6 138 lit pixels steadies it but the seeds share
+a realization structure. The `0.95` arm also moves two variables at once, and separating them used
+an assumed `spp^-0.5` law rather than a measured one. **The clean experiment is realizations at
+FIXED samples** — `-beamfreeze` against the default at equal spp rather than equal time — which is
+one render pair and would replace the inference with a measurement.
+
 **AND THE LIGHT-SIDE PERCENTAGE IS A SETPOINT, NOT A MEASUREMENT — which changes how every number
 in this entry should be read.** `main.cpp` ~24060 sizes each epoch from the measured preamble:
 *"whatever elapsed before the first sample landed IS the overhead, and the epoch runs `1/frac` of
