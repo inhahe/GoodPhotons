@@ -1405,6 +1405,46 @@ resolves.**
   beat by few large ones in the right places — so the status line's `ready` figure should not be
   read as a health indicator, which is exactly how I read it two entries ago.
 
+### "The auto-sizer is conservative" — WITHDRAWN. Doubling the cell costs real, measurable accuracy.
+
+The previous entry suggested the auto-sizer might be leaving utilisation on the table, and flagged it
+as a suggestion needing seeds. It got them, and the suggestion is wrong.
+
+Auto (0.4004) against 2x auto (0.8008), three seeds, 256 spp, **paired per seed** against a 1024-spp
+no-cache reference:
+
+| material | px | err at auto, per seed | **PAIRED (2x - auto)** |
+|---|---|---|---|
+| `white` | 6297 | -0.25, +1.28, +0.48 | **-0.767 ± 0.387** |
+| `red` | 1614 | +0.23, -0.06, -0.21 | **-0.464 ± 0.138** (3.4 sigma) |
+| `green` | 1597 | -0.11, +0.85, +0.45 | **-0.365 ± 0.277** |
+| `glass` | 1164 | +1.26, -0.38, -1.26 | **-3.620 ± 1.507** |
+
+termination: auto **3.0 %** (1.9 / 3.7 / 3.3), 2x auto **27.0 %** (22.1 / 34.4 / 24.6)
+
+**All four materials move the same way — negative — and `red` is 3.4 sigma.** A consistent signed
+drift across independent seeds is the signature of bias, not noise. So doubling the cell buys 9x the
+utilisation and **pays for it**: about half a point on the diffuse walls and ~3.6 points on the
+glass, which is the material with the sharpest radiance variation and therefore the one a coarser
+cell blurs most. That is exactly the failure mode the surface-cache entry predicts for cell
+averaging, arriving on schedule.
+
+**The auto-sizer is therefore not conservative; it is making a defensible trade**, and the earlier
+suggestion that it was leaving free utilisation on the table is withdrawn.
+
+**The pairing is the reason any of this is visible, and that is the transferable part.** Look at the
+`err at auto` column: `white` swings from -0.25 to +1.28 across seeds and `glass` from +1.26 to
+-1.26. Those swings are *larger than the effect being measured*. Unpaired, at three seeds, every
+column here would read "no significant difference" — which is precisely what the previous entry
+concluded from a single unpaired seed. Pairing works because each seed's noise appears in BOTH arms
+and subtracts out; what survives is the systematic part. It cost nothing but running the arms at
+matched seeds, and it is the same trick that resolved the tangle gate's +7.69 on `skin` earlier
+today.
+
+**Limits.** Three seeds (the fourth was still rendering), one scene, one spp. `glass` at ±1.507 is
+2.4 sigma and should be read as "large and negative", not as -3.6. What is solid is the SIGN, shared
+by all four materials, and `red`'s magnitude.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
