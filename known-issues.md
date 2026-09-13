@@ -2561,10 +2561,32 @@ failed a control rather than a direct test.
   declaration reasons that a float sum of `n` same-sign terms errs `~n * 2^-24` relative, which at the
   measured ~2300 photons per query is **1.4e-4** — four orders of magnitude below a 28 % SD increase.
   Worth recording as a caution: a build-flag experiment only tests the code the flag reaches.
-* **The gather radius or accepted count.** The device accepts **2.1 % fewer photons per query** (2259
-  against 2307), worth only 1.01x on its own but showing the two queries do not select identically.
-  This is now the leading candidate and wants a direct comparison of the adaptive-radius logic —
-  `dPmAdaptiveRadius` on the device against the host's, on the same point.
+* **The adaptive gather radius — ELIMINATED, and the test produced a better clue than the
+  hypothesis.** `-pmradius 0.05` pins the radius on both backends (verified: both logs report
+  `radius 0.05`, so the flag is honoured on the device — worth checking, since `-max-bounce` is not).
+  Pinning does **not** close the gap; it **widens** it:
+
+  | radius | GPU | CPU | ratio |
+  |---|---:|---:|---:|
+  | adaptive (default) | 0.03155 | 0.02460 | **1.282** |
+  | pinned 0.05 | 0.00775 | 0.00516 | **1.502** |
+
+  (Three seeds per arm for both rows, since the pinned sweep lost its fourth CPU seed to a timeout —
+  matched estimators matter more than the extra seed, and the 3-seed adaptive figure reproduces the
+  4-seed 1.277 to within 0.005.)
+
+  **The ratio is therefore not a constant — it GROWS with the number of photons gathered.** That is
+  the most diagnostic fact yet: whatever the device does differently costs more the more photons a
+  query has, which is the opposite of a fixed per-query overhead and rules out anything that acts
+  once per query.
+* **The 3x3x3 neighbourhood walk — checked and correct.** `dPmNeighborhood` iterates a fixed
+  `dx,dy,dz in [-1,1]` block, which would silently drop photons if the gather radius exceeded
+  1.5x the cell size. It cannot: `DPhotonMap::cellSize` is documented and set as `== gather radius`,
+  so the block extends a full radius beyond the centre cell on every axis and always contains the
+  query sphere. Ruled out by construction rather than by measurement.
+* **The deposit.** Both trace 2 000 000 photons, but how many survive into the map, and with what
+  power distribution, has not been compared. Now the leading candidate, because a deposit-side
+  difference in photon *density* would produce exactly a gap that scales with gathered count.
 * **The deposit.** Both trace 2 000 000 photons, but how many survive into the map, and with what
   power distribution, has not been compared.
 
