@@ -2598,20 +2598,33 @@ failed a control rather than a direct test.
   backends then gather to the same 498 target. I had read a fragment of that line and inferred the
   wrong quantity from it — the full line says what it is.)
 
-**So counts, targets, radii, kernel, facing test and precision are all matched or bounded out, and
-mode `R` is at parity. What is left is the photons themselves** — their positions and powers. A
-device map that is more spatially clumped, or carries a wider power distribution, would raise gather
-variance at matched count, and clumping specifically would explain why the ratio *grows* with
-gathered photons: correlated samples do not average down as fast as independent ones.
+**THE MAPS THEMSELVES ARE EQUIVALENT — measured by dumping both and comparing the photons directly.**
+`-savemap` on each backend (same scene, same seed), parsed per `photonmap_io.h` (`FTPMP08`, 72-byte
+header, `Vec3 pos[]` then `Photon{Vec3 n; float power; float lambda}[]` — layout confirmed
+arithmetically against the file size before reading a value):
 
-**That is directly testable and the tooling already exists.** `-savemap` works on **both** backends
-(verified: ~863 MB each, sizes differing by the same 0.05 % as the stored counts), and the format is
-documented in `src/photonmap_io.h` — `FTPMP08
-` header, then surface, beam and caustic blocks. The
-next step is to dump both maps for the same scene and seed and compare the surface block's **power
-distribution** (spread, not mean) and **spatial clustering** (nearest-neighbour distances against a
-Poisson expectation). That is the instrumented comparison this entry has been deferring, and it is
-now the only place the difference can be hiding.
+| | photons | power mean | power CV | occupied cells | mean/cell | index of dispersion |
+|---|---:|---:|---:|---:|---:|---:|
+| GPU | 15 411 764 | 9.45039e14 | **0.5347** | 136 179 | 113.17 | **52.6** |
+| CPU | 15 404 436 | 9.45351e14 | **0.5344** | 136 200 | 113.10 | **60.7** |
+
+* **Power spread — eliminated.** Coefficient of variation matches to **0.06 %**, mean to 0.03 %. A
+  wider device power distribution would have raised gather variance; there isn't one.
+* **Spatial clumping — eliminated, and it points the wrong way.** Cells sized to the gather radius,
+  the **host** map is the more clumped (dispersion 60.7 against 52.6). Clumping *raises* gather
+  variance, so if anything this favours the device. Occupied-cell counts match to 0.015 % and mean
+  occupancy to 0.06 %.
+
+**So the map is not where the gap lives.** Same count, same powers, same occupancy, and the device's
+distribution is marginally *better* conditioned. Ten candidates are now eliminated and every one of
+them was on the light side or in the map.
+
+**Which forces the conclusion back to the camera side — but narrowly.** Mode `R` is at exact parity
+(0.999), so general camera transport, BSDF sampling and RNG are all sound. What remains is what mode
+`M` does *differently* from mode `R` on the camera side: how many photon-map lookups a sample
+performs, where along the path they are placed, and how each is weighted. That is a much smaller
+surface than "the mode-M path", and it is where the next tick should read — starting from whether the
+two backends make the same number of gather queries per camera sample, which is directly countable.
 * **The deposit.** Both trace 2 000 000 photons, but how many survive into the map, and with what
   power distribution, has not been compared.
 
