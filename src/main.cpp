@@ -23602,7 +23602,7 @@ static int run(int argc, char** argv) {
     for (const RenderCam& rc : toRender) if (rc.mode == 'M') ++mModeCams;
     bool budgetedGpuM = false;
 #ifdef HAVE_CUDA
-    budgetedGpuM = (timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0) && !preview &&
+    budgetedGpuM = (timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0) &&
                    mModeCams == 1 && !g_beamFreeze && g_pmapLoad.empty() && g_pmapSave.empty() &&
                    (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
                    cudaAvailable() && cudaPhotonMapSupported(scene);
@@ -24078,8 +24078,13 @@ static int run(int argc, char** argv) {
                 // Hoisted out of the `if` below because the gather's StageProgress needs it
                 // too, to tone-map the partial-film preview exactly as the live view does.
                 const double liveExp = toRender[idx[0]].exposure;
-                if (g_showWindow) {
-                    // Echo the same caption to stdout on a slow cadence. The window is the
+                // `-preview` DRIVES THIS PATH TOO (0.297.0). The ANSI thumbnail was listed as belonging to
+                // the single-camera driver, which is not true: the shared FORWARD group already draws
+                // one from its own accumulator (see the `preview || wantWin` block in runSharedGroup).
+                // Mode M's shared path simply never called it. Arming the same progress hook for
+                // `-preview` costs nothing when no preview is asked for, because the callback is only
+                // installed when one of the two consumers wants it.
+                if (g_showWindow || preview) {     // Echo the same caption to stdout on a slow cadence. The window is the
                     // only place this text went, so a backgrounded showcase render — the one
                     // that runs for hours and is read from its log — had nothing at all in it
                     // between the map build and the frame-written line, and a gather that
@@ -24091,7 +24096,9 @@ static int run(int argc, char** argv) {
                         const double el = std::chrono::duration<double>(now - gStart).count();
                         const std::string st = pmGatherStatus(f, sppDone, spp, gatherFrame + 1,
                                                               cams.size(), N, el);
-                        liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute, st.c_str());
+                        if (g_showWindow)
+                            liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute, st.c_str());
+                        if (preview) ansiPreview(f, (double)sppDone, liveExp, st.c_str());
                         if (lastEcho->time_since_epoch().count() == 0 ||
                             std::chrono::duration<double>(now - *lastEcho).count() >= 30.0) {
                             std::printf("[camera] %s\n", st.c_str());

@@ -2308,10 +2308,23 @@ of the image** — so a noise target *is* a sample target: `-noise X` is exactly
 was arithmetic, not a convergence criterion. Verified on the device: `-noise 20` stops at **25 spp**
 and `-noise 10` at **100 spp**, both on the shared photon map, with plain `-spp` unaffected.
 
-**Still excluded, deliberately:** `-preview` (the ANSI thumbnail belongs to the single-camera
-driver), lens cameras, and any group of more than one mode-M camera — a flythrough's shared map is
-the feature, and refreshing it would destroy the amortisation *and* give consecutive frames different
-realizations, which is flicker rather than convergence. The warning was reworded to say exactly this, since it had listed `-time`
+**`-preview` ADDED IN v0.297.0, and its exclusion was wrong for the same reason `-noise`'s was.** This
+entry claimed the ANSI thumbnail "belongs to the single-camera driver". It does not: the shared
+FORWARD group already draws one from its own accumulator (`ansiPreview` inside the `preview ||
+wantWin` block of `runSharedGroup`). Mode M's shared path simply never called it. Arming the same
+progress hook for `-preview` — `if (g_showWindow || preview)` instead of `if (g_showWindow)` — was
+the whole change. Verified: `-time 12 -preview -device gpu` runs on the shared photon map, draws the
+thumbnail, and emits no fallback warning; `-device cpu -preview` still draws; and a render without
+`-preview` draws nothing and stays on the device.
+
+**Still excluded, deliberately:** lens cameras, and any group of more than one mode-M camera — a
+flythrough's shared map is the feature, and refreshing it would destroy the amortisation *and* give
+consecutive frames different realizations, which is flicker rather than convergence.
+
+**Both wrong exclusions shared a shape worth naming.** Each was written while implementing the
+previous fix, from a plausible-sounding property of the feature ("a noise target must measure noise";
+"a terminal thumbnail needs the terminal driver") that was never checked against the code. Both took
+one grep to disprove and one line to fix, and both sat in the manual as limitations in the meantime. The warning was reworded to say exactly this, since it had listed `-time`
 among the flags that cost you the device and that is no longer true.
 
 **WHAT THE FIX IS ACTUALLY WORTH, MEASURED — and it is not what the throughput suggests.** At a
