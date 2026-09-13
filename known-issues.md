@@ -554,6 +554,50 @@ That is a hypothesis with a registered prediction available: on a minimal scene 
 under a controlled number of hair strands — the mode-M-vs-mode-R gap should grow with strand count
 and vanish at zero strands. It has not been tested, and is recorded as untested.
 
+### The strand-count rig: a real per-strand deficit, monotone, null clean — and 13x too small
+
+`scenes/_fur_recip.ftsl`, prediction committed in 295d661 before the renders existed. Four identical
+diffuse patches differing only in strand count, all in one frame so photon count, camera, light and
+exposure are the same numbers for every patch. Mode M vs a 512-spp mode-R reference, two seeds:
+
+| patch | strands/m² | seed 3 | seed 7 | mean |
+|---|---|---|---|---|
+| `p0` | **0** | +0.20 % | +0.07 % | **+0.13 %** |
+| `p1` | 10k | -0.56 % | -1.08 % | -0.82 % |
+| `p2` | 40k | -1.55 % | -0.72 % | -1.13 % |
+| `p3` | 160k | -2.85 % | -2.05 % | **-2.45 %** |
+| `hair` | (the strands) | -2.60 % | -1.99 % | -2.29 % |
+
+**The null passes at +0.13 %**, so the rig is sound and the other columns can be read. The deficit is
+real and monotone in the means, and `p3` at -2.45 % is well clear of the seed spread.
+
+**And it is 13x too small.** `p3` runs 160 000 strands/m²; the creature's barrel coat is 56 549
+strands on 0.3217 m² = **175 800/m²**, so the densities are matched to 0.91x — and the creature's
+belly is -32 % where this flat patch is -2.45 %. Confirmed as a mechanism, refuted as *the*
+explanation. That is the same shape of result as the corner effect two ticks ago, and the eighth
+mechanism in this thread to survive its test and fail its magnitude.
+
+**The material was checked rather than assumed, and it kills the framing I gave this.** I called the
+hypothesis "hair BCSDF non-reciprocity". `fur_creature`'s coat is `type diffuse`
+(`material "coat" { type diffuse reflect rgb 0.40 0.25 0.13 }`) and so is this rig's — there is no
+hair BCSDF declared in either scene. Whatever BSDF fiber geometry actually receives, both scenes
+receive the same one, so this is not a material difference and the name was wrong.
+
+**The scaling law is NOT determinable from this data, and saying so is the point.** Each step is 4x
+in count, but `ln(1+d)` goes -0.0082 -> -0.0114 -> -0.0248, i.e. ratios of 1.38x then 2.18x. That is
+neither linear in count (would be 4x) nor cleanly square-root (would be 2x each). With two seeds and
+a ±0.4-point spread, `p1` and `p2` overlap and no exponent can be fitted. Anyone continuing needs
+more seeds before quoting one.
+
+**What the rig understates BY CONSTRUCTION, which is the most likely reason for the 13x.** This is
+one flat patch with strands standing on it: light crosses the coat once. The creature's belly is on
+a *sphere* whose strands radiate outward, tucked underneath, and surrounded by other furred body
+parts — light reaching it crosses fur repeatedly and at grazing angles. A -2.45 % per-crossing
+deficit compounding over ~13-15 effective crossings reaches -30 %, which matches; but that is a
+post-hoc arithmetic fit to one number, not a measurement, and it is recorded as such. The follow-up
+that would test it is a LAYERED rig — stacked furred shells at a fixed areal density — where the
+prediction is that `ln(1+deficit)` is linear in the number of layers crossed.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
