@@ -1311,6 +1311,58 @@ on this scene** — by a factor of at least four.
 cell 0.40 give different images, so the earlier tick's "validation changes nothing" was entirely the
 swallowed-flag artifact and not a property of the feature.
 
+### RETRACTION of the entry above: the cache is NOT inert at its default, and I broke it twice myself
+
+The previous entry claims *"at its default cell size the cache is byte-identical to not having a
+cache"*. **That is wrong and is withdrawn.** Run at its actual defaults, the cache works:
+
+    [radcache] cell 0.4004; 33 cells: 1 ready, 1 retired, 31 pending;
+               308320 update samples; 8453/1171701 consults terminated (0.7%)
+
+and the image differs from `-no-radcache`. Two separate errors of mine produced the false claim, and
+both are the same kind — a flag whose semantics I had not read.
+
+**1. `-radcache-validate 1` DISABLES cache termination.** The fraction is how often a reader
+*verifies instead of using* the cell: the consult site draws a coin and a validating path *"takes
+NOTHING from the cache and traces to full length"*. I set it to **1**, meaning **100 % of reads
+validate**, so `nTerm` could never increment. The 0.0 % termination rate I reported as a finding was
+the flag doing exactly what it says. The default is **0.05**, and the log even printed
+`100% of reads verified`.
+
+That also explains the images that *did* differ at cells 0.20 and 0.40. With validation at 1 the
+cache contributes nothing to `L` — but the coin still draws a random number, so the RNG stream
+diverges and the noise changes. **I was measuring RNG divergence and reporting it as a cache effect.**
+Where no cell was ready, no coin was drawn, the stream stayed aligned, and the render came out
+byte-identical — which I read as "the cache is inert" when it meant "the cache was never consulted".
+
+**2. The default cell is NOT 0.05 — it is AUTO-SIZED.** `baseCell = 0.05` is the struct's initial
+value; `prepare()` overwrites it with `g_radCacheCell > 0.0 ? g_radCacheCell : autoCell`, and
+`g_radCacheCell` defaults to 0, meaning auto. The auto value is `32 x` the pixel footprint at scene
+distance, clamped to `[R/256, R/2]` — **0.4004** on `cornell`. I read the initialiser and called it
+the default.
+
+**What the sweep actually measured, correctly re-read.** Every cell I passed was an *override* of the
+auto-sizer, from 1x down to 1/32 of it. And in that light the numbers say something useful and
+favourable:
+
+| cell | vs auto | outcome |
+|---|---|---|
+| 0.4004 (auto) | 1x | **0.7 % of consults terminated** — the cache works |
+| 0.20 | 1/2 | still active |
+| 0.10 and below | 1/4 and finer | **0 ready cells, cache never consulted successfully** |
+
+**So the auto-sizer is doing real work.** Forcing a cell 4x finer than it chooses silently disables
+the cache on this scene — 1009 cells, 0.4 % full, nothing ready — and that stays true at 8x the
+sample budget (29 ready of 1015, still 0 terminated). A user "tuning for quality" by asking for finer
+cells would turn the feature off and see only a slower render.
+
+**The lesson is the one this file keeps writing down, now in its fifth form today.** Every failure in
+this thread — the GPU that has no cache, the flag that swallowed the next flag, the validation
+fraction that disables what it measures, the initialiser mistaken for a default — was *documented*.
+`REFERENCE.md` states the validate fraction and its 0.05 default in one sentence. I did not read it
+before running eight renders and publishing a conclusion. **Reading the flag costs one grep; not
+reading it cost three sweeps and a retracted entry.**
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
