@@ -1493,6 +1493,51 @@ the more a coarse cell hurts. A volume cache inherits that: whatever cell size t
 field permits, it must not be applied to the order-1 term, and the hybrid above is what keeps them
 apart.
 
+### VOLCACHE's payoff argument is wrong: "83.2 % of gather candidates" is a share of CANDIDATES, not of COST
+
+Before building the hybrid, the economics. The intended ceiling measurement was full beams against
+`-beams-order 1` on `_fog_thick`: if order >= 2 costs most of the gather, a cache that removes it
+perfectly and for free saves that much, and nothing can beat that number.
+
+**Three attempts, and the third invalidates the question rather than answering it.**
+
+**1. Blocked timing, 52.4 s vs 61.8 s.** Order-1 *slower*, by 18 %. This file's own cost note warns
+that blocked runs drift 10.1 % → 26.7 % on thermal alone, so the number was discarded unread.
+
+**2. Interleaved, three rounds: full 23.0 s, order-1 25.7 s.** Same direction every round, so not
+thermal — order-1 really was ~11 % slower. The logs say why:
+
+    full  mfp 0.4687 m -> kernel radius 0.004687 m -> a probe ray gathers 2583.1 beams
+    o1    mfp 0.5984 m -> kernel radius 0.005984 m -> a probe ray gathers 4399.6 beams
+
+Capping the order lengthens the mean free path, which widens the adaptive kernel, which puts **1.7x
+more beams under every probe**. I was timing the radius, not the order — the exact confound this
+entry already records as *"`-beamradius` must be pinned or arms differ in blur"*.
+
+**3. Radius pinned at 0.004687, interleaved: full 22.7 s, order-1 22.6 s** — 0.6 % apart against a
+1.4 s within-arm spread. No difference.
+
+**And the reason there is no difference is the finding.** `-beamcount` trims both arms to the same
+target: **999 494 beams full, 999 489 with order capped**. The map holds the same number of beams
+either way; capping the order changes *which* beams exist, not how many. Traversal cost is identical
+by construction, so this experiment could never have isolated the cost of order >= 2 — and neither
+can any variant of it that leaves `-beamcount` in charge.
+
+**What that does to the payoff argument.** The entry justifies VOLCACHE with *"83.2 % of gather
+candidates are order >= 2"*. That is a share of **candidates**, and candidates are not cost: the
+gather's expense is **beam count x kernel radius** — the traversal that finds which beams are near
+the ray — and both are set by `-beamcount` and the mfp, independently of scattering order. Skipping
+order >= 2 beams at *query* time would save their per-beam evaluation and none of the traversal.
+
+**So the payoff can only come from replacing the traversal**, which is precisely what last entry's
+architecture note concluded on structural grounds: a cache cannot attach to a beam query, only to a
+march. The two arguments meet. The measurement VOLCACHE actually needs is therefore **march cost vs
+traversal cost** — how long it takes to walk a segment against the medium's majorant grid, compared
+with the 2583-beam query that walk would replace — and neither number is in this file yet.
+
+**Nothing here says VOLCACHE is not worth building.** It says the number quoted as its payoff does
+not measure its payoff, and the real one is still unmeasured.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
