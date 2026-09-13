@@ -447,6 +447,51 @@ wholly to whichever material the centre hit — the same sub-pixel approximation
 makes. Purity for a round object is capped near π/4 ≈ 0.785 by geometry alone, which is why the
 default gate is 0.60 and not higher.
 
+## DONE (2026-09-13): MAXBOUNCE-IGNORED — `-max-bounce` was accepted and silently dropped by modes M and S; the GPU mode-M path cannot honour it at all
+
+Chasing `belly`'s -33 % deficit, the leading hypothesis was bounce truncation: the belly sits under
+dense fur, so its light arrives after many scatters, and a path budget that cuts those shorter than
+the reference's would darken it while leaving flat surfaces — lit in one or two bounces — exact.
+That predicts the deficit shrinks as the cap rises.
+
+The measurement came back perfectly null: `-max-bounce 32` and `64` agreed on every material to two
+decimal places. **The null was too clean**, so before recording "truncation refuted" the rig was
+checked against the prompt's own rule — can it see the effect at all? `-max-bounce 2` was rendered.
+A two-bounce image cannot match a thirty-two-bounce one, and it did: **max |b2 - b32| = 5.3e-09**,
+the GPU accumulation-order floor.
+
+**The flag was being dropped.** Modes `A`/`B`/`C` (`renderForward`) and `R` (`renderBackward`) read
+`g_maxBounceOverride`; modes `M` and `S` passed a **hardcoded literal 32** at all five of their call
+sites (main.cpp 16947, 17067, 17110, 23272, 24316). Fixed by routing them through a new
+`effMaxBounce()`.
+
+**And the GPU mode-M path cannot honour it even in principle**: `renderPhotonMapSharedCuda` has no
+bounce-limit parameter in its signature at all — the device tracer's cap lives inside
+`render_cuda.cu`. Plumbing it through is a real change (parameter, kernel threading, `DScene`
+upload) and is NOT done. What is done is that the flag now **warns loudly** instead of being
+accepted and ignored:
+
+    [warn] -max-bounce 4 is NOT honoured by mode M on the GPU: the device photon path has no
+    bounce-limit parameter, so this render uses the built-in cap. Use -device cpu for a
+    bounce-limited mode-M render.
+
+`REFERENCE.md` claimed the flag "applies to ... the photon modes", which was false; corrected.
+
+**THE HYPOTHESIS IS STILL UNTESTED, NOT REFUTED.** No evidence either way was produced about whether
+bounce truncation explains `belly`. Recording it as refuted would have been the worst outcome of the
+tick — a false negative propagated into the file on the strength of a flag that did nothing. The
+retest needs `-device cpu`, or the GPU plumbing.
+
+**One genuine result did survive.** Mode R at `-max-bounce 32` and `64` is **byte-identical**
+(same md5), so on the camera side Russian roulette terminates every path well before 32 and the cap
+is not binding for the reference. That is a real, if small, null — and it is trustworthy for exactly
+the reason the other one was not: mode R demonstrably reads the flag.
+
+**Why this is worth an entry rather than a line.** It is the same failure as the ROI mismatches
+earlier today, one layer down: *the thing measured is not the thing meant*. Here the parameter swept
+was not the parameter the renderer used. The sweep was clean, monotone in nothing, reproducible, and
+void. The only thing that caught it was rendering a value so extreme that agreement was impossible.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than

@@ -12579,6 +12579,16 @@ static bool g_heroCSet = false;
 // camera side of the P composite. The forward light tracer (B) and the photon /
 // bidirectional modes (M/S/D) honour maxBounce but ignore directOnly.
 static int  g_maxBounceOverride = -1;
+
+// `-max-bounce` reaches modes A/B/C (renderForward) and R (renderBackward) through
+// `g_maxBounceOverride`, but modes M and S passed a hardcoded literal 32 at all five of their
+// call sites, so the flag was accepted and silently did nothing there. That is worse than an
+// unsupported flag: a sweep over it returns a clean, stable, entirely meaningless null. It was
+// found by a sensitivity check -- `-max-bounce 2` produced an image matching `-max-bounce 32`
+// to 5.3e-09, and a two-bounce render cannot match a thirty-two-bounce one.
+static int effMaxBounce(int dflt = 32) {
+    return (g_maxBounceOverride >= 1) ? g_maxBounceOverride : dflt;
+}
 static bool g_directOnly = false;
 
 // -mode W: the DETERMINISTIC Whitted preview. g_directOnly alone still leaves every
@@ -16944,7 +16954,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
-                                              diffraction, /*maxBounce*/32, off, g_pmFinalGather,
+                                              diffraction, effMaxBounce(), off, g_pmFinalGather,
                                               wantBeams ? &bmap : nullptr,
                                               g_pmCaustics ? &pmC : nullptr);
                 });
@@ -17064,7 +17074,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if ((wantGpu || wantAuto) && !cam.hasLens() &&
                 cudaAvailable() && cudaSppmSupported(scene)) {
                 SppmSession* sess = sppmSessionBegin(scene, cam, res, resY, R0, diffraction,
-                                                     /*maxBounce*/32, g_heroC);
+                                                     effMaxBounce(), g_heroC);
                 if (sess) {
                     std::printf("mode S: SPPM on %s — %lld photons/pass, R0=%.4g, alpha=%.2f "
                                 "at %dx%d (light=%s) ...\n",
@@ -17107,7 +17117,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
             for (long long pass = 0; pass < passTarget; ++pass) {
                 sppmPass(scene, cam, st, N, nThreads, diffraction, g_sppmAlpha,
-                         /*maxBounce*/32, (uint64_t)(pass + 1), g_heroC);
+                         effMaxBounce(), (uint64_t)(pass + 1), g_heroC);
                 disp = sppmResolve(st);
                 for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone
                 if (p->report(disp, st.passes, st.passes >= passTarget)) break;
@@ -23269,7 +23279,7 @@ static int run(int argc, char** argv) {
                     meterPmapBuilt = true;
                 }
                 mf = renderPhotonCamera(scene, mc.cam, W, H, meterPmap, meterSpp, nThreads,
-                                        diffraction, /*maxBounce*/32, 0, g_pmFinalGather,
+                                        diffraction, effMaxBounce(), 0, g_pmFinalGather,
                                         meterBeams ? &meterBmap : nullptr,
                                         g_pmCaustics ? &meterPmapC : nullptr);
                 filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
@@ -24035,6 +24045,18 @@ static int run(int argc, char** argv) {
                 // Left at its zeros by the no-refresh call below, which therefore adapts
                 // exactly as it always did. See PmRadiiPin in render_cuda.h.
                 PmRadiiPin radiiPin;
+                // `-max-bounce` CANNOT reach this path: renderPhotonMapSharedCuda takes no bounce
+                // limit at all, the device tracer's cap living inside render_cuda.cu. Say so out
+                // loud rather than accept the flag and ignore it. A flag that is silently dropped
+                // turns a sweep over it into a clean, stable, entirely meaningless null -- which
+                // is precisely what happened here: `-max-bounce 2`, `32` and `64` produced images
+                // agreeing to 5.3e-09, and a two-bounce render cannot match a thirty-two-bounce
+                // one. The null looked like evidence until a sensitivity check was run on it.
+                if (g_maxBounceOverride >= 1)
+                    std::printf("[warn] -max-bounce %d is NOT honoured by mode M on the GPU: the "
+                                "device photon path has no bounce-limit parameter, so this render "
+                                "uses the built-in cap. Use -device cpu for a bounce-limited "
+                                "mode-M render.\n", g_maxBounceOverride);
                 auto runPass = [&](long long sppWant, const SppProgress* p,
                                    const std::function<bool(int, const Film&, long long)>* onF,
                                    PmRadiiPin* pin) {
@@ -24313,7 +24335,7 @@ static int run(int argc, char** argv) {
             Film f = cpuSppChunks(spp, g_showWindow ? &liveProg : nullptr, rc.res, rc.resY,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, c, nThreads,
-                                              diffraction, /*maxBounce*/32, off,
+                                              diffraction, effMaxBounce(), off,
                                               g_pmFinalGather, wantBeams ? &bmap : nullptr,
                                               g_pmCaustics ? &pmC : nullptr);
                 });
