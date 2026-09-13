@@ -2584,9 +2584,34 @@ failed a control rather than a direct test.
   1.5x the cell size. It cannot: `DPhotonMap::cellSize` is documented and set as `== gather radius`,
   so the block extends a full radius beyond the centre cell on every axis and always contains the
   query sphere. Ruled out by construction rather than by measurement.
-* **The deposit.** Both trace 2 000 000 photons, but how many survive into the map, and with what
-  power distribution, has not been compared. Now the leading candidate, because a deposit-side
-  difference in photon *density* would produce exactly a gap that scales with gathered count.
+* **The deposit COUNT — ELIMINATED.** The startup line reports what actually reaches the map, and
+  the two backends agree to **0.05 %**: GPU **15 411 764** stored against CPU **15 404 436**. The
+  per-gather target is *identical* (**498** photons on both), and the adaptive radii land within
+  **1.07 %** — GPU 0.008131, CPU 0.008045.
+
+  Note the direction of that last one: **the device's radius is LARGER**, so it gathers slightly
+  *more* photons, which would *lower* its variance. The one asymmetry available points the wrong way
+  to explain the gap.
+
+  (Correcting a number this entry cited earlier: the "2259 against 2307 photons per query" figures
+  are photons seen at the *starting* radius during calibration, not the gathered count. Both
+  backends then gather to the same 498 target. I had read a fragment of that line and inferred the
+  wrong quantity from it — the full line says what it is.)
+
+**So counts, targets, radii, kernel, facing test and precision are all matched or bounded out, and
+mode `R` is at parity. What is left is the photons themselves** — their positions and powers. A
+device map that is more spatially clumped, or carries a wider power distribution, would raise gather
+variance at matched count, and clumping specifically would explain why the ratio *grows* with
+gathered photons: correlated samples do not average down as fast as independent ones.
+
+**That is directly testable and the tooling already exists.** `-savemap` works on **both** backends
+(verified: ~863 MB each, sizes differing by the same 0.05 % as the stored counts), and the format is
+documented in `src/photonmap_io.h` — `FTPMP08
+` header, then surface, beam and caustic blocks. The
+next step is to dump both maps for the same scene and seed and compare the surface block's **power
+distribution** (spread, not mean) and **spatial clustering** (nearest-neighbour distances against a
+Poisson expectation). That is the instrumented comparison this entry has been deferring, and it is
+now the only place the difference can be hiding.
 * **The deposit.** Both trace 2 000 000 photons, but how many survive into the map, and with what
   power distribution, has not been compared.
 
