@@ -1835,6 +1835,46 @@ sharper alternative is to test on a scene whose light side is genuinely small, w
 was presumably tuned; the same table there would show many realizations at 0.10 and the comparison
 would have something to compare.
 
+### CORRECTION: absolute timings in this session vary up to 4.5x on identical work — the SHARES are unreliable, the A/Bs are not
+
+Measuring the beam BVH build on **identical input** (`_fog_thick`, `-beamcount 250000`, ~2.93 M
+splits) at different moments of this session:
+
+| when | BVH build |
+|---|---|
+| during the `-beamsplitmax` sweep | **2.55 s** |
+| immediately after stopping a background sweep | **6.23 s** |
+| three consecutive runs on an idle machine | **1.58 / 1.39 / 2.29 s** |
+
+**A 4.5x spread on the same work.** The build is a **host** SAH build, and several of this session's
+timings were taken while a `nohup`'d render was still running — I stopped one sweep and began timing
+the next measurement while the stopped process was still finishing its chunk. CPU contention, not
+scene behaviour.
+
+**What this invalidates, and what it does not.**
+
+* **Invalid as quoted: the absolute SHARES.** "The beam BVH build is 31 % of a `_fog_thick` frame"
+  and "the light side is 43 % of the frame at spp 16" are single unreplicated measurements whose
+  numerator has a 4.5x uncertainty. Both should be read as *"large — tens of percent"*, which is
+  still enough to contradict the 0.35 % figure they were raised against, and not as the numbers they
+  were written as. A separate symptom of the same weakness: the two-point extrapolation `t = L +
+  spp·g` gave **L = 10.2 s at 250 k beams against 8.6 s at 1 M**, i.e. a *larger* fixed cost for
+  *less* work, which is impossible and is the model failing rather than the renderer.
+* **Still valid: the `-beamsplitmax` default change.** That compared arms **interleaved within each
+  batch** (every cap run once per repeat, twice), across **three scenes**, with the same direction
+  and a consistent knee in all six repeats. Contention inflates a batch as a whole, not one arm
+  within it, which is exactly why the file's own cost note prescribes interleaving. The relative
+  result survives; only the absolute seconds beside it are soft.
+
+**The rule this adds to the file's cost note**, which previously warned only about thermal drift in
+*blocked* runs: **never time a foreground render while anything else is rendering, including a
+background job you have just asked to stop** — `ftrace -stop` returns when the process is gone, but a
+job launched by a still-running *script* will start another render immediately afterwards. Check
+`ftrace -stop` reports "no ftrace processes are running" before timing anything.
+
+This is the same failure as everything else today in one respect: a number was quoted without the
+conditions that produced it. The difference is that this time the number was mine.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
