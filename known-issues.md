@@ -1993,6 +1993,48 @@ render achieved **2 realizations**, where that table predicted about ten.
 `frac/(1+frac)` predicts 47 %. Same order, so the controller is behaving roughly as designed even
 though the absolute throughput it is dividing up is the anomalous one.
 
+### BUG: `-time` silently ignores `-device gpu` for mode M and runs on the CPU — ~20x slower, no warning
+
+Two renders differing in **one flag**, everything else identical (`_fog_thick`, 128², `-device gpu`,
+`-beams -beamcount 1000000 -beamfreeze`, same seed):
+
+    -spp 64     [camera] shared photon map (mode M) on NVIDIA GeForce RTX 4090 ...
+                [gpu] photon beams: 3883025 sub-beams, 2499673 BVH nodes ... uploaded
+                -> 60 spp in 47.7 s   (0.79 s/spp)
+
+    -time 100   mode M: photon map — tracing 2000000 photons on 12 CPU THREADS ...
+                (no upload line at all — grep counts 1 against 0)
+                -> 6 spp in 106 s     (~16 s/spp)
+
+**The `-time` render never touched the GPU.** `-device gpu` was passed and silently disregarded.
+
+**The sample counts are real, not a reporting artifact** — the first thing checked, since it would
+have voided the comparison. Noise scales as expected: the `-spp` run read 28.87 % at 12 spp, and
+28.87 × sqrt(12/6) = **40.8 %**, exactly the 40.82 % the `-time` run reported at 6 spp. Six samples
+in a hundred seconds is what actually happened.
+
+**This is not a corner case.** `CLAUDE.md` tells the operator to *"prefer a bounded budget over a
+giant `-n`"* and names `-time`, `-noise` and `-forever` as the way to render. So the documented
+default workflow for this project takes a ~20x penalty on mode M, silently. Reproduced on both
+`-time` runs made this session (frozen, and `-beamrefresh 0.90`).
+
+**Where to start.** There are two mode-M implementations: a host one whose message is
+`mode M: photon map — tracing ... on %d CPU threads` (main.cpp ~16883, inside the single-camera
+path), and the batched GPU one printing `[camera] '%s' (mode M/GPU ...)` around ~24031, which is
+what calls `renderPhotonMapSharedCuda`. A time-budgeted render is routed to the first. Whether the
+right fix is to route it to the second, or to teach the first to use the device, is not something
+this entry establishes.
+
+**Minimum acceptable fix, if the routing is hard: WARN.** `-radcache` already does exactly this when
+it cannot honour a flag — *"IGNORED: the GPU backward megakernel has no cache — pass `-device cpu`"* —
+and `-max-bounce` was given the same treatment earlier today. A silent 20x is the worst of the three
+outcomes; a loud one at least lets the operator choose.
+
+**Caveat on my own numbers, stated because today has repeatedly punished not doing so:** one scene,
+one resolution, one device, single runs of each arm. The 20x is a ratio of two unreplicated timings
+and should be read as "more than an order of magnitude". What is *not* uncertain is the routing: the
+log lines name the device outright, and the upload count is 1 against 0.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
