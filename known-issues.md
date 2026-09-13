@@ -1576,6 +1576,50 @@ approximate and the split between deposit and gather inside the 47 % slice is *n
 needs instrumentation, and it is the one number still missing before VOLCACHE can be priced. But the
 bound is now grounded: **not 83 %, and not more than about half the frame even in the best case.**
 
+### The beam BVH build is 31 % of a frame, and `-beamsplitmax`'s default is roughly twice its optimum — on TIME. Image equivalence NOT established.
+
+The previous entry found the beam BVH build at 31 % of a `_fog_thick` frame, saturating with beam
+count. The saturation is the split cap: beams are split before the BVH is built, and the log says
+*"split limited by `-beamsplitmax`, not by the rule"*.
+
+| `-beamcount` | stored | after split | ratio |
+|---|---|---|---|
+| 250 k | 250 246 | 2 932 592 | 11.7x |
+| 500 k | 500 602 | 5 858 769 | 11.7x |
+| 1 M | 999 494 | 7 799 747 | **7.8x — capped** |
+| 2 M | 1 999 169 | 7 753 455 | **3.9x — capped** |
+
+Build time tracks split entries at **~1.05 µs each**, not beam count, which is why it saturates.
+
+**So the cap is a build-versus-traverse knob. Swept at 1 M beams, radius pinned, two repeats:**
+
+| `-beamsplitmax` | splits | BVH build | **total** | traversal (total − BVH) |
+|---|---|---|---|---|
+| 2 M | 1.96 M | 2.0 s | 21.0 s | 19.0 s |
+| **4 M** | 3.88 M | 4.1 s | **20.5 s** | 16.4 s |
+| **8 M (default)** | 7.80 M | 8.7 s | **24.2 s** | 15.5 s |
+| 16 M | 11.7 M | 11.7 s | 26.9 s | 15.2 s |
+
+Build rises linearly while traversal **saturates** — 19.0, 16.4, 15.5, 15.2 — so there is a genuine
+interior optimum, and the default is past it. **4 M beats the 8 M default in both repeats** (20.8 vs
+25.7, and 20.2 vs 22.6), about **15 % of the frame**.
+
+**But the timing win is not yet a win, and this is the part that stops it shipping.** The arms are
+not the same image: against the 8 M default the frame mean moves **-1.52 % (2 M), -1.25 % (4 M),
+-1.80 % (16 M)**. That is **non-monotonic in the split cap** — 16 M is FURTHER from 8 M than 4 M is —
+which is the signature of noise rather than a split-induced bias, since more splits should converge
+toward the exact kernel, not away. At one seed and spp 16 that cannot be separated from chance, and
+a 15 % speed-up that quietly costs 1 % of accuracy is not a speed-up.
+
+**So: recorded as a promising, unfinished optimisation, not a recommendation.** What it needs is
+several seeds against a converged reference, scored per material — the same paired rig that settled
+the radiance-cache cell size earlier today, which resolved a 0.46-point effect that an unpaired
+single seed called noise. Until then `-beamsplitmax` should keep its default.
+
+**Independently useful regardless of how that lands:** build is ~1.05 µs per split entry and
+traversal saturates above ~4 M splits on this scene. Those two constants are what any future tuning
+of this knob has to trade off, and neither was written down before.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
