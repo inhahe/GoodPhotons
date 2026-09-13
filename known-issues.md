@@ -1590,6 +1590,31 @@ this is a share of *candidates*, not of cost — but today's cost decomposition 
 * and those beams leave the BVH too, so most of the remaining 1.57 s build goes as well, for a total
   near **58 %**, before the cache pays its own march cost.
 
+**THE CACHEABLE SHARE IS STRONGLY OPTICAL-DEPTH DEPENDENT — VOLCACHE is a THICK-MEDIA feature.**
+Before building on the 83 %, swept it across three depths with the same counter:
+
+| `sigma_t` | candidates (traversal) | accepted hits (shading) | gap |
+|---:|---:|---:|---:|
+| 0.6 | 49.5 % | **42.5 %** | 7.0 pts |
+| 6 | 63.5 % | **55.4 %** | 8.1 pts |
+| 20 | 83.8 % | **81.5 %** | 2.3 pts |
+
+**The cacheable share halves from thick to thin.** Carrying it through the cost split, VOLCACHE's
+gross ceiling goes from ~51-58 % of the frame at `sigma_t 20` to roughly **a quarter** at
+`sigma_t 0.6` — before the cache pays its own march cost, which is charged in full at every depth.
+On a thin medium the feature plausibly loses.
+
+**A second thing the sweep shows, which reverses a call made one tick earlier.** The candidate and
+hit shares were found to agree at `sigma_t 20` (83.8 vs 81.5), and that was recorded as "order >= 2
+chords are NOT rejected at a different rate". Across depth they clearly are — the gap is 7-8 points
+at `sigma_t 0.6` and 6, and only closes at 20. The original hypothesis was right; it was tested at
+the one depth where it happens to be false.
+
+**Practical consequence for the entry's design.** The hybrid keeps order-1 beams and caches the rest,
+so its value tracks this curve directly. Any future prototype should be priced on a mid-depth scene
+rather than `_fog_thick`, which is the most favourable case in the repo (order 1 is 17.0 % there and
+order 7+ alone is 49.6 %).
+
 **AND THE SHARE HOLDS FOR SHADING WORK TOO, not just traversal (v0.295.1).** `candMS` counts
 intersection *tests*, which is the right measure for BVH traversal but not for the per-hit kernel and
 transmittance work. If order >= 2 chords — shorter and more scattered — were rejected at a different
