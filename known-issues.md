@@ -1693,6 +1693,38 @@ second medium, not more work on the image.
 count; traversal **saturates above ~4 M splits**; and the seed-to-seed noise floor on this scene at
 spp 16 is **~5 %**, which is the number any future beam experiment here has to clear.
 
+### SHIPPED (v0.290.0): `-beamsplitmax` default 8 M → 4 M, worth 6.7-15.3 %
+
+The entries above left this as "promising, unfinished" because the timing rested on two repeats of
+one scene, and a default is a claim about every scene. Two more media, in deliberately different
+regimes, settle it:
+
+| scene | `sigma_t` | phase | 4 M vs 8 M |
+|---|---|---|---|
+| `_fog_thick` | 20 | g 0 | **15.3 % faster** |
+| `_fog_g9deep` | 191 | **g 0.9** | **9.3 % faster** |
+| `_fog_st2` | **2** | g 0 | **6.7 % faster** |
+
+4 M wins **all six repeats**, across a 100x range of `sigma_t` and both phase functions. Verified
+after the change landed: the new default yields 3.88 M splits, BVH **4.07 s**, frame **21.2 s**
+against ~24 s before.
+
+**The mechanism, now in the code comment and the manual so it is not rediscovered:** build costs
+**~1.05 µs per split entry** and rises linearly, while traversal **saturates** — 19.0, 16.4, 15.5,
+15.2 s at 2/4/8/16 M on `_fog_thick`. Past ~4 M you buy build for traversal you no longer get.
+
+**And the thread's own moral.** It started from a single-seed observation that cells differed by
+1.2-1.8 %, which looked like a real accuracy cost and nearly stopped the change. The control —
+the 8 M arm scored against *itself* across seeds — reads **+0.00, +3.76, +5.30**. The alarm was
+**four times smaller than the noise of the configuration it was alarmed about.** The paired
+three-seed test then found no cap significantly different from the default at 2 dof, exactly as
+`photonbeams.h`'s *"nothing has to be re-integrated"* had already promised.
+
+**Side effect worth noting:** the beam BVH build was **31 %** of a `_fog_thick` frame before this
+change and is now **~19 %** (4.07 s of 21.2 s). Still the single largest identifiable block after
+traversal, and still not amortised across frames — whether `-beamfreeze` avoids the rebuild on a
+flyby is unmeasured and is the obvious next question.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
