@@ -26412,10 +26412,47 @@ not see the beam BVH at all, because `-parseonly` never renders and therefore ne
 instructions precisely for this, and it was the instrumentation added in the same commit —
 `FTRACE_BVH_TIME` — that caught it one tick later.
 
-**Remaining target, now properly scoped:** parallelise `buildRecursive` for the beam-BVH caller. The
-verification bar is unchanged and strict — `-checkspherequery`, `-checkgrid`, `-checktrinormal`, plus
-bit-identical output — and is achievable, since building left and right subtrees in parallel into
-private buffers and splicing them in sequential DFS order reproduces the serial node array exactly.
+**DONE in v0.292.0 — parallel build, proven identical.** `buildRecursive` became `buildRange`,
+which takes a private node buffer, and a node forks its two children onto separate threads while a
+shared atomic budget allows. Measured idle, `FTRACE_BVH_TIME=1`:
+
+| caller | before | after | speedup |
+|---|---:|---:|---:|
+| beam BVH (`_fog_thick`, 3.7 M sub-beams, **per epoch**) | 3.20 s | **1.57 s** | 2.04x |
+| scene BVH (`gallery_rain`, 2.5 M prims, once) | 2.33 s | **0.75 s** | 3.11x |
+
+**A budget, not a fork depth.** Subtree sizes differ by orders of magnitude, so a fixed depth 4 hands
+one thread a tenth of the tree and eleven threads nothing. Forking depth-first while an atomic
+counter allows it follows the tree's real shape and still caps threads at `hardware_concurrency`.
+
+**Bit-identity is structural rather than hoped for.** Sequentially the array reads parent at `k`,
+then the whole left subtree, then the whole right. Each side builds into a private buffer, and
+splicing at `k+1` and `k+1+|left|` while shifting each internal node's child indices by its buffer's
+base reproduces that layout exactly. Leaves index `bp` absolutely and need no remap.
+
+**Verified by `-checkbvhparallel`** (new): builds the same 400 000 primitives serially and on 12
+threads *inside one process* and compares node-for-node — 257 877 nodes, every box, child index,
+`first` and `count` equal, `primIdx` equal. Stronger than an image diff, which could not do this job
+anyway: GPU accumulation order leaves a ~1e-7 floor so byte equality is unavailable there, and a CPU
+image diff would only show the tree is *equivalent*, not that it is the *same* tree — a
+differently-shaped but still-correct BVH would pass while silently changing traversal order and every
+`-bvhstats` number. The primitives are deliberately lopsided (three decades of size, clustered),
+because the fork path only fires on large uneven subtrees and a uniform cloud would pass vacuously.
+`-checkspherequery`, `-checkgrid` and `-checktrinormal` also still pass.
+
+**Two traps hit on the way, both recorded because they generalise:** adding `std::atomic` *members*
+silently deleted `Bvh`'s implicit copy-assignment and broke `scene.h:2508`, so the build state now
+lives in `build()`'s frame and travels by reference — a compile error, which is the good case, but a
+class quietly losing copyability is the kind of thing that usually surfaces far from its cause. And
+the C++ `
+` escapes were mangled for the **seventh** time by putting a literal through a shell
+heredoc; the fix that finally works is to build the backslash from `chr(92)` and never write an
+escape through the shell at all.
+
+**Limits.** The equality test uses synthetic primitives, so real geometry is covered only indirectly
+by the other three self-tests. And 2-3x is well short of an ideal fork-join's ~10x, because the top
+levels are inherently serial — one thread bins all `n` primitives at the root — which is also why the
+beam caller gains less than the scene one despite being the larger tree.
 
 **Where it would still matter, and is not refuted:** the interactive explorer and quick previews,
 where load latency *is* the product rather than a prelude to a long render. A 2.3 s stall before an
