@@ -1911,6 +1911,52 @@ ground. With `L` ≈ 8.3 s and `epoch = L/frac`, the default 0.10 gives an 83-se
 scene gets **one realization** in any render shorter than ~90 s. The feature is on and idle at its
 own default.
 
+### ROOT CAUSE: the beam BVH build is SINGLE-THREADED and allocates ~805 MB per call — one defect explains the cost, the variance, and the starved refresh
+
+Three separate puzzles from the last few entries turn out to share a cause.
+
+`Bvh::build()` is `buildRecursive` — **no `parallelFor`, no threads** — on a machine with **12
+cores**. Per build, at the current 3.87 M split beams:
+
+| | |
+|---|---|
+| `BuildPrim` array (`Aabb` 48 B + `Vec3` 24 B + `int`, padded to 80 B) | **310 MB** |
+| `nodes.reserve(2n)` (`BvhNode` 64 B) | **496 MB** |
+| **fresh allocation per build** | **~805 MB** |
+| throughput | **0.92 M prims/s, one core** |
+
+**That single fact explains all three observations:**
+
+1. **Why the light side is 41 % of a frame.** A ~4 s serial build on 12 idle cores is most of the
+   8.3 s light side. It is not that the beam pipeline is inherently expensive; it is that its
+   largest component uses one twelfth of the machine.
+2. **Why the build time varies 2x on identical work** (4.10 / 4.35 / 4.15 / 8.01 / 5.55 / 4.59 s
+   with nothing else running). ~805 MB of *fresh* allocation is first-touched every call, and
+   first-touch cost depends on how many zeroed pages the OS has ready — which varies with system
+   state in exactly this way. A serial compute loop on constant input does not vary 2x; a
+   0.8 GB page-fault storm does.
+3. **Why `-beamrefresh 0.10` is starved.** A realization pays this build, so the epoch is
+   `8.3 s / 0.10` = 83 s and the scene gets one realization per 90-second render. The feature is
+   starved by the build's serial cost, not by its own tuning.
+
+**Three targets, in increasing order of effort, none attempted here:**
+
+* **Reuse the buffers across rebuilds.** A refresh rebuilds every epoch and re-allocates 805 MB each
+  time. Keeping `bp` and `nodes` alive between builds costs nothing in correctness and should remove
+  both the repeated page-fault cost and most of the 2x variance. Cheapest, and testable against the
+  variance itself.
+* **Parallelise the build.** Binned-SAH parallel construction is standard, and 12 cores against one
+  is the headline. This is the one that would make `-beamrefresh` viable at its own default, since
+  realizations would cost a fraction of what they do.
+* **Shrink `BuildPrim`.** 80 B per primitive with the `Aabb` stored in `double` — floats would halve
+  it. Worth considering only alongside the above, and it changes numerics.
+
+**Recorded rather than attempted** because a BVH builder is load-bearing for every mode, and this
+session's lesson is that the verification matters more than the change: `-checkspherequery` and the
+existing `-checkgrid` / `-checktrinormal` self-tests would need to pass, plus bit-identical output
+on a fixed scene, before any of it could be trusted. The measurements above are what a future
+attempt needs to justify itself against.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
