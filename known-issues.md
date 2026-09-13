@@ -1957,6 +1957,42 @@ existing `-checkgrid` / `-checktrinormal` self-tests would need to pass, plus bi
 on a fixed scene, before any of it could be trusted. The measurements above are what a future
 attempt needs to justify itself against.
 
+### ANOMALY: `-time` renders reach ~20x fewer samples per second than `-spp` renders on the same scene
+
+Measured while checking the refresh controller, `_fog_thick`, 128², GPU, `-beams -beamcount 1000000`,
+`-beamfreeze` on both, same seed:
+
+| invocation | wall clock | samples | per-spp |
+|---|---|---|---|
+| `-spp 64` | 47.7 s (at 60 spp, its own progress line) | **60 spp** | **0.79 s** |
+| `-time 100` | 106 s | **6 spp** | **~16 s** |
+
+Both are frozen, so neither is paying for light-side realizations, and the noise figures agree with
+the sample counts (12.9 % at 60 spp against 40.8 % at 6 spp) — the `-time` run really did take six
+samples in a hundred seconds while the `-spp` run took sixty in forty-eight.
+
+**This is reported as an anomaly, not a diagnosis.** I have not found the cause, and three candidates
+are worth checking in order:
+
+1. **Per-chunk light-side or upload work.** A `-time` render auto-chunks; if each chunk re-uploads
+   the 3.9 M sub-beam map and its device BVH (~0.35 s measured once), many chunks would add up,
+   though not obviously to 20x.
+2. **Chunk sizing.** If the progressive path picks very small chunks, per-chunk fixed cost dominates.
+3. **The `spp` figure meaning something different** in the two paths, which would make the whole
+   comparison void — though the noise percentages argue against it, since they track the sample
+   counts in the way independent samples should.
+
+**Why it matters beyond curiosity.** Every wall-clock-budgeted render — which is what a user reaches
+for, and what `-beamrefresh` is designed around — would be paying this. And it invalidates a piece of
+my own reasoning: the realization-count table two entries ago used the `-spp`-derived rate to predict
+how many refreshes fit in a wall-clock budget. Measured directly at `-beamrefresh 0.90`, a 106 s
+render achieved **2 realizations**, where that table predicted about ten.
+
+**One thing the same experiment did confirm.** Equal time, frozen against `-beamrefresh 0.90`:
+**6 spp against 4 spp**, i.e. refreshing cost 33 % of throughput where the controller's law
+`frac/(1+frac)` predicts 47 %. Same order, so the controller is behaving roughly as designed even
+though the absolute throughput it is dividing up is the anomalous one.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
