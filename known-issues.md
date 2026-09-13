@@ -2517,9 +2517,31 @@ spp 34 and **1.00x** at spp 8. Any figure quoted for this defect must carry the 
 at. (The M-TIME-CPU re-pricing elsewhere in this file — GPU's 8x samples being worth ~5x — used the
 1.63x and is therefore the pessimistic end; at spp 64 it would be ~5.8x.)
 
-**Caveat on the sweep itself:** three seeds per point, so the non-monotonic shape (1.277 then 1.177)
-is within the noise of the estimator and should not be read as a precise peak. What is solid across
-seed counts is the qualitative shape — parity at low spp, a gap in the middle, narrowing at high spp.
+**SETTLED: both backends plateau, at DIFFERENT floors, so the gap narrows but does not close.**
+Pushing the sweep to production spp:
+
+| spp | 8 | 34 | 64 | 128 | 256 |
+|---|---:|---:|---:|---:|---:|
+| GPU | 0.03700 | 0.03470 | 0.03133 | 0.03097 | **0.03079** |
+| CPU | 0.03708 | 0.02718 | 0.02662 | 0.02856 | — |
+
+The device's floor is solid — spp 128 and 256 agree to **0.6 %** at ~**0.0308**. The host's is
+**~0.0276**, taking its 64 and 128 points together. That is an asymptotic **SD ratio ~1.12, variance
+ratio ~1.25** — real and permanent, but far below the **1.63x variance** this entry led with, which
+was the transient spp-34 peak.
+
+**The estimator's own noise is now visible and bounds every ratio quoted in this entry.** The host
+reading *rose* from spp 64 to 128 (0.02662 -> 0.02856), which variance cannot do with more samples.
+Three seeds per point therefore carries roughly **7-10 % noise**, which is the same size as several
+differences argued over above — including the "peak at 1.277 then 1.177" shape, which should be read
+as "a gap that narrows", not as a located maximum. Anything needing better than ~10 % precision here
+wants 8+ seeds per point.
+
+**Final characterisation.** The device's mode-M map-noise floor is ~1.25x the host's in variance.
+Below spp ~16 the difference is invisible (camera noise dominates both); it is most pronounced in the
+mid range where the host has converged and the device has not; it settles near 1.25x. The eleven
+eliminated candidates remain eliminated — the source is the deposited map's realization noise, which
+the `-loadmap` parity result localises and nothing since has moved.
 
 
 Separated out of GPU-BEAM-TAIL, which turned out to describe two different things: a tail gap needing
