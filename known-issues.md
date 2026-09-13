@@ -1445,6 +1445,43 @@ today.
 2.4 sigma and should be read as "large and negative", not as -3.6. What is solid is the SIGN, shared
 by all four materials, and `red`'s magnitude.
 
+### VOLCACHE — BOTTOM LINE FIRST (2026-09-13). A thick-media feature with a measured ceiling, one unmeasured term, and a design that is fully specified.
+
+*The four sections below are the derivations, accumulated over several sittings and partly
+superseding one another. This is what they add up to; read it before adding an experiment.*
+
+**What it would replace:** the `order >= 2` share of the beam gather. Order-1 chords stay by design,
+so their deposit, their BVH build and their traversal are charged in full whatever happens.
+
+**What that share is worth, measured two independent ways that agree** — a `-beamcount` timing sweep
+and an in-gather counter (`FTRACE_BEAM_DIAG=1`) — **and it is strongly optical-depth dependent:**
+
+| `sigma_t` | cacheable share of gather work | gross ceiling, share of frame |
+|---:|---:|---:|
+| 0.6 | ~43 % | **~a quarter** |
+| 6 | ~55 % | ~a third |
+| 20 | ~82 % | **~51-58 %** |
+
+(The frame shares use the `8.8 s fixed + 0.70 s/spp` cost split, with the fixed part now 7.2 s since
+v0.292.x parallelised the beam BVH build. `_fog_thick` at `sigma_t 20` is the most favourable scene
+in the repo — order 1 is 17.0 % of its chords and order 7+ alone is 49.6 % — so it is the wrong
+scene to price a prototype on.)
+
+**The one term still unmeasured:** what marching a cached field costs in place of the queries it
+removes. It is charged at *every* optical depth while the saving shrinks with depth, so it decides
+the thin-media case outright and cannot be estimated from instrumentation — it needs a prototype,
+even a stub that marches and returns zero.
+
+**Recommendation.** Worth prototyping *if* thick media matter to the intended workload, and the
+prototype should be a cost-only stub priced on a mid-depth scene (`sigma_t ~6`), not on
+`_fog_thick`. If the workload is thin or mixed media, the ceiling is around a quarter of a frame
+before the cache's own cost, and the item is probably not worth the complexity.
+
+**Two traps already walked into and documented below, so they are not repeated:** `-beams-order 1`
+does not measure the cacheable share (it changes which chords are deposited and made the gather 56 %
+*slower*); and the original "83.2 % of gather candidates" figure is a share of candidates, which
+only became a cost statement once the timing split existed to convert it.
+
 ### VOLCACHE cannot "extend the radiance cache" as worded — the volumetric gather is a BEAM QUERY, not a point lookup
 
 Before building, the structural question: where would a cache attach? The surface cache terminates a
