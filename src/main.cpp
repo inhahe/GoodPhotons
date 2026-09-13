@@ -18319,6 +18319,7 @@ static int run(int argc, char** argv) {
     bool checkCavityOnly = false;
     bool checkTriNormalOnly = false;
     bool checkSphereQueryOnly = false;
+    bool checkBvhParallelOnly = false;
     // -roiboxes and its gates. The defaults are deliberately strict: this tool's whole
     // point is that an ROI you cannot trust should not be easy to copy out of its output.
     bool      roiBoxesOnly = false;
@@ -19271,6 +19272,7 @@ static int run(int argc, char** argv) {
         // segment note at the top of the option table: append to a segment, and start a new
         // one once it nears ~100 links.
         if (!std::strcmp(argv[i], "-checkspherequery")) checkSphereQueryOnly = true;
+        else if (!std::strcmp(argv[i], "-checkbvhparallel")) checkBvhParallelOnly = true;
         else if (!std::strcmp(argv[i], "-roiboxes")) roiBoxesOnly = true;
         else if (!std::strcmp(argv[i], "-roi-audit") && i + 1 < argc) roiAuditFile = argv[++i];
         else if (!std::strcmp(argv[i], "-roi-mask")  && i + 1 < argc) roiMaskFile  = argv[++i];
@@ -19515,6 +19517,7 @@ static int run(int argc, char** argv) {
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkTriNormalOnly) return checkTriNormal(); // ditto (intersectTri's side/normal convention)
     if (checkSphereQueryOnly) return bvhSphereQuerySelfTest() ? 0 : 1;  // ditto (Bvh::traverseSphere)
+    if (checkBvhParallelOnly) return bvhParallelSelfTest() ? 0 : 1;     // parallel build == serial build
     if (checkMeshFormatsOnly) return checkMeshFormats(); // ditto (OBJ/PLY/STL agree on the same cube)
     if (checkPreferOnly)   return checkPrefer();   // ditto (prefer{}/else{} resolution semantics)
     if (checkPathsOnly)    return checkPaths();    // ditto (where a relative asset path is looked for)

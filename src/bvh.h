@@ -8,8 +8,11 @@
 #include <algorithm>
 #include <cfloat>
 #include <chrono>
+#include <atomic>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include "linalg.h"
 #include "geometry.h"
 #include "parallel.h"    // ft::stopRequested — cooperative `-stop` during a long build
@@ -117,43 +120,87 @@ struct Bvh {
     // (see buildRecursive) — this says only that it is coarse, not that it is unusable.
     bool stopped = false;
 
-    void build(const std::vector<Aabb>& boxes) {
+    // `maxThreads` exists for the parallel-vs-serial self-test (-checkbvhparallel), which has
+    // to build the SAME primitives both ways inside one process to compare the node arrays.
+    // Default -1 = use the hardware count.
+    void build(const std::vector<Aabb>& boxes, int maxThreads = -1) {
         int n = (int)boxes.size();
         nodes.clear();
         primIdx.clear();
         stopped = false;
-        m_pollTick = 0;
         if (n == 0) return;
         // FTRACE_BVH_TIME=1 reports every build costing more than a tenth of a second.
         // Off by default because a scene builds many small trees and the noise would bury
         // the one that matters; on, it is the only way to see this cost at all, since the
-        // build happens before the first pixel and no existing line reports it. The whole
-        // build is SINGLE-THREADED (buildRecursive recurses without ft::parallelFor), which
-        // is the thing worth knowing before anyone optimises it -- measure with this rather
-        // than inferring from wall clock, which on this machine varied 4.5x across one
-        // session and 2x even idle, because a concurrent render moves it.
+        // build happens before the first pixel and no existing line reports it. Measure with
+        // this rather than inferring from wall clock, which on this machine varied 4.5x across
+        // one session and 2x even idle, because a concurrent render moves it. The thread count
+        // it reports is the CAP, not an observed occupancy: a tree too small or too lopsided
+        // to fork simply never spends the budget.
         const bool timeIt = bvhTimeEnabled();
         const auto t0 = timeIt ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
         std::vector<BuildPrim> bp(n);
         for (int i = 0; i < n; ++i) { bp[i].box = boxes[i]; bp[i].centroid = boxes[i].center(); bp[i].idx = i; }
         nodes.reserve(2 * n);
-        buildRecursive(bp, 0, n);
+        // One less than the hardware count: this thread is already one of the workers.
+        unsigned hw = std::thread::hardware_concurrency();
+        int threads = (hw < 2) ? 1 : (int)hw;
+        if (maxThreads > 0) threads = maxThreads;
+        BuildCtx ctx;
+        ctx.budget.store(threads - 1, std::memory_order_relaxed);
+        unsigned tick = 0;
+        buildRange(bp, 0, n, nodes, tick, ctx);
+        stopped = ctx.stop.load(std::memory_order_relaxed);
         primIdx.resize(n);
         for (int i = 0; i < n; ++i) primIdx[i] = bp[i].idx;
         if (timeIt) {
             const double el = std::chrono::duration<double>(
                                   std::chrono::steady_clock::now() - t0).count();
             if (el >= 0.1)
-                std::printf("[bvh] %d prims -> %zu nodes in %.2f s, 1 thread "
-                            "(%.1f MB of BuildPrim)\n", n, nodes.size(), el,
+                std::printf("[bvh] %d prims -> %zu nodes in %.2f s, up to %d threads "
+                            "(%.1f MB of BuildPrim)\n", n, nodes.size(), el, threads,
                             (double)(n * sizeof(BuildPrim)) / (1024.0 * 1024.0));
         }
     }
 
-    unsigned m_pollTick = 0;   // stop-poll divider for buildRecursive; reset by build()
+    // PARALLEL BUILD. Left and right recursions own DISJOINT ranges of `bp` (std::partition
+    // has already split them), so they can run at once without touching each other's
+    // primitives. What they cannot share is the node array: a node's index is its position at
+    // push time, so two threads appending to one vector would interleave and the layout would
+    // depend on who won.
+    //
+    // BIT-IDENTITY comes from giving each side a PRIVATE buffer and splicing afterwards.
+    // Sequentially the array reads: parent at k, the whole left subtree at k+1.., then the
+    // whole right subtree. Splicing lbuf at k+1 and rbuf at k+1+lbuf.size() reproduces exactly
+    // that, provided every internal node's child indices are shifted by its buffer's base.
+    // Leaves carry `first`/`count` into `bp`, which are absolute and need no remap.
+    //
+    // The budget, not a fixed fork depth, is what bounds the threads. A fixed depth is easy to
+    // reason about but balances badly: subtree sizes differ by orders of magnitude, so depth 4
+    // hands one thread a tenth of the tree and eleven threads nothing. Spawning depth-first
+    // while a counter allows it lets the split follow the tree's real shape, and the counter
+    // caps total threads at hardware_concurrency no matter how lopsided it gets.
+    // Deliberately NOT members. A std::atomic member deletes Bvh's implicit copy-assignment,
+    // and scene.h:2508 assigns one Bvh to another -- so the build state lives in build()'s frame
+    // and travels down the recursion by pointer instead. Caught at compile time, which is the
+    // good case; a Bvh that silently stopped being copyable would have been a worse bug.
+    struct BuildCtx { std::atomic<int> budget{0}; std::atomic<bool> stop{false}; };
 
-    int buildRecursive(std::vector<BuildPrim>& bp, int start, int end) {
+    static void appendRemap(std::vector<BvhNode>& out, const std::vector<BvhNode>& buf) {
+        const int base = (int)out.size();
+        for (const BvhNode& src : buf) {
+            BvhNode n = src;
+            if (n.count == 0) { n.left += base; n.right += base; }   // internal: shift children
+            out.push_back(n);
+        }
+    }
+
+    // `tick` is per-call rather than a shared member so the stop poll costs no atomic in the
+    // hot path. Each parallel task therefore polls on its own schedule, which changes only how
+    // fast a `-stop` lands, never the tree: when nothing stops, the flag is never read true.
+    int buildRange(std::vector<BuildPrim>& bp, int start, int end,
+                   std::vector<BvhNode>& nodes, unsigned& m_pollTick, BuildCtx& ctx) {
         int nodeIdx = (int)nodes.size();
         nodes.push_back(BvhNode{});
         Aabb bounds, cbounds;
@@ -182,8 +229,10 @@ struct Bvh {
         // call through a relaxed atomic slot, and a 5M-node build would make five million of
         // them. Each poll is amortised over at least 256 * LEAF_SIZE primitives of binning
         // work, so the interval is free and the latency is still sub-millisecond.
-        if (!stopped && (++m_pollTick & 255) == 0 && ft::stopRequested()) stopped = true;
-        if (stopped) { makeLeaf(); return nodeIdx; }
+        if (!ctx.stop.load(std::memory_order_relaxed) && (++m_pollTick & 255) == 0 &&
+            ft::stopRequested())
+            ctx.stop.store(true, std::memory_order_relaxed);
+        if (ctx.stop.load(std::memory_order_relaxed)) { makeLeaf(); return nodeIdx; }
 
         int axis = cbounds.largestAxis();
         double cLo = vget(cbounds.lo, axis), cHi = vget(cbounds.hi, axis);
@@ -240,8 +289,33 @@ struct Bvh {
                              });
         }
 
-        int l = buildRecursive(bp, start, midIdx);
-        int r = buildRecursive(bp, midIdx, end);
+        int l, r;
+        // Only fork where the subtree is big enough to pay for a thread, and only while the
+        // budget allows. fetch_sub returns the PREVIOUS value, so `> 0` is the test for having
+        // actually claimed one; when it fails the decrement is undone immediately.
+        constexpr int PAR_MIN = 50000;          // prims below which a thread costs more than it saves
+        bool forked = false;
+        if ((end - start) >= PAR_MIN) {
+            if (ctx.budget.fetch_sub(1, std::memory_order_relaxed) > 0) forked = true;
+            else ctx.budget.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (forked) {
+            std::vector<BvhNode> lbuf, rbuf;
+            unsigned lt = 0, rt = 0;
+            // The spawned thread takes the LEFT half and this one continues with the right, so
+            // the caller's stack keeps doing useful work instead of blocking on a join.
+            std::thread th([&] { buildRange(bp, start, midIdx, lbuf, lt, ctx); });
+            buildRange(bp, midIdx, end, rbuf, rt, ctx);
+            th.join();
+            ctx.budget.fetch_add(1, std::memory_order_relaxed);
+            // `nodes` still holds exactly this parent as its last element, so the two bases
+            // below are the same positions the sequential build would have used.
+            l = (int)nodes.size(); appendRemap(nodes, lbuf);
+            r = (int)nodes.size(); appendRemap(nodes, rbuf);
+        } else {
+            l = buildRange(bp, start, midIdx, nodes, m_pollTick, ctx);
+            r = buildRange(bp, midIdx, end, nodes, m_pollTick, ctx);
+        }
         // nodes may have reallocated during recursion; index by nodeIdx.
         BvhNode& node = nodes[nodeIdx];
         node.box = bounds; node.left = l; node.right = r; node.count = 0;
@@ -374,6 +448,61 @@ struct Bvh {
 // from the defect it is being built to fix; a bug there would be attributed to the
 // estimator for a long time before anyone suspected the query. So the check is written
 // now, before a single caller exists, rather than after a measurement goes wrong.
+// PARALLEL BUILD == SERIAL BUILD, asserted on the data structure rather than on an image.
+// An image comparison cannot do this job on the GPU (accumulation order leaves a ~1e-7 floor),
+// and on the CPU it would only prove the tree is *equivalent*, not that it is the SAME tree --
+// a differently-shaped but still-correct BVH would pass while quietly changing traversal order
+// and every downstream `-bvhstats` number. So compare the arrays directly.
+//
+// The primitive set is deliberately awkward: sizes spanning three orders of magnitude and a
+// clustered distribution, because the fork path only triggers on large lopsided subtrees and a
+// tidy uniform cloud would exercise the serial path almost everywhere and pass vacuously.
+inline bool bvhParallelSelfTest() {
+    uint64_t st = 0xD1B54A32D192ED03ull;
+    auto rnd = [&]() {
+        st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+        return (double)(st >> 11) * (1.0 / 9007199254740992.0);
+    };
+    // Large enough to cross PAR_MIN (50000) several times over, or the test proves nothing.
+    const int N = 400000;
+    std::vector<Aabb> boxes(N);
+    for (int i = 0; i < N; ++i) {
+        const double cluster = (i % 7 == 0) ? 40.0 : 1.0;      // lopsided, so splits are uneven
+        const Vec3 c{(rnd() - 0.5) * cluster, (rnd() - 0.5) * cluster, (rnd() - 0.5) * cluster};
+        const double r = 0.001 + rnd() * rnd() * 1.0;          // three decades of size
+        boxes[i].expand(Vec3{c.x - r, c.y - r, c.z - r});
+        boxes[i].expand(Vec3{c.x + r, c.y + r, c.z + r});
+    }
+    Bvh a, b;
+    a.build(boxes, 1);                                          // forced serial
+    b.build(boxes, (int)std::max(4u, std::thread::hardware_concurrency()));
+    if (a.nodes.size() != b.nodes.size() || a.primIdx.size() != b.primIdx.size()) {
+        std::printf("[checkbvhparallel] FAIL: size %zu/%zu nodes, %zu/%zu prims\n",
+                    a.nodes.size(), b.nodes.size(), a.primIdx.size(), b.primIdx.size());
+        return false;
+    }
+    for (size_t i = 0; i < a.nodes.size(); ++i) {
+        const BvhNode& x = a.nodes[i];
+        const BvhNode& y = b.nodes[i];
+        if (x.left != y.left || x.right != y.right || x.first != y.first || x.count != y.count ||
+            std::memcmp(&x.box, &y.box, sizeof(Aabb)) != 0) {
+            std::printf("[checkbvhparallel] FAIL: node %zu differs "
+                        "(l %d/%d r %d/%d first %d/%d count %d/%d)\n",
+                        i, x.left, y.left, x.right, y.right, x.first, y.first, x.count, y.count);
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.primIdx.size(); ++i)
+        if (a.primIdx[i] != b.primIdx[i]) {
+            std::printf("[checkbvhparallel] FAIL: primIdx %zu differs (%d vs %d)\n",
+                        i, a.primIdx[i], b.primIdx[i]);
+            return false;
+        }
+    std::printf("[checkbvhparallel] PASS -- %zu nodes, %d prims bit-identical serial vs %u threads\n",
+                a.nodes.size(), N, std::max(4u, std::thread::hardware_concurrency()));
+    return true;
+}
+
 inline bool bvhSphereQuerySelfTest() {
     uint64_t st = 0x9E3779B97F4A7C15ull;
     auto rnd = [&]() {
