@@ -1875,6 +1875,42 @@ job launched by a still-running *script* will start another render immediately a
 This is the same failure as everything else today in one respect: a number was quoted without the
 conditions that produced it. The difference is that this time the number was mine.
 
+### The light-side share SURVIVES replication: 41 % at spp 16, not 0.35 % — and the host BVH build varies 2x even idle
+
+Last entry downgraded the 43 % figure to "tens of percent" because it was a single unreplicated
+two-point extrapolation taken while other renders were running. Re-measured on a **verified idle**
+machine (`ftrace -stop` reporting none running first), **interleaved**, three repeats, with a longer
+lever arm (spp 8 against 64):
+
+| repeat | spp 8 | spp 64 | fitted `g` (ms/spp) | fitted `L` (s) |
+|---|---|---|---|---|
+| 1 | 13.36 s | 54.99 s | 743 | **7.41** |
+| 2 | 13.44 s | 59.61 s | 824 | **6.85** |
+| 3 | 16.07 s | 54.02 s | 678 | **10.65** |
+
+**`L` = 8.30 ± 1.19 s**, `g` ≈ 748 ms/spp. At spp 16 that gives a frame of ~20.3 s and a light-side
+share of **41 %** — within noise of the 43 % originally quoted, and three orders of magnitude from
+the **0.35 %** the code comment uses to justify `-beamrefresh`'s default.
+
+**So the correction to my correction is: the number was right, my confidence in it was not.** It
+needed replication, it got it, and it held. The downgrade to "tens of percent" was the correct
+response to unreplicated data, and the replication is what turns it back into a figure.
+
+**A second fact that did NOT go away, and is worth its own line:** the host beam-BVH build varied
+**4.10 / 4.35 / 4.15 / 8.01 / 5.55 / 4.59 s** across these six runs — a **2x spread on identical
+work with nothing else running.** Contention explained the 4.5x seen earlier; it does not explain
+this. Something in the host SAH build is itself 2x variable run to run, which means:
+
+* any single BVH timing is worth ±50 %, and
+* the build is a plausible target for investigation in its own right — a 2x swing on deterministic
+  input usually means thread scheduling, an allocation cliff, or work-stealing imbalance, all of
+  which are fixable and none of which is noise.
+
+**What this settles for `-beamrefresh`:** the arithmetic from two entries ago stands on replicated
+ground. With `L` ≈ 8.3 s and `epoch = L/frac`, the default 0.10 gives an 83-second epoch, so this
+scene gets **one realization** in any render shorter than ~90 s. The feature is on and idle at its
+own default.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
