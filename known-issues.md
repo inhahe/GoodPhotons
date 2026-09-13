@@ -2671,28 +2671,35 @@ three measurements is answering a different question from the one it appears to.
 both arms, which reads as a tidy null. Asking why a null was quite so perfect is what exposed the
 spectral bundle underneath it.)*
 
-**AN ATTEMPT AT THE RIGHT STATISTIC THAT FAILED, AND WHY IT IS WORTH RECORDING.** The quantity that
-would settle this is *how many independent photon paths contribute to one gather* — same photon
-count, fewer distinct contributors, higher realization variance. Since same-path photons are adjacent
-in file order, counting index-runs per gather-sized cell looked like a cheap proxy. It produced a
-tidy-looking result (device 76 photons from 8 runs, host 60 from 15) that **must not be believed**,
-for two independent reasons found after the fact:
+**THE DEFECT, STATED PROPERLY: the device's mode-M variance does not average down with samples.**
+An spp sweep reframes everything above:
 
-1. **The proxy is backend-dependent.** Index adjacency means "same path" only where paths are stored
-   contiguously — which is the device. The host interleaves across 12 threads, so one host path is
-   fragmented into many runs and its run count *overstates* its distinct paths. The statistic is not
-   comparable between the two things it was built to compare.
-2. **The window is a prefix, not a sample.** Reading the first 3 M photons is a near-random sample of
-   an interleaved host map but a spatially-localised subset of a path-contiguous device map. That
-   alone explains the device's apparent 2.6x excess of dense cells (20 677 against 7 801) without any
-   physical difference at all.
+| configuration | GPU | CPU | ratio |
+|---|---:|---:|---:|
+| `-n 200000`, spp 8 | — | — | 0.979 |
+| `-n 2000000`, spp 8 | 0.03700 | 0.03708 | **0.998** |
+| `-n 2000000`, spp 34 | 0.03470 | 0.02718 | **1.277** |
 
-**Neither flaw is fixable within the saved format:** correcting the window needs random sampling,
-which breaks the run-counting that needs contiguity; and correcting the proxy needs a path identifier,
-which the map deliberately does not store (`photonmap_io.h`: "What is NOT stored, deliberately: every
-derived structure"). **So the honest next step is instrumentation** — tag each deposit with its path
-id in a debug build and count distinct paths per gather directly. That is a real change rather than
-another analysis of data already on disk, and everything cheaper has now been tried.
+**At spp 8 the two backends are at parity at either photon count. The gap is created by raising spp.**
+Going 8 -> 34, the **host improves 27 %** (0.0371 -> 0.0272) while the **device improves 6 %**
+(0.0370 -> 0.0347). Extra camera samples average camera noise but not map noise, so each backend
+floors at its own map-realization level — and the device's floor is markedly higher.
+
+**That reconciles every result in this entry**, including the ones that looked contradictory:
+* shared map -> parity, because an identical map means an identical floor;
+* different maps gathered by one backend -> parity *when run at spp 8*, because the floor is masked;
+* native spp 34 -> 1.277, because that is where the floor is exposed.
+
+**And it means the map-swap test was doubly blind** — run at spp 8 *and* at a tenth the photon count
+of the finding it was meant to explain. Its clean parity result says nothing about the deposit. The
+control that caught it was simply measuring the NATIVE gap at the map test's own settings: 0.979,
+i.e. no effect to detect. **A null from a rig that cannot see the effect is worth nothing, and this is
+the second time in this investigation that running that control changed the conclusion.**
+
+**The corrected experiment** is the same map swap at `-n 2000000` and spp >= 34, where the floor is
+visible. It costs ~863 MB per map, so three per backend rather than four. That, not the path-id
+instrumentation proposed earlier, is the next step — the instrumentation is only needed if the swap
+confirms the deposit and the *reason* is still unclear.
 * **The deposit.** Both trace 2 000 000 photons, but how many survive into the map, and with what
   power distribution, has not been compared.
 
