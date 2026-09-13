@@ -1781,6 +1781,24 @@ paired, same seed, sub-second timing:
 | beamcount 2 M | 34.77 s | 30.68 s | **4.09 s (11.8 %)** |
 | beamcount 2 M, as shipped default | 34.77 s | 31.50-32.58 s | ~2.7 s (7.9 %) |
 
+**RE-VERIFIED under the timing-noise rule (2026-09-13), because the original 2 M reading was a single
+run per arm with 4 M measured FIRST — i.e. the arm that was reverted away from carried the warm-up
+penalty.** Three paired reps, warm-up discarded, alternating within each rep:
+
+| rep | 4 M | 8 M | 8 M advantage |
+|---|---:|---:|---:|
+| 1 | 38.37 s | 33.73 s | 4.64 s |
+| 2 | 36.91 s | 36.38 s | 0.53 s |
+| 3 | 35.73 s | 32.48 s | 3.25 s |
+
+**8 M wins 3 of 3**, mean advantage 2.81 s — smaller than the 4.09 s single-run figure that drove the
+change, but consistent in direction in every pair. **The revert stands.**
+
+**And the re-test demonstrates why the pairing mattered.** Every one of these six readings is slower
+than the original sweep (35.7-38.4 against 34.77, 32.5-36.4 against 30.68) because the machine had
+drifted between sittings. The absolute numbers moved by 10-15 %; the paired differences did not
+change sign. **Pair within a rep and drift cancels; compare across sittings and it does not.**
+
 Consistent in direction at both operating points and growing with beam density, which is what the
 mechanism predicts: denser beams make the 4 M cap bind harder, forcing coarser sub-beams and so more
 traversal, while the build cost that used to punish 8 M is now cheap. Nothing in the accuracy
