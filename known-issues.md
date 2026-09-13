@@ -1952,6 +1952,35 @@ envelope.
   change to the density estimate and wants its own measurement campaign; the point of this entry is
   that the *diagnosis* is now settled.
 
+**A SUBTLETY ABOUT THE FIX, BECAUSE THE OBVIOUS FORM IS WRONG AND IT INTERACTS WITH A CLOSED
+LINE.** "Normalise by a cylinder's `2 pi a L` instead of `pi r^2`" is the natural first move and it
+does not follow from the measurement. A *single* strand would give `A ∝ a·r` — **linear** in `r`,
+so the current estimator would be too **dark** there, the opposite of what is observed. What is
+measured is `r^1.54` for the collected photons, i.e. a coat presents a **1.54-dimensional** set,
+not a line: many strands enter the ball, each contributing length, and the count and the length
+scale together. A fixed cylinder formula would be as wrong as the fixed disc, just in the other
+direction.
+
+**What the estimate actually needs is the measure of the photon-bearing set at the gather radius —
+which is what a footprint correction is for.** That is an uncomfortable place to arrive, because
+v0.277.0's fiber gate *disables* the footprint correction on strands. The gate was right on its own
+terms: the correction had the wrong **sign** on fur. But this result suggests the sign was wrong
+because the correction, like the normalisation, assumes a surface — so the two are the same defect
+seen twice, and the fix may be one thing rather than two.
+
+**Anyone picking this up must read M-GATHERAREA's closed lines first.** That entry records a
+covariance-ellipse attempt tried and REVERTED, and states flatly that **no photon statistic can
+work** because photon density confounds geometry with illumination. A dimensional estimator built
+on photon counts would walk straight back into it. The distinction to hold onto is that `r^1.54`
+here was measured by varying `r` with the photon population **fixed** — a geometric probe sweep
+could establish the same exponent without ever counting photons, and that is the only direction
+this entry endorses.
+
+**The next cheap measurement, before any of that: is the exponent universal?** `fur_basics` and
+`fur_species` are different coats. If `r^-0.46` is a property of fur in general the fix can be a
+formula; if it varies with coat density it has to be measured per gather, which is a much larger
+feature and changes whether this is worth doing at all.
+
 **Not a regression** — it has been true since mode `M` gained fur, and it is only visible now
 because the footprint work made everything else on that ROI accurate enough to see past.
 
