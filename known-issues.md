@@ -2105,23 +2105,38 @@ Verified on all three cases, because a warning that fires in the wrong one is wo
 stays silent and reads "on NVIDIA GeForce RTX 4090"; `-time` + `-device cpu` stays silent, since a
 user who asked for the CPU has lost nothing and telling them otherwise would be false.
 
-**STILL OPEN — the warning is not the fix. And the fix is NOT the obvious one.** When this entry
-was first written I proposed "teach `runSharedPhotonMap` to gather in spp chunks against a budget,
-it already writes each frame as its gather completes". **That would have been a silent quality
-regression**, and the code says so in its own words. Mode M's convergence model (`main.cpp`
-12017-12032, 12128-12131) is that the light side is *rebuilt under a fresh salt every epoch* and the
-realizations averaged, "turning the floor into a `1/sqrt(epochs)` decay" — the per-epoch MAP REFRESH
-is what makes mode M converge at all. A shared path that traces N photons once and then accumulates
-spp averages only the GATHER noise; the photon realization's own streaks and blur stay in the image
-permanently. It would be fast, and it would stop converging at a floor, which is a worse answer to
-`-time 600` than the slow CPU render it replaced.
+**STILL OPEN, BUT MUCH SMALLER THAN TWO EARLIER VERSIONS OF THIS ENTRY CLAIMED.** The entry first
+proposed spp-chunking (wrong: it would pin one photon realization and stop converging), then
+epoch-looping the shared device path (right in principle, scoped as a large new feature). Reading the
+code before building it shows **the epoch loop already exists on the device** and has since 0.253.0 —
+`main.cpp` ~24212, *"THE LIGHT-SIDE REFRESH, ON THE DEVICE, FOR A LONE CAMERA"*. It carries every
+piece the design called for:
 
-So the real fix is the harder one: the shared path must **loop epochs** — retrace and rebuild under a
-fresh salt, gather, accumulate, repeat until the budget expires — exactly as the progressive driver
-does. Then the device's throughput buys more epochs and the `1/sqrt(epochs)` decay is preserved
-rather than traded away. The per-chunk hook needed for the stop test already exists
-(`liveProg.report` returns "stop after this chunk", and is how a closed window ends a gather), but it
-is armed only under `g_showWindow` and would have to be unconditional.
+* `RngSaltScope(lightEpoch)` per epoch, with **epoch 0 the identity**, so a single-epoch render is
+  bit-for-bit what it always was — the by-construction guarantee that nothing existing changes.
+* `PmRadiiPin`, so epoch 0 adapts the gather radii and later epochs re-bin at exactly those radii.
+  Not cosmetic: the estimate is biased at finite radius, so re-adapting per epoch would average
+  estimators that are not the same estimator. (The entry there records the drift it fixed,
+  0.05781 -> 0.05794 over two epochs.)
+* Per-epoch film capture and accumulation, and the `frac`-driven epoch length.
+
+**That comment even names this bug.** It observes that `plainRender` routes a fixed-`-spp` lone camera
+to the refreshing device path *"while the same render with `-time` did not. Two paths, same mode,
+opposite behaviour, decided by a flag that has nothing to do with the light side."*
+
+**So the remaining work is two small things, not a feature:**
+
+1. The loop's stop condition is `sppAll < spp` — a total-sample target. It needs the wall-clock,
+   noise and indefinite budgets as additional stop tests.
+2. The grouping gate at `main.cpp:23576` must admit a budgeted mode-M camera into `groupM`. The
+   fold-back gate at 23600 already sends it to the CPU path unless the GPU route is available, so
+   that half needs no change. `-preview` should stay excluded, since the ANSI thumbnail genuinely
+   belongs to the single-camera driver.
+
+**One trap to respect while doing it:** a MULTI-camera group must keep its single shared map. The
+0.253.0 comment is explicit that refreshing a flythrough would destroy the amortisation that is the
+entire point of the shared path *and* hand consecutive frames different realizations, which is
+temporal flicker rather than convergence. So the budget must only admit a group of exactly one.
 
 **WHAT THE 20x IS WORTH IS REGIME-DEPENDENT — measured on two scenes, 2026-09-13.** The ratio is
 denominated in spp, so it is worth whatever an spp is worth, and that turns out to differ by a factor
