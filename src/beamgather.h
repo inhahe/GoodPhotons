@@ -26,6 +26,8 @@
 // was; `gatherPhotonBeams` below is that instantiation, kept under its old name and
 // signature so every existing call site is untouched.
 #pragma once
+#include <cstdlib>
+#include <vector>
 #include <cmath>
 #include "render.h"
 #include "photonbeams.h"
@@ -191,12 +193,47 @@ struct TrRay {
 // Note the two transmittance marches per surviving beam (one along the beam, one back along
 // the camera ray). For a heterogeneous medium those are ratio-tracking walks, and they are
 // the dominant cost of this estimator; see known-issues.md.
+// Read once; a gather runs millions of times and getenv is not free in a loop.
+inline int volCacheStubSteps() {
+    static const int n = [] {
+        const char* e = std::getenv("FTRACE_VOLCACHE_STUB");
+        return (e && *e) ? std::atoi(e) : 0;
+    }();
+    return n;
+}
+inline double& volCacheSink() { static thread_local double s = 0.0; return s; }
+
 template <class WeightFn>
 inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const BeamMap& bm,
                                const Vec3& oc, const Vec3& dc, double tMax,
                                double aGlassCam, Pcg32& rng, const WeightFn& w1) {
     Vec3 acc{0, 0, 0};
     if (bm.empty() || bm.nEmitted <= 0) return acc;
+    // VOLCACHE COST STUB (FTRACE_VOLCACHE_STUB=<steps>, 0 = off). Marches the camera ray with
+    // `steps` uniform samples, each doing one hashed 3D grid read, and throws the result away.
+    // It renders nothing and answers one question: what would a cached-field march COST in place
+    // of the beam queries VOLCACHE would remove? That term cannot come from instrumentation --
+    // every counter in this file measures work that already happens -- and it is charged at every
+    // optical depth while the saving shrinks with depth, so it decides the thin-media case.
+    // A stub is enough because the cost is the memory traffic and the step count, not the values.
+    if (const int vcSteps = volCacheStubSteps()) {
+        static const std::vector<float> grid = [] {           // ~1 MB, sized like a real cache
+            std::vector<float> g((size_t)64 * 64 * 64 * 4);
+            for (size_t i = 0; i < g.size(); ++i) g[i] = (float)(i & 255) * (1.0f / 255.0f);
+            return g;
+        }();
+        double sink = 0.0;
+        const double dt = tMax / (double)vcSteps;
+        for (int i = 0; i < vcSteps; ++i) {
+            const Vec3 p = oc + dc * (dt * (i + 0.5));
+            const int ix = (int)((p.x * 7.3 + 4096.0)) & 63;
+            const int iy = (int)((p.y * 7.3 + 4096.0)) & 63;
+            const int iz = (int)((p.z * 7.3 + 4096.0)) & 63;
+            const size_t k = (((size_t)iz * 64 + iy) * 64 + ix) * 4;
+            sink += grid[k] + grid[k + 1] + grid[k + 2] + grid[k + 3];
+        }
+        volCacheSink() += sink;      // keeps the loop from being optimised away
+    }
     const double invN = 1.0 / (double)bm.nEmitted;
     const PatTables tabs = scene.patTables();
     bm.gather(oc, dc, tMax, [&](const BeamHit& bh) {

@@ -1467,10 +1467,33 @@ v0.292.x parallelised the beam BVH build. `_fog_thick` at `sigma_t 20` is the mo
 in the repo — order 1 is 17.0 % of its chords and order 7+ alone is 49.6 % — so it is the wrong
 scene to price a prototype on.)
 
-**The one term still unmeasured:** what marching a cached field costs in place of the queries it
-removes. It is charged at *every* optical depth while the saving shrinks with depth, so it decides
-the thin-media case outright and cannot be estimated from instrumentation — it needs a prototype,
-even a stub that marches and returns zero.
+**The march cost, now measured (v0.296.0, `FTRACE_VOLCACHE_STUB=<steps>`).** The stub marches the
+camera ray with `steps` uniform samples, each doing one hashed read from a 1 MB grid, and discards
+the result — it renders nothing and prices only the memory traffic and step count.
+
+| steps | frame | delta vs off |
+|---:|---:|---:|
+| off | 15.63 s | — |
+| 128 | 19.45 s | +3.82 s |
+| 256 | 22.23 s | +6.60 s |
+
+**~0.026 s per step per frame** in the linear region. A realistic march is **32-64 steps** — the
+deposit reports a `22x22x22` grid, so a ray crossing the medium passes ~22-38 cells — which
+extrapolates to **~0.8-1.7 s, i.e. 4-10 % of this frame**.
+
+**That is an extrapolation, not a direct reading, and the reason matters.** At 32 and 64 steps the
+effect is *below the measurement floor*: repeats put the **baseline alone** at 15.63, 19.41 and
+19.05 s for identical commands — a 24 % spread, larger than the term being measured. The linear
+region above 128 steps clears that noise, so the rate is taken there and extrapolated down.
+
+**Net.** Against a cacheable share worth ~51-58 % of frame at `sigma_t 20`, a 4-10 % march cost makes
+VOLCACHE **strongly positive on thick media**. At `sigma_t 0.6` the saving is ~a quarter against the
+same cost — still positive, but the margin is thin enough that implementation overheads could erase
+it.
+
+**Caveat, and it points one way:** the stub reads 4 floats from a 1 MB grid that fits in L2. A real
+cache is larger and may interpolate, so this is a **lower bound** on lookup cost; the true march is
+somewhere above 4-10 %.
 
 **Recommendation.** Worth prototyping *if* thick media matter to the intended workload, and the
 prototype should be a cost-only stub priced on a mid-depth scene (`sigma_t ~6`), not on
