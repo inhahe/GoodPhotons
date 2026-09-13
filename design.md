@@ -4459,6 +4459,14 @@ as the one at fault.
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.
+- **`bvh.h` sphere queries** — `Aabb::dist2To` (exact point-to-box squared distance) and
+  `Bvh::traverseSphere(c, r, leafFn)`, an unordered no-early-exit traversal reporting every
+  primitive in a node box meeting the ball. Built for M-GATHERAREA's geometric footprint: the
+  gather divides by pi r^2 while collecting only the same-facing surface actually present, and
+  no photon statistic can recover the difference (measured bracket on `fur_creature`'s belly:
+  -33.6 % with the fiber gate, +46.8 % without). Candidates are a deliberate superset — a false
+  candidate costs a test, a missed one costs correctness. `-checkspherequery` brute-force
+  verifies the no-miss invariant.
 - **`roiboxes.h`** — `-roiboxes`: per-material measurement ROIs read off a pixel-centre
   primary-visibility pass, split into connected components and gated on purity/share.
   Depends on `camera.h` (it asks `genRay` which raster row is the top rather than

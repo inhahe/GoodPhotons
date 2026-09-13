@@ -18305,6 +18305,7 @@ static int run(int argc, char** argv) {
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
     bool checkTriNormalOnly = false;
+    bool checkSphereQueryOnly = false;
     // -roiboxes and its gates. The defaults are deliberately strict: this tool's whole
     // point is that an ROI you cannot trust should not be easy to copy out of its output.
     bool      roiBoxesOnly = false;
@@ -19036,12 +19037,6 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checktrinormal")) checkTriNormalOnly = true;
-        else if (!std::strcmp(argv[i], "-roiboxes")) roiBoxesOnly = true;
-        else if (!std::strcmp(argv[i], "-roi-audit") && i + 1 < argc) roiAuditFile = argv[++i];
-        else if (!std::strcmp(argv[i], "-roi-mask")  && i + 1 < argc) roiMaskFile  = argv[++i];
-        else if (!std::strcmp(argv[i], "-roi-minpurity") && i + 1 < argc) roiMinPurity = std::atof(argv[++i]);
-        else if (!std::strcmp(argv[i], "-roi-minshare")  && i + 1 < argc) roiMinShare  = std::atof(argv[++i]);
-        else if (!std::strcmp(argv[i], "-roi-minpx")     && i + 1 < argc) roiMinPx     = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkmesh")) checkMeshFormatsOnly = true;
         else if (!std::strcmp(argv[i], "-checkprefer")) checkPreferOnly = true;
         else if (!std::strcmp(argv[i], "-checkpaths")) checkPathsOnly = true;
@@ -19254,7 +19249,21 @@ static int run(int argc, char** argv) {
         // valid flag defined further down would be rejected before it is ever tested.
         if (!handled) {
         handled = true;
-        if ((!std::strcmp(argv[i], "-nd") || !std::strcmp(argv[i], "-ndim")) && i + 1 < argc) {
+        // Moved here from the previous segment, which hit MSVC C1061 (blocks nested too
+        // deeply) at ~128 else-if links when -checkspherequery was appended to it. See the
+        // segment note at the top of the option table: append to a segment, and start a new
+        // one once it nears ~100 links.
+        if (!std::strcmp(argv[i], "-checkspherequery")) checkSphereQueryOnly = true;
+        else if (!std::strcmp(argv[i], "-roiboxes")) roiBoxesOnly = true;
+        else if (!std::strcmp(argv[i], "-roi-audit") && i + 1 < argc) roiAuditFile = argv[++i];
+        else if (!std::strcmp(argv[i], "-roi-mask")  && i + 1 < argc) roiMaskFile  = argv[++i];
+        else if (!std::strcmp(argv[i], "-roi-minpurity") && i + 1 < argc) roiMinPurity = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-roi-minshare")  && i + 1 < argc) roiMinShare  = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-roi-minpx")     && i + 1 < argc) roiMinPx     = std::atoll(argv[++i]);
+        // Chain continues into this segment's original head: without the `else` the two
+        // chains are independent and the trailing `else handled = false;` below would mark
+        // every flag above as unrecognised.
+        else if ((!std::strcmp(argv[i], "-nd") || !std::strcmp(argv[i], "-ndim")) && i + 1 < argc) {
             const int d = std::atoi(argv[++i]);
             if (d < 3 || d > 12) {
                 std::fprintf(stderr, "[nd] -nd %d: dimensions must be 3..12 "
@@ -19476,6 +19485,7 @@ static int run(int argc, char** argv) {
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkTriNormalOnly) return checkTriNormal(); // ditto (intersectTri's side/normal convention)
+    if (checkSphereQueryOnly) return bvhSphereQuerySelfTest() ? 0 : 1;  // ditto (Bvh::traverseSphere)
     if (checkMeshFormatsOnly) return checkMeshFormats(); // ditto (OBJ/PLY/STL agree on the same cube)
     if (checkPreferOnly)   return checkPrefer();   // ditto (prefer{}/else{} resolution semantics)
     if (checkPathsOnly)    return checkPaths();    // ditto (where a relative asset path is looked for)

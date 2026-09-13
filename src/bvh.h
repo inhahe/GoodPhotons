@@ -26,6 +26,19 @@ struct Aabb {
     }
     void expand(const Aabb& b) { expand(b.lo); expand(b.hi); }
     Vec3 center() const { return (lo + hi) * 0.5; }
+    // Squared distance from `p` to the nearest point of the box; 0 when inside. The
+    // building block of the sphere-overlap traversal below, and exact rather than a
+    // centre-plus-radius approximation — an approximate reject would silently drop
+    // primitives that really do intersect the ball, which is the one failure a
+    // footprint measurement cannot tolerate (it would under-count area and so
+    // over-brighten, indistinguishably from the defect it is meant to fix).
+    double dist2To(const Vec3& p) const {
+        double d = 0.0, v;
+        v = p.x < lo.x ? lo.x - p.x : (p.x > hi.x ? p.x - hi.x : 0.0); d += v * v;
+        v = p.y < lo.y ? lo.y - p.y : (p.y > hi.y ? p.y - hi.y : 0.0); d += v * v;
+        v = p.z < lo.z ? lo.z - p.z : (p.z > hi.z ? p.z - hi.z : 0.0); d += v * v;
+        return d;
+    }
     double area() const {
         Vec3 d = hi - lo;
         if (d.x < 0 || d.y < 0 || d.z < 0) return 0.0;   // empty
@@ -276,4 +289,101 @@ struct Bvh {
         }
         return false;
     }
+
+    // Sphere-overlap traversal: visit every primitive whose leaf belongs to a node box
+    // intersecting the ball |x - c| <= r. Unlike the two traversals above this has no
+    // ordering and no early exit — every candidate is reported, because the caller is
+    // measuring an AREA and an area needs all of its pieces.
+    //
+    // WHY IT EXISTS (M-GATHERAREA). The gather divides by pi r^2, the area of a full
+    // disc, while collecting only from the same-facing surface actually present inside
+    // the ball. Where those differ the estimate is wrong, and on a tangle it is wrong by
+    // tens of percent in a direction the shipped gates can only choose between: measured
+    // on `fur_creature`'s belly, -33.6 % with the fiber gate and +46.8 % without, with
+    // the truth bracketed in between and no setting reaching it. Every attempt to infer
+    // the footprint from a PHOTON statistic has failed for the reason that entry gives —
+    // the probe sees the nearest layer while the query gathers from the whole ball — so
+    // the footprint has to be measured from the GEOMETRY, and that starts here.
+    //
+    // `leafFn(primIndex)` is called once per candidate primitive. Candidates are a
+    // superset of the true overlap set: a box can intersect the ball when its primitive
+    // does not, so the caller must still test the primitive itself. Erring that way round
+    // is deliberate — a false candidate costs a test, a missed one costs correctness.
+    template <class LeafFn>
+    void traverseSphere(const Vec3& c, double r, LeafFn&& leafFn) const {
+        // r == 0 is a legitimate degenerate query (is this point inside anything?) and
+        // falls out of dist2To correctly, so only a negative radius is rejected.
+        if (nodes.empty() || !(r >= 0.0)) return;
+        const double r2 = r * r;
+        if (nodes[0].box.dist2To(c) > r2) return;
+        int stack[64]; int sp = 0; stack[sp++] = 0;
+        while (sp) {
+            const BvhNode& n = nodes[stack[--sp]];
+            if (n.isLeaf()) {
+                for (int i = 0; i < n.count; ++i) leafFn(primIdx[n.first + i]);
+            } else {
+                // Guard the push: `stack[64]` is the same depth budget the ray
+                // traversals use, but they shrink tMax and this cannot, so a pathological
+                // tree could in principle keep both children live at every level. Drop
+                // rather than overrun — a dropped subtree under-counts area, which the
+                // caller can at least detect as a coverage above 1.
+                if (sp + 2 <= 64) {
+                    if (nodes[n.left].box.dist2To(c)  <= r2) stack[sp++] = n.left;
+                    if (nodes[n.right].box.dist2To(c) <= r2) stack[sp++] = n.right;
+                }
+            }
+        }
+    }
 };
+
+// `-checkspherequery`: brute-force self-test for traverseSphere. Deterministic, needs no
+// scene, and checks the ONE invariant the footprint measurement depends on — every
+// primitive whose own box meets the ball is reported. A traversal that quietly skipped
+// some would under-count area and so OVER-brighten the gather, which is indistinguishable
+// from the defect it is being built to fix; a bug there would be attributed to the
+// estimator for a long time before anyone suspected the query. So the check is written
+// now, before a single caller exists, rather than after a measurement goes wrong.
+inline bool bvhSphereQuerySelfTest() {
+    uint64_t st = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&]() {
+        st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+        return (double)(st >> 11) * (1.0 / 9007199254740992.0);
+    };
+    std::vector<Aabb> boxes;
+    boxes.reserve(2000);
+    for (int i = 0; i < 2000; ++i) {
+        Vec3 c{rnd() * 10.0, rnd() * 10.0, rnd() * 10.0};
+        Vec3 h{rnd() * 0.3 + 0.01, rnd() * 0.3 + 0.01, rnd() * 0.3 + 0.01};
+        Aabb b; b.expand(c - h); b.expand(c + h);
+        boxes.push_back(b);
+    }
+    Bvh bvh; bvh.build(boxes);
+    long long missed = 0, reported = 0, truth = 0;
+    std::vector<char> seen(boxes.size(), 0);
+    const int kQueries = 500;
+    for (int q = 0; q < kQueries; ++q) {
+        Vec3 c{rnd() * 10.0, rnd() * 10.0, rnd() * 10.0};
+        const double r = (q == 0) ? 0.0 : rnd() * 2.0 + 0.05;   // q==0 exercises r == 0
+        std::fill(seen.begin(), seen.end(), (char)0);
+        bvh.traverseSphere(c, r, [&](int p) { seen[p] = 1; ++reported; });
+        const double r2 = r * r;
+        for (size_t p = 0; p < boxes.size(); ++p)
+            if (boxes[p].dist2To(c) <= r2) { ++truth; if (!seen[p]) ++missed; }
+    }
+    std::printf("[checkspherequery] %d queries over %d boxes: %lld true overlaps, "
+                "%lld candidates reported (%.2fx), %lld MISSED\n",
+                kQueries, (int)boxes.size(), truth, reported,
+                truth > 0 ? (double)reported / (double)truth : 0.0, missed);
+    if (missed) {
+        std::printf("[checkspherequery] FAIL — the traversal skipped %lld primitive(s) whose "
+                    "own box meets the query ball.\n", missed);
+        return false;
+    }
+    if (truth == 0) {
+        std::printf("[checkspherequery] FAIL — no overlaps generated, so the test proved "
+                    "nothing. Check the box/radius ranges.\n");
+        return false;
+    }
+    std::printf("[checkspherequery] PASS\n");
+    return true;
+}
