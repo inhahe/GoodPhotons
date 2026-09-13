@@ -2158,6 +2158,41 @@ scalar or needs a directional representation (SH, or a small lobe set) is a sepa
 the experiment for it is two cameras at very different angles scoring the same world region — not
 this one.
 
+**HOW COARSE MAY A CELL BE? Sized from data already on disk (`scraps/vc_cell.py`, no new
+renders).** "The field is smooth" is a safety result, not a design parameter, and the structure
+test cannot give one: a structure fraction of zero says there is no detail at the scale the image
+resolves, not how far you may blur before the *large*-scale variation starts to go — and that
+variation is obviously real, since the medium is lit at one end.
+
+Comparing a blurred image to its own unblurred self measures nothing, because blurring mostly
+removes Monte Carlo noise. The standard way round it is to blur **seed A** and compare against
+**unblurred seed B**, whose noise is independent: the noise term falls with radius while the signal
+term rises, so the curve has a minimum. `_fog_thick`, 128x128:
+
+| blur r (px) | 0 | 1 | 2 | **3** | 4 | 6 | 8 | 12 | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| RMS(blur(A) − B) / RMS(B) | 0.266 | 0.214 | 0.201 | **0.197** | 0.199 | 0.214 | 0.241 | 0.329 | 0.436 | 0.600 | 0.698 |
+
+**Minimum at r = 3 px — a 7 px box — and it does not cross the unblurred noise level until
+somewhere between r = 8 and r = 12.** Two readings, and they answer different questions:
+
+* **r = 3 (7 px box): blurring is strictly free.** On a 1 m box filling a 128 px frame that is
+  **~5.5 cm**, i.e. ~18 cells across the medium and ~6 000 cells for the volume — a small cache.
+* **r ~ 8-12 (17-25 px): blurring costs no more than the sampling noise already present.** The
+  ceiling if a cache is allowed to be as wrong as the renderer's own noise.
+
+**Two honest caveats, because both numbers are easy to over-read.**
+
+1. **The minimum's location depends on sample count.** At higher spp the noise term at r = 0
+   falls, so the optimum moves to smaller r. What is *not* noise-dependent is the steep rise
+   beyond r ~ 8, which is signal being destroyed; that is the number to design against, and it is
+   the more conservative of the two.
+2. **Pixels are not world units.** A cell is a world-space volume and the pixel-to-world mapping
+   varies with depth. It happens to be well behaved *here* — at optical depth 20 the camera sees
+   ~1 mean free path in, so pixels map to a roughly constant depth — but that is a property of the
+   thick regime, and the conversion would need redoing on a thin medium where rays see all the way
+   through.
+
 **The rig is two scripts and four renders**, so re-testing on another scene is cheap:
 `-beamradius` pinned, two seeds, `scraps/ms_struct.py`. A scene whose medium is genuinely
 diffuse — `_fog_thick`, which measures 82.8 % order >= 2 against `gallery_rain`'s 40.7 % — is the
