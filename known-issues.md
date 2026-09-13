@@ -2495,7 +2495,32 @@ phenomenon from the tail and is unexplained by any of the five eliminated candid
 **The rig is reusable:** `scraps/tail.py <prefix> <label>` scores any pair of two-seed PFM arms by
 percentile. Render with `-hdr`, matched `-spp`, seeds 1 and 2, named `png/<prefix>_<dev>_<seed>.png`.
 
-### GPU-VARIANCE — the device needs **1.63x the samples** for equal noise, on a scene with no beams at all (2026-09-13)
+### GPU-VARIANCE — the device CONVERGES MORE SLOWLY in mode M; the gap is spp-dependent and peaks around 1.28x SD, not a constant 1.63x (2026-09-13)
+
+**HEADLINE CORRECTED.** This entry opened claiming a flat "1.63x the variance". That figure was
+measured at one spp and does not hold across the sweep:
+
+| spp | GPU | CPU | SD ratio |
+|---:|---:|---:|---:|
+| 8 | 0.03700 | 0.03708 | **0.998** |
+| 34 | 0.03470 | 0.02718 | **1.277** |
+| 64 | 0.03133 | 0.02662 | **1.177** |
+
+**At spp 8 the backends are identical; the gap opens, peaks near spp 34, and is already narrowing by
+spp 64.** The host falls quickly (0.0371 -> 0.0272) and then plateaus at its map-noise floor
+(0.0266 at 64); the device declines more slowly and is *still falling* at 64. So the defect is a
+**convergence-rate** difference over a limited spp range, not a permanent per-sample tax, and the two
+may approach similar floors at high spp — which this sweep cannot yet say, because it stops at 64.
+
+**In practical terms** the device needs `1.177^2` = **1.39x** the samples at spp 64, against 1.63x at
+spp 34 and **1.00x** at spp 8. Any figure quoted for this defect must carry the spp it was measured
+at. (The M-TIME-CPU re-pricing elsewhere in this file — GPU's 8x samples being worth ~5x — used the
+1.63x and is therefore the pessimistic end; at spp 64 it would be ~5.8x.)
+
+**Caveat on the sweep itself:** three seeds per point, so the non-monotonic shape (1.277 then 1.177)
+is within the noise of the estimator and should not be read as a precise peak. What is solid across
+seed counts is the qualitative shape — parity at low spp, a gap in the middle, narrowing at high spp.
+
 
 Separated out of GPU-BEAM-TAIL, which turned out to describe two different things: a tail gap needing
 beams and extreme optical depth (one scene in the repo), and this — a **variance deficit present in
