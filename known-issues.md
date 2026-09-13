@@ -862,6 +862,65 @@ the ball when its primitives do not, which is why `wall` shows 2.3 curve segment
 nowhere near the creature. The true counts are lower. The 200x contrast is far too large for that to
 matter, but the figures should not be quoted as exact overlaps.
 
+### The geometric footprint WORKS — and it says fur's footprint is ~3x pi r^2, not less
+
+`-gafparea <r>` reports the measured same-facing surface area inside the gather ball as a multiple
+of pi r^2, which is exactly the factor the estimator currently assumes is 1.
+
+**It passes the test that could have failed.** `_ga_null` is one 12 m flat quad, where a ball centred
+on the surface meets it in a disc of exactly pi r^2:
+
+    white   576 gathers   footprint 1.0000   min 1.0000   max 1.0000
+
+Exactly 1, with zero spread. **And `_ga_corner` reproduces the analytic answer across a gradient:**
+
+| strip | distance from wall | footprint | min |
+|---|---|---|---|
+| `s00` | 0.00-0.25 m | **0.5986** | 0.5156 |
+| `s02` | 0.25-0.50 m | 0.7832 | 0.7031 |
+| `s05` | 0.50-1.00 m | 0.9570 | 0.8594 |
+| `s10`, `s20` | 1-4 m | **1.0000** | **1.0000** |
+| `s40` | 4-8 m | 0.9771 | 0.6563 |
+
+The interior strips are exactly 1.0 with no spread; the wall-adjacent strip clips to ~0.60 with a
+minimum of **0.5156**, and a gather point sitting ON the wall junction must see exactly half a disc.
+`s40`'s departure is the floor's outer edge at x = 8 — the scene flaw recorded two entries above,
+here rediscovered by measurement rather than by argument.
+
+**Now the result that matters.** `fur_creature` at its own adaptive radius:
+
+| material | footprint (x pi r^2) | min | max |
+|---|---|---|---|
+| `wall` | **0.9917** | 0.5312 | 1.0000 |
+| `floor` | **0.9991** | 0.5156 | 1.1213 |
+| `coat` | **2.9464** | 0.4285 | 9.8173 |
+| `belly` | **2.0617** | 0.2016 | 8.3615 |
+| `tan` | 1.9407 | 0.9225 | 3.3967 |
+| `skin` | 0.4516 | 0.0000 | 3.1042 |
+
+**A coat's gather ball contains about THREE TIMES pi r^2 of same-facing strand surface, not less
+than it.** That inverts the premise the fix was built on. Dividing by a measured footprint of 2.95
+would make `coat` roughly three times DARKER, and `coat` already reads **-17 %** against truth — so
+for fur the geometric footprint points the wrong way, and harder than the error it was meant to cure.
+
+**Why that is not a defeat, and what it actually settles.** The footprint is *correct* — a tangle
+genuinely does hold that much surface. What it shows is that **"divide by the surface area in the
+ball" is the wrong estimator for a tangle**, not that the measurement is wrong. The photon-map
+density estimate assumes the ball meets ONE locally flat surface, so the divisor and the collected
+photons describe the same small neighbourhood. With ~600 strands in the ball (the census two entries
+above) the photons come from surface that is nowhere near the shading point, and no divisor repairs
+that, because the numerator is already measuring the wrong region. This is M-GATHERAREA's thesis —
+*no photon statistic can work on a tangle* — arriving from the geometric side and agreeing.
+
+**So item 2 splits in two, which is the useful outcome:**
+
+1. **For surfaces — clipped discs at edges, caps, cloth — the geometric footprint is exact and
+   ready**: 1.0000 on flat, 0.5986 next to a wall, graded correctly in between, and validated
+   against an analytic half-disc. That is precisely the `alice_dress` / `cap_gyroid` family the
+   queue names, and it can be shipped behind a flag on its own merits.
+2. **For fur it must NOT be used as a divisor.** A tangle needs a different estimator, not a
+   different denominator, and that is a larger question than this item was scoped as.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than

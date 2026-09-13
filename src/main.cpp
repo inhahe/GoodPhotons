@@ -18312,6 +18312,8 @@ static int run(int argc, char** argv) {
     const char* roiAuditFile = nullptr;
     const char* roiMaskFile  = nullptr;
     double gaFootprintR = 0.0;   // -gafootprint <r>
+    double gaFpAreaR = 0.0;      // -gafparea <r>
+    int    gaFpDisc = 64, gaFpCurve = 4;
     int    gaFootprintStride = 4;
     double    roiMinPurity = 0.60;
     double    roiMinShare  = 0.50;
@@ -19263,6 +19265,9 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-roi-minshare")  && i + 1 < argc) roiMinShare  = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-roi-minpx")     && i + 1 < argc) roiMinPx     = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-gafootprint") && i + 1 < argc) gaFootprintR = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-gafparea") && i + 1 < argc) gaFpAreaR = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-gafp-disc") && i + 1 < argc) gaFpDisc = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-gafp-curve") && i + 1 < argc) gaFpCurve = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-gafootprint-stride") && i + 1 < argc) gaFootprintStride = std::atoi(argv[++i]);
         // Chain continues into this segment's original head: without the `else` the two
         // chains are independent and the trailing `else handled = false;` below would mark
@@ -20328,6 +20333,12 @@ static int run(int argc, char** argv) {
         if (toRender.empty()) { std::fprintf(stderr, "[gafootprint] no camera selected\n"); return 1; }
         const RenderCam& rc = toRender.front();
         return gaFootprintReport(scene, rc.cam, rc.res, rc.resY, gaFootprintR, gaFootprintStride);
+    }
+    if (gaFpAreaR > 0.0) {
+        if (toRender.empty()) { std::fprintf(stderr, "[gafparea] no camera selected"); return 1; }
+        const RenderCam& rc = toRender.front();
+        return gaFpAreaReport(scene, rc.cam, rc.res, rc.resY, gaFpAreaR, gaFootprintStride,
+                              gaFpDisc, gaFpCurve);
     }
     // -roi-mask: write the per-pixel material id as a .pfm, plus a `<path>.materials.txt`
     // legend. A rectangle cannot represent a thin material -- fur scores purity 0.44 over
