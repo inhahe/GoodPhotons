@@ -2495,6 +2495,48 @@ phenomenon from the tail and is unexplained by any of the five eliminated candid
 **The rig is reusable:** `scraps/tail.py <prefix> <label>` scores any pair of two-seed PFM arms by
 percentile. Render with `-hdr`, matched `-spp`, seeds 1 and 2, named `png/<prefix>_<dev>_<seed>.png`.
 
+### GPU-VARIANCE — the device needs **1.63x the samples** for equal noise, on a scene with no beams at all (2026-09-13)
+
+Separated out of GPU-BEAM-TAIL, which turned out to describe two different things: a tail gap needing
+beams and extreme optical depth (one scene in the repo), and this — a **variance deficit present in
+every condition tested**, beams or not.
+
+**Measured properly, with four seeds rather than a pair.** Per-pixel standard deviation across seeds
+1-4, `_cornell_diffuse`, `-mode M -spp 34`, scene-linear PFM:
+
+| arm | median per-pixel SD (of level) |
+|---|---:|
+| GPU FP32 | 0.03470 |
+| GPU FP64 | 0.03473 |
+| CPU | **0.02718** |
+
+**SD ratio 1.277, i.e. 1.63x the VARIANCE** — the device needs 1.63x the samples for the same noise.
+
+**The obvious confound is ruled out.** A two-seed estimate assumes both backends decorrelate seeds
+equally; if the host's seed-to-stream mapping left seeds 1 and 2 partly correlated, its spread would
+understate its variance and manufacture this gap. All six seed pairs agree to ~2 % within each arm
+(GPU 0.0330-0.0337, CPU 0.0260-0.0266), so both decorrelate equally and the gap is not an artifact of
+the pair chosen.
+
+**Three causes eliminated:**
+* **Precision.** The FP64 build (`-DFTRACE_GPU_FP32=OFF`) reads 0.03473 against FP32's 0.03470 —
+  indistinguishable. Every one of the eight candidates eliminated under GPU-BEAM-TAIL was aimed at the
+  tail; this is the first tested against the median, and it fails here too.
+* **Doing less work.** Both backends report `34 spp` and trace `2000000` photons.
+* **Gathering fewer photons.** The device's queries do accept slightly fewer (2259 against 2307 per
+  query, 2.1 %), but that is worth `sqrt(2307/2259)` = **1.01x**, not 1.28x.
+
+**Why this matters beyond the number.** It re-prices the device against the host generally. The
+M-TIME-CPU work measured the GPU gathering **8x** the samples of the CPU at matched wall clock; if
+each device sample is worth 1/1.63 of a host sample, the effective advantage is nearer **5x**. Every
+GPU-vs-CPU throughput comparison in this file is subject to the same correction.
+
+**Not established:** the mechanism. The leading candidate is a sampling-quality difference — host
+stratification the device does not replicate would produce exactly a modest, scene-independent,
+precision-independent constant factor. A grep for `stratif`/`jitter` finds only *spectral*
+stratification on the host side, so this is a hypothesis, not a finding. The rig is four seeds and
+`np.std(..., ddof=1)` over scene-linear PFMs; it is cheap and it works on any scene.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
