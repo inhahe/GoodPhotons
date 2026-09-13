@@ -896,6 +896,40 @@ LBVH kernel itself still reports **3.7 ms** against the 4.3 ms recorded above, s
 where the time goes. The residual — host-side split, CIE table, box pass and upload — is
 **~400 ms**, not 51 ms.
 
+**AT FIXED SAMPLES THE LIGHT SIDE CARRIES ~31 % OF THE VARIANCE, SO REMOVING IT ENTIRELY IS WORTH
+1.20x. THAT IS A CEILING, NOT AN ESTIMATE (2026-09-12, `scraps/j_fixed.sh`).** The equal-time arms
+below could only separate realizations from samples by assuming an `spp^-0.5` law. Fixing `-spp`
+removes the confound by construction: every arm integrates the same 1024 camera samples and differs
+only in how many independent light maps they were spread over. `_fog_thick` 96^2, 4 seeds:
+
+| arm | realizations | median rel s.d. | p75 |
+|---|---|---|---|
+| `-beamfreeze` | 1 | 0.3126 | 0.4640 |
+| `-beamrefresh 0.10` (default) | 2 | 0.2933 | 0.4364 |
+| `-beamrefresh 0.5` | 11 | **0.2639** | 0.4321 |
+
+**Eleven times the realizations buys 18 %** — `N^0.07`, against the `N^0.33` this entry's premise
+check implies and the `N^0.19` the equal-time arms implied.
+
+**The ceiling is the useful form.** Writing total variance as camera `C` plus light `L`, frozen is
+`C + L` and 11 realizations is `C + L/11`; the measured ratio 1.18^2 = 1.39 gives `L/C = 0.446`,
+i.e. the light side is **31 % of the variance**. So `L -> 0` — a *perfect* light side, infinitely
+many free realizations, which is strictly more than the port can deliver — is worth
+**sqrt(1.446) = 1.20x**. The port's realistic ~9x more realizations is worth **1.16x**.
+
+**This contradicts the premise check above (1 -> 5 realizations at 2.9x in variance, 1.75x in
+s.d.) and the disagreement is not resolved.** What differs: that measurement was at equal *time*
+rather than equal samples, scored block means rather than per-pixel spread, and ran at 20 s
+(~2 600 spp) against 1024 spp here. The direction is the puzzle — at higher spp the camera term
+`C` is smaller, so the light side should be a *larger* share and realizations should matter
+*more*, which is the opposite of what the two measurements show together. **The check that would
+settle it is this same fixed-`spp` sweep repeated at 4096 spp:** if `L/C` grows with spp the
+ceiling rises and the port's value with it, and if it does not then the 2.9x figure is measuring
+something other than realization count.
+
+**Until that is run, treat the port as worth ~1.2x on this scene, not 12-14x** — and note that the
+ceiling argument is robust to the exponent being wrong, because it does not use one.
+
 **AND REALIZATIONS HAVE SHARPLY DIMINISHING RETURNS, WHICH RE-PRICES THIS WHOLE PORT
 (2026-09-12).** The plan values the port at "~100x cheaper realizations", and that is a fair
 estimate of the COST side. It is not the value side, because image error does not fall linearly in
