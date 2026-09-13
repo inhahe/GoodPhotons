@@ -1656,6 +1656,43 @@ others: the photon query already rejects cross-surface leakage (killing a hypoth
 `-max-bounce` never reaching mode M (explaining a null), and `-radcache-validate`'s fraction meaning
 the opposite of what I assumed (voiding three sweeps).
 
+### `-beamsplitmax` does NOT detectably change the image — and the single-seed alarm was noise 4x smaller than the seed spread
+
+Paired per seed against the 8 M default, three seeds, `_fog_thick`, frame mean (the fog box fills
+the frame, so the whole frame is the population):
+
+| `-beamsplitmax` | per-seed diff vs 8 M | mean ± se |
+|---|---|---|
+| 2 M | -0.22, -0.45, +0.31 | **-0.120 ± 0.225** |
+| 4 M | -0.51, -0.57, -0.05 | **-0.375 ± 0.165** |
+| 16 M | +3.42, +0.36, -0.61 | **+1.056 ± 1.214** |
+
+**The row that settles it is the control**: the 8 M arm *against itself* across seeds reads
+**+0.00, +3.76, +5.30**. A **5.3 % seed-to-seed spread on a fixed configuration** — four times larger
+than the 1.2-1.8 % single-seed differences that prompted this whole investigation. Those differences
+were noise, exactly as the code's *"nothing has to be re-integrated"* predicted.
+
+At n = 3 the right test has **2 degrees of freedom**, where the 95 % critical t is **4.30**. The
+largest paired result is 4 M at 2.3 — not significant. So **no cap differs detectably from the
+default**, which is what an integral-preserving subdivision should do.
+
+**Stated as precisely as the data allows, because "no significant difference" is not "no
+difference".** This is a weak null: with a 5 % noise floor and three seeds it could not have detected
+a 1 % bias if one existed. It rules out the several-percent effect the single-seed look suggested,
+and nothing finer. **Certifying equivalence to ±0.5 % needs higher spp, not more seeds** — noise
+falls as 1/sqrt(spp), so spp 256 would bring the 5.3 % spread to ~1.3 % for 16x the render time,
+while sixteen seeds at spp 16 costs the same and only narrows the error of the *mean*.
+
+**So the 15 % speed-up at 4 M is very likely free — and the default still should not change yet.**
+Not because of the image, but because the *timing* half rests on two repeats of one scene on one
+device. A default is a claim about every scene, and the cheap next step is repeating the timing on a
+second medium, not more work on the image.
+
+**What this thread produced that outlasts the question:** the beam BVH build is **31 % of a
+`_fog_thick` frame**; build costs **~1.05 µs per split entry** and tracks split count, not beam
+count; traversal **saturates above ~4 M splits**; and the seed-to-seed noise floor on this scene at
+spp 16 is **~5 %**, which is the number any future beam experiment here has to clear.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
