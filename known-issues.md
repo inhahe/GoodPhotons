@@ -1769,6 +1769,36 @@ and the model assumes the light side is exactly fixed and the gather exactly lin
 approximations. The 43 % should be read as "tens of percent", which is all that is needed to
 contradict 0.35 %.
 
+### Is `-beamrefresh 0.10` right for MODE M? The justification argues the wrong way (measurement running)
+
+`main.cpp` keeps mode M at 0.10 while mode J on the device was retuned to 0.30, reasoning:
+
+> *NOT applied to mode M or to CPU mode J: neither gets the device tree, so a realization still
+> costs them the full host SAH build and **their optimum has not moved**.*
+
+**Under the controller's own law that argues the opposite way.** Epoch length is `overhead/frac`, so
+the light-side share is `frac/(1+frac)` **by construction** — `frac` is a share of wall clock, not a
+count of rebuilds. A dearer realization therefore does not spend more; it buys **fewer realizations
+at the same share**. Since decorrelation improves with the *number* of independent beam sets, a
+higher per-realization cost is an argument for a *larger* frac if anything, or for abandoning refresh
+entirely — not for the smaller one the comment settles on. The optimum cannot be assumed unmoved
+because the cost moved; cost is exactly what the controller already normalises away.
+
+**The measurement now running**, `_fog_thick`, mode M, **equal 30 s per arm** (not equal spp — an
+spp-matched comparison would hand the frozen arm free light-side realizations it never paid for),
+`-beamrefresh` ∈ {0, 0.05, 0.10, 0.30, 0.60}, two seeds, scored as RMS relative error against a
+240 s reference.
+
+Error rather than variance, because refresh changes decorrelation and two arms can share a variance
+while one sits further from truth; the bias column is carried alongside to confirm every arm is
+unbiased, which it must be — refresh changes *which* beams exist, not the expectation.
+
+**PREDICTION, registered before the numbers:** if 0.10 is right for mode M the error minimises there.
+If the mode-J device result transfers (0.30 beat 0.10 by 1.56x, with 0.60 worse than 0.30, so an
+interior optimum), 0.30 wins and *"their optimum has not moved"* is wrong. A third outcome is live
+and would be the most interesting: **frac 0 wins**, i.e. on mode M refreshing does not pay for itself
+at all, and the light side should simply be frozen.
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
