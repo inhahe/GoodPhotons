@@ -26383,7 +26383,76 @@ prims = 188 MB, so 805 MB cannot have been this array); and only **one** tree pe
 0.1 s, so "reuse buffers across rebuilds" was solving a rebuild storm that does not happen on these
 scenes.
 
+**CORRECTED SAME DAY, AND THE CORRECTION REVERSES THE VERDICT FOR THE OTHER CALLER.** The null above
+is sound for the **scene** BVH, which is what `-parseonly` measures: built once, 2.33 s, amortised
+over a render of minutes. But `Bvh::build()` has a second caller that the `-parseonly` measurement
+cannot see, and it is the expensive one. With `FTRACE_BVH_TIME=1` on a `_fog_thick` beam render:
+
+    [bvh] 3707943 prims -> 2389597 nodes in 3.20 s, 1 thread (282.9 MB of BuildPrim)
+    [gpu] photon beams: 3707943 sub-beams, 2389597 BVH nodes ... uploaded for the volume gather
+
+**The beam BVH is built by the same single-threaded host builder, it is larger than the scene BVH
+(3.7 M prims against 2.5 M), and unlike the scene BVH it is rebuilt EVERY EPOCH** on any render that
+refreshes its light side — which is every mode-M render that is not `-beamfreeze`. At 3.20 s inside
+a 20 s frame that is **16 % of the frame, once per epoch**, and the VOLCACHE ceiling entry measured
+the same build at **31 %** of its frame independently.
+
+So the correct verdict is split, and the earlier one-line version of it was wrong:
+
+| caller | frequency | cost | worth parallelising? |
+|---|---|---|---|
+| scene BVH | once per render | 2.33 s | **no** — under 1 % of a long render |
+| beam BVH | **once per epoch** | 3.20 s | **yes** — 16–31 % of a frame, repeatedly |
+
+**How the error happened, because it is the fourth instance of one pattern today:** I measured the
+scene BVH with `-parseonly`, correctly concluded it was not worth parallelising, and then wrote that
+conclusion about *"the BVH build"* — generalising a null past the case actually tested. The rig could
+not see the beam BVH at all, because `-parseonly` never renders and therefore never emits a beam.
+"Check that the rig can actually see the effect before trusting a null result" is in the standing
+instructions precisely for this, and it was the instrumentation added in the same commit —
+`FTRACE_BVH_TIME` — that caught it one tick later.
+
+**Remaining target, now properly scoped:** parallelise `buildRecursive` for the beam-BVH caller. The
+verification bar is unchanged and strict — `-checkspherequery`, `-checkgrid`, `-checktrinormal`, plus
+bit-identical output — and is achievable, since building left and right subtrees in parallel into
+private buffers and splicing them in sequential DFS order reproduces the serial node array exactly.
+
 **Where it would still matter, and is not refuted:** the interactive explorer and quick previews,
 where load latency *is* the product rather than a prelude to a long render. A 2.3 s stall before an
 explore session is felt; the same 2.3 s before a 40-minute `gallery_rain` frame is not. If that ever
 becomes the complaint, the measurement rig is now in the binary.
+
+### VOLCACHE: the missing deposit-vs-gather split, measured without instrumentation (2026-09-13)
+
+The ceiling entry above ends "the split between deposit and gather inside the 47 % slice is *not*
+resolved — that needs instrumentation, and it is the one number still missing before VOLCACHE can be
+priced." It does not need instrumentation. **Deposit is per-beam and so fixed in spp; gather is
+per-sample and so linear in spp** — freezing the map and sweeping spp separates them by construction,
+using only flags that already exist.
+
+`_fog_thick` at 128² (matching the ceiling entry's resolution, since gather scales with pixels and
+deposit does not), `-device gpu -beams -beamcount 1000000 -beamradius 0.004687 -beamfreeze`, one seed,
+nothing else running:
+
+| spp | 1 | 2 | 4 | 8 | 16 |
+|---|---:|---:|---:|---:|---:|
+| wall | 10 s | 10 s | 12 s | 14 s | 20 s |
+
+Least-squares over the sweep: **`total = 8.8 s fixed + 0.70 s per spp`**, which reproduces every
+point (spp 1 → 9.5 vs 10, spp 4 → 11.6 vs 12, spp 16 → 20.0 vs 20).
+
+**At the ceiling entry's spp-16 operating point that is gather 11.2 s (56 %) against fixed 8.8 s
+(44 %).** The ceiling entry's independent decomposition — sweeping *beamcount* rather than spp —
+put the gather slice at 47 %. Two different experiments, two different swept variables, agreeing
+within a few points, which is the useful part: neither is a lone measurement any more.
+
+**And the fixed 8.8 s is not mostly deposit.** `FTRACE_BVH_TIME=1` shows **3.20 s of it is the beam
+BVH build** (3.7 M sub-beams, single-threaded, see the BVH-BUILD entry), leaving ~5.6 s for the
+photon trace, the map build, the deposit proper and every upload combined. **Deposit is not the
+expensive half of the "deposit and gather" question** — the build is.
+
+**What this prices for VOLCACHE.** A cache can only replace the gather query: ~56 % at spp 16, less
+at low spp, and it must pay its own march cost out of that. The hybrid design keeps order-1 beams, so
+the 3.2 s beam BVH build stays regardless. The honest ceiling is therefore *below* half the frame and
+falls as spp falls — while **parallelising the beam BVH build is an unconditional win that needs no
+cache at all**, and is now the better-value half of this entry.
