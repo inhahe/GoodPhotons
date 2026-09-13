@@ -2053,10 +2053,31 @@ Verified on all three cases, because a warning that fires in the wrong one is wo
 stays silent and reads "on NVIDIA GeForce RTX 4090"; `-time` + `-device cpu` stays silent, since a
 user who asked for the CPU has lost nothing and telling them otherwise would be false.
 
-**STILL OPEN — the warning is not the fix.** The real fix is one of: teach
-`runSharedPhotonMap` to gather in spp chunks against a budget (it already writes each frame as its
-gather completes, so the crash-safety half exists), or give `runRender`'s mode-M branch a device
-path. The first looks closer to the grain of the code.
+**STILL OPEN — the warning is not the fix. And the fix is NOT the obvious one.** When this entry
+was first written I proposed "teach `runSharedPhotonMap` to gather in spp chunks against a budget,
+it already writes each frame as its gather completes". **That would have been a silent quality
+regression**, and the code says so in its own words. Mode M's convergence model (`main.cpp`
+12017-12032, 12128-12131) is that the light side is *rebuilt under a fresh salt every epoch* and the
+realizations averaged, "turning the floor into a `1/sqrt(epochs)` decay" — the per-epoch MAP REFRESH
+is what makes mode M converge at all. A shared path that traces N photons once and then accumulates
+spp averages only the GATHER noise; the photon realization's own streaks and blur stay in the image
+permanently. It would be fast, and it would stop converging at a floor, which is a worse answer to
+`-time 600` than the slow CPU render it replaced.
+
+So the real fix is the harder one: the shared path must **loop epochs** — retrace and rebuild under a
+fresh salt, gather, accumulate, repeat until the budget expires — exactly as the progressive driver
+does. Then the device's throughput buys more epochs and the `1/sqrt(epochs)` decay is preserved
+rather than traded away. The per-chunk hook needed for the stop test already exists
+(`liveProg.report` returns "stop after this chunk", and is how a closed window ends a gather), but it
+is armed only under `g_showWindow` and would have to be unconditional.
+
+**A caveat on my own 20x that cuts the other way:** both arms of that measurement carried
+`-beamfreeze`, i.e. both were forbidden to refresh. That makes the throughput comparison fair, but it
+means the 20x was measured in the one configuration where the shared path's inability to refresh
+costs it nothing. An epoch-looping implementation pays a rebuild per epoch that the `-spp` arm never
+paid, so **do not expect the fixed version to be 20x** — the honest prediction is "somewhat less, by
+an unmeasured amount". Worth measuring against a reference rather than by reported `% noise`, which
+is computed from the film and so keeps falling on a frozen map even while the map error does not.
 
 **Caveat on my own numbers:** one scene, one resolution, single runs of each arm, so the 20x is a
 ratio of two unreplicated timings and should read as "more than an order of magnitude". The
