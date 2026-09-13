@@ -1620,6 +1620,42 @@ single seed called noise. Until then `-beamsplitmax` should keep its default.
 traversal saturates above ~4 M splits on this scene. Those two constants are what any future tuning
 of this knob has to trade off, and neither was written down before.
 
+### Splitting is integral-preserving BY CONSTRUCTION — so a significant difference between caps would be a BUG, not a tradeoff
+
+Before spending more renders on whether `-beamsplitmax` changes the image, the code answers half of
+it. `photonbeams.h`, on the split:
+
+> *Sub-segments share the parent's origin and power and only carry their own `[s0, s0+len]` range,
+> **so nothing has to be re-integrated**.*
+
+Splitting is a **spatial subdivision for BVH tightness**, not a resampling: a beam cut into pieces
+contributes exactly what it contributed whole, because each piece carries the parent's power and
+integrates only over its own extent.
+
+**That changes what the pending measurement means.** It was framed as a quality-versus-speed
+tradeoff — "a 15 % speed-up that costs 1 % accuracy is not a speed-up". It is not a tradeoff at all.
+If the caps genuinely differ in expectation, **splitting is wrong somewhere**, and the 15 % is
+unavailable for a quite different reason.
+
+Two mechanisms could still produce a *real* difference without contradicting the design:
+
+* **the candidate set at the kernel boundary.** Tighter boxes change which beams a query finds at
+  the margin of the gather radius. That is a real effect, but it should CONVERGE as splits increase,
+  toward the exact set. The single-seed look saw 16 M further from 8 M than 4 M was, which is the
+  wrong shape for convergence — and is exactly what noise looks like.
+* **accumulation order**, which is float-level and cannot produce 1 %.
+
+**So the measurement now has a sharper hypothesis than when it was launched.** Paired across seeds,
+the difference between caps should be consistent with zero. If it is instead several sigma and
+consistently signed — as the radiance-cache cell difference was, at 3.4 sigma — that is a defect in
+the split path worth more than the 15 %, and the speed-up should stay unshipped until it is
+explained rather than merely measured.
+
+This is the fourth time today that reading the code first changed what an experiment was for. The
+others: the photon query already rejects cross-surface leakage (killing a hypothesis before a render),
+`-max-bounce` never reaching mode M (explaining a null), and `-radcache-validate`'s fraction meaning
+the opposite of what I assumed (voiding three sweeps).
+
 ## Open issues
 
 **THIRD AUDIT, 2026-09-12.** The rows below were re-derived from measurement rather than
