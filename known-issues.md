@@ -3870,6 +3870,26 @@ where the denominator is dominated by something else is not a measurement of the
 81 %-beams figure was in `-mstats` output that had already been read, on this same scene, in the
 VOLCACHE entry.
 
+**WHAT `cap_gyroid`'s RESIDUAL WOULD TAKE, AND WHY THE DIAGNOSTIC CANNOT YET ANSWER IT.** The
+uncorrected ROI reads **-33.0 %**, i.e. 0.670 of truth, so the exact correction it needs is
+**1/0.670 = 1.49x** — equivalently a true coverage of **0.670**, a 33.0 % miss. That is now a
+specific target rather than a mystery, and it is the number any future probe change has to hit.
+
+**It cannot be compared against the 23.4 % the diagnostic reports, and the reason is worth stating
+because it is this file's most-repeated error.** `FTRACE_GADIAG` tallies **per material**, over
+every gather point on `capmarble_gyroidx` — including the cap's flat interior, where nothing is
+truncated and probes accept ~100 %. The ROI is an **edge strip** of that material. So the
+diagnostic's population is a superset that dilutes exactly the effect being measured, and
+"23.4 % measured against 33.0 % needed" would be a **numerator and denominator drawn from different
+populations** — the same mistake as `GaDiagMat::fiber`, `-beamk`'s knee and BEAMORDER-GPU, and one
+I had the arithmetic written out before catching.
+
+**What would make them comparable** is a region-restricted tally: gate the `gaDiag` counters on a
+screen-space box (the ROI is already defined in `scraps/gallery_rain.rois`) or on a world-space
+bound, so the probe statistics come from the same gather points the ROI scores. That is a small
+change to an existing diagnostic and it is the prerequisite for attacking this residual at all —
+without it, any probe-side fix would be tuned against a diluted number.
+
 **THE DIAGNOSTIC CAN NAME THINGS NOW (v0.278.3).** `FTRACE_GADIAG` printed `mat39` / `mat45` for
 exactly the materials this entry is about, because `nmOf` named a material by finding a **MeshGroup**
 that used it — which works for imported meshes and fails for isosurfaces, CSG, quads and spheres.
