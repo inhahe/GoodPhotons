@@ -1913,7 +1913,7 @@ knee's own variance is understood — shrinking the pilot on a scene where the e
 unstable would make the map size *more* random, not less. `FTRACE_JPILOT=<n>` overrides the size
 for exactly this investigation.
 
-### FURDIM — OPEN (2026-09-12, v0.278.4; **mechanism CORRECTED the same evening**): mode `M`'s fur estimate scales as **`r^-0.46`** on `gallery_rain` and gets **WORSE as the gather radius shrinks**, so more photons make fur less accurate. **The cause is NOT fur's dimensionality — two other coats show no radius dependence at all. It is that the gather ball is 2.4x the RADIUS of the body part it sits on**
+### FURDIM — ~~OPEN~~ **LARGELY DISSOLVED (2026-09-13): it is not a fur defect.** Filed 2026-09-12 (v0.278.4) as a fur normalisation error, after `gallery_rain`'s `creature` was measured getting **worse as the gather radius shrinks**. A controlled sweep on the SAME creature asset with the rain medium removed **flips the sign**, so the effect belongs to the volumetric beam gather at large `r/R`, and fur at its own adaptive radius is accurate to **0.1 %**
 
 **Measured with the photon count held FIXED and only the radius moving** (`-pmradius` with
 `-pmadaptive 0`, so the beam map, the photon map and every sample are identical between arms;
@@ -1981,6 +1981,46 @@ scenes it is 8 % of it. Once the ball engulfs the object the collected flux satu
 more fur to find — so the estimate tends to `1/r^2` while a normal gather holds steady, and
 `r^-0.46` is that saturation partway in. **That is the same family as this entry's founding
 observation** that "the gather disc is wider than her head", not a new dimensional defect.
+
+**THE CONTROLLED COMPARISON: SAME CREATURE, MEDIUM REMOVED, SIGN FLIPS (2026-09-13,
+`scraps/fur_cross3.sh`).** The refutation below carried a confound I introduced — `gallery_rain`'s
+sweep ran `-beams -beamfreeze` over a rain medium and `fur_basics` had neither. `fur_creature`
+removes it almost perfectly: `[fur]` reports **56 549 strands / 339 294 segments** on `coat_barrel`,
+digit for digit the same asset as `gallery_rain`'s `cr_coat_barrel`, and the scene declares **no
+medium at all**.
+
+| `r` | `r/R` | error vs its own 2048-spp mode-`R` reference |
+|---|---|---|
+| 0.02 | 0.20 | **+0.1 %** |
+| 0.05 | 0.50 | +1.2 % |
+| 0.10 | 1.00 | +3.0 % |
+| 0.20 | 2.00 | +9.0 % |
+| 0.40 | 4.00 | **+24.8 %** |
+
+**Monotone RISE — the same direction as `fur_basics` and the opposite of `gallery_rain`.** Three
+scenes now:
+
+| scene | medium | direction with increasing `r` |
+|---|---|---|
+| `gallery_rain` `creature` | rain + beams | **FALLS** (+60.7 % -> -37.7 %) |
+| `fur_creature` (same asset) | **none** | **RISES** (+0.1 % -> +24.8 %) |
+| `fur_basics` | none | **RISES** (+1.6 % -> +27.9 %) |
+
+**Same asset, one variable, opposite sign. The medium is what does it**, and the fur was only where
+it was visible.
+
+**And the number that dissolves this entry: at `fur_creature`'s OWN adaptive radius the error is
++0.1 %.** Its adaptive rule picks 0.009192 against an `R` of 0.100 m, i.e. `r/R` = 0.09 — the far
+left of that table. **Fur rendered normally is accurate.** The error only appears when `r/R` is
+pushed toward and past 1, which `gallery_rain` does (`r/R` = 2.40) because it is a large scene at
+low photon density, not because it contains fur.
+
+**So what is left is not a fur entry.** The rising branch on a medium-free scene is the ordinary
+finite-radius smoothing bias, expected and documented. The falling branch on `gallery_rain` is a
+**volumetric gather** interacting with radius, and belongs with the beam-gather entries rather than
+here. The one actionable fact for a user is that mode `M`'s accuracy degrades once the gather radius
+approaches the size of the objects being shaded — which is M-GATHERAREA's founding observation,
+arrived at from the opposite direction.
 
 **SECOND SCENE: THE PREDICTION IS REFUTED — THE ERROR RUNS THE OTHER WAY, SO NO `r/R` THRESHOLD
 EXISTS AND NO DIAGNOSTIC SHIPS (`scraps/fur_cross2.sh`).** The gate this entry set was whether the
