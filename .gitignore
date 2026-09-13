@@ -3,6 +3,7 @@
 /build_cuda/
 /build_cuda2/
 /build_het/
+/build_fp64/
 /build_verify/
 /build_asan/
 /build_plain/

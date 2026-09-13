@@ -2288,14 +2288,32 @@ would mean fewer beams per query and so genuinely more variance. They agree to 0
 gathering **790.5 beams**, well past the `-beamk` floor of 32. With 790 contributions per query, a
 heavy tail means individual terms can spike, not that the estimate is starved.
 
-**Remaining candidate, with its test:** the **FP32 device build**. `CMakeLists.txt:136` makes it an
-option (`FTRACE_GPU_FP32`, ON by default) and `render_cuda.cu:183` notes `-DFTRACE_GPU_FP32=OFF`
-builds the exact-FP64 path. Single precision would not merely bias an otherwise-fine estimate, but it
-*would* amplify a near-degenerate denominator into a spike, which is the shape of the evidence.
-**The decisive test is to configure a separate build directory with `-DFTRACE_GPU_FP32=OFF`** — a
-separate directory so the working binary is untouched — and re-run the beams-on arms. If the tail
-collapses to CPU parity, the mechanism is precision; if it does not, it is the beam traversal
-arithmetic itself and the next step is reading that kernel.
+**FP32 ELIMINATED — the test was run and precision is not the mechanism.** Configured a separate
+`build_fp64/` with `-DFTRACE_GPU_FP32=OFF` (separate so the working binary was never touched) and
+re-ran the beams-on arms:
+
+| arm | median | p90 | p99 | max/level |
+|---|---:|---:|---:|---:|
+| GPU FP32 (shipped) | 0.2245 | 1.3975 | 4.685 | 23.9 |
+| GPU **FP64** (test build) | 0.2252 | 1.3906 | **4.529** | 17.1 |
+| CPU (reference) | 0.1668 | 0.7345 | **1.577** | 5.0 |
+
+Exact double precision tracks single to within noise at every quantile — median 0.2252 against
+0.2245, p90 1.391 against 1.398 — and still sits at **2.9x the CPU's p99**. The `max/level` did fall
+(17.1 from 23.9) but that is one pixel and not a basis for a claim. Precision was the most plausible
+of the three candidates on the grounds that it can amplify a near-degenerate denominator; it does
+not.
+
+**So all three initial candidates are eliminated by measurement** — kernel radius (agrees to 0.06 %),
+beam set and split (agrees to 0.14 %), precision (FP64 changes nothing) — and the conclusion is the
+one left standing: **the device beam gather computes a different estimator than the host's, not the
+same one less accurately.** Both are unbiased in the mean (radiance agrees to 1.62 %), so this is a
+variance difference between two genuinely different formulas or sampling schemes.
+
+**Next step is now unambiguous and is code reading, not more measurement:** compare the device beam
+gather's per-beam contribution against the host's in `photonbeams.h` term by term. The host gathers
+790 beams per probe and produces a tail 3x thinner from the same geometry, so the difference is in
+what each contribution *is*, not in how many there are.
 
 **The rig is reusable:** `scraps/tail.py <prefix> <label>` scores any pair of two-seed PFM arms by
 percentile. Render with `-hdr`, matched `-spp`, seeds 1 and 2, named `png/<prefix>_<dev>_<seed>.png`.
