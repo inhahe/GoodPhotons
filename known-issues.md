@@ -1913,6 +1913,48 @@ knee's own variance is understood — shrinking the pilot on a scene where the e
 unstable would make the map size *more* random, not less. `FTRACE_JPILOT=<n>` overrides the size
 for exactly this investigation.
 
+### FURDIM — OPEN (2026-09-12, v0.278.4): mode `M`'s density estimate divides by `pi r^2` — a **surface** normalisation — but fur is not a surface, so the fur estimate scales as **`r^-0.46`** and gets **WORSE as the gather radius shrinks**. More photons make fur less accurate, which is the opposite of what anyone would expect
+
+**Measured with the photon count held FIXED and only the radius moving** (`-pmradius` with
+`-pmadaptive 0`, so the beam map, the photon map and every sample are identical between arms;
+`gallery_rain`, 320x180, `-spp 64`, 4 seeds, `scraps/ga_rfix.sh`):
+
+| ROI | `r = 0.3846` | `r = 0.2412` | ratio | expected |
+|---|---|---|---|---|
+| **`creature`** (fur) | +9.5 % | **+35.5 %** | **1.237** | 1/r = 1.59 if a pure line |
+| `alice_hair` (mesh) | -10.0 % | -16.8 % | 0.924 | 1.00 |
+| `alice_dress` | -5.1 % | -5.7 % | 0.994 | 1.00 |
+| `cap_gyroid` | -7.5 % | -5.4 % | 1.022 | 1.00 |
+| **`grid_ground`** (control) | -2.6 % | -2.5 % | **1.002** | **1.00** |
+
+**The control is what makes this a measurement rather than an anecdote.** `grid_ground` is a
+genuine surface and its estimate is radius-independent to **0.2 %** — so the rig isolates radius
+correctly, and the fur's 1.237 is not an artefact of changing `r`.
+
+**The mechanism is dimensional.** The estimate is `Sum(Phi) / (pi r^2 N)` because `pi r^2` is the
+area a *surface* presents to a disc of radius `r`. Photons near a 0.64 mm strand do not scale as
+`r^2`; along a line they scale as `r`. Dividing a population that grows like `r` by an area that
+grows like `r^2` leaves `1/r`, so the estimate **diverges as the radius shrinks**. The measured
+exponent is **`r^-0.46`**, i.e. an effective dimension of **~1.54** — between a line (1) and a
+surface (2), which is exactly what a coat of strands is: locally 1D at the fibre, 2D at the
+envelope.
+
+**Consequences.**
+* **Raising `-n` makes fur worse.** The adaptive radius shrinks as photon density rises, so the
+  user action that improves every other part of the image degrades this one. The 4x-photon run saw
+  `creature` go +9.5 % -> +41.0 %; this radius-only run reproduces +35.5 % of that, so the radius
+  is the dominant cause and the beam map contributes the rest.
+* **The fiber gate cannot fix it and was never meant to.** v0.277.0's gate switches the *coverage
+  correction* off on strands, which is right — the residual is the **normalisation**, one level
+  below. M-GATHERAREA's remaining `creature` +7.2 against the anchor is this, not that.
+* **Any fix has to change the estimator on curve geometry**, e.g. normalise by a cylinder's
+  cross-section (`2 r L`) rather than a disc's area where `Hit::fiberRadius > 0`. That is a real
+  change to the density estimate and wants its own measurement campaign; the point of this entry is
+  that the *diagnosis* is now settled.
+
+**Not a regression** — it has been true since mode `M` gained fur, and it is only visible now
+because the footprint work made everything else on that ROI accurate enough to see past.
+
 ### BEAMORDER-GPU — ~~OPEN~~ **DONE (v0.278.1, 2026-09-12)** (found while starting VOLCACHE's `_fog_thick` check): `PhotonBeam::order` is **never set on the device**, so VOLCACHE's own order histogram is silently empty under `-device gpu` — and the report counts the untracked chords in its DENOMINATOR
 
 Same scene, same binary, same everything but the backend:
