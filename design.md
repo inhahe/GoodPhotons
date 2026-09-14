@@ -3423,8 +3423,21 @@ as the one at fault.
   via `volCacheSplit` in `beamgather.h`, so the SAH split, the CIE table, the boxes and the BVH are
   all built over the order-1 remainder only. Measured 64 % faster and energy-correct to 0.2 % on
   thick isotropic media; the erase, not the query-side skip, is where the whole gain is.
-  **A scalar fluence assumes an isotropic phase function**, so `build()` refuses `g != 0` and
-  heterogeneous media rather than silently averaging. See known-issues, VOLCACHE, for the scope
+  Since 0.301.0 it also serves **anisotropic** media: in-scattering is a convolution of the
+  directional radiance with the phase, which is diagonal in spherical harmonics, so directional
+  bins were built (`FTRACE_VOLCACHE_SH=1`, Legendre moment `g^l` per band). **Measured not to
+  help** -- the cached component is order >= 2, which diffusion has already made nearly isotropic
+  -- so the default stays the scalar `l = 0` reconstruction, which is as accurate and 9x smaller.
+  Since 0.302.0 it serves **heterogeneous** media too (optical depth is integrated along the
+  chord rather than assumed) and keeps **one grid per medium**, so a scene can be partially
+  cached -- `gallery_rain` caches its HG cloud while its `phase rainbow` rain stays as beams.
+  Since 0.303.0 it also serves **rainbow** phases, by a different formulation: a bow's colour is a
+  function of scattering angle, so the CIE lives in the KERNEL (per-channel Legendre moments of
+  `Scene::BowLut`, by quadrature) and the stored coefficients are scalar. Restricted to the
+  gather-time-fold (`achro == 2`) beams of one emitter; everything else stays a real beam.
+  The split is **host-only** and refuses to run when the device will gather, because the march
+  has no device twin; and the march is clipped to each grid's box, not to the camera ray, since
+  a ray that hits nothing is handed `tMax = 1e30`. See known-issues, VOLCACHE, for the scope
   limits and for the cache-ownership bug that made its first measurement meaningless.
 
 - **`surfmerge.h`** (0.258.0) — the **surface photon map mode `J` merges against**, i.e. the

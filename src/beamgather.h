@@ -201,23 +201,22 @@ struct TrRay {
 // medium. `volCacheUsable` checks both and the cache stays off otherwise, so a scene it cannot
 // serve renders normally rather than wrongly.
 namespace vcstate {
-inline VolCache&      cache()    { static VolCache c;                 return c; }
-inline std::mutex&    mtx()      { static std::mutex m;               return m; }
-// What the live cache was built from. Keyed on the map POINTER **and** its contents, because a
+inline std::vector<VolCache>& caches() { static std::vector<VolCache> v; return v; }
+inline std::mutex&            mtx()    { static std::mutex m;            return m; }
+// What the live caches were built from. Keyed on the map POINTER **and** its contents, because a
 // pointer alone is not a key here: mode M rebuilds the light side into the SAME BeamMap object
 // every epoch, so a pointer-only guard serves epoch 0's cache forever while the beams under it
 // change. The v0.299.0 prototype had exactly that bug; it never showed because every measurement
 // was a single-epoch plain render, which is precisely the regime where the bug is invisible.
 struct Key { const BeamMap* p = nullptr; size_t n = 0; long long emitted = -1;
-             // Set when the DEPOSIT SPLIT built this cache. The split owns the cache outright
-             // and the content key CANNOT arbitrate afterwards: the split runs before
+             // Set when the DEPOSIT SPLIT built these caches. The split owns them outright and
+             // the content key CANNOT arbitrate afterwards: the split runs before
              // BeamMap::build, which then splits the surviving chords into sub-beams, so
-             // `beams.size()` changes underneath the key (28 786 chords -> 556 033 sub-beams on
-             // the measured scene). A content-keyed guard therefore sees a "different" map at
-             // gather time and rebuilds from the order-1 remainder -- producing an EMPTY cache
-             // and silently discarding the order >= 2 energy the split had just routed into it.
-             // That is not hypothetical: it is what v0.300.0's first build did, and it read as a
-             // 62 % speedup because the march was contributing nothing at all.
+             // `beams.size()` changes underneath the key. A content-keyed guard therefore sees a
+             // "different" map at gather time and rebuilds from the order-1 remainder --
+             // producing EMPTY caches and silently discarding the energy the split just routed
+             // into them. That is what v0.300.0's first build did, and it read as a 62 %
+             // speedup because the march was contributing nothing at all.
              bool fromSplit = false; };
 inline Key& builtFor() { static Key k; return k; }
 inline Key keyOf(const BeamMap& bm) { return Key{&bm, bm.beams.size(), (long long)bm.nEmitted}; }
@@ -226,72 +225,145 @@ inline bool same(const Key& a, const Key& b) {
 }
 }  // namespace vcstate
 
-// The media gate, in ONE place so the query path and the split path cannot come to different
-// conclusions about which scenes this cache may serve. A scalar fluence is only exact for an
-// isotropic phase function (see volcache.h), and the attenuation term assumes homogeneity.
-inline bool volCacheMediaOk(const Scene& sc, double& sigmaT) {
-    bool ok = !sc.media.empty();
-    sigmaT = 0.0;
-    for (const auto& m : sc.media) {
-        if (!m.enabled) continue;
-        if (m.g != 0.0 || m.heterogeneous()) { ok = false; break; }
-        sigmaT = m.sigma_a(550.0) + m.sigma_s(550.0);   // extinction = a + s
+// LEGENDRE MOMENTS OF THE BOW KERNEL, by quadrature over `Scene::BowLut`.
+//
+// The LUT already tabulates what is needed: `cie[i] * phaseLum[i]` is `Bow(cos)`, the full
+// spectral integral `integral spd(l) CIE(l) p(cos, l) dl` as a CIE triple, over 8192 bins uniform
+// in cos. So the moments are a trapezoid sum over a table the renderer already built -- no new
+// tabulation, and no sampling of the Airy formula.
+//
+// SELF-CHECK WORTH KNOWING: the l = 0 moment of a NORMALISED phase is 1, so `kMom[0]` here must
+// come out as the emitter's SPD-weighted mean CIE -- the same triple the achromatic fold stores
+// as `cieA`. If it does not, the quadrature or the LUT convention is wrong.
+inline void volBowMoments(const Scene::BowLut& lut, Vec3* mom3) {
+    const int N = Scene::BowLut::kBins;
+    Vec3 m0{0, 0, 0}, m1{0, 0, 0}, m2{0, 0, 0};
+    const double dt = 2.0 / (double)(N - 1);
+    for (int i = 0; i < N; ++i) {
+        const double t = -1.0 + 2.0 * (double)i / (double)(N - 1);
+        const Vec3 B = lut.cie[i] * (double)lut.phaseLum[i];
+        const double w = (i == 0 || i == N - 1) ? 0.5 : 1.0;    // trapezoid endpoints
+        m0 = m0 + B * (w * dt);
+        m1 = m1 + B * (w * dt * t);
+        m2 = m2 + B * (w * dt * 0.5 * (3.0 * t * t - 1.0));
     }
-    return ok;
+    const double twoPi = 6.283185307179586;
+    mom3[0] = m0 * twoPi; mom3[1] = m1 * twoPi; mom3[2] = m2 * twoPi;
 }
 
-inline VolCache& volCacheFor(const Scene& sc, const BeamMap& bm) {
+// The gate is now PER MEDIUM, which is what lets a scene be partially cached. Anisotropy and
+// heterogeneity are both served (see volcache.h); a RAINBOW phase is not, because it is a
+// wavelength-dependent Airy table whose Legendre moments are neither g^l nor achromatic.
+inline bool volCacheMedOk(const Scene& sc, size_t mi, double& gOut) {
+    if (mi >= sc.media.size()) return false;
+    const Medium& m = sc.media[mi];
+    if (!m.enabled || m.rainbow()) return false;
+    gOut = m.g;
+    return true;
+}
+
+// Build one grid per cacheable medium. `sigmaAt` sums EVERY enabled medium's extinction, not
+// just this one's, because the transmittance a chord accrues is the transmittance of everything
+// it passes through -- which is exactly what the gather's marched transmittance measures.
+inline void volCacheBuildAll(const Scene& sc, const BeamMap& bm) {
+    const PatTables tabs = sc.patTables();
+    auto sigmaAt = [&sc, &tabs](const Vec3& p) {
+        double t = 0.0;
+        for (const Medium& m : sc.media) {
+            if (!m.enabled) continue;
+            t += (m.sigma_a(550.0) + m.sigma_s(550.0)) * m.densityAt(p, &tabs);
+        }
+        return t;
+    };
+    std::vector<VolCache>& cs = vcstate::caches();
+    cs.assign(sc.media.size(), VolCache{});
+    for (size_t mi = 0; mi < sc.media.size(); ++mi) {
+        const Medium& m = sc.media[mi];
+        if (!m.enabled) continue;
+        if (m.rainbow()) {
+            // Pick the emitter whose gather-time-fold beams this medium actually carries. One
+            // bow LUT is per (emitter, medium), so a medium lit by two emitters would need two
+            // grids; the eligibility predicate leaves the others as real beams rather than
+            // serving them the wrong kernel.
+            int em = -1;
+            for (size_t i = 0; i < bm.beams.size(); ++i) {
+                const PhotonBeam& pb = bm.beams[i];
+                if (pb.med == (int)mi && pb.achro == 2 && pb.emIdx >= 0 &&
+                    pb.order != kBeamOrderUnknown && (int)pb.order >= 2) { em = pb.emIdx; break; }
+            }
+            const Scene::BowLut* lut = (em >= 0) ? sc.bowLut(em, (int)mi) : nullptr;
+            if (!lut || !lut->valid()) continue;      // no fold to cache: keep every beam
+            Vec3 mom[3];
+            volBowMoments(*lut, mom);
+            if (std::getenv("FTRACE_VOLCACHE_DIAG")) {
+                // The l = 0 moment of a normalised phase is 1, so mom[0] must reproduce the
+                // emitter's SPD-weighted mean CIE -- which is exactly what an achromatic-fold
+                // beam already carries in cieA. Printing both turns the derivation into a test.
+                Vec3 ref{0, 0, 0};
+                for (size_t i = 0; i < bm.beams.size(); ++i) {
+                    const PhotonBeam& pb = bm.beams[i];
+                    if (pb.med == (int)mi && pb.achro == 2 && (int)pb.emIdx == em) {
+                        ref = Vec3(pb.cieA[0], pb.cieA[1], pb.cieA[2]); break;
+                    }
+                }
+                std::fprintf(stderr,
+                    "[vcdiag] bow med %d em %d: kMom0 (%.5g %.5g %.5g) vs beam cieA "
+"(%.5g %.5g %.5g)  ratioY %.4f\n",
+                    (int)mi, em, mom[0].x, mom[0].y, mom[0].z, ref.x, ref.y, ref.z,
+                    ref.y != 0.0 ? mom[0].y / ref.y : 0.0);
+            }
+            cs[mi].build(bm, volCacheRes(), 2, true, sigmaAt, 0.0, (int)mi, mom, em);
+        } else {
+            cs[mi].build(bm, volCacheRes(), 2, true, sigmaAt, m.g, (int)mi);
+        }
+    }
+}
+
+inline const std::vector<VolCache>& volCacheAll(const Scene& sc, const BeamMap& bm) {
     std::lock_guard<std::mutex> lk(vcstate::mtx());
     const vcstate::Key k = vcstate::keyOf(bm);
     // The split is authoritative when it ran: never second-guess it from the map's contents,
-    // because after BeamMap::build those contents no longer describe what the cache holds.
+    // because after BeamMap::build those contents no longer describe what the caches hold.
     if (!vcstate::builtFor().fromSplit && !vcstate::same(vcstate::builtFor(), k)) {
-        double sigmaT = 0.0;
-        const bool ok = volCacheMediaOk(sc, sigmaT);
-        vcstate::cache().build(bm, volCacheRes(), 2, ok, sigmaT);
+        volCacheBuildAll(sc, bm);
         vcstate::builtFor() = k;
     }
-    return vcstate::cache();
+    return vcstate::caches();
 }
 
-// THE DEPOSIT SPLIT. Build the cache from the raw chords, then ERASE the ones it now carries.
+// THE DEPOSIT SPLIT. Build the caches from the raw chords, then ERASE the ones they now carry.
 //
 // Must run BEFORE BeamMap::build, and that ordering is the whole feature: everything expensive
 // about a beam -- the SAH split, the CIE fold, the inflated box, the BVH node it occupies and the
 // traversal that later walks it -- happens in or after that call. A chord removed here costs
 // nothing anywhere downstream, whereas the v0.299.0 query-side skip removed only the last of
-// those. Returns the number of chords routed into the cache (0 if the split did not run).
-//
-// `-beams-minorder 2` is NOT the cost floor for this path, and the first version of this comment
-// claimed it was. The two filter at different points in the pipeline and that changes the
-// POPULATION, not just the timing: `-beams-minorder` drops at `push`, so the `-beamcount` budget
-// and the per-thread bank self-halving are spent entirely on order-1 chords, while the split runs
-// after the budget has already been apportioned across all orders and keeps only order-1's share.
-// Measured on this scene at `-beamcount 100000`: the split leaves 28 786 chords, `-beams-minorder
-// 2` leaves 99 909 -- 3.5x more -- so it renders a cleaner order-1 estimate more slowly and is a
-// different experiment, not a bound on this one. The honest control is the baseline, which holds
-// the order-1 population fixed by construction.
+// those. Only chords whose OWN medium got a ready grid are erased, so a partially-cacheable
+// scene keeps the rest as real beams. Returns the number of chords routed into the caches.
 inline size_t volCacheSplit(const Scene& sc, BeamMap& bm) {
     if (volCacheRes() <= 0 || !volCacheSplitEnabled()) return 0;
+    // Never erase beams the consuming gather cannot replace (see volCacheHostGather).
+    if (!volCacheHostGather()) return 0;
     std::lock_guard<std::mutex> lk(vcstate::mtx());
-    double sigmaT = 0.0;
-    const bool ok = volCacheMediaOk(sc, sigmaT);
-    VolCache& c = vcstate::cache();
-    c.build(bm, volCacheRes(), 2, ok, sigmaT);
+    volCacheBuildAll(sc, bm);
     vcstate::builtFor() = vcstate::keyOf(bm);
-    if (!c.ready) return 0;   // gate refused: leave fromSplit false so the query path still works     // gate refused (anisotropic / heterogeneous): keep every chord
+    const std::vector<VolCache>& cs = vcstate::caches();
+    bool anyReady = false;
+    for (const VolCache& c : cs) if (c.ready) anyReady = true;
+    if (!anyReady) return 0;              // every medium refused: keep every chord
     const size_t before = bm.beams.size();
     size_t w = 0;
     for (size_t i = 0; i < before; ++i) {
         const PhotonBeam& b = bm.beams[i];
-        // The cache took exactly the chords VolCache::build splatted: known order, >= 2.
-        if (b.order != kBeamOrderUnknown && (int)b.order >= 2) continue;
+        // Ask the cache itself whether it took this beam. Re-deriving the condition here is how
+        // a beam gets erased that was never splatted, which deletes its energy outright.
+        const bool cached = b.med >= 0 && (size_t)b.med < cs.size() && cs[b.med].ready &&
+                            cs[b.med].eligible(b);
+        if (cached) continue;
         bm.beams[w++] = bm.beams[i];
     }
     bm.beams.resize(w);
-    // The key must be re-taken AFTER the erase, or the gather's content-keyed guard sees a
-    // different beam count and rebuilds the cache from the remainder -- which is the order < 2
-    // set, i.e. it would quietly replace the cache with an empty one.
+    // Re-taken AFTER the erase, then claimed, or the gather's content key rebuilds from the
+    // remainder and replaces the caches with empty ones.
     vcstate::builtFor() = vcstate::keyOf(bm);
     vcstate::builtFor().fromSplit = true;
     return before - w;
@@ -315,25 +387,35 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
     // VOLCACHE: replace the order >= 2 beam queries with a march of the cached fluence.
     // `phase` is the ISOTROPIC 1/(4 pi) -- see volcache.h for why a scalar cache admits no
     // other, and why the build refuses anisotropic media rather than pretending.
-    const bool vcLive = volCacheRes() > 0 && volCacheFor(scene, bm).ready;
-    if (vcLive) {
-        const VolCache& vc = volCacheFor(scene, bm);
+    const std::vector<VolCache>& vcs = volCacheAll(scene, bm);
+    bool vcAny = false;
+    for (const VolCache& c : vcs) if (c.ready) vcAny = true;
+    if (volCacheRes() > 0 && vcAny) {
         const PatTables vcTabs = scene.patTables();
         const int steps = 64;
-        const double dt = tMax / (double)steps;
-        const double invFourPi = 1.0 / (4.0 * 3.14159265358979323846);
-        for (int i = 0; i < steps; ++i) {
-            const double t = dt * (i + 0.5);
-            const Vec3 p = oc + dc * t;
-            Vec3 fl;
-            if (!vc.lookup(p, fl)) continue;
-            for (size_t mi = 0; mi < scene.media.size(); ++mi) {
-                const auto& md = scene.media[mi];
-                if (!md.enabled) continue;
+        // The direction the scattered light travels TOWARD THE CAMERA. The gather's phase
+        // argument is dot(b.d, -dc) (see the note at the phaseValue call), so -dc is where the
+        // SH convolution must be evaluated. Getting this sign wrong would mirror the phase lobe
+        // -- forward scattering reading as backward -- and on an isotropic medium it would be
+        // invisible, because l = 0 has no direction to mirror.
+        const Vec3 wOut = dc * -1.0;
+        for (size_t mi = 0; mi < vcs.size(); ++mi) {
+            const VolCache& vc = vcs[mi];
+            if (!vc.ready) continue;
+            const Medium& md = scene.media[mi];
+            // Bounded by the GRID, not by the ray: see VolCache::raySpan.
+            double tA = 0.0, tB = 0.0;
+            if (!vc.raySpan(oc, dc, 0.0, tMax, tA, tB)) continue;
+            const double dt = (tB - tA) / (double)steps;
+            for (int i = 0; i < steps; ++i) {
+                const double t = tA + dt * (i + 0.5);
+                const Vec3 p = oc + dc * t;
+                Vec3 fl;
+                if (!vc.inScatter(p, wOut, fl)) continue;
                 const double ss = md.sigma_s(550.0) * md.densityAt(p, &vcTabs);
                 if (!(ss > 0.0)) continue;
                 const double T = mats.mediaTransmittance(scene, oc, dc, t, 550.0, rng);
-                acc += fl * (ss * invFourPi * T * dt);
+                acc += fl * (ss * T * dt);   // phase already folded in by inScatter
             }
         }
     }
@@ -366,7 +448,10 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
     const PatTables tabs = scene.patTables();
     bm.gather(oc, dc, tMax, [&](const BeamHit& bh) {
         const PhotonBeam& b = bm.beams[bh.idx];
-        if (vcLive && b.order >= 2 && b.order != kBeamOrderUnknown) return;  // in the cache
+        // Skip only if THIS beam's own medium has a ready grid -- a partially-cached scene
+        // still gathers the uncached media's beams normally.
+        if (vcAny && b.med >= 0 && (size_t)b.med < vcs.size() && vcs[b.med].ready &&
+            vcs[b.med].eligible(b)) return;
         beamDiag().bump(beamDiag().pass);
         if (beamDiag().on && b.order >= 2 && b.order != kBeamOrderUnknown)
             beamDiag().passMS.fetch_add(1, std::memory_order_relaxed);

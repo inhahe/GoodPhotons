@@ -1515,6 +1515,135 @@ order-1 estimate more slowly. That is why the measured 64 % *exceeds* the old "c
 was never a bound, it was a different experiment. The honest control is the plain baseline, which
 holds the order-1 population fixed by construction.
 
+**ANISOTROPIC MEDIA NOW ACCEPTED (v0.301.0) — and the directional bins that were supposed to be
+needed turned out not to be.** The cache previously refused any `g != 0` medium, on the correct
+reasoning that a scalar fluence has averaged the incoming directions away and so admits only the
+isotropic phase average. The proposed fix was spherical-harmonic directional bins per cell. It was
+built: in-scattering is a convolution of the directional radiance with a rotationally-symmetric
+phase, convolution is diagonal in SH (Funk-Hecke), and Henyey-Greenstein's l-th Legendre moment is
+exactly `g^l`, so `L_s(w) = sigma_s * sum_lm g^l c_lm Y_lm(w)` is the anisotropic phase to the
+truncation order -- not a fit to it. At `g = 0` it reduces to the scalar cache exactly, which is a
+free regression test and it passes (1.0026 against the scalar path's 1.0022).
+
+**Measured against the uncached render on `_beams_ms` at 96^2, per-pixel median error:**
+
+| medium | SH order 2 (nSH = 9) | l = 0 only (nSH = 1) |
+|---|---:|---:|
+| `g = 0.5` | 3.03 % | **1.88 %** |
+| `g = 0.85` | 2.31 % | **2.13 %** |
+
+**The scalar reconstruction is as good or better at both, including a strongly forward medium.**
+The reason is structural and should have been predicted: this cache only ever holds the
+**order >= 2** component, and by the second scattering event diffusion has made the radiance field
+nearly isotropic. The anisotropy is spent in the FIRST scattering, which stays a real beam and is
+never cached. So the `l >= 1` bands carry little signal and a full share of estimator noise, and
+clamping their ringing to non-negative biases the result bright (+0.8 % against the scalar path's
+-1.0 % -- opposite signs, same magnitude).
+
+**So the real fix was to stop refusing anisotropic media, not to add directions to the cache.** With
+the gate opened and the scalar reconstruction retained, `g = 0.5` measures **mean ratio 0.9906,
+median 2.56 %, p90 9.35 %**, and is **64 % faster** (paired, warm-up discarded: 0.355, 0.362, 0.410)
+-- the same speedup isotropic media already got. The SH path is kept behind `FTRACE_VOLCACHE_SH=1`
+because it is correct and would matter for a cache that held order 1, where the anisotropy is real;
+it costs 9x the memory and is off by default.
+
+**The gate also got stricter in one place while loosening in another.** It now refuses media that
+DISAGREE on `sigma_t` or `g`: one grid carries one pair of both, and the previous version silently
+took the LAST enabled medium's `sigma_t` and applied it to every beam -- an error that reads as a
+soft bias rather than as a failure.
+
+**HETEROGENEOUS MEDIA AND PER-MEDIUM GRIDS (v0.302.0), plus TWO REAL BUGS THE WORK EXPOSED.**
+Two gates are gone. Optical depth is now INTEGRATED along the chord the splat is already walking
+(midpoint rule, one extinction evaluation per step, with the prefix `[0, s0]` marched but not
+splatted so a sub-beam attenuates from its PARENT origin) instead of assuming `exp(-sigma_t s)`.
+And there is now ONE GRID PER MEDIUM, so a scene can be PARTIALLY cached: `gallery_rain` caches
+its HG cloud while its `phase rainbow` curtain stays as real beams -- which a single shared grid
+could not express at all, and which also retires the "media must agree on sigma_t and g" gate.
+
+**BUG 1, latent since v0.300.0: the deposit split ran on the DEVICE, where nothing marches it.**
+`volCacheSplit` is called from `buildBeamMap`, which is host code that runs whatever backend will
+gather; the march lives in `beamgather.h` and has **no device twin** (zero volcache symbols in
+`render_cuda.cu`). So `FTRACE_VOLCACHE_SPLIT=1 -device gpu` erased the order >= 2 chords and
+nothing ever added them back. Measured on `gallery_rain`: the cloud lost **72 %** of its energy.
+Every earlier validation was `-device cpu`, which is exactly why it survived. Guarded now by
+`volCacheHostGather()`, cleared in the CUDA branches.
+
+**BUG 2, latent since v0.299.0: the march missed the medium entirely on any ray that escaped.**
+`photonmap_render.h` hands the gather `dSeg = h.valid ? h.t : 1e30` -- a ray that hits nothing
+gets `tMax = 1e30`. The march divided *that* into 64 steps, so every sample sat ~1e28 away and
+the cache contributed **nothing** to any pixel seeing sky. That is most of a cloud silhouette.
+It stayed invisible through every earlier test because those scenes are **closed boxes where
+every ray hits a wall**. The march is now clipped to each grid's own box (`VolCache::raySpan`),
+which is both correct and strictly better sampling -- the 64 steps land where the medium is.
+
+Effect of fixing them, `gallery_rain` on the CPU, cloud cached and rain kept as beams:
+
+| | before | after |
+|---|---:|---:|
+| cloud crop vs uncached | 0.2762 | **1.0679** |
+| whole ROI vs uncached | 0.9270 | **1.0088** |
+
+and `_bms96` regression holds at 1.0019 (was 1.0026).
+
+**But it does NOT make `gallery_rain` faster, and that is the honest bottom line.** Paired, warm-up
+discarded: **0.980, 0.982** -- a 2 % gain, against **64 %** on a fully-cacheable single-medium
+scene. The reason is structural: only **22.7 %** of chords are cacheable here, because the rain
+(141 k chords against the cloud's 118 k) carries a `phase rainbow` and is refused, and the march
+costs about what the removed traversal saved. **Caching helps in proportion to the share of the
+medium it is allowed to take**, and on this scene that share is small. Making it pay would need
+the rainbow phase cacheable -- its Legendre moments by quadrature per CIE channel -- which is the
+next real piece of work and is not done.
+
+**RAINBOW PHASES NOW CACHEABLE (v0.303.0) — by Legendre moments of the bow kernel, per CIE
+channel.** The last refusal is gone, and it needed a different formulation rather than a bigger
+one. A Henyey-Greenstein medium has a scalar phase, so a beam's CIE triple is a constant that can
+be folded into the coefficients and the kernel is the single number `g^l`. **A rainbow's colour is
+a function of the SCATTERING ANGLE**, so the CIE has to live in the KERNEL and the coefficients
+must stay scalar:
+
+    L_s[c](w) = sum_lm  C_l[c] * a_lm * Y_lm(w),    C_l[c] = 2 pi integral Bow_c(t) P_l(t) dt
+
+That is the structural reason a CIE-weighted cache could never hold a bow, and why this is not the
+same fix as the anisotropy one.
+
+**The moments cost no new tabulation.** `Scene::BowLut` already stores `cie[i] * phaseLum[i]` =
+`Bow(cos)`, the full spectral integral `integral spd(l) CIE(l) p(cos, l) dl`, over 8192 bins
+uniform in cos. The moments are a trapezoid sum over that table.
+
+**The derivation was turned into a test, and it passes exactly.** The l = 0 moment of a normalised
+phase is 1, so `C_0` must reproduce the emitter's SPD-weighted mean CIE -- the very triple an
+achromatic-fold beam already carries as `cieA`. Measured on `gallery_rain`:
+
+    kMom0 (0.24790 0.25539 0.25771)  vs  beam cieA (0.24790 0.25539 0.25771)   ratioY 1.0000
+
+**Scope: only the gather-time-fold beams (`achro == 2`) of one emitter.** Their spectral integral
+is exactly what the LUT tabulates and is decidable only once the scattering angle is known --
+which is what the convolution supplies. A monochromatic or bundled beam carries its own lambda and
+would need its own kernel, so it stays a real beam. One bow LUT is per (emitter, medium), so a
+medium lit by two emitters caches one of them and leaves the rest as beams. **Bow mode always uses
+full SH order**: a bow is a sharp angular feature whose kernel keeps weight well past band 2, so
+unlike the HG case the directional bins are not optional.
+
+**Result on `gallery_rain` (CPU, both media now cached -- HG cloud and bow rain):**
+
+| | value |
+|---|---:|
+| chords routed to grids | **38.3 %** (was 22.7 % with the cloud alone) |
+| ROI mean ratio vs uncached | **1.0081** (median \|d\| 0.00 %, p90 1.66 %) |
+| cloud crop | 1.0659 |
+| bow / rain crop | 1.0446 |
+| speedup, paired, warm-up discarded | **0.942, 0.957, 0.984** |
+
+HG regressions hold: `_bms96` 1.0019 (unchanged), `_bms_aniso` 0.9894 (was 0.9906).
+
+**So it is correct, and it is still only ~4-5 % faster here.** Doubling the cacheable share from
+22.7 % to 38.3 % roughly doubled the gain, from ~2 % to ~4-5 %, which is the consistent story: the
+cache pays in proportion to the share it is allowed to take, and on this scene order-1 chords --
+which are never cacheable, because the anisotropy and the bow both live in the first scattering --
+still dominate the map. The march also now walks TWO grids per ray at 64 steps each. Against the
+**64 %** on a single-medium scene where everything is cacheable, `gallery_rain` is simply not a
+volume-dominated render: its cost is spread across a large surface scene.
+
 **Still open before this could ship as a real feature.** The `res` is fixed by hand and the error
 stops improving past ~48 (finer cells have less bias but fewer samples each). There is no confidence
 gate, no validation path and no adaptive resolution. Anisotropic media need directional bins
@@ -3447,6 +3576,52 @@ and was really the epoch loop degenerating into one epoch per progress callback.
 instrumenting `epochSec` after the 6x slowdown looked disproportionate to the policy it claimed to
 implement. **A variance improvement bought by an unexplained slowdown is a bug until the cost is
 accounted for.**
+
+### FIXED (2026-09-14, v0.304.0): `-checkpoint` in modes J and M — one mode already had it undocumented, one was excluded for a reason that stopped being true, and a resume re-used its own light-side realizations
+
+**Asked as** *"for general use and consistency, shouldn't mode J and M and whatever other new
+modes support -checkpoint?"* Three separate things turned out to be wrong, and only one of them
+was the missing feature.
+
+**1. Mode J already supported it, and the help text said otherwise.** `-h` read *"modes A/B/C,
+R/D, P"*. Mode J writes and reloads a sidecar correctly -- verified end to end, 2 spp -> resume ->
+4 spp. Another instance of the pattern this file's STALE-LIMITATION AUDIT is about: the capability
+shipped and the documentation did not follow.
+
+**2. Mode M's exclusion rested on a claim that the light-side refresh had already retired.** The
+stated reason was *"a photon map is persistent state a film-only sidecar cannot rebuild"*. True of
+the map, irrelevant to the estimator: since v0.247.0 mode M **redraws the light side every epoch
+and averages the realizations**, so a resume never needs the old map -- it needs the accumulated
+film and one more epoch, which is exactly what mode J does. The single-camera progressive driver
+already called the same `runSppProgressive` helper as mode J; it simply omitted the four trailing
+checkpoint arguments. Enabling it was passing them.
+
+**3. THE PART THAT WOULD HAVE MADE IT A USELESS FEATURE. `RngSaltScope(epoch)` restarts at 0, and
+epoch 0 is the identity.** A resumed render therefore drew *the identical sequence of light-side
+realizations it already held*, so the added samples re-added the same light-side noise instead of
+averaging it down. This file already recorded the symptom for mode J -- "extra spp decorrelate the
+CONNECTION half only" -- without connecting it to the salt. **It matters far more in mode M**,
+where the measurements taken earlier the same day put the per-realization MAP noise at 0.0778
+against a camera noise of 0.0077, about **100x in variance**: a resume that reuses maps improves
+essentially nothing. Fixed by offsetting the salt with the resumed sample base
+(`buildLightSide(epoch, prog->sampleBase)`), which is the identity on a fresh run -- `sampleBase`
+is 0 there -- so unresumed renders are bit-for-bit unchanged. Applied to **both** J and M.
+
+**Verified:** mode M progressive, `-time 12 -checkpoint` -> `holds 141 spp`; rerun with `-resume`
+-> `loaded ... 141 spp accumulated`, `holds 274 spp`.
+
+**What is still deliberately excluded, and now says so accurately: the SHARED multi-camera mode-M
+path.** It gathers a fixed spp per frame and **writes each frame the instant that frame's gather
+ends** -- which is the crash-safety a sidecar would have bought, at one-frame granularity. Its
+message used to claim `-checkpoint` "applies only to modes A/B/C, R/D, P", which was stale in two
+directions at once (it omitted J, and it denied the mode M support that now exists). It now says
+what is true, including that the progressive driver does support the flags.
+
+**A second copy of the same check is why the first fix appeared not to work.** The scope test
+exists in `runRender` AND on the shared path, with independently-worded messages; patching one
+left the other firing the old text. Worth remembering as the same failure mode this file records
+for MIS weights written in two places: **when a rule is stated twice, a change has to visit both
+or the untouched copy becomes the behaviour.**
 
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
