@@ -37,6 +37,7 @@
 #include <vector>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include "linalg.h"
 #include "photonbeams.h"
 
@@ -57,6 +58,16 @@ struct VolCache {
     // as the gather does (`mediaTransmittance(b.o, b.d, sBeam)`), or every cached cell is
     // too bright by the transmittance it skipped. Homogeneous only -- a heterogeneous
     // medium needs the marched transmittance and the caller gates on that too.
+    // The CIE triple of one chord, duplicating BeamMap::build's rule. Needed because the
+    // DEPOSIT SPLIT builds this cache from the RAW pre-split chords, before `bm.cie` exists --
+    // and it has to, since the whole point of the split is that those chords never reach the
+    // split/CIE/BVH stage at all.
+    static Vec3 chordCie(const PhotonBeam& b) {
+        if (b.achro) return Vec3(b.cieA[0], b.cieA[1], b.cieA[2]);
+        const double lam = (double)b.lambda;
+        return Vec3(cieX(lam), cieY(lam), cieZ(lam));
+    }
+
     void build(const BeamMap& bm, int res, int minOrder, bool gOK, double sigmaT) {
         ready = false;
         if (!gOK) return;                      // anisotropic: a scalar cache cannot serve it
@@ -76,15 +87,17 @@ struct VolCache {
         xyz.assign((size_t)nx * ny * nz * 3, 0.0f);
 
         const double step = std::min(ext.x / nx, std::min(ext.y / ny, ext.z / nz)) * 0.5;
+        long long nSplat = 0;
         const double invN = 1.0 / (double)bm.nEmitted;
         for (size_t i = 0; i < bm.beams.size(); ++i) {
             const PhotonBeam& b = bm.beams[i];
             if (b.order == kBeamOrderUnknown || (int)b.order < minOrder) continue;
+            ++nSplat;
             const double len = (double)b.len;
             if (!(len > 0.0)) continue;
             const int ns = (int)std::ceil(len / step);
             const double ds = len / (double)ns;
-            const Vec3 cie = bm.cie[i];
+            const Vec3 cie = (i < bm.cie.size()) ? bm.cie[i] : chordCie(b);
             for (int k = 0; k < ns; ++k) {
                 const Vec3 p = b.o + b.d * ((double)b.s0 + ds * (k + 0.5));
                 const int ix = (int)((p.x - lo.x) / ext.x * nx);
@@ -101,6 +114,12 @@ struct VolCache {
             }
         }
         ready = true;
+        if (std::getenv("FTRACE_VOLCACHE_DIAG"))
+            std::fprintf(stderr, "[vcdiag] splatted %lld of %lld beams, nEmitted %lld, "
+                         "totalY %.6g, step %.4g, ext %.4g x %.4g x %.4g\n",
+                         (long long)nSplat, (long long)bm.beams.size(),
+                         (long long)bm.nEmitted, totalY(), step,
+                         ext.x, ext.y, ext.z);
     }
 
     bool lookup(const Vec3& p, Vec3& out) const {
@@ -123,6 +142,26 @@ struct VolCache {
         return s * cellVol;
     }
 };
+
+// `FTRACE_VOLCACHE_SPLIT=1` turns the prototype from a QUERY-side skip into a DEPOSIT SPLIT.
+//
+// v0.299.0 built the cache from the finished beam map and then declined to traverse the
+// order >= 2 beams -- but they were still deposited, split, CIE-folded, boxed and BVH-built, so
+// the only cost it removed was traversal-and-shading, and it added a march. Measured: ~7 %,
+// against a 51-58 % ceiling from dropping those chords outright (`-beams-minorder 2`).
+//
+// The split closes that gap by routing instead of skipping: the cache is built from the raw
+// chords BEFORE `BeamMap::build`, and those chords are then ERASED, so the split, the CIE table,
+// the box array and the SAH BVH all see only the order < 2 remainder. `-beams-minorder 2` is the
+// same erase without the cache -- i.e. exactly this minus the energy -- which is what makes it a
+// calibrated ceiling rather than a guess.
+inline bool volCacheSplitEnabled() {
+    static const bool b = [] {
+        const char* e = std::getenv("FTRACE_VOLCACHE_SPLIT");
+        return e && *e && std::atoi(e) != 0;
+    }();
+    return b;
+}
 
 inline int volCacheRes() {
     static const int n = [] {

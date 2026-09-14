@@ -1445,44 +1445,81 @@ today.
 2.4 sigma and should be read as "large and negative", not as -3.6. What is solid is the SIGN, shared
 by all four materials, and `red`'s magnitude.
 
-### VOLCACHE — **PROTOTYPE BUILT AND MEASURED (v0.299.0)**: the mechanism works, the realised gain does not reach the ceiling, and the reason is actionable
+### VOLCACHE — **DEPOSIT SPLIT BUILT AND MEASURED (v0.300.0)**: 64 % faster, energy-correct, and the "ceiling" it was measured against turned out to be wrong
 
-`FTRACE_VOLCACHE=<res>` builds an `res^3` fluence grid from the `order >= 2` chords and marches it
-in their place. `src/volcache.h` + the gather hook in `beamgather.h`. **Scope, enforced rather than
-assumed:** isotropic (`g == 0`) and homogeneous media only — `build()` refuses anything else, because
-a scalar fluence cache assumes an isotropic phase function (see the correction recorded below).
+Two flags, both prototype-gated by environment variable:
 
-**Correctness — it is energy-correct.** On `_beams_ms` (`sigma_t 6`), cached against uncached:
+- `FTRACE_VOLCACHE=<res>` (v0.299.0) — build an `res^3` fluence grid from the `order >= 2` chords and
+  march it in their place at gather time.
+- `FTRACE_VOLCACHE_SPLIT=1` (v0.300.0) — additionally **erase** those chords from the beam map,
+  before `BeamMap::build`, so the SAH split, the CIE table, the boxes and the BVH never see them.
 
-| grid | frame-mean ratio | median error on touched pixels | p90 |
-|---|---:|---:|---:|
-| 8 | 1.0153 | 5.9 % | 39.5 % |
-| **48** | **1.0021** | **2.0 %** | 6.6 % |
-| 96 | 1.0019 | 2.5 % | 8.8 % |
+`src/volcache.h` + `volCacheSplit` in `beamgather.h`. **Scope, enforced rather than assumed:**
+isotropic (`g == 0`) and homogeneous media only — `build()` refuses anything else, because a scalar
+fluence cache assumes an isotropic phase function.
 
-The frame mean converges to **0.2 %**, which validates the fluence formulation, the chord attenuation
-and the units. **But score it per-ROI, not per-frame:** the cache touches only the **19.4 %** of pixels
-whose camera ray crosses the medium, and on those the error is **~2 %**, not 0.2 %. The whole-frame
-number is diluted by the 80 % it never touches. The error also stops improving past res 48 — finer
-cells have less bias but fewer samples each, which is the binned-estimator tradeoff and implies an
-optimum resolution rather than "finer is better".
+**The measurement.** `scraps/_bms96.ftsl` (`_beams_ms` at 96^2), `sigma_t 6`, mode M, CPU,
+`-beamcount 100000`, with **radius and split length pinned** (`-beamradius 0.004 -beamsplit 0.0212`)
+so the arms differ only in which chords exist — the auto radius is re-derived from the surviving
+chords' mean free path, so leaving it free would have compared two different kernels.
 
-**Speed — ~7 %, far below the 51-58 % ceiling.** Seven paired reps, warm-up discarded, the four
-settled ones reading **+1.20, -0.54, +2.67, +3.10 s** on ~27 s: median **+1.94 s, ~7 %**, three of
-four favouring the cache. (The first reps read +48.4 and +5.95 s and are discarded — the machine was
-still settling, and the collapsing margin is machine state, not signal.)
+| arm | what it does | sub-beams in map | median wall vs baseline |
+|---|---|---:|---:|
+| A baseline | every chord stored as a beam | 1 376 019 | 1.000 |
+| B query-only | cache marched, beams still stored | 1 376 019 | ~0.998 |
+| **C deposit split** | order >= 2 routed to grid and erased | **557 566** | **0.362** |
 
-**Why it falls short, and this is the actionable part.** The prototype skips order >= 2 beams *at
-query time* but they are still **deposited, stored, and built into the BVH**. It therefore buys only
-the traversal-and-shading share, minus the march it adds. **To approach the ceiling the deposit must
-split**: order >= 2 chords should go into the cache *instead of* the beam map, so the map shrinks by
-~83 %, its BVH build shrinks with it, and traversal has less to walk. The machinery for a
-deposit-side order filter already exists (`-beams-minorder`, v0.298.0); what is missing is its
-complement — route order >= 2 to the cache rather than dropping it.
+n = 9 paired reps, arms adjacent within each rep, warm-up discarded; range 0.337–0.425.
+**64 % reduction.**
 
-**Verdict.** The mechanism is sound and measured; the current form is a ~7 % gain with a ~2 % local
-error at `sigma_t 6`, on isotropic homogeneous media. Whether it is worth finishing depends on the
-deposit split, which is the next real piece of work and is well-defined.
+**Correctness.** ROI mean ratio C/A **1.0022**, reproducing query-only's 1.0021. Per-pixel |C-A|
+median 1.12 %, p90 3.84 % — both **below the seed-to-seed control** (median 2.32 %, p90 8.08 %), i.e.
+within noise. The raw-chord splat was independently confirmed exact against the sub-beam splat:
+totalY 1.20874e+14 vs 1.20877e+14, 0.002 % apart.
+
+**Why B buys nothing and C buys 64 %.** In B the `order >= 2` beams are still **in the BVH**, so
+traversal still descends to them and still runs the per-beam intersection; only the final shading is
+skipped. That saving roughly cancels the march B adds, hence ~1.00. In C they are gone from the tree
+entirely — 2.47x fewer sub-beams — so traversal shrinks with the population and the BVH build shrinks
+with it. The march itself is nearly free (64 steps per camera ray against ~2000 beams per probe),
+which is exactly why removing beams, not skipping them, is where the whole gain lives.
+
+**THE BUG THAT ALMOST SHIPPED AS A RESULT — read this before trusting any speedup here.** The first
+build of the split measured **62 % faster with ±2 % consistency across reps**, agreeing beautifully
+with the 51-58 % figure then on record. It was wrong. `volCacheSplit` built the cache correctly and
+then `volCacheFor` **rebuilt it from the post-split map and wiped it to zero**, so the march
+contributed nothing and arm C was silently rendering as `-beams-minorder 2`. The guard was keyed on
+the map's contents, and `BeamMap::build` *splits the survivors into sub-beams afterwards*
+(28 786 chords -> 556 033 sub-beams), so the key no longer matched at gather time. Fixed with an
+explicit `fromSplit` ownership flag: when the split has run it owns the cache outright and the
+content key may not arbitrate.
+
+Three things are worth keeping from that:
+
+1. **The energy check is what caught it**, not the timing: ROI mean ratio read **0.9162** against a
+   seed-noise control of 0.9961 — 20x the noise floor, unmistakably systematic. Timing alone would
+   have published it.
+2. **Agreement with a prior estimate is not evidence.** 62 % sat right next to the 51-58 % on record,
+   which made it *more* believable, not less. The prior number was itself wrong (below).
+3. **Tight reps are not a correctness signal.** The broken arm was reproducible to ±2 % precisely
+   *because* it was doing strictly less work every time; the corrected arm is noisier (0.337-0.425).
+   Low variance measures the rig's stability, never the result's validity.
+
+**`-beams-minorder 2` IS NOT A COST FLOOR FOR THIS PATH, and the recorded 51-58 % ceiling inherits
+that error.** The two filter at different points and that changes the *population*, not just the
+timing: `-beams-minorder` drops at `push`, so the `-beamcount` budget and the per-thread bank
+self-halving are spent entirely on order-1 chords, while the split runs after the budget has been
+apportioned across all orders and keeps only order-1's share. Measured here: the split leaves
+**28 786** chords, `-beams-minorder 2` leaves **99 909** — 3.5x more — so it renders a cleaner
+order-1 estimate more slowly. That is why the measured 64 % *exceeds* the old "ceiling": the ceiling
+was never a bound, it was a different experiment. The honest control is the plain baseline, which
+holds the order-1 population fixed by construction.
+
+**Still open before this could ship as a real feature.** The `res` is fixed by hand and the error
+stops improving past ~48 (finer cells have less bias but fewer samples each). There is no confidence
+gate, no validation path and no adaptive resolution. Anisotropic media need directional bins
+(SH or a discrete direction set) per cell, which multiplies memory by the bin count and changes this
+cost model. And the whole measurement is one scene at one optical depth on the CPU.
 
 ### VOLCACHE — BOTTOM LINE FIRST (2026-09-13). A thick-media feature with a measured ceiling, one unmeasured term, and a design that is fully specified.
 

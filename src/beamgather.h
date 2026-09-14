@@ -200,23 +200,101 @@ struct TrRay {
 // is exact only where a scalar fluence cache can be: an ISOTROPIC (g == 0) and HOMOGENEOUS
 // medium. `volCacheUsable` checks both and the cache stays off otherwise, so a scene it cannot
 // serve renders normally rather than wrongly.
-inline VolCache& volCacheFor(const Scene& sc, const BeamMap& bm) {
-    static VolCache cache;
-    static const BeamMap* built = nullptr;
-    static std::mutex mtx;
-    std::lock_guard<std::mutex> lk(mtx);
-    if (built != &bm) {
-        built = &bm;
-        bool ok = !sc.media.empty();
-        double sigmaT = 0.0;
-        for (const auto& m : sc.media) {
-            if (!m.enabled) continue;
-            if (m.g != 0.0 || m.heterogeneous()) { ok = false; break; }
-            sigmaT = m.sigma_a(550.0) + m.sigma_s(550.0);   // extinction = a + s
-        }
-        cache.build(bm, volCacheRes(), 2, ok, sigmaT);
+namespace vcstate {
+inline VolCache&      cache()    { static VolCache c;                 return c; }
+inline std::mutex&    mtx()      { static std::mutex m;               return m; }
+// What the live cache was built from. Keyed on the map POINTER **and** its contents, because a
+// pointer alone is not a key here: mode M rebuilds the light side into the SAME BeamMap object
+// every epoch, so a pointer-only guard serves epoch 0's cache forever while the beams under it
+// change. The v0.299.0 prototype had exactly that bug; it never showed because every measurement
+// was a single-epoch plain render, which is precisely the regime where the bug is invisible.
+struct Key { const BeamMap* p = nullptr; size_t n = 0; long long emitted = -1;
+             // Set when the DEPOSIT SPLIT built this cache. The split owns the cache outright
+             // and the content key CANNOT arbitrate afterwards: the split runs before
+             // BeamMap::build, which then splits the surviving chords into sub-beams, so
+             // `beams.size()` changes underneath the key (28 786 chords -> 556 033 sub-beams on
+             // the measured scene). A content-keyed guard therefore sees a "different" map at
+             // gather time and rebuilds from the order-1 remainder -- producing an EMPTY cache
+             // and silently discarding the order >= 2 energy the split had just routed into it.
+             // That is not hypothetical: it is what v0.300.0's first build did, and it read as a
+             // 62 % speedup because the march was contributing nothing at all.
+             bool fromSplit = false; };
+inline Key& builtFor() { static Key k; return k; }
+inline Key keyOf(const BeamMap& bm) { return Key{&bm, bm.beams.size(), (long long)bm.nEmitted}; }
+inline bool same(const Key& a, const Key& b) {
+    return a.p == b.p && a.n == b.n && a.emitted == b.emitted;
+}
+}  // namespace vcstate
+
+// The media gate, in ONE place so the query path and the split path cannot come to different
+// conclusions about which scenes this cache may serve. A scalar fluence is only exact for an
+// isotropic phase function (see volcache.h), and the attenuation term assumes homogeneity.
+inline bool volCacheMediaOk(const Scene& sc, double& sigmaT) {
+    bool ok = !sc.media.empty();
+    sigmaT = 0.0;
+    for (const auto& m : sc.media) {
+        if (!m.enabled) continue;
+        if (m.g != 0.0 || m.heterogeneous()) { ok = false; break; }
+        sigmaT = m.sigma_a(550.0) + m.sigma_s(550.0);   // extinction = a + s
     }
-    return cache;
+    return ok;
+}
+
+inline VolCache& volCacheFor(const Scene& sc, const BeamMap& bm) {
+    std::lock_guard<std::mutex> lk(vcstate::mtx());
+    const vcstate::Key k = vcstate::keyOf(bm);
+    // The split is authoritative when it ran: never second-guess it from the map's contents,
+    // because after BeamMap::build those contents no longer describe what the cache holds.
+    if (!vcstate::builtFor().fromSplit && !vcstate::same(vcstate::builtFor(), k)) {
+        double sigmaT = 0.0;
+        const bool ok = volCacheMediaOk(sc, sigmaT);
+        vcstate::cache().build(bm, volCacheRes(), 2, ok, sigmaT);
+        vcstate::builtFor() = k;
+    }
+    return vcstate::cache();
+}
+
+// THE DEPOSIT SPLIT. Build the cache from the raw chords, then ERASE the ones it now carries.
+//
+// Must run BEFORE BeamMap::build, and that ordering is the whole feature: everything expensive
+// about a beam -- the SAH split, the CIE fold, the inflated box, the BVH node it occupies and the
+// traversal that later walks it -- happens in or after that call. A chord removed here costs
+// nothing anywhere downstream, whereas the v0.299.0 query-side skip removed only the last of
+// those. Returns the number of chords routed into the cache (0 if the split did not run).
+//
+// `-beams-minorder 2` is NOT the cost floor for this path, and the first version of this comment
+// claimed it was. The two filter at different points in the pipeline and that changes the
+// POPULATION, not just the timing: `-beams-minorder` drops at `push`, so the `-beamcount` budget
+// and the per-thread bank self-halving are spent entirely on order-1 chords, while the split runs
+// after the budget has already been apportioned across all orders and keeps only order-1's share.
+// Measured on this scene at `-beamcount 100000`: the split leaves 28 786 chords, `-beams-minorder
+// 2` leaves 99 909 -- 3.5x more -- so it renders a cleaner order-1 estimate more slowly and is a
+// different experiment, not a bound on this one. The honest control is the baseline, which holds
+// the order-1 population fixed by construction.
+inline size_t volCacheSplit(const Scene& sc, BeamMap& bm) {
+    if (volCacheRes() <= 0 || !volCacheSplitEnabled()) return 0;
+    std::lock_guard<std::mutex> lk(vcstate::mtx());
+    double sigmaT = 0.0;
+    const bool ok = volCacheMediaOk(sc, sigmaT);
+    VolCache& c = vcstate::cache();
+    c.build(bm, volCacheRes(), 2, ok, sigmaT);
+    vcstate::builtFor() = vcstate::keyOf(bm);
+    if (!c.ready) return 0;   // gate refused: leave fromSplit false so the query path still works     // gate refused (anisotropic / heterogeneous): keep every chord
+    const size_t before = bm.beams.size();
+    size_t w = 0;
+    for (size_t i = 0; i < before; ++i) {
+        const PhotonBeam& b = bm.beams[i];
+        // The cache took exactly the chords VolCache::build splatted: known order, >= 2.
+        if (b.order != kBeamOrderUnknown && (int)b.order >= 2) continue;
+        bm.beams[w++] = bm.beams[i];
+    }
+    bm.beams.resize(w);
+    // The key must be re-taken AFTER the erase, or the gather's content-keyed guard sees a
+    // different beam count and rebuilds the cache from the remainder -- which is the order < 2
+    // set, i.e. it would quietly replace the cache with an empty one.
+    vcstate::builtFor() = vcstate::keyOf(bm);
+    vcstate::builtFor().fromSplit = true;
+    return before - w;
 }
 
 inline int volCacheStubSteps() {

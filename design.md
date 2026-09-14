@@ -3414,6 +3414,19 @@ as the one at fault.
   0.9996 in absolute units, solar disc `1/16` on both — and `cornell.ftsl` mode U is
   **byte-identical** before and after the port, since every new density sits behind
   `dIsDeltaEmitter` and the area path keeps its RNG draw order.
+- **`volcache.h`** (0.299.0; deposit split 0.300.0) — **PROTOTYPE, environment-gated, off by
+  default and not a supported feature.** A volumetric **fluence** cache for the `order >= 2` part of
+  the beam gather: an `res^3` grid of CIE-weighted photon path-length density, built by splatting
+  multiply-scattered chords and marched by the camera in their place
+  (`L += sigma_s * phase * fluence * T * dx`). `FTRACE_VOLCACHE=<res>` marches it; adding
+  `FTRACE_VOLCACHE_SPLIT=1` also **erases** those chords from the `BeamMap` before `BeamMap::build`,
+  via `volCacheSplit` in `beamgather.h`, so the SAH split, the CIE table, the boxes and the BVH are
+  all built over the order-1 remainder only. Measured 64 % faster and energy-correct to 0.2 % on
+  thick isotropic media; the erase, not the query-side skip, is where the whole gain is.
+  **A scalar fluence assumes an isotropic phase function**, so `build()` refuses `g != 0` and
+  heterogeneous media rather than silently averaging. See known-issues, VOLCACHE, for the scope
+  limits and for the cache-ownership bug that made its first measurement meaningless.
+
 - **`surfmerge.h`** (0.258.0) — the **surface photon map mode `J` merges against**, i.e. the
   half folded in from mode `U`. Three things live here and nowhere else:
   **On by default on the CPU since 0.260.0** — all three UPBP-VM gates green (gate 3: switching the

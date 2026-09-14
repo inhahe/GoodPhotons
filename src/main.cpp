@@ -223,6 +223,23 @@ static bool endsWithCI(const std::string& s, const char* ext) {
 // (PPM bytes in a .png file) breaks any consumer that trusts the extension.
 // Returns true on success. `label` is the human name printed by the caller.
 static bool writeImage(const std::string& path, int W, int H, const std::vector<uint8_t>& img) {
+    // A FLOAT-FORMAT EXTENSION ON AN 8-BIT WRITE IS ALWAYS A MISTAKE, so say so. `-o out.pfm`
+    // does not produce a PFM -- `.pfm` is not a recognised output extension, so it lands here and
+    // is written as a tone-mapped 8-bit PPM *under a .pfm name*, which every reader that trusts
+    // the extension will happily misread as scene-linear float. REFERENCE.md has documented this
+    // trap for a while; documenting it is not enough, because the failure is silent and the file
+    // looks right. It cost a measurement in this repo: an A/B scored on auto-exposed LDR, where
+    // the exposure normalises away the very mean-radiance difference being measured, so a broken
+    // arm read as a confident ratio near 1. `-hdr` is the only way to get a real PFM.
+    static bool warned = false;
+    if (!warned && (endsWithCI(path, ".pfm") || endsWithCI(path, ".hdr") ||
+                    endsWithCI(path, ".exr"))) {
+        warned = true;
+        std::fprintf(stderr,
+            "[warn] \"%s\" has a float-format extension but is being written as TONE-MAPPED "
+            "8-BIT data -- .pfm/.hdr/.exr are not output formats. Use -hdr, which writes a real "
+            "32-bit float PFM beside -o.\n", path.c_str());
+    }
     if (endsWithCI(path, ".png"))
         return stbi_write_png(path.c_str(), W, H, 3, img.data(), W * 3) != 0;
     if (endsWithCI(path, ".jpg") || endsWithCI(path, ".jpeg"))
@@ -12251,7 +12268,8 @@ static bool jSkipHostBvh() {
     return g_jDevBeamOk && !g_jHostLight && !envOff;
 }
 
-static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet = false) {
+static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet = false,
+                           const Scene* vcScene = nullptr) {
     // `quiet` exists for mode J's light-side REFRESH (see g_beamFreeze): that rebuilds this
     // map once per progressive epoch, and re-printing the same four-line map description on
     // every rebuild would bury the render's own status lines under a description that has not
@@ -12260,6 +12278,19 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
         if (!quiet) std::printf(fmt, args...);
     };
     auto t0 = std::chrono::steady_clock::now();
+    // VOLCACHE DEPOSIT SPLIT (flag-gated, inert unless FTRACE_VOLCACHE + FTRACE_VOLCACHE_SPLIT).
+    // Before ANY of the expensive per-beam work below: route the order >= 2 chords into the
+    // fluence grid and drop them from the map, so the split, the CIE table, the boxes and the
+    // BVH are all built over the order < 2 remainder only.
+    size_t vcSplitOut = 0;
+    if (vcScene) {
+        const size_t nSplit = vcSplitOut = volCacheSplit(*vcScene, bm);
+        if (nSplit && !quiet)
+            std::printf("%s volcache: %zu order>=2 chords routed to the %d^3 fluence grid, "
+                        "%zu chords left in the map (%.1f%% removed)\n",
+                        tag, nSplit, volCacheRes(), bm.beams.size(),
+                        100.0 * (double)nSplit / (double)(nSplit + bm.beams.size()));
+    }
     const size_t raw = bm.beams.size();
     double r;
     // Say when the budget actually bit. The per-thread banks keep everything until they hit
@@ -12267,9 +12298,12 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
     // exact trim to -beamcount. Printing it turns "why did -beamcount 1e6 give me exactly
     // 1e6?" into an observation, and makes a scene that never reaches its budget (small
     // bounded media in a large scene) visibly different from one that blows through it.
-    if (bm.nDeposited > raw)
+    // `raw + vcSplitOut`, not `raw`: the volcache split has already removed its share above, and
+    // attributing that to -beamcount would report a working feature as a budget overflow.
+    if (bm.nDeposited > raw + vcSplitOut)
         say("%s photon beams: %zu collected, trimmed to %zu by -beamcount "
-                    "(survivors rescaled, unbiased)\n", tag, bm.nDeposited, raw);
+                    "(survivors rescaled, unbiased)\n", tag, bm.nDeposited,
+                    raw + vcSplitOut);
     // SPECTRAL COVERAGE OF THE STORED BEAMS (photonbeams.h): what fraction carry the
     // achromatic fold (`-beamachro`), and what fraction carry a stratified wavelength bundle
     // (`-beamspec`). The two are alternatives, not additions — BeamBank::push prefers the fold
@@ -16627,7 +16661,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
                 buildBeamMap(bmap, "mode J:",
                              (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
-                             /*quiet*/!first);
+                             /*quiet*/!first, &scene);
             }
             const double buildSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
@@ -16973,7 +17007,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
                 buildBeamMap(bmap, "mode M:",
                              (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
-                             /*quiet*/!first);
+                             /*quiet*/!first, &scene);
             }
         };
         buildLightSide(0);
@@ -23364,7 +23398,8 @@ static int run(int argc, char** argv) {
                     // spends less on a BVH build that is about to be discarded.
                     if (meterBeams)
                         buildBeamMap(meterBmap, "[meter]",
-                                     (double)W * (double)H * (double)meterSpp);
+                                     (double)W * (double)H * (double)meterSpp,
+                                     /*quiet*/false, &scene);
                     meterPmapBuilt = true;
                 }
                 mf = renderPhotonCamera(scene, mc.cam, W, H, meterPmap, meterSpp, nThreads,
@@ -23477,8 +23512,8 @@ static int run(int argc, char** argv) {
                         : 0;
                     const double mWork = (double)cams[0].res * (double)cams[0].resY
                                        * (double)meterSpp;
-                    mBeamPass.build = [mWork](BeamMap& bm) {
-                        buildBeamMap(bm, "[meter]", mWork);
+                    mBeamPass.build = [mWork, &scene](BeamMap& bm) {
+                        buildBeamMap(bm, "[meter]", mWork, /*quiet*/false, &scene);
                     };
                 }
                 renderPhotonMapSharedCuda(scene, mcams, rxs, rys, meterN, radius, e,
@@ -24186,10 +24221,10 @@ static int run(int argc, char** argv) {
                     // Name the stage in the title bar: the beam BVH on a big scene is minutes
                     // of silence between the deposit and the first gathered frame, and without
                     // this the window sits on the previous caption looking wedged.
-                    beamPass.build  = [work, tw, th, &lightEpoch](BeamMap& bm) {
+                    beamPass.build  = [work, tw, th, &lightEpoch, &scene](BeamMap& bm) {
                         if (lightEpoch == 0)
                             liveWindowPlaceholder(tw, th, "building beam map\xE2\x80\xA6");
-                        buildBeamMap(bm, "[camera]", work, /*quiet*/lightEpoch != 0);
+                        buildBeamMap(bm, "[camera]", work, /*quiet*/lightEpoch != 0, &scene);
                     };
                 }
                 // Aimed caustic emission (-causticn), the exact twin of the CPU call below.
@@ -24496,7 +24531,7 @@ static int run(int argc, char** argv) {
             for (int i : idx)
                 work += (double)toRender[i].res * (double)toRender[i].resY
                       * (double)(spp > 0 ? spp : 16);
-            buildBeamMap(bmap, "[camera]", work);
+            buildBeamMap(bmap, "[camera]", work, /*quiet*/false, &scene);
         }
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("[camera] photon map: %zu photons (+%zu caustic) from %lld emitted in %s, "
