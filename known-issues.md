@@ -3692,6 +3692,39 @@ single bright pixel rather than the kernel's point-spread function painted acros
 the lattice gone it still over-smooths -- the hamster and the glass sphere lose their shape at
 tolerance 2 and are soft at 1. The bug is fixed; the feature is still the wrong tool for this scene.
 
+### VOLCACHE is SILENTLY INERT on the device path (OPEN, 2026-09-14)
+
+Every correctness measurement for the v0.300.0 deposit split and its v0.301.0/v0.303.0 successors
+was taken on `-device cpu`. On `-device gpu` the split **does not run at all**: with
+`FTRACE_VOLCACHE=48 FTRACE_VOLCACHE_SPLIT=1` set, `gallery_rain` fly150 produced **99 975 stored
+chords in both arms** -- byte-identical beam populations -- and no `volcache:` line, no `vcdiag`
+line, and no per-medium grid. `VolCache::build` never reaches `ready`.
+
+**The good news first, because the opposite would have been serious.** Inert is SAFE. Had the split
+erased the order >= 2 chords while the device gather (which has zero `volcache` references in
+`render_cuda.cu` -- there is no device march) went on without them, the energy would have vanished
+silently. It does not: the 0.74 % frame difference between the two arms is ordinary run-to-run
+beam-realization noise, and the sub-beam counts differ by the same order (825 244 vs 824 809).
+
+**Cause not yet established.** The device beam record carries `med` (`DBeamRec::med`, an index into
+`DScene::media`), so the obvious theory -- that downloaded device beams lack a medium index and fail
+the `b.med != medOnly` filter -- is not confirmed. Diagnosing it needs a print inside
+`volCacheSplit`, which needs a rebuild, which was blocked by a long user render holding
+`ftrace.exe`.
+
+**Two things to fix when picked up:**
+1. **Say so.** A flag that does nothing must announce it. `-checkpoint` on the shared mode-M path
+   already sets this precedent; VOLCACHE should match it rather than being quietly ignored.
+2. **Then decide** whether the split should work on the device at all. It needs either a device-side
+   march (a real port) or an explicit refusal when the gather will run on the GPU. Until then the
+   feature is CPU-only in fact, and the documentation implies otherwise.
+
+**Method note.** This is the second time today the same hole appeared: validate on one backend,
+assume the other. The v0.300.0 GPU check looked only at the split's *diagnostic line*, never at the
+energy, so "the split fired" was mistaken for "the split is correct". The habit that catches it is
+cheap -- compare the beam POPULATION between arms, which is one grep and would have shown identical
+counts immediately.
+
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
 Three recorded blockers dissolved in one session, each on a single grep against code that had moved
