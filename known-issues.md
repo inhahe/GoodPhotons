@@ -1515,6 +1515,43 @@ order-1 estimate more slowly. That is why the measured 64 % *exceeds* the old "c
 was never a bound, it was a different experiment. The honest control is the plain baseline, which
 holds the order-1 population fixed by construction.
 
+**ANISOTROPIC MEDIA NOW ACCEPTED (v0.301.0) — and the directional bins that were supposed to be
+needed turned out not to be.** The cache previously refused any `g != 0` medium, on the correct
+reasoning that a scalar fluence has averaged the incoming directions away and so admits only the
+isotropic phase average. The proposed fix was spherical-harmonic directional bins per cell. It was
+built: in-scattering is a convolution of the directional radiance with a rotationally-symmetric
+phase, convolution is diagonal in SH (Funk-Hecke), and Henyey-Greenstein's l-th Legendre moment is
+exactly `g^l`, so `L_s(w) = sigma_s * sum_lm g^l c_lm Y_lm(w)` is the anisotropic phase to the
+truncation order -- not a fit to it. At `g = 0` it reduces to the scalar cache exactly, which is a
+free regression test and it passes (1.0026 against the scalar path's 1.0022).
+
+**Measured against the uncached render on `_beams_ms` at 96^2, per-pixel median error:**
+
+| medium | SH order 2 (nSH = 9) | l = 0 only (nSH = 1) |
+|---|---:|---:|
+| `g = 0.5` | 3.03 % | **1.88 %** |
+| `g = 0.85` | 2.31 % | **2.13 %** |
+
+**The scalar reconstruction is as good or better at both, including a strongly forward medium.**
+The reason is structural and should have been predicted: this cache only ever holds the
+**order >= 2** component, and by the second scattering event diffusion has made the radiance field
+nearly isotropic. The anisotropy is spent in the FIRST scattering, which stays a real beam and is
+never cached. So the `l >= 1` bands carry little signal and a full share of estimator noise, and
+clamping their ringing to non-negative biases the result bright (+0.8 % against the scalar path's
+-1.0 % -- opposite signs, same magnitude).
+
+**So the real fix was to stop refusing anisotropic media, not to add directions to the cache.** With
+the gate opened and the scalar reconstruction retained, `g = 0.5` measures **mean ratio 0.9906,
+median 2.56 %, p90 9.35 %**, and is **64 % faster** (paired, warm-up discarded: 0.355, 0.362, 0.410)
+-- the same speedup isotropic media already got. The SH path is kept behind `FTRACE_VOLCACHE_SH=1`
+because it is correct and would matter for a cache that held order 1, where the anisotropy is real;
+it costs 9x the memory and is off by default.
+
+**The gate also got stricter in one place while loosening in another.** It now refuses media that
+DISAGREE on `sigma_t` or `g`: one grid carries one pair of both, and the previous version silently
+took the LAST enabled medium's `sigma_t` and applied it to every beam -- an error that reads as a
+soft bias rather than as a failure.
+
 **Still open before this could ship as a real feature.** The `res` is fixed by hand and the error
 stops improving past ~48 (finer cells have less bias but fewer samples each). There is no confidence
 gate, no validation path and no adaptive resolution. Anisotropic media need directional bins

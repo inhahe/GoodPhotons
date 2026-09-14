@@ -229,13 +229,21 @@ inline bool same(const Key& a, const Key& b) {
 // The media gate, in ONE place so the query path and the split path cannot come to different
 // conclusions about which scenes this cache may serve. A scalar fluence is only exact for an
 // isotropic phase function (see volcache.h), and the attenuation term assumes homogeneity.
-inline bool volCacheMediaOk(const Scene& sc, double& sigmaT) {
-    bool ok = !sc.media.empty();
-    sigmaT = 0.0;
+inline bool volCacheMediaOk(const Scene& sc, double& sigmaT, double& gOut) {
+    bool ok = false, first = true;
+    sigmaT = 0.0; gOut = 0.0;
     for (const auto& m : sc.media) {
         if (!m.enabled) continue;
-        if (m.g != 0.0 || m.heterogeneous()) { ok = false; break; }
-        sigmaT = m.sigma_a(550.0) + m.sigma_s(550.0);   // extinction = a + s
+        // A RAINBOW phase is a wavelength-dependent Airy table, not Henyey-Greenstein, so its
+        // Legendre moments are neither g^l nor achromatic and the SH convolution below does
+        // not describe it. Refuse rather than serve it an HG reconstruction.
+        if (m.rainbow() || m.heterogeneous()) return false;
+        const double st = m.sigma_a(550.0) + m.sigma_s(550.0);
+        if (first) { sigmaT = st; gOut = m.g; first = false; ok = true; }
+        // ONE grid carries ONE (sigma_t, g). Two media that disagree cannot both be served by
+        // it, and the previous version silently applied the LAST enabled medium's sigma_t to
+        // every beam -- an error that reads as a soft bias, not as a failure.
+        else if (st != sigmaT || m.g != gOut) return false;
     }
     return ok;
 }
@@ -246,9 +254,9 @@ inline VolCache& volCacheFor(const Scene& sc, const BeamMap& bm) {
     // The split is authoritative when it ran: never second-guess it from the map's contents,
     // because after BeamMap::build those contents no longer describe what the cache holds.
     if (!vcstate::builtFor().fromSplit && !vcstate::same(vcstate::builtFor(), k)) {
-        double sigmaT = 0.0;
-        const bool ok = volCacheMediaOk(sc, sigmaT);
-        vcstate::cache().build(bm, volCacheRes(), 2, ok, sigmaT);
+        double sigmaT = 0.0, gHG = 0.0;
+        const bool ok = volCacheMediaOk(sc, sigmaT, gHG);
+        vcstate::cache().build(bm, volCacheRes(), 2, ok, sigmaT, gHG);
         vcstate::builtFor() = k;
     }
     return vcstate::cache();
@@ -274,10 +282,10 @@ inline VolCache& volCacheFor(const Scene& sc, const BeamMap& bm) {
 inline size_t volCacheSplit(const Scene& sc, BeamMap& bm) {
     if (volCacheRes() <= 0 || !volCacheSplitEnabled()) return 0;
     std::lock_guard<std::mutex> lk(vcstate::mtx());
-    double sigmaT = 0.0;
-    const bool ok = volCacheMediaOk(sc, sigmaT);
+    double sigmaT = 0.0, gHG = 0.0;
+    const bool ok = volCacheMediaOk(sc, sigmaT, gHG);
     VolCache& c = vcstate::cache();
-    c.build(bm, volCacheRes(), 2, ok, sigmaT);
+    c.build(bm, volCacheRes(), 2, ok, sigmaT, gHG);
     vcstate::builtFor() = vcstate::keyOf(bm);
     if (!c.ready) return 0;   // gate refused: leave fromSplit false so the query path still works     // gate refused (anisotropic / heterogeneous): keep every chord
     const size_t before = bm.beams.size();
@@ -321,19 +329,24 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         const PatTables vcTabs = scene.patTables();
         const int steps = 64;
         const double dt = tMax / (double)steps;
-        const double invFourPi = 1.0 / (4.0 * 3.14159265358979323846);
+        // The direction the scattered light travels TOWARD THE CAMERA. The gather's phase
+        // argument is dot(b.d, -dc) (see the note at the phaseValue call), so -dc is the
+        // direction the SH convolution must be evaluated at. Getting this sign wrong would
+        // mirror the phase lobe -- forward scattering would read as backward -- and on an
+        // isotropic medium it would be invisible, because l = 0 has no direction to mirror.
+        const Vec3 wOut = dc * -1.0;
         for (int i = 0; i < steps; ++i) {
             const double t = dt * (i + 0.5);
             const Vec3 p = oc + dc * t;
             Vec3 fl;
-            if (!vc.lookup(p, fl)) continue;
+            if (!vc.inScatter(p, wOut, fl)) continue;
             for (size_t mi = 0; mi < scene.media.size(); ++mi) {
                 const auto& md = scene.media[mi];
                 if (!md.enabled) continue;
                 const double ss = md.sigma_s(550.0) * md.densityAt(p, &vcTabs);
                 if (!(ss > 0.0)) continue;
                 const double T = mats.mediaTransmittance(scene, oc, dc, t, 550.0, rng);
-                acc += fl * (ss * invFourPi * T * dt);
+                acc += fl * (ss * T * dt);   // phase already folded in by inScatter
             }
         }
     }
