@@ -3577,6 +3577,52 @@ instrumenting `epochSec` after the 6x slowdown looked disproportionate to the po
 implement. **A variance improvement bought by an unexplained slowdown is a bug until the cost is
 accounted for.**
 
+### FIXED (2026-09-14, v0.304.0): `-checkpoint` in modes J and M — one mode already had it undocumented, one was excluded for a reason that stopped being true, and a resume re-used its own light-side realizations
+
+**Asked as** *"for general use and consistency, shouldn't mode J and M and whatever other new
+modes support -checkpoint?"* Three separate things turned out to be wrong, and only one of them
+was the missing feature.
+
+**1. Mode J already supported it, and the help text said otherwise.** `-h` read *"modes A/B/C,
+R/D, P"*. Mode J writes and reloads a sidecar correctly -- verified end to end, 2 spp -> resume ->
+4 spp. Another instance of the pattern this file's STALE-LIMITATION AUDIT is about: the capability
+shipped and the documentation did not follow.
+
+**2. Mode M's exclusion rested on a claim that the light-side refresh had already retired.** The
+stated reason was *"a photon map is persistent state a film-only sidecar cannot rebuild"*. True of
+the map, irrelevant to the estimator: since v0.247.0 mode M **redraws the light side every epoch
+and averages the realizations**, so a resume never needs the old map -- it needs the accumulated
+film and one more epoch, which is exactly what mode J does. The single-camera progressive driver
+already called the same `runSppProgressive` helper as mode J; it simply omitted the four trailing
+checkpoint arguments. Enabling it was passing them.
+
+**3. THE PART THAT WOULD HAVE MADE IT A USELESS FEATURE. `RngSaltScope(epoch)` restarts at 0, and
+epoch 0 is the identity.** A resumed render therefore drew *the identical sequence of light-side
+realizations it already held*, so the added samples re-added the same light-side noise instead of
+averaging it down. This file already recorded the symptom for mode J -- "extra spp decorrelate the
+CONNECTION half only" -- without connecting it to the salt. **It matters far more in mode M**,
+where the measurements taken earlier the same day put the per-realization MAP noise at 0.0778
+against a camera noise of 0.0077, about **100x in variance**: a resume that reuses maps improves
+essentially nothing. Fixed by offsetting the salt with the resumed sample base
+(`buildLightSide(epoch, prog->sampleBase)`), which is the identity on a fresh run -- `sampleBase`
+is 0 there -- so unresumed renders are bit-for-bit unchanged. Applied to **both** J and M.
+
+**Verified:** mode M progressive, `-time 12 -checkpoint` -> `holds 141 spp`; rerun with `-resume`
+-> `loaded ... 141 spp accumulated`, `holds 274 spp`.
+
+**What is still deliberately excluded, and now says so accurately: the SHARED multi-camera mode-M
+path.** It gathers a fixed spp per frame and **writes each frame the instant that frame's gather
+ends** -- which is the crash-safety a sidecar would have bought, at one-frame granularity. Its
+message used to claim `-checkpoint` "applies only to modes A/B/C, R/D, P", which was stale in two
+directions at once (it omitted J, and it denied the mode M support that now exists). It now says
+what is true, including that the progressive driver does support the flags.
+
+**A second copy of the same check is why the first fix appeared not to work.** The scope test
+exists in `runRender` AND on the shared path, with independently-worded messages; patching one
+left the other firing the old text. Worth remembering as the same failure mode this file records
+for MIS weights written in two places: **when a rule is stated twice, a change has to visit both
+or the untouched copy becomes the behaviour.**
+
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
 Three recorded blockers dissolved in one session, each on a single grep against code that had moved

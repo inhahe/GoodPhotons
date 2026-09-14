@@ -15936,9 +15936,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // would also throw away the map's whole reason for existing on a flyby.)
     if ((resume || wantCheckpointFlag) &&
         !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' ||
-          mode == 'J' || mode == 'P')) {
+          mode == 'J' || mode == 'M' || mode == 'P')) {
         std::fprintf(stderr, "[render] -resume/-checkpoint apply only to modes A/B/C "
-                             "(forward), R/D/J (reference), and P (composite); ignoring for mode %c\n", mode);
+                             "(forward), R/D/J (reference), M (photon map) and P (composite); "
+                             "ignoring for mode %c\n", mode);
         resume = false; wantCheckpointFlag = false;
     }
     if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever) &&
@@ -16511,8 +16512,18 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // freezing on one. That is the whole of the UPBP-THICK fix — see g_beamFreeze for the
         // measurements, and rng.h's RngSaltScope for why the salt has to come back off before
         // the camera pass runs.
-        auto buildLightSide = [&](uint64_t epoch) {
-            RngSaltScope saltScope(epoch);
+        // `saltOff` OFFSETS THE REALIZATION SEQUENCE ON RESUME, and it is what makes a resume
+        // worth having rather than merely consistent. `RngSaltScope(epoch)` with epoch restarting
+        // at 0 hands a resumed render the identical light-side realizations it already holds, so
+        // the extra samples re-add the same light-side noise instead of averaging it down. That
+        // is the limitation recorded elsewhere in this file as "extra spp decorrelate the
+        // CONNECTION half only". It bites hardest in mode M: measured on _cornell_diffuse the
+        // per-realization MAP noise is 0.0778 against a camera noise of 0.0077 -- ~100x in
+        // variance -- so a resume that reuses maps improves almost nothing. `epoch == 0` still
+        // decides FIRST-ness, so the reports and the one-time setup are unmoved, and a fresh run
+        // passes saltOff = 0 and is bit-for-bit unchanged.
+        auto buildLightSide = [&](uint64_t epoch, uint64_t saltOff = 0) {
+            RngSaltScope saltScope(epoch + saltOff);
             const bool first = (epoch == 0);
             if (!first) { bmap = BeamMap{}; smap = bdpt::SurfMap{}; }   // drop the old
                                                        // realization before redrawing
@@ -16795,7 +16806,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 double rebuildSec = 0.0;
                 if (epoch > 0) {
                     auto tr = clk::now();
-                    buildLightSide(epoch);
+                    buildLightSide(epoch, prog ? (uint64_t)prog->sampleBase : 0ull);
                     rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
                     // A refresh that came back empty would leave the gather pointing at an
                     // empty map, which silently turns the rest of the render into mode D.
@@ -16980,8 +16991,18 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // It is also nearly free here for a reason peculiar to mode M: the deposit is ~3 s of a
         // 900 s render (the gather dominates completely), so a 10 % rebuild budget buys tens of
         // independent realizations.
-        auto buildLightSide = [&](uint64_t epoch) {
-            RngSaltScope saltScope(epoch);
+        // `saltOff` OFFSETS THE REALIZATION SEQUENCE ON RESUME, and it is what makes a resume
+        // worth having rather than merely consistent. `RngSaltScope(epoch)` with epoch restarting
+        // at 0 hands a resumed render the identical light-side realizations it already holds, so
+        // the extra samples re-add the same light-side noise instead of averaging it down. That
+        // is the limitation recorded elsewhere in this file as "extra spp decorrelate the
+        // CONNECTION half only". It bites hardest in mode M: measured on _cornell_diffuse the
+        // per-realization MAP noise is 0.0778 against a camera noise of 0.0077 -- ~100x in
+        // variance -- so a resume that reuses maps improves almost nothing. `epoch == 0` still
+        // decides FIRST-ness, so the reports and the one-time setup are unmoved, and a fresh run
+        // passes saltOff = 0 and is bit-for-bit unchanged.
+        auto buildLightSide = [&](uint64_t epoch, uint64_t saltOff = 0) {
+            RngSaltScope saltScope(epoch + saltOff);
             const bool first = (epoch == 0);
             if (!first) { pm = PhotonMap{}; pmC = PhotonMap{}; bmap = BeamMap{}; }
             tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC, 0,
@@ -17044,7 +17065,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 double rebuildSec = 0.0;
                 if (epoch > 0) {
                     auto tr = clk::now();
-                    buildLightSide(epoch);
+                    buildLightSide(epoch, prog ? (uint64_t)prog->sampleBase : 0ull);
                     rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
                     // A refresh that came back empty would leave the gather pointing at empty
                     // maps, which silently turns the rest of the render black (or, for the beam
@@ -17113,9 +17134,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // beam gather inside the camera pass. Printed after the render so it covers every
             // epoch, and silent unless asked for.
             const auto tM0 = std::chrono::steady_clock::now();
+            const bool mCkpt = resume || wantCheckpointFlag ||
+                               timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
             const auto out = runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                          timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
-                                         renderChunked, res, resY);
+                                         renderChunked, res, resY, resume, mCkpt,
+                                         checkpointGuard(scene, mode, res, resY), mode);
             mStats().report(std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - tM0).count());
             gaDiagReport(scene);          // FTRACE_GADIAG=1; silent otherwise
@@ -18155,7 +18179,7 @@ static void printHelp(const char* prog) {
 "  -preview              live ANSI thumbnail in the terminal\n"
 "  -interval <sec>       periodic image-write / status / ANSI-preview cadence (default: 15)\n"
 "  -window-interval <s>  live-window repaint cadence, independent of -interval (default: 0.2)\n"
-"  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C, R/D, P;\n"
+"  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C, R/D/J, M, P;\n"
 "                        also carries the -radcache table, so a resume continues warm)\n"
 "  -resume               continue an accumulated render from its .ftbuf checkpoint\n"
 "  -parseonly            load the scene, print a contents summary, exit (no render)\n"
@@ -24050,11 +24074,13 @@ static int run(int argc, char** argv) {
         // nothing is worse than one that says it does nothing.
         if (resume || wantCheckpointFlag)
             std::fprintf(stderr,
-                "[render] -resume/-checkpoint apply only to modes A/B/C (forward), R/D "
-                "(reference), and P (composite); ignoring for mode M.\n"
-                "         (A photon map is persistent state a film-only sidecar cannot "
-                "rebuild. The shared\n         mode-M path is crash-safe anyway: it writes "
-                "each frame the instant that frame's gather ends.)\n");
+                "[render] -checkpoint/-resume: the SHARED mode-M path needs no sidecar and\n"
+                "         ignores them. It writes each frame the instant that frame's gather\n"
+                "         ends, which is the crash-safety a sidecar would have bought, and a\n"
+                "         photon map is persistent state a film-only sidecar cannot rebuild.\n"
+                "         Mode M's PROGRESSIVE driver does support them (-time/-noise/-forever\n"
+                "         /-preview), and a resume there draws fresh light-side realizations.\n");
+
         // Trap Ctrl-C for the whole mode-M gather. Without this the default SIGINT action
         // terminates the process, which on a -window-less / backgrounded run would abruptly
         // kill a live CUDA context mid-gather — the exact scenario cudaGracefulShutdown()
